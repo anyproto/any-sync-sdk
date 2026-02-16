@@ -9,7 +9,6 @@ import (
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/debugstat"
 	"github.com/anyproto/any-sync/commonspace"
-	"github.com/anyproto/any-sync/commonspace/credentialprovider"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/node/nodeclient"
@@ -40,7 +39,7 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 	a.Register(configAdapter).
 		Register(accountAdapter).
 		Register(debugstat.New()).
-		Register(credentialprovider.NewNoOp()).
+		Register(components.NewCredentialProvider()).
 		Register(nodeconfstore.New()).
 		Register(coordSource).
 		Register(nodeconf.New()).

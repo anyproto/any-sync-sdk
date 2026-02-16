@@ -12,13 +12,18 @@ import (
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/util/crypto"
 )
 
 type clientImpl struct {
 	app          *app.App
 	spaceService commonspace.SpaceService
+	coordClient  coordinatorclient.CoordinatorClient
 	cfg          syncsdk.Config
+	peerId       string
+	networkId    string
 
 	mu       sync.Mutex
 	spaces   map[string]*spaceimpl.SpaceImpl
@@ -51,11 +56,15 @@ func New(ctx context.Context, cfg syncsdk.Config) (syncsdk.Client, error) {
 	}
 
 	spaceService := a.MustComponent(commonspace.CName).(commonspace.SpaceService)
+	coordClient := a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
 
 	return &clientImpl{
 		app:          a,
 		spaceService: spaceService,
+		coordClient:  coordClient,
 		cfg:          cfg,
+		peerId:       cfg.PeerKey.GetPublic().PeerId(),
+		networkId:    cfg.Network.NetworkID,
 		spaces:       make(map[string]*spaceimpl.SpaceImpl),
 	}, nil
 }
@@ -145,6 +154,61 @@ func (c *clientImpl) Subscribe(handler syncsdk.Handler) (unsubscribe func()) {
 			c.handlers[idx] = nil
 		}
 	}
+}
+
+func (c *clientImpl) DeleteSpace(ctx context.Context, spaceID string) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return syncsdk.ErrClientClosed
+	}
+	c.mu.Unlock()
+
+	confirmation, err := coordinatorproto.PrepareDeleteConfirmation(c.cfg.SigningKey, spaceID, c.peerId, c.networkId)
+	if err != nil {
+		return err
+	}
+	if err := c.coordClient.SpaceDelete(ctx, spaceID, confirmation); err != nil {
+		return err
+	}
+
+	// Close and remove the space from local cache if it was open.
+	c.mu.Lock()
+	sp, ok := c.spaces[spaceID]
+	if ok {
+		delete(c.spaces, spaceID)
+	}
+	c.mu.Unlock()
+	if ok {
+		_ = sp.Close(ctx)
+	}
+	return nil
+}
+
+func (c *clientImpl) DeleteAccount(ctx context.Context) (int64, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return 0, syncsdk.ErrClientClosed
+	}
+	c.mu.Unlock()
+
+	confirmation, err := coordinatorproto.PrepareAccountDeleteConfirmation(c.cfg.SigningKey, c.peerId, c.networkId)
+	if err != nil {
+		return 0, err
+	}
+	return c.coordClient.AccountDelete(ctx, confirmation)
+}
+
+func (c *clientImpl) RevertAccountDeletion(ctx context.Context) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return syncsdk.ErrClientClosed
+	}
+	c.mu.Unlock()
+
+	return c.coordClient.AccountRevertDeletion(ctx)
 }
 
 func (c *clientImpl) Close(ctx context.Context) error {

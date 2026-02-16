@@ -83,6 +83,9 @@ type Client interface {
     CreateSpace(ctx, ...SpaceCreateOption) (Space, error)
     DeriveSpace(ctx, spaceType string) (Space, error)  // Deterministic from key + type
     OpenSpace(ctx, spaceID string) (Space, error)       // Lazy — no I/O until first use
+    DeleteSpace(ctx, spaceID string) error              // Coordinator RPC + local cleanup
+    DeleteAccount(ctx) (deletionTimestamp int64, err error) // Schedule account deletion
+    RevertAccountDeletion(ctx) error                    // Cancel pending account deletion
     Subscribe(Handler) (unsubscribe func())
     Close(ctx) error
 }
@@ -215,8 +218,8 @@ go test -run TestCreateObject ./...  # Single test
 | File | Count | Coverage |
 |------|-------|----------|
 | `syncsdk_test.go` | 15 | Config validation, key gen, option resolvers, error values |
-| `integration_test.go` | 21 | Full lifecycle: create/derive/open spaces, create/derive/delete objects, add content, iterate, subscribe, concurrent access, persistence, KV |
-| `e2e_test.go` | 2 | Staging network (skipped in `-short` mode) |
+| `integration_test.go` | 24 | Full lifecycle: create/derive/open spaces, create/derive/delete objects, add content, iterate, subscribe, concurrent access, persistence, KV, delete space/account after close |
+| `e2e_test.go` | 5 | Staging network (skipped in `-short` mode): create space, derive space, delete space, delete/revert account |
 
 ### Adding a new component adapter
 

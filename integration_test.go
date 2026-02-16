@@ -504,6 +504,49 @@ func TestDeriveObject(t *testing.T) {
 	assert.Equal(t, obj.ID(), obj2.ID())
 }
 
+func TestDeleteSpace_AfterClose(t *testing.T) {
+	cfg := testConfig(t)
+	ctx := context.Background()
+
+	c, err := client.New(ctx, cfg)
+	require.NoError(t, err)
+
+	err = c.Close(ctx)
+	require.NoError(t, err)
+
+	// DeleteSpace on a closed client should return ErrClientClosed
+	err = c.DeleteSpace(ctx, "nonexistent-space")
+	assert.ErrorIs(t, err, syncsdk.ErrClientClosed)
+}
+
+func TestDeleteAccount_AfterClose(t *testing.T) {
+	cfg := testConfig(t)
+	ctx := context.Background()
+
+	c, err := client.New(ctx, cfg)
+	require.NoError(t, err)
+
+	err = c.Close(ctx)
+	require.NoError(t, err)
+
+	_, err = c.DeleteAccount(ctx)
+	assert.ErrorIs(t, err, syncsdk.ErrClientClosed)
+}
+
+func TestRevertAccountDeletion_AfterClose(t *testing.T) {
+	cfg := testConfig(t)
+	ctx := context.Background()
+
+	c, err := client.New(ctx, cfg)
+	require.NoError(t, err)
+
+	err = c.Close(ctx)
+	require.NoError(t, err)
+
+	err = c.RevertAccountDeletion(ctx)
+	assert.ErrorIs(t, err, syncsdk.ErrClientClosed)
+}
+
 func TestDeleteObject(t *testing.T) {
 	c := newTestClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

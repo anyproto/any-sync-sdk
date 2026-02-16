@@ -110,3 +110,73 @@ func TestE2EDeriveSpaceOnStaging(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, space.ID(), space2.ID())
 }
+
+func TestE2EDeleteSpaceOnStaging(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+
+	network := loadStagingConfig(t)
+
+	signingKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+	masterKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+
+	cfg := syncsdk.Config{
+		SigningKey:   signingKey,
+		MasterKey:   masterKey,
+		Network:     network,
+		StoragePath: t.TempDir(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	c, err := client.New(ctx, cfg)
+	require.NoError(t, err)
+	defer func() { _ = c.Close(context.Background()) }()
+
+	// Create a space, then delete it
+	space, err := c.CreateSpace(ctx)
+	require.NoError(t, err)
+
+	err = c.DeleteSpace(ctx, space.ID())
+	require.NoError(t, err)
+}
+
+func TestE2EDeleteAccountOnStaging(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+
+	network := loadStagingConfig(t)
+
+	signingKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+	masterKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+
+	cfg := syncsdk.Config{
+		SigningKey:   signingKey,
+		MasterKey:   masterKey,
+		Network:     network,
+		StoragePath: t.TempDir(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	c, err := client.New(ctx, cfg)
+	require.NoError(t, err)
+	defer func() { _ = c.Close(context.Background()) }()
+
+	// Delete account and verify we get a timestamp back
+	ts, err := c.DeleteAccount(ctx)
+	require.NoError(t, err)
+	assert.Greater(t, ts, int64(0), "deletion timestamp should be positive")
+
+	// Revert the deletion
+	err = c.RevertAccountDeletion(ctx)
+	require.NoError(t, err)
+}

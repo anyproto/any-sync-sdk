@@ -39,19 +39,21 @@ type SpaceImpl struct {
 	kvOnce sync.Once
 	kv     syncsdk.KeyValue
 
-	mu       sync.Mutex
-	objects  map[string]syncsdk.Object
-	handlers []syncsdk.Handler
-	closed   bool
+	mu                sync.Mutex
+	objects           map[string]syncsdk.Object
+	handlers          []syncsdk.Handler
+	knownJoinRequests map[string]struct{}
+	closed            bool
 }
 
 func New(id string, spaceService commonspace.SpaceService, cfg syncsdk.Config, coordClient coordinatorclient.CoordinatorClient) *SpaceImpl {
 	return &SpaceImpl{
-		id:           id,
-		spaceService: spaceService,
-		coordClient:  coordClient,
-		cfg:          cfg,
-		objects:      make(map[string]syncsdk.Object),
+		id:                id,
+		spaceService:      spaceService,
+		coordClient:       coordClient,
+		cfg:               cfg,
+		objects:           make(map[string]syncsdk.Object),
+		knownJoinRequests: make(map[string]struct{}),
 	}
 }
 
@@ -71,6 +73,17 @@ func (s *SpaceImpl) ensure(ctx context.Context) error {
 			return
 		}
 		s.cs = cs
+
+		// Capture existing join requests so they don't fire events,
+		// then register as AclUpdater for future notifications.
+		acl := cs.Acl()
+		acl.RLock()
+		initialJoinRecords, _ := acl.AclState().JoinRecords(false)
+		for _, rec := range initialJoinRecords {
+			s.knownJoinRequests[rec.RecordId] = struct{}{}
+		}
+		acl.RUnlock()
+		acl.SetAclUpdater(s)
 	})
 	return s.initErr
 }
@@ -393,6 +406,56 @@ func (s *SpaceImpl) DeclineJoinRequest(ctx context.Context, identity crypto.PubK
 		return err
 	}
 	return s.cs.AclClient().DeclineRequest(ctx, identity)
+}
+
+func (s *SpaceImpl) RevokeInvite(ctx context.Context, inviteRecordID string) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	return s.cs.AclClient().RevokeInvite(ctx, inviteRecordID)
+}
+
+// UpdateAcl implements headupdater.AclUpdater. It is called by syncacl
+// while the ACL lock is held; dispatch must be async to avoid deadlock.
+func (s *SpaceImpl) UpdateAcl(aclList list.AclList) {
+	joinRecords, _ := aclList.AclState().JoinRecords(false)
+	var newEvents []syncsdk.Event
+	current := make(map[string]struct{}, len(joinRecords))
+	for _, rec := range joinRecords {
+		current[rec.RecordId] = struct{}{}
+		if _, known := s.knownJoinRequests[rec.RecordId]; !known {
+			newEvents = append(newEvents, syncsdk.Event{
+				Type:     syncsdk.JoinRequestReceived,
+				SpaceID:  s.id,
+				Identity: rec.RequestIdentity,
+			})
+		}
+	}
+	s.knownJoinRequests = current
+	if len(newEvents) > 0 {
+		go func() {
+			for _, evt := range newEvents {
+				s.dispatch(evt)
+			}
+		}()
+	}
+}
+
+// dispatch sends an event to all registered space-level handlers.
+func (s *SpaceImpl) dispatch(evt syncsdk.Event) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	subs := make([]syncsdk.Handler, len(s.handlers))
+	copy(subs, s.handlers)
+	s.mu.Unlock()
+	for _, h := range subs {
+		if h != nil {
+			h(evt)
+		}
+	}
 }
 
 func (s *SpaceImpl) Push(ctx context.Context) error {

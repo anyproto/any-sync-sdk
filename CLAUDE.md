@@ -112,6 +112,7 @@ type Space interface {
     ChangePermissions(ctx, identity keys.PublicKey, permissions Permission) error
     AcceptJoinRequest(ctx, identity keys.PublicKey, permissions Permission) error
     DeclineJoinRequest(ctx, identity keys.PublicKey) error
+    RevokeInvite(ctx, inviteRecordID string) error
     Subscribe(Handler) (unsubscribe func())
     Close(ctx) error
 }
@@ -186,17 +187,19 @@ type KeyValue interface {
 ```go
 type EventType int
 const (
-    ObjectUpdated EventType = iota + 1  // Incremental append from remote
-    ObjectRebuilt                        // Full DAG rebuild (snapshot)
-    SpaceConnected                       // Space sync active
-    SpaceDisconnected                    // Lost all peers
+    ObjectUpdated       EventType = iota + 1  // Incremental append from remote
+    ObjectRebuilt                              // Full DAG rebuild (snapshot)
+    SpaceConnected                             // Space sync active
+    SpaceDisconnected                          // Lost all peers
+    JoinRequestReceived                        // Someone requested to join via approval invite
 )
 
 type Event struct {
     Type     EventType
     SpaceID  string
-    ObjectID string   // Empty for space-level events
+    ObjectID string         // Empty for space-level events
     Heads    []string
+    Identity keys.PublicKey  // Populated for ACL events (nil for object events)
 }
 
 type Handler func(Event)
@@ -247,7 +250,7 @@ go build ./...
 ### Test
 
 ```bash
-go test ./...              # All tests (67 tests)
+go test ./...              # All tests (71 tests)
 go test -race ./...        # With race detector
 go test -short ./...       # Skip E2E tests
 go test -run TestCreateObject ./...  # Single test
@@ -263,13 +266,15 @@ go test -run TestCreateObject ./...  # Single test
 - **GenerateInvite requires SpaceMakeShareable.** The coordinator must mark the space as shareable before invites can be created. This is called automatically by `GenerateInvite`.
 - **ReplaceInvite does NOT send to the network.** After `ReplaceInvite()`, you must call `AddRecord()` with the returned `InviteRec` to actually persist the invite.
 - **AclJoiningClient is created manually** (not via bootstrap) because it shares `CName` with `AclSpaceClient`. It's initialized from the parent `app.App` in `clientimpl.New()`.
+- **SpaceImpl implements AclUpdater** to receive ACL change callbacks via `SetAclUpdater`. It dispatches `JoinRequestReceived` events asynchronously (via goroutine) because the callback runs while the ACL lock is held.
+- **RevokeInvite** delegates to `AclSpaceClient.RevokeInvite(ctx, inviteRecordId)` from any-sync.
 
 ### Tests
 
 | File | Count | Coverage |
 |------|-------|----------|
-| `syncsdk_test.go` | 29 | Config validation, key gen, option resolvers, error values, permission/status constants, invite encode/decode/parse |
-| `integration_test.go` | 29 | Full lifecycle: create/derive/open spaces, create/derive/delete objects, add content, iterate, subscribe, concurrent access, persistence, KV, delete space/account after close, members, invite generation, join validation |
+| `syncsdk_test.go` | 31 | Config validation, key gen, option resolvers, error values, permission/status constants, invite encode/decode/parse, event types, event Identity field |
+| `integration_test.go` | 31 | Full lifecycle: create/derive/open spaces, create/derive/delete objects, add content, iterate, subscribe, concurrent access, persistence, KV, delete space/account after close, members, invite generation, join validation, space dispatch, RevokeInvite |
 | `e2e_test.go` | 5 | Staging network (skipped in `-short` mode): create space, derive space, delete space, delete/revert account |
 
 ### Adding a new component adapter

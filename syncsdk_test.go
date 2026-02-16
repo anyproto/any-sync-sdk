@@ -74,6 +74,20 @@ func TestEventTypeConstants(t *testing.T) {
 	assert.Equal(t, syncsdk.EventType(2), syncsdk.ObjectRebuilt)
 	assert.Equal(t, syncsdk.EventType(3), syncsdk.SpaceConnected)
 	assert.Equal(t, syncsdk.EventType(4), syncsdk.SpaceDisconnected)
+	assert.Equal(t, syncsdk.EventType(5), syncsdk.JoinRequestReceived)
+}
+
+func TestEventIdentityField(t *testing.T) {
+	// Default Event has nil Identity
+	evt := syncsdk.Event{Type: syncsdk.ObjectUpdated, SpaceID: "sp1"}
+	assert.Nil(t, evt.Identity)
+
+	// Identity can carry a public key for ACL events
+	_, pubKey, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+	evt = syncsdk.Event{Type: syncsdk.JoinRequestReceived, SpaceID: "sp2", Identity: pubKey}
+	assert.NotNil(t, evt.Identity)
+	assert.True(t, evt.Identity.Equals(pubKey))
 }
 
 func TestResolveAddOptions_Defaults(t *testing.T) {

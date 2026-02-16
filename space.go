@@ -61,6 +61,8 @@ type Space interface {
 	AcceptJoinRequest(ctx context.Context, identity keys.PublicKey, permissions Permission) error
 	// DeclineJoinRequest rejects a pending join request.
 	DeclineJoinRequest(ctx context.Context, identity keys.PublicKey) error
+	// RevokeInvite revokes an existing invite by its record ID.
+	RevokeInvite(ctx context.Context, inviteRecordID string) error
 
 	// Push registers the space with the coordinator and makes it available
 	// on the network. This is called automatically by operations that need

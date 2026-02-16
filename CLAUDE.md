@@ -36,10 +36,12 @@ Depends on `github.com/anyproto/any-sync` (currently via local replace directive
 
 ```
 .
-├── client.go          # Client interface
-├── space.go           # Space interface, ObjectCreateOption, ObjectDeriveOption
+├── client.go          # Client interface (incl. JoinSpace)
+├── space.go           # Space interface (incl. sharing/ACL methods)
 ├── object.go          # Object interface, ChangeInfo, AddOption
 ├── keyvalue.go        # KeyValue interface
+├── permission.go      # Permission, MemberStatus, Member, InviteOption types
+├── invite.go          # Invite encode/decode/parse helpers
 ├── event.go           # EventType, Event, Handler
 ├── config.go          # Config, NetworkConfig, NodeInfo
 ├── errors.go          # Sentinel errors
@@ -83,6 +85,7 @@ type Client interface {
     CreateSpace(ctx, ...SpaceCreateOption) (Space, error)
     DeriveSpace(ctx, spaceType string) (Space, error)  // Deterministic from key + type
     OpenSpace(ctx, spaceID string) (Space, error)       // Lazy — no I/O until first use
+    JoinSpace(ctx, invite string) (Space, error)        // Join via invite link
     DeleteSpace(ctx, spaceID string) error              // Coordinator RPC + local cleanup
     DeleteAccount(ctx) (deletionTimestamp int64, err error) // Schedule account deletion
     RevertAccountDeletion(ctx) error                    // Cancel pending account deletion
@@ -102,9 +105,54 @@ type Space interface {
     DeleteObject(ctx, objectID string) error
     ListObjectIDs(ctx) ([]string, error)
     KeyValue() KeyValue
+    GenerateInvite(ctx, ...InviteOption) (invite string, err error)
+    Members(ctx) ([]Member, error)
+    AddMember(ctx, identity keys.PublicKey, permissions Permission) error
+    RemoveMember(ctx, identity keys.PublicKey) error
+    ChangePermissions(ctx, identity keys.PublicKey, permissions Permission) error
+    AcceptJoinRequest(ctx, identity keys.PublicKey, permissions Permission) error
+    DeclineJoinRequest(ctx, identity keys.PublicKey) error
     Subscribe(Handler) (unsubscribe func())
     Close(ctx) error
 }
+```
+
+### Permissions & Members
+
+```go
+type Permission int
+const (
+    PermissionOwner  Permission = 1
+    PermissionAdmin  Permission = 2
+    PermissionWriter Permission = 3
+    PermissionReader Permission = 4
+)
+
+type MemberStatus int
+const (
+    MemberStatusActive   MemberStatus = 1
+    MemberStatusJoining  MemberStatus = 2
+    MemberStatusRemoving MemberStatus = 3
+)
+
+type Member struct {
+    Identity    keys.PublicKey
+    Permissions Permission
+    Status      MemberStatus
+}
+```
+
+### Invites
+
+```go
+// Functional options for GenerateInvite
+WithInvitePermission(Permission)  // default: PermissionWriter
+WithApprovalRequired()            // creates RequestToJoin invite
+
+// Standalone functions (no Space needed)
+EncodeInvite(spaceID string, inviteKey crypto.PrivKey, approvalRequired bool) (string, error)
+DecodeInvite(invite string) (spaceID string, inviteKey crypto.PrivKey, approvalRequired bool, err error)
+ParseInvite(invite string) (spaceID string, err error)
 ```
 
 ### Object
@@ -168,7 +216,7 @@ type Config struct {
 
 ### Errors
 
-`ErrInvalidConfig`, `ErrClientClosed`, `ErrSpaceClosed`, `ErrSpaceNotFound`, `ErrObjectNotFound`
+`ErrInvalidConfig`, `ErrClientClosed`, `ErrSpaceClosed`, `ErrSpaceNotFound`, `ErrObjectNotFound`, `ErrJoinRequestPending`, `ErrInvalidInvite`
 
 ## Architecture
 
@@ -199,7 +247,7 @@ go build ./...
 ### Test
 
 ```bash
-go test ./...              # All tests (38 tests)
+go test ./...              # All tests (67 tests)
 go test -race ./...        # With race detector
 go test -short ./...       # Skip E2E tests
 go test -run TestCreateObject ./...  # Single test
@@ -212,13 +260,16 @@ go test -run TestCreateObject ./...  # Single test
 - **ListObjectIDs uses HeadStorage directly**, not `StoredIds()`. The diff manager excludes empty-root trees from its NewDiff, so recently created objects without content wouldn't appear.
 - **HeadUpdater is async.** The DiffManager receives updates via a goroutine queue, not synchronously from HeadStorage writes.
 - **Space.Close() closes cached objects** before closing the underlying commonspace to prevent resource leaks.
+- **GenerateInvite requires SpaceMakeShareable.** The coordinator must mark the space as shareable before invites can be created. This is called automatically by `GenerateInvite`.
+- **ReplaceInvite does NOT send to the network.** After `ReplaceInvite()`, you must call `AddRecord()` with the returned `InviteRec` to actually persist the invite.
+- **AclJoiningClient is created manually** (not via bootstrap) because it shares `CName` with `AclSpaceClient`. It's initialized from the parent `app.App` in `clientimpl.New()`.
 
 ### Tests
 
 | File | Count | Coverage |
 |------|-------|----------|
-| `syncsdk_test.go` | 15 | Config validation, key gen, option resolvers, error values |
-| `integration_test.go` | 24 | Full lifecycle: create/derive/open spaces, create/derive/delete objects, add content, iterate, subscribe, concurrent access, persistence, KV, delete space/account after close |
+| `syncsdk_test.go` | 29 | Config validation, key gen, option resolvers, error values, permission/status constants, invite encode/decode/parse |
+| `integration_test.go` | 29 | Full lifecycle: create/derive/open spaces, create/derive/delete objects, add content, iterate, subscribe, concurrent access, persistence, KV, delete space/account after close, members, invite generation, join validation |
 | `e2e_test.go` | 5 | Staging network (skipped in `-short` mode): create space, derive space, delete space, delete/revert account |
 
 ### Adding a new component adapter

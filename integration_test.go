@@ -561,3 +561,58 @@ func TestDeleteObject(t *testing.T) {
 	err = space.DeleteObject(ctx, obj.ID())
 	assert.NoError(t, err)
 }
+
+func TestMembers_OwnerOnly(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	space, err := c.CreateSpace(ctx)
+	require.NoError(t, err)
+
+	members, err := space.Members(ctx)
+	require.NoError(t, err)
+	require.Len(t, members, 1, "new space should have exactly one member (owner)")
+	assert.Equal(t, syncsdk.PermissionOwner, members[0].Permissions)
+	assert.Equal(t, syncsdk.MemberStatusActive, members[0].Status)
+}
+
+func TestJoinSpace_InvalidInvite(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := c.JoinSpace(ctx, "garbage-not-an-invite")
+	assert.ErrorIs(t, err, syncsdk.ErrInvalidInvite)
+}
+
+func TestJoinSpace_AfterClose(t *testing.T) {
+	cfg := testConfig(t)
+	ctx := context.Background()
+
+	c, err := client.New(ctx, cfg)
+	require.NoError(t, err)
+
+	err = c.Close(ctx)
+	require.NoError(t, err)
+
+	_, err = c.JoinSpace(ctx, "anything")
+	assert.ErrorIs(t, err, syncsdk.ErrClientClosed)
+}
+
+func TestGenerateInvite_AfterClose(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	space, err := c.CreateSpace(ctx)
+	require.NoError(t, err)
+
+	err = c.Close(ctx)
+	require.NoError(t, err)
+
+	// Space is still reachable but underlying client/coordinator is closed.
+	// GenerateInvite requires coordinator RPC — should fail.
+	_, err = space.GenerateInvite(ctx)
+	assert.Error(t, err)
+}

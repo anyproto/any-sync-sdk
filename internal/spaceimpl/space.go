@@ -13,17 +13,23 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/objectimpl"
 
 	"github.com/anyproto/any-sync/commonspace"
+	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
+	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/syncstatus"
+	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
+	"github.com/anyproto/any-sync/util/crypto"
 )
 
 // SpaceImpl implements syncsdk.Space with lazy initialization.
 type SpaceImpl struct {
 	id           string
 	spaceService commonspace.SpaceService
+	coordClient  coordinatorclient.CoordinatorClient
 	cfg          syncsdk.Config
 
 	once    sync.Once
@@ -39,10 +45,11 @@ type SpaceImpl struct {
 	closed   bool
 }
 
-func New(id string, spaceService commonspace.SpaceService, cfg syncsdk.Config) *SpaceImpl {
+func New(id string, spaceService commonspace.SpaceService, cfg syncsdk.Config, coordClient coordinatorclient.CoordinatorClient) *SpaceImpl {
 	return &SpaceImpl{
 		id:           id,
 		spaceService: spaceService,
+		coordClient:  coordClient,
 		cfg:          cfg,
 		objects:      make(map[string]syncsdk.Object),
 	}
@@ -249,6 +256,160 @@ func (s *SpaceImpl) Close(ctx context.Context) error {
 	return nil
 }
 
+func (s *SpaceImpl) GenerateInvite(ctx context.Context, opts ...syncsdk.InviteOption) (string, error) {
+	if err := s.ensure(ctx); err != nil {
+		return "", err
+	}
+	resolved := syncsdk.ResolveInviteOptions(opts)
+
+	if err := s.coordClient.SpaceMakeShareable(ctx, s.id); err != nil {
+		return "", err
+	}
+
+	var inviteType aclrecordproto.AclInviteType
+	var permissions list.AclPermissions
+	if resolved.ApprovalRequired {
+		inviteType = aclrecordproto.AclInviteType_RequestToJoin
+		permissions = list.AclPermissionsNone
+	} else {
+		inviteType = aclrecordproto.AclInviteType_AnyoneCanJoin
+		permissions = permissionToAcl(resolved.Permission)
+	}
+
+	result, err := s.cs.AclClient().ReplaceInvite(ctx, aclclient.InvitePayload{
+		InviteType:  inviteType,
+		Permissions: permissions,
+	})
+	if errors.Is(err, list.ErrDuplicateInvites) {
+		// Same invite type already exists — re-read the existing invite key.
+		// For simplicity, return the error; caller can re-generate with different opts.
+		return "", err
+	}
+	if err != nil {
+		return "", err
+	}
+
+	if err := s.cs.AclClient().AddRecord(ctx, result.InviteRec); err != nil {
+		return "", err
+	}
+
+	return syncsdk.EncodeInvite(s.id, result.InviteKey, resolved.ApprovalRequired)
+}
+
+func (s *SpaceImpl) Members(ctx context.Context) ([]syncsdk.Member, error) {
+	if err := s.ensure(ctx); err != nil {
+		return nil, err
+	}
+	acl := s.cs.Acl()
+	acl.RLock()
+	defer acl.RUnlock()
+
+	accounts := acl.AclState().CurrentAccounts()
+	var members []syncsdk.Member
+	for _, acc := range accounts {
+		status := aclStatusToMemberStatus(acc.Status)
+		perm := aclToPermission(acc.Permissions)
+		// Skip accounts with no permissions that are not in joining/removing state
+		if acc.Permissions.NoPermissions() && status != syncsdk.MemberStatusJoining && status != syncsdk.MemberStatusRemoving {
+			continue
+		}
+		members = append(members, syncsdk.Member{
+			Identity:    acc.PubKey,
+			Permissions: perm,
+			Status:      status,
+		})
+	}
+	return members, nil
+}
+
+func (s *SpaceImpl) AddMember(ctx context.Context, identity crypto.PubKey, permissions syncsdk.Permission) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	return s.cs.AclClient().AddAccounts(ctx, list.AccountsAddPayload{
+		Additions: []list.AccountAdd{
+			{
+				Identity:    identity,
+				Permissions: permissionToAcl(permissions),
+			},
+		},
+	})
+}
+
+func (s *SpaceImpl) RemoveMember(ctx context.Context, identity crypto.PubKey) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	readKey, err := crypto.NewRandomAES()
+	if err != nil {
+		return err
+	}
+	metadataKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		return err
+	}
+	return s.cs.AclClient().RemoveAccounts(ctx, list.AccountRemovePayload{
+		Identities: []crypto.PubKey{identity},
+		Change: list.ReadKeyChangePayload{
+			MetadataKey: metadataKey,
+			ReadKey:     readKey,
+		},
+	})
+}
+
+func (s *SpaceImpl) ChangePermissions(ctx context.Context, identity crypto.PubKey, permissions syncsdk.Permission) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	return s.cs.AclClient().ChangePermissions(ctx, list.PermissionChangesPayload{
+		Changes: []list.PermissionChangePayload{
+			{
+				Identity:    identity,
+				Permissions: permissionToAcl(permissions),
+			},
+		},
+	})
+}
+
+func (s *SpaceImpl) AcceptJoinRequest(ctx context.Context, identity crypto.PubKey, permissions syncsdk.Permission) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	acl := s.cs.Acl()
+	acl.RLock()
+	rec, err := acl.AclState().JoinRecord(identity, false)
+	acl.RUnlock()
+	if err != nil {
+		return err
+	}
+	return s.cs.AclClient().AcceptRequest(ctx, list.RequestAcceptPayload{
+		RequestRecordId: rec.RecordId,
+		Permissions:     permissionToAcl(permissions),
+	})
+}
+
+func (s *SpaceImpl) DeclineJoinRequest(ctx context.Context, identity crypto.PubKey) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	return s.cs.AclClient().DeclineRequest(ctx, identity)
+}
+
+func (s *SpaceImpl) Push(ctx context.Context) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	state, err := s.cs.Storage().StateStorage().GetState(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = s.coordClient.SpaceSign(ctx, coordinatorclient.SpaceSignPayload{
+		SpaceId:     s.id,
+		SpaceHeader: state.SpaceHeader,
+	})
+	return err
+}
+
 // CommonSpace returns the underlying commonspace.Space, initializing it lazily.
 // This is used by other internal packages.
 func (s *SpaceImpl) CommonSpace(ctx context.Context) (commonspace.Space, error) {
@@ -256,4 +417,29 @@ func (s *SpaceImpl) CommonSpace(ctx context.Context) (commonspace.Space, error) 
 		return nil, err
 	}
 	return s.cs, nil
+}
+
+// permissionToAcl converts an SDK Permission to an any-sync AclPermissions.
+// Values match directly since Permission constants mirror AclUserPermissions.
+func permissionToAcl(p syncsdk.Permission) list.AclPermissions {
+	return list.AclPermissions(p)
+}
+
+// aclToPermission converts an any-sync AclPermissions to an SDK Permission.
+func aclToPermission(p list.AclPermissions) syncsdk.Permission {
+	return syncsdk.Permission(p)
+}
+
+// aclStatusToMemberStatus maps any-sync AclStatus to the SDK MemberStatus.
+func aclStatusToMemberStatus(s list.AclStatus) syncsdk.MemberStatus {
+	switch s {
+	case list.StatusActive:
+		return syncsdk.MemberStatusActive
+	case list.StatusJoining:
+		return syncsdk.MemberStatusJoining
+	case list.StatusRemoving:
+		return syncsdk.MemberStatusRemoving
+	default:
+		return syncsdk.MemberStatusActive
+	}
 }

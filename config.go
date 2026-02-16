@@ -27,6 +27,11 @@ type NodeInfo struct {
 	Types     []string `yaml:"types"`
 }
 
+// NetworkConfigToYAML serializes a NetworkConfig to YAML.
+func NetworkConfigToYAML(cfg NetworkConfig) ([]byte, error) {
+	return yaml.Marshal(cfg)
+}
+
 // NetworkConfigFromYAML parses a NetworkConfig from YAML data.
 // The ID field is not part of the YAML format and must be set separately.
 func NetworkConfigFromYAML(data []byte) (NetworkConfig, error) {

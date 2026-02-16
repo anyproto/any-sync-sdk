@@ -1,6 +1,10 @@
 package syncsdk
 
-import "context"
+import (
+	"context"
+
+	"github.com/anyproto/any-sync-sdk/keys"
+)
 
 type SpaceCreateOption func(*spaceCreateOptions)
 type ObjectCreateOption func(*objectCreateOptions)
@@ -42,6 +46,28 @@ type Space interface {
 	DeleteObject(ctx context.Context, objectID string) error
 	ListObjectIDs(ctx context.Context) ([]string, error)
 	KeyValue() KeyValue
+
+	// GenerateInvite creates a new invite link for this space.
+	GenerateInvite(ctx context.Context, opts ...InviteOption) (invite string, err error)
+	// Members returns all members of this space with their permissions and status.
+	Members(ctx context.Context) ([]Member, error)
+	// AddMember adds an account directly to the space by identity.
+	AddMember(ctx context.Context, identity keys.PublicKey, permissions Permission) error
+	// RemoveMember removes a member from the space by identity.
+	RemoveMember(ctx context.Context, identity keys.PublicKey) error
+	// ChangePermissions updates the permission level of an existing member.
+	ChangePermissions(ctx context.Context, identity keys.PublicKey, permissions Permission) error
+	// AcceptJoinRequest approves a pending join request.
+	AcceptJoinRequest(ctx context.Context, identity keys.PublicKey, permissions Permission) error
+	// DeclineJoinRequest rejects a pending join request.
+	DeclineJoinRequest(ctx context.Context, identity keys.PublicKey) error
+
+	// Push registers the space with the coordinator and makes it available
+	// on the network. This is called automatically by operations that need
+	// network access, but can be called explicitly to ensure the space is
+	// registered before generating invites or sharing.
+	Push(ctx context.Context) error
+
 	Subscribe(handler Handler) (unsubscribe func())
 	Close(ctx context.Context) error
 }

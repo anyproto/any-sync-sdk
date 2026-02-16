@@ -175,3 +175,117 @@ func TestNetworkConfigFromFile_NotFound(t *testing.T) {
 	_, err := syncsdk.NetworkConfigFromFile("nonexistent.yml")
 	assert.Error(t, err)
 }
+
+func TestPermissionConstants(t *testing.T) {
+	assert.Equal(t, syncsdk.Permission(1), syncsdk.PermissionOwner)
+	assert.Equal(t, syncsdk.Permission(2), syncsdk.PermissionAdmin)
+	assert.Equal(t, syncsdk.Permission(3), syncsdk.PermissionWriter)
+	assert.Equal(t, syncsdk.Permission(4), syncsdk.PermissionReader)
+}
+
+func TestMemberStatusConstants(t *testing.T) {
+	assert.Equal(t, syncsdk.MemberStatus(1), syncsdk.MemberStatusActive)
+	assert.Equal(t, syncsdk.MemberStatus(2), syncsdk.MemberStatusJoining)
+	assert.Equal(t, syncsdk.MemberStatus(3), syncsdk.MemberStatusRemoving)
+}
+
+func TestResolveInviteOptions_Defaults(t *testing.T) {
+	resolved := syncsdk.ResolveInviteOptions(nil)
+	assert.Equal(t, syncsdk.PermissionWriter, resolved.Permission)
+	assert.False(t, resolved.ApprovalRequired)
+}
+
+func TestResolveInviteOptions_CustomPermission(t *testing.T) {
+	resolved := syncsdk.ResolveInviteOptions([]syncsdk.InviteOption{
+		syncsdk.WithInvitePermission(syncsdk.PermissionReader),
+	})
+	assert.Equal(t, syncsdk.PermissionReader, resolved.Permission)
+	assert.False(t, resolved.ApprovalRequired)
+}
+
+func TestResolveInviteOptions_ApprovalRequired(t *testing.T) {
+	resolved := syncsdk.ResolveInviteOptions([]syncsdk.InviteOption{
+		syncsdk.WithApprovalRequired(),
+	})
+	assert.True(t, resolved.ApprovalRequired)
+}
+
+func TestInviteEncodeDecode_AnyoneCanJoin(t *testing.T) {
+	privKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+
+	encoded, err := syncsdk.EncodeInvite("space123", privKey, false)
+	require.NoError(t, err)
+	assert.NotEmpty(t, encoded)
+
+	spaceID, decodedKey, approvalRequired, err := syncsdk.DecodeInvite(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, "space123", spaceID)
+	assert.False(t, approvalRequired)
+	assert.True(t, decodedKey.GetPublic().Equals(privKey.GetPublic()))
+}
+
+func TestInviteEncodeDecode_RequestToJoin(t *testing.T) {
+	privKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+
+	encoded, err := syncsdk.EncodeInvite("spaceXYZ", privKey, true)
+	require.NoError(t, err)
+
+	spaceID, decodedKey, approvalRequired, err := syncsdk.DecodeInvite(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, "spaceXYZ", spaceID)
+	assert.True(t, approvalRequired)
+	assert.True(t, decodedKey.GetPublic().Equals(privKey.GetPublic()))
+}
+
+func TestParseInvite_Valid(t *testing.T) {
+	privKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+
+	encoded, err := syncsdk.EncodeInvite("space456", privKey, false)
+	require.NoError(t, err)
+
+	spaceID, err := syncsdk.ParseInvite(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, "space456", spaceID)
+}
+
+func TestParseInvite_InvalidBase64(t *testing.T) {
+	_, err := syncsdk.ParseInvite("not-valid-base64!!!")
+	assert.ErrorIs(t, err, syncsdk.ErrInvalidInvite)
+}
+
+func TestParseInvite_InvalidJSON(t *testing.T) {
+	// Valid base64 but not JSON
+	_, err := syncsdk.ParseInvite("aGVsbG8=")
+	assert.ErrorIs(t, err, syncsdk.ErrInvalidInvite)
+}
+
+func TestDecodeInvite_BadBase64(t *testing.T) {
+	_, _, _, err := syncsdk.DecodeInvite("not-base64!!!")
+	assert.ErrorIs(t, err, syncsdk.ErrInvalidInvite)
+}
+
+func TestDecodeInvite_MissingSpaceID(t *testing.T) {
+	// Encode valid base64 JSON with empty space ID
+	_, _, _, err := syncsdk.DecodeInvite("eyJzIjoiIiwiayI6ImFiYyIsInQiOjF9")
+	assert.ErrorIs(t, err, syncsdk.ErrInvalidInvite)
+}
+
+func TestDecodeInvite_MissingKey(t *testing.T) {
+	// {"s":"space","k":"","t":1}
+	_, _, _, err := syncsdk.DecodeInvite("eyJzIjoic3BhY2UiLCJrIjoiIiwidCI6MX0=")
+	assert.ErrorIs(t, err, syncsdk.ErrInvalidInvite)
+}
+
+func TestDecodeInvite_InvalidKeyBytes(t *testing.T) {
+	// {"s":"space","k":"aGVsbG8=","t":1} - valid base64 key but not a valid ed25519 key
+	_, _, _, err := syncsdk.DecodeInvite("eyJzIjoic3BhY2UiLCJrIjoiYUdWc2JHOD0iLCJ0IjoxfQ==")
+	assert.ErrorIs(t, err, syncsdk.ErrInvalidInvite)
+}
+
+func TestErrorValues_NewErrors(t *testing.T) {
+	assert.EqualError(t, syncsdk.ErrJoinRequestPending, "join request pending approval")
+	assert.EqualError(t, syncsdk.ErrInvalidInvite, "invalid invite")
+}

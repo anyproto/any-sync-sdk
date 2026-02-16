@@ -8,6 +8,12 @@ type Client interface {
 	DeriveSpace(ctx context.Context, spaceType string) (Space, error)
 	OpenSpace(ctx context.Context, spaceID string) (Space, error)
 
+	// JoinSpace joins a space using a base64 invite string.
+	// For AnyoneCanJoin invites, returns the Space immediately.
+	// For RequestToJoin invites, returns (nil, ErrJoinRequestPending).
+	// Use ParseInvite() to get the spaceID, then OpenSpace() after owner accepts.
+	JoinSpace(ctx context.Context, invite string) (Space, error)
+
 	// DeleteSpace requests deletion of a space on the coordinator.
 	DeleteSpace(ctx context.Context, spaceID string) error
 	// DeleteAccount requests deletion of the account on the coordinator.
@@ -15,6 +21,10 @@ type Client interface {
 	DeleteAccount(ctx context.Context) (deletionTimestamp int64, err error)
 	// RevertAccountDeletion cancels a pending account deletion.
 	RevertAccountDeletion(ctx context.Context) error
+
+	// NetworkConfig fetches the current network configuration from the coordinator.
+	// Returns a fresh NetworkConfig with the latest node addresses and topology.
+	NetworkConfig(ctx context.Context) (NetworkConfig, error)
 
 	Subscribe(handler Handler) (unsubscribe func())
 	Close(ctx context.Context) error

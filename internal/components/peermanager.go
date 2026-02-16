@@ -2,11 +2,14 @@ package components
 
 import (
 	"context"
+	"fmt"
 
 	"storj.io/drpc"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace/peermanager"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/commonspace/sync/objectsync/objectmessages"
 	"github.com/anyproto/any-sync/net/peer"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/nodeconf"
@@ -49,15 +52,7 @@ func (m *spacePeerManager) Name() string {
 }
 
 func (m *spacePeerManager) GetResponsiblePeers(ctx context.Context) ([]peer.Peer, error) {
-	nodeIds := m.nodeConf.NodeIds(m.spaceId)
-	if len(nodeIds) == 0 {
-		return nil, nil
-	}
-	p, err := m.pool.GetOneOf(ctx, nodeIds)
-	if err != nil {
-		return nil, err
-	}
-	return []peer.Peer{p}, nil
+	return m.GetNodePeers(ctx)
 }
 
 func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error) {
@@ -73,16 +68,61 @@ func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error
 	return peers, nil
 }
 
-func (m *spacePeerManager) BroadcastMessage(_ context.Context, _ drpc.Message) error {
-	// no-op for SDK client; sync tree handles its own messaging
+func (m *spacePeerManager) BroadcastMessage(ctx context.Context, msg drpc.Message) error {
+	objMsg, err := toObjectSyncMessage(msg)
+	if err != nil {
+		return err
+	}
+	peers, err := m.GetNodePeers(ctx)
+	if err != nil {
+		return err
+	}
+	for _, p := range peers {
+		_ = p.DoDrpc(ctx, func(conn drpc.Conn) error {
+			cl := spacesyncproto.NewDRPCSpaceSyncClient(conn)
+			_, err := cl.ObjectSync(ctx, objMsg)
+			return err
+		})
+	}
 	return nil
 }
 
-func (m *spacePeerManager) SendMessage(_ context.Context, _ string, _ drpc.Message) error {
-	// no-op for SDK client; sync tree handles its own messaging
-	return nil
+func (m *spacePeerManager) SendMessage(ctx context.Context, peerId string, msg drpc.Message) error {
+	objMsg, err := toObjectSyncMessage(msg)
+	if err != nil {
+		return err
+	}
+	p, err := m.pool.Get(ctx, peerId)
+	if err != nil {
+		return err
+	}
+	return p.DoDrpc(ctx, func(conn drpc.Conn) error {
+		cl := spacesyncproto.NewDRPCSpaceSyncClient(conn)
+		_, err := cl.ObjectSync(ctx, objMsg)
+		return err
+	})
 }
 
 func (m *spacePeerManager) KeepAlive(_ context.Context) {
 	// no-op for SDK client
+}
+
+// toObjectSyncMessage converts a drpc.Message to an ObjectSyncMessage for sending via RPC.
+func toObjectSyncMessage(msg drpc.Message) (*spacesyncproto.ObjectSyncMessage, error) {
+	switch m := msg.(type) {
+	case *spacesyncproto.ObjectSyncMessage:
+		return m, nil
+	case *objectmessages.HeadUpdate:
+		protoMsg, err := m.ProtoMessage()
+		if err != nil {
+			return nil, err
+		}
+		osm, ok := protoMsg.(*spacesyncproto.ObjectSyncMessage)
+		if !ok {
+			return nil, fmt.Errorf("unexpected proto type: %T", protoMsg)
+		}
+		return osm, nil
+	default:
+		return nil, fmt.Errorf("unsupported message type: %T", msg)
+	}
 }

@@ -91,3 +91,5 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.37.1 // indirect
 )
+
+replace github.com/anyproto/any-sync => /home/dev/work/any-sync

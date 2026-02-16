@@ -13,6 +13,10 @@ type Config struct {
 	PeerKey     keys.PrivateKey
 	Network     NetworkConfig
 	StoragePath string
+	// LogPath sets the directory for log files. When set, logs are written
+	// to files in this directory instead of stderr. If empty (default),
+	// logging to stderr is disabled entirely.
+	LogPath string
 }
 
 type NetworkConfig struct {

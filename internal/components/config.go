@@ -33,6 +33,7 @@ func (c *ConfigAdapter) Name() string {
 // config.ConfigGetter
 func (c *ConfigAdapter) GetSpace() config.Config {
 	return config.Config{
+		SyncPeriod:           2, // seconds — enables periodic diff with peers
 		KeepTreeDataInMemory: true,
 	}
 }

@@ -7,12 +7,14 @@ import (
 
 	syncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/internal/bootstrap"
+	"github.com/anyproto/any-sync-sdk/internal/components"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/treemanager"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
@@ -20,13 +22,15 @@ import (
 )
 
 type clientImpl struct {
-	app            *app.App
-	spaceService   commonspace.SpaceService
-	coordClient    coordinatorclient.CoordinatorClient
-	joiningClient  aclclient.AclJoiningClient
-	cfg            syncsdk.Config
-	peerId         string
-	networkId      string
+	app              *app.App
+	spaceService     commonspace.SpaceService
+	coordClient      coordinatorclient.CoordinatorClient
+	joiningClient    aclclient.AclJoiningClient
+	treeManager      *components.TreeManagerAdapter
+	spaceSyncHandler *components.SpaceSyncHandler
+	cfg              syncsdk.Config
+	peerId           string
+	networkId        string
 
 	mu       sync.Mutex
 	spaces   map[string]*spaceimpl.SpaceImpl
@@ -60,6 +64,8 @@ func New(ctx context.Context, cfg syncsdk.Config) (syncsdk.Client, error) {
 
 	spaceService := a.MustComponent(commonspace.CName).(commonspace.SpaceService)
 	coordClient := a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
+	treeMgr := a.MustComponent(treemanager.CName).(*components.TreeManagerAdapter)
+	syncHandler := a.MustComponent(components.SpaceSyncHandlerCName).(*components.SpaceSyncHandler)
 
 	joiningClient := aclclient.NewAclJoiningClient()
 	if err := joiningClient.Init(a); err != nil {
@@ -68,14 +74,16 @@ func New(ctx context.Context, cfg syncsdk.Config) (syncsdk.Client, error) {
 	}
 
 	return &clientImpl{
-		app:           a,
-		spaceService:  spaceService,
-		coordClient:   coordClient,
-		joiningClient: joiningClient,
-		cfg:           cfg,
-		peerId:        cfg.PeerKey.GetPublic().PeerId(),
-		networkId:     cfg.Network.NetworkID,
-		spaces:        make(map[string]*spaceimpl.SpaceImpl),
+		app:              a,
+		spaceService:     spaceService,
+		coordClient:      coordClient,
+		joiningClient:    joiningClient,
+		treeManager:      treeMgr,
+		spaceSyncHandler: syncHandler,
+		cfg:              cfg,
+		peerId:           cfg.PeerKey.GetPublic().PeerId(),
+		networkId:        cfg.Network.NetworkID,
+		spaces:           make(map[string]*spaceimpl.SpaceImpl),
 	}, nil
 }
 
@@ -147,7 +155,7 @@ func (c *clientImpl) OpenSpace(ctx context.Context, spaceID string) (syncsdk.Spa
 		return sp, nil
 	}
 
-	sp := spaceimpl.New(spaceID, c.spaceService, c.cfg, c.coordClient)
+	sp := spaceimpl.New(spaceID, c.spaceService, c.cfg, c.coordClient, c.treeManager, c.spaceSyncHandler)
 	c.spaces[spaceID] = sp
 	return sp, nil
 }

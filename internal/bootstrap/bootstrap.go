@@ -2,12 +2,14 @@ package bootstrap
 
 import (
 	"context"
+	"path/filepath"
 
 	syncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/internal/components"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/debugstat"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
@@ -26,6 +28,15 @@ import (
 // NewApp creates and starts a fully wired app.App with all components needed
 // for the SDK.
 func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
+	logCfg := logger.Config{
+		DefaultLevel:  "WARN",
+		DisableStdErr: true,
+	}
+	if cfg.LogPath != "" {
+		logCfg.AddOutputPaths = []string{filepath.Join(cfg.LogPath, "any-sync-sdk.log")}
+	}
+	logCfg.ApplyGlobal()
+
 	keys := accountdata.New(cfg.PeerKey, cfg.SigningKey)
 
 	configAdapter := components.NewConfig(cfg)
@@ -34,6 +45,8 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 	peerManagerProvider := components.NewPeerManagerProvider()
 	treeManager := components.NewTreeManager()
 	coordSource := components.NewCoordinatorSource()
+
+	spaceSyncHandler := components.NewSpaceSyncHandler()
 
 	a := new(app.App)
 	a.Register(configAdapter).
@@ -48,6 +61,7 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 		Register(quic.New()).
 		Register(peerservice.New()).
 		Register(server.New()).
+		Register(spaceSyncHandler).
 		Register(pool.New()).
 		Register(peerManagerProvider).
 		Register(coordinatorclient.New()).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"math/big"
 	"sync"
 	"time"
 
@@ -20,17 +21,21 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/commonspace/syncstatus"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/util/crypto"
+	"storj.io/drpc"
 )
 
 // SpaceImpl implements syncsdk.Space with lazy initialization.
 type SpaceImpl struct {
-	id           string
-	spaceService commonspace.SpaceService
-	coordClient  coordinatorclient.CoordinatorClient
-	cfg          syncsdk.Config
+	id               string
+	spaceService     commonspace.SpaceService
+	coordClient      coordinatorclient.CoordinatorClient
+	treeManager      *components.TreeManagerAdapter
+	spaceSyncHandler *components.SpaceSyncHandler
+	cfg              syncsdk.Config
 
 	once    sync.Once
 	initErr error
@@ -46,11 +51,13 @@ type SpaceImpl struct {
 	closed            bool
 }
 
-func New(id string, spaceService commonspace.SpaceService, cfg syncsdk.Config, coordClient coordinatorclient.CoordinatorClient) *SpaceImpl {
+func New(id string, spaceService commonspace.SpaceService, cfg syncsdk.Config, coordClient coordinatorclient.CoordinatorClient, treeManager *components.TreeManagerAdapter, spaceSyncHandler *components.SpaceSyncHandler) *SpaceImpl {
 	return &SpaceImpl{
 		id:                id,
 		spaceService:      spaceService,
 		coordClient:       coordClient,
+		treeManager:       treeManager,
+		spaceSyncHandler:  spaceSyncHandler,
 		cfg:               cfg,
 		objects:           make(map[string]syncsdk.Object),
 		knownJoinRequests: make(map[string]struct{}),
@@ -73,6 +80,15 @@ func (s *SpaceImpl) ensure(ctx context.Context) error {
 			return
 		}
 		s.cs = cs
+
+		// Register with tree manager and sync handler so incoming sync
+		// requests can find user trees and dispatch to this space.
+		if s.treeManager != nil {
+			s.treeManager.RegisterBuilder(s.id, cs.TreeBuilder())
+		}
+		if s.spaceSyncHandler != nil {
+			s.spaceSyncHandler.RegisterSpace(s.id, cs)
+		}
 
 		// Capture existing join requests so they don't fire events,
 		// then register as AclUpdater for future notifications.
@@ -120,6 +136,9 @@ func (s *SpaceImpl) GetObject(ctx context.Context, objectID string) (syncsdk.Obj
 		return existing, nil
 	}
 	s.objects[objectID] = obj
+	if s.treeManager != nil {
+		s.treeManager.RegisterTree(s.id, objectID, tree)
+	}
 	return obj, nil
 }
 
@@ -155,6 +174,9 @@ func (s *SpaceImpl) CreateObject(ctx context.Context, opts ...syncsdk.ObjectCrea
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.objects[tree.Id()] = obj
+	if s.treeManager != nil {
+		s.treeManager.RegisterTree(s.id, tree.Id(), tree)
+	}
 	return obj, nil
 }
 
@@ -184,6 +206,9 @@ func (s *SpaceImpl) DeriveObject(ctx context.Context, opts ...syncsdk.ObjectDeri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.objects[tree.Id()] = obj
+	if s.treeManager != nil {
+		s.treeManager.RegisterTree(s.id, tree.Id(), tree)
+	}
 	return obj, nil
 }
 
@@ -207,7 +232,9 @@ func (s *SpaceImpl) ListObjectIDs(ctx context.Context) ([]string, error) {
 	exclude[stateStorage.SettingsId()] = struct{}{}
 
 	var ids []string
+	var totalEntries int
 	err := s.cs.Storage().HeadStorage().IterateEntries(ctx, headstorage.IterOpts{}, func(entry headstorage.HeadsEntry) (bool, error) {
+		totalEntries++
 		if _, ok := exclude[entry.Id]; !ok {
 			ids = append(ids, entry.Id)
 		}
@@ -259,8 +286,22 @@ func (s *SpaceImpl) Close(ctx context.Context) error {
 	s.objects = nil
 	s.mu.Unlock()
 
+	// Unregister trees before closing them.
+	if s.treeManager != nil {
+		for id := range objects {
+			s.treeManager.UnregisterTree(s.id, id)
+		}
+	}
 	for _, obj := range objects {
 		_ = obj.Close()
+	}
+
+	// Unregister from sync handler and tree manager before closing the commonspace.
+	if s.spaceSyncHandler != nil {
+		s.spaceSyncHandler.UnregisterSpace(s.id)
+	}
+	if s.treeManager != nil {
+		s.treeManager.UnregisterBuilder(s.id)
 	}
 
 	if s.cs != nil {
@@ -466,11 +507,65 @@ func (s *SpaceImpl) Push(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.coordClient.SpaceSign(ctx, coordinatorclient.SpaceSignPayload{
+
+	// Get a signed receipt from the coordinator proving this space is valid.
+	receipt, err := s.coordClient.SpaceSign(ctx, coordinatorclient.SpaceSignPayload{
 		SpaceId:     s.id,
 		SpaceHeader: state.SpaceHeader,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	cred, err := receipt.MarshalVT()
+	if err != nil {
+		return err
+	}
+
+	// Build the space payload (header + ACL root + settings root).
+	aclStorage, err := s.cs.Storage().AclStorage()
+	if err != nil {
+		return err
+	}
+	aclRoot, err := aclStorage.Root(ctx)
+	if err != nil {
+		return err
+	}
+	settingsStorage, err := s.cs.Storage().TreeStorage(ctx, state.SettingsId)
+	if err != nil {
+		return err
+	}
+	settingsRoot, err := settingsStorage.Root(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Push to one random tree node — sync nodes replicate among themselves.
+	peers, err := s.cs.GetNodePeers(ctx)
+	if err != nil {
+		return err
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	idx := 0
+	if len(peers) > 1 {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(peers))))
+		idx = int(n.Int64())
+	}
+	return peers[idx].DoDrpc(ctx, func(conn drpc.Conn) error {
+		cl := spacesyncproto.NewDRPCSpaceSyncClient(conn)
+		_, err := cl.SpacePush(ctx, &spacesyncproto.SpacePushRequest{
+			Payload: &spacesyncproto.SpacePayload{
+				SpaceHeader:            &spacesyncproto.RawSpaceHeaderWithId{RawHeader: state.SpaceHeader, Id: s.id},
+				AclPayload:             aclRoot.RawRecord,
+				AclPayloadId:           aclRoot.Id,
+				SpaceSettingsPayload:   settingsRoot.RawChange,
+				SpaceSettingsPayloadId: settingsRoot.Id,
+			},
+			Credential: cred,
+		})
+		return err
+	})
 }
 
 // CommonSpace returns the underlying commonspace.Space, initializing it lazily.

@@ -250,7 +250,7 @@ go build ./...
 ### Test
 
 ```bash
-go test ./...              # All tests (71 tests)
+go test ./...              # All tests (72 tests)
 go test -race ./...        # With race detector
 go test -short ./...       # Skip E2E tests
 go test -run TestCreateObject ./...  # Single test
@@ -275,7 +275,7 @@ go test -run TestCreateObject ./...  # Single test
 |------|-------|----------|
 | `syncsdk_test.go` | 31 | Config validation, key gen, option resolvers, error values, permission/status constants, invite encode/decode/parse, event types, event Identity field |
 | `integration_test.go` | 31 | Full lifecycle: create/derive/open spaces, create/derive/delete objects, add content, iterate, subscribe, concurrent access, persistence, KV, delete space/account after close, members, invite generation, join validation, space dispatch, RevokeInvite |
-| `e2e_test.go` | 5 | Staging network (skipped in `-short` mode): create space, derive space, delete space, delete/revert account |
+| `e2e_test.go` | 6 | Staging network (skipped in `-short` mode): create space, derive space, delete space, invite generation, multi-client sync, delete/revert account |
 
 ### Adding a new component adapter
 

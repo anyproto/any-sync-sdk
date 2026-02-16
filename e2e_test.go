@@ -149,11 +149,6 @@ func TestE2EDeleteSpaceOnStaging(t *testing.T) {
 }
 
 func TestE2EGenerateInviteOnStaging(t *testing.T) {
-	// TODO: tree nodes reject space receipt as invalid, so AclClient.AddRecord
-	// fails with "log not found". Need to investigate why the SpaceSign receipt
-	// is rejected by tree nodes — possibly a space type validation issue.
-	t.Skip("skipping: tree nodes reject space receipt, AddRecord fails with 'log not found'")
-
 	if testing.Short() {
 		t.Skip("skipping E2E test in short mode")
 	}
@@ -248,6 +243,105 @@ func TestE2ENetworkConfigOnStaging(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "networkId:")
 	t.Logf("Fresh network config:\n%s", data)
+}
+
+func newE2EClient(t *testing.T, ctx context.Context, network syncsdk.NetworkConfig) syncsdk.Client {
+	t.Helper()
+	signingKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+	masterKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+	c, err := client.New(ctx, syncsdk.Config{
+		SigningKey:   signingKey,
+		MasterKey:   masterKey,
+		Network:     network,
+		StoragePath: t.TempDir(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	return c
+}
+
+func TestE2EMultiClientSync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+
+	network := loadStagingConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Client A: create space, object, and content
+	clientA := newE2EClient(t, ctx, network)
+	spaceA, err := clientA.CreateSpace(ctx)
+	require.NoError(t, err)
+
+	objA, err := spaceA.CreateObject(ctx)
+	require.NoError(t, err)
+	_, err = objA.AddContent(ctx, []byte("from A"))
+	require.NoError(t, err)
+
+	// Push space and generate invite
+	err = spaceA.Push(ctx)
+	require.NoError(t, err)
+	invite, err := spaceA.GenerateInvite(ctx)
+	require.NoError(t, err)
+
+	// Client B: join space via invite
+	clientB := newE2EClient(t, ctx, network)
+	spaceB, err := clientB.JoinSpace(ctx, invite)
+	require.NoError(t, err)
+	assert.Equal(t, spaceA.ID(), spaceB.ID())
+
+	// Client B: wait for object to appear via sync
+	var objectIDs []string
+	require.Eventually(t, func() bool {
+		objectIDs, err = spaceB.ListObjectIDs(ctx)
+		if err != nil {
+			t.Logf("ListObjectIDs error: %v", err)
+			return false
+		}
+		t.Logf("ListObjectIDs returned %d ids: %v (looking for %s)", len(objectIDs), objectIDs, objA.ID())
+		for _, id := range objectIDs {
+			if id == objA.ID() {
+				return true
+			}
+		}
+		return false
+	}, 60*time.Second, 2*time.Second, "client B should see client A's object")
+
+	// Client B: verify content from A
+	objB, err := spaceB.GetObject(ctx, objA.ID())
+	require.NoError(t, err)
+	var foundA bool
+	require.Eventually(t, func() bool {
+		foundA = false
+		_ = objB.Iterate(func(ci syncsdk.ChangeInfo) bool {
+			if string(ci.Data) == "from A" {
+				foundA = true
+				return false
+			}
+			return true
+		})
+		return foundA
+	}, 60*time.Second, 2*time.Second, "client B should see 'from A' content")
+
+	// Client B: add content
+	_, err = objB.AddContent(ctx, []byte("from B"))
+	require.NoError(t, err)
+
+	// Client A: wait for content from B
+	require.Eventually(t, func() bool {
+		var foundB bool
+		_ = objA.Iterate(func(ci syncsdk.ChangeInfo) bool {
+			if string(ci.Data) == "from B" {
+				foundB = true
+				return false
+			}
+			return true
+		})
+		return foundB
+	}, 60*time.Second, 2*time.Second, "client A should see 'from B' content")
 }
 
 func TestE2EDeleteAccountOnStaging(t *testing.T) {

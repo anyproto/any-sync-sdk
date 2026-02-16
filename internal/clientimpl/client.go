@@ -18,6 +18,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/util/crypto"
 )
 
@@ -28,6 +29,7 @@ type clientImpl struct {
 	joiningClient    aclclient.AclJoiningClient
 	treeManager      *components.TreeManagerAdapter
 	spaceSyncHandler *components.SpaceSyncHandler
+	streamPool       streampool.StreamPool
 	cfg              syncsdk.Config
 	peerId           string
 	networkId        string
@@ -66,6 +68,7 @@ func New(ctx context.Context, cfg syncsdk.Config) (syncsdk.Client, error) {
 	coordClient := a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
 	treeMgr := a.MustComponent(treemanager.CName).(*components.TreeManagerAdapter)
 	syncHandler := a.MustComponent(components.SpaceSyncHandlerCName).(*components.SpaceSyncHandler)
+	sp := a.MustComponent(streampool.CName).(streampool.StreamPool)
 
 	joiningClient := aclclient.NewAclJoiningClient()
 	if err := joiningClient.Init(a); err != nil {
@@ -80,6 +83,7 @@ func New(ctx context.Context, cfg syncsdk.Config) (syncsdk.Client, error) {
 		joiningClient:    joiningClient,
 		treeManager:      treeMgr,
 		spaceSyncHandler: syncHandler,
+		streamPool:       sp,
 		cfg:              cfg,
 		peerId:           cfg.PeerKey.GetPublic().PeerId(),
 		networkId:        cfg.Network.NetworkID,
@@ -155,7 +159,7 @@ func (c *clientImpl) OpenSpace(ctx context.Context, spaceID string) (syncsdk.Spa
 		return sp, nil
 	}
 
-	sp := spaceimpl.New(spaceID, c.spaceService, c.cfg, c.coordClient, c.treeManager, c.spaceSyncHandler)
+	sp := spaceimpl.New(spaceID, c.spaceService, c.cfg, c.coordClient, c.treeManager, c.spaceSyncHandler, c.streamPool)
 	c.spaces[spaceID] = sp
 	return sp, nil
 }

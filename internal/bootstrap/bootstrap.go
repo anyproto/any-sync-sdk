@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"path/filepath"
+	"sync"
 
 	syncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/internal/components"
@@ -18,6 +19,7 @@ import (
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/secureservice"
+	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/net/transport/quic"
 	"github.com/anyproto/any-sync/net/transport/yamux"
 	"github.com/anyproto/any-sync/nodeconf"
@@ -25,17 +27,21 @@ import (
 	"github.com/anyproto/any-sync/util/syncqueues"
 )
 
+var logOnce sync.Once
+
 // NewApp creates and starts a fully wired app.App with all components needed
 // for the SDK.
 func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
-	logCfg := logger.Config{
-		DefaultLevel:  "WARN",
-		DisableStdErr: true,
-	}
-	if cfg.LogPath != "" {
-		logCfg.AddOutputPaths = []string{filepath.Join(cfg.LogPath, "any-sync-sdk.log")}
-	}
-	logCfg.ApplyGlobal()
+	logOnce.Do(func() {
+		logCfg := logger.Config{
+			DefaultLevel:  "WARN",
+			DisableStdErr: true,
+		}
+		if cfg.LogPath != "" {
+			logCfg.AddOutputPaths = []string{filepath.Join(cfg.LogPath, "any-sync-sdk.log")}
+		}
+		logCfg.ApplyGlobal()
+	})
 
 	keys := accountdata.New(cfg.PeerKey, cfg.SigningKey)
 
@@ -47,6 +53,7 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 	coordSource := components.NewCoordinatorSource()
 
 	spaceSyncHandler := components.NewSpaceSyncHandler()
+	streamHandler := components.NewStreamHandler(spaceSyncHandler)
 
 	a := new(app.App)
 	a.Register(configAdapter).
@@ -61,6 +68,8 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 		Register(quic.New()).
 		Register(peerservice.New()).
 		Register(server.New()).
+		Register(streamHandler).
+		Register(streampool.New()).
 		Register(spaceSyncHandler).
 		Register(pool.New()).
 		Register(peerManagerProvider).

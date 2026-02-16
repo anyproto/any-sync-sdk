@@ -344,6 +344,87 @@ func TestE2EMultiClientSync(t *testing.T) {
 	}, 60*time.Second, 2*time.Second, "client A should see 'from B' content")
 }
 
+func TestE2EDelayedSync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+
+	network := loadStagingConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 210*time.Second)
+	defer cancel()
+
+	// Set up two clients sharing a space with one object.
+	clientA := newE2EClient(t, ctx, network)
+	spaceA, err := clientA.CreateSpace(ctx)
+	require.NoError(t, err)
+
+	objA, err := spaceA.CreateObject(ctx)
+	require.NoError(t, err)
+	_, err = objA.AddContent(ctx, []byte("initial"))
+	require.NoError(t, err)
+
+	err = spaceA.Push(ctx)
+	require.NoError(t, err)
+	invite, err := spaceA.GenerateInvite(ctx)
+	require.NoError(t, err)
+
+	clientB := newE2EClient(t, ctx, network)
+	spaceB, err := clientB.JoinSpace(ctx, invite)
+	require.NoError(t, err)
+
+	// Wait for B to see the object and initial content.
+	require.Eventually(t, func() bool {
+		ids, _ := spaceB.ListObjectIDs(ctx)
+		for _, id := range ids {
+			if id == objA.ID() {
+				return true
+			}
+		}
+		return false
+	}, 60*time.Second, 2*time.Second)
+
+	objB, err := spaceB.GetObject(ctx, objA.ID())
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var found bool
+		_ = objB.Iterate(func(ci syncsdk.ChangeInfo) bool {
+			if string(ci.Data) == "initial" {
+				found = true
+				return false
+			}
+			return true
+		})
+		return found
+	}, 60*time.Second, 2*time.Second)
+	t.Log("Both clients synced. Waiting 70 seconds before adding new content...")
+
+	// Wait 70 seconds — well past the SyncPeriod window — to see if
+	// connections are still alive.
+	time.Sleep(70 * time.Second)
+
+	// Client A adds new content after the delay.
+	t.Log("Adding 'after delay' content from client A...")
+	_, err = objA.AddContent(ctx, []byte("after delay"))
+	require.NoError(t, err)
+
+	// Measure how long it takes for Client B to receive it.
+	start := time.Now()
+	require.Eventually(t, func() bool {
+		var found bool
+		_ = objB.Iterate(func(ci syncsdk.ChangeInfo) bool {
+			if string(ci.Data) == "after delay" {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			t.Logf("Client B received 'after delay' in %s", time.Since(start).Round(time.Millisecond))
+		}
+		return found
+	}, 60*time.Second, 500*time.Millisecond, "client B should see 'after delay' content")
+}
+
 func TestE2EDeleteAccountOnStaging(t *testing.T) {
 	// TODO: staging coordinator returns "account is deleted" for fresh accounts.
 	// Need to investigate how the coordinator registers accounts before deletion

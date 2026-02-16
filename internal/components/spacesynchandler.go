@@ -9,6 +9,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/net/rpc/server"
+	"github.com/anyproto/any-sync/net/streampool"
 )
 
 const SpaceSyncHandlerCName = "client.spacesynchandler"
@@ -20,8 +21,9 @@ const SpaceSyncHandlerCName = "client.spacesynchandler"
 type SpaceSyncHandler struct {
 	spacesyncproto.DRPCSpaceSyncUnimplementedServer
 
-	mu     sync.RWMutex
-	spaces map[string]commonspace.Space
+	mu         sync.RWMutex
+	spaces     map[string]commonspace.Space
+	streamPool streampool.StreamPool
 }
 
 func NewSpaceSyncHandler() *SpaceSyncHandler {
@@ -31,6 +33,7 @@ func NewSpaceSyncHandler() *SpaceSyncHandler {
 }
 
 func (h *SpaceSyncHandler) Init(a *app.App) error {
+	h.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
 	srv := a.MustComponent(server.CName).(server.DRPCServer)
 	return spacesyncproto.DRPCRegisterSpaceSync(srv, h)
 }
@@ -63,6 +66,17 @@ func (h *SpaceSyncHandler) getSpace(spaceId string) (commonspace.Space, error) {
 	return sp, nil
 }
 
+// RegisteredSpaceIds returns all currently registered space IDs.
+func (h *SpaceSyncHandler) RegisteredSpaceIds() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	ids := make([]string, 0, len(h.spaces))
+	for id := range h.spaces {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // ObjectSyncRequestStream handles incoming stream sync requests from nodes.
 // This is the critical path: when a node receives a HeadUpdate it doesn't have,
 // it sends an ObjectSyncRequestStream back to the client to fetch the tree data.
@@ -81,4 +95,10 @@ func (h *SpaceSyncHandler) HeadSync(ctx context.Context, req *spacesyncproto.Hea
 		return nil, err
 	}
 	return sp.HandleRangeRequest(ctx, req)
+}
+
+// ObjectSyncStream handles incoming bidirectional sync streams from nodes.
+// The node calls this when it wants to push HeadUpdates reactively.
+func (h *SpaceSyncHandler) ObjectSyncStream(stream spacesyncproto.DRPCSpaceSync_ObjectSyncStreamStream) error {
+	return h.streamPool.ReadStream(stream, 100)
 }

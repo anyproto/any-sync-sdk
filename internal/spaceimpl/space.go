@@ -24,6 +24,8 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/commonspace/syncstatus"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
+	"github.com/anyproto/any-sync/net/peer"
+	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/util/crypto"
 	"storj.io/drpc"
 )
@@ -35,6 +37,7 @@ type SpaceImpl struct {
 	coordClient      coordinatorclient.CoordinatorClient
 	treeManager      *components.TreeManagerAdapter
 	spaceSyncHandler *components.SpaceSyncHandler
+	streamPool       streampool.StreamPool
 	cfg              syncsdk.Config
 
 	once    sync.Once
@@ -51,13 +54,14 @@ type SpaceImpl struct {
 	closed            bool
 }
 
-func New(id string, spaceService commonspace.SpaceService, cfg syncsdk.Config, coordClient coordinatorclient.CoordinatorClient, treeManager *components.TreeManagerAdapter, spaceSyncHandler *components.SpaceSyncHandler) *SpaceImpl {
+func New(id string, spaceService commonspace.SpaceService, cfg syncsdk.Config, coordClient coordinatorclient.CoordinatorClient, treeManager *components.TreeManagerAdapter, spaceSyncHandler *components.SpaceSyncHandler, sp streampool.StreamPool) *SpaceImpl {
 	return &SpaceImpl{
 		id:                id,
 		spaceService:      spaceService,
 		coordClient:       coordClient,
 		treeManager:       treeManager,
 		spaceSyncHandler:  spaceSyncHandler,
+		streamPool:        sp,
 		cfg:               cfg,
 		objects:           make(map[string]syncsdk.Object),
 		knownJoinRequests: make(map[string]struct{}),
@@ -88,6 +92,24 @@ func (s *SpaceImpl) ensure(ctx context.Context) error {
 		}
 		if s.spaceSyncHandler != nil {
 			s.spaceSyncHandler.RegisterSpace(s.id, cs)
+		}
+
+		// Send a subscription message for this space to node peers.
+		// This ensures the node tags existing streams with this space ID,
+		// enabling reactive push-based sync via the StreamPool.
+		// The message is sent as *ObjectSyncMessage (not HeadUpdate) because
+		// HeadUpdate.ProtoMessage() drops the Bytes field when Update is nil.
+		if s.streamPool != nil {
+			subMsg := &spacesyncproto.SpaceSubscription{
+				SpaceIds: []string{s.id},
+				Action:   spacesyncproto.SpaceSubscriptionAction_Subscribe,
+			}
+			payload, _ := subMsg.MarshalVT()
+			_ = s.streamPool.Send(ctx, &spacesyncproto.ObjectSyncMessage{
+				Payload: payload,
+			}, func(ctx context.Context) ([]peer.Peer, error) {
+				return cs.GetNodePeers(ctx)
+			})
 		}
 
 		// Capture existing join requests so they don't fire events,
@@ -567,6 +589,7 @@ func (s *SpaceImpl) Push(ctx context.Context) error {
 		return err
 	})
 }
+
 
 // CommonSpace returns the underlying commonspace.Space, initializing it lazily.
 // This is used by other internal packages.

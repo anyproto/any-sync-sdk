@@ -7,6 +7,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/config"
 	"github.com/anyproto/any-sync/net/rpc"
 	"github.com/anyproto/any-sync/net/secureservice"
+	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/net/transport/quic"
 	"github.com/anyproto/any-sync/net/transport/yamux"
 	"github.com/anyproto/any-sync/nodeconf"
@@ -33,7 +34,7 @@ func (c *ConfigAdapter) Name() string {
 // config.ConfigGetter
 func (c *ConfigAdapter) GetSpace() config.Config {
 	return config.Config{
-		SyncPeriod:           2, // seconds — enables periodic diff with peers
+		SyncPeriod:           30, // seconds — periodic diff with peers
 		KeepTreeDataInMemory: true,
 	}
 }
@@ -90,6 +91,15 @@ func (c *ConfigAdapter) GetQuic() quic.Config {
 // secureservice configGetter
 func (c *ConfigAdapter) GetSecureService() secureservice.Config {
 	return secureservice.Config{}
+}
+
+// streampool configGetter
+func (c *ConfigAdapter) GetStreamConfig() streampool.StreamConfig {
+	return streampool.StreamConfig{
+		SendQueueSize:    100,
+		DialQueueWorkers: 4,
+		DialQueueSize:    100,
+	}
 }
 
 // nodeconfstore configGetter

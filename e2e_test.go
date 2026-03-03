@@ -20,6 +20,65 @@ func loadStagingConfig(t *testing.T) syncsdk.NetworkConfig {
 	return cfg
 }
 
+func loadNetworkWebRTCOnly(t *testing.T) syncsdk.NetworkConfig {
+	t.Helper()
+	cfg, err := syncsdk.NetworkConfigFromFile("network2.yaml")
+	require.NoError(t, err)
+	return cfg
+}
+
+func TestE2EWebRTCCreateSpace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E test in short mode")
+	}
+
+	network := loadNetworkWebRTCOnly(t)
+
+	signingKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+	masterKey, _, err := keys.GenerateRandomKey()
+	require.NoError(t, err)
+
+	cfg := syncsdk.Config{
+		SigningKey:   signingKey,
+		MasterKey:   masterKey,
+		Network:     network,
+		StoragePath: t.TempDir(),
+		WebRTC: &syncsdk.WebRTCConfig{
+			ICEServers: []string{"stun:stun.l.google.com:19302"},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	c, err := client.New(ctx, cfg)
+	require.NoError(t, err)
+	defer func() { _ = c.Close(context.Background()) }()
+
+	space, err := c.CreateSpace(ctx)
+	require.NoError(t, err)
+	assert.NotEmpty(t, space.ID())
+	t.Logf("Created space: %s", space.ID())
+
+	// Create an object and add content (local operations)
+	obj, err := space.CreateObject(ctx)
+	require.NoError(t, err)
+	t.Logf("Created object: %s", obj.ID())
+
+	info, err := obj.AddContent(ctx, []byte("webrtc-test"))
+	require.NoError(t, err)
+	assert.NotEmpty(t, info.ID)
+	t.Logf("Added content, change: %s", info.ID)
+
+	// NetworkConfig forces an actual RPC to the coordinator via WebRTC
+	netCfg, err := c.NetworkConfig(ctx)
+	require.NoError(t, err)
+	assert.NotEmpty(t, netCfg.NetworkID)
+	assert.NotEmpty(t, netCfg.Nodes)
+	t.Logf("Connected via WebRTC, got %d nodes", len(netCfg.Nodes))
+}
+
 func TestE2ECreateSpaceOnStaging(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping E2E test in short mode")

@@ -83,6 +83,7 @@ func (o *objectImpl) AddContent(ctx context.Context, data []byte, opts ...syncsd
 		Identity:    o.signKey.GetPublic(),
 		Timestamp:   ts,
 		IsSnapshot:  resolved.IsSnapshot,
+		Version:     added.OrderId,
 	}, nil
 }
 
@@ -103,6 +104,7 @@ func (o *objectImpl) Iterate(visitor func(change syncsdk.ChangeInfo) bool) error
 			Identity:    change.Identity,
 			Timestamp:   change.Timestamp,
 			IsSnapshot:  change.IsSnapshot,
+			Version:     change.OrderId,
 		})
 	})
 }

@@ -34,6 +34,7 @@ type ChangeInfo struct {
 	Identity    keys.PublicKey
 	Timestamp   int64
 	IsSnapshot  bool
+	Version     string
 }
 
 // ResolvedAddOptions holds the resolved values of AddOption functions.

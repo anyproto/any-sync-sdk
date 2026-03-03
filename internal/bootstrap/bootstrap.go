@@ -20,8 +20,7 @@ import (
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/secureservice"
 	"github.com/anyproto/any-sync/net/streampool"
-	"github.com/anyproto/any-sync/net/transport/quic"
-	"github.com/anyproto/any-sync/net/transport/yamux"
+	"github.com/anyproto/any-sync/net/transport/webrtc"
 	"github.com/anyproto/any-sync/nodeconf"
 	"github.com/anyproto/any-sync/nodeconf/nodeconfstore"
 	"github.com/anyproto/any-sync/util/syncqueues"
@@ -47,7 +46,7 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 
 	configAdapter := components.NewConfig(cfg)
 	accountAdapter := components.NewAccount(keys)
-	storageProvider := components.NewStorageProvider(cfg.StoragePath)
+	storageProvider := components.NewStorageProvider(cfg.StoragePath, cfg.StoreConfig)
 	peerManagerProvider := components.NewPeerManagerProvider()
 	treeManager := components.NewTreeManager()
 	coordSource := components.NewCoordinatorSource()
@@ -63,10 +62,12 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 		Register(nodeconfstore.New()).
 		Register(coordSource).
 		Register(nodeconf.New()).
-		Register(secureservice.New()).
-		Register(yamux.New()).
-		Register(quic.New()).
-		Register(peerservice.New()).
+		Register(secureservice.New())
+	registerTransports(a)
+	if cfg.WebRTC != nil {
+		a.Register(webrtc.New().(app.Component))
+	}
+	a.Register(peerservice.New()).
 		Register(server.New()).
 		Register(streamHandler).
 		Register(streampool.New()).

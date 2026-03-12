@@ -2,9 +2,14 @@
 
 package bootstrap
 
-import "github.com/anyproto/any-sync/app"
+import (
+	"github.com/anyproto/any-sync/app"
+	"github.com/anyproto/any-sync/net/transport/webtransport"
+)
 
-func registerTransports(_ *app.App) {
+func registerTransports(a *app.App) {
 	// On js/wasm, yamux and quic are not available.
-	// Only WebRTC is supported (registered separately when configured).
+	// WebRTC is registered separately when configured.
+	// WebTransport is always available in browsers (including Web Workers).
+	a.Register(webtransport.New())
 }

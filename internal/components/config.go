@@ -10,6 +10,7 @@ import (
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/net/transport/quic"
 	"github.com/anyproto/any-sync/net/transport/webrtc"
+	"github.com/anyproto/any-sync/net/transport/webtransport"
 	"github.com/anyproto/any-sync/net/transport/yamux"
 	"github.com/anyproto/any-sync/nodeconf"
 
@@ -101,6 +102,13 @@ func (c *ConfigAdapter) GetWebRTC() webrtc.Config {
 		WriteTimeoutSec: c.sdkCfg.WebRTC.WriteTimeoutSec,
 		CloseTimeoutSec: c.sdkCfg.WebRTC.CloseTimeoutSec,
 		ICEServers:      c.sdkCfg.WebRTC.ICEServers,
+	}
+}
+
+// webtransport configGetter
+func (c *ConfigAdapter) GetWebTransport() webtransport.Config {
+	return webtransport.Config{
+		DialTimeoutSec: 30,
 	}
 }
 

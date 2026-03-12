@@ -84,6 +84,7 @@ func (o *objectImpl) AddContent(ctx context.Context, data []byte, opts ...syncsd
 		Timestamp:   ts,
 		IsSnapshot:  resolved.IsSnapshot,
 		Version:     added.OrderId,
+		ApplySeq:    added.ApplySeq,
 	}, nil
 }
 
@@ -105,8 +106,35 @@ func (o *objectImpl) Iterate(visitor func(change syncsdk.ChangeInfo) bool) error
 			Timestamp:   change.Timestamp,
 			IsSnapshot:  change.IsSnapshot,
 			Version:     change.OrderId,
+			ApplySeq:    change.ApplySeq,
 		})
 	})
+}
+
+func (o *objectImpl) IterateAfterApplySeq(applySeq uint64, visitor func(change syncsdk.ChangeInfo) bool) error {
+	o.tree.Lock()
+	defer o.tree.Unlock()
+	return o.tree.Storage().GetAfterApplySeq(context.Background(), applySeq,
+		func(ctx context.Context, sc objecttree.StorageChange) (bool, error) {
+			if sc.Id == o.tree.Id() {
+				return true, nil
+			}
+			ch, err := o.tree.GetChange(sc.Id)
+			if err != nil {
+				return true, nil
+			}
+			return visitor(syncsdk.ChangeInfo{
+				ID:          ch.Id,
+				PreviousIDs: ch.PreviousIds,
+				Data:        ch.Data,
+				DataType:    ch.DataType,
+				Identity:    ch.Identity,
+				Timestamp:   ch.Timestamp,
+				IsSnapshot:  ch.IsSnapshot,
+				Version:     ch.OrderId,
+				ApplySeq:    sc.ApplySeq,
+			}), nil
+		})
 }
 
 func (o *objectImpl) Subscribe(handler syncsdk.Handler) (unsubscribe func()) {

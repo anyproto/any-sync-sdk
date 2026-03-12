@@ -3,6 +3,7 @@ package components
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/anyproto/any-sync/app"
@@ -89,6 +90,7 @@ func (t *TreeManagerAdapter) GetTree(ctx context.Context, spaceId, treeId string
 	t.mu.RLock()
 	if tree, ok := t.trees[treeKey(spaceId, treeId)]; ok {
 		t.mu.RUnlock()
+		fmt.Printf("[TREEMGR-DEBUG] GetTree: found cached treeId=%s\n", treeId)
 		return tree, nil
 	}
 	builder, ok := t.builders[spaceId]
@@ -96,6 +98,7 @@ func (t *TreeManagerAdapter) GetTree(ctx context.Context, spaceId, treeId string
 	if !ok {
 		return nil, errTreeManagerNotSupported
 	}
+	fmt.Printf("[TREEMGR-DEBUG] GetTree: building tree (background sync) treeId=%s\n", treeId)
 	return builder.BuildTree(ctx, treeId, objecttreebuilder.BuildTreeOpts{})
 }
 

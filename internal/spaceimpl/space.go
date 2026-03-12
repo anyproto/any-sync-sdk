@@ -13,18 +13,22 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/kvimpl"
 	"github.com/anyproto/any-sync-sdk/internal/objectimpl"
 
+	"github.com/anyproto/any-store/query"
+
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/commonspace/syncstatus"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/net/peer"
+	"github.com/anyproto/any-sync/net/rpc/rpcerr"
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/util/crypto"
 	"storj.io/drpc"
@@ -562,6 +566,8 @@ func (s *SpaceImpl) Push(ctx context.Context) error {
 	}
 
 	// Push to one random tree node — sync nodes replicate among themselves.
+	// Retry on ErrSpaceMissing because the sync node may not have received
+	// the space registration from the coordinator yet.
 	peers, err := s.cs.GetNodePeers(ctx)
 	if err != nil {
 		return err
@@ -574,22 +580,93 @@ func (s *SpaceImpl) Push(ctx context.Context) error {
 		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(peers))))
 		idx = int(n.Int64())
 	}
-	return peers[idx].DoDrpc(ctx, func(conn drpc.Conn) error {
-		cl := spacesyncproto.NewDRPCSpaceSyncClient(conn)
-		_, err := cl.SpacePush(ctx, &spacesyncproto.SpacePushRequest{
-			Payload: &spacesyncproto.SpacePayload{
-				SpaceHeader:            &spacesyncproto.RawSpaceHeaderWithId{RawHeader: state.SpaceHeader, Id: s.id},
-				AclPayload:             aclRoot.RawRecord,
-				AclPayloadId:           aclRoot.Id,
-				SpaceSettingsPayload:   settingsRoot.RawChange,
-				SpaceSettingsPayloadId: settingsRoot.Id,
-			},
-			Credential: cred,
+	pushReq := &spacesyncproto.SpacePushRequest{
+		Payload: &spacesyncproto.SpacePayload{
+			SpaceHeader:            &spacesyncproto.RawSpaceHeaderWithId{RawHeader: state.SpaceHeader, Id: s.id},
+			AclPayload:             aclRoot.RawRecord,
+			AclPayloadId:           aclRoot.Id,
+			SpaceSettingsPayload:   settingsRoot.RawChange,
+			SpaceSettingsPayloadId: settingsRoot.Id,
+		},
+		Credential: cred,
+	}
+	for attempt := 0; ; attempt++ {
+		pushErr := peers[idx].DoDrpc(ctx, func(conn drpc.Conn) error {
+			cl := spacesyncproto.NewDRPCSpaceSyncClient(conn)
+			_, err := cl.SpacePush(ctx, pushReq)
+			return err
 		})
-		return err
-	})
+		if pushErr == nil {
+			return nil
+		}
+		if rpcerr.Unwrap(pushErr) != spacesyncproto.ErrSpaceMissing || attempt >= 10 {
+			return pushErr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
+
+func (s *SpaceImpl) IterateAfterSeq(ctx context.Context, afterSeq uint64, visitor func(change syncsdk.SpaceChangeInfo) bool) error {
+	if err := s.ensure(ctx); err != nil {
+		return err
+	}
+	db := s.cs.Storage().AnyStore()
+	changesColl, err := db.Collection(ctx, objecttree.CollName)
+	if err != nil {
+		return err
+	}
+	filter := query.Key{
+		Path:   []string{objecttree.ApplySeqKey},
+		Filter: query.NewComp(query.CompOpGt, afterSeq),
+	}
+	iter, err := changesColl.Find(filter).Sort(objecttree.ApplySeqKey).Iter(ctx)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	rawCh := &treechangeproto.RawTreeChange{}
+	treeCh := &treechangeproto.TreeChange{}
+	for iter.Next() {
+		doc, docErr := iter.Doc()
+		if docErr != nil {
+			continue
+		}
+		v := doc.Value()
+		treeID := v.GetString(objecttree.TreeKey)
+		if treeID == "" {
+			continue
+		}
+		info := syncsdk.SpaceChangeInfo{
+			ObjectID: treeID,
+			ChangeID: v.GetString("id"),
+			Version:  v.GetString(objecttree.OrderKey),
+			ApplySeq: uint64(v.GetInt(objecttree.ApplySeqKey)),
+		}
+		// Parse raw change to extract Data, DataType, Timestamp
+		rawBytes := v.GetBytes("r")
+		if len(rawBytes) > 0 {
+			rawCh.Reset()
+			if err := rawCh.UnmarshalVT(rawBytes); err == nil && len(rawCh.Payload) > 0 {
+				treeCh.Reset()
+				if err := treeCh.UnmarshalVT(rawCh.Payload); err == nil {
+					info.Data = treeCh.ChangesData
+					info.DataType = treeCh.DataType
+					info.Timestamp = treeCh.Timestamp
+				}
+			}
+		}
+		if !visitor(info) {
+			return nil
+		}
+	}
+	return nil
+}
 
 // CommonSpace returns the underlying commonspace.Space, initializing it lazily.
 // This is used by other internal packages.

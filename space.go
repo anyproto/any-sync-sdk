@@ -38,6 +38,17 @@ func ResolveObjectCreateOptions(opts []ObjectCreateOption) ResolvedObjectCreateO
 	}
 }
 
+// SpaceChangeInfo is a change from space-level storage iteration.
+type SpaceChangeInfo struct {
+	ObjectID  string
+	ChangeID  string
+	Data      []byte // raw change data (application payload)
+	DataType  string
+	Version   string // OrderId — used for LWW
+	ApplySeq  uint64
+	Timestamp int64
+}
+
 type Space interface {
 	ID() string
 	GetObject(ctx context.Context, objectID string) (Object, error)
@@ -69,6 +80,10 @@ type Space interface {
 	// network access, but can be called explicitly to ensure the space is
 	// registered before generating invites or sharing.
 	Push(ctx context.Context) error
+
+	// IterateAfterSeq iterates ALL changes across all objects in the space
+	// where ApplySeq > afterSeq, ordered by ApplySeq.
+	IterateAfterSeq(ctx context.Context, afterSeq uint64, visitor func(change SpaceChangeInfo) bool) error
 
 	Subscribe(handler Handler) (unsubscribe func())
 	Close(ctx context.Context) error

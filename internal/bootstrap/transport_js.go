@@ -9,7 +9,6 @@ import (
 
 func registerTransports(a *app.App) {
 	// On js/wasm, yamux and quic are not available.
-	// WebRTC is registered separately when configured.
 	// WebTransport is always available in browsers (including Web Workers).
 	a.Register(webtransport.New())
 }

@@ -9,7 +9,6 @@ import (
 	anystore "github.com/anyproto/any-store"
 
 	"github.com/anyproto/any-sync/app"
-	"github.com/anyproto/any-sync/osfuncs"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
 )
 
@@ -29,7 +28,7 @@ func NewStorageProvider(storagePath string, storeConfig *anystore.Config) *Stora
 }
 
 func (s *StorageProvider) Init(_ *app.App) error {
-	return osfuncs.MkdirAll(s.storagePath, 0o755)
+	return os.MkdirAll(s.storagePath, 0o755)
 }
 
 func (s *StorageProvider) Name() string {
@@ -48,7 +47,7 @@ func (s *StorageProvider) WaitSpaceStorage(ctx context.Context, id string) (spac
 	}
 	s.mu.Unlock()
 	dbPath := s.dbPath(id)
-	if _, err := osfuncs.Stat(dbPath); os.IsNotExist(err) {
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil, spacestorage.ErrSpaceStorageMissing
 	}
 	db, err := anystore.Open(ctx, dbPath, s.storeConfig)
@@ -68,7 +67,7 @@ func (s *StorageProvider) WaitSpaceStorage(ctx context.Context, id string) (spac
 func (s *StorageProvider) CreateSpaceStorage(ctx context.Context, payload spacestorage.SpaceStorageCreatePayload) (spacestorage.SpaceStorage, error) {
 	spaceId := payload.SpaceHeaderWithId.Id
 	dbPath := s.dbPath(spaceId)
-	if _, err := osfuncs.Stat(dbPath); err == nil {
+	if _, err := os.Stat(dbPath); err == nil {
 		return nil, spacestorage.ErrSpaceStorageExists
 	}
 	db, err := anystore.Open(ctx, dbPath, s.storeConfig)
@@ -78,7 +77,7 @@ func (s *StorageProvider) CreateSpaceStorage(ctx context.Context, payload spaces
 	st, err := spacestorage.Create(ctx, db, payload)
 	if err != nil {
 		_ = db.Close()
-		_ = osfuncs.Remove(dbPath)
+		_ = os.Remove(dbPath)
 		return nil, err
 	}
 	s.mu.Lock()
@@ -88,6 +87,6 @@ func (s *StorageProvider) CreateSpaceStorage(ctx context.Context, payload spaces
 }
 
 func (s *StorageProvider) SpaceExists(id string) bool {
-	_, err := osfuncs.Stat(s.dbPath(id))
+	_, err := os.Stat(s.dbPath(id))
 	return err == nil
 }

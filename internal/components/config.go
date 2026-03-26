@@ -9,7 +9,6 @@ import (
 	"github.com/anyproto/any-sync/net/secureservice"
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/net/transport/quic"
-	"github.com/anyproto/any-sync/net/transport/webrtc"
 	"github.com/anyproto/any-sync/net/transport/webtransport"
 	"github.com/anyproto/any-sync/net/transport/yamux"
 	"github.com/anyproto/any-sync/nodeconf"
@@ -87,21 +86,6 @@ func (c *ConfigAdapter) GetQuic() quic.Config {
 		DialTimeoutSec:     10,
 		MaxStreams:          128,
 		KeepAlivePeriodSec: 25,
-	}
-}
-
-// webrtc configGetter
-func (c *ConfigAdapter) GetWebRTC() webrtc.Config {
-	if c.sdkCfg.WebRTC == nil {
-		return webrtc.Config{}
-	}
-	return webrtc.Config{
-		ListenAddrs:     c.sdkCfg.WebRTC.ListenAddrs,
-		SignalPort:      c.sdkCfg.WebRTC.SignalPort,
-		DialTimeoutSec:  c.sdkCfg.WebRTC.DialTimeoutSec,
-		WriteTimeoutSec: c.sdkCfg.WebRTC.WriteTimeoutSec,
-		CloseTimeoutSec: c.sdkCfg.WebRTC.CloseTimeoutSec,
-		ICEServers:      c.sdkCfg.WebRTC.ICEServers,
 	}
 }
 

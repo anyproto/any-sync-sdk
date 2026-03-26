@@ -84,7 +84,7 @@ func (o *objectImpl) AddContent(ctx context.Context, data []byte, opts ...syncsd
 		Timestamp:   ts,
 		IsSnapshot:  resolved.IsSnapshot,
 		Version:     added.OrderId,
-		ApplySeq:    added.ApplySeq,
+		AddSeq:      added.AddSeq,
 	}, nil
 }
 
@@ -106,15 +106,15 @@ func (o *objectImpl) Iterate(visitor func(change syncsdk.ChangeInfo) bool) error
 			Timestamp:   change.Timestamp,
 			IsSnapshot:  change.IsSnapshot,
 			Version:     change.OrderId,
-			ApplySeq:    change.ApplySeq,
+			AddSeq:      change.AddSeq,
 		})
 	})
 }
 
-func (o *objectImpl) IterateAfterApplySeq(applySeq uint64, visitor func(change syncsdk.ChangeInfo) bool) error {
+func (o *objectImpl) IterateAfterAddSeq(addSeq uint64, visitor func(change syncsdk.ChangeInfo) bool) error {
 	o.tree.Lock()
 	defer o.tree.Unlock()
-	return o.tree.Storage().GetAfterApplySeq(context.Background(), applySeq,
+	return o.tree.Storage().GetAfterAddSeq(context.Background(), addSeq,
 		func(ctx context.Context, sc objecttree.StorageChange) (bool, error) {
 			if sc.Id == o.tree.Id() {
 				return true, nil
@@ -132,7 +132,7 @@ func (o *objectImpl) IterateAfterApplySeq(applySeq uint64, visitor func(change s
 				Timestamp:   ch.Timestamp,
 				IsSnapshot:  ch.IsSnapshot,
 				Version:     ch.OrderId,
-				ApplySeq:    sc.ApplySeq,
+				AddSeq:      sc.AddSeq,
 			}), nil
 		})
 }

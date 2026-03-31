@@ -26,6 +26,12 @@ type Client interface {
 	// Returns a fresh NetworkConfig with the latest node addresses and topology.
 	NetworkConfig(ctx context.Context) (NetworkConfig, error)
 
+	// SetNetworkEnabled toggles all network activity.
+	// When disabled (offline mode), all peer connections are dropped and
+	// no new dials will succeed. Local edits still persist to storage.
+	// When re-enabled, peer addresses are restored and sync resumes.
+	SetNetworkEnabled(ctx context.Context, enabled bool) error
+
 	Subscribe(handler Handler) (unsubscribe func())
 	Close(ctx context.Context) error
 }

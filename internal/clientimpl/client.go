@@ -18,6 +18,8 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+	"github.com/anyproto/any-sync/net/peerservice"
+	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/util/crypto"
 )
@@ -30,6 +32,8 @@ type clientImpl struct {
 	treeManager      *components.TreeManagerAdapter
 	spaceSyncHandler *components.SpaceSyncHandler
 	streamPool       streampool.StreamPool
+	peerService      peerservice.PeerService
+	pool             pool.Pool
 	cfg              syncsdk.Config
 	peerId           string
 	networkId        string
@@ -76,6 +80,9 @@ func New(ctx context.Context, cfg syncsdk.Config) (syncsdk.Client, error) {
 		return nil, err
 	}
 
+	ps := a.MustComponent(peerservice.CName).(peerservice.PeerService)
+	pl := a.MustComponent(pool.CName).(pool.Pool)
+
 	return &clientImpl{
 		app:              a,
 		spaceService:     spaceService,
@@ -84,6 +91,8 @@ func New(ctx context.Context, cfg syncsdk.Config) (syncsdk.Client, error) {
 		treeManager:      treeMgr,
 		spaceSyncHandler: syncHandler,
 		streamPool:       sp,
+		peerService:      ps,
+		pool:             pl,
 		cfg:              cfg,
 		peerId:           cfg.PeerKey.GetPublic().PeerId(),
 		networkId:        cfg.Network.NetworkID,
@@ -322,6 +331,24 @@ func nodeTypeToString(t coordinatorproto.NodeType) string {
 	default:
 		return "unknown"
 	}
+}
+
+func (c *clientImpl) SetNetworkEnabled(ctx context.Context, enabled bool) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return syncsdk.ErrClientClosed
+	}
+	c.mu.Unlock()
+
+	if !enabled {
+		// TODO: re-enable when peerService.SetDisabled is available in any-sync
+		// c.peerService.SetDisabled(true)
+		_ = c.pool.Flush(ctx)
+	} else {
+		// c.peerService.SetDisabled(false)
+	}
+	return nil
 }
 
 func (c *clientImpl) Close(ctx context.Context) error {

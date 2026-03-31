@@ -45,7 +45,7 @@ type SpaceChangeInfo struct {
 	Data      []byte // raw change data (application payload)
 	DataType  string
 	Version   string // OrderId — used for LWW
-	ApplySeq  uint64
+	AddSeq  uint64
 	Timestamp int64
 }
 
@@ -82,7 +82,7 @@ type Space interface {
 	Push(ctx context.Context) error
 
 	// IterateAfterSeq iterates ALL changes across all objects in the space
-	// where ApplySeq > afterSeq, ordered by ApplySeq.
+	// where AddSeq > afterSeq, ordered by AddSeq.
 	IterateAfterSeq(ctx context.Context, afterSeq uint64, visitor func(change SpaceChangeInfo) bool) error
 
 	Subscribe(handler Handler) (unsubscribe func())

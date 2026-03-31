@@ -35,7 +35,7 @@ type ChangeInfo struct {
 	Timestamp   int64
 	IsSnapshot  bool
 	Version     string
-	ApplySeq    uint64 // Space-global monotonic sequence; assigned on storage insert
+	AddSeq    uint64 // Space-global monotonic sequence; assigned on storage insert
 }
 
 // ResolvedAddOptions holds the resolved values of AddOption functions.
@@ -65,7 +65,7 @@ type Object interface {
 	Heads() []string
 	AddContent(ctx context.Context, data []byte, opts ...AddOption) (ChangeInfo, error)
 	Iterate(visitor func(change ChangeInfo) bool) error
-	IterateAfterApplySeq(applySeq uint64, visitor func(change ChangeInfo) bool) error
+	IterateAfterAddSeq(applySeq uint64, visitor func(change ChangeInfo) bool) error
 	Subscribe(handler Handler) (unsubscribe func())
 	Close() error
 }

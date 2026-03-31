@@ -20,7 +20,6 @@ import (
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/secureservice"
 	"github.com/anyproto/any-sync/net/streampool"
-	"github.com/anyproto/any-sync/net/transport/webrtc"
 	"github.com/anyproto/any-sync/nodeconf"
 	"github.com/anyproto/any-sync/nodeconf/nodeconfstore"
 	"github.com/anyproto/any-sync/util/syncqueues"
@@ -64,9 +63,6 @@ func NewApp(ctx context.Context, cfg syncsdk.Config) (*app.App, error) {
 		Register(nodeconf.New()).
 		Register(secureservice.New())
 	registerTransports(a)
-	if cfg.WebRTC != nil {
-		a.Register(webrtc.New().(app.Component))
-	}
 	a.Register(peerservice.New()).
 		Register(server.New()).
 		Register(streamHandler).

@@ -9,8 +9,8 @@ import (
 	anystore "github.com/anyproto/any-store"
 
 	"github.com/anyproto/any-sync/app"
-	"github.com/anyproto/any-sync/osfuncs"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
+	"github.com/anyproto/any-sync/osfuncs"
 )
 
 type StorageProvider struct {

@@ -621,10 +621,10 @@ func (s *SpaceImpl) IterateAfterSeq(ctx context.Context, afterSeq uint64, visito
 		return err
 	}
 	filter := query.Key{
-		Path:   []string{objecttree.ApplySeqKey},
+		Path:   []string{objecttree.AddSeqKey},
 		Filter: query.NewComp(query.CompOpGt, afterSeq),
 	}
-	iter, err := changesColl.Find(filter).Sort(objecttree.ApplySeqKey).Iter(ctx)
+	iter, err := changesColl.Find(filter).Sort(objecttree.AddSeqKey).Iter(ctx)
 	if err != nil {
 		return err
 	}
@@ -646,7 +646,7 @@ func (s *SpaceImpl) IterateAfterSeq(ctx context.Context, afterSeq uint64, visito
 			ObjectID: treeID,
 			ChangeID: v.GetString("id"),
 			Version:  v.GetString(objecttree.OrderKey),
-			ApplySeq: uint64(v.GetInt(objecttree.ApplySeqKey)),
+			AddSeq: uint64(v.GetInt(objecttree.AddSeqKey)),
 		}
 		// Parse raw change to extract Data, DataType, Timestamp
 		rawBytes := v.GetBytes("r")

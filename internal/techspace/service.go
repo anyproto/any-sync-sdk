@@ -1,0 +1,302 @@
+package techspace
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
+	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
+	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+
+	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
+)
+
+// Service runs the account-private tech space — derived from the
+// account key, owner-only ACL — and exposes typed access to the
+// space-index dataset.
+//
+// Loads the underlying any-sync space lazily through anysyncx's
+// space cache. The CRDT controller stays loaded for the life of the
+// SDK (cheap, DB-backed); the any-sync side evicts on TTL like any
+// other space. Each write rebinds an *object.Object to the freshly
+// loaded tree before issuing tree.AddContent.
+type Service struct {
+	app *anysyncx.App
+	db  anystore.DB
+
+	mu      sync.Mutex
+	open    bool
+	spaceId string
+	indexId string
+	ctrl    *crdt.Controller
+	alloc   *object.VersionAllocator
+}
+
+// New returns a Service ready for Open.
+func New(app *anysyncx.App, db anystore.DB) *Service {
+	return &Service{app: app, db: db}
+}
+
+// Open derives the tech-space id, ensures storage exists, and
+// computes the space-index object id. The space itself is loaded via
+// the cache as needed (and on the first call to do an initial cold
+// restore so subscribed callers see persisted state immediately).
+func (s *Service) Open(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.open {
+		return nil
+	}
+
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return errors.New("techspace: anysyncx app has no account keys")
+	}
+
+	spaceCfg := spacepayloads.SpaceDerivePayload{
+		SigningKey: keys.SignKey,
+		MasterKey:  keys.SignKey,
+		SpaceType:  spacepayloads.SpaceReserved,
+	}
+	spaceId, err := s.app.SpaceService().DeriveId(ctx, spaceCfg)
+	if err != nil {
+		return fmt.Errorf("techspace: derive id: %w", err)
+	}
+	s.spaceId = spaceId
+
+	if !s.app.SpaceExists(spaceId) {
+		if _, err := s.app.SpaceService().DeriveSpace(ctx, spaceCfg); err != nil {
+			return fmt.Errorf("techspace: derive: %w", err)
+		}
+	}
+
+	// Load the space once at boot so we can compute the index objectId
+	// (depends on the space's keys/state) and run cold restore. After
+	// this returns, the space is in cache and may TTL-evict if idle.
+	handle, err := s.app.GetSpace(ctx, spaceId)
+	if err != nil {
+		return fmt.Errorf("techspace: get space: %w", err)
+	}
+	cs := handle.Inner()
+
+	derivePayload := objecttree.ObjectTreeDerivePayload{
+		ChangePayload: []byte(SpaceIndexDeriveSeed),
+		SpaceId:       spaceId,
+		IsEncrypted:   true,
+	}
+	storagePayload, err := cs.TreeBuilder().DeriveTree(ctx, derivePayload)
+	if err != nil {
+		return fmt.Errorf("techspace: derive index tree payload: %w", err)
+	}
+	s.indexId = storagePayload.RootRawChange.Id
+
+	collName := s.indexId + "/" + SpaceIndexDataset
+	if _, err := s.db.Collection(ctx, collName); err != nil {
+		return fmt.Errorf("techspace: open index collection: %w", err)
+	}
+
+	ctrl, err := crdt.NewController(ctx, s.indexId, s.db, SpaceIndexHandler{})
+	if err != nil {
+		return fmt.Errorf("techspace: new controller: %w", err)
+	}
+	s.ctrl = ctrl
+	s.alloc = object.NewVersionAllocator("")
+
+	// First-time PutTree (creates) or BuildTree (already created on a
+	// prior boot). Either way we run ColdRestore against the freshly
+	// bound tree.
+	obj, err := s.bindIndexObject(ctx, cs, storagePayload)
+	if err != nil {
+		return err
+	}
+	if err := obj.ColdRestore(ctx); err != nil {
+		return fmt.Errorf("techspace: cold restore: %w", err)
+	}
+
+	s.open = true
+	return nil
+}
+
+// bindIndexObject wires a fresh *object.Object to the index tree under
+// the given (loaded) commonspace.Space. The Object is short-lived —
+// callers use it for a single LocalWrite or ColdRestore and let it go.
+// On subsequent calls under a different (re-loaded) Space, a new
+// Object is built; both share the same controller and allocator.
+func (s *Service) bindIndexObject(ctx context.Context, cs interface {
+	TreeBuilder() objecttreebuilder.TreeBuilder
+}, storagePayload treestorage.TreeStorageCreatePayload) (*object.Object, error) {
+	keys := s.app.AccountKeys()
+	obj := object.NewObject(s.spaceId, keys.SignKey, s.ctrl, s.alloc)
+
+	tree, err := cs.TreeBuilder().PutTree(ctx, storagePayload, obj)
+	if err != nil {
+		if !errors.Is(err, treestorage.ErrTreeExists) {
+			return nil, fmt.Errorf("techspace: put index tree: %w", err)
+		}
+		tree, err = cs.TreeBuilder().BuildTree(ctx, s.indexId, objecttreebuilder.BuildTreeOpts{Listener: obj})
+		if err != nil {
+			return nil, fmt.Errorf("techspace: build index tree: %w", err)
+		}
+	}
+	obj.SetTree(tree)
+	return obj, nil
+}
+
+// indexObject loads the tech space (via cache), rebinds an Object to
+// the index tree, and returns it. Each write is a separate Get →
+// rebind cycle; the cache TTL governs when the underlying space tears
+// down.
+func (s *Service) indexObject(ctx context.Context) (*object.Object, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return nil, fmt.Errorf("techspace: get space: %w", err)
+	}
+	derivePayload := objecttree.ObjectTreeDerivePayload{
+		ChangePayload: []byte(SpaceIndexDeriveSeed),
+		SpaceId:       s.spaceId,
+		IsEncrypted:   true,
+	}
+	storagePayload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, derivePayload)
+	if err != nil {
+		return nil, fmt.Errorf("techspace: derive index tree payload: %w", err)
+	}
+	return s.bindIndexObject(ctx, handle.Inner(), storagePayload)
+}
+
+// SpaceId returns the tech-space id once Open has run.
+func (s *Service) SpaceId() string { return s.spaceId }
+
+// IndexObjectId returns the space-index object id once Open has run.
+func (s *Service) IndexObjectId() string { return s.indexId }
+
+// Add writes a new space-index record.
+func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteResult, error) {
+	if !s.open {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	if rec.Id == "" {
+		return object.WriteResult{}, errors.New("techspace: SpaceIndexRecord.Id required")
+	}
+
+	obj, err := s.indexObject(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+
+	arena := &anyenc.Arena{}
+	payload := rec.EncodeCreate(arena)
+
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id:     rec.Id,
+				Upsert: true,
+				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+			},
+		},
+	}
+	return obj.LocalWrite(ctx, change)
+}
+
+// SetLocalStatus updates the localStatus field of an existing record.
+func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
+	if !s.open {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObject(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldLocalStatus},
+					Payload: arena.NewString(status),
+				}},
+			},
+		},
+	}
+	return obj.LocalWrite(ctx, change)
+}
+
+// Get returns the current state of one space-index record. Reads
+// straight off the controller — no space load needed.
+func (s *Service) Get(ctx context.Context, spaceId string) (SpaceIndexRecord, bool) {
+	if !s.open {
+		return SpaceIndexRecord{}, false
+	}
+	v := s.ctrl.Get(ctx, SpaceIndexDataset, spaceId)
+	if v == nil {
+		return SpaceIndexRecord{}, false
+	}
+	return DecodeSpaceIndexRecord(v), true
+}
+
+// List returns every live space-index record.
+func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
+	if !s.open {
+		return nil
+	}
+	rows := s.ctrl.Records(ctx, SpaceIndexDataset)
+	out := make([]SpaceIndexRecord, 0, len(rows))
+	for _, v := range rows {
+		out = append(out, DecodeSpaceIndexRecord(v))
+	}
+	return out
+}
+
+// Close marks the service inactive. Underlying space cleanup happens
+// via the App's space cache on its own schedule.
+func (s *Service) Close(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.open = false
+	return nil
+}
+
+// SpaceRegistry adapter — the tech-space owns one tree (the index).
+// Anything else routes back through the app's broader SpaceRegistry
+// (set later when regular spaces gain their own one).
+
+var ErrSpaceRegistryUnknown = errors.New("techspace: unknown (spaceId, treeId)")
+
+func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
+	if spaceId != s.spaceId || treeId != s.indexId {
+		return nil, ErrSpaceRegistryUnknown
+	}
+	handle, err := s.app.GetSpace(ctx, spaceId)
+	if err != nil {
+		return nil, err
+	}
+	// Use a no-op listener — inbound sync into this tree won't reach
+	// our controller until the next bindIndexObject. This is acceptable
+	// for the tech space: SDK-internal writes are the only writers and
+	// every write rebinds.
+	return handle.Inner().TreeBuilder().BuildTree(ctx, treeId, objecttreebuilder.BuildTreeOpts{})
+}
+
+func (s *Service) PutTree(_ context.Context, _ string, _ treestorage.TreeStorageCreatePayload) error {
+	return ErrSpaceRegistryUnknown
+}
+
+func (s *Service) MarkTreeDeleted(_ context.Context, _, _ string) error { return nil }
+
+func (s *Service) DeleteTree(_ context.Context, _, _ string) error {
+	return ErrSpaceRegistryUnknown
+}

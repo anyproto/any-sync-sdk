@@ -27,7 +27,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // Kind is the declared type of a value.
@@ -61,7 +61,9 @@ func (k Kind) String() string {
 	return "unknown"
 }
 
-func parseKind(s string) (Kind, bool) {
+// ParseKind decodes the on-wire kind label ("string", "number", …) into
+// a Kind. Returns false on an unknown label.
+func ParseKind(s string) (Kind, bool) {
 	switch s {
 	case "string":
 		return KindString, true
@@ -147,7 +149,7 @@ func compileSchema(v *anyenc.Value) (*Schema, error) {
 		return nil, fmt.Errorf("%w: missing or non-string `kind`", ErrCompile)
 	}
 	kindStr := string(kindV.GetStringBytes())
-	k, ok := parseKind(kindStr)
+	k, ok := ParseKind(kindStr)
 	if !ok {
 		return nil, fmt.Errorf("%w: unknown kind %q", ErrCompile, kindStr)
 	}
@@ -218,9 +220,14 @@ func (v *Validator) Validate(name string, value *anyenc.Value) error {
 	return validateValue(s, value)
 }
 
-// kindOf maps an anyenc type to its schema Kind. Returns KindUnknown for
-// unsupported types (e.g. binary).
-func kindOf(v *anyenc.Value) Kind {
+// KindOf maps an anyenc value's type to its schema Kind. Returns
+// KindUnknown for nil or unsupported types (e.g. binary). Used by
+// per-op handler validators to match a payload against a property's
+// declared kind without compiling a full Validator.
+func KindOf(v *anyenc.Value) Kind {
+	if v == nil {
+		return KindUnknown
+	}
 	switch v.Type() {
 	case anyenc.TypeString:
 		return KindString
@@ -251,7 +258,7 @@ func validateValue(s *Schema, value *anyenc.Value) error {
 	if value == nil {
 		return nil
 	}
-	actual := kindOf(value)
+	actual := KindOf(value)
 	if actual == KindUnknown {
 		return fmt.Errorf("%w: unsupported value type", ErrKind)
 	}

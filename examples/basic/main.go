@@ -139,7 +139,7 @@ func run() error {
 	// Write user data into a type-owned dataset. In v1 datasets are
 	// permissionless — "notes" here is free-form and its schema is
 	// whatever the caller writes.
-	ver, err := sp.Modify(ctx, space.ModifyBatch{
+	res, err := sp.Modify(ctx, space.ModifyBatch{
 		ObjectId: objectId,
 		Dataset:  "notes",
 		Records: []space.RecordModify{{
@@ -157,7 +157,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("write note: %w", err)
 	}
-	log.Printf("wrote note at version %s", ver)
+	// res.RecordIds[0] is the auto-derived id for the new note —
+	// equals base58(xxh3-64(res.ChangeId)) since we passed empty Id.
+	log.Printf("wrote note %s at version %s (changeId %s)",
+		res.RecordIds[0], res.VersionId, res.ChangeId)
 
 	// Query the notes back, ordered by creation time (newest first).
 	notes, err := sp.Query(objectId, "notes").

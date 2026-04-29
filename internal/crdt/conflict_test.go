@@ -6,7 +6,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/lexid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

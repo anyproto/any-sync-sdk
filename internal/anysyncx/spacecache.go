@@ -1,0 +1,131 @@
+package anysyncx
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/anyproto/any-sync/app/ocache"
+	"github.com/anyproto/any-sync/commonspace"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
+	"github.com/anyproto/any-sync/commonspace/syncstatus"
+)
+
+// spaceLoaderTTL controls how long an idle commonspace.Space sits in
+// the cache before TryClose is offered. Mirrors anytype-heart and
+// any-sync-node defaults — long enough that bursty writes don't
+// thrash, short enough that idle resources release within a minute.
+const spaceLoaderTTL = 60 * time.Second
+
+// spaceLoaderGC is the cache's GC tick.
+const spaceLoaderGC = 20 * time.Second
+
+// SpaceHandle is the handle returned by App.GetSpace. Callers operate
+// on it for the duration of a logical operation; the underlying
+// commonspace.Space is reachable via Inner. The cache TTL releases
+// idle spaces in the background — callers don't refcount manually.
+type SpaceHandle interface {
+	Id() string
+	Inner() commonspace.Space
+}
+
+// spaceWrapper implements ocache.Object and SpaceHandle. Holds the
+// commonspace.Space and tags itself for sync-handler register /
+// unregister on load / close.
+type spaceWrapper struct {
+	id  string
+	cs  commonspace.Space
+	app *App
+}
+
+func (s *spaceWrapper) Id() string                  { return s.id }
+func (s *spaceWrapper) Inner() commonspace.Space    { return s.cs }
+
+// Close unregisters this space from the inbound sync handler before
+// closing the commonspace. Called by ocache on Remove/shutdown and
+// after a successful TryClose.
+func (s *spaceWrapper) Close() error {
+	s.app.sync.UnregisterSpace(s.id)
+	return s.cs.Close()
+}
+
+// TryClose forwards to commonspace.Space — it knows whether the space
+// has unfinished sync work and refuses to close while busy.
+func (s *spaceWrapper) TryClose(ttl time.Duration) (bool, error) {
+	closed, err := s.cs.TryClose(ttl)
+	if closed {
+		s.app.sync.UnregisterSpace(s.id)
+	}
+	return closed, err
+}
+
+// newSpaceCache builds the cache. The loader fully wires a space —
+// NewSpace, Init, register — so callers reach a ready Space straight
+// from Get.
+func (a *App) newSpaceCache() ocache.OCache {
+	return ocache.New(
+		a.loadSpaceForCache,
+		ocache.WithTTL(spaceLoaderTTL),
+		ocache.WithGCPeriod(spaceLoaderGC),
+	)
+}
+
+// loadSpaceForCache is the ocache LoadFunc. Independent of "is this a
+// regular space or the tech space" — both flow through here. Storage
+// must already exist (caller is expected to Create / Derive first if
+// the space is new).
+func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, error) {
+	cs, err := a.spaceService.NewSpace(ctx, id, commonspace.Deps{
+		SyncStatus: syncstatus.NewNoOpSyncStatus(),
+		TreeSyncer: a.NewTreeSyncer(),
+	})
+	if err != nil {
+		if errors.Is(err, spacestorage.ErrSpaceStorageMissing) {
+			return nil, fmt.Errorf("anysyncx: space %s not found locally: %w", id, err)
+		}
+		return nil, fmt.Errorf("anysyncx: NewSpace %s: %w", id, err)
+	}
+	if err := cs.Init(ctx); err != nil {
+		_ = cs.Close()
+		return nil, fmt.Errorf("anysyncx: Init %s: %w", id, err)
+	}
+	a.sync.RegisterSpace(id, cs)
+
+	// Hash cache: seed from current state and subscribe to future
+	// changes. The observer is owned by the StateStorage and lives
+	// for the duration of the SpaceStorage instance — survives our
+	// spaceWrapper.Close (any-sync re-creates StateStorage on the
+	// next NewSpace).
+	if state, stErr := cs.Storage().StateStorage().GetState(ctx); stErr == nil && state.NewHash != "" {
+		a.headCache.Set(id, state.NewHash)
+	}
+	cs.Storage().StateStorage().SetObserver(a.headCache.observerFor(id))
+
+	return &spaceWrapper{id: id, cs: cs, app: a}, nil
+}
+
+// GetSpace returns a handle for the given space id, loading it through
+// the cache if necessary. The handle is valid for the duration of the
+// operation; the cache TTL evicts idle spaces in the background.
+func (a *App) GetSpace(ctx context.Context, id string) (SpaceHandle, error) {
+	if a.spaceCache == nil {
+		return nil, errors.New("anysyncx: space cache not initialised")
+	}
+	v, err := a.spaceCache.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return v.(SpaceHandle), nil
+}
+
+// EvictSpace forces immediate close + remove from cache. Used by
+// space-delete paths to drop the in-memory state right away rather
+// than waiting for TTL.
+func (a *App) EvictSpace(ctx context.Context, id string) error {
+	if a.spaceCache == nil {
+		return nil
+	}
+	_, err := a.spaceCache.Remove(ctx, id)
+	return err
+}

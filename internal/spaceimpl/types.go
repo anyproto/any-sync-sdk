@@ -1,0 +1,345 @@
+package spaceimpl
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
+
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
+	"github.com/anyproto/any-sync-sdk/space"
+)
+
+// typesAPI implements space.TypesAPI. MVP scope: Create + AddProperty.
+// The other methods return "not implemented" so callers see a
+// consistent failure mode while we wait for the Registry / List /
+// Get implementations.
+type typesAPI struct {
+	parent *spaceImpl
+}
+
+func newTypesAPI(parent *spaceImpl) *typesAPI { return &typesAPI{parent: parent} }
+
+// Create mints a new type object: a fresh any-sync tree whose
+// `properties` dataset record carries the type's display metadata
+// (any.name / any.description / any.icon) and `any.types =
+// ["__type__"]` to mark it as a meta-type instance.
+//
+// The returned typeId is the new tree's id (= root change id) — used
+// as the namespace prefix in property paths on instance objects.
+func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (string, error) {
+	obj, err := t.parent.store.Create(ctx, spaceobjects.CreateOpts{
+		ChangeType: "type",
+	})
+	if err != nil {
+		return "", err
+	}
+	typeId := obj.Id()
+
+	arena := &anyenc.Arena{}
+	multi := arena.NewObject()
+	if params.Name != "" {
+		multi.Set("any.name", arena.NewString(params.Name))
+	}
+	if params.Description != "" {
+		multi.Set("any.description", arena.NewString(params.Description))
+	}
+	if params.IconCID != "" {
+		multi.Set("any.icon", arena.NewString(params.IconCID))
+	}
+	// Mark the object as a meta-type instance — the convention we use
+	// in MVP to distinguish types from regular objects without a
+	// dedicated catalog.
+	types := arena.NewArray()
+	types.SetArrayItem(0, arena.NewString("__type__"))
+	multi.Set("any.types", types)
+
+	dataVersion, err := t.parent.store.DataVersion(properties.Dataset)
+	if err != nil {
+		return "", err
+	}
+	if _, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: dataVersion,
+		Records: []crdt.RecordChange{{
+			Id:     typeId,
+			Upsert: true,
+			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
+		}},
+	}); err != nil {
+		return "", fmt.Errorf("typesAPI: seed type metadata: %w", err)
+	}
+	return typeId, nil
+}
+
+// AddProperty writes a property-definition record to the type
+// object's `defs` dataset. The record's id (= propId) is auto-derived
+// from the change's ChangeId per the empty-id-resolution rule;
+// returned so the caller can reference it from instance writes.
+func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.PropertyDraft) (string, error) {
+	if draft.Kind == 0 {
+		return "", errors.New("typesAPI: PropertyDraft.Kind required")
+	}
+	arena := &anyenc.Arena{}
+	payload := arena.NewObject()
+	payload.Set(typetype.FieldKind, arena.NewString(propertyKindLabel(draft.Kind)))
+	if draft.Name != "" {
+		payload.Set(typetype.FieldName, arena.NewString(draft.Name))
+	}
+	if draft.Description != "" {
+		payload.Set(typetype.FieldDescription, arena.NewString(draft.Description))
+	}
+	if draft.XKey != "" {
+		payload.Set(typetype.FieldXKey, arena.NewString(draft.XKey))
+	}
+
+	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetProperties)
+	if err != nil {
+		return "", err
+	}
+	obj, err := t.parent.store.Get(ctx, typeId)
+	if err != nil {
+		return "", err
+	}
+	res, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     typetype.DatasetProperties,
+		DataVersion: dataVersion,
+		Records: []crdt.RecordChange{{
+			Upsert: true, // empty Id → propId derived from ChangeId
+			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+		}},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(res.RecordIds) == 0 {
+		return "", errors.New("typesAPI: write returned no record id")
+	}
+	return res.RecordIds[0], nil
+}
+
+// builtInAnyTypeInfo describes the synthetic `any` type — present in
+// every space without materialisation. Returned by List / Get so
+// callers can iterate the type catalog uniformly.
+func builtInAnyTypeInfo() space.TypeInfo {
+	return space.TypeInfo{
+		Id:          anytype.TypeId,
+		Name:        anytype.Name,
+		Description: anytype.Description,
+		BuiltIn:     true,
+	}
+}
+
+// List walks the space's tree-storage index and returns every object
+// whose `properties` record marks it as a meta-type instance
+// (`any.types` contains "__type__"). One controller load per
+// candidate — fine for MVP scale. The synthetic `any` built-in is
+// prepended.
+func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
+	handle, err := t.parent.app.GetSpace(ctx, t.parent.id)
+	if err != nil {
+		return nil, fmt.Errorf("typesAPI: get space: %w", err)
+	}
+	storage := handle.Inner().Storage()
+	state, err := storage.StateStorage().GetState(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("typesAPI: state: %w", err)
+	}
+	exclude := map[string]struct{}{
+		handle.Inner().Acl().Id():                     {},
+		handle.Inner().KeyValue().DefaultStore().Id(): {},
+		state.SettingsId:                              {},
+	}
+
+	var ids []string
+	if err := storage.HeadStorage().IterateEntries(ctx, headstorage.IterOpts{}, func(entry headstorage.HeadsEntry) (bool, error) {
+		if _, skip := exclude[entry.Id]; skip {
+			return true, nil
+		}
+		ids = append(ids, entry.Id)
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("typesAPI: iterate entries: %w", err)
+	}
+
+	out := make([]space.TypeInfo, 0, len(ids)+1)
+	out = append(out, builtInAnyTypeInfo())
+	for _, id := range ids {
+		info, ok, err := t.readTypeInfo(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, info)
+		}
+	}
+	return out, nil
+}
+
+// Get returns one type's display metadata or space.ErrNotFound when
+// the id isn't a meta-type instance on this space. Special-cases the
+// synthetic `any` built-in.
+func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, error) {
+	if typeId == anytype.TypeId {
+		return builtInAnyTypeInfo(), nil
+	}
+	info, ok, err := t.readTypeInfo(ctx, typeId)
+	if err != nil {
+		return space.TypeInfo{}, err
+	}
+	if !ok {
+		return space.TypeInfo{}, space.ErrNotFound
+	}
+	return info, nil
+}
+
+// readTypeInfo loads the object's `properties` record and, if its
+// `any.types` array contains "__type__", returns the typed view.
+// Returns ok=false when the object doesn't claim to be a type.
+func (t *typesAPI) readTypeInfo(ctx context.Context, objectId string) (space.TypeInfo, bool, error) {
+	obj, err := t.parent.store.Get(ctx, objectId)
+	if err != nil {
+		return space.TypeInfo{}, false, fmt.Errorf("typesAPI: load %s: %w", objectId, err)
+	}
+	rec := obj.Controller().Get(ctx, properties.Dataset, objectId)
+	if rec == nil {
+		return space.TypeInfo{}, false, nil
+	}
+	if !hasTypeMarker(rec) {
+		return space.TypeInfo{}, false, nil
+	}
+	return space.TypeInfo{
+		Id:          objectId,
+		Name:        rec.GetString("any", "name"),
+		Description: rec.GetString("any", "description"),
+		IconCID:     rec.GetString("any", "icon"),
+		BuiltIn:     false,
+	}, true, nil
+}
+
+// hasTypeMarker reports whether `record.any.types` contains the
+// reserved meta-type label "__type__". Used to distinguish type
+// objects from regular objects without a separate catalog.
+func hasTypeMarker(rec *anyenc.Value) bool {
+	arr := rec.GetArray("any", "types")
+	for _, v := range arr {
+		if string(v.GetStringBytes()) == "__type__" {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *typesAPI) Delete(_ context.Context, _ string) error {
+	return errors.New("typesAPI: Delete not implemented")
+}
+
+// Properties returns the property definitions of a type. For the
+// built-in `any` type, the list is hardcoded (one entry per
+// anytype.Properties). For user-created types, the list is read off
+// the type object's `defs` dataset.
+func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.PropertyDef, error) {
+	if typeId == anytype.TypeId {
+		return builtInAnyProperties(), nil
+	}
+	obj, err := t.parent.store.Get(ctx, typeId)
+	if err != nil {
+		return nil, fmt.Errorf("typesAPI: load %s: %w", typeId, err)
+	}
+	rows := obj.Controller().Records(ctx, typetype.DatasetProperties)
+	out := make([]space.PropertyDef, 0, len(rows))
+	for _, v := range rows {
+		out = append(out, decodePropertyDef(v))
+	}
+	return out, nil
+}
+
+// builtInAnyProperties translates anytype.Properties into the public
+// PropertyDef shape. Built-ins use human-readable ids — they pass
+// through to the SDK's permissive validator unchanged.
+func builtInAnyProperties() []space.PropertyDef {
+	out := make([]space.PropertyDef, 0, len(anytype.Properties))
+	for _, p := range anytype.Properties {
+		out = append(out, space.PropertyDef{
+			Id:   p.Id,
+			Name: p.Name,
+			Kind: schemaKindToPropertyKind(p.Kind),
+		})
+	}
+	return out
+}
+
+// decodePropertyDef parses one row from a type object's `defs`
+// dataset into the public PropertyDef shape. Unknown or missing
+// fields default to zero values.
+func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
+	if v == nil {
+		return space.PropertyDef{}
+	}
+	def := space.PropertyDef{
+		Id:          v.GetString("id"),
+		Name:        v.GetString(typetype.FieldName),
+		Description: v.GetString(typetype.FieldDescription),
+		XKey:        v.GetString(typetype.FieldXKey),
+	}
+	if k, ok := schema.ParseKind(v.GetString(typetype.FieldKind)); ok {
+		def.Kind = schemaKindToPropertyKind(k)
+	}
+	return def
+}
+
+// schemaKindToPropertyKind maps the internal schema.Kind enum to the
+// public space.PropertyKind. Values track 1:1 but differ by package.
+func schemaKindToPropertyKind(k schema.Kind) space.PropertyKind {
+	switch k {
+	case schema.KindString:
+		return space.PropertyKindString
+	case schema.KindNumber:
+		return space.PropertyKindNumber
+	case schema.KindBoolean:
+		return space.PropertyKindBoolean
+	case schema.KindNull:
+		return space.PropertyKindNull
+	case schema.KindArray:
+		return space.PropertyKindArray
+	case schema.KindObject:
+		return space.PropertyKindObject
+	}
+	return 0
+}
+
+func (t *typesAPI) RemoveProperty(_ context.Context, _, _ string) error {
+	return errors.New("typesAPI: RemoveProperty not implemented")
+}
+
+func (t *typesAPI) UpdatePropertyMeta(_ context.Context, _, _ string, _ space.PropertyMetaUpdate) error {
+	return errors.New("typesAPI: UpdatePropertyMeta not implemented")
+}
+
+// propertyKindLabel maps the public PropertyKind enum to the on-wire
+// label typetype.PropertyHandler expects.
+func propertyKindLabel(k space.PropertyKind) string {
+	switch k {
+	case space.PropertyKindString:
+		return "string"
+	case space.PropertyKindNumber:
+		return "number"
+	case space.PropertyKindBoolean:
+		return "boolean"
+	case space.PropertyKindNull:
+		return "null"
+	case space.PropertyKindArray:
+		return "array"
+	case space.PropertyKindObject:
+		return "object"
+	default:
+		return ""
+	}
+}

@@ -22,6 +22,14 @@ import "github.com/anyproto/any-sync-sdk/internal/schema"
 // `any` type object, always derived from this seed.
 const WellKnownDeriveSeed = "builtin:any"
 
+// TypeId is the public type id used to address `any`-typed properties
+// on instance objects. v1 uses the literal "any" as both the
+// namespace key in property records (`record.any.name`) and the
+// TypeInfo.Id surfaced through Space.Types() — it's reserved
+// (user-derived ids are content-addressable, never produce this
+// string), so there's no collision risk.
+const TypeId = "any"
+
 // Display metadata for the `any` type object.
 const (
 	Name        = "Any"

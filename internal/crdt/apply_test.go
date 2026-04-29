@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	anystore "github.com/anyproto/any-store"
-	"github.com/anyproto/any-store/anyenc"
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1385,14 +1385,17 @@ type rejectingHandler struct {
 	DefaultHandler
 }
 
-func (rejectingHandler) Validate(_ RecordChange, op Op) error {
+func (rejectingHandler) BeforeModify(_ *ChangeCtx, _ *RecordChange, op *Op, _ *Sink) error {
 	if op.Type == OpUnset {
 		return assert.AnError
 	}
 	return nil
 }
 
-func TestValidation_RejectsWholeChange(t *testing.T) {
+// Per-op handler errors drop just the offending op; other ops in the same
+// RecordChange still apply and ApplyChange returns nil. Path-syntax errors
+// abort the whole Change (see TestValidate_* cases above).
+func TestValidation_DropsOffendingOp(t *testing.T) {
 	arena := &anyenc.Arena{}
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
 	require.NoError(t, err)
@@ -1405,18 +1408,15 @@ func TestValidation_RejectsWholeChange(t *testing.T) {
 		Type:    OpSet,
 		Payload: recordPayload(arena, map[string]any{"name": "hi"}),
 	})))
-	// A change containing one bad op (here $unset) gets rejected wholesale,
-	// so the accompanying $set is also dropped.
-	err = st.ApplyChange(ctx, makeChange("v2", "r1",
+	// $unset is rejected → dropped silently. $set color landed at v2.
+	require.NoError(t, st.ApplyChange(ctx, makeChange("v2", "r1",
 		Op{Type: OpSet, Path: []string{"color"}, Payload: arena.NewString("red")},
 		Op{Type: OpUnset, Path: []string{"name"}},
-	))
-	require.Error(t, err)
+	)))
 
-	// State unchanged: name still present at v1, color never landed.
 	rec := st.Get(ctx, testDS, "r1")
-	assert.Equal(t, "hi", rec.GetString("name"))
-	assert.Nil(t, rec.Get("color"))
+	assert.Equal(t, "hi", rec.GetString("name"))   // $unset was dropped, name survives
+	assert.Equal(t, "red", rec.GetString("color")) // $set landed
 }
 
 func TestUnknownDataset(t *testing.T) {

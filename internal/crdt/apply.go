@@ -3,8 +3,8 @@ package crdt
 import (
 	"strings"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/anyenc/anyencutil"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 )
 
 // applyOp dispatches one op to its arena-parameterized handler. All

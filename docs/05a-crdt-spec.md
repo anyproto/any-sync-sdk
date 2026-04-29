@@ -141,15 +141,15 @@ The GC rule keeps the map bounded by the number of **distinct versionIds current
 
 **Name reservation.** `_traces` uses the underscore-prefix rule from §3.1 — user ops cannot write to it. No validation relaxation needed.
 
-#### Empty id → `base58(xxhash64(changeId))` sugar
+#### Empty id → `base58(xxh3-64(changeId))` sugar
 
 When a `RecordChange` carries an empty `id`, the CRDT layer auto-assigns it from the enclosing `Change.changeId` via:
 
 ```
-DeriveRecordId(changeId) = base58(xxhash64(changeId))   // up to 11 chars
+DeriveRecordId(changeId) = base58(xxh3-64(changeId))   // up to 11 chars
 ```
 
-`changeId` is any-sync's content-addressable, immutable DAG change id — globally unique by construction and uniformly distributed. Hashing it with xxhash64 preserves the uniformity (collision space 2⁶⁴; P(collision) < 1e-6 up to ~6M derived ids per storage namespace), and base58 encodes the 8-byte digest in a compact ~11-char form. Using the full changeId verbatim was rejected because it's ~50–60 chars, making storage-heavy records (e.g. per-object property records carrying many property-id keys) unnecessarily bulky. Implementation: `crdt.DeriveRecordId` in `crdt/idderive.go`, using `github.com/cespare/xxhash/v2` and `github.com/mr-tron/base58` (the latter is the base58 library any-sync already depends on).
+`changeId` is any-sync's content-addressable, immutable DAG change id — globally unique by construction and uniformly distributed. Hashing it with xxh3-64 preserves the uniformity (collision space 2⁶⁴; P(collision) < 1e-6 up to ~6M derived ids per storage namespace), and base58 encodes the 8-byte digest in a compact ~11-char form. Using the full changeId verbatim was rejected because it's ~50–60 chars, making storage-heavy records (e.g. per-object property records carrying many property-id keys) unnecessarily bulky. Implementation: `crdt.DeriveRecordId` in `crdt/idderive.go`, using `github.com/zeebo/xxh3` (≈2.5× faster than `cespare/xxhash` on CID-length inputs) and `github.com/mr-tron/base58` (the latter is the base58 library any-sync already depends on).
 
 Resolution rules (per change, before validation):
 
@@ -586,19 +586,27 @@ The record-level versionId is the greatest versionId in the record's `_ver` tree
 Two methods, both accept raw operations.
 
 ```go
-Modify(objectId, datasetName, id, ops, opts...) -> (versionId, error)
-Delete(objectId, datasetName, id) -> (versionId, error)
+Modify(objectId, datasetName, id, ops, opts...) -> (ModifyResult, error)
+Delete(objectId, datasetName, id) -> (ModifyResult, error)
+
+type ModifyResult struct {
+    VersionId string   // peer-local lexid stamped on the records
+    ChangeId  string   // any-sync DAG change id (content-addressable, stable across peers)
+    RecordIds []string // per-record id, aligned to input order
+}
 ```
 
 - `ops` is a list of operations from §5 — callers write `$set`, `$addToSet`, `$inc`, etc. directly
 - `Modify` defaults to strict (no record creation). Pass `WithUpsert()` (or equivalent option) to enable auto-creation — this is the "create" path. A typical create is `Modify(id, [{$set: multiFieldPayload}], WithUpsert())`
-- Return value is the real local versionId any-sync assigned to the write — synchronous, because any-sync is offline-first and commits locally before returning
+- `VersionId` is synchronous — any-sync is offline-first and commits locally before returning
+- `ChangeId` is the any-sync DAG hash; use it for tracing and cross-peer correlation
+- `RecordIds[i]` is the resolved id of record `i`. For records the caller submitted with empty Id, the resolved value is `base58(xxh3-64(ChangeId))` (with `/<index>` for the second-and-later empty ids in a batch). This is the propId / shortId convention — property creates read it from `RecordIds[0]`
 
 ### 12.1 Property-scope Writes
 
 ```go
-SetDeviceProperty(objectId, fields) -> (versionId, error)
-SetAccountProperty(objectId, fields) -> (versionId, error)
+SetDeviceProperty(objectId, fields) -> (ModifyResult, error)
+SetAccountProperty(objectId, fields) -> (ModifyResult, error)
 ```
 
 `base`-scope property writes go through regular `Modify()` targeting the base-property dataset.

@@ -1,0 +1,358 @@
+package spaceimpl
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/space"
+)
+
+// spaceImpl is the per-space handle returned by Service.Create / Get.
+//
+// Holds a reference to the per-space spaceobjects.Store. Sub-APIs
+// (Objects, Types, Properties) are constructed lazily and memoised on
+// first access — they're cheap structs that delegate back to the
+// store for actual work.
+type spaceImpl struct {
+	id    string
+	app   *anysyncx.App
+	tsp   *techspace.Service
+	store *spaceobjects.Store
+
+	objects    *objectService
+	types      *typesAPI
+	properties *propertiesAPI
+}
+
+func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *spaceobjects.Store) *spaceImpl {
+	s := &spaceImpl{id: id, app: app, tsp: tsp, store: store}
+	s.objects = newObjectService(s)
+	s.types = newTypesAPI(s)
+	s.properties = newPropertiesAPI(s)
+	return s
+}
+
+func (s *spaceImpl) Id() string { return s.id }
+
+// Info reads the space-index snapshot.
+func (s *spaceImpl) Info() space.SpaceInfo {
+	rec, ok := s.tsp.Get(context.Background(), s.id)
+	if !ok {
+		return space.SpaceInfo{Id: s.id}
+	}
+	return space.SpaceInfo{
+		Id:          rec.Id,
+		Type:        rec.Type,
+		Name:        rec.Name,
+		Description: rec.Description,
+		IconCID:     rec.IconCID,
+		Status:      mapStatus(rec.LocalStatus, rec.RemoteStatus),
+	}
+}
+
+func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
+func (s *spaceImpl) Types() space.TypesAPI           { return s.types }
+func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
+
+// Sub-APIs not wired in MVP. Return nil for interfaces; methods
+// returning errors are stubbed elsewhere on this type.
+func (s *spaceImpl) ACL() space.ACL                  { return nil }
+func (s *spaceImpl) Members() space.MembersAPI       { return nil }
+func (s *spaceImpl) SyncStatus() space.SyncStatusAPI { return nil }
+// Query builds a chainable read query against (objectId, dataset).
+// The query is single-shot; call Space.Query() again per read.
+func (s *spaceImpl) Query(objectId, dataset string) space.Query {
+	return newQuery(s, objectId, dataset)
+}
+
+// QueryObjects builds a chainable query against the per-space
+// `objects` collection — one row per regular object's property
+// values, keyed by objectId.
+func (s *spaceImpl) QueryObjects() space.Query {
+	return newSharedQuery(s)
+}
+
+// Modify resolves the target object via the per-space store, builds a
+// crdt.Change from the public batch, and submits it through the
+// Object's local-write path. Returns the bundled identifiers.
+func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
+	if batch.ObjectId == "" {
+		return space.ModifyResult{}, errors.New("spaceimpl: ObjectId required")
+	}
+	if batch.Dataset == "" {
+		return space.ModifyResult{}, errors.New("spaceimpl: Dataset required")
+	}
+	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	obj, err := s.store.Get(ctx, batch.ObjectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	change, err := buildChange(batch, dataVersion)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	res, err := obj.LocalWrite(ctx, change)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	return modifyResultFromWrite(res), nil
+}
+
+// ModifyMany pre-validates every batch up-front (against the
+// target object's controller) and only proceeds with the actual
+// AddContent + apply pipeline if all pass. A validation error on
+// any batch fails the whole call without touching any-sync.
+//
+// All batches must target the same ObjectId. Datasets may differ.
+// Each batch produces one any-sync DAG entry.
+func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch) ([]space.ModifyResult, error) {
+	if len(batches) == 0 {
+		return nil, errors.New("spaceimpl: ModifyMany: empty batches")
+	}
+	objectId := batches[0].ObjectId
+	if objectId == "" {
+		return nil, errors.New("spaceimpl: ModifyMany: ObjectId required")
+	}
+	for i := 1; i < len(batches); i++ {
+		if batches[i].ObjectId != objectId {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d ObjectId %q differs from batch 0 %q (cross-object batches not supported)",
+				i, batches[i].ObjectId, objectId)
+		}
+	}
+
+	obj, err := s.store.Get(ctx, objectId)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pre-validation pass: build all crdt.Changes and run
+	// Controller.ValidateChange on each. Aggregate failures so the
+	// caller can see every problem in one shot.
+	changes := make([]crdt.Change, len(batches))
+	var validationErrs []error
+	for i, b := range batches {
+		dataVersion, err := s.store.DataVersion(b.Dataset)
+		if err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
+			continue
+		}
+		ch, err := buildChange(b, dataVersion)
+		if err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: build: %w", i, err))
+			continue
+		}
+		if err := obj.Controller().ValidateChange(ch); err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: validate: %w", i, err))
+			continue
+		}
+		changes[i] = ch
+	}
+	if len(validationErrs) > 0 {
+		return nil, errors.Join(validationErrs...)
+	}
+
+	// All valid — apply each. Per-op rejections at apply time
+	// still surface in each ModifyResult.Rejections.
+	out := make([]space.ModifyResult, 0, len(changes))
+	for i := range changes {
+		res, err := obj.LocalWrite(ctx, changes[i])
+		if err != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d write: %w", i, err)
+		}
+		out = append(out, modifyResultFromWrite(res))
+	}
+	return out, nil
+}
+
+// Delete produces sticky tombstones for the listed record ids.
+// Implemented as a Modify with one delete op per record.
+func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.ModifyResult, error) {
+	if len(batch.RecordIds) == 0 {
+		return space.ModifyResult{}, errors.New("spaceimpl: DeleteBatch.RecordIds empty")
+	}
+	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	obj, err := s.store.Get(ctx, batch.ObjectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	records := make([]crdt.RecordChange, len(batch.RecordIds))
+	for i, id := range batch.RecordIds {
+		records[i] = crdt.RecordChange{
+			Id:  id,
+			Ops: []crdt.Op{{Type: crdt.OpDelete}},
+		}
+	}
+	change := crdt.Change{
+		Dataset:     batch.Dataset,
+		DataVersion: dataVersion,
+		TraceIds:    batch.TraceIds,
+		Records:     records,
+	}
+	res, err := obj.LocalWrite(ctx, change)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	return modifyResultFromWrite(res), nil
+}
+
+func (s *spaceImpl) Subscribe(_ context.Context, _ []space.SubscribeTarget, _ space.SubscribeOpts) (space.Subscription, error) {
+	return nil, errors.New("spaceimpl: Subscribe not implemented")
+}
+
+// buildChange converts a public space.ModifyBatch into the internal
+// crdt.Change representation. Op payloads (caller-supplied `any`)
+// land on a fresh anyenc arena owned by the change — the encoder
+// runs inside LocalWrite before the arena goes out of scope.
+func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, error) {
+	arena := &anyenc.Arena{}
+	records := make([]crdt.RecordChange, len(batch.Records))
+	for i := range batch.Records {
+		rec, err := buildRecord(arena, &batch.Records[i])
+		if err != nil {
+			return crdt.Change{}, fmt.Errorf("record %d: %w", i, err)
+		}
+		records[i] = rec
+	}
+	return crdt.Change{
+		Dataset:     batch.Dataset,
+		DataVersion: dataVersion,
+		TraceIds:    batch.TraceIds,
+		Records:     records,
+	}, nil
+}
+
+func buildRecord(a *anyenc.Arena, rec *space.RecordModify) (crdt.RecordChange, error) {
+	ops := make([]crdt.Op, len(rec.Ops))
+	for i := range rec.Ops {
+		op, err := buildOp(a, &rec.Ops[i])
+		if err != nil {
+			return crdt.RecordChange{}, fmt.Errorf("op %d: %w", i, err)
+		}
+		ops[i] = op
+	}
+	return crdt.RecordChange{
+		Id:     rec.Id,
+		Upsert: rec.Upsert,
+		Ops:    ops,
+	}, nil
+}
+
+func buildOp(a *anyenc.Arena, op *space.Op) (crdt.Op, error) {
+	out := crdt.Op{Type: crdt.OpType(op.Type)}
+	if op.Path != "" {
+		out.Path = splitPath(op.Path)
+	}
+	if op.Value != nil {
+		v, err := goToAnyenc(a, op.Value)
+		if err != nil {
+			return crdt.Op{}, fmt.Errorf("value: %w", err)
+		}
+		out.Payload = v
+	}
+	return out, nil
+}
+
+// splitPath breaks "a.b.c" into ["a","b","c"]. Empty input returns
+// nil — the multi-field $set/$unset shape uses an empty Path.
+func splitPath(p string) []string {
+	if p == "" {
+		return nil
+	}
+	out := []string{}
+	start := 0
+	for i := 0; i < len(p); i++ {
+		if p[i] == '.' {
+			out = append(out, p[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, p[start:])
+	return out
+}
+
+// goToAnyenc converts a Go value into an anyenc.Value on the given
+// arena. Accepts:
+//
+//   - Native Go types (string, bool, ints, float64, []byte, []any,
+//     []string, map[string]any) for in-process callers.
+//   - *fastjson.Value for HTTP / JSON callers — they parse the
+//     request body once with a pooled fastjson.Parser, then hand the
+//     parsed values straight through. anyenc.Arena.NewFromFastJson
+//     does the conversion in one walk on our arena, no Go-native
+//     intermediate.
+//   - *anyenc.Value passes through unchanged (already on the right
+//     arena, or cross-arena — caller's responsibility).
+func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
+	switch x := v.(type) {
+	case nil:
+		return a.NewNull(), nil
+	case *fastjson.Value:
+		if x == nil {
+			return a.NewNull(), nil
+		}
+		return a.NewFromFastJson(x), nil
+	case *anyenc.Value:
+		return x, nil
+	case bool:
+		if x {
+			return a.NewTrue(), nil
+		}
+		return a.NewFalse(), nil
+	case string:
+		return a.NewString(x), nil
+	case int:
+		return a.NewNumberInt(x), nil
+	case int64:
+		return a.NewNumberInt(int(x)), nil
+	case float64:
+		return a.NewNumberFloat64(x), nil
+	case []byte:
+		return a.NewBinary(x), nil
+	case []any:
+		arr := a.NewArray()
+		for i, e := range x {
+			ev, err := goToAnyenc(a, e)
+			if err != nil {
+				return nil, fmt.Errorf("[%d]: %w", i, err)
+			}
+			arr.SetArrayItem(i, ev)
+		}
+		return arr, nil
+	case []string:
+		arr := a.NewArray()
+		for i, e := range x {
+			arr.SetArrayItem(i, a.NewString(e))
+		}
+		return arr, nil
+	case map[string]any:
+		obj := a.NewObject()
+		for k, vv := range x {
+			ev, err := goToAnyenc(a, vv)
+			if err != nil {
+				return nil, fmt.Errorf("%q: %w", k, err)
+			}
+			obj.Set(k, ev)
+		}
+		return obj, nil
+	default:
+		return nil, fmt.Errorf("unsupported value type %T", v)
+	}
+}

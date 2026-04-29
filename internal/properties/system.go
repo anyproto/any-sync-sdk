@@ -3,17 +3,31 @@
 
 package properties
 
-import "github.com/anyproto/any-sync-sdk/internal/crdt"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
 
-// Dataset is the name every object uses for its base-scope property
-// writes on its own CRDT. Writes on this dataset project into the
-// per-space `properties` system collection keyed by objectId.
+	"github.com/anyproto/any-store/v2/anyenc"
+
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
+	"github.com/anyproto/any-sync-sdk/internal/types"
+)
+
+// Dataset is the name every regular object uses for its base-scope
+// property writes on its own CRDT. The handler is registered against
+// a SHARED per-space collection (also called "objects") via the
+// Controller's shared-collection override — every regular object's
+// values land in one row in that collection, keyed by the change's
+// ObjectId. Type objects don't register this handler; their own
+// metadata (any.name etc.) lives in their per-type-object storage
+// behind a different dataset.
 //
-// The same name appears in two places: the per-object dataset (source
-// of writes, handled here) and the per-space system collection
-// (projection target). This is intentional — the dataset keeps its
-// identity across the hop and queries don't need to learn two names.
-const Dataset = "properties"
+// See docs/06-data-structure.md § "Storage" — the per-space
+// `objects` collection model.
+const Dataset = "objects"
 
 // HandlerVersion is the DataVersion string stamped on every change
 // this handler emits against an object's `properties` dataset. Bump
@@ -23,39 +37,165 @@ const Dataset = "properties"
 // identifier in Phase 1).
 const HandlerVersion = "systemPropertyHandler-v1"
 
-// SystemPropertiesHandler validates base-scope property writes on
-// every user object. Corresponds to the `baseProperty` handler named
-// in docs/06-data-structure.md § "Handlers" — renamed here to
-// emphasize its scope (the per-space `properties` system dataset)
-// and to distinguish it from the types package's property handler
-// (which governs property definitions on type objects).
-//
-// One instance is registered on every user object's crdt.Controller
-// at open time. The concrete validator will enforce, per
-// docs/06-data-structure.md § "Object Properties":
-//
-//   - "an object can only update its own record" — base-scope writes
-//     use RecordChange.Id == "" (docs convention: empty record id),
-//     and the handler pins the projected record id to the owning
-//     object's id;
-//   - path namespacing — top-level keys must be a known typeId (or
-//     the `any` shortId) that the object implements, and nested
-//     keys must be registered propIds under that type;
-//   - value kinds — validated against the schema compiled from the
-//     governing type object's current property records (see types
-//     Registry); kind-mismatched ops drop silently per Phase-1
-//     "per-op atomicity".
-//
-// `any`-typed objects (universal base properties like name,
-// description, icon) flow through this same handler — their schema
-// comes from internal/types/any.Properties, not a user type record.
-//
-// The projection into the per-space `properties` collection lives
-// outside the crdt.Handler.Validate contract (see crdt/handler.go:
-// "Apply is omitted ... Phase 2 will add hooks if/when needed").
-// Scaffolded as a no-op until the registry and the apply hook land.
-type SystemPropertiesHandler struct{}
+// Sentinels — wrap crdt.ErrValidation in handler returns.
+var (
+	ErrInvalidPath        = errors.New("properties: path must be {typeId}.{propId}")
+	ErrUnknownProperty    = errors.New("properties: unknown (typeId, propId)")
+	ErrKindMismatch       = errors.New("properties: payload kind does not match property kind")
+)
 
-func (SystemPropertiesHandler) Dataset() string                              { return Dataset }
-func (SystemPropertiesHandler) Version() int                                 { return 1 }
-func (SystemPropertiesHandler) Validate(_ crdt.RecordChange, _ crdt.Op) error { return nil }
+// SystemPropertiesHandler validates property writes on every user
+// object. Corresponds to the `baseProperty` handler named in
+// docs/06-data-structure.md § "Handlers" — renamed to emphasize its
+// scope (the per-space `properties` system dataset) and to
+// distinguish it from typetype.PropertyHandler (which governs
+// property definitions on type objects).
+//
+// Variant routing (`_base` / `_account` / `_device`) is handled by
+// the apply loop via RecordChange.Variant — the handler is variant-
+// agnostic and only validates kinds against the type Registry.
+//
+// Path shape for a single-path op: `[typeId, propId]`. The handler
+// looks the kind up via Registry.LookupKind and silently drops the
+// op if (a) the path doesn't fit the shape, (b) the property is
+// unknown, or (c) the payload's anyenc kind doesn't match the
+// declared kind. "Per-op atomicity" — other ops in the same
+// RecordChange still apply.
+//
+// Multi-field $set with empty Path expects the payload to be an
+// object whose keys are dotted "{typeId}.{propId}" paths. Same kind
+// rules apply per-key; if any key fails, the whole op drops (we
+// don't mutate payloads to filter individual keys in v1).
+type SystemPropertiesHandler struct {
+	// Registry resolves declared kinds. May be nil — when nil the
+	// handler skips kind validation entirely (passes everything),
+	// which is the bring-up mode before the type system is wired.
+	Registry types.Registry
+}
+
+// New constructs a SystemPropertiesHandler bound to a Registry. Pass
+// nil to disable kind validation (early bring-up).
+func New(reg types.Registry) *SystemPropertiesHandler {
+	return &SystemPropertiesHandler{Registry: reg}
+}
+
+func (*SystemPropertiesHandler) Dataset() string              { return Dataset }
+func (*SystemPropertiesHandler) Version() int                 { return 1 }
+func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
+
+// BeforeCreate validates every op in the creation payload. Stricter
+// than BeforeModify: any per-op validation failure rejects the whole
+// record, because a creation with a bad field implies a buggy or
+// version-mismatched writer (and the DataVersion gate on ApplyChange
+// already filters those upstream — by the time a create lands here,
+// we should know its schema).
+func (h *SystemPropertiesHandler) BeforeCreate(_ *crdt.ChangeCtx, rec *crdt.RecordChange, _ *crdt.Sink) error {
+	if h.Registry == nil {
+		return nil
+	}
+	for i := range rec.Ops {
+		if err := h.validateOp(&rec.Ops[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BeforeModify validates one op against the Registry. Drops the op
+// silently on any validation failure; other ops in the same
+// RecordChange still apply.
+func (h *SystemPropertiesHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
+	if h.Registry == nil {
+		return nil
+	}
+	return h.validateOp(op)
+}
+
+// BeforeDelete is a no-op — deleting a property record (the per-
+// object property store entry) is allowed; no Registry lookup
+// applies to the record-as-a-whole.
+func (*SystemPropertiesHandler) BeforeDelete(_ *crdt.ChangeCtx, _ *crdt.RecordChange, _ *crdt.Sink) error {
+	return nil
+}
+
+// validateOp routes by op shape. Single-path: validate one
+// (typeId, propId, payload-kind). Multi-field: validate every key.
+// Other op kinds (delete, addToSet, pull, inc, incGated) follow the
+// same single-path rule using op.Payload's kind.
+func (h *SystemPropertiesHandler) validateOp(op *crdt.Op) error {
+	if op.Type == crdt.OpDelete {
+		return nil // record-level delete; no per-property validation
+	}
+	if len(op.Path) == 0 {
+		// Multi-field $set/$unset.
+		return h.validateMultiField(op)
+	}
+	return h.validateSinglePath(op.Path, op.Payload, op.Type)
+}
+
+func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *anyenc.Value, opType crdt.OpType) error {
+	if len(path) < 2 {
+		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrInvalidPath)
+	}
+	typeId, propId := path[0], path[1]
+	declared, ok := h.Registry.LookupKind(typeId, propId)
+	if !ok {
+		return fmt.Errorf("%w: %w (%s, %s)", crdt.ErrValidation, ErrUnknownProperty, typeId, propId)
+	}
+	// $unset payloads are absent / ignored — no kind to match.
+	// $set / $addToSet / $pull / $inc / $incGated all carry the
+	// candidate value as Payload, against which we kind-match.
+	if opType == crdt.OpUnset {
+		return nil
+	}
+	got := schema.KindOf(payload)
+	if got != declared {
+		return fmt.Errorf("%w: %w (declared=%s got=%s, %s.%s)",
+			crdt.ErrValidation, ErrKindMismatch, declared, got, typeId, propId)
+	}
+	return nil
+}
+
+// validateMultiField walks the payload of a multi-field $set/$unset.
+// Every top-level key must be a dotted "typeId.propId" pair; any
+// failure rejects the whole op (see SystemPropertiesHandler doc on
+// the "no payload mutation" v1 limitation).
+func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op) error {
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+		return nil
+	}
+	obj, _ := op.Payload.Object()
+	var firstErr error
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if firstErr != nil {
+			return
+		}
+		key := string(k)
+		dot := strings.IndexByte(key, '.')
+		if dot <= 0 || dot == len(key)-1 {
+			firstErr = fmt.Errorf("%w: %w (key=%q)", crdt.ErrValidation, ErrInvalidPath, key)
+			return
+		}
+		typeId, propId := key[:dot], key[dot+1:]
+		// Reject if any further dots (nested paths not supported in v1
+		// validation; treat as invalid to keep semantics simple).
+		if strings.IndexByte(propId, '.') >= 0 {
+			firstErr = fmt.Errorf("%w: %w (key=%q)", crdt.ErrValidation, ErrInvalidPath, key)
+			return
+		}
+		declared, ok := h.Registry.LookupKind(typeId, propId)
+		if !ok {
+			firstErr = fmt.Errorf("%w: %w (%s, %s)", crdt.ErrValidation, ErrUnknownProperty, typeId, propId)
+			return
+		}
+		if op.Type == crdt.OpUnset {
+			return
+		}
+		got := schema.KindOf(v)
+		if got != declared {
+			firstErr = fmt.Errorf("%w: %w (declared=%s got=%s, %s.%s)",
+				crdt.ErrValidation, ErrKindMismatch, declared, got, typeId, propId)
+		}
+	})
+	return firstErr
+}

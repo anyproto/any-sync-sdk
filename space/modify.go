@@ -17,7 +17,7 @@ type ModifyBatch struct {
 // RecordModify groups ops applied to one record id.
 //
 // Id: when empty, the CRDT layer derives one from the change's
-// ChangeId (base58(xxhash64(ChangeId))); subsequent empty-id records
+// ChangeId (base58(xxh3-64(ChangeId))); subsequent empty-id records
 // in the same batch get a "/<index>" suffix. Empty id requires
 // Upsert=true.
 //
@@ -65,4 +65,52 @@ type DeleteBatch struct {
 	Dataset   string
 	RecordIds []string
 	TraceIds  []string
+}
+
+// ModifyResult bundles the identifiers Space.Modify and Space.Delete
+// return for any successful batch.
+//
+//   - VersionId is the peer-local lexid stamped on the batch's
+//     records. Compare with CompareVersion against other VersionIds
+//     this peer has observed.
+//   - ChangeId is the any-sync DAG change id — content-addressable,
+//     stable across peers. Use it for tracing / cross-peer
+//     correlation.
+//   - RecordIds is the per-record id list aligned to the input
+//     RecordModify slice. For records the caller submitted with an
+//     empty Id, the resolved value is `base58(xxh3-64(ChangeId))`
+//     (with `/<index>` suffix for the second-and-later empty ids in
+//     a batch). This is the propId / shortId convention; callers
+//     creating types or properties read it from RecordIds[0].
+//   - Rejections lists per-op handler rejections — ops that the
+//     change carries but the handler refused (kind mismatch,
+//     terminal status, immutable field, unknown property…). The
+//     change still committed with a fresh VersionId, but those ops
+//     did not land. HTTP layers can surface this as a partial
+//     success or a hard error per their policy.
+type ModifyResult struct {
+	VersionId  VersionId
+	ChangeId   string
+	RecordIds  []string
+	Rejections []OpRejection
+}
+
+// OpRejection describes one op the handler refused to apply. The
+// containing change still committed; this op's effect did not.
+//
+//   - RecordIndex / RecordId identify the affected record in the
+//     input batch.
+//   - OpIndex is the index into RecordModify.Ops that was rejected;
+//     -1 means the whole record was rejected (BeforeCreate /
+//     BeforeDelete).
+//   - Reason is the human-readable error string the handler
+//     returned. Programmatic discrimination uses the SDK's typed
+//     errors via errors.Is on the underlying error — exposed via
+//     ReasonErr.
+type OpRejection struct {
+	RecordIndex int
+	RecordId    string
+	OpIndex     int
+	Reason      string
+	ReasonErr   error
 }

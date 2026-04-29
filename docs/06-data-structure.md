@@ -46,7 +46,7 @@ Rejected:
 - **Proposal 3** (any-store views) — requires a new feature in any-store, shouldn't block v1
 
 ### Handlers
-- **`baseProperty` handler** — built-in, runs on every object. Applies `base` property changes (from the object's own CRDT) to the space's `objects` collection, and enforces "object can only update its own record"
+- **`SystemPropertiesHandler`** (was named `baseProperty` in earlier drafts) — built-in, runs on regular objects. Wired against the per-space `objects` collection via the Controller's shared-collection override: every write to dataset `objects` lands in one row keyed by the change's ObjectId. The "object can only update its own record" rule is enforced at the apply layer (`ch.ObjectId` is what the row id is set to, regardless of the inbound `RecordChange.Id`).
 - **`rewriteObject` handler** — built-in, lives in tech space. Watches the account-level rewrite object and applies `account` variants to the corresponding space's `objects` collection
 - Together these two handlers keep the computed root value in sync across `_device` / `_account` / `_base` writes
 
@@ -82,16 +82,18 @@ Built-ins are expected to exist as **derived objects** in every space (well-know
 Every user-defined property has a property id derived from the changeId of the change that created its definition record:
 
 ```
-propId = base58(xxhash64(changeId))   // up to 11 chars
+propId = base58(xxh3-64(changeId))   // up to 11 chars
 ```
 
 This is the default empty-id resolution the CRDT layer already produces (see CRDT spec §3.3 / `crdt.DeriveRecordId`). Properties use it directly as their record id, and the same string is used as the field key under which values are stored on objects (see below).
 
 Built-in properties (on `any`, `type`) use **hardcoded human-readable ids** like `"name"`, `"description"`, `"icon"`. They never collide with user property ids — 11-char base58 never produces those strings.
 
-### Property record shape (in the space's `properties` system dataset)
+### Property record shape (in the space's `objects` system collection)
 
-One record per object, `id = objectId`. Values are namespaced by `typeId` (or short id for built-ins), and within each namespace keyed by `propId`:
+One record per regular object, `id = objectId`. Values are namespaced by `typeId` (or short id for built-ins), and within each namespace keyed by `propId`:
+
+The CRDT-side dataset name on regular objects is also `objects` — the `properties.SystemPropertiesHandler` is wired against the per-space `objects` collection via the Controller's shared-collection override, so every regular object's writes coalesce into one row in that collection. Type objects do NOT register this handler; their own `any.name`/`any.description`/etc. live on per-type-object storage and don't appear in the per-space `objects` collection.
 
 ```json
 {
@@ -112,7 +114,7 @@ One record per definition. Shape:
 
 | field | kind | mutability |
 |---|---|---|
-| `id` | string = `base58(xxhash64(changeId))` | immutable (record id) |
+| `id` | string = `base58(xxh3-64(changeId))` | immutable (record id) |
 | `type` | enum: `string` / `number` / `boolean` / `array` / `object` | first-write-wins on the record |
 | `name` | string (human label) | CRDT-mutable |
 | `description` | string | CRDT-mutable |

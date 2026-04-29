@@ -3,7 +3,7 @@ package space
 import (
 	"context"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // PropertiesAPI reads and writes the per-object property record in
@@ -30,12 +30,12 @@ import (
 type PropertiesAPI interface {
 	Get(ctx context.Context, objectId string, opts PropertyReadOpts) (*anyenc.Value, error)
 
-	SetBase(ctx context.Context, objectId, typeId string, patch map[string]any) (VersionId, error)
-	SetAccount(ctx context.Context, objectId, typeId string, patch map[string]any) (VersionId, error)
+	SetBase(ctx context.Context, objectId, typeId string, patch map[string]any) (ModifyResult, error)
+	SetAccount(ctx context.Context, objectId, typeId string, patch map[string]any) (ModifyResult, error)
 	SetDevice(ctx context.Context, objectId, typeId string, patch map[string]any) error
 
-	AttachType(ctx context.Context, objectId, typeId string) (VersionId, error)
-	DetachType(ctx context.Context, objectId, typeId string) (VersionId, error)
+	AttachType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
+	DetachType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
 }
 
 // PropertyReadOpts controls which reserved fields appear in the

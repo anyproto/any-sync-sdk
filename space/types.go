@@ -29,7 +29,7 @@ type TypesAPI interface {
 	Properties(ctx context.Context, typeId string) ([]PropertyDef, error)
 
 	// AddProperty mints a new property on the type. The returned
-	// propId is base58(xxhash64(changeId)) — immutable for the life of
+	// propId is base58(xxh3-64(changeId)) — immutable for the life of
 	// the property.
 	AddProperty(ctx context.Context, typeId string, draft PropertyDraft) (propId string, err error)
 
@@ -67,7 +67,7 @@ type TypeCreateParams struct {
 // fields reflect the current (post-merge) state; renames and other
 // CRDT-mutable changes are visible via List / Properties refresh.
 type PropertyDef struct {
-	Id          string // base58(xxhash64(changeId)), immutable
+	Id          string // base58(xxh3-64(changeId)), immutable
 	Name        string // display label, CRDT-mutable
 	Description string // CRDT-mutable
 

@@ -2,9 +2,14 @@ package space
 
 import (
 	"context"
+	"errors"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
+
+// ErrNotFound is returned by Query.One when the query produced no
+// match. Other lookups (Get, etc.) return their own dedicated errors.
+var ErrNotFound = errors.New("space: not found")
 
 // Query is the caller-facing query builder, returned by Space.Query.
 // Chainable — each option returns a new Query (the underlying builder

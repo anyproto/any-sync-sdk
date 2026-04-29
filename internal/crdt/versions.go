@@ -1,7 +1,7 @@
 package crdt
 
 import (
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // VersionsKey is the reserved field on every record holding the per-field

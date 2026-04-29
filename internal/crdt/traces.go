@@ -1,6 +1,6 @@
 package crdt
 
-import "github.com/anyproto/any-store/anyenc"
+import "github.com/anyproto/any-store/v2/anyenc"
 
 // TracesKey is the reserved field that holds per-versionId trace lists on a
 // record. Shape: `{ "<versionId>": ["traceA", "traceB"], ... }`. Keyed by

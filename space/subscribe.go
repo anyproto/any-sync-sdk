@@ -1,6 +1,6 @@
 package space
 
-import "github.com/anyproto/any-store/anyenc"
+import "github.com/anyproto/any-store/v2/anyenc"
 
 // Subscription delivers simplified user events (inserted / updated /
 // deleted) for a fixed set of objects. Backed internally by a

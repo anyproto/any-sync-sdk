@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
+
+	"github.com/anyproto/any-sync-sdk/handler"
 )
 
 // Config is the full SDK configuration passed to sdk.Open. Pure data —
@@ -19,6 +21,14 @@ type Config struct {
 	// calls Log.ApplyGlobal() during Open; internal packages pull their
 	// named loggers via logger.NewNamed.
 	Log logger.Config
+
+	// Types is the optional list of caller-defined types extending
+	// the SDK's built-in catalog. Each Type binds a typeId to the
+	// dataset handlers it owns; every handler's Dataset() name must
+	// be unique across the whole catalog (no collisions with the
+	// built-in datasets "objects", "properties", "shortIds", and no
+	// duplicates across other Types). Empty or nil = built-ins only.
+	Types []handler.Type
 }
 
 // Storage controls on-disk layout.

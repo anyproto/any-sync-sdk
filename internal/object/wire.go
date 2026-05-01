@@ -31,10 +31,10 @@ import (
 // VersionId, ChangeId, AddSeq, ObjectId, SpaceId, Timestamp travel on
 // the any-sync envelope and are NOT part of this payload.
 //
-// TODO: switch to any-store v2 anyenc + MarshalCompressed for the
-// large-payload wins called out in docs/cold_restore_perf.md. The
-// controller still operates on v1 anyenc today, so deferring until that
-// migration to avoid v1↔v2 conversion at the codec boundary.
+// Encoded via anyenc MarshalCompressed: payloads above CompressMinSize
+// land as S2-compressed objects (TypeCompressedObjectS2 marker byte);
+// smaller ones fall back to plain MarshalTo. Decode goes through
+// anyenc.Parser which transparently handles both.
 const (
 	keyDataset     = "d"
 	keyDataVersion = "v"
@@ -63,6 +63,9 @@ var ErrEmptyPayload = errors.New("object: empty or non-object change payload")
 type Codec struct {
 	arena  anyenc.Arena
 	parser anyenc.Parser
+	// scratch is the reusable intermediate buffer threaded through
+	// MarshalCompressed across Encode calls — holds the uncompressed
+	// marshal so the next call can reuse the allocation.
 	scratch []byte
 }
 
@@ -99,9 +102,8 @@ func (c *Codec) Encode(ch *crdt.Change) ([]byte, error) {
 	}
 	root.Set(keyRecords, recs)
 
-	c.scratch = root.MarshalTo(c.scratch[:0])
-	out := make([]byte, len(c.scratch))
-	copy(out, c.scratch)
+	var out []byte
+	out, c.scratch = root.MarshalCompressed(nil, c.scratch)
 	return out, nil
 }
 

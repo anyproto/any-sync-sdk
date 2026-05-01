@@ -7,8 +7,10 @@ require (
 	github.com/anyproto/any-store/v2 v2.0.0-alpha.2
 	github.com/anyproto/any-sync v0.11.21
 	github.com/anyproto/lexid v0.0.6
+	github.com/cheggaaa/mb/v3 v3.0.2
 	github.com/mr-tron/base58 v1.3.0
 	github.com/stretchr/testify v1.11.1
+	github.com/valyala/fastjson v1.6.7
 	github.com/zeebo/xxh3 v1.1.0
 	gopkg.in/yaml.v3 v3.0.1
 	storj.io/drpc v0.0.34
@@ -28,7 +30,6 @@ require (
 	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce // indirect
 	github.com/cespare/xxhash v1.1.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cheggaaa/mb/v3 v3.0.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
@@ -71,7 +72,6 @@ require (
 	github.com/quic-go/webtransport-go v0.10.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/tetratelabs/wazero v1.10.1 // indirect
-	github.com/valyala/fastjson v1.6.7 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	github.com/zeebo/errs v1.3.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect

@@ -30,7 +30,7 @@ func TestGate_ParkAndDrain(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	store := NewStore(nil, db, nil, "spaceA", nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil)
 
 	// Park a fake parked change. payload bytes are opaque to the
 	// gate's bookkeeping; we use a short marker.

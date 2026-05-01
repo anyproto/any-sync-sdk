@@ -15,14 +15,19 @@ var ErrNotFound = errors.New("space: not found")
 // Chainable — each option returns a new Query (the underlying builder
 // may be mutable but the public contract is immutable-looking).
 type Query interface {
-	// Filter applies a mongo-style filter. Value is typically a
-	// map[string]any; see docs/06-data-structure.md for supported
-	// operators ($eq, $gt, $in, $and, …).
+	// Filter applies a query condition. Anything query.ParseCondition
+	// accepts works — an already-built query.Filter, a JSON-shaped
+	// string ("{\"any.name\":\"Casablanca\"}"), or a map literal with
+	// mongo-style operators ($eq, $gt, $in, $and, $or, …). The
+	// argument is parsed eagerly; a malformed filter surfaces on the
+	// first terminal call (Iter / All / One / Count), not silently.
 	Filter(filter any) Query
 
-	// Sort orders results by the given keys. Prefix "-" for descending
-	// (e.g. "-_ver.id").
-	Sort(keys ...string) Query
+	// Sort orders results by the given keys. Anything query.ParseSort
+	// accepts works — string keys ("-_ver.id" for descending) or
+	// already-built query.Sort values. Parsed eagerly; errors surface
+	// on the terminal call.
+	Sort(sorts ...any) Query
 
 	// Limit caps returned records. Zero means unlimited.
 	Limit(n int) Query

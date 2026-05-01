@@ -8,6 +8,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 
+	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -83,7 +84,15 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 // object's `defs` dataset. The record's id (= propId) is auto-derived
 // from the change's ChangeId per the empty-id-resolution rule;
 // returned so the caller can reference it from instance writes.
+//
+// Registered types from config.Config.Types are statically declared
+// and don't accept runtime property additions — AddProperty returns
+// an error. Use a custom dataset/handler for that type's mutable
+// state.
 func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.PropertyDraft) (string, error) {
+	if _, ok := t.findRegisteredType(typeId); ok {
+		return "", fmt.Errorf("typesAPI: %q is a registered type — properties are statically declared", typeId)
+	}
 	if draft.Kind == 0 {
 		return "", errors.New("typesAPI: PropertyDraft.Kind required")
 	}
@@ -137,6 +146,38 @@ func builtInAnyTypeInfo() space.TypeInfo {
 	}
 }
 
+// registeredTypeInfo maps a caller-registered handler.Type into the
+// public TypeInfo shape. Registered types are statically declared at
+// SDK init (via config.Config.Types), so they're surfaced with
+// BuiltIn=true to indicate "not user-created in this space" — same
+// semantics as the synthetic `any` type. The caller's Name falls
+// back to the type Id when empty so list rendering never shows a
+// blank label.
+func registeredTypeInfo(t handler.Type) space.TypeInfo {
+	name := t.Name
+	if name == "" {
+		name = t.Id
+	}
+	return space.TypeInfo{
+		Id:          t.Id,
+		Name:        name,
+		Description: t.Description,
+		IconCID:     t.IconCID,
+		BuiltIn:     true,
+	}
+}
+
+// findRegisteredType returns the catalog entry for typeId, or
+// (zero, false) if none.
+func (t *typesAPI) findRegisteredType(typeId string) (handler.Type, bool) {
+	for _, rt := range t.parent.store.ExternalTypes() {
+		if rt.Id == typeId {
+			return rt, true
+		}
+	}
+	return handler.Type{}, false
+}
+
 // List walks the space's tree-storage index and returns every object
 // whose `properties` record marks it as a meta-type instance
 // (`any.types` contains "__type__"). One controller load per
@@ -169,8 +210,12 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 		return nil, fmt.Errorf("typesAPI: iterate entries: %w", err)
 	}
 
-	out := make([]space.TypeInfo, 0, len(ids)+1)
+	registered := t.parent.store.ExternalTypes()
+	out := make([]space.TypeInfo, 0, len(ids)+1+len(registered))
 	out = append(out, builtInAnyTypeInfo())
+	for _, rt := range registered {
+		out = append(out, registeredTypeInfo(rt))
+	}
 	for _, id := range ids {
 		info, ok, err := t.readTypeInfo(ctx, id)
 		if err != nil {
@@ -185,10 +230,15 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 
 // Get returns one type's display metadata or space.ErrNotFound when
 // the id isn't a meta-type instance on this space. Special-cases the
-// synthetic `any` built-in.
+// synthetic `any` built-in and any caller-registered type from
+// config.Config.Types — both are statically declared at SDK init and
+// don't live in the space's tree storage.
 func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyTypeInfo(), nil
+	}
+	if rt, ok := t.findRegisteredType(typeId); ok {
+		return registeredTypeInfo(rt), nil
 	}
 	info, ok, err := t.readTypeInfo(ctx, typeId)
 	if err != nil {
@@ -243,11 +293,17 @@ func (t *typesAPI) Delete(_ context.Context, _ string) error {
 
 // Properties returns the property definitions of a type. For the
 // built-in `any` type, the list is hardcoded (one entry per
-// anytype.Properties). For user-created types, the list is read off
-// the type object's `defs` dataset.
+// anytype.Properties). Caller-registered types own datasets, not
+// property definitions, so an empty slice is returned (those types
+// expose state via custom datasets reached through Space.Modify /
+// Query, not through the property API). For user-created types, the
+// list is read off the type object's `defs` dataset.
 func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.PropertyDef, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyProperties(), nil
+	}
+	if _, ok := t.findRegisteredType(typeId); ok {
+		return nil, nil
 	}
 	obj, err := t.parent.store.Get(ctx, typeId)
 	if err != nil {

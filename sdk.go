@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/config"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -43,6 +44,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	if cfg.Storage.DataDir == "" {
 		return nil, errors.New("anysyncsdk: Storage.DataDir is required")
 	}
+	if err := spaceobjects.ValidateExternalTypes(cfg.Types); err != nil {
+		return nil, fmt.Errorf("anysyncsdk: %w", err)
+	}
 
 	// any-sync stores its per-space state under <DataDir>/anysync (v1
 	// DB, owned by any-sync). The SDK's CRDT state lives at
@@ -71,7 +75,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
 
-	spaces := spaceimpl.New(app, tsp, db)
+	spaces := spaceimpl.New(app, tsp, db, cfg.Types)
 	account := newAccountImpl(app)
 
 	return &SDK{

@@ -27,6 +27,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -39,15 +40,14 @@ import (
 // for a dataset the store doesn't know how to version.
 var ErrUnknownDataset = errors.New("spaceobjects: unknown dataset")
 
-// dataVersions maps dataset names to the DataVersion stamp the
-// corresponding handler emits. The CRDT Change carries this string;
-// any-sync's apply path treats it as opaque equality. Centralised
-// here so space.Modify doesn't have to know which handler is on the
-// other end of which dataset.
-var dataVersions = map[string]string{
-	properties.Dataset:        properties.HandlerVersion,
-	typetype.DatasetProperties:      typetype.HandlerVersion,
-	typetype.ShortIdsDataset:  "shortIds-v1",
+// builtinDataVersions is the dataset → DataVersion stamp for the
+// SDK's built-in handlers (always registered on every controller).
+// External Registrations supplied via NewStore extend this map at
+// construction time; collisions with built-ins are rejected up front.
+var builtinDataVersions = map[string]string{
+	properties.Dataset:         properties.HandlerVersion,
+	typetype.DatasetProperties: typetype.HandlerVersion,
+	typetype.ShortIdsDataset:   "shortIds-v1",
 }
 
 // SpaceObjectsCollection is the on-disk collection name for the
@@ -87,6 +87,13 @@ type Store struct {
 	spaceId string
 	reg     *types.LiveRegistry
 
+	// extTypes are the caller-supplied type catalog entries; their
+	// handlers are carried onto every per-object Controller
+	// alongside the built-ins. dataVersions overlays the built-in
+	// map with each type's registered handlers.
+	extTypes     []handler.Type
+	dataVersions map[string]string
+
 	mu          sync.Mutex
 	objects     map[string]*object.Object
 	// restored maps objectId → ready channel. The channel is created
@@ -109,20 +116,78 @@ type Store struct {
 // NewStore constructs a Store. The allocator is per-space (shared
 // across all objects in this space). The async drainer is built and
 // started here — it lives until Close.
-func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator) *Store {
+//
+// extTypes is the caller-supplied type catalog. Each type's handlers
+// are wired onto every per-object Controller built by this store,
+// alongside the built-in system handlers. Validation happens in
+// ValidateExternalTypes — call it before NewStore at the SDK
+// boundary so collisions are caught at Open time.
+func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type) *Store {
+	dv := make(map[string]string, len(builtinDataVersions))
+	for k, v := range builtinDataVersions {
+		dv[k] = v
+	}
+	for _, t := range extTypes {
+		for _, r := range t.Handlers {
+			dv[r.Handler.Dataset()] = r.DataVersion
+		}
+	}
 	s := &Store{
-		app:      app,
-		db:       db,
-		signKey:  signKey,
-		alloc:    alloc,
-		spaceId:  spaceId,
-		reg:      types.NewLiveRegistry(db),
-		objects:  make(map[string]*object.Object),
-		restored: make(map[string]chan struct{}),
+		app:          app,
+		db:           db,
+		signKey:      signKey,
+		alloc:        alloc,
+		spaceId:      spaceId,
+		reg:          types.NewLiveRegistry(db),
+		extTypes:     extTypes,
+		dataVersions: dv,
+		objects:      make(map[string]*object.Object),
+		restored:     make(map[string]chan struct{}),
 	}
 	s.drainer = newDrainer(s)
 	s.drainer.Run()
 	return s
+}
+
+// ValidateExternalTypes checks the caller-supplied catalog against
+// the built-in dataset names, against each other, and for internal
+// well-formedness. Returns the first error encountered. Called once
+// at sdk.Open before any Store is constructed.
+func ValidateExternalTypes(extTypes []handler.Type) error {
+	seenTypeIds := make(map[string]struct{}, len(extTypes))
+	seenDatasets := make(map[string]struct{}, len(extTypes))
+	for i, t := range extTypes {
+		if t.Id == "" {
+			return fmt.Errorf("spaceobjects: type[%d]: empty Id", i)
+		}
+		if _, dup := seenTypeIds[t.Id]; dup {
+			return fmt.Errorf("spaceobjects: type[%d]: duplicate type Id %q", i, t.Id)
+		}
+		seenTypeIds[t.Id] = struct{}{}
+		if len(t.Handlers) == 0 {
+			return fmt.Errorf("spaceobjects: type[%d] (%q): zero handlers — types must own at least one dataset", i, t.Id)
+		}
+		for j, r := range t.Handlers {
+			if r.Handler == nil {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: nil Handler", i, t.Id, j)
+			}
+			name := r.Handler.Dataset()
+			if name == "" {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: empty Dataset()", i, t.Id, j)
+			}
+			if r.DataVersion == "" {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d] (%q): empty DataVersion", i, t.Id, j, name)
+			}
+			if _, dup := builtinDataVersions[name]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: dataset %q is reserved by a built-in", i, t.Id, j, name)
+			}
+			if _, dup := seenDatasets[name]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: duplicate dataset %q across catalog", i, t.Id, j, name)
+			}
+			seenDatasets[name] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // Close shuts down per-Store background workers (currently the
@@ -143,6 +208,13 @@ func (s *Store) NotifyDrainer(pair types.DataVersionPair) {
 // for property kinds, known shortIds, and latest shortIds. Used by
 // the writer-side stamping path and the apply-time gate.
 func (s *Store) Registry() *types.LiveRegistry { return s.reg }
+
+// ExternalTypes returns the caller-supplied type catalog passed at
+// construction time (config.Config.Types). Read-only — the slice is
+// shared, callers must not mutate. Surfaced for the public
+// space.Types() API to enumerate registered catalog entries
+// alongside user-created types.
+func (s *Store) ExternalTypes() []handler.Type { return s.extTypes }
 
 // SpaceId returns the id of the space this store serves.
 func (s *Store) SpaceId() string { return s.spaceId }
@@ -175,9 +247,11 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 
 
 // DataVersion looks up the DataVersion stamp for a known dataset.
-// Used by space.Modify to populate crdt.Change.DataVersion.
+// Used by space.Modify to populate crdt.Change.DataVersion. The
+// map is the union of the built-ins and any external Registrations
+// supplied at construction time.
 func (s *Store) DataVersion(dataset string) (string, error) {
-	v, ok := dataVersions[dataset]
+	v, ok := s.dataVersions[dataset]
 	if !ok {
 		return "", fmt.Errorf("%w: %q", ErrUnknownDataset, dataset)
 	}
@@ -361,11 +435,17 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		return nil, err
 	}
 	shared := crdt.SharedCollections{properties.Dataset: coll}
-	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared,
+	handlers := []crdt.Handler{
 		properties.New(nil),
 		typetype.PropertyHandler{},
 		crdt.DefaultHandler{DatasetName: typetype.ShortIdsDataset, HandlerVersion: 1},
-	)
+	}
+	for _, t := range s.extTypes {
+		for _, r := range t.Handlers {
+			handlers = append(handlers, r.Handler)
+		}
+	}
+	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, handlers...)
 }
 
 // coldRestoreOnce runs Object.ColdRestore the first time we see an

@@ -7,6 +7,7 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
+	"github.com/anyproto/any-store/v2/query"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -28,10 +29,15 @@ type queryImpl struct {
 	objectId string
 	dataset  string
 
-	filter     any
-	sort       []any
-	limit      uint
-	offset     uint
+	// filter / sort hold the parsed query.Filter / query.Sort. Parse
+	// errors are stashed in parseErr and surfaced on the first
+	// terminal call (Iter / All / One / Count) so the caller sees
+	// them in the same path as any other read error.
+	filter   query.Filter
+	sort     query.Sort
+	limit    uint
+	offset   uint
+	parseErr error
 }
 
 func newQuery(parent *spaceImpl, objectId, dataset string) *queryImpl {
@@ -44,14 +50,45 @@ func newSharedQuery(parent *spaceImpl) *queryImpl {
 	return &queryImpl{parent: parent, dataset: "<shared:objects>"}
 }
 
+// Filter parses the caller-supplied condition eagerly via
+// query.ParseCondition (which itself accepts an already-built
+// query.Filter, a JSON string, or a map literal). Multiple Filter
+// calls AND together. Parse errors are stashed and surfaced on the
+// first terminal call.
 func (q *queryImpl) Filter(filter any) space.Query {
-	q.filter = filter
+	if q.parseErr != nil {
+		return q
+	}
+	parsed, err := query.ParseCondition(filter)
+	if err != nil {
+		q.parseErr = fmt.Errorf("query: filter: %w", err)
+		return q
+	}
+	if q.filter == nil {
+		q.filter = parsed
+	} else {
+		q.filter = query.And{q.filter, parsed}
+	}
 	return q
 }
 
-func (q *queryImpl) Sort(keys ...string) space.Query {
-	for _, k := range keys {
-		q.sort = append(q.sort, k)
+// Sort parses the caller-supplied sort keys eagerly via
+// query.ParseSort. Each call appends; multiple sorts compose in
+// declaration order. Parse errors are stashed and surfaced on the
+// first terminal call.
+func (q *queryImpl) Sort(sorts ...any) space.Query {
+	if q.parseErr != nil || len(sorts) == 0 {
+		return q
+	}
+	parsed, err := query.ParseSort(sorts...)
+	if err != nil {
+		q.parseErr = fmt.Errorf("query: sort: %w", err)
+		return q
+	}
+	if q.sort == nil {
+		q.sort = parsed
+	} else {
+		q.sort = query.Sorts{q.sort, parsed}
 	}
 	return q
 }
@@ -179,15 +216,23 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 	return coll, nil
 }
 
-// build folds caller filter / sort / limit / offset into an
-// any-store Query. Tombstones are filtered post-iteration in
-// queryIterator.Next — any-store's Find takes a single filter `any`
-// (JSON / parsed Filter / fastjson), so we don't compose AND on
-// the query side without re-parsing the caller's input.
+// build folds the parsed filter / sort / limit / offset into an
+// any-store Query. Filter and Sort are already typed query.Filter /
+// query.Sort values (parsed by Filter() / Sort() at chain time);
+// any-store accepts both directly. Tombstones are filtered post-
+// iteration in queryIterator.Next.
 func (q *queryImpl) build(coll anystore.Collection) (anystore.Query, error) {
-	out := coll.Find(q.filter)
-	if len(q.sort) > 0 {
-		out = out.Sort(q.sort...)
+	if q.parseErr != nil {
+		return nil, q.parseErr
+	}
+	var out anystore.Query
+	if q.filter != nil {
+		out = coll.Find(q.filter)
+	} else {
+		out = coll.Find(nil)
+	}
+	if q.sort != nil {
+		out = out.Sort(q.sort)
 	}
 	if q.limit > 0 {
 		out = out.Limit(q.limit)

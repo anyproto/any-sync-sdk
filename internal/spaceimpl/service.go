@@ -13,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -51,6 +52,11 @@ type Service struct {
 	tsp *techspace.Service
 	db  anystore.DB
 
+	// extTypes carry through to every per-space Store created by
+	// storeFor — each type's handlers are applied alongside the
+	// built-in catalog.
+	extTypes []handler.Type
+
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
@@ -58,13 +64,16 @@ type Service struct {
 
 // New returns a Service ready to be returned via SDK.Spaces(). The
 // db argument is the shared SDK DB where CRDT collections live.
-func New(app *anysyncx.App, tsp *techspace.Service, db anystore.DB) *Service {
+// extTypes must already have been validated by
+// spaceobjects.ValidateExternalTypes at the SDK boundary.
+func New(app *anysyncx.App, tsp *techspace.Service, db anystore.DB, extTypes []handler.Type) *Service {
 	return &Service{
-		app:    app,
-		tsp:    tsp,
-		db:     db,
-		stores: make(map[string]*spaceobjects.Store),
-		allocs: make(map[string]*object.VersionAllocator),
+		app:      app,
+		tsp:      tsp,
+		db:       db,
+		extTypes: extTypes,
+		stores:   make(map[string]*spaceobjects.Store),
+		allocs:   make(map[string]*object.VersionAllocator),
 	}
 }
 
@@ -81,7 +90,7 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	}
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
-	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc)
+	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
 	s.stores[spaceId] = st
 	s.mu.Unlock()
 	// Kick the drainer once so prior-session parked rows whose

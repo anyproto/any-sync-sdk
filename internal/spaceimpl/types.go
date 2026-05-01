@@ -109,7 +109,7 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 		payload.Set(typetype.FieldXKey, arena.NewString(draft.XKey))
 	}
 
-	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetProperties)
+	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
 	if err != nil {
 		return "", err
 	}
@@ -118,7 +118,7 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 		return "", err
 	}
 	res, err := obj.LocalWrite(ctx, crdt.Change{
-		Dataset:     typetype.DatasetProperties,
+		Dataset:     typetype.DatasetPropertyDefs,
 		DataVersion: dataVersion,
 		Records: []crdt.RecordChange{{
 			Upsert: true, // empty Id → propId derived from ChangeId
@@ -309,7 +309,7 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 	if err != nil {
 		return nil, fmt.Errorf("typesAPI: load %s: %w", typeId, err)
 	}
-	rows := obj.Controller().Records(ctx, typetype.DatasetProperties)
+	rows := obj.Controller().Records(ctx, typetype.DatasetPropertyDefs)
 	out := make([]space.PropertyDef, 0, len(rows))
 	for _, v := range rows {
 		out = append(out, decodePropertyDef(v))

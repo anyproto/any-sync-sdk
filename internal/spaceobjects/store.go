@@ -31,6 +31,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/types"
@@ -47,7 +48,7 @@ var ErrUnknownDataset = errors.New("spaceobjects: unknown dataset")
 // construction time; collisions with built-ins are rejected up front.
 var builtinDataVersions = map[string]string{
 	properties.Dataset:         properties.HandlerVersion,
-	typetype.DatasetProperties: typetype.HandlerVersion,
+	typetype.DatasetPropertyDefs: typetype.HandlerVersion,
 	typetype.ShortIdsDataset:   "shortIds-v1",
 }
 
@@ -112,6 +113,11 @@ type Store struct {
 	// afterApply hooks push pairs in, the drainer consumes them and
 	// coalesces bursts into single Drain passes. See drainer.go.
 	drainer *drainer
+
+	// dispatcher is the per-space pub/sub for CRDT apply events.
+	// afterApply forwards the change here after a HasSubscribers
+	// gate; subscriptions live until Close.
+	dispatcher *eventbus.Dispatcher
 }
 
 // NewStore constructs a Store. The allocator is per-space (shared
@@ -144,6 +150,7 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 		dataVersions: dv,
 		objects:      make(map[string]*object.Object),
 		restored:     make(map[string]chan struct{}),
+		dispatcher:   eventbus.New(spaceId),
 	}
 	s.drainer = newDrainer(s)
 	s.drainer.Run()
@@ -191,11 +198,20 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 	return nil
 }
 
-// Close shuts down per-Store background workers (currently the
-// drainer). Safe to call multiple times.
+// Close shuts down per-Store background workers (drainer +
+// dispatcher). Safe to call multiple times.
 func (s *Store) Close() error {
-	return s.drainer.Close()
+	derr := s.drainer.Close()
+	if s.dispatcher != nil {
+		_ = s.dispatcher.Close()
+	}
+	return derr
 }
+
+// Dispatcher returns the per-space event dispatcher. Used by the
+// space layer to expose the public Subscribe / SubscribeProperties
+// surface.
+func (s *Store) Dispatcher() *eventbus.Dispatcher { return s.dispatcher }
 
 // NotifyDrainer is the public hook used by callers (e.g. the
 // space service on first-touch) to trigger an asynchronous Drain

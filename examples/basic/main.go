@@ -90,12 +90,9 @@ func run() error {
 	}
 	log.Printf("object %s", objectId)
 
-	// Subscribe before further writes — catches our own writes and
-	// any inbound sync events through the same channel.
-	sub, err := sp.Subscribe(ctx,
-		[]space.SubscribeTarget{{ObjectId: objectId}}, // all datasets on this object
-		space.SubscribeOpts{IncludeOwnWrites: true},
-	)
+	// Subscribe before further writes — every property-value change
+	// across this space lands on the firehose.
+	sub, err := sp.SubscribeProperties(ctx)
 	if err != nil {
 		return err
 	}
@@ -252,9 +249,14 @@ func findOrCreateSpace(ctx context.Context, svc space.Service, name string) (spa
 
 func pumpEvents(sub space.Subscription) {
 	defer sub.Close()
-	for ev := range sub.Events() {
-		for _, rec := range ev.Records {
-			log.Printf("event %s/%s %v %s", ev.ObjectId, ev.Dataset, rec.Type, rec.Id)
+	ctx := context.Background()
+	for {
+		events, err := sub.Mailbox().Wait(ctx)
+		if err != nil {
+			return // ErrClosed on Close
+		}
+		for _, ev := range events {
+			log.Printf("event %s/%s addSeq=%d", ev.ObjectId, ev.Dataset, ev.AddSeq)
 		}
 	}
 }

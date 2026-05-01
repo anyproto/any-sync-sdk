@@ -13,7 +13,7 @@ import (
 )
 
 // ShortIdsDataset is the name of the sibling collection registered on
-// every type object's Controller alongside DatasetProperties. One row
+// every type object's Controller alongside DatasetPropertyDefs. One row
 // per important change to the type's properties dataset.
 //
 // docs/types-properties-proposal.md § "Known-shortIds set":

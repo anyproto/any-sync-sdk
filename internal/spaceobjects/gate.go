@@ -56,26 +56,27 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 	}
 }
 
-// afterApplyFor is the post-apply hook. Notifies the per-Store
-// drainer that something landed which may unblock parked changes;
-// the drainer goroutine consumes pairs off its mb queue and runs
-// Store.Drain off this apply path's locks.
+// afterApplyFor is the post-apply hook. Two independent fan-outs
+// run off every successful change:
 //
-// Decoupled from the apply lock for two reasons:
-//  1. afterApply runs under o.mu (called from applyDecodedLocked).
-//     Drain ultimately calls obj.ApplyDecoded, which retakes o.mu —
-//     synchronous Drain re-entered the same Object's lock and
-//     deadlocked when a parked row was for the same Object.
-//  2. LocalWrite latency no longer absorbs unrelated parked replays.
+//  1. dispatcher.Dispatch — gated by HasSubscribers (single atomic
+//     load), so the cold-restore path stays free when nobody is
+//     listening. Routes to per-(object, dataset) and properties-
+//     firehose subscribers.
 //
-// We only push when the change is a typetype.PropertyHandler write
-// (its sibling Project lands shortIds), since that's currently the
-// only path that can produce new (typeId, shortId) pairs the gate
-// is waiting on. Other dataset writes don't notify — the drainer
-// would just scan _detached and find nothing changed.
+//  2. drainer.Notify — only fires for typetype.PropertyHandler
+//     writes (those land shortIds and may unblock parked changes).
+//     Decoupled from the apply lock to avoid the o.mu re-entry
+//     deadlock that synchronous Drain previously hit.
 func (s *Store) afterApplyFor() object.AfterApply {
 	return func(_ context.Context, ch *crdt.Change) {
-		if ch == nil || ch.Dataset != typetype.DatasetProperties {
+		if ch == nil {
+			return
+		}
+		if s.dispatcher != nil && s.dispatcher.HasSubscribers() {
+			s.dispatcher.Dispatch(ch)
+		}
+		if ch.Dataset != typetype.DatasetPropertyDefs {
 			return
 		}
 		ids, err := crdt.ResolveRecordIds(*ch)

@@ -135,7 +135,18 @@ type Change struct {
 	// SystemPropertiesHandler to auto-stamp `author` at row root on
 	// first record creation. Empty on hand-built changes (tests) where
 	// no tree is wired.
+	//
+	// Distinct from Creator below: ObjectAuthor is the constant root
+	// signer (object creator); Creator is the per-change signer (who
+	// wrote THIS change). They coincide for the root change but diverge
+	// for subsequent changes in shared / multi-author objects.
 	ObjectAuthor string
+	// Creator is the StrKey-encoded identity (PubKey.Account()) of the
+	// peer that signed THIS change — i.e. the per-change author. Stamped
+	// by Object.stampObjectMeta from the underlying any-sync change's
+	// Identity (looked up via tree.GetChange by ChangeId). Empty on
+	// hand-built changes (tests) where no tree is wired.
+	Creator string
 	// ObjectCreatedAt is the Unix-seconds timestamp of the tree's root
 	// change — the moment the object was created. Constant across every
 	// change in a tree. Used by SystemPropertiesHandler to auto-stamp

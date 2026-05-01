@@ -20,7 +20,14 @@ var ErrValidation = errors.New("crdt: validation rejected")
 
 // ChangeCtx is the per-callback context handed to a Handler. It carries the
 // originating Change (read-only metadata: VersionId, ChangeId, Timestamp,
-// Creator, …) and the record's pre-op state.
+// Creator, ObjectAuthor, …) and the record's pre-op state.
+//
+// ObjectAuthor is the constant root-signer (object creator); Creator is the
+// per-change signer (who wrote THIS change). For the root change they
+// coincide; for shared spaces / multi-author objects they diverge — handlers
+// that gate "only the author of this message can edit it" should read
+// Creator, while handlers that stamp object-level provenance should read
+// ObjectAuthor.
 //
 // Before evolves across ops in the same RecordChange: op[1]'s Before is
 // op[0]'s after — but only counting ops that actually landed (rejected ops

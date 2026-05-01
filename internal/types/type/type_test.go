@@ -44,7 +44,7 @@ func newTypeController(t *testing.T) *crdt.Controller {
 func makeChange(versionId crdt.VersionId, changeId string, recId string, upsert bool, ops ...crdt.Op) crdt.Change {
 	return crdt.Change{
 		ObjectId:    testObjectId,
-		Dataset:     typetype.DatasetProperties,
+		Dataset:     typetype.DatasetPropertyDefs,
 		ChangeId:    changeId,
 		VersionId:   versionId,
 		DataVersion: testDataVer,
@@ -93,7 +93,7 @@ func TestPropertyHandler_CreateProjectsShortId(t *testing.T) {
 	)))
 
 	// Property record landed.
-	rec := ctrl.Get(context.Background(), typetype.DatasetProperties, propId)
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
 	require.NotNil(t, rec)
 	assert.Equal(t, "actors", rec.GetString(typetype.FieldKey))
 	assert.Equal(t, "array", rec.GetString(typetype.FieldKind))
@@ -125,7 +125,7 @@ func TestPropertyHandler_CreateRejectedWithoutKind(t *testing.T) {
 	)))
 
 	// BeforeCreate dropped the record; nothing landed.
-	assert.Nil(t, ctrl.Get(context.Background(), typetype.DatasetProperties, propId))
+	assert.Nil(t, ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId))
 	// And no shortIds row was projected.
 	shortId := crdt.DeriveRecordId("ch-no-kind")
 	assert.Nil(t, ctrl.Get(context.Background(), typetype.ShortIdsDataset, shortId))
@@ -144,7 +144,7 @@ func TestPropertyHandler_CreateRejectedOnUnknownKind(t *testing.T) {
 		}),
 	)))
 
-	assert.Nil(t, ctrl.Get(context.Background(), typetype.DatasetProperties, propId))
+	assert.Nil(t, ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId))
 }
 
 // ----------------------------------------------------------------------------
@@ -171,7 +171,7 @@ func TestPropertyHandler_DisplayOnlyEditPasses(t *testing.T) {
 		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldName}, Payload: arena.NewString("Release Year")},
 	)))
 
-	rec := ctrl.Get(context.Background(), typetype.DatasetProperties, propId)
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
 	require.NotNil(t, rec)
 	assert.Equal(t, "Release Year", rec.GetString(typetype.FieldName))
 	assert.Equal(t, "number", rec.GetString(typetype.FieldKind), "kind must be untouched")
@@ -199,7 +199,7 @@ func TestPropertyHandler_KindEditDropped(t *testing.T) {
 		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldName}, Payload: arena.NewString("Renamed")},
 	)))
 
-	rec := ctrl.Get(context.Background(), typetype.DatasetProperties, propId)
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
 	require.NotNil(t, rec)
 	assert.Equal(t, "string", rec.GetString(typetype.FieldKind), "kind survives the edit attempt")
 	assert.Equal(t, "Renamed", rec.GetString(typetype.FieldName), "non-schema edit landed")
@@ -230,7 +230,7 @@ func TestPropertyHandler_MultiFieldSchemaEditDropped(t *testing.T) {
 		}),
 	)))
 
-	rec := ctrl.Get(context.Background(), typetype.DatasetProperties, propId)
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
 	require.NotNil(t, rec)
 	assert.Equal(t, "string", rec.GetString(typetype.FieldKind))
 	// Per the rejection-is-whole-op rule, the bundled name change
@@ -264,7 +264,7 @@ func TestPropertyHandler_DeleteProjectsRemovalShortId(t *testing.T) {
 
 	// Original record is tombstoned (Get returns the tombstone shape;
 	// Records() filters tombstones out).
-	live := ctrl.Records(context.Background(), typetype.DatasetProperties)
+	live := ctrl.Records(context.Background(), typetype.DatasetPropertyDefs)
 	for _, r := range live {
 		assert.NotEqual(t, propId, r.GetString("id"), "deleted property should not be among live records")
 	}

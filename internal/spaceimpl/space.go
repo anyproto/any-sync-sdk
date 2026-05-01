@@ -213,8 +213,23 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 	return modifyResultFromWrite(res), nil
 }
 
-func (s *spaceImpl) Subscribe(_ context.Context, _ []space.SubscribeTarget, _ space.SubscribeOpts) (space.Subscription, error) {
-	return nil, errors.New("spaceimpl: Subscribe not implemented")
+// Subscribe registers a listener for the given (objectId, dataset)
+// pair. Delegates to the per-space dispatcher; Close on the returned
+// Subscription detaches and closes the channel.
+func (s *spaceImpl) Subscribe(_ context.Context, objectId, dataset string) (space.Subscription, error) {
+	if objectId == "" {
+		return nil, errors.New("spaceimpl: Subscribe: objectId required")
+	}
+	if dataset == "" {
+		return nil, errors.New("spaceimpl: Subscribe: dataset required")
+	}
+	return s.store.Dispatcher().Subscribe(objectId, dataset, 0), nil
+}
+
+// SubscribeProperties registers a firehose for property-value
+// changes on every object in this space.
+func (s *spaceImpl) SubscribeProperties(_ context.Context) (space.Subscription, error) {
+	return s.store.Dispatcher().SubscribeProperties(0), nil
 }
 
 // buildChange converts a public space.ModifyBatch into the internal

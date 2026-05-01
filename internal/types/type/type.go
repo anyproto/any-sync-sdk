@@ -32,14 +32,14 @@ const (
 	Description = "A type — defines properties (and optionally datasets) for the objects that implement it"
 )
 
-// DatasetProperties is the name of the dataset on a type object that holds
-// its property-definition records.
-//
-// Renamed from "properties" so it can coexist with each object's
-// values dataset (also called "properties", handled by
+// DatasetPropertyDefs is the dataset on a type object that holds its
+// property-*definition* records (id, name, kind, ...). On disk the
+// collection is named "properties"; the Go identifier was chosen to
+// disambiguate from property *values*, which live in a separate
+// dataset called "objects" (properties.Dataset, handled by
 // properties.SystemPropertiesHandler). Every object registers both
-// handlers — only type objects actually write to "properties".
-const DatasetProperties = "properties"
+// handlers — only type objects actually write to this one.
+const DatasetPropertyDefs = "properties"
 
 // HandlerVersion is the DataVersion string stamped onto every change
 // this handler emits against the `properties` dataset of a type
@@ -89,7 +89,7 @@ var ErrMissingKind = errors.New("typetype: property record requires `kind`")
 // § "ShortId — derivation".
 type PropertyHandler struct{}
 
-func (PropertyHandler) Dataset() string              { return DatasetProperties }
+func (PropertyHandler) Dataset() string              { return DatasetPropertyDefs }
 func (PropertyHandler) Version() int                 { return 1 }
 func (PropertyHandler) Init(_ context.Context) error { return nil }
 

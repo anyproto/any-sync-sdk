@@ -78,16 +78,18 @@ type Space interface {
 	// Returned RecordIds mirror the input order.
 	Delete(ctx context.Context, batch DeleteBatch) (ModifyResult, error)
 
-	// Subscribe delivers simplified user events for a set of
-	// (objectId, dataset) pairs. The subscription runs until Close is
-	// called on the returned handle or sdk.Close runs.
-	Subscribe(ctx context.Context, targets []SubscribeTarget, opts SubscribeOpts) (Subscription, error)
-}
+	// Subscribe registers an explicit (objectId, dataset) listener.
+	// The returned Subscription delivers an Event per matching
+	// successful apply; Close releases the subscription.
+	Subscribe(ctx context.Context, objectId, dataset string) (Subscription, error)
 
-// SubscribeTarget pins a subscription to one object. Datasets filter
-// further to a subset of the object's datasets; empty Datasets means
-// all.
-type SubscribeTarget struct {
-	ObjectId string
-	Datasets []string
+	// SubscribeProperties registers a firehose for property-value
+	// changes across every object in this space (the per-space
+	// `objects` dataset). Useful for UIs that render any object's
+	// property panel without prior knowledge of which objects exist.
+	//
+	// v1 is intentionally unfiltered — finer subscriptions (per
+	// object, per property kind) layer on top once a concrete UI
+	// need lands.
+	SubscribeProperties(ctx context.Context) (Subscription, error)
 }

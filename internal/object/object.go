@@ -124,13 +124,23 @@ func (o *Object) applyDecodedLocked(ctx context.Context, ch crdt.Change) (crdt.A
 }
 
 // stampObjectMeta fills ch.ObjectAuthor / ObjectCreatedAt from the
-// tree's root change. Both values are constant across every change
-// in a tree (the root is immutable + signed), so handlers that
+// tree's root change, and ch.Creator from the per-change signer.
+//
+// ObjectAuthor / ObjectCreatedAt are constant across every change in
+// a tree (the root is immutable + signed), so handlers that
 // auto-stamp record-level fields like `author` and `createdAt` can
 // rely on them regardless of which specific change is being applied.
 //
-// No-op when the tree isn't wired (tests / pre-bind drains) or when
-// the root has no Identity attached (derived trees in some flows).
+// Creator comes from THIS change's any-sync envelope (the signer of
+// the individual change, not the tree root) — looked up via
+// tree.GetChange(ch.ChangeId). For the root change Creator and
+// ObjectAuthor coincide; for subsequent changes in shared / multi-
+// author objects they diverge.
+//
+// No-op when the tree isn't wired (tests / pre-bind drains), when
+// the root has no Identity attached (derived trees in some flows),
+// or when the change is not yet attached to the tree (hand-built
+// changes in tests).
 func (o *Object) stampObjectMeta(ch *crdt.Change) {
 	if o.tree == nil {
 		return
@@ -144,6 +154,11 @@ func (o *Object) stampObjectMeta(ch *crdt.Change) {
 	}
 	if ch.ObjectAuthor == "" && root.Identity != nil {
 		ch.ObjectAuthor = root.Identity.Account()
+	}
+	if ch.Creator == "" && ch.ChangeId != "" {
+		if tc, err := o.tree.GetChange(ch.ChangeId); err == nil && tc != nil && tc.Identity != nil {
+			ch.Creator = tc.Identity.Account()
+		}
 	}
 }
 
@@ -226,12 +241,18 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	// Back-fill the apply-time timestamp before AddContent so the
+	// downstream apply path (BeforeCreate / BeforeModify hooks) sees
+	// the same value any-sync stamps on the wire. Mirrors how
+	// replayLocked sets decoded.Timestamp = full.Timestamp on the
+	// inbound side. ts() preserves caller-supplied positive values.
+	ch.Timestamp = ts(ch.Timestamp)
 	res, err := o.tree.AddContent(ctx, objecttree.SignableChangeContent{
 		Data:              payload,
 		Key:               o.signKey,
 		ShouldBeEncrypted: true,
 		DataType:          ch.Dataset,
-		Timestamp:         ts(ch.Timestamp),
+		Timestamp:         ch.Timestamp,
 	})
 	if err != nil {
 		return WriteResult{}, fmt.Errorf("object: AddContent: %w", err)

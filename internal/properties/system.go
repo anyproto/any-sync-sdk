@@ -111,30 +111,33 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 
 // stampAutoFields queues derived ops for the row-root auto fields
 // — `author`, `createdAt`, `spaceId` — that live alongside `id` at
-// the top of the record (NOT under `any.*`). They are derived from
-// the change envelope and stamped once at record creation;
-// BeforeCreate fires only on first-touch so they aren't re-applied
-// to existing rows. The derived ops inherit the change's VersionId,
-// so concurrent peer-side BeforeCreate stamps converge under
-// standard LWW.
+// the top of the record (NOT under `any.*`). Stamped once at record
+// creation; BeforeCreate fires only on first-touch so they don't
+// re-apply.
 //
-// Derived ops route to row root (see Modify in controller.go) so
-// these stamps land at `record.author` / `record.createdAt` /
-// `record.spaceId`, not under any variant subdoc — consistent with
-// `id`, which is also at row root.
+// `author` and `createdAt` are taken from the tree's ROOT change
+// (immutable header), not from the per-change envelope — those are
+// constants per object, regardless of which change happens to land
+// first locally. `spaceId` comes from the apply context. Derived
+// ops route to row root (see recordModifier.Modify) so these land
+// at `record.author` / `record.createdAt` / `record.spaceId`,
+// alongside `id`.
+//
+// All three stamps inherit the change's VersionId, so concurrent
+// peer-side BeforeCreate stamps converge under standard LWW.
 func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
 	a := &anyenc.Arena{}
-	if creator := ctx.Change.Creator; creator != "" {
+	if author := ctx.Change.ObjectAuthor; author != "" {
 		sink.Derive(crdt.Op{
 			Type:    crdt.OpSet,
 			Path:    []string{"author"},
-			Payload: a.NewString(creator),
+			Payload: a.NewString(author),
 		})
 	}
-	if ts := ctx.Change.Timestamp; ts > 0 {
+	if ts := ctx.Change.ObjectCreatedAt; ts > 0 {
 		sink.Derive(crdt.Op{
 			Type:    crdt.OpSet,
 			Path:    []string{"createdAt"},

@@ -112,6 +112,7 @@ func (o *Object) applyDecodedLocked(ctx context.Context, ch crdt.Change) (crdt.A
 	if ch.VersionId == "" {
 		return crdt.ApplyResult{}, errors.New("object: applyDecodedLocked requires pre-stamped VersionId (any-sync OrderId)")
 	}
+	o.stampObjectMeta(&ch)
 	res, err := o.ctrl.ApplyChangeWithResult(ctx, ch)
 	if err != nil {
 		return res, err
@@ -120,6 +121,30 @@ func (o *Object) applyDecodedLocked(ctx context.Context, ch crdt.Change) (crdt.A
 		o.afterApply(ctx, &ch)
 	}
 	return res, nil
+}
+
+// stampObjectMeta fills ch.ObjectAuthor / ObjectCreatedAt from the
+// tree's root change. Both values are constant across every change
+// in a tree (the root is immutable + signed), so handlers that
+// auto-stamp record-level fields like `author` and `createdAt` can
+// rely on them regardless of which specific change is being applied.
+//
+// No-op when the tree isn't wired (tests / pre-bind drains) or when
+// the root has no Identity attached (derived trees in some flows).
+func (o *Object) stampObjectMeta(ch *crdt.Change) {
+	if o.tree == nil {
+		return
+	}
+	root := o.tree.Root()
+	if root == nil {
+		return
+	}
+	if ch.ObjectCreatedAt == 0 {
+		ch.ObjectCreatedAt = root.Timestamp
+	}
+	if ch.ObjectAuthor == "" && root.Identity != nil {
+		ch.ObjectAuthor = root.Identity.Account()
+	}
 }
 
 // Tree returns the bound tree, or nil if SetTree hasn't run.
@@ -226,7 +251,9 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	ch.ChangeId = added.Id
 	ch.AddSeq = added.AddSeq
 	ch.VersionId = crdt.VersionId(added.OrderId)
-	ch.Creator = o.signKey.GetPublic().Account()
+	// ObjectAuthor / ObjectCreatedAt are stamped from the tree root in
+	// applyDecodedLocked, so all paths (local write, inbound replay,
+	// drain) agree on the same canonical values.
 
 	// Resolve record ids before apply so the caller can correlate the
 	// returned RecordIds with the input batch order even when the
@@ -317,9 +344,8 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		decoded.AddSeq = sc.AddSeq
 		decoded.Timestamp = full.Timestamp
 		decoded.VersionId = crdt.VersionId(sc.OrderId)
-		if full.Identity != nil {
-			decoded.Creator = full.Identity.Account()
-		}
+		// ObjectAuthor / ObjectCreatedAt come from the tree root via
+		// stampObjectMeta inside applyDecodedLocked.
 
 		// Schema gate: a DataVersion referencing unknown shortIds
 		// parks the change (proceed=false) — intentional skip, don't

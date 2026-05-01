@@ -128,13 +128,19 @@ type Change struct {
 	// `deletedAt` field). The CRDT layer treats it as advisory metadata; it is
 	// not used for conflict resolution.
 	Timestamp int64
-	// Creator is the StrKey-encoded identity (PubKey.Account()) of the
-	// peer that signed this change. Stamped by the LocalWrite path from
-	// the local signing key, and by the inbound-replay path from the
-	// any-sync change envelope's Identity. Empty on hand-built changes
-	// from tests / drains where the identity isn't available — handlers
-	// that auto-stamp author should treat empty as "no creator known".
-	Creator string
+	// ObjectAuthor is the StrKey-encoded identity (PubKey.Account()) of
+	// the peer that created the OBJECT — i.e. the signer of the tree's
+	// root change. Constant across every change in a tree; the apply
+	// pipeline stamps it before calling Controller.ApplyChange. Used by
+	// SystemPropertiesHandler to auto-stamp `author` at row root on
+	// first record creation. Empty on hand-built changes (tests) where
+	// no tree is wired.
+	ObjectAuthor string
+	// ObjectCreatedAt is the Unix-seconds timestamp of the tree's root
+	// change — the moment the object was created. Constant across every
+	// change in a tree. Used by SystemPropertiesHandler to auto-stamp
+	// `createdAt` at row root on first record creation.
+	ObjectCreatedAt int64
 	// TraceIds are opaque correlation tokens attached by the originating
 	// caller (e.g. a UI session id, an AI operation id). They travel with the
 	// change through any-sync (stored in a dedicated, non-encrypted field on

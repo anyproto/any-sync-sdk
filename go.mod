@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/anyproto/any-store v0.4.7-0.20260218145837-38e0159b0ddb
-	github.com/anyproto/any-store/v2 v2.0.0-alpha.2
+	github.com/anyproto/any-store/v2 v2.0.0-alpha.3
 	github.com/anyproto/any-sync v0.11.21
 	github.com/anyproto/lexid v0.0.6
 	github.com/cheggaaa/mb/v3 v3.0.2
@@ -15,8 +15,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	storj.io/drpc v0.0.34
 )
-
-replace github.com/anyproto/any-store/v2 => ../any-store-v2
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -78,12 +76,12 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
+	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/exp v0.0.0-20260212183809-81e46e3db34a // indirect
 	golang.org/x/image v0.21.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.43.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect

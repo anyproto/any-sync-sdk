@@ -24,6 +24,27 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+// normalizeSpaceType applies the SpaceType allow-list before
+// stamping the value into an immutable space header. The
+// any-sync-coordinator rejects anything outside this set with
+// "unknown space type: <value>", causing periodic headsync to fail
+// forever — and since the type is content-addressable into the
+// header, you can't fix the space after the fact. Catch it here.
+//
+// Empty defaults to SpaceTypeRegular, mirroring anytype-heart and
+// matching the coordinator's "" → SpaceTypeRegular treatment.
+func normalizeSpaceType(t string) (string, error) {
+	switch t {
+	case "":
+		return space.SpaceTypeRegular, nil
+	case space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne:
+		return t, nil
+	default:
+		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s, %s, %s)",
+			t, space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne)
+	}
+}
+
 // replicationKeyFromSpaceId extracts the base36-encoded replication
 // key suffix from a spaceId. Format: `<cid>.<repKey-base36>`.
 // Returns 0 when the suffix is missing or unparseable — a defensive
@@ -118,9 +139,9 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		return nil, fmt.Errorf("spaceimpl: metadata key: %w", err)
 	}
 
-	spaceType := req.SpaceType
-	if spaceType == "" {
-		spaceType = space.SpaceTypeRegular
+	spaceType, err := normalizeSpaceType(req.SpaceType)
+	if err != nil {
+		return nil, err
 	}
 
 	// Reuse the tech-space's replication key so all spaces for this

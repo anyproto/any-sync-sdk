@@ -76,7 +76,7 @@ func TestSDK_OpenCreateList(t *testing.T) {
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{
 		Name:        "Demo",
 		Description: "test space",
-		SpaceType:   "regular",
+		SpaceType:   space.SpaceTypeRegular,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, sp)
@@ -99,7 +99,7 @@ func TestSDK_OpenCreateList(t *testing.T) {
 	got := findSpace(list, sp.Id())
 	require.NotNil(t, got, "first created space missing from List")
 	assert.Equal(t, "Demo", got.Name)
-	assert.Equal(t, "regular", got.Type)
+	assert.Equal(t, space.SpaceTypeRegular, got.Type)
 	assert.Equal(t, space.StatusActive, got.Status)
 
 	// Soft-delete the first space — Status flips to Deleted, row

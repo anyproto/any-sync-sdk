@@ -18,8 +18,10 @@ type SpaceIndexRecord struct {
 	// Id is the spaceId — primary key in the dataset.
 	Id string
 
-	// Type is the space type label ("regular", "1-1", …). First-write-
-	// wins: pinned for life by SpaceIndexHandler.BeforeModify.
+	// Type mirrors the space header's SpaceType — one of the
+	// space.SpaceType* constants (anytype.space / anytype.chatspace
+	// / anytype.onetoone). First-write-wins: pinned for life by
+	// SpaceIndexHandler.BeforeModify.
 	Type string
 
 	Name        string

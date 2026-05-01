@@ -46,8 +46,13 @@ type CreateRequest struct {
 	Name        string
 	Description string
 	IconCID     string
-	// SpaceType distinguishes user-defined kinds of spaces. Opaque to
-	// the SDK. Empty = default "regular" space.
+	// SpaceType is stamped into the space header at create time and
+	// gated by the any-sync-coordinator. Must be one of the public
+	// constants (SpaceTypeRegular, SpaceTypeChat, SpaceTypeOneToOne)
+	// or empty — empty defaults to SpaceTypeRegular. Anything else
+	// is rejected by Create with a clear error; passing an invalid
+	// type would otherwise produce a space the coordinator refuses
+	// to sync.
 	SpaceType string
 }
 

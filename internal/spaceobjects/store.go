@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
@@ -368,6 +369,13 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 		SpaceId:       s.spaceId,
 		IsEncrypted:   true,
 		Seed:          seed,
+		// Timestamp is the creation moment baked into the immutable
+		// root change. SystemPropertiesHandler reads it back via
+		// tree.Root().Timestamp to auto-stamp `createdAt` on the
+		// object's row at first property write — without setting it
+		// here, the root carries 0 and the auto-stamp is silently
+		// skipped (see properties.stampAutoFields).
+		Timestamp: time.Now().Unix(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: CreateTree: %w", err)

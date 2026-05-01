@@ -662,7 +662,10 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		for i := range rc.Ops {
 			applyOp(a, target, *ch, rc.Ops[i])
 		}
-		m.drainDerivedTo(a, target, ch)
+		// Derived ops are record-level by convention (author, createdAt,
+		// id-like markers), so they target root regardless of the
+		// triggering variant.
+		m.drainDerivedTo(a, existing, ch)
 	} else if isTombstone(existing) {
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 			updateTraces(a, existing, *ch)
@@ -686,7 +689,8 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			}
 			applyOp(a, target, *ch, *op)
 		}
-		m.drainDerivedTo(a, target, ch)
+		// Derived ops are record-level — see BeforeCreate path.
+		m.drainDerivedTo(a, existing, ch)
 	}
 
 	updateTraces(a, existing, *ch)

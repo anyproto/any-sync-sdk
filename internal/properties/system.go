@@ -83,22 +83,71 @@ func (*SystemPropertiesHandler) Dataset() string              { return Dataset }
 func (*SystemPropertiesHandler) Version() int                 { return 1 }
 func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 
-// BeforeCreate validates every op in the creation payload. Stricter
-// than BeforeModify: any per-op validation failure rejects the whole
-// record, because a creation with a bad field implies a buggy or
-// version-mismatched writer (and the DataVersion gate on ApplyChange
-// already filters those upstream — by the time a create lands here,
-// we should know its schema).
-func (h *SystemPropertiesHandler) BeforeCreate(_ *crdt.ChangeCtx, rec *crdt.RecordChange, _ *crdt.Sink) error {
-	if h.Registry == nil {
-		return nil
-	}
-	for i := range rec.Ops {
-		if err := h.validateOp(&rec.Ops[i]); err != nil {
-			return err
+// BeforeCreate validates every op in the creation payload, then
+// auto-stamps the `any`-scope auto fields (author, createdAt,
+// spaceId) via sink.Derive so every newly minted row in the per-
+// space `objects` collection carries them. The stamps are derived
+// from the change envelope (Creator from the signing identity,
+// Timestamp from the change wire, SpaceId from the apply context),
+// not from caller input — these fields are ScopeAuto in the `any`
+// type, read-only by convention.
+//
+// Stricter than BeforeModify on validation: any per-op validation
+// failure rejects the whole record, because a creation with a bad
+// field implies a buggy or version-mismatched writer (and the
+// DataVersion gate on ApplyChange already filters those upstream —
+// by the time a create lands here, we should know its schema).
+func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
+	if h.Registry != nil {
+		for i := range rec.Ops {
+			if err := h.validateOp(&rec.Ops[i]); err != nil {
+				return err
+			}
 		}
 	}
+	stampAutoFields(ctx, sink)
 	return nil
+}
+
+// stampAutoFields queues derived ops for the row-root auto fields
+// — `author`, `createdAt`, `spaceId` — that live alongside `id` at
+// the top of the record (NOT under `any.*`). They are derived from
+// the change envelope and stamped once at record creation;
+// BeforeCreate fires only on first-touch so they aren't re-applied
+// to existing rows. The derived ops inherit the change's VersionId,
+// so concurrent peer-side BeforeCreate stamps converge under
+// standard LWW.
+//
+// Derived ops route to row root (see Modify in controller.go) so
+// these stamps land at `record.author` / `record.createdAt` /
+// `record.spaceId`, not under any variant subdoc — consistent with
+// `id`, which is also at row root.
+func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+	if ctx == nil || ctx.Change == nil || sink == nil {
+		return
+	}
+	a := &anyenc.Arena{}
+	if creator := ctx.Change.Creator; creator != "" {
+		sink.Derive(crdt.Op{
+			Type:    crdt.OpSet,
+			Path:    []string{"author"},
+			Payload: a.NewString(creator),
+		})
+	}
+	if ts := ctx.Change.Timestamp; ts > 0 {
+		sink.Derive(crdt.Op{
+			Type:    crdt.OpSet,
+			Path:    []string{"createdAt"},
+			Payload: a.NewNumberInt(int(ts)),
+		})
+	}
+	if spaceId := ctx.Change.SpaceId; spaceId != "" {
+		sink.Derive(crdt.Op{
+			Type:    crdt.OpSet,
+			Path:    []string{"spaceId"},
+			Payload: a.NewString(spaceId),
+		})
+	}
 }
 
 // BeforeModify validates one op against the Registry. Drops the op

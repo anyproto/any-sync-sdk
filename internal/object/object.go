@@ -226,6 +226,7 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	ch.ChangeId = added.Id
 	ch.AddSeq = added.AddSeq
 	ch.VersionId = crdt.VersionId(added.OrderId)
+	ch.Creator = o.signKey.GetPublic().Account()
 
 	// Resolve record ids before apply so the caller can correlate the
 	// returned RecordIds with the input batch order even when the
@@ -316,6 +317,9 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		decoded.AddSeq = sc.AddSeq
 		decoded.Timestamp = full.Timestamp
 		decoded.VersionId = crdt.VersionId(sc.OrderId)
+		if full.Identity != nil {
+			decoded.Creator = full.Identity.Account()
+		}
 
 		// Schema gate: a DataVersion referencing unknown shortIds
 		// parks the change (proceed=false) — intentional skip, don't

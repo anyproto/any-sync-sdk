@@ -128,6 +128,13 @@ type Change struct {
 	// `deletedAt` field). The CRDT layer treats it as advisory metadata; it is
 	// not used for conflict resolution.
 	Timestamp int64
+	// Creator is the StrKey-encoded identity (PubKey.Account()) of the
+	// peer that signed this change. Stamped by the LocalWrite path from
+	// the local signing key, and by the inbound-replay path from the
+	// any-sync change envelope's Identity. Empty on hand-built changes
+	// from tests / drains where the identity isn't available — handlers
+	// that auto-stamp author should treat empty as "no creator known".
+	Creator string
 	// TraceIds are opaque correlation tokens attached by the originating
 	// caller (e.g. a UI session id, an AI operation id). They travel with the
 	// change through any-sync (stored in a dedicated, non-encrypted field on

@@ -11,6 +11,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
+	"github.com/anyproto/any-sync/coordinator/nodeconfsource"
 	"github.com/anyproto/any-sync/net/peerservice"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/rpc/server"
@@ -73,7 +74,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(debugstat.New()).
 		Register(newCredentialProvider()).
 		Register(nodeconfstore.New()).
-		Register(newCoordinatorSource()).
+		Register(nodeconfsource.New()).
 		Register(nodeconf.New()).
 		Register(secureservice.New())
 	registerTransports(a)

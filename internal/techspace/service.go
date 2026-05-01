@@ -39,6 +39,13 @@ type Service struct {
 	alloc   *object.VersionAllocator
 }
 
+// TechSpaceType is the on-the-wire SpaceType stamped into the
+// tech-space's space header. Mirrors anytype-heart's
+// spacedomain.SpaceTypeTech and is the value the any-sync-coordinator
+// recognises for tech spaces (see any-sync-coordinator
+// spacestatus/changeverifier.go).
+const TechSpaceType = "anytype.techspace"
+
 // New returns a Service ready for Open.
 func New(app *anysyncx.App, db anystore.DB) *Service {
 	return &Service{app: app, db: db}
@@ -60,10 +67,15 @@ func (s *Service) Open(ctx context.Context) error {
 		return errors.New("techspace: anysyncx app has no account keys")
 	}
 
+	// SpaceType for the tech space matches the any-sync-coordinator's
+	// allow-list (see spacestatus/changeverifier.go in
+	// any-sync-coordinator). The library default
+	// spacepayloads.SpaceReserved ("any-sync.space") is rejected by
+	// the coordinator — it only knows the anytype.* family.
 	spaceCfg := spacepayloads.SpaceDerivePayload{
 		SigningKey: keys.SignKey,
 		MasterKey:  keys.SignKey,
-		SpaceType:  spacepayloads.SpaceReserved,
+		SpaceType:  TechSpaceType,
 	}
 	spaceId, err := s.app.SpaceService().DeriveId(ctx, spaceCfg)
 	if err != nil {

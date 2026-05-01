@@ -67,7 +67,13 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	tsp := techspace.New(app, db)
-	app.SetSpaceRegistry(tsp)
+	spaces := spaceimpl.New(app, tsp, db, cfg.Types)
+	// Wire spaceimpl.Service as the space registry so any-sync's
+	// treemanager-driven callbacks (deletion-manager DeleteTree,
+	// space-sync PutTree, head-sync GetTree for arbitrary trees)
+	// route to the per-space Store. spaceimpl internally delegates
+	// the tech-space's own indexId back to techspace.
+	app.SetSpaceRegistry(spaces)
 
 	if err := tsp.Open(ctx); err != nil {
 		_ = db.Close()
@@ -75,7 +81,6 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
 
-	spaces := spaceimpl.New(app, tsp, db, cfg.Types)
 	account := newAccountImpl(app)
 
 	return &SDK{

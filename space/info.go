@@ -2,12 +2,35 @@ package space
 
 import "time"
 
+// On-the-wire SpaceType strings stamped into the space header at
+// derive/create time. The any-sync-coordinator gates inbound space
+// changes against this value (see any-sync-coordinator
+// spacestatus/changeverifier.go) — only the strings below plus an
+// empty value are accepted; anything else is rejected with
+// "unknown space type: <value>" and headsync fails.
+//
+// These mirror anytype-heart's spacedomain.SpaceType* constants so a
+// space created by the SDK is interoperable with any-sync clients
+// running anytype-heart.
+const (
+	// SpaceTypeRegular is the default for newly created spaces. Used
+	// when CreateRequest.SpaceType is empty.
+	SpaceTypeRegular = "anytype.space"
+
+	// SpaceTypeChat is for chat spaces (one shared chat per space).
+	SpaceTypeChat = "anytype.chatspace"
+
+	// SpaceTypeOneToOne is for derived 1-1 spaces shared between two
+	// identities.
+	SpaceTypeOneToOne = "anytype.onetoone"
+)
+
 // SpaceInfo is a point-in-time snapshot of space metadata. Returned by
 // Service.List and Space.Info; does not auto-update — subscribe via
 // Service.Subscribe for live changes.
 type SpaceInfo struct {
 	Id          string
-	Type        string // space type (regular, 1-1, tech — not returned for tech)
+	Type        string // space type (anytype.space, anytype.chatspace, anytype.onetoone — never the tech type)
 	Name        string
 	Description string
 	IconCID     string

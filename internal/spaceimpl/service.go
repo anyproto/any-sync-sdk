@@ -10,6 +10,8 @@ import (
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/util/crypto"
 
@@ -118,7 +120,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 
 	spaceType := req.SpaceType
 	if spaceType == "" {
-		spaceType = "regular"
+		spaceType = space.SpaceTypeRegular
 	}
 
 	// Reuse the tech-space's replication key so all spaces for this
@@ -211,6 +213,70 @@ func (s *Service) OneToOne(_ context.Context, _ string) (space.Space, error) {
 // Close is a no-op — the space cache lives on the App and is closed
 // during App.Close.
 func (s *Service) Close(_ context.Context) error { return nil }
+
+// SpaceRegistry implementation. Routes between the tech-space (which
+// owns its own one-tree index) and regular spaces (which route
+// through their per-space Store).
+
+// GetTree resolves a tree by (spaceId, treeId). Tech-space lookups
+// route to techspace.Service; everything else loads via the
+// per-space Store, which builds the listener-bound *object.Object
+// so inbound changes flow into the controller.
+func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
+	if spaceId == s.tsp.SpaceId() {
+		return s.tsp.GetTree(ctx, spaceId, treeId)
+	}
+	store := s.storeFor(spaceId)
+	obj, err := store.Get(ctx, treeId)
+	if err != nil {
+		return nil, err
+	}
+	tree := obj.Tree()
+	if tree == nil {
+		return nil, fmt.Errorf("spaceimpl: tree %s/%s has no bound any-sync tree", spaceId, treeId)
+	}
+	return tree, nil
+}
+
+// PutTree binds a remote-delivered tree payload. Tech-space's
+// index tree is locally created, never put from the network — the
+// tech-space's adapter rejects this, which is the correct behavior.
+func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {
+	if spaceId == s.tsp.SpaceId() {
+		return s.tsp.PutTree(ctx, spaceId, payload)
+	}
+	store := s.storeFor(spaceId)
+	if _, err := store.PutTreeFromPayload(ctx, payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+// MarkTreeDeleted is the soft-delete hook fired when the settings
+// tree announces a deletion. Drops the cached object so a future
+// load reflects the deleted state. Tech-space defers to its own
+// no-op adapter (the index tree itself is never marked deleted).
+func (s *Service) MarkTreeDeleted(ctx context.Context, spaceId, treeId string) error {
+	if spaceId == s.tsp.SpaceId() {
+		return s.tsp.MarkTreeDeleted(ctx, spaceId, treeId)
+	}
+	s.storeFor(spaceId).Drop(treeId)
+	return nil
+}
+
+// DeleteTree performs the per-tree cleanup the deletion-manager
+// drives: marks the any-sync tree storage deleted via tree.Delete()
+// and drops our cached *object.Object. Tech-space defers to its
+// own adapter (the index tree is never explicitly deleted).
+func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error {
+	if spaceId == s.tsp.SpaceId() {
+		return s.tsp.DeleteTree(ctx, spaceId, treeId)
+	}
+	return s.storeFor(spaceId).DeleteTree(ctx, treeId)
+}
+
+// Compile-time check that we satisfy the registry contract.
+var _ anysyncx.SpaceRegistry = (*Service)(nil)
 
 // mapStatus collapses (localStatus, remoteStatus) into the public
 // space.Status enum.

@@ -277,6 +277,52 @@ func (s *Store) Drop(objectId string) {
 	delete(s.restored, objectId)
 }
 
+// PutTreeFromPayload binds a tree delivered by a remote peer.
+// Used by the SpaceRegistry's PutTree route — any-sync's space-sync
+// delivers a TreeStorageCreatePayload for a tree we don't have
+// locally yet. Falls back to BuildTree on ErrTreeExists, matching
+// the Derive idempotency contract.
+func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.TreeStorageCreatePayload) (*object.Object, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
+	}
+	objectId := payload.RootRawChange.Id
+	obj, err := s.bind(ctx, handle, objectId, &payload)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.coldRestoreOnce(ctx, objectId, obj); err != nil {
+		return nil, err
+	}
+	return obj, nil
+}
+
+// DeleteTree marks the underlying any-sync tree as deleted and drops
+// the cached *object.Object. Wired into the SpaceRegistry's
+// DeleteTree route so the deletion-manager's per-tree cleanup pass
+// removes both the any-sync storage flag and our in-memory state.
+//
+// any-store rows for the deleted object are NOT cleaned up — same
+// rationale as Drop: queries skip tombstones, ids are content-
+// addressable.
+func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
+	obj, err := s.Get(ctx, treeId)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: load %s: %w", treeId, err)
+	}
+	tree := obj.Tree()
+	if tree == nil {
+		s.Drop(treeId)
+		return nil
+	}
+	if err := tree.Delete(); err != nil {
+		return fmt.Errorf("spaceobjects: tree.Delete %s: %w", treeId, err)
+	}
+	s.Drop(treeId)
+	return nil
+}
+
 // Get returns the *object.Object for objectId, lazy-loading on first
 // access. The space is acquired through the App's space cache; the
 // per-object Controller is built once and reused.

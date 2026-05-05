@@ -10,6 +10,7 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/acl/syncacl"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
@@ -440,6 +441,12 @@ type memberWatcher struct {
 	// hasn't moved.
 	profilesDirty bool
 
+	// kickCh is signalled by UpdateAcl (called by syncacl on every ACL
+	// record add — local OR pushed from peers) so the watcher tick fires
+	// immediately rather than waiting up to memberPollInterval. Buffered
+	// 1 so coalesced kicks don't block the syncacl write path.
+	kickCh chan struct{}
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -455,6 +462,7 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 		subs:     make(map[int]func(space.MemberEvent)),
 		snapshot: make(map[string]space.Member),
 		profiles: make(map[string]space.AccountMetadata),
+		kickCh:   make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
 	}
 	// Seed the snapshot AND reconcile the disk collection synchronously
@@ -470,6 +478,12 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 			w.snapshot[m.Identity] = m
 		}
 		_ = w.reconcileCollection(ctx, nil, w.snapshot)
+		// Register as the syncacl AclUpdater so we tick immediately on
+		// every record add. The cast is safe — commonspace.Space.Acl()
+		// returns syncacl.SyncAcl, and our aclList() forwards that.
+		if su, ok := acl.(syncacl.SyncAcl); ok {
+			su.SetAclUpdater(w)
+		}
 	}
 	w.wg.Add(2)
 	go w.loop()
@@ -516,7 +530,25 @@ func (w *memberWatcher) loop() {
 			return
 		case <-t.C:
 			w.tick()
+		case <-w.kickCh:
+			w.tick()
 		}
+	}
+}
+
+// UpdateAcl satisfies headupdater.AclUpdater. Called by syncacl
+// synchronously after every ACL record add — local AcceptRequest /
+// CreateInvite as well as pushed records from peers. We coalesce by
+// buffered channel so the syncacl write path stays non-blocking.
+//
+// Without this hook the watcher only ticks on memberPollInterval, so a
+// fast local stack can collapse a join+accept into a single observed
+// head and emit only Added(Active) — losing the intermediate
+// Added(Joining) event subscribers care about.
+func (w *memberWatcher) UpdateAcl(_ list.AclList) {
+	select {
+	case w.kickCh <- struct{}{}:
+	default:
 	}
 }
 

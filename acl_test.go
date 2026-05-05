@@ -252,6 +252,22 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	assert.Equal(t, joiner.Account().Id(), joinReq.Identity)
 	assert.NotEmpty(t, joinReq.RecordId)
 
+	// Wait for the watcher to fire Added(Joining) BEFORE accepting.
+	// Otherwise on a fast local stack the AcceptRequest can land between
+	// two 250ms ticks of the watcher, the head jumps directly to
+	// joiner=Active, and the firehose only emits a single Added(Active)
+	// event — losing the intermediate Joining state observers care about.
+	require.Eventually(t, func() bool {
+		for _, ev := range collectedEvents() {
+			if ev.Member.Identity == joiner.Account().Id() &&
+				ev.Kind == space.MemberEventAdded &&
+				ev.Member.Status == space.MemberStatusJoining {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 50*time.Millisecond, "watcher never observed the joining state")
+
 	// 5. Owner accepts with PermissionWriter. AcceptRequest both pushes
 	// the record to consensus AND updates the owner's local AclList
 	// synchronously, so Members().List should reflect the new member

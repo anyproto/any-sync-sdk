@@ -2,9 +2,11 @@ package anysyncx
 
 import (
 	"context"
+	"time"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace/peermanager"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/net/peer"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/streampool"
@@ -28,17 +30,92 @@ func (p *peerManagerProvider) NewPeerManager(_ context.Context, spaceId string) 
 // spacePeerManager resolves nodes via nodeconf and ships messages
 // through the StreamPool for reactive push-based sync.
 type spacePeerManager struct {
-	spaceId    string
-	nodeConf   nodeconf.Service
-	pool       pool.Pool
-	streamPool streampool.StreamPool
+	spaceId         string
+	nodeConf        nodeconf.Service
+	pool            pool.Pool
+	streamPool      streampool.StreamPool
+	subscribeMsgRaw []byte
+
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 func (m *spacePeerManager) Init(a *app.App) error {
 	m.nodeConf = a.MustComponent(nodeconf.CName).(nodeconf.Service)
 	m.pool = a.MustComponent(pool.CName).(pool.Pool)
 	m.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
+	sub := &spacesyncproto.SpaceSubscription{
+		SpaceIds: []string{m.spaceId},
+		Action:   spacesyncproto.SpaceSubscriptionAction_Subscribe,
+	}
+	payload, err := sub.MarshalVT()
+	if err != nil {
+		return err
+	}
+	m.subscribeMsgRaw = payload
+	m.runCtx, m.runCancel = context.WithCancel(context.Background())
 	return nil
+}
+
+// Run / Close make spacePeerManager an app.ComponentRunnable so the
+// per-space app starts the subscribe loop on Start and tears it down
+// on Close.
+func (m *spacePeerManager) Run(_ context.Context) error {
+	go m.subscribeLoop()
+	return nil
+}
+
+func (m *spacePeerManager) Close(_ context.Context) error {
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+	return nil
+}
+
+// subscribeLoop fast-retries SpaceSubscription_Subscribe to sync nodes
+// until peers are reachable, then settles to a slow refresh tick.
+//
+// Why we need this beyond diffsyncer's KeepAlive:
+//   - any-sync's diffsyncer calls KeepAlive only at the END of a
+//     successful Sync round. The first periodic tick fires immediately
+//     on space load — but at that moment DNS / dial often hasn't
+//     settled yet, so GetResponsiblePeers errors out and Sync returns
+//     before reaching KeepAlive.
+//   - Without our own loop, the next subscribe attempt is the second
+//     headsync tick at SyncPeriod (~30s), so any ACL push (e.g. a
+//     joiner's RequestJoin) sent in that window is missed and only
+//     surfaces via the periodic pull.
+//
+// The loop is best-effort: BroadcastMessage failures are silently
+// ignored — if peers aren't connected yet, the next iteration retries.
+// Once peers are reachable, the message hits all of them via the
+// streampool's existing-or-newly-opened streams.
+func (m *spacePeerManager) subscribeLoop() {
+	delays := []time.Duration{
+		200 * time.Millisecond,
+		500 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+	}
+	const slowTick = 30 * time.Second
+	for i := 0; ; i++ {
+		var d time.Duration
+		if i < len(delays) {
+			d = delays[i]
+		} else {
+			d = slowTick
+		}
+		select {
+		case <-m.runCtx.Done():
+			return
+		case <-time.After(d):
+		}
+		ctx, cancel := context.WithTimeout(m.runCtx, 10*time.Second)
+		m.KeepAlive(ctx)
+		cancel()
+	}
 }
 
 func (m *spacePeerManager) Name() string { return peermanager.CName }
@@ -88,4 +165,17 @@ func (m *spacePeerManager) SendMessage(ctx context.Context, peerId string, msg d
 	})
 }
 
-func (m *spacePeerManager) KeepAlive(_ context.Context) {}
+// KeepAlive (re)broadcasts a SpaceSubscription_Subscribe so sync nodes
+// keep our spaceId tagged on their outbound streams to us. Without this
+// we only get push for spaces that were registered when the stream
+// first opened — a fresh-Created space loaded after the stream was
+// opened (e.g. by coordinator/nodeconf traffic) would otherwise wait
+// for the next headsync periodic pull (SyncPeriod=30s) to see ACL
+// updates. Called by diffsyncer at the end of every headsync cycle.
+func (m *spacePeerManager) KeepAlive(ctx context.Context) {
+	if len(m.subscribeMsgRaw) == 0 {
+		return
+	}
+	msg := &spacesyncproto.ObjectSyncMessage{Payload: m.subscribeMsgRaw}
+	_ = m.BroadcastMessage(ctx, msg)
+}

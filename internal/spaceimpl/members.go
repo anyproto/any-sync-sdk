@@ -565,10 +565,15 @@ func (w *memberWatcher) tick() {
 	// in-memory firehose is independent.
 	_ = w.reconcileCollection(ctx, prev, next)
 
-	// Emit add / change events for the new view.
+	// Emit add / change events for the new view. Track newcomers so we
+	// can pull their identityRepo profile right away — without this the
+	// join-time fallback name lingers until the next slow profileLoop
+	// tick (up to identityRepoPollInterval).
+	var newcomers []string
 	for id, m := range next {
 		old, existed := prev[id]
 		if !existed {
+			newcomers = append(newcomers, id)
 			fanout(subs, space.MemberEvent{
 				Kind:   space.MemberEventAdded,
 				Member: m,
@@ -583,6 +588,9 @@ func (w *memberWatcher) tick() {
 				Previous: &oldCopy,
 			})
 		}
+	}
+	if len(newcomers) > 0 {
+		go w.fetchProfilesFor(context.Background(), newcomers)
 	}
 	// Emit remove events for identities that disappeared.
 	for id, old := range prev {
@@ -702,18 +710,25 @@ func (w *memberWatcher) profileLoop() {
 // our SDK exposes elsewhere. Build the request in strkey form and
 // reverse-map responses back to PeerId via a per-call lookup table.
 func (w *memberWatcher) fetchProfilesOnce(ctx context.Context) {
-	app := w.api.s.app
-	if app == nil || app.Coordinator() == nil {
-		return
-	}
-	// Snapshot the current member ids and convert PeerId → strkey
-	// + extract the pubkey (we need it later for signature verify).
 	w.mu.Lock()
 	peerIds := make([]string, 0, len(w.snapshot))
 	for id := range w.snapshot {
 		peerIds = append(peerIds, id)
 	}
 	w.mu.Unlock()
+	w.fetchProfilesFor(ctx, peerIds)
+}
+
+// fetchProfilesFor pulls identityRepo profiles for the given peerIds.
+// Same merge semantics as fetchProfilesOnce — sets profilesDirty so the
+// next tick rebuilds the snapshot. Used to flip a newly-added member's
+// fallback display name to the live profile without waiting up to
+// identityRepoPollInterval.
+func (w *memberWatcher) fetchProfilesFor(ctx context.Context, peerIds []string) {
+	app := w.api.s.app
+	if app == nil || app.Coordinator() == nil {
+		return
+	}
 	if len(peerIds) == 0 {
 		return
 	}

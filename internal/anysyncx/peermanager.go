@@ -43,8 +43,20 @@ func (m *spacePeerManager) Init(a *app.App) error {
 
 func (m *spacePeerManager) Name() string { return peermanager.CName }
 
+// GetResponsiblePeers returns a single node peer per call. As a client we
+// only need to diff-sync against one node per cycle; pool.GetOneOf reuses
+// a live connection when possible and otherwise dials a random node from
+// the configured set.
 func (m *spacePeerManager) GetResponsiblePeers(ctx context.Context) ([]peer.Peer, error) {
-	return m.GetNodePeers(ctx)
+	nodeIds := m.nodeConf.NodeIds(m.spaceId)
+	if len(nodeIds) == 0 {
+		return nil, nil
+	}
+	p, err := m.pool.GetOneOf(ctx, nodeIds)
+	if err != nil {
+		return nil, err
+	}
+	return []peer.Peer{p}, nil
 }
 
 func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error) {

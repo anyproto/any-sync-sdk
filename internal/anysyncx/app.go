@@ -9,6 +9,7 @@ import (
 	"github.com/anyproto/any-sync/app/debugstat"
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace"
+	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/nodeconfsource"
@@ -35,6 +36,7 @@ type App struct {
 	spaceService commonspace.SpaceService
 	coord        coordinatorclient.CoordinatorClient
 	streamPool   streampool.StreamPool
+	joining      aclclient.AclJoiningClient
 
 	sync    *spaceSyncHandler
 	tree    *treeManagerAdapter
@@ -90,7 +92,8 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(storage).
 		Register(tree).
 		Register(syncqueues.New()).
-		Register(commonspace.New())
+		Register(commonspace.New()).
+		Register(aclclient.NewAclJoiningClient())
 
 	if err := a.Start(ctx); err != nil {
 		return nil, fmt.Errorf("anysyncx: app start: %w", err)
@@ -101,6 +104,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		spaceService: a.MustComponent(commonspace.CName).(commonspace.SpaceService),
 		coord:        a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient),
 		streamPool:   a.MustComponent(streampool.CName).(streampool.StreamPool),
+		joining:      a.MustComponent(aclclient.CName).(aclclient.AclJoiningClient),
 		sync:         sync,
 		tree:         tree,
 		storage:      storage,
@@ -134,6 +138,11 @@ func (a *App) Coordinator() coordinatorclient.CoordinatorClient { return a.coord
 // StreamPool is the outbound DRPC stream pool. The space layer uses it
 // to send SpaceSubscription messages when a new space loads.
 func (a *App) StreamPool() streampool.StreamPool { return a.streamPool }
+
+// JoiningClient is the account-level ACL client used to send
+// RequestJoin / CancelJoin RPCs to the coordinator+nodes for a space
+// the caller is not yet a member of.
+func (a *App) JoiningClient() aclclient.AclJoiningClient { return a.joining }
 
 // AccountKeys holds the decoded peer/sign keys.
 func (a *App) AccountKeys() *accountdata.AccountKeys { return a.keys }

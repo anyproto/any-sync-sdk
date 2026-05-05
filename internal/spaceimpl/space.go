@@ -22,21 +22,26 @@ import (
 // first access — they're cheap structs that delegate back to the
 // store for actual work.
 type spaceImpl struct {
-	id    string
-	app   *anysyncx.App
-	tsp   *techspace.Service
-	store *spaceobjects.Store
+	id     string
+	app    *anysyncx.App
+	tsp    *techspace.Service
+	store  *spaceobjects.Store
+	parent *Service
 
 	objects    *objectService
 	types      *typesAPI
 	properties *propertiesAPI
+	acl        *aclAPI
+	members    *membersAPI
 }
 
-func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *spaceobjects.Store) *spaceImpl {
-	s := &spaceImpl{id: id, app: app, tsp: tsp, store: store}
+func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *spaceobjects.Store, parent *Service) *spaceImpl {
+	s := &spaceImpl{id: id, app: app, tsp: tsp, store: store, parent: parent}
 	s.objects = newObjectService(s)
 	s.types = newTypesAPI(s)
 	s.properties = newPropertiesAPI(s)
+	s.acl = newACLAPI(s)
+	s.members = newMembersAPI(s)
 	return s
 }
 
@@ -62,10 +67,11 @@ func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
 func (s *spaceImpl) Types() space.TypesAPI           { return s.types }
 func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
 
-// Sub-APIs not wired in MVP. Return nil for interfaces; methods
-// returning errors are stubbed elsewhere on this type.
-func (s *spaceImpl) ACL() space.ACL                  { return nil }
-func (s *spaceImpl) Members() space.MembersAPI       { return nil }
+func (s *spaceImpl) ACL() space.ACL            { return s.acl }
+func (s *spaceImpl) Members() space.MembersAPI { return s.members }
+
+// SyncStatus is not yet wired in MVP — returned as nil; interface
+// stubbed elsewhere.
 func (s *spaceImpl) SyncStatus() space.SyncStatusAPI { return nil }
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.

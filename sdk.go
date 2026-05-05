@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
@@ -81,7 +82,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
 
-	account := newAccountImpl(app)
+	account := newAccountImpl(app, spaces)
 
 	return &SDK{
 		app:     app,
@@ -127,14 +128,19 @@ type AccountAPI interface {
 	UpdateMetadata(ctx context.Context, meta space.AccountMetadata) error
 }
 
-// accountImpl is a placeholder: Id() returns the account's libp2p-
-// style PeerId. UpdateMetadata is not yet wired (identityRepo
-// integration is groomed in its own pass).
+// accountImpl exposes the account-level surface. Id() returns the
+// account's libp2p-style PeerId; UpdateMetadata pushes the profile
+// to identityRepo and kicks every running members watcher so the new
+// profile becomes visible across already-loaded spaces without
+// waiting for the slow tick.
 type accountImpl struct {
-	app *anysyncx.App
+	app    *anysyncx.App
+	spaces *spaceimpl.Service
 }
 
-func newAccountImpl(app *anysyncx.App) *accountImpl { return &accountImpl{app: app} }
+func newAccountImpl(app *anysyncx.App, spaces *spaceimpl.Service) *accountImpl {
+	return &accountImpl{app: app, spaces: spaces}
+}
 
 func (a *accountImpl) Id() string {
 	keys := a.app.AccountKeys()
@@ -144,6 +150,48 @@ func (a *accountImpl) Id() string {
 	return keys.SignKey.GetPublic().PeerId()
 }
 
-func (a *accountImpl) UpdateMetadata(_ context.Context, _ space.AccountMetadata) error {
-	return errors.New("anysyncsdk: UpdateMetadata not implemented")
+// UpdateMetadata publishes the account's profile (name / description /
+// icon CID) to identityRepo. The bytes are signed with the account
+// signing key so other peers can verify authenticity at fetch time.
+//
+// Kind is "anysync-sdk.profile" — namespaced separately from
+// anytype-heart's "profile" record because the on-the-wire format
+// differs (this SDK uses a flat NUL-separated layout; heart uses an
+// encrypted protobuf). Switching consumers between the two would
+// require explicit format negotiation, which is out of scope.
+//
+// Any-store the encoded plaintext locally? Not yet — the fetcher
+// reads its own profile back from identityRepo on next poll, same as
+// any other member. Skipping the local cache keeps the code small.
+func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMetadata) error {
+	keys := a.app.AccountKeys()
+	if keys == nil {
+		return errors.New("anysyncsdk: UpdateMetadata: no account keys")
+	}
+	payload := space.EncodeAccountMetadata(meta)
+	if len(payload) == 0 {
+		return errors.New("anysyncsdk: UpdateMetadata: empty metadata")
+	}
+	signature, err := keys.SignKey.Sign(payload)
+	if err != nil {
+		return fmt.Errorf("anysyncsdk: sign profile: %w", err)
+	}
+	// identityRepo on the coordinator expects the strkey-encoded
+	// "account address" form for the identity, not the libp2p PeerId
+	// our public Account.Id() returns. Translate at the boundary.
+	identity := keys.SignKey.GetPublic().Account()
+	if err := a.app.Coordinator().IdentityRepoPut(ctx, identity, []*identityrepoproto.Data{{
+		Kind:      space.IdentityProfileKind,
+		Data:      payload,
+		Signature: signature,
+	}}); err != nil {
+		return err
+	}
+	// Kick every running members watcher so the just-published
+	// profile is reflected in their snapshots without waiting for
+	// the periodic identityRepo tick (60s).
+	if a.spaces != nil {
+		a.spaces.KickProfiles(ctx)
+	}
+	return nil
 }

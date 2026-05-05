@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
@@ -83,6 +84,10 @@ type Service struct {
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
+
+	// watchers tracks every active members poller across all loaded
+	// spaceImpls so SDK shutdown can drain them deterministically.
+	watchers watcherRegistry
 }
 
 // New returns a Service ready to be returned via SDK.Spaces(). The
@@ -178,7 +183,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err
 	}
-	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId)), nil
+	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
 }
 
 // Get returns a handle to a known space.
@@ -186,7 +191,7 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
 		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
 	}
-	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId)), nil
+	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
 }
 
 // List returns the space-index snapshot.
@@ -219,21 +224,150 @@ func (s *Service) Subscribe(_ func(space.SpaceListEvent)) (cancel func()) {
 	return func() {}
 }
 
-func (s *Service) Join(_ context.Context, _ space.JoinRequest) (space.Space, error) {
-	return nil, errors.New("spaceimpl: Join not implemented")
+// Derive creates (or rehydrates) a deterministic space from req.Seed.
+// The same (account, seed) pair always produces the same spaceId, so
+// repeat calls are idempotent and just return the existing space if
+// it already exists locally.
+func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Space, error) {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
+	}
+	payload := spacepayloads.SpaceDerivePayload{
+		SigningKey:   keys.SignKey,
+		MasterKey:    keys.SignKey,
+		SpaceType:    space.SpaceTypeRegular,
+		SpacePayload: req.Seed,
+	}
+	spaceId, err := s.app.SpaceService().DeriveId(ctx, payload)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: derive id: %w", err)
+	}
+	if !s.app.SpaceExists(spaceId) {
+		if _, err := s.app.SpaceService().DeriveSpace(ctx, payload); err != nil {
+			return nil, fmt.Errorf("spaceimpl: derive: %w", err)
+		}
+	}
+	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+			Id:           spaceId,
+			Type:         space.SpaceTypeRegular,
+			LocalStatus:  techspace.StatusActive,
+			RemoteStatus: techspace.StatusActive,
+		}); err != nil {
+			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+		}
+	}
+	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+		return nil, err
+	}
+	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
 }
 
-func (s *Service) Derive(_ context.Context, _ space.DeriveRequest) (space.Space, error) {
-	return nil, errors.New("spaceimpl: Derive not implemented")
+// OneToOne returns the derived 1-1 space with otherIdentity, creating
+// it locally if it does not yet exist. Same id regardless of which
+// side called first — both peers land on the same space.
+func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Space, error) {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
+	}
+	otherPk, err := decodeIdentity(otherIdentity)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
+	}
+	spaceId, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
+	}
+	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+			Id:           spaceId,
+			Type:         space.SpaceTypeOneToOne,
+			LocalStatus:  techspace.StatusActive,
+			RemoteStatus: techspace.StatusActive,
+		}); err != nil {
+			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+		}
+	}
+	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+		return nil, err
+	}
+	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
 }
 
-func (s *Service) OneToOne(_ context.Context, _ string) (space.Space, error) {
-	return nil, errors.New("spaceimpl: OneToOne not implemented")
+// ErrJoinPending is returned by Join after a RequestToJoin invite was
+// successfully posted but the owner has not yet accepted. The space
+// is recorded in the tech-space index with LocalStatus=Joining;
+// callers can poll List for the status flip and then call Get.
+var ErrJoinPending = errors.New("spaceimpl: join pending owner approval")
+
+// Join sends a join request via the invite. v1 only supports
+// RequestToJoin invites — AnyoneCanJoin is deferred until any-sync
+// ships v2 of that invite type.
+//
+// Behavior: decode invite, send RequestJoin RPC to the network, write
+// a tech-space record with LocalStatus=Joining. Returns
+// (nil, ErrJoinPending) on success — the joiner doesn't yet have
+// local space storage; that lands after the owner accepts and the
+// space syncs down. Callers poll Service.List for the status flip
+// to StatusActive.
+func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space, error) {
+	if req.Invite == "" {
+		return nil, errors.New("spaceimpl: Join: Invite required")
+	}
+	inv, err := space.DecodeInvite(req.Invite)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: Join: %w", err)
+	}
+	jc := s.app.JoiningClient()
+	if jc == nil {
+		return nil, errors.New("spaceimpl: Join: joining client unavailable")
+	}
+	_, err = jc.RequestJoin(ctx, inv.SpaceId, list.RequestJoinPayload{
+		InviteKey: inv.InviteKey,
+		Metadata:  encodeMetadata(req.Metadata),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: RequestJoin: %w", err)
+	}
+	// Record the pending-join state in the tech space so it shows up
+	// in List with StatusJoining. The actual space object lands after
+	// owner approval + sync.
+	if _, ok := s.tsp.Get(ctx, inv.SpaceId); !ok {
+		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+			Id:           inv.SpaceId,
+			Type:         space.SpaceTypeRegular,
+			LocalStatus:  joiningLocalStatus,
+			RemoteStatus: techspace.StatusActive,
+		}); err != nil {
+			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+		}
+	}
+	return nil, ErrJoinPending
 }
 
-// Close is a no-op — the space cache lives on the App and is closed
-// during App.Close.
-func (s *Service) Close(_ context.Context) error { return nil }
+// joiningLocalStatus is the localStatus value the SDK stamps on a
+// space-index entry while a RequestToJoin is still pending owner
+// approval. Maps to space.StatusJoining via mapStatus.
+const joiningLocalStatus = "joining"
+
+// Close stops per-space subsystems the SDK owns directly — currently
+// just members watchers (one polling goroutine each). The any-sync
+// side of each space is owned by the App's space cache and torn down
+// separately by App.Close.
+func (s *Service) Close(_ context.Context) error {
+	s.watchers.stopAll()
+	return nil
+}
+
+// KickProfiles asks every running members watcher to refetch
+// identityRepo profiles immediately. Called by the SDK after the
+// caller publishes their own profile via Account.UpdateMetadata so
+// the self-view propagates without waiting for the slow tick.
+func (s *Service) KickProfiles(ctx context.Context) {
+	s.watchers.kickProfiles(ctx)
+}
 
 // SpaceRegistry implementation. Routes between the tech-space (which
 // owns its own one-tree index) and regular spaces (which route
@@ -307,6 +441,8 @@ func mapStatus(local, remote string) space.Status {
 		return space.StatusDeleted
 	case remote == techspace.StatusDeleted:
 		return space.StatusRemoteDead
+	case local == joiningLocalStatus:
+		return space.StatusJoining
 	case local == "" && remote == "":
 		return space.StatusUnknown
 	default:

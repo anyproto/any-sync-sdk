@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/anyproto/any-store/v2/anyenc"
+
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
@@ -69,26 +72,71 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 //     Decoupled from the apply lock to avoid the o.mu re-entry
 //     deadlock that synchronous Drain previously hit.
 func (s *Store) afterApplyFor() object.AfterApply {
-	return func(_ context.Context, ch *crdt.Change) {
+	return func(ctx context.Context, ch *crdt.Change) {
 		if ch == nil {
 			return
 		}
+		// Resolve record ids once — both the dispatcher (for the
+		// $set/$unset projection) and the drainer (for shortId-keyed
+		// wakeups) want them. Resolution can fail on malformed input;
+		// when it does we still feed the drainer a generic wakeup to
+		// avoid stuck parked changes.
+		ids, idsErr := crdt.ResolveRecordIds(*ch)
+
 		if s.dispatcher != nil && s.dispatcher.HasSubscribers() {
-			s.dispatcher.Dispatch(ch)
+			rowIds, postValue := s.postValueFor(ctx, ch, ids)
+			s.dispatcher.Dispatch(ch, rowIds, postValue)
 		}
+
 		if ch.Dataset != typetype.DatasetPropertyDefs {
 			return
 		}
-		ids, err := crdt.ResolveRecordIds(*ch)
-		if err != nil {
-			// Resolution failed — fall back to a generic wakeup so
-			// the drainer doesn't miss the signal entirely.
+		if idsErr != nil {
 			s.drainer.Notify(types.DataVersionPair{TypeId: ch.ObjectId})
 			return
 		}
 		for _, id := range ids {
 			s.drainer.Notify(types.DataVersionPair{TypeId: ch.ObjectId, ShortId: id})
 		}
+	}
+}
+
+// postValueFor returns the row-id slice and the per-record post-apply
+// lookup the dispatcher needs to project $inc / $addToSet / etc. ops
+// down to a $set against the merged value.
+//
+// Shared datasets (per-space `objects`): the controller stores all
+// rows under ch.ObjectId regardless of the change's RecordChange.Id;
+// we mirror that here so the wire's EventRecord.Id matches what a
+// follow-up Query on the same dataset returns. Per-object datasets
+// keep the resolved RecordChange ids untouched.
+func (s *Store) postValueFor(ctx context.Context, ch *crdt.Change, ids []string) ([]string, eventbus.PostValueFn) {
+	s.mu.Lock()
+	obj := s.objects[ch.ObjectId]
+	s.mu.Unlock()
+	if obj == nil {
+		return ids, nil
+	}
+	ctrl := obj.Controller()
+	if ctrl == nil {
+		return ids, nil
+	}
+	rowIds := ids
+	if ctrl.IsShared(ch.Dataset) {
+		rowIds = make([]string, len(ids))
+		for i := range rowIds {
+			rowIds[i] = ch.ObjectId
+		}
+	}
+	return rowIds, func(i int) *anyenc.Value {
+		if i < 0 || i >= len(rowIds) {
+			return nil
+		}
+		rowId := rowIds[i]
+		if rowId == "" {
+			return nil
+		}
+		return ctrl.Get(ctx, ch.Dataset, rowId)
 	}
 }
 

@@ -8,12 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/cheggaaa/mb/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/config"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -132,10 +134,19 @@ func TestSDK_Subscribe(t *testing.T) {
 	assert.Equal(t, sp.Id(), propsEv.SpaceId)
 	assert.Equal(t, objectId, propsEv.ObjectId)
 	assert.Equal(t, "objects", propsEv.Dataset)
+	// Wire-shape contract: every event carries the per-change
+	// VersionId and the projected $set/$unset records. The property
+	// firehose must produce the same shape as an explicit subscription
+	// — same change, same projection, just different routing.
+	assert.NotEmpty(t, propsEv.VersionId, "VersionId must be populated")
+	assertProjectedSet(t, propsEv, objectId, []string{typeId, titleProp}, "Casablanca")
 
 	explicitEv := mustReceive(t, explicitSub, 2*time.Second)
 	assert.Equal(t, objectId, explicitEv.ObjectId)
 	assert.Equal(t, "objects", explicitEv.Dataset)
+	assert.Equal(t, propsEv.VersionId, explicitEv.VersionId,
+		"explicit and firehose subs must see the same VersionId for one change")
+	assertProjectedSet(t, explicitEv, objectId, []string{typeId, titleProp}, "Casablanca")
 
 	// Mismatched subs received nothing.
 	assertNoEvent(t, wrongObjSub, 100*time.Millisecond)
@@ -153,9 +164,97 @@ func TestSDK_Subscribe(t *testing.T) {
 	explicitEv2 := mustReceive(t, explicitSub, 2*time.Second)
 	assert.Equal(t, objectId, explicitEv2.ObjectId)
 
+	// Wire-shape on the second write reaches explicitSub with the
+	// new value — confirms the projection still tracks post-apply
+	// state across multiple changes on the same record.
+	assertProjectedSet(t, explicitEv2, objectId, []string{typeId, titleProp}, "Vertigo")
+
 	// Closed subscription's mailbox must return ErrClosed.
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer closeCancel()
 	_, err = propsSub.Mailbox().Wait(closeCtx)
 	assert.ErrorIs(t, err, mb.ErrClosed, "propsSub.Mailbox() should be closed after Close")
+}
+
+// assertProjectedSet checks that ev carries a record (id = rowId)
+// with a $set whose effective target is `path` and whose value
+// string-equals wantValue. Handles both wire forms the SDK ships:
+//
+//   - single-field: Op{Type=$set, Path=path, Payload=value}
+//   - multi-field:  Op{Type=$set, Path=[], Payload={"a.b.c": value, ...}}
+//
+// Tolerates extra ops the SDK may emit (auto-stamps like createdAt /
+// updatedAt) — we only require the user-visible (path, value) to be
+// present.
+func assertProjectedSet(t *testing.T, ev space.Event, rowId string, path []string, wantValue string) {
+	t.Helper()
+	if len(ev.Records) == 0 {
+		t.Fatalf("event has no records: %+v", ev)
+	}
+	var rec *space.EventRecord
+	for i := range ev.Records {
+		if ev.Records[i].Id == rowId {
+			rec = &ev.Records[i]
+			break
+		}
+	}
+	if rec == nil {
+		t.Fatalf("no record for id %s in event: %+v", rowId, ev.Records)
+	}
+	dotted := joinPath(path)
+	for _, op := range rec.Ops {
+		if op.Type != crdt.OpSet {
+			continue
+		}
+		val := opValueForPath(op, path, dotted)
+		if val == nil {
+			continue
+		}
+		got := string(val.GetStringBytes())
+		if got == wantValue {
+			return
+		}
+		t.Fatalf("payload for path %v = %q, want %q", path, got, wantValue)
+	}
+	t.Fatalf("no $set %v=%q op in record %s: %+v", path, wantValue, rowId, rec.Ops)
+}
+
+// opValueForPath resolves the effective value an op writes at the
+// requested path, accounting for the multi-field form. Returns nil
+// when the op doesn't target this path.
+func opValueForPath(op space.EventOp, path []string, dotted string) *anyenc.Value {
+	if len(op.Path) > 0 {
+		if pathsEqual(op.Path, path) {
+			return op.Payload
+		}
+		return nil
+	}
+	// Multi-field form: payload is an object keyed by dotted paths.
+	if op.Payload == nil {
+		return nil
+	}
+	return op.Payload.Get(dotted)
+}
+
+func joinPath(p []string) string {
+	if len(p) == 0 {
+		return ""
+	}
+	out := p[0]
+	for _, seg := range p[1:] {
+		out += "." + seg
+	}
+	return out
+}
+
+func pathsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

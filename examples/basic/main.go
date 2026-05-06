@@ -256,7 +256,7 @@ func pumpEvents(sub space.Subscription) {
 			return // ErrClosed on Close
 		}
 		for _, ev := range events {
-			log.Printf("event %s/%s addSeq=%d", ev.ObjectId, ev.Dataset, ev.AddSeq)
+			log.Printf("event %s/%s versionId=%s records=%d", ev.ObjectId, ev.Dataset, ev.VersionId, len(ev.Records))
 		}
 	}
 }

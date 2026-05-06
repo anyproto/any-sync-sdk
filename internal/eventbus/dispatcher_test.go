@@ -3,11 +3,13 @@ package eventbus
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/cheggaaa/mb/v3"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -60,16 +62,20 @@ func expectClosed(t *testing.T, sub Subscription) {
 }
 
 // changeOn builds a minimal Change for routing tests — only the
-// fields the dispatcher inspects matter (SpaceId/ObjectId/Dataset
-// /AddSeq).
+// fields the dispatcher inspects matter (SpaceId/ObjectId/Dataset),
+// plus a per-test VersionId derived from seq so assertions have a
+// stable identifier on the post-dispatch Event.
 func changeOn(spaceId, objectId, dataset string, seq uint64) *crdt.Change {
 	return &crdt.Change{
-		SpaceId:  spaceId,
-		ObjectId: objectId,
-		Dataset:  dataset,
-		AddSeq:   seq,
+		SpaceId:   spaceId,
+		ObjectId:  objectId,
+		Dataset:   dataset,
+		VersionId: crdt.VersionId(fmt.Sprintf("v%d", seq)),
 	}
 }
+
+// vId returns the VersionId we expect on an event built via changeOn.
+func vId(seq uint64) crdt.VersionId { return crdt.VersionId(fmt.Sprintf("v%d", seq)) }
 
 func TestHasSubscribers_GateOnCounter(t *testing.T) {
 	d := New("space1")
@@ -100,8 +106,8 @@ func TestHasSubscribers_GateOnCounter(t *testing.T) {
 func TestDispatch_NoSubscribers_NoOp(t *testing.T) {
 	d := New("space1")
 	// Nothing to assert beyond "doesn't panic / crash".
-	d.Dispatch(changeOn("space1", "obj1", "data1", 7))
-	d.Dispatch(changeOn("space1", "obj1", ObjectsDataset, 8))
+	d.Dispatch(changeOn("space1", "obj1", "data1", 7), nil, nil)
+	d.Dispatch(changeOn("space1", "obj1", ObjectsDataset, 8), nil, nil)
 }
 
 func TestSubscribe_RoutesByObjectAndDataset(t *testing.T) {
@@ -113,15 +119,15 @@ func TestSubscribe_RoutesByObjectAndDataset(t *testing.T) {
 	subC := d.Subscribe("objA", "data2", 8)
 
 	// Event for (objA, data1) → subA only.
-	d.Dispatch(changeOn("space1", "objA", "data1", 1))
-	if got := recv(t, subA); got.ObjectId != "objA" || got.Dataset != "data1" || got.AddSeq != 1 {
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil)
+	if got := recv(t, subA); got.ObjectId != "objA" || got.Dataset != "data1" || got.VersionId != vId(1) {
 		t.Fatalf("subA unexpected: %+v", got)
 	}
 	expectNoEvent(t, subB)
 	expectNoEvent(t, subC)
 
 	// Event for (objB, data1) → subB only.
-	d.Dispatch(changeOn("space1", "objB", "data1", 2))
+	d.Dispatch(changeOn("space1", "objB", "data1", 2), nil, nil)
 	if got := recv(t, subB); got.ObjectId != "objB" {
 		t.Fatalf("subB unexpected: %+v", got)
 	}
@@ -136,9 +142,9 @@ func TestSubscribeProperties_FirehoseAcrossObjects(t *testing.T) {
 	sub := d.SubscribeProperties(8)
 
 	// Property changes on different objects all land.
-	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 10))
-	d.Dispatch(changeOn("space1", "objB", ObjectsDataset, 11))
-	d.Dispatch(changeOn("space1", "objC", ObjectsDataset, 12))
+	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 10), nil, nil)
+	d.Dispatch(changeOn("space1", "objB", ObjectsDataset, 11), nil, nil)
+	d.Dispatch(changeOn("space1", "objC", ObjectsDataset, 12), nil, nil)
 
 	// Wait coalesces — one call returns the whole batch.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -150,19 +156,19 @@ func TestSubscribeProperties_FirehoseAcrossObjects(t *testing.T) {
 	if len(msgs) != 3 {
 		t.Fatalf("expected 3 events, got %d (%+v)", len(msgs), msgs)
 	}
-	want := map[uint64]bool{10: true, 11: true, 12: true}
+	want := map[crdt.VersionId]bool{vId(10): true, vId(11): true, vId(12): true}
 	for _, ev := range msgs {
-		if !want[ev.AddSeq] {
-			t.Fatalf("unexpected AddSeq=%d", ev.AddSeq)
+		if !want[ev.VersionId] {
+			t.Fatalf("unexpected VersionId=%s", ev.VersionId)
 		}
-		delete(want, ev.AddSeq)
+		delete(want, ev.VersionId)
 	}
 	if len(want) != 0 {
-		t.Fatalf("missing events for AddSeq: %+v", want)
+		t.Fatalf("missing events for VersionId: %+v", want)
 	}
 
 	// Non-properties dataset must NOT fire the firehose.
-	d.Dispatch(changeOn("space1", "objA", "otherDataset", 13))
+	d.Dispatch(changeOn("space1", "objA", "otherDataset", 13), nil, nil)
 	expectNoEvent(t, sub)
 }
 
@@ -177,12 +183,12 @@ func TestSubscribeProperties_AndExplicitObjectsBothFire(t *testing.T) {
 	explicitSub := d.Subscribe("objA", ObjectsDataset, 8)
 	otherObjSub := d.Subscribe("objB", ObjectsDataset, 8)
 
-	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 99))
+	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 99), nil, nil)
 
-	if ev := recv(t, propSub); ev.AddSeq != 99 {
+	if ev := recv(t, propSub); ev.VersionId != vId(99) {
 		t.Fatalf("propSub unexpected: %+v", ev)
 	}
-	if ev := recv(t, explicitSub); ev.AddSeq != 99 {
+	if ev := recv(t, explicitSub); ev.VersionId != vId(99) {
 		t.Fatalf("explicitSub unexpected: %+v", ev)
 	}
 	expectNoEvent(t, otherObjSub)
@@ -195,12 +201,12 @@ func TestMultipleSubsToSamePair_AllReceive(t *testing.T) {
 	sub1 := d.Subscribe("objA", "data1", 8)
 	sub2 := d.Subscribe("objA", "data1", 8)
 
-	d.Dispatch(changeOn("space1", "objA", "data1", 5))
+	d.Dispatch(changeOn("space1", "objA", "data1", 5), nil, nil)
 
-	if recv(t, sub1).AddSeq != 5 {
+	if recv(t, sub1).VersionId != vId(5) {
 		t.Fatalf("sub1 missed event")
 	}
-	if recv(t, sub2).AddSeq != 5 {
+	if recv(t, sub2).VersionId != vId(5) {
 		t.Fatalf("sub2 missed event")
 	}
 }
@@ -234,8 +240,8 @@ func TestSubscriptionClose_StopsDelivery(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 
 	sub := d.Subscribe("objA", "data1", 4)
-	d.Dispatch(changeOn("space1", "objA", "data1", 1))
-	if recv(t, sub).AddSeq != 1 {
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil)
+	if recv(t, sub).VersionId != vId(1) {
 		t.Fatalf("missed pre-close event")
 	}
 
@@ -246,7 +252,7 @@ func TestSubscriptionClose_StopsDelivery(t *testing.T) {
 
 	// Subsequent Dispatch must not panic (closed mb's TryAdd
 	// returns ErrClosed; deliver discards it).
-	d.Dispatch(changeOn("space1", "objA", "data1", 2))
+	d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil)
 }
 
 func TestDispatcherClose_ClosesAllSubs(t *testing.T) {
@@ -298,12 +304,12 @@ func TestDispatch_NonBlockingOnFullMailbox(t *testing.T) {
 
 	sub := d.Subscribe("objA", "data1", 1)
 
-	d.Dispatch(changeOn("space1", "objA", "data1", 1))
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil)
 
 	done := make(chan struct{})
 	go func() {
-		d.Dispatch(changeOn("space1", "objA", "data1", 2)) // would block on full mb; must drop
-		d.Dispatch(changeOn("space1", "objA", "data1", 3)) // also drops
+		d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil) // would block on full mb; must drop
+		d.Dispatch(changeOn("space1", "objA", "data1", 3), nil, nil) // also drops
 		close(done)
 	}()
 	select {
@@ -313,7 +319,7 @@ func TestDispatch_NonBlockingOnFullMailbox(t *testing.T) {
 	}
 
 	// First event lands; later were dropped, surfaced via Dropped().
-	if recv(t, sub).AddSeq != 1 {
+	if recv(t, sub).VersionId != vId(1) {
 		t.Fatalf("first event missed")
 	}
 	expectNoEvent(t, sub)
@@ -328,7 +334,7 @@ func TestDropped_ZeroOnHealthyConsumer(t *testing.T) {
 
 	sub := d.Subscribe("objA", "data1", 16)
 	for i := 0; i < 8; i++ {
-		d.Dispatch(changeOn("space1", "objA", "data1", uint64(i)))
+		d.Dispatch(changeOn("space1", "objA", "data1", uint64(i)), nil, nil)
 	}
 	// Drain.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -355,14 +361,14 @@ func TestDropped_NotIncrementedAfterClose(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 
 	sub := d.Subscribe("objA", "data1", 1)
-	d.Dispatch(changeOn("space1", "objA", "data1", 1)) // fills
-	d.Dispatch(changeOn("space1", "objA", "data1", 2)) // drops → Dropped=1
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil) // fills
+	d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil) // drops → Dropped=1
 	if got := sub.Dropped(); got != 1 {
 		t.Fatalf("Dropped() before Close = %d, want 1", got)
 	}
 	_ = sub.Close()
-	d.Dispatch(changeOn("space1", "objA", "data1", 3))
-	d.Dispatch(changeOn("space1", "objA", "data1", 4))
+	d.Dispatch(changeOn("space1", "objA", "data1", 3), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 4), nil, nil)
 	if got := sub.Dropped(); got != 1 {
 		t.Fatalf("Dropped() = %d after post-Close dispatches, want 1 (frozen)", got)
 	}
@@ -409,7 +415,7 @@ func TestConcurrent_SubscribeDispatchClose_NoRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
-				d.Dispatch(changeOn("space1", "objA", "data1", uint64(j)))
+				d.Dispatch(changeOn("space1", "objA", "data1", uint64(j)), nil, nil)
 			}
 		}()
 	}
@@ -445,7 +451,7 @@ func TestDispatch_NilChange_NoOp(t *testing.T) {
 	d := New("space1")
 	t.Cleanup(func() { _ = d.Close() })
 	_ = d.SubscribeProperties(4) // make sure HasSubscribers passes
-	d.Dispatch(nil)              // no panic
+	d.Dispatch(nil, nil, nil)    // no panic
 }
 
 func TestSubscription_BatchDelivery(t *testing.T) {
@@ -456,7 +462,7 @@ func TestSubscription_BatchDelivery(t *testing.T) {
 
 	sub := d.SubscribeProperties(64)
 	for i := 0; i < 10; i++ {
-		d.Dispatch(changeOn("space1", "objA", ObjectsDataset, uint64(i)))
+		d.Dispatch(changeOn("space1", "objA", ObjectsDataset, uint64(i)), nil, nil)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -468,4 +474,166 @@ func TestSubscription_BatchDelivery(t *testing.T) {
 	if len(msgs) != 10 {
 		t.Fatalf("expected 10 batched events in one Wait, got %d", len(msgs))
 	}
+}
+
+// TestDispatch_ProjectsRecordsToSetUnset is the contract for the
+// $set/$unset wire shape: every input op has to come out as either a
+// $set with the post-apply value at that path or a $unset, and a
+// record-level delete collapses to EventRecord.Deleted with no ops.
+//
+// We simulate the apply side (post-apply value lookup) with an
+// in-memory map keyed by record index — the dispatcher doesn't care
+// where the value came from, only that PostValueFn returns it.
+func TestDispatch_ProjectsRecordsToSetUnset(t *testing.T) {
+	d := New("space1")
+	t.Cleanup(func() { _ = d.Close() })
+
+	sub := d.Subscribe("objA", "data1", 8)
+
+	a := &anyenc.Arena{}
+	post := a.NewObject()
+	// post-apply state: { count: 7, tags: ["new", "hot"], leftover: "x" }
+	post.Set("count", a.NewNumberInt(7))
+	tags := a.NewArray()
+	tags.SetArrayItem(0, a.NewString("new"))
+	tags.SetArrayItem(1, a.NewString("hot"))
+	post.Set("tags", tags)
+	post.Set("leftover", a.NewString("x"))
+
+	ch := &crdt.Change{
+		SpaceId:   "space1",
+		ObjectId:  "objA",
+		Dataset:   "data1",
+		AddSeq:    42,
+		VersionId: crdt.VersionId("v-001"),
+		ChangeId:  "ch-abc",
+		Records: []crdt.RecordChange{
+			{
+				Id: "r-keep",
+				Ops: []crdt.Op{
+					{Type: crdt.OpInc, Path: []string{"count"}, Payload: a.NewNumberInt(1)},
+					{Type: crdt.OpAddToSet, Path: []string{"tags"}, Payload: a.NewString("hot")},
+					{Type: crdt.OpSet, Path: []string{"leftover"}, Payload: a.NewString("x")},
+					{Type: crdt.OpUnset, Path: []string{"missing"}},
+				},
+			},
+			{
+				Id:  "r-gone",
+				Ops: []crdt.Op{{Type: crdt.OpDelete}},
+			},
+		},
+	}
+
+	resolvedIds := []string{"r-keep", "r-gone"}
+	postValue := func(i int) *anyenc.Value {
+		if i == 0 {
+			return post
+		}
+		return nil // r-gone is tombstoned — no post value
+	}
+
+	d.Dispatch(ch, resolvedIds, postValue)
+	got := recv(t, sub)
+
+	if got.VersionId != "v-001" {
+		t.Errorf("VersionId = %q, want v-001", got.VersionId)
+	}
+	if len(got.Records) != 2 {
+		t.Fatalf("got %d records, want 2: %+v", len(got.Records), got.Records)
+	}
+
+	// Record 0: r-keep, with projected ops.
+	r0 := got.Records[0]
+	if r0.Id != "r-keep" || r0.Deleted {
+		t.Errorf("record 0 unexpected: %+v", r0)
+	}
+	if len(r0.Ops) != 4 {
+		t.Fatalf("record 0 ops count = %d, want 4: %+v", len(r0.Ops), r0.Ops)
+	}
+	// $inc → $set with the post value.
+	if r0.Ops[0].Type != crdt.OpSet || pathOf(r0.Ops[0]) != "count" {
+		t.Errorf("op[0] not $set count: %+v", r0.Ops[0])
+	}
+	if got, want := r0.Ops[0].Payload.GetInt(), 7; got != want {
+		t.Errorf("op[0] payload = %d, want %d", got, want)
+	}
+	// $addToSet → $set with the new array.
+	if r0.Ops[1].Type != crdt.OpSet || pathOf(r0.Ops[1]) != "tags" {
+		t.Errorf("op[1] not $set tags: %+v", r0.Ops[1])
+	}
+	if arr := r0.Ops[1].Payload.GetArray(); len(arr) != 2 {
+		t.Errorf("op[1] tags len = %d, want 2", len(arr))
+	}
+	// $set passes through.
+	if r0.Ops[2].Type != crdt.OpSet || pathOf(r0.Ops[2]) != "leftover" {
+		t.Errorf("op[2] not $set leftover: %+v", r0.Ops[2])
+	}
+	// $unset passes through.
+	if r0.Ops[3].Type != crdt.OpUnset || pathOf(r0.Ops[3]) != "missing" {
+		t.Errorf("op[3] not $unset missing: %+v", r0.Ops[3])
+	}
+
+	// Record 1: r-gone, deleted, no ops.
+	r1 := got.Records[1]
+	if r1.Id != "r-gone" || !r1.Deleted || len(r1.Ops) != 0 {
+		t.Errorf("record 1 should be deleted with no ops: %+v", r1)
+	}
+}
+
+// TestDispatch_PayloadOutlivesArena guarantees the Op.Payload pointers
+// on the Event don't alias the post-apply arena that produced them.
+// If they did, a subsequent reset of that arena (or buffer reuse on
+// the next apply) would silently corrupt the consumer's view.
+func TestDispatch_PayloadOutlivesArena(t *testing.T) {
+	d := New("space1")
+	t.Cleanup(func() { _ = d.Close() })
+
+	sub := d.SubscribeProperties(8)
+
+	a := &anyenc.Arena{}
+	post := a.NewObject()
+	post.Set("title", a.NewString("Casablanca"))
+
+	ch := &crdt.Change{
+		SpaceId:  "space1",
+		ObjectId: "objA",
+		Dataset:  ObjectsDataset,
+		Records: []crdt.RecordChange{{
+			Id: "objA",
+			Ops: []crdt.Op{{
+				Type:    crdt.OpInc,
+				Path:    []string{"title"}, // bogus inc on a string — the projector still derives the post value.
+				Payload: a.NewNumberInt(1),
+			}},
+		}},
+	}
+
+	d.Dispatch(ch, []string{"objA"}, func(i int) *anyenc.Value {
+		return post
+	})
+	got := recv(t, sub)
+
+	// Recycle the source arena — if the projection didn't deep-copy,
+	// reading got's Payload below would pull whatever the arena now holds.
+	a.Reset()
+	a.NewString("ZZZZZZZ")
+
+	if len(got.Records) != 1 || len(got.Records[0].Ops) != 1 {
+		t.Fatalf("event shape unexpected: %+v", got.Records)
+	}
+	if v := string(got.Records[0].Ops[0].Payload.GetStringBytes()); v != "Casablanca" {
+		t.Fatalf("payload aliasing: got %q, want Casablanca", v)
+	}
+}
+
+// pathOf is a tiny stringifier for op-path assertions.
+func pathOf(op EventOp) string {
+	if len(op.Path) == 0 {
+		return ""
+	}
+	out := op.Path[0]
+	for _, seg := range op.Path[1:] {
+		out += "." + seg
+	}
+	return out
 }

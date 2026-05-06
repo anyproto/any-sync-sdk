@@ -194,6 +194,18 @@ func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value 
 	return cloneValue(doc.Value())
 }
 
+// IsShared reports whether the dataset uses a per-space shared
+// collection (write-side rule: row id = ObjectId, not RecordChange.Id).
+// Subscribers projecting changes back to a path-based wire need this
+// to look up the right post-apply row.
+func (c *Controller) IsShared(dataset string) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := c.shared[dataset]
+	return ok
+}
+
 // Records returns all live (non-tombstone) records in the dataset.
 //
 // Each value is cloned off the iterator's reusable buffer onto its

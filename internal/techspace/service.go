@@ -114,7 +114,7 @@ func (s *Service) Open(ctx context.Context) error {
 		return fmt.Errorf("techspace: open index collection: %w", err)
 	}
 
-	ctrl, err := crdt.NewController(ctx, s.indexId, s.db, SpaceIndexHandler{})
+	ctrl, err := crdt.NewController(ctx, s.indexId, s.db, SpaceIndexHandler{}, ProfileHandler{})
 	if err != nil {
 		return fmt.Errorf("techspace: new controller: %w", err)
 	}
@@ -271,6 +271,49 @@ func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
 		out = append(out, DecodeSpaceIndexRecord(v))
 	}
 	return out
+}
+
+// GetProfile returns the locally-stored profile (the source-of-truth
+// the SDK pushes to identityRepo on boot). The second return is true
+// when a profile has ever been written; false on a fresh device that
+// hasn't seen UpdateMetadata yet.
+func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
+	if !s.open {
+		return ProfileRecord{}, false
+	}
+	v := s.ctrl.Get(ctx, ProfileDataset, ProfileSelfId)
+	if v == nil {
+		return ProfileRecord{}, false
+	}
+	return DecodeProfileRecord(v), true
+}
+
+// SetProfile writes (or replaces) the local profile row. Called by
+// Account.UpdateMetadata to persist the value before pushing it to
+// identityRepo, so a subsequent boot can republish without the user
+// re-calling UpdateMetadata.
+func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
+	if !s.open {
+		return errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObject(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     ProfileDataset,
+		DataVersion: ProfileHandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id:     ProfileSelfId,
+				Upsert: true,
+				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: rec.encodeUpsert(arena)}},
+			},
+		},
+	}
+	_, err = obj.LocalWrite(ctx, change)
+	return err
 }
 
 // Close marks the service inactive. Underlying space cleanup happens

@@ -82,7 +82,22 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
 
-	account := newAccountImpl(app, spaces)
+	account := newAccountImpl(app, tsp, spaces)
+
+	// Republish the locally-stored profile to identityRepo on every
+	// boot. Heart's ownProfileSubscription does the equivalent (reads
+	// the local profile object, calls IdentityRepoPut). Without this,
+	// other peers only see our profile after we explicitly call
+	// UpdateMetadata in this process — which never happens for a
+	// freshly-started client that's only re-loading existing state.
+	//
+	// Best-effort: a failed push doesn't prevent SDK use. The next
+	// successful push (next UpdateMetadata or next boot) heals it.
+	if err := account.republishStoredProfile(ctx); err != nil {
+		// Log via the any-sync log? We don't have one wired here.
+		// Swallow — Open succeeds; the rest of the SDK is functional.
+		_ = err
+	}
 
 	return &SDK{
 		app:     app,
@@ -129,17 +144,18 @@ type AccountAPI interface {
 }
 
 // accountImpl exposes the account-level surface. Id() returns the
-// account's libp2p-style PeerId; UpdateMetadata pushes the profile
-// to identityRepo and kicks every running members watcher so the new
-// profile becomes visible across already-loaded spaces without
-// waiting for the slow tick.
+// account's libp2p-style PeerId; UpdateMetadata persists the profile
+// to the tech-space and pushes to identityRepo, then kicks every
+// running members watcher so the new profile becomes visible across
+// already-loaded spaces without waiting for the slow tick.
 type accountImpl struct {
 	app    *anysyncx.App
+	tsp    *techspace.Service
 	spaces *spaceimpl.Service
 }
 
-func newAccountImpl(app *anysyncx.App, spaces *spaceimpl.Service) *accountImpl {
-	return &accountImpl{app: app, spaces: spaces}
+func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl.Service) *accountImpl {
+	return &accountImpl{app: app, tsp: tsp, spaces: spaces}
 }
 
 func (a *accountImpl) Id() string {
@@ -164,27 +180,25 @@ func (a *accountImpl) Id() string {
 // reads its own profile back from identityRepo on next poll, same as
 // any other member. Skipping the local cache keeps the code small.
 func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMetadata) error {
-	keys := a.app.AccountKeys()
-	if keys == nil {
+	if a.app.AccountKeys() == nil {
 		return errors.New("anysyncsdk: UpdateMetadata: no account keys")
 	}
-	payload := space.EncodeAccountMetadata(meta)
-	if len(payload) == 0 {
+	if space.EncodeAccountMetadata(meta) == nil {
 		return errors.New("anysyncsdk: UpdateMetadata: empty metadata")
 	}
-	signature, err := keys.SignKey.Sign(payload)
-	if err != nil {
-		return fmt.Errorf("anysyncsdk: sign profile: %w", err)
+	// Persist locally first so a future boot can republish without
+	// the user re-supplying the metadata. Tech-space writes are
+	// owner-only and cheap (single CRDT row).
+	if a.tsp != nil {
+		if err := a.tsp.SetProfile(ctx, techspace.ProfileRecord{
+			Name:        meta.Name,
+			Description: meta.Description,
+			IconCID:     meta.IconCID,
+		}); err != nil {
+			return fmt.Errorf("anysyncsdk: persist profile: %w", err)
+		}
 	}
-	// identityRepo on the coordinator expects the strkey-encoded
-	// "account address" form for the identity, not the libp2p PeerId
-	// our public Account.Id() returns. Translate at the boundary.
-	identity := keys.SignKey.GetPublic().Account()
-	if err := a.app.Coordinator().IdentityRepoPut(ctx, identity, []*identityrepoproto.Data{{
-		Kind:      space.IdentityProfileKind,
-		Data:      payload,
-		Signature: signature,
-	}}); err != nil {
+	if err := a.pushToIdentityRepo(ctx, meta); err != nil {
 		return err
 	}
 	// Kick every running members watcher so the just-published
@@ -194,4 +208,47 @@ func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMeta
 		a.spaces.KickProfiles(ctx)
 	}
 	return nil
+}
+
+// republishStoredProfile reads the locally-stored profile (if any) and
+// pushes it to identityRepo. Called on SDK boot to mirror heart's
+// ownProfileSubscription.Run path. No-op when no profile has been
+// written yet (fresh device, never called UpdateMetadata).
+func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
+	if a.tsp == nil {
+		return nil
+	}
+	rec, ok := a.tsp.GetProfile(ctx)
+	if !ok || rec.IsEmpty() {
+		return nil
+	}
+	return a.pushToIdentityRepo(ctx, space.AccountMetadata{
+		Name:        rec.Name,
+		Description: rec.Description,
+		IconCID:     rec.IconCID,
+	})
+}
+
+// pushToIdentityRepo signs and uploads the profile bytes to the
+// coordinator's identityRepo. Returns the raw error from the RPC so
+// callers can decide whether to surface it.
+func (a *accountImpl) pushToIdentityRepo(ctx context.Context, meta space.AccountMetadata) error {
+	keys := a.app.AccountKeys()
+	payload := space.EncodeAccountMetadata(meta)
+	if len(payload) == 0 {
+		return nil
+	}
+	signature, err := keys.SignKey.Sign(payload)
+	if err != nil {
+		return fmt.Errorf("anysyncsdk: sign profile: %w", err)
+	}
+	// identityRepo on the coordinator expects the strkey-encoded
+	// "account address" form for the identity, not the libp2p PeerId
+	// our public Account.Id() returns. Translate at the boundary.
+	identity := keys.SignKey.GetPublic().Account()
+	return a.app.Coordinator().IdentityRepoPut(ctx, identity, []*identityrepoproto.Data{{
+		Kind:      space.IdentityProfileKind,
+		Data:      payload,
+		Signature: signature,
+	}})
 }

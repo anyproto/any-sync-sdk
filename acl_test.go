@@ -180,6 +180,15 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.NotEqual(t, owner.Account().Id(), joiner.Account().Id(),
 		"owner and joiner must have distinct account ids")
 
+	// Joiner publishes their profile up-front. Mirrors heart's
+	// ownProfileSubscription, which auto-pushes the locally-stored
+	// profile to identityRepo on app boot — so by the time the joiner
+	// asks to join, owner-side fetchProfilesFor (kicked when the new
+	// member appears in the ACL) finds the live profile already there.
+	require.NoError(t, joiner.Account().UpdateMetadata(ctx, space.AccountMetadata{
+		Name: "Joiner Live Name",
+	}))
+
 	// 1. Owner creates a space.
 	sp, err := owner.Spaces().Create(ctx, space.CreateRequest{Name: "E2E"})
 	require.NoError(t, err)
@@ -345,7 +354,11 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, joiner.Account().Id(), doc.GetString("id"))
 	assert.Equal(t, "active", doc.GetString("status"))
-	assert.Equal(t, "Joiner Display Name", doc.GetString("name"))
+	// Name comes from identityRepo via the newcomer-fetch path —
+	// joiner published "Joiner Live Name" before the join, so by the
+	// time the owner's members collection reconciles, the live profile
+	// has overridden the join-time fallback.
+	assert.Equal(t, "Joiner Live Name", doc.GetString("name"))
 
 	// Sorting by id round-trips both rows; just check we got two
 	// distinct ids.
@@ -392,25 +405,18 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 		return err == nil && doc.GetString("name") == "Owner Live Name"
 	}, 5*time.Second, 100*time.Millisecond, "owner profile not visible via Query")
 
-	// Joiner publishes their profile too; owner's view of the
-	// joiner flips from the join-time snapshot ("Joiner Display Name")
-	// to the live profile ("Joiner Live Name"). UpdateMetadata kicks
-	// only the joiner SDK's watchers (no overlap with owner's), so
-	// the owner has to wait for its own slow tick OR the regular
-	// 250 ms tick after the headsync pulls something else — but
-	// since the joiner-side watcher kicks both peers via identityRepo
-	// and the owner's regular tick re-pulls every 60s anyway, we
-	// wait up to 65 s for the owner to see the change.
-	require.NoError(t, joiner.Account().UpdateMetadata(ctx, space.AccountMetadata{
-		Name: "Joiner Live Name",
-	}))
+	// Joiner's profile was published before they asked to join, so the
+	// owner's newcomer-fetch (triggered when joiner first appears in
+	// the ACL snapshot) hit identityRepo immediately and overrode the
+	// join-time fallback name with "Joiner Live Name". Should be visible
+	// quickly — well under the 60s identityRepoPollInterval.
 	require.Eventually(t, func() bool {
 		j, err := sp.Members().Get(ctx, joiner.Account().Id())
 		if err != nil {
 			return false
 		}
 		return j.Name == "Joiner Live Name"
-	}, 65*time.Second, 1*time.Second, "joiner profile override never applied on owner side")
+	}, 5*time.Second, 100*time.Millisecond, "joiner profile override never applied on owner side")
 }
 
 // TestSDK_Spaces_Derive verifies the deterministic-derive surface:

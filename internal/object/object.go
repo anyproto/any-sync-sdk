@@ -333,38 +333,61 @@ func (o *Object) ColdRestore(ctx context.Context) error {
 // Skips the root change (objectId == change.Id) — it carries no CRDT
 // payload, just the tree header. Non-CRDT data types (e.g. settings
 // changes injected by any-sync itself) decode-fail and skip silently.
+//
+// Uses tree.IterateAfterAddSeq so any-sync handles ReadKeyId-based
+// decryption for us — going through the bare storage and reading
+// Change.Data directly returns the encrypted payload, which the SDK
+// codec can't parse (manifests as "unknown type N" anyenc errors and,
+// crucially, silent drops of every inbound change on a fresh joiner /
+// new device). The convert callback receives the already-decrypted
+// bytes; we hand off the parsed Change to the iterate callback via
+// Change.Model.
 func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	rootId := tree.Id()
 	from := o.ctrl.MaxAddSeq()
-	stor := tree.Storage()
 
-	return stor.GetAfterAddSeq(ctx, from, func(_ context.Context, sc objecttree.StorageChange) (bool, error) {
-		if sc.Id == rootId {
-			return true, nil
-		}
-		// Pull the decrypted Change so we have .Data.
-		full, err := tree.GetChange(sc.Id)
-		if err != nil {
-			return true, nil
-		}
-		if len(full.Data) == 0 {
-			return true, nil
-		}
+	// captured outside the iterate closure so we can surface fatal
+	// errors past IterateAfterAddSeq's bool return.
+	var fatalErr error
 
-		decoded, decodeErr := o.codec.Decode(full.Data)
+	convert := func(ch *objecttree.Change, decrypted []byte) (any, error) {
+		// root has no CRDT payload by construction.
+		if ch.Id == rootId {
+			return nil, nil
+		}
+		if len(decrypted) == 0 {
+			return nil, nil
+		}
+		decoded, decodeErr := o.codec.Decode(decrypted)
 		if decodeErr != nil {
-			// Non-CRDT payload (e.g. settings tree change). Skip.
-			return true, nil
+			// Non-CRDT payload (settings-tree change, foreign data
+			// type, etc.) — skip silently. Returning the error here
+			// would halt the entire iteration, which we explicitly
+			// don't want; we want one bad row to not poison the rest.
+			return nil, nil
 		}
+		// any-sync reuses `decrypted` across iterations, so anything we
+		// retain past this callback (the parked-payload bytes for the
+		// schema gate) must be cloned now.
+		raw := append([]byte(nil), decrypted...)
+		return &replayItem{decoded: decoded, raw: raw}, nil
+	}
+
+	iter := func(ch *objecttree.Change) bool {
+		item, ok := ch.Model.(*replayItem)
+		if !ok || item == nil {
+			return true
+		}
+		decoded := item.decoded
 		decoded.SpaceId = o.spaceId
 		decoded.ObjectId = rootId
-		decoded.ChangeId = full.Id
-		decoded.AddSeq = sc.AddSeq
-		decoded.Timestamp = full.Timestamp
-		decoded.VersionId = crdt.VersionId(sc.OrderId)
+		decoded.ChangeId = ch.Id
+		decoded.AddSeq = ch.AddSeq
+		decoded.Timestamp = ch.Timestamp
+		decoded.VersionId = crdt.VersionId(ch.OrderId)
 		// ObjectAuthor / ObjectCreatedAt come from the tree root via
 		// stampObjectMeta inside applyDecodedLocked.
 
@@ -379,12 +402,13 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		// next replay (Update / Rebuild / boot) re-tries the whole
 		// remainder.
 		if o.gate != nil {
-			proceed, gateErr := o.gate(ctx, &decoded, full.Data)
+			proceed, gateErr := o.gate(ctx, &decoded, item.raw)
 			if gateErr != nil {
-				return false, fmt.Errorf("object: gate %s: %w", full.Id, gateErr)
+				fatalErr = fmt.Errorf("object: gate %s: %w", ch.Id, gateErr)
+				return false
 			}
 			if !proceed {
-				return true, nil
+				return true
 			}
 		}
 
@@ -395,10 +419,24 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		// surfaced inside ApplyResult.Rejections, NOT through err, and
 		// don't halt the iter.
 		if _, applyErr := o.applyDecodedLocked(ctx, decoded); applyErr != nil {
-			return false, fmt.Errorf("object: apply %s: %w", full.Id, applyErr)
+			fatalErr = fmt.Errorf("object: apply %s: %w", ch.Id, applyErr)
+			return false
 		}
-		return true, nil
-	})
+		return true
+	}
+
+	if err := tree.IterateAfterAddSeq(ctx, from, convert, iter); err != nil {
+		return err
+	}
+	return fatalErr
+}
+
+// replayItem couples a decoded crdt.Change with the (cloned) decrypted
+// bytes that produced it. The bytes are needed by the schema gate's
+// Park path; the decoded Change is what applyDecodedLocked consumes.
+type replayItem struct {
+	decoded crdt.Change
+	raw     []byte
 }
 
 // ts replaces a zero/negative timestamp with time.Now — matches the

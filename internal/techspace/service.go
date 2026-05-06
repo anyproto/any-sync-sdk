@@ -331,19 +331,29 @@ func (s *Service) Close(_ context.Context) error {
 
 var ErrSpaceRegistryUnknown = errors.New("techspace: unknown (spaceId, treeId)")
 
+// GetTree resolves the index tree with our CRDT controller's listener
+// bound. Anything else under the tech space is unknown.
+//
+// Why a fresh bindIndexObject per call: ocache may TTL-evict the
+// underlying commonspace.Space between calls, which closes the
+// previous tree handle. Each call rebinds the listener onto the
+// currently-loaded tree so the synctree's AddRawChangesFromPeer path
+// fires Update on us — without that the on-disk tree fills up but
+// our space-index controller stays empty (the cold-sync regression
+// surfaced by TestE2E_ColdSyncSameKey).
 func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
 	if spaceId != s.spaceId || treeId != s.indexId {
 		return nil, ErrSpaceRegistryUnknown
 	}
-	handle, err := s.app.GetSpace(ctx, spaceId)
+	obj, err := s.indexObject(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// Use a no-op listener — inbound sync into this tree won't reach
-	// our controller until the next bindIndexObject. This is acceptable
-	// for the tech space: SDK-internal writes are the only writers and
-	// every write rebinds.
-	return handle.Inner().TreeBuilder().BuildTree(ctx, treeId, objecttreebuilder.BuildTreeOpts{})
+	tree := obj.Tree()
+	if tree == nil {
+		return nil, fmt.Errorf("techspace: index tree not bound after indexObject")
+	}
+	return tree, nil
 }
 
 func (s *Service) PutTree(_ context.Context, _ string, _ treestorage.TreeStorageCreatePayload) error {

@@ -163,7 +163,13 @@ func (a *App) HeadCache() *HeadCache { return a.headCache }
 // NewTreeSyncer returns a fresh TreeSyncer instance ready to be passed
 // into commonspace.Deps. One per space; any-sync's commonspace wires
 // it into the per-space app via spacestate during NewSpace.
-func (a *App) NewTreeSyncer() *treeSyncerAdapter { return newTreeSyncer() }
+//
+// Captures the SpaceRegistry currently set on the tree manager so the
+// per-space SyncAll can route through it (this is what hooks the
+// CRDT-controller listener onto inbound trees). NewTreeSyncer is
+// invoked from loadSpaceForCache, which only runs after sdk.Open's
+// SetSpaceRegistry call, so the registry is reliably wired by then.
+func (a *App) NewTreeSyncer() *treeSyncerAdapter { return newTreeSyncer(a.tree.registry) }
 
 // loadAccountKeys decodes the raw seeds from the auth.Provider into
 // any-sync crypto keys. Both keys are required — empty seeds are a

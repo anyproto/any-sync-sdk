@@ -72,25 +72,31 @@ func (m *spacePeerManager) Close(_ context.Context) error {
 	return nil
 }
 
-// subscribeLoop fast-retries SpaceSubscription_Subscribe to sync nodes
-// until peers are reachable, then settles to a slow refresh tick.
+// subscribeLoop publishes SpaceSubscription_Subscribe to sync nodes:
+// once immediately on Run, then a fast-retry ramp, then a slow tick.
 //
-// Why we need this beyond diffsyncer's KeepAlive:
-//   - any-sync's diffsyncer calls KeepAlive only at the END of a
-//     successful Sync round. The first periodic tick fires immediately
-//     on space load — but at that moment DNS / dial often hasn't
-//     settled yet, so GetResponsiblePeers errors out and Sync returns
-//     before reaching KeepAlive.
-//   - Without our own loop, the next subscribe attempt is the second
-//     headsync tick at SyncPeriod (~30s), so any ACL push (e.g. a
-//     joiner's RequestJoin) sent in that window is missed and only
-//     surfaces via the periodic pull.
+// The eager first send is critical for cold-start convergence. Without
+// it, the order is "headsync.Sync → diff → KeepAlive at end of Sync":
+// if the diff happens to query a node that hasn't yet replicated our
+// ACL activation (e.g. a joiner whose accept-record is still in
+// flight across the node cluster), it returns newIds=0 and we wait
+// the next SyncPeriod tick (~30s) for another attempt. Firing
+// Subscribe up front tags us on every reachable node before the diff
+// runs, so the diff response includes our missing trees on the first
+// try. Documented separately because it converts what looks like a
+// 30s/3.4s flake into a deterministic ~3s convergence.
 //
-// The loop is best-effort: BroadcastMessage failures are silently
-// ignored — if peers aren't connected yet, the next iteration retries.
-// Once peers are reachable, the message hits all of them via the
-// streampool's existing-or-newly-opened streams.
+// The fast-retry ramp covers the case where the eager send loses on
+// DNS / dial — once any peer becomes reachable the next iteration
+// hits it. KeepAlive failures are silently swallowed; the loop keeps
+// trying.
+//
+// Beyond cold-start, a slow refresh tick keeps the tagging fresh
+// across stream churn (network blips, server restarts) without
+// pinning the periodic-pull cadence.
 func (m *spacePeerManager) subscribeLoop() {
+	m.broadcastSubscribe()
+
 	delays := []time.Duration{
 		200 * time.Millisecond,
 		500 * time.Millisecond,
@@ -112,10 +118,17 @@ func (m *spacePeerManager) subscribeLoop() {
 			return
 		case <-time.After(d):
 		}
-		ctx, cancel := context.WithTimeout(m.runCtx, 10*time.Second)
-		m.KeepAlive(ctx)
-		cancel()
+		m.broadcastSubscribe()
 	}
+}
+
+// broadcastSubscribe is one Subscribe broadcast against m.runCtx with
+// a 10s deadline. Best-effort: errors are swallowed because the
+// subscribeLoop retries on a backoff.
+func (m *spacePeerManager) broadcastSubscribe() {
+	ctx, cancel := context.WithTimeout(m.runCtx, 10*time.Second)
+	defer cancel()
+	m.KeepAlive(ctx)
 }
 
 func (m *spacePeerManager) Name() string { return peermanager.CName }

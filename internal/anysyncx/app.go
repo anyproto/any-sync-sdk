@@ -48,12 +48,16 @@ type App struct {
 	keys *accountdata.AccountKeys
 }
 
-// New brings up the any-sync app. Order matters: log config first, then
-// keys (provider may block on user input), then nodeconf parsing, then
-// component registration mirroring the legacy bootstrap order.
+// New brings up the any-sync app. Order matters: keys first (provider
+// may block on user input), then nodeconf parsing, then component
+// registration mirroring the legacy bootstrap order.
+//
+// Logger setup is the caller's job — call (logger.Config{}).ApplyGlobal
+// once before Open. We intentionally don't touch the global logger here
+// because ApplyGlobal mutates named-logger structs in place, and a
+// second Open in the same process would race goroutines from the first
+// SDK that are already using those loggers.
 func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, error) {
-	cfg.Log.ApplyGlobal()
-
 	keys, err := loadAccountKeys(ctx, provider)
 	if err != nil {
 		return nil, err

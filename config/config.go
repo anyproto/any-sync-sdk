@@ -3,24 +3,22 @@ package config
 import (
 	"time"
 
-	"github.com/anyproto/any-sync/app/logger"
-
 	"github.com/anyproto/any-sync-sdk/handler"
 )
 
 // Config is the full SDK configuration passed to sdk.Open. Pure data —
 // zero behavior lives here. AuthProvider is NOT in this struct; it is
 // a behavior and travels as a separate argument to sdk.Open.
+//
+// Logger setup is intentionally not part of Config. Callers should
+// invoke (logger.Config{...}).ApplyGlobal() once at process start
+// before Open. ApplyGlobal mutates already-handed-out named loggers in
+// place, so calling it inside Open would race goroutines from a prior
+// SDK instance in the same process.
 type Config struct {
 	Storage Storage
 	Network Network
 	Sync    Sync
-
-	// Log is any-sync's logger configuration (production mode, default
-	// level, per-name level overrides, output paths, format). The SDK
-	// calls Log.ApplyGlobal() during Open; internal packages pull their
-	// named loggers via logger.NewNamed.
-	Log logger.Config
 
 	// Types is the optional list of caller-defined types extending
 	// the SDK's built-in catalog. Each Type binds a typeId to the

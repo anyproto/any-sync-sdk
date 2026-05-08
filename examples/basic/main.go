@@ -36,6 +36,11 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Configure any-sync's global logger before opening the SDK. Done
+	// here (not inside Open) so a process can host multiple SDK
+	// instances without ApplyGlobal racing goroutines from earlier ones.
+	logger.Config{DefaultLevel: "info"}.ApplyGlobal()
+
 	provider, err := makeAuth(ctx)
 	if err != nil {
 		return fmt.Errorf("auth: %w", err)
@@ -49,7 +54,6 @@ func run() error {
 		Network: config.Network{
 			NodeConfYAML: mustRead("network.yaml"),
 		},
-		Log: logger.Config{DefaultLevel: "info"},
 	}
 
 	sdk, err := anysyncsdk.Open(ctx, cfg, provider)

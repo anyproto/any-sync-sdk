@@ -8,7 +8,13 @@
 //   - Storage   — DB path(s), dbRouter policy (shared vs per-space),
 //     any-store tuning
 //   - Sync      — timeouts, retries, snapshot heuristic tuning
-//   - Log       — optional logger injection
+//
+// Logger setup lives outside Config. Callers should call
+// (any-sync/app/logger.Config{...}).ApplyGlobal() once before sdk.Open
+// (see examples/basic/main.go). It is not safe to call from inside
+// Open because ApplyGlobal mutates named-logger structs in place and
+// would race goroutines spawned by a previously-opened SDK in the same
+// process.
 //
 // Auth is NOT here — it is a behavior (AuthProvider from the auth
 // package), not data, so it is passed separately to sdk.Open.

@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -157,6 +158,19 @@ func builtInAnyTypeInfo() space.TypeInfo {
 	}
 }
 
+// builtInSpaceIndexTypeInfo describes the synthetic `spaceIndex`
+// type — one derived object per space carrying name / description /
+// icon / spaceType. Surfaced alongside `any` so callers see the
+// full built-in catalog.
+func builtInSpaceIndexTypeInfo() space.TypeInfo {
+	return space.TypeInfo{
+		Id:          spaceindex.TypeId,
+		Name:        spaceindex.Name,
+		Description: spaceindex.Description,
+		BuiltIn:     true,
+	}
+}
+
 // registeredTypeInfo maps a caller-registered handler.Type into the
 // public TypeInfo shape. Registered types are statically declared at
 // SDK init (via config.Config.Types), so they're surfaced with
@@ -207,8 +221,9 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 	defer iter.Close()
 
 	registered := t.parent.store.ExternalTypes()
-	out := make([]space.TypeInfo, 0, 1+len(registered))
+	out := make([]space.TypeInfo, 0, 2+len(registered))
 	out = append(out, builtInAnyTypeInfo())
+	out = append(out, builtInSpaceIndexTypeInfo())
 	for _, rt := range registered {
 		out = append(out, registeredTypeInfo(rt))
 	}
@@ -240,6 +255,9 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyTypeInfo(), nil
+	}
+	if typeId == spaceindex.TypeId {
+		return builtInSpaceIndexTypeInfo(), nil
 	}
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeInfo(rt), nil
@@ -307,6 +325,9 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 	if typeId == anytype.TypeId {
 		return builtInAnyProperties(), nil
 	}
+	if typeId == spaceindex.TypeId {
+		return builtInSpaceIndexProperties(), nil
+	}
 	if _, ok := t.findRegisteredType(typeId); ok {
 		return nil, nil
 	}
@@ -346,6 +367,21 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 func builtInAnyProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
+		out = append(out, space.PropertyDef{
+			Id:   p.Id,
+			Name: p.Name,
+			Kind: schemaKindToPropertyKind(p.Kind),
+		})
+	}
+	return out
+}
+
+// builtInSpaceIndexProperties translates spaceindex.Properties into
+// the public PropertyDef shape. Same treatment as `any` — human-
+// readable ids, permissive validator.
+func builtInSpaceIndexProperties() []space.PropertyDef {
+	out := make([]space.PropertyDef, 0, len(spaceindex.Properties))
+	for _, p := range spaceindex.Properties {
 		out = append(out, space.PropertyDef{
 			Id:   p.Id,
 			Name: p.Name,

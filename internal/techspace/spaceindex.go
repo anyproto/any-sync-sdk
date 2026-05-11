@@ -39,6 +39,7 @@ const HandlerVersion = "spaceIndexHandler-v1"
 const (
 	FieldType         = "type"
 	FieldName         = "name"
+	FieldDescription  = "description"
 	FieldIcon         = "icon"
 	FieldLocalStatus  = "localStatus"
 	FieldRemoteStatus = "remoteStatus"

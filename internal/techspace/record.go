@@ -47,6 +47,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		Id:           v.GetString("id"),
 		Type:         v.GetString(FieldType),
 		Name:         v.GetString(FieldName),
+		Description:  v.GetString(FieldDescription),
 		IconCID:      v.GetString(FieldIcon),
 		LocalStatus:  v.GetString(FieldLocalStatus),
 		RemoteStatus: v.GetString(FieldRemoteStatus),
@@ -67,6 +68,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	}
 	if r.Name != "" {
 		obj.Set(FieldName, a.NewString(r.Name))
+	}
+	if r.Description != "" {
+		obj.Set(FieldDescription, a.NewString(r.Description))
 	}
 	if r.IconCID != "" {
 		obj.Set(FieldIcon, a.NewString(r.IconCID))

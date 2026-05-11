@@ -267,15 +267,17 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	}
 	assert.True(t, saw, "any.types must contain %s", typeId)
 
-	// Types.List returns the synthetic `any` built-in plus the
-	// user-created Movie type, in that order.
+	// Types.List returns the two synthetic built-ins (`any`,
+	// `spaceIndex`) plus the user-created Movie type, in that order.
 	typeList, err := sp.Types().List(ctx)
 	require.NoError(t, err)
-	require.Len(t, typeList, 2)
+	require.Len(t, typeList, 3)
 	assert.Equal(t, "any", typeList[0].Id)
 	assert.True(t, typeList[0].BuiltIn)
-	assert.Equal(t, typeId, typeList[1].Id)
-	assert.Equal(t, "Movie", typeList[1].Name)
+	assert.Equal(t, "spaceIndex", typeList[1].Id)
+	assert.True(t, typeList[1].BuiltIn)
+	assert.Equal(t, typeId, typeList[2].Id)
+	assert.Equal(t, "Movie", typeList[2].Name)
 
 	// Types.Get on the typeId returns the user-created row.
 	tinfo, err := sp.Types().Get(ctx, typeId)
@@ -316,11 +318,12 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 
 	// QueryObjects walks the per-space `objects` collection — every
 	// object's property values live there, including the Movie type's
-	// own metadata. So the row count is 2 at this point: the type row
-	// and the regular object's row.
+	// own metadata and the per-space spaceIndex row. So the row count
+	// is 3 at this point: the spaceIndex row (seeded by Create), the
+	// type row, and the regular object's row.
 	docs, err := sp.QueryObjects().Limit(10).All(ctx)
 	require.NoError(t, err)
-	require.Len(t, docs, 2)
+	require.Len(t, docs, 3)
 
 	byId := map[string]*anyenc.Value{}
 	for _, d := range docs {
@@ -334,7 +337,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	// Count via the same shared collection.
 	count, err := sp.QueryObjects().Count(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 2, count)
+	assert.Equal(t, 3, count)
 
 	// Multi-object cross-query: create a second movie, set Title,
 	// confirm both rows show up in the per-space collection and a
@@ -350,8 +353,8 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 
 	all, err := sp.QueryObjects().All(ctx)
 	require.NoError(t, err)
-	// type row + first Movie + second Movie = 3
-	assert.Len(t, all, 3)
+	// spaceIndex row + type row + first Movie + second Movie = 4
+	assert.Len(t, all, 4)
 
 	// Filter by id to fetch one row. any-store accepts a JSON-shaped
 	// filter as a string.

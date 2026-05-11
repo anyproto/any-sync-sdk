@@ -68,7 +68,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	tsp := techspace.New(app, db)
-	spaces := spaceimpl.New(app, tsp, db, cfg.Types)
+	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
 	// Wire spaceimpl.Service as the space registry so any-sync's
 	// treemanager-driven callbacks (deletion-manager DeleteTree,
 	// space-sync PutTree, head-sync GetTree for arbitrary trees)

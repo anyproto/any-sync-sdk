@@ -16,6 +16,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // Service runs the account-private tech space — derived from the
@@ -37,6 +38,17 @@ type Service struct {
 	indexId string
 	ctrl    *crdt.Controller
 	alloc   *object.VersionAllocator
+
+	// bindMu serializes bindIndexObject calls. Each call constructs a
+	// fresh *object.Object and runs the synctree afterBuild → Rebuild
+	// → replayLocked cycle against the shared Controller. With two
+	// different *Object instances reading/writing Controller.MaxAddSeq
+	// concurrently (one from a writer like SetSpaceMetadata, another
+	// from sync service's HandleHeadUpdate routing through GetTree),
+	// the unprotected uint64 access races. Caller-driven serialization
+	// keeps the existing fresh-Object pattern (per the cold-sync
+	// rationale in GetTree's docstring) without the race.
+	bindMu sync.Mutex
 }
 
 // TechSpaceType is the on-the-wire SpaceType stamped into the
@@ -165,6 +177,12 @@ func (s *Service) bindIndexObject(ctx context.Context, cs interface {
 // the index tree, and returns it. Each write is a separate Get →
 // rebind cycle; the cache TTL governs when the underlying space tears
 // down.
+//
+// Caller must hold s.bindMu — see Service.bindMu docstring. The lock
+// covers BOTH the bind (which runs the synctree afterBuild → Rebuild
+// → replayLocked cycle against the shared Controller) AND the
+// follow-up Controller mutation (LocalWrite), so two callers don't
+// interleave on the Controller's MaxAddSeq watermark.
 func (s *Service) indexObject(ctx context.Context) (*object.Object, error) {
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
@@ -197,6 +215,8 @@ func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteRe
 		return object.WriteResult{}, errors.New("techspace: SpaceIndexRecord.Id required")
 	}
 
+	s.bindMu.Lock()
+	defer s.bindMu.Unlock()
 	obj, err := s.indexObject(ctx)
 	if err != nil {
 		return object.WriteResult{}, err
@@ -219,11 +239,51 @@ func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteRe
 	return obj.LocalWrite(ctx, change)
 }
 
+// SetSpaceMetadata is the idempotent overwrite of the row's
+// name / description / icon fields — driven by the per-space
+// spaceIndex watcher whenever the in-space spaceIndex object's
+// converged state changes. `type` is intentionally left untouched
+// (pinned on first write by SpaceIndexHandler.BeforeModify); status
+// fields stay under their own setters.
+//
+// The write is a single multi-field $set so all three columns land
+// under one VersionId. No-op when every field equals the empty
+// string (rare — the spaceIndex object can carry an empty mirror
+// state right after Create, before the initial property write has
+// applied).
+func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, description, iconCID string) (object.WriteResult, error) {
+	if !s.open {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	s.bindMu.Lock()
+	defer s.bindMu.Unlock()
+	obj, err := s.indexObject(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	payload := arena.NewObject()
+	payload.Set(FieldName, arena.NewString(name))
+	payload.Set(FieldDescription, arena.NewString(description))
+	payload.Set(FieldIcon, arena.NewString(iconCID))
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{{
+			Id:  spaceId,
+			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+		}},
+	}
+	return obj.LocalWrite(ctx, change)
+}
+
 // SetLocalStatus updates the localStatus field of an existing record.
 func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
 	if !s.open {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
+	s.bindMu.Lock()
+	defer s.bindMu.Unlock()
 	obj, err := s.indexObject(ctx)
 	if err != nil {
 		return object.WriteResult{}, err
@@ -296,6 +356,8 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 	if !s.open {
 		return errors.New("techspace: service not open")
 	}
+	s.bindMu.Lock()
+	defer s.bindMu.Unlock()
 	obj, err := s.indexObject(ctx)
 	if err != nil {
 		return err
@@ -315,6 +377,75 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 	_, err = obj.LocalWrite(ctx, change)
 	return err
 }
+
+// OnSpaceCreated satisfies space.Indexer. Adds a fresh record to the
+// space-index dataset with the supplied metadata. The existing
+// spaceimpl.Service.Create still calls Add() directly for the eager
+// caller-round-trip seed; this method exists for future callers that
+// route everything through the Indexer seam.
+func (s *Service) OnSpaceCreated(ctx context.Context, spaceId string, meta space.SpaceInfo) error {
+	if !s.open {
+		return errors.New("techspace: service not open")
+	}
+	if spaceId == "" {
+		return errors.New("techspace: OnSpaceCreated: empty spaceId")
+	}
+	if _, ok := s.Get(ctx, spaceId); ok {
+		return nil // idempotent — row already exists
+	}
+	_, err := s.Add(ctx, SpaceIndexRecord{
+		Id:           spaceId,
+		Type:         meta.Type,
+		Name:         meta.Name,
+		Description:  meta.Description,
+		IconCID:      meta.IconCID,
+		LocalStatus:  StatusActive,
+		RemoteStatus: StatusActive,
+	})
+	return err
+}
+
+// OnSpaceDeleted satisfies space.Indexer. Flips the row to
+// localStatus=deleted; the record is never physically removed.
+func (s *Service) OnSpaceDeleted(ctx context.Context, spaceId string) error {
+	if !s.open {
+		return errors.New("techspace: service not open")
+	}
+	_, err := s.SetLocalStatus(ctx, spaceId, StatusDeleted)
+	return err
+}
+
+// OnSpaceMetadataUpdated satisfies space.Indexer. Idempotent
+// overwrite of the row's name / description / icon — the mirror
+// from the in-space spaceIndex derived object into this device's
+// tech-space row. Skipped when:
+//
+//   - The row is absent (joiner without a tech-space record yet, or
+//     a peer that hasn't completed Join).
+//   - All three fields already equal what we would write. This is
+//     the common case for the initial seed (Service.Create's
+//     tsp.Add wrote the row first; the in-space spaceIndex apply
+//     then triggers the watcher to re-write the SAME values).
+//     Dedup avoids a pointless second CRDT change on the tech-space
+//     tree, which would otherwise race with caller-initiated writes
+//     like SetLocalStatus on the apply lock.
+func (s *Service) OnSpaceMetadataUpdated(ctx context.Context, spaceId string, meta space.SpaceInfo) error {
+	if !s.open {
+		return errors.New("techspace: service not open")
+	}
+	rec, ok := s.Get(ctx, spaceId)
+	if !ok {
+		return nil
+	}
+	if rec.Name == meta.Name && rec.Description == meta.Description && rec.IconCID == meta.IconCID {
+		return nil
+	}
+	_, err := s.SetSpaceMetadata(ctx, spaceId, meta.Name, meta.Description, meta.IconCID)
+	return err
+}
+
+// Compile-time check that the Service satisfies space.Indexer.
+var _ space.Indexer = (*Service)(nil)
 
 // Close marks the service inactive. Underlying space cleanup happens
 // via the App's space cache on its own schedule.
@@ -345,6 +476,8 @@ func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttr
 	if spaceId != s.spaceId || treeId != s.indexId {
 		return nil, ErrSpaceRegistryUnknown
 	}
+	s.bindMu.Lock()
+	defer s.bindMu.Unlock()
 	obj, err := s.indexObject(ctx)
 	if err != nil {
 		return nil, err

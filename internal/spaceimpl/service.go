@@ -22,6 +22,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -72,9 +73,10 @@ func replicationKeyFromSpaceId(spaceId string) uint64 {
 // stays loaded so live writes don't pay the controller-build cost
 // twice.
 type Service struct {
-	app *anysyncx.App
-	tsp *techspace.Service
-	db  anystore.DB
+	app     *anysyncx.App
+	tsp     *techspace.Service
+	indexer space.Indexer
+	db      anystore.DB
 
 	// extTypes carry through to every per-space Store created by
 	// storeFor — each type's handlers are applied alongside the
@@ -85,6 +87,17 @@ type Service struct {
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
 
+	// spaceIndexIds caches the deterministic spaceIndex object id per
+	// spaceId so SetMetadata / Info-side reads don't re-derive on every
+	// call. Populated by ensureSpaceIndexWiring.
+	spaceIndexIds map[string]string
+
+	// spaceIndexWatchers holds one watcher per loaded spaceId; the
+	// watcher subscribes to the spaceIndex object's properties dataset
+	// and forwards converged state into the Indexer. Lifetime: until
+	// SDK.Close (mirrors the members-watcher sticky lifecycle).
+	spaceIndexWatchers map[string]*spaceIndexWatcher
+
 	// watchers tracks every active members poller across all loaded
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
@@ -93,15 +106,21 @@ type Service struct {
 // New returns a Service ready to be returned via SDK.Spaces(). The
 // db argument is the shared SDK DB where CRDT collections live.
 // extTypes must already have been validated by
-// spaceobjects.ValidateExternalTypes at the SDK boundary.
-func New(app *anysyncx.App, tsp *techspace.Service, db anystore.DB, extTypes []handler.Type) *Service {
+// spaceobjects.ValidateExternalTypes at the SDK boundary. indexer is
+// the seam through which the tech-space mirrors converged in-space
+// spaceIndex state into its rows; usually tsp itself (which
+// satisfies space.Indexer).
+func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type) *Service {
 	return &Service{
-		app:      app,
-		tsp:      tsp,
-		db:       db,
-		extTypes: extTypes,
-		stores:   make(map[string]*spaceobjects.Store),
-		allocs:   make(map[string]*object.VersionAllocator),
+		app:                app,
+		tsp:                tsp,
+		indexer:            indexer,
+		db:                 db,
+		extTypes:           extTypes,
+		stores:             make(map[string]*spaceobjects.Store),
+		allocs:             make(map[string]*object.VersionAllocator),
+		spaceIndexIds:      make(map[string]string),
+		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
 	}
 }
 
@@ -125,6 +144,82 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	// dependencies have since landed get picked up on first touch.
 	st.NotifyDrainer(types.DataVersionPair{})
 	return st
+}
+
+// ensureSpaceIndexWiring is idempotent per spaceId: on first call it
+// derives the deterministic spaceIndex object id, caches it, and
+// spawns a spaceIndexWatcher that mirrors the converged in-space
+// state into the tech-space row through the Indexer. Subsequent
+// calls for the same spaceId return the cached id without rewiring.
+//
+// Called from every load path (Create / Get / Derive / OneToOne).
+// Failures to derive the id are returned as errors so the caller
+// can surface them — without an id, neither SetMetadata nor the
+// mirror can target the right tree.
+func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (string, error) {
+	s.mu.Lock()
+	if id, ok := s.spaceIndexIds[spaceId]; ok {
+		s.mu.Unlock()
+		return id, nil
+	}
+	s.mu.Unlock()
+
+	handle, err := s.app.GetSpace(ctx, spaceId)
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: ensureSpaceIndexWiring: %w", err)
+	}
+	derivePayload := objecttree.ObjectTreeDerivePayload{
+		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
+		SpaceId:       spaceId,
+		IsEncrypted:   true,
+	}
+	storagePayload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, derivePayload)
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: derive spaceIndex tree id: %w", err)
+	}
+	objectId := storagePayload.RootRawChange.Id
+
+	s.mu.Lock()
+	if existing, ok := s.spaceIndexIds[spaceId]; ok {
+		s.mu.Unlock()
+		return existing, nil
+	}
+	s.spaceIndexIds[spaceId] = objectId
+	store := s.stores[spaceId]
+	s.mu.Unlock()
+
+	// Spawn the watcher outside the lock — newSpaceIndexWatcher does
+	// the initial reconcile read which may take any-store latency.
+	if store != nil && s.indexer != nil {
+		w := newSpaceIndexWatcher(ctx, store, s.indexer, spaceId, objectId)
+		s.mu.Lock()
+		if _, dup := s.spaceIndexWatchers[spaceId]; dup {
+			// Race: another goroutine wired concurrently. Stop the
+			// extra one so we don't leak. Cheap — the duplicate's
+			// reconcile already ran and is harmless.
+			s.mu.Unlock()
+			w.stop()
+		} else {
+			s.spaceIndexWatchers[spaceId] = w
+			s.watchers.register(w)
+			s.mu.Unlock()
+		}
+	}
+	return objectId, nil
+}
+
+// spaceIndexObjectIdFor returns the cached spaceIndex object id for
+// spaceId, deriving on demand if ensureSpaceIndexWiring hasn't run
+// yet. Used by SetMetadata to address the spaceIndex tree without
+// requiring the caller to have hit a load path that wires first.
+func (s *Service) spaceIndexObjectIdFor(ctx context.Context, spaceId string) (string, error) {
+	s.mu.Lock()
+	id, ok := s.spaceIndexIds[spaceId]
+	s.mu.Unlock()
+	if ok {
+		return id, nil
+	}
+	return s.ensureSpaceIndexWiring(ctx, spaceId)
 }
 
 // Create creates a new regular space owned by the authenticated
@@ -183,7 +278,14 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err
 	}
-	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
+	store := s.storeFor(spaceId)
+	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
+		return nil, err
+	}
+	if err := s.seedSpaceIndexOnCreate(ctx, store, spaceId, req, spaceType); err != nil {
+		return nil, fmt.Errorf("spaceimpl: seed spaceIndex: %w", err)
+	}
+	return newSpace(spaceId, s.app, s.tsp, store, s), nil
 }
 
 // Get returns a handle to a known space. Eagerly loads the any-sync
@@ -203,7 +305,16 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
 	}
-	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
+	store := s.storeFor(spaceId)
+	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
+		return nil, err
+	}
+	sp := newSpace(spaceId, s.app, s.tsp, store, s)
+	// Background lazy-seed for legacy / never-seeded spaces: only the
+	// owner can write the initial spaceIndex properties, and non-
+	// owners skip silently (the owner's eventual write propagates).
+	go sp.maybeLazySeedSpaceIndex()
+	return sp, nil
 }
 
 // List returns the space-index snapshot.
@@ -273,7 +384,13 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err
 	}
-	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
+	store := s.storeFor(spaceId)
+	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
+		return nil, err
+	}
+	sp := newSpace(spaceId, s.app, s.tsp, store, s)
+	go sp.maybeLazySeedSpaceIndex()
+	return sp, nil
 }
 
 // OneToOne returns the derived 1-1 space with otherIdentity, creating
@@ -305,7 +422,13 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err
 	}
-	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
+	store := s.storeFor(spaceId)
+	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
+		return nil, err
+	}
+	sp := newSpace(spaceId, s.app, s.tsp, store, s)
+	go sp.maybeLazySeedSpaceIndex()
+	return sp, nil
 }
 
 // ErrJoinPending is returned by Join after a RequestToJoin invite was

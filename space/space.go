@@ -2,6 +2,15 @@ package space
 
 import "context"
 
+// SetMetadataRequest is the input to Space.SetMetadata. Pointer
+// semantics: nil = leave-unchanged; non-nil empty string = set-empty.
+// Mirrors PropertyMetaUpdate's per-field patching shape.
+type SetMetadataRequest struct {
+	Name        *string
+	Description *string
+	IconCID     *string
+}
+
 // Space is the caller-facing interface to one space. Obtained from
 // Service.Create / Join / Derive / Get. Middleware holds Space handles
 // for the lifetime of use; the SDK manages underlying ocache loading
@@ -77,6 +86,31 @@ type Space interface {
 	// Delete produces sticky tombstones for the listed record ids.
 	// Returned RecordIds mirror the input order.
 	Delete(ctx context.Context, batch DeleteBatch) (ModifyResult, error)
+
+	// SetMetadata mutates this space's display metadata (name,
+	// description, icon) by writing to the per-space `spaceIndex`
+	// derived object. The write is CRDT-replicated to every member;
+	// each device's indexer hook mirrors the converged state into its
+	// own tech-space row.
+	//
+	// Pointer-to-string semantics: a nil pointer means "leave
+	// unchanged"; a non-nil pointer to an empty string means "set to
+	// empty". This lets callers patch a single field without
+	// clobbering the others.
+	//
+	// SpaceType is intentionally not settable — it's pinned by the
+	// initial Create write on the spaceIndex object.
+	//
+	// v1 has no caller-side permission gate; non-writers are rejected
+	// downstream by the ACL at apply time on peers.
+	SetMetadata(ctx context.Context, req SetMetadataRequest) error
+
+	// SpaceIndexObjectId returns the deterministic id of the in-space
+	// `spaceIndex` derived object. Stable across peers and across
+	// SDK reboots — same id on every member's device. Useful for
+	// wrappers that want to attach a Subscribe stream on the
+	// spaceIndex's `objects` dataset for live UI updates.
+	SpaceIndexObjectId() string
 
 	// Subscribe registers an explicit (objectId, dataset) listener.
 	// The returned Subscription delivers an Event per matching

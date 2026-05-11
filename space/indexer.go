@@ -17,4 +17,13 @@ type Indexer interface {
 	// space index record to Status = StatusDeleted; the record is
 	// never physically removed (see docs/02-tech-space.md).
 	OnSpaceDeleted(ctx context.Context, spaceId string) error
+
+	// OnSpaceMetadataUpdated mirrors the converged state of the
+	// per-space `spaceIndex` derived object into the tech-space row.
+	// Fired by the per-space watcher every time the spaceIndex
+	// object's property record applies (locally or pushed from a
+	// peer). Idempotent overwrite of name/description/icon — `type`
+	// stays pinned by the tech-space handler. See docs/09-space-
+	// index.md for the convergence story.
+	OnSpaceMetadataUpdated(ctx context.Context, spaceId string, meta SpaceInfo) error
 }

@@ -130,12 +130,12 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 			"device A should see its own type + objects locally; got %d docs in %s", len(docs), fix.Id)
 	}
 
-	// Give the writes a moment to be picked up by node sync. The
-	// owner's broadcast happens on PutSyncTree, but the node-side
-	// receive + storage write takes a beat. 2s is a finger-in-the-air
-	// figure; if it's not enough device B will surface that as
-	// timeouts in the converge loop below.
-	time.Sleep(2 * time.Second)
+	// Brief pause so device A's PutSyncTree broadcasts durably land
+	// on the local node before B's SpacePull asks for them. Stream
+	// sync is reactive, but the node still needs a beat to commit
+	// the received header to its own storage; without this, B's
+	// first SpacePull races A's push and gets ErrSpaceMissing.
+	time.Sleep(500 * time.Millisecond)
 
 	// Device B: fresh DB, same keys.
 	dataDirB := t.TempDir()
@@ -151,13 +151,14 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 		"shared seed should derive the same account id on both devices")
 
 	// Step 1: tech-space rehydrates from coordinator → both spaces
-	// must show up in List on device B. This is the same path that
-	// the post-acceptance joiner exercises.
+	// must show up in List on device B. No public Subscribe API on
+	// the tech-space, so we tail List() at a tight cadence — it's a
+	// local read against an in-process store, the cost is negligible.
 	wantSpaceIds := []string{wantSpaces[0].Id, wantSpaces[1].Id}
 	sort.Strings(wantSpaceIds)
 
 	var lastList []space.SpaceInfo
-	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+	if !waitFor(ctx, 90*time.Second, 50*time.Millisecond, func() bool {
 		list, err := sdkB.Spaces().List(ctx)
 		if err != nil {
 			return false
@@ -171,19 +172,34 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 			wantSpaceIds, spaceIdsOnly(lastList))
 	}
 
-	// Step 2: per-space — types and objects must converge. We poll
-	// because the headsync period is ~30s; one tick may not cover
-	// every tree on the first sync round.
+	// Step 2: per-space — types and objects must converge. Event-
+	// driven via SubscribeProperties: the per-space `objects`
+	// firehose fires on every tree's "objects" dataset write
+	// (eventbus.ObjectsDataset), which covers BOTH type creates
+	// (typesAPI.Create writes any.types=["__type__"] to objects)
+	// AND instance creates / SetBase. We register the firehose
+	// before re-checking and recheck on every event arrival until
+	// the local snapshot satisfies the fixture.
 	for _, fix := range wantSpaces {
 		fix := fix
 		t.Run("space="+fix.Name, func(t *testing.T) {
-			sp, err := sdkB.Spaces().Get(ctx, fix.Id)
-			require.NoError(t, err, "device B: Spaces().Get(%s)", fix.Id)
+			// Get may transiently fail with "space is missing" if the
+			// space-index entry has propagated through the tech-space
+			// but the space's own tree hasn't finished loading via the
+			// commonspace cache. Local check, retry tightly.
+			var sp space.Space
+			require.True(t, waitFor(ctx, 30*time.Second, 50*time.Millisecond, func() bool {
+				sp, err = sdkB.Spaces().Get(ctx, fix.Id)
+				return err == nil
+			}), "device B: Spaces().Get(%s) never succeeded: %v", fix.Id, err)
+
+			propsSub, err := sp.SubscribeProperties(ctx)
+			require.NoError(t, err, "device B: SubscribeProperties(%s)", fix.Id)
+			defer propsSub.Close()
 
 			var lastTypeIds []string
 			var lastObjectIds []string
-
-			converged := waitFor(ctx, 3*time.Minute, 2*time.Second, func() bool {
+			snapshotConverged := func() bool {
 				typeIds := userTypeIds(sp, ctx)
 				lastTypeIds = typeIds
 				if !containsString(typeIds, fix.TypeId) {
@@ -203,14 +219,36 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 						return false
 					}
 				}
+				// Property values must also be present — SetBase
+				// is a separate "objects" write from the create,
+				// so seeing the row id isn't enough.
+				for i, objId := range fix.ObjectIds {
+					wantTitle := fix.Name + []string{"-One", "-Two"}[i]
+					rec, err := sp.Properties().Get(ctx, objId, space.PropertyReadOpts{})
+					if err != nil || rec == nil {
+						return false
+					}
+					if rec.GetString(fix.TypeId, fix.PropId) != wantTitle {
+						return false
+					}
+				}
 				return true
-			})
-			if !converged {
-				t.Fatalf("device B: space %s never converged\n  want type=%s objects=%v\n  got types=%v objects=%v",
-					fix.Name, fix.TypeId, fix.ObjectIds, lastTypeIds, lastObjectIds)
 			}
 
-			// Property values landed?
+			waitCtx, cancelWait := context.WithTimeout(ctx, 3*time.Minute)
+			defer cancelWait()
+
+			for !snapshotConverged() {
+				if _, err := propsSub.Mailbox().WaitOne(waitCtx); err != nil {
+					t.Fatalf("device B: space %s never converged\n  want type=%s objects=%v\n  got types=%v objects=%v\n  wait err: %v",
+						fix.Name, fix.TypeId, fix.ObjectIds, lastTypeIds, lastObjectIds, err)
+				}
+			}
+
+			// Re-read property values for the explicit assertion
+			// signal — the convergence gate above already verified
+			// equality, so these only fail on a regression in the
+			// gate itself.
 			for i, objId := range fix.ObjectIds {
 				wantTitle := fix.Name + []string{"-One", "-Two"}[i]
 				rec, err := sp.Properties().Get(ctx, objId, space.PropertyReadOpts{})

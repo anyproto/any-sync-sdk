@@ -377,5 +377,29 @@ Query result = merge(deviceLocal, accountLevel, defaults)
     - `sdk.Properties.SetAccount(...)`?
 14. Are device/account writes atomic with the event emission, or eventually consistent?
 
+### Types & Property Lifecycle
+16. **What happens to property values when a user removes or adds a type on an object?** The current note ("values in that namespace become orphan data, read-tolerant") is a one-liner; we need a real answer covering the points below. Code-state anchors are inlined so we know what's already implemented vs. open design:
+
+    **Current state in code (2026-05-11):**
+    - No dedicated `AttachType` / `DetachType` API — both are declared in `space/properties.go:37` but return "not implemented" in `internal/spaceimpl/properties.go:139`. Today `any.types` is written as a freeform `$set` array during `objects.bootstrap()` and `typesAPI.Create()`.
+    - `SystemPropertiesHandler` (`internal/properties/system.go:59`) validates by `Registry.LookupKind(typeId, propId)` only — it does **not** consult `any.types`. Writes for a type not in the object's `any.types` list apply blindly.
+    - `Properties.Get()` (`internal/spaceimpl/properties.go:36`) returns the full record verbatim — no filter/projection by current `any.types`. Orphan values are visible to callers as-is.
+    - No cleanup / GC / `dropType` / `removeType` code exists anywhere in the tree. "Read tolerance" is documented intent, not active behavior.
+    - `any` and `type` built-ins are synthesized on read but **not guarded** against removal from `any.types` at the handler level.
+    - `RemoveProperty` (`internal/spaceimpl/types.go:425`) is "not implemented"; `PropertyHandler.BeforeDelete` marks the shortId but does not cascade to per-object values.
+    - Tests: `sdk_test.go:183` (`TestSDK_TypesAndProperties`) covers type binding at create only; no remove / re-add / orphan-value tests exist.
+
+    **Open sub-questions:**
+    - **Drop semantics.** When `{typeId}` is removed from `any.types`, the `{typeId}.*` value bag stays on the record by default (current code does nothing else). Do we keep this, expose it via a read flag (e.g. `includeOrphans`), hide it from default projections, or wipe it? If we wipe — at apply time, or via a background GC pass?
+    - **Re-add (toggle) semantics.** If the user re-adds the same `{typeId}` later, do prior values reappear (orphan-resurrection — what we get for free today) or are they gone? Resurrection is the cheap default but surprises the user; wipe-on-drop is intuitive but loses data on accidental toggles.
+    - **Concurrent drop vs write.** Peer A removes the type while peer B writes a value under that namespace. With LWW per field, the write lands on a record where the type is already gone — value persists as orphan. Acceptable, or do we need an apply-side guard (handler consults `any.types` before applying)? Note: adding such a guard breaks the "out-of-order writes are tolerable" property we currently have.
+    - **Required fields.** If a removed type had `required` properties, what does validation report for the now-orphan values? Probably just "type not implemented, values are orphan" — no error. Confirm.
+    - **Built-in types (`any`, `type`).** No handler guard today. Decide: enforce non-removability at apply time (convergent), at SDK write time only (client-soft), or leave it (any synthesizer on read masks the damage anyway)?
+    - **Events.** Adding/removing a type currently lands as a generic `$set` on `any.types` — no synthetic per-field events for the `{typeId}.*` namespace. Do we want one? Callers can re-read but lose the delta.
+    - **Queries.** `find({"{typeId}.year": 1995})` matches objects that still carry the value but no longer implement the type (current behavior — values are not filtered). Default behavior + opt-out flag?
+    - **Property-definition deletion** (separate but related): if the type deletes a property definition, per-object values are left behind today (no cascade in `PropertyHandler.BeforeDelete`). Future writes to that propId drop silently via the unknown-property rule in `SystemPropertiesHandler`. Same orphan policy as type-drop, or different?
+
+    **Dedicated API.** Whatever we decide, `AttachType` / `DetachType` should be the only sanctioned mutation path — freeform `$set` on `any.types` makes some of the policies above (e.g. cascade-wipe, built-in guard) un-enforceable without inspecting every op.
+
 ### Dependencies
 15. Event format for property variants must be agreed with the CRDT section (question 6 above is the cross-section one to resolve)

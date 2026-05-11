@@ -236,9 +236,30 @@ func (s *Store) ExternalTypes() []handler.Type { return s.extTypes }
 // SpaceId returns the id of the space this store serves.
 func (s *Store) SpaceId() string { return s.spaceId }
 
+// OpenObjectCollection opens the per-object any-store collection
+// `{objectId}/{dataset}` without binding the any-sync tree. Read-only
+// callers (Properties.Get, queries against per-object datasets, type
+// `defs` reads, etc.) take this route to skip BuildSyncTree +
+// ColdRestore — the persisted any-store state is already what they
+// want.
+//
+// Open-only: returns anystore.ErrCollectionNotFound if the writer
+// hasn't initialised the dataset yet. Callers should treat that as
+// "no records" — equivalent to an empty controller.
+func (s *Store) OpenObjectCollection(ctx context.Context, objectId, dataset string) (anystore.Collection, error) {
+	if objectId == "" {
+		return nil, errors.New("spaceobjects: OpenObjectCollection: objectId required")
+	}
+	if dataset == "" {
+		return nil, errors.New("spaceobjects: OpenObjectCollection: dataset required")
+	}
+	return s.db.OpenCollection(ctx, objectId+"/"+dataset)
+}
+
 // SharedObjects returns the per-space `objects` collection, opening
 // it on first call. Callers can hit it directly for cross-object
-// queries (find all rows where any.name = X, etc.).
+// queries (find all rows where any.name = X, etc.). First open also
+// installs the standing read-side indexes.
 func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) {
 	s.mu.Lock()
 	if s.sharedColl != nil {
@@ -251,6 +272,17 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	coll, err := s.db.Collection(ctx, collName)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
+	}
+	// Sparse index on `any.types` so the type-marker query
+	// (typesAPI.List → `any.types $in ["__type__"]`) doesn't scan
+	// every object's row. Sparse keeps the index small: only rows
+	// that actually carry a type list contribute entries. EnsureIndex
+	// is idempotent — safe to call on every fresh open.
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Fields: []string{"any.types"},
+		Sparse: true,
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: ensure any.types index: %w", err)
 	}
 	s.mu.Lock()
 	if s.sharedColl == nil {
@@ -470,11 +502,31 @@ func (s *Store) bind(ctx context.Context, handle anysyncx.SpaceHandle, objectId 
 // openTree picks PutTree vs BuildTree based on whether the caller has
 // a creation payload in hand. Falls through to BuildTree when PutTree
 // reports ErrTreeExists — supports idempotent Derive.
+//
+// Sets SetDeferredUpdater(true) on the resulting tree: any-sync's
+// default order in AddRawChangesWithUpdater is
+// addChangesToTree → updater → storage.AddAll, which means our
+// listener (Object.Update → replayLocked) runs *before* the new
+// change is persisted to tree storage. replayLocked scans storage
+// via tree.IterateAfterAddSeq(ctx, MaxAddSeq, …); with the change
+// not yet in storage, GetAfterAddSeq returns nothing, no
+// applyDecodedLocked fires, the controller stays out of sync with
+// the tree, and inbound-only writes (e.g. a writer joiner's
+// sp.Delete that Owner pulls via HeadUpdate) never project into
+// the controller's collection — the in-memory tree advances heads
+// but the materialised state stays stuck.
+//
+// `SetDeferredUpdater(true)` flips the order so storage.AddAll
+// runs first; the listener then sees the new change via
+// IterateAfterAddSeq. Local writes are unaffected: tree.AddContent
+// in any-sync persists to storage before broadcasting, regardless
+// of this flag.
 func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objectId string, payload *treestorage.TreeStorageCreatePayload, listener *object.Object) (objecttree.ObjectTree, error) {
 	tb := handle.Inner().TreeBuilder()
 	if payload != nil {
 		tree, err := tb.PutTree(ctx, *payload, listener)
 		if err == nil {
+			deferIfSyncTree(tree)
 			return tree, nil
 		}
 		if !errors.Is(err, treestorage.ErrTreeExists) {
@@ -486,7 +538,21 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: BuildTree %s: %w", objectId, err)
 	}
+	deferIfSyncTree(tree)
 	return tree, nil
+}
+
+// deferIfSyncTree flips the SyncTree into deferred-updater mode (see
+// openTree's docstring for the rationale). No-op when the returned
+// objecttree implementation isn't a SyncTree (defensive — every
+// production path returns a SyncTree, but tests may stub).
+func deferIfSyncTree(tree objecttree.ObjectTree) {
+	type deferredSetter interface {
+		SetDeferredUpdater(deferred bool)
+	}
+	if d, ok := tree.(deferredSetter); ok {
+		d.SetDeferredUpdater(true)
+	}
 }
 
 // newController opens or creates the per-object Controller, registering

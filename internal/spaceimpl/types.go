@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
+	"github.com/anyproto/any-store/v2/query"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -16,6 +17,16 @@ import (
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
+)
+
+// listTypesFilter selects rows from the per-space `objects` collection
+// whose `any.types` array carries the meta-type marker and that aren't
+// tombstoned. Compiled once — ParseCondition allocates and walks the
+// query tree on every call, which we don't want on a hot read path.
+// JSON literal (not map[string]any) because ParseCondition's map path
+// goes through json.Marshal under the hood, which we'd rather skip.
+var listTypesFilter = query.MustParseCondition(
+	`{"any.types":{"$in":["__type__"]},"_deletedAt":{"$exists":false}}`,
 )
 
 // typesAPI implements space.TypesAPI. MVP scope: Create + AddProperty.
@@ -178,52 +189,42 @@ func (t *typesAPI) findRegisteredType(typeId string) (handler.Type, bool) {
 	return handler.Type{}, false
 }
 
-// List walks the space's tree-storage index and returns every object
-// whose `properties` record marks it as a meta-type instance
-// (`any.types` contains "__type__"). One controller load per
-// candidate — fine for MVP scale. The synthetic `any` built-in is
-// prepended.
+// List returns every object whose persisted `properties` row is a
+// meta-type instance (`any.types` contains "__type__"). One any-store
+// query against the per-space `objects` collection — no tree builds,
+// no any-sync calls. Eventual-consistency: rows that the controller
+// has applied are visible; whatever any-sync hasn't replayed yet
+// isn't, which is what the user wants from a read-only listing.
 func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
-	handle, err := t.parent.app.GetSpace(ctx, t.parent.id)
+	coll, err := t.parent.store.SharedObjects(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("typesAPI: get space: %w", err)
+		return nil, fmt.Errorf("typesAPI: shared objects: %w", err)
 	}
-	storage := handle.Inner().Storage()
-	state, err := storage.StateStorage().GetState(ctx)
+	iter, err := coll.Find(listTypesFilter).Iter(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("typesAPI: state: %w", err)
+		return nil, fmt.Errorf("typesAPI: iter: %w", err)
 	}
-	exclude := map[string]struct{}{
-		handle.Inner().Acl().Id():                     {},
-		handle.Inner().KeyValue().DefaultStore().Id(): {},
-		state.SettingsId:                              {},
-	}
-
-	var ids []string
-	if err := storage.HeadStorage().IterateEntries(ctx, headstorage.IterOpts{}, func(entry headstorage.HeadsEntry) (bool, error) {
-		if _, skip := exclude[entry.Id]; skip {
-			return true, nil
-		}
-		ids = append(ids, entry.Id)
-		return true, nil
-	}); err != nil {
-		return nil, fmt.Errorf("typesAPI: iterate entries: %w", err)
-	}
+	defer iter.Close()
 
 	registered := t.parent.store.ExternalTypes()
-	out := make([]space.TypeInfo, 0, len(ids)+1+len(registered))
+	out := make([]space.TypeInfo, 0, 1+len(registered))
 	out = append(out, builtInAnyTypeInfo())
 	for _, rt := range registered {
 		out = append(out, registeredTypeInfo(rt))
 	}
-	for _, id := range ids {
-		info, ok, err := t.readTypeInfo(ctx, id)
+	for iter.Next() {
+		doc, err := iter.Doc()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("typesAPI: doc: %w", err)
 		}
-		if ok {
-			out = append(out, info)
+		v := doc.Value()
+		if v == nil {
+			continue
 		}
+		out = append(out, typeInfoFromRow(v))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("typesAPI: iter err: %w", err)
 	}
 	return out, nil
 }
@@ -233,6 +234,9 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 // synthetic `any` built-in and any caller-registered type from
 // config.Config.Types — both are statically declared at SDK init and
 // don't live in the space's tree storage.
+//
+// Reads from the per-space `objects` collection in any-store. No
+// any-sync calls.
 func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyTypeInfo(), nil
@@ -240,38 +244,35 @@ func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, erro
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeInfo(rt), nil
 	}
-	info, ok, err := t.readTypeInfo(ctx, typeId)
+	coll, err := t.parent.store.SharedObjects(ctx)
 	if err != nil {
-		return space.TypeInfo{}, err
+		return space.TypeInfo{}, fmt.Errorf("typesAPI: shared objects: %w", err)
 	}
-	if !ok {
+	doc, err := coll.FindId(ctx, typeId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return space.TypeInfo{}, space.ErrNotFound
+		}
+		return space.TypeInfo{}, fmt.Errorf("typesAPI: find %s: %w", typeId, err)
+	}
+	v := doc.Value()
+	if v == nil || v.Get(crdt.DeletedAtField) != nil || !hasTypeMarker(v) {
 		return space.TypeInfo{}, space.ErrNotFound
 	}
-	return info, nil
+	return typeInfoFromRow(v), nil
 }
 
-// readTypeInfo loads the object's `properties` record and, if its
-// `any.types` array contains "__type__", returns the typed view.
-// Returns ok=false when the object doesn't claim to be a type.
-func (t *typesAPI) readTypeInfo(ctx context.Context, objectId string) (space.TypeInfo, bool, error) {
-	obj, err := t.parent.store.Get(ctx, objectId)
-	if err != nil {
-		return space.TypeInfo{}, false, fmt.Errorf("typesAPI: load %s: %w", objectId, err)
-	}
-	rec := obj.Controller().Get(ctx, properties.Dataset, objectId)
-	if rec == nil {
-		return space.TypeInfo{}, false, nil
-	}
-	if !hasTypeMarker(rec) {
-		return space.TypeInfo{}, false, nil
-	}
+// typeInfoFromRow decodes a row from the per-space `objects`
+// collection into the public TypeInfo shape. Caller is responsible
+// for having checked hasTypeMarker.
+func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 	return space.TypeInfo{
-		Id:          objectId,
+		Id:          rec.GetString(crdt.IdField),
 		Name:        rec.GetString("any", "name"),
 		Description: rec.GetString("any", "description"),
 		IconCID:     rec.GetString("any", "icon"),
 		BuiltIn:     false,
-	}, true, nil
+	}
 }
 
 // hasTypeMarker reports whether `record.any.types` contains the
@@ -298,6 +299,10 @@ func (t *typesAPI) Delete(_ context.Context, _ string) error {
 // expose state via custom datasets reached through Space.Modify /
 // Query, not through the property API). For user-created types, the
 // list is read off the type object's `defs` dataset.
+//
+// Pure any-store read — no any-sync tree build. Empty slice if the
+// type has no `defs` writes yet (collection not initialised) or if
+// the typeId isn't a known type.
 func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.PropertyDef, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyProperties(), nil
@@ -305,14 +310,32 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 	if _, ok := t.findRegisteredType(typeId); ok {
 		return nil, nil
 	}
-	obj, err := t.parent.store.Get(ctx, typeId)
+	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
 	if err != nil {
-		return nil, fmt.Errorf("typesAPI: load %s: %w", typeId, err)
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("typesAPI: open defs %s: %w", typeId, err)
 	}
-	rows := obj.Controller().Records(ctx, typetype.DatasetPropertyDefs)
-	out := make([]space.PropertyDef, 0, len(rows))
-	for _, v := range rows {
+	iter, err := coll.Find(nil).Iter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("typesAPI: iter defs: %w", err)
+	}
+	defer iter.Close()
+	var out []space.PropertyDef
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return nil, fmt.Errorf("typesAPI: doc: %w", err)
+		}
+		v := doc.Value()
+		if v == nil || v.Get(crdt.DeletedAtField) != nil {
+			continue
+		}
 		out = append(out, decodePropertyDef(v))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("typesAPI: iter err: %w", err)
 	}
 	return out, nil
 }

@@ -302,6 +302,13 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 // Update implements updatelistener.UpdateListener. Fired by synctree
 // from inside AddRawChanges / buildSyncTree, with the tree lock
 // already held — we must NOT re-lock here.
+//
+// The tree must be opened with SetDeferredUpdater(true) — see
+// spaceobjects/store.go:openTree. Without it, any-sync's default
+// AddRawChangesWithUpdater order fires this listener BEFORE
+// storage.AddAll, so replayLocked's IterateAfterAddSeq scan finds
+// nothing new in storage and silently no-ops; tree heads advance
+// while the controller stays out of sync.
 func (o *Object) Update(tree objecttree.ObjectTree) error {
 	return o.replayLocked(context.Background(), tree)
 }

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
@@ -29,14 +31,30 @@ func newPropertiesAPI(parent *spaceImpl) *propertiesAPI { return &propertiesAPI{
 // because we only write base-scope.
 //
 // Returns nil with no error if the object has no property record
-// yet (never written).
+// yet (never written) or has been tombstoned. Pure any-store read —
+// no any-sync tree build, no cold restore.
 func (p *propertiesAPI) Get(ctx context.Context, objectId string, _ space.PropertyReadOpts) (*anyenc.Value, error) {
-	obj, err := p.parent.store.Get(ctx, objectId)
+	coll, err := p.parent.store.SharedObjects(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("propertiesAPI: shared objects: %w", err)
 	}
-	v := obj.Controller().Get(ctx, properties.Dataset, objectId)
-	return v, nil
+	doc, err := coll.FindId(ctx, objectId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("propertiesAPI: find %s: %w", objectId, err)
+	}
+	v := doc.Value()
+	if v == nil || v.Get(crdt.DeletedAtField) != nil {
+		return nil, nil
+	}
+	// Doc's buffer is reused; clone before returning so callers can
+	// retain the value past this call (same contract as
+	// Controller.Get).
+	var cloned anyencutil.Value
+	cloned.FillCopy(v)
+	return cloned.Value, nil
 }
 
 // SetBase merges the patch into the object's own `properties` record.

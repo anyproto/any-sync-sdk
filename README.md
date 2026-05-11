@@ -2,7 +2,7 @@
 
 A Go SDK on top of [any-sync](https://github.com/anyproto/any-sync), built around a CRDT data plane: Mongo-style record stores per object, per-field version gating, and an apply pipeline that converges across peers.
 
-Status: **Phase 1 wiring** — CRDT apply, per-space stores, type catalog, query, and the bootstrap flow (account → tech space → regular spaces) are wired. Subscriptions, members, full ACL, identityRepo, and history APIs are not yet implemented; see *Status* below.
+Status: **Phase 2** — CRDT data plane, query, subscriptions, collaboration v1 (ACL, members, invites), and identityRepo-backed account metadata are wired. Sync-status, change history, files, and a few schema-edit APIs are still stubs; see *Status* below.
 
 ## Install
 
@@ -105,22 +105,25 @@ Registered types appear in `Space.Types().List()` alongside user-created types a
 ## Status
 
 Wired and tested:
-- CRDT apply (`$set`/`$unset`/`$inc`/`$incGated`/`$addToSet`/`$pull`, sticky tombstones, per-field `_ver` gating)
+- CRDT apply (`$set`/`$unset`/`$inc`/`$incGated`/`$addToSet`/`$pull`, sticky tombstones, per-field `_ver` gating, strict-skip surfaced as `ApplyResult.Rejections`)
 - Auto-stamping of `id`, `author`, `createdAt`, `spaceId` at row root, sourced from the tree's immutable header
-- Type catalog (built-in + caller-registered)
+- Type catalog (built-in + caller-registered) with registered-type query API
 - Per-object query (`Space.Query`) and per-space cross-object query (`Space.QueryObjects`)
+- Per-`(objectId, dataset)` and per-space property subscriptions (`Space.Subscribe`, `Space.SubscribeProperties`) — events projected to `$set`/`$unset` with `VersionId`
 - Local writes + inbound sync replay through one apply primitive
-- Cold restore, watermarked replay, parked-change drainer for missing schema dependencies
-- Tech space (per-account derived index of all spaces)
-- Account-level identity, space create/list/delete
+- Cold restore, watermarked replay (`MaxAddSeq`), parked-change drainer for missing schema dependencies
+- Tech space (per-account derived index of all spaces); spaces stay resident and are eager-loaded on boot
+- Space lifecycle: `Create` / `Get` / `List` / `Delete` / `Derive` / `OneToOne` / `Join`
+- Collaboration v1 — `ACL`: `CreateInvite` / `RevokeInvite` / `RevokeAllInvites` / `AcceptRequest` / `DeclineRequest` / `ChangePermissions` / `AddAccounts` / `RemoveAccounts` / `OwnershipChange` / `RequestSelfRemove` / `CancelJoinRequest` / `StopSharing`; `Members`: `List` / `Get` / `Me` / `JoinRequests` / `Invites` / `Subscribe` / `Query`
+- Account identity: `Account.Metadata` and `Account.UpdateMetadata`, persisted in the tech space and republished to identityRepo on boot; per-member profile refetch
 
 Not wired yet:
-- `Space.Subscribe` (returns "not implemented")
-- `Members`, `ACL` (CreateInvite / accept / revoke etc.), `SyncStatus` — all stub interfaces
-- `Space.Service.Join` / `Derive` / `OneToOne`
-- `Account.UpdateMetadata` (identityRepo integration)
+- `Space.SyncStatus` — interface is a stub (`Overall`, `Object`, `Peers`, `Subscribe`)
+- `Service.Subscribe` (space-list events; per-space `Space.Subscribe` is wired)
 - `TypesAPI.Delete` / `RemoveProperty` / `UpdatePropertyMeta`
-- Versioning APIs / change history
+- `PropertiesAPI.SetAccount` / `SetDevice` / `AttachType` / `DetachType`
+- Versioning APIs / change history (`internal/versioning` is doc-only)
+- Files / blobs (deferred; see `docs/07-files.md`)
 
 ## Specs
 

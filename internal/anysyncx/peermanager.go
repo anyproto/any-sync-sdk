@@ -162,8 +162,26 @@ func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error
 	return peers, nil
 }
 
-func (m *spacePeerManager) BroadcastMessage(ctx context.Context, msg drpc.Message) error {
-	return m.streamPool.Send(ctx, msg, func(ctx context.Context) ([]peer.Peer, error) {
+// BroadcastMessage queues msg for delivery to every node peer in this
+// space. Detaches from the caller's ctx on purpose: streamPool.Send
+// hands the actual peer-fetch + write off to a worker goroutine
+// (ExecPool.TryAdd), so by the time that worker dequeues the closure
+// the caller's ctx is typically already cancelled — most callers of
+// the underlying SyncTree.AddContent / SyncAcl.AddRawRecord pass an
+// HTTP request context that ends as soon as the response is written.
+// The symptom was every joiner-side write succeeding locally but
+// never reaching the sync node: streampool logged "send peer error:
+// context canceled" because pool.Get / openStream saw the dead ctx,
+// and Bob's change just sat on disk. Headsync's periodic pull picks
+// up incoming changes but does not push outgoing ones — that's the
+// broadcast's job, and it has to outlive the caller.
+//
+// The runCtx is the per-space manager lifetime, so shutdown still
+// cancels in-flight broadcasts. This mirrors any-sync's own
+// synctest.TestPeerManager, which uses context.Background() for the
+// same reason.
+func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message) error {
+	return m.streamPool.Send(m.runCtx, msg, func(ctx context.Context) ([]peer.Peer, error) {
 		return m.GetNodePeers(ctx)
 	})
 }

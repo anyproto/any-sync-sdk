@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -48,10 +49,29 @@ func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *space
 func (s *spaceImpl) Id() string { return s.id }
 
 // Info reads the space-index snapshot.
+//
+// LocalStatus="joining" is fact-checked against the live AclList: if
+// the local identity is already StatusActive in the ACL (owner accepted,
+// records replicated locally) we return StatusActive without waiting
+// for the tech-space record to flip. The self-heal write that updates
+// the cached tech-space row lives in the members watcher
+// (memberWatcher.tick), so the fix here covers the read path even when
+// the watcher hasn't been started yet (e.g. caller hits Info() before
+// any Members().Subscribe / Query).
 func (s *spaceImpl) Info() space.SpaceInfo {
-	rec, ok := s.tsp.Get(context.Background(), s.id)
+	ctx := context.Background()
+	rec, ok := s.tsp.Get(ctx, s.id)
 	if !ok {
 		return space.SpaceInfo{Id: s.id}
+	}
+	status := mapStatus(rec.LocalStatus, rec.RemoteStatus)
+	if status == space.StatusJoining && s.localIdentityActive(ctx) {
+		status = space.StatusActive
+		// Fire-and-forget self-heal so the next List() / Get() reads
+		// the right cached status without a live AclList round-trip.
+		// Members watcher does the same flip when running; this path
+		// covers callers that never start the watcher.
+		go s.healJoiningStatus()
 	}
 	return space.SpaceInfo{
 		Id:          rec.Id,
@@ -59,8 +79,47 @@ func (s *spaceImpl) Info() space.SpaceInfo {
 		Name:        rec.Name,
 		Description: rec.Description,
 		IconCID:     rec.IconCID,
-		Status:      mapStatus(rec.LocalStatus, rec.RemoteStatus),
+		Status:      status,
 	}
+}
+
+// healJoiningStatus writes LocalStatus="active" if the cached row
+// still says "joining". Idempotent guard via the tsp Get; intended to
+// be called from a goroutine with no return path. Failures are
+// dropped — the next Info() / watcher tick retries.
+func (s *spaceImpl) healJoiningStatus() {
+	ctx := context.Background()
+	rec, ok := s.tsp.Get(ctx, s.id)
+	if !ok || rec.LocalStatus != joiningLocalStatus {
+		return
+	}
+	_, _ = s.tsp.SetLocalStatus(ctx, s.id, techspace.StatusActive)
+}
+
+// localIdentityActive returns true when the live AclList places our
+// account in StatusActive. Used by Info() to override a stale
+// LocalStatus="joining" left over from before the owner's accept
+// landed. Best-effort: any failure to load the space / read the ACL
+// returns false (caller falls back to the cached status).
+func (s *spaceImpl) localIdentityActive(ctx context.Context) bool {
+	handle, err := s.app.GetSpace(ctx, s.id)
+	if err != nil {
+		return false
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return false
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	state := acl.AclState()
+	me := state.Identity()
+	for _, acc := range state.CurrentAccounts() {
+		if acc.PubKey.Equals(me) {
+			return acc.Status == list.StatusActive
+		}
+	}
+	return false
 }
 
 func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }

@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -573,7 +574,28 @@ func (w *memberWatcher) tick() {
 		return
 	}
 	current := collectMembers(acl)
+	state := acl.AclState()
+	meActive := false
+	if me := state.Identity(); me != nil {
+		for _, acc := range state.CurrentAccounts() {
+			if acc.PubKey.Equals(me) {
+				meActive = acc.Status == list.StatusActive
+				break
+			}
+		}
+	}
 	acl.RUnlock()
+
+	// Self-heal the tech-space LocalStatus when the owner has accepted
+	// our join. Without this the index keeps LocalStatus="joining"
+	// forever (Service.Join wrote it; nothing else flips it), so
+	// Service.List / Space.Info return Status=Joining while members.Me
+	// already reads "active" off the live AclList. The watcher ticks
+	// on every ACL record add via SetAclUpdater, so the flip lands
+	// promptly after the owner's accept replicates.
+	if meActive {
+		w.maybeFlipTechSpaceJoining(ctx)
+	}
 
 	w.mu.Lock()
 	prev := w.snapshot
@@ -635,6 +657,31 @@ func (w *memberWatcher) tick() {
 			Member:   old,
 			Previous: &oldCopy,
 		})
+	}
+}
+
+// maybeFlipTechSpaceJoining writes LocalStatus="active" to the
+// space-index record if (and only if) the cached value is still
+// "joining". Cheap no-op once the row reaches "active" — we read the
+// current value first to avoid burning a CRDT change every tick.
+//
+// Best-effort: any failure (tsp not open, write rejected) is dropped;
+// the next tick retries.
+func (w *memberWatcher) maybeFlipTechSpaceJoining(ctx context.Context) {
+	tsp := w.api.s.tsp
+	if tsp == nil {
+		return
+	}
+	rec, ok := tsp.Get(ctx, w.api.s.id)
+	if !ok {
+		return
+	}
+	if rec.LocalStatus != joiningLocalStatus {
+		return
+	}
+	if _, err := tsp.SetLocalStatus(ctx, w.api.s.id, techspace.StatusActive); err != nil {
+		// Swallow; transient failures heal on the next tick.
+		_ = err
 	}
 }
 

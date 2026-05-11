@@ -600,7 +600,7 @@ type ModifyResult struct {
 - `Modify` defaults to strict (no record creation). Pass `WithUpsert()` (or equivalent option) to enable auto-creation — this is the "create" path. A typical create is `Modify(id, [{$set: multiFieldPayload}], WithUpsert())`
 - `VersionId` is synchronous — any-sync is offline-first and commits locally before returning
 - `ChangeId` is the any-sync DAG hash; use it for tracing and cross-peer correlation
-- `RecordIds[i]` is the resolved id of record `i`. For records the caller submitted with empty Id, the resolved value is `base58(xxh3-64(ChangeId))` (with `/<index>` for the second-and-later empty ids in a batch). This is the propId / shortId convention — property creates read it from `RecordIds[0]`
+- `RecordIds[i]` is the resolved id of record `i`. For records the caller submitted with empty Id, the resolved value is `base58(xxh3-64(ChangeId))` (with `:<index>` for the second-and-later empty ids in a batch; `:` rather than `/` so the id is safe in URL path segments). This is the propId / shortId convention — property creates read it from `RecordIds[0]`
 
 ### 12.1 Property-scope Writes
 

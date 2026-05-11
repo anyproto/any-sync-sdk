@@ -950,17 +950,17 @@ func TestEmptyId_MultipleRecordsGetSuffixed(t *testing.T) {
 	}
 	require.NoError(t, st.ApplyChange(ctx, ch))
 
-	// First empty uses DeriveRecordId(ChangeId); subsequent get /1, /2, ...
+	// First empty uses DeriveRecordId(ChangeId); subsequent get :1, :2, ...
 	derived := DeriveRecordId("chA")
 	a := st.Get(ctx, testDS, derived)
 	require.NotNil(t, a)
 	assert.Equal(t, "a", a.GetString("name"))
 
-	b := st.Get(ctx, testDS, derived+"/1")
+	b := st.Get(ctx, testDS, derived+":1")
 	require.NotNil(t, b)
 	assert.Equal(t, "b", b.GetString("name"))
 
-	c := st.Get(ctx, testDS, derived+"/2")
+	c := st.Get(ctx, testDS, derived+":2")
 	require.NotNil(t, c)
 	assert.Equal(t, "c", c.GetString("name"))
 }
@@ -984,7 +984,7 @@ func TestEmptyId_MixedWithExplicitIdsSkipsExplicit(t *testing.T) {
 			{Id: "explicit2", Upsert: true, Ops: []Op{{Type: OpSet,
 				Payload: recordPayload(arena, map[string]any{"name": "y"}),
 			}}},
-			{Upsert: true, Ops: []Op{{Type: OpSet, // second empty → /1
+			{Upsert: true, Ops: []Op{{Type: OpSet, // second empty → :1
 				Payload: recordPayload(arena, map[string]any{"name": "b"}),
 			}}},
 		},
@@ -995,7 +995,7 @@ func TestEmptyId_MixedWithExplicitIdsSkipsExplicit(t *testing.T) {
 	assert.Equal(t, "x", st.Get(ctx, testDS, "explicit1").GetString("name"))
 	assert.Equal(t, "a", st.Get(ctx, testDS, derived).GetString("name"))
 	assert.Equal(t, "y", st.Get(ctx, testDS, "explicit2").GetString("name"))
-	assert.Equal(t, "b", st.Get(ctx, testDS, derived+"/1").GetString("name"))
+	assert.Equal(t, "b", st.Get(ctx, testDS, derived+":1").GetString("name"))
 }
 
 func TestEmptyId_ErrorsWhenUpsertFalse(t *testing.T) {
@@ -1193,7 +1193,7 @@ func TestBatch_DuplicateIdAppliesSequentially(t *testing.T) {
 	assert.Equal(t, "red", rec.GetString("color"))
 }
 
-// Auto-resolved empty ids disambiguate against each other via the /N
+// Auto-resolved empty ids disambiguate against each other via the :N
 // suffix, so two empty-id records in one batch are NOT duplicates —
 // they produce distinct records.
 func TestBatch_MultipleEmptyIdsProduceDistinctRecords(t *testing.T) {
@@ -1215,7 +1215,7 @@ func TestBatch_MultipleEmptyIdsProduceDistinctRecords(t *testing.T) {
 	require.NoError(t, st.ApplyChange(ctx, ch))
 	derived := DeriveRecordId("chA")
 	assert.Equal(t, "a", st.Get(ctx, testDS, derived).GetString("name"))
-	assert.Equal(t, "b", st.Get(ctx, testDS, derived+"/1").GetString("name"))
+	assert.Equal(t, "b", st.Get(ctx, testDS, derived+":1").GetString("name"))
 }
 
 // ----------------------------------------------------------------------------

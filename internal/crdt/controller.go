@@ -517,8 +517,11 @@ func (c *Controller) applySiblings(ctx context.Context, ch *Change, siblings []S
 // ResolveRecordIds replaces empty RecordChange.Ids with ChangeId-
 // derived values and returns the resolved id per record. First
 // empty-id gets `base58(xxh3-64(ChangeId))`; subsequent empty ids get
-// that seed with `/<index>` appended. Caller-supplied ids pass through
+// that seed with `:<index>` appended. Caller-supplied ids pass through
 // unchanged.
+//
+// The suffix separator is `:` (not `/`) so resolved ids are safe to
+// embed in REST URL path segments without extra encoding.
 //
 // Exposed so the write path can return the resolved record ids
 // alongside VersionId/ChangeId — useful for property creates where
@@ -546,7 +549,7 @@ func resolveRecordIds(ch Change) ([]string, error) {
 		if emptySeen == 0 {
 			out[i] = seed
 		} else {
-			out[i] = seed + "/" + strconv.Itoa(emptySeen)
+			out[i] = seed + ":" + strconv.Itoa(emptySeen)
 		}
 		emptySeen++
 	}

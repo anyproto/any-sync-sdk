@@ -18,7 +18,7 @@ type ModifyBatch struct {
 //
 // Id: when empty, the CRDT layer derives one from the change's
 // ChangeId (base58(xxh3-64(ChangeId))); subsequent empty-id records
-// in the same batch get a "/<index>" suffix. Empty id requires
+// in the same batch get a ":<index>" suffix. Empty id requires
 // Upsert=true.
 //
 // Upsert: false (default) = strict update-if-exists — modifies on an
@@ -79,7 +79,7 @@ type DeleteBatch struct {
 //   - RecordIds is the per-record id list aligned to the input
 //     RecordModify slice. For records the caller submitted with an
 //     empty Id, the resolved value is `base58(xxh3-64(ChangeId))`
-//     (with `/<index>` suffix for the second-and-later empty ids in
+//     (with `:<index>` suffix for the second-and-later empty ids in
 //     a batch). This is the propId / shortId convention; callers
 //     creating types or properties read it from RecordIds[0].
 //   - Rejections lists per-op handler rejections — ops that the

@@ -142,10 +142,21 @@ func (o *Object) applyDecodedLocked(ctx context.Context, ch crdt.Change) (crdt.A
 // or when the change is not yet attached to the tree (hand-built
 // changes in tests).
 func (o *Object) stampObjectMeta(ch *crdt.Change) {
-	if o.tree == nil {
+	o.stampObjectMetaFromTree(ch, o.tree)
+}
+
+// stampObjectMetaFromTree is the tree-explicit form of stampObjectMeta.
+// Used by replayLocked when a tree-bound listener fires before
+// SetTree has wired o.tree — the tree is in hand via the listener
+// callback, but the Object hasn't been promoted to "the tree owner"
+// yet. Without this path, replays during the build phase find
+// o.tree == nil and silently skip Creator stamping, producing
+// records whose author is missing on every joiner.
+func (o *Object) stampObjectMetaFromTree(ch *crdt.Change, tree objecttree.ObjectTree) {
+	if tree == nil {
 		return
 	}
-	root := o.tree.Root()
+	root := tree.Root()
 	if root == nil {
 		return
 	}
@@ -156,7 +167,7 @@ func (o *Object) stampObjectMeta(ch *crdt.Change) {
 		ch.ObjectAuthor = root.Identity.Account()
 	}
 	if ch.Creator == "" && ch.ChangeId != "" {
-		if tc, err := o.tree.GetChange(ch.ChangeId); err == nil && tc != nil && tc.Identity != nil {
+		if tc, err := tree.GetChange(ch.ChangeId); err == nil && tc != nil && tc.Identity != nil {
 			ch.Creator = tc.Identity.Account()
 		}
 	}
@@ -395,8 +406,15 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		decoded.AddSeq = ch.AddSeq
 		decoded.Timestamp = ch.Timestamp
 		decoded.VersionId = crdt.VersionId(ch.OrderId)
-		// ObjectAuthor / ObjectCreatedAt come from the tree root via
-		// stampObjectMeta inside applyDecodedLocked.
+		// Stamp ObjectAuthor / ObjectCreatedAt / Creator from the tree
+		// we're iterating — applyDecodedLocked's o.stampObjectMeta
+		// reads o.tree, which is nil when this replay fires from the
+		// synctree's Update listener before SetTree has run (initial
+		// build path on a fresh joiner). The decoded change here is
+		// fully formed, so stamp it directly off the local `tree` and
+		// the inner stampObjectMeta call no-ops on the already-filled
+		// fields.
+		o.stampObjectMetaFromTree(&decoded, tree)
 
 		// Schema gate: a DataVersion referencing unknown shortIds
 		// parks the change (proceed=false) — intentional skip, don't

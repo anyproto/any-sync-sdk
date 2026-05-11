@@ -99,6 +99,31 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = err
 	}
 
+	// Eager-load every non-deleted space from the tech-space index so
+	// per-space headsync / syncacl start running at boot rather than
+	// waiting for the first caller-driven access. Combined with the
+	// disabled space-cache TTL (anysyncx/spacecache.go), this means
+	// every joined space stays subscribed for the SDK's lifetime —
+	// idle peers receive ACL updates and pushed changes without anyone
+	// touching them first.
+	//
+	// Best-effort per space: a single failure (e.g. corrupted local
+	// storage for one space) is logged and skipped so SDK.Open still
+	// succeeds for the rest. Pending-join records (LocalStatus=joining)
+	// are skipped too — Service.Join wrote those before any-sync
+	// storage exists.
+	for _, rec := range tsp.List(ctx) {
+		if rec.LocalStatus == techspace.StatusDeleted {
+			continue
+		}
+		if !app.SpaceExists(rec.Id) {
+			continue
+		}
+		if _, err := app.GetSpace(ctx, rec.Id); err != nil {
+			_ = err
+		}
+	}
+
 	return &SDK{
 		app:     app,
 		db:      db,
@@ -138,6 +163,18 @@ type AccountAPI interface {
 	// Id returns the account's identity string (StrKey-encoded).
 	Id() string
 
+	// Metadata returns the locally-stored profile (the source-of-truth
+	// copy that's also pushed to identityRepo on UpdateMetadata).
+	// Reading from the tech-space is deterministic — no coordinator
+	// round-trip, no 60-second watcher tick — so callers that just want
+	// to read back what they wrote (e.g. a settings UI rendering after a
+	// page reload) don't depend on identityRepo being reachable.
+	//
+	// `present` is false when no profile has been written yet on this
+	// device (fresh wallet). The same `present` and zero-value distinction
+	// the SDK exposes via tsp.GetProfile.
+	Metadata(ctx context.Context) (meta space.AccountMetadata, present bool, err error)
+
 	// UpdateMetadata updates the account's public metadata
 	// (identityRepo-backed). Applies across all spaces.
 	UpdateMetadata(ctx context.Context, meta space.AccountMetadata) error
@@ -164,6 +201,25 @@ func (a *accountImpl) Id() string {
 		return ""
 	}
 	return keys.SignKey.GetPublic().PeerId()
+}
+
+// Metadata reads the locally-persisted profile from the tech-space.
+// Symmetric with UpdateMetadata's local-first write — never hits the
+// network. See AccountAPI.Metadata for the (present, zero-value)
+// contract.
+func (a *accountImpl) Metadata(ctx context.Context) (space.AccountMetadata, bool, error) {
+	if a.tsp == nil {
+		return space.AccountMetadata{}, false, nil
+	}
+	rec, ok := a.tsp.GetProfile(ctx)
+	if !ok {
+		return space.AccountMetadata{}, false, nil
+	}
+	return space.AccountMetadata{
+		Name:        rec.Name,
+		Description: rec.Description,
+		IconCID:     rec.IconCID,
+	}, true, nil
 }
 
 // UpdateMetadata publishes the account's profile (name / description /

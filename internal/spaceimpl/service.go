@@ -186,10 +186,22 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
 }
 
-// Get returns a handle to a known space.
+// Get returns a handle to a known space. Eagerly loads the any-sync
+// side via the cache so periodic headsync / syncacl start running
+// from this point — without this, Get only consults the tech-space
+// index and the per-space components stay dormant until the first
+// Modify or per-object Query (the cold paths that go through
+// store.Get(objectId) → app.GetSpace). QueryObjects and members reads
+// satisfied from local storage would otherwise leave a peer unable
+// to receive pushed changes for an arbitrarily long stretch.
+//
+// Mirrors the eager-load that Create / Derive / OneToOne already do.
 func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) {
 	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
 		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
+	}
+	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+		return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
 	}
 	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s), nil
 }

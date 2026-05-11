@@ -12,14 +12,24 @@ import (
 	"github.com/anyproto/any-sync/commonspace/syncstatus"
 )
 
-// spaceLoaderTTL controls how long an idle commonspace.Space sits in
-// the cache before TryClose is offered. Mirrors anytype-heart and
-// any-sync-node defaults — long enough that bursty writes don't
-// thrash, short enough that idle resources release within a minute.
-const spaceLoaderTTL = 60 * time.Second
-
-// spaceLoaderGC is the cache's GC tick.
-const spaceLoaderGC = 20 * time.Second
+// Space cache TTL is disabled: once a commonspace.Space is loaded it
+// stays loaded for the SDK lifetime. Loaded spaces own only headsync
+// + syncacl + a small set of tree handles per active object — the
+// per-space memory floor is bounded and well below what auto-eviction
+// was designed to claw back. Keeping spaces resident lets headsync /
+// syncacl stay subscribed at all times so a peer that wakes up offline
+// receives ACL updates and pushed changes without anyone touching the
+// space first. Eviction also broke the inverse case: if no caller
+// referenced a space for spaceLoaderTTL after boot, periodic headsync
+// never fired at all (the per-space components only start on first
+// app.GetSpace), so an idle peer would silently fall behind.
+//
+// Passing 0 to either WithTTL or WithGCPeriod disables the ocache
+// ticker entirely (see app/ocache/ocache.go: `if c.ttl != 0 && c.gc != 0`).
+const (
+	spaceLoaderTTL = 0
+	spaceLoaderGC  = 0
+)
 
 // SpaceHandle is the handle returned by App.GetSpace. Callers operate
 // on it for the duration of a logical operation; the underlying

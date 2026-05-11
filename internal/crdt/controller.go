@@ -18,6 +18,17 @@ var (
 	ErrMissingRecordId       = errors.New("crdt: RecordChange.Id is empty and Change.ChangeId is also empty")
 	ErrEmptyIdRequiresUpsert = errors.New("crdt: RecordChange.Id is empty but Upsert is false")
 	ErrMissingDataVersion    = errors.New("crdt: Change.DataVersion is empty")
+
+	// ErrStrictSkipAbsent surfaces the documented strict-mode behaviour
+	// (Upsert=false on an absent record = silent no-op) as a per-record
+	// rejection. Without this, callers who happen to send a
+	// non-existent record id with Upsert=false get a fully successful
+	// WriteResult (RecordIds populated, Rejections empty) but the
+	// record never lands in the projection — and the same change still
+	// commits to the tree, so peers see the same skip. The rejection
+	// lets writers detect the case via ApplyResult.Rejections without
+	// changing the strict-mode semantics that other paths rely on.
+	ErrStrictSkipAbsent = errors.New("crdt: strict modify (Upsert=false) skipped because record id does not exist")
 )
 
 // OpRejection records one per-op handler rejection. The op was
@@ -441,7 +452,13 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 	} else {
 		if _, err := coll.UpdateId(ctx, id, mod); err != nil {
 			if errors.Is(err, anystore.ErrDocNotFound) {
-				return nil, nil // strict mode: silent skip on absent
+				// Strict mode: the record doesn't exist. The change still
+				// commits to the tree (caller already ran AddContent), but
+				// nothing lands in the projection. Surface this as a
+				// per-record rejection so callers can distinguish "wrote
+				// successfully" from "structural id resolved but no
+				// projection happened".
+				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil
 			}
 			return nil, err
 		}

@@ -1079,6 +1079,26 @@ func TestUpsert_StrictSkipsAbsent(t *testing.T) {
 	assert.Nil(t, st.Get(ctx, testDS, "r1"))
 }
 
+func TestUpsert_StrictSkipSurfacesRejection(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	// The skip is silent in terms of state (no record, no error), but a
+	// rejection is surfaced via ApplyResult so callers can detect that
+	// nothing landed in the projection — useful when middleware computes
+	// "inserted ids" from RecordIds (resolved structurally pre-apply)
+	// and would otherwise report a fully successful write.
+	res, err := st.ApplyChangeWithResult(ctx, makeChange("v1", "r1", Op{
+		Type:    OpSet,
+		Payload: recordPayload(arena, map[string]any{"name": "ghost"}),
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrStrictSkipAbsent)
+	assert.Equal(t, "r1", res.Rejections[0].RecordId)
+	assert.Nil(t, st.Get(ctx, testDS, "r1"))
+}
+
 func TestUpsert_TrueCreatesAbsent(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}

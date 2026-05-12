@@ -146,6 +146,12 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	return st
 }
 
+// StoreFor returns the per-space spaceobjects.Store, building it on
+// first access. Exposed for callers outside the package (e.g. the
+// spacesync catch-up driver invoked from SDK.Open) that need the
+// store handle without going through Get / Create / Derive.
+func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
+
 // ensureSpaceIndexWiring is idempotent per spaceId: on first call it
 // derives the deterministic spaceIndex object id, caches it, and
 // spawns a spaceIndexWatcher that mirrors the converged in-space

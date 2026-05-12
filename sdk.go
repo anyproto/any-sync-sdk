@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/spacesync"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -120,6 +121,14 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 			continue
 		}
 		if _, err := app.GetSpace(ctx, rec.Id); err != nil {
+			_ = err
+			continue
+		}
+		// Catch up any trees that advanced while we were offline (or
+		// that we have never opened). Best-effort: a failure here
+		// shouldn't block SDK.Open for the rest of the spaces — the
+		// per-object lazy ColdRestore on first user touch still works.
+		if err := spacesync.Run(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
 			_ = err
 		}
 	}

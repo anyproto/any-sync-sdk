@@ -17,7 +17,16 @@ const MetaCollectionName = "_meta"
 const (
 	metaAddSeqKey          = "q"
 	metaHandlerVersionsKey = "hv"
+
+	// spaceMetaKeyPrefix namespaces space-scoped rows inside the same
+	// _meta collection. Colon is not a valid char in any-sync's
+	// content-addressable object IDs, so "space:<id>" rows can't
+	// collide with per-object rows keyed by objectId.
+	spaceMetaKeyPrefix = "space:"
 )
+
+// SpaceMetaKey returns the _meta document id for a space's row.
+func SpaceMetaKey(spaceId string) string { return spaceMetaKeyPrefix + spaceId }
 
 // LoadMeta reads the per-object metadata from the _meta collection.
 // Returns zero values if the document doesn't exist yet.
@@ -88,4 +97,33 @@ func (c *Controller) LoadAndSeedMeta(ctx context.Context, metaColl anystore.Coll
 	}
 	c.maxAddSeq = maxAddSeq
 	return hv, nil
+}
+
+// LoadSpaceMaxAddSeq reads the persisted space-level head-store
+// watermark — the lower bound of "we've already replayed any-sync
+// trees up to this LastAddSeq for this space". Returns 0 when no
+// row exists yet (first boot or never caught up).
+func LoadSpaceMaxAddSeq(ctx context.Context, coll anystore.Collection, spaceId string) (uint64, error) {
+	doc, err := coll.FindId(ctx, SpaceMetaKey(spaceId))
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return uint64(doc.Value().GetInt(metaAddSeqKey)), nil
+}
+
+// PersistSpaceMaxAddSeq writes the space-level head-store watermark.
+// Written once at the end of a successful catch-up pass — per-change
+// progress is already captured by the per-object _meta rows, so this
+// value is a coarse-grained "no work needed at startup" hint, not a
+// per-change atomic counter.
+func PersistSpaceMaxAddSeq(ctx context.Context, coll anystore.Collection, spaceId string, maxAddSeq uint64) error {
+	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		v.Set(metaAddSeqKey, a.NewNumberInt(int(maxAddSeq)))
+		return v, true, nil
+	})
+	_, err := coll.UpsertId(ctx, SpaceMetaKey(spaceId), mod)
+	return err
 }

@@ -91,6 +91,52 @@ func TestMeta_ControllerLoadAndSeed(t *testing.T) {
 	assert.NotEqual(t, storedHV["blocks"], currentHV["blocks"])
 }
 
+func TestMeta_SpaceMaxAddSeq_RoundTrip(t *testing.T) {
+	_, coll := openMetaColl(t)
+
+	require.NoError(t, PersistSpaceMaxAddSeq(ctx, coll, "spaceA", 123))
+	got, err := LoadSpaceMaxAddSeq(ctx, coll, "spaceA")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(123), got)
+}
+
+func TestMeta_SpaceMaxAddSeq_MissingReturnsZero(t *testing.T) {
+	_, coll := openMetaColl(t)
+
+	got, err := LoadSpaceMaxAddSeq(ctx, coll, "never-written")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), got)
+}
+
+func TestMeta_SpaceMaxAddSeq_Overwrite(t *testing.T) {
+	_, coll := openMetaColl(t)
+
+	require.NoError(t, PersistSpaceMaxAddSeq(ctx, coll, "spaceA", 10))
+	require.NoError(t, PersistSpaceMaxAddSeq(ctx, coll, "spaceA", 200))
+
+	got, err := LoadSpaceMaxAddSeq(ctx, coll, "spaceA")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(200), got)
+}
+
+// Per-object and per-space rows share the _meta collection. Verify
+// they don't collide: writing to one must not change the other.
+func TestMeta_SpaceMaxAddSeq_DoesNotCollideWithObjectRows(t *testing.T) {
+	_, coll := openMetaColl(t)
+
+	require.NoError(t, PersistMeta(ctx, coll, "objA", 7, map[string]int{"blocks": 1}))
+	require.NoError(t, PersistSpaceMaxAddSeq(ctx, coll, "objA", 999))
+
+	objSeq, hv, err := LoadMeta(ctx, coll, "objA")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(7), objSeq, "object row untouched by space write")
+	assert.Equal(t, 1, hv["blocks"])
+
+	spaceSeq, err := LoadSpaceMaxAddSeq(ctx, coll, "objA")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(999), spaceSeq, "space row untouched by object write")
+}
+
 func TestMeta_ControllerPersistMeta(t *testing.T) {
 	db, coll := openMetaColl(t)
 	arena := &anyenc.Arena{}

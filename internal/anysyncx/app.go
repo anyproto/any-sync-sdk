@@ -209,7 +209,19 @@ func (a *App) HeadCache() *HeadCache { return a.headCache }
 // The adapter is also indexed in a.syncers so PeerSyncStats(spaceId)
 // can read its per-peer counters for the debug surface.
 func (a *App) newTreeSyncerForSpace(spaceId string) *treeSyncerAdapter {
-	ts := newTreeSyncer(spaceId, a.tree.registry)
+	// onRound: a 0/0 success round against a responsible peer means
+	// the entire space is converged — sweep every tree the tracker
+	// has seen to Synced, and anchor lastAllSyncedAt so trees the
+	// tracker has never seen (cold-restored, no recent hook) also
+	// read as Synced. Non-zero counts or errors are no-ops here;
+	// the per-tree HeadsApply path still handles them.
+	onRound := func(peerId string, newCount, changedCount int, err error) {
+		if err != nil || newCount != 0 || changedCount != 0 {
+			return
+		}
+		a.syncStatus.For(spaceId).BulkSyncedFromPeer(peerId)
+	}
+	ts := newTreeSyncer(spaceId, a.tree.registry, onRound)
 	a.syncersMu.Lock()
 	a.syncers[spaceId] = ts
 	a.syncersMu.Unlock()

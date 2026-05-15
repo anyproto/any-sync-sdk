@@ -31,10 +31,23 @@ type Tracker struct {
 	parent   *Service // for cross-tracker access (refresh, conn status); may be nil in tests
 	excluded map[string]struct{}
 
-	mu       sync.Mutex
-	trees    map[string]*treeState
+	mu sync.Mutex
+	// trees maps treeId → per-tree state. Populated by the
+	// any-sync StatusUpdater hooks (HeadsChange, ObjectReceive,
+	// HeadsApply) and by BulkSyncedFromPeer.
+	trees map[string]*treeState
+	// lastSync is the most recent HeadsApply timestamp across all
+	// trees — used in the space-level rollup as LastSyncedAt.
 	lastSync time.Time
-	subs     *registry[space.ObjectSyncStatus]
+	// lastAllSyncedAt is the most recent moment a responsible
+	// peer reported a fully-converged diff round (0 new, 0
+	// changed). When non-zero, Detail/Object for a tree the
+	// tracker has never seen returns Synced anchored to this
+	// timestamp — covers cold-restored trees that haven't had a
+	// per-tree hook fire yet but are demonstrably in sync at the
+	// space level.
+	lastAllSyncedAt time.Time
+	subs            *registry[space.ObjectSyncStatus]
 }
 
 // treeState is the per-tree row of the tracker. Pending heads are
@@ -109,15 +122,24 @@ func (t *Tracker) AddExcluded(treeIds ...string) {
 func (t *Tracker) Object(objectId string) space.ObjectSyncStatus {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	st, ok := t.trees[objectId]
-	if !ok {
-		return space.ObjectSyncStatus{ObjectId: objectId, State: space.SyncStateUnknown}
+	if st, ok := t.trees[objectId]; ok {
+		return space.ObjectSyncStatus{
+			ObjectId:   objectId,
+			State:      st.state,
+			LastSyncAt: st.lastApplied,
+		}
 	}
-	return space.ObjectSyncStatus{
-		ObjectId:   objectId,
-		State:      st.state,
-		LastSyncAt: st.lastApplied,
+	// No per-tree row, but a responsible peer has confirmed
+	// space-level convergence at lastAllSyncedAt — that anchors
+	// this tree's state to Synced. Otherwise Unknown.
+	if !t.lastAllSyncedAt.IsZero() {
+		return space.ObjectSyncStatus{
+			ObjectId:   objectId,
+			State:      space.SyncStateSynced,
+			LastSyncAt: t.lastAllSyncedAt,
+		}
 	}
+	return space.ObjectSyncStatus{ObjectId: objectId, State: space.SyncStateUnknown}
 }
 
 // Detail returns the full per-tree snapshot used by the debug
@@ -130,15 +152,20 @@ func (t *Tracker) Object(objectId string) space.ObjectSyncStatus {
 func (t *Tracker) Detail(objectId string) (state space.SyncState, pending []string, lastApplied time.Time, known bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	st, ok := t.trees[objectId]
-	if !ok {
-		return space.SyncStateUnknown, nil, time.Time{}, false
+	if st, ok := t.trees[objectId]; ok {
+		var p []string
+		if len(st.pending) > 0 {
+			p = append(p, st.pending...)
+		}
+		return st.state, p, st.lastApplied, true
 	}
-	var p []string
-	if len(st.pending) > 0 {
-		p = append(p, st.pending...)
+	if !t.lastAllSyncedAt.IsZero() {
+		// Synced anchored to the last 0/0 responsible-peer round.
+		// known=false signals "no per-tree hook history" but the
+		// state is still meaningful — callers can render it.
+		return space.SyncStateSynced, nil, t.lastAllSyncedAt, false
 	}
-	return st.state, p, st.lastApplied, true
+	return space.SyncStateUnknown, nil, time.Time{}, false
 }
 
 // SubscribeObject registers cb for state flips on objectId. Cheap;
@@ -267,6 +294,50 @@ func (t *Tracker) HeadsApply(senderId, treeId string, heads []string, allAdded b
 	}
 	t.mu.Unlock()
 	t.dispatchAndRefresh(ev)
+}
+
+// BulkSyncedFromPeer is the space-level convergence hook: when a
+// responsible peer reports a fully-zero diff round (no new, no
+// changed trees from our side), every locally-known tree is by
+// definition in sync with that peer. Sweep the tracker: clear
+// pending heads on every recorded tree, flip to Synced, anchor
+// lastSync to now. Unknown-to-tracker trees inherit Synced via
+// lastAllSyncedAt on the next Detail/Object read.
+//
+// Non-responsible senders and empty peerIds are ignored — same
+// rule HeadsApply uses, prevents a stray reply from collapsing
+// the state machine.
+func (t *Tracker) BulkSyncedFromPeer(peerId string) {
+	if peerId == "" || !t.isResponsibleSender(peerId) {
+		return
+	}
+	now := time.Now()
+	t.mu.Lock()
+	t.lastAllSyncedAt = now
+	if now.After(t.lastSync) {
+		t.lastSync = now
+	}
+	var events []space.ObjectSyncStatus
+	for treeId, st := range t.trees {
+		flipped := st.state != space.SyncStateSynced
+		st.pending = st.pending[:0]
+		st.state = space.SyncStateSynced
+		st.lastApplied = now
+		if flipped {
+			events = append(events, space.ObjectSyncStatus{
+				ObjectId:   treeId,
+				State:      space.SyncStateSynced,
+				LastSyncAt: now,
+			})
+		}
+	}
+	t.mu.Unlock()
+	for _, ev := range events {
+		t.subs.dispatch(ev)
+	}
+	if t.parent != nil {
+		t.parent.refresh(t.spaceId)
+	}
 }
 
 // close drops all subscribers. Called from Service.close.

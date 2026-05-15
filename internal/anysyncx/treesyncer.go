@@ -36,6 +36,14 @@ type PeerSyncSnapshot struct {
 // listener, which silently breaks cold sync — the tree storage
 // receives changes but our controller never sees them. See
 // docs/sync-listener-wiring or the cold-sync e2e for the trail.
+// PeerRoundCallback fires after every SyncAll completes. Wired by
+// the App to route 0/0 success rounds into the syncstatus tracker
+// for the space-level "all synced" sweep. peerId is the responsible
+// peer (caller filters); newCount / changedCount are the post-
+// deletionState-filter sizes (what SyncAll actually acted on); err
+// is the SyncAll error, nil on success.
+type PeerRoundCallback func(peerId string, newCount, changedCount int, err error)
+
 type treeSyncerAdapter struct {
 	spaceId     string
 	treeBuilder objecttreebuilder.TreeBuilder
@@ -49,13 +57,18 @@ type treeSyncerAdapter struct {
 	// boot). In-memory only; cleared on SDK restart.
 	statsMu sync.Mutex
 	stats   map[string]PeerSyncSnapshot
+
+	// onRound is the optional space-level "round done" callback —
+	// fires on every SyncAll. nil-safe.
+	onRound PeerRoundCallback
 }
 
-func newTreeSyncer(spaceId string, registry SpaceRegistry) *treeSyncerAdapter {
+func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCallback) *treeSyncerAdapter {
 	return &treeSyncerAdapter{
 		spaceId:  spaceId,
 		registry: registry,
 		stats:    map[string]PeerSyncSnapshot{},
+		onRound:  onRound,
 	}
 }
 
@@ -113,8 +126,9 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 	return nil
 }
 
-// record stores the latest per-peer snapshot. Overwrites any prior
-// row for peerId — only the most recent round is retained.
+// record stores the latest per-peer snapshot and fires the
+// onRound callback. Overwrites any prior row for peerId — only
+// the most recent round is retained.
 func (t *treeSyncerAdapter) record(peerId string, newCount, changedCount int, err error) {
 	if peerId == "" {
 		return
@@ -131,6 +145,9 @@ func (t *treeSyncerAdapter) record(peerId string, newCount, changedCount int, er
 	t.statsMu.Lock()
 	t.stats[peerId] = snap
 	t.statsMu.Unlock()
+	if t.onRound != nil {
+		t.onRound(peerId, newCount, changedCount, err)
+	}
 }
 
 // Stats returns a copy of the per-peer snapshot map. Cheap; map

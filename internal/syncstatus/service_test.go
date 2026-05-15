@@ -177,6 +177,75 @@ func TestTracker_NonResponsibleSenderIgnored(t *testing.T) {
 	}
 }
 
+// TestTracker_BulkSyncedFromPeer covers the space-level "0/0 round"
+// convergence shortcut. Three cases in one walk:
+//
+//  1. Tree the tracker has a row for, currently Syncing → flips to
+//     Synced; pending heads dropped; subscribers fire.
+//  2. Tree the tracker has never seen (cold-restored, no hooks
+//     yet) → Object()/Detail() report Synced via lastAllSyncedAt.
+//  3. Non-responsible peer → no-op (state unchanged).
+func TestTracker_BulkSyncedFromPeer(t *testing.T) {
+	svc := NewService()
+	defer svc.Close()
+	svc.SetNodeIdsFn(func(string) []string { return []string{"node-1"} })
+
+	tr := svc.For("space-1")
+
+	const trackedTree = "obj-tracked"
+	const unknownTree = "obj-untouched"
+
+	var seen []space.ObjectSyncStatus
+	var mu sync.Mutex
+	cancel := tr.SubscribeObject(trackedTree, func(ev space.ObjectSyncStatus) {
+		mu.Lock()
+		seen = append(seen, ev)
+		mu.Unlock()
+	})
+	defer cancel()
+
+	// Tree with a row, in Syncing.
+	tr.HeadsChange(trackedTree, []string{"head-x"})
+	if got := tr.Object(trackedTree).State; got != space.SyncStateSyncing {
+		t.Fatalf("setup: tracked tree state = %v, want Syncing", got)
+	}
+
+	// Unknown tree before any 0/0 round → Unknown.
+	if got := tr.Object(unknownTree).State; got != space.SyncStateUnknown {
+		t.Fatalf("untouched tree pre-sweep state = %v, want Unknown", got)
+	}
+
+	// Non-responsible sender: drop.
+	tr.BulkSyncedFromPeer("stranger")
+	if got := tr.Object(trackedTree).State; got != space.SyncStateSyncing {
+		t.Fatalf("non-responsible sweep flipped state to %v, want Syncing", got)
+	}
+	if got := tr.Object(unknownTree).State; got != space.SyncStateUnknown {
+		t.Fatalf("non-responsible sweep flipped unknown tree to %v, want Unknown", got)
+	}
+
+	// Responsible peer 0/0 round: sweep both into Synced.
+	before := time.Now()
+	tr.BulkSyncedFromPeer("node-1")
+
+	if got := tr.Object(trackedTree); got.State != space.SyncStateSynced {
+		t.Fatalf("tracked tree state = %v, want Synced", got.State)
+	} else if !got.LastSyncAt.After(before.Add(-time.Second)) {
+		t.Fatalf("tracked tree LastSyncAt = %v, want >= %v", got.LastSyncAt, before)
+	}
+	if got := tr.Object(unknownTree); got.State != space.SyncStateSynced {
+		t.Fatalf("unknown tree state = %v, want Synced (via lastAllSyncedAt)", got.State)
+	}
+
+	// Subscriber fires only on flips: setup (Syncing) + sweep (Synced).
+	mu.Lock()
+	got := append([]space.ObjectSyncStatus(nil), seen...)
+	mu.Unlock()
+	if len(got) != 2 || got[0].State != space.SyncStateSyncing || got[1].State != space.SyncStateSynced {
+		t.Fatalf("subscribe events = %+v, want [Syncing, Synced]", got)
+	}
+}
+
 // TestTracker_ExcludedTrees verifies the tracker drops hooks for
 // excluded tree ids (ACL, spaceIndex, etc).
 func TestTracker_ExcludedTrees(t *testing.T) {

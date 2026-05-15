@@ -129,9 +129,14 @@ func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
 func (s *spaceImpl) ACL() space.ACL            { return s.acl }
 func (s *spaceImpl) Members() space.MembersAPI { return s.members }
 
-// SyncStatus is not yet wired in MVP — returned as nil; interface
-// stubbed elsewhere.
-func (s *spaceImpl) SyncStatus() space.SyncStatusAPI { return nil }
+// SyncStatus returns the per-space sync-status accessor backed by the
+// account-level syncstatus.Service held on anysyncx.App. The accessor
+// is a thin pointer wrapper — safe to construct on every call (no
+// hidden state) but we memoise on the spaceImpl to avoid extra
+// allocations when middleware polls.
+func (s *spaceImpl) SyncStatus() space.SyncStatusAPI {
+	return newSyncStatusAPI(s.app.SyncStatus(), s.id)
+}
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {

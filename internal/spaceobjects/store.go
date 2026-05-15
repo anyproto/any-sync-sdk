@@ -236,6 +236,25 @@ func (s *Store) ExternalTypes() []handler.Type { return s.extTypes }
 // SpaceId returns the id of the space this store serves.
 func (s *Store) SpaceId() string { return s.spaceId }
 
+// RegularObjectCount returns the count of rows in the per-space
+// `objects` collection — one row per user-visible regular object.
+// Used by the sync-status rollup as the Total denominator.
+//
+// Returns 0 if the collection hasn't been opened yet (cold start
+// before any object lives in this space) or on read error — both
+// produce the right rollup result (Synced/0 = trivially Synced).
+func (s *Store) RegularObjectCount(ctx context.Context) int {
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return 0
+	}
+	n, err := coll.Count(ctx)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // OpenObjectCollection opens the per-object any-store collection
 // `{objectId}/{dataset}` without binding the any-sync tree. Read-only
 // callers (Properties.Get, queries against per-object datasets, type

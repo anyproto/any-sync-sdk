@@ -111,7 +111,7 @@ type Service struct {
 // spaceIndex state into its rows; usually tsp itself (which
 // satisfies space.Indexer).
 func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type) *Service {
-	return &Service{
+	s := &Service{
 		app:                app,
 		tsp:                tsp,
 		indexer:            indexer,
@@ -122,6 +122,22 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		spaceIndexIds:      make(map[string]string),
 		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
 	}
+	// Wire the Total source for the sync-status rollup. The rollup
+	// loop reads the per-space `objects` row count via the live Store
+	// to compute Synced/Total. nil-store cases (querying status for
+	// a space before storeFor has run) report 0, which is correct.
+	if ss := app.SyncStatus(); ss != nil {
+		ss.SetTotalFn(func(spaceId string) int {
+			s.mu.Lock()
+			store := s.stores[spaceId]
+			s.mu.Unlock()
+			if store == nil {
+				return 0
+			}
+			return store.RegularObjectCount(context.Background())
+		})
+	}
+	return s
 }
 
 // storeFor returns the per-space spaceobjects.Store, building it on
@@ -193,6 +209,14 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 	s.spaceIndexIds[spaceId] = objectId
 	store := s.stores[spaceId]
 	s.mu.Unlock()
+
+	// Tell the sync-status tracker to ignore this tree — the
+	// spaceIndex is a derived per-space metadata object, not a
+	// user-visible regular object, so it shouldn't contribute to
+	// the Pending count.
+	if ss := s.app.SyncStatus(); ss != nil {
+		ss.For(spaceId).AddExcluded(objectId)
+	}
 
 	// Spawn the watcher outside the lock — newSpaceIndexWatcher does
 	// the initial reconcile read which may take any-store latency.
@@ -351,6 +375,19 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 // Subscribe is not yet wired — returns a no-op cancel.
 func (s *Service) Subscribe(_ func(space.SpaceListEvent)) (cancel func()) {
 	return func() {}
+}
+
+// Status returns a snapshot of spaceId's rolled-up sync state. Routes
+// through the per-account syncstatus.Service on anysyncx.App.
+func (s *Service) Status(spaceId string) space.SpaceSyncStatus {
+	return s.app.SyncStatus().Status(spaceId)
+}
+
+// SubscribeStatus registers cb for SpaceSyncStatus events across
+// every known space. Account-wide firehose backed by the syncstatus
+// Service's subscriber registry.
+func (s *Service) SubscribeStatus(cb func(space.SpaceSyncStatus)) (cancel func()) {
+	return s.app.SyncStatus().SubscribeStatus(cb)
 }
 
 // Derive creates (or rehydrates) a deterministic space from req.Seed.

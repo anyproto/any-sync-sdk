@@ -9,7 +9,6 @@ import (
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
-	"github.com/anyproto/any-sync/commonspace/syncstatus"
 )
 
 // Space cache TTL is disabled: once a commonspace.Space is loaded it
@@ -86,8 +85,14 @@ func (a *App) newSpaceCache() ocache.OCache {
 // must already exist (caller is expected to Create / Derive first if
 // the space is new).
 func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, error) {
+	// The Tracker is constructed lazily and reused across reloads of
+	// the same spaceId; we wire it as commonspace.Deps.SyncStatus so
+	// any-sync dispatches HeadsChange / ObjectReceive / HeadsApply
+	// straight into it.
+	tracker := a.syncStatus.For(id)
+
 	cs, err := a.spaceService.NewSpace(ctx, id, commonspace.Deps{
-		SyncStatus: syncstatus.NewNoOpSyncStatus(),
+		SyncStatus: tracker,
 		TreeSyncer: a.NewTreeSyncer(),
 	})
 	if err != nil {
@@ -101,6 +106,21 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 		return nil, fmt.Errorf("anysyncx: Init %s: %w", id, err)
 	}
 	a.sync.RegisterSpace(id, cs)
+
+	// Register system trees the rollup must ignore. ACL fires only
+	// HeadsReceive (which the tracker no-ops anyway), but the settings
+	// tree is a regular synctree that fires HeadsChange / HeadsApply —
+	// excluding it keeps the Pending count tied to user-visible trees.
+	// The spaceIndex object id is registered separately by the space
+	// layer when ensureSpaceIndexWiring derives it.
+	if acl := cs.Acl(); acl != nil {
+		tracker.AddExcluded(acl.Id())
+	}
+	if st := cs.Storage(); st != nil {
+		if state := st.StateStorage(); state != nil {
+			tracker.AddExcluded(state.SettingsId())
+		}
+	}
 
 	// Hash cache: seed from current state and subscribe to future
 	// changes. The observer is owned by the StateStorage and lives

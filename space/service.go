@@ -39,6 +39,18 @@ type Service interface {
 	// Subscribe delivers space-list changes (added / updated / removed).
 	// Returns a cancel function.
 	Subscribe(cb func(SpaceListEvent)) (cancel func())
+
+	// Status returns a snapshot of one space's rolled-up sync state.
+	// Cheap; safe to call on every render tick. Spaces unknown to
+	// the SDK return SpaceSyncStatus{SpaceId: spaceId,
+	// State: SyncStateUnknown}.
+	Status(spaceId string) SpaceSyncStatus
+
+	// SubscribeStatus delivers SpaceSyncStatus events whenever any
+	// known space's rollup transitions. Account-wide — one cb sees
+	// every space. cb runs synchronously on the dispatcher
+	// goroutine; keep work small or hand off.
+	SubscribeStatus(cb func(SpaceSyncStatus)) (cancel func())
 }
 
 // CreateRequest is the input to Service.Create.

@@ -26,6 +26,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
+	"github.com/anyproto/any-sync-sdk/internal/syncstatus"
 )
 
 // App is the running any-sync app plus the components downstream
@@ -44,6 +45,8 @@ type App struct {
 
 	spaceCache ocache.OCache
 	headCache  *HeadCache
+
+	syncStatus *syncstatus.Service
 
 	keys *accountdata.AccountKeys
 }
@@ -113,8 +116,18 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		tree:         tree,
 		storage:      storage,
 		headCache:    newHeadCache(),
+		syncStatus:   syncstatus.NewService(),
 		keys:         keys,
 	}
+	// Wire the responsible-node resolver so per-space trackers can
+	// filter inbound HeadsApply senders. nodeconf is registered above;
+	// fetch the component once here so the closure stays cheap.
+	nc := a.MustComponent(nodeconf.CName).(nodeconf.Service)
+	out.syncStatus.SetNodeIdsFn(nc.NodeIds)
+	// Start the rollup loop. The loop ticks once per second, drains
+	// the dirty set, and dispatches SpaceSyncStatus events to
+	// account-wide subscribers. Close() cancels via syncStatus.Close.
+	out.syncStatus.Run(context.Background())
 	out.spaceCache = out.newSpaceCache()
 	// Wire the head cache into the sync handler so HeadSync's fast
 	// path sees the same map updated by space loads.
@@ -129,8 +142,16 @@ func (a *App) Close(ctx context.Context) error {
 	if a.spaceCache != nil {
 		_ = a.spaceCache.Close()
 	}
+	if a.syncStatus != nil {
+		a.syncStatus.Close()
+	}
 	return a.a.Close(ctx)
 }
+
+// SyncStatus exposes the per-account sync-status registry. Wired
+// into commonspace.Deps.SyncStatus in Phase 2; for now the space
+// layer reads it for snapshot + subscribe.
+func (a *App) SyncStatus() *syncstatus.Service { return a.syncStatus }
 
 // SpaceService is any-sync's per-account space create/derive/join surface.
 func (a *App) SpaceService() commonspace.SpaceService { return a.spaceService }

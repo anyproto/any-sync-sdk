@@ -1,9 +1,18 @@
-// Package syncstatus tracks per-space, per-object, and per-peer sync
-// state for the SyncStatus accessor exposed by space/. Subscribes to
-// eventbus for apply events and to anysyncx for transport/peer signals,
-// computes derived status, and emits updates middleware can observe.
+// Package syncstatus tracks per-space, per-object sync state from
+// any-sync's StatusUpdater hooks and exposes it via the SyncStatusAPI
+// surfaced on space.Space. Two subscription scopes are supported:
 //
-// Designed as a separate subsystem so status UI concerns stay out of
-// the CRDT/apply hot path. See docs/00-common-context.md §"SDK
-// Sections" (9) — the concrete status model is groomed in its own pass.
+//   - Account-wide via space.Service.SubscribeStatus (one cb sees every
+//     space's rollup transitions; backed by Service's registry).
+//   - Per-object via Space.SyncStatus().SubscribeObject (one cb per
+//     objectId; backed by per-Tracker registry).
+//
+// The Service owns one Tracker per space (lazy, via For(spaceId)) and
+// the account-wide subscriber registry. The Tracker holds the
+// per-tree state machine and per-object subscriber registry.
+//
+// Phase 1 (this commit) lands types + skeleton + Service/Tracker
+// construction wired through anysyncx.App. Phase 2 will plug Tracker
+// into commonspace.Deps.SyncStatus and start the rollup loop;
+// Phase 3 adds the peer-presence reader.
 package syncstatus

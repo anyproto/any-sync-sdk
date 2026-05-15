@@ -2,182 +2,250 @@
 
 ## Vision
 
-Caller-facing view of "what's the sync state of this space right now":
+Caller-facing view of "what's the sync state of this space right now",
+consumed in-process by middleware. The SDK ingests any-sync's per-tree
+status hooks, runs a per-space rollup, and exposes:
 
-1. **Space-level aggregate** — single rollup state per space.
-2. **Per-object state** — for any known objectId, is it synced / syncing / has local changes / errored.
-3. **Recently-synced list** — last N objects to converge with a remote (useful for activity UI).
-4. **Connected peers** (future) — network nodes + p2p, with connection state.
+1. **Account-wide firehose** — one event per space whenever its rollup
+   transitions. Middleware paints a list view ("42/187 synced") off
+   this. `space.Service.SubscribeStatus(cb)`.
+2. **Per-object subscription** — one event per state flip for a single
+   objectId. Middleware paints a per-object indicator off this.
+   `Space.SyncStatus().SubscribeObject(objectId, cb)`.
+3. **Point-in-time getters** — snapshot reads of either scope:
+   `Service.Status(spaceId)`, `SyncStatus().Space()`,
+   `SyncStatus().Object(objectId)`.
 
-Consumed in-process by middleware. No transport here — middleware decides cadence and projects this to clients.
+No transport here. Middleware decides cadence + projects to clients.
 
 ## What we already have
 
-- **`syncstatus.StatusUpdater` hook** in any-sync (`commonspace.Deps.SyncStatus`). Currently wired to `NewNoOpSyncStatus()` in `internal/anysyncx/spacecache.go:90`. Fires on every head change / receive / apply, per tree, with senderId. This is the canonical inbound feed.
-- **`object.AfterApply` hook** in our CRDT layer (`internal/spaceobjects/gate.go:74`). Already feeds eventbus + drainer; we can add a third fan-out for the tracker.
-- **`nodeconf.NodeIds(spaceId)`** — responsible-node list for a space (network peers).
-- **`pool.Pick(ctx, id)`** — non-dialing "is this peer currently connected?" check.
-- **`HeadCache`** — converged per-space hash, already updated atomically with state writes.
+- **`syncstatus.StatusUpdater` hook** in any-sync (per-space, passed
+  via `commonspace.Deps.SyncStatus` at `internal/anysyncx/spacecache.go:90`).
+  Currently wired to `NewNoOpSyncStatus()`. Fires on every head
+  change / receive / apply. This is the canonical inbound feed.
+- **`spaceobjects.Store`** maintains the per-space `objects` shared
+  dataset — one row per regular object. We read its size for `Total`.
+- **`nodeconf.NodeIds(spaceId)`** — responsible-node id list for the
+  "is this sender a node?" filter.
+- **`pool.Pick(ctx, id)`** — non-dialing "is this peer currently
+  connected?" check. Fed into the per-space `ConnectionStatus` map.
+- **`nodeconf.NetworkCompatibilityStatus()`** — incompatible-version /
+  needs-update signal that maps to `SyncStateError`.
 
-## Hook semantics (any-sync)
+## Hook semantics (any-sync v0.12.4)
+
+Confirmed call sites in any-sync (v0.12.4):
+
+```
+HeadsChange  (treeId, heads)                     // synctree.AddContent (local write)
+HeadsReceive (senderId, treeId, heads)           // pre-apply HeadUpdate — UNUSED in v1
+ObjectReceive(senderId, treeId, heads)           // BuildSyncTree from non-responsible pull
+HeadsApply   (senderId, treeId, heads, allAdded) // synchandler post-apply
+```
+
+Tracker reactions:
+
+- `HeadsChange` → mark tree `Syncing(pendingHeads=heads)`.
+- `HeadsApply(_, allAdded=true)` from responsible-node sender → drain
+  matching heads, mark `Synced` once `pendingHeads` empties.
+- `ObjectReceive` → ensure the tree is tracked (so a newly discovered
+  tree shows up in the rollup).
+- `HeadsReceive` → no-op (matches heart; nothing to do pre-apply).
+
+`RemoveAllExcept` / `tempSynced` machinery from heart is **not**
+replicated — it's driven by heart-internal triggers that don't fire
+in the SDK's universe. v1 keeps the convergence model simple: only
+responsible-node `HeadsApply` flips `Synced`.
+
+## Public API
 
 ```go
-HeadsChange  (treeId, heads)                  // local heads moved (we wrote)
-HeadsReceive (senderId, treeId, heads)        // remote announced heads
-ObjectReceive(senderId, treeId, heads)        // remote delivered heads (pre-apply)
-HeadsApply   (senderId, treeId, heads, allAdded) // ApplyChange landed
-```
+// space.Service additions
+type Service interface {
+    // ...existing...
 
-Match (heart's `core/syncstatus/objectsyncstatus/syncstatus.go`):
-- `HeadsChange` → mark object `Syncing` with these heads pending.
-- `HeadsApply(_, _, _, allAdded=true)` with senderId in `nodeconf.NodeIds` → object `Synced` (responsible node confirmed our heads landed there).
-- Senders outside `NodeIds` (peers) → don't flip status; remember in tempSynced for later confirmation.
+    // Status returns a snapshot of one space's rollup.
+    Status(spaceId string) SpaceSyncStatus
 
-## Components
-
-```
-internal/syncstatus/
-  tracker.go        per-space Tracker, owned by Service
-  service.go        per-account Service, registry of trackers
-  hooks.go          adapter implementing any-sync's syncstatus.StatusUpdater
-  peers.go          network/p2p presence reader (pool.Pick poll + future p2p source)
-  recent.go         bounded ring buffer of last-N applied objects
-  events.go         per-tracker pub/sub (mb/v3 mailbox, same shape as eventbus)
-```
-
-### Tracker (per space)
-
-```go
-type Tracker struct {
-    spaceId   string
-    nodeIds   []string             // from nodeconf.NodeIds at construction
-    trees     map[string]treeState // treeId → state
-    recent    *ring                // last N applied
-    peers     map[string]peerState
-    dispatch  *mailbox             // status updates fan-out
+    // SubscribeStatus delivers an event per space-rollup transition.
+    // Account-wide; one cb sees every space.
+    SubscribeStatus(cb func(SpaceSyncStatus)) (cancel func())
 }
 
-type treeState struct {
-    pendingHeads []string  // heads waiting for a responsible-node ack
-    lastApplied  time.Time
-    lastSender   string
-    state        ObjectSyncState
-}
-```
+// space.Space adds (already declared):
+//   SyncStatus() SyncStatusAPI
 
-### Service (per SDK)
-
-- Constructed in `anysyncx.New` (or `sdk.Open` — see boot-ordering note below).
-- `For(spaceId)` returns the per-space Tracker, building one on first call (mirrors how `headCache.observerFor` is wired at load).
-- Implements `syncstatus.StatusUpdater` as a dispatcher: each method looks up the tracker by treeId/spaceId via a `spaceState`-driven init. The cleanest fit is one `StatusUpdater` *instance per space* (matches commonspace's per-space app graph) — `loadSpaceForCache` plucks `Tracker.For(id)` and passes it as `commonspace.Deps.SyncStatus`.
-
-### Peer presence
-
-- **Network**: every 1s (cheap), `pool.Pick` each `nodeconf.NodeIds(spaceId)`. Down → `ConnState=Down`; alive → `ConnState=Connected`. Set `LastSeenAt` on `peer.Peer.Context().Done()` close transitions.
-- **P2P**: future. Slot is in the type; count is `0` until a p2p discovery source lands in `anysyncx`. Document the placeholder explicitly so callers don't read "0" as "broken".
-
-### Recent
-
-- Bounded ring (N=50 default; configurable). Push on `HeadsApply allAdded=true`. Each entry: `{ObjectId, At, FromPeer}`. Coalesce: if the same objectId is already at the head, bump its timestamp rather than duplicating.
-
-## Public API (space/syncstatus.go)
-
-```go
 type SyncStatusAPI interface {
-    // Space returns the rolled-up space state.
-    Space(ctx context.Context) SpaceSyncStatus
+    // Space returns the rolled-up state for this space.
+    Space() SpaceSyncStatus
 
     // Object returns the state for a specific objectId. Unknown ids
-    // return SyncStateUnknown, not an error — middleware shouldn't
-    // distinguish "never seen" from "missing".
-    Object(ctx context.Context, objectId string) ObjectSyncStatus
+    // return SyncState=Unknown — middleware shouldn't distinguish
+    // "never seen" from "missing".
+    Object(objectId string) ObjectSyncStatus
 
-    // Recent returns the last-applied objects, newest first. limit ≤ 0
-    // returns the full ring (default cap 50).
-    Recent(ctx context.Context, limit int) []ObjectSyncStatus
-
-    // Peers returns connected peers — network nodes always, p2p when
-    // available. v1: network only.
-    Peers(ctx context.Context) []PeerInfo
-
-    // Subscribe delivers status updates as they happen. The mailbox is
-    // bounded and drops on overflow, matching eventbus semantics.
-    Subscribe(ctx context.Context) (StatusSubscription, error)
+    // SubscribeObject delivers ObjectSyncStatus events for one object
+    // on every state flip. cb runs synchronously on the dispatcher
+    // goroutine — keep it small.
+    SubscribeObject(objectId string, cb func(ObjectSyncStatus)) (cancel func())
 }
 
 type SpaceSyncStatus struct {
-    State          SyncState
-    NetworkPeers   int        // count of currently-connected responsible nodes
-    P2PPeers       int        // 0 in v1
-    LastSyncedAt   time.Time  // most-recent HeadsApply timestamp
-    PendingObjects int        // count of trees in state != Synced
+    SpaceId      string
+    State        SyncState
+    Synced       int       // converged with a responsible node
+    Total        int       // total regular objects known locally
+    NetworkPeers int       // currently-connected responsible nodes
+    LastSyncedAt time.Time // most-recent successful HeadsApply
 }
 
 type ObjectSyncStatus struct {
     ObjectId   string
     State      SyncState
     LastSyncAt time.Time
-    LastSender string  // empty when state == NotSynced
-}
-
-type PeerInfo struct {
-    PeerId     string
-    Kind       PeerKind     // PeerKindNetwork | PeerKindP2P
-    ConnState  ConnState    // Connected | Down
-    LastSeenAt time.Time
 }
 
 type SyncState uint8
 const (
-    SyncStateUnknown SyncState = iota
-    SyncStateOffline   // no responsible node reachable
-    SyncStateSyncing   // pending heads
-    SyncStateSynced    // all known heads acked by a responsible node
-    SyncStateError     // last sync attempt errored (transport + parse, not CRDT-level)
+    SyncStateUnknown          SyncState = iota
+    SyncStateOffline                    // no responsible node reachable
+    SyncStateSyncing                    // pending heads
+    SyncStateSynced                     // all known trees acked by a node
+    SyncStateError                      // incompatible / needs-update
 )
 ```
 
-Update events carry the same record shape (one `ObjectSyncStatus` per affected object, plus an optional `SpaceSyncStatus` snapshot when the rollup transitions).
+All callbacks run synchronously on the dispatch goroutine, matching
+`Members().Subscribe` and `Service.Subscribe` — consistent with the
+rest of the SDK.
 
-## Rollup rule (space state)
+## Rollup rule
 
-Highest priority wins:
-1. **Offline** — zero `PeerInfo{Kind: Network, ConnState: Connected}`.
-2. **Syncing** — any tree in `Syncing` *or* the network is reachable but our last `HeadsChange` is unconfirmed.
-3. **Synced** — at least one responsible node connected and every known tree is in `Synced`.
-4. **Unknown** — bootstrap state, never seen a successful sync yet.
+Priority — highest match wins:
 
-`Error` is reserved for transport-level failures the peer manager surfaces (TBD; not in any-sync's StatusUpdater contract today).
+1. **Error** — `nodeconf.NetworkCompatibilityStatus()` is `Incompatible`
+   or `NeedsUpdate`.
+2. **Offline** — zero currently-connected responsible nodes.
+3. **Syncing** — at least one responsible node connected *and* any
+   tree is in pending state (`Synced < Total`).
+4. **Synced** — at least one responsible node connected and every
+   tracked tree converged.
+5. **Unknown** — bootstrap; no hooks fired yet, no peers polled yet.
+
+`Total` is the count of regular-object rows in the per-space `objects`
+collection (`spaceobjects.Store`). Excludes ACL tree, spaceIndex,
+settings, members system collection — not user-visible.
+
+`Synced = Total - Pending`, where `Pending` is the number of tracked
+trees currently in `Syncing`. A tree we've never seen a hook for is
+treated as `Synced` (no evidence of work needed) — matches user
+intuition and works correctly through cold restore as `ObjectReceive
+→ HeadsApply` transitions land each new tree through `Syncing → Synced`.
+
+## Components
+
+```
+internal/syncstatus/
+  service.go      Per-account; registry of trackers; account-wide
+                  subscribe registry; owns peer-presence reader and
+                  per-space ConnectionStatus map.
+  tracker.go      Per-space; implements syncstatus.StatusUpdater;
+                  treeHeads state machine; per-object subscribe registry.
+  rollup.go       Refresh-debounce queue + 1s tick (matches heart).
+                  Composes SpaceSyncStatus and dispatches to subscribers
+                  on edge transitions only.
+  peers.go        Single-goroutine pool.Pick reader (1s tick across
+                  the union of all loaded spaces' NodeIds). Writes
+                  the ConnectionStatus map; nudges trackers via Refresh().
+  subscribers.go  Sync-callback registry primitive used by both the
+                  account-wide and per-object scopes.
+```
+
+### Tracker (per space)
+
+```go
+type treeState struct {
+    pendingHeads []string
+    state        SyncState // Syncing | Synced (never Unknown after first hook)
+    lastApplied  time.Time
+}
+
+type Tracker struct {
+    spaceId string
+    nodeIds []string
+    mu      sync.Mutex
+    trees   map[string]treeState
+    subs    *subscriberRegistry[ObjectSyncStatus] // keyed by objectId
+}
+```
+
+### Service (per account)
+
+- Constructed inside `anysyncx.New`, exposed via `App.SyncStatus()`.
+- `For(spaceId)` lazily builds a `*Tracker` on first call. Returned
+  trackers are reused — `loadSpaceForCache` plucks the tracker as
+  `commonspace.Deps.SyncStatus`.
+- Holds the account-wide `subscriberRegistry[SpaceSyncStatus]` and
+  the per-space `ConnectionStatus` map.
+
+### Rollup loop
+
+Pattern adopted from heart's `spacesyncstatus`:
+
+- `Refresh(spaceId)` enqueues an id in a dedupe set.
+- 1s tick drains the set, recomputes each space's rollup, compares
+  to last-emitted, dispatches to subscribers on inequality.
+- Each per-space `Tracker` state change calls `service.Refresh(spaceId)`
+  to schedule the rollup.
+
+### Peer presence
+
+Single goroutine on the Service. 1s tick over the union of
+`nodeConf.NodeIds(s)` across every currently-loaded space. `pool.Pick`
+each id — present → `Online`, absent → `ConnectionError`. On
+transitions, write the per-space map and `Refresh(spaceId)`.
+
+Sharing the reader across spaces means one tick regardless of space
+count. Trackers don't own goroutines for this.
 
 ## Boot ordering
 
-`commonspace.Deps.SyncStatus` is passed in `loadSpaceForCache` (`spacecache.go:88`). The tracker has to exist *before* that call. Two options:
+The per-space `Tracker` *is* the `commonspace.Deps.SyncStatus`
+instance. `loadSpaceForCache` calls `app.SyncStatus().For(spaceId)`
+and passes the result inline. No pre-seeding; lazy is fine — the
+tracker has no expensive state.
 
-1. **Per-space lazy** — `App.syncStatusService.For(spaceId)` builds the tracker on first `loadSpaceForCache` for that id. Simple; the Service struct lives on `*anysyncx.App` alongside `headCache`.
-2. **Pre-seeded** — `sdk.Open`'s eager-load loop (`sdk.go:115-125`) constructs trackers up-front from the tech-space List. Faster `Recent` answers for cold callers, but duplicates the lifecycle bookkeeping.
+## What lives inside the SDK vs outside
 
-Recommend (1). The tracker has no expensive state to pre-warm.
-
-## Subscriptions
-
-Same shape as `eventbus.Dispatcher`:
-- bounded `mb/v3` mailbox per subscriber
-- `Mailbox()` exposes the full mb vocabulary (Wait for batched delivery, etc.)
-- non-blocking sends; slow consumers drop and report via `Dropped()`
-- closed when `Tracker` closes
-
-One subscription = full firehose of status events for the space. v1 doesn't filter — callers re-filter client-side. (Mirrors `SubscribeProperties`.)
+| Concern                                | SDK | Middleware |
+| -------------------------------------- | --- | ---------- |
+| `StatusUpdater` hook ingestion         | ✓   |            |
+| Per-tree state machine                 | ✓   |            |
+| 1s refresh-debounce rollup             | ✓   |            |
+| Peer-presence reader (`pool.Pick`)     | ✓   |            |
+| Dedupe identical events                | ✓   |            |
+| Network-compatibility status read      | ✓   |            |
+| Projection to wire (proto / JSON)      |     | ✓          |
+| Replay to fresh client sessions        |     | ✓          |
+| Cross-feature counters (files, etc.)   |     | ✓          |
 
 ## Tests
 
-- Unit: synthesize `StatusUpdater` calls, assert tracker state machine (HeadsChange → Syncing, HeadsApply allAdded with responsible sender → Synced, etc.).
-- Integration: reuse `cold_sync_test.go` topology — alice writes, bob loads, both report `Synced` after convergence. Asserts the same end-state both sides report.
-- Peer flap: stop responsible node, assert `Space → Offline`, restart, assert `→ Synced`.
+- Unit: synthesize `StatusUpdater` calls, assert tracker state machine
+  (HeadsChange → Syncing, HeadsApply(responsible, allAdded) → Synced).
+- Rollup: bound the in-test tick or expose a test-only `tickNow()` so
+  edges fire deterministically.
+- Integration: extend `cold_sync_test.go` topology — alice writes,
+  bob loads, both report `State=Synced` and `Synced==Total>0` after
+  convergence.
+- Peer flap: stop responsible node, assert `State=Offline`; restart,
+  assert `State=Synced`.
 
-## Open questions
+## Out of scope for v1
 
-1. **P2P slot now or later?** Adding `P2PPeers int` to `SpaceSyncStatus` and `PeerKindP2P` to the enum costs nothing today and prevents an API break later. Recommend including the slot, documenting "always 0 in v1".
-2. **`Recent` cap** — 50 default? Per-space, in-memory only (lost on restart).
-3. **`SyncStateError`** — heart conflates a few sources (incompatible version, storage quota, transport error). For the SDK we only have transport visibility. Worth modelling at all in v1, or drop until we have a concrete signal?
-4. **Senders we don't recognize** — a writer-peer's `HeadsApply` confirms convergence-with-that-peer but not with a responsible node. Heart's solution is `tempSynced` + later confirmation when a node sender's `RemoveAllExcept` fires. Do we replicate that, or only count responsible-node senders for v1?
-5. **Live presence vs polled** — `pool.Pick` is cheap but a 1s poll is still 1s/space. For accounts with many spaces, sharing a single peer-presence reader across spaces (keyed on `peerId`) is a small extra mile. Worth it now or revisit when we see contention?
+- P2P presence (slot reserved later if needed; not modelled now)
+- File / storage counters
+- "Missing ids" diff from headsync (heart's `UpdateMissingIds`)
+- Session-replay for fresh subscribers (middleware concern)
+- Persistence of any status state across restarts

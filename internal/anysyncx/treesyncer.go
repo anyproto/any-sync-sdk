@@ -2,6 +2,8 @@ package anysyncx
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
@@ -10,6 +12,16 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacestate"
 	"github.com/anyproto/any-sync/net/peer"
 )
+
+// PeerSyncSnapshot is the latest per-peer headsync result the
+// adapter has observed. Returned by Stats() — debug surface only.
+type PeerSyncSnapshot struct {
+	PeerId     string
+	LastSyncAt time.Time
+	New        int
+	Changed    int
+	LastErr    string
+}
 
 // treeSyncerAdapter is registered by anysyncx as the per-space
 // commonspace.Deps.TreeSyncer. On SyncAll it builds (fetches) missing
@@ -31,14 +43,31 @@ type treeSyncerAdapter struct {
 	// dispatches between tech-space and regular spaces and binds the
 	// right listener for each.
 	registry SpaceRegistry
+
+	// statsMu guards stats. The map keys by peer.Id() and holds the
+	// latest snapshot per peer (one row per peer ever seen since
+	// boot). In-memory only; cleared on SDK restart.
+	statsMu sync.Mutex
+	stats   map[string]PeerSyncSnapshot
 }
 
-func newTreeSyncer(registry SpaceRegistry) *treeSyncerAdapter {
-	return &treeSyncerAdapter{registry: registry}
+func newTreeSyncer(spaceId string, registry SpaceRegistry) *treeSyncerAdapter {
+	return &treeSyncerAdapter{
+		spaceId:  spaceId,
+		registry: registry,
+		stats:    map[string]PeerSyncSnapshot{},
+	}
 }
 
 func (t *treeSyncerAdapter) Init(a *app.App) error {
-	t.spaceId = a.MustComponent(spacestate.CName).(*spacestate.SpaceState).SpaceId
+	// spaceId is pre-bound at construction (App.newTreeSyncerForSpace).
+	// Cross-check against spacestate in case any-sync constructs the
+	// per-space app for a different id — a wiring bug we want to fail
+	// loudly on rather than silently mis-record stats.
+	got := a.MustComponent(spacestate.CName).(*spacestate.SpaceState).SpaceId
+	if t.spaceId == "" {
+		t.spaceId = got
+	}
 	t.treeBuilder = a.MustComponent(objecttreebuilder.CName).(objecttreebuilder.TreeBuilder)
 	return nil
 }
@@ -63,15 +92,16 @@ func (t *treeSyncerAdapter) ShouldSync(_ string) bool { return true }
 // registry errors: a missing registry would mean we have a bug in
 // SDK boot ordering, and silently bypassing it would re-create the
 // listener-loss bug this method exists to fix.
-func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, missing []string) error {
+func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, missing []string) (err error) {
+	defer t.record(p.Id(), len(missing), len(existing), err)
 	if t.registry == nil {
 		return ErrSpaceRegistryUnset
 	}
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
 	for _, ids := range [][]string{missing, existing} {
 		for _, id := range ids {
-			tree, err := t.registry.GetTree(peerCtx, t.spaceId, id)
-			if err != nil {
+			tree, regErr := t.registry.GetTree(peerCtx, t.spaceId, id)
+			if regErr != nil {
 				continue
 			}
 			if st, ok := tree.(synctree.SyncTree); ok {
@@ -81,4 +111,39 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 		}
 	}
 	return nil
+}
+
+// record stores the latest per-peer snapshot. Overwrites any prior
+// row for peerId — only the most recent round is retained.
+func (t *treeSyncerAdapter) record(peerId string, newCount, changedCount int, err error) {
+	if peerId == "" {
+		return
+	}
+	snap := PeerSyncSnapshot{
+		PeerId:     peerId,
+		LastSyncAt: time.Now(),
+		New:        newCount,
+		Changed:    changedCount,
+	}
+	if err != nil {
+		snap.LastErr = err.Error()
+	}
+	t.statsMu.Lock()
+	t.stats[peerId] = snap
+	t.statsMu.Unlock()
+}
+
+// Stats returns a copy of the per-peer snapshot map. Cheap; map
+// is bounded by the responsible-peer set (1–3 in practice).
+func (t *treeSyncerAdapter) Stats() []PeerSyncSnapshot {
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	if len(t.stats) == 0 {
+		return nil
+	}
+	out := make([]PeerSyncSnapshot, 0, len(t.stats))
+	for _, s := range t.stats {
+		out = append(out, s)
+	}
+	return out
 }

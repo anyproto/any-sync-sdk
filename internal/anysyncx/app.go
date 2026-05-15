@@ -3,6 +3,7 @@ package anysyncx
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/anyproto/any-sync/accountservice"
 	"github.com/anyproto/any-sync/app"
@@ -47,6 +48,14 @@ type App struct {
 	headCache  *HeadCache
 
 	syncStatus *syncstatus.Service
+
+	// syncers indexes the per-space treeSyncerAdapter so the debug
+	// surface can read per-peer SyncAll stats by spaceId. Populated
+	// from newTreeSyncerForSpace; never removed (adapter lives as
+	// long as the space stays in the spaceCache, and stats survive
+	// brief ocache evictions when the same id loads again).
+	syncersMu sync.Mutex
+	syncers   map[string]*treeSyncerAdapter
 
 	keys *accountdata.AccountKeys
 }
@@ -117,6 +126,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		storage:      storage,
 		headCache:    newHeadCache(),
 		syncStatus:   syncstatus.NewService(),
+		syncers:      map[string]*treeSyncerAdapter{},
 		keys:         keys,
 	}
 	// Wire the responsible-node resolver so per-space trackers can
@@ -185,16 +195,40 @@ func (a *App) SpaceExists(spaceId string) bool { return a.storage.SpaceExists(sp
 // has a direct reference for its fast path.
 func (a *App) HeadCache() *HeadCache { return a.headCache }
 
-// NewTreeSyncer returns a fresh TreeSyncer instance ready to be passed
-// into commonspace.Deps. One per space; any-sync's commonspace wires
-// it into the per-space app via spacestate during NewSpace.
+// newTreeSyncerForSpace returns a fresh TreeSyncer instance bound to
+// spaceId, ready to be passed into commonspace.Deps. One per space;
+// any-sync's commonspace wires it into the per-space app via
+// spacestate during NewSpace.
 //
 // Captures the SpaceRegistry currently set on the tree manager so the
 // per-space SyncAll can route through it (this is what hooks the
-// CRDT-controller listener onto inbound trees). NewTreeSyncer is
-// invoked from loadSpaceForCache, which only runs after sdk.Open's
-// SetSpaceRegistry call, so the registry is reliably wired by then.
-func (a *App) NewTreeSyncer() *treeSyncerAdapter { return newTreeSyncer(a.tree.registry) }
+// CRDT-controller listener onto inbound trees). Invoked from
+// loadSpaceForCache, which only runs after sdk.Open's SetSpaceRegistry
+// call, so the registry is reliably wired by then.
+//
+// The adapter is also indexed in a.syncers so PeerSyncStats(spaceId)
+// can read its per-peer counters for the debug surface.
+func (a *App) newTreeSyncerForSpace(spaceId string) *treeSyncerAdapter {
+	ts := newTreeSyncer(spaceId, a.tree.registry)
+	a.syncersMu.Lock()
+	a.syncers[spaceId] = ts
+	a.syncersMu.Unlock()
+	return ts
+}
+
+// PeerSyncStats returns the latest per-peer SyncAll snapshots for
+// spaceId. Empty slice if the space has never had an outbound diff
+// round (or was never loaded). In-memory only — cleared on SDK
+// restart. Used by the debug API; not a stable surface.
+func (a *App) PeerSyncStats(spaceId string) []PeerSyncSnapshot {
+	a.syncersMu.Lock()
+	ts := a.syncers[spaceId]
+	a.syncersMu.Unlock()
+	if ts == nil {
+		return nil
+	}
+	return ts.Stats()
+}
 
 // loadAccountKeys decodes the raw seeds from the auth.Provider into
 // any-sync crypto keys. Both keys are required — empty seeds are a

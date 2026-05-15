@@ -120,6 +120,27 @@ func (t *Tracker) Object(objectId string) space.ObjectSyncStatus {
 	}
 }
 
+// Detail returns the full per-tree snapshot used by the debug
+// API: state, a copy of the pending-heads slice, lastApplied,
+// and whether the tracker has seen this id at all.
+//
+// Unknown ids return known=false and zero values — debug callers
+// pre-distinguish "we never saw a hook" from "we saw it and it
+// converged" (the latter has lastApplied set).
+func (t *Tracker) Detail(objectId string) (state space.SyncState, pending []string, lastApplied time.Time, known bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st, ok := t.trees[objectId]
+	if !ok {
+		return space.SyncStateUnknown, nil, time.Time{}, false
+	}
+	var p []string
+	if len(st.pending) > 0 {
+		p = append(p, st.pending...)
+	}
+	return st.state, p, st.lastApplied, true
+}
+
 // SubscribeObject registers cb for state flips on objectId. Cheap;
 // the dispatcher delivers on every change, not on every hook (so a
 // HeadsChange followed by a HeadsApply with no net transition fires

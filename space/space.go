@@ -45,6 +45,11 @@ type Space interface {
 	// SyncStatus exposes per-space/object/peer status.
 	SyncStatus() SyncStatusAPI
 
+	// Debug returns the diagnostic surface for this space. See
+	// DebugAPI — not a stable interface, intended for tooling and
+	// inspection.
+	Debug() DebugAPI
+
 	// Query builds a read query against (objectId, dataset). Used for
 	// per-object datasets that exist on the object's own controller —
 	// e.g. a type object's `properties` (definitions) dataset.

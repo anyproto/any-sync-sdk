@@ -93,7 +93,7 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 
 	cs, err := a.spaceService.NewSpace(ctx, id, commonspace.Deps{
 		SyncStatus: tracker,
-		TreeSyncer: a.NewTreeSyncer(),
+		TreeSyncer: a.newTreeSyncerForSpace(id),
 	})
 	if err != nil {
 		if errors.Is(err, spacestorage.ErrSpaceStorageMissing) {

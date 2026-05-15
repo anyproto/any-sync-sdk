@@ -137,6 +137,12 @@ func (s *spaceImpl) Members() space.MembersAPI { return s.members }
 func (s *spaceImpl) SyncStatus() space.SyncStatusAPI {
 	return newSyncStatusAPI(s.app.SyncStatus(), s.id)
 }
+
+// Debug returns the per-space diagnostic surface. Constructed on
+// every call; no hidden state. See space.DebugAPI.
+func (s *spaceImpl) Debug() space.DebugAPI {
+	return newDebugAPI(s)
+}
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {

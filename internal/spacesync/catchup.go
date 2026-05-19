@@ -88,7 +88,14 @@ func Run(ctx context.Context, app *anysyncx.App, db anystore.DB, store *spaceobj
 		// in _detached, decode error, etc.) does NOT halt the pass.
 		// Per-object _meta already encodes per-object progress, and
 		// the _detached drainer picks up parked rows on the next event.
-		_, _ = store.Get(ctx, id)
+		//
+		// Drop the cached Object as soon as the restore completes —
+		// the catch-up pass can touch thousands of trees, and we
+		// don't want to retain them all in RAM until the cache TTL
+		// expires. Subsequent live accesses re-load on demand.
+		if _, err := store.Get(ctx, id); err == nil {
+			store.Drop(id)
+		}
 	}
 
 	if err := crdt.PersistSpaceMaxAddSeq(ctx, metaColl, spaceId, snapshot); err != nil {

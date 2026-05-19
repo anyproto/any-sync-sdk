@@ -23,6 +23,7 @@ import (
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
@@ -80,8 +81,11 @@ type DeriveOpts struct {
 // instances for one space. Constructed once per loaded space by the
 // space-level service.
 //
-// Not safe for concurrent Create on the same id; concurrent Get on
-// distinct ids is fine (per-objectId mutex inside).
+// Backed by ocache: LoadFunc builds Object + Controller + tree +
+// ColdRestore atomically; concurrent Get on the same id is
+// serialized by ocache. TTL-evicted Objects detach their synctree
+// listener via TryClose, so stale tree references can't fire
+// callbacks on a freshly-loaded peer Object.
 type Store struct {
 	app     *anysyncx.App
 	db      anystore.DB
@@ -97,18 +101,14 @@ type Store struct {
 	extTypes     []handler.Type
 	dataVersions map[string]string
 
-	mu          sync.Mutex
-	objects     map[string]*object.Object
-	// restored maps objectId → ready channel. The channel is created
-	// the first time we see an objectId; the cold-restore goroutine
-	// closes it after restore returns, success or fail. Concurrent
-	// Get callers wait on the channel before handing the *Object to
-	// the caller, so reads (which don't take tree.Lock or o.mu) never
-	// see partial state. Replaces the old `loaded map[string]bool`
-	// flag-then-restore which exposed the partial state.
-	restored    map[string]chan struct{}
-	sharedColl  anystore.Collection // per-space `objects` collection, lazy-opened
-	detached    anystore.Collection // per-space `_detached` collection, lazy-opened
+	// cache is the per-space *object.Object cache. LoadFunc holds
+	// the per-id lock during build+ColdRestore, so peers waiting on
+	// the same id never see partial state.
+	cache ocache.OCache
+
+	mu         sync.Mutex
+	sharedColl anystore.Collection // per-space `objects` collection, lazy-opened
+	detached   anystore.Collection // per-space `_detached` collection, lazy-opened
 
 	// drainer runs Store.Drain asynchronously off the apply path —
 	// afterApply hooks push pairs in, the drainer consumes them and
@@ -119,6 +119,29 @@ type Store struct {
 	// afterApply forwards the change here after a HasSubscribers
 	// gate; subscriptions live until Close.
 	dispatcher *eventbus.Dispatcher
+}
+
+// objectCacheTTL is the idle window before a cached Object is
+// eligible for eviction. objectCacheGC is how often the GC ticker
+// runs. Both default to 0 (no GC) — debugging a staging regression
+// in TestE2E_ColdSyncSameKey before enabling 1m/20s.
+const (
+	objectCacheTTL = 0
+	objectCacheGC  = 0
+)
+
+// loadPayloadKey is the context-key type for the optional
+// TreeStorageCreatePayload threaded into LoadFunc by Create / Derive
+// / PutTreeFromPayload. Absent → LoadFunc takes the BuildTree path.
+type loadPayloadKey struct{}
+
+func ctxWithLoadPayload(ctx context.Context, p *treestorage.TreeStorageCreatePayload) context.Context {
+	return context.WithValue(ctx, loadPayloadKey{}, p)
+}
+
+func loadPayloadFromCtx(ctx context.Context) *treestorage.TreeStorageCreatePayload {
+	p, _ := ctx.Value(loadPayloadKey{}).(*treestorage.TreeStorageCreatePayload)
+	return p
 }
 
 // NewStore constructs a Store. The allocator is per-space (shared
@@ -149,10 +172,13 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 		reg:          types.NewLiveRegistry(db),
 		extTypes:     extTypes,
 		dataVersions: dv,
-		objects:      make(map[string]*object.Object),
-		restored:     make(map[string]chan struct{}),
 		dispatcher:   eventbus.New(spaceId),
 	}
+	s.cache = ocache.New(
+		s.loadObject,
+		ocache.WithTTL(objectCacheTTL),
+		ocache.WithGCPeriod(objectCacheGC),
+	)
 	s.drainer = newDrainer(s)
 	s.drainer.Run()
 	return s
@@ -200,9 +226,13 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 }
 
 // Close shuts down per-Store background workers (drainer +
-// dispatcher). Safe to call multiple times.
+// dispatcher) and tears down the object cache (which closes every
+// resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
 	derr := s.drainer.Close()
+	if s.cache != nil {
+		_ = s.cache.Close()
+	}
 	if s.dispatcher != nil {
 		_ = s.dispatcher.Close()
 	}
@@ -331,19 +361,17 @@ func (s *Store) DataVersion(dataset string) (string, error) {
 // the space-level service can reuse it for restore-time bumping.
 func (s *Store) Allocator() *object.VersionAllocator { return s.alloc }
 
-// Drop removes the cached *object.Object for objectId. Used after
-// any-sync DeleteTree fires so a subsequent Get rebuilds (or fails
-// with the appropriate any-sync deletion error).
+// Drop evicts the cached *object.Object for objectId. Used after
+// any-sync DeleteTree fires (so a subsequent Get rebuilds or fails
+// with the appropriate any-sync deletion error) and by the
+// cold-restore catch-up pass to release Objects ASAP.
 //
 // Does NOT touch the any-store collections — record rows persist
 // until a separate cleanup pass. v1: leave them; queries skip
 // tombstones, and a deleted object's id is content-addressable so
 // it never reuses.
 func (s *Store) Drop(objectId string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.objects, objectId)
-	delete(s.restored, objectId)
+	_, _ = s.cache.Remove(context.Background(), objectId)
 }
 
 // PutTreeFromPayload binds a tree delivered by a remote peer.
@@ -352,19 +380,7 @@ func (s *Store) Drop(objectId string) {
 // locally yet. Falls back to BuildTree on ErrTreeExists, matching
 // the Derive idempotency contract.
 func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.TreeStorageCreatePayload) (*object.Object, error) {
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
-		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
-	}
-	objectId := payload.RootRawChange.Id
-	obj, err := s.bind(ctx, handle, objectId, &payload)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.coldRestoreOnce(ctx, objectId, obj); err != nil {
-		return nil, err
-	}
-	return obj, nil
+	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
 }
 
 // DeleteTree marks the underlying any-sync tree as deleted and drops
@@ -393,28 +409,16 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 }
 
 // Get returns the *object.Object for objectId, lazy-loading on first
-// access. The space is acquired through the App's space cache; the
-// per-object Controller is built once and reused.
+// access via the ocache LoadFunc. Concurrent Get on the same id
+// share one load; the LoadFunc runs Controller build, tree open,
+// SetTree, and ColdRestore atomically before returning, so peers
+// never observe a partial Object.
 func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error) {
-	s.mu.Lock()
-	if obj, ok := s.objects[objectId]; ok {
-		s.mu.Unlock()
-		return obj, nil
-	}
-	s.mu.Unlock()
-
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
-		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
-	}
-	obj, err := s.bind(ctx, handle, objectId, nil) // nil → BuildTree (existing tree)
+	v, err := s.cache.Get(ctx, objectId)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.coldRestoreOnce(ctx, objectId, obj); err != nil {
-		return nil, err
-	}
-	return obj, nil
+	return v.(*object.Object), nil
 }
 
 // Create makes a new object on the space and returns its bound
@@ -448,13 +452,13 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: CreateTree: %w", err)
 	}
-	objectId := payload.RootRawChange.Id
-	return s.bind(ctx, handle, objectId, &payload)
+	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
 }
 
 // Derive makes a deterministic object on the space. Idempotent — a
 // second Derive with the same opts.ChangePayload returns the same
-// objectId. If the tree already exists locally, falls back to Get.
+// objectId. If the tree already exists locally, ocache's per-id
+// LoadFunc serialization deduplicates parallel callers.
 func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, error) {
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
@@ -469,36 +473,26 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: DeriveTree: %w", err)
 	}
-	objectId := payload.RootRawChange.Id
-	obj, err := s.bind(ctx, handle, objectId, &payload)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.coldRestoreOnce(ctx, objectId, obj); err != nil {
-		return nil, err
-	}
-	return obj, nil
+	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
 }
 
-// bind constructs and caches the *object.Object for objectId. When
-// payload is non-nil, PutTree is used (creation/derivation path); on
-// ErrTreeExists or nil payload, falls back to BuildTree.
-//
-// Uses the cached kind to decide whether to wire the per-space
-// `objects` shared collection — regular objects project values
-// there; type objects keep their own metadata local.
-func (s *Store) bind(ctx context.Context, handle anysyncx.SpaceHandle, objectId string, payload *treestorage.TreeStorageCreatePayload) (*object.Object, error) {
-	s.mu.Lock()
-	if obj, ok := s.objects[objectId]; ok {
-		s.mu.Unlock()
-		return obj, nil
+// loadObject is the ocache.LoadFunc. Builds Controller + Object +
+// any-sync tree + ColdRestore in one atomic step under ocache's
+// per-id load lock. Reads an optional TreeStorageCreatePayload from
+// ctx (set by Create / Derive / PutTreeFromPayload via
+// ctxWithLoadPayload) — payload present takes the PutTree path with
+// BuildTree fallback on ErrTreeExists; absent takes BuildTree
+// directly.
+func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
 	}
-	s.mu.Unlock()
-
 	ctrl, err := s.newController(ctx, objectId)
 	if err != nil {
 		return nil, err
 	}
+	payload := loadPayloadFromCtx(ctx)
 	obj, err := object.New(object.Config{
 		SpaceId:    s.spaceId,
 		SignKey:    s.signKey,
@@ -512,14 +506,9 @@ func (s *Store) bind(ctx context.Context, handle anysyncx.SpaceHandle, objectId 
 	if err != nil {
 		return nil, err
 	}
-
-	s.mu.Lock()
-	if existing, ok := s.objects[objectId]; ok {
-		s.mu.Unlock()
-		return existing, nil
+	if err := obj.ColdRestore(ctx); err != nil {
+		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
 	}
-	s.objects[objectId] = obj
-	s.mu.Unlock()
 	return obj, nil
 }
 
@@ -608,32 +597,3 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, handlers...)
 }
 
-// coldRestoreOnce runs Object.ColdRestore the first time we see an
-// objectId on this Store. Subsequent / concurrent calls block on
-// the per-object ready channel until the first call's restore
-// finishes — neither writers nor readers see a partial controller.
-//
-// The channel is closed in BOTH success and failure paths; if
-// restore failed, the in-memory state is what it is, but at least
-// callers don't deadlock waiting on a never-ready Object.
-func (s *Store) coldRestoreOnce(ctx context.Context, objectId string, obj *object.Object) error {
-	s.mu.Lock()
-	if ready, ok := s.restored[objectId]; ok {
-		s.mu.Unlock()
-		// Another goroutine is doing (or did) the restore — wait it out.
-		select {
-		case <-ready:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	ready := make(chan struct{})
-	s.restored[objectId] = ready
-	s.mu.Unlock()
-	defer close(ready)
-	if err := obj.ColdRestore(ctx); err != nil {
-		return fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
-	}
-	return nil
-}

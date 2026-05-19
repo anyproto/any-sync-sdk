@@ -111,10 +111,15 @@ func (s *Store) afterApplyFor() object.AfterApply {
 // follow-up Query on the same dataset returns. Per-object datasets
 // keep the resolved RecordChange ids untouched.
 func (s *Store) postValueFor(ctx context.Context, ch *crdt.Change, ids []string) ([]string, eventbus.PostValueFn) {
-	s.mu.Lock()
-	obj := s.objects[ch.ObjectId]
-	s.mu.Unlock()
-	if obj == nil {
+	// Pick (not Get) — afterApply fires *after* a successful apply on
+	// an already-loaded Object, so it must be cached. Avoids a
+	// recursive LoadFunc call from inside the apply path.
+	cached, err := s.cache.Pick(ctx, ch.ObjectId)
+	if err != nil {
+		return ids, nil
+	}
+	obj, ok := cached.(*object.Object)
+	if !ok || obj == nil {
 		return ids, nil
 	}
 	ctrl := obj.Controller()

@@ -67,15 +67,6 @@ func Run(ctx context.Context, app *anysyncx.App, db anystore.DB, store *spaceobj
 		return nil
 	}
 
-	// ACL and Settings trees are not CRDT-controlled; loading them
-	// through spaceobjects.Store would create useless _meta rows and
-	// waste a controller build. Skip them explicitly.
-	state, err := storage.StateStorage().GetState(ctx)
-	if err != nil {
-		return fmt.Errorf("spacesync: StateStorage.GetState: %w", err)
-	}
-	skip := map[string]struct{}{state.AclId: {}, state.SettingsId: {}}
-
 	// Two-phase: collect ids while the iterator is open, then load.
 	// Holding the any-store cursor across spaceobjects.Store.Get would
 	// risk deadlocks (Get takes its own locks and may block on
@@ -83,9 +74,6 @@ func Run(ctx context.Context, app *anysyncx.App, db anystore.DB, store *spaceobj
 	var toLoad []string
 	iterErr := hs.IterateEntries(ctx, headstorage.IterOpts{MinLastAddSeq: sdkSeq}, func(e headstorage.HeadsEntry) (bool, error) {
 		if e.DeletedStatus != headstorage.DeletedStatusNotDeleted {
-			return true, nil
-		}
-		if _, ok := skip[e.Id]; ok {
 			return true, nil
 		}
 		toLoad = append(toLoad, e.Id)

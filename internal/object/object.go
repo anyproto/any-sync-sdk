@@ -8,31 +8,33 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 )
 
-// ErrTreeNotSet is returned when an Object method is called before
-// SetTree. The constructor wires the tree post-build because the
-// objecttree.UpdateListener (this Object) must exist before BuildTree
-// can run.
+// ErrTreeNotSet is retained for callers that historically distinguished
+// "tree not yet bound" from other errors. The current constructor
+// guarantees tree-on-construction, so this only surfaces if an Object
+// is somehow zeroed out (defensive).
 var ErrTreeNotSet = errors.New("object: tree not set")
 
 // Object binds one any-sync object tree to one crdt.Controller.
 //
-// Lifecycle:
+// Constructed via object.New, which builds the Object, runs the
+// caller-supplied TreeFunc with the new Object as the synctree's
+// update listener, and returns a fully-initialised Object with its
+// tree bound. There is no intermediate state where an Object is
+// returned without a tree — the listener wiring chicken/egg is
+// resolved entirely inside New.
 //
-//  1. NewObject — instantiate.
-//  2. spaceService.TreeBuilder().BuildTree(ctx, id, BuildTreeOpts{Listener: obj})
-//     to materialise the synctree with this Object as the update listener.
-//  3. SetTree(tree) — caller wires the built tree back in.
-//  4. ColdRestore(ctx) — replay any-sync changes the controller hasn't
-//     seen yet (uses controller.MaxAddSeq watermark).
-//
-// After (4) the Object is live: LocalWrite produces new changes, and
-// inbound sync calls fire Update/Rebuild which re-run the same replay
-// path.
+// After construction the Object is live: LocalWrite produces new
+// changes, and inbound sync calls fire Update/Rebuild which re-run
+// the same replay path. Run ColdRestore once before publishing the
+// Object to readers to drain any tree-changes the controller's
+// MaxAddSeq watermark hasn't caught up to yet.
 //
 // Not safe for concurrent LocalWrite — the apply path is serialised
 // through a per-Object mutex.
@@ -62,32 +64,140 @@ type Object struct {
 	gate       ApplyGate
 	afterApply AfterApply
 
-	mu   sync.Mutex
-	tree objecttree.ObjectTree
+	mu     sync.Mutex
+	tree   objecttree.ObjectTree
+	closed bool
 }
 
-// NewObject returns an Object ready to be wired as an UpdateListener.
-// The tree is set post-build via SetTree (BuildTree needs us as the
-// listener at construction time).
-func NewObject(spaceId string, signKey crypto.PrivKey, ctrl *crdt.Controller, alloc *VersionAllocator) *Object {
-	return &Object{
-		signKey: signKey,
-		codec:   NewCodec(),
-		alloc:   alloc,
-		ctrl:    ctrl,
-		spaceId: spaceId,
+// Config carries the dependencies object.New wires onto a new
+// Object. Gate and AfterApply are optional (nil = disabled).
+type Config struct {
+	SpaceId    string
+	SignKey    crypto.PrivKey
+	Controller *crdt.Controller
+	Allocator  *VersionAllocator
+	Gate       ApplyGate
+	AfterApply AfterApply
+}
+
+// TreeFunc constructs the any-sync ObjectTree for the new Object,
+// receiving the Object (as its UpdateListener) as input. Called
+// exactly once from inside object.New; the returned tree is wired
+// into the Object before New returns. Typical implementations call
+// TreeBuilder.PutTree (creation/derivation path) and/or
+// TreeBuilder.BuildTree (existing-tree path) with the listener
+// passed straight through.
+type TreeFunc func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error)
+
+// New constructs a fully-initialised Object with its any-sync tree
+// bound. The TreeFunc closure runs with the partially-built Object
+// as its update listener; the returned tree is wired in atomically
+// before New returns, so the Object is never observable to callers
+// without a tree.
+//
+// During TreeFunc execution any synctree listener callbacks
+// (Update / Rebuild fired by BuildSyncTreeOrGetRemote's initial
+// rebuild) see o.tree == nil — replayLocked handles that by
+// stamping ObjectAuthor / Creator from the explicit tree arg it
+// receives rather than from o.tree.
+func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
+	if cfg.Controller == nil {
+		return nil, errors.New("object: New: nil Controller")
+	}
+	if treeFunc == nil {
+		return nil, errors.New("object: New: nil TreeFunc")
+	}
+	o := &Object{
+		signKey:    cfg.SignKey,
+		codec:      NewCodec(),
+		alloc:      cfg.Allocator,
+		ctrl:       cfg.Controller,
+		spaceId:    cfg.SpaceId,
+		gate:       cfg.Gate,
+		afterApply: cfg.AfterApply,
+	}
+	tree, err := treeFunc(o)
+	if err != nil {
+		return nil, err
+	}
+	if tree == nil {
+		return nil, errors.New("object: New: TreeFunc returned nil tree")
+	}
+	o.tree = tree
+	return o, nil
+}
+
+// Close detaches the tree listener and marks the Object closed.
+// Blocks until in-flight LocalWrite / replay / inbound apply finish.
+// Idempotent — second call is a no-op. ocache calls this on Remove
+// and on cache shutdown.
+//
+// Lock order: tree.Lock first, then o.mu — matching LocalWrite and
+// the synchandler-driven Update path. Using the opposite order here
+// (o.mu first, then tree.Lock) created an AB-BA deadlock under load
+// at shutdown: a goroutine inside the synchandler holding tree.Lock
+// would block on o.mu while Close holding o.mu blocked on
+// tree.Lock. Reproduces as `panic: app.Close timeout`.
+//
+// After Close, any-sync's tree may still hold this *Object in
+// memory (via SyncAll iteration holding the tree past eviction),
+// but its listener field is nil — Update / Rebuild callbacks no-op
+// on the synctree side, preventing stale apply against a freshly-
+// loaded peer Object.
+func (o *Object) Close() error {
+	if o.tree != nil {
+		o.tree.Lock()
+		defer o.tree.Unlock()
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return nil
+	}
+	if o.tree != nil {
+		o.setListenerNilLocked()
+	}
+	o.closed = true
+	return nil
+}
+
+// TryClose is the non-blocking variant ocache GC uses. Returns
+// (false, nil) when the Object is busy (mid-write, mid-replay, or
+// the tree is locked by an in-flight inbound handler). ocache
+// retries on the next tick.
+//
+// Same lock order as Close: tree first, then o.mu. Either TryLock
+// failing means a concurrent code path is mid-flight; back off and
+// let the next tick retry.
+func (o *Object) TryClose(_ time.Duration) (bool, error) {
+	if o.tree != nil {
+		if !o.tree.TryLock() {
+			return false, nil
+		}
+		defer o.tree.Unlock()
+	}
+	if !o.mu.TryLock() {
+		return false, nil
+	}
+	defer o.mu.Unlock()
+	if o.closed {
+		return true, nil
+	}
+	if o.tree != nil {
+		o.setListenerNilLocked()
+	}
+	o.closed = true
+	return true, nil
+}
+
+// setListenerNilLocked sets the synctree listener to nil. Caller
+// must hold both o.tree's lock AND o.mu. No-op when the underlying
+// tree is not a synctree (e.g. tests with a plain objecttree mock).
+func (o *Object) setListenerNilLocked() {
+	if setter, ok := o.tree.(synctree.ListenerSetter); ok {
+		setter.SetListener(nil)
 	}
 }
-
-// SetTree binds the built any-sync ObjectTree.
-func (o *Object) SetTree(tree objecttree.ObjectTree) { o.tree = tree }
-
-// SetGate wires the optional DataVersion gate. nil disables gating
-// (all changes apply directly).
-func (o *Object) SetGate(g ApplyGate) { o.gate = g }
-
-// SetAfterApply wires a post-apply hook. nil disables.
-func (o *Object) SetAfterApply(h AfterApply) { o.afterApply = h }
 
 // ApplyDecoded applies a pre-stamped Change to the controller —
 // bypasses the gate, used by the drain path when re-applying a
@@ -251,6 +361,9 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	defer o.tree.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.closed {
+		return WriteResult{}, errors.New("object: closed")
+	}
 
 	// Back-fill the apply-time timestamp before AddContent so the
 	// downstream apply path (BeforeCreate / BeforeModify hooks) sees
@@ -363,6 +476,11 @@ func (o *Object) ColdRestore(ctx context.Context) error {
 func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.closed {
+		// Stale callback after Close (listener detach race) — no-op.
+		// The freshly-loaded peer Object owns subsequent applies.
+		return nil
+	}
 
 	rootId := tree.Id()
 	from := o.ctrl.MaxAddSeq()

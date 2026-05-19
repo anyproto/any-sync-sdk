@@ -9,6 +9,7 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
@@ -157,20 +158,25 @@ func (s *Service) bindIndexObject(ctx context.Context, cs interface {
 	TreeBuilder() objecttreebuilder.TreeBuilder
 }, storagePayload treestorage.TreeStorageCreatePayload) (*object.Object, error) {
 	keys := s.app.AccountKeys()
-	obj := object.NewObject(s.spaceId, keys.SignKey, s.ctrl, s.alloc)
-
-	tree, err := cs.TreeBuilder().PutTree(ctx, storagePayload, obj)
-	if err != nil {
+	return object.New(object.Config{
+		SpaceId:    s.spaceId,
+		SignKey:    keys.SignKey,
+		Controller: s.ctrl,
+		Allocator:  s.alloc,
+	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
+		tree, err := cs.TreeBuilder().PutTree(ctx, storagePayload, listener)
+		if err == nil {
+			return tree, nil
+		}
 		if !errors.Is(err, treestorage.ErrTreeExists) {
 			return nil, fmt.Errorf("techspace: put index tree: %w", err)
 		}
-		tree, err = cs.TreeBuilder().BuildTree(ctx, s.indexId, objecttreebuilder.BuildTreeOpts{Listener: obj})
+		tree, err = cs.TreeBuilder().BuildTree(ctx, s.indexId, objecttreebuilder.BuildTreeOpts{Listener: listener})
 		if err != nil {
 			return nil, fmt.Errorf("techspace: build index tree: %w", err)
 		}
-	}
-	obj.SetTree(tree)
-	return obj, nil
+		return tree, nil
+	})
 }
 
 // indexObject loads the tech space (via cache), rebinds an Object to

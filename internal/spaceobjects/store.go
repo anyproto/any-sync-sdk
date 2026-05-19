@@ -24,6 +24,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/util/crypto"
@@ -498,15 +499,19 @@ func (s *Store) bind(ctx context.Context, handle anysyncx.SpaceHandle, objectId 
 	if err != nil {
 		return nil, err
 	}
-	obj := object.NewObject(s.spaceId, s.signKey, ctrl, s.alloc)
-	obj.SetGate(s.gateFor(objectId))
-	obj.SetAfterApply(s.afterApplyFor())
-
-	tree, err := s.openTree(ctx, handle, objectId, payload, obj)
+	obj, err := object.New(object.Config{
+		SpaceId:    s.spaceId,
+		SignKey:    s.signKey,
+		Controller: ctrl,
+		Allocator:  s.alloc,
+		Gate:       s.gateFor(objectId),
+		AfterApply: s.afterApplyFor(),
+	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
+		return s.openTree(ctx, handle, objectId, payload, listener)
+	})
 	if err != nil {
 		return nil, err
 	}
-	obj.SetTree(tree)
 
 	s.mu.Lock()
 	if existing, ok := s.objects[objectId]; ok {
@@ -540,7 +545,7 @@ func (s *Store) bind(ctx context.Context, handle anysyncx.SpaceHandle, objectId 
 // IterateAfterAddSeq. Local writes are unaffected: tree.AddContent
 // in any-sync persists to storage before broadcasting, regardless
 // of this flag.
-func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objectId string, payload *treestorage.TreeStorageCreatePayload, listener *object.Object) (objecttree.ObjectTree, error) {
+func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objectId string, payload *treestorage.TreeStorageCreatePayload, listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 	tb := handle.Inner().TreeBuilder()
 	if payload != nil {
 		tree, err := tb.PutTree(ctx, *payload, listener)

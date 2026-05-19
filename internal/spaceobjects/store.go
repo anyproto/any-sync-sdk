@@ -272,7 +272,7 @@ func (s *Store) OpenObjectCollection(ctx context.Context, objectId, dataset stri
 	if dataset == "" {
 		return nil, errors.New("spaceobjects: OpenObjectCollection: dataset required")
 	}
-	return s.db.OpenCollection(ctx, objectId+"/"+dataset)
+	return s.db.OpenCollection(ctx, objectId+"_"+dataset)
 }
 
 // SharedObjects returns the per-space `objects` collection, opening
@@ -287,7 +287,7 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 		return coll, nil
 	}
 	s.mu.Unlock()
-	collName := s.spaceId + "/" + SpaceObjectsCollection
+	collName := s.spaceId + "_" + SpaceObjectsCollection
 	coll, err := s.db.Collection(ctx, collName)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)

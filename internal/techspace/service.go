@@ -121,7 +121,7 @@ func (s *Service) Open(ctx context.Context) error {
 	}
 	s.indexId = storagePayload.RootRawChange.Id
 
-	collName := s.indexId + "/" + SpaceIndexDataset
+	collName := s.indexId + "_" + SpaceIndexDataset
 	if _, err := s.db.Collection(ctx, collName); err != nil {
 		return fmt.Errorf("techspace: open index collection: %w", err)
 	}

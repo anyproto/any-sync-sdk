@@ -169,7 +169,7 @@ func (c *Controller) registerHandler(ctx context.Context, h Handler) error {
 		// Shared collection was wired at construction time; reuse it.
 		return nil
 	}
-	collName := c.objectId + "/" + name
+	collName := c.objectId + "_" + name
 	coll, err := c.db.Collection(ctx, collName)
 	if err != nil {
 		return fmt.Errorf("crdt: open collection %q: %w", collName, err)

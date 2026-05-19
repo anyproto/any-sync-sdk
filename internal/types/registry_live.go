@@ -117,7 +117,7 @@ func (r *LiveRegistry) LatestShortId(ctx context.Context, typeId string) (string
 // openCollection opens (and lazily creates) the named per-type-
 // object collection. Returns the same handle on subsequent calls.
 func (r *LiveRegistry) openCollection(ctx context.Context, typeId, dataset string) (anystore.Collection, error) {
-	return r.db.Collection(ctx, typeId+"/"+dataset)
+	return r.db.Collection(ctx, typeId+"_"+dataset)
 }
 
 // Compile-time check that LiveRegistry satisfies Registry.

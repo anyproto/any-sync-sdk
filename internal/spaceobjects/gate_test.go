@@ -67,7 +67,7 @@ func TestGate_ParkAndDrain(t *testing.T) {
 	assert.Len(t, seen, 1, "row should remain when shortId still missing")
 
 	// Land the shortId in the type's shortIds collection.
-	shortIdsColl, err := db.Collection(ctx, "typeT/shortIds")
+	shortIdsColl, err := db.Collection(ctx, "typeT_shortIds")
 	require.NoError(t, err)
 	a := &anyenc.Arena{}
 	doc := a.NewObject()

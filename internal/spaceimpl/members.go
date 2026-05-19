@@ -58,11 +58,11 @@ type membersAPI struct {
 func newMembersAPI(s *spaceImpl) *membersAPI { return &membersAPI{s: s} }
 
 // collection returns the materialised members collection, opening it
-// on first call. Per-space; named "<spaceId>/members" via the SDK
+// on first call. Per-space; named "<spaceId>_members" via the SDK
 // shared db. Never blocks the watcher lock.
 func (m *membersAPI) collection(ctx context.Context) (anystore.Collection, error) {
 	m.collOnce.Do(func() {
-		collName := m.s.id + "/" + MembersCollection
+		collName := m.s.id + "_" + MembersCollection
 		coll, err := m.s.parent.db.Collection(ctx, collName)
 		if err != nil {
 			m.collErr = fmt.Errorf("members: open %s: %w", collName, err)

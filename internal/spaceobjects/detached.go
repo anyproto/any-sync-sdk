@@ -58,7 +58,7 @@ func (s *Store) Detached(ctx context.Context) (anystore.Collection, error) {
 		return coll, nil
 	}
 	s.mu.Unlock()
-	collName := s.spaceId + "/" + DetachedCollection
+	collName := s.spaceId + "_" + DetachedCollection
 	coll, err := s.db.Collection(ctx, collName)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)

@@ -72,7 +72,7 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 //     Decoupled from the apply lock to avoid the o.mu re-entry
 //     deadlock that synchronous Drain previously hit.
 func (s *Store) afterApplyFor() object.AfterApply {
-	return func(ctx context.Context, ch *crdt.Change) {
+	return func(ctx context.Context, obj *object.Object, ch *crdt.Change) {
 		if ch == nil {
 			return
 		}
@@ -84,7 +84,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		ids, idsErr := crdt.ResolveRecordIds(*ch)
 
 		if s.dispatcher != nil && s.dispatcher.HasSubscribers() {
-			rowIds, postValue := s.postValueFor(ctx, ch, ids)
+			rowIds, postValue := s.postValueFor(ctx, obj, ch, ids)
 			s.dispatcher.Dispatch(ch, rowIds, postValue)
 		}
 
@@ -110,16 +110,15 @@ func (s *Store) afterApplyFor() object.AfterApply {
 // we mirror that here so the wire's EventRecord.Id matches what a
 // follow-up Query on the same dataset returns. Per-object datasets
 // keep the resolved RecordChange ids untouched.
-func (s *Store) postValueFor(ctx context.Context, ch *crdt.Change, ids []string) ([]string, eventbus.PostValueFn) {
-	// Pick (not Get) — afterApply fires *after* a successful apply on
-	// an already-loaded Object, so it must be cached. Avoids a
-	// recursive LoadFunc call from inside the apply path.
-	cached, err := s.cache.Pick(ctx, ch.ObjectId)
-	if err != nil {
-		return ids, nil
-	}
-	obj, ok := cached.(*object.Object)
-	if !ok || obj == nil {
+func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.Change, ids []string) ([]string, eventbus.PostValueFn) {
+	// The Object is handed in by afterApply directly — DO NOT do a
+	// cache lookup here. afterApply runs from inside the LoadFunc on
+	// a fresh joiner (synctree's afterBuild → Rebuild → replayLocked
+	// → applyDecodedLocked); any cache.Pick / cache.Get on the same
+	// id would block on the load channel that hasn't closed yet,
+	// producing a self-recursive deadlock that any-sync surfaces as
+	// `panic: app.Close timeout`.
+	if obj == nil {
 		return ids, nil
 	}
 	ctrl := obj.Controller()

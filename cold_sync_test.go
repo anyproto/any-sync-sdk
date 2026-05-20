@@ -345,7 +345,6 @@ func containsString(s []string, v string) bool {
 func loadAnySyncNetwork() ([]byte, string, error) {
 	candidates := []string{
 		os.Getenv("ANYSYNC_NETWORK_YAML"),
-		"/tmp/anysync-dev/sdk-network.yml",
 		filepath.Join("..", "test-etc", "staging.yml"),
 	}
 	for _, p := range candidates {

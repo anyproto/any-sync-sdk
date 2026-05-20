@@ -52,7 +52,15 @@ type ApplyGate func(ctx context.Context, ch *crdt.Change, rawPayload []byte) (pr
 // AfterApply fires after a successful ApplyChange — both the replay
 // path and LocalWrite. Used by the space layer to drain parked
 // changes whose missing shortIds may have just landed.
-type AfterApply func(ctx context.Context, ch *crdt.Change)
+//
+// The Object firing the hook is passed in so the space layer can
+// reach the Controller directly without going through a cache
+// lookup. That matters because afterApply runs from inside the
+// LoadFunc on a fresh joiner (synctree's afterBuild → Rebuild →
+// replayLocked → applyDecodedLocked → afterApply); any cache.Pick
+// on the same id would block on the load channel that hasn't
+// closed yet, producing a self-recursive deadlock.
+type AfterApply func(ctx context.Context, o *Object, ch *crdt.Change)
 
 type Object struct {
 	signKey    crypto.PrivKey
@@ -217,7 +225,7 @@ func (o *Object) applyDecodedLocked(ctx context.Context, ch crdt.Change) (crdt.A
 		return res, err
 	}
 	if o.afterApply != nil {
-		o.afterApply(ctx, &ch)
+		o.afterApply(ctx, o, &ch)
 	}
 	return res, nil
 }

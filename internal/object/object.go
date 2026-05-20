@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
@@ -64,7 +63,12 @@ type Object struct {
 	gate       ApplyGate
 	afterApply AfterApply
 
-	mu     sync.Mutex
+	// tree's own lock (synctree.Lock) is the single mutex guarding
+	// all writes into the Controller: LocalWrite, replayLocked (via
+	// Update/Rebuild/ColdRestore), and ApplyDecoded (drain path).
+	// Don't add a separate Object-level mutex — sync.Mutex is non-
+	// reentrant, so any path that's already under tree.Lock (the
+	// synchandler-driven Update) must NOT try to re-lock.
 	tree   objecttree.ObjectTree
 	closed bool
 }
@@ -128,16 +132,11 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 }
 
 // Close detaches the tree listener and marks the Object closed.
-// Blocks until in-flight LocalWrite / replay / inbound apply finish.
-// Idempotent — second call is a no-op. ocache calls this on Remove
-// and on cache shutdown.
-//
-// Lock order: tree.Lock first, then o.mu — matching LocalWrite and
-// the synchandler-driven Update path. Using the opposite order here
-// (o.mu first, then tree.Lock) created an AB-BA deadlock under load
-// at shutdown: a goroutine inside the synchandler holding tree.Lock
-// would block on o.mu while Close holding o.mu blocked on
-// tree.Lock. Reproduces as `panic: app.Close timeout`.
+// Blocks on tree.Lock — that's the same lock LocalWrite, the
+// synchandler-driven Update, and the drain path all serialize on,
+// so waiting here is the natural "let in-flight applies finish"
+// barrier. Idempotent — second call is a no-op. ocache calls this
+// on Remove and on cache shutdown.
 //
 // After Close, any-sync's tree may still hold this *Object in
 // memory (via SyncAll iteration holding the tree past eviction),
@@ -145,54 +144,44 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 // on the synctree side, preventing stale apply against a freshly-
 // loaded peer Object.
 func (o *Object) Close() error {
-	if o.tree != nil {
-		o.tree.Lock()
-		defer o.tree.Unlock()
+	if o.tree == nil {
+		o.closed = true
+		return nil
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.tree.Lock()
+	defer o.tree.Unlock()
 	if o.closed {
 		return nil
 	}
-	if o.tree != nil {
-		o.setListenerNilLocked()
-	}
+	o.setListenerNilLocked()
 	o.closed = true
 	return nil
 }
 
 // TryClose is the non-blocking variant ocache GC uses. Returns
-// (false, nil) when the Object is busy (mid-write, mid-replay, or
-// the tree is locked by an in-flight inbound handler). ocache
-// retries on the next tick.
-//
-// Same lock order as Close: tree first, then o.mu. Either TryLock
-// failing means a concurrent code path is mid-flight; back off and
-// let the next tick retry.
+// (false, nil) when the tree is locked by an in-flight handler
+// (LocalWrite, inbound synchandler, drain). ocache retries on the
+// next tick.
 func (o *Object) TryClose(_ time.Duration) (bool, error) {
-	if o.tree != nil {
-		if !o.tree.TryLock() {
-			return false, nil
-		}
-		defer o.tree.Unlock()
+	if o.tree == nil {
+		o.closed = true
+		return true, nil
 	}
-	if !o.mu.TryLock() {
+	if !o.tree.TryLock() {
 		return false, nil
 	}
-	defer o.mu.Unlock()
+	defer o.tree.Unlock()
 	if o.closed {
 		return true, nil
 	}
-	if o.tree != nil {
-		o.setListenerNilLocked()
-	}
+	o.setListenerNilLocked()
 	o.closed = true
 	return true, nil
 }
 
 // setListenerNilLocked sets the synctree listener to nil. Caller
-// must hold both o.tree's lock AND o.mu. No-op when the underlying
-// tree is not a synctree (e.g. tests with a plain objecttree mock).
+// must hold o.tree's lock. No-op when the underlying tree is not a
+// synctree (e.g. tests with a plain objecttree mock).
 func (o *Object) setListenerNilLocked() {
 	if setter, ok := o.tree.(synctree.ListenerSetter); ok {
 		setter.SetListener(nil)
@@ -202,10 +191,12 @@ func (o *Object) setListenerNilLocked() {
 // ApplyDecoded applies a pre-stamped Change to the controller —
 // bypasses the gate, used by the drain path when re-applying a
 // previously-parked change whose dependencies have now landed.
-// Thin wrapper around applyDecodedLocked that takes o.mu.
+// Takes tree.Lock (the apply-serializing mutex) and runs
+// applyDecodedLocked. Drain operations may wait briefly on inbound
+// sync — that's fine, drain is off the critical path.
 func (o *Object) ApplyDecoded(ctx context.Context, ch crdt.Change) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.tree.Lock()
+	defer o.tree.Unlock()
 	_, err := o.applyDecodedLocked(ctx, ch)
 	return err
 }
@@ -214,10 +205,8 @@ func (o *Object) ApplyDecoded(ctx context.Context, ch crdt.Change) error {
 // LocalWrite, replayLocked, and the drain path all reduce to this
 // after they've prepared a Change with envelope filled (especially
 // VersionId, which must come from any-sync's OrderId — see lexid.go
-// docs). Caller must hold o.mu.
-//
-// The tree lock is NOT touched — this only writes to the
-// controller's any-store collections.
+// docs). Caller must hold tree.Lock — that's the single mutex
+// guarding every write into the Controller.
 func (o *Object) applyDecodedLocked(ctx context.Context, ch crdt.Change) (crdt.ApplyResult, error) {
 	if ch.VersionId == "" {
 		return crdt.ApplyResult{}, errors.New("object: applyDecodedLocked requires pre-stamped VersionId (any-sync OrderId)")
@@ -330,12 +319,13 @@ type WriteResult struct {
 // state is impossible because AddContent and ApplyChange each run in
 // their own atomic step.
 //
-// Locking: tree.Lock first, then o.mu. The sync-receiver path
-// (synctree.AddRawChanges → Update/Rebuild → replayLocked) acquires
-// the tree lock at the synctree layer and then takes o.mu inside
-// replayLocked, so following the same order here avoids AB-BA
-// deadlocks. tree.AddContent expects the caller to hold the tree
-// lock — without it, any-sync logs "use tree when unlocked" at ERROR.
+// Locking: tree.Lock is the single mutex guarding every write into
+// the Controller. The sync-receiver path (synctree.AddRawChanges →
+// Update/Rebuild → replayLocked) already runs under tree.Lock at
+// the synctree layer; ColdRestore and ApplyDecoded acquire it
+// themselves; LocalWrite acquires it here. tree.AddContent also
+// requires the caller to hold tree.Lock — without it, any-sync
+// logs "use tree when unlocked" at ERROR.
 func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, error) {
 	if o.tree == nil {
 		return WriteResult{}, ErrTreeNotSet
@@ -359,8 +349,6 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 
 	o.tree.Lock()
 	defer o.tree.Unlock()
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.closed {
 		return WriteResult{}, errors.New("object: closed")
 	}
@@ -458,8 +446,10 @@ func (o *Object) ColdRestore(ctx context.Context) error {
 // replayLocked walks any-sync changes with AddSeq >
 // controller.MaxAddSeq, decoding each payload, stamping its VersionId
 // from any-sync's StorageChange.OrderId, and applying through the
-// controller. The caller must hold the tree lock; o.mu serialises
-// against concurrent local writes.
+// controller. The caller must hold tree.Lock — that's the single
+// mutex guarding every write into the Controller, and it's already
+// held by the synchandler-driven Update/Rebuild path and by
+// ColdRestore (which takes it explicitly).
 //
 // Skips the root change (objectId == change.Id) — it carries no CRDT
 // payload, just the tree header. Non-CRDT data types (e.g. settings
@@ -474,8 +464,6 @@ func (o *Object) ColdRestore(ctx context.Context) error {
 // bytes; we hand off the parsed Change to the iterate callback via
 // Change.Model.
 func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.closed {
 		// Stale callback after Close (listener detach race) — no-op.
 		// The freshly-loaded peer Object owns subsequent applies.

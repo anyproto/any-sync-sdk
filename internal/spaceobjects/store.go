@@ -123,11 +123,11 @@ type Store struct {
 
 // objectCacheTTL is the idle window before a cached Object is
 // eligible for eviction. objectCacheGC is how often the GC ticker
-// runs. Both default to 0 (no GC) — debugging a staging regression
-// in TestE2E_ColdSyncSameKey before enabling 1m/20s.
+// runs. Eviction safety relies on Object.TryClose detaching the
+// synctree listener under tree.Lock — see object.Close docstring.
 const (
-	objectCacheTTL = 0
-	objectCacheGC  = 0
+	objectCacheTTL = time.Minute
+	objectCacheGC  = 20 * time.Second
 )
 
 // loadPayloadKey is the context-key type for the optional

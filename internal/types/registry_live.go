@@ -42,6 +42,8 @@ func (r *LiveRegistry) LookupKind(typeId, propId string) (schema.Kind, bool) {
 	ctx := context.Background()
 	coll, err := r.openCollection(ctx, typeId, "properties")
 	if err != nil {
+		// ErrCollectionNotFound means no writer has touched this
+		// type's `properties` dataset yet — treat as "unknown".
 		return schema.KindUnknown, false
 	}
 	doc, err := coll.FindId(ctx, propId)
@@ -69,6 +71,9 @@ func (r *LiveRegistry) KnownShortId(ctx context.Context, typeId, shortId string)
 	}
 	coll, err := r.openCollection(ctx, typeId, "shortIds")
 	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return false, nil
+		}
 		return false, err
 	}
 	if _, err := coll.FindId(ctx, shortId); err != nil {
@@ -93,6 +98,9 @@ func (r *LiveRegistry) LatestShortId(ctx context.Context, typeId string) (string
 	}
 	coll, err := r.openCollection(ctx, typeId, "shortIds")
 	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return "", nil
+		}
 		return "", err
 	}
 	iter, err := coll.Find(nil).Sort("-_ver.id").Limit(1).Iter(ctx)
@@ -114,10 +122,14 @@ func (r *LiveRegistry) LatestShortId(ctx context.Context, typeId string) (string
 	return v.GetString("id"), nil
 }
 
-// openCollection opens (and lazily creates) the named per-type-
-// object collection. Returns the same handle on subsequent calls.
+// openCollection opens the named per-type-object collection without
+// creating it. Returns anystore.ErrCollectionNotFound when no writer
+// has materialised the dataset yet — callers treat that as "no rows".
+// Using OpenCollection (not Collection) is what keeps reads from
+// leaking empty collections for built-in or unwritten types (e.g.
+// the virtual `any` type that contributes no real datasets).
 func (r *LiveRegistry) openCollection(ctx context.Context, typeId, dataset string) (anystore.Collection, error) {
-	return r.db.Collection(ctx, typeId+"_"+dataset)
+	return r.db.OpenCollection(ctx, typeId+"_"+dataset)
 }
 
 // Compile-time check that LiveRegistry satisfies Registry.

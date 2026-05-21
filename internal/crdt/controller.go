@@ -71,9 +71,17 @@ const (
 //
 // Not safe for concurrent use.
 type Controller struct {
-	objectId    string
-	db          anystore.DB
-	handlers    map[string]Handler
+	objectId string
+	db       anystore.DB
+	handlers map[string]Handler
+
+	// collMu guards collections. Per-object collections are opened
+	// lazily — on first write via db.Collection (creates), on read via
+	// db.OpenCollection (no-create). Shared (per-space) handles are
+	// installed at construction and never replaced. Reads can race
+	// applies because they don't go through tree.Lock; the mutex
+	// protects map access only.
+	collMu      sync.Mutex
 	collections map[string]anystore.Collection
 	// shared maps a dataset to a "shared" (typically per-space)
 	// collection that supersedes the per-object collection. Writes to
@@ -165,25 +173,82 @@ func (c *Controller) registerHandler(ctx context.Context, h Handler) error {
 		return fmt.Errorf("crdt: init handler %q: %w", name, err)
 	}
 	c.handlers[name] = h
-	if _, isShared := c.shared[name]; isShared {
-		// Shared collection was wired at construction time; reuse it.
-		return nil
+	// Per-object collections are opened lazily — on first write
+	// (creates) or on first read (no-create). This keeps unwritten
+	// datasets (e.g. typetype's `properties` / `shortIds` on regular
+	// objects, or an external type's handlers attached to every
+	// Controller) from materialising empty rows in any-store.
+	// Shared (per-space) collections are wired at construction time
+	// by the caller and live in c.collections from the start.
+	return nil
+}
+
+// collectionForWrite returns the on-disk collection for the dataset,
+// opening it (and creating it if absent) on first use. Caches the
+// handle so subsequent writes skip the open. Used by the apply path.
+func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (anystore.Collection, error) {
+	c.collMu.Lock()
+	if coll, ok := c.collections[dataset]; ok {
+		c.collMu.Unlock()
+		return coll, nil
 	}
-	collName := c.objectId + "_" + name
+	c.collMu.Unlock()
+	collName := c.objectId + "_" + dataset
 	coll, err := c.db.Collection(ctx, collName)
 	if err != nil {
-		return fmt.Errorf("crdt: open collection %q: %w", collName, err)
+		return nil, fmt.Errorf("crdt: open collection %q: %w", collName, err)
 	}
-	c.collections[name] = coll
-	return nil
+	c.collMu.Lock()
+	if existing, ok := c.collections[dataset]; ok {
+		coll = existing
+	} else {
+		c.collections[dataset] = coll
+	}
+	c.collMu.Unlock()
+	return coll, nil
+}
+
+// collectionForRead returns the on-disk collection for the dataset
+// without creating it. Returns nil when no writer has materialised
+// the dataset yet — callers treat that as "no rows". Caches the
+// handle on first successful open.
+func (c *Controller) collectionForRead(ctx context.Context, dataset string) anystore.Collection {
+	c.collMu.Lock()
+	if coll, ok := c.collections[dataset]; ok {
+		c.collMu.Unlock()
+		return coll
+	}
+	c.collMu.Unlock()
+	if _, ok := c.handlers[dataset]; !ok {
+		return nil
+	}
+	coll, err := c.db.OpenCollection(ctx, c.objectId+"_"+dataset)
+	if err != nil {
+		return nil
+	}
+	c.collMu.Lock()
+	if existing, ok := c.collections[dataset]; ok {
+		coll = existing
+	} else {
+		c.collections[dataset] = coll
+	}
+	c.collMu.Unlock()
+	return coll
 }
 
 // Collection returns the any-store collection backing the named
 // dataset. Exposed so query / iteration paths can hit any-store
 // directly without going through Controller's own helpers. Returns
-// nil when the dataset has no registered handler.
-func (c *Controller) Collection(dataset string) anystore.Collection {
-	return c.collections[dataset]
+// nil when the dataset has no registered handler or no writer has
+// materialised the per-object collection on disk yet.
+func (c *Controller) Collection(ctx context.Context, dataset string) anystore.Collection {
+	c.collMu.Lock()
+	coll, ok := c.collections[dataset]
+	c.collMu.Unlock()
+	if ok {
+		return coll
+	}
+	return c.collectionForRead(ctx, dataset)
 }
 
 // Get returns the record by id from the dataset, or nil if absent.
@@ -194,8 +259,8 @@ func (c *Controller) Collection(dataset string) anystore.Collection {
 // before this function returns (any-store's FindId releases via
 // defer).
 func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value {
-	coll, ok := c.collections[dataset]
-	if !ok {
+	coll := c.collectionForRead(ctx, dataset)
+	if coll == nil {
 		return nil
 	}
 	doc, err := coll.FindId(ctx, id)
@@ -225,8 +290,8 @@ func (c *Controller) IsShared(dataset string) bool {
 // For streaming over many rows, hit Collection(dataset).Find(...) +
 // Iter directly and clone selectively — Records always materialises.
 func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Value {
-	coll, ok := c.collections[dataset]
-	if !ok {
+	coll := c.collectionForRead(ctx, dataset)
+	if coll == nil {
 		return nil
 	}
 	iter, err := coll.Find(nil).Iter(ctx)
@@ -298,9 +363,6 @@ func (c *Controller) ValidateChange(ch Change) error {
 	if _, ok := c.handlers[ch.Dataset]; !ok {
 		return ErrUnknownDataset
 	}
-	if _, ok := c.collections[ch.Dataset]; !ok {
-		return ErrUnknownDataset
-	}
 	for i, rc := range ch.Records {
 		// Empty record id only resolves at apply time (when ChangeId
 		// is known); enforcing the Upsert requirement here keeps
@@ -352,9 +414,11 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	if !ok {
 		return res, ErrUnknownDataset
 	}
-	coll, ok := c.collections[ch.Dataset]
-	if !ok {
-		return res, ErrUnknownDataset
+	// Lazy-open the per-object collection on first write. Reads stay
+	// tolerant of "not yet materialised" — see collectionForRead.
+	coll, err := c.collectionForWrite(ctx, ch.Dataset)
+	if err != nil {
+		return res, err
 	}
 
 	// Resolve empty ids from ChangeId. For shared (per-space) datasets,
@@ -489,14 +553,18 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 func (c *Controller) applySiblings(ctx context.Context, ch *Change, siblings []Sibling) error {
 	for i := range siblings {
 		sib := &siblings[i]
-		coll, ok := c.collections[sib.Dataset]
-		if !ok {
+		if _, ok := c.handlers[sib.Dataset]; !ok {
+			// Unknown dataset for this controller: silent skip
+			// (Sibling.Dataset wasn't registered).
 			continue
+		}
+		coll, err := c.collectionForWrite(ctx, sib.Dataset)
+		if err != nil {
+			return err
 		}
 		mod := c.modifierPool.Get().(*recordModifier)
 		mod.setSibling(ch, sib)
 		op := sib.Record
-		var err error
 		if hasDelete(op.Ops) || op.Upsert {
 			_, err = coll.UpsertId(ctx, sib.Record.Id, mod)
 		} else {

@@ -177,6 +177,9 @@ func (q *queryImpl) Count(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if coll == nil {
+		return 0, nil
+	}
 	built, err := q.build(coll)
 	if err != nil {
 		return 0, err
@@ -190,6 +193,9 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
+	if coll == nil {
+		return emptyIterator{}, nil
+	}
 	built, err := q.build(coll)
 	if err != nil {
 		return nil, err
@@ -201,6 +207,14 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	return &queryIterator{inner: asIter}, nil
 }
 
+// collection resolves the dataset's any-store collection. Returns
+// (nil, nil) when the dataset has no rows materialised yet — callers
+// treat that as an empty result rather than an error, so the first
+// query on a fresh object surfaces an empty list / zero count instead
+// of a 500. The (nil, nil) signal also fires for unknown datasets;
+// distinguishing the two cases would require a Controller-level
+// accessor and isn't worth it — querying a typo dataset name already
+// silently returns empty in any-store too.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
 	if q.dataset == "<shared:objects>" {
 		return q.parent.store.SharedObjects(ctx)
@@ -209,12 +223,18 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
-	coll := obj.Controller().Collection(q.dataset)
-	if coll == nil {
-		return nil, fmt.Errorf("query: dataset %q has no collection", q.dataset)
-	}
-	return coll, nil
+	return obj.Controller().Collection(ctx, q.dataset), nil
 }
+
+// emptyIterator is the Iter() result when the dataset has no
+// materialised collection yet. Next always returns false; Doc never
+// gets called by well-behaved callers.
+type emptyIterator struct{}
+
+func (emptyIterator) Next() bool                   { return false }
+func (emptyIterator) Doc() (*anyenc.Value, error)  { return nil, nil }
+func (emptyIterator) Err() error                   { return nil }
+func (emptyIterator) Close() error                 { return nil }
 
 // build folds the parsed filter / sort / limit / offset into an
 // any-store Query. Filter and Sort are already typed query.Filter /

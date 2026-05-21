@@ -258,3 +258,126 @@ func pathsEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// collectSetPaths flattens every $set in the EventRecord for rowId
+// into a dotted-path set. Handles both wire shapes — single-field
+// (Path=[…], Payload=value) and multi-field (Path=[], Payload=object
+// keyed by dotted paths). Used to assert auto-field stamps land on
+// the wire on create.
+func collectSetPaths(t *testing.T, ev space.Event, rowId string) map[string]struct{} {
+	t.Helper()
+	out := make(map[string]struct{})
+	for i := range ev.Records {
+		if ev.Records[i].Id != rowId {
+			continue
+		}
+		for _, op := range ev.Records[i].Ops {
+			if op.Type != crdt.OpSet {
+				continue
+			}
+			if len(op.Path) > 0 {
+				out[joinPath(op.Path)] = struct{}{}
+				continue
+			}
+			if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+				continue
+			}
+			obj, _ := op.Payload.Object()
+			obj.Visit(func(k []byte, _ *anyenc.Value) {
+				out[string(k)] = struct{}{}
+			})
+		}
+	}
+	return out
+}
+
+// TestSDK_Subscribe_CreateEmitsAutoFields catches the regression where
+// a freshly-created record's auto-stamped fields (author / createdAt /
+// spaceId / _ver.id) never reached subscribers. The dispatcher used to
+// project only ch.Records[i].Ops, missing every field the apply layer
+// stamped via sink.Derive or directly onto the storage value. A viewer
+// must see no difference between user-supplied and auto fields — same
+// $set shape, same wire — so a fresh row reconstructs in one event.
+func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
+	confPath := filepath.Join("..", "test-etc", "staging.yml")
+	yaml, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Skipf("staging config not available at %s: %v", confPath, err)
+	}
+
+	cfg := config.Config{
+		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+		Network: config.Network{NodeConfYAML: yaml},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "AutoFields"})
+	require.NoError(t, err)
+
+	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Movie"})
+	require.NoError(t, err)
+	titleProp, err := sp.Types().AddProperty(ctx, typeId, space.PropertyDraft{
+		Name: "Title",
+		XKey: "title",
+		Kind: space.PropertyKindString,
+	})
+	require.NoError(t, err)
+
+	// Subscribe BEFORE creating the object so the create-time write
+	// into the per-space `objects` dataset fires as a CREATE event
+	// (not an UPDATE — that's the path that exercises BeforeCreate
+	// stamping and the _ver.id synthetic op).
+	propsSub, err := sp.SubscribeProperties(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = propsSub.Close() })
+
+	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Types: []string{typeId},
+	})
+	require.NoError(t, err)
+
+	ev := mustReceive(t, propsSub, 2*time.Second)
+	assert.Equal(t, objectId, ev.ObjectId)
+	assert.Equal(t, "objects", ev.Dataset)
+
+	paths := collectSetPaths(t, ev, objectId)
+
+	// SystemPropertiesHandler.BeforeCreate stamps these via sink.Derive.
+	assert.Contains(t, paths, "author",
+		"create event missing $set author — viewer can't tell who created the record")
+	assert.Contains(t, paths, "createdAt",
+		"create event missing $set createdAt — viewer can't sort/display creation time")
+	assert.Contains(t, paths, "spaceId",
+		"create event missing $set spaceId — viewer can't route across spaces")
+
+	// recordModifier.Modify stamps this directly onto storage; we
+	// surface it via a synthetic derived op so it rides the same wire.
+	assert.Contains(t, paths, "_ver.id",
+		"create event missing $set _ver.id — chat-message-style queries rely on this sort key")
+
+	// Now write a property value on the SAME row. This is an UPDATE
+	// (BeforeCreate doesn't fire on an existing row); derived stamps
+	// must NOT re-emit, or viewers would see noisy churn on every edit.
+	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
+		titleProp: "Casablanca",
+	})
+	require.NoError(t, err)
+
+	upd := mustReceive(t, propsSub, 2*time.Second)
+	updPaths := collectSetPaths(t, upd, objectId)
+	assert.NotContains(t, updPaths, "author",
+		"update must not re-stamp author")
+	assert.NotContains(t, updPaths, "createdAt",
+		"update must not re-stamp createdAt")
+	assert.NotContains(t, updPaths, "spaceId",
+		"update must not re-stamp spaceId")
+	assert.NotContains(t, updPaths, "_ver.id",
+		"update must not re-stamp _ver.id — that marker is creation-only")
+	// And the user-supplied write still lands on the wire.
+	assertProjectedSet(t, upd, objectId, []string{typeId, titleProp}, "Casablanca")
+}

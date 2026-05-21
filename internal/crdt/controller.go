@@ -50,8 +50,18 @@ type OpRejection struct {
 // the change still committed (with a fresh VersionId), but specific
 // ops or records were dropped. Empty Rejections means everything
 // landed.
+//
+// DerivedOps surfaces, per ch.Records index, the extra ops the apply
+// path stamped onto the record beyond the input ops: handler-emitted
+// sink.derived ops (author, createdAt, …) and the modifier's own
+// auto-stamped fields (_ver.id on create). The dispatcher merges
+// these into the EventRecord so a viewer can reconstruct a fresh
+// record without having to know which fields are "auto" vs "user".
+// Nil when no record had extras (the common update path); per-record
+// entry is nil when that record had none.
 type ApplyResult struct {
 	Rejections []OpRejection
+	DerivedOps [][]Op
 }
 
 // Reserved field names.
@@ -454,7 +464,7 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 
 	for i := range ch.Records {
 		id := resolvedIds[i]
-		recRej, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i])
+		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i])
 		if err != nil {
 			_ = tx.Rollback()
 			return res, err
@@ -465,6 +475,14 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 			recRej[j].RecordId = id
 		}
 		res.Rejections = append(res.Rejections, recRej...)
+		if recDerived != nil {
+			// Lazy-allocate so updates (where every record returns nil
+			// derived) don't pay for the parent slice.
+			if res.DerivedOps == nil {
+				res.DerivedOps = make([][]Op, len(ch.Records))
+			}
+			res.DerivedOps[i] = recDerived
+		}
 	}
 
 	// Persist the watermark in the same WriteTx as the record
@@ -496,8 +514,11 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 // drains the handler's sink, and applies any sibling writes. Returns
 // the per-op rejections recorded by the handler — the apply path
 // keeps going past per-op failures, but surfaces them so callers
-// know the change committed with a hole.
-func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange) ([]OpRejection, error) {
+// know the change committed with a hole — plus the extra ops the
+// modifier stamped beyond rc.Ops (handler-emitted derived ops,
+// _ver.id creation marker), which the dispatcher merges into the
+// EventRecord.
+func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange) ([]OpRejection, []Op, error) {
 	sink := c.sinkPool.Get().(*Sink)
 	mod := c.modifierPool.Get().(*recordModifier)
 	mod.set(handler, ch, id, rc, sink)
@@ -511,7 +532,7 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 
 	if hasDelete(rc.Ops) || rc.Upsert {
 		if _, err := coll.UpsertId(ctx, id, mod); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
 		if _, err := coll.UpdateId(ctx, id, mod); err != nil {
@@ -522,13 +543,14 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 				// per-record rejection so callers can distinguish "wrote
 				// successfully" from "structural id resolved but no
 				// projection happened".
-				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil
+				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, nil
 			}
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	rejections := mod.takeRejections()
+	derived := mod.takeDerived()
 
 	// Sibling writes go on different collections and so cannot reuse
 	// the same modifier instance (collection-keyed locks). Each runs
@@ -536,14 +558,14 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 	// rejected by the handler, drop siblings too — Project calls
 	// before the rejection are honored only when the record lands.
 	if mod.recordErr() != nil {
-		return rejections, nil
+		return rejections, derived, nil
 	}
 	if len(sink.sibling) > 0 {
 		if err := c.applySiblings(ctx, ch, sink.sibling); err != nil {
-			return rejections, err
+			return rejections, derived, err
 		}
 	}
-	return rejections, nil
+	return rejections, derived, nil
 }
 
 // applySiblings runs each Sibling as its own UpsertId on the matching
@@ -656,6 +678,16 @@ type recordModifier struct {
 	// record itself still applies; whole-record drops use
 	// recordedErr instead and surface as an OpIndex=-1 rejection.
 	rejections []OpRejection
+
+	// appliedDerived collects the extra ops that landed on the record
+	// outside of rc.Ops: handler-emitted sink.derived stamps (author,
+	// createdAt, …) and the modifier's own auto-stamped record fields
+	// (_ver.id on create). Surfaced through takeDerived so the
+	// dispatcher can project them onto the wire — without them, a
+	// viewer reconstructing a new record would miss every auto field.
+	// Buffer is pool-recycled; payloads live on appliedDerivedArena.
+	appliedDerived      []Op
+	appliedDerivedArena *anyenc.Arena
 }
 
 func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange, sink *Sink) {
@@ -668,6 +700,8 @@ func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange,
 	m.siblingRec = nil
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
+	m.appliedDerived = m.appliedDerived[:0]
+	m.appliedDerivedArena = nil
 }
 
 func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
@@ -680,6 +714,8 @@ func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
 	m.siblingRec = &sib.Record
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
+	m.appliedDerived = m.appliedDerived[:0]
+	m.appliedDerivedArena = nil
 }
 
 func (m *recordModifier) clear() {
@@ -691,6 +727,8 @@ func (m *recordModifier) clear() {
 	m.siblingRec = nil
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
+	m.appliedDerived = m.appliedDerived[:0]
+	m.appliedDerivedArena = nil
 }
 
 func (m *recordModifier) recordErr() error { return m.recordedErr }
@@ -706,6 +744,35 @@ func (m *recordModifier) takeRejections() []OpRejection {
 	copy(out, m.rejections)
 	m.rejections = m.rejections[:0]
 	return out
+}
+
+// takeDerived returns the extra ops the modifier applied beyond
+// rc.Ops — handler-emitted sink.derived stamps plus the modifier's
+// own auto-stamped fields (_ver.id on create). The returned slice is
+// a fresh copy so the caller can retain it past the next set();
+// payload pointers stay rooted on appliedDerivedArena (kept alive by
+// the Op references). Returns nil when the modifier emitted no
+// extras, so the common update path pays one length check.
+func (m *recordModifier) takeDerived() []Op {
+	if len(m.appliedDerived) == 0 {
+		return nil
+	}
+	out := make([]Op, len(m.appliedDerived))
+	copy(out, m.appliedDerived)
+	m.appliedDerived = m.appliedDerived[:0]
+	return out
+}
+
+// derivedArena returns the modifier-scoped arena for synthetic op
+// payloads (the auto-stamped record fields). Lazily allocated on
+// first use so updates don't pay for it. Cleared on set/clear so
+// each record gets its own arena and we don't accidentally retain
+// payloads from a previous apply.
+func (m *recordModifier) derivedArena() *anyenc.Arena {
+	if m.appliedDerivedArena == nil {
+		m.appliedDerivedArena = &anyenc.Arena{}
+	}
+	return m.appliedDerivedArena
 }
 
 // Modify is the apply algorithm hot path. Branches:
@@ -751,6 +818,16 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		ver := a.NewObject()
 		ver.Set(IdField, a.NewString(string(ch.VersionId)))
 		existing.Set(VersionsKey, ver)
+		// Mirror the stamp as a synthetic derived op so the dispatcher
+		// includes _ver.id in the create event. Allocates on the
+		// modifier's own arena — a's lifetime ends with this Modify
+		// call (any-store resets its DocBuffer), so we can't reuse
+		// `ver` for the wire payload.
+		m.appliedDerived = append(m.appliedDerived, Op{
+			Type:    OpSet,
+			Path:    []string{VersionsKey, IdField},
+			Payload: m.derivedArena().NewString(string(ch.VersionId)),
+		})
 
 		ctx := &ChangeCtx{Change: ch, Before: nil}
 		if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
@@ -843,6 +920,11 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 // is responsible for picking target — same routing as the original ops
 // (root or variant subdoc). No-op when no handler is wired (sibling
 // path) or when nothing was emitted.
+//
+// Captures the drained ops onto m.appliedDerived so the dispatcher can
+// project them onto the wire. Payloads live on the handler's own arena
+// (stampAutoFields allocates a fresh &anyenc.Arena{} per BeforeCreate
+// call) — the Op references hold that arena alive past the apply call.
 func (m *recordModifier) drainDerivedTo(a *anyenc.Arena, target *anyenc.Value, ch *Change) {
 	if m.sink == nil || len(m.sink.derived) == 0 {
 		return
@@ -850,6 +932,7 @@ func (m *recordModifier) drainDerivedTo(a *anyenc.Arena, target *anyenc.Value, c
 	for i := range m.sink.derived {
 		applyOp(a, target, *ch, m.sink.derived[i])
 	}
+	m.appliedDerived = append(m.appliedDerived, m.sink.derived...)
 	m.sink.derived = m.sink.derived[:0]
 }
 

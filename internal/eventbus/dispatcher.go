@@ -174,13 +174,20 @@ func (d *Dispatcher) HasSubscribers() bool {
 // datasets → all entries equal ch.ObjectId). When len(recordIds)
 // != len(ch.Records) we fall back to RecordChange.Id as best-effort.
 //
+// derivedOps carries, per ch.Records index, the extra $set ops the
+// apply path stamped beyond the input ops (handler-emitted derived
+// stamps + _ver.id creation marker). The dispatcher merges them
+// into the projected EventRecord so a viewer can reconstruct a
+// fresh record without distinguishing user-supplied from auto
+// fields. nil / len mismatch → no merge for that record.
+//
 // postValue is consulted once per record to look up the merged
 // row state, used to project non-set/unset ops down to a $set on
 // the post-apply path value (or $unset if the path went absent).
 // May be nil — in that case ops on non-set/unset types pass through
 // the projector with a nil Payload, which downstream consumers
 // should treat as "fetch this record fresh".
-func (d *Dispatcher) Dispatch(ch *crdt.Change, recordIds []string, postValue PostValueFn) {
+func (d *Dispatcher) Dispatch(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, postValue PostValueFn) {
 	if d.closed.Load() {
 		return
 	}
@@ -195,7 +202,7 @@ func (d *Dispatcher) Dispatch(ch *crdt.Change, recordIds []string, postValue Pos
 		ObjectId:  ch.ObjectId,
 		Dataset:   ch.Dataset,
 		VersionId: ch.VersionId,
-		Records:   projectRecords(ch, recordIds, postValue),
+		Records:   projectRecords(ch, recordIds, derivedOps, postValue),
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -218,9 +225,16 @@ func (d *Dispatcher) Dispatch(ch *crdt.Change, recordIds []string, postValue Pos
 // post-apply state, and a record-level "delete" op is collapsed into
 // EventRecord.Deleted.
 //
+// derivedOps[i] carries the auto-stamped extras the apply path added
+// to record i beyond rc.Ops (author / createdAt / spaceId / _ver.id).
+// They project through the same projectOp path as input ops — the
+// EventRecord's consumer can't tell them apart, which is the point:
+// a viewer reconstructs a fresh record with all its fields in one
+// go, no second-class wire form for auto fields.
+//
 // Op.Payload values are deep-cloned via anyencutil.Value.FillCopy so
 // the resulting Event is safe to outlive the dispatch call.
-func projectRecords(ch *crdt.Change, recordIds []string, postValue PostValueFn) []EventRecord {
+func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, postValue PostValueFn) []EventRecord {
 	if len(ch.Records) == 0 {
 		return nil
 	}
@@ -249,6 +263,18 @@ func projectRecords(ch *crdt.Change, recordIds []string, postValue PostValueFn) 
 				continue
 			}
 			er.Ops = append(er.Ops, projected)
+		}
+		// Derived stamps are record-level (author / createdAt / _ver.id
+		// land at root regardless of which variant the triggering op
+		// used), so they project with an empty variant prefix.
+		if i < len(derivedOps) {
+			for _, op := range derivedOps[i] {
+				projected, ok := projectOp(op, "", post)
+				if !ok {
+					continue
+				}
+				er.Ops = append(er.Ops, projected)
+			}
 		}
 		out = append(out, er)
 	}

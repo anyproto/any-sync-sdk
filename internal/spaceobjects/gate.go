@@ -72,7 +72,7 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 //     Decoupled from the apply lock to avoid the o.mu re-entry
 //     deadlock that synchronous Drain previously hit.
 func (s *Store) afterApplyFor() object.AfterApply {
-	return func(ctx context.Context, obj *object.Object, ch *crdt.Change) {
+	return func(ctx context.Context, obj *object.Object, ch *crdt.Change, res *crdt.ApplyResult) {
 		if ch == nil {
 			return
 		}
@@ -85,7 +85,11 @@ func (s *Store) afterApplyFor() object.AfterApply {
 
 		if s.dispatcher != nil && s.dispatcher.HasSubscribers() {
 			rowIds, postValue := s.postValueFor(ctx, obj, ch, ids)
-			s.dispatcher.Dispatch(ch, rowIds, postValue)
+			var derivedOps [][]crdt.Op
+			if res != nil {
+				derivedOps = res.DerivedOps
+			}
+			s.dispatcher.Dispatch(ch, rowIds, derivedOps, postValue)
 		}
 
 		if ch.Dataset != typetype.DatasetPropertyDefs {

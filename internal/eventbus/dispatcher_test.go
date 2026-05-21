@@ -106,8 +106,8 @@ func TestHasSubscribers_GateOnCounter(t *testing.T) {
 func TestDispatch_NoSubscribers_NoOp(t *testing.T) {
 	d := New("space1")
 	// Nothing to assert beyond "doesn't panic / crash".
-	d.Dispatch(changeOn("space1", "obj1", "data1", 7), nil, nil)
-	d.Dispatch(changeOn("space1", "obj1", ObjectsDataset, 8), nil, nil)
+	d.Dispatch(changeOn("space1", "obj1", "data1", 7), nil, nil, nil)
+	d.Dispatch(changeOn("space1", "obj1", ObjectsDataset, 8), nil, nil, nil)
 }
 
 func TestSubscribe_RoutesByObjectAndDataset(t *testing.T) {
@@ -119,7 +119,7 @@ func TestSubscribe_RoutesByObjectAndDataset(t *testing.T) {
 	subC := d.Subscribe("objA", "data2", 8)
 
 	// Event for (objA, data1) → subA only.
-	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil, nil)
 	if got := recv(t, subA); got.ObjectId != "objA" || got.Dataset != "data1" || got.VersionId != vId(1) {
 		t.Fatalf("subA unexpected: %+v", got)
 	}
@@ -127,7 +127,7 @@ func TestSubscribe_RoutesByObjectAndDataset(t *testing.T) {
 	expectNoEvent(t, subC)
 
 	// Event for (objB, data1) → subB only.
-	d.Dispatch(changeOn("space1", "objB", "data1", 2), nil, nil)
+	d.Dispatch(changeOn("space1", "objB", "data1", 2), nil, nil, nil)
 	if got := recv(t, subB); got.ObjectId != "objB" {
 		t.Fatalf("subB unexpected: %+v", got)
 	}
@@ -142,9 +142,9 @@ func TestSubscribeProperties_FirehoseAcrossObjects(t *testing.T) {
 	sub := d.SubscribeProperties(8)
 
 	// Property changes on different objects all land.
-	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 10), nil, nil)
-	d.Dispatch(changeOn("space1", "objB", ObjectsDataset, 11), nil, nil)
-	d.Dispatch(changeOn("space1", "objC", ObjectsDataset, 12), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 10), nil, nil, nil)
+	d.Dispatch(changeOn("space1", "objB", ObjectsDataset, 11), nil, nil, nil)
+	d.Dispatch(changeOn("space1", "objC", ObjectsDataset, 12), nil, nil, nil)
 
 	// Wait coalesces — one call returns the whole batch.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -168,7 +168,7 @@ func TestSubscribeProperties_FirehoseAcrossObjects(t *testing.T) {
 	}
 
 	// Non-properties dataset must NOT fire the firehose.
-	d.Dispatch(changeOn("space1", "objA", "otherDataset", 13), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "otherDataset", 13), nil, nil, nil)
 	expectNoEvent(t, sub)
 }
 
@@ -183,7 +183,7 @@ func TestSubscribeProperties_AndExplicitObjectsBothFire(t *testing.T) {
 	explicitSub := d.Subscribe("objA", ObjectsDataset, 8)
 	otherObjSub := d.Subscribe("objB", ObjectsDataset, 8)
 
-	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 99), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", ObjectsDataset, 99), nil, nil, nil)
 
 	if ev := recv(t, propSub); ev.VersionId != vId(99) {
 		t.Fatalf("propSub unexpected: %+v", ev)
@@ -201,7 +201,7 @@ func TestMultipleSubsToSamePair_AllReceive(t *testing.T) {
 	sub1 := d.Subscribe("objA", "data1", 8)
 	sub2 := d.Subscribe("objA", "data1", 8)
 
-	d.Dispatch(changeOn("space1", "objA", "data1", 5), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 5), nil, nil, nil)
 
 	if recv(t, sub1).VersionId != vId(5) {
 		t.Fatalf("sub1 missed event")
@@ -240,7 +240,7 @@ func TestSubscriptionClose_StopsDelivery(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 
 	sub := d.Subscribe("objA", "data1", 4)
-	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil, nil)
 	if recv(t, sub).VersionId != vId(1) {
 		t.Fatalf("missed pre-close event")
 	}
@@ -252,7 +252,7 @@ func TestSubscriptionClose_StopsDelivery(t *testing.T) {
 
 	// Subsequent Dispatch must not panic (closed mb's TryAdd
 	// returns ErrClosed; deliver discards it).
-	d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil, nil)
 }
 
 func TestDispatcherClose_ClosesAllSubs(t *testing.T) {
@@ -304,12 +304,12 @@ func TestDispatch_NonBlockingOnFullMailbox(t *testing.T) {
 
 	sub := d.Subscribe("objA", "data1", 1)
 
-	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil, nil)
 
 	done := make(chan struct{})
 	go func() {
-		d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil) // would block on full mb; must drop
-		d.Dispatch(changeOn("space1", "objA", "data1", 3), nil, nil) // also drops
+		d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil, nil) // would block on full mb; must drop
+		d.Dispatch(changeOn("space1", "objA", "data1", 3), nil, nil, nil) // also drops
 		close(done)
 	}()
 	select {
@@ -334,7 +334,7 @@ func TestDropped_ZeroOnHealthyConsumer(t *testing.T) {
 
 	sub := d.Subscribe("objA", "data1", 16)
 	for i := 0; i < 8; i++ {
-		d.Dispatch(changeOn("space1", "objA", "data1", uint64(i)), nil, nil)
+		d.Dispatch(changeOn("space1", "objA", "data1", uint64(i)), nil, nil, nil)
 	}
 	// Drain.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -361,14 +361,14 @@ func TestDropped_NotIncrementedAfterClose(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 
 	sub := d.Subscribe("objA", "data1", 1)
-	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil) // fills
-	d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil) // drops → Dropped=1
+	d.Dispatch(changeOn("space1", "objA", "data1", 1), nil, nil, nil) // fills
+	d.Dispatch(changeOn("space1", "objA", "data1", 2), nil, nil, nil) // drops → Dropped=1
 	if got := sub.Dropped(); got != 1 {
 		t.Fatalf("Dropped() before Close = %d, want 1", got)
 	}
 	_ = sub.Close()
-	d.Dispatch(changeOn("space1", "objA", "data1", 3), nil, nil)
-	d.Dispatch(changeOn("space1", "objA", "data1", 4), nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 3), nil, nil, nil)
+	d.Dispatch(changeOn("space1", "objA", "data1", 4), nil, nil, nil)
 	if got := sub.Dropped(); got != 1 {
 		t.Fatalf("Dropped() = %d after post-Close dispatches, want 1 (frozen)", got)
 	}
@@ -415,7 +415,7 @@ func TestConcurrent_SubscribeDispatchClose_NoRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
-				d.Dispatch(changeOn("space1", "objA", "data1", uint64(j)), nil, nil)
+				d.Dispatch(changeOn("space1", "objA", "data1", uint64(j)), nil, nil, nil)
 			}
 		}()
 	}
@@ -451,7 +451,7 @@ func TestDispatch_NilChange_NoOp(t *testing.T) {
 	d := New("space1")
 	t.Cleanup(func() { _ = d.Close() })
 	_ = d.SubscribeProperties(4) // make sure HasSubscribers passes
-	d.Dispatch(nil, nil, nil)    // no panic
+	d.Dispatch(nil, nil, nil, nil)    // no panic
 }
 
 func TestSubscription_BatchDelivery(t *testing.T) {
@@ -462,7 +462,7 @@ func TestSubscription_BatchDelivery(t *testing.T) {
 
 	sub := d.SubscribeProperties(64)
 	for i := 0; i < 10; i++ {
-		d.Dispatch(changeOn("space1", "objA", ObjectsDataset, uint64(i)), nil, nil)
+		d.Dispatch(changeOn("space1", "objA", ObjectsDataset, uint64(i)), nil, nil, nil)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -532,7 +532,7 @@ func TestDispatch_ProjectsRecordsToSetUnset(t *testing.T) {
 		return nil // r-gone is tombstoned — no post value
 	}
 
-	d.Dispatch(ch, resolvedIds, postValue)
+	d.Dispatch(ch, resolvedIds, nil, postValue)
 	got := recv(t, sub)
 
 	if got.VersionId != "v-001" {
@@ -608,7 +608,7 @@ func TestDispatch_PayloadOutlivesArena(t *testing.T) {
 		}},
 	}
 
-	d.Dispatch(ch, []string{"objA"}, func(i int) *anyenc.Value {
+	d.Dispatch(ch, []string{"objA"}, nil, func(i int) *anyenc.Value {
 		return post
 	})
 	got := recv(t, sub)

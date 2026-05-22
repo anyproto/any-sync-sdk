@@ -65,6 +65,12 @@ type Event struct {
 type EventRecord struct {
 	Id      string
 	Variant string
+	// Created is true when this change first materialised the record.
+	// It stands in for the _ver.id creation marker: that marker's
+	// value is always this change's VersionId, which the Event already
+	// carries — so the flag plus Event.VersionId convey it without a
+	// redundant $set op. Mutually exclusive with Deleted.
+	Created bool
 	// Deleted is true when the change tombstoned this record. Ops is
 	// empty in that case; the consumer should drop the record from
 	// its local state.
@@ -269,6 +275,14 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 		// used), so they project with an empty variant prefix.
 		if i < len(derivedOps) {
 			for _, op := range derivedOps[i] {
+				if isCreationMarker(op) {
+					// The marker's value is always ch.VersionId
+					// (newRecord stamps _ver.id = ch.VersionId), which
+					// the Event already carries. Surface it as the
+					// Created flag, not a redundant $set op.
+					er.Created = true
+					continue
+				}
 				projected, ok := projectOp(op, "", post)
 				if !ok {
 					continue
@@ -291,6 +305,19 @@ func hasRecordDelete(ops []crdt.Op) bool {
 		}
 	}
 	return false
+}
+
+// isCreationMarker reports whether op is the synthetic _ver.id stamp
+// the apply path emits exactly once — on the change that first
+// materialises a record (recordModifier.Modify, the `creating`
+// branch). The min-rule re-stamp on later upserts does NOT emit a
+// derived op, so the marker's presence in a record's derivedOps is an
+// unambiguous "this change created the record" signal.
+func isCreationMarker(op crdt.Op) bool {
+	return op.Type == crdt.OpSet &&
+		len(op.Path) == 2 &&
+		op.Path[0] == crdt.VersionsKey &&
+		op.Path[1] == crdt.IdField
 }
 
 // projectOp converts a single input op against a post-apply record

@@ -120,15 +120,34 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 	return objectId, nil
 }
 
-// Delete marks the object deleted via the space's settings tree and
-// drops our cached state. The any-sync settings-tree write fans out
-// to peers; locally cached CRDT rows stay until a future cleanup
-// pass — Query already skips tombstones, and ids are content-
-// addressable so reuse can't happen.
+// Delete tombstones the object, then marks it deleted via the space's
+// settings tree and drops our cached state.
+//
+// The CRDT `delete` op below runs first, while the tree is still
+// live: the apply pipeline tombstones the object's `objects` record
+// (Query's tombstone filter then hides it) and fires the Deleted
+// subscription event via afterApply. The any-sync settings-tree write
+// then fans the deletion out to peers; the local any-store tombstone
+// row stays until a future cleanup pass — Query skips it, and ids are
+// content-addressable so reuse can't happen.
 func (o *objectService) Delete(ctx context.Context, objectId string) error {
 	if objectId == "" {
 		return errors.New("spaceimpl: Objects.Delete requires objectId")
 	}
+	obj, err := o.parent.store.Get(ctx, objectId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: get object %s: %w", objectId, err)
+	}
+	if _, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: properties.HandlerVersion,
+		Records: []crdt.RecordChange{
+			{Id: objectId, Ops: []crdt.Op{{Type: crdt.OpDelete}}},
+		},
+	}); err != nil {
+		return fmt.Errorf("spaceimpl: tombstone %s: %w", objectId, err)
+	}
+
 	handle, err := o.parent.app.GetSpace(ctx, o.parent.id)
 	if err != nil {
 		return fmt.Errorf("spaceimpl: get space: %w", err)

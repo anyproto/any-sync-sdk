@@ -450,8 +450,8 @@ func TestUnregister_CleansEmptyNestedMaps(t *testing.T) {
 func TestDispatch_NilChange_NoOp(t *testing.T) {
 	d := New("space1")
 	t.Cleanup(func() { _ = d.Close() })
-	_ = d.SubscribeProperties(4) // make sure HasSubscribers passes
-	d.Dispatch(nil, nil, nil, nil)    // no panic
+	_ = d.SubscribeProperties(4)   // make sure HasSubscribers passes
+	d.Dispatch(nil, nil, nil, nil) // no panic
 }
 
 func TestSubscription_BatchDelivery(t *testing.T) {
@@ -623,6 +623,76 @@ func TestDispatch_PayloadOutlivesArena(t *testing.T) {
 	}
 	if v := string(got.Records[0].Ops[0].Payload.GetStringBytes()); v != "Casablanca" {
 		t.Fatalf("payload aliasing: got %q, want Casablanca", v)
+	}
+}
+
+// TestDispatch_CreatedFlag is the contract for EventRecord.Created:
+// the dispatcher sets it when (and only when) a record's derivedOps
+// carry the synthetic _ver.id creation marker the apply path stamps
+// on first materialisation. The marker op is consumed into the flag,
+// not forwarded — its value is always Event.VersionId. Created is
+// mutually exclusive with Deleted: a deleted record short-circuits
+// before the derivedOps walk, so a stray marker can't flip it.
+func TestDispatch_CreatedFlag(t *testing.T) {
+	d := New("space1")
+	t.Cleanup(func() { _ = d.Close() })
+
+	sub := d.Subscribe("objA", "data1", 8)
+
+	a := &anyenc.Arena{}
+	post := a.NewObject()
+	post.Set("title", a.NewString("Casablanca"))
+
+	verIdMarker := crdt.Op{
+		Type:    crdt.OpSet,
+		Path:    []string{crdt.VersionsKey, crdt.IdField},
+		Payload: a.NewString("v-001"),
+	}
+	titleSet := crdt.Op{Type: crdt.OpSet, Path: []string{"title"}, Payload: a.NewString("Casablanca")}
+
+	ch := &crdt.Change{
+		SpaceId:   "space1",
+		ObjectId:  "objA",
+		Dataset:   "data1",
+		VersionId: crdt.VersionId("v-001"),
+		Records: []crdt.RecordChange{
+			{Id: "r-new", Ops: []crdt.Op{titleSet}},               // create
+			{Id: "r-old", Ops: []crdt.Op{titleSet}},               // update
+			{Id: "r-gone", Ops: []crdt.Op{{Type: crdt.OpDelete}}}, // delete
+		},
+	}
+	// Record 0 created → derivedOps carry the marker. Record 1 updated
+	// → no marker. Record 2 deleted → a marker here must be ignored.
+	derivedOps := [][]crdt.Op{{verIdMarker}, nil, {verIdMarker}}
+
+	d.Dispatch(ch, []string{"r-new", "r-old", "r-gone"}, derivedOps,
+		func(i int) *anyenc.Value { return post })
+	got := recv(t, sub)
+
+	if len(got.Records) != 3 {
+		t.Fatalf("got %d records, want 3: %+v", len(got.Records), got.Records)
+	}
+
+	// Record 0: created, marker consumed into the flag — not forwarded.
+	r0 := got.Records[0]
+	if !r0.Created || r0.Deleted {
+		t.Errorf("record 0 should be Created and not Deleted: %+v", r0)
+	}
+	for _, op := range r0.Ops {
+		if op.Type == crdt.OpSet && pathOf(op) == crdt.VersionsKey+"."+crdt.IdField {
+			t.Errorf("record 0 must not ship the redundant _ver.id op: %+v", r0.Ops)
+		}
+	}
+
+	// Record 1: plain update — not Created.
+	if r1 := got.Records[1]; r1.Created || r1.Deleted {
+		t.Errorf("record 1 (update) should be neither Created nor Deleted: %+v", r1)
+	}
+
+	// Record 2: deleted — Deleted wins, Created stays false despite the
+	// marker sitting in derivedOps[2].
+	if r2 := got.Records[2]; r2.Created || !r2.Deleted {
+		t.Errorf("record 2 should be Deleted and not Created: %+v", r2)
 	}
 }
 

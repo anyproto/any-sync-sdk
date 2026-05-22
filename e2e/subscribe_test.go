@@ -256,6 +256,17 @@ func pathsEqual(a, b []string) bool {
 	return true
 }
 
+// recordFor returns the EventRecord for rowId in ev, or nil when the
+// event carries no record under that id.
+func recordFor(ev space.Event, rowId string) *space.EventRecord {
+	for i := range ev.Records {
+		if ev.Records[i].Id == rowId {
+			return &ev.Records[i]
+		}
+	}
+	return nil
+}
+
 // collectSetPaths flattens every $set in the EventRecord for rowId
 // into a dotted-path set. Handles both wire shapes — single-field
 // (Path=[…], Payload=value) and multi-field (Path=[], Payload=object
@@ -341,6 +352,11 @@ func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
 	assert.Equal(t, objectId, ev.ObjectId)
 	assert.Equal(t, "objects", ev.Dataset)
 
+	if rec := recordFor(ev, objectId); assert.NotNil(t, rec, "create event has no record for objectId") {
+		assert.True(t, rec.Created, "create event must set EventRecord.Created")
+		assert.False(t, rec.Deleted, "create event must not set Deleted")
+	}
+
 	paths := collectSetPaths(t, ev, objectId)
 
 	// SystemPropertiesHandler.BeforeCreate stamps these via sink.Derive.
@@ -351,10 +367,11 @@ func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
 	assert.Contains(t, paths, "spaceId",
 		"create event missing $set spaceId — viewer can't route across spaces")
 
-	// recordModifier.Modify stamps this directly onto storage; we
-	// surface it via a synthetic derived op so it rides the same wire.
-	assert.Contains(t, paths, "_ver.id",
-		"create event missing $set _ver.id — chat-message-style queries rely on this sort key")
+	// _ver.id is NOT shipped as an op — its value is always the
+	// event's VersionId, so EventRecord.Created plus Event.VersionId
+	// convey the creation marker without a redundant $set.
+	assert.NotContains(t, paths, "_ver.id",
+		"_ver.id must not ship as an op — redundant with Event.VersionId")
 
 	// Now write a property value on the SAME row. This is an UPDATE
 	// (BeforeCreate doesn't fire on an existing row); derived stamps
@@ -365,6 +382,9 @@ func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
 	require.NoError(t, err)
 
 	upd := mustReceive(t, propsSub, 2*time.Second)
+	if rec := recordFor(upd, objectId); assert.NotNil(t, rec) {
+		assert.False(t, rec.Created, "update event must not set Created — _ver.id is creation-only")
+	}
 	updPaths := collectSetPaths(t, upd, objectId)
 	assert.NotContains(t, updPaths, "author",
 		"update must not re-stamp author")
@@ -376,4 +396,66 @@ func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
 		"update must not re-stamp _ver.id — that marker is creation-only")
 	// And the user-supplied write still lands on the wire.
 	assertProjectedSet(t, upd, objectId, []string{typeId, titleProp}, "Casablanca")
+}
+
+// TestSDK_Subscribe_DeleteEmitsTombstone covers object deletion end to
+// end: Objects.Delete writes a CRDT delete op on the object's `objects`
+// record before tearing down the any-sync tree. Subscribers see a
+// Deleted event for the row, and a follow-up QueryObjects no longer
+// returns it — the tombstone is filtered by queryIterator.Next.
+func TestSDK_Subscribe_DeleteEmitsTombstone(t *testing.T) {
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("staging config not available at %s: %v", confPath, err)
+	}
+
+	cfg := config.Config{
+		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+		Network: config.Network{NodeConfYAML: yaml},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "DeleteSub"})
+	require.NoError(t, err)
+
+	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Movie"})
+	require.NoError(t, err)
+
+	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Types: []string{typeId},
+	})
+	require.NoError(t, err)
+
+	// Subscribe AFTER Create so the create-time writes are gated out by
+	// HasSubscribers — the only event we expect is the delete.
+	propsSub, err := sp.SubscribeProperties(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = propsSub.Close() })
+
+	require.NoError(t, sp.Objects().Delete(ctx, objectId))
+
+	ev := mustReceive(t, propsSub, 2*time.Second)
+	assert.Equal(t, objectId, ev.ObjectId)
+	assert.Equal(t, "objects", ev.Dataset)
+	if rec := recordFor(ev, objectId); assert.NotNil(t, rec, "delete event has no record for objectId") {
+		assert.True(t, rec.Deleted, "delete event must set EventRecord.Deleted")
+		assert.False(t, rec.Created, "delete event must not set Created")
+		assert.Empty(t, rec.Ops, "deleted record must carry no ops")
+	}
+
+	// The deleted object is gone from QueryObjects — its `objects` row
+	// is now a tombstone, which queryIterator.Next skips.
+	rows, err := sp.QueryObjects().All(ctx)
+	require.NoError(t, err)
+	for _, row := range rows {
+		if id := row.Get(crdt.IdField); id != nil {
+			assert.NotEqual(t, objectId, string(id.GetStringBytes()),
+				"deleted object still returned by QueryObjects")
+		}
+	}
 }

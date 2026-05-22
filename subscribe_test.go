@@ -3,8 +3,6 @@ package anysyncsdk_test
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -60,8 +58,7 @@ func assertNoEvent(t *testing.T, sub space.Subscription, window time.Duration) {
 // explicit (objectId, dataset) listener; mismatched pairs receive
 // nothing; closing one sub leaves the others working.
 func TestSDK_Subscribe(t *testing.T) {
-	confPath := filepath.Join("..", "test-etc", "staging.yml")
-	yaml, err := os.ReadFile(confPath)
+	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
 	}
@@ -299,8 +296,7 @@ func collectSetPaths(t *testing.T, ev space.Event, rowId string) map[string]stru
 // must see no difference between user-supplied and auto fields — same
 // $set shape, same wire — so a fresh row reconstructs in one event.
 func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
-	confPath := filepath.Join("..", "test-etc", "staging.yml")
-	yaml, err := os.ReadFile(confPath)
+	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
 	}

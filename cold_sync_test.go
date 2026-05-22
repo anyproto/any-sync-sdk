@@ -327,34 +327,18 @@ func containsString(s []string, v string) bool {
 	return false
 }
 
-// loadAnySyncNetwork picks the best available network config for the
-// e2e test. Order:
-//
-//  1. ANYSYNC_NETWORK_YAML — explicit override path. Set this on CI
-//     (or locally) to point at a controlled fixture.
-//  2. /tmp/anysync-dev/sdk-network.yml — the path the local
-//     any-sync-tools/any-sync-network bootstrapper writes when
-//     --output is left at default. Catches the common "I started a
-//     local network for debugging" case automatically.
-//  3. ../test-etc/staging.yml — public staging. Slow + flaky against
-//     parts of the cluster (some addresses no longer resolve), but
-//     works for a smoke run.
-//
-// Returns (yaml bytes, path used, err). err is non-nil only when
-// nothing readable was found; callers should t.Skip on that.
+// stagingNetworkPath is the single any-sync network config every e2e
+// test uses. Hard-coded (no env-var indirection) so the whole test
+// process targets one network deterministically — mixing networks
+// across tests in the same run was a real source of cross-test
+// interference. To point a local debugging run at a different
+// network, edit this constant or replace the file at the path.
+var stagingNetworkPath = filepath.Join("..", "test-etc", "staging.yml")
+
+// loadAnySyncNetwork reads the staging network YAML. Returns
+// (yaml bytes, path used, err). The path is returned in both the
+// success and failure case so callers can use it in t.Skipf messages.
 func loadAnySyncNetwork() ([]byte, string, error) {
-	candidates := []string{
-		os.Getenv("ANYSYNC_NETWORK_YAML"),
-		filepath.Join("..", "test-etc", "staging.yml"),
-	}
-	for _, p := range candidates {
-		if p == "" {
-			continue
-		}
-		yaml, err := os.ReadFile(p)
-		if err == nil {
-			return yaml, p, nil
-		}
-	}
-	return nil, "", os.ErrNotExist
+	yaml, err := os.ReadFile(stagingNetworkPath)
+	return yaml, stagingNetworkPath, err
 }

@@ -2,8 +2,6 @@ package anysyncsdk_test
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -30,8 +28,7 @@ import (
 // config isn't present, same as the other end-to-end tests in this
 // package — Open requires a node-config YAML.
 func TestSDK_DebugAPI(t *testing.T) {
-	confPath := filepath.Join("..", "test-etc", "staging.yml")
-	yaml, err := os.ReadFile(confPath)
+	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
 	}

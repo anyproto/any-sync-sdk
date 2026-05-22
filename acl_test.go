@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -39,8 +37,7 @@ func anySyncCryptoGenerate() (crypto.PrivKey, crypto.PubKey, error) {
 // The owner-on-empty-space surface needs no second peer, so it runs
 // against staging without a parallel SDK instance.
 func TestSDK_ACL_OwnerSurface(t *testing.T) {
-	confPath := filepath.Join("..", "test-etc", "staging.yml")
-	yaml, err := os.ReadFile(confPath)
+	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
 	}
@@ -153,8 +150,7 @@ func newRandomPeerId(t *testing.T) string {
 // Skips if staging is unreachable. Each Open uses a separate temp dir
 // and a fresh account key so the two SDKs are genuinely distinct.
 func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
-	confPath := filepath.Join("..", "test-etc", "staging.yml")
-	yaml, err := os.ReadFile(confPath)
+	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
 	}
@@ -423,8 +419,7 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 // same (account, seed) lands on the same spaceId across calls, the
 // space appears in List with StatusActive, and the OwnRole is owner.
 func TestSDK_Spaces_Derive(t *testing.T) {
-	confPath := filepath.Join("..", "test-etc", "staging.yml")
-	yaml, err := os.ReadFile(confPath)
+	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
 	}
@@ -474,8 +469,7 @@ func TestSDK_Join_PendingErrIsExpected(t *testing.T) {
 	// The point of this test is only to verify the codepath wires
 	// through end-to-end (DecodeInvite → JoiningClient.RequestJoin →
 	// returned error). A two-account integration test is deferred.
-	confPath := filepath.Join("..", "test-etc", "staging.yml")
-	yaml, err := os.ReadFile(confPath)
+	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
 	}

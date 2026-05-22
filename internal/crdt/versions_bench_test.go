@@ -138,28 +138,26 @@ func newBenchController(b *testing.B) *Controller {
 // to get 1k- and 100k-change wall-clock numbers.
 func BenchmarkApply_MultiFieldCreate(b *testing.B) {
 	st := newBenchController(b)
-	arena := &anyenc.Arena{}
 	g := newVersionGen()
 
-	// Pre-build the payload shape once and clone its content via the
-	// op payload helper inside the loop. Mirrors the user's example 1
-	// record: id + 3 small string fields, all stamped at one version.
-	payloads := make([]*anyenc.Value, b.N)
-	versions := make([]VersionId, b.N)
+	// Per-iteration arena that gets Reset, mirroring production where
+	// the change's payload lives on the caller's transient arena and
+	// can be discarded once ApplyChange returns. Pre-allocating one
+	// arena and holding 100k payloads on it would inflate live memory
+	// without reflecting real apply cost.
+	arena := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		payloads[i] = recordPayload(arena, map[string]any{
+		arena.Reset()
+		payload := recordPayload(arena, map[string]any{
 			"changeId": "abc-" + strconv.Itoa(i),
 			"kind":     "string",
 			"propId":   "p-" + strconv.Itoa(i),
 		})
-		versions[i] = g.Next()
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		ch := makeUpsert(versions[i], "r"+strconv.Itoa(i), Op{
+		ch := makeUpsert(g.Next(), "r"+strconv.Itoa(i), Op{
 			Type:    OpSet,
-			Payload: payloads[i],
+			Payload: payload,
 		})
 		if err := st.ApplyChange(ctx, ch); err != nil {
 			b.Fatal(err)
@@ -172,28 +170,28 @@ func BenchmarkApply_MultiFieldCreate(b *testing.B) {
 // (the hottest no-op-compaction path).
 func BenchmarkApply_SingleFieldUpdate(b *testing.B) {
 	st := newBenchController(b)
-	arena := &anyenc.Arena{}
 	g := newVersionGen()
 
-	// Seed one record with an initial multi-field create.
-	if err := st.ApplyChange(ctx, makeUpsert(g.Next(), "r1", Op{
-		Type: OpSet,
-		Payload: recordPayload(arena, map[string]any{
-			"name":  "init",
-			"count": 0,
-		}),
-	})); err != nil {
-		b.Fatal(err)
+	// Seed one record with an initial multi-field create on a throwaway arena.
+	{
+		a := &anyenc.Arena{}
+		if err := st.ApplyChange(ctx, makeUpsert(g.Next(), "r1", Op{
+			Type: OpSet,
+			Payload: recordPayload(a, map[string]any{
+				"name":  "init",
+				"count": 0,
+			}),
+		})); err != nil {
+			b.Fatal(err)
+		}
 	}
 
-	versions := make([]VersionId, b.N)
-	for i := 0; i < b.N; i++ {
-		versions[i] = g.Next()
-	}
+	arena := &anyenc.Arena{}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ch := makeChange(versions[i], "r1", Op{
+		arena.Reset()
+		ch := makeChange(g.Next(), "r1", Op{
 			Type:    OpSet,
 			Path:    []string{"name"},
 			Payload: arena.NewString("v" + strconv.Itoa(i)),

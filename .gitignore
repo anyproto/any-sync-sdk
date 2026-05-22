@@ -21,3 +21,7 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Local any-sync network config consumed by e2e tests.
+# Copy from your source of truth (e.g. ../test-etc/staging.yml).
+/staging.yml

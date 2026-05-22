@@ -3,7 +3,6 @@ package anysyncsdk_test
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"sort"
 	"testing"
 	"time"
@@ -331,9 +330,11 @@ func containsString(s []string, v string) bool {
 // test uses. Hard-coded (no env-var indirection) so the whole test
 // process targets one network deterministically — mixing networks
 // across tests in the same run was a real source of cross-test
-// interference. To point a local debugging run at a different
-// network, edit this constant or replace the file at the path.
-var stagingNetworkPath = filepath.Join("..", "test-etc", "staging.yml")
+// interference. Kept inside the repo (and gitignored) so tests run
+// without leaning on a path outside the module; refresh by copying
+// from your local source of truth. Edit this constant or replace
+// the file to point at a different network.
+var stagingNetworkPath = "staging.yml"
 
 // loadAnySyncNetwork reads the staging network YAML. Returns
 // (yaml bytes, path used, err). The path is returned in both the

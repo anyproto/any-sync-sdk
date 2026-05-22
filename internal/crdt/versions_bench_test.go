@@ -113,7 +113,14 @@ func BenchmarkCompact_RootFactor(b *testing.B) {
 // with the default "blocks" handler.
 func newBenchController(b *testing.B) *Controller {
 	b.Helper()
-	db, err := anystore.Open(ctx, filepath.Join(b.TempDir(), "bench.db"), nil)
+	return newBenchControllerWith(b, nil)
+}
+
+// newBenchControllerWith opens with an explicit any-store config — used
+// by the _FixedCache benches to test the global page-buffer slab path.
+func newBenchControllerWith(b *testing.B, cfg *anystore.Config) *Controller {
+	b.Helper()
+	db, err := anystore.Open(ctx, filepath.Join(b.TempDir(), "bench.db"), cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -158,6 +165,78 @@ func BenchmarkApply_MultiFieldCreate(b *testing.B) {
 		ch := makeUpsert(g.Next(), "r"+strconv.Itoa(i), Op{
 			Type:    OpSet,
 			Payload: payload,
+		})
+		if err := st.ApplyChange(ctx, ch); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkApply_MultiFieldCreate_FixedCache runs the same workload as
+// BenchmarkApply_MultiFieldCreate but with any-store's global page
+// buffer slab — anystore.InitPageBuffer + Config.UseGlobalPageBuffer.
+// Mirrors the mobile / memory-bounded deployment shape: total page
+// cache memory is capped at a fixed slab size regardless of how many
+// DBs are open.
+func BenchmarkApply_MultiFieldCreate_FixedCache(b *testing.B) {
+	// 4 KiB pages × 5000 = 20 MiB slab (same as default per-DB cache,
+	// but now process-wide and pre-allocated). Init is idempotent
+	// across the process — first call wins, subsequent are no-ops.
+	anystore.InitPageBuffer(4096, 5000)
+	st := newBenchControllerWith(b, &anystore.Config{UseGlobalPageBuffer: true})
+	g := newVersionGen()
+
+	arena := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		arena.Reset()
+		payload := recordPayload(arena, map[string]any{
+			"changeId": "abc-" + strconv.Itoa(i),
+			"kind":     "string",
+			"propId":   "p-" + strconv.Itoa(i),
+		})
+		ch := makeUpsert(g.Next(), "r"+strconv.Itoa(i), Op{
+			Type:    OpSet,
+			Payload: payload,
+		})
+		if err := st.ApplyChange(ctx, ch); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkApply_SingleFieldUpdate_FixedCache: steady-state update
+// against a slab-backed DB. The single-record hot loop barely
+// touches the cache (one btree leaf), so this is a sanity check
+// rather than a stress test.
+func BenchmarkApply_SingleFieldUpdate_FixedCache(b *testing.B) {
+	anystore.InitPageBuffer(4096, 5000)
+	st := newBenchControllerWith(b, &anystore.Config{UseGlobalPageBuffer: true})
+	g := newVersionGen()
+
+	{
+		a := &anyenc.Arena{}
+		if err := st.ApplyChange(ctx, makeUpsert(g.Next(), "r1", Op{
+			Type: OpSet,
+			Payload: recordPayload(a, map[string]any{
+				"name":  "init",
+				"count": 0,
+			}),
+		})); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	arena := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		arena.Reset()
+		ch := makeChange(g.Next(), "r1", Op{
+			Type:    OpSet,
+			Path:    []string{"name"},
+			Payload: arena.NewString("v" + strconv.Itoa(i)),
 		})
 		if err := st.ApplyChange(ctx, ch); err != nil {
 			b.Fatal(err)

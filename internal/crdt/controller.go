@@ -871,6 +871,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 	}
 
 	updateTraces(a, existing, *ch)
+	compactVersions(a, existing)
 	return existing, true, nil
 }
 
@@ -913,6 +914,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		applyOp(a, target, *ch, rc.Ops[i])
 	}
 	updateTraces(a, existing, *ch)
+	compactVersions(a, existing)
 	return existing, true, nil
 }
 

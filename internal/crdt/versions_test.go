@@ -208,6 +208,280 @@ func TestIsCollapsible(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// ----------------------------------------------------------------------------
+// compactVersions
+// ----------------------------------------------------------------------------
+
+func TestCompact_NoopOnEmpty(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := arena.NewObject()
+	rec.Set(IdField, arena.NewString("rec"))
+	compactVersions(arena, rec)
+	// No _ver to compact — must not create one.
+	assert.Nil(t, rec.Get(VersionsKey))
+}
+
+func TestCompact_NoopOnCanonicalRoot(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField:    "v1",
+		defaultKey: "v1",
+	})
+	compactVersions(arena, rec)
+	// Already in canonical {id, *} shape — leave untouched.
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	assert.Equal(t, VersionId("v1"), VersionId(o.Get(IdField).GetStringBytes()))
+	assert.Equal(t, VersionId("v1"), VersionId(o.Get(defaultKey).GetStringBytes()))
+	assert.Equal(t, 2, o.GetObject().Len())
+}
+
+func TestCompact_NoopOnTombstone(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := arena.NewObject()
+	rec.Set(IdField, arena.NewString("rec"))
+	rec.Set(DeletedAtField, arena.NewNumberInt(1715000000))
+	// Even a "weird" non-canonical _ver on a tombstone must be left alone —
+	// tombstones are sticky and the modifier never re-enters their _ver.
+	rec.Set(VersionsKey, treeToValue(arena, map[string]any{
+		IdField:  "v1",
+		"name":   "v9",
+		"author": "v9",
+	}))
+	compactVersions(arena, rec)
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	assert.Equal(t, 3, o.GetObject().Len(), "tombstone _ver must not be touched")
+}
+
+func TestCompact_RootFactorAllSameVersion(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField:    "v1",
+		"changeId": "v1",
+		"kind":     "v1",
+		"propId":   "v1",
+	})
+	compactVersions(arena, rec)
+	// {id, changeId, kind, propId} all v1 → factor non-id siblings into `*`.
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	assert.Equal(t, VersionId("v1"), VersionId(o.Get(IdField).GetStringBytes()))
+	assert.Equal(t, VersionId("v1"), VersionId(o.Get(defaultKey).GetStringBytes()))
+	assert.Nil(t, o.Get("changeId"))
+	assert.Nil(t, o.Get("kind"))
+	assert.Nil(t, o.Get("propId"))
+	// Lookup preserves explicit versions and resolves new fields via `*`.
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "changeId"))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "anyNewField"))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, IdField))
+}
+
+func TestCompact_RootFactorPreservesDistinctVersions(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField:     "v0",
+		"author":    "v1",
+		"createdAt": "v1",
+		"spaceId":   "v1",
+		"name":      "v9", // outlier — must survive
+	})
+	compactVersions(arena, rec)
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	// v1 trio factored, v9 outlier preserved, id preserved.
+	assert.Equal(t, VersionId("v0"), VersionId(o.Get(IdField).GetStringBytes()))
+	assert.Equal(t, VersionId("v1"), VersionId(o.Get(defaultKey).GetStringBytes()))
+	assert.Equal(t, VersionId("v9"), VersionId(o.Get("name").GetStringBytes()))
+	assert.Nil(t, o.Get("author"))
+	assert.Nil(t, o.Get("createdAt"))
+	assert.Nil(t, o.Get("spaceId"))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "author"))
+	assert.Equal(t, VersionId("v9"), GetRecordVersion(rec, "name"))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "newField"))
+}
+
+func TestCompact_NoRootFactorOnSingleNonIdSibling(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField: "v1",
+		"name":  "v2",
+	})
+	compactVersions(arena, rec)
+	// Only one non-id sibling — no factoring (would change semantics for
+	// unenumerated fields without any supporting evidence).
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	assert.Nil(t, o.Get(defaultKey))
+	assert.Equal(t, VersionId("v2"), VersionId(o.Get("name").GetStringBytes()))
+}
+
+func TestCompact_NoRootFactorWhenStarPresent(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField:    "v1",
+		defaultKey: "v5",
+		"a":        "v9",
+		"b":        "v9",
+	})
+	compactVersions(arena, rec)
+	// `*` already present at root — leave alone (treat as a tombstone-like
+	// or already-factored shape). Explicit a/b stay even though they share.
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	assert.Equal(t, VersionId("v5"), VersionId(o.Get(defaultKey).GetStringBytes()))
+	assert.NotNil(t, o.Get("a"))
+	assert.NotNil(t, o.Get("b"))
+}
+
+func TestCompact_SubtreeCollapseAllSame(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField: "v1",
+		"nav": map[string]any{
+			"type":     "v5",
+			"parentId": "v5",
+			"pos":      "v5",
+		},
+	})
+	compactVersions(arena, rec)
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	nav := o.Get("nav")
+	require.NotNil(t, nav)
+	assert.Equal(t, anyenc.TypeString, nav.Type())
+	assert.Equal(t, VersionId("v5"), VersionId(nav.GetStringBytes()))
+	// Lookup invariant: every previously-set path returns its version.
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "nav", "type"))
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "nav", "parentId"))
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "nav", "pos"))
+}
+
+func TestCompact_SubtreeMixedNotCollapsed(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField: "v1",
+		"any": map[string]any{
+			"types": "v5",
+			"name":  "v3", // mixed — must stay expanded
+		},
+	})
+	compactVersions(arena, rec)
+	any := rec.Get(VersionsKey).Get("any")
+	require.NotNil(t, any)
+	assert.Equal(t, anyenc.TypeObject, any.Type())
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "any", "types"))
+	assert.Equal(t, VersionId("v3"), GetRecordVersion(rec, "any", "name"))
+}
+
+func TestCompact_SubtreeSingleEntryNotCollapsed(t *testing.T) {
+	arena := &anyenc.Arena{}
+	// Spec §3.2 example: $set "a.b.c" at v5 → _ver: {a:{b:{c:v5}}}.
+	// Single-entry subtrees with no defaultKey must NOT collapse upward —
+	// that would falsely claim authority over unenumerated siblings.
+	rec := buildRecord(t, arena, map[string]any{
+		"a": map[string]any{
+			"b": map[string]any{
+				"c": "v5",
+			},
+		},
+	})
+	compactVersions(arena, rec)
+	a := rec.Get(VersionsKey).Get("a")
+	require.NotNil(t, a)
+	assert.Equal(t, anyenc.TypeObject, a.Type())
+	b := a.Get("b")
+	require.NotNil(t, b)
+	assert.Equal(t, anyenc.TypeObject, b.Type())
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "a", "b", "c"))
+	assert.Equal(t, VersionId(""), GetRecordVersion(rec, "a", "b", "other"))
+}
+
+func TestCompact_SubtreeWithStarCollapsesEvenSingleEntry(t *testing.T) {
+	arena := &anyenc.Arena{}
+	// {*: v5, color: v5} is lossless to "v5" — the `*` already claimed
+	// authority for all siblings.
+	rec := buildRecord(t, arena, map[string]any{
+		"meta": map[string]any{
+			defaultKey: "v5",
+			"color":    "v5",
+		},
+	})
+	compactVersions(arena, rec)
+	meta := rec.Get(VersionsKey).Get("meta")
+	require.NotNil(t, meta)
+	assert.Equal(t, anyenc.TypeString, meta.Type())
+	assert.Equal(t, VersionId("v5"), VersionId(meta.GetStringBytes()))
+}
+
+func TestCompact_BottomUpCascades(t *testing.T) {
+	arena := &anyenc.Arena{}
+	// Deep nesting where every leaf shares a version with siblings.
+	rec := buildRecord(t, arena, map[string]any{
+		IdField: "v1",
+		"outer": map[string]any{
+			"x": map[string]any{"a": "v5", "b": "v5"},
+			"y": map[string]any{"a": "v5", "b": "v5"},
+		},
+	})
+	compactVersions(arena, rec)
+	outer := rec.Get(VersionsKey).Get("outer")
+	require.NotNil(t, outer)
+	// outer.x and outer.y both collapse to "v5", then outer itself
+	// has {x:"v5", y:"v5"} — ≥2 same-version strings → collapse to "v5".
+	assert.Equal(t, anyenc.TypeString, outer.Type())
+	assert.Equal(t, VersionId("v5"), VersionId(outer.GetStringBytes()))
+}
+
+func TestCompact_Idempotent(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField:    "v1",
+		"a":        "v1",
+		"b":        "v1",
+		"c":        "v1",
+		"someBig":  "v9",
+		"someBig2": "v9",
+		"nav": map[string]any{
+			"type":     "v5",
+			"parentId": "v5",
+		},
+	})
+	compactVersions(arena, rec)
+	first := encodeVer(t, rec)
+	compactVersions(arena, rec)
+	compactVersions(arena, rec)
+	second := encodeVer(t, rec)
+	assert.Equal(t, first, second, "compactVersions must be idempotent")
+}
+
+// encodeVer marshals a record's _ver to bytes for equality comparison.
+func encodeVer(t *testing.T, rec *anyenc.Value) []byte {
+	t.Helper()
+	o := rec.Get(VersionsKey)
+	if o == nil {
+		return nil
+	}
+	return o.MarshalTo(nil)
+}
+
+func TestCompact_PreservesIdAlwaysExplicit(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := buildRecord(t, arena, map[string]any{
+		IdField: "v1",
+		"a":     "v1",
+		"b":     "v1",
+	})
+	compactVersions(arena, rec)
+	o := rec.Get(VersionsKey)
+	require.NotNil(t, o)
+	// _ver.id stays as an explicit string entry, never factored into `*`.
+	idVer := o.Get(IdField)
+	require.NotNil(t, idVer)
+	assert.Equal(t, anyenc.TypeString, idVer.Type())
+	assert.Equal(t, VersionId("v1"), VersionId(idVer.GetStringBytes()))
+}
+
 func TestCompareVersion(t *testing.T) {
 	assert.Equal(t, 0, CompareVersion("", ""))
 	assert.Equal(t, -1, CompareVersion("", "a"))

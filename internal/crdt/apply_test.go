@@ -128,10 +128,12 @@ func TestSet_AutoCreatesRecordWithMultiField(t *testing.T) {
 	// Each enumerated field is gated at v1.
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "name"))
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "count"))
-	// Unmentioned fields have NO recorded version (auto-create leaves _ver
-	// empty for unspecified paths). This is a known divergence from the old
-	// insert form which collapsed _ver to a single defaultKey entry.
-	assert.Equal(t, VersionId(""), GetRecordVersion(rec, "anything"))
+	// Unmentioned fields inherit from the `*` default that compactVersions
+	// factors out of the multi-field create — every non-`id` sibling shared
+	// versionId v1, so the post-apply compaction step collapses them into
+	// {id: v1, *: v1}. Lookups for unenumerated paths now resolve to v1
+	// via the `*` default (spec §3.2).
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "anything"))
 }
 
 // Two multi-field $sets racing on the same id merge per-field via gating —
@@ -584,6 +586,137 @@ func TestDelete_StickyTombstoneRejectsAllOps(t *testing.T) {
 	assert.Nil(t, rec.Get("name"))
 	assert.Nil(t, rec.Get("tags"))
 	assert.Nil(t, rec.Get("count"))
+}
+
+// ----------------------------------------------------------------------------
+// _ver compaction (spec §3.2)
+// ----------------------------------------------------------------------------
+
+// TestCompact_MultiFieldCreateFactorsRoot verifies that the post-apply
+// compaction pass collapses an auto-created record whose non-`id` siblings
+// all share the change's versionId into the canonical {id: v, *: v} shape.
+// This is the behavior the subscriber-visible body and the DB-persisted
+// body share.
+func TestCompact_MultiFieldCreateFactorsRoot(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+		Type: OpSet,
+		Payload: recordPayload(arena, map[string]any{
+			"changeId": "abc",
+			"kind":     "string",
+			"propId":   "",
+		}),
+	})))
+
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec)
+	ver := rec.Get(VersionsKey)
+	require.NotNil(t, ver)
+	// Canonical compacted shape: only `id` and `*` remain at root.
+	assert.Equal(t, 2, ver.GetObject().Len(), "_ver = %s", ver.MarshalTo(nil))
+	assert.Equal(t, VersionId("v1"), VersionId(ver.Get(IdField).GetStringBytes()))
+	assert.Equal(t, VersionId("v1"), VersionId(ver.Get(defaultKey).GetStringBytes()))
+	// Lookup still returns v1 for every previously-explicit path and for
+	// new fields (via the `*` default).
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "changeId"))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "kind"))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "propId"))
+}
+
+// TestCompact_TracesSurviveFactor verifies that the trace map remains
+// consistent after compaction: every trace key is still reachable
+// through the compacted `_ver` (the change's versionId is preserved
+// via the `*` default factored at the root).
+func TestCompact_TracesSurviveFactor(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	ch := makeUpsert("v1", "r1", Op{
+		Type: OpSet,
+		Payload: recordPayload(arena, map[string]any{
+			"name":  "hello",
+			"count": 7,
+		}),
+	})
+	ch.TraceIds = []string{"session-A"}
+	require.NoError(t, st.ApplyChange(ctx, ch))
+
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec)
+	tr := readTraces(rec)
+	require.NotNil(t, tr)
+	// Trace for v1 survives — v1 is still present via `*` after factoring.
+	assert.Equal(t, []string{"session-A"}, tr["v1"])
+}
+
+// TestCompact_DerivedOpsHaveNoFactorLeak verifies that the compaction
+// step does not emit derived ops describing the factor-into-`*`
+// transformation. The only derived op surfaced on create remains the
+// existing `_ver.id` stamp from commit 79faee3 — compaction is a pure
+// representation rewrite, not a logical state change.
+func TestCompact_DerivedOpsHaveNoFactorLeak(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	res, err := st.ApplyChangeWithResult(ctx, makeUpsert("v1", "r1", Op{
+		Type: OpSet,
+		Payload: recordPayload(arena, map[string]any{
+			"name":   "hello",
+			"count":  7,
+			"kind":   "x",
+			"propId": "y",
+		}),
+	}))
+	require.NoError(t, err)
+	require.NotNil(t, res.DerivedOps)
+	require.Len(t, res.DerivedOps, 1)
+
+	derived := res.DerivedOps[0]
+	// Find every derived op that targets _ver. Expect exactly one — the
+	// _ver.id auto-stamp. Compaction must not synthesize derived ops for
+	// the factored siblings (they're a representation change, not user-
+	// visible writes).
+	verOps := 0
+	for _, op := range derived {
+		if len(op.Path) >= 1 && op.Path[0] == VersionsKey {
+			verOps++
+			require.Equal(t, []string{VersionsKey, IdField}, op.Path,
+				"unexpected derived op targets _ver beyond the id stamp")
+		}
+	}
+	assert.Equal(t, 1, verOps, "exactly one _ver-derived op (the id stamp) should be surfaced")
+}
+
+// TestCompact_DBBodyMatchesGet verifies the body any-store persists is
+// the same body ctrl.Get returns — i.e. compaction runs inside the
+// modifier (pre-persistence), so subscribers reading via postValue see
+// the same compacted shape the DB holds.
+func TestCompact_DBBodyMatchesGet(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+		Type: OpSet,
+		Payload: recordPayload(arena, map[string]any{
+			"a": "x", "b": "y", "c": "z",
+		}),
+	})))
+
+	// Two reads back-to-back: both must reflect the compacted shape
+	// (no separate "subscriber view" — the subscriber-visible body
+	// comes from the same ctrl.Get path).
+	a := st.Get(ctx, testDS, "r1")
+	b := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, a)
+	require.NotNil(t, b)
+	assert.Equal(t, a.Get(VersionsKey).MarshalTo(nil), b.Get(VersionsKey).MarshalTo(nil))
+	// And both equal the canonical factored shape.
+	ver := a.Get(VersionsKey)
+	assert.Equal(t, 2, ver.GetObject().Len())
+	assert.NotNil(t, ver.Get(IdField))
+	assert.NotNil(t, ver.Get(defaultKey))
 }
 
 func TestSet_MultiFieldNestedPaths(t *testing.T) {

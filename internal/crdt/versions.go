@@ -1,6 +1,8 @@
 package crdt
 
 import (
+	"bytes"
+
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
@@ -139,8 +141,10 @@ func setVersion(arena *anyenc.Arena, node *anyenc.Value, version VersionId, path
 	rest := path[1:]
 	if len(rest) == 0 {
 		// Leaf: overwrite (drop any existing subtree at this key).
+		// Bottom-up collapse is deferred to compactVersions, run once
+		// per change in the modifier — keeps the per-op write path
+		// cheap on cold-restore replay.
 		node.Set(key, arena.NewString(string(version)))
-		collapseObject(arena, node)
 		return
 	}
 	child := node.Get(key)
@@ -163,29 +167,26 @@ func setVersion(arena *anyenc.Arena, node *anyenc.Value, version VersionId, path
 		node.Set(key, child)
 	}
 	setVersion(arena, child, version, rest)
-	collapseObject(arena, node)
 }
 
-// collapseObject collapses an object node to a single string when every
-// entry (including defaultKey) holds the same version string. Currently a
-// no-op — the only case that matters in v1 is a $set at exactly the field's
-// path, which the leaf-overwrite branch above already handles. Aggressive
-// bottom-up collapse is a future optimization; correctness does not depend
-// on it.
-func collapseObject(_ *anyenc.Arena, _ *anyenc.Value) {}
-
-// IsCollapsible reports whether `node` is an object that can be losslessly
-// represented as a single string version (every entry, including defaultKey
-// if present, is the same string). Used by tests.
+// IsCollapsible reports whether `node` is an object that can be replaced
+// with a single string version. Required: every entry is a string, every
+// entry holds the same version, and (≥2 entries OR the defaultKey is
+// present). The defaultKey requirement makes the collapse lossless (the
+// object already claimed authority over unenumerated siblings). The ≥2
+// requirement preserves spec §3.2's narrow-path semantic — a single
+// $set on "a.b.c" must stay `{a:{b:{c:v}}}`, not collapse all the way
+// up to `{a:v}`.
 func IsCollapsible(node *anyenc.Value) (VersionId, bool) {
 	if node == nil || node.Type() != anyenc.TypeObject {
 		return "", false
 	}
 	obj, _ := node.Object()
 	var common VersionId
-	first := true
+	count := 0
+	hasDefault := false
 	ok := true
-	obj.Visit(func(_ []byte, v *anyenc.Value) {
+	obj.Visit(func(k []byte, v *anyenc.Value) {
 		if !ok {
 			return
 		}
@@ -194,17 +195,179 @@ func IsCollapsible(node *anyenc.Value) (VersionId, bool) {
 			return
 		}
 		s := VersionId(v.GetStringBytes())
-		if first {
+		if count == 0 {
 			common = s
-			first = false
+		} else if s != common {
+			ok = false
 			return
 		}
-		if s != common {
-			ok = false
+		count++
+		if string(k) == defaultKey {
+			hasDefault = true
 		}
 	})
-	if !ok || first {
+	if !ok || count == 0 {
+		return "", false
+	}
+	if count == 1 && !hasDefault {
 		return "", false
 	}
 	return common, true
+}
+
+// compactVersions rewrites a record's `_ver` map to its canonical
+// compact form (spec §3.2 — "if every field under a subtree shares the
+// same version, only the subtree root is tracked").
+//
+// Two transformations, applied bottom-up in one pass:
+//
+//  1. Subtree collapse: any inner object whose entries (post-recursion)
+//     are all strings with the same version, and which has either the
+//     defaultKey present or ≥2 entries, is replaced in its parent with
+//     a single string version.
+//
+//  2. Root sibling factor: at the `_ver` root, ≥2 non-`id` string
+//     siblings sharing a version are removed and replaced with a
+//     single `*: version` default. `_ver.id` is never touched (it's
+//     the creation marker, spec §3.5). Skipped when `*` already
+//     exists at root (delete tombstones already use this shape).
+//
+// Tombstones are short-circuited — they're already in canonical
+// `{id, *}` shape and are sticky.
+//
+// Invariants preserved:
+//   - GetRecordVersion(rec, path) is unchanged for every path that
+//     already had an explicit entry. Unenumerated paths may switch
+//     from "" to a `*` default (the documented broader-claim shift).
+//   - The set of versionIds present in `_ver` is unchanged — every
+//     factored versionId still appears via `*`. Trace GC at §3.6
+//     therefore agrees with itself before and after compaction.
+//   - `_ver.id` and `_ver` root object-ness are preserved.
+func compactVersions(arena *anyenc.Arena, rec *anyenc.Value) {
+	if rec == nil {
+		return
+	}
+	if rec.Get(DeletedAtField) != nil {
+		return
+	}
+	v := rec.Get(VersionsKey)
+	if v == nil || v.Type() != anyenc.TypeObject {
+		return
+	}
+	compactSubtree(arena, v)
+	factorRootSiblings(arena, v)
+}
+
+// compactSubtree walks `node`'s object children, recurses into each,
+// and replaces any child that became safely collapsible with the
+// equivalent single-string version. Single-pass: the in-place Set on
+// the current key never resizes anyenc's underlying kvs slice, so
+// mutation during Visit is safe. Zero allocations when no child is
+// an object (the common case — most `_ver` maps are flat).
+func compactSubtree(arena *anyenc.Arena, node *anyenc.Value) {
+	obj, _ := node.Object()
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if v.Type() != anyenc.TypeObject {
+			return
+		}
+		compactSubtree(arena, v)
+		if collapsed, ok := IsCollapsible(v); ok {
+			node.Set(string(k), arena.NewString(string(collapsed)))
+		}
+	})
+}
+
+// rootFactorBufSize is the on-stack capacity of the duplicate-detection
+// buffer used by factorRootSiblings. Records with more than this many
+// top-level `_ver` string siblings fall back to the slow path (rare in
+// practice — typical records have ≤ a dozen fields).
+const rootFactorBufSize = 16
+
+// factorRootSiblings: at the `_ver` root, factor the most common
+// version among non-`id`, non-`*` string siblings into the `*`
+// defaultKey. Only fires when (a) `*` is absent and (b) some version
+// occurs in ≥2 such siblings. Ties on count are broken
+// lexicographically by version (deterministic across peers and runs).
+//
+// Hot path is allocation-free: a stack-sized buffer detects whether
+// any two siblings share a version, and we return early when none do.
+// Map allocation happens only when a duplicate is confirmed.
+func factorRootSiblings(arena *anyenc.Arena, root *anyenc.Value) {
+	if root.Get(defaultKey) != nil {
+		return
+	}
+	obj, _ := root.Object()
+
+	var seenBuf [rootFactorBufSize][]byte
+	seen := seenBuf[:0]
+	foundDup := false
+	overflowed := false
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if foundDup || overflowed {
+			return
+		}
+		if string(k) == IdField || string(k) == defaultKey {
+			return
+		}
+		if v.Type() != anyenc.TypeString {
+			return
+		}
+		s := v.GetStringBytes()
+		for _, prev := range seen {
+			if bytes.Equal(prev, s) {
+				foundDup = true
+				return
+			}
+		}
+		if len(seen) < cap(seen) {
+			seen = append(seen, s)
+		} else {
+			overflowed = true
+		}
+	})
+	if !foundDup && !overflowed {
+		return
+	}
+	factorRootSlow(arena, root)
+}
+
+// factorRootSlow performs the full count-based selection. Allocates a
+// map keyed by versionId — only called when factorRootSiblings has
+// already confirmed there is work to do (or the fast path overflowed).
+func factorRootSlow(arena *anyenc.Arena, root *anyenc.Value) {
+	counts := map[string]int{}
+	obj, _ := root.Object()
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if string(k) == IdField || string(k) == defaultKey {
+			return
+		}
+		if v.Type() != anyenc.TypeString {
+			return
+		}
+		counts[string(v.GetStringBytes())]++
+	})
+	winner := ""
+	winnerCount := 0
+	for ver, c := range counts {
+		if c > winnerCount || (c == winnerCount && (winner == "" || ver < winner)) {
+			winner = ver
+			winnerCount = c
+		}
+	}
+	if winnerCount < 2 {
+		return
+	}
+	var toRemove []string
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if string(k) == IdField || string(k) == defaultKey {
+			return
+		}
+		if v.Type() == anyenc.TypeString && string(v.GetStringBytes()) == winner {
+			toRemove = append(toRemove, string(k))
+		}
+	})
+	for _, k := range toRemove {
+		root.Del(k)
+	}
+	root.Set(defaultKey, arena.NewString(winner))
 }

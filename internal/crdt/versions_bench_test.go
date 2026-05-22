@@ -1,8 +1,11 @@
 package crdt
 
 import (
+	"path/filepath"
+	"strconv"
 	"testing"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
@@ -102,6 +105,102 @@ func BenchmarkCompact_RootFactor(b *testing.B) {
 		})
 		b.StartTimer()
 		compactVersions(arena, rec)
+	}
+}
+
+// newBenchController is the *testing.B equivalent of newTestController —
+// opens a fresh any-store DB under a temp dir and returns a Controller
+// with the default "blocks" handler.
+func newBenchController(b *testing.B) *Controller {
+	b.Helper()
+	db, err := anystore.Open(ctx, filepath.Join(b.TempDir(), "bench.db"), nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+	st, err := NewController(ctx, "obj1", db, DefaultHandler{DatasetName: testDS})
+	if err != nil {
+		b.Fatal(err)
+	}
+	return st
+}
+
+// BenchmarkApply_MultiFieldCreate measures end-to-end ApplyChange
+// throughput against a real any-store DB. Each iteration applies one
+// multi-field create on a fresh record id — the shape that triggers
+// the root-factor compaction step.
+//
+// Run with:
+//
+//	go test -bench=BenchmarkApply_MultiFieldCreate -benchtime=1000x   ./internal/crdt/...
+//	go test -bench=BenchmarkApply_MultiFieldCreate -benchtime=100000x ./internal/crdt/...
+//
+// to get 1k- and 100k-change wall-clock numbers.
+func BenchmarkApply_MultiFieldCreate(b *testing.B) {
+	st := newBenchController(b)
+	arena := &anyenc.Arena{}
+	g := newVersionGen()
+
+	// Pre-build the payload shape once and clone its content via the
+	// op payload helper inside the loop. Mirrors the user's example 1
+	// record: id + 3 small string fields, all stamped at one version.
+	payloads := make([]*anyenc.Value, b.N)
+	versions := make([]VersionId, b.N)
+	for i := 0; i < b.N; i++ {
+		payloads[i] = recordPayload(arena, map[string]any{
+			"changeId": "abc-" + strconv.Itoa(i),
+			"kind":     "string",
+			"propId":   "p-" + strconv.Itoa(i),
+		})
+		versions[i] = g.Next()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ch := makeUpsert(versions[i], "r"+strconv.Itoa(i), Op{
+			Type:    OpSet,
+			Payload: payloads[i],
+		})
+		if err := st.ApplyChange(ctx, ch); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkApply_SingleFieldUpdate measures the steady-state update
+// path: a pre-populated record gets a sequence of single-field $sets
+// (the hottest no-op-compaction path).
+func BenchmarkApply_SingleFieldUpdate(b *testing.B) {
+	st := newBenchController(b)
+	arena := &anyenc.Arena{}
+	g := newVersionGen()
+
+	// Seed one record with an initial multi-field create.
+	if err := st.ApplyChange(ctx, makeUpsert(g.Next(), "r1", Op{
+		Type: OpSet,
+		Payload: recordPayload(arena, map[string]any{
+			"name":  "init",
+			"count": 0,
+		}),
+	})); err != nil {
+		b.Fatal(err)
+	}
+
+	versions := make([]VersionId, b.N)
+	for i := 0; i < b.N; i++ {
+		versions[i] = g.Next()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ch := makeChange(versions[i], "r1", Op{
+			Type:    OpSet,
+			Path:    []string{"name"},
+			Payload: arena.NewString("v" + strconv.Itoa(i)),
+		})
+		if err := st.ApplyChange(ctx, ch); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

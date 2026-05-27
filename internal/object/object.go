@@ -357,15 +357,19 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 		return WriteResult{}, fmt.Errorf("object: validate: %w", err)
 	}
 
-	payload, err := o.codec.Encode(&ch)
-	if err != nil {
-		return WriteResult{}, fmt.Errorf("object: encode: %w", err)
-	}
-
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
 		return WriteResult{}, errors.New("object: closed")
+	}
+
+	// Encode under tree.Lock — the codec's arena is shared with the
+	// replay/Decode path and is not safe for concurrent use. Concurrent
+	// LocalWrite callers (e.g. the background spaceIndex seeder racing
+	// a foreground Modify) would otherwise corrupt the arena cache.
+	payload, err := o.codec.Encode(&ch)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("object: encode: %w", err)
 	}
 
 	// Back-fill the apply-time timestamp before AddContent so the

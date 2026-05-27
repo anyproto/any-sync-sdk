@@ -72,6 +72,7 @@ func (d *debugAPI) Object(ctx context.Context, objectId string) (space.ObjectDeb
 	treeLen := tree.Len()
 	snapshots, branches, walkErr := walkTreeStats(tree)
 	latest := latestVersionLocked(tree, heads)
+	maxAddSeq := obj.Controller().MaxAddSeq()
 	tree.Unlock()
 	if walkErr != nil {
 		return space.ObjectDebug{}, fmt.Errorf("debug: tree walk %s: %w", objectId, walkErr)
@@ -87,7 +88,7 @@ func (d *debugAPI) Object(ctx context.Context, objectId string) (space.ObjectDeb
 	out.TreeLen = treeLen
 	out.Snapshots = snapshots
 	out.LatestVersionId = latest
-	out.MaxAddSeq = obj.Controller().MaxAddSeq()
+	out.MaxAddSeq = maxAddSeq
 
 	st, pending, lastApplied, _ := d.syncStatus.For(d.spaceId).Detail(objectId)
 	out.SyncState = st

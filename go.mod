@@ -4,13 +4,13 @@ go 1.26.2
 
 require (
 	github.com/anyproto/any-store v0.4.6
-	github.com/anyproto/any-store/v2 v2.0.0-alpha.3
+	github.com/anyproto/any-store/v2 v2.0.0-alpha.5
 	github.com/anyproto/any-sync v0.12.4
 	github.com/anyproto/lexid v0.0.6
 	github.com/cheggaaa/mb/v3 v3.0.2
 	github.com/mr-tron/base58 v1.3.0
 	github.com/stretchr/testify v1.11.1
-	github.com/valyala/fastjson v1.6.7
+	github.com/valyala/fastjson v1.6.10
 	github.com/zeebo/xxh3 v1.1.0
 	gopkg.in/yaml.v3 v3.0.1
 	storj.io/drpc v0.0.34
@@ -48,7 +48,7 @@ require (
 	github.com/ipfs/go-block-format v0.2.3 // indirect
 	github.com/ipfs/go-cid v0.6.1 // indirect
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
-	github.com/klauspost/compress v1.18.4 // indirect
+	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-libp2p v0.48.0 // indirect
@@ -82,11 +82,11 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
-	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
+	golang.org/x/crypto v0.52.0 // indirect
+	golang.org/x/exp v0.0.0-20260527015227-08cc5374adb3 // indirect
 	golang.org/x/image v0.21.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect

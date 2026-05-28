@@ -189,7 +189,30 @@ func (c *Controller) registerHandler(ctx context.Context, h Handler) error {
 	// objects, or an external type's handlers attached to every
 	// Controller) from materialising empty rows in any-store.
 	// Shared (per-space) collections are wired at construction time
-	// by the caller and live in c.collections from the start.
+	// by the caller and live in c.collections from the start — for
+	// those we ensure indexes now, since the lazy path won't fire.
+	if coll, ok := c.collections[name]; ok {
+		if err := ensureHandlerIndexes(ctx, h, coll); err != nil {
+			return fmt.Errorf("crdt: ensure indexes for %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// ensureHandlerIndexes calls EnsureIndex for every IndexInfo the
+// handler declares via the optional IndexedHandler interface. No-op
+// for handlers that don't implement it. EnsureIndex is idempotent, so
+// callers may invoke this on every open without checking persistence.
+func ensureHandlerIndexes(ctx context.Context, h Handler, coll anystore.Collection) error {
+	ih, ok := h.(IndexedHandler)
+	if !ok {
+		return nil
+	}
+	for _, idx := range ih.Indexes() {
+		if err := coll.EnsureIndex(ctx, idx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -207,6 +230,11 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 	coll, err := c.db.Collection(ctx, collName)
 	if err != nil {
 		return nil, fmt.Errorf("crdt: open collection %q: %w", collName, err)
+	}
+	if h, ok := c.handlers[dataset]; ok {
+		if err := ensureHandlerIndexes(ctx, h, coll); err != nil {
+			return nil, fmt.Errorf("crdt: ensure indexes for %q: %w", dataset, err)
+		}
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
@@ -229,11 +257,15 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 		return coll
 	}
 	c.collMu.Unlock()
-	if _, ok := c.handlers[dataset]; !ok {
+	h, ok := c.handlers[dataset]
+	if !ok {
 		return nil
 	}
 	coll, err := c.db.OpenCollection(ctx, c.objectId+"_"+dataset)
 	if err != nil {
+		return nil
+	}
+	if err := ensureHandlerIndexes(ctx, h, coll); err != nil {
 		return nil
 	}
 	c.collMu.Lock()

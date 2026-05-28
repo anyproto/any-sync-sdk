@@ -70,6 +70,15 @@ const (
 // that only need to override a subset of lifecycle hooks.
 type DefaultHandler = crdt.DefaultHandler
 
+// IndexedHandler is an optional interface a Handler may implement to
+// declare any-store indexes for its dataset's collection. The SDK
+// calls EnsureIndex on each entry the first time the collection is
+// opened (per process). EnsureIndex is idempotent — restarts re-run
+// it harmlessly. Pair-import any-store for the IndexInfo type:
+//
+//	import anystore "github.com/anyproto/any-store/v2"
+type IndexedHandler = crdt.IndexedHandler
+
 // ErrValidation is the sentinel wrapped by handler returns when an
 // op is rejected. Programmatic discrimination uses errors.Is.
 var ErrValidation = crdt.ErrValidation

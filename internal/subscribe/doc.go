@@ -1,7 +1,8 @@
-// Package subscribe owns the per-space live-query engine. One Engine
-// per loaded space; afterApply calls Engine.OnApply alongside the
-// existing eventbus dispatcher, and the engine routes each event to
-// matching querySubs whose windows are maintained incrementally.
+// Package subscribe owns the per-space live-query engine and the
+// projected Event types the apply path hands to it. One Engine per
+// loaded space; afterApply builds an Event via BuildEvent and calls
+// Engine.OnApply, which routes each event to matching querySubs
+// whose windows are maintained incrementally.
 //
 // Two subscription scopes:
 //

@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -83,12 +82,12 @@ func subscribeSorted(t *testing.T, eng *Engine, scope Scope, filter query.Filter
 // fireEvent invokes engine.OnApply with a single-record event built
 // from the given (id, postDoc, deleted, ops, sourceObjectId).
 func fireEvent(eng *Engine, objectId, dataset, id string, postDoc *anyenc.Value, deleted bool, ops []space.EventOp) {
-	ev := eventbus.Event{
+	ev := Event{
 		SpaceId:  "test",
 		ObjectId: objectId,
 		Dataset:  dataset,
 		VersionId: crdt.VersionId("v" + id),
-		Records: []eventbus.EventRecord{{Id: id, Deleted: deleted, Ops: ops}},
+		Records: []EventRecord{{Id: id, Deleted: deleted, Ops: ops}},
 	}
 	postValue := func(i int) *anyenc.Value {
 		if i == 0 {
@@ -417,12 +416,12 @@ func TestScope_SharedAndExplicitDoNotCrossFire(t *testing.T) {
 	defer eng.Close()
 
 	shared := subscribeSorted(t, eng, Scope{Shared: true}, nil, 0, nil)
-	explicit := subscribeSorted(t, eng, Scope{Shared: false, ObjectId: "obj1", Dataset: eventbus.ObjectsDataset}, nil, 0, nil)
+	explicit := subscribeSorted(t, eng, Scope{Shared: false, ObjectId: "obj1", Dataset: ObjectsDataset}, nil, 0, nil)
 
 	arena := newArena()
 	// Event for obj1 → shared and explicit both fire.
 	r1 := makeRow(arena, "x", 1, nil)
-	fireEvent(eng, "obj1", eventbus.ObjectsDataset, "x", r1.d, false, nil)
+	fireEvent(eng, "obj1", ObjectsDataset, "x", r1.d, false, nil)
 
 	ev, err := waitOne(t, shared)
 	require.NoError(t, err)
@@ -433,7 +432,7 @@ func TestScope_SharedAndExplicitDoNotCrossFire(t *testing.T) {
 
 	// Event for obj2 → only shared fires.
 	r2 := makeRow(arena, "y", 2, nil)
-	fireEvent(eng, "obj2", eventbus.ObjectsDataset, "y", r2.d, false, nil)
+	fireEvent(eng, "obj2", ObjectsDataset, "y", r2.d, false, nil)
 
 	ev3, err := waitOne(t, shared)
 	require.NoError(t, err)

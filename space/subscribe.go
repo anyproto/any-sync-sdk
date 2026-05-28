@@ -7,7 +7,6 @@ import (
 	"github.com/cheggaaa/mb/v3"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 )
 
 // EventOp is one $set or $unset operation inside a SubRecord.Ops
@@ -17,7 +16,11 @@ import (
 // $incGated / delete never reach the wire — those are projected
 // down to $set / $unset against the post-apply value before
 // delivery.
-type EventOp = eventbus.EventOp
+type EventOp struct {
+	Type    crdt.OpType
+	Path    []string
+	Payload *anyenc.Value
+}
 
 // QuerySubscription is the live handle returned by Query.Subscribe.
 // It mirrors the shape of Subscription but carries SubscriptionEvent

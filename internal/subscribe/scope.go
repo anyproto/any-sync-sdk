@@ -1,10 +1,8 @@
 package subscribe
 
-import "github.com/anyproto/any-sync-sdk/internal/eventbus"
-
 // Scope locates which events a sub cares about.
 //
-// Shared=true means "every event whose dataset == eventbus.ObjectsDataset
+// Shared=true means "every event whose dataset == ObjectsDataset
 // across every object in the space" — the property firehose. The
 // ObjectId/Dataset fields are ignored in this case.
 //
@@ -73,8 +71,8 @@ func (idx *scopeIndex) remove(s *querySub) {
 // subs fire only on exact-object+dataset match. The two sets are
 // disjoint by construction, so callers can iterate the union without
 // dedup.
-func (idx *scopeIndex) matches(ev eventbus.Event, out []*querySub) []*querySub {
-	if ev.Dataset == eventbus.ObjectsDataset {
+func (idx *scopeIndex) matches(ev Event, out []*querySub) []*querySub {
+	if ev.Dataset == ObjectsDataset {
 		for _, s := range idx.shared {
 			out = append(out, s)
 		}

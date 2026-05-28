@@ -10,7 +10,6 @@ import (
 	"github.com/anyproto/any-store/v2/syncpool"
 	"github.com/cheggaaa/mb/v3"
 
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -148,7 +147,7 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 // Cheap when there are no subs (HasSubscribers check returns false
 // before this is even invoked by the caller). When subs exist, takes
 // engine.mu briefly to fan to the matching ones.
-func (e *Engine) OnApply(ev eventbus.Event, postValue eventbus.PostValueFn) {
+func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 	if e.closed.Load() {
 		return
 	}

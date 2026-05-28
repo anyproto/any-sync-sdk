@@ -139,7 +139,7 @@ func (q *membersQuery) Snapshot(ctx context.Context, opts space.QueryOpts) (*spa
 }
 
 // Subscribe is not supported for members in v1 — the members watcher
-// writes any-store rows directly without emitting an eventbus event.
+// writes any-store rows directly without feeding the subscribe engine.
 // Adding a synthetic emission path is a follow-up.
 func (q *membersQuery) Subscribe(_ context.Context, _ space.QueryOpts) (*space.QueryResult, error) {
 	return nil, space.ErrSubscribeUnsupported

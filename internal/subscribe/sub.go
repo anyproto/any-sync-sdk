@@ -10,7 +10,6 @@ import (
 	"github.com/anyproto/any-store/v2/syncpool"
 	"github.com/cheggaaa/mb/v3"
 
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -115,7 +114,7 @@ type pendingRec struct {
 // per call. Per-record classification, sentinel transitions, drift +
 // overflow checks all happen here under Engine.mu (so other engine
 // methods observe consistent state).
-func (s *querySub) apply(ev eventbus.Event, postValue eventbus.PostValueFn) {
+func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	if s.closed {
 		return
 	}
@@ -168,7 +167,7 @@ func (s *querySub) apply(ev eventbus.Event, postValue eventbus.PostValueFn) {
 // applyRecord classifies one EventRecord and updates p accordingly.
 // Pulls postKey / postDoc lazily and short-circuits via the maxKey
 // fast-reject when possible.
-func (s *querySub) applyRecord(i int, rc eventbus.EventRecord, postValue eventbus.PostValueFn, p *subPending) {
+func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *subPending) {
 	p.seen[rc.Id] = struct{}{}
 
 	prevSentinelId := s.sentinelId()
@@ -274,7 +273,7 @@ func (s *querySub) checkDrift() {
 }
 
 // cloneValue deep-copies v onto a fresh parser-owned arena via
-// anyencutil.Value.FillCopy. Mirrors eventbus.clonePayload. nil-safe.
+// anyencutil.Value.FillCopy. Mirrors event.go's clonePayload. nil-safe.
 func cloneValue(v *anyenc.Value) *anyenc.Value {
 	if v == nil {
 		return nil

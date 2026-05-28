@@ -1,4 +1,4 @@
-package eventbus
+package subscribe
 
 import (
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -6,12 +6,12 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // ObjectsDataset is the CRDT dataset whose changes feed the
-// shared-objects path of the subscribe engine — the per-space
-// `objects` collection, where every object's property values land
-// regardless of object kind.
+// shared-objects scope — the per-space `objects` collection, where
+// every object's property values land regardless of object kind.
 //
 // User-facing terminology calls these "property values"; the dataset
 // is named "objects" because each row is one object's values record.
@@ -19,7 +19,7 @@ import (
 // on type objects).
 const ObjectsDataset = properties.Dataset
 
-// Event is a single CRDT apply event handed to the subscribe engine.
+// Event is a single CRDT apply event handed to the engine.
 //
 // Pipeline contract: receive change → apply to CRDT → commit the
 // any-store tx → THEN build this event. By the time a consumer sees
@@ -58,33 +58,18 @@ type EventRecord struct {
 	// decide Added vs Updated emit semantics.
 	Created bool
 	// Deleted is true when the change tombstoned this record. Ops is
-	// empty in that case; engine drops the entry from its held set.
+	// empty in that case; the engine drops the entry from its held
+	// set.
 	Deleted bool
 	// Ops is the projected $set / $unset operations on the post-apply
 	// record. Empty when Deleted is true. Surfaced verbatim to
 	// SubscriptionEvent SubRecord.Ops for atomic-update consumers.
-	Ops []EventOp
-}
-
-// EventOp is one $set or $unset operation inside an EventRecord. By
-// construction we never ship $inc / $addToSet / $pull / $incGated /
-// delete on the wire — those are projected to set/unset against the
-// post-apply value before delivery.
-//
-// Path is the dotted-segment field path. For $set, an empty Path
-// activates the multi-field form (Payload is an object whose keys are
-// dot-separated paths); for $unset, an empty Path means "remove the
-// record" (use EventRecord.Deleted instead, kept here for symmetry
-// with the input op shape).
-type EventOp struct {
-	Type    crdt.OpType
-	Path    []string
-	Payload *anyenc.Value
+	Ops []space.EventOp
 }
 
 // PostValueFn returns the post-apply value for one record in the
-// change being built. Provided by the per-space layer (the spaceobjects
-// Store holds the controller). Index is into ch.Records.
+// change being built. Provided by the per-space layer (the
+// spaceobjects Store holds the controller). Index is into ch.Records.
 //
 // May return nil for tombstoned / dropped records (e.g. a gated op
 // that didn't land); callers should treat nil as "the record no
@@ -94,7 +79,7 @@ type PostValueFn func(recordIndex int) *anyenc.Value
 // BuildEvent projects (ch, recordIds, derivedOps, postValue) into the
 // wire Event shape — runs the same per-record projection an engine
 // caller would need, with deep-cloned op payloads. afterApplyFor
-// builds this once per change before handing it to the engine.
+// builds this once per change before handing it to Engine.OnApply.
 //
 // Safe to call with a nil change — returns a zero Event in that case;
 // callers should check ch != nil themselves if they want to skip work.
@@ -145,9 +130,9 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 		if postValue != nil {
 			post = postValue(i)
 		}
-		// Variant ops apply to a sub-document rooted at rc.Variant; the
-		// post-apply lookup we use targets the record root, so paths
-		// in the projected ops carry the variant prefix to match.
+		// Variant ops apply to a sub-document rooted at rc.Variant;
+		// the post-apply lookup we use targets the record root, so
+		// paths in the projected ops carry the variant prefix to match.
 		for _, op := range rc.Ops {
 			projected, ok := projectOp(op, rc.Variant, post)
 			if !ok {
@@ -181,8 +166,7 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 }
 
 // hasRecordDelete reports whether ops contains a record-level delete.
-// Mirrors the apply-side helper of the same name (kept private over
-// here so eventbus stays self-contained).
+// Mirrors the apply-side helper of the same name.
 func hasRecordDelete(ops []crdt.Op) bool {
 	for _, op := range ops {
 		if op.Type == crdt.OpDelete {
@@ -196,8 +180,8 @@ func hasRecordDelete(ops []crdt.Op) bool {
 // the apply path emits exactly once — on the change that first
 // materialises a record (recordModifier.Modify, the `creating`
 // branch). The min-rule re-stamp on later upserts does NOT emit a
-// derived op, so the marker's presence in a record's derivedOps is an
-// unambiguous "this change created the record" signal.
+// derived op, so the marker's presence in a record's derivedOps is
+// an unambiguous "this change created the record" signal.
 func isCreationMarker(op crdt.Op) bool {
 	return op.Type == crdt.OpSet &&
 		len(op.Path) == 2 &&
@@ -215,16 +199,16 @@ func isCreationMarker(op crdt.Op) bool {
 // (RecordChange.Variant != ""), the post-apply value at op.Path
 // lives under post[variant][path...]; we reflect that in the wire
 // path so the consumer's local copy has the same nested shape.
-func projectOp(op crdt.Op, variant string, post *anyenc.Value) (EventOp, bool) {
+func projectOp(op crdt.Op, variant string, post *anyenc.Value) (space.EventOp, bool) {
 	switch op.Type {
 	case crdt.OpDelete:
 		// Record-level — handled out-of-band via EventRecord.Deleted.
-		return EventOp{}, false
+		return space.EventOp{}, false
 	case crdt.OpSet, crdt.OpUnset:
 		// Already in the wire-friendly form. Clone the payload off
-		// any caller-owned arena so the event can outlive the
-		// build call.
-		return EventOp{
+		// any caller-owned arena so the event can outlive the build
+		// call.
+		return space.EventOp{
 			Type:    op.Type,
 			Path:    prependVariant(variant, op.Path),
 			Payload: clonePayload(op.Payload),
@@ -236,12 +220,12 @@ func projectOp(op crdt.Op, variant string, post *anyenc.Value) (EventOp, bool) {
 		path := prependVariant(variant, op.Path)
 		val := lookupPath(post, path)
 		if val == nil {
-			return EventOp{
+			return space.EventOp{
 				Type: crdt.OpUnset,
 				Path: path,
 			}, true
 		}
-		return EventOp{
+		return space.EventOp{
 			Type:    crdt.OpSet,
 			Path:    path,
 			Payload: clonePayload(val),
@@ -282,7 +266,7 @@ func lookupPath(v *anyenc.Value, path []string) *anyenc.Value {
 
 // clonePayload deep-copies an anyenc value off its current arena onto
 // a fresh parser-owned arena. Mirrors crdt.cloneValue; we duplicate
-// here to keep eventbus free of crdt-internal helpers. nil-safe.
+// here to keep this package free of crdt-internal helpers. nil-safe.
 func clonePayload(v *anyenc.Value) *anyenc.Value {
 	if v == nil {
 		return nil

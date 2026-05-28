@@ -7,8 +7,8 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
@@ -88,7 +88,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			if res != nil {
 				derivedOps = res.DerivedOps
 			}
-			ev := eventbus.BuildEvent(ch, rowIds, derivedOps, postValue)
+			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
 			s.engine.OnApply(ev, postValue)
 		}
 
@@ -114,7 +114,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 // we mirror that here so the wire's EventRecord.Id matches what a
 // follow-up Query on the same dataset returns. Per-object datasets
 // keep the resolved RecordChange ids untouched.
-func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.Change, ids []string) ([]string, eventbus.PostValueFn) {
+func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.Change, ids []string) ([]string, subscribe.PostValueFn) {
 	// The Object is handed in by afterApply directly — DO NOT do a
 	// cache lookup here. afterApply runs from inside the LoadFunc on
 	// a fresh joiner (synctree's afterBuild → Rebuild → replayLocked

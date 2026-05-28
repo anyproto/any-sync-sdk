@@ -173,12 +173,10 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 
 	// Step 2: per-space — types and objects must converge. Event-
 	// driven via QueryObjects().Subscribe: the per-space `objects`
-	// firehose fires on every tree's "objects" dataset write
-	// (eventbus.ObjectsDataset), which covers BOTH type creates
-	// (typesAPI.Create writes any.types=["__type__"] to objects)
-	// AND instance creates / SetBase. We register before re-checking
-	// and recheck on every event arrival until the local snapshot
-	// satisfies the fixture.
+	// dataset writes fire for BOTH type creates (typesAPI.Create
+	// writes any.types=["__type__"] to objects) AND instance creates
+	// / SetBase. We register before re-checking and recheck on every
+	// event arrival until the local snapshot satisfies the fixture.
 	for _, fix := range wantSpaces {
 		fix := fix
 		t.Run("space="+fix.Name, func(t *testing.T) {

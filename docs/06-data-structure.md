@@ -315,14 +315,16 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 - **Property variants in queries** — default projection **hides** `_device` / `_account` / `_base`. Caller can opt-in via a flag. Projection control may live at API level, not SDK level
 
 ### Subscriptions / Event Flow
-- **Two event layers** — internal CRDT events (raw ops, used by handlers / property recompute / versioning) and user events (simplified `inserted`/`updated`/`deleted` with new field values). SDK callers see only user events by default. See CRDT spec §7.
-- **Batcher** — use `github.com/cheggaaa/mb/v3`. Each subscriber gets its own `mb` instance (no shared fan-out)
-- **Granularity** — subscribe to a single document (object) or a set of documents by `ids`. No per-query live subscriptions in v1
-- **User event payload** — `{spaceId, objectId, dataset, records: [{id, type, fields?}]}`. Delta fields only; caller re-reads any-store for full state if needed
-- **Backpressure** — handled by `mb` limits (built-in)
-- **Sessions** — deferred. When added, probably at the API layer, not SDK core
-- **Variant-level events** — opt-in advanced channel for `_device`/`_account`/`_base` internal events (debugging, settings UI)
-- **System collections** — same event flow. Caller can narrow subscriptions to e.g. properties-only or members-only
+- **Single API: `Query.Subscribe(ctx, opts)`** — windowed live queries. Chain `Filter / Sort / Limit` then call `Subscribe` for a live `*QueryResult{Initial, Total, Sub}`, or `Snapshot(opts)` for the same shape without a live `Sub`. There is no separate raw-event firehose.
+- **Engine** — `internal/subscribe.Engine`, one per loaded space, owned by `spaceobjects.Store`. Single `engine.mu` serializes register / close / per-event apply; the apply path's afterApply hook calls `engine.OnApply(ev, postValue)` gated on `engine.HasSubscribers()`.
+- **Batcher** — `github.com/cheggaaa/mb/v3`, per sub. Bounded capacity (default 256, min 16). Each consumer reads via `sub.Events().Wait(ctx)` (batches naturally) or `WaitOne(ctx)`.
+- **Granularity** — per-sub `Scope` is either the shared `objects` dataset (`Space.QueryObjects()`) or an explicit `(objectId, dataset)`. Members feed is NOT yet plumbed into the engine (`MembersQuery.Subscribe` returns `ErrSubscribeUnsupported`) — separate change.
+- **Event payload** — `SubscriptionEvent{VersionId, Added, Updated, Removed}`. `Added`/`Updated` are `[]SubRecord{Id, Doc, Ops}` carrying the full post-apply value (deep-cloned, safe to retain) AND the projected `$set`/`$unset` ops; `Removed` is `[]string` of ids. Consumer's view drops ids on `Removed` regardless of cause — deleted / filter-rejected / sentinel-displaced are NOT distinguished on the wire (call `Snapshot` if you need to know).
+- **Window semantics** — when `Limit > 0` the engine internally holds `Limit + 1` rows; the largest-tuple row is the *sentinel* (kept but not visible to the consumer), so single new arrivals at the top of the sort absorb cleanly without an any-store re-query. `Limit == 0` is unbounded; RAM grows with the matching set.
+- **Snapshot fence** — initial snapshot read runs UNDER `engine.mu`. Apply events that fire during the read queue on the lock and process correctly after the new sub is registered. No `VersionId` dedupe needed.
+- **Overflow / drift** — overflow = mailbox full; sub closes with `ErrSubscriptionOverflow`. Drift = more than `DriftBudgetPercent` (default 30) of `Limit` records left the held window without replacement; sub closes with `ErrSubscriptionDrifted`. Both signal "resubscribe to recover" — the resubscribe path is the only recovery contract (no silent drops, no per-event count).
+- **Total** — `QueryOpts.IncludeTotal` runs a single `Count(filter)` at snapshot time; not maintained on the live stream. Call `Snapshot` again for a refreshed count.
+- **Variant-level events** — opt-in advanced channel for `_device`/`_account`/`_base` internal events (debugging, settings UI). Not in v1.
 
 ### Storage Topology
 - **Flexible via `dbRouter`** — scope → DB instance. Allows starting with one shared DB (simpler, enables cross-space transactions) and moving to per-space DBs if performance dictates
@@ -353,10 +355,10 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 1. Exact shape of the query wrapper — final list of helpers on `Query` (`projection`, `iterate`, `all`, `one`, `count`, `explain`?)
 2. Pagination semantics once offset-based starts hurting (10k+ results) — add cursors? Continue using offsets with an index?
 
-### Events
-3. Change shape inside `{spaceId, objectId, []changes}` — reuse the CRDT change format verbatim, or strip signing/encryption metadata?
-4. `mb` tuning — default buffer size, overflow policy (block vs oldest-drop)?
-5. Subscription filter inside a document set — does the caller pass e.g. `{datasetName: "properties"}` to narrow, or do they read the full change list and filter client-side?
+### Events (resolved — see §"Subscriptions / Event Flow" above)
+3. ~Change shape inside `{spaceId, objectId, []changes}`~ → `SubscriptionEvent{VersionId, Added, Updated, Removed}` is the wire shape; signing/encryption metadata never leaves the engine.
+4. ~`mb` tuning — default buffer size, overflow policy?~ → default 256, min 16; overflow ⇒ close-with-sentinel-error.
+5. ~Subscription filter inside a document set?~ → `Query.Subscribe` takes the full chained `Filter`/`Sort`/`Limit`/`Offset`; no separate dataset narrowing knob.
 
 ### Property Events (cross-section)
 6. Events must carry property changes even though each variant (`_device` / `_account` / `_base`) has its own `_o` version. How is the event delta represented — as a change to the computed root, as a change to one of the `_*` variants, or both? This affects CRDT event format too.

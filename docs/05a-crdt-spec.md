@@ -557,13 +557,20 @@ What callers never see:
 ## 11. Queries
 
 ```go
-Query(objectId, datasetName, filter, sort, opts) -> Iterator
+Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Offset(n)
+QueryObjects().Filter(...).Sort(...).Limit(n).Offset(n)
 ```
 
-- `filter` is a mongo-like document parsed via `query.ParseCondition`
-- `sort` is a mongo-like spec
-- `opts` includes projection, limit, offset, versionId inclusion flag
-- Each result record is an `anyenc.Value` plus a record-level `versionId`
+Terminal calls:
+
+- `Iter(ctx) -> Iterator` — streaming.
+- `All(ctx) -> []anyenc.Value` — materialise all.
+- `One(ctx) -> anyenc.Value` — first match or `ErrNotFound`.
+- `Count(ctx) -> int` — match count.
+- `Snapshot(ctx, opts) -> *QueryResult` — point-in-time view + optional total (§13).
+- `Subscribe(ctx, opts) -> *QueryResult` — initial view + live `Sub` (§13).
+
+`Filter` accepts anything `query.ParseCondition` accepts (already-built `query.Filter`, JSON string, or map literal with mongo operators). `Sort` accepts anything `query.ParseSort` accepts (`"name"`, `"-_ver.id"` for descending, or already-built `query.Sort`). Parse errors are stashed eagerly and surfaced on the first terminal call.
 
 ### 11.1 Projections
 
@@ -618,91 +625,73 @@ A single `Modify` can target multiple records (as one batch) if the API supports
 
 ## 13. Subscriptions and Events
 
-Two subscription modes:
+Single surface: windowed live queries.
 
 ```go
-Subscribe(objectId, datasetName | ids, opts)       -> EventStream
-SubscribeSimplified(objectId, datasetName | ids)   -> SimplifiedEventStream
+Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
+QueryObjects().Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
 ```
 
-Callers pick one per subscription. They carry the same information at different levels of detail.
+Returns `*QueryResult{Initial, Total, Sub}` where `Sub` is the live `QuerySubscription`. Both call shapes also support `Snapshot(ctx, opts)` for a point-in-time read with the same result shape (no live `Sub`).
 
-### 13.1 Primary Event
-Same shape as `Change` from the protocol, with the final versionId.
+### 13.1 Event Shape
+
+One `SubscriptionEvent` per CRDT apply that touches the sub's scope; emitted **after** the any-store write tx commits (read-your-writes safe).
 
 ```
-Event {
-  spaceId:    string
-  objectId:   string
-  dataset:    string
-  versionId:  string              // always final
-  records: [
-    RecordEvent {
-      id:  string
-      ops: [Operation, ...]       // raw operations from §5
-    },
-    ...
-  ]
+SubscriptionEvent {
+  versionId: string             // per-change DAG order; for fence-and-replay
+  added:   [SubRecord, ...]     // records that entered the visible window
+  updated: [SubRecord, ...]     // records already in the window, changed
+  removed: [string, ...]        // ids that left the visible window
+}
+
+SubRecord {
+  id:  string
+  doc: anyenc.Value             // full post-apply value, deep-cloned
+  ops: [EventOp, ...]           // projected $set / $unset ops from the change
 }
 ```
 
-Characteristics:
-- Ops-centric — the caller sees exactly which operations produced the change
-- Always carries the real local versionId any-sync assigned on commit
-- Emitted **after** the any-store write tx commits (read-your-writes safe)
-- Each `RecordEvent` carries enough information for a client to reconcile its own in-memory state per field: the ops identify exactly which paths changed, and the change's versionId is the new per-field version for each touched path. Clients that mirror the SDK state combine this with an initial `Query` (which returns `_ver` alongside each record) to establish a baseline and then incrementally apply events.
+`ops` is post-projection: every `$inc` / `$addToSet` / `$pull` / `$incGated` has been merged on the SDK side and ships as a `$set` against the post-apply value (or `$unset` when the path went away). A thin client can apply `ops` against a JSON-like local mirror without a CRDT engine. `doc` carries the full post-apply state for clients that prefer to rerender from scratch.
 
-### 13.2 Simplified Event
+### 13.2 Window Semantics
 
-For callers that don't want to reason about ops.
+The window tracks filter + sort + limit incrementally.
 
-```
-SimplifiedEvent {
-  spaceId:   string
-  objectId:  string
-  dataset:   string
-  versionId: string               // still exposed — consistency primitive
-  records: [
-    SimplifiedRecordEvent {
-      id:   string
-      type: "created" | "updated" | "deleted"
-      fields?: { [path: string]: anyenc.Value }
-    },
-    ...
-  ]
-}
-```
+- When `Limit > 0`, the engine internally holds `Limit + 1` rows; the largest-tuple row is the *sentinel* — kept but not visible to the consumer. Single new arrivals at the top of the sort cause an `Added` (the new row) + `Removed` (the previous bottom-visible row that demoted to sentinel) without any any-store re-query.
+- `Limit == 0` is unbounded; RAM grows with the matching set.
+- `Offset` applies to the initial snapshot only; the live window has no offset.
 
-Transform from primary → simplified:
+### 13.3 Removed Semantics
 
-| Op in primary event | Simplified type | Simplified `fields` contents |
-|----|----|----|
-| `$set` (auto-creating) | `created` | the record's persisted fields (without `_ver`) |
-| `$set` (existing record) | `updated` | affected paths with new values |
-| `$unset` | `updated` | affected paths with `null` marker |
-| `$addToSet` / `$pull` | `updated` | field name with the **new set value** |
-| `$inc` / `$incGated` | `updated` | field name with the **new numeric value** |
-| `delete` | `deleted` | omitted |
+`Removed` is just "drop this id from your view". Three causes funnel into the same signal and are NOT distinguished on the wire:
+- Deleted (the record was tombstoned in the DB).
+- Filter-rejected (an update changed a field so the filter no longer matches).
+- Displaced (a higher-priority arrival pushed the record past `Limit`).
 
-The SDK distinguishes "created" from "updated" by tracking whether the record existed at the start of the change. Auto-creation is an emergent property of the protocol; the simplified event surfaces it for caller convenience.
+Consumers needing to disambiguate call `Snapshot` / `Query.One` with the id (deleted ⇒ `ErrNotFound`; filter-rejected ⇒ doc that doesn't match the active filter; displaced ⇒ doc that does).
 
-Multiple ops on the same record collapse into one `SimplifiedRecordEvent`.
+### 13.4 Property Variants in Events
+For the `objects` collection: `SubRecord.Doc` carries the merged post-apply value (computed root). Variant-level (`_device` / `_account` / `_base`) introspection is not exposed in v1; an advanced channel is deferred.
 
-### 13.3 Property Variants in Events
-For the `objects` collection:
-- **Primary events** carry a `scope` field on each record event indicating which variant moved (`device` | `account` | `base`). The caller sees the raw variant change
-- **Simplified events** carry only the **new computed root values** — the variant is hidden. No event is emitted if the computed root didn't change (e.g., a stale `base` write while `device` overrides)
+### 13.5 Ordering
+- Events are emitted in `applyChange` order (strictly after tx commit).
+- Within one change, all record transitions ship in a single `SubscriptionEvent`.
+- Cross-object ordering is not guaranteed.
 
-### 13.4 Ordering
-- Events are emitted in the order `applyChange` processes them (strictly after tx commit)
-- Within one change, ops are delivered as a single event
-- Cross-object ordering is not guaranteed
+### 13.6 Own-write events
+Caller receives their own writes as events. They recognize them by matching the returned versionId on the change against `SubscriptionEvent.VersionId`. Session-based suppression is deferred.
 
-### 13.5 Own-write events
-Caller receives their own writes as events. They recognize them by matching the returned versionId. Session-based suppression is deferred.
+### 13.7 Backpressure + Recovery
 
-### 13.6 Backpressure
-Implemented via `github.com/cheggaaa/mb/v3`. Each subscriber gets its own `mb` instance with built-in limits.
+Per-sub mailbox is `mb/v3`-bounded (default 256, min 16). There is no silent-drop policy: on overflow the engine closes the sub with `ErrSubscriptionOverflow`. A second close mode is `ErrSubscriptionDrifted` — fired when more than `DriftBudgetPercent` (default 30) of `Limit` records leave the held window without replacements (the engine never re-queries any-store on the hot path to backfill).
+
+Either error is the only recovery contract: the client resubscribes and the new snapshot reconciles state. There is no `Dropped()` counter or partial-delivery mode.
+
+### 13.8 Initial Snapshot Fence
+
+`Subscribe`'s snapshot read runs UNDER the engine's mutex; apply events that fire during the read queue on the lock and process correctly after the new sub is registered. No per-event `VersionId` dedupe needed.
 
 ---
 

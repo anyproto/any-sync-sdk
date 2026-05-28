@@ -2,14 +2,17 @@ package spaceimpl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -169,6 +172,191 @@ func cloneAnyenc(v *anyenc.Value) (*anyenc.Value, error) {
 	var w anyencutil.Value
 	w.FillCopy(v)
 	return w.Value, nil
+}
+
+// Snapshot returns a point-in-time view plus optional total count.
+// Stub for the engine integration — filled in by task 4.
+func (q *queryImpl) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
+	initial, err := q.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	total := -1
+	if opts.IncludeTotal {
+		// Build a fresh queryImpl for the count — the original's limit/offset
+		// are still in effect on this builder, but Count ignores them.
+		n, err := q.Count(ctx)
+		if err != nil {
+			return nil, err
+		}
+		total = n
+	}
+	return &space.QueryResult{Initial: initial, Total: total}, nil
+}
+
+// Subscribe is the live-query terminal. Builds a windowed sub via the
+// per-space engine; the snapshot read runs under engine.mu so apply
+// events are fenced between the snapshot and the sub's registration.
+//
+// Initial in the returned QueryResult is the user-visible window
+// (limit rows excluding the sentinel; or all rows when limit == 0).
+// Subsequent live updates flow through QueryResult.Sub.
+func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
+	if q.parseErr != nil {
+		return nil, q.parseErr
+	}
+	if q.limit > 0 && q.sort == nil {
+		return nil, subscribe.ErrLimitWithoutSort
+	}
+
+	// Resolve scope from the original builder shape.
+	var scope subscribe.Scope
+	if q.dataset == "<shared:objects>" {
+		scope = subscribe.Scope{Shared: true}
+	} else {
+		scope = subscribe.Scope{Shared: false, ObjectId: q.objectId, Dataset: q.dataset}
+	}
+
+	// Combine user filter with the tombstone-skip clause so the engine
+	// matches what the snapshot path returns (queryIterator.Next drops
+	// _deletedAt rows post-iteration; we push it into the filter for
+	// the live path).
+	combined, err := combineWithTombstoneSkip(q.filter)
+	if err != nil {
+		return nil, err
+	}
+
+	// Hold the snapshot rows for both the engine's initial population
+	// AND the user-visible Initial slice. Same iteration, two outputs.
+	var snapshotRows []*anyenc.Value
+	var snapshotIds []string
+	totalCount := -1
+
+	cfg := subscribe.SubConfig{
+		Scope:       scope,
+		Filter:      combined,
+		Sort:        q.sort,
+		Limit:       int(q.limit),
+		MailboxCap:  opts.MailboxCapacity,
+		DriftBudget: opts.DriftBudgetPercent,
+	}
+
+	sub, err := q.parent.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
+		coll, err := q.collection(ctx)
+		if err != nil {
+			// Object doesn't exist yet — treat as empty initial. The
+			// engine still registers; if the object lands later, events
+			// flow into this sub. Mirrors how a not-yet-materialised
+			// dataset gets a nil collection and an empty snapshot.
+			if errors.Is(err, treestorage.ErrUnknownTreeId) {
+				return nil
+			}
+			return err
+		}
+		if coll == nil {
+			return nil // dataset has no materialised collection yet → empty
+		}
+		aq := coll.Find(combined)
+		if q.sort != nil {
+			aq = aq.Sort(q.sort)
+		}
+		// Snapshot pulls limit+1 to seed the sentinel; the user sees only the
+		// first `limit` rows in Initial.
+		if q.limit > 0 {
+			aq = aq.Limit(q.limit + 1)
+		}
+		if q.offset > 0 {
+			aq = aq.Offset(q.offset)
+		}
+		it, err := aq.Iter(ctx)
+		if err != nil {
+			return err
+		}
+		defer it.Close()
+		for it.Next() {
+			doc, err := it.Doc()
+			if err != nil {
+				return err
+			}
+			v := doc.Value()
+			if v == nil {
+				continue
+			}
+			id := string(v.GetStringBytes("id"))
+			if id == "" {
+				continue
+			}
+			// Capture for Initial — clone now so the slice survives past
+			// the iterator (which reuses its buffer).
+			cloned, cerr := cloneAnyenc(v)
+			if cerr != nil {
+				return cerr
+			}
+			snapshotRows = append(snapshotRows, cloned)
+			snapshotIds = append(snapshotIds, id)
+			yield(id, v)
+		}
+		return it.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.IncludeTotal {
+		// Run a separate Count(filter) outside the snapshot fence (engine.mu
+		// already released). Slightly stale relative to events that fired
+		// after we released, but documented as snapshot-only semantics.
+		n, cerr := q.countWithFilter(ctx, combined)
+		if cerr != nil {
+			_ = sub.Close()
+			return nil, cerr
+		}
+		totalCount = n
+	}
+
+	// Initial = first limit rows (excluding the sentinel). When limit==0
+	// (unbounded), all rows are visible.
+	var initial []*anyenc.Value
+	if q.limit > 0 && len(snapshotRows) > int(q.limit) {
+		initial = snapshotRows[:q.limit]
+	} else {
+		initial = snapshotRows
+	}
+	_ = snapshotIds // currently unused, but kept for symmetry / future debugging hooks
+
+	return &space.QueryResult{Initial: initial, Total: totalCount, Sub: sub}, nil
+}
+
+// combineWithTombstoneSkip returns the user filter ANDed with a
+// `_deletedAt missing` clause. The engine's live-path filter eval
+// must reject tombstoned post-states the same way the snapshot-time
+// filter does — pushing the skip into the filter keeps the two paths
+// in lock-step.
+func combineWithTombstoneSkip(userFilter query.Filter) (query.Filter, error) {
+	skip, err := query.ParseCondition(map[string]any{
+		crdt.DeletedAtField: map[string]any{"$exists": false},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("subscribe: build tombstone-skip filter: %w", err)
+	}
+	if userFilter == nil {
+		return skip, nil
+	}
+	return query.And{userFilter, skip}, nil
+}
+
+// countWithFilter runs Count against the resolved collection using the
+// given parsed filter. Used by Snapshot/Subscribe to populate
+// QueryResult.Total when QueryOpts.IncludeTotal is set.
+func (q *queryImpl) countWithFilter(ctx context.Context, f query.Filter) (int, error) {
+	coll, err := q.collection(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if coll == nil {
+		return 0, nil
+	}
+	return coll.Find(f).Count(ctx)
 }
 
 // Count returns the match count.

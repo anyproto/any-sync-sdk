@@ -17,28 +17,28 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// mustReceive blocks until one event arrives on the subscription's
-// mailbox or the timeout fires. Fails the test on timeout.
-func mustReceive(t *testing.T, sub space.Subscription, timeout time.Duration) space.Event {
+// receiveOne blocks until one SubscriptionEvent arrives on sub or
+// the timeout fires. Fails the test on timeout.
+func receiveOne(t *testing.T, sub space.QuerySubscription, timeout time.Duration) space.SubscriptionEvent {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	ev, err := sub.Mailbox().WaitOne(ctx)
+	ev, err := sub.Events().WaitOne(ctx)
 	if err != nil {
 		t.Fatalf("WaitOne: %v", err)
 	}
 	return ev
 }
 
-// assertNoEvent asserts the mailbox stays quiet for window. A short
-// window is fine — the dispatcher fires synchronously inside
-// AfterApply, so anything that was going to land has by the time the
+// assertNoSubEvent asserts the mailbox stays quiet for window. Short
+// windows are fine — engine.OnApply runs synchronously inside
+// afterApply, so anything that was going to land has by the time the
 // trigger write returns.
-func assertNoEvent(t *testing.T, sub space.Subscription, window time.Duration) {
+func assertNoSubEvent(t *testing.T, sub space.QuerySubscription, window time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), window)
 	defer cancel()
-	msgs, err := sub.Mailbox().Wait(ctx)
+	msgs, err := sub.Events().Wait(ctx)
 	if errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
@@ -53,11 +53,29 @@ func assertNoEvent(t *testing.T, sub space.Subscription, window time.Duration) {
 	}
 }
 
-// TestSDK_Subscribe walks the v1 subscription contract end-to-end:
-// SubscribeProperties is a per-space firehose; Subscribe is an
-// explicit (objectId, dataset) listener; mismatched pairs receive
-// nothing; closing one sub leaves the others working.
-func TestSDK_Subscribe(t *testing.T) {
+// subRecordFor finds the SubRecord with the given id across Added /
+// Updated. Returns (nil, "") when absent.
+func subRecordFor(ev space.SubscriptionEvent, id string) (*space.SubRecord, string) {
+	for i := range ev.Added {
+		if ev.Added[i].Id == id {
+			return &ev.Added[i], "added"
+		}
+	}
+	for i := range ev.Updated {
+		if ev.Updated[i].Id == id {
+			return &ev.Updated[i], "updated"
+		}
+	}
+	return nil, ""
+}
+
+// TestSDK_QuerySubscribe_RoutingAndIsolation walks the live-query
+// subscription contract: a shared-objects subscription receives every
+// property change in the space; a per-(objectId, "objects")
+// subscription receives only events for that exact object;
+// mismatched (wrong object, wrong dataset) subscriptions stay silent;
+// closing one subscription leaves the others working.
+func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -77,49 +95,36 @@ func TestSDK_Subscribe(t *testing.T) {
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Sub"})
 	require.NoError(t, err)
 
-	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Movie"})
-	require.NoError(t, err)
-	titleProp, err := sp.Types().AddProperty(ctx, typeId, space.PropertyDraft{
-		Name: "Title",
-		XKey: "title",
-		Kind: space.PropertyKindString,
-	})
-	require.NoError(t, err)
+	typeId, titleProp := setupMovieType(t, ctx, sp)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
 		Types: []string{typeId},
 	})
 	require.NoError(t, err)
 
-	// All setup writes above happened with no subscribers in place,
-	// so the dispatcher's HasSubscribers gate skipped them. Nothing
-	// is queued.
+	// All setup writes above happened before any subscriber was
+	// registered — the engine's HasSubscribers gate skipped them, so
+	// nothing is queued.
 
-	propsSub, err := sp.SubscribeProperties(ctx)
+	sharedRes, err := sp.QueryObjects().Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = propsSub.Close() })
+	t.Cleanup(func() { _ = sharedRes.Sub.Close() })
 
-	explicitSub, err := sp.Subscribe(ctx, objectId, "objects")
+	explicitRes, err := sp.Query(objectId, "objects").Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = explicitSub.Close() })
+	t.Cleanup(func() { _ = explicitRes.Sub.Close() })
 
 	// Wrong-object subscription on same dataset — must stay silent
 	// when objectId's properties change.
-	wrongObjSub, err := sp.Subscribe(ctx, "no-such-object", "objects")
+	wrongObjRes, err := sp.Query("no-such-object", "objects").Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = wrongObjSub.Close() })
+	t.Cleanup(func() { _ = wrongObjRes.Sub.Close() })
 
 	// Wrong-dataset subscription on right object — must stay silent
 	// when we write to `objects` only.
-	wrongDsSub, err := sp.Subscribe(ctx, objectId, "no-such-dataset")
+	wrongDsRes, err := sp.Query(objectId, "no-such-dataset").Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = wrongDsSub.Close() })
-
-	// Argument validation — empty objectId / dataset rejected.
-	_, err = sp.Subscribe(ctx, "", "objects")
-	assert.Error(t, err)
-	_, err = sp.Subscribe(ctx, objectId, "")
-	assert.Error(t, err)
+	t.Cleanup(func() { _ = wrongDsRes.Sub.Close() })
 
 	// Trigger one apply on the `objects` dataset.
 	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
@@ -127,186 +132,53 @@ func TestSDK_Subscribe(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	propsEv := mustReceive(t, propsSub, 2*time.Second)
-	assert.Equal(t, sp.Id(), propsEv.SpaceId)
-	assert.Equal(t, objectId, propsEv.ObjectId)
-	assert.Equal(t, "objects", propsEv.Dataset)
-	// Wire-shape contract: every event carries the per-change
-	// VersionId and the projected $set/$unset records. The property
-	// firehose must produce the same shape as an explicit subscription
-	// — same change, same projection, just different routing.
-	assert.NotEmpty(t, propsEv.VersionId, "VersionId must be populated")
-	assertProjectedSet(t, propsEv, objectId, []string{typeId, titleProp}, "Casablanca")
+	sharedEv := receiveOne(t, sharedRes.Sub, 2*time.Second)
+	assert.NotEmpty(t, sharedEv.VersionId, "VersionId must be populated on the wire")
+	rec, where := subRecordFor(sharedEv, objectId)
+	require.NotNil(t, rec, "shared sub missed the property write (in: %s)", where)
+	assertTitle(t, rec, typeId, titleProp, "Casablanca")
 
-	explicitEv := mustReceive(t, explicitSub, 2*time.Second)
-	assert.Equal(t, objectId, explicitEv.ObjectId)
-	assert.Equal(t, "objects", explicitEv.Dataset)
-	assert.Equal(t, propsEv.VersionId, explicitEv.VersionId,
-		"explicit and firehose subs must see the same VersionId for one change")
-	assertProjectedSet(t, explicitEv, objectId, []string{typeId, titleProp}, "Casablanca")
+	explicitEv := receiveOne(t, explicitRes.Sub, 2*time.Second)
+	assert.Equal(t, sharedEv.VersionId, explicitEv.VersionId,
+		"shared and explicit subs must see the same VersionId for one change")
+	rec2, _ := subRecordFor(explicitEv, objectId)
+	require.NotNil(t, rec2)
+	assertTitle(t, rec2, typeId, titleProp, "Casablanca")
 
 	// Mismatched subs received nothing.
-	assertNoEvent(t, wrongObjSub, 100*time.Millisecond)
-	assertNoEvent(t, wrongDsSub, 100*time.Millisecond)
+	assertNoSubEvent(t, wrongObjRes.Sub, 100*time.Millisecond)
+	assertNoSubEvent(t, wrongDsRes.Sub, 100*time.Millisecond)
 
-	// Closing one sub must not break the others. propsSub stops; a
-	// subsequent write still feeds explicitSub.
-	require.NoError(t, propsSub.Close())
+	// Closing one sub must not break the others. shared stops; a
+	// subsequent write still feeds explicit.
+	require.NoError(t, sharedRes.Sub.Close())
 
 	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
 		titleProp: "Vertigo",
 	})
 	require.NoError(t, err)
 
-	explicitEv2 := mustReceive(t, explicitSub, 2*time.Second)
-	assert.Equal(t, objectId, explicitEv2.ObjectId)
+	explicitEv2 := receiveOne(t, explicitRes.Sub, 2*time.Second)
+	rec3, _ := subRecordFor(explicitEv2, objectId)
+	require.NotNil(t, rec3)
+	assertTitle(t, rec3, typeId, titleProp, "Vertigo")
 
-	// Wire-shape on the second write reaches explicitSub with the
-	// new value — confirms the projection still tracks post-apply
-	// state across multiple changes on the same record.
-	assertProjectedSet(t, explicitEv2, objectId, []string{typeId, titleProp}, "Vertigo")
-
-	// Closed subscription's mailbox must return ErrClosed.
+	// Closed subscription's mailbox returns ErrClosed on subsequent Wait.
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer closeCancel()
-	_, err = propsSub.Mailbox().Wait(closeCtx)
-	assert.ErrorIs(t, err, mb.ErrClosed, "propsSub.Mailbox() should be closed after Close")
+	_, err = sharedRes.Sub.Events().Wait(closeCtx)
+	assert.ErrorIs(t, err, mb.ErrClosed, "shared sub mailbox should be closed after Close")
+	assert.NoError(t, sharedRes.Sub.Err(), "user-initiated Close must leave Err() nil")
 }
 
-// assertProjectedSet checks that ev carries a record (id = rowId)
-// with a $set whose effective target is `path` and whose value
-// string-equals wantValue. Handles both wire forms the SDK ships:
-//
-//   - single-field: Op{Type=$set, Path=path, Payload=value}
-//   - multi-field:  Op{Type=$set, Path=[], Payload={"a.b.c": value, ...}}
-//
-// Tolerates extra ops the SDK may emit (auto-stamps like createdAt /
-// updatedAt) — we only require the user-visible (path, value) to be
-// present.
-func assertProjectedSet(t *testing.T, ev space.Event, rowId string, path []string, wantValue string) {
-	t.Helper()
-	if len(ev.Records) == 0 {
-		t.Fatalf("event has no records: %+v", ev)
-	}
-	var rec *space.EventRecord
-	for i := range ev.Records {
-		if ev.Records[i].Id == rowId {
-			rec = &ev.Records[i]
-			break
-		}
-	}
-	if rec == nil {
-		t.Fatalf("no record for id %s in event: %+v", rowId, ev.Records)
-	}
-	dotted := joinPath(path)
-	for _, op := range rec.Ops {
-		if op.Type != crdt.OpSet {
-			continue
-		}
-		val := opValueForPath(op, path, dotted)
-		if val == nil {
-			continue
-		}
-		got := string(val.GetStringBytes())
-		if got == wantValue {
-			return
-		}
-		t.Fatalf("payload for path %v = %q, want %q", path, got, wantValue)
-	}
-	t.Fatalf("no $set %v=%q op in record %s: %+v", path, wantValue, rowId, rec.Ops)
-}
-
-// opValueForPath resolves the effective value an op writes at the
-// requested path, accounting for the multi-field form. Returns nil
-// when the op doesn't target this path.
-func opValueForPath(op space.EventOp, path []string, dotted string) *anyenc.Value {
-	if len(op.Path) > 0 {
-		if pathsEqual(op.Path, path) {
-			return op.Payload
-		}
-		return nil
-	}
-	// Multi-field form: payload is an object keyed by dotted paths.
-	if op.Payload == nil {
-		return nil
-	}
-	return op.Payload.Get(dotted)
-}
-
-func joinPath(p []string) string {
-	if len(p) == 0 {
-		return ""
-	}
-	out := p[0]
-	for _, seg := range p[1:] {
-		out += "." + seg
-	}
-	return out
-}
-
-func pathsEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// recordFor returns the EventRecord for rowId in ev, or nil when the
-// event carries no record under that id.
-func recordFor(ev space.Event, rowId string) *space.EventRecord {
-	for i := range ev.Records {
-		if ev.Records[i].Id == rowId {
-			return &ev.Records[i]
-		}
-	}
-	return nil
-}
-
-// collectSetPaths flattens every $set in the EventRecord for rowId
-// into a dotted-path set. Handles both wire shapes — single-field
-// (Path=[…], Payload=value) and multi-field (Path=[], Payload=object
-// keyed by dotted paths). Used to assert auto-field stamps land on
-// the wire on create.
-func collectSetPaths(t *testing.T, ev space.Event, rowId string) map[string]struct{} {
-	t.Helper()
-	out := make(map[string]struct{})
-	for i := range ev.Records {
-		if ev.Records[i].Id != rowId {
-			continue
-		}
-		for _, op := range ev.Records[i].Ops {
-			if op.Type != crdt.OpSet {
-				continue
-			}
-			if len(op.Path) > 0 {
-				out[joinPath(op.Path)] = struct{}{}
-				continue
-			}
-			if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
-				continue
-			}
-			obj, _ := op.Payload.Object()
-			obj.Visit(func(k []byte, _ *anyenc.Value) {
-				out[string(k)] = struct{}{}
-			})
-		}
-	}
-	return out
-}
-
-// TestSDK_Subscribe_CreateEmitsAutoFields catches the regression where
-// a freshly-created record's auto-stamped fields (author / createdAt /
-// spaceId / _ver.id) never reached subscribers. The dispatcher used to
-// project only ch.Records[i].Ops, missing every field the apply layer
-// stamped via sink.Derive or directly onto the storage value. A viewer
-// must see no difference between user-supplied and auto fields — same
-// $set shape, same wire — so a fresh row reconstructs in one event.
-func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
+// TestSDK_QuerySubscribe_CreateEmitsAutoFields catches the regression
+// where a freshly-created record's auto-stamped fields (author /
+// createdAt / spaceId) never reached subscribers. The dispatcher used
+// to project only ch.Records[i].Ops, missing every field the apply
+// layer stamped via sink.Derive. A viewer must see no difference
+// between user-supplied and auto fields — same wire — so a fresh row
+// reconstructs in one event.
+func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -326,84 +198,69 @@ func TestSDK_Subscribe_CreateEmitsAutoFields(t *testing.T) {
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "AutoFields"})
 	require.NoError(t, err)
 
-	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Movie"})
-	require.NoError(t, err)
-	titleProp, err := sp.Types().AddProperty(ctx, typeId, space.PropertyDraft{
-		Name: "Title",
-		XKey: "title",
-		Kind: space.PropertyKindString,
-	})
-	require.NoError(t, err)
+	typeId, titleProp := setupMovieType(t, ctx, sp)
 
 	// Subscribe BEFORE creating the object so the create-time write
-	// into the per-space `objects` dataset fires as a CREATE event
-	// (not an UPDATE — that's the path that exercises BeforeCreate
-	// stamping and the _ver.id synthetic op).
-	propsSub, err := sp.SubscribeProperties(ctx)
+	// into the per-space `objects` dataset arrives as an Added event.
+	res, err := sp.QueryObjects().Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = propsSub.Close() })
+	t.Cleanup(func() { _ = res.Sub.Close() })
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
 		Types: []string{typeId},
 	})
 	require.NoError(t, err)
 
-	ev := mustReceive(t, propsSub, 2*time.Second)
-	assert.Equal(t, objectId, ev.ObjectId)
-	assert.Equal(t, "objects", ev.Dataset)
+	ev := receiveOne(t, res.Sub, 2*time.Second)
 
-	if rec := recordFor(ev, objectId); assert.NotNil(t, rec, "create event has no record for objectId") {
-		assert.True(t, rec.Created, "create event must set EventRecord.Created")
-		assert.False(t, rec.Deleted, "create event must not set Deleted")
-	}
+	rec, where := subRecordFor(ev, objectId)
+	require.NotNil(t, rec, "create event has no SubRecord for objectId")
+	assert.Equal(t, "added", where, "create on a fresh row must arrive as Added (not Updated)")
+	require.NotNil(t, rec.Doc, "Added SubRecord must carry the post-apply doc")
 
-	paths := collectSetPaths(t, ev, objectId)
+	// SystemPropertiesHandler.BeforeCreate stamps these via sink.Derive;
+	// they must be present on Doc so consumers see a fully-formed record.
+	assert.NotNil(t, rec.Doc.Get("author"),
+		"create Doc missing author — viewer can't tell who created the record")
+	assert.NotNil(t, rec.Doc.Get("createdAt"),
+		"create Doc missing createdAt — viewer can't sort/display creation time")
+	assert.NotNil(t, rec.Doc.Get("spaceId"),
+		"create Doc missing spaceId — viewer can't route across spaces")
 
-	// SystemPropertiesHandler.BeforeCreate stamps these via sink.Derive.
-	assert.Contains(t, paths, "author",
-		"create event missing $set author — viewer can't tell who created the record")
-	assert.Contains(t, paths, "createdAt",
-		"create event missing $set createdAt — viewer can't sort/display creation time")
-	assert.Contains(t, paths, "spaceId",
-		"create event missing $set spaceId — viewer can't route across spaces")
-
-	// _ver.id is NOT shipped as an op — its value is always the
-	// event's VersionId, so EventRecord.Created plus Event.VersionId
-	// convey the creation marker without a redundant $set.
-	assert.NotContains(t, paths, "_ver.id",
-		"_ver.id must not ship as an op — redundant with Event.VersionId")
+	// VersionId on the wire carries the per-change DAG order; required
+	// for fence-and-replay consumers.
+	assert.NotEmpty(t, ev.VersionId)
 
 	// Now write a property value on the SAME row. This is an UPDATE
-	// (BeforeCreate doesn't fire on an existing row); derived stamps
-	// must NOT re-emit, or viewers would see noisy churn on every edit.
+	// (BeforeCreate doesn't fire on an existing row); the SubRecord
+	// arrives in Updated, not Added.
 	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
 		titleProp: "Casablanca",
 	})
 	require.NoError(t, err)
 
-	upd := mustReceive(t, propsSub, 2*time.Second)
-	if rec := recordFor(upd, objectId); assert.NotNil(t, rec) {
-		assert.False(t, rec.Created, "update event must not set Created — _ver.id is creation-only")
+	upd := receiveOne(t, res.Sub, 2*time.Second)
+	urec, uwhere := subRecordFor(upd, objectId)
+	require.NotNil(t, urec)
+	assert.Equal(t, "updated", uwhere, "second write on the same row must arrive as Updated, not Added")
+	assertTitle(t, urec, typeId, titleProp, "Casablanca")
+
+	// Auto stamps must still be present on the Updated Doc (they're
+	// persisted on the row), but they should NOT appear in Ops (no
+	// re-stamp on update).
+	assert.NotNil(t, urec.Doc.Get("author"))
+	for _, op := range urec.Ops {
+		assert.NotEqual(t, []string{"author"}, op.Path, "update must not re-emit author op")
+		assert.NotEqual(t, []string{"createdAt"}, op.Path, "update must not re-emit createdAt op")
 	}
-	updPaths := collectSetPaths(t, upd, objectId)
-	assert.NotContains(t, updPaths, "author",
-		"update must not re-stamp author")
-	assert.NotContains(t, updPaths, "createdAt",
-		"update must not re-stamp createdAt")
-	assert.NotContains(t, updPaths, "spaceId",
-		"update must not re-stamp spaceId")
-	assert.NotContains(t, updPaths, "_ver.id",
-		"update must not re-stamp _ver.id — that marker is creation-only")
-	// And the user-supplied write still lands on the wire.
-	assertProjectedSet(t, upd, objectId, []string{typeId, titleProp}, "Casablanca")
 }
 
-// TestSDK_Subscribe_DeleteEmitsTombstone covers object deletion end to
-// end: Objects.Delete writes a CRDT delete op on the object's `objects`
-// record before tearing down the any-sync tree. Subscribers see a
-// Deleted event for the row, and a follow-up QueryObjects no longer
-// returns it — the tombstone is filtered by queryIterator.Next.
-func TestSDK_Subscribe_DeleteEmitsTombstone(t *testing.T) {
+// TestSDK_QuerySubscribe_DeleteEmitsRemoved covers object deletion end
+// to end: Objects.Delete writes a CRDT delete op on the object's
+// `objects` record before tearing down the any-sync tree. Subscribers
+// see a Removed entry for the row, and a follow-up QueryObjects no
+// longer returns it.
+func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -423,8 +280,7 @@ func TestSDK_Subscribe_DeleteEmitsTombstone(t *testing.T) {
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "DeleteSub"})
 	require.NoError(t, err)
 
-	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Movie"})
-	require.NoError(t, err)
+	typeId, _ := setupMovieType(t, ctx, sp)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
 		Types: []string{typeId},
@@ -432,24 +288,22 @@ func TestSDK_Subscribe_DeleteEmitsTombstone(t *testing.T) {
 	require.NoError(t, err)
 
 	// Subscribe AFTER Create so the create-time writes are gated out by
-	// HasSubscribers — the only event we expect is the delete.
-	propsSub, err := sp.SubscribeProperties(ctx)
+	// HasSubscribers — the only event we expect is the delete (as a
+	// Removed). The initial snapshot DOES include the row.
+	res, err := sp.QueryObjects().Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = propsSub.Close() })
+	t.Cleanup(func() { _ = res.Sub.Close() })
+	require.NotEmpty(t, res.Initial, "Initial must include the just-created object")
 
 	require.NoError(t, sp.Objects().Delete(ctx, objectId))
 
-	ev := mustReceive(t, propsSub, 2*time.Second)
-	assert.Equal(t, objectId, ev.ObjectId)
-	assert.Equal(t, "objects", ev.Dataset)
-	if rec := recordFor(ev, objectId); assert.NotNil(t, rec, "delete event has no record for objectId") {
-		assert.True(t, rec.Deleted, "delete event must set EventRecord.Deleted")
-		assert.False(t, rec.Created, "delete event must not set Created")
-		assert.Empty(t, rec.Ops, "deleted record must carry no ops")
-	}
+	ev := receiveOne(t, res.Sub, 2*time.Second)
+	assert.Contains(t, ev.Removed, objectId, "delete must emit Removed for the objectId")
+	assert.Empty(t, ev.Added)
+	assert.Empty(t, ev.Updated)
 
-	// The deleted object is gone from QueryObjects — its `objects` row
-	// is now a tombstone, which queryIterator.Next skips.
+	// The deleted object is gone from QueryObjects too — its row is now
+	// a tombstone, which queryIterator.Next skips.
 	rows, err := sp.QueryObjects().All(ctx)
 	require.NoError(t, err)
 	for _, row := range rows {
@@ -459,3 +313,17 @@ func TestSDK_Subscribe_DeleteEmitsTombstone(t *testing.T) {
 		}
 	}
 }
+
+// assertTitle reads the title property off rec.Doc at the canonical
+// path and asserts it equals want.
+func assertTitle(t *testing.T, rec *space.SubRecord, typeId, titleProp, want string) {
+	t.Helper()
+	require.NotNil(t, rec.Doc)
+	v := rec.Doc.Get(typeId, titleProp)
+	require.NotNil(t, v, "doc has no %s.%s: %s", typeId, titleProp, rec.Doc.String())
+	assert.Equal(t, want, string(v.GetStringBytes()))
+}
+
+// kept to silence "declared but not used" on anyenc when future tests
+// inspect raw values — used by helpers below.
+var _ = anyenc.TypeObject

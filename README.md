@@ -108,8 +108,8 @@ Wired and tested:
 - CRDT apply (`$set`/`$unset`/`$inc`/`$incGated`/`$addToSet`/`$pull`, sticky tombstones, per-field `_ver` gating, strict-skip surfaced as `ApplyResult.Rejections`)
 - Auto-stamping of `id`, `author`, `createdAt`, `spaceId` at row root, sourced from the tree's immutable header
 - Type catalog (built-in + caller-registered) with registered-type query API
-- Per-object query (`Space.Query`) and per-space cross-object query (`Space.QueryObjects`)
-- Per-`(objectId, dataset)` and per-space property subscriptions (`Space.Subscribe`, `Space.SubscribeProperties`) — events projected to `$set`/`$unset` with `VersionId`
+- Per-object query (`Space.Query`) and per-space cross-object query (`Space.QueryObjects`) with chained `Filter`/`Sort`/`Limit`/`Offset` and terminals `Iter`/`All`/`One`/`Count`/`Snapshot`/`Subscribe`
+- Live windowed subscriptions via `Query.Subscribe(ctx, opts)` — same builder, returns `*QueryResult{Initial, Total, Sub}`. `Sub.Events()` carries `SubscriptionEvent{VersionId, Added, Updated, Removed}` with the full post-apply doc + projected `$set`/`$unset` ops per record. `limit+1` sentinel absorbs single-arrival shifts without re-querying; overflow closes with `ErrSubscriptionOverflow`, drift past `DriftBudgetPercent` (default 30%) closes with `ErrSubscriptionDrifted` — resubscribe to recover
 - Local writes + inbound sync replay through one apply primitive
 - Cold restore, watermarked replay (`MaxAddSeq`), parked-change drainer for missing schema dependencies
 - Tech space (per-account derived index of all spaces); spaces stay resident and are eager-loaded on boot
@@ -119,7 +119,7 @@ Wired and tested:
 
 Not wired yet:
 - `Space.SyncStatus` — interface is a stub (`Overall`, `Object`, `Peers`, `Subscribe`)
-- `Service.Subscribe` (space-list events; per-space `Space.Subscribe` is wired)
+- `Service.Subscribe` (space-list events)
 - `TypesAPI.Delete` / `RemoveProperty` / `UpdatePropertyMeta`
 - `PropertiesAPI.SetAccount` / `SetDevice` / `AttachType` / `DetachType`
 - Versioning APIs / change history (`internal/versioning` is doc-only)

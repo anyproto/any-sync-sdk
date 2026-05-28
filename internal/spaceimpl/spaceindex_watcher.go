@@ -10,9 +10,9 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -22,30 +22,30 @@ import (
 // row, via the space.Indexer seam. One watcher per loaded spaceId.
 //
 // Lifecycle:
-//   - Subscribe to (spaceIndexObjectId, properties.Dataset) on the
-//     per-space dispatcher.
+//   - Register an unbounded sub on (spaceIndexObjectId,
+//     properties.Dataset) via the per-space subscribe engine.
 //   - On start, do a one-shot read of the current projected row and
 //     forward it to indexer.OnSpaceMetadataUpdated. Closes the
-//     cold-start gap: subscriptions deliver events going forward,
-//     but state that landed before we subscribed (e.g. a tree pulled
-//     via background sync before the SDK booted this watcher) needs
-//     this reconciliation to propagate.
-//   - Loop until stop(): read events from the mailbox, decode the
-//     four fields off the post-apply row, forward to the indexer.
+//     cold-start gap: live updates deliver events going forward, but
+//     state that landed before we subscribed (e.g. a tree pulled via
+//     background sync before the SDK booted this watcher) needs this
+//     reconciliation to propagate.
+//   - Loop until stop(): read events from the sub's mailbox, decode
+//     the four fields off the post-apply row, forward to the indexer.
 //
-// Drop tolerance: the per-subscription mailbox is bounded. A dropped
-// event delays mirror propagation until the next change re-fires,
-// which is acceptable — the indexer call is a pure function of the
-// converged state, so convergence is preserved.
+// Overflow tolerance: the per-sub mailbox is bounded. On overflow the
+// engine closes the sub with ErrSubscriptionOverflow; the watcher
+// returns from the loop. A higher layer can resubscribe; for v1 we
+// log-and-exit since the watcher is best-effort.
 type spaceIndexWatcher struct {
-	store       *spaceobjects.Store
-	indexer     space.Indexer
-	spaceId     string
-	objectId    string
-	sub         space.Subscription
-	stopCh      chan struct{}
-	stopOnce    sync.Once
-	wg          sync.WaitGroup
+	store    *spaceobjects.Store
+	indexer  space.Indexer
+	spaceId  string
+	objectId string
+	sub      *subscribe.Sub
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // newSpaceIndexWatcher constructs the watcher, subscribes, fires the
@@ -53,12 +53,23 @@ type spaceIndexWatcher struct {
 // ready for watcherRegistry.register; the caller still owns the
 // stop() lifecycle.
 func newSpaceIndexWatcher(ctx context.Context, store *spaceobjects.Store, indexer space.Indexer, spaceId, spaceIndexObjectId string) *spaceIndexWatcher {
+	// Register a sub scoped to this object's `properties` dataset.
+	// Empty filter / sort / limit — the watcher doesn't care about
+	// per-event content, only that something changed; it always
+	// re-reads the projected row.
+	sub, _ := store.SubEngine().Subscribe(subscribe.SubConfig{
+		Scope: subscribe.Scope{
+			Shared:   false,
+			ObjectId: spaceIndexObjectId,
+			Dataset:  properties.Dataset,
+		},
+	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
 	w := &spaceIndexWatcher{
 		store:    store,
 		indexer:  indexer,
 		spaceId:  spaceId,
 		objectId: spaceIndexObjectId,
-		sub:      store.Dispatcher().Subscribe(spaceIndexObjectId, properties.Dataset, 0),
+		sub:      sub,
 		stopCh:   make(chan struct{}),
 	}
 	// Initial reconcile — fire-and-forget. Any read failure is swallowed
@@ -71,10 +82,9 @@ func newSpaceIndexWatcher(ctx context.Context, store *spaceobjects.Store, indexe
 
 func (w *spaceIndexWatcher) stop() {
 	w.stopOnce.Do(func() {
-		// Closing the subscription unblocks the mailbox Wait with
-		// mb.ErrClosed, which exits the loop. stopCh is the secondary
-		// signal for the reconcile pass.
-		_ = w.sub.Close()
+		if w.sub != nil {
+			_ = w.sub.Close()
+		}
 		close(w.stopCh)
 	})
 	w.wg.Wait()
@@ -82,7 +92,10 @@ func (w *spaceIndexWatcher) stop() {
 
 func (w *spaceIndexWatcher) loop() {
 	defer w.wg.Done()
-	mb := w.sub.Mailbox()
+	if w.sub == nil {
+		return
+	}
+	mb := w.sub.Events()
 	for {
 		select {
 		case <-w.stopCh:
@@ -91,7 +104,7 @@ func (w *spaceIndexWatcher) loop() {
 		}
 		events, err := mb.Wait(context.Background())
 		if err != nil {
-			return // ErrClosed on stop
+			return // ErrClosed on stop / overflow / drift
 		}
 		// Coalesce — when many events arrive between Wait calls the
 		// mirror state is whatever the latest row says, so a single
@@ -166,9 +179,3 @@ func getString(v *anyenc.Value, key string) string {
 // Compile-time check: spaceIndexWatcher satisfies stopper so it can
 // register with watcherRegistry alongside memberWatcher.
 var _ stopper = (*spaceIndexWatcher)(nil)
-
-// Sanity check that the eventbus contract we depend on remains
-// internal — the consumer code uses space.Subscription, but it is a
-// type alias for eventbus.Subscription. Re-exporting the alias here
-// keeps a single import path for the watcher.
-var _ space.Subscription = (eventbus.Subscription)(nil)

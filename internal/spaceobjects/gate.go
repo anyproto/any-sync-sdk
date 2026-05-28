@@ -62,10 +62,9 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 // afterApplyFor is the post-apply hook. Two independent fan-outs
 // run off every successful change:
 //
-//  1. dispatcher.Dispatch — gated by HasSubscribers (single atomic
-//     load), so the cold-restore path stays free when nobody is
-//     listening. Routes to per-(object, dataset) and properties-
-//     firehose subscribers.
+//  1. engine.OnApply — gated by HasSubscribers (single atomic load),
+//     so the cold-restore path stays free when nobody is listening.
+//     Routes to windowed Query.Subscribe consumers.
 //
 //  2. drainer.Notify — only fires for typetype.PropertyHandler
 //     writes (those land shortIds and may unblock parked changes).
@@ -76,20 +75,21 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		if ch == nil {
 			return
 		}
-		// Resolve record ids once — both the dispatcher (for the
+		// Resolve record ids once — both the event build (for the
 		// $set/$unset projection) and the drainer (for shortId-keyed
 		// wakeups) want them. Resolution can fail on malformed input;
 		// when it does we still feed the drainer a generic wakeup to
 		// avoid stuck parked changes.
 		ids, idsErr := crdt.ResolveRecordIds(*ch)
 
-		if s.dispatcher != nil && s.dispatcher.HasSubscribers() {
+		if s.engine != nil && s.engine.HasSubscribers() {
 			rowIds, postValue := s.postValueFor(ctx, obj, ch, ids)
 			var derivedOps [][]crdt.Op
 			if res != nil {
 				derivedOps = res.DerivedOps
 			}
-			s.dispatcher.Dispatch(ch, rowIds, derivedOps, postValue)
+			ev := eventbus.BuildEvent(ch, rowIds, derivedOps, postValue)
+			s.engine.OnApply(ev, postValue)
 		}
 
 		if ch.Dataset != typetype.DatasetPropertyDefs {

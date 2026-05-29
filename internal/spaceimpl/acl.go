@@ -283,13 +283,13 @@ func newReadKeyChange() (list.ReadKeyChangePayload, error) {
 	return list.ReadKeyChangePayload{MetadataKey: mdKey, ReadKey: readKey}, nil
 }
 
-// decodeIdentity parses the SDK-facing identity string (libp2p PeerId
-// form, matching Account.Id()) into a crypto.PubKey.
+// decodeIdentity parses the SDK-facing identity string (StrKey account
+// address form, matching Account.Id()) into a crypto.PubKey.
 func decodeIdentity(s string) (crypto.PubKey, error) {
 	if s == "" {
 		return nil, errors.New("acl: identity empty")
 	}
-	pk, err := crypto.DecodePeerId(s)
+	pk, err := crypto.DecodeAccountAddress(s)
 	if err != nil {
 		return nil, fmt.Errorf("acl: decode identity %q: %w", s, err)
 	}

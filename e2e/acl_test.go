@@ -114,22 +114,22 @@ func TestSDK_ACL_OwnerSurface(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, reqs)
 
-	// Get(unknown) returns ErrNotFound. Synthesise a peer-id from a
-	// freshly generated key so the address parses correctly but the
+	// Get(unknown) returns ErrNotFound. Synthesise an account address from
+	// a freshly generated key so the address parses correctly but the
 	// identity isn't a member.
-	otherId := newRandomPeerId(t)
+	otherId := newRandomIdentity(t)
 	_, err = sp.Members().Get(ctx, otherId)
 	assert.ErrorIs(t, err, space.ErrNotFound)
 }
 
-// newRandomPeerId returns a libp2p-style PeerId derived from a fresh
+// newRandomIdentity returns a strkey account address derived from a fresh
 // ed25519 key. Used by tests that need a syntactically valid but
 // non-member identity.
-func newRandomPeerId(t *testing.T) string {
+func newRandomIdentity(t *testing.T) string {
 	t.Helper()
 	priv, _, err := anySyncCryptoGenerate()
 	require.NoError(t, err)
-	return priv.GetPublic().PeerId()
+	return priv.GetPublic().Account()
 }
 
 // TestE2E_OwnerInviteJoinerAccept walks the full RequestToJoin flow

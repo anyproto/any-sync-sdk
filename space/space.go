@@ -113,22 +113,8 @@ type Space interface {
 	// SpaceIndexObjectId returns the deterministic id of the in-space
 	// `spaceIndex` derived object. Stable across peers and across
 	// SDK reboots — same id on every member's device. Useful for
-	// wrappers that want to attach a Subscribe stream on the
+	// wrappers that want to attach a Query.Subscribe stream on the
 	// spaceIndex's `objects` dataset for live UI updates.
 	SpaceIndexObjectId() string
 
-	// Subscribe registers an explicit (objectId, dataset) listener.
-	// The returned Subscription delivers an Event per matching
-	// successful apply; Close releases the subscription.
-	Subscribe(ctx context.Context, objectId, dataset string) (Subscription, error)
-
-	// SubscribeProperties registers a firehose for property-value
-	// changes across every object in this space (the per-space
-	// `objects` dataset). Useful for UIs that render any object's
-	// property panel without prior knowledge of which objects exist.
-	//
-	// v1 is intentionally unfiltered — finer subscriptions (per
-	// object, per property kind) layer on top once a concrete UI
-	// need lands.
-	SubscribeProperties(ctx context.Context) (Subscription, error)
 }

@@ -33,9 +33,9 @@ import (
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
@@ -115,10 +115,11 @@ type Store struct {
 	// coalesces bursts into single Drain passes. See drainer.go.
 	drainer *drainer
 
-	// dispatcher is the per-space pub/sub for CRDT apply events.
-	// afterApply forwards the change here after a HasSubscribers
-	// gate; subscriptions live until Close.
-	dispatcher *eventbus.Dispatcher
+	// engine drives windowed live queries (Query.Subscribe). The
+	// afterApply hook gates on engine.HasSubscribers so the cold-
+	// restore path stays a single atomic load when nobody is
+	// listening.
+	engine *subscribe.Engine
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -172,7 +173,7 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 		reg:          types.NewLiveRegistry(db),
 		extTypes:     extTypes,
 		dataVersions: dv,
-		dispatcher:   eventbus.New(spaceId),
+		engine:       subscribe.New(spaceId),
 	}
 	s.cache = ocache.New(
 		s.loadObject,
@@ -233,16 +234,15 @@ func (s *Store) Close() error {
 	if s.cache != nil {
 		_ = s.cache.Close()
 	}
-	if s.dispatcher != nil {
-		_ = s.dispatcher.Close()
+	if s.engine != nil {
+		_ = s.engine.Close()
 	}
 	return derr
 }
 
-// Dispatcher returns the per-space event dispatcher. Used by the
-// space layer to expose the public Subscribe / SubscribeProperties
-// surface.
-func (s *Store) Dispatcher() *eventbus.Dispatcher { return s.dispatcher }
+// SubEngine returns the per-space live-query engine. Used by the
+// space layer to back Query.Subscribe.
+func (s *Store) SubEngine() *subscribe.Engine { return s.engine }
 
 // NotifyDrainer is the public hook used by callers (e.g. the
 // space service on first-touch) to trigger an asynchronous Drain

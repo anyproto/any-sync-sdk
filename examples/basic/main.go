@@ -95,12 +95,13 @@ func run() error {
 	log.Printf("object %s", objectId)
 
 	// Subscribe before further writes — every property-value change
-	// across this space lands on the firehose.
-	sub, err := sp.SubscribeProperties(ctx)
+	// across this space lands on the windowed query (Limit=0,
+	// unbounded → firehose semantics with the new API).
+	subRes, err := sp.QueryObjects().Subscribe(ctx, space.QueryOpts{})
 	if err != nil {
 		return err
 	}
-	go pumpEvents(sub)
+	go pumpEvents(subRes.Sub)
 
 	// Account-scope override: rename the notebook just for this user
 	// across their devices. Routes through the tech space under the
@@ -251,16 +252,17 @@ func findOrCreateSpace(ctx context.Context, svc space.Service, name string) (spa
 	return svc.Create(ctx, space.CreateRequest{Name: name})
 }
 
-func pumpEvents(sub space.Subscription) {
+func pumpEvents(sub space.QuerySubscription) {
 	defer sub.Close()
 	ctx := context.Background()
 	for {
-		events, err := sub.Mailbox().Wait(ctx)
+		events, err := sub.Events().Wait(ctx)
 		if err != nil {
-			return // ErrClosed on Close
+			return // ErrClosed on Close / overflow / drift
 		}
 		for _, ev := range events {
-			log.Printf("event %s/%s versionId=%s records=%d", ev.ObjectId, ev.Dataset, ev.VersionId, len(ev.Records))
+			log.Printf("event versionId=%s added=%d updated=%d removed=%d",
+				ev.VersionId, len(ev.Added), len(ev.Updated), len(ev.Removed))
 		}
 	}
 }

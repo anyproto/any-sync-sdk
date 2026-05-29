@@ -121,6 +121,30 @@ func (q *membersQuery) One(ctx context.Context) (*anyenc.Value, error) {
 	return cloneAnyenc(doc)
 }
 
+// Snapshot returns the snapshot of matching members with optional total.
+func (q *membersQuery) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
+	initial, err := q.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	total := -1
+	if opts.IncludeTotal {
+		n, err := q.Count(ctx)
+		if err != nil {
+			return nil, err
+		}
+		total = n
+	}
+	return &space.QueryResult{Initial: initial, Total: total}, nil
+}
+
+// Subscribe is not supported for members in v1 — the members watcher
+// writes any-store rows directly without feeding the subscribe engine.
+// Adding a synthetic emission path is a follow-up.
+func (q *membersQuery) Subscribe(_ context.Context, _ space.QueryOpts) (*space.QueryResult, error) {
+	return nil, space.ErrSubscribeUnsupported
+}
+
 func (q *membersQuery) Count(ctx context.Context) (int, error) {
 	coll, err := q.api.collection(ctx)
 	if err != nil {

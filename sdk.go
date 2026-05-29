@@ -190,7 +190,8 @@ type AccountAPI interface {
 }
 
 // accountImpl exposes the account-level surface. Id() returns the
-// account's libp2p-style PeerId; UpdateMetadata persists the profile
+// account's StrKey-encoded identity (PubKey.Account()), the same form
+// used for change authorship and identityRepo; UpdateMetadata persists the profile
 // to the tech-space and pushes to identityRepo, then kicks every
 // running members watcher so the new profile becomes visible across
 // already-loaded spaces without waiting for the slow tick.
@@ -209,7 +210,7 @@ func (a *accountImpl) Id() string {
 	if keys == nil {
 		return ""
 	}
-	return keys.SignKey.GetPublic().PeerId()
+	return keys.SignKey.GetPublic().Account()
 }
 
 // Metadata reads the locally-persisted profile from the tech-space.

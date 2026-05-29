@@ -42,10 +42,9 @@ Each record stores normal anyenc fields plus `_ver` — a map of per-field/per-p
 ```
 
 ### Client Workflow
-1. `subscribe(objectId)` — receive all changes for all datasets in an object
-2. `getRecords(dataset, filter, sort, limit, offset)` — query local data
-3. `modifyRecords(edits…, opts…) → versionId` — batch of `$set`/`$unset`/`$addToSet`/`$pull`/`$inc`/`$incGated` ops; one versionId for the batch. Defaults to strict update-if-exists. Pass an `upsert` option to auto-create the target record — that's the create path
-4. `deleteRecords(ids…) → versionId` — produces sticky tombstones
+1. `Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)` — windowed live query. Returns `*QueryResult{Initial, Total, Sub}`; live deltas flow through `Sub.Events()`. Use `Snapshot(ctx, opts)` for a one-shot view with the same shape.
+2. `Modify(edits…, opts…) → ModifyResult{VersionId, ChangeId, RecordIds}` — batch of `$set`/`$unset`/`$addToSet`/`$pull`/`$inc`/`$incGated` ops; one versionId for the batch. Defaults to strict update-if-exists. Pass an `upsert` option to auto-create the target record — that's the create path.
+3. `Delete(ids…) → ModifyResult` — produces sticky tombstones.
 
 ### Future Directions (from proposal)
 - **Field scopes** — account scope vs shared scope (separate datasets, namespaces, or per-field metadata)
@@ -146,7 +145,7 @@ Every change carries optional `traceIds` — opaque caller-supplied correlation 
 - **Event format** — similar to change format, possibly the same. A full spec (proper naming, structure) is a TODO
 - **Own-write events** — future plan: session-based filtering, so the client doesn't receive its own writes in the originating session but does in other sessions. Decide later
 - **Ordering** — not a required guarantee, but probably will arrive ordered in practice
-- **Reconnection** — `subscribe() → query()` pattern (re-query on reconnect)
+- **Reconnection / recovery** — `Query.Subscribe` is the single recovery surface. On `ErrSubscriptionOverflow` (mailbox full) or `ErrSubscriptionDrifted` (held window depleted past the budget), the consumer resubscribes and the new `QueryResult.Initial` reconciles state.
 - **Caller view** — SDK may wrap events into a simplified view for the client
 
 ## Full Spec

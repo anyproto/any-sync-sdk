@@ -172,13 +172,11 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 	}
 
 	// Step 2: per-space — types and objects must converge. Event-
-	// driven via SubscribeProperties: the per-space `objects`
-	// firehose fires on every tree's "objects" dataset write
-	// (eventbus.ObjectsDataset), which covers BOTH type creates
-	// (typesAPI.Create writes any.types=["__type__"] to objects)
-	// AND instance creates / SetBase. We register the firehose
-	// before re-checking and recheck on every event arrival until
-	// the local snapshot satisfies the fixture.
+	// driven via QueryObjects().Subscribe: the per-space `objects`
+	// dataset writes fire for BOTH type creates (typesAPI.Create
+	// writes any.types=["__type__"] to objects) AND instance creates
+	// / SetBase. We register before re-checking and recheck on every
+	// event arrival until the local snapshot satisfies the fixture.
 	for _, fix := range wantSpaces {
 		fix := fix
 		t.Run("space="+fix.Name, func(t *testing.T) {
@@ -192,9 +190,9 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 				return err == nil
 			}), "device B: Spaces().Get(%s) never succeeded: %v", fix.Id, err)
 
-			propsSub, err := sp.SubscribeProperties(ctx)
-			require.NoError(t, err, "device B: SubscribeProperties(%s)", fix.Id)
-			defer propsSub.Close()
+			subRes, err := sp.QueryObjects().Subscribe(ctx, space.QueryOpts{})
+			require.NoError(t, err, "device B: QueryObjects().Subscribe(%s)", fix.Id)
+			defer subRes.Sub.Close()
 
 			var lastTypeIds []string
 			var lastObjectIds []string
@@ -238,7 +236,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 			defer cancelWait()
 
 			for !snapshotConverged() {
-				if _, err := propsSub.Mailbox().WaitOne(waitCtx); err != nil {
+				if _, err := subRes.Sub.Events().WaitOne(waitCtx); err != nil {
 					t.Fatalf("device B: space %s never converged\n  want type=%s objects=%v\n  got types=%v objects=%v\n  wait err: %v",
 						fix.Name, fix.TypeId, fix.ObjectIds, lastTypeIds, lastObjectIds, err)
 				}

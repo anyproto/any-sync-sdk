@@ -111,11 +111,13 @@ Changes are signed by the creator's key and optionally encrypted with the space 
 
 ### Object API (v1)
 ```
-object.create()
-object.derive()
-object.delete()
-object.subscribe()
-object.query(datasetName, filter, sort)
+space.Objects().Create(opts)
+space.Objects().Derive(opts)
+space.Objects().Delete(objectId)
+
+// Reads + live updates: chained query builder on the Space.
+space.Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe
+space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe
 ```
 
 ### Lifecycle
@@ -155,10 +157,10 @@ object.query(datasetName, filter, sort)
 ## Grooming Questions (open)
 
 ### Object API
-1. Object creation — minimal payload? `space.Object.Create() → objectId` or does it need a "type"/"typeList" argument even in permissionless v1?
-2. `derive()` — what are the inputs? Derived from what (keys? parent object? external seed)?
-3. `subscribe()` at object level vs dataset level — does the caller subscribe to the whole object (all datasets) or per dataset?
-4. `query(datasetName, filter, sort)` on the object level — is this the same API as `space.Query(...)`, just scoped?
+1. Object creation — minimal payload? `space.Objects().Create(opts) → objectId` or does it need a "type"/"typeList" argument even in permissionless v1?
+2. `Derive` — what are the inputs? Derived from what (keys? parent object? external seed)?
+3. ~Subscribe at object level vs dataset level?~ → resolved: subscription scope is `(objectId, dataset)` via `space.Query(objectId, dataset).Subscribe(...)`. The shared cross-object firehose uses `space.QueryObjects().Subscribe(...)`. No "whole object" subscribe — callers chain per dataset.
+4. ~`query(datasetName, filter, sort)` on the object level?~ → resolved: `space.Query(objectId, dataset)` is the only path; same builder, same terminal verbs (Iter/All/One/Count/Snapshot/Subscribe).
 5. How does a caller attach multiple "types" to an object if we're going permissionless in v1? Free-form list that can be validated later?
 
 ### Deletion & Settings Tree

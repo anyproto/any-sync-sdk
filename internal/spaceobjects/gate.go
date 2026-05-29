@@ -7,8 +7,8 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
-	"github.com/anyproto/any-sync-sdk/internal/eventbus"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
@@ -62,10 +62,9 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 // afterApplyFor is the post-apply hook. Two independent fan-outs
 // run off every successful change:
 //
-//  1. dispatcher.Dispatch — gated by HasSubscribers (single atomic
-//     load), so the cold-restore path stays free when nobody is
-//     listening. Routes to per-(object, dataset) and properties-
-//     firehose subscribers.
+//  1. engine.OnApply — gated by HasSubscribers (single atomic load),
+//     so the cold-restore path stays free when nobody is listening.
+//     Routes to windowed Query.Subscribe consumers.
 //
 //  2. drainer.Notify — only fires for typetype.PropertyHandler
 //     writes (those land shortIds and may unblock parked changes).
@@ -76,20 +75,21 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		if ch == nil {
 			return
 		}
-		// Resolve record ids once — both the dispatcher (for the
+		// Resolve record ids once — both the event build (for the
 		// $set/$unset projection) and the drainer (for shortId-keyed
 		// wakeups) want them. Resolution can fail on malformed input;
 		// when it does we still feed the drainer a generic wakeup to
 		// avoid stuck parked changes.
 		ids, idsErr := crdt.ResolveRecordIds(*ch)
 
-		if s.dispatcher != nil && s.dispatcher.HasSubscribers() {
+		if s.engine != nil && s.engine.HasSubscribers() {
 			rowIds, postValue := s.postValueFor(ctx, obj, ch, ids)
 			var derivedOps [][]crdt.Op
 			if res != nil {
 				derivedOps = res.DerivedOps
 			}
-			s.dispatcher.Dispatch(ch, rowIds, derivedOps, postValue)
+			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
+			s.engine.OnApply(ev, postValue)
 		}
 
 		if ch.Dataset != typetype.DatasetPropertyDefs {
@@ -114,7 +114,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 // we mirror that here so the wire's EventRecord.Id matches what a
 // follow-up Query on the same dataset returns. Per-object datasets
 // keep the resolved RecordChange ids untouched.
-func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.Change, ids []string) ([]string, eventbus.PostValueFn) {
+func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.Change, ids []string) ([]string, subscribe.PostValueFn) {
 	// The Object is handed in by afterApply directly — DO NOT do a
 	// cache lookup here. afterApply runs from inside the LoadFunc on
 	// a fresh joiner (synctree's afterBuild → Rebuild → replayLocked

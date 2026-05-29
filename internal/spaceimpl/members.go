@@ -302,7 +302,7 @@ func (m *membersAPI) ensureWatcher() *memberWatcher {
 func memberFromAccountState(acc list.AccountState, keys map[string]list.AclKeys) space.Member {
 	md := decodeAccountMetadata(acc.RequestMetadata, keys, acc.KeyRecordId)
 	return space.Member{
-		Identity:    acc.PubKey.PeerId(),
+		Identity:    acc.PubKey.Account(),
 		Permission:  fromAclPermissions(acc.Permissions),
 		Status:      fromAclStatus(acc.Status),
 		Name:        md.Name,
@@ -318,7 +318,7 @@ func memberFromAccountState(acc list.AccountState, keys map[string]list.AclKeys)
 func memberFromJoinRecord(r list.RequestRecord) space.Member {
 	md := decodeMetadata(r.RequestMetadata)
 	return space.Member{
-		Identity:        r.RequestIdentity.PeerId(),
+		Identity:        r.RequestIdentity.Account(),
 		Permission:      space.PermissionNone,
 		Status:          space.MemberStatusJoining,
 		Name:            md.Name,
@@ -363,7 +363,7 @@ func collectJoinRequests(acl list.AclList) []space.JoinRequestInfo {
 		md := decodeMetadata(r.RequestMetadata)
 		out = append(out, space.JoinRequestInfo{
 			RecordId:    r.RecordId,
-			Identity:    r.RequestIdentity.PeerId(),
+			Identity:    r.RequestIdentity.Account(),
 			Name:        md.Name,
 			Description: md.Description,
 			IconCID:     md.IconCID,
@@ -433,7 +433,7 @@ type memberWatcher struct {
 	snapshot map[string]space.Member
 
 	// profiles caches the latest identityRepo profile per member,
-	// keyed by identity (PeerId form). Applied as overrides when
+	// keyed by identity (strkey account-address form). Applied as overrides when
 	// rebuilding the snapshot from AclList state. Updated by the
 	// identityRepo fetcher loop. Empty fields don't override.
 	profiles map[string]space.AccountMetadata
@@ -781,55 +781,45 @@ func (w *memberWatcher) profileLoop() {
 
 // fetchProfilesOnce pulls every current member's identityRepo profile
 // in one DRPC call, verifies signatures, decodes the bytes, and
-// merges into w.profiles (keyed on PeerId). Sets profilesDirty when
-// anything changed so the next tick rebuilds the snapshot.
-//
-// Identity translation: identityRepo uses the strkey-encoded
-// "account address" form (PubKey.Account()), not the libp2p PeerId
-// our SDK exposes elsewhere. Build the request in strkey form and
-// reverse-map responses back to PeerId via a per-call lookup table.
+// merges into w.profiles (keyed on the strkey account-address identity).
+// Sets profilesDirty when anything changed so the next tick rebuilds
+// the snapshot.
 func (w *memberWatcher) fetchProfilesOnce(ctx context.Context) {
 	w.mu.Lock()
-	peerIds := make([]string, 0, len(w.snapshot))
+	identities := make([]string, 0, len(w.snapshot))
 	for id := range w.snapshot {
-		peerIds = append(peerIds, id)
+		identities = append(identities, id)
 	}
 	w.mu.Unlock()
-	w.fetchProfilesFor(ctx, peerIds)
+	w.fetchProfilesFor(ctx, identities)
 }
 
-// fetchProfilesFor pulls identityRepo profiles for the given peerIds.
+// fetchProfilesFor pulls identityRepo profiles for the given identities.
 // Same merge semantics as fetchProfilesOnce — sets profilesDirty so the
 // next tick rebuilds the snapshot. Used to flip a newly-added member's
 // fallback display name to the live profile without waiting up to
 // identityRepoPollInterval.
-func (w *memberWatcher) fetchProfilesFor(ctx context.Context, peerIds []string) {
+//
+// Member identities are already in the strkey account-address form
+// identityRepo expects, so the request needs no translation. We only
+// decode each address back to a PubKey to verify the record signature.
+func (w *memberWatcher) fetchProfilesFor(ctx context.Context, identities []string) {
 	app := w.api.s.app
 	if app == nil || app.Coordinator() == nil {
 		return
 	}
-	if len(peerIds) == 0 {
+	if len(identities) == 0 {
 		return
 	}
-	type entry struct {
-		peerId string
-		pubKey crypto.PubKey
-	}
-	byAccount := make(map[string]entry, len(peerIds))
-	identities := make([]string, 0, len(peerIds))
-	for _, peerId := range peerIds {
-		pk, err := crypto.DecodePeerId(peerId)
+	pubKeys := make(map[string]crypto.PubKey, len(identities))
+	for _, id := range identities {
+		pk, err := crypto.DecodeAccountAddress(id)
 		if err != nil {
 			continue
 		}
-		acc := pk.Account()
-		if acc == "" {
-			continue
-		}
-		byAccount[acc] = entry{peerId: peerId, pubKey: pk}
-		identities = append(identities, acc)
+		pubKeys[id] = pk
 	}
-	if len(identities) == 0 {
+	if len(pubKeys) == 0 {
 		return
 	}
 
@@ -843,17 +833,17 @@ func (w *memberWatcher) fetchProfilesFor(ctx context.Context, peerIds []string) 
 	defer w.mu.Unlock()
 	changed := false
 	for _, dwi := range res {
-		e, ok := byAccount[dwi.Identity]
+		pk, ok := pubKeys[dwi.Identity]
 		if !ok {
 			continue
 		}
-		profile, ok := decodeIdentityRepoProfile(dwi.Data, e.pubKey)
+		profile, ok := decodeIdentityRepoProfile(dwi.Data, pk)
 		if !ok {
 			continue
 		}
-		prev := w.profiles[e.peerId]
+		prev := w.profiles[dwi.Identity]
 		if prev != profile {
-			w.profiles[e.peerId] = profile
+			w.profiles[dwi.Identity] = profile
 			changed = true
 		}
 	}

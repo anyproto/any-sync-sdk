@@ -52,6 +52,57 @@ type Query interface {
 
 	// Count returns the match count without returning documents.
 	Count(ctx context.Context) (int, error)
+
+	// Snapshot is the typed terminal that returns an initial result set
+	// plus an optional one-shot total count, without subscribing for
+	// live updates. Same result shape as Subscribe — callers that only
+	// need a point-in-time view can use this instead of chaining
+	// All + Count separately.
+	Snapshot(ctx context.Context, opts QueryOpts) (*QueryResult, error)
+
+	// Subscribe returns the initial snapshot AND a live QuerySubscription
+	// whose mailbox carries incremental updates (added / updated /
+	// removed records within the windowed view). The window tracks the
+	// chained filter / sort / limit; offset applies to the initial
+	// snapshot only.
+	//
+	// Sub closes with ErrSubscriptionOverflow when its mailbox fills,
+	// or ErrSubscriptionDrifted when too many in-window records leave
+	// without replacements. Both signal "resubscribe to recover".
+	Subscribe(ctx context.Context, opts QueryOpts) (*QueryResult, error)
+}
+
+// QueryOpts is the option block for Snapshot and Subscribe. The same
+// struct serves both terminals; subscription-only fields are documented
+// and ignored by Snapshot.
+type QueryOpts struct {
+	// IncludeTotal asks for a one-shot count of filter-matching records
+	// (independent of limit/offset), returned in QueryResult.Total.
+	// Snapshot-only: no live total events are emitted by Subscribe.
+	// Callers who need a refreshed count call Snapshot again. When
+	// false, Total is -1.
+	IncludeTotal bool
+
+	// MailboxCapacity bounds the per-subscription event queue. Default
+	// 256, minimum 16. On overflow the subscription closes; Wait
+	// returns mb.ErrClosed and Err() returns ErrSubscriptionOverflow.
+	// Subscribe-only.
+	MailboxCapacity int
+
+	// DriftBudgetPercent: when more than this fraction of Limit
+	// records leave the held window without replacements, the
+	// subscription closes with ErrSubscriptionDrifted. Default 30.
+	// Ignored when Limit == 0. Subscribe-only.
+	DriftBudgetPercent int
+}
+
+// QueryResult is what Snapshot and Subscribe return. Sub is nil for
+// Snapshot, non-nil for Subscribe. Initial is always the materialised
+// point-in-time view bounded by the chained limit/offset.
+type QueryResult struct {
+	Initial []*anyenc.Value
+	Total   int               // -1 unless QueryOpts.IncludeTotal=true
+	Sub     QuerySubscription // nil for Snapshot
 }
 
 // Iterator streams query results. Usage:

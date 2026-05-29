@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
@@ -103,6 +104,16 @@ type Handler interface {
 	BeforeCreate(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
 	BeforeModify(ctx *ChangeCtx, rec *RecordChange, op *Op, sink *Sink) error
 	BeforeDelete(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
+}
+
+// IndexedHandler is implemented by Handlers that want any-store indexes
+// ensured on their dataset's collection. The Controller calls
+// EnsureIndex on each returned IndexInfo the first time it opens the
+// dataset's per-object collection (or, for shared datasets, at
+// handler registration). EnsureIndex is idempotent, so re-running on
+// subsequent process starts is safe.
+type IndexedHandler interface {
+	Indexes() []anystore.IndexInfo
 }
 
 // DefaultHandler is a no-op handler accepting every op for the given

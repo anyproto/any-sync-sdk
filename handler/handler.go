@@ -21,6 +21,8 @@ package handler
 import (
 	"errors"
 
+	anystore "github.com/anyproto/any-store/v2"
+
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 )
@@ -70,17 +72,9 @@ const (
 )
 
 // DefaultHandler is a no-op Handler embeddable as a base for handlers
-// that only need to override a subset of lifecycle hooks.
+// that only need to override a subset of lifecycle hooks. Dataset name,
+// version, and indexes live on the Dataset registration, not here.
 type DefaultHandler = crdt.DefaultHandler
-
-// IndexedHandler is an optional interface a Handler may implement to
-// declare any-store indexes for its dataset's collection. The SDK
-// calls EnsureIndex on each entry the first time the collection is
-// opened (per process). EnsureIndex is idempotent — restarts re-run
-// it harmlessly. Pair-import any-store for the IndexInfo type:
-//
-//	import anystore "github.com/anyproto/any-store/v2"
-type IndexedHandler = crdt.IndexedHandler
 
 // ErrValidation is the sentinel wrapped by handler returns when an
 // op is rejected. Programmatic discrimination uses errors.Is.
@@ -142,22 +136,30 @@ func ClassifyValidation(err error) (ValidationReason, bool) {
 // registered handler.
 var ErrUnknownDataset = crdt.ErrUnknownDataset
 
-// Registration bundles a Handler with its on-the-wire DataVersion
-// stamp. The stamp travels on every change emitted on this dataset
-// and is what peers gate against. Bump the stamp suffix when changing
-// validation in a way that must reject older writers — peers running
-// older SDK builds will park changes carrying an unknown stamp rather
-// than misapply them.
-type Registration struct {
-	// Handler implements the dataset's apply-time validation and
-	// (optionally) projection / derivation behavior.
+// Dataset is a self-contained declaration of one dataset a type owns:
+// its name, the on-wire DataVersion peers gate against, the Handler
+// implementing its apply-time behavior, and any indexes to ensure on
+// its collection. A type may own several (see Type.Datasets); names
+// must be unique across the whole catalog.
+type Dataset struct {
+	// Name is the dataset's collection name. Required, unique across
+	// the catalog; reserved names ("objects", "properties", "shortIds")
+	// are rejected.
+	Name string
+
+	// DataVersion is stamped on every change emitted on this dataset and
+	// is what peers gate against. Required (non-empty). Convention:
+	// "<name>-v<n>" — but any opaque string unique to a (handler logic,
+	// dataset) pair works. Bump the suffix when changing validation in a
+	// way that must reject older writers.
+	DataVersion string
+
+	// Handler implements the dataset's lifecycle (Init / Before*).
 	Handler Handler
 
-	// DataVersion is the string stamped on every change emitted on
-	// this handler's dataset. Required (non-empty). Convention:
-	// "<datasetName>-v<n>" — but any opaque string works as long as
-	// it is unique to a (handler logic, dataset) pair.
-	DataVersion string
+	// Indexes are ensured on the dataset's collection the first time it
+	// is opened. Optional. Idempotent across restarts.
+	Indexes []anystore.IndexInfo
 }
 
 // Type binds a typeId to the dataset handlers it owns. Built-in
@@ -165,11 +167,11 @@ type Registration struct {
 // `type` owns `properties` and `shortIds`. Callers extend the
 // catalog by supplying additional Types via config.Config.Types.
 //
-// A Type must carry something the SDK can act on: at least one
-// dataset handler (Handlers) OR at least one property declaration
-// (Properties). A property-only type (no Handlers) is valid — e.g. a
-// type whose entire footprint is values in the shared `objects`
-// namespace. A type with neither is rejected at sdk.Open.
+// A Type is a uniform declaration of what it owns: zero or more
+// Datasets and/or zero or more Properties. Any combination is valid —
+// dataset-only (e.g. an editor body tree), property-only (values in the
+// shared `objects` namespace, e.g. a nav type), both, or neither (a
+// pure declaration / tag in any.types). Only a non-empty Id is required.
 //
 // Display metadata (Name / Description / IconCID) is surfaced via
 // space.Types().List() and Get() alongside user-created types, so
@@ -193,11 +195,11 @@ type Type struct {
 	// service). Opaque to the SDK.
 	IconCID string
 
-	// Handlers is the dataset registrations this type owns. Every
-	// handler's Dataset() name must be unique across the whole
-	// catalog (built-ins + every external Type's handlers); the
-	// SDK rejects collisions at sdk.Open.
-	Handlers []Registration
+	// Datasets is the self-contained dataset registrations this type
+	// owns (zero or more). Each Dataset.Name must be unique across the
+	// whole catalog (built-ins + every external Type); the SDK rejects
+	// collisions at sdk.Open.
+	Datasets []Dataset
 
 	// Properties declares this type's property definitions for the
 	// per-space `objects` namespace keyed by Type.Id. The SDK

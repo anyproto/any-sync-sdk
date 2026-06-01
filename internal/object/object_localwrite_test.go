@@ -71,7 +71,7 @@ func (h *timestampHandler) BeforeCreate(ctx *crdt.ChangeCtx, _ *crdt.RecordChang
 	return nil
 }
 
-func newLocalWriteFixture(t *testing.T, handler crdt.Handler) (*Object, *fakeLocalWriteTree) {
+func newLocalWriteFixture(t *testing.T, dataset string, handler crdt.Handler) (*Object, *fakeLocalWriteTree) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -79,7 +79,7 @@ func newLocalWriteFixture(t *testing.T, handler crdt.Handler) (*Object, *fakeLoc
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	ctrl, err := crdt.NewController(ctx, "obj-lw", db, handler)
+	ctrl, err := crdt.NewController(ctx, "obj-lw", db, crdt.HandlerReg{Name: dataset, Handler: handler})
 	require.NoError(t, err)
 
 	priv, _, err := crypto.GenerateRandomEd25519KeyPair()
@@ -134,8 +134,8 @@ func recordOp(t *testing.T, key string, val any) crdt.Op {
 // captured AddContent timestamp and the handler-observed timestamp
 // must agree.
 func TestLocalWrite_BackfillsTimestamp(t *testing.T) {
-	h := &timestampHandler{DefaultHandler: crdt.DefaultHandler{DatasetName: "blocks"}}
-	o, tree := newLocalWriteFixture(t, h)
+	h := &timestampHandler{}
+	o, tree := newLocalWriteFixture(t, "blocks", h)
 
 	before := time.Now().Unix()
 	_, err := o.LocalWrite(context.Background(), crdt.Change{
@@ -165,8 +165,8 @@ func TestLocalWrite_BackfillsTimestamp(t *testing.T) {
 // existing ts() helper handles the branch; this is a regression guard
 // against accidentally always-overwriting.
 func TestLocalWrite_PreservesCallerTimestamp(t *testing.T) {
-	h := &timestampHandler{DefaultHandler: crdt.DefaultHandler{DatasetName: "blocks"}}
-	o, tree := newLocalWriteFixture(t, h)
+	h := &timestampHandler{}
+	o, tree := newLocalWriteFixture(t, "blocks", h)
 
 	const wanted int64 = 1234567890
 	_, err := o.LocalWrite(context.Background(), crdt.Change{

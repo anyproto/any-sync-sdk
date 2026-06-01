@@ -136,10 +136,67 @@ func (p *propertiesAPI) SetDevice(_ context.Context, _, _ string, _ map[string]a
 	return errors.New("propertiesAPI: SetDevice not implemented")
 }
 
-func (p *propertiesAPI) AttachType(_ context.Context, _, _ string) (space.ModifyResult, error) {
-	return space.ModifyResult{}, errors.New("propertiesAPI: AttachType not implemented")
+// AttachType adds typeId to the object's any.types list, declaring that
+// the object implements the type. Idempotent ($addToSet — re-attaching
+// is a no-op). This is the sanctioned way to let an object host a type's
+// properties or datasets: the write-time membership checks
+// (SystemPropertiesHandler.PreValidate for properties, Modify for
+// datasets) require the type to be present here first.
+func (p *propertiesAPI) AttachType(ctx context.Context, objectId, typeId string) (space.ModifyResult, error) {
+	if objectId == "" || typeId == "" {
+		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and typeId required")
+	}
+	obj, err := p.parent.store.Get(ctx, objectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	res, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: properties.HandlerVersion,
+		Records: []crdt.RecordChange{{
+			Id:     objectId,
+			Upsert: true,
+			Ops: []crdt.Op{{
+				Type:    crdt.OpAddToSet,
+				Path:    []string{"any", "types"},
+				Payload: arena.NewString(typeId),
+			}},
+		}},
+	})
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	return modifyResultFromWrite(res), nil
 }
 
-func (p *propertiesAPI) DetachType(_ context.Context, _, _ string) (space.ModifyResult, error) {
-	return space.ModifyResult{}, errors.New("propertiesAPI: DetachType not implemented")
+// DetachType removes typeId from the object's any.types ($pull). Values
+// in that namespace and records in the type's datasets become orphan
+// data, read-tolerant (docs/06-data-structure.md §"read tolerance").
+func (p *propertiesAPI) DetachType(ctx context.Context, objectId, typeId string) (space.ModifyResult, error) {
+	if objectId == "" || typeId == "" {
+		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and typeId required")
+	}
+	obj, err := p.parent.store.Get(ctx, objectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	res, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: properties.HandlerVersion,
+		Records: []crdt.RecordChange{{
+			Id:     objectId,
+			Upsert: true,
+			Ops: []crdt.Op{{
+				Type:    crdt.OpPull,
+				Path:    []string{"any", "types"},
+				Payload: arena.NewString(typeId),
+			}},
+		}},
+	})
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	return modifyResultFromWrite(res), nil
 }

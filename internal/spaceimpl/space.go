@@ -11,6 +11,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -156,6 +157,33 @@ func (s *spaceImpl) QueryObjects() space.Query {
 	return newSharedQuery(s)
 }
 
+// checkDatasetMembership enforces the unified ownership invariant for
+// type-owned datasets: an object may only hold a type's dataset if it
+// implements that type (any.types ∋ owner). No-op for built-in / unknown
+// datasets (DatasetOwner returns false) — property-namespace membership
+// is enforced separately by SystemPropertiesHandler.PreValidate. Local
+// write-time only; inbound apply stays read-tolerant.
+func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
+	owner, ok := s.store.DatasetOwner(dataset)
+	if !ok {
+		return nil
+	}
+	types, err := s.store.ObjectTypes(ctx, objectId)
+	if err != nil {
+		return err
+	}
+	for _, t := range types {
+		if t == owner {
+			return nil
+		}
+	}
+	return &properties.ValidationError{
+		Reason: properties.ReasonTypeNotImplemented,
+		TypeId: owner,
+		Types:  types,
+	}
+}
+
 // Modify resolves the target object via the per-space store, builds a
 // crdt.Change from the public batch, and submits it through the
 // Object's local-write path. Returns the bundled identifiers.
@@ -168,6 +196,9 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	}
 	dataVersion, err := s.store.DataVersion(batch.Dataset)
 	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := s.checkDatasetMembership(ctx, batch.ObjectId, batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
 
@@ -229,6 +260,10 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		ch, err := buildChange(b, dataVersion)
 		if err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: build: %w", i, err))
+			continue
+		}
+		if err := s.checkDatasetMembership(ctx, objectId, b.Dataset); err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
 		}
 		if err := obj.Controller().ValidateChange(ch); err != nil {

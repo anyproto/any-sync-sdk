@@ -125,7 +125,7 @@ func newBenchControllerWith(b *testing.B, cfg *anystore.Config) *Controller {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = db.Close() })
-	st, err := NewController(ctx, "obj1", db, DefaultHandler{DatasetName: testDS})
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
 	if err != nil {
 		b.Fatal(err)
 	}

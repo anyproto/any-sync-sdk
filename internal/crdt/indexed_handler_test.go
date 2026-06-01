@@ -11,27 +11,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type indexedHandler struct {
-	DefaultHandler
-	idx []anystore.IndexInfo
-}
-
-func (h indexedHandler) Indexes() []anystore.IndexInfo { return h.idx }
-
-// IndexedHandler.Indexes() is honoured the first time the dataset's
-// per-object collection materialises through an apply.
-func TestIndexedHandler_LazyEnsureOnFirstWrite(t *testing.T) {
+// HandlerReg.Indexes are ensured the first time the dataset's per-object
+// collection materialises through an apply.
+func TestHandlerReg_Indexes_LazyEnsureOnFirstWrite(t *testing.T) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	h := indexedHandler{
-		DefaultHandler: DefaultHandler{DatasetName: testDS},
-		idx: []anystore.IndexInfo{
-			{Name: "idx_status", Fields: []string{"status"}, Sparse: true},
-		},
-	}
-	c, err := NewController(ctx, "obj1", db, h)
+	c, err := NewController(ctx, "obj1", db, HandlerReg{
+		Name:    testDS,
+		Handler: DefaultHandler{},
+		Indexes: []anystore.IndexInfo{{Name: "idx_status", Fields: []string{"status"}, Sparse: true}},
+	})
 	require.NoError(t, err)
 
 	arena := &anyenc.Arena{}
@@ -44,9 +35,9 @@ func TestIndexedHandler_LazyEnsureOnFirstWrite(t *testing.T) {
 	assert.Contains(t, names, "idx_status")
 }
 
-// IndexedHandler.Indexes() runs at registerHandler time for datasets
-// pre-wired via SharedCollections, since the lazy open path is skipped.
-func TestIndexedHandler_SharedCollectionEagerEnsure(t *testing.T) {
+// HandlerReg.Indexes run at registerHandler time for datasets pre-wired
+// via SharedCollections, since the lazy open path is skipped.
+func TestHandlerReg_Indexes_SharedCollectionEagerEnsure(t *testing.T) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -54,14 +45,12 @@ func TestIndexedHandler_SharedCollectionEagerEnsure(t *testing.T) {
 	shared, err := db.Collection(ctx, "space1_shared")
 	require.NoError(t, err)
 
-	h := indexedHandler{
-		DefaultHandler: DefaultHandler{DatasetName: testDS},
-		idx: []anystore.IndexInfo{
-			{Name: "idx_kind", Fields: []string{"kind"}},
-		},
-	}
 	_, err = NewControllerWithShared(ctx, "obj1", db,
-		SharedCollections{testDS: shared}, h)
+		SharedCollections{testDS: shared}, HandlerReg{
+			Name:    testDS,
+			Handler: DefaultHandler{},
+			Indexes: []anystore.IndexInfo{{Name: "idx_kind", Fields: []string{"kind"}}},
+		})
 	require.NoError(t, err)
 
 	names := indexNames(shared.GetIndexes())

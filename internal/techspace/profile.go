@@ -80,8 +80,6 @@ func (r ProfileRecord) encodeUpsert(a *anyenc.Arena) *anyenc.Value {
 // flat strings, no immutability rules, owner-only at the ACL layer.
 type ProfileHandler struct{}
 
-func (ProfileHandler) Dataset() string              { return ProfileDataset }
-func (ProfileHandler) Version() int                 { return 1 }
 func (ProfileHandler) Init(_ context.Context) error { return nil }
 
 func (ProfileHandler) BeforeCreate(_ *crdt.ChangeCtx, rec *crdt.RecordChange, _ *crdt.Sink) error {

@@ -34,7 +34,7 @@ func newPropsController(t *testing.T, reg types.Registry) *crdt.Controller {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctrl, err := crdt.NewController(context.Background(), testObjectId, db,
-		properties.New(reg),
+		crdt.HandlerReg{Name: properties.Dataset, Handler: properties.New(reg)},
 	)
 	require.NoError(t, err)
 	return ctrl

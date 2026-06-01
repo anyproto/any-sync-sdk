@@ -25,7 +25,7 @@ func newTestController(t *testing.T) *Controller {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	st, err := NewController(ctx, "obj1", db, DefaultHandler{DatasetName: testDS})
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
 	require.NoError(t, err)
 	return st
 }
@@ -1553,7 +1553,7 @@ func TestValidation_DropsOffendingOp(t *testing.T) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	st, err := NewController(ctx, "obj1", db, rejectingHandler{DefaultHandler{DatasetName: testDS}})
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: rejectingHandler{DefaultHandler{}}})
 	require.NoError(t, err)
 
 	// Auto-create via $set is allowed by the handler.

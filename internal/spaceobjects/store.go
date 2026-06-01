@@ -105,6 +105,12 @@ type Store struct {
 	// map with each type's registered handlers.
 	extTypes     []handler.Type
 	dataVersions map[string]string
+	// datasetOwners maps an external type-owned dataset name to the
+	// typeId that owns it (N datasets → one owner). Built from extTypes.
+	// Used to enforce that an object implements a type before writing to
+	// one of its datasets. Built-in datasets (objects/properties/shortIds)
+	// are absent.
+	datasetOwners map[string]string
 
 	// cache is the per-space *object.Object cache. LoadFunc holds
 	// the per-id lock during build+ColdRestore, so peers waiting on
@@ -164,9 +170,11 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 	for k, v := range builtinDataVersions {
 		dv[k] = v
 	}
+	owners := make(map[string]string)
 	for _, t := range extTypes {
-		for _, r := range t.Handlers {
-			dv[r.Handler.Dataset()] = r.DataVersion
+		for _, d := range t.Datasets {
+			dv[d.Name] = d.DataVersion
+			owners[d.Name] = t.Id
 		}
 	}
 	s := &Store{
@@ -175,10 +183,11 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 		signKey:      signKey,
 		alloc:        alloc,
 		spaceId:      spaceId,
-		reg:          types.NewLiveRegistry(db, buildStaticSchema(extTypes)),
-		extTypes:     extTypes,
-		dataVersions: dv,
-		engine:       subscribe.New(spaceId),
+		reg:           types.NewLiveRegistry(db, buildStaticSchema(extTypes)),
+		extTypes:      extTypes,
+		dataVersions:  dv,
+		datasetOwners: owners,
+		engine:        subscribe.New(spaceId),
 	}
 	s.cache = ocache.New(
 		s.loadObject,
@@ -267,27 +276,25 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			return fmt.Errorf("spaceobjects: type[%d]: duplicate type Id %q", i, t.Id)
 		}
 		seenTypeIds[t.Id] = struct{}{}
-		if len(t.Handlers) == 0 && len(t.Properties) == 0 {
-			return fmt.Errorf("spaceobjects: type[%d] (%q): empty — a type must own at least one dataset (Handlers) or declare at least one property (Properties)", i, t.Id)
-		}
-		for j, r := range t.Handlers {
-			if r.Handler == nil {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: nil Handler", i, t.Id, j)
+		// A type may own datasets, properties, both, or neither (a pure
+		// declaration / tag). Only a non-empty Id is required.
+		for j, d := range t.Datasets {
+			if d.Handler == nil {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: nil Handler", i, t.Id, j)
 			}
-			name := r.Handler.Dataset()
-			if name == "" {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: empty Dataset()", i, t.Id, j)
+			if d.Name == "" {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: empty Name", i, t.Id, j)
 			}
-			if r.DataVersion == "" {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d] (%q): empty DataVersion", i, t.Id, j, name)
+			if d.DataVersion == "" {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d] (%q): empty DataVersion", i, t.Id, j, d.Name)
 			}
-			if _, dup := builtinDataVersions[name]; dup {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: dataset %q is reserved by a built-in", i, t.Id, j, name)
+			if _, dup := builtinDataVersions[d.Name]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: name %q is reserved by a built-in", i, t.Id, j, d.Name)
 			}
-			if _, dup := seenDatasets[name]; dup {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: duplicate dataset %q across catalog", i, t.Id, j, name)
+			if _, dup := seenDatasets[d.Name]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: duplicate dataset name %q across catalog", i, t.Id, j, d.Name)
 			}
-			seenDatasets[name] = struct{}{}
+			seenDatasets[d.Name] = struct{}{}
 		}
 		seenProps := make(map[string]struct{}, len(t.Properties))
 		for k, p := range t.Properties {
@@ -349,6 +356,42 @@ func (s *Store) ExternalTypes() []handler.Type { return s.extTypes }
 
 // SpaceId returns the id of the space this store serves.
 func (s *Store) SpaceId() string { return s.spaceId }
+
+// DatasetOwner returns the typeId that owns an external type-owned
+// dataset, or ("", false) for built-in / unknown datasets. Used by the
+// write path to enforce that an object implements a type before writing
+// into one of its datasets.
+func (s *Store) DatasetOwner(dataset string) (string, bool) {
+	owner, ok := s.datasetOwners[dataset]
+	return owner, ok
+}
+
+// ObjectTypes returns the typeIds an object implements (its any.types),
+// read from the shared per-space `objects` row. Returns (nil, nil) when
+// the object has no row yet — callers treat that as "implements nothing".
+func (s *Store) ObjectTypes(ctx context.Context, objectId string) ([]string, error) {
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := coll.FindId(ctx, objectId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	v := doc.Value()
+	if v == nil {
+		return nil, nil
+	}
+	arr := v.GetArray("any", "types")
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		out = append(out, string(e.GetStringBytes()))
+	}
+	return out, nil
+}
 
 // RegularObjectCount returns the count of rows in the per-space
 // `objects` collection — one row per user-visible regular object.
@@ -667,16 +710,16 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		return nil, err
 	}
 	shared := crdt.SharedCollections{properties.Dataset: coll}
-	handlers := []crdt.Handler{
-		properties.New(s.reg),
-		typetype.PropertyHandler{},
-		crdt.DefaultHandler{DatasetName: typetype.ShortIdsDataset, HandlerVersion: 1},
+	regs := []crdt.HandlerReg{
+		{Name: properties.Dataset, Handler: properties.New(s.reg)},
+		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}},
+		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}},
 	}
 	for _, t := range s.extTypes {
-		for _, r := range t.Handlers {
-			handlers = append(handlers, r.Handler)
+		for _, d := range t.Datasets {
+			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes})
 		}
 	}
-	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, handlers...)
+	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
 }
 

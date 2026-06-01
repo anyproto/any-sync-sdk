@@ -89,8 +89,6 @@ var ErrMissingKind = errors.New("typetype: property record requires `kind`")
 // § "ShortId — derivation".
 type PropertyHandler struct{}
 
-func (PropertyHandler) Dataset() string              { return DatasetPropertyDefs }
-func (PropertyHandler) Version() int                 { return 1 }
 func (PropertyHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates a creation: the record must declare a known

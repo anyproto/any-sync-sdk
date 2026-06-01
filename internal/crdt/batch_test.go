@@ -21,7 +21,7 @@ func TestBatch_ManyChangesOneTransaction(t *testing.T) {
 	metaColl, err := db.Collection(ctx, MetaCollectionName)
 	require.NoError(t, err)
 
-	ctrl, err := NewController(ctx, "obj1", db, DefaultHandler{DatasetName: testDS})
+	ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
 	require.NoError(t, err)
 
 	lx := lexid.Must(lexid.CharsAllNoEscape, 4, 100)
@@ -80,7 +80,7 @@ func TestBatch_RollbackLeavesDBClean(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	ctrl, err := NewController(ctx, "obj1", db, DefaultHandler{DatasetName: testDS})
+	ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
 	require.NoError(t, err)
 	arena := &anyenc.Arena{}
 
@@ -117,7 +117,7 @@ func TestBatch_ReopenPersistsState(t *testing.T) {
 		metaColl, err := db.Collection(ctx, MetaCollectionName)
 		require.NoError(t, err)
 
-		ctrl, err := NewController(ctx, "obj1", db, DefaultHandler{DatasetName: testDS})
+		ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
 		require.NoError(t, err)
 
 		ch := Change{
@@ -141,7 +141,7 @@ func TestBatch_ReopenPersistsState(t *testing.T) {
 		metaColl, err := db.Collection(ctx, MetaCollectionName)
 		require.NoError(t, err)
 
-		ctrl, err := NewController(ctx, "obj1", db, DefaultHandler{DatasetName: testDS})
+		ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
 		require.NoError(t, err)
 
 		// Load metadata.

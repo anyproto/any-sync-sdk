@@ -85,8 +85,6 @@ var statusFields = map[string]struct{}{
 // any-sync layer; this handler is defence in depth on the apply side.
 type SpaceIndexHandler struct{}
 
-func (SpaceIndexHandler) Dataset() string              { return SpaceIndexDataset }
-func (SpaceIndexHandler) Version() int                 { return 1 }
 func (SpaceIndexHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate requires the `type` field to be present and a non-empty

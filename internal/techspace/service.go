@@ -127,7 +127,10 @@ func (s *Service) Open(ctx context.Context) error {
 		return fmt.Errorf("techspace: open index collection: %w", err)
 	}
 
-	ctrl, err := crdt.NewController(ctx, s.indexId, s.db, SpaceIndexHandler{}, ProfileHandler{})
+	ctrl, err := crdt.NewController(ctx, s.indexId, s.db,
+		crdt.HandlerReg{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}},
+		crdt.HandlerReg{Name: ProfileDataset, Handler: ProfileHandler{}},
+	)
 	if err != nil {
 		return fmt.Errorf("techspace: new controller: %w", err)
 	}

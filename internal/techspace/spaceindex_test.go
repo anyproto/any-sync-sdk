@@ -27,7 +27,7 @@ func newSpaceIndexController(t *testing.T) *crdt.Controller {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctrl, err := crdt.NewController(context.Background(), testObjectId, db,
-		techspace.SpaceIndexHandler{},
+		crdt.HandlerReg{Name: techspace.SpaceIndexDataset, Handler: techspace.SpaceIndexHandler{}},
 	)
 	require.NoError(t, err)
 	return ctrl

@@ -84,6 +84,12 @@ type Controller struct {
 	objectId string
 	db       anystore.DB
 	handlers map[string]Handler
+	// versions and indexes are keyed by dataset name, populated from each
+	// HandlerReg at registration. versions feeds the persisted _meta
+	// handler-version map; indexes are ensured when the dataset's
+	// collection is first opened.
+	versions map[string]int
+	indexes  map[string][]anystore.IndexInfo
 
 	// collMu guards collections. Per-object collections are opened
 	// lazily — on first write via db.Collection (creates), on read via
@@ -120,20 +126,22 @@ type SharedCollections map[string]anystore.Collection
 // names are `{objectId}/{datasetName}` unless a shared collection is
 // supplied for that dataset, in which case the shared one is used and
 // row ids in writes default to the change's ObjectId.
-func NewController(ctx context.Context, objectId string, db anystore.DB, handlers ...Handler) (*Controller, error) {
-	return NewControllerWithShared(ctx, objectId, db, nil, handlers...)
+func NewController(ctx context.Context, objectId string, db anystore.DB, regs ...HandlerReg) (*Controller, error) {
+	return NewControllerWithShared(ctx, objectId, db, nil, regs...)
 }
 
 // NewControllerWithShared opens the per-dataset collections, accepting
 // shared overrides for specific datasets (typically the per-space
 // `objects` values collection). Datasets not in `shared` get the
 // usual per-object collection.
-func NewControllerWithShared(ctx context.Context, objectId string, db anystore.DB, shared SharedCollections, handlers ...Handler) (*Controller, error) {
+func NewControllerWithShared(ctx context.Context, objectId string, db anystore.DB, shared SharedCollections, regs ...HandlerReg) (*Controller, error) {
 	c := &Controller{
 		objectId:    objectId,
 		db:          db,
-		handlers:    make(map[string]Handler, len(handlers)),
-		collections: make(map[string]anystore.Collection, len(handlers)),
+		handlers:    make(map[string]Handler, len(regs)),
+		versions:    make(map[string]int, len(regs)),
+		indexes:     make(map[string][]anystore.IndexInfo, len(regs)),
+		collections: make(map[string]anystore.Collection, len(regs)),
 		shared:      make(map[string]struct{}, len(shared)),
 	}
 	c.sinkPool.New = func() any { return &Sink{} }
@@ -142,8 +150,8 @@ func NewControllerWithShared(ctx context.Context, objectId string, db anystore.D
 		c.collections[name] = coll
 		c.shared[name] = struct{}{}
 	}
-	for _, h := range handlers {
-		if err := c.registerHandler(ctx, h); err != nil {
+	for _, reg := range regs {
+		if err := c.registerHandler(ctx, reg); err != nil {
 			return nil, err
 		}
 	}
@@ -170,19 +178,31 @@ func (c *Controller) MaxAddSeq() uint64 { return c.maxAddSeq }
 func (c *Controller) SetMaxAddSeq(seq uint64) { c.maxAddSeq = seq }
 
 // RegisterHandler adds a handler at runtime (for late-bound datasets).
-func (c *Controller) RegisterHandler(ctx context.Context, h Handler) error {
-	return c.registerHandler(ctx, h)
+func (c *Controller) RegisterHandler(ctx context.Context, reg HandlerReg) error {
+	return c.registerHandler(ctx, reg)
 }
 
-func (c *Controller) registerHandler(ctx context.Context, h Handler) error {
-	name := h.Dataset()
+func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error {
+	name := reg.Name
+	if name == "" {
+		return fmt.Errorf("crdt: handler registration with empty dataset name")
+	}
+	if reg.Handler == nil {
+		return fmt.Errorf("crdt: nil handler for dataset %q", name)
+	}
 	if _, dup := c.handlers[name]; dup {
 		return fmt.Errorf("crdt: duplicate handler for dataset %q", name)
 	}
-	if err := h.Init(ctx); err != nil {
+	if err := reg.Handler.Init(ctx); err != nil {
 		return fmt.Errorf("crdt: init handler %q: %w", name, err)
 	}
-	c.handlers[name] = h
+	c.handlers[name] = reg.Handler
+	version := reg.Version
+	if version == 0 {
+		version = 1
+	}
+	c.versions[name] = version
+	c.indexes[name] = reg.Indexes
 	// Per-object collections are opened lazily — on first write
 	// (creates) or on first read (no-create). This keeps unwritten
 	// datasets (e.g. typetype's `properties` / `shortIds` on regular
@@ -192,23 +212,19 @@ func (c *Controller) registerHandler(ctx context.Context, h Handler) error {
 	// by the caller and live in c.collections from the start — for
 	// those we ensure indexes now, since the lazy path won't fire.
 	if coll, ok := c.collections[name]; ok {
-		if err := ensureHandlerIndexes(ctx, h, coll); err != nil {
+		if err := ensureHandlerIndexes(ctx, reg.Indexes, coll); err != nil {
 			return fmt.Errorf("crdt: ensure indexes for %q: %w", name, err)
 		}
 	}
 	return nil
 }
 
-// ensureHandlerIndexes calls EnsureIndex for every IndexInfo the
-// handler declares via the optional IndexedHandler interface. No-op
-// for handlers that don't implement it. EnsureIndex is idempotent, so
-// callers may invoke this on every open without checking persistence.
-func ensureHandlerIndexes(ctx context.Context, h Handler, coll anystore.Collection) error {
-	ih, ok := h.(IndexedHandler)
-	if !ok {
-		return nil
-	}
-	for _, idx := range ih.Indexes() {
+// ensureHandlerIndexes calls EnsureIndex for every IndexInfo a dataset
+// declared on its HandlerReg. No-op for an empty slice. EnsureIndex is
+// idempotent, so callers may invoke this on every open without checking
+// persistence.
+func ensureHandlerIndexes(ctx context.Context, indexes []anystore.IndexInfo, coll anystore.Collection) error {
+	for _, idx := range indexes {
 		if err := coll.EnsureIndex(ctx, idx); err != nil {
 			return err
 		}
@@ -231,10 +247,8 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 	if err != nil {
 		return nil, fmt.Errorf("crdt: open collection %q: %w", collName, err)
 	}
-	if h, ok := c.handlers[dataset]; ok {
-		if err := ensureHandlerIndexes(ctx, h, coll); err != nil {
-			return nil, fmt.Errorf("crdt: ensure indexes for %q: %w", dataset, err)
-		}
+	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
+		return nil, fmt.Errorf("crdt: ensure indexes for %q: %w", dataset, err)
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
@@ -257,15 +271,14 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 		return coll
 	}
 	c.collMu.Unlock()
-	h, ok := c.handlers[dataset]
-	if !ok {
+	if _, ok := c.handlers[dataset]; !ok {
 		return nil
 	}
 	coll, err := c.db.OpenCollection(ctx, c.objectId+"_"+dataset)
 	if err != nil {
 		return nil
 	}
-	if err := ensureHandlerIndexes(ctx, h, coll); err != nil {
+	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
 		return nil
 	}
 	c.collMu.Lock()

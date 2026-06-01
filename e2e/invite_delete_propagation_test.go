@@ -30,9 +30,10 @@ func newBlocksType() handler.Type {
 	return handler.Type{
 		Id:   "blocks-type",
 		Name: "Blocks",
-		Handlers: []handler.Registration{{
-			Handler:     handler.DefaultHandler{DatasetName: blocksDataset, HandlerVersion: 1},
+		Datasets: []handler.Dataset{{
+			Name:        blocksDataset,
 			DataVersion: blocksDataVersion,
+			Handler:     handler.DefaultHandler{},
 		}},
 	}
 }
@@ -111,7 +112,7 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 		t.Fatalf("alice: Spaces().Create: %v", err)
 	}
 
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
 	require.NoError(t, err, "alice: Objects().Create")
 
 	const recId = "rec-X"

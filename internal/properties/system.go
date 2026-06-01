@@ -77,8 +77,6 @@ func New(reg types.Registry) *SystemPropertiesHandler {
 	return &SystemPropertiesHandler{Registry: reg}
 }
 
-func (*SystemPropertiesHandler) Dataset() string              { return Dataset }
-func (*SystemPropertiesHandler) Version() int                 { return 1 }
 func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates every op in the creation payload, then

@@ -101,6 +101,16 @@ type Service struct {
 	// watchers tracks every active members poller across all loaded
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
+
+	// seedWG / seedCtx track the fire-and-forget spaceIndex lazy-seed
+	// goroutines (goSeed). Close cancels seedCtx and waits on seedWG so
+	// no background seed is still touching the store / tech space when
+	// the SDK tears them down. closing (under mu) stops new seeds from
+	// being spawned during shutdown.
+	seedWG     sync.WaitGroup
+	seedCtx    context.Context
+	seedCancel context.CancelFunc
+	closing    bool
 }
 
 // New returns a Service ready to be returned via SDK.Spaces(). The
@@ -122,6 +132,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		spaceIndexIds:      make(map[string]string),
 		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
 	}
+	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store
 	// to compute Synced/Total. nil-store cases (querying status for
@@ -343,7 +354,7 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	// Background lazy-seed for legacy / never-seeded spaces: only the
 	// owner can write the initial spaceIndex properties, and non-
 	// owners skip silently (the owner's eventual write propagates).
-	go sp.maybeLazySeedSpaceIndex()
+	s.goSeed(sp)
 	return sp, nil
 }
 
@@ -432,7 +443,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 		return nil, err
 	}
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
-	go sp.maybeLazySeedSpaceIndex()
+	s.goSeed(sp)
 	return sp, nil
 }
 
@@ -470,7 +481,7 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 		return nil, err
 	}
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
-	go sp.maybeLazySeedSpaceIndex()
+	s.goSeed(sp)
 	return sp, nil
 }
 
@@ -535,8 +546,34 @@ const joiningLocalStatus = "joining"
 // side of each space is owned by the App's space cache and torn down
 // separately by App.Close.
 func (s *Service) Close(_ context.Context) error {
+	// Stop spawning new lazy-seed goroutines, cancel any in flight, and
+	// wait for them to return before the caller tears down the store /
+	// tech space — otherwise a background seed can race teardown
+	// (techspace.Service.Get vs Close, store use-after-close).
+	s.mu.Lock()
+	s.closing = true
+	s.mu.Unlock()
+	s.seedCancel()
+	s.seedWG.Wait()
 	s.watchers.stopAll()
 	return nil
+}
+
+// goSeed launches the spaceIndex lazy-seed in the background, tracked by
+// seedWG and bound to seedCtx so Close can drain it. No-op once closing —
+// keeps the WaitGroup from gaining work during shutdown.
+func (s *Service) goSeed(sp *spaceImpl) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.seedWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.seedWG.Done()
+		sp.maybeLazySeedSpaceIndex(s.seedCtx)
+	}()
 }
 
 // KickProfiles asks every running members watcher to refetch

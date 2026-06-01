@@ -98,9 +98,7 @@ func (s *Service) seedSpaceIndexOnCreate(ctx context.Context, store *spaceobject
 // background goroutine has no return path, and the next load
 // retries the whole sequence. Logging is deferred — none of the
 // failure modes here are actionable from a single space load.
-func (s *spaceImpl) maybeLazySeedSpaceIndex() {
-	ctx := context.Background()
-
+func (s *spaceImpl) maybeLazySeedSpaceIndex(ctx context.Context) {
 	if !s.localIdentityIsOwner(ctx) {
 		return
 	}

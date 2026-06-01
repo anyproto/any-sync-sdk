@@ -124,6 +124,16 @@ func idsOf(rs []space.SubRecord) []string {
 	return out
 }
 
+// removedIdsOf extracts the ids from a Removed slice, for assertions
+// that only care about which ids left (not the cause).
+func removedIdsOf(rs []space.RemovedRecord) []string {
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, r.Id)
+	}
+	return out
+}
+
 // ---------- tests ----------
 
 // Insert into an empty window yields a single Added emit with the new
@@ -188,7 +198,7 @@ func TestApply_UpdateOutOfFilterEmitsRemoved(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, ev.Added)
 	assert.Empty(t, ev.Updated)
-	assert.Equal(t, []string{"m1"}, ev.Removed, "filter-rejected update must emit Removed")
+	assert.Equal(t, []space.RemovedRecord{{Id: "m1", Reason: space.RemoveFilteredOut}}, ev.Removed, "filter-rejected update must emit Removed with RemoveFilteredOut")
 
 	// Engine state: entry dropped, lost bumped (counts toward drift).
 	assert.Equal(t, 0, len(sub.entries), "entry must leave the held set when the filter rejects the post-apply doc")
@@ -214,7 +224,7 @@ func TestApply_UpdateBackIntoFilterEmitsAdded(t *testing.T) {
 	fireEvent(eng, "obj1", "chat", "m1", r2.d, false, nil)
 	ev1, err := waitOne(t, sub)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"m1"}, ev1.Removed)
+	assert.Equal(t, []space.RemovedRecord{{Id: "m1", Reason: space.RemoveFilteredOut}}, ev1.Removed)
 
 	// Back into filter.
 	r3 := makeRow(arena, "m1", 10, map[string]any{"status": "active"})
@@ -238,7 +248,7 @@ func TestApply_DeleteHeldRecordEmitsRemoved(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, ev.Added)
 	assert.Empty(t, ev.Updated)
-	assert.Equal(t, []string{"m1"}, ev.Removed)
+	assert.Equal(t, []space.RemovedRecord{{Id: "m1", Reason: space.RemoveDeleted}}, ev.Removed)
 }
 
 // Limit+1 sentinel: a new arrival with a smaller sort key than every
@@ -271,7 +281,7 @@ func TestSentinel_DemotePreviousBottomVisible(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"e"}, idsOf(ev.Added))
 	assert.Empty(t, ev.Updated)
-	assert.Equal(t, []string{"b"}, ev.Removed)
+	assert.Equal(t, []space.RemovedRecord{{Id: "b", Reason: space.RemoveDisplaced}}, ev.Removed)
 }
 
 // Sentinel promotion: delete a visible record; the sentinel (formerly
@@ -296,7 +306,64 @@ func TestSentinel_PromoteOnVisibleDelete(t *testing.T) {
 	// sentinel (not visible) → promoted to visible (Added).
 	assert.ElementsMatch(t, []string{"c"}, idsOf(ev.Added))
 	assert.Empty(t, ev.Updated)
-	assert.ElementsMatch(t, []string{"a"}, ev.Removed)
+	assert.ElementsMatch(t, []space.RemovedRecord{{Id: "a", Reason: space.RemoveDeleted}}, ev.Removed)
+}
+
+// The three RemoveReason causes are reported distinctly: a tombstone is
+// RemoveDeleted, a filter-breaking update is RemoveFilteredOut, and a
+// higher-priority arrival pushing a visible row to the sentinel is
+// RemoveDisplaced. Clients branch on RemoveDeleted to tell "gone" from
+// "left my window but still exists".
+func TestApply_RemoveReasonsAreDistinct(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+
+	filter, err := query.ParseCondition(map[string]any{"status": "active"})
+	require.NoError(t, err)
+	sort, err := query.ParseSort("n")
+	require.NoError(t, err)
+
+	// Limit=3, snapshot holds 4 active rows: a(1)..d(4) — sentinel=d,
+	// visible {a,b,c}. DriftBudget is relaxed so the filter/delete losses
+	// below don't trip drift before we observe all three reasons.
+	initial := []row{
+		makeRow(arena, "a", 1, map[string]any{"status": "active"}),
+		makeRow(arena, "b", 2, map[string]any{"status": "active"}),
+		makeRow(arena, "c", 3, map[string]any{"status": "active"}),
+		makeRow(arena, "d", 4, map[string]any{"status": "active"}),
+	}
+	sub, err := eng.Subscribe(SubConfig{
+		Scope:       Scope{ObjectId: "obj1", Dataset: "chat"},
+		Filter:      filter,
+		Sort:        sort,
+		Limit:       3,
+		MailboxCap:  minMailboxCap,
+		DriftBudget: 100,
+	}, snapshotFromRows(initial))
+	require.NoError(t, err)
+
+	// Displaced: z(0) arrives smaller than all → evicts sentinel d,
+	// demotes c out of the visible window. c still matches the filter.
+	z := makeRow(arena, "z", 0, map[string]any{"status": "active"})
+	fireEvent(eng, "obj1", "chat", "z", z.d, false, nil)
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	assert.Equal(t, []space.RemovedRecord{{Id: "c", Reason: space.RemoveDisplaced}}, ev.Removed)
+
+	// FilteredOut: a updates to status=archived → fails the filter, but
+	// the record still exists in the database.
+	aArchived := makeRow(arena, "a", 1, map[string]any{"status": "archived"})
+	fireEvent(eng, "obj1", "chat", "a", aArchived.d, false, nil)
+	ev, err = waitOne(t, sub)
+	require.NoError(t, err)
+	assert.Contains(t, ev.Removed, space.RemovedRecord{Id: "a", Reason: space.RemoveFilteredOut})
+
+	// Deleted: tombstone z → gone from the database.
+	fireEvent(eng, "obj1", "chat", "z", nil, true, nil)
+	ev, err = waitOne(t, sub)
+	require.NoError(t, err)
+	assert.Contains(t, ev.Removed, space.RemovedRecord{Id: "z", Reason: space.RemoveDeleted})
 }
 
 // Drift: loss without replacement crosses the budget → sub closes

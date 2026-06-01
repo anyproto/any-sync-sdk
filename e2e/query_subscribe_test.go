@@ -141,7 +141,9 @@ func drainSubEvents(t *testing.T, sub space.QuerySubscription, window time.Durat
 		}
 		for _, ev := range evs {
 			addedAll = append(addedAll, ev.Added...)
-			removedAll = append(removedAll, ev.Removed...)
+			for _, r := range ev.Removed {
+				removedAll = append(removedAll, r.Id)
+			}
 		}
 		if len(addedAll) > 0 {
 			return addedAll, removedAll

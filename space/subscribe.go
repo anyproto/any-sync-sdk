@@ -47,33 +47,58 @@ type QuerySubscription interface {
 	Close() error
 }
 
+// RemoveReason classifies why a record left the visible window, carried
+// per id on SubscriptionEvent.Removed. RemoveDeleted means the object is
+// gone from the database; the other two mean it left your result set but
+// still exists, so a Snapshot/Query.One would still return it.
+type RemoveReason uint8
+
+const (
+	// RemoveDeleted: the record was tombstoned; it no longer exists in
+	// the database. A Query.One for this id now returns ErrNotFound.
+	RemoveDeleted RemoveReason = iota
+	// RemoveFilteredOut: an update changed a field so the query's filter
+	// no longer matches the record. The record still exists.
+	RemoveFilteredOut
+	// RemoveDisplaced: a higher-priority arrival (or the record's own
+	// sort-key change) pushed it past the Limit boundary. The record
+	// still matches the filter; it just sits outside the visible window.
+	RemoveDisplaced
+)
+
+// String renders the reason for logging and test output.
+func (r RemoveReason) String() string {
+	switch r {
+	case RemoveDeleted:
+		return "deleted"
+	case RemoveFilteredOut:
+		return "filtered-out"
+	case RemoveDisplaced:
+		return "displaced"
+	default:
+		return "unknown"
+	}
+}
+
+// RemovedRecord is one id that left the visible window, tagged with the
+// cause. Symmetric with SubRecord on Added/Updated, minus the doc/ops —
+// a removed record carries no post-apply payload.
+type RemovedRecord struct {
+	Id     string
+	Reason RemoveReason
+}
+
 // SubscriptionEvent is one batch of windowed transitions delivered to
 // a QuerySubscription. It groups every record-level change observed
 // during one CRDT apply: records that entered the visible window
 // (Added), records already in the window whose state changed
 // (Updated), and records that left the visible window (Removed).
 //
-// Removed semantics — read carefully:
-//
-// Removed carries every id that left the visible window between
-// apply ticks. Three engine-internal causes funnel into the same
-// signal:
-//
-//   - Deleted: the record was tombstoned in the database.
-//   - Filter-rejected: an update changed a field so the query's
-//     filter no longer matches the record; the record still exists.
-//   - Displaced: a higher-priority arrival pushed this record past
-//     the Limit boundary; the record still matches the filter, but
-//     sits outside the visible window now.
-//
-// They are NOT distinguished on the wire. From the consumer's view
-// the action is the same regardless of cause: drop the id from your
-// local mirror. If you need to know the record's current state, call
-// Snapshot or Query.One with the id — that disambiguates (deleted ⇒
-// ErrNotFound; filter-rejected ⇒ doc that doesn't match the active
-// filter; displaced ⇒ doc that does). Causes are debugging-grade
-// information, not view-rendering information; we deliberately don't
-// branch view code on them.
+// Removed carries every id that left the visible window between apply
+// ticks, each tagged with a RemoveReason. Branch on RemoveDeleted to
+// tell "the object is gone" (drop it for good) from RemoveFilteredOut /
+// RemoveDisplaced ("it left your result set but still exists" — a
+// Snapshot or Query.One would still return it). See RemoveReason.
 //
 // VersionId carries the per-change DAG order of the underlying CRDT
 // apply this event was derived from. Useful for consumers that want
@@ -88,7 +113,7 @@ type SubscriptionEvent struct {
 	VersionId crdt.VersionId
 	Added     []SubRecord
 	Updated   []SubRecord
-	Removed   []string
+	Removed   []RemovedRecord
 }
 
 // SubRecord is one record's worth of state inside a SubscriptionEvent.

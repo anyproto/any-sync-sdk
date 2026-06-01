@@ -16,6 +16,16 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+// spaceIndexTypesArray builds the any.types value for the spaceIndex
+// object: the single built-in spaceIndex type it implements. Declared
+// on seed so the write-time pre-flight admits the spaceIndex.*
+// namespace.
+func spaceIndexTypesArray(arena *anyenc.Arena) *anyenc.Value {
+	arr := arena.NewArray()
+	arr.SetArrayItem(0, arena.NewString(spaceindex.TypeId))
+	return arr
+}
+
 // seedSpaceIndexOnCreate is the owner-side initial write of the
 // in-space spaceIndex object. Runs once during Service.Create after
 // the space header lands and ensureSpaceIndexWiring has cached the
@@ -43,6 +53,11 @@ func (s *Service) seedSpaceIndexOnCreate(ctx context.Context, store *spaceobject
 	// Always set all four keys, even when empty — keeps the row's
 	// `spaceIndex.*` namespace present on disk so subsequent reads
 	// distinguish "seeded with blanks" from "never seeded".
+	// Declare the type this object implements so the write-time schema
+	// pre-flight admits the spaceIndex.* namespace (any.types
+	// membership). Same change as the values — collectTypeAdditions
+	// picks it up.
+	payload.Set("any.types", spaceIndexTypesArray(arena))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldName, arena.NewString(req.Name))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldDescription, arena.NewString(req.Description))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldIcon, arena.NewString(req.IconCID))
@@ -119,6 +134,7 @@ func (s *spaceImpl) maybeLazySeedSpaceIndex() {
 	}
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
+	payload.Set("any.types", spaceIndexTypesArray(arena))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldName, arena.NewString(rec.Name))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldDescription, arena.NewString(rec.Description))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldIcon, arena.NewString(rec.IconCID))

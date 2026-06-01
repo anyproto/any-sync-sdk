@@ -363,6 +363,17 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 		return WriteResult{}, errors.New("object: closed")
 	}
 
+	// Writer-side schema pre-flight: strict validation against the
+	// current record state, BEFORE the change enters the DAG. A failure
+	// here returns an agent-readable error and keeps the malformed
+	// change out of any-sync entirely (no AddContent). Runs under
+	// tree.Lock so the pre-state read and the apply below are
+	// consistent with concurrent local writers. No-op for datasets
+	// whose handler doesn't implement LocalPreValidator.
+	if err := o.ctrl.PreValidateLocal(ctx, &ch); err != nil {
+		return WriteResult{}, err
+	}
+
 	// Encode under tree.Lock — the codec's arena is shared with the
 	// replay/Decode path and is not safe for concurrent use. Concurrent
 	// LocalWrite callers (e.g. the background spaceIndex seeder racing

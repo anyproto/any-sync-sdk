@@ -81,9 +81,46 @@ func TestValidateExternalTypes(t *testing.T) {
 			err: `duplicate type Id "movie"`,
 		},
 		{
-			name:     "type without handlers",
+			name:     "type with neither handlers nor properties",
 			extTypes: []handler.Type{{Id: "movie"}},
-			err:      "zero handlers",
+			err:      "at least one dataset",
+		},
+		{
+			name: "property-only type is valid",
+			extTypes: []handler.Type{{
+				Id: "nav",
+				Properties: []handler.PropertyDecl{
+					{Id: "type", Kind: handler.PropertyKindNumber},
+					{Id: "pos", Kind: handler.PropertyKindString},
+				},
+			}},
+		},
+		{
+			name: "property with invalid kind",
+			extTypes: []handler.Type{{
+				Id:         "nav",
+				Properties: []handler.PropertyDecl{{Id: "pos"}}, // zero Kind
+			}},
+			err: "invalid Kind",
+		},
+		{
+			name: "property with reserved id",
+			extTypes: []handler.Type{{
+				Id:         "nav",
+				Properties: []handler.PropertyDecl{{Id: "_x", Kind: handler.PropertyKindString}},
+			}},
+			err: "reserved or invalid Id",
+		},
+		{
+			name: "duplicate property id",
+			extTypes: []handler.Type{{
+				Id: "nav",
+				Properties: []handler.PropertyDecl{
+					{Id: "pos", Kind: handler.PropertyKindString},
+					{Id: "pos", Kind: handler.PropertyKindNumber},
+				},
+			}},
+			err: "duplicate property Id",
 		},
 		{
 			name:     "nil handler",

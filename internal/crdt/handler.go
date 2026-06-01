@@ -106,6 +106,23 @@ type Handler interface {
 	BeforeDelete(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
 }
 
+// LocalPreValidator is an optional interface a Handler may implement
+// to validate a LOCAL change before it enters the DAG. The Controller
+// calls PreValidate from the local-write path (not on inbound apply);
+// a non-nil error rejects the whole write, keeping a malformed change
+// out of any-sync entirely. Used for strict writer-side schema
+// validation that returns an agent-readable error, while inbound apply
+// stays read-tolerant.
+//
+// `before` is the current value of the change's target record (nil
+// when the change creates it). The Controller resolves it once and
+// hands it to PreValidate, which inspects ch.Records itself. For the
+// shared `objects` dataset every RecordChange collapses onto the
+// object's single row, so one `before` suffices.
+type LocalPreValidator interface {
+	PreValidate(ch *Change, before *anyenc.Value) error
+}
+
 // IndexedHandler is implemented by Handlers that want any-store indexes
 // ensured on their dataset's collection. The Controller calls
 // EnsureIndex on each returned IndexInfo the first time it opens the

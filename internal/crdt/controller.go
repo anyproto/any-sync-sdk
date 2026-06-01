@@ -421,6 +421,38 @@ func (c *Controller) ValidateChange(ch Change) error {
 	return nil
 }
 
+// PreValidateLocal runs the dataset handler's optional LocalPreValidator
+// against a LOCAL change before it enters the DAG. No-op when the
+// dataset has no handler or the handler doesn't implement the
+// interface. Reads the current value of the change's target record and
+// hands it to PreValidate; a non-nil error rejects the whole write.
+//
+// Unlike ValidateChange (pure, structural), this does a DB read — but
+// it runs only on the local-write path, never on the inbound hot path.
+// ch.ChangeId is not yet known here, so empty record ids can't be
+// resolved; for the shared `objects` dataset the row id is the
+// controller's own objectId, which is always known.
+func (c *Controller) PreValidateLocal(ctx context.Context, ch *Change) error {
+	if c == nil || ch == nil {
+		return nil
+	}
+	h, ok := c.handlers[ch.Dataset]
+	if !ok {
+		return nil
+	}
+	pv, ok := h.(LocalPreValidator)
+	if !ok {
+		return nil
+	}
+	var before *anyenc.Value
+	if c.IsShared(ch.Dataset) {
+		before = c.Get(ctx, ch.Dataset, c.objectId)
+	} else if ids, err := ResolveRecordIds(*ch); err == nil && len(ids) > 0 {
+		before = c.Get(ctx, ch.Dataset, ids[0])
+	}
+	return pv.PreValidate(ch, before)
+}
+
 // ApplyChange is the simple entry point — wraps ApplyChangeWithResult
 // and discards the per-op rejection list. Existing callers that
 // don't need rejection info (tests, replay paths) keep the original

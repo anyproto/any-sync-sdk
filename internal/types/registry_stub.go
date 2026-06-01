@@ -22,6 +22,32 @@ func (s StubRegistry) LookupKind(typeId, propId string) (schema.Kind, bool) {
 	return k, ok
 }
 
+// TypeKnown reports whether the stub has any entry for typeId.
+func (s StubRegistry) TypeKnown(typeId string) bool {
+	if s.Kinds == nil {
+		return false
+	}
+	_, ok := s.Kinds[typeId]
+	return ok
+}
+
+// PropsOf returns the stub's declared properties for typeId. Names are
+// empty (the stub stores kinds only). ok mirrors TypeKnown.
+func (s StubRegistry) PropsOf(typeId string) ([]PropInfo, bool) {
+	props, ok := s.Kinds[typeId]
+	if !ok {
+		return nil, false
+	}
+	out := make([]PropInfo, 0, len(props))
+	for id, k := range props {
+		out = append(out, PropInfo{Id: id, Kind: k})
+	}
+	return out, true
+}
+
+// Compile-time check that StubRegistry satisfies Registry.
+var _ Registry = StubRegistry{}
+
 // Set adds or overwrites a property entry. Useful for incremental
 // test setup: r.Set("any", "name", schema.KindString).
 func (s *StubRegistry) Set(typeId, propId string, kind schema.Kind) {

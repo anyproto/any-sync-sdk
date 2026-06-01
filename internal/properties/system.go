@@ -5,8 +5,7 @@ package properties
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -14,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 )
 
 // Dataset is the name every regular object uses for its base-scope
@@ -37,13 +37,6 @@ const Dataset = "objects"
 // identifier in Phase 1).
 const HandlerVersion = "systemPropertyHandler-v1"
 
-// Sentinels — wrap crdt.ErrValidation in handler returns.
-var (
-	ErrInvalidPath        = errors.New("properties: path must be {typeId}.{propId}")
-	ErrUnknownProperty    = errors.New("properties: unknown (typeId, propId)")
-	ErrKindMismatch       = errors.New("properties: payload kind does not match property kind")
-)
-
 // SystemPropertiesHandler validates property writes on every user
 // object. Corresponds to the `baseProperty` handler named in
 // docs/06-data-structure.md § "Handlers" — renamed to emphasize its
@@ -55,17 +48,22 @@ var (
 // the apply loop via RecordChange.Variant — the handler is variant-
 // agnostic and only validates kinds against the type Registry.
 //
-// Path shape for a single-path op: `[typeId, propId]`. The handler
-// looks the kind up via Registry.LookupKind and silently drops the
-// op if (a) the path doesn't fit the shape, (b) the property is
-// unknown, or (c) the payload's anyenc kind doesn't match the
-// declared kind. "Per-op atomicity" — other ops in the same
-// RecordChange still apply.
+// Two validation paths, split along the local/inbound line:
 //
-// Multi-field $set with empty Path expects the payload to be an
-// object whose keys are dotted "{typeId}.{propId}" paths. Same kind
-// rules apply per-key; if any key fails, the whole op drops (we
-// don't mutate payloads to filter individual keys in v1).
+//   - PreValidate (local writes, before the DAG): STRICT. Path syntax,
+//     any.types membership, type resolvability, unknown property, and
+//     kind. The first violation rejects the WHOLE write with an
+//     agent-readable *ValidationError.
+//   - BeforeCreate / BeforeModify (inbound + replay, schema known):
+//     DEFENSIVE per-op drop. Same checks minus the any.types membership
+//     guard (which would break out-of-order tolerance); a failing op is
+//     dropped, the rest of the record still applies.
+//
+// Path shape for a single-path op: `[typeId, propId]`. Multi-field
+// $set with empty Path expects an object payload whose keys are dotted
+// "{typeId}.{propId}" pairs; same rules per key; if any key fails the
+// whole op drops (payloads aren't mutated to filter individual keys in
+// v1). $unset / $delete touch no value and are always valid.
 type SystemPropertiesHandler struct {
 	// Registry resolves declared kinds. May be nil — when nil the
 	// handler skips kind validation entirely (passes everything),
@@ -92,18 +90,24 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 // not from caller input — these fields are ScopeAuto in the `any`
 // type, read-only by convention.
 //
-// Stricter than BeforeModify on validation: any per-op validation
-// failure rejects the whole record, because a creation with a bad
-// field implies a buggy or version-mismatched writer (and the
-// DataVersion gate on ApplyChange already filters those upstream —
-// by the time a create lands here, we should know its schema).
+// Validation is per-op drop, same as BeforeModify: ops that fail the
+// current schema are filtered out and the rest of the record still
+// lands (spec §"Validation atomicity" — drop per op, skip the record
+// only if every op drops). Local creates never hit this with bad ops
+// (PreValidate rejected the whole write upstream); inbound creates
+// that reach here have passed the DataVersion gate, so a dropped op
+// means a removed-property replay or cross-peer bug, not a sync gap.
+// No any.types membership check (out-of-order tolerance).
 func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
-	if h.Registry != nil {
+	if h.Registry != nil && len(rec.Ops) > 0 {
+		kept := rec.Ops[:0]
 		for i := range rec.Ops {
-			if err := h.validateOp(&rec.Ops[i]); err != nil {
-				return err
+			if verr := h.validateOp(&rec.Ops[i], nil); verr != nil {
+				continue // per-op drop
 			}
+			kept = append(kept, rec.Ops[i])
 		}
+		rec.Ops = kept
 	}
 	stampAutoFields(ctx, sink)
 	return nil
@@ -153,14 +157,25 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	}
 }
 
-// BeforeModify validates one op against the Registry. Drops the op
-// silently on any validation failure; other ops in the same
-// RecordChange still apply.
+// BeforeModify validates one inbound op against the current schema.
+// Drops the op silently (records a Rejection) on any validation
+// failure; other ops in the same RecordChange still apply. This is
+// the spec's defensive per-op layer (outcome 2): it only ever sees
+// changes whose DataVersion is known (the gate parks not-synced ones),
+// so a drop here means a removed-property replay, a cross-peer bug, or
+// genuine junk — never data merely waiting on a schema sync.
+//
+// No any.types membership check here: an apply-time membership guard
+// would drop values written before the attach-type change arrives,
+// breaking out-of-order tolerance (docs/06-data-structure.md §397).
 func (h *SystemPropertiesHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
 	if h.Registry == nil {
 		return nil
 	}
-	return h.validateOp(op)
+	if verr := h.validateOp(op, nil); verr != nil {
+		return verr
+	}
+	return nil
 }
 
 // BeforeDelete is a no-op — deleting a property record (the per-
@@ -170,84 +185,199 @@ func (*SystemPropertiesHandler) BeforeDelete(_ *crdt.ChangeCtx, _ *crdt.RecordCh
 	return nil
 }
 
-// validateOp routes by op shape. Single-path: validate one
-// (typeId, propId, payload-kind). Multi-field: validate every key.
-// Other op kinds (delete, addToSet, pull, inc, incGated) follow the
-// same single-path rule using op.Payload's kind.
-func (h *SystemPropertiesHandler) validateOp(op *crdt.Op) error {
-	if op.Type == crdt.OpDelete {
-		return nil // record-level delete; no per-property validation
-	}
-	if len(op.Path) == 0 {
-		// Multi-field $set/$unset.
-		return h.validateMultiField(op)
-	}
-	return h.validateSinglePath(op.Path, op.Payload, op.Type)
-}
-
-func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *anyenc.Value, opType crdt.OpType) error {
-	if len(path) < 2 {
-		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrInvalidPath)
-	}
-	typeId, propId := path[0], path[1]
-	declared, ok := h.Registry.LookupKind(typeId, propId)
-	if !ok {
-		return fmt.Errorf("%w: %w (%s, %s)", crdt.ErrValidation, ErrUnknownProperty, typeId, propId)
-	}
-	// $unset payloads are absent / ignored — no kind to match.
-	// $set / $addToSet / $pull / $inc / $incGated all carry the
-	// candidate value as Payload, against which we kind-match.
-	if opType == crdt.OpUnset {
+// PreValidate is the local write-time pre-flight (LocalPreValidator).
+// It runs strict, full validation BEFORE the change enters the DAG:
+// path syntax, any.types membership, type resolvability, unknown
+// property, and kind. The FIRST violation rejects the WHOLE write with
+// an agent-readable *ValidationError — nothing is signed or shipped to
+// peers. `before` is the record's current value (nil on first write).
+//
+// Stricter than BeforeModify by design: this catches programmer/agent
+// mistakes locally, where rejecting is the right answer; inbound stays
+// tolerant (gate parks not-synced; BeforeModify drops residual
+// mismatches).
+func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Value) error {
+	if h.Registry == nil || ch == nil {
 		return nil
 	}
-	got := schema.KindOf(payload)
-	if got != declared {
-		return fmt.Errorf("%w: %w (declared=%s got=%s, %s.%s)",
-			crdt.ErrValidation, ErrKindMismatch, declared, got, typeId, propId)
+	pf := h.buildPreflight(ch, before)
+	for ri := range ch.Records {
+		rc := &ch.Records[ri]
+		for oi := range rc.Ops {
+			if verr := h.validateOp(&rc.Ops[oi], pf); verr != nil {
+				return verr
+			}
+		}
 	}
 	return nil
 }
 
-// validateMultiField walks the payload of a multi-field $set/$unset.
-// Every top-level key must be a dotted "typeId.propId" pair; any
-// failure rejects the whole op (see SystemPropertiesHandler doc on
-// the "no payload mutation" v1 limitation).
-func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op) error {
+// preflight carries the local-write membership set (the typeIds the
+// object effectively implements) used only by PreValidate. nil means
+// apply-time mode — skip the membership check.
+type preflight struct {
+	members map[string]struct{}
+	list    []string // sorted, for error messages
+}
+
+// buildPreflight computes the set of typeIds the object implements
+// after this change: the universal `any` type, the types already in
+// the record's any.types, plus any types this change attaches.
+func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc.Value) *preflight {
+	members := map[string]struct{}{anytype.TypeId: {}}
+	if before != nil {
+		for _, v := range before.GetArray("any", "types") {
+			members[string(v.GetStringBytes())] = struct{}{}
+		}
+	}
+	for ri := range ch.Records {
+		for oi := range ch.Records[ri].Ops {
+			collectTypeAdditions(&ch.Records[ri].Ops[oi], members)
+		}
+	}
+	list := make([]string, 0, len(members))
+	for t := range members {
+		list = append(list, t)
+	}
+	sort.Strings(list)
+	return &preflight{members: members, list: list}
+}
+
+// collectTypeAdditions records typeIds an op adds to any.types, so a
+// batch that attaches a type and writes its values in one change
+// validates the new namespace. Handles the multi-field "any.types"
+// key, the single-path ["any","types"] $set (array payload), and the
+// ["any","types"] $addToSet (element payload).
+func collectTypeAdditions(op *crdt.Op, members map[string]struct{}) {
+	switch {
+	case len(op.Path) == 0 && op.Type == crdt.OpSet:
+		if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+			return
+		}
+		obj, _ := op.Payload.Object()
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			if string(k) == anytype.TypeId+".types" {
+				addArrayStrings(v, members)
+			}
+		})
+	case len(op.Path) == 2 && op.Path[0] == anytype.TypeId && op.Path[1] == "types":
+		switch op.Type {
+		case crdt.OpSet:
+			addArrayStrings(op.Payload, members)
+		case crdt.OpAddToSet:
+			if op.Payload != nil && op.Payload.Type() == anyenc.TypeString {
+				members[string(op.Payload.GetStringBytes())] = struct{}{}
+			}
+		}
+	}
+}
+
+// addArrayStrings unions the string elements of an array value into
+// the set. No-op for non-array values.
+func addArrayStrings(v *anyenc.Value, members map[string]struct{}) {
+	if v == nil || v.Type() != anyenc.TypeArray {
+		return
+	}
+	arr, _ := v.Array()
+	for _, e := range arr {
+		if e.Type() == anyenc.TypeString {
+			members[string(e.GetStringBytes())] = struct{}{}
+		}
+	}
+}
+
+// validateOp routes by op shape. pf != nil enables the local pre-flight
+// membership check; nil is apply-time mode. $unset / $delete touch no
+// value and are always valid (no `required` keyword in v1).
+func (h *SystemPropertiesHandler) validateOp(op *crdt.Op, pf *preflight) *ValidationError {
+	if op.Type == crdt.OpUnset || op.Type == crdt.OpDelete {
+		return nil
+	}
+	if len(op.Path) == 0 {
+		return h.validateMultiField(op, pf)
+	}
+	return h.validateSinglePath(op.Path, op.Payload, op.Type, pf)
+}
+
+func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
+	if len(path) < 2 {
+		return &ValidationError{Reason: ReasonInvalidPath, Path: path}
+	}
+	return h.validateField(path[0], path[1], payload, opType, pf)
+}
+
+// validateMultiField walks a multi-field $set payload. Every top-level
+// key must be a dotted "typeId.propId" pair (no deeper nesting in v1);
+// the first failing key rejects the whole op.
+func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight) *ValidationError {
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return nil
 	}
 	obj, _ := op.Payload.Object()
-	var firstErr error
+	var firstErr *ValidationError
 	obj.Visit(func(k []byte, v *anyenc.Value) {
 		if firstErr != nil {
 			return
 		}
 		key := string(k)
 		dot := strings.IndexByte(key, '.')
-		if dot <= 0 || dot == len(key)-1 {
-			firstErr = fmt.Errorf("%w: %w (key=%q)", crdt.ErrValidation, ErrInvalidPath, key)
+		if dot <= 0 || dot == len(key)-1 || strings.IndexByte(key[dot+1:], '.') >= 0 {
+			firstErr = &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
 			return
 		}
-		typeId, propId := key[:dot], key[dot+1:]
-		// Reject if any further dots (nested paths not supported in v1
-		// validation; treat as invalid to keep semantics simple).
-		if strings.IndexByte(propId, '.') >= 0 {
-			firstErr = fmt.Errorf("%w: %w (key=%q)", crdt.ErrValidation, ErrInvalidPath, key)
-			return
-		}
-		declared, ok := h.Registry.LookupKind(typeId, propId)
-		if !ok {
-			firstErr = fmt.Errorf("%w: %w (%s, %s)", crdt.ErrValidation, ErrUnknownProperty, typeId, propId)
-			return
-		}
-		if op.Type == crdt.OpUnset {
-			return
-		}
-		got := schema.KindOf(v)
-		if got != declared {
-			firstErr = fmt.Errorf("%w: %w (declared=%s got=%s, %s.%s)",
-				crdt.ErrValidation, ErrKindMismatch, declared, got, typeId, propId)
-		}
+		firstErr = h.validateField(key[:dot], key[dot+1:], v, op.Type, pf)
 	})
 	return firstErr
+}
+
+// validateField is the shared per-(typeId, propId) check. Order:
+// membership (pre-flight only) → type resolvable → property declared →
+// kind. Returns the first violation as a *ValidationError, or nil.
+func (h *SystemPropertiesHandler) validateField(typeId, propId string, payload *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
+	if pf != nil {
+		if _, ok := pf.members[typeId]; !ok {
+			return &ValidationError{Reason: ReasonTypeNotImplemented, TypeId: typeId, Types: pf.list}
+		}
+	}
+	props, ok := h.Registry.PropsOf(typeId)
+	if !ok {
+		return &ValidationError{Reason: ReasonTypeUnknown, TypeId: typeId, PropId: propId}
+	}
+	declared, name, found := schema.KindUnknown, "", false
+	for _, p := range props {
+		if p.Id == propId {
+			declared, name, found = p.Kind, p.Name, true
+			break
+		}
+	}
+	if !found {
+		return &ValidationError{Reason: ReasonUnknownProperty, TypeId: typeId, PropId: propId, Known: props}
+	}
+	expected, got, ok := kindCheck(opType, declared, payload)
+	if !ok {
+		return &ValidationError{
+			Reason: ReasonKindMismatch, TypeId: typeId, PropId: propId, PropName: name,
+			Expected: expected, Got: got,
+		}
+	}
+	return nil
+}
+
+// kindCheck applies the op-type-aware kind rule and returns the kinds
+// to report on mismatch.
+//
+//   - $set: the value's kind must equal the declared kind.
+//   - $addToSet / $pull: the property must be an array (the element's
+//     kind is unchecked in v1 — items schemas aren't in the registry).
+//   - $inc / $incGated: the property must be a number.
+func kindCheck(opType crdt.OpType, declared schema.Kind, payload *anyenc.Value) (expected, got schema.Kind, ok bool) {
+	switch opType {
+	case crdt.OpAddToSet, crdt.OpPull:
+		return schema.KindArray, declared, declared == schema.KindArray
+	case crdt.OpInc, crdt.OpIncGated:
+		return schema.KindNumber, declared, declared == schema.KindNumber
+	default: // OpSet
+		got = schema.KindOf(payload)
+		return declared, got, got == declared
+	}
 }

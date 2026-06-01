@@ -10,8 +10,9 @@
 // MVP scope: every Object registers the same handler set —
 // SystemPropertiesHandler on "properties", typetype.PropertyHandler
 // on "defs", DefaultHandler on "shortIds". Type-ness is convention,
-// not a separate object kind. Schema validation is disabled
-// (registry=nil). Subscriptions and projections aren't wired.
+// not a separate object kind. Schema validation is wired through the
+// LiveRegistry (built-in + registered + user-type schemas): strict on
+// local writes (pre-flight), defensive per-op on apply.
 package spaceobjects
 
 import (
@@ -19,6 +20,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,8 +37,11 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
@@ -170,7 +175,7 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 		signKey:      signKey,
 		alloc:        alloc,
 		spaceId:      spaceId,
-		reg:          types.NewLiveRegistry(db),
+		reg:          types.NewLiveRegistry(db, buildStaticSchema(extTypes)),
 		extTypes:     extTypes,
 		dataVersions: dv,
 		engine:       subscribe.New(spaceId),
@@ -183,6 +188,68 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 	s.drainer = newDrainer(s)
 	s.drainer.Run()
 	return s
+}
+
+// buildStaticSchema assembles the registry's static overlay: the
+// schema for types whose definitions don't live in a per-type-object
+// `properties` collection — the built-in `any` / `spaceIndex` tables
+// and every registered external type's declared Properties. User
+// types are absent (resolved from their defs collection at lookup).
+//
+// Returns typeId → propId → PropInfo. Safe with nil/empty extTypes.
+func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.PropInfo {
+	static := make(map[string]map[string]types.PropInfo, 2+len(extTypes))
+
+	anyProps := make(map[string]types.PropInfo, len(anytype.Properties))
+	for _, p := range anytype.Properties {
+		anyProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind}
+	}
+	static[anytype.TypeId] = anyProps
+
+	siProps := make(map[string]types.PropInfo, len(spaceindex.Properties))
+	for _, p := range spaceindex.Properties {
+		siProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind}
+	}
+	static[spaceindex.TypeId] = siProps
+
+	for _, t := range extTypes {
+		if len(t.Properties) == 0 {
+			// A registered type that contributes no `objects`-namespace
+			// values (owns only separate datasets). Record it as known
+			// with an empty prop set so writes under its namespace fail
+			// with unknown_property rather than type_unknown.
+			static[t.Id] = map[string]types.PropInfo{}
+			continue
+		}
+		props := make(map[string]types.PropInfo, len(t.Properties))
+		for _, p := range t.Properties {
+			props[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: propertyKindToSchema(p.Kind)}
+		}
+		static[t.Id] = props
+	}
+	return static
+}
+
+// propertyKindToSchema maps the public handler.PropertyKind enum to
+// the internal schema.Kind. Returns KindUnknown for the zero value —
+// ValidateExternalTypes rejects that up front, so it never reaches a
+// live overlay.
+func propertyKindToSchema(k handler.PropertyKind) schema.Kind {
+	switch k {
+	case handler.PropertyKindString:
+		return schema.KindString
+	case handler.PropertyKindNumber:
+		return schema.KindNumber
+	case handler.PropertyKindBoolean:
+		return schema.KindBoolean
+	case handler.PropertyKindNull:
+		return schema.KindNull
+	case handler.PropertyKindArray:
+		return schema.KindArray
+	case handler.PropertyKindObject:
+		return schema.KindObject
+	}
+	return schema.KindUnknown
 }
 
 // ValidateExternalTypes checks the caller-supplied catalog against
@@ -200,8 +267,8 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			return fmt.Errorf("spaceobjects: type[%d]: duplicate type Id %q", i, t.Id)
 		}
 		seenTypeIds[t.Id] = struct{}{}
-		if len(t.Handlers) == 0 {
-			return fmt.Errorf("spaceobjects: type[%d] (%q): zero handlers — types must own at least one dataset", i, t.Id)
+		if len(t.Handlers) == 0 && len(t.Properties) == 0 {
+			return fmt.Errorf("spaceobjects: type[%d] (%q): empty — a type must own at least one dataset (Handlers) or declare at least one property (Properties)", i, t.Id)
 		}
 		for j, r := range t.Handlers {
 			if r.Handler == nil {
@@ -221,6 +288,22 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) handler[%d]: duplicate dataset %q across catalog", i, t.Id, j, name)
 			}
 			seenDatasets[name] = struct{}{}
+		}
+		seenProps := make(map[string]struct{}, len(t.Properties))
+		for k, p := range t.Properties {
+			if p.Id == "" {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: empty Id", i, t.Id, k)
+			}
+			if p.Id == "id" || strings.HasPrefix(p.Id, "_") || strings.ContainsAny(p.Id, ".") {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: reserved or invalid Id %q (no \"id\", no \"_\" prefix, no dots)", i, t.Id, k, p.Id)
+			}
+			if propertyKindToSchema(p.Kind) == schema.KindUnknown {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d] (%q): invalid Kind %d", i, t.Id, k, p.Id, p.Kind)
+			}
+			if _, dup := seenProps[p.Id]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: duplicate property Id %q", i, t.Id, k, p.Id)
+			}
+			seenProps[p.Id] = struct{}{}
 		}
 	}
 	return nil
@@ -585,7 +668,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	shared := crdt.SharedCollections{properties.Dataset: coll}
 	handlers := []crdt.Handler{
-		properties.New(nil),
+		properties.New(s.reg),
 		typetype.PropertyHandler{},
 		crdt.DefaultHandler{DatasetName: typetype.ShortIdsDataset, HandlerVersion: 1},
 	}

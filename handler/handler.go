@@ -19,7 +19,10 @@
 package handler
 
 import (
+	"errors"
+
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/properties"
 )
 
 // Handler owns one dataset. Lifecycle hooks fire inside any-store's
@@ -83,6 +86,58 @@ type IndexedHandler = crdt.IndexedHandler
 // op is rejected. Programmatic discrimination uses errors.Is.
 var ErrValidation = crdt.ErrValidation
 
+// Per-reason property-validation sentinels. A rejected property write
+// satisfies errors.Is(err, ErrValidation) and, additionally, exactly one
+// of these — letting callers classify the specific cause with errors.Is
+// instead of matching on the message text. Returned by the write-time
+// pre-flight and recorded for apply-time per-op drops.
+var (
+	ErrValidationInvalidPath        = properties.ErrInvalidPath
+	ErrValidationTypeNotImplemented = properties.ErrTypeNotImplemented
+	ErrValidationTypeUnknown        = properties.ErrTypeUnknown
+	ErrValidationUnknownProperty    = properties.ErrUnknownProperty
+	ErrValidationKindMismatch       = properties.ErrKindMismatch
+)
+
+// ValidationReason is the machine-readable cause of a property-write
+// rejection. Returned by ClassifyValidation so callers can switch on a
+// single typed value instead of chaining errors.Is against each
+// sentinel. The string values are stable and match the discriminant
+// carried on the wire-agnostic rejection.
+type ValidationReason string
+
+const (
+	ReasonInvalidPath        ValidationReason = properties.ReasonInvalidPath
+	ReasonTypeNotImplemented ValidationReason = properties.ReasonTypeNotImplemented
+	ReasonTypeUnknown        ValidationReason = properties.ReasonTypeUnknown
+	ReasonUnknownProperty    ValidationReason = properties.ReasonUnknownProperty
+	ReasonKindMismatch       ValidationReason = properties.ReasonKindMismatch
+)
+
+// ClassifyValidation maps a property-validation rejection to its cause
+// in one call. It returns (reason, true) for any error produced by the
+// property write-time pre-flight or apply-time per-op validator
+// (anywhere in the error's Unwrap chain), and ("", false) for anything
+// else — including nil. Classification is structural (errors.As on the
+// rejection value), never a match on the message text.
+//
+//	if r, ok := handler.ClassifyValidation(err); ok {
+//	    switch r {
+//	    case handler.ReasonKindMismatch: ...
+//	    case handler.ReasonUnknownProperty: ...
+//	    }
+//	}
+//
+// errors.Is(err, handler.ErrValidation) remains the umbrella check, and
+// the per-reason ErrValidation* sentinels still work with errors.Is.
+func ClassifyValidation(err error) (ValidationReason, bool) {
+	var ve *properties.ValidationError
+	if errors.As(err, &ve) {
+		return ValidationReason(ve.Reason), true
+	}
+	return "", false
+}
+
 // ErrUnknownDataset signals a change targeting a dataset with no
 // registered handler.
 var ErrUnknownDataset = crdt.ErrUnknownDataset
@@ -110,8 +165,11 @@ type Registration struct {
 // `type` owns `properties` and `shortIds`. Callers extend the
 // catalog by supplying additional Types via config.Config.Types.
 //
-// A Type with zero handlers is rejected — types exist to own
-// handlers, so an empty Handlers slice is meaningless.
+// A Type must carry something the SDK can act on: at least one
+// dataset handler (Handlers) OR at least one property declaration
+// (Properties). A property-only type (no Handlers) is valid — e.g. a
+// type whose entire footprint is values in the shared `objects`
+// namespace. A type with neither is rejected at sdk.Open.
 //
 // Display metadata (Name / Description / IconCID) is surfaced via
 // space.Types().List() and Get() alongside user-created types, so
@@ -140,4 +198,42 @@ type Type struct {
 	// catalog (built-ins + every external Type's handlers); the
 	// SDK rejects collisions at sdk.Open.
 	Handlers []Registration
+
+	// Properties declares this type's property definitions for the
+	// per-space `objects` namespace keyed by Type.Id. The SDK
+	// validates writes to `{typeId}.{propId}` against these: the
+	// propId must be declared here and the value's kind must match.
+	//
+	// Optional. A type that only owns separate datasets (e.g. an
+	// editor body tree) and contributes no values to the `objects`
+	// record leaves this empty. Built-in `any` / `spaceIndex` carry
+	// the equivalent tables internally; external types declare theirs
+	// here so the SDK can resolve and enforce their schema.
+	Properties []PropertyDecl
+}
+
+// PropertyKind mirrors the JSON-Schema-subset value kinds the SDK
+// validates against. The zero value is invalid — every declared
+// property has a concrete kind. Values track space.PropertyKind 1:1
+// but live here so callers declaring types via config.Config.Types
+// don't need to import the space package.
+type PropertyKind uint8
+
+const (
+	PropertyKindString PropertyKind = iota + 1
+	PropertyKindNumber
+	PropertyKindBoolean
+	PropertyKindNull
+	PropertyKindArray
+	PropertyKindObject
+)
+
+// PropertyDecl is one property definition declared by an external
+// Type. Id is the on-record field key under `{typeId}`; Kind is the
+// value kind enforced on write; Name is an optional display label
+// surfaced through space.Types().Properties().
+type PropertyDecl struct {
+	Id   string
+	Name string
+	Kind PropertyKind
 }

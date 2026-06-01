@@ -2,6 +2,7 @@ package properties_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -173,19 +174,44 @@ func TestSystemPropertiesHandler_UnknownPropertyDrops(t *testing.T) {
 	assert.Equal(t, float64(3), rec.GetFloat64("_base", typeAny, propRating))
 }
 
-func TestSystemPropertiesHandler_CreateRejectedOnAnyMismatch(t *testing.T) {
+func TestSystemPropertiesHandler_CreatePerOpDrop(t *testing.T) {
 	ctrl := newPropsController(t, defaultRegistry())
 	arena := &anyenc.Arena{}
 
-	// Stricter on create: any mismatch in the creation drops the whole record.
+	// Per-op drop on create (inbound read-tolerance): the kind-mismatched
+	// op (string into a number field) is dropped, the valid op lands, and
+	// the record is created.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v1", testObjectId, "_base", true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("ok")},
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")},
 	)))
 
-	// Both ops dropped — record never landed.
-	assert.Nil(t, ctrl.Get(context.Background(), properties.Dataset, testObjectId))
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "ok", rec.GetString("_base", typeAny, propName), "valid op landed")
+	assert.Nil(t, rec.Get("_base", typeAny, propRating), "kind-mismatched op dropped")
+}
+
+func TestSystemPropertiesHandler_CreateSkippedWhenAllOpsDrop(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	// Every op invalid → all drop. The record still materializes with
+	// only the auto-stamped fields (author/createdAt/spaceId are absent
+	// here since the change carries no envelope), so assert no property
+	// value landed under the type namespace.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", testObjectId, "_base", true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "unknown-prop"}, Payload: arena.NewString("x")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	if rec != nil {
+		assert.Nil(t, rec.Get("_base", typeAny, propRating), "mismatched op dropped")
+		assert.Nil(t, rec.Get("_base", typeAny, "unknown-prop"), "unknown-prop op dropped")
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -227,4 +253,149 @@ func TestSystemPropertiesHandler_NilRegistryPasses(t *testing.T) {
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
 	assert.Equal(t, "anything", rec.GetString("_base", "not-a-type", "not-a-prop"))
+}
+
+// ----------------------------------------------------------------------------
+// PreValidate — strict local write-time validation (LocalPreValidator)
+// ----------------------------------------------------------------------------
+
+const propUserT = "userT" // a non-universal user type for membership tests
+
+func preflightRegistry() *types.StubRegistry {
+	r := defaultRegistry() // any: p-name(string), p-rating(number), p-tags(array)
+	r.Set(typeAny, "types", schema.KindArray) // any.types is a real built-in prop
+	r.Set(propUserT, "p1", schema.KindString)
+	return r
+}
+
+// beforeWithTypes builds a record pre-state carrying any.types.
+func beforeWithTypes(arena *anyenc.Arena, typeIds ...string) *anyenc.Value {
+	rec := arena.NewObject()
+	anyNs := arena.NewObject()
+	arr := arena.NewArray()
+	for i, t := range typeIds {
+		arr.SetArrayItem(i, arena.NewString(t))
+	}
+	anyNs.Set("types", arr)
+	rec.Set("any", anyNs)
+	return rec
+}
+
+// singlePathChange wraps one single-path op into a change.
+func singlePathChange(opType crdt.OpType, path []string, payload *anyenc.Value) *crdt.Change {
+	return &crdt.Change{
+		ObjectId: testObjectId, Dataset: properties.Dataset, DataVersion: testDataVer,
+		Records: []crdt.RecordChange{{Id: testObjectId, Upsert: true,
+			Ops: []crdt.Op{{Type: opType, Path: path, Payload: payload}}}},
+	}
+}
+
+// multiFieldChange wraps one multi-field $set op (dotted keys) into a change.
+func multiFieldChange(payload *anyenc.Value) *crdt.Change {
+	return &crdt.Change{
+		ObjectId: testObjectId, Dataset: properties.Dataset, DataVersion: testDataVer,
+		Records: []crdt.RecordChange{{Id: testObjectId, Upsert: true,
+			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: payload}}}},
+	}
+}
+
+func TestPreValidate_GoodWrites(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	a := &anyenc.Arena{}
+
+	// Universal `any` namespace — always implemented.
+	require.NoError(t, h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{typeAny, propName}, a.NewString("x")), nil))
+
+	// User type present in any.types, valid prop + kind.
+	require.NoError(t, h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")),
+		beforeWithTypes(a, propUserT)))
+}
+
+func TestPreValidate_UnknownProperty(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	a := &anyenc.Arena{}
+	err := h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{typeAny, "ghost"}, a.NewString("x")), nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, crdt.ErrValidation)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonUnknownProperty, ve.Reason)
+}
+
+func TestPreValidate_KindMismatch(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	a := &anyenc.Arena{}
+	err := h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{typeAny, propRating}, a.NewString("not-a-number")), nil)
+	require.ErrorIs(t, err, crdt.ErrValidation)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonKindMismatch, ve.Reason)
+	assert.Equal(t, schema.KindNumber, ve.Expected)
+	assert.Equal(t, schema.KindString, ve.Got)
+}
+
+func TestPreValidate_TypeNotImplemented(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	a := &anyenc.Arena{}
+	// userT is known to the registry but NOT in the object's any.types.
+	err := h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")), nil)
+	require.ErrorIs(t, err, crdt.ErrValidation)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonTypeNotImplemented, ve.Reason)
+}
+
+func TestPreValidate_TypeUnknown(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	a := &anyenc.Arena{}
+	// ghostT is in any.types (member) but not in the registry.
+	err := h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{"ghostT", "x"}, a.NewString("v")),
+		beforeWithTypes(a, "ghostT"))
+	require.ErrorIs(t, err, crdt.ErrValidation)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonTypeUnknown, ve.Reason)
+}
+
+func TestPreValidate_AttachAndWriteInSameChange(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	a := &anyenc.Arena{}
+	// Multi-field $set that both adds userT to any.types and writes its prop.
+	payload := a.NewObject()
+	arr := a.NewArray()
+	arr.SetArrayItem(0, a.NewString(propUserT))
+	payload.Set("any.types", arr)
+	payload.Set(propUserT+".p1", a.NewString("v"))
+	require.NoError(t, h.PreValidate(multiFieldChange(payload), nil))
+}
+
+func TestPreValidate_InvalidPath(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	a := &anyenc.Arena{}
+	err := h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{typeAny}, a.NewString("x")), nil)
+	require.ErrorIs(t, err, crdt.ErrValidation)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonInvalidPath, ve.Reason)
+}
+
+func TestPreValidate_UnsetAlwaysValid(t *testing.T) {
+	h := properties.New(preflightRegistry())
+	// $unset of an unknown property under an unimplemented type is a no-op.
+	require.NoError(t, h.PreValidate(
+		singlePathChange(crdt.OpUnset, []string{"whatever", "ghost"}, nil), nil))
+}
+
+func TestPreValidate_NilRegistryPasses(t *testing.T) {
+	h := properties.New(nil)
+	a := &anyenc.Arena{}
+	require.NoError(t, h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{"x", "y"}, a.NewString("z")), nil))
 }

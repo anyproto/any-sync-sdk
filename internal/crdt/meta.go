@@ -73,9 +73,9 @@ func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string,
 // HandlerVersions returns a map of dataset→version from the Controller's
 // registered handlers.
 func (c *Controller) HandlerVersions() map[string]int {
-	hv := make(map[string]int, len(c.handlers))
-	for name, h := range c.handlers {
-		hv[name] = h.Version()
+	hv := make(map[string]int, len(c.versions))
+	for name, ver := range c.versions {
+		hv[name] = ver
 	}
 	return hv
 }

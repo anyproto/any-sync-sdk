@@ -328,8 +328,8 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 	if typeId == spaceindex.TypeId {
 		return builtInSpaceIndexProperties(), nil
 	}
-	if _, ok := t.findRegisteredType(typeId); ok {
-		return nil, nil
+	if rt, ok := t.findRegisteredType(typeId); ok {
+		return registeredTypeProperties(rt), nil
 	}
 	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
 	if err != nil {
@@ -389,6 +389,47 @@ func builtInSpaceIndexProperties() []space.PropertyDef {
 		})
 	}
 	return out
+}
+
+// registeredTypeProperties maps a caller-registered type's declared
+// PropertyDecls into the public PropertyDef shape, so
+// space.Types().Properties() surfaces the same schema the SDK
+// validates writes against. Returns nil for a type that declares no
+// properties (owns only separate datasets).
+func registeredTypeProperties(t handler.Type) []space.PropertyDef {
+	if len(t.Properties) == 0 {
+		return nil
+	}
+	out := make([]space.PropertyDef, 0, len(t.Properties))
+	for _, p := range t.Properties {
+		out = append(out, space.PropertyDef{
+			Id:   p.Id,
+			Name: p.Name,
+			Kind: handlerKindToPropertyKind(p.Kind),
+		})
+	}
+	return out
+}
+
+// handlerKindToPropertyKind maps the public handler.PropertyKind enum
+// to space.PropertyKind. The two track 1:1 but live in different
+// packages.
+func handlerKindToPropertyKind(k handler.PropertyKind) space.PropertyKind {
+	switch k {
+	case handler.PropertyKindString:
+		return space.PropertyKindString
+	case handler.PropertyKindNumber:
+		return space.PropertyKindNumber
+	case handler.PropertyKindBoolean:
+		return space.PropertyKindBoolean
+	case handler.PropertyKindNull:
+		return space.PropertyKindNull
+	case handler.PropertyKindArray:
+		return space.PropertyKindArray
+	case handler.PropertyKindObject:
+		return space.PropertyKindObject
+	}
+	return 0
 }
 
 // decodePropertyDef parses one row from a type object's `defs`

@@ -22,4 +22,25 @@ type Registry interface {
 	// given (typeId, propId). Returns (KindUnknown, false) if either
 	// the type or the property is unknown to this registry.
 	LookupKind(typeId, propId string) (schema.Kind, bool)
+
+	// TypeKnown reports whether a schema for typeId is resolvable —
+	// a built-in (any / spaceIndex), a registered external type, or a
+	// user type whose property defs have synced. Distinguishes
+	// "type not implemented / not here yet" from "type known, property
+	// unknown" so the writer-side validator can produce a precise
+	// rejection.
+	TypeKnown(typeId string) bool
+
+	// PropsOf returns the declared properties of typeId for validation
+	// and for building agent-readable error messages (valid-property
+	// lists). ok is false when the type is unresolvable.
+	PropsOf(typeId string) (props []PropInfo, ok bool)
+}
+
+// PropInfo is one declared property: its id, display name, and kind.
+// Returned by PropsOf for validation and error formatting.
+type PropInfo struct {
+	Id   string
+	Name string
+	Kind schema.Kind
 }

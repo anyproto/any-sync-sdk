@@ -643,7 +643,7 @@ SubscriptionEvent {
   versionId: string             // per-change DAG order; for fence-and-replay
   added:   [SubRecord, ...]     // records that entered the visible window
   updated: [SubRecord, ...]     // records already in the window, changed
-  removed: [string, ...]        // ids that left the visible window
+  removed: [RemovedRecord, ...] // records that left the visible window, tagged with cause
 }
 
 SubRecord {
@@ -651,9 +651,22 @@ SubRecord {
   doc: anyenc.Value             // full post-apply value, deep-cloned
   ops: [EventOp, ...]           // projected $set / $unset ops from the change
 }
+
+RemovedRecord {
+  id:     string
+  reason: deleted | filtered-out | displaced
+}
 ```
 
 `ops` is post-projection: every `$inc` / `$addToSet` / `$pull` / `$incGated` has been merged on the SDK side and ships as a `$set` against the post-apply value (or `$unset` when the path went away). A thin client can apply `ops` against a JSON-like local mirror without a CRDT engine. `doc` carries the full post-apply state for clients that prefer to rerender from scratch.
+
+`removed` carries each id that left the visible window, tagged with **why** so clients can tell "the object is gone" from "it left my result set but still exists":
+
+- `deleted` — the record was tombstoned; gone from the database. A `Query.One` now returns `ErrNotFound`.
+- `filtered-out` — an update changed a field so the query filter no longer matches; the record still exists.
+- `displaced` — a higher-priority arrival (or the record's own sort-key change) pushed it past the `Limit` boundary; it still matches the filter, just sits outside the visible window.
+
+Branch on `deleted` to drop the object for good; the other two mean a `Snapshot`/`Query.One` would still return it.
 
 ### 13.2 Window Semantics
 
@@ -665,12 +678,12 @@ The window tracks filter + sort + limit incrementally.
 
 ### 13.3 Removed Semantics
 
-`Removed` is just "drop this id from your view". Three causes funnel into the same signal and are NOT distinguished on the wire:
-- Deleted (the record was tombstoned in the DB).
-- Filter-rejected (an update changed a field so the filter no longer matches).
-- Displaced (a higher-priority arrival pushed the record past `Limit`).
+Each `RemovedRecord` carries the id plus a `reason` so consumers can tell "the object is gone" from "it left my result set but still exists":
+- `deleted` — the record was tombstoned in the DB; a `Query.One` for the id now returns `ErrNotFound`.
+- `filtered-out` — an update changed a field so the filter no longer matches; the record still exists.
+- `displaced` — a higher-priority arrival (or the record's own sort-key change) pushed it past `Limit`; it still matches the filter, just sits outside the visible window.
 
-Consumers needing to disambiguate call `Snapshot` / `Query.One` with the id (deleted ⇒ `ErrNotFound`; filter-rejected ⇒ doc that doesn't match the active filter; displaced ⇒ doc that does).
+Branch on `deleted` to drop the object for good. For `filtered-out` / `displaced`, a `Snapshot` / `Query.One` with the id still returns the doc (filtered-out ⇒ doesn't match the active filter; displaced ⇒ does).
 
 ### 13.4 Property Variants in Events
 For the `objects` collection: `SubRecord.Doc` carries the merged post-apply value (computed root). Variant-level (`_device` / `_account` / `_base`) introspection is not exposed in v1; an advanced channel is deferred.

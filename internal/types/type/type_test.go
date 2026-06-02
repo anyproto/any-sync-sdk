@@ -33,8 +33,8 @@ func newTypeController(t *testing.T) *crdt.Controller {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctrl, err := crdt.NewController(context.Background(), testObjectId, db,
-		typetype.PropertyHandler{},
-		crdt.DefaultHandler{DatasetName: typetype.ShortIdsDataset},
+		crdt.HandlerReg{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}},
+		crdt.HandlerReg{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}},
 	)
 	require.NoError(t, err)
 	return ctrl

@@ -12,12 +12,11 @@ import (
 )
 
 // stubHandler is the minimal Handler used to exercise registration
-// validation without standing up an actual apply pipeline.
-type stubHandler struct{ name string }
+// validation without standing up an actual apply pipeline. Name /
+// version / indexes live on the handler.Dataset, not here.
+type stubHandler struct{}
 
-func (s stubHandler) Dataset() string                                        { return s.name }
-func (s stubHandler) Version() int                                           { return 1 }
-func (stubHandler) Init(_ context.Context) error                             { return nil }
+func (stubHandler) Init(_ context.Context) error { return nil }
 func (stubHandler) BeforeCreate(*handler.ChangeCtx, *handler.RecordChange, *handler.Sink) error {
 	return nil
 }
@@ -39,100 +38,135 @@ func TestValidateExternalTypes(t *testing.T) {
 			extTypes: nil,
 		},
 		{
-			name: "valid single",
+			name: "valid single dataset",
 			extTypes: []handler.Type{
-				{
-					Id: "movie",
-					Handlers: []handler.Registration{
-						{Handler: stubHandler{name: "scenes"}, DataVersion: "scenes-v1"},
-					},
-				},
+				{Id: "movie", Datasets: []handler.Dataset{
+					{Name: "scenes", DataVersion: "scenes-v1", Handler: stubHandler{}},
+				}},
 			},
 		},
 		{
-			name: "valid multiple types and handlers",
+			name: "valid: one type owns many datasets",
 			extTypes: []handler.Type{
-				{
-					Id: "movie",
-					Handlers: []handler.Registration{
-						{Handler: stubHandler{name: "scenes"}, DataVersion: "scenes-v1"},
-						{Handler: stubHandler{name: "credits"}, DataVersion: "credits-v1"},
-					},
-				},
-				{
-					Id: "task",
-					Handlers: []handler.Registration{
-						{Handler: stubHandler{name: "subtasks"}, DataVersion: "subtasks-v1"},
-					},
-				},
+				{Id: "movie", Datasets: []handler.Dataset{
+					{Name: "scenes", DataVersion: "scenes-v1", Handler: stubHandler{}},
+					{Name: "credits", DataVersion: "credits-v1", Handler: stubHandler{}},
+				}},
+				{Id: "task", Datasets: []handler.Dataset{
+					{Name: "subtasks", DataVersion: "subtasks-v1", Handler: stubHandler{}},
+				}},
 			},
+		},
+		{
+			name: "valid: pure-declaration type (no datasets, no properties)",
+			extTypes: []handler.Type{{Id: "tag"}},
+		},
+		{
+			name: "valid: property-only type",
+			extTypes: []handler.Type{{
+				Id: "nav",
+				Properties: []handler.PropertyDecl{
+					{Id: "type", Kind: handler.PropertyKindNumber},
+					{Id: "pos", Kind: handler.PropertyKindString},
+				},
+			}},
+		},
+		{
+			name: "valid: datasets + properties on one type",
+			extTypes: []handler.Type{{
+				Id:         "doc",
+				Datasets:   []handler.Dataset{{Name: "doc_blocks", DataVersion: "doc-v1", Handler: stubHandler{}}},
+				Properties: []handler.PropertyDecl{{Id: "title", Kind: handler.PropertyKindString}},
+			}},
 		},
 		{
 			name:     "empty type id",
-			extTypes: []handler.Type{{Id: "", Handlers: []handler.Registration{{Handler: stubHandler{name: "x"}, DataVersion: "v1"}}}},
+			extTypes: []handler.Type{{Id: "", Datasets: []handler.Dataset{{Name: "x", DataVersion: "v1", Handler: stubHandler{}}}}},
 			err:      "empty Id",
 		},
 		{
 			name: "duplicate type id",
 			extTypes: []handler.Type{
-				{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: "a"}, DataVersion: "v1"}}},
-				{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: "b"}, DataVersion: "v1"}}},
+				{Id: "movie", Datasets: []handler.Dataset{{Name: "a", DataVersion: "v1", Handler: stubHandler{}}}},
+				{Id: "movie", Datasets: []handler.Dataset{{Name: "b", DataVersion: "v1", Handler: stubHandler{}}}},
 			},
 			err: `duplicate type Id "movie"`,
 		},
 		{
-			name:     "type without handlers",
-			extTypes: []handler.Type{{Id: "movie"}},
-			err:      "zero handlers",
+			name: "property with invalid kind",
+			extTypes: []handler.Type{{
+				Id:         "nav",
+				Properties: []handler.PropertyDecl{{Id: "pos"}}, // zero Kind
+			}},
+			err: "invalid Kind",
+		},
+		{
+			name: "property with reserved id",
+			extTypes: []handler.Type{{
+				Id:         "nav",
+				Properties: []handler.PropertyDecl{{Id: "_x", Kind: handler.PropertyKindString}},
+			}},
+			err: "reserved or invalid Id",
+		},
+		{
+			name: "duplicate property id",
+			extTypes: []handler.Type{{
+				Id: "nav",
+				Properties: []handler.PropertyDecl{
+					{Id: "pos", Kind: handler.PropertyKindString},
+					{Id: "pos", Kind: handler.PropertyKindNumber},
+				},
+			}},
+			err: "duplicate property Id",
 		},
 		{
 			name:     "nil handler",
-			extTypes: []handler.Type{{Id: "movie", Handlers: []handler.Registration{{DataVersion: "v1"}}}},
+			extTypes: []handler.Type{{Id: "movie", Datasets: []handler.Dataset{{Name: "x", DataVersion: "v1"}}}},
 			err:      "nil Handler",
 		},
 		{
-			name:     "empty dataset",
-			extTypes: []handler.Type{{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: ""}, DataVersion: "v1"}}}},
-			err:      "empty Dataset",
+			name:     "empty dataset name",
+			extTypes: []handler.Type{{Id: "movie", Datasets: []handler.Dataset{{DataVersion: "v1", Handler: stubHandler{}}}}},
+			err:      "empty Name",
 		},
 		{
 			name:     "empty data version",
-			extTypes: []handler.Type{{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: "x"}}}}},
+			extTypes: []handler.Type{{Id: "movie", Datasets: []handler.Dataset{{Name: "x", Handler: stubHandler{}}}}},
 			err:      "empty DataVersion",
 		},
 		{
 			name:     "collides with built-in objects",
-			extTypes: []handler.Type{{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: "objects"}, DataVersion: "v1"}}}},
-			err:      `dataset "objects" is reserved`,
+			extTypes: []handler.Type{{Id: "movie", Datasets: []handler.Dataset{{Name: "objects", DataVersion: "v1", Handler: stubHandler{}}}}},
+			err:      `"objects" is reserved`,
 		},
 		{
 			name:     "collides with built-in properties",
-			extTypes: []handler.Type{{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: "properties"}, DataVersion: "v1"}}}},
-			err:      `dataset "properties" is reserved`,
+			extTypes: []handler.Type{{Id: "movie", Datasets: []handler.Dataset{{Name: "properties", DataVersion: "v1", Handler: stubHandler{}}}}},
+			err:      `"properties" is reserved`,
 		},
 		{
 			name:     "collides with built-in shortIds",
-			extTypes: []handler.Type{{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: "shortIds"}, DataVersion: "v1"}}}},
-			err:      `dataset "shortIds" is reserved`,
+			extTypes: []handler.Type{{Id: "movie", Datasets: []handler.Dataset{{Name: "shortIds", DataVersion: "v1", Handler: stubHandler{}}}}},
+			err:      `"shortIds" is reserved`,
 		},
 		{
 			name: "duplicate dataset across same type",
 			extTypes: []handler.Type{{
 				Id: "movie",
-				Handlers: []handler.Registration{
-					{Handler: stubHandler{name: "scenes"}, DataVersion: "v1"},
-					{Handler: stubHandler{name: "scenes"}, DataVersion: "v2"},
+				Datasets: []handler.Dataset{
+					{Name: "scenes", DataVersion: "v1", Handler: stubHandler{}},
+					{Name: "scenes", DataVersion: "v2", Handler: stubHandler{}},
 				},
 			}},
-			err: `duplicate dataset "scenes"`,
+			err: `duplicate dataset name "scenes"`,
 		},
 		{
 			name: "duplicate dataset across types",
 			extTypes: []handler.Type{
-				{Id: "movie", Handlers: []handler.Registration{{Handler: stubHandler{name: "scenes"}, DataVersion: "v1"}}},
-				{Id: "task", Handlers: []handler.Registration{{Handler: stubHandler{name: "scenes"}, DataVersion: "v2"}}},
+				{Id: "movie", Datasets: []handler.Dataset{{Name: "scenes", DataVersion: "v1", Handler: stubHandler{}}}},
+				{Id: "task", Datasets: []handler.Dataset{{Name: "scenes", DataVersion: "v2", Handler: stubHandler{}}}},
 			},
-			err: `duplicate dataset "scenes"`,
+			err: `duplicate dataset name "scenes"`,
 		},
 	}
 
@@ -151,12 +185,9 @@ func TestValidateExternalTypes(t *testing.T) {
 
 func TestStore_DataVersion_External(t *testing.T) {
 	extTypes := []handler.Type{
-		{
-			Id: "movie",
-			Handlers: []handler.Registration{
-				{Handler: stubHandler{name: "scenes"}, DataVersion: "scenes-v3"},
-			},
-		},
+		{Id: "movie", Datasets: []handler.Dataset{
+			{Name: "scenes", DataVersion: "scenes-v3", Handler: stubHandler{}},
+		}},
 	}
 	require.NoError(t, ValidateExternalTypes(extTypes))
 
@@ -167,7 +198,7 @@ func TestStore_DataVersion_External(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "systemPropertyHandler-v1", v)
 
-	// External type's handler resolves.
+	// External type's dataset resolves.
 	v, err = store.DataVersion("scenes")
 	require.NoError(t, err)
 	assert.Equal(t, "scenes-v3", v)
@@ -175,4 +206,30 @@ func TestStore_DataVersion_External(t *testing.T) {
 	// Unknown dataset still errors.
 	_, err = store.DataVersion("nope")
 	assert.True(t, errors.Is(err, ErrUnknownDataset))
+}
+
+func TestStore_DatasetOwner(t *testing.T) {
+	extTypes := []handler.Type{
+		{Id: "movie", Datasets: []handler.Dataset{
+			{Name: "scenes", DataVersion: "v1", Handler: stubHandler{}},
+			{Name: "credits", DataVersion: "v1", Handler: stubHandler{}},
+		}},
+		{Id: "nav", Properties: []handler.PropertyDecl{{Id: "pos", Kind: handler.PropertyKindString}}},
+	}
+	require.NoError(t, ValidateExternalTypes(extTypes))
+	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes)
+
+	// Both datasets of one type map to that owner (N→1).
+	owner, ok := store.DatasetOwner("scenes")
+	assert.True(t, ok)
+	assert.Equal(t, "movie", owner)
+	owner, ok = store.DatasetOwner("credits")
+	assert.True(t, ok)
+	assert.Equal(t, "movie", owner)
+
+	// Built-in and property-only types own no external dataset.
+	_, ok = store.DatasetOwner("objects")
+	assert.False(t, ok)
+	_, ok = store.DatasetOwner("nope")
+	assert.False(t, ok)
 }

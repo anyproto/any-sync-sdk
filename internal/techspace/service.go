@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -33,8 +34,11 @@ type Service struct {
 	app *anysyncx.App
 	db  anystore.DB
 
-	mu      sync.Mutex
-	open    bool
+	mu sync.Mutex
+	// open is read lock-free from many methods (incl. background
+	// goroutines like the spaceIndex lazy-seed) and flipped to false by
+	// Close — atomic to keep those concurrent accesses race-free.
+	open    atomic.Bool
 	spaceId string
 	indexId string
 	ctrl    *crdt.Controller
@@ -71,7 +75,7 @@ func New(app *anysyncx.App, db anystore.DB) *Service {
 func (s *Service) Open(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.open {
+	if s.open.Load() {
 		return nil
 	}
 
@@ -127,7 +131,10 @@ func (s *Service) Open(ctx context.Context) error {
 		return fmt.Errorf("techspace: open index collection: %w", err)
 	}
 
-	ctrl, err := crdt.NewController(ctx, s.indexId, s.db, SpaceIndexHandler{}, ProfileHandler{})
+	ctrl, err := crdt.NewController(ctx, s.indexId, s.db,
+		crdt.HandlerReg{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}},
+		crdt.HandlerReg{Name: ProfileDataset, Handler: ProfileHandler{}},
+	)
 	if err != nil {
 		return fmt.Errorf("techspace: new controller: %w", err)
 	}
@@ -145,7 +152,7 @@ func (s *Service) Open(ctx context.Context) error {
 		return fmt.Errorf("techspace: cold restore: %w", err)
 	}
 
-	s.open = true
+	s.open.Store(true)
 	return nil
 }
 
@@ -214,7 +221,7 @@ func (s *Service) IndexObjectId() string { return s.indexId }
 
 // Add writes a new space-index record.
 func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteResult, error) {
-	if !s.open {
+	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
 	if rec.Id == "" {
@@ -258,7 +265,7 @@ func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteRe
 // state right after Create, before the initial property write has
 // applied).
 func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, description, iconCID string) (object.WriteResult, error) {
-	if !s.open {
+	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
 	s.bindMu.Lock()
@@ -285,7 +292,7 @@ func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, descripti
 
 // SetLocalStatus updates the localStatus field of an existing record.
 func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
-	if !s.open {
+	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
 	s.bindMu.Lock()
@@ -316,7 +323,7 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 // Get returns the current state of one space-index record. Reads
 // straight off the controller — no space load needed.
 func (s *Service) Get(ctx context.Context, spaceId string) (SpaceIndexRecord, bool) {
-	if !s.open {
+	if !s.open.Load() {
 		return SpaceIndexRecord{}, false
 	}
 	v := s.ctrl.Get(ctx, SpaceIndexDataset, spaceId)
@@ -328,7 +335,7 @@ func (s *Service) Get(ctx context.Context, spaceId string) (SpaceIndexRecord, bo
 
 // List returns every live space-index record.
 func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
-	if !s.open {
+	if !s.open.Load() {
 		return nil
 	}
 	rows := s.ctrl.Records(ctx, SpaceIndexDataset)
@@ -344,7 +351,7 @@ func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
 // when a profile has ever been written; false on a fresh device that
 // hasn't seen UpdateMetadata yet.
 func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
-	if !s.open {
+	if !s.open.Load() {
 		return ProfileRecord{}, false
 	}
 	v := s.ctrl.Get(ctx, ProfileDataset, ProfileSelfId)
@@ -359,7 +366,7 @@ func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
 // identityRepo, so a subsequent boot can republish without the user
 // re-calling UpdateMetadata.
 func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
-	if !s.open {
+	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
 	s.bindMu.Lock()
@@ -390,7 +397,7 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 // caller-round-trip seed; this method exists for future callers that
 // route everything through the Indexer seam.
 func (s *Service) OnSpaceCreated(ctx context.Context, spaceId string, meta space.SpaceInfo) error {
-	if !s.open {
+	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
 	if spaceId == "" {
@@ -414,7 +421,7 @@ func (s *Service) OnSpaceCreated(ctx context.Context, spaceId string, meta space
 // OnSpaceDeleted satisfies space.Indexer. Flips the row to
 // localStatus=deleted; the record is never physically removed.
 func (s *Service) OnSpaceDeleted(ctx context.Context, spaceId string) error {
-	if !s.open {
+	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
 	_, err := s.SetLocalStatus(ctx, spaceId, StatusDeleted)
@@ -436,7 +443,7 @@ func (s *Service) OnSpaceDeleted(ctx context.Context, spaceId string) error {
 //     tree, which would otherwise race with caller-initiated writes
 //     like SetLocalStatus on the apply lock.
 func (s *Service) OnSpaceMetadataUpdated(ctx context.Context, spaceId string, meta space.SpaceInfo) error {
-	if !s.open {
+	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
 	rec, ok := s.Get(ctx, spaceId)
@@ -456,9 +463,7 @@ var _ space.Indexer = (*Service)(nil)
 // Close marks the service inactive. Underlying space cleanup happens
 // via the App's space cache on its own schedule.
 func (s *Service) Close(_ context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.open = false
+	s.open.Store(false)
 	return nil
 }
 

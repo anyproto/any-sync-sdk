@@ -84,19 +84,20 @@ func (s *Sink) reset() {
 	s.sibling = s.sibling[:0]
 }
 
-// Handler owns one dataset. Lifecycle hooks fire inside any-store's Modify
-// callback so handlers can read pre-state from ctx.Before and emit derived
-// or sibling writes via sink without an extra DB round-trip.
+// Handler is the lifecycle behavior for one dataset. Hooks fire inside
+// any-store's Modify callback so handlers can read pre-state from
+// ctx.Before and emit derived or sibling writes via sink without an extra
+// DB round-trip.
 //
 // Per-op error returns from BeforeModify drop just the offending op; other
 // ops in the same RecordChange still apply. BeforeCreate / BeforeDelete are
 // per-record, and an error there drops the whole RecordChange.
 //
-// All three Before* methods may be no-ops (see DefaultHandler).
+// A handler is pure behavior: its dataset name, wire DataVersion, handler
+// version, and indexes are declared alongside it in a HandlerReg at
+// registration (see NewController / HandlerReg), not via methods on the
+// handler. All three Before* methods may be no-ops (see DefaultHandler).
 type Handler interface {
-	Dataset() string
-	Version() int
-
 	// Init runs once at registration (NewController / RegisterHandler).
 	// Use it to acquire dependencies; nil for stateless handlers.
 	Init(ctx context.Context) error
@@ -106,31 +107,40 @@ type Handler interface {
 	BeforeDelete(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
 }
 
-// IndexedHandler is implemented by Handlers that want any-store indexes
-// ensured on their dataset's collection. The Controller calls
-// EnsureIndex on each returned IndexInfo the first time it opens the
-// dataset's per-object collection (or, for shared datasets, at
-// handler registration). EnsureIndex is idempotent, so re-running on
-// subsequent process starts is safe.
-type IndexedHandler interface {
-	Indexes() []anystore.IndexInfo
+// HandlerReg binds a dataset name to its handler behavior and the
+// metadata the Controller needs: the handler Version (persisted in _meta
+// for re-index decisions; defaults to 1) and any indexes to ensure on the
+// dataset's collection. The wire DataVersion peers gate against is a
+// write-time concern owned by the caller (it stamps Change.DataVersion),
+// not the Controller — so it lives on the public handler.Dataset, not here.
+type HandlerReg struct {
+	Name    string
+	Version int
+	Handler Handler
+	Indexes []anystore.IndexInfo
 }
 
-// DefaultHandler is a no-op handler accepting every op for the given
-// dataset. Useful as a base for tests and as a convenient embed.
-type DefaultHandler struct {
-	DatasetName    string
-	HandlerVersion int
+// LocalPreValidator is an optional interface a Handler may implement
+// to validate a LOCAL change before it enters the DAG. The Controller
+// calls PreValidate from the local-write path (not on inbound apply);
+// a non-nil error rejects the whole write, keeping a malformed change
+// out of any-sync entirely. Used for strict writer-side schema
+// validation that returns an agent-readable error, while inbound apply
+// stays read-tolerant.
+//
+// `before` is the current value of the change's target record (nil
+// when the change creates it). The Controller resolves it once and
+// hands it to PreValidate, which inspects ch.Records itself. For the
+// shared `objects` dataset every RecordChange collapses onto the
+// object's single row, so one `before` suffices.
+type LocalPreValidator interface {
+	PreValidate(ch *Change, before *anyenc.Value) error
 }
 
-func (d DefaultHandler) Dataset() string { return d.DatasetName }
-
-func (d DefaultHandler) Version() int {
-	if d.HandlerVersion == 0 {
-		return 1
-	}
-	return d.HandlerVersion
-}
+// DefaultHandler is a no-op handler accepting every op. Useful as a base
+// for tests and as a convenient embed; the dataset name / version /
+// indexes live on the HandlerReg, not here.
+type DefaultHandler struct{}
 
 func (DefaultHandler) Init(_ context.Context) error { return nil }
 

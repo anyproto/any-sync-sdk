@@ -298,7 +298,8 @@ func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
 	require.NoError(t, sp.Objects().Delete(ctx, objectId))
 
 	ev := receiveOne(t, res.Sub, 2*time.Second)
-	assert.Contains(t, ev.Removed, objectId, "delete must emit Removed for the objectId")
+	assert.Contains(t, ev.Removed, space.RemovedRecord{Id: objectId, Reason: space.RemoveDeleted},
+		"delete must emit Removed for the objectId with RemoveDeleted")
 	assert.Empty(t, ev.Added)
 	assert.Empty(t, ev.Updated)
 

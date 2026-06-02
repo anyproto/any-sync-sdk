@@ -24,19 +24,43 @@ import (
 // typetype.PropertyHandler at apply time.
 type LiveRegistry struct {
 	db anystore.DB
+
+	// static is the schema overlay for types whose definitions don't
+	// live in a per-type-object `properties` collection: the built-in
+	// `any` / `spaceIndex` tables and every registered external type's
+	// declared Properties. Keyed typeId → propId → PropInfo. Read-only
+	// after construction. A typeId present here is resolved ENTIRELY
+	// from the overlay (no defs-collection fallback); user types are
+	// absent here and fall through to the collection read.
+	static map[string]map[string]PropInfo
 }
 
-// NewLiveRegistry returns a Registry bound to the given SDK DB.
-// Pass nil to disable lookups (every method returns "not found",
-// equivalent to StubRegistry{}).
-func NewLiveRegistry(db anystore.DB) *LiveRegistry { return &LiveRegistry{db: db} }
+// NewLiveRegistry returns a Registry bound to the given SDK DB and a
+// static schema overlay (built-ins + registered external types).
+// Pass a nil db to disable collection lookups (overlay-only, e.g.
+// equivalent to StubRegistry{} for user types); pass a nil overlay
+// for none.
+func NewLiveRegistry(db anystore.DB, static map[string]map[string]PropInfo) *LiveRegistry {
+	return &LiveRegistry{db: db, static: static}
+}
 
-// LookupKind reads the property-definition record for (typeId,
-// propId) from the type's `properties` dataset and returns its
-// declared kind. Returns (KindUnknown, false) when the type, the
-// property, or the kind field is absent.
+// LookupKind resolves the declared kind of (typeId, propId): from the
+// static overlay when typeId is a built-in / registered type,
+// otherwise from the type's `properties` defs collection. Returns
+// (KindUnknown, false) when the type, the property, or the kind is
+// absent.
 func (r *LiveRegistry) LookupKind(typeId, propId string) (schema.Kind, bool) {
-	if r == nil || r.db == nil {
+	if r == nil {
+		return schema.KindUnknown, false
+	}
+	if props, ok := r.static[typeId]; ok {
+		p, ok := props[propId]
+		if !ok {
+			return schema.KindUnknown, false
+		}
+		return p.Kind, true
+	}
+	if r.db == nil {
 		return schema.KindUnknown, false
 	}
 	ctx := context.Background()
@@ -59,6 +83,79 @@ func (r *LiveRegistry) LookupKind(typeId, propId string) (schema.Kind, bool) {
 		return schema.KindUnknown, false
 	}
 	return schema.ParseKind(label)
+}
+
+// TypeKnown reports whether a schema source exists for typeId: the
+// static overlay (built-in / registered) or a materialised
+// `<typeId>_properties` defs collection (a user type with at least
+// one important change). Used by the writer-side validator to tell
+// "type not here yet" apart from "type known, property unknown".
+func (r *LiveRegistry) TypeKnown(typeId string) bool {
+	if r == nil {
+		return false
+	}
+	if _, ok := r.static[typeId]; ok {
+		return true
+	}
+	if r.db == nil {
+		return false
+	}
+	_, err := r.openCollection(context.Background(), typeId, "properties")
+	return err == nil
+}
+
+// PropsOf returns the declared properties of typeId — from the static
+// overlay, or by scanning the defs collection for a user type. ok is
+// false only when neither source resolves (unknown type). An empty,
+// existing type resolves as (nil, true).
+func (r *LiveRegistry) PropsOf(typeId string) ([]PropInfo, bool) {
+	if r == nil {
+		return nil, false
+	}
+	if props, ok := r.static[typeId]; ok {
+		out := make([]PropInfo, 0, len(props))
+		for _, p := range props {
+			out = append(out, p)
+		}
+		return out, true
+	}
+	if r.db == nil {
+		return nil, false
+	}
+	ctx := context.Background()
+	coll, err := r.openCollection(ctx, typeId, "properties")
+	if err != nil {
+		return nil, false
+	}
+	iter, err := coll.Find(nil).Iter(ctx)
+	if err != nil {
+		return nil, false
+	}
+	defer iter.Close()
+	var out []PropInfo
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		if derr != nil {
+			return nil, false
+		}
+		v := doc.Value()
+		if v == nil {
+			continue
+		}
+		kind, ok := schema.ParseKind(v.GetString("kind"))
+		if !ok {
+			continue
+		}
+		out = append(out, PropInfo{
+			Id:   v.GetString("id"),
+			Name: v.GetString("name"),
+			Kind: kind,
+		})
+	}
+	if iter.Err() != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // KnownShortId reports whether the type's shortIds dataset has a

@@ -101,7 +101,7 @@ func (s *querySub) sentinelId() string {
 type subPending struct {
 	added   []pendingRec
 	updated []pendingRec
-	removed []string
+	removed []space.RemovedRecord
 	seen    map[string]struct{}
 }
 
@@ -232,7 +232,19 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 	case wasVisible && isVisible:
 		p.updated = append(p.updated, pendingRec{e: newEntry, ops: rc.Ops})
 	case wasVisible && !isVisible:
-		p.removed = append(p.removed, rc.Id)
+		// isHeld ⇒ the record updated and became the sentinel via its
+		// own sort move: still matches, just slid out of view.
+		// Otherwise it left the held set: tombstoned (or dropped) ⇒
+		// deleted, else the post-apply doc failed the filter.
+		reason := space.RemoveDisplaced
+		if !isHeld {
+			if rc.Deleted || postDoc == nil {
+				reason = space.RemoveDeleted
+			} else {
+				reason = space.RemoveFilteredOut
+			}
+		}
+		p.removed = append(p.removed, space.RemovedRecord{Id: rc.Id, Reason: reason})
 	}
 
 	// Implicit transitions caused by sentinel movement.
@@ -251,7 +263,9 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if newSentinelId != "" && newSentinelId != rc.Id {
 			if _, alreadySeen := p.seen[newSentinelId]; !alreadySeen {
 				if newSentinelId != prevSentinelId {
-					p.removed = append(p.removed, newSentinelId)
+					// Demoted to sentinel by another record's arrival: still
+					// matches the filter, just lost its visible slot.
+					p.removed = append(p.removed, space.RemovedRecord{Id: newSentinelId, Reason: space.RemoveDisplaced})
 					p.seen[newSentinelId] = struct{}{}
 				}
 			}

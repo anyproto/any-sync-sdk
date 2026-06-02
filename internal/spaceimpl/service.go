@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
@@ -306,6 +307,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 		Id:           spaceId,
 		Type:         spaceType,
+		SpaceType:    spaceType,
 		Name:         req.Name,
 		Description:  req.Description,
 		IconCID:      req.IconCID,
@@ -366,6 +368,8 @@ func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 		out = append(out, space.SpaceInfo{
 			Id:          r.Id,
 			Type:        r.Type,
+			SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
+			Author:      s.resolveAuthor(ctx, r.Id),
 			Name:        r.Name,
 			Description: r.Description,
 			IconCID:     r.IconCID,
@@ -410,12 +414,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if keys == nil {
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
 	}
-	payload := spacepayloads.SpaceDerivePayload{
-		SigningKey:   keys.SignKey,
-		MasterKey:    keys.SignKey,
-		SpaceType:    space.SpaceTypeRegular,
-		SpacePayload: req.Seed,
-	}
+	payload := s.derivePayload(keys, req)
 	spaceId, err := s.app.SpaceService().DeriveId(ctx, payload)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive id: %w", err)
@@ -429,6 +428,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
 			Type:         space.SpaceTypeRegular,
+			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
 		}); err != nil {
@@ -445,6 +445,47 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
 	s.goSeed(sp)
 	return sp, nil
+}
+
+// DeriveId returns the deterministic spaceId for req without creating
+// or loading the space — pure computation over the account keys and
+// seed. Same id as Derive(req).Id() for the same request.
+func (s *Service) DeriveId(ctx context.Context, req space.DeriveRequest) (string, error) {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return "", errors.New("spaceimpl: anysyncx app has no account keys")
+	}
+	id, err := s.app.SpaceService().DeriveId(ctx, s.derivePayload(keys, req))
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: derive id: %w", err)
+	}
+	return id, nil
+}
+
+// derivePayload builds the any-sync derive payload shared by Derive and
+// DeriveId. The on-wire header SpaceType stays SpaceTypeRegular
+// (coordinator-gated). The app-level SpaceType tag and the seed are
+// encoded together into SpaceHeaderPayload, which is part of the header
+// (and thus the derived id) and is recoverable from the header alone on
+// cold restore. Both Derive and DeriveId build the identical payload, so
+// the derived id is stable for a given (seed, SpaceType) pair.
+func (s *Service) derivePayload(keys *accountdata.AccountKeys, req space.DeriveRequest) spacepayloads.SpaceDerivePayload {
+	return spacepayloads.SpaceDerivePayload{
+		SigningKey:   keys.SignKey,
+		MasterKey:    keys.SignKey,
+		SpaceType:    space.SpaceTypeRegular,
+		SpacePayload: encodeDerivePayload(req.Seed, deriveSpaceTypeTag(req.SpaceType)),
+	}
+}
+
+// deriveSpaceTypeTag resolves the app-level SpaceType tag, defaulting an
+// empty request value to SpaceTypeRegular so existing Derive callers
+// keep today's behavior.
+func deriveSpaceTypeTag(t string) string {
+	if t == "" {
+		return space.SpaceTypeRegular
+	}
+	return t
 }
 
 // OneToOne returns the derived 1-1 space with otherIdentity, creating
@@ -467,6 +508,7 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
 			Type:         space.SpaceTypeOneToOne,
+			SpaceType:    space.SpaceTypeOneToOne,
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
 		}); err != nil {

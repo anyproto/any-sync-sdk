@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -75,12 +76,40 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	// Snapshot (no subscription) returns Initial + Total when requested.
 	snap, err := sp.QueryObjects().
 		Filter(map[string]any{typeId + "." + yearProp: map[string]any{"$gte": 1980}}).
-		Sort(typeId + "." + yearProp).
+		Sort(typeId+"."+yearProp).
 		Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
 	require.NoError(t, err)
 	assert.Nil(t, snap.Sub, "Snapshot must not return a live Sub")
 	assert.GreaterOrEqual(t, snap.Total, 2, "Total should count both seeded movies")
 	assert.GreaterOrEqual(t, len(snap.Initial), 2, "Initial should include both seeded movies")
+
+	// A limited Snapshot must still report the unbounded total — Total is
+	// independent of limit/offset.
+	yearFilter := fmt.Sprintf(`{%q:{"$gte":1980}}`, typeId+"."+yearProp)
+	limited, err := sp.QueryObjects().
+		Filter(yearFilter).
+		Sort(typeId+"."+yearProp).
+		Limit(1).
+		Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
+	require.NoError(t, err)
+	assert.Len(t, limited.Initial, 1, "Initial must be capped at Limit")
+	assert.Equal(t, 2, limited.Total, "Total must ignore Limit and count all matches")
+	assert.True(t, limited.HasNext, "HasNext must be true: offset+len(Initial)=1 < Total=2")
+
+	// The full (unbounded) Snapshot reaches the end → HasNext false.
+	assert.False(t, snap.HasNext, "HasNext must be false when the page covers all matches")
+
+	// A limit larger than the match count: the page is short (2 < 5), so
+	// Total is the full match count and HasNext is false.
+	short, err := sp.QueryObjects().
+		Filter(yearFilter).
+		Sort(typeId+"."+yearProp).
+		Limit(5).
+		Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
+	require.NoError(t, err)
+	assert.Len(t, short.Initial, 2, "Initial holds all 2 matches (below the limit)")
+	assert.Equal(t, 2, short.Total, "Total derived from the short page")
+	assert.False(t, short.HasNext, "HasNext false: the short page reached the end")
 
 	// Subscribe with limit=2 — the snapshot holds limit+1 internally.
 	// Add a third movie that lands at the *top* of the sort (most recent
@@ -88,7 +117,7 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	// the previous bottom-visible row arrives Removed (now sentinel).
 	res, err := sp.QueryObjects().
 		Filter(map[string]any{typeId + "." + yearProp: map[string]any{"$gte": 1980}}).
-		Sort("-" + typeId + "." + yearProp).
+		Sort("-"+typeId+"."+yearProp).
 		Limit(2).
 		Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
 	require.NoError(t, err)
@@ -266,7 +295,7 @@ func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
 
 		res, err := sp.QueryObjects().
 			Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
-			Sort(typeId + "." + titleProp).
+			Sort(typeId+"."+titleProp).
 			Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = res.Sub.Close() })
@@ -311,7 +340,7 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 
 	res, err := sp.QueryObjects().
 		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
-		Sort(typeId + "." + titleProp).
+		Sort(typeId+"."+titleProp).
 		Limit(10).
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
@@ -338,7 +367,7 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	// Resubscribe — fresh snapshot of the *current* state.
 	res2, err := sp.QueryObjects().
 		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
-		Sort(typeId + "." + titleProp).
+		Sort(typeId+"."+titleProp).
 		Limit(10).
 		Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
 	require.NoError(t, err)

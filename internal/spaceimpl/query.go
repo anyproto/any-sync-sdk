@@ -174,24 +174,102 @@ func cloneAnyenc(v *anyenc.Value) (*anyenc.Value, error) {
 	return w.Value, nil
 }
 
-// Snapshot returns a point-in-time view plus optional total count.
-// Stub for the engine integration — filled in by task 4.
+// Snapshot returns a point-in-time view plus, when opts.IncludeTotal is
+// set, the count of matching records ignoring limit/offset and HasNext.
+// The page and the count read from a single transaction. The
+// tombstone-skip clause is pushed into the page filter so the page and
+// the count match.
 func (q *queryImpl) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
-	initial, err := q.All(ctx)
+	if q.parseErr != nil {
+		return nil, q.parseErr
+	}
+	coll, err := q.collection(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if coll == nil {
+		// Dataset not materialised yet → empty page, zero total.
+		total := -1
+		if opts.IncludeTotal {
+			total = 0
+		}
+		return &space.QueryResult{Initial: nil, Total: total}, nil
+	}
+
+	combined, err := combineWithTombstoneSkip(q.filter)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := coll.ReadTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Commit() }() // release the read tx
+
+	initial, err := q.page(tx.Context(), coll, combined)
+	if err != nil {
+		return nil, err
+	}
+
 	total := -1
+	hasNext := false
 	if opts.IncludeTotal {
-		// Build a fresh queryImpl for the count — the original's limit/offset
-		// are still in effect on this builder, but Count ignores them.
-		n, err := q.Count(ctx)
+		total, err = q.totalWithin(tx.Context(), coll, combined, len(initial))
 		if err != nil {
 			return nil, err
 		}
-		total = n
+		hasNext = int(q.offset)+len(initial) < total
 	}
-	return &space.QueryResult{Initial: initial, Total: total}, nil
+
+	return &space.QueryResult{Initial: initial, Total: total, HasNext: hasNext}, nil
+}
+
+// page materializes the limit/offset window of `combined` within the
+// supplied (transaction-bound) context. Rows are cloned off the
+// iterator's reused buffer so they survive past iteration.
+func (q *queryImpl) page(ctx context.Context, coll anystore.Collection, combined query.Filter) ([]*anyenc.Value, error) {
+	aq := coll.Find(combined)
+	if q.sort != nil {
+		aq = aq.Sort(q.sort)
+	}
+	if q.limit > 0 {
+		aq = aq.Limit(q.limit)
+	}
+	if q.offset > 0 {
+		aq = aq.Offset(q.offset)
+	}
+	it, err := aq.Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var out []*anyenc.Value
+	for it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return nil, err
+		}
+		cloned, err := cloneAnyenc(doc.Value())
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cloned)
+	}
+	return out, it.Err()
+}
+
+// totalWithin returns the count of `combined` matches ignoring
+// limit/offset, reading within the supplied context. When the page
+// already reached the end of the result set the total is offset+pageLen
+// and no count query runs: that holds for an unbounded query (limit 0)
+// or a page shorter than the limit, with the pageLen>0 || offset==0
+// guard ruling out an offset past the end of the result set.
+func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, combined query.Filter, pageLen int) (int, error) {
+	if (q.limit == 0 || pageLen < int(q.limit)) && (pageLen > 0 || q.offset == 0) {
+		return int(q.offset) + pageLen, nil
+	}
+	return coll.Find(combined).Count(ctx)
 }
 
 // Subscribe is the live-query terminal. Builds a windowed sub via the
@@ -324,7 +402,11 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	}
 	_ = snapshotIds // currently unused, but kept for symmetry / future debugging hooks
 
-	return &space.QueryResult{Initial: initial, Total: totalCount, Sub: sub}, nil
+	hasNext := false
+	if opts.IncludeTotal {
+		hasNext = int(q.offset)+len(initial) < totalCount
+	}
+	return &space.QueryResult{Initial: initial, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
 }
 
 // combineWithTombstoneSkip returns the user filter ANDed with a
@@ -419,10 +501,10 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 // gets called by well-behaved callers.
 type emptyIterator struct{}
 
-func (emptyIterator) Next() bool                   { return false }
-func (emptyIterator) Doc() (*anyenc.Value, error)  { return nil, nil }
-func (emptyIterator) Err() error                   { return nil }
-func (emptyIterator) Close() error                 { return nil }
+func (emptyIterator) Next() bool                  { return false }
+func (emptyIterator) Doc() (*anyenc.Value, error) { return nil, nil }
+func (emptyIterator) Err() error                  { return nil }
+func (emptyIterator) Close() error                { return nil }
 
 // build folds the parsed filter / sort / limit / offset into an
 // any-store Query. Filter and Sort are already typed query.Filter /

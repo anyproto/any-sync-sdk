@@ -51,6 +51,9 @@ type TypeInfo struct {
 	Name        string
 	Description string
 	IconCID     string
+	// XKey is the optional caller-side "programmatic" name set at
+	// Create. Empty if unset.
+	XKey string
 	// BuiltIn marks `any` / `type` (immutable, always-present). User
 	// types return false.
 	BuiltIn bool
@@ -61,6 +64,12 @@ type TypeCreateParams struct {
 	Name        string
 	Description string
 	IconCID     string
+
+	// XKey is an optional stable, caller-side "programmatic" name for
+	// the type (e.g. for generated client code mapping). Like Name and
+	// Description it's client-set display metadata — not unique, not
+	// enforced by the SDK.
+	XKey string
 }
 
 // PropertyDef is the live shape of one property definition. All

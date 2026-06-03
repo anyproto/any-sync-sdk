@@ -360,6 +360,14 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	return sp, nil
 }
 
+// SyncSpaceList forces an immediate head-sync round on the tech space
+// so spaces added or removed on other devices land in the local index
+// without waiting for the periodic headsync timer. Call before List to
+// converge on demand.
+func (s *Service) SyncSpaceList(ctx context.Context) error {
+	return s.tsp.SyncHeads(ctx)
+}
+
 // List returns the space-index snapshot.
 func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 	rows := s.tsp.List(ctx)

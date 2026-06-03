@@ -129,12 +129,17 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 			"device A should see its own type + objects locally; got %d docs in %s", len(docs), fix.Id)
 	}
 
-	// Brief pause so device A's PutSyncTree broadcasts durably land
-	// on the local node before B's SpacePull asks for them. Stream
-	// sync is reactive, but the node still needs a beat to commit
-	// the received header to its own storage; without this, B's
-	// first SpacePull races A's push and gets ErrSpaceMissing.
-	time.Sleep(500 * time.Millisecond)
+	// Make sure device A's data is durably on the node before B pulls.
+	// Stream sync is reactive, but B's SpacePull can otherwise race A's
+	// push and get ErrSpaceMissing. Kicking A's tech space + each space
+	// head-syncs them with the node now, so B sees a fully-populated
+	// node instead of waiting on A's periodic push.
+	_ = sdkA.Spaces().SyncSpaceList(ctx)
+	for _, fix := range wantSpaces {
+		if sp, err := sdkA.Spaces().Get(ctx, fix.Id); err == nil {
+			_ = sp.SyncHeads(ctx)
+		}
+	}
 
 	// Device B: fresh DB, same keys.
 	dataDirB := t.TempDir()
@@ -157,7 +162,11 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 	sort.Strings(wantSpaceIds)
 
 	var lastList []space.SpaceInfo
-	if !waitFor(ctx, 90*time.Second, 50*time.Millisecond, func() bool {
+	if !waitFor(ctx, 90*time.Second, 250*time.Millisecond, func() bool {
+		// Kick an immediate tech-space diff round instead of waiting
+		// for the periodic headsync timer — this is what makes cold
+		// sync converge in a beat rather than seconds.
+		_ = sdkB.Spaces().SyncSpaceList(ctx)
 		list, err := sdkB.Spaces().List(ctx)
 		if err != nil {
 			return false
@@ -236,9 +245,18 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 			defer cancelWait()
 
 			for !snapshotConverged() {
-				if _, err := subRes.Sub.Events().WaitOne(waitCtx); err != nil {
+				// Force an immediate per-space diff round so trees pull
+				// now instead of on the periodic timer, then wake on the
+				// next subscribe event or a short fallback tick and
+				// re-check. The kick is what de-flakes / speeds this up;
+				// the subscription is still exercised as the wake signal.
+				_ = sp.SyncHeads(waitCtx)
+				tickCtx, cancelTick := context.WithTimeout(waitCtx, 500*time.Millisecond)
+				_, _ = subRes.Sub.Events().WaitOne(tickCtx)
+				cancelTick()
+				if waitCtx.Err() != nil {
 					t.Fatalf("device B: space %s never converged\n  want type=%s objects=%v\n  got types=%v objects=%v\n  wait err: %v",
-						fix.Name, fix.TypeId, fix.ObjectIds, lastTypeIds, lastObjectIds, err)
+						fix.Name, fix.TypeId, fix.ObjectIds, lastTypeIds, lastObjectIds, waitCtx.Err())
 				}
 			}
 

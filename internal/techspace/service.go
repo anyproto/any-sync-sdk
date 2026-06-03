@@ -68,6 +68,16 @@ func New(app *anysyncx.App, db anystore.DB) *Service {
 	return &Service{app: app, db: db}
 }
 
+// SyncHeads forces an immediate head-sync round on the tech space, so
+// remotely-added or -removed spaces land in the local index without
+// waiting for the periodic headsync timer. No-op before Open.
+func (s *Service) SyncHeads(ctx context.Context) error {
+	if !s.open.Load() || s.spaceId == "" {
+		return nil
+	}
+	return s.app.SyncHeads(ctx, s.spaceId)
+}
+
 // Open derives the tech-space id, ensures storage exists, and
 // computes the space-index object id. The space itself is loaded via
 // the cache as needed (and on the first call to do an initial cold

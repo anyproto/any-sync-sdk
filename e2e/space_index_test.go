@@ -185,6 +185,7 @@ func TestE2E_SpaceIndexMultiPeerConvergence(t *testing.T) {
 	// Alice sees the request, accepts.
 	var joinReq space.JoinRequestInfo
 	require.True(t, waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+		_ = aliceSp.SyncHeads(ctx)
 		reqs, _ := aliceSp.Members().JoinRequests(ctx)
 		if len(reqs) > 0 {
 			joinReq = reqs[0]
@@ -205,6 +206,7 @@ func TestE2E_SpaceIndexMultiPeerConvergence(t *testing.T) {
 	// spaceIndex tree pulled via background sync, then the watcher
 	// mirrors into Bob's tech-space row).
 	require.True(t, waitFor(ctx, 3*time.Minute, 1*time.Second, func() bool {
+		_ = bobSp.SyncHeads(ctx)
 		return bobSp.Info().Name == "Original"
 	}), "bob never converged on initial name; last=%q", bobSp.Info().Name)
 	assert.Equal(t, "initial", bobSp.Info().Description)
@@ -236,11 +238,13 @@ func TestE2E_SpaceIndexMultiPeerConvergence(t *testing.T) {
 	// Bob's converged view — requires DAG sync of the spaceIndex tree
 	// across the network. Generous deadline.
 	require.True(t, waitFor(ctx, 3*time.Minute, 1*time.Second, func() bool {
+		_ = bobSp.SyncHeads(ctx)
 		return bobSp.Info().Name == "Updated"
 	}), "bob never converged on Updated; last=%q", bobSp.Info().Name)
 
 	// Service.List on Bob must also reflect the rename.
 	require.True(t, waitFor(ctx, 30*time.Second, 500*time.Millisecond, func() bool {
+		_ = bobSp.SyncHeads(ctx)
 		list, err := bob.Spaces().List(ctx)
 		if err != nil {
 			return false

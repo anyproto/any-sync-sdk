@@ -137,9 +137,12 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	require.True(t, errors.Is(err, spaceimpl.ErrJoinPending),
 		"bob: Join must return ErrJoinPending, got %v", err)
 
-	// Alice waits for the request to land via her headsync (~30s).
+	// Alice waits for the request to land via her headsync. Kicking a
+	// diff round each poll pulls the ACL record now instead of waiting
+	// for the periodic tick.
 	var joinReq space.JoinRequestInfo
 	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+		_ = sp.SyncHeads(ctx)
 		reqs, _ := sp.Members().JoinRequests(ctx)
 		if len(reqs) > 0 {
 			joinReq = reqs[0]
@@ -170,6 +173,7 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	}
 
 	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+		_ = bobSpace.SyncHeads(ctx)
 		me, err := bobSpace.Members().Me(ctx)
 		if err != nil {
 			return false
@@ -185,6 +189,7 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	var lastTypes []string
 	var lastObjs []string
 	converged := waitFor(ctx, 3*time.Minute, 2*time.Second, func() bool {
+		_ = bobSpace.SyncHeads(ctx)
 		typeIds := userTypeIds(bobSpace, ctx)
 		lastTypes = typeIds
 		if !containsString(typeIds, typeId) {

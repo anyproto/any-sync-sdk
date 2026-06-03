@@ -117,4 +117,11 @@ type Space interface {
 	// spaceIndex's `objects` dataset for live UI updates.
 	SpaceIndexObjectId() string
 
+	// SyncHeads forces an immediate head-sync (diff) round on this
+	// space against its responsible nodes, instead of waiting for the
+	// periodic timer. Blocks until the round completes. Use it to
+	// converge on demand (e.g. tests, or a manual "sync now"); normal
+	// operation does not need it — periodic and reactive sync keep the
+	// space up to date on their own.
+	SyncHeads(ctx context.Context) error
 }

@@ -37,6 +37,10 @@ const (
 type SpaceHandle interface {
 	Id() string
 	Inner() commonspace.Space
+	// SyncHeads forces an immediate head-sync (diff) round on this
+	// space, rather than waiting for the periodic timer. Blocks until
+	// the round completes and returns its error verbatim.
+	SyncHeads(ctx context.Context) error
 }
 
 // spaceWrapper implements ocache.Object and SpaceHandle. Holds the
@@ -50,6 +54,8 @@ type spaceWrapper struct {
 
 func (s *spaceWrapper) Id() string                  { return s.id }
 func (s *spaceWrapper) Inner() commonspace.Space    { return s.cs }
+
+func (s *spaceWrapper) SyncHeads(ctx context.Context) error { return s.cs.SyncHeads(ctx) }
 
 // Close unregisters this space from the inbound sync handler before
 // closing the commonspace. Called by ocache on Remove/shutdown and
@@ -147,6 +153,17 @@ func (a *App) GetSpace(ctx context.Context, id string) (SpaceHandle, error) {
 		return nil, err
 	}
 	return v.(SpaceHandle), nil
+}
+
+// SyncHeads loads the space (through the cache) and forces an immediate
+// head-sync (diff) round on it. Used to converge on demand instead of
+// waiting for the periodic headsync timer.
+func (a *App) SyncHeads(ctx context.Context, id string) error {
+	h, err := a.GetSpace(ctx, id)
+	if err != nil {
+		return err
+	}
+	return h.SyncHeads(ctx)
 }
 
 // EvictSpace forces immediate close + remove from cache. Used by

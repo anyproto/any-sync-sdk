@@ -37,6 +37,13 @@ type Service interface {
 	// Mirror of the tech space's space index.
 	List(ctx context.Context) ([]SpaceInfo, error)
 
+	// SyncSpaceList forces an immediate head-sync round on the tech
+	// space so spaces added or removed on other devices land in the
+	// local index, instead of waiting for the periodic timer. Call it
+	// before List to converge the space list on demand. Blocks until
+	// the round completes.
+	SyncSpaceList(ctx context.Context) error
+
 	// Delete tears down a space locally. For regular spaces this also
 	// flags the space as deleted on the network; for 1-1 spaces it is
 	// local-only (the space is always re-derivable). The record stays

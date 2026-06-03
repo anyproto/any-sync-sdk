@@ -246,6 +246,9 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	// fresh ACL records from the consensus node — period 30s.
 	var joinReq space.JoinRequestInfo
 	require.Eventually(t, func() bool {
+		// Kick a diff round so the ACL record pulls now instead of on
+		// the ~30s periodic headsync tick.
+		_ = sp.SyncHeads(ctx)
 		reqs, err := sp.Members().JoinRequests(ctx)
 		if err != nil || len(reqs) == 0 {
 			return false

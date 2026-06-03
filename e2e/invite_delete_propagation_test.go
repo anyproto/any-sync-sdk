@@ -157,6 +157,7 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 	// Alice accepts.
 	var joinReq space.JoinRequestInfo
 	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+		_ = sp.SyncHeads(ctx)
 		reqs, _ := sp.Members().JoinRequests(ctx)
 		if len(reqs) > 0 {
 			joinReq = reqs[0]
@@ -176,6 +177,7 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 	}), "bob: Spaces().Get(%s) never succeeded: %v", sp.Id(), err)
 
 	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+		_ = bobSpace.SyncHeads(ctx)
 		me, mErr := bobSpace.Members().Me(ctx)
 		if mErr != nil {
 			return false
@@ -187,6 +189,7 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 
 	// Bob waits for Alice's seed record to converge.
 	if !waitFor(ctx, 2*time.Minute, 1*time.Second, func() bool {
+		_ = bobSpace.SyncHeads(ctx)
 		rec, qErr := bobSpace.Query(objId, blocksDataset).
 			Filter(map[string]any{"id": recId}).One(ctx)
 		return qErr == nil && rec != nil
@@ -220,6 +223,7 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 	// keeps returning the record forever.
 	deadline := 2 * time.Minute
 	if !waitFor(ctx, deadline, 1*time.Second, func() bool {
+		_ = sp.SyncHeads(ctx)
 		_, qErr := sp.Query(objId, blocksDataset).
 			Filter(map[string]any{"id": recId}).One(ctx)
 		return qErr != nil && errors.Is(qErr, space.ErrNotFound)

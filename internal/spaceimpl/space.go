@@ -132,6 +132,13 @@ func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
 func (s *spaceImpl) ACL() space.ACL            { return s.acl }
 func (s *spaceImpl) Members() space.MembersAPI { return s.members }
 
+// SyncHeads forces an immediate head-sync (diff) round on this space
+// instead of waiting for the periodic timer. Blocks until the round
+// completes and returns its error verbatim.
+func (s *spaceImpl) SyncHeads(ctx context.Context) error {
+	return s.app.SyncHeads(ctx, s.id)
+}
+
 // SyncStatus returns the per-space sync-status accessor backed by the
 // account-level syncstatus.Service held on anysyncx.App. The accessor
 // is a thin pointer wrapper — safe to construct on every call (no

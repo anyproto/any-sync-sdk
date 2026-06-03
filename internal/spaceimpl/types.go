@@ -42,7 +42,7 @@ func newTypesAPI(parent *spaceImpl) *typesAPI { return &typesAPI{parent: parent}
 
 // Create mints a new type object: a fresh any-sync tree whose
 // `properties` dataset record carries the type's display metadata
-// (any.name / any.description / any.icon) and `any.types =
+// (any.name / any.description / any.icon / any.xkey) and `any.types =
 // ["__type__"]` to mark it as a meta-type instance.
 //
 // The returned typeId is the new tree's id (= root change id) — used
@@ -66,6 +66,9 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 	}
 	if params.IconCID != "" {
 		multi.Set("any.icon", arena.NewString(params.IconCID))
+	}
+	if params.XKey != "" {
+		multi.Set("any.xkey", arena.NewString(params.XKey))
 	}
 	// Mark the object as a meta-type instance — the convention we use
 	// in MVP to distinguish types from regular objects without a
@@ -289,6 +292,7 @@ func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 		Name:        rec.GetString("any", "name"),
 		Description: rec.GetString("any", "description"),
 		IconCID:     rec.GetString("any", "icon"),
+		XKey:        rec.GetString("any", "xkey"),
 		BuiltIn:     false,
 	}
 }

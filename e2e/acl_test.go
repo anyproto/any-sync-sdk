@@ -455,6 +455,113 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 	require.Len(t, list, 2)
 }
 
+// TestSDK_Spaces_DeriveId confirms DeriveId is a pure, side-effect-free
+// computation: it returns the same id as Derive for the same request and
+// does not create or register a space.
+func TestSDK_Spaces_DeriveId(t *testing.T) {
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("staging config not available at %s: %v", confPath, err)
+	}
+	cfg := config.Config{
+		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+		Network: config.Network{NodeConfYAML: yaml},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+
+	req := space.DeriveRequest{Seed: []byte("copilot:agent"), SpaceType: "copilot.agent"}
+
+	// DeriveId alone creates nothing.
+	id, err := sdk.Spaces().DeriveId(ctx, req)
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+	list, err := sdk.Spaces().List(ctx)
+	require.NoError(t, err)
+	require.Empty(t, list, "DeriveId must not register a space")
+
+	// Deterministic and equal to Derive's id; recomputable from seed+type.
+	id2, err := sdk.Spaces().DeriveId(ctx, req)
+	require.NoError(t, err)
+	assert.Equal(t, id, id2)
+
+	sp, err := sdk.Spaces().Derive(ctx, req)
+	require.NoError(t, err)
+	assert.Equal(t, id, sp.Id(), "DeriveId must match Derive().Id() for the same request")
+
+	// Distinct type → distinct id (the type is part of the derivation).
+	idOther, err := sdk.Spaces().DeriveId(ctx, space.DeriveRequest{Seed: []byte("copilot:agent")})
+	require.NoError(t, err)
+	assert.NotEqual(t, id, idOther)
+}
+
+// TestSDK_Spaces_DeriveType confirms the app-level SpaceType tag is
+// surfaced in the client view (Info + List), is distinct from the
+// coordinator-gated header Type, and survives a cold restart — recovered
+// from the space header.
+func TestSDK_Spaces_DeriveType(t *testing.T) {
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("staging config not available at %s: %v", confPath, err)
+	}
+	dir := t.TempDir()
+	mkCfg := func() config.Config {
+		return config.Config{
+			Storage: config.Storage{DataDir: dir, Topology: config.StorageShared},
+			Network: config.Network{NodeConfYAML: yaml},
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Same provider instance across both Open calls → same account, so
+	// reopening the same DataDir is a genuine cold restart.
+	prov := newFixedSeedProvider(t)
+
+	sdk, err := anysyncsdk.Open(ctx, mkCfg(), prov)
+	require.NoError(t, err)
+
+	sp, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{
+		Seed:      []byte("copilot:agent"),
+		SpaceType: "copilot.agent",
+	})
+	require.NoError(t, err)
+	id := sp.Id()
+
+	info := sp.Info()
+	assert.Equal(t, "copilot.agent", info.SpaceType, "app tag surfaced in SpaceInfo.SpaceType")
+	assert.Equal(t, space.SpaceTypeRegular, info.Type, "header Type stays the gated regular type")
+
+	// Empty SpaceType defaults to the regular tag.
+	spReg, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: []byte("plain")})
+	require.NoError(t, err)
+	assert.Equal(t, space.SpaceTypeRegular, spReg.Info().SpaceType)
+
+	require.NoError(t, sdk.Close())
+
+	// Cold restart: reopen the same DataDir and confirm the tag is still
+	// there (header-backed; survives without the original in-memory state).
+	sdk2, err := anysyncsdk.Open(ctx, mkCfg(), prov)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk2.Close() })
+
+	list, err := sdk2.Spaces().List(ctx)
+	require.NoError(t, err)
+	var found bool
+	for _, sinfo := range list {
+		if sinfo.Id == id {
+			found = true
+			assert.Equal(t, "copilot.agent", sinfo.SpaceType, "SpaceType survives cold restart")
+			assert.Equal(t, space.SpaceTypeRegular, sinfo.Type)
+		}
+	}
+	assert.True(t, found, "derived space present after restart")
+}
+
 // TestSDK_Join_PendingErrIsExpected confirms that calling Join with a
 // valid invite (against a space the joiner is not the owner of) lands
 // the request and surfaces ErrJoinPending — the joiner's local space

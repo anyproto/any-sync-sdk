@@ -43,6 +43,10 @@ const (
 	FieldIcon         = "icon"
 	FieldLocalStatus  = "localStatus"
 	FieldRemoteStatus = "remoteStatus"
+	// FieldSpaceType mirrors the in-space spaceIndex.spaceType app tag.
+	// Distinct from FieldType (the on-wire header type): not pinned, so
+	// the watcher can mirror the converged value.
+	FieldSpaceType = "spaceType"
 )
 
 // Status lattice values. `Deleted` is terminal — once a record's

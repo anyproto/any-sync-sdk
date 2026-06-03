@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -136,7 +137,10 @@ func (s *spaceImpl) maybeLazySeedSpaceIndex(ctx context.Context) {
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldName, arena.NewString(rec.Name))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldDescription, arena.NewString(rec.Description))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldIcon, arena.NewString(rec.IconCID))
-	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldSpaceType, arena.NewString(rec.Type))
+	// spaceIndex.spaceType carries the app-level tag (rec.SpaceType), not
+	// the on-wire header type. Fall back to rec.Type for legacy rows
+	// written before the SpaceType column existed.
+	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldSpaceType, arena.NewString(lazySpaceTypeTag(rec)))
 
 	dataVersion, err := s.store.DataVersion(properties.Dataset)
 	if err != nil {
@@ -151,6 +155,16 @@ func (s *spaceImpl) maybeLazySeedSpaceIndex(ctx context.Context) {
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
 		}},
 	})
+}
+
+// lazySpaceTypeTag resolves the app-level spaceType to seed into the
+// in-space spaceIndex object. Prefers the SpaceType column; falls back to
+// the header type (Type) for legacy rows written before SpaceType existed.
+func lazySpaceTypeTag(rec techspace.SpaceIndexRecord) string {
+	if rec.SpaceType != "" {
+		return rec.SpaceType
+	}
+	return rec.Type
 }
 
 // SetMetadata writes the spaceIndex object's properties for the

@@ -264,7 +264,7 @@ func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteRe
 // string (rare — the spaceIndex object can carry an empty mirror
 // state right after Create, before the initial property write has
 // applied).
-func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, description, iconCID string) (object.WriteResult, error) {
+func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, description, iconCID, spaceType string) (object.WriteResult, error) {
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
@@ -279,6 +279,7 @@ func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, descripti
 	payload.Set(FieldName, arena.NewString(name))
 	payload.Set(FieldDescription, arena.NewString(description))
 	payload.Set(FieldIcon, arena.NewString(iconCID))
+	payload.Set(FieldSpaceType, arena.NewString(spaceType))
 	change := crdt.Change{
 		Dataset:     SpaceIndexDataset,
 		DataVersion: HandlerVersion,
@@ -409,6 +410,7 @@ func (s *Service) OnSpaceCreated(ctx context.Context, spaceId string, meta space
 	_, err := s.Add(ctx, SpaceIndexRecord{
 		Id:           spaceId,
 		Type:         meta.Type,
+		SpaceType:    meta.SpaceType,
 		Name:         meta.Name,
 		Description:  meta.Description,
 		IconCID:      meta.IconCID,
@@ -450,10 +452,10 @@ func (s *Service) OnSpaceMetadataUpdated(ctx context.Context, spaceId string, me
 	if !ok {
 		return nil
 	}
-	if rec.Name == meta.Name && rec.Description == meta.Description && rec.IconCID == meta.IconCID {
+	if rec.Name == meta.Name && rec.Description == meta.Description && rec.IconCID == meta.IconCID && rec.SpaceType == meta.SpaceType {
 		return nil
 	}
-	_, err := s.SetSpaceMetadata(ctx, spaceId, meta.Name, meta.Description, meta.IconCID)
+	_, err := s.SetSpaceMetadata(ctx, spaceId, meta.Name, meta.Description, meta.IconCID, meta.SpaceType)
 	return err
 }
 

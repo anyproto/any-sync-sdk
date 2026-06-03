@@ -127,7 +127,7 @@ func (w *spaceIndexWatcher) reconcileOnce(ctx context.Context) {
 
 // readSpaceIndexRow loads the spaceIndex object's projected row from
 // the per-space `objects` collection and decodes the four spaceIndex
-// fields into a space.SpaceInfo (Id + Name/Description/IconCID/Type).
+// fields into a space.SpaceInfo (Id + Name/Description/IconCID/SpaceType).
 // Returns (zero, false) when the row is absent, tombstoned, or holds
 // no spaceIndex fields — none of which should trigger a mirror write.
 func readSpaceIndexRow(ctx context.Context, store *spaceobjects.Store, spaceIndexObjectId, spaceId string) (space.SpaceInfo, bool) {
@@ -162,7 +162,11 @@ func readSpaceIndexRow(ctx context.Context, store *spaceobjects.Store, spaceInde
 		Name:        getString(siNs, spaceindex.FieldName),
 		Description: getString(siNs, spaceindex.FieldDescription),
 		IconCID:     getString(siNs, spaceindex.FieldIcon),
-		Type:        getString(siNs, spaceindex.FieldSpaceType),
+		// The in-space spaceIndex.spaceType is the app-level tag; mirror
+		// it into SpaceInfo.SpaceType (the tech-space FieldSpaceType
+		// column). Header Type is pinned in the tech-space record and is
+		// not touched by the metadata mirror.
+		SpaceType: getString(siNs, spaceindex.FieldSpaceType),
 	}, true
 }
 

@@ -77,6 +77,8 @@ func (s *spaceImpl) Info() space.SpaceInfo {
 	return space.SpaceInfo{
 		Id:          rec.Id,
 		Type:        rec.Type,
+		SpaceType:   s.parent.resolveSpaceType(ctx, rec.Id, rec.SpaceType),
+		Author:      s.parent.resolveAuthor(ctx, rec.Id),
 		Name:        rec.Name,
 		Description: rec.Description,
 		IconCID:     rec.IconCID,

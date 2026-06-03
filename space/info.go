@@ -29,8 +29,16 @@ const (
 // Service.List and Space.Info; does not auto-update — subscribe via
 // Service.Subscribe for live changes.
 type SpaceInfo struct {
-	Id          string
-	Type        string // space type (anytype.space, anytype.chatspace, anytype.onetoone — never the tech type)
+	Id   string
+	Type string // on-wire header type (anytype.space, anytype.chatspace, anytype.onetoone — never the tech type)
+	// SpaceType is the app-level tag set via DeriveRequest.SpaceType,
+	// read from the in-space spaceIndex. Independent of the header Type;
+	// use it for client-side classification/filtering. Empty/regular
+	// spaces carry SpaceTypeRegular.
+	SpaceType string
+	// Author is the space owner's account identity, resolved from the
+	// ACL. Best-effort: empty when the ACL is not loadable.
+	Author      string
 	Name        string
 	Description string
 	IconCID     string

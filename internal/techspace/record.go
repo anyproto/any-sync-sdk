@@ -24,6 +24,12 @@ type SpaceIndexRecord struct {
 	// SpaceIndexHandler.BeforeModify.
 	Type string
 
+	// SpaceType is the app-level tag mirrored from the in-space
+	// spaceIndex.spaceType (surfaced as space.SpaceInfo.SpaceType).
+	// Independent of Type and not pinned — the watcher overwrites it
+	// with the converged in-space value.
+	SpaceType string
+
 	Name        string
 	IconCID     string
 	Description string
@@ -46,6 +52,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 	return SpaceIndexRecord{
 		Id:           v.GetString("id"),
 		Type:         v.GetString(FieldType),
+		SpaceType:    v.GetString(FieldSpaceType),
 		Name:         v.GetString(FieldName),
 		Description:  v.GetString(FieldDescription),
 		IconCID:      v.GetString(FieldIcon),
@@ -65,6 +72,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	obj := a.NewObject()
 	if r.Type != "" {
 		obj.Set(FieldType, a.NewString(r.Type))
+	}
+	if r.SpaceType != "" {
+		obj.Set(FieldSpaceType, a.NewString(r.SpaceType))
 	}
 	if r.Name != "" {
 		obj.Set(FieldName, a.NewString(r.Name))

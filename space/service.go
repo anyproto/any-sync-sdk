@@ -17,6 +17,13 @@ type Service interface {
 	// the tech space (never returned here) and future derived spaces.
 	Derive(ctx context.Context, req DeriveRequest) (Space, error)
 
+	// DeriveId returns the deterministic spaceId for a DeriveRequest
+	// without creating or loading the space. Same id as Derive(...).Id()
+	// for the same request. Lets a consumer recompute a known derived
+	// space's id (from its own seed) to recognize or filter it
+	// client-side.
+	DeriveId(ctx context.Context, req DeriveRequest) (string, error)
+
 	// OneToOne returns the derived 1-1 space shared with otherIdentity,
 	// creating it locally if it does not yet exist. Same id regardless
 	// of key order — both peers land on the same space.
@@ -84,6 +91,12 @@ type DeriveRequest struct {
 	// Seed is hashed into the derivation. Zero seed = account-root
 	// derivation (tech space).
 	Seed []byte
+
+	// SpaceType is an app-level tag surfaced as SpaceInfo.SpaceType for
+	// client-side filtering. It is NOT the on-wire header type (that
+	// stays anytype.space and is coordinator-gated) and not stamped into
+	// the header. Empty defaults to SpaceTypeRegular.
+	SpaceType string
 }
 
 // SpaceListEvent is delivered to Service.Subscribe callbacks.

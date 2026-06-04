@@ -6,6 +6,8 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // ErrUnknownDataset is returned when a change targets a dataset that has no
@@ -118,6 +120,13 @@ type HandlerReg struct {
 	Version int
 	Handler Handler
 	Indexes []anystore.IndexInfo
+	// Schema is the dataset's required, JSON-Schema-compatible field
+	// declaration. Each field carries a class (Scope: synced/derived/
+	// local) the apply path enforces: derived fields are handler-only,
+	// local fields never sync, and a dataset that isn't Dynamic rejects
+	// undeclared fields. Free-form datasets (shortIds, the per-type
+	// `objects` namespace) set Schema.Dynamic.
+	Schema schema.Dataset
 }
 
 // LocalPreValidator is an optional interface a Handler may implement

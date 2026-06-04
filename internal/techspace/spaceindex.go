@@ -12,7 +12,26 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
+
+// SpaceIndexSchema declares the `spaces` dataset fields and their class.
+// Synced metadata mirrors across the account's devices; localStatus is
+// per-device (never synced); remoteStatus carries the account-wide
+// delete. Used as the controller's enforced schema and surfaced to
+// consumers via discovery.
+func SpaceIndexSchema() schema.Dataset {
+	str := func() *schema.Schema { return schema.Leaf(schema.KindString) }
+	return schema.Dataset{Fields: []schema.Field{
+		{Id: FieldType, Name: "Type", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldSpaceType, Name: "Space type", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal},
+	}}
+}
 
 // SpaceIndexDeriveSeed mints the same space-index object id on every
 // device for a given account. Tech space has exactly one space-index
@@ -41,13 +60,13 @@ const (
 	FieldName        = "name"
 	FieldDescription = "description"
 	FieldIcon        = "icon"
-	// FieldLocalStatus is a DEVICE-LOCAL field (crdt.LocalFieldPrefix):
+	// FieldLocalStatus is a DEVICE-LOCAL field (schema.ScopeLocal):
 	// per-device lifecycle (active/joining/offloaded) that must NOT sync
 	// — a space offloaded on one device must stay loaded on another, and
 	// the value is meaningless offline or on a different network. Written
 	// only via Service.SetLocalStatus → Object.LocalSet; never enters the
 	// DAG. Absence means active.
-	FieldLocalStatus = crdt.LocalFieldPrefix + "localStatus"
+	FieldLocalStatus = "localStatus"
 	// FieldRemoteStatus is synced (account-wide). It carries the
 	// account-wide delete signal (StatusDeleted) so every device drops
 	// the space; the handler keeps it terminal.

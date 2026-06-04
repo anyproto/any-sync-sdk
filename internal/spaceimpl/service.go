@@ -3,6 +3,7 @@ package spaceimpl
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -493,6 +494,27 @@ func (s *Service) SpaceIndexObjectId() string { return s.tsp.IndexObjectId() }
 // the spaces / profile datasets.
 func (s *Service) Query(objectId, dataset string) space.Query {
 	return newQuery(s.tsp.Store(), objectId, dataset)
+}
+
+// Datasets returns the JSON-Schema description of the tech-space system
+// datasets (spaces, profile) for discovery.
+func (s *Service) Datasets() []space.DatasetSchema {
+	return toDatasetSchemas(s.tsp.Store().Schemas())
+}
+
+// toDatasetSchemas marshals each dataset's declared schema into a public
+// JSON-Schema document for discovery. A schema that fails to marshal is
+// skipped (should never happen — the doc is a plain map).
+func toDatasetSchemas(named []spaceobjects.NamedSchema) []space.DatasetSchema {
+	out := make([]space.DatasetSchema, 0, len(named))
+	for _, ns := range named {
+		raw, err := json.Marshal(ns.Schema)
+		if err != nil {
+			continue
+		}
+		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw})
+	}
+	return out
 }
 
 // Status returns a snapshot of spaceId's rolled-up sync state. Routes

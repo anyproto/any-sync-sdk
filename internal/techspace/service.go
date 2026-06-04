@@ -116,8 +116,8 @@ func (s *Service) Open(ctx context.Context) error {
 		SpaceId: s.spaceId,
 		Alloc:   object.NewVersionAllocator(""),
 		Handlers: []crdt.HandlerReg{
-			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}},
-			{Name: ProfileDataset, Handler: ProfileHandler{}},
+			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
+			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
 		},
 		DisableGate: true,
 		DataVersions: map[string]string{

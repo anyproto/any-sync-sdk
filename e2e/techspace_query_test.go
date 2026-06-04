@@ -2,9 +2,11 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
@@ -77,4 +79,40 @@ func TestE2E_TechSpaceGenericQuery(t *testing.T) {
 			Filter(map[string]any{"id": b.Id()}).One(ctx)
 		return qerr == nil && got != nil && got.GetString("remoteStatus") == "deleted"
 	}), "deleted space should show remoteStatus=deleted via query")
+
+	// Discovery: the tech-space `spaces` dataset is exposed as JSON Schema
+	// with per-field classes (x-scope). localStatus is device-local.
+	spacesSchema := findDataset(t, svc.Datasets(), "spaces")
+	assert.Equal(t, "local", xScope(t, spacesSchema, "localStatus"))
+	assert.Equal(t, "synced", xScope(t, spacesSchema, "remoteStatus"))
+
+	// A regular space exposes its datasets too; `objects` is dynamic.
+	sp, err := svc.Get(ctx, a.Id())
+	require.NoError(t, err)
+	objs := findDataset(t, sp.Datasets(), "objects")
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(objs.JSONSchema, &doc))
+	assert.Equal(t, true, doc["additionalProperties"], "objects dataset is dynamic")
+}
+
+func findDataset(t *testing.T, dss []space.DatasetSchema, name string) space.DatasetSchema {
+	t.Helper()
+	for _, ds := range dss {
+		if ds.Name == name {
+			return ds
+		}
+	}
+	t.Fatalf("dataset %q not found in discovery (%d datasets)", name, len(dss))
+	return space.DatasetSchema{}
+}
+
+func xScope(t *testing.T, ds space.DatasetSchema, field string) string {
+	t.Helper()
+	var doc struct {
+		Properties map[string]struct {
+			XScope string `json:"x-scope"`
+		} `json:"properties"`
+	}
+	require.NoError(t, json.Unmarshal(ds.JSONSchema, &doc))
+	return doc.Properties[field].XScope
 }

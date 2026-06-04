@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
@@ -21,8 +22,8 @@ import (
 // are loaded; tests do it inline.
 
 const (
-	testObjectId   = "type-1"
-	testDataVer    = "typePropertyHandler-v1" // matches typetype.HandlerVersion
+	testObjectId = "type-1"
+	testDataVer  = "typePropertyHandler-v1" // matches typetype.HandlerVersion
 )
 
 func newTypeController(t *testing.T) *crdt.Controller {
@@ -33,8 +34,8 @@ func newTypeController(t *testing.T) *crdt.Controller {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctrl, err := crdt.NewController(context.Background(), testObjectId, db,
-		crdt.HandlerReg{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}},
-		crdt.HandlerReg{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}},
+		crdt.HandlerReg{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		crdt.HandlerReg{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
 	)
 	require.NoError(t, err)
 	return ctrl

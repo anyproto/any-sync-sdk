@@ -21,9 +21,9 @@ const (
 	testObjectId = "obj-1"
 	testDataVer  = "systemPropertyHandler-v1" // matches properties.HandlerVersion
 	typeAny      = "any"
-	propName     = "p-name"     // string
-	propRating   = "p-rating"   // number
-	propTags     = "p-tags"     // array
+	propName     = "p-name"   // string
+	propRating   = "p-rating" // number
+	propTags     = "p-tags"   // array
 )
 
 func newPropsController(t *testing.T, reg types.Registry) *crdt.Controller {
@@ -34,7 +34,7 @@ func newPropsController(t *testing.T, reg types.Registry) *crdt.Controller {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctrl, err := crdt.NewController(context.Background(), testObjectId, db,
-		crdt.HandlerReg{Name: properties.Dataset, Handler: properties.New(reg)},
+		crdt.HandlerReg{Name: properties.Dataset, Handler: properties.New(reg), Schema: schema.Dataset{Dynamic: true}},
 	)
 	require.NoError(t, err)
 	return ctrl
@@ -262,7 +262,7 @@ func TestSystemPropertiesHandler_NilRegistryPasses(t *testing.T) {
 const propUserT = "userT" // a non-universal user type for membership tests
 
 func preflightRegistry() *types.StubRegistry {
-	r := defaultRegistry() // any: p-name(string), p-rating(number), p-tags(array)
+	r := defaultRegistry()                    // any: p-name(string), p-rating(number), p-tags(array)
 	r.Set(typeAny, "types", schema.KindArray) // any.types is a real built-in prop
 	r.Set(propUserT, "p1", schema.KindString)
 	return r

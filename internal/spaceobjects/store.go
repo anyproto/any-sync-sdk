@@ -387,6 +387,37 @@ func (s *Store) Close() error {
 // space layer to back Query.Subscribe.
 func (s *Store) SubEngine() *subscribe.Engine { return s.engine }
 
+// NamedSchema pairs a dataset name with its declared schema. Returned by
+// Schemas for consumer discovery.
+type NamedSchema struct {
+	Name   string
+	Schema schema.Dataset
+}
+
+// Schemas returns the declared schema of every dataset this store hosts —
+// the same schemas its controllers enforce. Used by the space layer to
+// expose dataset discovery to consumers.
+func (s *Store) Schemas() []NamedSchema {
+	if s.customHandlers != nil {
+		out := make([]NamedSchema, 0, len(s.customHandlers))
+		for _, h := range s.customHandlers {
+			out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
+		}
+		return out
+	}
+	out := []NamedSchema{
+		{Name: properties.Dataset, Schema: objectsDatasetSchema()},
+		{Name: typetype.DatasetPropertyDefs, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.ShortIdsDataset, Schema: schema.Dataset{Dynamic: true}},
+	}
+	for _, t := range s.extTypes {
+		for _, d := range t.Datasets {
+			out = append(out, NamedSchema{Name: d.Name, Schema: schema.Dataset{Dynamic: true}})
+		}
+	}
+	return out
+}
+
 // NotifyDrainer is the public hook used by callers (e.g. the
 // space service on first-touch) to trigger an asynchronous Drain
 // pass. The afterApply path notifies internally; this is for
@@ -760,6 +791,23 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // the same per-space collection as everyone else; what's
 // type-specific is the `properties` dataset (definitions), which
 // stays per-type-object.
+// objectsDatasetSchema is the per-space `objects` (properties) dataset
+// schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
+// synced) with the built-in `any` fields declared by class — ScopeAuto
+// auto-fields (author/createdAt/spaceId/id) as Derived (handler-only),
+// ScopeBase fields (name/description/…) as Synced.
+func objectsDatasetSchema() schema.Dataset {
+	fields := make([]schema.Field, 0, len(anytype.Properties))
+	for _, p := range anytype.Properties {
+		cls := schema.ScopeSynced
+		if p.Scope == anytype.ScopeAuto {
+			cls = schema.ScopeDerived
+		}
+		fields = append(fields, schema.Field{Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: cls})
+	}
+	return schema.Dataset{Fields: fields, Dynamic: true}
+}
+
 func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Controller, error) {
 	if s.customHandlers != nil {
 		// Raw mode: exactly the caller's handlers, each on its own
@@ -773,13 +821,17 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	shared := crdt.SharedCollections{properties.Dataset: coll}
 	regs := []crdt.HandlerReg{
-		{Name: properties.Dataset, Handler: properties.New(s.reg)},
-		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}},
-		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}},
+		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema()},
+		// `properties` defs + `shortIds` carry content-addressed / dynamic
+		// keyspaces — declared Dynamic (synced).
+		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes})
+			// External custom datasets are Dynamic (synced) until the public
+			// handler.Dataset gains a field-schema declaration.
+			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: schema.Dataset{Dynamic: true}})
 		}
 	}
 	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)

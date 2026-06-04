@@ -167,6 +167,12 @@ func (s *spaceImpl) QueryObjects() space.Query {
 	return newSharedQuery(s.store)
 }
 
+// Datasets returns the JSON-Schema description of every dataset in this
+// space (discovery). See toDatasetSchemas.
+func (s *spaceImpl) Datasets() []space.DatasetSchema {
+	return toDatasetSchemas(s.store.Schemas())
+}
+
 // checkDatasetMembership enforces the unified ownership invariant for
 // type-owned datasets: an object may only hold a type's dataset if it
 // implements that type (any.types ∋ owner). No-op for built-in / unknown

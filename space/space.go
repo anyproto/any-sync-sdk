@@ -61,6 +61,13 @@ type Space interface {
 	// like "find every Movie with Title containing X".
 	QueryObjects() Query
 
+	// Datasets returns the JSON-Schema description of every dataset in
+	// this space — field names, value shapes, and per-field class
+	// (synced / derived / local) via the `x-scope` keyword. For
+	// discovery; per-type object property schemas are also available
+	// through Types().
+	Datasets() []DatasetSchema
+
 	// Modify applies a write batch. Returns the VersionId, ChangeId,
 	// and resolved per-record ids (auto-derived ids surface here for
 	// callers who submitted records with empty Id — propId / shortId

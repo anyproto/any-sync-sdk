@@ -66,6 +66,12 @@ type Service interface {
 	// wrappers over this.
 	Query(objectId, dataset string) Query
 
+	// Datasets returns the JSON-Schema description of the tech-space
+	// system datasets (spaces, profile) — field names, value shapes, and
+	// per-field class (synced / derived / local) via `x-scope`. For
+	// discovery, mirroring Space.Datasets.
+	Datasets() []DatasetSchema
+
 	// Status returns a snapshot of one space's rolled-up sync state.
 	// Cheap; safe to call on every render tick. Spaces unknown to
 	// the SDK return SpaceSyncStatus{SpaceId: spaceId,

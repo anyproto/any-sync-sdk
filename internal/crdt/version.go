@@ -2,7 +2,6 @@ package crdt
 
 import (
 	"cmp"
-	"strings"
 
 	"github.com/anyproto/lexid"
 )
@@ -20,21 +19,9 @@ var localVersionGen = lexid.Must(lexid.CharsAllNoEscape, 4, 100)
 // lexid order. Empty v yields the smallest version. Used by the
 // device-local write path to advance a local field past its current
 // version (read from the record's _ver), which is correct because no
-// synced change ever writes a local-namespace path to compete with it.
+// synced change ever writes a Local-class field to compete with it.
 func NextVersion(v VersionId) VersionId {
 	return VersionId(localVersionGen.Next(string(v)))
-}
-
-// LocalFieldPrefix marks a record field as device-local: written only by
-// the Change.Local path, never synced, never gated against synced
-// versions. Reserved like `id` / `_*` — see reserved_fields docs.
-const LocalFieldPrefix = "~"
-
-// IsLocalPath reports whether path targets a device-local field — its
-// first segment carries LocalFieldPrefix. The synced apply path rejects
-// these; the local path requires them.
-func IsLocalPath(path []string) bool {
-	return len(path) > 0 && strings.HasPrefix(path[0], LocalFieldPrefix)
 }
 
 // VersionId is a lexicographically-sortable local ordering key maintained by

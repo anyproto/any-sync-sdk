@@ -7,25 +7,24 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 )
 
-// opTouchesLocal reports whether op writes any device-local
-// (LocalFieldPrefix) path — either via op.Path or, for a multi-field
-// $set/$unset (empty Path, object payload keyed by dotted paths), via
-// any payload key's first segment.
-func opTouchesLocal(op Op) bool {
+// opFieldHeads returns the top-level field name(s) an op writes: the
+// first path segment for a single-path op, or — for a multi-field
+// $set/$unset (empty Path, object payload keyed by dotted paths) — the
+// head segment of each payload key. Used by the controller's field-class
+// enforcement to look each touched field up in the dataset schema.
+func opFieldHeads(op Op) []string {
 	if len(op.Path) > 0 {
-		return IsLocalPath(op.Path)
+		return []string{op.Path[0]}
 	}
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
-		return false
+		return nil
 	}
-	found := false
+	var heads []string
 	obj, _ := op.Payload.Object()
 	obj.Visit(func(k []byte, _ *anyenc.Value) {
-		if strings.HasPrefix(strings.SplitN(string(k), ".", 2)[0], LocalFieldPrefix) {
-			found = true
-		}
+		heads = append(heads, strings.SplitN(string(k), ".", 2)[0])
 	})
-	return found
+	return heads
 }
 
 // applyOp dispatches one op to its arena-parameterized handler. All

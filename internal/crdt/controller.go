@@ -11,6 +11,8 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/query"
+
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // Sentinel errors.
@@ -90,6 +92,9 @@ type Controller struct {
 	// collection is first opened.
 	versions map[string]int
 	indexes  map[string][]anystore.IndexInfo
+	// schemas is the per-dataset field declaration (field classes +
+	// Dynamic). Source of truth for synced/derived/local enforcement.
+	schemas map[string]schema.Dataset
 
 	// collMu guards collections. Per-object collections are opened
 	// lazily — on first write via db.Collection (creates), on read via
@@ -141,6 +146,7 @@ func NewControllerWithShared(ctx context.Context, objectId string, db anystore.D
 		handlers:    make(map[string]Handler, len(regs)),
 		versions:    make(map[string]int, len(regs)),
 		indexes:     make(map[string][]anystore.IndexInfo, len(regs)),
+		schemas:     make(map[string]schema.Dataset, len(regs)),
 		collections: make(map[string]anystore.Collection, len(regs)),
 		shared:      make(map[string]struct{}, len(shared)),
 	}
@@ -193,6 +199,13 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 	if _, dup := c.handlers[name]; dup {
 		return fmt.Errorf("crdt: duplicate handler for dataset %q", name)
 	}
+	// A dataset must describe itself: either declare its fields or mark
+	// itself Dynamic. This is the source of truth for synced/derived/
+	// local enforcement — a silently-undeclared dataset would accept
+	// anything as synced, defeating the point.
+	if len(reg.Schema.Fields) == 0 && !reg.Schema.Dynamic {
+		return fmt.Errorf("crdt: dataset %q registered without a schema (declare Fields or set Dynamic)", name)
+	}
 	if err := reg.Handler.Init(ctx); err != nil {
 		return fmt.Errorf("crdt: init handler %q: %w", name, err)
 	}
@@ -203,6 +216,7 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 	}
 	c.versions[name] = version
 	c.indexes[name] = reg.Indexes
+	c.schemas[name] = reg.Schema
 	// Per-object collections are opened lazily — on first write
 	// (creates) or on first read (no-create). This keeps unwritten
 	// datasets (e.g. typetype's `properties` / `shortIds` on regular
@@ -549,23 +563,23 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// proposal.md § "Validation atomicity"). Handler validation moves
 	// into the Modify callback below.
 	//
-	// Local/synced namespace enforcement (the invariant that makes
-	// device-local versioning safe): a synced change must never touch a
-	// local-namespace path, and a Change.Local must touch ONLY local
-	// paths. This keeps the two field classes disjoint, so a local
-	// field's locally-allocated version never competes with a synced
-	// field's any-sync OrderId.
+	// Field-class enforcement (the dataset schema is the source of truth):
+	//   - Derived fields are handler-only — no input op may write one;
+	//   - Local fields never sync — only a Change.Local may write one,
+	//     and a Change.Local may write ONLY Local fields;
+	//   - on a non-Dynamic dataset, an undeclared field is rejected.
+	// This keeps the classes disjoint, so a local field's locally-allocated
+	// version never competes with a synced field's any-sync OrderId.
+	ds := c.schemas[ch.Dataset]
 	for i, rc := range ch.Records {
 		for _, op := range rc.Ops {
 			if err := validateOpPaths(op); err != nil {
 				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: %w", resolvedIds[i], op.Type, err))
 			}
-			local := opTouchesLocal(op)
-			if ch.Local && !local {
-				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: local change may only write %s-prefixed fields", resolvedIds[i], op.Type, LocalFieldPrefix))
-			}
-			if !ch.Local && local {
-				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: synced change may not write %s-prefixed (device-local) fields", resolvedIds[i], op.Type, LocalFieldPrefix))
+			for _, field := range opFieldHeads(op) {
+				if err := classifyFieldWrite(ds, field, ch.Local); err != nil {
+					return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s field %q: %w", resolvedIds[i], op.Type, field, err))
+				}
 			}
 		}
 	}
@@ -623,6 +637,33 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// Commit succeeded — advance the in-memory mirror.
 	c.maxAddSeq = newMaxAddSeq
 	return res, nil
+}
+
+// classifyFieldWrite enforces the dataset field-class rules for an input
+// op writing `field` (a top-level field name) on a change whose Local
+// flag is `isLocal`. Reserved fields (id, _*) are already rejected by
+// validateOpPaths, so this only sees user-facing field heads.
+func classifyFieldWrite(ds schema.Dataset, field string, isLocal bool) error {
+	sc, declared := ds.ScopeOf(field)
+	if !declared {
+		if !ds.Dynamic {
+			return fmt.Errorf("undeclared field on a non-dynamic dataset")
+		}
+		sc = schema.ScopeSynced // dynamic datasets default undeclared fields to synced
+	}
+	switch sc {
+	case schema.ScopeDerived:
+		return fmt.Errorf("derived field is handler-only, not writable by an input op")
+	case schema.ScopeLocal:
+		if !isLocal {
+			return fmt.Errorf("local (device-only) field is not writable by a synced change")
+		}
+	default: // ScopeSynced
+		if isLocal {
+			return fmt.Errorf("synced field is not writable by a local change")
+		}
+	}
+	return nil
 }
 
 // applyRecordChange applies one RecordChange via UpsertId or UpdateId,

@@ -229,6 +229,21 @@ func (s *Service) SpaceId() string { return s.spaceId }
 // IndexObjectId returns the space-index object id once Open has run.
 func (s *Service) IndexObjectId() string { return s.indexId }
 
+// projectIndex rebinds the index object so any tree changes pulled by
+// head-sync are replayed into the controller-backed store. Best-effort:
+// bind failures (e.g. the space briefly unavailable) leave the store at
+// its last projected state. Safe to call from any reader — it shares the
+// bindMu serialization with writers, so the MaxAddSeq watermark never
+// races across two *Object instances.
+func (s *Service) projectIndex(ctx context.Context) {
+	if !s.open.Load() || s.spaceId == "" {
+		return
+	}
+	s.bindMu.Lock()
+	defer s.bindMu.Unlock()
+	_, _ = s.indexObject(ctx)
+}
+
 // Add writes a new space-index record.
 func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteResult, error) {
 	if !s.open.Load() {
@@ -349,6 +364,16 @@ func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
 	if !s.open.Load() {
 		return nil
 	}
+	// Project any index-tree changes that background head-sync has pulled
+	// into tree storage but not yet into the controller-backed store this
+	// read uses. The synctree update listener that would do this live is
+	// not reliably attached on a cold joiner (the bound object is
+	// transient — see bindIndexObject), so reads actively drain instead.
+	// Rebinding runs the synctree afterBuild → Rebuild → replayLocked
+	// cycle; it's idempotent and watermark-cheap (a no-op once the
+	// controller is caught up) and best-effort — on bind failure we
+	// return the last projected state rather than erroring the read.
+	s.projectIndex(ctx)
 	rows := s.ctrl.Records(ctx, SpaceIndexDataset)
 	out := make([]SpaceIndexRecord, 0, len(rows))
 	for _, v := range rows {

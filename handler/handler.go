@@ -25,6 +25,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // Handler owns one dataset. Lifecycle hooks fire inside any-store's
@@ -160,7 +161,54 @@ type Dataset struct {
 	// Indexes are ensured on the dataset's collection the first time it
 	// is opened. Optional. Idempotent across restarts.
 	Indexes []anystore.IndexInfo
+
+	// Schema declares this dataset's fields and their classes (synced /
+	// derived / local) — the source of truth the apply path enforces and
+	// consumers discover via Space.Datasets() / Service.Datasets().
+	//
+	// Optional for backward compatibility: a zero Schema (no Fields, not
+	// Dynamic) is treated as Dynamic — a free-form synced keyspace, the
+	// pre-schema behavior. Declare Fields to get apply-time enforcement
+	// (undeclared fields rejected, derived fields handler-only) and a
+	// meaningful discovery document; set Dynamic to keep a free-form
+	// keyspace explicit.
+	Schema Schema
 }
+
+// Schema is a dataset's field-schema declaration: the set of declared
+// Fields plus whether the keyspace is Dynamic (free-form keys allowed,
+// defaulting to synced). Attach it to Dataset.Schema. Re-exported from
+// the SDK's internal schema layer so callers declare schemas without a
+// separate import.
+type Schema = schema.Dataset
+
+// Field is one declared dataset field — Id and optional display Name,
+// the value Shape (nil = unconstrained), and the field's Scope class.
+type Field = schema.Field
+
+// FieldShape is a recursive JSON-Schema-subset value shape: a Kind plus
+// optional Items (arrays) / Properties (objects). Build leaf shapes with
+// Leaf; nil means an unconstrained value.
+type FieldShape = schema.Schema
+
+// Scope is a dataset field's class: how it is written, versioned, and
+// synced. Use the Scope* constants.
+type Scope = schema.Scope
+
+const (
+	// ScopeSynced: user/DAG-written, change-versioned, synced across the
+	// account's devices (the default for undeclared dynamic fields).
+	ScopeSynced = schema.ScopeSynced
+	// ScopeDerived: handler-computed from the change, read-only to
+	// writers, converges across peers (e.g. creator / createdAt).
+	ScopeDerived = schema.ScopeDerived
+	// ScopeLocal: device-local, never synced (e.g. a per-device status).
+	ScopeLocal = schema.ScopeLocal
+)
+
+// Leaf builds an unconstrained scalar value shape for a PropertyKind —
+// convenience for declaring simple Field shapes.
+func Leaf(k PropertyKind) *FieldShape { return schema.Leaf(schema.Kind(k)) }
 
 // Type binds a typeId to the dataset handlers it owns. Built-in
 // types follow the same shape: `any` owns the `objects` dataset;

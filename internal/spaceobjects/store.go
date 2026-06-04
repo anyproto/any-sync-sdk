@@ -412,10 +412,21 @@ func (s *Store) Schemas() []NamedSchema {
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			out = append(out, NamedSchema{Name: d.Name, Schema: schema.Dataset{Dynamic: true}})
+			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d)})
 		}
 	}
 	return out
+}
+
+// datasetSchema resolves an external dataset's declared schema, applying
+// the backward-compatible default: a zero Schema (no Fields, not Dynamic)
+// is treated as a Dynamic synced keyspace — the pre-schema behavior — so
+// handlers that predate Dataset.Schema keep registering unchanged.
+func datasetSchema(d handler.Dataset) schema.Dataset {
+	if len(d.Schema.Fields) == 0 && !d.Schema.Dynamic {
+		return schema.Dataset{Dynamic: true}
+	}
+	return d.Schema
 }
 
 // NotifyDrainer is the public hook used by callers (e.g. the
@@ -829,9 +840,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			// External custom datasets are Dynamic (synced) until the public
-			// handler.Dataset gains a field-schema declaration.
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: schema.Dataset{Dynamic: true}})
+			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d)})
 		}
 	}
 	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)

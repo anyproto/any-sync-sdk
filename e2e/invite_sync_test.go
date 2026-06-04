@@ -185,9 +185,21 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 
 	// At this point Bob should be a writer on Alice's space. The
 	// content sync window is identical to the cold-sync test: types,
-	// objects, and property values must all converge.
+	// objects, AND per-object property values must all converge.
+	//
+	// The value check belongs INSIDE this wait, not after it. Each
+	// object reaches Bob as two separate DAG changes — the `any.types`
+	// bootstrap and the `SetBase` value — both parked behind the type
+	// def's shortId (the DataVersion gate). When the type def lands they
+	// drain in one pass but apply non-atomically per object: the
+	// `any.types` replay creates the object's row (so it shows up in
+	// QueryObjects) microseconds before the value replay lands. Gating
+	// only on object presence and then reading the value once races that
+	// gap — the value is correct on the very next read, but a one-shot
+	// assert flakes ~1/25. Poll until the values are present too.
 	var lastTypes []string
 	var lastObjs []string
+	var lastVals []string
 	converged := waitFor(ctx, 3*time.Minute, 2*time.Second, func() bool {
 		_ = bobSpace.SyncHeads(ctx)
 		typeIds := userTypeIds(bobSpace, ctx)
@@ -209,14 +221,27 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 				return false
 			}
 		}
+		lastVals = lastVals[:0]
+		for _, want := range objs {
+			rec, err := bobSpace.Properties().Get(ctx, want.id, space.PropertyReadOpts{})
+			if err != nil || rec == nil {
+				return false
+			}
+			got := rec.GetString(typeId, propId)
+			lastVals = append(lastVals, got)
+			if got != want.title {
+				return false
+			}
+		}
 		return true
 	})
 	if !converged {
-		t.Fatalf("bob: content never converged\n  want type=%s objects=%v\n  got types=%v objects=%v",
-			typeId, objIds(objs), lastTypes, lastObjs)
+		t.Fatalf("bob: content never converged\n  want type=%s objects=%v values=%v\n  got types=%v objects=%v values=%v",
+			typeId, objIds(objs), objTitles(objs), lastTypes, lastObjs, lastVals)
 	}
 
-	// Per-object property values landed?
+	// Re-assert the values for a clear failure message if the wait above
+	// is ever loosened — by here they are guaranteed present.
 	for _, want := range objs {
 		rec, err := bobSpace.Properties().Get(ctx, want.id, space.PropertyReadOpts{})
 		require.NoError(t, err, "bob: Properties().Get(%s)", want.id)
@@ -253,6 +278,14 @@ func objIds(objs []objFix) []string {
 	out := make([]string, 0, len(objs))
 	for _, o := range objs {
 		out = append(out, o.id)
+	}
+	return out
+}
+
+func objTitles(objs []objFix) []string {
+	out := make([]string, 0, len(objs))
+	for _, o := range objs {
+		out = append(out, o.title)
 	}
 	return out
 }

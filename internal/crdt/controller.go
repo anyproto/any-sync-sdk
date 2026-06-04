@@ -325,6 +325,30 @@ func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value 
 	return cloneValue(doc.Value())
 }
 
+// NextLocalVersion returns the VersionId to stamp on a device-local
+// (Change.Local) write: one version for the whole change, strictly
+// greater than every targeted field's current version on its record.
+// Because local fields are handler-exclusive and never written by a
+// synced change, a single bump above their current versions is
+// monotonic and cannot be overshadowed by a competing synced write.
+// Reads the current records by their explicit ids (local writes never
+// use empty-id resolution). Safe to call under the apply lock.
+func (c *Controller) NextLocalVersion(ctx context.Context, ch *Change) VersionId {
+	var max VersionId
+	for i := range ch.Records {
+		rec := c.Get(ctx, ch.Dataset, ch.Records[i].Id)
+		if rec == nil {
+			continue
+		}
+		for _, op := range ch.Records[i].Ops {
+			if v := GetRecordVersion(rec, op.Path...); v > max {
+				max = v
+			}
+		}
+	}
+	return NextVersion(max)
+}
+
 // IsShared reports whether the dataset uses a per-space shared
 // collection (write-side rule: row id = ObjectId, not RecordChange.Id).
 // Subscribers projecting changes back to a path-based wire need this
@@ -524,10 +548,24 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// Path syntax: whole-change abort on failure (docs/types-properties-
 	// proposal.md § "Validation atomicity"). Handler validation moves
 	// into the Modify callback below.
+	//
+	// Local/synced namespace enforcement (the invariant that makes
+	// device-local versioning safe): a synced change must never touch a
+	// local-namespace path, and a Change.Local must touch ONLY local
+	// paths. This keeps the two field classes disjoint, so a local
+	// field's locally-allocated version never competes with a synced
+	// field's any-sync OrderId.
 	for i, rc := range ch.Records {
 		for _, op := range rc.Ops {
 			if err := validateOpPaths(op); err != nil {
 				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: %w", resolvedIds[i], op.Type, err))
+			}
+			local := opTouchesLocal(op)
+			if ch.Local && !local {
+				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: local change may only write %s-prefixed fields", resolvedIds[i], op.Type, LocalFieldPrefix))
+			}
+			if !ch.Local && local {
+				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: synced change may not write %s-prefixed (device-local) fields", resolvedIds[i], op.Type, LocalFieldPrefix))
 			}
 		}
 	}
@@ -906,11 +944,13 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			Payload: m.derivedArena().NewString(string(ch.VersionId)),
 		})
 
-		ctx := &ChangeCtx{Change: ch, Before: nil}
-		if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
-			m.recordedErr = err
-			m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
-			return existing, false, nil
+		if !ch.Local {
+			ctx := &ChangeCtx{Change: ch, Before: nil}
+			if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
+				m.recordedErr = err
+				m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
+				return existing, false, nil
+			}
 		}
 		target := variantTarget(a, existing, rc.Variant)
 		for i := range rc.Ops {
@@ -934,12 +974,16 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		target := variantTarget(a, existing, rc.Variant)
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
-			if err := m.handler.BeforeModify(ctx, rc, op, m.sink); err != nil {
-				// Per-op drop; other ops in the same RecordChange
-				// still apply. Surface so the caller knows the
-				// change committed with a hole.
-				m.rejections = append(m.rejections, OpRejection{OpIndex: i, Err: err})
-				continue
+			// Device-local writes are handler-exclusive (see Change.Local):
+			// no handler validation/derivation, just apply the gated set.
+			if !ch.Local {
+				if err := m.handler.BeforeModify(ctx, rc, op, m.sink); err != nil {
+					// Per-op drop; other ops in the same RecordChange
+					// still apply. Surface so the caller knows the
+					// change committed with a hole.
+					m.rejections = append(m.rejections, OpRejection{OpIndex: i, Err: err})
+					continue
+				}
 			}
 			applyOp(a, target, *ch, *op)
 		}

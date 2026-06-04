@@ -152,18 +152,18 @@ func TestSpaceIndexHandler_StatusActiveToDeletedPasses(t *testing.T) {
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v1", spaceId, true,
 		setMulti(arena, map[string]string{
-			techspace.FieldType:        "private",
-			techspace.FieldLocalStatus: techspace.StatusActive,
+			techspace.FieldType:         "private",
+			techspace.FieldRemoteStatus: techspace.StatusActive,
 		}),
 	)))
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v2", spaceId, false,
-		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldLocalStatus}, Payload: arena.NewString(techspace.StatusDeleted)},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusDeleted)},
 	)))
 
 	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
 	require.NotNil(t, rec)
-	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldLocalStatus))
+	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldRemoteStatus))
 }
 
 func TestSpaceIndexHandler_StatusOutOfDeletedDropped(t *testing.T) {
@@ -174,19 +174,19 @@ func TestSpaceIndexHandler_StatusOutOfDeletedDropped(t *testing.T) {
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v1", spaceId, true,
 		setMulti(arena, map[string]string{
-			techspace.FieldType:        "private",
-			techspace.FieldLocalStatus: techspace.StatusDeleted,
+			techspace.FieldType:         "private",
+			techspace.FieldRemoteStatus: techspace.StatusDeleted,
 		}),
 	)))
 	// Try to revive — terminal, op dropped.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v2", spaceId, false,
-		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldLocalStatus}, Payload: arena.NewString(techspace.StatusActive)},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusActive)},
 	)))
 
 	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
 	require.NotNil(t, rec)
-	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldLocalStatus),
+	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldRemoteStatus),
 		"terminal status survives revival attempt")
 }
 
@@ -198,8 +198,8 @@ func TestSpaceIndexHandler_StatusOutOfDeletedDroppedMultiField(t *testing.T) {
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v1", spaceId, true,
 		setMulti(arena, map[string]string{
-			techspace.FieldType:        "private",
-			techspace.FieldLocalStatus: techspace.StatusDeleted,
+			techspace.FieldType:         "private",
+			techspace.FieldRemoteStatus: techspace.StatusDeleted,
 		}),
 	)))
 	// Multi-field $set whose payload includes localStatus → whole op
@@ -207,14 +207,14 @@ func TestSpaceIndexHandler_StatusOutOfDeletedDroppedMultiField(t *testing.T) {
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v2", spaceId, false,
 		setMulti(arena, map[string]string{
-			techspace.FieldLocalStatus: techspace.StatusActive,
-			techspace.FieldName:        "Zombie",
+			techspace.FieldRemoteStatus: techspace.StatusActive,
+			techspace.FieldName:         "Zombie",
 		}),
 	)))
 
 	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
 	require.NotNil(t, rec)
-	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldLocalStatus))
+	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldRemoteStatus))
 	// Bundled name change is also dropped — see rejectMultiField rationale.
 	assert.NotEqual(t, "Zombie", rec.GetString(techspace.FieldName))
 }

@@ -37,11 +37,20 @@ const HandlerVersion = "spaceIndexHandler-v1"
 // Space-index record fields. The shape is hardcoded — tech space is
 // account-private; no cross-version writers to negotiate with.
 const (
-	FieldType         = "type"
-	FieldName         = "name"
-	FieldDescription  = "description"
-	FieldIcon         = "icon"
-	FieldLocalStatus  = "localStatus"
+	FieldType        = "type"
+	FieldName        = "name"
+	FieldDescription = "description"
+	FieldIcon        = "icon"
+	// FieldLocalStatus is a DEVICE-LOCAL field (crdt.LocalFieldPrefix):
+	// per-device lifecycle (active/joining/offloaded) that must NOT sync
+	// — a space offloaded on one device must stay loaded on another, and
+	// the value is meaningless offline or on a different network. Written
+	// only via Service.SetLocalStatus → Object.LocalSet; never enters the
+	// DAG. Absence means active.
+	FieldLocalStatus = crdt.LocalFieldPrefix + "localStatus"
+	// FieldRemoteStatus is synced (account-wide). It carries the
+	// account-wide delete signal (StatusDeleted) so every device drops
+	// the space; the handler keeps it terminal.
 	FieldRemoteStatus = "remoteStatus"
 	// FieldSpaceType mirrors the in-space spaceIndex.spaceType app tag.
 	// Distinct from FieldType (the on-wire header type): not pinned, so
@@ -62,15 +71,17 @@ const (
 
 // Sentinels — wrap crdt.ErrValidation in handler returns.
 var (
-	ErrMissingType         = errors.New("techspace: space-index record requires `type`")
-	ErrTypeImmutable       = errors.New("techspace: `type` is pinned after first write")
-	ErrStatusTerminal      = errors.New("techspace: status=deleted is terminal")
-	ErrDeleteOpNotAllowed  = errors.New("techspace: deletion is via localStatus=deleted, not a delete op")
+	ErrMissingType        = errors.New("techspace: space-index record requires `type`")
+	ErrTypeImmutable      = errors.New("techspace: `type` is pinned after first write")
+	ErrStatusTerminal     = errors.New("techspace: status=deleted is terminal")
+	ErrDeleteOpNotAllowed = errors.New("techspace: deletion is via remoteStatus=deleted, not a delete op")
 )
 
-// statusFields are the fields whose terminal-Deleted rule is enforced.
+// statusFields are the SYNCED fields whose terminal-Deleted rule is
+// enforced. localStatus is device-local (handler-exclusive, never
+// synced) so it's absent here — only remoteStatus carries the
+// account-wide terminal delete.
 var statusFields = map[string]struct{}{
-	FieldLocalStatus:  {},
 	FieldRemoteStatus: {},
 }
 

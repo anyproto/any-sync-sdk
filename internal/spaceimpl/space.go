@@ -153,17 +153,18 @@ func (s *spaceImpl) SyncStatus() space.SyncStatusAPI {
 func (s *spaceImpl) Debug() space.DebugAPI {
 	return newDebugAPI(s)
 }
+
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {
-	return newQuery(s, objectId, dataset)
+	return newQuery(s.store, objectId, dataset)
 }
 
 // QueryObjects builds a chainable query against the per-space
 // `objects` collection — one row per regular object's property
 // values, keyed by objectId.
 func (s *spaceImpl) QueryObjects() space.Query {
-	return newSharedQuery(s)
+	return newSharedQuery(s.store)
 }
 
 // checkDatasetMembership enforces the unified ownership invariant for

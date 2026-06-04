@@ -1,6 +1,41 @@
 package crdt
 
-import "cmp"
+import (
+	"cmp"
+	"strings"
+
+	"github.com/anyproto/lexid"
+)
+
+// localVersionGen mints monotonic lexids for device-local fields (see
+// Change.Local / Object.LocalSet). Same parameters as any-sync's tree
+// allocator and internal/object's VersionAllocator so the values share
+// one comparable order space with any-sync's OrderIds — a local field's
+// version is always taken as NextVersion of that field's own current
+// version, so it advances monotonically without colliding with the
+// disjoint synced-field namespace.
+var localVersionGen = lexid.Must(lexid.CharsAllNoEscape, 4, 100)
+
+// NextVersion returns a VersionId strictly greater than v in the shared
+// lexid order. Empty v yields the smallest version. Used by the
+// device-local write path to advance a local field past its current
+// version (read from the record's _ver), which is correct because no
+// synced change ever writes a local-namespace path to compete with it.
+func NextVersion(v VersionId) VersionId {
+	return VersionId(localVersionGen.Next(string(v)))
+}
+
+// LocalFieldPrefix marks a record field as device-local: written only by
+// the Change.Local path, never synced, never gated against synced
+// versions. Reserved like `id` / `_*` — see reserved_fields docs.
+const LocalFieldPrefix = "~"
+
+// IsLocalPath reports whether path targets a device-local field — its
+// first segment carries LocalFieldPrefix. The synced apply path rejects
+// these; the local path requires them.
+func IsLocalPath(path []string) bool {
+	return len(path) > 0 && strings.HasPrefix(path[0], LocalFieldPrefix)
+}
 
 // VersionId is a lexicographically-sortable local ordering key maintained by
 // any-sync's tree storage (= its `orderId`). It is **local to one peer's view

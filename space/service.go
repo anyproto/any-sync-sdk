@@ -54,6 +54,18 @@ type Service interface {
 	// Returns a cancel function.
 	Subscribe(cb func(SpaceListEvent)) (cancel func())
 
+	// SpaceIndexObjectId returns the id of the tech-space index object —
+	// the handle for generic Query/Subscribe over the system datasets
+	// (spaces, profile). Future system objects expose their own ids.
+	SpaceIndexObjectId() string
+
+	// Query builds a generic read query over a system object's dataset
+	// (e.g. SpaceIndexObjectId() + "spaces"), with the same chainable
+	// Filter / Sort / Limit / Snapshot / Subscribe surface as
+	// Space.Query. The bespoke List / Subscribe methods are convenience
+	// wrappers over this.
+	Query(objectId, dataset string) Query
+
 	// Status returns a snapshot of one space's rolled-up sync state.
 	// Cheap; safe to call on every render tick. Spaces unknown to
 	// the SDK return SpaceSyncStatus{SpaceId: spaceId,

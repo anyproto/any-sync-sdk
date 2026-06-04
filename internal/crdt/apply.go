@@ -7,6 +7,27 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 )
 
+// opTouchesLocal reports whether op writes any device-local
+// (LocalFieldPrefix) path — either via op.Path or, for a multi-field
+// $set/$unset (empty Path, object payload keyed by dotted paths), via
+// any payload key's first segment.
+func opTouchesLocal(op Op) bool {
+	if len(op.Path) > 0 {
+		return IsLocalPath(op.Path)
+	}
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+		return false
+	}
+	found := false
+	obj, _ := op.Payload.Object()
+	obj.Visit(func(k []byte, _ *anyenc.Value) {
+		if strings.HasPrefix(strings.SplitN(string(k), ".", 2)[0], LocalFieldPrefix) {
+			found = true
+		}
+	})
+	return found
+}
+
 // applyOp dispatches one op to its arena-parameterized handler. All
 // allocation goes through the provided arena (which comes from any-store's
 // DocBuffer pool when running inside a modifier, or from the Controller's

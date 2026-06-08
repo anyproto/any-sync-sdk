@@ -77,7 +77,7 @@ func TestMeta_ControllerLoadAndSeed(t *testing.T) {
 	require.NoError(t, PersistMeta(ctx, coll, "obj1", 55, map[string]int{"blocks": 2}))
 
 	// Create a Controller and load.
-	ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: "blocks", Version: 3, Handler: DefaultHandler{}})
+	ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: "blocks", Version: 3, Handler: DefaultHandler{}, Schema: dynSchema})
 	require.NoError(t, err)
 	storedHV, err := ctrl.LoadAndSeedMeta(ctx, coll)
 	require.NoError(t, err)
@@ -141,7 +141,7 @@ func TestMeta_ControllerPersistMeta(t *testing.T) {
 	db, coll := openMetaColl(t)
 	arena := &anyenc.Arena{}
 
-	ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
+	ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}, Schema: dynSchema})
 	require.NoError(t, err)
 
 	// Apply a change to bump maxAddSeq.

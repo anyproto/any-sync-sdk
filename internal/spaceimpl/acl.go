@@ -10,6 +10,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/space"
@@ -58,10 +59,50 @@ func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	if err != nil {
 		return space.Invite{}, fmt.Errorf("acl: replace invite: %w", err)
 	}
-	if err := cl.AddRecord(ctx, res.InviteRec); err != nil {
+	if err := addRecordWaitingForLog(ctx, cl, res.InviteRec); err != nil {
 		return space.Invite{}, fmt.Errorf("acl: publish invite: %w", err)
 	}
 	return space.Invite{SpaceId: a.s.id, InviteKey: res.InviteKey}, nil
+}
+
+// addRecordWaitingForLog publishes an ACL record, retrying while the
+// space's consensus log is still being created. ensureShareable only
+// confirms the coordinator has the space header; the consensus ACL log
+// is created separately and lazily by a tree node when it first loads
+// the pushed space (nodeSpace.Init -> consensusclient.AddLog). Until
+// that lands, the node/coordinator reject the record with "log not
+// found". This is a transient startup race on a freshly-created space,
+// so we retry with a short backoff instead of surfacing it to callers.
+func addRecordWaitingForLog(ctx context.Context, cl aclclient.AclSpaceClient, rec *consensusproto.RawRecord) error {
+	const (
+		maxAttempts = 35
+		backoff     = time.Second
+	)
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		if err := cl.AddRecord(ctx, rec); err != nil {
+			lastErr = err
+			if !isLogNotReady(err) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("consensus log not ready after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// isLogNotReady matches the "log not found" rejection returned while a
+// freshly-created space's consensus ACL log is still being established.
+// The error crosses the DRPC boundary, so substring match is the
+// pragmatic route — there's no exported sentinel to errors.Is against.
+func isLogNotReady(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "log not found")
 }
 
 // ensureShareable calls coordinator.SpaceMakeShareable, retrying on

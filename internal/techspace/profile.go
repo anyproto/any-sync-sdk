@@ -6,7 +6,19 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
+
+// ProfileSchema declares the `profile` dataset fields — the account's
+// own profile, synced across its devices.
+func ProfileSchema() schema.Dataset {
+	str := func() *schema.Schema { return schema.Leaf(schema.KindString) }
+	return schema.Dataset{Fields: []schema.Field{
+		{Id: FieldProfileName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldProfileDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldProfileIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced},
+	}}
+}
 
 // Profile dataset / handler for the tech-space.
 //

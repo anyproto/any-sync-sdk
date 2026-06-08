@@ -22,6 +22,7 @@ func TestHandlerReg_Indexes_LazyEnsureOnFirstWrite(t *testing.T) {
 		Name:    testDS,
 		Handler: DefaultHandler{},
 		Indexes: []anystore.IndexInfo{{Name: "idx_status", Fields: []string{"status"}, Sparse: true}},
+		Schema:  dynSchema,
 	})
 	require.NoError(t, err)
 
@@ -50,6 +51,7 @@ func TestHandlerReg_Indexes_SharedCollectionEagerEnsure(t *testing.T) {
 			Name:    testDS,
 			Handler: DefaultHandler{},
 			Indexes: []anystore.IndexInfo{{Name: "idx_kind", Fields: []string{"kind"}}},
+			Schema:  dynSchema,
 		})
 	require.NoError(t, err)
 

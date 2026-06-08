@@ -162,4 +162,14 @@ type Change struct {
 	// "no trace for this change" — any prior `_traces[versionId]` entry for
 	// this versionId is cleared.
 	TraceIds []string
+	// Local marks a device-local materialization that does NOT flow
+	// through the any-sync DAG. Set by Object.LocalSet; never by a
+	// synced write or replay. When true the apply path: (1) skips the
+	// dataset handler (local fields are handler-exclusive), (2) requires
+	// every op path to be in the reserved local namespace (IsLocalPath),
+	// and the VersionId is locally allocated (NextVersion of the field's
+	// current version) rather than an any-sync OrderId. When false, the
+	// apply path rejects any op targeting a local-namespace path. The
+	// two field classes are disjoint by construction — see version.go.
+	Local bool
 }

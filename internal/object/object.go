@@ -441,6 +441,45 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	}, nil
 }
 
+// LocalSet applies a device-local materialization: it writes only
+// reserved local-namespace (crdt.LocalFieldPrefix) fields straight into
+// the controller's materialised row — NO tree.AddContent, so nothing
+// enters the any-sync DAG and nothing syncs to other devices. Each
+// device computes its own value. The version is locally allocated
+// (NextVersion of the field's current version), which is safe because
+// no synced change ever writes a local-namespace path. Fires afterApply
+// so Query/Subscribe see the change live, exactly like a synced write.
+//
+// Caller passes a Change with Dataset + Records (explicit ids, $set/$unset
+// ops on local-prefixed paths). VersionId/ChangeId/AddSeq are ignored on
+// input — VersionId is assigned here; the change never gets a ChangeId.
+func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, error) {
+	if o.tree == nil {
+		return WriteResult{}, ErrTreeNotSet
+	}
+	o.tree.Lock()
+	defer o.tree.Unlock()
+	if o.closed {
+		return WriteResult{}, errors.New("object: closed")
+	}
+	ch.Local = true
+	ch.SpaceId = o.spaceId
+	ch.ObjectId = o.tree.Id()
+	ch.Timestamp = ts(ch.Timestamp)
+	ch.VersionId = o.ctrl.NextLocalVersion(ctx, &ch)
+
+	res, err := o.applyDecodedLocked(ctx, ch)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("object: local set: %w", err)
+	}
+	recordIds, _ := crdt.ResolveRecordIds(ch)
+	return WriteResult{
+		VersionId:  ch.VersionId,
+		RecordIds:  recordIds,
+		Rejections: res.Rejections,
+	}, nil
+}
+
 // Update implements updatelistener.UpdateListener. Fired by synctree
 // from inside AddRawChanges / buildSyncTree, with the tree lock
 // already held — we must NOT re-lock here.

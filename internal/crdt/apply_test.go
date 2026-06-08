@@ -9,7 +9,14 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
+
+// dynSchema is the free-form (Dynamic) dataset schema used by tests that
+// write arbitrary fields against a DefaultHandler — every field is
+// treated as synced, matching the pre-schema test behavior.
+var dynSchema = schema.Dataset{Dynamic: true}
 
 var ctx = context.Background()
 
@@ -25,7 +32,7 @@ func newTestController(t *testing.T) *Controller {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}})
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}, Schema: dynSchema})
 	require.NoError(t, err)
 	return st
 }
@@ -1416,8 +1423,8 @@ func TestValidate_RejectsReservedKeyInMultiFieldSet(t *testing.T) {
 	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
 		Type: OpSet,
 		Payload: recordPayload(arena, map[string]any{
-			"name":        "hi",
-			"_deletedAt":  1000,
+			"name":       "hi",
+			"_deletedAt": 1000,
 		}),
 	}))
 	require.ErrorIs(t, err, ErrInvalidPath)
@@ -1553,7 +1560,7 @@ func TestValidation_DropsOffendingOp(t *testing.T) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: rejectingHandler{DefaultHandler{}}})
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: rejectingHandler{DefaultHandler{}}, Schema: dynSchema})
 	require.NoError(t, err)
 
 	// Auto-create via $set is allowed by the handler.

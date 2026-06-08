@@ -54,9 +54,9 @@ var ErrUnknownDataset = errors.New("spaceobjects: unknown dataset")
 // External Registrations supplied via NewStore extend this map at
 // construction time; collisions with built-ins are rejected up front.
 var builtinDataVersions = map[string]string{
-	properties.Dataset:         properties.HandlerVersion,
+	properties.Dataset:           properties.HandlerVersion,
 	typetype.DatasetPropertyDefs: typetype.HandlerVersion,
-	typetype.ShortIdsDataset:   "shortIds-v1",
+	typetype.ShortIdsDataset:     "shortIds-v1",
 }
 
 // SpaceObjectsCollection is the on-disk collection name for the
@@ -131,6 +131,18 @@ type Store struct {
 	// restore path stays a single atomic load when nobody is
 	// listening.
 	engine *subscribe.Engine
+
+	// customHandlers, when non-nil, makes this a "raw" store: every
+	// controller registers EXACTLY these handlers (no shared `objects`
+	// collection, no built-in properties/typetype/shortIds regs, no
+	// extTypes). Used by the tech space, whose index object holds its
+	// own datasets (spaces/profile) with bespoke handlers rather than
+	// the regular type/properties model. reg is nil in this mode.
+	customHandlers []crdt.HandlerReg
+	// disableGate skips the schema-gate on every object. Set together
+	// with customHandlers — the gate is a registry/type-system concept
+	// the tech space doesn't participate in.
+	disableGate bool
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -156,9 +168,31 @@ func loadPayloadFromCtx(ctx context.Context) *treestorage.TreeStorageCreatePaylo
 	return p
 }
 
-// NewStore constructs a Store. The allocator is per-space (shared
-// across all objects in this space). The async drainer is built and
-// started here — it lives until Close.
+// StoreConfig is the input to NewStoreWithConfig. It carries both the
+// regular type/properties path (ExtTypes) and the "raw" tech-space path
+// (Handlers + DisableGate + DataVersions). Exactly one path is active:
+// when Handlers is non-nil the store skips the LiveRegistry, the shared
+// `objects` collection, the built-in handler set, and the schema gate.
+type StoreConfig struct {
+	App     *anysyncx.App
+	DB      anystore.DB
+	SignKey crypto.PrivKey
+	SpaceId string
+	Alloc   *object.VersionAllocator
+
+	// ExtTypes is the caller-supplied type catalog (regular path).
+	ExtTypes []handler.Type
+
+	// Handlers, when non-nil, switches the store to raw mode: every
+	// controller registers EXACTLY these handlers. DataVersions then
+	// supplies the dataset → DataVersion stamp (no built-ins).
+	Handlers     []crdt.HandlerReg
+	DisableGate  bool
+	DataVersions map[string]string
+}
+
+// NewStore constructs a regular type/properties-backed Store. The
+// allocator is per-space (shared across all objects in this space).
 //
 // extTypes is the caller-supplied type catalog. Each type's handlers
 // are wired onto every per-object Controller built by this store,
@@ -166,28 +200,47 @@ func loadPayloadFromCtx(ctx context.Context) *treestorage.TreeStorageCreatePaylo
 // ValidateExternalTypes — call it before NewStore at the SDK
 // boundary so collisions are caught at Open time.
 func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type) *Store {
-	dv := make(map[string]string, len(builtinDataVersions))
-	for k, v := range builtinDataVersions {
-		dv[k] = v
-	}
-	owners := make(map[string]string)
-	for _, t := range extTypes {
-		for _, d := range t.Datasets {
-			dv[d.Name] = d.DataVersion
-			owners[d.Name] = t.Id
-		}
-	}
+	return NewStoreWithConfig(StoreConfig{
+		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes,
+	})
+}
+
+// NewStoreWithConfig constructs a Store from cfg. The async drainer is
+// built and started here — it lives until Close. The subscribe engine
+// is always built (both paths support Query.Subscribe). In raw mode
+// (cfg.Handlers != nil) the LiveRegistry is nil and the schema gate is
+// disabled — see newController / loadObject.
+func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s := &Store{
-		app:          app,
-		db:           db,
-		signKey:      signKey,
-		alloc:        alloc,
-		spaceId:      spaceId,
-		reg:           types.NewLiveRegistry(db, buildStaticSchema(extTypes)),
-		extTypes:      extTypes,
-		dataVersions:  dv,
-		datasetOwners: owners,
-		engine:        subscribe.New(spaceId),
+		app:            cfg.App,
+		db:             cfg.DB,
+		signKey:        cfg.SignKey,
+		alloc:          cfg.Alloc,
+		spaceId:        cfg.SpaceId,
+		engine:         subscribe.New(cfg.SpaceId),
+		customHandlers: cfg.Handlers,
+		disableGate:    cfg.DisableGate,
+	}
+	if cfg.Handlers != nil {
+		// Raw mode: no registry, no built-in dataset versions; the
+		// caller's DataVersions are authoritative.
+		s.dataVersions = cfg.DataVersions
+	} else {
+		dv := make(map[string]string, len(builtinDataVersions))
+		for k, v := range builtinDataVersions {
+			dv[k] = v
+		}
+		owners := make(map[string]string)
+		for _, t := range cfg.ExtTypes {
+			for _, d := range t.Datasets {
+				dv[d.Name] = d.DataVersion
+				owners[d.Name] = t.Id
+			}
+		}
+		s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes))
+		s.extTypes = cfg.ExtTypes
+		s.dataVersions = dv
+		s.datasetOwners = owners
 	}
 	s.cache = ocache.New(
 		s.loadObject,
@@ -334,6 +387,48 @@ func (s *Store) Close() error {
 // space layer to back Query.Subscribe.
 func (s *Store) SubEngine() *subscribe.Engine { return s.engine }
 
+// NamedSchema pairs a dataset name with its declared schema. Returned by
+// Schemas for consumer discovery.
+type NamedSchema struct {
+	Name   string
+	Schema schema.Dataset
+}
+
+// Schemas returns the declared schema of every dataset this store hosts —
+// the same schemas its controllers enforce. Used by the space layer to
+// expose dataset discovery to consumers.
+func (s *Store) Schemas() []NamedSchema {
+	if s.customHandlers != nil {
+		out := make([]NamedSchema, 0, len(s.customHandlers))
+		for _, h := range s.customHandlers {
+			out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
+		}
+		return out
+	}
+	out := []NamedSchema{
+		{Name: properties.Dataset, Schema: objectsDatasetSchema()},
+		{Name: typetype.DatasetPropertyDefs, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.ShortIdsDataset, Schema: schema.Dataset{Dynamic: true}},
+	}
+	for _, t := range s.extTypes {
+		for _, d := range t.Datasets {
+			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d)})
+		}
+	}
+	return out
+}
+
+// datasetSchema resolves an external dataset's declared schema, applying
+// the backward-compatible default: a zero Schema (no Fields, not Dynamic)
+// is treated as a Dynamic synced keyspace — the pre-schema behavior — so
+// handlers that predate Dataset.Schema keep registering unchanged.
+func datasetSchema(d handler.Dataset) schema.Dataset {
+	if len(d.Schema.Fields) == 0 && !d.Schema.Dynamic {
+		return schema.Dataset{Dynamic: true}
+	}
+	return d.Schema
+}
+
 // NotifyDrainer is the public hook used by callers (e.g. the
 // space service on first-touch) to trigger an asynchronous Drain
 // pass. The afterApply path notifies internally; this is for
@@ -469,7 +564,6 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	s.mu.Unlock()
 	return coll, nil
 }
-
 
 // DataVersion looks up the DataVersion stamp for a known dataset.
 // Used by space.Modify to populate crdt.Change.DataVersion. The
@@ -619,12 +713,16 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		return nil, err
 	}
 	payload := loadPayloadFromCtx(ctx)
+	var gate object.ApplyGate
+	if !s.disableGate {
+		gate = s.gateFor(objectId)
+	}
 	obj, err := object.New(object.Config{
 		SpaceId:    s.spaceId,
 		SignKey:    s.signKey,
 		Controller: ctrl,
 		Allocator:  s.alloc,
-		Gate:       s.gateFor(objectId),
+		Gate:       gate,
 		AfterApply: s.afterApplyFor(),
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
@@ -704,22 +802,46 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // the same per-space collection as everyone else; what's
 // type-specific is the `properties` dataset (definitions), which
 // stays per-type-object.
+// objectsDatasetSchema is the per-space `objects` (properties) dataset
+// schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
+// synced) with the built-in `any` fields declared by class — ScopeAuto
+// auto-fields (author/createdAt/spaceId/id) as Derived (handler-only),
+// ScopeBase fields (name/description/…) as Synced.
+func objectsDatasetSchema() schema.Dataset {
+	fields := make([]schema.Field, 0, len(anytype.Properties))
+	for _, p := range anytype.Properties {
+		cls := schema.ScopeSynced
+		if p.Scope == anytype.ScopeAuto {
+			cls = schema.ScopeDerived
+		}
+		fields = append(fields, schema.Field{Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: cls})
+	}
+	return schema.Dataset{Fields: fields, Dynamic: true}
+}
+
 func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Controller, error) {
+	if s.customHandlers != nil {
+		// Raw mode: exactly the caller's handlers, each on its own
+		// per-object collection (<objectId>_<dataset>). No shared
+		// `objects` collection, no built-in regs.
+		return crdt.NewController(ctx, objectId, s.db, s.customHandlers...)
+	}
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
 		return nil, err
 	}
 	shared := crdt.SharedCollections{properties.Dataset: coll}
 	regs := []crdt.HandlerReg{
-		{Name: properties.Dataset, Handler: properties.New(s.reg)},
-		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}},
-		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}},
+		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema()},
+		// `properties` defs + `shortIds` carry content-addressed / dynamic
+		// keyspaces — declared Dynamic (synced).
+		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes})
+			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d)})
 		}
 	}
 	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
 }
-

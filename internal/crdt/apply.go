@@ -7,6 +7,26 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 )
 
+// opFieldHeads returns the top-level field name(s) an op writes: the
+// first path segment for a single-path op, or — for a multi-field
+// $set/$unset (empty Path, object payload keyed by dotted paths) — the
+// head segment of each payload key. Used by the controller's field-class
+// enforcement to look each touched field up in the dataset schema.
+func opFieldHeads(op Op) []string {
+	if len(op.Path) > 0 {
+		return []string{op.Path[0]}
+	}
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+		return nil
+	}
+	var heads []string
+	obj, _ := op.Payload.Object()
+	obj.Visit(func(k []byte, _ *anyenc.Value) {
+		heads = append(heads, strings.SplitN(string(k), ".", 2)[0])
+	})
+	return heads
+}
+
 // applyOp dispatches one op to its arena-parameterized handler. All
 // allocation goes through the provided arena (which comes from any-store's
 // DocBuffer pool when running inside a modifier, or from the Controller's

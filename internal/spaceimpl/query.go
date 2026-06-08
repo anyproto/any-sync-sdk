@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -28,7 +29,7 @@ import (
 // is single-shot — re-using the builder across queries would conflate
 // state. Callers go through Space.Query() each time.
 type queryImpl struct {
-	parent   *spaceImpl
+	store    *spaceobjects.Store
 	objectId string
 	dataset  string
 
@@ -43,14 +44,14 @@ type queryImpl struct {
 	parseErr error
 }
 
-func newQuery(parent *spaceImpl, objectId, dataset string) *queryImpl {
-	return &queryImpl{parent: parent, objectId: objectId, dataset: dataset}
+func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
+	return &queryImpl{store: store, objectId: objectId, dataset: dataset}
 }
 
 // newSharedQuery builds a queryImpl that resolves to the per-space
 // `objects` collection on Iter — independent of any objectId.
-func newSharedQuery(parent *spaceImpl) *queryImpl {
-	return &queryImpl{parent: parent, dataset: "<shared:objects>"}
+func newSharedQuery(store *spaceobjects.Store) *queryImpl {
+	return &queryImpl{store: store, dataset: "<shared:objects>"}
 }
 
 // Filter parses the caller-supplied condition eagerly via
@@ -319,7 +320,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		DriftBudget: opts.DriftBudgetPercent,
 	}
 
-	sub, err := q.parent.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
+	sub, err := q.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
 		coll, err := q.collection(ctx)
 		if err != nil {
 			// Object doesn't exist yet — treat as empty initial. The
@@ -487,9 +488,9 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 // silently returns empty in any-store too.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
 	if q.dataset == "<shared:objects>" {
-		return q.parent.store.SharedObjects(ctx)
+		return q.store.SharedObjects(ctx)
 	}
-	obj, err := q.parent.store.Get(ctx, q.objectId)
+	obj, err := q.store.Get(ctx, q.objectId)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}

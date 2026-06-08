@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // fakeLocalWriteTree is a minimal stand-in for objecttree.ObjectTree —
@@ -79,7 +80,7 @@ func newLocalWriteFixture(t *testing.T, dataset string, handler crdt.Handler) (*
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	ctrl, err := crdt.NewController(ctx, "obj-lw", db, crdt.HandlerReg{Name: dataset, Handler: handler})
+	ctrl, err := crdt.NewController(ctx, "obj-lw", db, crdt.HandlerReg{Name: dataset, Handler: handler, Schema: schema.Dataset{Dynamic: true}})
 	require.NoError(t, err)
 
 	priv, _, err := crypto.GenerateRandomEd25519KeyPair()

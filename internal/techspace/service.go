@@ -4,20 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
-	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
-	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -34,26 +33,22 @@ type Service struct {
 	app *anysyncx.App
 	db  anystore.DB
 
-	mu sync.Mutex
 	// open is read lock-free from many methods (incl. background
 	// goroutines like the spaceIndex lazy-seed) and flipped to false by
 	// Close — atomic to keep those concurrent accesses race-free.
 	open    atomic.Bool
 	spaceId string
 	indexId string
-	ctrl    *crdt.Controller
-	alloc   *object.VersionAllocator
 
-	// bindMu serializes bindIndexObject calls. Each call constructs a
-	// fresh *object.Object and runs the synctree afterBuild → Rebuild
-	// → replayLocked cycle against the shared Controller. With two
-	// different *Object instances reading/writing Controller.MaxAddSeq
-	// concurrently (one from a writer like SetSpaceMetadata, another
-	// from sync service's HandleHeadUpdate routing through GetTree),
-	// the unprotected uint64 access races. Caller-driven serialization
-	// keeps the existing fresh-Object pattern (per the cold-sync
-	// rationale in GetTree's docstring) without the race.
-	bindMu sync.Mutex
+	// store backs the single index object. It is a "raw" spaceobjects
+	// Store (custom handlers, gate disabled) so the index inherits the
+	// regular-space sync + subscription machinery — ocache-resident
+	// object, SetDeferredUpdater(true), ColdRestore-on-load, and the
+	// subscribe.Engine — without the type/properties model. The index
+	// object's spaces/profile datasets live at <indexId>_spaces /
+	// <indexId>_profile, exactly as the previous bespoke controller
+	// wrote them.
+	store *spaceobjects.Store
 }
 
 // TechSpaceType is the on-the-wire SpaceType stamped into the
@@ -83,8 +78,6 @@ func (s *Service) SyncHeads(ctx context.Context) error {
 // the cache as needed (and on the first call to do an initial cold
 // restore so subscribed callers see persisted state immediately).
 func (s *Service) Open(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.open.Load() {
 		return nil
 	}
@@ -116,111 +109,46 @@ func (s *Service) Open(ctx context.Context) error {
 		}
 	}
 
-	// Load the space once at boot so we can compute the index objectId
-	// (depends on the space's keys/state) and run cold restore. After
-	// this returns, the space is in cache and may TTL-evict if idle.
-	handle, err := s.app.GetSpace(ctx, spaceId)
-	if err != nil {
-		return fmt.Errorf("techspace: get space: %w", err)
-	}
-	cs := handle.Inner()
+	s.store = spaceobjects.NewStoreWithConfig(spaceobjects.StoreConfig{
+		App:     s.app,
+		DB:      s.db,
+		SignKey: keys.SignKey,
+		SpaceId: s.spaceId,
+		Alloc:   object.NewVersionAllocator(""),
+		Handlers: []crdt.HandlerReg{
+			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
+			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
+		},
+		DisableGate: true,
+		DataVersions: map[string]string{
+			SpaceIndexDataset: HandlerVersion,
+			ProfileDataset:    ProfileHandlerVersion,
+		},
+	})
 
-	derivePayload := objecttree.ObjectTreeDerivePayload{
-		ChangePayload: []byte(SpaceIndexDeriveSeed),
-		SpaceId:       spaceId,
-		IsEncrypted:   true,
-	}
-	storagePayload, err := cs.TreeBuilder().DeriveTree(ctx, derivePayload)
+	// Derive the single index object through the Store. Store.Derive
+	// computes the deterministic id, then runs PutTree (first boot) /
+	// BuildTree (subsequent) + SetDeferredUpdater + ColdRestore
+	// atomically, and keeps the object resident in ocache so inbound
+	// head-sync changes project live via its listener. The id is the
+	// same SpaceIndexDeriveSeed-derived id the bespoke path used.
+	obj, err := s.store.Derive(ctx, spaceobjects.DeriveOpts{ChangePayload: []byte(SpaceIndexDeriveSeed)})
 	if err != nil {
-		return fmt.Errorf("techspace: derive index tree payload: %w", err)
+		return fmt.Errorf("techspace: derive index object: %w", err)
 	}
-	s.indexId = storagePayload.RootRawChange.Id
-
-	collName := s.indexId + "_" + SpaceIndexDataset
-	if _, err := s.db.Collection(ctx, collName); err != nil {
-		return fmt.Errorf("techspace: open index collection: %w", err)
-	}
-
-	ctrl, err := crdt.NewController(ctx, s.indexId, s.db,
-		crdt.HandlerReg{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}},
-		crdt.HandlerReg{Name: ProfileDataset, Handler: ProfileHandler{}},
-	)
-	if err != nil {
-		return fmt.Errorf("techspace: new controller: %w", err)
-	}
-	s.ctrl = ctrl
-	s.alloc = object.NewVersionAllocator("")
-
-	// First-time PutTree (creates) or BuildTree (already created on a
-	// prior boot). Either way we run ColdRestore against the freshly
-	// bound tree.
-	obj, err := s.bindIndexObject(ctx, cs, storagePayload)
-	if err != nil {
-		return err
-	}
-	if err := obj.ColdRestore(ctx); err != nil {
-		return fmt.Errorf("techspace: cold restore: %w", err)
-	}
+	s.indexId = obj.Id()
 
 	s.open.Store(true)
 	return nil
 }
 
-// bindIndexObject wires a fresh *object.Object to the index tree under
-// the given (loaded) commonspace.Space. The Object is short-lived —
-// callers use it for a single LocalWrite or ColdRestore and let it go.
-// On subsequent calls under a different (re-loaded) Space, a new
-// Object is built; both share the same controller and allocator.
-func (s *Service) bindIndexObject(ctx context.Context, cs interface {
-	TreeBuilder() objecttreebuilder.TreeBuilder
-}, storagePayload treestorage.TreeStorageCreatePayload) (*object.Object, error) {
-	keys := s.app.AccountKeys()
-	return object.New(object.Config{
-		SpaceId:    s.spaceId,
-		SignKey:    keys.SignKey,
-		Controller: s.ctrl,
-		Allocator:  s.alloc,
-	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
-		tree, err := cs.TreeBuilder().PutTree(ctx, storagePayload, listener)
-		if err == nil {
-			return tree, nil
-		}
-		if !errors.Is(err, treestorage.ErrTreeExists) {
-			return nil, fmt.Errorf("techspace: put index tree: %w", err)
-		}
-		tree, err = cs.TreeBuilder().BuildTree(ctx, s.indexId, objecttreebuilder.BuildTreeOpts{Listener: listener})
-		if err != nil {
-			return nil, fmt.Errorf("techspace: build index tree: %w", err)
-		}
-		return tree, nil
-	})
-}
-
-// indexObject loads the tech space (via cache), rebinds an Object to
-// the index tree, and returns it. Each write is a separate Get →
-// rebind cycle; the cache TTL governs when the underlying space tears
-// down.
-//
-// Caller must hold s.bindMu — see Service.bindMu docstring. The lock
-// covers BOTH the bind (which runs the synctree afterBuild → Rebuild
-// → replayLocked cycle against the shared Controller) AND the
-// follow-up Controller mutation (LocalWrite), so two callers don't
-// interleave on the Controller's MaxAddSeq watermark.
-func (s *Service) indexObject(ctx context.Context) (*object.Object, error) {
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
-		return nil, fmt.Errorf("techspace: get space: %w", err)
-	}
-	derivePayload := objecttree.ObjectTreeDerivePayload{
-		ChangePayload: []byte(SpaceIndexDeriveSeed),
-		SpaceId:       s.spaceId,
-		IsEncrypted:   true,
-	}
-	storagePayload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, derivePayload)
-	if err != nil {
-		return nil, fmt.Errorf("techspace: derive index tree payload: %w", err)
-	}
-	return s.bindIndexObject(ctx, handle.Inner(), storagePayload)
+// indexObj returns the resident index *object.Object via the Store's
+// ocache. Cheap on a cache hit; on a TTL-evicted miss the Store
+// rebuilds the tree with its listener + ColdRestore atomically. The
+// MaxAddSeq watermark is guarded by the single resident object's
+// tree.Lock and ocache's per-id load lock — no caller-side mutex.
+func (s *Service) indexObj(ctx context.Context) (*object.Object, error) {
+	return s.store.Get(ctx, s.indexId)
 }
 
 // SpaceId returns the tech-space id once Open has run.
@@ -228,6 +156,15 @@ func (s *Service) SpaceId() string { return s.spaceId }
 
 // IndexObjectId returns the space-index object id once Open has run.
 func (s *Service) IndexObjectId() string { return s.indexId }
+
+// SubEngine exposes the index object's live-query engine so the space
+// layer can back space.Service.Subscribe over the spaces dataset.
+func (s *Service) SubEngine() *subscribe.Engine { return s.store.SubEngine() }
+
+// Store exposes the tech-space object Store so the space layer can build
+// generic Query/Subscribe over the system datasets (spaces, profile,
+// future system objects) by object id.
+func (s *Service) Store() *spaceobjects.Store { return s.store }
 
 // Add writes a new space-index record.
 func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteResult, error) {
@@ -238,9 +175,7 @@ func (s *Service) Add(ctx context.Context, rec SpaceIndexRecord) (object.WriteRe
 		return object.WriteResult{}, errors.New("techspace: SpaceIndexRecord.Id required")
 	}
 
-	s.bindMu.Lock()
-	defer s.bindMu.Unlock()
-	obj, err := s.indexObject(ctx)
+	obj, err := s.indexObj(ctx)
 	if err != nil {
 		return object.WriteResult{}, err
 	}
@@ -278,9 +213,7 @@ func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, descripti
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
-	s.bindMu.Lock()
-	defer s.bindMu.Unlock()
-	obj, err := s.indexObject(ctx)
+	obj, err := s.indexObj(ctx)
 	if err != nil {
 		return object.WriteResult{}, err
 	}
@@ -301,14 +234,15 @@ func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, descripti
 	return obj.LocalWrite(ctx, change)
 }
 
-// SetLocalStatus updates the localStatus field of an existing record.
+// SetLocalStatus updates the device-local localStatus field via the
+// local-set path: it does NOT enter the DAG and never syncs to other
+// devices (each device owns its own value). Use for per-device
+// lifecycle — active / joining / offloaded.
 func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
-	s.bindMu.Lock()
-	defer s.bindMu.Unlock()
-	obj, err := s.indexObject(ctx)
+	obj, err := s.indexObj(ctx)
 	if err != nil {
 		return object.WriteResult{}, err
 	}
@@ -328,28 +262,69 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 			},
 		},
 	}
+	return obj.LocalSet(ctx, change)
+}
+
+// SetRemoteStatus updates the SYNCED remoteStatus field — account-wide
+// state that propagates to every device. Used for account-wide delete
+// (status=StatusDeleted); the handler keeps deleted terminal.
+func (s *Service) SetRemoteStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldRemoteStatus},
+					Payload: arena.NewString(status),
+				}},
+			},
+		},
+	}
 	return obj.LocalWrite(ctx, change)
 }
 
-// Get returns the current state of one space-index record. Reads
-// straight off the controller — no space load needed.
+// Get returns the current state of one space-index record. Reads off
+// the resident index object's controller; inbound changes are kept
+// current by the object's deferred-updater listener (no drain needed).
 func (s *Service) Get(ctx context.Context, spaceId string) (SpaceIndexRecord, bool) {
 	if !s.open.Load() {
 		return SpaceIndexRecord{}, false
 	}
-	v := s.ctrl.Get(ctx, SpaceIndexDataset, spaceId)
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return SpaceIndexRecord{}, false
+	}
+	v := obj.Controller().Get(ctx, SpaceIndexDataset, spaceId)
 	if v == nil {
 		return SpaceIndexRecord{}, false
 	}
 	return DecodeSpaceIndexRecord(v), true
 }
 
-// List returns every live space-index record.
+// List returns every live space-index record. Inbound head-sync
+// changes are projected live by the resident index object's
+// deferred-updater listener, so a plain controller read is current —
+// the old read-time drain is gone.
 func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
 	if !s.open.Load() {
 		return nil
 	}
-	rows := s.ctrl.Records(ctx, SpaceIndexDataset)
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return nil
+	}
+	rows := obj.Controller().Records(ctx, SpaceIndexDataset)
 	out := make([]SpaceIndexRecord, 0, len(rows))
 	for _, v := range rows {
 		out = append(out, DecodeSpaceIndexRecord(v))
@@ -365,7 +340,11 @@ func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
 	if !s.open.Load() {
 		return ProfileRecord{}, false
 	}
-	v := s.ctrl.Get(ctx, ProfileDataset, ProfileSelfId)
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return ProfileRecord{}, false
+	}
+	v := obj.Controller().Get(ctx, ProfileDataset, ProfileSelfId)
 	if v == nil {
 		return ProfileRecord{}, false
 	}
@@ -380,9 +359,7 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
-	s.bindMu.Lock()
-	defer s.bindMu.Unlock()
-	obj, err := s.indexObject(ctx)
+	obj, err := s.indexObj(ctx)
 	if err != nil {
 		return err
 	}
@@ -430,13 +407,14 @@ func (s *Service) OnSpaceCreated(ctx context.Context, spaceId string, meta space
 	return err
 }
 
-// OnSpaceDeleted satisfies space.Indexer. Flips the row to
-// localStatus=deleted; the record is never physically removed.
+// OnSpaceDeleted satisfies space.Indexer. Flips the row to the synced
+// remoteStatus=deleted (account-wide — propagates to every device); the
+// record is never physically removed.
 func (s *Service) OnSpaceDeleted(ctx context.Context, spaceId string) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
-	_, err := s.SetLocalStatus(ctx, spaceId, StatusDeleted)
+	_, err := s.SetRemoteStatus(ctx, spaceId, StatusDeleted)
 	return err
 }
 
@@ -472,10 +450,14 @@ func (s *Service) OnSpaceMetadataUpdated(ctx context.Context, spaceId string, me
 // Compile-time check that the Service satisfies space.Indexer.
 var _ space.Indexer = (*Service)(nil)
 
-// Close marks the service inactive. Underlying space cleanup happens
-// via the App's space cache on its own schedule.
+// Close marks the service inactive and tears down the index Store
+// (which closes the resident object + the subscribe engine). Underlying
+// space cleanup happens via the App's space cache on its own schedule.
 func (s *Service) Close(_ context.Context) error {
 	s.open.Store(false)
+	if s.store != nil {
+		_ = s.store.Close()
+	}
 	return nil
 }
 
@@ -485,29 +467,23 @@ func (s *Service) Close(_ context.Context) error {
 
 var ErrSpaceRegistryUnknown = errors.New("techspace: unknown (spaceId, treeId)")
 
-// GetTree resolves the index tree with our CRDT controller's listener
-// bound. Anything else under the tech space is unknown.
-//
-// Why a fresh bindIndexObject per call: ocache may TTL-evict the
-// underlying commonspace.Space between calls, which closes the
-// previous tree handle. Each call rebinds the listener onto the
-// currently-loaded tree so the synctree's AddRawChangesFromPeer path
-// fires Update on us — without that the on-disk tree fills up but
-// our space-index controller stays empty (the cold-sync regression
-// surfaced by TestE2E_ColdSyncSameKey).
+// GetTree resolves the index tree via the Store's resident object.
+// Anything else under the tech space is unknown. The Store returns the
+// listener-bound, deferred-updater, cold-restored object (reloading it
+// if ocache evicted), so the synctree's AddRawChangesFromPeer path
+// fires Update → replayLocked and inbound index changes project live —
+// the cold-sync path that TestE2E_ColdSyncSameKey covers.
 func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
 	if spaceId != s.spaceId || treeId != s.indexId {
 		return nil, ErrSpaceRegistryUnknown
 	}
-	s.bindMu.Lock()
-	defer s.bindMu.Unlock()
-	obj, err := s.indexObject(ctx)
+	obj, err := s.indexObj(ctx)
 	if err != nil {
 		return nil, err
 	}
 	tree := obj.Tree()
 	if tree == nil {
-		return nil, fmt.Errorf("techspace: index tree not bound after indexObject")
+		return nil, fmt.Errorf("techspace: index tree not bound")
 	}
 	return tree, nil
 }

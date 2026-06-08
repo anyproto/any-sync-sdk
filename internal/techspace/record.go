@@ -85,9 +85,11 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	if r.IconCID != "" {
 		obj.Set(FieldIcon, a.NewString(r.IconCID))
 	}
-	if r.LocalStatus != "" {
-		obj.Set(FieldLocalStatus, a.NewString(r.LocalStatus))
-	}
+	// LocalStatus is intentionally NOT written here — it's a device-local
+	// field (FieldLocalStatus is crdt.LocalFieldPrefix-prefixed) and a
+	// synced create may not touch local paths. Set it via
+	// Service.SetLocalStatus (Object.LocalSet) after the row exists.
+	// Absence means active.
 	if r.RemoteStatus != "" {
 		obj.Set(FieldRemoteStatus, a.NewString(r.RemoteStatus))
 	}

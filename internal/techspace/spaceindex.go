@@ -12,7 +12,26 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
+
+// SpaceIndexSchema declares the `spaces` dataset fields and their class.
+// Synced metadata mirrors across the account's devices; localStatus is
+// per-device (never synced); remoteStatus carries the account-wide
+// delete. Used as the controller's enforced schema and surfaced to
+// consumers via discovery.
+func SpaceIndexSchema() schema.Dataset {
+	str := func() *schema.Schema { return schema.Leaf(schema.KindString) }
+	return schema.Dataset{Fields: []schema.Field{
+		{Id: FieldType, Name: "Type", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldSpaceType, Name: "Space type", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal},
+	}}
+}
 
 // SpaceIndexDeriveSeed mints the same space-index object id on every
 // device for a given account. Tech space has exactly one space-index
@@ -37,11 +56,20 @@ const HandlerVersion = "spaceIndexHandler-v1"
 // Space-index record fields. The shape is hardcoded — tech space is
 // account-private; no cross-version writers to negotiate with.
 const (
-	FieldType         = "type"
-	FieldName         = "name"
-	FieldDescription  = "description"
-	FieldIcon         = "icon"
-	FieldLocalStatus  = "localStatus"
+	FieldType        = "type"
+	FieldName        = "name"
+	FieldDescription = "description"
+	FieldIcon        = "icon"
+	// FieldLocalStatus is a DEVICE-LOCAL field (schema.ScopeLocal):
+	// per-device lifecycle (active/joining/offloaded) that must NOT sync
+	// — a space offloaded on one device must stay loaded on another, and
+	// the value is meaningless offline or on a different network. Written
+	// only via Service.SetLocalStatus → Object.LocalSet; never enters the
+	// DAG. Absence means active.
+	FieldLocalStatus = "localStatus"
+	// FieldRemoteStatus is synced (account-wide). It carries the
+	// account-wide delete signal (StatusDeleted) so every device drops
+	// the space; the handler keeps it terminal.
 	FieldRemoteStatus = "remoteStatus"
 	// FieldSpaceType mirrors the in-space spaceIndex.spaceType app tag.
 	// Distinct from FieldType (the on-wire header type): not pinned, so
@@ -62,15 +90,17 @@ const (
 
 // Sentinels — wrap crdt.ErrValidation in handler returns.
 var (
-	ErrMissingType         = errors.New("techspace: space-index record requires `type`")
-	ErrTypeImmutable       = errors.New("techspace: `type` is pinned after first write")
-	ErrStatusTerminal      = errors.New("techspace: status=deleted is terminal")
-	ErrDeleteOpNotAllowed  = errors.New("techspace: deletion is via localStatus=deleted, not a delete op")
+	ErrMissingType        = errors.New("techspace: space-index record requires `type`")
+	ErrTypeImmutable      = errors.New("techspace: `type` is pinned after first write")
+	ErrStatusTerminal     = errors.New("techspace: status=deleted is terminal")
+	ErrDeleteOpNotAllowed = errors.New("techspace: deletion is via remoteStatus=deleted, not a delete op")
 )
 
-// statusFields are the fields whose terminal-Deleted rule is enforced.
+// statusFields are the SYNCED fields whose terminal-Deleted rule is
+// enforced. localStatus is device-local (handler-exclusive, never
+// synced) so it's absent here — only remoteStatus carries the
+// account-wide terminal delete.
 var statusFields = map[string]struct{}{
-	FieldLocalStatus:  {},
 	FieldRemoteStatus: {},
 }
 

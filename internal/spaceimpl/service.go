@@ -3,6 +3,7 @@ package spaceimpl
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
@@ -21,6 +23,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
@@ -311,7 +314,6 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		Name:         req.Name,
 		Description:  req.Description,
 		IconCID:      req.IconCID,
-		LocalStatus:  techspace.StatusActive,
 		RemoteStatus: techspace.StatusActive,
 	}); err != nil {
 		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
@@ -373,31 +375,146 @@ func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 	rows := s.tsp.List(ctx)
 	out := make([]space.SpaceInfo, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, space.SpaceInfo{
-			Id:          r.Id,
-			Type:        r.Type,
-			SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
-			Author:      s.resolveAuthor(ctx, r.Id),
-			Name:        r.Name,
-			Description: r.Description,
-			IconCID:     r.IconCID,
-			Status:      mapStatus(r.LocalStatus, r.RemoteStatus),
-		})
+		out = append(out, s.recordToInfo(ctx, r))
 	}
 	return out, nil
 }
 
-// Delete is a soft-delete on the index.
+// recordToInfo maps a tech-space index record to the public SpaceInfo,
+// resolving the spaceType / author and folding local+remote status.
+// Shared by List and the Subscribe translator so both surface the same
+// shape.
+func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord) space.SpaceInfo {
+	return space.SpaceInfo{
+		Id:          r.Id,
+		Type:        r.Type,
+		SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
+		Author:      s.resolveAuthor(ctx, r.Id),
+		Name:        r.Name,
+		Description: r.Description,
+		IconCID:     r.IconCID,
+		Status:      mapStatus(r.LocalStatus, r.RemoteStatus),
+	}
+}
+
+// Delete is an account-wide soft-delete on the index: it writes the
+// SYNCED remoteStatus=deleted so every device drops the space. The row
+// is never physically removed (Status stays Deleted in List).
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
-	if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
+	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
 	}
 	return nil
 }
 
-// Subscribe is not yet wired — returns a no-op cancel.
-func (s *Service) Subscribe(_ func(space.SpaceListEvent)) (cancel func()) {
-	return func() {}
+// Subscribe delivers live space-list deltas. It registers a sub on the
+// tech-space index object's `spaces` dataset (which now projects inbound
+// head-sync changes live, since the index object is Store-backed with a
+// deferred-updater listener) and translates each engine event into a
+// SpaceListEvent. Delta-only: callers seed current state via List.
+//
+// Mapping: a row whose localStatus is "deleted" (sticky soft-delete)
+// surfaces under Removed regardless of whether the engine classified it
+// Added/Updated; everything else maps to Added/Updated as the engine
+// saw it. The cancel func stops the drain goroutine and closes the sub.
+func (s *Service) Subscribe(cb func(space.SpaceListEvent)) (cancel func()) {
+	sub, err := s.tsp.SubEngine().Subscribe(subscribe.SubConfig{
+		Scope: subscribe.Scope{ObjectId: s.tsp.IndexObjectId(), Dataset: techspace.SpaceIndexDataset},
+	}, func(func(id string, doc *anyenc.Value)) error { return nil })
+	if err != nil {
+		return func() {}
+	}
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	go func() {
+		events := sub.Events()
+		for {
+			evs, werr := events.Wait(ctx)
+			if werr != nil {
+				return
+			}
+			for _, ev := range evs {
+				if out, ok := s.toSpaceListEvent(ctx, ev); ok {
+					cb(out)
+				}
+			}
+		}
+	}()
+	return func() {
+		cancelCtx()
+		_ = sub.Close()
+	}
+}
+
+// toSpaceListEvent translates a record-level SubscriptionEvent on the
+// `spaces` dataset into a SpaceListEvent. Returns ok=false when the
+// event carries nothing actionable.
+func (s *Service) toSpaceListEvent(ctx context.Context, ev space.SubscriptionEvent) (space.SpaceListEvent, bool) {
+	var out space.SpaceListEvent
+	classify := func(rec space.SubRecord, updated bool) {
+		if rec.Doc == nil {
+			return
+		}
+		r := techspace.DecodeSpaceIndexRecord(rec.Doc)
+		if r.RemoteStatus == techspace.StatusDeleted {
+			// Account-wide delete (synced) → leaves the live list.
+			out.Removed = append(out.Removed, r.Id)
+			return
+		}
+		info := s.recordToInfo(ctx, r)
+		if updated {
+			out.Updated = append(out.Updated, info)
+		} else {
+			out.Added = append(out.Added, info)
+		}
+	}
+	for _, rec := range ev.Added {
+		classify(rec, false)
+	}
+	for _, rec := range ev.Updated {
+		classify(rec, true)
+	}
+	for _, rec := range ev.Removed {
+		out.Removed = append(out.Removed, rec.Id)
+	}
+	if len(out.Added) == 0 && len(out.Updated) == 0 && len(out.Removed) == 0 {
+		return space.SpaceListEvent{}, false
+	}
+	return out, true
+}
+
+// SpaceIndexObjectId returns the well-known id of the tech-space index
+// object. Pass it to Query/Subscribe to read the system datasets
+// (spaces, profile) generically. Future system objects expose their
+// own ids the same way.
+func (s *Service) SpaceIndexObjectId() string { return s.tsp.IndexObjectId() }
+
+// Query builds a generic read query over a tech-space system object's
+// dataset — same chainable Filter/Sort/Limit/Subscribe surface regular
+// spaces use, but bound to the tech Store. Use SpaceIndexObjectId() for
+// the spaces / profile datasets.
+func (s *Service) Query(objectId, dataset string) space.Query {
+	return newQuery(s.tsp.Store(), objectId, dataset)
+}
+
+// Datasets returns the JSON-Schema description of the tech-space system
+// datasets (spaces, profile) for discovery.
+func (s *Service) Datasets() []space.DatasetSchema {
+	return toDatasetSchemas(s.tsp.Store().Schemas())
+}
+
+// toDatasetSchemas marshals each dataset's declared schema into a public
+// JSON-Schema document for discovery. A schema that fails to marshal is
+// skipped (should never happen — the doc is a plain map).
+func toDatasetSchemas(named []spaceobjects.NamedSchema) []space.DatasetSchema {
+	out := make([]space.DatasetSchema, 0, len(named))
+	for _, ns := range named {
+		raw, err := json.Marshal(ns.Schema)
+		if err != nil {
+			continue
+		}
+		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw})
+	}
+	return out
 }
 
 // Status returns a snapshot of spaceId's rolled-up sync state. Routes
@@ -571,16 +688,19 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 		return nil, fmt.Errorf("spaceimpl: RequestJoin: %w", err)
 	}
 	// Record the pending-join state in the tech space so it shows up
-	// in List with StatusJoining. The actual space object lands after
-	// owner approval + sync.
+	// in List with StatusJoining. The synced row carries the metadata;
+	// the joining lifecycle is per-device (localStatus is a local field),
+	// so it's set separately via SetLocalStatus after the row exists.
 	if _, ok := s.tsp.Get(ctx, inv.SpaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           inv.SpaceId,
 			Type:         space.SpaceTypeRegular,
-			LocalStatus:  joiningLocalStatus,
 			RemoteStatus: techspace.StatusActive,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+		}
+		if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, joiningLocalStatus); err != nil {
+			return nil, fmt.Errorf("spaceimpl: mark joining: %w", err)
 		}
 	}
 	return nil, ErrJoinPending
@@ -702,13 +822,14 @@ var _ anysyncx.SpaceRegistry = (*Service)(nil)
 // space.Status enum.
 func mapStatus(local, remote string) space.Status {
 	switch {
-	case local == techspace.StatusDeleted:
-		return space.StatusDeleted
 	case remote == techspace.StatusDeleted:
-		return space.StatusRemoteDead
+		// Account-wide delete (synced) — propagated to every device.
+		return space.StatusDeleted
 	case local == joiningLocalStatus:
 		return space.StatusJoining
 	case local == "" && remote == "":
+		// localStatus is device-local and absent means active; remote
+		// absent too means we have no info yet.
 		return space.StatusUnknown
 	default:
 		return space.StatusActive

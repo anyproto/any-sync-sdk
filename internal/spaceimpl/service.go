@@ -319,6 +319,16 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 	}
 
+	// Add() can't write localStatus — it's a device-local field set only
+	// via the local-set path (see techspace/record.go). Stamp it active
+	// now so an owner-created space reports StatusActive consistently
+	// instead of sitting at localStatus="" until a join flow heals it.
+	// Without this, consumers that filter on the raw localStatus row
+	// never match their own freshly-created spaces.
+	if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+		return nil, fmt.Errorf("spaceimpl: set local status: %w", err)
+	}
+
 	// Eagerly load once so the caller receives a live handle.
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err

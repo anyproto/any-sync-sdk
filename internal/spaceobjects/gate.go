@@ -92,6 +92,14 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			s.engine.OnApply(ev, postValue)
 		}
 
+		// Change-index feed: one notification per applied change across
+		// every dataset (base content, properties, type defs). Gated on
+		// hasSubscribers so the cold-restore / catch-up path stays free
+		// when no indexer is attached.
+		if s.changeSubs.hasSubscribers() {
+			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, AddSeq: ch.AddSeq})
+		}
+
 		if ch.Dataset != typetype.DatasetPropertyDefs {
 			return
 		}

@@ -128,7 +128,9 @@ Every change carries optional `traceIds` — opaque caller-supplied correlation 
 - **Per-object in the CRDT layer.** The `Controller` exposes `MaxAddSeq()` / `SetMaxAddSeq(seq)`. On restore, the space layer reads every Controller's watermark, asks any-sync for heads with `LastAddSeq > watermark`, and replays the missing changes into the right Controllers.
 - **Monotonic.** ApplyChange bumps the watermark only when incoming AddSeq is strictly greater; a replay with a lower AddSeq still applies (CRDT is idempotent) but does not regress the watermark.
 - **Crash-safe by construction.** Because the CRDT is idempotent, a crash between apply and watermark persist is harmless — on restart the replay becomes a no-op via gating and sticky tombstones.
-- **Per-record `_seq` deferred.** Events (Phase 2) cover the "show me diffs since batch N" use case.
+- **Per-record `_addSeq`.** The apply path stamps the change's AddSeq onto every record it writes (root field `_addSeq`, monotonic max — a lower out-of-order replay never regresses it). Tombstones carry it too. An `_addSeq` index is ensured on every collection. This is storage metadata, kept off the `Query.Subscribe` wire projection; it surfaces only through explicit reads and the change-index query.
+- **Per-object `_meta` index.** Each per-object `_meta` row already persists the object's max AddSeq atomically in the apply tx; it now also carries the `spaceId` (`sp` field, indexed as `(sp, q)`) so the change-index query can scope "objects in this space with AddSeq > N" against the shared SDK DB.
+- **Change-index surface.** `Space.Changes()` (`ChangeIndexAPI`) exposes `ChangedSince(since, limit)` (catch-up pull, ascending by AddSeq), `MaxAddSeq()` (cursor ceiling), and `Subscribe(cb)` (best-effort live feed of `(objectId, addSeq)`). Built for consumer-side incremental indexers (full-text / vector search): the consumer owns the cursor; the two paths reconcile because both order on AddSeq. See `12-change-index-proposal.md`.
 
 ### Conflict Rules
 - **LWW by versionId** (v1) — acceptable for all ops except `$inc` (commutative counter) and the commutative set ops `$addToSet` / `$pull`

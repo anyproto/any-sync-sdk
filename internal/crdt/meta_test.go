@@ -24,7 +24,7 @@ func TestMeta_RoundTrip(t *testing.T) {
 	_, coll := openMetaColl(t)
 
 	hv := map[string]int{"blocks": 1, "chat": 2}
-	require.NoError(t, PersistMeta(ctx, coll, "obj1", 42, hv))
+	require.NoError(t, PersistMeta(ctx, coll, "obj1", 42, hv, ""))
 
 	seq, hvOut, err := LoadMeta(ctx, coll, "obj1")
 	require.NoError(t, err)
@@ -44,8 +44,8 @@ func TestMeta_MissingReturnsZero(t *testing.T) {
 func TestMeta_UpdateOverwrites(t *testing.T) {
 	_, coll := openMetaColl(t)
 
-	require.NoError(t, PersistMeta(ctx, coll, "obj1", 10, map[string]int{"blocks": 1}))
-	require.NoError(t, PersistMeta(ctx, coll, "obj1", 20, map[string]int{"blocks": 2, "chat": 1}))
+	require.NoError(t, PersistMeta(ctx, coll, "obj1", 10, map[string]int{"blocks": 1}, ""))
+	require.NoError(t, PersistMeta(ctx, coll, "obj1", 20, map[string]int{"blocks": 2, "chat": 1}, ""))
 
 	seq, hv, err := LoadMeta(ctx, coll, "obj1")
 	require.NoError(t, err)
@@ -61,7 +61,7 @@ func TestMeta_InsideSameTx(t *testing.T) {
 	require.NoError(t, err)
 	txCtx := tx.Context()
 
-	require.NoError(t, PersistMeta(txCtx, coll, "obj1", 99, map[string]int{"blocks": 3}))
+	require.NoError(t, PersistMeta(txCtx, coll, "obj1", 99, map[string]int{"blocks": 3}, ""))
 	require.NoError(t, tx.Commit())
 
 	seq, hv, err := LoadMeta(ctx, coll, "obj1")
@@ -74,7 +74,7 @@ func TestMeta_ControllerLoadAndSeed(t *testing.T) {
 	db, coll := openMetaColl(t)
 
 	// Persist some metadata.
-	require.NoError(t, PersistMeta(ctx, coll, "obj1", 55, map[string]int{"blocks": 2}))
+	require.NoError(t, PersistMeta(ctx, coll, "obj1", 55, map[string]int{"blocks": 2}, ""))
 
 	// Create a Controller and load.
 	ctrl, err := NewController(ctx, "obj1", db, HandlerReg{Name: "blocks", Version: 3, Handler: DefaultHandler{}, Schema: dynSchema})
@@ -124,7 +124,7 @@ func TestMeta_SpaceMaxAddSeq_Overwrite(t *testing.T) {
 func TestMeta_SpaceMaxAddSeq_DoesNotCollideWithObjectRows(t *testing.T) {
 	_, coll := openMetaColl(t)
 
-	require.NoError(t, PersistMeta(ctx, coll, "objA", 7, map[string]int{"blocks": 1}))
+	require.NoError(t, PersistMeta(ctx, coll, "objA", 7, map[string]int{"blocks": 1}, ""))
 	require.NoError(t, PersistSpaceMaxAddSeq(ctx, coll, "objA", 999))
 
 	objSeq, hv, err := LoadMeta(ctx, coll, "objA")

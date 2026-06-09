@@ -132,6 +132,11 @@ type Store struct {
 	// listening.
 	engine *subscribe.Engine
 
+	// changeSubs is the change-index live feed (consumer-side FTS /
+	// vector indexers). afterApply dispatches (objectId, addSeq) here,
+	// gated on hasSubscribers so an idle space pays nothing.
+	changeSubs *changeRegistry
+
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
 	// collection, no built-in properties/typetype/shortIds regs, no
@@ -218,6 +223,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		alloc:          cfg.Alloc,
 		spaceId:        cfg.SpaceId,
 		engine:         subscribe.New(cfg.SpaceId),
+		changeSubs:     newChangeRegistry(),
 		customHandlers: cfg.Handlers,
 		disableGate:    cfg.DisableGate,
 	}
@@ -824,7 +830,12 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		// Raw mode: exactly the caller's handlers, each on its own
 		// per-object collection (<objectId>_<dataset>). No shared
 		// `objects` collection, no built-in regs.
-		return crdt.NewController(ctx, objectId, s.db, s.customHandlers...)
+		ctrl, err := crdt.NewController(ctx, objectId, s.db, s.customHandlers...)
+		if err != nil {
+			return nil, err
+		}
+		ctrl.SetSpaceId(s.spaceId)
+		return ctrl, nil
 	}
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
@@ -843,5 +854,10 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d)})
 		}
 	}
-	return crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
+	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
+	if err != nil {
+		return nil, err
+	}
+	ctrl.SetSpaceId(s.spaceId)
+	return ctrl, nil
 }

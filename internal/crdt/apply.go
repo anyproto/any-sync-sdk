@@ -173,6 +173,25 @@ func applyIncGated(arena *anyenc.Arena, rec *anyenc.Value, ch Change, op Op) {
 // Record lifecycle helpers (used by Controller.buildModifier)
 // ----------------------------------------------------------------------------
 
+// stampAddSeq records the change's any-sync AddSeq on the record root as
+// _addSeq, advancing monotonically. An out-of-order replay (parked-change
+// drain, cold-restore re-apply) can carry a lower AddSeq than the record
+// already holds; the CRDT applies it idempotently, but the "changed since
+// N" watermark must not regress, so we keep the max. A zero AddSeq (unit
+// tests, device-local materialisations with no any-sync envelope) is a
+// no-op — there's nothing meaningful to stamp.
+func stampAddSeq(arena *anyenc.Arena, rec *anyenc.Value, addSeq uint64) {
+	if rec == nil || addSeq == 0 {
+		return
+	}
+	if cur := rec.Get(AddSeqField); cur != nil && cur.Type() == anyenc.TypeNumber {
+		if uint64(cur.GetInt()) >= addSeq {
+			return
+		}
+	}
+	rec.Set(AddSeqField, arena.NewNumberInt(int(addSeq)))
+}
+
 // newRecord allocates an empty record with the _ver.id creation marker.
 func newRecord(arena *anyenc.Arena, id string, version VersionId) *anyenc.Value {
 	rec := arena.NewObject()
@@ -212,6 +231,9 @@ func newTombstone(arena *anyenc.Arena, id string, ch Change, existing *anyenc.Va
 			tomb.Set(TracesKey, cloneInto(arena, t))
 		}
 	}
+	// A delete is itself a change touching the object — carry the AddSeq
+	// onto the tombstone so it surfaces in "changed since N" scans.
+	stampAddSeq(arena, tomb, ch.AddSeq)
 	return tomb
 }
 

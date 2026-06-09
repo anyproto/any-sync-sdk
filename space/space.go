@@ -45,6 +45,12 @@ type Space interface {
 	// SyncStatus exposes per-space/object/peer status.
 	SyncStatus() SyncStatusAPI
 
+	// Changes exposes the change-index surface: a live feed and a
+	// "changed since cursor N" query over the objects in this space,
+	// for consumer-side incremental indexers (full-text / vector
+	// search). See ChangeIndexAPI.
+	Changes() ChangeIndexAPI
+
 	// Debug returns the diagnostic surface for this space. See
 	// DebugAPI — not a stable interface, intended for tooling and
 	// inspection.

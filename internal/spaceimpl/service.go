@@ -822,6 +822,14 @@ var _ anysyncx.SpaceRegistry = (*Service)(nil)
 // space.Status enum.
 func mapStatus(local, remote string) space.Status {
 	switch {
+	case local == techspace.StatusDeleted:
+		// Device-local delete — the user removed this space on THIS device.
+		// Must report Deleted even when remote is still active, else a
+		// locally-deleted space surfaces as Active and clients trusting the
+		// mapped status re-adopt a space the user removed. Checked before
+		// the remote case so a local delete always wins locally. (Regressed
+		// when the index was Store-backed; this restores the prior case.)
+		return space.StatusDeleted
 	case remote == techspace.StatusDeleted:
 		// Account-wide delete (synced) — propagated to every device.
 		return space.StatusDeleted

@@ -39,6 +39,12 @@ type SpaceIndexRecord struct {
 	// handler refuses moves out of it.
 	LocalStatus  string
 	RemoteStatus string
+
+	// CreatedAt is the added-to-account time in unix seconds, stamped by
+	// SpaceIndexHandler.BeforeCreate when the row first lands (see
+	// FieldCreatedAt). Zero on rows created before the field existed —
+	// treat 0 as "unknown".
+	CreatedAt int64
 }
 
 // DecodeSpaceIndexRecord pulls the fields off an anyenc value as
@@ -58,6 +64,9 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		IconCID:      v.GetString(FieldIcon),
 		LocalStatus:  v.GetString(FieldLocalStatus),
 		RemoteStatus: v.GetString(FieldRemoteStatus),
+		// Float64 read — GetInt narrows through `int` and would truncate
+		// on 32-bit platforms; anyenc numbers are float64 on the wire.
+		CreatedAt:    int64(v.GetFloat64(FieldCreatedAt)),
 	}
 }
 
@@ -93,5 +102,8 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	if r.RemoteStatus != "" {
 		obj.Set(FieldRemoteStatus, a.NewString(r.RemoteStatus))
 	}
+	// CreatedAt is intentionally NOT written here — it's handler-derived
+	// (ScopeDerived; BeforeCreate stamps it from the change timestamp)
+	// and an input op writing it would be rejected by the controller.
 	return obj
 }

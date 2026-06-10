@@ -30,6 +30,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldSpaceType, Name: "Space type", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal},
+		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
 	}}
 }
 
@@ -75,6 +76,22 @@ const (
 	// Distinct from FieldType (the on-wire header type): not pinned, so
 	// the watcher can mirror the converged value.
 	FieldSpaceType = "spaceType"
+	// FieldCreatedAt is the added-to-account time: unix seconds, stamped
+	// by BeforeCreate from the creating change's timestamp when the row
+	// first lands locally (Create / Derive / OneToOne / Join all create
+	// the row once). ScopeDerived — handler-only, no input op may write
+	// it, so it's immutable for life.
+	//
+	// Caveats (accepted — the value is advisory ordering metadata):
+	//   - stamping is per-device first-touch: a device whose store
+	//     materialized the row under an older handler reads 0 forever
+	//     (no backfill), while a device replaying the same DAG with this
+	//     handler stamps the real value;
+	//   - two devices independently creating the same row (e.g. both
+	//     Derive/Join before tech-space sync converges) each keep their
+	//     own change's timestamp — typically seconds apart.
+	// Callers treat 0 as "unknown".
+	FieldCreatedAt = "createdAt"
 )
 
 // Status lattice values. `Deleted` is terminal — once a record's
@@ -125,10 +142,27 @@ func (SpaceIndexHandler) Init(_ context.Context) error { return nil }
 // string. Strict allow-listing of type values is deferred until the
 // canonical space-type enum is consolidated; for now any non-empty
 // label passes.
-func (SpaceIndexHandler) BeforeCreate(_ *crdt.ChangeCtx, rec *crdt.RecordChange, _ *crdt.Sink) error {
+//
+// It also stamps `createdAt` (added-to-account time) from the change's
+// timestamp via sink.Derive — derived from the change envelope, so every
+// device replaying the same create lands on the same value. (Convergence
+// caveats in the FieldCreatedAt doc.)
+func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
 	t, ok := extractStringField(rec.Ops, FieldType)
 	if !ok || t == "" {
 		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrMissingType)
+	}
+	if ctx != nil && ctx.Change != nil && sink != nil && ctx.Change.Timestamp > 0 {
+		// Fresh arena per call — the derived Op holds it alive until
+		// the apply loop drains the sink (see drainDerivedTo).
+		// Float64 constructor: anyenc numbers are float64 on the wire,
+		// and NewNumberInt would truncate int64 on 32-bit platforms.
+		a := &anyenc.Arena{}
+		sink.Derive(crdt.Op{
+			Type:    crdt.OpSet,
+			Path:    []string{FieldCreatedAt},
+			Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp)),
+		})
 	}
 	return nil
 }

@@ -65,25 +65,16 @@ func (s *spaceImpl) Info() space.SpaceInfo {
 	if !ok {
 		return space.SpaceInfo{Id: s.id}
 	}
-	status := mapStatus(rec.LocalStatus, rec.RemoteStatus)
-	if status == space.StatusJoining && s.localIdentityActive(ctx) {
-		status = space.StatusActive
+	info := s.parent.recordToInfo(ctx, rec)
+	if info.Status == space.StatusJoining && s.localIdentityActive(ctx) {
+		info.Status = space.StatusActive
 		// Fire-and-forget self-heal so the next List() / Get() reads
 		// the right cached status without a live AclList round-trip.
 		// Members watcher does the same flip when running; this path
 		// covers callers that never start the watcher.
 		go s.healJoiningStatus()
 	}
-	return space.SpaceInfo{
-		Id:          rec.Id,
-		Type:        rec.Type,
-		SpaceType:   s.parent.resolveSpaceType(ctx, rec.Id, rec.SpaceType),
-		Author:      s.parent.resolveAuthor(ctx, rec.Id),
-		Name:        rec.Name,
-		Description: rec.Description,
-		IconCID:     rec.IconCID,
-		Status:      status,
-	}
+	return info
 }
 
 // healJoiningStatus writes LocalStatus="active" if the cached row

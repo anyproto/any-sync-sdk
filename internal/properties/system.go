@@ -141,9 +141,12 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	}
 	if ts := ctx.Change.ObjectCreatedAt; ts > 0 {
 		sink.Derive(crdt.Op{
-			Type:    crdt.OpSet,
-			Path:    []string{"createdAt"},
-			Payload: a.NewNumberInt(int(ts)),
+			Type: crdt.OpSet,
+			Path: []string{"createdAt"},
+			// Float64, not NewNumberInt(int(ts)) — same wire encoding
+			// (anyenc numbers are float64), but int() would truncate the
+			// int64 timestamp on 32-bit platforms.
+			Payload: a.NewNumberFloat64(float64(ts)),
 		})
 	}
 	if spaceId := ctx.Change.SpaceId; spaceId != "" {

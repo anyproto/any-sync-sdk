@@ -92,6 +92,69 @@ func TestSpaceIndexHandler_CreateRejectedWithoutType(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// BeforeCreate — `createdAt` is stamped from the change timestamp
+// ----------------------------------------------------------------------------
+
+func TestSpaceIndexHandler_CreateStampsCreatedAt(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-stamped"
+	ch := makeChange("v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldType: "private"}),
+	)
+	ch.Timestamp = 1717000000
+	require.NoError(t, ctrl.ApplyChange(context.Background(), ch))
+
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, int64(1717000000), techspace.DecodeSpaceIndexRecord(rec).CreatedAt)
+}
+
+func TestSpaceIndexHandler_CreatedAtInputOpRejected(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-forged"
+	ch := makeChange("v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldType: "private"}),
+	)
+	ch.Timestamp = 1717000000
+	require.NoError(t, ctrl.ApplyChange(context.Background(), ch))
+
+	// createdAt is ScopeDerived — a synced input op targeting it is
+	// rejected by the controller's scope enforcement.
+	err := ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldCreatedAt}, Payload: arena.NewNumberInt(1)},
+	))
+	require.ErrorIs(t, err, crdt.ErrValidation)
+
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, int64(1717000000), techspace.DecodeSpaceIndexRecord(rec).CreatedAt,
+		"derived createdAt must survive a forged input op")
+}
+
+func TestSpaceIndexHandler_CreateWithoutTimestampSkipsCreatedAt(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	// Change without a timestamp — no stamp, field absent, decode reads
+	// zero (same shape as rows created before the field existed).
+	const spaceId = "space-legacy"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldType: "private"}),
+	)))
+
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(techspace.FieldCreatedAt))
+	assert.Zero(t, techspace.DecodeSpaceIndexRecord(rec).CreatedAt)
+}
+
+// ----------------------------------------------------------------------------
 // BeforeModify — type is pinned, deleted is terminal
 // ----------------------------------------------------------------------------
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -395,7 +396,7 @@ func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 // Shared by List and the Subscribe translator so both surface the same
 // shape.
 func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord) space.SpaceInfo {
-	return space.SpaceInfo{
+	info := space.SpaceInfo{
 		Id:          r.Id,
 		Type:        r.Type,
 		SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
@@ -405,6 +406,10 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		IconCID:     r.IconCID,
 		Status:      mapStatus(r.LocalStatus, r.RemoteStatus),
 	}
+	if r.CreatedAt > 0 {
+		info.CreatedAt = time.Unix(r.CreatedAt, 0)
+	}
+	return info
 }
 
 // Delete is an account-wide soft-delete on the index: it writes the

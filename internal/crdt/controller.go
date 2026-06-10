@@ -1087,8 +1087,9 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 //
 // Captures the drained ops onto m.appliedDerived so the dispatcher can
 // project them onto the wire. Payloads live on the handler's own arena
-// (stampAutoFields allocates a fresh &anyenc.Arena{} per BeforeCreate
-// call) — the Op references hold that arena alive past the apply call.
+// (stamping handlers — stampAutoFields, SpaceIndexHandler.BeforeCreate —
+// allocate a fresh &anyenc.Arena{} per call) — the Op references hold
+// that arena alive past the apply call.
 func (m *recordModifier) drainDerivedTo(a *anyenc.Arena, target *anyenc.Value, ch *Change) {
 	if m.sink == nil || len(m.sink.derived) == 0 {
 		return

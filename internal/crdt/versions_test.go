@@ -206,6 +206,16 @@ func TestIsCollapsible(t *testing.T) {
 	})
 	_, ok = IsCollapsible(nested)
 	assert.False(t, ok)
+
+	// Uniform but WITHOUT a defaultKey → not collapsible. The node never
+	// claimed authority over unenumerated siblings; collapsing would
+	// invent a version for never-written fields and break convergence.
+	uniformNoDefault := treeToValue(arena, map[string]any{
+		"name":  "v5",
+		"color": "v5",
+	})
+	_, ok = IsCollapsible(uniformNoDefault)
+	assert.False(t, ok)
 }
 
 // ----------------------------------------------------------------------------
@@ -254,7 +264,7 @@ func TestCompact_NoopOnTombstone(t *testing.T) {
 	assert.Equal(t, 3, o.GetObject().Len(), "tombstone _ver must not be touched")
 }
 
-func TestCompact_RootFactorAllSameVersion(t *testing.T) {
+func TestCompact_NoRootFactor_SharedVersionsStayExplicit(t *testing.T) {
 	arena := &anyenc.Arena{}
 	rec := buildRecord(t, arena, map[string]any{
 		IdField:    "v1",
@@ -263,42 +273,38 @@ func TestCompact_RootFactorAllSameVersion(t *testing.T) {
 		"propId":   "v1",
 	})
 	compactVersions(arena, rec)
-	// {id, changeId, kind, propId} all v1 → factor non-id siblings into `*`.
+	// Shared versions are NOT factored into `*` — no write ever claimed
+	// authority over unenumerated fields, so inventing a default would
+	// gate out concurrent older writes to fresh fields (divergence).
 	o := rec.Get(VersionsKey)
 	require.NotNil(t, o)
+	assert.Nil(t, o.Get(defaultKey))
 	assert.Equal(t, VersionId("v1"), VersionId(o.Get(IdField).GetStringBytes()))
-	assert.Equal(t, VersionId("v1"), VersionId(o.Get(defaultKey).GetStringBytes()))
-	assert.Nil(t, o.Get("changeId"))
-	assert.Nil(t, o.Get("kind"))
-	assert.Nil(t, o.Get("propId"))
-	// Lookup preserves explicit versions and resolves new fields via `*`.
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "changeId"))
-	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "anyNewField"))
-	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, IdField))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "kind"))
+	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "propId"))
+	// Never-written fields stay unversioned.
+	assert.Equal(t, VersionId(""), GetRecordVersion(rec, "anyNewField"))
 }
 
-func TestCompact_RootFactorPreservesDistinctVersions(t *testing.T) {
+func TestCompact_NoRootFactor_OutlierUnaffected(t *testing.T) {
 	arena := &anyenc.Arena{}
 	rec := buildRecord(t, arena, map[string]any{
 		IdField:     "v0",
 		"author":    "v1",
 		"createdAt": "v1",
 		"spaceId":   "v1",
-		"name":      "v9", // outlier — must survive
+		"name":      "v9",
 	})
 	compactVersions(arena, rec)
 	o := rec.Get(VersionsKey)
 	require.NotNil(t, o)
-	// v1 trio factored, v9 outlier preserved, id preserved.
+	// Nothing factored; every field keeps its explicit version.
+	assert.Nil(t, o.Get(defaultKey))
 	assert.Equal(t, VersionId("v0"), VersionId(o.Get(IdField).GetStringBytes()))
-	assert.Equal(t, VersionId("v1"), VersionId(o.Get(defaultKey).GetStringBytes()))
-	assert.Equal(t, VersionId("v9"), VersionId(o.Get("name").GetStringBytes()))
-	assert.Nil(t, o.Get("author"))
-	assert.Nil(t, o.Get("createdAt"))
-	assert.Nil(t, o.Get("spaceId"))
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "author"))
 	assert.Equal(t, VersionId("v9"), GetRecordVersion(rec, "name"))
-	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "newField"))
+	assert.Equal(t, VersionId(""), GetRecordVersion(rec, "newField"))
 }
 
 func TestCompact_NoRootFactorOnSingleNonIdSibling(t *testing.T) {
@@ -316,25 +322,28 @@ func TestCompact_NoRootFactorOnSingleNonIdSibling(t *testing.T) {
 	assert.Equal(t, VersionId("v2"), VersionId(o.Get("name").GetStringBytes()))
 }
 
-func TestCompact_NoRootFactorWhenStarPresent(t *testing.T) {
+func TestCompact_RootStar_DropsOnlyEntriesEqualToDefault(t *testing.T) {
 	arena := &anyenc.Arena{}
 	rec := buildRecord(t, arena, map[string]any{
 		IdField:    "v1",
 		defaultKey: "v5",
 		"a":        "v9",
 		"b":        "v9",
+		"c":        "v5", // equal to the default — redundant, lookup unchanged
 	})
 	compactVersions(arena, rec)
-	// `*` already present at root — leave alone (treat as a tombstone-like
-	// or already-factored shape). Explicit a/b stay even though they share.
 	o := rec.Get(VersionsKey)
 	require.NotNil(t, o)
 	assert.Equal(t, VersionId("v5"), VersionId(o.Get(defaultKey).GetStringBytes()))
+	// a/b differ from the default and must stay explicit.
 	assert.NotNil(t, o.Get("a"))
 	assert.NotNil(t, o.Get("b"))
+	// c equals the default — dropped, but its lookup falls back to `*`.
+	assert.Nil(t, o.Get("c"))
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "c"))
 }
 
-func TestCompact_SubtreeCollapseAllSame(t *testing.T) {
+func TestCompact_SubtreeAllSameWithoutStarStaysExpanded(t *testing.T) {
 	arena := &anyenc.Arena{}
 	rec := buildRecord(t, arena, map[string]any{
 		IdField: "v1",
@@ -347,14 +356,16 @@ func TestCompact_SubtreeCollapseAllSame(t *testing.T) {
 	compactVersions(arena, rec)
 	o := rec.Get(VersionsKey)
 	require.NotNil(t, o)
+	// No `*` at nav — the three leaf writes never claimed nav's other
+	// keys, so collapsing to a string (which WOULD claim them) is lossy
+	// and forbidden.
 	nav := o.Get("nav")
 	require.NotNil(t, nav)
-	assert.Equal(t, anyenc.TypeString, nav.Type())
-	assert.Equal(t, VersionId("v5"), VersionId(nav.GetStringBytes()))
-	// Lookup invariant: every previously-set path returns its version.
+	assert.Equal(t, anyenc.TypeObject, nav.Type())
 	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "nav", "type"))
 	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "nav", "parentId"))
 	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "nav", "pos"))
+	assert.Equal(t, VersionId(""), GetRecordVersion(rec, "nav", "unwritten"))
 }
 
 func TestCompact_SubtreeMixedNotCollapsed(t *testing.T) {
@@ -416,21 +427,35 @@ func TestCompact_SubtreeWithStarCollapsesEvenSingleEntry(t *testing.T) {
 
 func TestCompact_BottomUpCascades(t *testing.T) {
 	arena := &anyenc.Arena{}
-	// Deep nesting where every leaf shares a version with siblings.
+	// Deep nesting with `*` claims at every level: each subtree collapses
+	// to its default, then the parent (all entries equal to ITS default)
+	// collapses too.
 	rec := buildRecord(t, arena, map[string]any{
+		IdField: "v1",
+		"outer": map[string]any{
+			defaultKey: "v5",
+			"x":        map[string]any{defaultKey: "v5", "a": "v5", "b": "v5"},
+			"y":        map[string]any{defaultKey: "v5", "a": "v5", "b": "v5"},
+		},
+	})
+	compactVersions(arena, rec)
+	outer := rec.Get(VersionsKey).Get("outer")
+	require.NotNil(t, outer)
+	assert.Equal(t, anyenc.TypeString, outer.Type())
+	assert.Equal(t, VersionId("v5"), VersionId(outer.GetStringBytes()))
+	// Without the `*` claims, the same shape must stay fully expanded.
+	rec2 := buildRecord(t, arena, map[string]any{
 		IdField: "v1",
 		"outer": map[string]any{
 			"x": map[string]any{"a": "v5", "b": "v5"},
 			"y": map[string]any{"a": "v5", "b": "v5"},
 		},
 	})
-	compactVersions(arena, rec)
-	outer := rec.Get(VersionsKey).Get("outer")
-	require.NotNil(t, outer)
-	// outer.x and outer.y both collapse to "v5", then outer itself
-	// has {x:"v5", y:"v5"} — ≥2 same-version strings → collapse to "v5".
-	assert.Equal(t, anyenc.TypeString, outer.Type())
-	assert.Equal(t, VersionId("v5"), VersionId(outer.GetStringBytes()))
+	compactVersions(arena, rec2)
+	outer2 := rec2.Get(VersionsKey).Get("outer")
+	require.NotNil(t, outer2)
+	assert.Equal(t, anyenc.TypeObject, outer2.Type())
+	assert.Equal(t, anyenc.TypeObject, outer2.Get("x").Type())
 }
 
 func TestCompact_Idempotent(t *testing.T) {

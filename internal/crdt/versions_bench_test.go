@@ -87,23 +87,20 @@ func BenchmarkCompact_Tombstone(b *testing.B) {
 	}
 }
 
-// BenchmarkCompact_RootFactor: multi-field create case — 4 non-id
-// siblings all at the same version, should factor into `*`.
-func BenchmarkCompact_RootFactor(b *testing.B) {
+// BenchmarkCompact_SharedVersionSiblings: multi-field create case — 4
+// non-id siblings all at the same version. Compaction leaves this shape
+// untouched; measures the no-op scan cost.
+func BenchmarkCompact_SharedVersionSiblings(b *testing.B) {
 	arena := &anyenc.Arena{}
+	rec := recordWith(arena, map[string]any{
+		IdField:    "v1",
+		"changeId": "v1",
+		"kind":     "v1",
+		"propId":   "v1",
+	})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		// Build fresh each iteration so we measure the cost on the
-		// shape that actually needs work (Del + Set).
-		b.StopTimer()
-		rec := recordWith(arena, map[string]any{
-			IdField:    "v1",
-			"changeId": "v1",
-			"kind":     "v1",
-			"propId":   "v1",
-		})
-		b.StartTimer()
 		compactVersions(arena, rec)
 	}
 }

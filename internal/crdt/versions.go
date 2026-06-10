@@ -150,7 +150,14 @@ func setVersion(arena *anyenc.Arena, node *anyenc.Value, version VersionId, path
 	child := node.Get(key)
 	switch {
 	case child == nil:
+		// A missing key under a node with a defaultKey is COVERED by that
+		// default — the new intermediate must inherit it, or lookups for
+		// its unenumerated siblings would drop from the inherited version
+		// to "" and gate differently than on peers holding explicit state.
 		child = arena.NewObject()
+		if def := node.Get(defaultKey); def != nil && def.Type() == anyenc.TypeString {
+			child.Set(defaultKey, def)
+		}
 		node.Set(key, child)
 	case child.Type() == anyenc.TypeString:
 		// Expand: { defaultKey: oldVersion }
@@ -169,14 +176,101 @@ func setVersion(arena *anyenc.Arena, node *anyenc.Value, version VersionId, path
 	setVersion(arena, child, version, rest)
 }
 
+// setVersionNodeAt writes an arbitrary `_ver` node (string or object) at
+// `path`, with the same collapsed-ancestor expansion and default
+// propagation as setVersion. Used by the broad-write merge path, which
+// computes a whole subtree node rather than a single leaf version.
+func setVersionNodeAt(arena *anyenc.Arena, record *anyenc.Value, node *anyenc.Value, path []string) {
+	if record == nil || len(path) == 0 {
+		return
+	}
+	o := record.Get(VersionsKey)
+	if o == nil || o.Type() != anyenc.TypeObject {
+		o = arena.NewObject()
+		record.Set(VersionsKey, o)
+	}
+	for len(path) > 1 {
+		key := path[0]
+		path = path[1:]
+		child := o.Get(key)
+		switch {
+		case child == nil:
+			child = arena.NewObject()
+			if def := o.Get(defaultKey); def != nil && def.Type() == anyenc.TypeString {
+				child.Set(defaultKey, def)
+			}
+			o.Set(key, child)
+		case child.Type() == anyenc.TypeString:
+			expanded := arena.NewObject()
+			expanded.Set(defaultKey, arena.NewStringBytes(child.GetStringBytes()))
+			o.Set(key, expanded)
+			child = expanded
+		case child.Type() == anyenc.TypeObject:
+			// descend
+		default:
+			child = arena.NewObject()
+			o.Set(key, child)
+		}
+		o = child
+	}
+	o.Set(path[0], node)
+}
+
+// gateVersion resolves the gating context for a $set/$unset at `path`.
+// When the path resolves to a single authoritative version — an explicit
+// string entry, a collapsed ancestor, a `*` default, or "" when
+// untracked — it returns (version, nil). When the `_ver` entry AT the
+// path is an object, finer-grained writes exist below it: there is no
+// single gate and the caller must merge per-leaf (see mergeReplace), so
+// it returns ("", node).
+func gateVersion(record *anyenc.Value, path []string) (VersionId, *anyenc.Value) {
+	if record == nil {
+		return "", nil
+	}
+	cur := record.Get(VersionsKey)
+	for _, key := range path {
+		if cur == nil {
+			return "", nil
+		}
+		switch cur.Type() {
+		case anyenc.TypeString:
+			// Collapsed ancestor — applies to everything at and below.
+			return VersionId(cur.GetStringBytes()), nil
+		case anyenc.TypeObject:
+			next := cur.Get(key)
+			if next != nil {
+				cur = next
+				continue
+			}
+			if def := cur.Get(defaultKey); def != nil {
+				return VersionId(def.GetStringBytes()), nil
+			}
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+	if cur == nil {
+		return "", nil
+	}
+	switch cur.Type() {
+	case anyenc.TypeString:
+		return VersionId(cur.GetStringBytes()), nil
+	case anyenc.TypeObject:
+		return "", cur
+	}
+	return "", nil
+}
+
 // IsCollapsible reports whether `node` is an object that can be replaced
-// with a single string version. Required: every entry is a string, every
-// entry holds the same version, and (≥2 entries OR the defaultKey is
-// present). The defaultKey requirement makes the collapse lossless (the
-// object already claimed authority over unenumerated siblings). The ≥2
-// requirement preserves spec §3.2's narrow-path semantic — a single
-// $set on "a.b.c" must stay `{a:{b:{c:v}}}`, not collapse all the way
-// up to `{a:v}`.
+// with a single string version without changing any lookup. Required: the
+// defaultKey is present and every entry is a string holding the same
+// version. Only a node that already claims authority over unenumerated
+// siblings (via `*`) may become a collapsed string, which claims the same
+// authority — collapsing sibling enumerations WITHOUT a default would
+// invent a version for never-written fields and gate out concurrent
+// older writes to them, diverging from peers that applied those writes
+// before the collapse.
 func IsCollapsible(node *anyenc.Value) (VersionId, bool) {
 	if node == nil || node.Type() != anyenc.TypeObject {
 		return "", false
@@ -206,43 +300,39 @@ func IsCollapsible(node *anyenc.Value) (VersionId, bool) {
 			hasDefault = true
 		}
 	})
-	if !ok || count == 0 {
-		return "", false
-	}
-	if count == 1 && !hasDefault {
+	if !ok || count == 0 || !hasDefault {
 		return "", false
 	}
 	return common, true
 }
 
 // compactVersions rewrites a record's `_ver` map to its canonical
-// compact form (spec §3.2 — "if every field under a subtree shares the
-// same version, only the subtree root is tracked").
+// compact form. Only lossless transformations are applied: every
+// GetRecordVersion lookup — explicit or unenumerated — returns exactly
+// the same version before and after compaction. Inventing a `*`
+// default for paths no write ever claimed is forbidden: it would gate
+// out concurrent older writes to fresh fields and diverge from peers
+// that applied those writes before compacting.
 //
 // Two transformations, applied bottom-up in one pass:
 //
-//  1. Subtree collapse: any inner object whose entries (post-recursion)
-//     are all strings with the same version, and which has either the
-//     defaultKey present or ≥2 entries, is replaced in its parent with
-//     a single string version.
+//  1. Redundant-entry drop: inside an object that has a defaultKey,
+//     explicit string entries equal to the default are removed —
+//     lookup falls back to the default with the same result.
 //
-//  2. Root sibling factor: at the `_ver` root, ≥2 non-`id` string
-//     siblings sharing a version are removed and replaced with a
-//     single `*: version` default. `_ver.id` is never touched (it's
-//     the creation marker, spec §3.5). Skipped when `*` already
-//     exists at root (delete tombstones already use this shape).
+//  2. Subtree collapse: any inner object whose entries (post-recursion)
+//     are all strings equal to its own defaultKey is replaced in its
+//     parent with that single string version. The defaultKey already
+//     claims authority over every unenumerated sibling, so the
+//     collapsed string claims nothing new.
 //
 // Tombstones are short-circuited — they're already in canonical
 // `{id, *}` shape and are sticky.
 //
-// Invariants preserved:
-//   - GetRecordVersion(rec, path) is unchanged for every path that
-//     already had an explicit entry. Unenumerated paths may switch
-//     from "" to a `*` default (the documented broader-claim shift).
-//   - The set of versionIds present in `_ver` is unchanged — every
-//     factored versionId still appears via `*`. Trace GC at §3.6
-//     therefore agrees with itself before and after compaction.
-//   - `_ver.id` and `_ver` root object-ness are preserved.
+// The set of versionIds present in `_ver` is unchanged (a dropped
+// entry's version survives in the default it equaled), so trace GC at
+// §3.6 agrees with itself before and after compaction. `_ver.id` and
+// `_ver` root object-ness are preserved.
 func compactVersions(arena *anyenc.Arena, rec *anyenc.Value) {
 	if rec == nil {
 		return
@@ -254,120 +344,51 @@ func compactVersions(arena *anyenc.Arena, rec *anyenc.Value) {
 	if v == nil || v.Type() != anyenc.TypeObject {
 		return
 	}
-	compactSubtree(arena, v)
-	factorRootSiblings(arena, v)
+	compactSubtree(v, true)
 }
 
-// compactSubtree walks `node`'s object children, recurses into each,
-// and replaces any child that became safely collapsible with the
-// equivalent single-string version. Single-pass: the in-place Set on
-// the current key never resizes anyenc's underlying kvs slice, so
-// mutation during Visit is safe. Zero allocations when no child is
-// an object (the common case — most `_ver` maps are flat).
-func compactSubtree(arena *anyenc.Arena, node *anyenc.Value) {
+// compactSubtree applies the two lossless compaction rules bottom-up:
+// recurse into object children, replace any child that became safely
+// collapsible with the equivalent single-string version, then drop
+// explicit string entries equal to the node's own defaultKey. In-place
+// Set during Visit never resizes anyenc's underlying kvs slice, so the
+// mutation is safe; deletions are collected first and applied after the
+// Visit. Zero allocations when no child is an object and no defaultKey
+// is present (the common case — most `_ver` maps are flat).
+//
+// isRoot guards `_ver.id`: the creation marker stays explicit even when
+// it equals a root default (tombstones never reach here, but the
+// invariant is cheap to keep).
+func compactSubtree(node *anyenc.Value, isRoot bool) {
 	obj, _ := node.Object()
 	obj.Visit(func(k []byte, v *anyenc.Value) {
 		if v.Type() != anyenc.TypeObject {
 			return
 		}
-		compactSubtree(arena, v)
-		if collapsed, ok := IsCollapsible(v); ok {
-			node.Set(string(k), arena.NewString(string(collapsed)))
+		compactSubtree(v, false)
+		if _, ok := IsCollapsible(v); ok {
+			// Reuse the child's own defaultKey string node — same arena,
+			// no allocation.
+			node.Set(string(k), v.Get(defaultKey))
 		}
 	})
-}
-
-// rootFactorBufSize is the on-stack capacity of the duplicate-detection
-// buffer used by factorRootSiblings. Records with more than this many
-// top-level `_ver` string siblings fall back to the slow path (rare in
-// practice — typical records have ≤ a dozen fields).
-const rootFactorBufSize = 16
-
-// factorRootSiblings: at the `_ver` root, factor the most common
-// version among non-`id`, non-`*` string siblings into the `*`
-// defaultKey. Only fires when (a) `*` is absent and (b) some version
-// occurs in ≥2 such siblings. Ties on count are broken
-// lexicographically by version (deterministic across peers and runs).
-//
-// Hot path is allocation-free: a stack-sized buffer detects whether
-// any two siblings share a version, and we return early when none do.
-// Map allocation happens only when a duplicate is confirmed.
-func factorRootSiblings(arena *anyenc.Arena, root *anyenc.Value) {
-	if root.Get(defaultKey) != nil {
+	def := node.Get(defaultKey)
+	if def == nil || def.Type() != anyenc.TypeString {
 		return
 	}
-	obj, _ := root.Object()
-
-	var seenBuf [rootFactorBufSize][]byte
-	seen := seenBuf[:0]
-	foundDup := false
-	overflowed := false
+	defVer := def.GetStringBytes()
+	var redundant []string
+	obj, _ = node.Object()
 	obj.Visit(func(k []byte, v *anyenc.Value) {
-		if foundDup || overflowed {
+		key := string(k)
+		if key == defaultKey || (isRoot && key == IdField) {
 			return
 		}
-		if string(k) == IdField || string(k) == defaultKey {
-			return
-		}
-		if v.Type() != anyenc.TypeString {
-			return
-		}
-		s := v.GetStringBytes()
-		for _, prev := range seen {
-			if bytes.Equal(prev, s) {
-				foundDup = true
-				return
-			}
-		}
-		if len(seen) < cap(seen) {
-			seen = append(seen, s)
-		} else {
-			overflowed = true
+		if v.Type() == anyenc.TypeString && bytes.Equal(v.GetStringBytes(), defVer) {
+			redundant = append(redundant, key)
 		}
 	})
-	if !foundDup && !overflowed {
-		return
+	for _, k := range redundant {
+		node.Del(k)
 	}
-	factorRootSlow(arena, root)
-}
-
-// factorRootSlow performs the full count-based selection. Allocates a
-// map keyed by versionId — only called when factorRootSiblings has
-// already confirmed there is work to do (or the fast path overflowed).
-func factorRootSlow(arena *anyenc.Arena, root *anyenc.Value) {
-	counts := map[string]int{}
-	obj, _ := root.Object()
-	obj.Visit(func(k []byte, v *anyenc.Value) {
-		if string(k) == IdField || string(k) == defaultKey {
-			return
-		}
-		if v.Type() != anyenc.TypeString {
-			return
-		}
-		counts[string(v.GetStringBytes())]++
-	})
-	winner := ""
-	winnerCount := 0
-	for ver, c := range counts {
-		if c > winnerCount || (c == winnerCount && (winner == "" || ver < winner)) {
-			winner = ver
-			winnerCount = c
-		}
-	}
-	if winnerCount < 2 {
-		return
-	}
-	var toRemove []string
-	obj.Visit(func(k []byte, v *anyenc.Value) {
-		if string(k) == IdField || string(k) == defaultKey {
-			return
-		}
-		if v.Type() == anyenc.TypeString && string(v.GetStringBytes()) == winner {
-			toRemove = append(toRemove, string(k))
-		}
-	})
-	for _, k := range toRemove {
-		root.Del(k)
-	}
-	root.Set(defaultKey, arena.NewString(winner))
 }

@@ -243,3 +243,15 @@ avoid collision.
 4. **PerSpace topology** — with `Topology=PerSpace`, `_meta` is already
    space-isolated and `sp` is redundant-but-harmless. No special-casing
    needed; the `sp` filter still holds.
+5. **Tombstone visibility for deletion streaming** — *resolved.* A
+   consumer-side indexer must see deletes to evict them from its index,
+   but the find path skips `_deletedAt` rows. Resolution: `ProjectionOpts`
+   gained `IncludeDeleted bool`. With it set, the find path (Iter / All /
+   One / Count) returns the tombstone — content wiped, `_deletedAt` set,
+   `_addSeq` carried from the delete — so a `ChangedSince`-driven scan
+   past the cursor surfaces deletions in the same ascending `_addSeq`
+   stream as live edits. Snapshot/Subscribe are unchanged: the windowed
+   live view always skips tombstones (a removed row leaves the window as
+   a `removed` event, not a surfaced tombstone). See
+   `space/query.go::ProjectionOpts.IncludeDeleted` and the
+   `combineWithTombstoneSkip` gate in `internal/spaceimpl/query.go`.

@@ -133,4 +133,13 @@ type ProjectionOpts struct {
 	// them unless the caller needs per-field version info (e.g. to
 	// reconcile optimistic state).
 	IncludeMeta bool
+
+	// IncludeDeleted returns tombstone rows (id, _deletedAt, _ver,
+	// _traces, _addSeq; content wiped) instead of skipping them.
+	// Honored by the find path (Iter / All / One / Count);
+	// Snapshot/Subscribe keep skipping tombstones (the windowed live
+	// view is unchanged). Use it to stream deletions for incremental
+	// re-indexing — a tombstone surfaced this way carries the delete's
+	// _addSeq, so it shows up in a changed-since scan past the cursor.
+	IncludeDeleted bool
 }

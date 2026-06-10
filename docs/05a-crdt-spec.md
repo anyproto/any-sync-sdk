@@ -71,7 +71,7 @@ Out-of-order delivery is safe. There is no multi-head / conflict state — every
 - A **string** (a versionId) — collapsed: every subkey at and below this point shares this version
 - An **object** with explicit per-key entries plus an optional `*` default key. The `*` default holds the version inherited by any sibling not enumerated in the object — this is how expansion preserves precision when a finer write splits a previously-collapsed subtree. `*` is chosen because it only ever appears inside `_ver` subtrees (never in the user-facing record body), is visually distinct from real field names, and avoids anyenc's special empty-key byte encoding.
 
-Lookup descends `_ver` along the path; if it falls off into unenumerated territory, the closest ancestor's `*` default applies, otherwise the version is `""` (the empty string is the "no version" sentinel, smaller than any real versionId).
+Lookup descends `_ver` along the path; if it falls off into unenumerated territory, the `*` default at the node where the walk fell off applies, otherwise the version is `""` (the empty string is the "no version" sentinel, smaller than any real versionId). The node-local `*` is always sufficient because splitting a covered entry propagates the inherited version onto every created intermediate (§3.2).
 
 ### 3.2 `_ver` Collapsing Rules
 
@@ -469,6 +469,8 @@ mergeReplace(rec, path, verSubtree, value, v):              // value nil = unset
 ```
 
 `gateVersion(rec, path)` walks `_ver` along the path and returns either a single authoritative version (an explicit string, a collapsed ancestor, the local `*` default, or `""` when untracked) or — when the entry AT the path is an object — the subtree itself, signalling that finer writes exist below and the per-leaf merge must run.
+
+`getOrder(rec, path)` is the gate for the commutative ops (`$addToSet`/`$pull`/`$inc`/`$incGated`): same walk as `gateVersion`, except that when the entry at the path is an object it returns the **maximum** version below it. The conservative aggregate is safe here because these ops never produce a per-leaf merge — they additionally type-check the existing value (array for set ops, number for counters), and a position with finer `_ver` entries below it holds an object, so the op skips regardless.
 
 `compareVersion(a, b)` returns `< 0` if `a < b`, `0` if equal, `> 0` if `a > b`. The empty string compares less than any non-empty version.
 

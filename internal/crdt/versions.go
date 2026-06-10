@@ -21,7 +21,10 @@ const VersionsKey = "_ver"
 //
 // Lookup walks the tree, descending into objects until it either lands on
 // the requested key (then returns that subtree's max version) or the key is
-// missing (then returns the closest ancestor's defaultKey, or "" if none).
+// missing (then returns the defaultKey of the node where the walk fell off,
+// or "" if that node has none — sufficient because splitting a covered
+// entry propagates the inherited version onto created intermediates, see
+// setVersion).
 //
 // `*` is chosen because:
 //   - it's visually distinct from real field names ("this applies to any

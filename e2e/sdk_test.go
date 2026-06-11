@@ -222,9 +222,29 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 		Name: "Title",
 		XKey: "title",
 		Kind: space.PropertyKindString,
+		Meta: map[string]string{"index": "basic"},
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, titleProp)
+
+	// Meta is opaque consumer metadata — it must round-trip verbatim,
+	// and props without it must come back with a nil Meta.
+	plainProp, err := sp.Types().AddProperty(ctx, typeId, space.PropertyDraft{
+		Name: "Year",
+		XKey: "year",
+		Kind: space.PropertyKindNumber,
+	})
+	require.NoError(t, err)
+	defs, err := sp.Types().Properties(ctx, typeId)
+	require.NoError(t, err)
+	defById := map[string]space.PropertyDef{}
+	for _, d := range defs {
+		defById[d.Id] = d
+	}
+	require.Contains(t, defById, titleProp)
+	require.Contains(t, defById, plainProp)
+	assert.Equal(t, map[string]string{"index": "basic"}, defById[titleProp].Meta)
+	assert.Nil(t, defById[plainProp].Meta)
 
 	// 4. Object — bind type at birth via InitialProperties.
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
@@ -298,14 +318,18 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	assert.Equal(t, space.PropertyKindString, gotProps["icon"])
 	assert.Equal(t, space.PropertyKindArray, gotProps["types"])
 
-	// User-type properties: the Title we added shows up via the
+	// User-type properties: the Title + Year we added show up via the
 	// type's `defs` dataset.
 	movieProps, err := sp.Types().Properties(ctx, typeId)
 	require.NoError(t, err)
-	require.Len(t, movieProps, 1)
-	assert.Equal(t, titleProp, movieProps[0].Id)
-	assert.Equal(t, "Title", movieProps[0].Name)
-	assert.Equal(t, space.PropertyKindString, movieProps[0].Kind)
+	require.Len(t, movieProps, 2)
+	movieById := map[string]space.PropertyDef{}
+	for _, d := range movieProps {
+		movieById[d.Id] = d
+	}
+	assert.Equal(t, "Title", movieById[titleProp].Name)
+	assert.Equal(t, space.PropertyKindString, movieById[titleProp].Kind)
+	assert.Equal(t, "Year", movieById[plainProp].Name)
 
 	// Get on a regular object id (not a type) returns ErrNotFound.
 	_, err = sp.Types().Get(ctx, objectId)

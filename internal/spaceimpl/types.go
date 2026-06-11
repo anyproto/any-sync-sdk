@@ -123,6 +123,13 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	if draft.XKey != "" {
 		payload.Set(typetype.FieldXKey, arena.NewString(draft.XKey))
 	}
+	if len(draft.Meta) > 0 {
+		metaObj := arena.NewObject()
+		for k, v := range draft.Meta {
+			metaObj.Set(k, arena.NewString(v))
+		}
+		payload.Set(typetype.FieldMeta, metaObj)
+	}
 
 	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
 	if err != nil {
@@ -451,6 +458,17 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 	}
 	if k, ok := schema.ParseKind(v.GetString(typetype.FieldKind)); ok {
 		def.Kind = schemaKindToPropertyKind(k)
+	}
+	if metaObj := v.GetObject(typetype.FieldMeta); metaObj != nil {
+		meta := map[string]string{}
+		metaObj.Visit(func(key []byte, val *anyenc.Value) {
+			if val.Type() == anyenc.TypeString {
+				meta[string(key)] = string(val.GetStringBytes())
+			}
+		})
+		if len(meta) > 0 {
+			def.Meta = meta
+		}
 	}
 	return def
 }

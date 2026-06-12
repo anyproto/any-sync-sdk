@@ -67,6 +67,19 @@ type Space interface {
 	// like "find every Movie with Title containing X".
 	QueryObjects() Query
 
+	// Aggregate builds a MongoDB-style aggregation pipeline against
+	// (objectId, dataset) — the aggregation sibling of Query. The
+	// pipeline is accepted in the same forms Query.Filter takes a
+	// condition: a JSON string, *fastjson.Value, *anyenc.Value,
+	// marshaled-anyenc []byte, or any JSON-marshalable Go value.
+	// Snapshot-only. See Agg.
+	Aggregate(objectId, dataset string, pipeline any) Agg
+
+	// AggregateObjects builds an aggregation pipeline against the
+	// per-space `objects` collection — the aggregation sibling of
+	// QueryObjects. See Agg.
+	AggregateObjects(pipeline any) Agg
+
 	// Datasets returns the JSON-Schema description of every dataset in
 	// this space — field names, value shapes, and per-field class
 	// (synced / derived / local) via the `x-scope` keyword. For

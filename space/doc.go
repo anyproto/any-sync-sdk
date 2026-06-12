@@ -5,6 +5,7 @@
 //   - ACL                   — invite, accept/decline, change perms, ownership
 //   - Members               — members system collection
 //   - Query, Subscription   — read + event flow over any-store
+//   - Agg                   — MongoDB-style aggregation pipelines (snapshot-only)
 //   - ModifyBatch           — writes (CRDT ops) returning VersionId
 //   - TypesAPI              — type objects and property definitions
 //   - PropertiesAPI         — per-scope property writes (base/account/device)

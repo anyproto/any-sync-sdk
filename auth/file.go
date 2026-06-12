@@ -48,6 +48,14 @@ var ErrInvalidMnemonic = errors.New("invalid mnemonic")
 // set but an existing wallet file stores a different phrase.
 var ErrMnemonicMismatch = errors.New("wallet exists with a different mnemonic")
 
+// ErrPasskeyRequired is returned when the wallet file is encrypted but
+// no passkey was supplied.
+var ErrPasskeyRequired = errors.New("wallet is encrypted but no passkey provided")
+
+// ErrWrongPasskey is returned when the supplied passkey fails to
+// decrypt the wallet (or the file is corrupted).
+var ErrWrongPasskey = errors.New("decrypt wallet: wrong passkey or corrupted file")
+
 // FileProvider is a Provider backed by a JSON wallet file on disk.
 // Generated on first use, loaded on subsequent launches. Exposes
 // Mnemonic so the caller can display it once on first generation for
@@ -196,7 +204,7 @@ func loadWallet(path, passkey string) (*wallet, error) {
 	var p walletPayload
 	if env.Crypt != nil {
 		if passkey == "" {
-			return nil, errors.New("wallet is encrypted but no passkey provided")
+			return nil, ErrPasskeyRequired
 		}
 		plain, err := decryptPayload(env.Crypt, passkey)
 		if err != nil {
@@ -310,7 +318,7 @@ func decryptPayload(c *walletCrypt, passkey string) (walletPayload, error) {
 	}
 	pt, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {
-		return walletPayload{}, errors.New("decrypt wallet: wrong passkey or corrupted file")
+		return walletPayload{}, ErrWrongPasskey
 	}
 
 	var p walletPayload

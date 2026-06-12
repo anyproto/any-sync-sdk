@@ -166,6 +166,18 @@ func (s *spaceImpl) QueryObjects() space.Query {
 	return newSharedQuery(s.store)
 }
 
+// Aggregate builds an aggregation pipeline against (objectId,
+// dataset). Single-shot; call Space.Aggregate() again per read.
+func (s *spaceImpl) Aggregate(objectId, dataset string, pipeline any) space.Agg {
+	return newAgg(s.store, objectId, dataset, pipeline)
+}
+
+// AggregateObjects builds an aggregation pipeline against the
+// per-space `objects` collection.
+func (s *spaceImpl) AggregateObjects(pipeline any) space.Agg {
+	return newSharedAgg(s.store, pipeline)
+}
+
 // Datasets returns the JSON-Schema description of every dataset in this
 // space (discovery). See toDatasetSchemas.
 func (s *spaceImpl) Datasets() []space.DatasetSchema {

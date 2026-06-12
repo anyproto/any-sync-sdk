@@ -49,10 +49,15 @@ func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
 	return &queryImpl{store: store, objectId: objectId, dataset: dataset}
 }
 
+// sharedObjectsDataset is the sentinel dataset name that makes the
+// query/aggregation builders resolve to the per-space `objects`
+// collection instead of a per-object dataset.
+const sharedObjectsDataset = "<shared:objects>"
+
 // newSharedQuery builds a queryImpl that resolves to the per-space
 // `objects` collection on Iter — independent of any objectId.
 func newSharedQuery(store *spaceobjects.Store) *queryImpl {
-	return &queryImpl{store: store, dataset: "<shared:objects>"}
+	return &queryImpl{store: store, dataset: sharedObjectsDataset}
 }
 
 // Filter parses the caller-supplied condition eagerly via
@@ -295,7 +300,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 
 	// Resolve scope from the original builder shape.
 	var scope subscribe.Scope
-	if q.dataset == "<shared:objects>" {
+	if q.dataset == sharedObjectsDataset {
 		scope = subscribe.Scope{Shared: true}
 	} else {
 		scope = subscribe.Scope{Shared: false, ObjectId: q.objectId, Dataset: q.dataset}
@@ -501,14 +506,23 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 // accessor and isn't worth it — querying a typo dataset name already
 // silently returns empty in any-store too.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
-	if q.dataset == "<shared:objects>" {
-		return q.store.SharedObjects(ctx)
+	return resolveCollection(ctx, q.store, q.objectId, q.dataset)
+}
+
+// resolveCollection is the dataset → any-store collection lookup
+// shared by the query and aggregation builders. dataset
+// "<shared:objects>" selects the per-space objects collection;
+// anything else goes through the object's controller. See
+// queryImpl.collection for the (nil, nil) empty-dataset contract.
+func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (anystore.Collection, error) {
+	if dataset == sharedObjectsDataset {
+		return store.SharedObjects(ctx)
 	}
-	obj, err := q.store.Get(ctx, q.objectId)
+	obj, err := store.Get(ctx, objectId)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
-	return obj.Controller().Collection(ctx, q.dataset), nil
+	return obj.Controller().Collection(ctx, dataset), nil
 }
 
 // emptyIterator is the Iter() result when the dataset has no

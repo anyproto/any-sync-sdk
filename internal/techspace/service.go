@@ -473,39 +473,67 @@ func (s *Service) Close(_ context.Context) error {
 	return nil
 }
 
-// SpaceRegistry adapter — the tech-space owns one tree (the index).
-// Anything else routes back through the app's broader SpaceRegistry
-// (set later when regular spaces gain their own one).
+// SpaceRegistry adapter — the tech-space hosts the index object plus
+// one account-values carrier object per target space, all served by
+// the same raw Store. Every tech-space tree routes through it so the
+// listener-bound, deferred-updater, cold-restored object is what the
+// tree syncer touches.
 
 var ErrSpaceRegistryUnknown = errors.New("techspace: unknown (spaceId, treeId)")
 
-// GetTree resolves the index tree via the Store's resident object.
-// Anything else under the tech space is unknown. The Store returns the
-// listener-bound, deferred-updater, cold-restored object (reloading it
-// if ocache evicted), so the synctree's AddRawChangesFromPeer path
-// fires Update → replayLocked and inbound index changes project live —
-// the cold-sync path that TestE2E_ColdSyncSameKey covers.
+// GetTree resolves any tech-space tree via the Store. The Store
+// returns the listener-bound, deferred-updater, cold-restored object
+// (reloading it if ocache evicted), so the synctree's
+// AddRawChangesFromPeer path fires Update → replayLocked and inbound
+// changes project live — for the index object (the cold-sync path
+// TestE2E_ColdSyncSameKey covers) AND the account-values carriers
+// (TestE2E_AccountScopeSync): restricting this to the index id used to
+// silently skip carrier trees in every headsync round, so account
+// values never crossed devices.
+//
+// Accepting arbitrary tree ids is safe: the tech space is owner-only —
+// every tree in it is this account's, and the raw Store registers the
+// full tech handler set (spaces/profile/account_values) on every
+// controller. An id any-sync can't resolve fails inside Store.Get and
+// the syncer skips it.
 func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
-	if spaceId != s.spaceId || treeId != s.indexId {
+	if spaceId != s.spaceId {
 		return nil, ErrSpaceRegistryUnknown
 	}
-	obj, err := s.indexObj(ctx)
+	obj, err := s.store.Get(ctx, treeId)
 	if err != nil {
 		return nil, err
 	}
 	tree := obj.Tree()
 	if tree == nil {
-		return nil, fmt.Errorf("techspace: index tree not bound")
+		return nil, fmt.Errorf("techspace: tree %s not bound", treeId)
 	}
 	return tree, nil
 }
 
-func (s *Service) PutTree(_ context.Context, _ string, _ treestorage.TreeStorageCreatePayload) error {
-	return ErrSpaceRegistryUnknown
+// PutTree binds a remote-delivered tech-space tree payload — a carrier
+// created by another of the account's devices that this device hasn't
+// derived yet. (The index object is always derived locally at Open, so
+// it never arrives this way, but accepting it is harmless: Derive and
+// PutTree converge on the same deterministic tree.)
+func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {
+	if spaceId != s.spaceId {
+		return ErrSpaceRegistryUnknown
+	}
+	_, err := s.store.PutTreeFromPayload(ctx, payload)
+	return err
 }
 
 func (s *Service) MarkTreeDeleted(_ context.Context, _, _ string) error { return nil }
 
-func (s *Service) DeleteTree(_ context.Context, _, _ string) error {
-	return ErrSpaceRegistryUnknown
+// DeleteTree handles the deletion-manager's per-tree cleanup — fired
+// for carrier objects dropped on space leave/delete.
+func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error {
+	if spaceId != s.spaceId {
+		return ErrSpaceRegistryUnknown
+	}
+	if treeId == s.indexId {
+		return ErrSpaceRegistryUnknown // the index tree is never deleted
+	}
+	return s.store.DeleteTree(ctx, treeId)
 }

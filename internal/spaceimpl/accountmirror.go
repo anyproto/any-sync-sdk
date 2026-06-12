@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/app/logger"
+	"go.uber.org/zap"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
@@ -35,7 +38,13 @@ import (
 //     (same pattern as spaceIndexWatcher). Sub close (overflow /
 //     shutdown) ends the loop — the next space load re-mirrors;
 //   - target row events: row created ⇒ replay that object's pending
-//     carrier record; row tombstoned ⇒ GC its carrier records.
+//     carrier record; row tombstoned ⇒ GC its carrier records;
+//   - a periodic tick: the retry for everything no event covers —
+//     chiefly carrier values whose property DEFINITIONS hadn't synced
+//     yet when the other triggers fired (the Hole-A skip is "retried
+//     by the next re-mirror"; the tick IS that re-mirror), and it
+//     keeps the carrier object resident/caught-up between headsync
+//     rounds.
 //
 // Mirror applies are InjectedSet batches grouped by carrier version —
 // never a single max-version claim — and always go through the
@@ -50,10 +59,22 @@ type accountMirror struct {
 	cancelRowEvts func()
 	rowEvts       chan spaceobjects.RowEvent
 
+	tick time.Duration
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
+
+// mirrorTickInterval is the periodic reconcile cadence — the catch-all
+// retry for triggers no event covers (late-syncing property
+// definitions, transient tree-load failures). Idempotent and cheap
+// when nothing changed (Diff returns nil per record).
+const mirrorTickInterval = 30 * time.Second
+
+// mirrorLog is the account mirror's named logger — wired into the same
+// any-sync logging backend the rest of the process uses.
+var mirrorLog = logger.NewNamed("sdk.accountmirror")
 
 // newAccountMirror derives the carrier (idempotent), subscribes to its
 // dataset, runs the initial re-mirror, and starts the loops. Returns
@@ -62,8 +83,12 @@ type accountMirror struct {
 func newAccountMirror(ctx context.Context, store *spaceobjects.Store, tsp *techspace.Service, spaceId string) *accountMirror {
 	carrier, err := tsp.AccountValuesObject(ctx, spaceId)
 	if err != nil {
+		mirrorLog.Warn("carrier derive failed; mirror not started",
+			zap.String("spaceId", spaceId), zap.Error(err))
 		return nil
 	}
+	mirrorLog.Debug("mirror starting",
+		zap.String("spaceId", spaceId), zap.String("carrierId", carrier.Id()))
 	sub, _ := tsp.Store().SubEngine().Subscribe(subscribe.SubConfig{
 		Scope: subscribe.Scope{
 			ObjectId: carrier.Id(),
@@ -76,6 +101,7 @@ func newAccountMirror(ctx context.Context, store *spaceobjects.Store, tsp *techs
 		tsp:     tsp,
 		spaceId: spaceId,
 		sub:     sub,
+		tick:    mirrorTickInterval,
 		rowEvts: make(chan spaceobjects.RowEvent, 64),
 		stopCh:  make(chan struct{}),
 	}
@@ -90,9 +116,10 @@ func newAccountMirror(ctx context.Context, store *spaceobjects.Store, tsp *techs
 	})
 
 	m.reconcileAll(ctx)
-	m.wg.Add(2)
+	m.wg.Add(3)
 	go m.carrierLoop()
 	go m.rowLoop()
+	go m.tickLoop()
 	return m
 }
 
@@ -129,6 +156,21 @@ func (m *accountMirror) carrierLoop() {
 	}
 }
 
+// tickLoop is the periodic catch-all reconcile (see mirrorTickInterval).
+func (m *accountMirror) tickLoop() {
+	defer m.wg.Done()
+	t := time.NewTicker(m.tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-t.C:
+			m.reconcileAll(context.Background())
+		}
+	}
+}
+
 // rowLoop serves target-row lifecycle events: created rows replay
 // their pending carrier record, tombstoned rows GC their carrier
 // records in tech space.
@@ -157,7 +199,9 @@ func (m *accountMirror) rowLoop() {
 func (m *accountMirror) reconcileAll(ctx context.Context) {
 	resolve := m.newResolver()
 	var gc []string
-	_ = m.tsp.IterAccountValues(ctx, m.spaceId, func(rec *anyenc.Value) error {
+	records := 0
+	if err := m.tsp.IterAccountValues(ctx, m.spaceId, func(rec *anyenc.Value) error {
+		records++
 		objectId, dataset, _, ok := accountvalues.ParseKey(rec.GetString(crdt.IdField))
 		if !ok || dataset != properties.Dataset {
 			return nil // v1 mirrors the objects rows only
@@ -167,7 +211,10 @@ func (m *accountMirror) reconcileAll(ctx context.Context) {
 			gc = append(gc, objectId)
 		}
 		return nil
-	})
+	}); err != nil {
+		mirrorLog.Warn("reconcile iterate failed", zap.String("spaceId", m.spaceId), zap.Error(err))
+	}
+	mirrorLog.Debug("reconcile pass", zap.String("spaceId", m.spaceId), zap.Int("carrierRecords", records))
 	for _, objectId := range gc {
 		_ = m.tsp.DeleteAccountValuesForObject(ctx, m.spaceId, objectId)
 	}
@@ -212,10 +259,12 @@ func (m *accountMirror) mirrorRecord(ctx context.Context, objectId string, carri
 	}
 	obj, err := m.store.Get(ctx, objectId)
 	if err != nil {
+		mirrorLog.Warn("target object load failed; will retry",
+			zap.String("spaceId", m.spaceId), zap.String("objectId", objectId), zap.Error(err))
 		return mirrorDone // tree unavailable — next reconcile retries
 	}
 	for _, b := range batches {
-		_, _ = obj.InjectedSet(ctx, crdt.Change{
+		if _, ierr := obj.InjectedSet(ctx, crdt.Change{
 			Dataset:     properties.Dataset,
 			DataVersion: properties.HandlerVersion,
 			VersionId:   b.VersionId,
@@ -223,7 +272,15 @@ func (m *accountMirror) mirrorRecord(ctx context.Context, objectId string, carri
 				Id:  objectId,
 				Ops: b.Ops,
 			}},
-		})
+		}); ierr != nil {
+			mirrorLog.Warn("injected apply failed",
+				zap.String("spaceId", m.spaceId), zap.String("objectId", objectId),
+				zap.String("versionId", string(b.VersionId)), zap.Error(ierr))
+		} else {
+			mirrorLog.Debug("injected apply",
+				zap.String("spaceId", m.spaceId), zap.String("objectId", objectId),
+				zap.String("versionId", string(b.VersionId)), zap.Int("ops", len(b.Ops)))
+		}
 	}
 	return mirrorDone
 }

@@ -524,16 +524,33 @@ func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestora
 	return err
 }
 
-func (s *Service) MarkTreeDeleted(_ context.Context, _, _ string) error { return nil }
+// MarkTreeDeleted is the soft-delete hook fired when the settings tree
+// announces a deletion — for the tech space that means a carrier
+// object dropped by another of the account's devices. Same contract as
+// the regular-space registry: drop the cached object so reads/mirrors
+// stop touching it; the storage delete follows via DeleteTree.
+// Unconditional like the regular path — dropping the index object
+// would merely force a reload on next use.
+func (s *Service) MarkTreeDeleted(_ context.Context, spaceId, treeId string) error {
+	if spaceId == s.spaceId && s.store != nil {
+		s.store.Drop(treeId)
+	}
+	return nil
+}
 
 // DeleteTree handles the deletion-manager's per-tree cleanup — fired
-// for carrier objects dropped on space leave/delete.
+// for carrier objects dropped on space leave/delete. Same contract as
+// the regular-space registry, with ONE deliberate exception: the index
+// tree is refused. It is the account's space list — storage-deleting
+// it is unrecoverable locally (the deterministic re-derive hits the
+// deleted-storage mark) and no SDK path ever legitimately requests it,
+// so a request can only be a bug we'd rather surface than obey.
 func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error {
 	if spaceId != s.spaceId {
 		return ErrSpaceRegistryUnknown
 	}
 	if treeId == s.indexId {
-		return ErrSpaceRegistryUnknown // the index tree is never deleted
+		return fmt.Errorf("techspace: refusing to delete the index tree")
 	}
 	return s.store.DeleteTree(ctx, treeId)
 }

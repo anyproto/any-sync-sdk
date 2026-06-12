@@ -113,3 +113,59 @@ func TestApply_LocalSetIsolatedFromSynced(t *testing.T) {
 	assert.Equal(t, "Beta", rec.GetString("name"))
 	assert.Equal(t, "offloaded", rec.GetString("status"))
 }
+
+// ----------------------------------------------------------------------------
+// DynamicScopeByKey — per-key-scoped dynamic datasets (the objects dataset)
+// ----------------------------------------------------------------------------
+
+// newScopeByKeyController declares a Dynamic dataset with
+// DynamicScopeByKey plus one declared derived field — the objects
+// dataset's shape: undeclared heads (`any`, typeIds) carry per-property
+// scopes the controller can't see; declared fields stay enforced.
+func newScopeByKeyController(t *testing.T) *Controller {
+	t.Helper()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	ds := schema.Dataset{Dynamic: true, Fields: []schema.Field{
+		{Id: "createdAt", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
+	}}
+	st, err := NewController(ctx, "obj1", db,
+		HandlerReg{Name: testDS, Handler: DefaultHandler{}, Schema: ds, DynamicScopeByKey: true})
+	require.NoError(t, err)
+	return st
+}
+
+// A Local change may write UNDECLARED heads on a DynamicScopeByKey
+// dataset — the per-key scope is the dataset layer's responsibility
+// (Properties.Set routing + handler registry validation), not the
+// controller's head-level check.
+func TestApply_ScopeByKeyAllowsLocalOnUndeclared(t *testing.T) {
+	st := newScopeByKeyController(t)
+	arena := &anyenc.Arena{}
+
+	// Seed the record with a synced-route write so the local one
+	// modifies an existing row (mirrors the bootstrap-then-Set flow).
+	require.NoError(t, st.ApplyChange(ctx, makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"any", "name"}, Payload: arena.NewString("shared")})))
+
+	ch := makeUpsert("v2", "r1",
+		Op{Type: OpSet, Path: []string{"someType", "pinProp"}, Payload: arena.NewTrue()})
+	ch.Local = true
+	require.NoError(t, st.ApplyChange(ctx, ch))
+
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec)
+	assert.Equal(t, "shared", rec.GetString("any", "name"))
+	assert.True(t, rec.GetBool("someType", "pinProp"))
+}
+
+// Declared fields keep full enforcement even with DynamicScopeByKey.
+func TestApply_ScopeByKeyKeepsDeclaredEnforcement(t *testing.T) {
+	st := newScopeByKeyController(t)
+	arena := &anyenc.Arena{}
+
+	err := st.ApplyChange(ctx, makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"createdAt"}, Payload: arena.NewNumberFloat64(1)}))
+	require.Error(t, err, "derived field stays handler-only")
+}

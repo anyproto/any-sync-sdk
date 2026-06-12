@@ -867,7 +867,12 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	shared := crdt.SharedCollections{properties.Dataset: coll}
 	regs := []crdt.HandlerReg{
-		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema()},
+		// DynamicScopeByKey: undeclared heads (`any`, typeIds) carry
+		// per-PROPERTY scopes resolved from the type registry — the
+		// handler enforces them on the DAG route, Properties.Set on
+		// the local/account routes. Declared derived heads (author /
+		// createdAt / spaceId) stay controller-enforced.
+		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true},
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
 		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},

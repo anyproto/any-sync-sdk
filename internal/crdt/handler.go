@@ -122,11 +122,21 @@ type HandlerReg struct {
 	Indexes []anystore.IndexInfo
 	// Schema is the dataset's required, JSON-Schema-compatible field
 	// declaration. Each field carries a class (Scope: synced/derived/
-	// local) the apply path enforces: derived fields are handler-only,
-	// local fields never sync, and a dataset that isn't Dynamic rejects
-	// undeclared fields. Free-form datasets (shortIds, the per-type
-	// `objects` namespace) set Schema.Dynamic.
+	// local/account) the apply path enforces: derived fields are
+	// handler-only, local fields never sync, and a dataset that isn't
+	// Dynamic rejects undeclared fields. Free-form datasets (shortIds,
+	// the per-type `objects` namespace) set Schema.Dynamic.
 	Schema schema.Dataset
+
+	// DynamicScopeByKey marks a Dynamic dataset whose UNDECLARED field
+	// heads carry per-key scopes owned by the dataset's own layer (the
+	// per-space `objects` dataset: scope lives on the property
+	// definition, resolved by the writer's routing and the handler's
+	// registry validation — the controller can't see second path
+	// segments). For such datasets the head-level local/synced
+	// direction check is skipped for undeclared heads; DECLARED fields
+	// (e.g. the derived author/createdAt/spaceId) stay fully enforced.
+	DynamicScopeByKey bool
 }
 
 // LocalPreValidator is an optional interface a Handler may implement

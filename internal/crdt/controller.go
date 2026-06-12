@@ -126,6 +126,10 @@ type Controller struct {
 	// RecordChange.Id), so all objects in the space project into one
 	// row each. Used for the per-space `objects` values collection.
 	shared    map[string]struct{}
+	// scopeByKey marks datasets whose undeclared field heads carry
+	// per-key scopes (HandlerReg.DynamicScopeByKey).
+	scopeByKey map[string]bool
+
 	metaColl    anystore.Collection // _meta — persisted maxAddSeq/maxApplySeq + handler versions
 	maxAddSeq   uint64
 	maxApplySeq uint64
@@ -262,6 +266,12 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 	c.versions[name] = version
 	c.indexes[name] = reg.Indexes
 	c.schemas[name] = reg.Schema
+	if reg.DynamicScopeByKey {
+		if c.scopeByKey == nil {
+			c.scopeByKey = make(map[string]bool)
+		}
+		c.scopeByKey[name] = true
+	}
 	// Per-object collections are opened lazily — on first write
 	// (creates) or on first read (no-create). This keeps unwritten
 	// datasets (e.g. typetype's `properties` / `shortIds` on regular
@@ -637,13 +647,14 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// This keeps the classes disjoint, so a local field's locally-allocated
 	// version never competes with a synced field's any-sync OrderId.
 	ds := c.schemas[ch.Dataset]
+	scopeByKey := c.scopeByKey[ch.Dataset]
 	for i, rc := range ch.Records {
 		for _, op := range rc.Ops {
 			if err := validateOpPaths(op); err != nil {
 				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: %w", resolvedIds[i], op.Type, err))
 			}
 			for _, field := range opFieldHeads(op) {
-				if err := classifyFieldWrite(ds, field, ch.Local); err != nil {
+				if err := classifyFieldWrite(ds, field, ch.Local, scopeByKey); err != nil {
 					return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s field %q: %w", resolvedIds[i], op.Type, field, err))
 				}
 			}
@@ -733,11 +744,20 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 // op writing `field` (a top-level field name) on a change whose Local
 // flag is `isLocal`. Reserved fields (id, _*) are already rejected by
 // validateOpPaths, so this only sees user-facing field heads.
-func classifyFieldWrite(ds schema.Dataset, field string, isLocal bool) error {
+//
+// scopeByKey (HandlerReg.DynamicScopeByKey) exempts UNDECLARED heads
+// from the direction check: those datasets carry per-key scopes the
+// controller can't see (the objects dataset's per-property scope),
+// enforced by the dataset's handler (DAG route) and writer layer
+// (local/account routes). Declared heads stay fully enforced.
+func classifyFieldWrite(ds schema.Dataset, field string, isLocal bool, scopeByKey bool) error {
 	sc, declared := ds.ScopeOf(field)
 	if !declared {
 		if !ds.Dynamic {
 			return fmt.Errorf("undeclared field on a non-dynamic dataset")
+		}
+		if scopeByKey {
+			return nil // per-key scope — owned by the dataset layer
 		}
 		sc = schema.ScopeSynced // dynamic datasets default undeclared fields to synced
 	}
@@ -748,6 +768,8 @@ func classifyFieldWrite(ds schema.Dataset, field string, isLocal bool) error {
 		if !isLocal {
 			return fmt.Errorf("local (device-only) field is not writable by a synced change")
 		}
+	case schema.ScopeAccount:
+		return fmt.Errorf("account field is not writable by this route (tech-space mirror only)")
 	default: // ScopeSynced
 		if isLocal {
 			return fmt.Errorf("synced field is not writable by a local change")

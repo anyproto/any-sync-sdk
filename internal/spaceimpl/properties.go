@@ -18,10 +18,9 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// propertiesAPI implements space.PropertiesAPI. The synced route is
-// live; account and local routes land with their transports (tech-
-// space carrier / LocalSet wiring — see
-// docs/scoped-properties-proposal.md slices 3 and 4).
+// propertiesAPI implements space.PropertiesAPI. The synced and local
+// routes are live; the account route lands with its tech-space carrier
+// (docs/scoped-properties-proposal.md slice 4).
 type propertiesAPI struct {
 	parent *spaceImpl
 }
@@ -78,7 +77,7 @@ func (p *propertiesAPI) Set(ctx context.Context, objectId, typeId string, patch 
 		return space.ModifyResult{}, errors.New("propertiesAPI: empty patch")
 	}
 
-	route, err := resolveRoute(p.parent.store.Registry(), typeId, patch)
+	route, props, err := resolveRoute(p.parent.store.Registry(), typeId, patch)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -87,7 +86,7 @@ func (p *propertiesAPI) Set(ctx context.Context, objectId, typeId string, patch 
 	case schema.ScopeSynced:
 		return p.setSynced(ctx, objectId, typeId, patch)
 	case schema.ScopeLocal:
-		return space.ModifyResult{}, errors.New("propertiesAPI: local-scoped writes not implemented yet (scoped-properties slice 3)")
+		return p.setLocal(ctx, objectId, typeId, patch, props)
 	case schema.ScopeAccount:
 		return space.ModifyResult{}, errors.New("propertiesAPI: account-scoped writes not implemented yet (scoped-properties slice 4)")
 	}
@@ -101,10 +100,14 @@ func (p *propertiesAPI) Set(ctx context.Context, objectId, typeId string, patch 
 // PreValidate then owns the precise rejection). A mix of resolved
 // scopes is a caller error, reported with the per-scope key split so
 // the caller can re-issue one call per scope.
-func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (schema.Scope, error) {
+//
+// Also returns the type's declared properties (nil when the type is
+// unresolvable) so the non-synced routes — which skip the dataset
+// handler — can run the same strict validation writer-side.
+func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (schema.Scope, []types.PropInfo, error) {
 	props, ok := reg.PropsOf(typeId)
 	if !ok {
-		return schema.ScopeSynced, nil
+		return schema.ScopeSynced, nil, nil
 	}
 	byId := make(map[string]types.PropInfo, len(props))
 	for _, pi := range props {
@@ -121,9 +124,9 @@ func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (sche
 	}
 	if len(byScope) <= 1 {
 		for sc := range byScope {
-			return sc, nil
+			return sc, props, nil
 		}
-		return schema.ScopeSynced, nil
+		return schema.ScopeSynced, props, nil
 	}
 	parts := make([]string, 0, len(byScope))
 	for sc, keys := range byScope {
@@ -131,7 +134,7 @@ func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (sche
 		parts = append(parts, fmt.Sprintf("%s: [%s]", sc, strings.Join(keys, ", ")))
 	}
 	sort.Strings(parts)
-	return 0, fmt.Errorf("propertiesAPI: patch spans multiple scopes — issue one Set per scope (%s)", strings.Join(parts, "; "))
+	return 0, nil, fmt.Errorf("propertiesAPI: patch spans multiple scopes — issue one Set per scope (%s)", strings.Join(parts, "; "))
 }
 
 // setSynced is the synced route: a multi-field $set in a single change
@@ -170,6 +173,66 @@ func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, 
 	})
 	if err != nil {
 		return space.ModifyResult{}, err
+	}
+	return modifyResultFromWrite(res), nil
+}
+
+// setLocal is the local (device-only) route: a strict-mode LocalSet on
+// the object's row — no DAG, no sync, versions minted by the local
+// lexid allocator. The dataset handler doesn't run on local writes, so
+// the strict validation the synced route gets from PreValidate happens
+// here, writer-side: every key must be a declared local-scoped
+// property and the value's kind must match.
+//
+// Strict (non-upsert): the row is born by the object's bootstrap
+// create, so a missing row means the caller has the wrong object id —
+// better a clear error than a local-domain creation marker.
+func (p *propertiesAPI) setLocal(ctx context.Context, objectId, typeId string, patch map[string]any, props []types.PropInfo) (space.ModifyResult, error) {
+	byId := make(map[string]types.PropInfo, len(props))
+	for _, pi := range props {
+		byId[pi.Id] = pi
+	}
+	arena := &anyenc.Arena{}
+	multi := arena.NewObject()
+	for propId, val := range patch {
+		info, found := byId[propId]
+		if !found {
+			return space.ModifyResult{}, &properties.ValidationError{
+				Reason: properties.ReasonUnknownProperty, TypeId: typeId, PropId: propId, Known: props,
+			}
+		}
+		v, err := goToAnyenc(arena, val)
+		if err != nil {
+			return space.ModifyResult{}, fmt.Errorf("propertiesAPI: convert %s.%s: %w", typeId, propId, err)
+		}
+		if got := schema.KindOf(v); got != info.Kind {
+			return space.ModifyResult{}, &properties.ValidationError{
+				Reason: properties.ReasonKindMismatch, TypeId: typeId, PropId: propId, PropName: info.Name,
+				Expected: info.Kind, Got: got,
+			}
+		}
+		multi.Set(typeId+"."+propId, v)
+	}
+
+	obj, err := p.parent.store.Get(ctx, objectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	res, err := obj.LocalSet(ctx, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: properties.HandlerVersion,
+		Records: []crdt.RecordChange{{
+			Id:  objectId,
+			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
+		}},
+	})
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	for _, rej := range res.Rejections {
+		if errors.Is(rej.Err, crdt.ErrStrictSkipAbsent) {
+			return space.ModifyResult{}, fmt.Errorf("propertiesAPI: object %s has no property record (not created in this space?)", objectId)
+		}
 	}
 	return modifyResultFromWrite(res), nil
 }

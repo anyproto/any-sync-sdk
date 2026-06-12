@@ -170,17 +170,26 @@ delete" (which would race the schema-sync window):
   (content-addressed ids), and the object-delete / space-leave paths
   reclaim them eventually.
 
-## Device route (slice 3)
+## Local route (slice 3 — landed)
 
-Existing `Object.LocalSet` + `NextLocalVersion`, gated per-prop instead
-of per-schema-field (the `objects` dataset's `classifyFieldWrite` can
-only see top-level heads; per-prop scope checks live writer-side and in
-the handler). `device_variants` sidecar is NOT needed in this model? —
-it is: local values live in any-store rows that DAG rebuild wipes.
-Decision kept from expert review: **local-scope source of truth is a
-small local sidecar collection** (`(objectId, dataset, recordId) →
-{values, vers}`); the row value is a materialization; rebuild re-injects
-sidecar + re-mirrors account state after replaying the DAG.
+`Properties.Set` routes local-scoped patches through `Object.LocalSet`
+(strict mode — the row must exist; no local-domain creation markers).
+Writer-side strict validation (unknown property / kind) replaces the
+handler pass local writes skip. The controller's head-level class check
+gets `HandlerReg.DynamicScopeByKey`: undeclared heads on the objects
+dataset carry per-property scopes the controller can't see, so the
+direction check is skipped for them (declared derived heads stay
+enforced); per-prop enforcement lives in the handler (DAG route) and
+`Set` (local/account routes).
+
+**Sidecar deferred.** The expert-recommended local sidecar collection
+(`(objectId, dataset, recordId) → {values, vers}` as the durable source
+of truth, row value a materialization) only matters for the
+wipe-and-rebuild re-index path — machinery that does not exist yet
+(docs/08 is all open questions). Local values are durable in any-store
+today. The sidecar lands WITH the rebuild machinery; until then a
+handler-version-bump wipe (if implemented naively) must not be shipped
+without it.
 
 ## applySeq (slice 2) — consumer-feed watermark
 

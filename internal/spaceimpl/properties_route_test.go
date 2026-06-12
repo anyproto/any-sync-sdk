@@ -35,7 +35,7 @@ func TestResolveRoute_SingleScope(t *testing.T) {
 		{"local", map[string]any{"pin": true}, schema.ScopeLocal},
 		{"account multi-key", map[string]any{"read": true}, schema.ScopeAccount},
 	} {
-		got, err := resolveRoute(reg, "movie", tc.patch)
+		got, _, err := resolveRoute(reg, "movie", tc.patch)
 		require.NoError(t, err, tc.name)
 		assert.Equal(t, tc.want, got, tc.name)
 	}
@@ -46,24 +46,24 @@ func TestResolveRoute_SingleScope(t *testing.T) {
 func TestResolveRoute_UnresolvedFallsToSynced(t *testing.T) {
 	reg := routeRegistry()
 
-	got, err := resolveRoute(reg, "movie", map[string]any{"ghost": 1})
+	got, _, err := resolveRoute(reg, "movie", map[string]any{"ghost": 1})
 	require.NoError(t, err)
 	assert.Equal(t, schema.ScopeSynced, got)
 
-	got, err = resolveRoute(reg, "unknown-type", map[string]any{"title": "x"})
+	got, _, err = resolveRoute(reg, "unknown-type", map[string]any{"title": "x"})
 	require.NoError(t, err)
 	assert.Equal(t, schema.ScopeSynced, got)
 
 	// Typed-nil registry (raw-mode store) — bring-up passthrough.
 	var nilReg *types.LiveRegistry
-	got, err = resolveRoute(nilReg, "movie", map[string]any{"title": "x"})
+	got, _, err = resolveRoute(nilReg, "movie", map[string]any{"title": "x"})
 	require.NoError(t, err)
 	assert.Equal(t, schema.ScopeSynced, got)
 }
 
 func TestResolveRoute_MixedScopesRejected(t *testing.T) {
 	reg := routeRegistry()
-	_, err := resolveRoute(reg, "movie", map[string]any{"title": "x", "read": true})
+	_, _, err := resolveRoute(reg, "movie", map[string]any{"title": "x", "read": true})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "spans multiple scopes")
 	assert.Contains(t, err.Error(), "synced: [title]")
@@ -75,7 +75,7 @@ func TestResolveRoute_MixedScopesRejected(t *testing.T) {
 // the precise unknown_property error).
 func TestResolveRoute_UnresolvedRidesResolvedRoute(t *testing.T) {
 	reg := routeRegistry()
-	got, err := resolveRoute(reg, "movie", map[string]any{"read": true, "ghost": 1})
+	got, _, err := resolveRoute(reg, "movie", map[string]any{"read": true, "ghost": 1})
 	require.NoError(t, err)
 	assert.Equal(t, schema.ScopeAccount, got)
 }

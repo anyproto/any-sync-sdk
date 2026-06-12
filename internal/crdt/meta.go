@@ -17,6 +17,7 @@ const MetaCollectionName = "_meta"
 
 const (
 	metaAddSeqKey          = "q"
+	metaApplySeqKey        = "as"
 	metaHandlerVersionsKey = "hv"
 	// metaSpaceIdKey scopes a per-object row to its space. The SDK DB is
 	// shared across spaces by default and AddSeq is per-space, so the
@@ -35,13 +36,21 @@ const (
 )
 
 // ensureMetaIndexes ensures the indexes the _meta collection needs.
-// Idempotent — safe to call on every open. The (sp, q) compound index
-// backs QueryChangedObjects' "objects in this space with AddSeq > N,
-// ordered by AddSeq" scan.
+// Idempotent — safe to call on every open. The (sp, as) compound index
+// backs QueryChangedObjects' "objects in this space with applySeq > N,
+// ordered by applySeq" scan; the legacy (sp, q) index stays for the
+// restore-watermark reads.
 func ensureMetaIndexes(ctx context.Context, coll anystore.Collection) error {
-	return coll.EnsureIndex(ctx, anystore.IndexInfo{
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "idx__meta_sp_q",
 		Fields: []string{metaSpaceIdKey, metaAddSeqKey},
+		Sparse: true,
+	}); err != nil {
+		return err
+	}
+	return coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Name:   "idx__meta_sp_as",
+		Fields: []string{metaSpaceIdKey, metaApplySeqKey},
 		Sparse: true,
 	})
 }
@@ -51,16 +60,17 @@ func SpaceMetaKey(spaceId string) string { return spaceMetaKeyPrefix + spaceId }
 
 // LoadMeta reads the per-object metadata from the _meta collection.
 // Returns zero values if the document doesn't exist yet.
-func LoadMeta(ctx context.Context, coll anystore.Collection, objectId string) (maxAddSeq uint64, handlerVersions map[string]int, err error) {
+func LoadMeta(ctx context.Context, coll anystore.Collection, objectId string) (maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int, err error) {
 	doc, findErr := coll.FindId(ctx, objectId)
 	if findErr != nil {
 		if errors.Is(findErr, anystore.ErrDocNotFound) {
-			return 0, nil, nil
+			return 0, 0, nil, nil
 		}
-		return 0, nil, findErr
+		return 0, 0, nil, findErr
 	}
 	v := doc.Value()
 	maxAddSeq = uint64(v.GetInt(metaAddSeqKey))
+	maxApplySeq = uint64(v.GetInt(metaApplySeqKey))
 	if hv := v.Get(metaHandlerVersionsKey); hv != nil && hv.Type() == anyenc.TypeObject {
 		handlerVersions = make(map[string]int)
 		obj, _ := hv.Object()
@@ -70,7 +80,7 @@ func LoadMeta(ctx context.Context, coll anystore.Collection, objectId string) (m
 			}
 		})
 	}
-	return maxAddSeq, handlerVersions, nil
+	return maxAddSeq, maxApplySeq, handlerVersions, nil
 }
 
 // PersistMeta writes per-object metadata to the _meta collection. Call
@@ -80,9 +90,12 @@ func LoadMeta(ctx context.Context, coll anystore.Collection, objectId string) (m
 // unset (unit tests, raw mode without a space). An unset row is
 // invisible to QueryChangedObjects, which is the accepted lazy-backfill
 // behaviour.
-func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string, maxAddSeq uint64, handlerVersions map[string]int, spaceId string) error {
+func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string, maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int, spaceId string) error {
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set(metaAddSeqKey, a.NewNumberInt(int(maxAddSeq)))
+		if maxApplySeq > 0 {
+			v.Set(metaApplySeqKey, a.NewNumberInt(int(maxApplySeq)))
+		}
 		if spaceId != "" {
 			v.Set(metaSpaceIdKey, a.NewString(spaceId))
 		}
@@ -99,29 +112,35 @@ func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string,
 	return err
 }
 
-// ObjectSeq pairs an object id with its persisted max AddSeq. Returned
-// by QueryChangedObjects for the consumer-side change-index feed.
+// ObjectSeq pairs an object id with its persisted max applySeq.
+// Returned by QueryChangedObjects for the consumer-side change-index
+// feed.
 type ObjectSeq struct {
 	ObjectId string
-	AddSeq   uint64
+	ApplySeq uint64
 }
 
 // QueryChangedObjects returns the objects in spaceId whose persisted max
-// AddSeq exceeds `since`, ordered by AddSeq ascending so the caller can
-// page by passing the last returned AddSeq as the next `since`. limit<=0
+// applySeq exceeds `since`, ordered ascending so the caller can page by
+// passing the last returned ApplySeq as the next `since`. limit<=0
 // means no cap. Backs the change-index "what changed" pull path.
+//
+// Keyed on applySeq (not AddSeq) so non-DAG mutations — the account
+// mirror's injected applies and device-local writes — surface to
+// consumers; legacy rows are seeded applySeq := addSeq by
+// BackfillApplySeq, keeping pre-existing cursors on one axis.
 //
 // The spaceId filter naturally excludes the `space:<id>` watermark rows
 // (no `sp` field) and per-object rows written before space-scoping.
 func QueryChangedObjects(ctx context.Context, coll anystore.Collection, spaceId string, since uint64, limit int) ([]ObjectSeq, error) {
 	filter, err := query.ParseCondition(map[string]any{
-		metaSpaceIdKey: spaceId,
-		metaAddSeqKey:  map[string]any{"$gt": int(since)},
+		metaSpaceIdKey:  spaceId,
+		metaApplySeqKey: map[string]any{"$gt": int(since)},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("crdt: build changed-objects filter: %w", err)
 	}
-	sort, err := query.ParseSort(metaAddSeqKey)
+	sort, err := query.ParseSort(metaApplySeqKey)
 	if err != nil {
 		return nil, fmt.Errorf("crdt: build changed-objects sort: %w", err)
 	}
@@ -143,27 +162,29 @@ func QueryChangedObjects(ctx context.Context, coll anystore.Collection, spaceId 
 		v := doc.Value()
 		out = append(out, ObjectSeq{
 			ObjectId: v.GetString(IdField),
-			AddSeq:   uint64(v.GetInt(metaAddSeqKey)),
+			ApplySeq: uint64(v.GetInt(metaApplySeqKey)),
 		})
 	}
 	return out, nil
 }
 
-// MaxObjectAddSeq returns the highest persisted per-object AddSeq in
-// spaceId — the current upper bound a change-index cursor can reach.
-// Returns 0 when the space has no scoped object rows yet.
-func MaxObjectAddSeq(ctx context.Context, coll anystore.Collection, spaceId string) (uint64, error) {
+// MaxObjectApplySeq returns the highest persisted per-object applySeq
+// in spaceId — the current upper bound a change-index cursor can reach,
+// and the ApplySeqAllocator's seed. Returns 0 when the space has no
+// scoped object rows yet. Run BackfillApplySeq first so legacy rows
+// participate.
+func MaxObjectApplySeq(ctx context.Context, coll anystore.Collection, spaceId string) (uint64, error) {
 	filter, err := query.ParseCondition(map[string]any{metaSpaceIdKey: spaceId})
 	if err != nil {
-		return 0, fmt.Errorf("crdt: build max-addseq filter: %w", err)
+		return 0, fmt.Errorf("crdt: build max-applyseq filter: %w", err)
 	}
-	sort, err := query.ParseSort("-" + metaAddSeqKey)
+	sort, err := query.ParseSort("-" + metaApplySeqKey)
 	if err != nil {
-		return 0, fmt.Errorf("crdt: build max-addseq sort: %w", err)
+		return 0, fmt.Errorf("crdt: build max-applyseq sort: %w", err)
 	}
 	iter, err := coll.Find(filter).Sort(sort).Limit(1).Iter(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("crdt: max-addseq iter: %w", err)
+		return 0, fmt.Errorf("crdt: max-applyseq iter: %w", err)
 	}
 	defer iter.Close()
 	if iter.Next() {
@@ -171,9 +192,82 @@ func MaxObjectAddSeq(ctx context.Context, coll anystore.Collection, spaceId stri
 		if derr != nil {
 			return 0, derr
 		}
-		return uint64(doc.Value().GetInt(metaAddSeqKey)), nil
+		return uint64(doc.Value().GetInt(metaApplySeqKey)), nil
 	}
 	return 0, nil
+}
+
+// BackfillApplySeq seeds applySeq := addSeq on this space's legacy
+// per-object _meta rows (rows written before the applySeq watermark
+// existed). One-off per space, guarded by a flag on the space's own
+// _meta row; idempotent. Keeps consumer cursors valid across the
+// re-key: every historical position N (AddSeq units) means the same
+// thing on the applySeq axis, and the allocator seeds past it.
+func BackfillApplySeq(ctx context.Context, coll anystore.Collection, spaceId string) error {
+	const backfillFlagKey = "asbf"
+	spaceKey := SpaceMetaKey(spaceId)
+	if doc, err := coll.FindId(ctx, spaceKey); err == nil {
+		if doc.Value().GetBool(backfillFlagKey) {
+			return nil
+		}
+	} else if !errors.Is(err, anystore.ErrDocNotFound) {
+		return err
+	}
+
+	filter, err := query.ParseCondition(map[string]any{
+		metaSpaceIdKey:  spaceId,
+		metaApplySeqKey: map[string]any{"$exists": false},
+	})
+	if err != nil {
+		return fmt.Errorf("crdt: build applyseq-backfill filter: %w", err)
+	}
+	// Collect ids first (the iterator and per-row updates can't share a
+	// cursor), then stamp each row. Legacy rows are bounded by the
+	// space's object count; this runs once per space ever.
+	var ids []string
+	var seqs []int
+	iter, err := coll.Find(filter).Iter(ctx)
+	if err != nil {
+		return fmt.Errorf("crdt: applyseq backfill iter: %w", err)
+	}
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		if derr != nil {
+			_ = iter.Close()
+			return derr
+		}
+		v := doc.Value()
+		if q := v.GetInt(metaAddSeqKey); q > 0 {
+			ids = append(ids, v.GetString(IdField))
+			seqs = append(seqs, q)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		_ = iter.Close()
+		return fmt.Errorf("crdt: applyseq backfill iter: %w", err)
+	}
+	_ = iter.Close()
+	for i, id := range ids {
+		seq := seqs[i]
+		mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+			if v.Get(metaApplySeqKey) != nil {
+				return v, false, nil // raced a live apply — its stamp wins
+			}
+			v.Set(metaApplySeqKey, a.NewNumberInt(seq))
+			return v, true, nil
+		})
+		if _, err := coll.UpdateId(ctx, id, mod); err != nil && !errors.Is(err, anystore.ErrDocNotFound) {
+			return fmt.Errorf("crdt: applyseq backfill %s: %w", id, err)
+		}
+	}
+	flagMod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		v.Set(backfillFlagKey, a.NewTrue())
+		return v, true, nil
+	})
+	if _, err := coll.UpsertId(ctx, spaceKey, flagMod); err != nil {
+		return fmt.Errorf("crdt: applyseq backfill flag: %w", err)
+	}
+	return nil
 }
 
 // HandlerVersions returns a map of dataset→version from the Controller's
@@ -186,22 +280,23 @@ func (c *Controller) HandlerVersions() map[string]int {
 	return hv
 }
 
-// PersistMeta writes the Controller's maxAddSeq and handler versions to
+// PersistMeta writes the Controller's watermarks and handler versions to
 // the _meta collection. The caller should pass a context carrying the same
 // WriteTx as the record mutations for atomicity.
 func (c *Controller) PersistMeta(ctx context.Context, metaColl anystore.Collection) error {
-	return PersistMeta(ctx, metaColl, c.objectId, c.maxAddSeq, c.HandlerVersions(), c.spaceId)
+	return PersistMeta(ctx, metaColl, c.objectId, c.maxAddSeq, c.maxApplySeq, c.HandlerVersions(), c.spaceId)
 }
 
 // LoadAndSeedMeta reads metadata from the _meta collection, seeds the
 // Controller's maxAddSeq, and returns the stored handler versions so the
 // caller can compare them with current versions for re-indexing decisions.
 func (c *Controller) LoadAndSeedMeta(ctx context.Context, metaColl anystore.Collection) (handlerVersions map[string]int, err error) {
-	maxAddSeq, hv, err := LoadMeta(ctx, metaColl, c.objectId)
+	maxAddSeq, maxApplySeq, hv, err := LoadMeta(ctx, metaColl, c.objectId)
 	if err != nil {
 		return nil, err
 	}
 	c.maxAddSeq = maxAddSeq
+	c.maxApplySeq = maxApplySeq
 	return hv, nil
 }
 

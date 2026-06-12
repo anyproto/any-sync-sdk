@@ -70,6 +70,16 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 //     writes (those land shortIds and may unblock parked changes).
 //     Decoupled from the apply lock to avoid the o.mu re-entry
 //     deadlock that synchronous Drain previously hit.
+// applySeqOf extracts the apply sequence the controller allocated for
+// this change. ApplyChangeWithResult takes the Change by value, so the
+// allocation only travels back through the result.
+func applySeqOf(res *crdt.ApplyResult) uint64 {
+	if res == nil {
+		return 0
+	}
+	return res.ApplySeq
+}
+
 func (s *Store) afterApplyFor() object.AfterApply {
 	return func(ctx context.Context, obj *object.Object, ch *crdt.Change, res *crdt.ApplyResult) {
 		if ch == nil {
@@ -97,7 +107,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// hasSubscribers so the cold-restore / catch-up path stays free
 		// when no indexer is attached.
 		if s.changeSubs.hasSubscribers() {
-			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, AddSeq: ch.AddSeq})
+			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
 		}
 
 		if ch.Dataset != typetype.DatasetPropertyDefs {

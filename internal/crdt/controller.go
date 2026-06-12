@@ -64,6 +64,10 @@ type OpRejection struct {
 type ApplyResult struct {
 	Rejections []OpRejection
 	DerivedOps [][]Op
+	// ApplySeq is the per-space apply sequence allocated for this
+	// change (0 when the Controller has no allocator — unit tests).
+	// Forwarded to the change-index feed so consumers cursor on it.
+	ApplySeq uint64
 }
 
 // Reserved field names.
@@ -122,8 +126,13 @@ type Controller struct {
 	// RecordChange.Id), so all objects in the space project into one
 	// row each. Used for the per-space `objects` values collection.
 	shared    map[string]struct{}
-	metaColl  anystore.Collection // _meta — persisted maxAddSeq + handler versions
-	maxAddSeq uint64
+	metaColl    anystore.Collection // _meta — persisted maxAddSeq/maxApplySeq + handler versions
+	maxAddSeq   uint64
+	maxApplySeq uint64
+	// applySeqs mints the per-space apply sequence (shared across the
+	// space's Controllers). nil disables applySeq stamping (unit
+	// tests, callers without a consumer feed).
+	applySeqs *ApplySeqAllocator
 
 	// Pools for the per-RecordChange hot path. Both are scoped to this
 	// Controller to keep contention bounded; the apply loop is single-
@@ -208,6 +217,16 @@ func (c *Controller) SetSpaceId(spaceId string) {
 
 // SetMaxAddSeq seeds the watermark from persisted storage on restore.
 func (c *Controller) SetMaxAddSeq(seq uint64) { c.maxAddSeq = seq }
+
+// SetApplySeqAllocator wires the per-space apply-sequence allocator.
+// Call once right after construction, before the first apply. No-op on
+// a nil controller.
+func (c *Controller) SetApplySeqAllocator(a *ApplySeqAllocator) {
+	if c == nil {
+		return
+	}
+	c.applySeqs = a
+}
 
 // RegisterHandler adds a handler at runtime (for late-bound datasets).
 func (c *Controller) RegisterHandler(ctx context.Context, reg HandlerReg) error {
@@ -638,6 +657,21 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	}
 	txCtx := tx.Context()
 
+	// Allocate the apply sequence AFTER the WriteTx is held: any-store's
+	// single writer then serializes allocation order = commit order, so
+	// an ascending-cursor consumer can't observe seq N+1 before N
+	// committed. A rolled-back tx just skips its seq (gaps are fine).
+	// Replays of already-applied changes re-stamp (the modifier can't
+	// see whether ops gated to no-ops) — a spurious bump costs a
+	// consumer one idempotent re-chunk, never a miss.
+	if c.applySeqs != nil {
+		ch.ApplySeq, err = c.applySeqs.Next(txCtx)
+		if err != nil {
+			_ = tx.Rollback()
+			return res, fmt.Errorf("crdt: allocate applySeq: %w", err)
+		}
+	}
+
 	for i := range ch.Records {
 		id := resolvedIds[i]
 		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i])
@@ -661,17 +695,24 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		}
 	}
 
-	// Persist the watermark in the same WriteTx as the record
-	// mutations: maxAddSeq + record state move atomically. Without
-	// this, a crash between commit and a separate persist would
+	// Persist the watermarks in the same WriteTx as the record
+	// mutations: maxAddSeq/maxApplySeq + record state move atomically.
+	// Without this, a crash between commit and a separate persist would
 	// re-replay the change on next boot and (with the halt-on-error
-	// iter) potentially get stuck if anything errored mid-iter.
+	// iter) potentially get stuck if anything errored mid-iter. The
+	// in-tx persist is also what makes the applySeq allocator
+	// crash-safe without a counter row of its own — re-seeding reads
+	// the max persisted stamp.
 	newMaxAddSeq := c.maxAddSeq
 	if ch.AddSeq > newMaxAddSeq {
 		newMaxAddSeq = ch.AddSeq
 	}
+	newMaxApplySeq := c.maxApplySeq
+	if ch.ApplySeq > newMaxApplySeq {
+		newMaxApplySeq = ch.ApplySeq
+	}
 	if c.metaColl != nil {
-		if err := PersistMeta(txCtx, c.metaColl, c.objectId, newMaxAddSeq, c.HandlerVersions(), c.spaceId); err != nil {
+		if err := PersistMeta(txCtx, c.metaColl, c.objectId, newMaxAddSeq, newMaxApplySeq, c.HandlerVersions(), c.spaceId); err != nil {
 			_ = tx.Rollback()
 			return res, fmt.Errorf("crdt: persist meta: %w", err)
 		}
@@ -681,8 +722,10 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		return res, fmt.Errorf("crdt: commit: %w", err)
 	}
 
-	// Commit succeeded — advance the in-memory mirror.
+	// Commit succeeded — advance the in-memory mirrors.
 	c.maxAddSeq = newMaxAddSeq
+	c.maxApplySeq = newMaxApplySeq
+	res.ApplySeq = ch.ApplySeq
 	return res, nil
 }
 
@@ -996,6 +1039,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		if isTombstone(existing) {
 			if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 				stampAddSeq(a, existing, ch.AddSeq)
+				stampApplySeq(a, existing, ch.ApplySeq)
 				updateTraces(a, existing, *ch)
 				return existing, true, nil
 			}
@@ -1075,6 +1119,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 	}
 
 	stampAddSeq(a, existing, ch.AddSeq)
+	stampApplySeq(a, existing, ch.ApplySeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil
@@ -1091,6 +1136,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		if isTombstone(existing) {
 			if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 				stampAddSeq(a, existing, ch.AddSeq)
+				stampApplySeq(a, existing, ch.ApplySeq)
 				updateTraces(a, existing, *ch)
 				return existing, true, nil
 			}
@@ -1120,6 +1166,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		applyOp(a, existing, *ch, rc.Ops[i])
 	}
 	stampAddSeq(a, existing, ch.AddSeq)
+	stampApplySeq(a, existing, ch.ApplySeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil

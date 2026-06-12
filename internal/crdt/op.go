@@ -96,7 +96,14 @@ type Change struct {
 	ChangeId  string
 	VersionId VersionId
 	AddSeq    uint64
-	Records   []RecordChange
+	// ApplySeq is the per-space apply sequence the Controller allocates
+	// inside the apply transaction (never set by callers, never on the
+	// wire). Stamped on every written record as _applySeq and persisted
+	// as the per-object maxApplySeq — the consumer-feed watermark that,
+	// unlike AddSeq, also covers non-DAG applies (account mirror,
+	// device-local writes). Zero when the Controller has no allocator.
+	ApplySeq uint64
+	Records  []RecordChange
 	// DataVersion pins the change to a specific schema/handler version. Its
 	// meaning depends on the dataset:
 	//

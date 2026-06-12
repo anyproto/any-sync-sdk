@@ -31,13 +31,13 @@ func TestChangeRegistry_DispatchAndCancel(t *testing.T) {
 	cancel := s.SubscribeChanges(func(ev ObjectChange) { got = append(got, ev) })
 	assert.True(t, s.changeSubs.hasSubscribers())
 
-	s.changeSubs.dispatch(ObjectChange{ObjectId: "o1", AddSeq: 7})
-	s.changeSubs.dispatch(ObjectChange{ObjectId: "o2", AddSeq: 8})
+	s.changeSubs.dispatch(ObjectChange{ObjectId: "o1", ApplySeq: 7})
+	s.changeSubs.dispatch(ObjectChange{ObjectId: "o2", ApplySeq: 8})
 	require.Equal(t, []ObjectChange{{"o1", 7}, {"o2", 8}}, got)
 
 	cancel()
 	assert.False(t, s.changeSubs.hasSubscribers())
-	s.changeSubs.dispatch(ObjectChange{ObjectId: "o3", AddSeq: 9})
+	s.changeSubs.dispatch(ObjectChange{ObjectId: "o3", ApplySeq: 9})
 	assert.Len(t, got, 2, "no delivery after cancel")
 
 	cancel() // idempotent
@@ -54,15 +54,15 @@ func TestStoreChangedObjects_DelegatesToMeta(t *testing.T) {
 	ctx, s := feedStore(t)
 	coll, err := s.metaCollection(ctx)
 	require.NoError(t, err)
-	require.NoError(t, crdt.PersistMeta(ctx, coll, "o1", 5, nil, "spaceA"))
-	require.NoError(t, crdt.PersistMeta(ctx, coll, "o2", 15, nil, "spaceA"))
-	require.NoError(t, crdt.PersistMeta(ctx, coll, "other", 99, nil, "spaceB"))
+	require.NoError(t, crdt.PersistMeta(ctx, coll, "o1", 5, 5, nil, "spaceA"))
+	require.NoError(t, crdt.PersistMeta(ctx, coll, "o2", 15, 15, nil, "spaceA"))
+	require.NoError(t, crdt.PersistMeta(ctx, coll, "other", 99, 99, nil, "spaceB"))
 
 	changed, err := s.ChangedObjects(ctx, 0, 0)
 	require.NoError(t, err)
 	require.Equal(t, []ObjectChange{{"o1", 5}, {"o2", 15}}, changed)
 
-	max, err := s.MaxAddSeq(ctx)
+	max, err := s.MaxApplySeq(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(15), max)
 

@@ -133,9 +133,17 @@ type Store struct {
 	engine *subscribe.Engine
 
 	// changeSubs is the change-index live feed (consumer-side FTS /
-	// vector indexers). afterApply dispatches (objectId, addSeq) here,
-	// gated on hasSubscribers so an idle space pays nothing.
+	// vector indexers). afterApply dispatches (objectId, applySeq)
+	// here, gated on hasSubscribers so an idle space pays nothing.
 	changeSubs *changeRegistry
+
+	// applySeqs mints the per-space apply sequence shared by every
+	// controller — the consumer-feed watermark covering DAG, mirror,
+	// and local applies. Seeded lazily from the persisted max (post
+	// legacy backfill, guarded by applySeqBackfill).
+	applySeqs           *crdt.ApplySeqAllocator
+	applySeqBackfill    sync.Once
+	applySeqBackfillErr error
 
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
@@ -248,6 +256,13 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		s.dataVersions = dv
 		s.datasetOwners = owners
 	}
+	s.applySeqs = crdt.NewApplySeqAllocator(func(ctx context.Context) (uint64, error) {
+		coll, err := s.applySeqMeta(ctx)
+		if err != nil {
+			return 0, err
+		}
+		return crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
+	})
 	s.cache = ocache.New(
 		s.loadObject,
 		ocache.WithTTL(objectCacheTTL),
@@ -843,6 +858,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 			return nil, err
 		}
 		ctrl.SetSpaceId(s.spaceId)
+		ctrl.SetApplySeqAllocator(s.applySeqs)
 		return ctrl, nil
 	}
 	coll, err := s.SharedObjects(ctx)
@@ -867,5 +883,6 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		return nil, err
 	}
 	ctrl.SetSpaceId(s.spaceId)
+	ctrl.SetApplySeqAllocator(s.applySeqs)
 	return ctrl, nil
 }

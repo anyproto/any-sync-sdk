@@ -213,9 +213,15 @@ Per-object tracking in the CRDT Controller:
 
 The CRDT's idempotency means the contract tolerates crash-after-apply-before-watermark-persist: on restart the replay sees the same changes again and they become no-ops via gating and sticky tombstones.
 
+### ApplySeq (consumer-feed watermark)
+
+`applySeq` is a third counter, SDK-owned, per-space: allocated inside the apply transaction for EVERY apply that writes records — DAG changes, the tech-space account mirror's applies, and device-local writes. Stamped on written records as `_applySeq` and persisted as the per-object `maxApplySeq` in the same WriteTx (which is also what makes the allocator crash-safe without a counter row: re-seeding reads the max persisted stamp).
+
+Division of labor: **AddSeq answers "is any-store caught up with any-sync"** (the per-object restore watermark; only DAG changes have one); **applySeq answers "is a consumer caught up with any-store"** (the change-index feed `Space.Changes()` is keyed on it, so non-DAG mutations surface to indexers). Allocation happens after the WriteTx is acquired — any-store's single writer makes allocation order = commit order, so ascending-cursor consumers can't skip a late-committing seq. Gaps (rolled-back txs) are normal; replays of already-applied changes may re-stamp (a spurious bump costs one idempotent re-chunk, never a miss). Legacy rows are backfilled `applySeq := addSeq` once per space, and the allocator seeds past the historical max, so pre-existing consumer cursors stay valid on one axis.
+
 ### Why not a separate per-record `_seq`?
 
-Deferred. The two use cases (incremental UI updates, "what changed in batch N") are better served by the Phase 2 event stream. Adding `_seq` later is a backward-compatible schema change if a concrete query pattern demands it.
+Deferred at the time; `_applySeq` (above) is exactly this, added once the account/local routes made AddSeq an incomplete feed coordinate.
 
 ---
 

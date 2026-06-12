@@ -10,12 +10,13 @@ import (
 )
 
 // ObjectChange is the payload of the change-index live feed: an object
-// in this space applied a change that advanced (or re-stamped) its
-// per-space AddSeq watermark. Consumers use it to mark the object dirty
-// for re-indexing.
+// in this space applied a change that advanced its per-space applySeq
+// watermark. Consumers use it to mark the object dirty for re-indexing.
+// ApplySeq covers every apply source — DAG changes, the account
+// mirror's injected applies, device-local writes.
 type ObjectChange struct {
 	ObjectId string
-	AddSeq   uint64
+	ApplySeq uint64
 }
 
 // changeRegistry is the synchronous callback firehose backing the
@@ -76,7 +77,7 @@ func (r *changeRegistry) dispatch(ev ObjectChange) {
 }
 
 // SubscribeChanges registers cb on the change-index feed; it fires once
-// per applied change in this space with (objectId, addSeq). cb runs
+// per applied change in this space with (objectId, applySeq). cb runs
 // synchronously on the apply path — keep it small or hand off. The
 // returned cancel is idempotent.
 //
@@ -89,11 +90,11 @@ func (s *Store) SubscribeChanges(cb func(ObjectChange)) (cancel func()) {
 }
 
 // ChangedObjects returns objects in this space whose persisted max
-// AddSeq exceeds `since`, ascending, capped at limit (0 = no cap). Page
-// by passing the last returned AddSeq as the next `since`. Backs the
-// change-index pull / catch-up path.
+// applySeq exceeds `since`, ascending, capped at limit (0 = no cap).
+// Page by passing the last returned ApplySeq as the next `since`. Backs
+// the change-index pull / catch-up path.
 func (s *Store) ChangedObjects(ctx context.Context, since uint64, limit int) ([]ObjectChange, error) {
-	coll, err := s.metaCollection(ctx)
+	coll, err := s.applySeqMeta(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -103,19 +104,36 @@ func (s *Store) ChangedObjects(ctx context.Context, since uint64, limit int) ([]
 	}
 	out := make([]ObjectChange, len(rows))
 	for i, r := range rows {
-		out[i] = ObjectChange{ObjectId: r.ObjectId, AddSeq: r.AddSeq}
+		out[i] = ObjectChange{ObjectId: r.ObjectId, ApplySeq: r.ApplySeq}
 	}
 	return out, nil
 }
 
-// MaxAddSeq returns the highest per-object AddSeq persisted in this
+// MaxApplySeq returns the highest per-object applySeq persisted in this
 // space — the current upper bound of the change-index cursor.
-func (s *Store) MaxAddSeq(ctx context.Context) (uint64, error) {
-	coll, err := s.metaCollection(ctx)
+func (s *Store) MaxApplySeq(ctx context.Context) (uint64, error) {
+	coll, err := s.applySeqMeta(ctx)
 	if err != nil {
 		return 0, err
 	}
-	return crdt.MaxObjectAddSeq(ctx, coll, s.spaceId)
+	return crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
+}
+
+// applySeqMeta opens the _meta collection AND guarantees the one-off
+// legacy backfill (applySeq := addSeq on pre-applySeq rows) has run, so
+// every feed read and the allocator seed observe a complete axis.
+func (s *Store) applySeqMeta(ctx context.Context) (anystore.Collection, error) {
+	coll, err := s.metaCollection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.applySeqBackfill.Do(func() {
+		s.applySeqBackfillErr = crdt.BackfillApplySeq(ctx, coll, s.spaceId)
+	})
+	if s.applySeqBackfillErr != nil {
+		return nil, s.applySeqBackfillErr
+	}
+	return coll, nil
 }
 
 // metaCollection opens the shared _meta collection the change-index

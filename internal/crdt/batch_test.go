@@ -68,7 +68,7 @@ func TestBatch_ManyChangesOneTransaction(t *testing.T) {
 	assert.Equal(t, uint64(N), ctrl.MaxAddSeq())
 
 	// Verify meta persisted.
-	seq, _, err := LoadMeta(ctx, metaColl, "obj1")
+	seq, _, _, err := LoadMeta(ctx, metaColl, "obj1")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(N), seq)
 }

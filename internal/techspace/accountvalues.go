@@ -176,9 +176,15 @@ func (s *Service) DeleteAccountValuesForObject(ctx context.Context, targetSpaceI
 }
 
 // DropAccountValues deletes the whole carrier object for
-// targetSpaceId — the space-leave/delete GC (one tree, gone).
-// Idempotent; a space that never had a carrier derives-then-deletes,
-// which is harmless.
+// targetSpaceId — the space-leave/delete GC.
+//
+// KNOWN PROTOCOL VIOLATION, to be replaced (see the proposal's
+// follow-up ledger): any-sync forbids deleting DERIVED trees —
+// deterministic ids mean delete + re-derive = the same identity with
+// fresh history (history replacement). This must become record-level
+// GC (tombstone every carrier record, keep the empty derived tree).
+// Kept for now because the target space is being deleted account-wide
+// anyway and the call is best-effort.
 func (s *Service) DropAccountValues(ctx context.Context, targetSpaceId string) error {
 	obj, err := s.AccountValuesObject(ctx, targetSpaceId)
 	if err != nil {

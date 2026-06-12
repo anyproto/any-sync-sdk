@@ -294,6 +294,19 @@ are listed at the end of this section.
 
 ## Follow-up ledger (post slices 1–4)
 
+- **Carrier GC must not tree-delete (any-sync rule on derived trees).**
+  any-sync forbids deleting DERIVED objects — deletion is allowed only
+  for ordinary (non-derived) trees — because a derived tree's id is
+  deterministic: delete + re-derive yields the SAME identity with
+  fresh history, i.e. history replacement. The carrier is derived
+  (`builtin:accountValues/<spaceId>`), so `DropAccountValues`'s
+  `tree.Delete` on space leave is invalid under the protocol. Replace
+  with record-level GC: tombstone every carrier record (CRDT deletes,
+  converge normally) and leave the empty derived tree in place;
+  storage reclamation is whatever any-sync ever offers for derived
+  trees. The per-object delete GC (DeleteAccountValuesForObject) is
+  already record-level and unaffected.
+
 - **Dataset-field account transport**: declaration + enforcement are
   live; the mirror handles the objects rows only. Extending it = key
   records by their real (dataset, recordId) and target per-object

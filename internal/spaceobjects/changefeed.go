@@ -142,3 +142,67 @@ func (s *Store) applySeqMeta(ctx context.Context) (anystore.Collection, error) {
 func (s *Store) metaCollection(ctx context.Context) (anystore.Collection, error) {
 	return s.db.Collection(ctx, crdt.MetaCollectionName)
 }
+
+// RowEvent notifies a structural transition of one row in the
+// per-space `objects` collection: Created fires when a change first
+// materialises the row, Deleted when it tombstones. The account mirror
+// keys its replay (carrier values waiting for the row) and its GC
+// (drop carrier records of deleted objects) off these.
+type RowEvent struct {
+	ObjectId string
+	Deleted  bool
+}
+
+// rowEventRegistry mirrors changeRegistry for RowEvent callbacks —
+// synchronous, on the apply path, keep callbacks cheap.
+type rowEventRegistry struct {
+	mu   sync.Mutex
+	next uint64
+	subs map[uint64]func(RowEvent)
+}
+
+func newRowEventRegistry() *rowEventRegistry {
+	return &rowEventRegistry{subs: make(map[uint64]func(RowEvent))}
+}
+
+func (r *rowEventRegistry) add(cb func(RowEvent)) uint64 {
+	if cb == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next++
+	r.subs[r.next] = cb
+	return r.next
+}
+
+func (r *rowEventRegistry) remove(id uint64) {
+	if id == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.subs, id)
+}
+
+func (r *rowEventRegistry) hasSubscribers() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.subs) > 0
+}
+
+func (r *rowEventRegistry) dispatch(ev RowEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, cb := range r.subs {
+		cb(ev)
+	}
+}
+
+// SubscribeRowEvents registers cb for objects-collection row
+// creations and deletions. cb runs synchronously on the apply path.
+// The returned cancel is idempotent.
+func (s *Store) SubscribeRowEvents(cb func(RowEvent)) (cancel func()) {
+	id := s.rowEvents.add(cb)
+	return func() { s.rowEvents.remove(id) }
+}

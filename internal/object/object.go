@@ -480,6 +480,49 @@ func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, err
 	}, nil
 }
 
+// InjectedSet applies an account-mirror materialization: ops on
+// account-class fields (or per-key-scoped dynamic heads) written
+// straight into the controller's materialised row — NO tree.AddContent,
+// nothing enters THIS object's any-sync DAG. Unlike LocalSet the
+// VersionId is CALLER-SUPPLIED: the tech-space carrier tree's orderId
+// for the change that produced the value, so per-path gating replays
+// the carrier's converged order exactly. Safe because account paths
+// have exactly one writer per device (the mirror) sourcing one tech
+// tree. Fires afterApply so Query/Subscribe and the applySeq feed see
+// the change live, exactly like every other apply.
+//
+// Caller passes a Change with Dataset + VersionId + Records (explicit
+// ids, $set/$unset ops). ChangeId/AddSeq stay zero — the change never
+// gets a DAG identity here; its provenance is the carrier change.
+func (o *Object) InjectedSet(ctx context.Context, ch crdt.Change) (WriteResult, error) {
+	if o.tree == nil {
+		return WriteResult{}, ErrTreeNotSet
+	}
+	if ch.VersionId == "" {
+		return WriteResult{}, errors.New("object: injected set requires a caller-supplied VersionId")
+	}
+	o.tree.Lock()
+	defer o.tree.Unlock()
+	if o.closed {
+		return WriteResult{}, errors.New("object: closed")
+	}
+	ch.Injected = true
+	ch.SpaceId = o.spaceId
+	ch.ObjectId = o.tree.Id()
+	ch.Timestamp = ts(ch.Timestamp)
+
+	res, err := o.applyDecodedLocked(ctx, ch)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("object: injected set: %w", err)
+	}
+	recordIds, _ := crdt.ResolveRecordIds(ch)
+	return WriteResult{
+		VersionId:  ch.VersionId,
+		RecordIds:  recordIds,
+		Rejections: res.Rejections,
+	}, nil
+}
+
 // Update implements updatelistener.UpdateListener. Fired by synctree
 // from inside AddRawChanges / buildSyncTree, with the tree lock
 // already held — we must NOT re-lock here.

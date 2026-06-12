@@ -119,30 +119,52 @@ Set(ctx, objectId, typeId string, patch map[string]any) (ModifyResult, error)
 - `Get(ctx, objectId)` returns the row verbatim (no opts, nothing to
   strip). `AttachType`/`DetachType` unchanged (synced-only).
 
-## Account transport (slice 4)
+## Account transport (slice 4 — landed 2026-06-12)
 
 - Tech space hosts **one derived carrier object per target space**
-  (seed: `builtin:accountVariants/<spaceId>`); bounded DAG, 1:1 space
-  lifecycle, trivial GC on leave.
-- One carrier record per **(objectId, dataset, recordId)** — the
-  objects row is the degenerate case (dataset `objects`, recordId =
-  objectId). Record fields are the account-scoped paths; the record's
-  own `_ver` (tech domain) is the version source, including retained
-  entries for unset paths.
-- Per-device watcher: live-subscribes to the carrier dataset and
-  applies converged values into the target rows as **injected applies**
-  — no DAG, handler-skipping like LocalSet, but with the caller
-  (mirror) supplying the tech versionId instead of minting a local one.
-  Gating is the standard `_ver.<path>` compare; monotone per peer
-  because the carrier's tech tree is.
+  (seed: `builtin:accountValues/<spaceId>`, dataset `account_values`,
+  package `internal/accountvalues`); bounded DAG, 1:1 space lifecycle,
+  trivial GC on leave. The names cover internals only — values sit at
+  their normal `{typeId}.{propId}` paths in carrier records AND target
+  rows; no new user-visible namespace exists.
+- One carrier record per **(objectId, dataset, recordId)**, record key
+  `objectId:dataset:recordId` (colon never appears in CIDs) — the
+  objects row is the degenerate case (`<objId>:objects:<objId>`).
+  Record fields are the account-scoped paths; the record's own `_ver`
+  (tech domain) is the version source, including retained entries for
+  unset paths. v1 mirror coverage: objects rows only; dataset-field
+  transport is a mechanical follow-up on the same key/Diff path.
+- **Injected applies** (`Change.Injected` + `Object.InjectedSet`): no
+  DAG, dataset handler skipped (like Local), but the versionId is
+  caller-supplied (the tech tree's) instead of locally minted; events
+  + applySeq flow through the one apply path. classifyFieldWrite
+  permits the injected route on declared account fields and undeclared
+  heads of DynamicScopeByKey datasets only. Injected applies always go
+  through the object's CACHED controller (store.Get) — a second bare
+  controller would persist stale in-memory maxApplySeq/maxAddSeq
+  mirrors into _meta and regress the feed/restore watermarks.
+- **`Diff` is a pure function** — `Diff(carrierRec, targetRec,
+  scopeResolver) []InjectedBatch`: value present ⇒ $set; absent with a
+  retained version ⇒ $unset; unknown propId ⇒ skip (Hole A — the next
+  re-mirror retries); already applied ⇒ no-op. Ops are GROUPED BY each
+  path's retained carrier version, one InjectedSet per distinct
+  version — never a max-version over-claim. Both mirror paths (live
+  event + on-load state re-mirror) share it.
 - **State-based full re-mirror on space load** (no cross-space replay
-  cursors): per carrier record, leaf-merge (value bag + retained
-  `_ver`) against the target row — value absent + newer version ⇒
-  `$unset`, so unsets propagate to devices that were offline. Fast-path
-  skip via per-record max-version watermark.
-- **No orphan rows**: an account value for an object whose row doesn't
-  exist locally waits; the row-creation path pulls pending carrier
-  records, so `_ver.id` stays purely object-tree domain.
+  cursors); live path is a windowed Query.Subscribe on the carrier
+  dataset whose overflow/drift recovery IS "re-run the re-mirror and
+  resubscribe". Fast-path per-record watermark skip: follow-up.
+- **No orphan rows / replay-log semantics**: a remote-originated
+  carrier value for an object not present locally just WAITS in the
+  carrier (the carrier record is the replay log); the row-created hook
+  (afterApply creation-marker detection on the objects dataset) and
+  the on-load re-mirror are the two replay triggers. A LOCAL
+  `Set(account)` call addressing an object whose row doesn't exist on
+  this device errors, symmetric with the local route (caller bug, not
+  a sync state).
+- **Read-your-writes**: Set's account branch writes the carrier, then
+  runs the injected apply inline for this device; the watcher's later
+  double-apply gates to a no-op.
 
 ## Removal / GC
 
@@ -236,6 +258,9 @@ is synced-scope; definitions without a `scope` field read as `synced`.
 
 ## Implementation slices (SDK, this branch)
 
+Slices 1–4 are landed on feat/scoped-properties; remaining follow-ups
+are listed at the end of this section.
+
 1. **Scope on declarations + enforcement + cleanup** — `schema.
    ScopeAccount` (+ ParseScope); unify `anytype`/`spaceindex` mini-enums
    onto schema.Scope; `PropertyDraft/Def.Scope` (+ space-package alias);
@@ -266,3 +291,21 @@ is synced-scope; definitions without a `scope` field read as `synced`.
 - `Properties.Set` replaces per-scope endpoints 1:1; docs 03/08/09.
 - Indexer/chunkers swap `_addSeq` → `_applySeq` (docs/13 § freshness +
   the "index reflects local view" note).
+
+## Follow-up ledger (post slices 1–4)
+
+- **Dataset-field account transport**: declaration + enforcement are
+  live; the mirror handles the objects rows only. Extending it = key
+  records by their real (dataset, recordId) and target per-object
+  dataset collections in mirrorRecord.
+- **Local sidecar** for local-scope durability — lands WITH the
+  wipe-and-rebuild re-index machinery it serves (docs/08).
+- **Re-mirror fast path**: per-carrier-record applied-watermark skip
+  for spaces with very many overridden objects.
+- **Carrier residency**: the mirror keeps the carrier object resident
+  while reconciling; a TTL-evicted carrier delays remote account
+  values until the next event/reconcile (same residency semantics as
+  the tech index object).
+- **`any` server follow-ups**: scope on property endpoints/CLI,
+  `_addSeq` → `_applySeq` in chunkers/indexer, docs 03/08/09/13, the
+  two shared-space footguns documented in client recipes.

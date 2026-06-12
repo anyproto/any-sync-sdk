@@ -106,9 +106,9 @@ func run() error {
 	// Property write: Set auto-routes by each key's declared scope —
 	// these props are synced-scope (the default), so this is one CRDT
 	// change on the object's own tree. Local-scoped (this device only)
-	// properties use the same call and never sync; account-scoped (my
-	// devices only) land with the tech-space carrier. Declare scopes
-	// via PropertyDraft.Scope.
+	// properties use the same call and never sync; account-scoped ones
+	// ride the tech space to this account's other devices. Declare
+	// scopes via PropertyDraft.Scope.
 	if _, err := sp.Properties().Set(ctx, objectId, typeId, map[string]any{
 		"title": "My Research",
 	}); err != nil {

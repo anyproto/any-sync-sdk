@@ -11,6 +11,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
+	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -18,9 +19,9 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// propertiesAPI implements space.PropertiesAPI. The synced and local
-// routes are live; the account route lands with its tech-space carrier
-// (docs/scoped-properties-proposal.md slice 4).
+// propertiesAPI implements space.PropertiesAPI. All three write routes
+// are live: synced (object CRDT), account (tech-space carrier +
+// mirror), local (LocalSet). See docs/scoped-properties-proposal.md.
 type propertiesAPI struct {
 	parent *spaceImpl
 }
@@ -88,7 +89,7 @@ func (p *propertiesAPI) Set(ctx context.Context, objectId, typeId string, patch 
 	case schema.ScopeLocal:
 		return p.setLocal(ctx, objectId, typeId, patch, props)
 	case schema.ScopeAccount:
-		return space.ModifyResult{}, errors.New("propertiesAPI: account-scoped writes not implemented yet (scoped-properties slice 4)")
+		return p.setAccount(ctx, objectId, typeId, patch, props)
 	}
 	return space.ModifyResult{}, fmt.Errorf("propertiesAPI: unroutable scope %s", route)
 }
@@ -137,18 +138,44 @@ func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (sche
 	return 0, nil, fmt.Errorf("propertiesAPI: patch spans multiple scopes — issue one Set per scope (%s)", strings.Join(parts, "; "))
 }
 
-// setSynced is the synced route: a multi-field $set in a single change
-// on the object's own CRDT. Patch keys are propIds; the resulting
-// paths are `{typeId}.{propId}`.
-func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, patch map[string]any) (space.ModifyResult, error) {
-	arena := &anyenc.Arena{}
-	multi := arena.NewObject()
+// patchOps converts a patch into the multi-field $set / $unset op
+// pair shared by every route: a nil patch value means "unset this
+// property". Either op may be absent when its half is empty.
+func patchOps(arena *anyenc.Arena, typeId string, patch map[string]any) ([]crdt.Op, error) {
+	sets := arena.NewObject()
+	unsets := arena.NewObject()
+	nSet, nUnset := 0, 0
 	for propId, val := range patch {
+		if val == nil {
+			unsets.Set(typeId+"."+propId, arena.NewTrue()) // value ignored by $unset
+			nUnset++
+			continue
+		}
 		v, err := goToAnyenc(arena, val)
 		if err != nil {
-			return space.ModifyResult{}, fmt.Errorf("propertiesAPI: convert %s.%s: %w", typeId, propId, err)
+			return nil, fmt.Errorf("propertiesAPI: convert %s.%s: %w", typeId, propId, err)
 		}
-		multi.Set(typeId+"."+propId, v)
+		sets.Set(typeId+"."+propId, v)
+		nSet++
+	}
+	var ops []crdt.Op
+	if nSet > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: sets})
+	}
+	if nUnset > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Payload: unsets})
+	}
+	return ops, nil
+}
+
+// setSynced is the synced route: one change on the object's own CRDT.
+// Patch keys are propIds; the resulting paths are `{typeId}.{propId}`;
+// nil values unset.
+func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, patch map[string]any) (space.ModifyResult, error) {
+	arena := &anyenc.Arena{}
+	ops, err := patchOps(arena, typeId, patch)
+	if err != nil {
+		return space.ModifyResult{}, err
 	}
 
 	// DataVersion: the latest shortId for this typeId. Empty when the
@@ -168,7 +195,7 @@ func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, 
 		Records: []crdt.RecordChange{{
 			Id:     objectId,
 			Upsert: true,
-			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
+			Ops:    ops,
 		}},
 	})
 	if err != nil {
@@ -181,8 +208,7 @@ func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, 
 // the object's row — no DAG, no sync, versions minted by the local
 // lexid allocator. The dataset handler doesn't run on local writes, so
 // the strict validation the synced route gets from PreValidate happens
-// here, writer-side: every key must be a declared local-scoped
-// property and the value's kind must match.
+// here, writer-side (validateRoutedPatch). nil values unset.
 //
 // Strict (non-upsert): the row is born by the object's bootstrap
 // create, so a missing row means the caller has the wrong object id —
@@ -192,26 +218,13 @@ func (p *propertiesAPI) setLocal(ctx context.Context, objectId, typeId string, p
 	for _, pi := range props {
 		byId[pi.Id] = pi
 	}
+	if err := validateRoutedPatch(typeId, patch, props, schema.ScopeLocal); err != nil {
+		return space.ModifyResult{}, err
+	}
 	arena := &anyenc.Arena{}
-	multi := arena.NewObject()
-	for propId, val := range patch {
-		info, found := byId[propId]
-		if !found {
-			return space.ModifyResult{}, &properties.ValidationError{
-				Reason: properties.ReasonUnknownProperty, TypeId: typeId, PropId: propId, Known: props,
-			}
-		}
-		v, err := goToAnyenc(arena, val)
-		if err != nil {
-			return space.ModifyResult{}, fmt.Errorf("propertiesAPI: convert %s.%s: %w", typeId, propId, err)
-		}
-		if got := schema.KindOf(v); got != info.Kind {
-			return space.ModifyResult{}, &properties.ValidationError{
-				Reason: properties.ReasonKindMismatch, TypeId: typeId, PropId: propId, PropName: info.Name,
-				Expected: info.Kind, Got: got,
-			}
-		}
-		multi.Set(typeId+"."+propId, v)
+	ops, err := patchOps(arena, typeId, patch)
+	if err != nil {
+		return space.ModifyResult{}, err
 	}
 
 	obj, err := p.parent.store.Get(ctx, objectId)
@@ -223,7 +236,7 @@ func (p *propertiesAPI) setLocal(ctx context.Context, objectId, typeId string, p
 		DataVersion: properties.HandlerVersion,
 		Records: []crdt.RecordChange{{
 			Id:  objectId,
-			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
+			Ops: ops,
 		}},
 	})
 	if err != nil {
@@ -235,6 +248,100 @@ func (p *propertiesAPI) setLocal(ctx context.Context, objectId, typeId string, p
 		}
 	}
 	return modifyResultFromWrite(res), nil
+}
+
+// setAccount is the account route: the patch is written to the
+// tech-space carrier (synced across this account's devices only) and
+// then mirrored into the local row inline so read-your-writes holds.
+// The returned VersionId is the carrier tree's — the version the
+// mirror stamps onto target rows everywhere.
+//
+// A LOCAL call addressing an object whose row doesn't exist on this
+// device errors, symmetric with the local route — remote-originated
+// carrier values for not-yet-synced objects wait in the carrier (the
+// replay log) instead.
+func (p *propertiesAPI) setAccount(ctx context.Context, objectId, typeId string, patch map[string]any, props []types.PropInfo) (space.ModifyResult, error) {
+	if err := validateRoutedPatch(typeId, patch, props, schema.ScopeAccount); err != nil {
+		return space.ModifyResult{}, err
+	}
+	// The row must exist locally — a caller writing account values for
+	// an object this device doesn't hold is a caller bug, not a sync
+	// state.
+	row, err := p.Get(ctx, objectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	if row == nil {
+		return space.ModifyResult{}, fmt.Errorf("propertiesAPI: object %s has no property record (not created in this space?)", objectId)
+	}
+
+	arena := &anyenc.Arena{}
+	ops, err := patchOps(arena, typeId, patch)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	res, err := p.parent.tsp.WriteAccountValues(ctx, p.parent.id, crdt.RecordChange{
+		Id:     accountvalues.Key(objectId, properties.Dataset, objectId),
+		Upsert: true,
+		Ops:    ops,
+	})
+	if err != nil {
+		return space.ModifyResult{}, fmt.Errorf("propertiesAPI: account write: %w", err)
+	}
+
+	// Inline mirror: replay this object's carrier record into the
+	// local row so an immediate Get reflects the write. The mirror
+	// watcher's own (event-driven) apply of the same change gates to a
+	// no-op.
+	if m := p.parent.parent.accountMirror(p.parent.id); m != nil {
+		m.reconcileObject(ctx, objectId)
+	}
+
+	return space.ModifyResult{
+		VersionId: res.VersionId,
+		ChangeId:  res.ChangeId,
+		RecordIds: []string{objectId},
+	}, nil
+}
+
+// validateRoutedPatch is the writer-side strict validation for routes
+// that skip the dataset handler (local / account): every key must be a
+// declared property of the route's scope, and non-nil values must
+// match the declared kind (nil = unset, no kind to check).
+func validateRoutedPatch(typeId string, patch map[string]any, props []types.PropInfo, route schema.Scope) error {
+	byId := make(map[string]types.PropInfo, len(props))
+	for _, pi := range props {
+		byId[pi.Id] = pi
+	}
+	arena := &anyenc.Arena{}
+	for propId, val := range patch {
+		info, found := byId[propId]
+		if !found {
+			return &properties.ValidationError{
+				Reason: properties.ReasonUnknownProperty, TypeId: typeId, PropId: propId, Known: props,
+			}
+		}
+		if sc := info.EffectiveScope(); sc != route {
+			return &properties.ValidationError{
+				Reason: properties.ReasonScopeMismatch, TypeId: typeId, PropId: propId, PropName: info.Name,
+				DeclaredScope: sc, WriteRoute: route,
+			}
+		}
+		if val == nil {
+			continue // unset — no kind to check
+		}
+		v, err := goToAnyenc(arena, val)
+		if err != nil {
+			return fmt.Errorf("propertiesAPI: convert %s.%s: %w", typeId, propId, err)
+		}
+		if got := schema.KindOf(v); got != info.Kind {
+			return &properties.ValidationError{
+				Reason: properties.ReasonKindMismatch, TypeId: typeId, PropId: propId, PropName: info.Name,
+				Expected: info.Kind, Got: got,
+			}
+		}
+	}
+	return nil
 }
 
 // dataVersionForType encodes a single-type DataVersion using the

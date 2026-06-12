@@ -646,15 +646,19 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	//   - on a non-Dynamic dataset, an undeclared field is rejected.
 	// This keeps the classes disjoint, so a local field's locally-allocated
 	// version never competes with a synced field's any-sync OrderId.
+	if ch.Local && ch.Injected {
+		return res, errors.Join(ErrValidation, errors.New("crdt: Local and Injected are mutually exclusive"))
+	}
 	ds := c.schemas[ch.Dataset]
 	scopeByKey := c.scopeByKey[ch.Dataset]
+	route := routeOf(&ch)
 	for i, rc := range ch.Records {
 		for _, op := range rc.Ops {
 			if err := validateOpPaths(op); err != nil {
 				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: %w", resolvedIds[i], op.Type, err))
 			}
 			for _, field := range opFieldHeads(op) {
-				if err := classifyFieldWrite(ds, field, ch.Local, scopeByKey); err != nil {
+				if err := classifyFieldWrite(ds, field, route, scopeByKey); err != nil {
 					return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s field %q: %w", resolvedIds[i], op.Type, field, err))
 				}
 			}
@@ -740,9 +744,23 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	return res, nil
 }
 
-// classifyFieldWrite enforces the dataset field-class rules for an input
-// op writing `field` (a top-level field name) on a change whose Local
-// flag is `isLocal`. Reserved fields (id, _*) are already rejected by
+// routeOf maps a change's flags to the write route it arrived on —
+// the scope a field must declare for the write to be admissible.
+func routeOf(ch *Change) schema.Scope {
+	switch {
+	case ch.Local:
+		return schema.ScopeLocal
+	case ch.Injected:
+		return schema.ScopeAccount
+	default:
+		return schema.ScopeSynced
+	}
+}
+
+// classifyFieldWrite enforces the dataset field-class rules for an
+// input op writing `field` (a top-level field name) on a change that
+// arrived via `route` (synced DAG / LocalSet / the account mirror's
+// InjectedSet). Reserved fields (id, _*) are already rejected by
 // validateOpPaths, so this only sees user-facing field heads.
 //
 // scopeByKey (HandlerReg.DynamicScopeByKey) exempts UNDECLARED heads
@@ -750,7 +768,7 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 // controller can't see (the objects dataset's per-property scope),
 // enforced by the dataset's handler (DAG route) and writer layer
 // (local/account routes). Declared heads stay fully enforced.
-func classifyFieldWrite(ds schema.Dataset, field string, isLocal bool, scopeByKey bool) error {
+func classifyFieldWrite(ds schema.Dataset, field string, route schema.Scope, scopeByKey bool) error {
 	sc, declared := ds.ScopeOf(field)
 	if !declared {
 		if !ds.Dynamic {
@@ -761,19 +779,11 @@ func classifyFieldWrite(ds schema.Dataset, field string, isLocal bool, scopeByKe
 		}
 		sc = schema.ScopeSynced // dynamic datasets default undeclared fields to synced
 	}
-	switch sc {
-	case schema.ScopeDerived:
+	if sc == schema.ScopeDerived {
 		return fmt.Errorf("derived field is handler-only, not writable by an input op")
-	case schema.ScopeLocal:
-		if !isLocal {
-			return fmt.Errorf("local (device-only) field is not writable by a synced change")
-		}
-	case schema.ScopeAccount:
-		return fmt.Errorf("account field is not writable by this route (tech-space mirror only)")
-	default: // ScopeSynced
-		if isLocal {
-			return fmt.Errorf("synced field is not writable by a local change")
-		}
+	}
+	if sc != route {
+		return fmt.Errorf("%s field is not writable by the %s route", sc, route)
 	}
 	return nil
 }
@@ -1098,7 +1108,9 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			Payload: m.derivedArena().NewString(string(ch.VersionId)),
 		})
 
-		if !ch.Local {
+		// Local and Injected materializations are handler-exclusive —
+		// their validation is writer-side (Properties.Set / the mirror).
+		if !ch.Local && !ch.Injected {
 			ctx := &ChangeCtx{Change: ch, Before: nil}
 			if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
 				m.recordedErr = err
@@ -1124,9 +1136,10 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		ctx := &ChangeCtx{Change: ch, Before: existing}
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
-			// Device-local writes are handler-exclusive (see Change.Local):
-			// no handler validation/derivation, just apply the gated set.
-			if !ch.Local {
+			// Local and Injected materializations are handler-exclusive
+			// (see Change.Local / Change.Injected): no handler
+			// validation/derivation, just the gated apply.
+			if !ch.Local && !ch.Injected {
 				if err := m.handler.BeforeModify(ctx, rc, op, m.sink); err != nil {
 					// Per-op drop; other ops in the same RecordChange
 					// still apply. Surface so the caller knows the

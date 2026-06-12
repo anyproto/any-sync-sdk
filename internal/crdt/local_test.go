@@ -169,3 +169,75 @@ func TestApply_ScopeByKeyKeepsDeclaredEnforcement(t *testing.T) {
 		Op{Type: OpSet, Path: []string{"createdAt"}, Payload: arena.NewNumberFloat64(1)}))
 	require.Error(t, err, "derived field stays handler-only")
 }
+
+// ----------------------------------------------------------------------------
+// Injected route — the account mirror's apply kind
+// ----------------------------------------------------------------------------
+
+// An injected change writes declared account fields with its
+// caller-supplied version; synced/local/derived declared fields and
+// every other route stay rejected.
+func TestApply_InjectedRouteClassification(t *testing.T) {
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	ds := schema.Dataset{Fields: []schema.Field{
+		{Id: "name", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
+		{Id: "read", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeAccount},
+	}}
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}, Schema: ds})
+	require.NoError(t, err)
+	arena := &anyenc.Arena{}
+
+	// Synced change cannot write the account field.
+	require.Error(t, st.ApplyChange(ctx, makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewTrue()})))
+
+	// Injected change writes it, at the supplied (tech) version.
+	ch := makeUpsert("tech-v7", "r1", Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewTrue()})
+	ch.Injected = true
+	require.NoError(t, st.ApplyChange(ctx, ch))
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec)
+	assert.True(t, rec.GetBool("read"))
+	assert.Equal(t, VersionId("tech-v7"), GetRecordVersion(rec, "read"))
+
+	// Injected change cannot write the synced field.
+	ch2 := makeUpsert("tech-v8", "r1", Op{Type: OpSet, Path: []string{"name"}, Payload: arena.NewString("x")})
+	ch2.Injected = true
+	require.Error(t, st.ApplyChange(ctx, ch2))
+
+	// A stale injected replay gates to a no-op (idempotent mirror).
+	ch3 := makeUpsert("tech-v3", "r1", Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewFalse()})
+	ch3.Injected = true
+	require.NoError(t, st.ApplyChange(ctx, ch3))
+	rec = st.Get(ctx, testDS, "r1")
+	assert.True(t, rec.GetBool("read"), "older injected version gated out")
+
+	// Local+Injected is a contradiction.
+	ch4 := makeUpsert("v9", "r1", Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewTrue()})
+	ch4.Local = true
+	ch4.Injected = true
+	require.Error(t, st.ApplyChange(ctx, ch4))
+}
+
+// Injected changes on a DynamicScopeByKey dataset may write undeclared
+// heads — the mirror resolved the per-key scope itself.
+func TestApply_InjectedOnScopeByKeyDataset(t *testing.T) {
+	st := newScopeByKeyController(t)
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, st.ApplyChange(ctx, makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"any", "name"}, Payload: arena.NewString("shared")})))
+
+	ch := makeUpsert("tech-v2", "r1",
+		Op{Type: OpSet, Path: []string{"movie", "read"}, Payload: arena.NewTrue()})
+	ch.Injected = true
+	require.NoError(t, st.ApplyChange(ctx, ch))
+
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec)
+	assert.True(t, rec.GetBool("movie", "read"))
+	assert.Equal(t, VersionId("tech-v2"), GetRecordVersion(rec, "movie", "read"))
+	assert.Equal(t, "shared", rec.GetString("any", "name"), "synced path untouched")
+}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
@@ -70,6 +71,7 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 //     writes (those land shortIds and may unblock parked changes).
 //     Decoupled from the apply lock to avoid the o.mu re-entry
 //     deadlock that synchronous Drain previously hit.
+//
 // applySeqOf extracts the apply sequence the controller allocated for
 // this change. ApplyChangeWithResult takes the Change by value, so the
 // allocation only travels back through the result.
@@ -108,6 +110,23 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// when no indexer is attached.
 		if s.changeSubs.hasSubscribers() {
 			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
+		}
+
+		// Row lifecycle events for the objects collection: creation is
+		// detected via the synthetic _ver.id derived op the apply path
+		// emits exactly once per record; deletion via a delete op in the
+		// change. Both key the account mirror's replay/GC.
+		if ch.Dataset == properties.Dataset && s.rowEvents.hasSubscribers() {
+			for i, rc := range ch.Records {
+				rid := ch.ObjectId // shared collection: row id = objectId
+				if hasDeleteOp(rc.Ops) {
+					s.rowEvents.dispatch(RowEvent{ObjectId: rid, Deleted: true})
+					continue
+				}
+				if res != nil && i < len(res.DerivedOps) && hasCreationMarker(res.DerivedOps[i]) {
+					s.rowEvents.dispatch(RowEvent{ObjectId: rid, Deleted: false})
+				}
+			}
 		}
 
 		if ch.Dataset != typetype.DatasetPropertyDefs {
@@ -230,4 +249,27 @@ func (s *Store) replayParked(ctx context.Context, row DetachedRow) error {
 		return fmt.Errorf("drain: get %s: %w", row.ObjectId, err)
 	}
 	return obj.ApplyDecoded(ctx, decoded)
+}
+
+// hasDeleteOp reports whether ops contains a record-level delete.
+func hasDeleteOp(ops []crdt.Op) bool {
+	for _, op := range ops {
+		if op.Type == crdt.OpDelete {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCreationMarker reports whether the apply emitted the one-shot
+// synthetic `_ver.id` stamp for this record — the unambiguous "this
+// change created the row" signal (see subscribe.projectRecords).
+func hasCreationMarker(derived []crdt.Op) bool {
+	for _, op := range derived {
+		if op.Type == crdt.OpSet && len(op.Path) == 2 &&
+			op.Path[0] == crdt.VersionsKey && op.Path[1] == crdt.IdField {
+			return true
+		}
+	}
+	return false
 }

@@ -145,6 +145,10 @@ type Store struct {
 	applySeqBackfill    sync.Once
 	applySeqBackfillErr error
 
+	// rowEvents notifies objects-row creations/deletions — the account
+	// mirror's replay and GC triggers. See SubscribeRowEvents.
+	rowEvents *rowEventRegistry
+
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
 	// collection, no built-in properties/typetype/shortIds regs, no
@@ -232,6 +236,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		spaceId:        cfg.SpaceId,
 		engine:         subscribe.New(cfg.SpaceId),
 		changeSubs:     newChangeRegistry(),
+		rowEvents:      newRowEventRegistry(),
 		customHandlers: cfg.Handlers,
 		disableGate:    cfg.DisableGate,
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -12,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 
+	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -39,6 +41,11 @@ type Service struct {
 	open    atomic.Bool
 	spaceId string
 	indexId string
+
+	// avIds caches targetSpaceId → derived account-values carrier
+	// object id (see accountvalues.go). Guarded by avMu.
+	avMu  sync.Mutex
+	avIds map[string]string
 
 	// store backs the single index object. It is a "raw" spaceobjects
 	// Store (custom handlers, gate disabled) so the index inherits the
@@ -118,11 +125,16 @@ func (s *Service) Open(ctx context.Context) error {
 		Handlers: []crdt.HandlerReg{
 			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
 			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
+			// Account-values carrier (one derived object per target
+			// space) — see accountvalues.go. Dynamic: carrier records
+			// carry free-form typeId heads at the target rows' paths.
+			{Name: accountvalues.Dataset, Handler: crdt.DefaultHandler{}, Schema: accountvalues.Schema()},
 		},
 		DisableGate: true,
 		DataVersions: map[string]string{
-			SpaceIndexDataset: HandlerVersion,
-			ProfileDataset:    ProfileHandlerVersion,
+			SpaceIndexDataset:     HandlerVersion,
+			ProfileDataset:        ProfileHandlerVersion,
+			accountvalues.Dataset: accountvalues.HandlerVersion,
 		},
 	})
 

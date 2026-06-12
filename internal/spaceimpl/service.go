@@ -102,6 +102,10 @@ type Service struct {
 	// and forwards converged state into the Indexer. Lifetime: until
 	// SDK.Close (mirrors the members-watcher sticky lifecycle).
 	spaceIndexWatchers map[string]*spaceIndexWatcher
+	// accountMirrors holds one account-values mirror per loaded
+	// spaceId — the tech-space → target-space apply side of
+	// account-scoped values (see accountmirror.go).
+	accountMirrors map[string]*accountMirror
 
 	// watchers tracks every active members poller across all loaded
 	// spaceImpls so SDK shutdown can drain them deterministically.
@@ -136,6 +140,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		allocs:             make(map[string]*object.VersionAllocator),
 		spaceIndexIds:      make(map[string]string),
 		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
+		accountMirrors:     make(map[string]*accountMirror),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	// Wire the Total source for the sync-status rollup. The rollup
@@ -183,6 +188,15 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // spacesync catch-up driver invoked from SDK.Open) that need the
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
+
+// accountMirror returns the live account-values mirror for spaceId,
+// or nil before the space's wiring ran. Used by Properties.Set's
+// account route for the inline read-your-writes replay.
+func (s *Service) accountMirror(spaceId string) *accountMirror {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountMirrors[spaceId]
+}
 
 // ensureSpaceIndexWiring is idempotent per spaceId: on first call it
 // derives the deterministic spaceIndex object id, caches it, and
@@ -249,6 +263,28 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 			s.spaceIndexWatchers[spaceId] = w
 			s.watchers.register(w)
 			s.mu.Unlock()
+		}
+	}
+
+	// Account-values mirror: tech-space carrier → this space's objects
+	// rows. Same dedup dance; the initial re-mirror runs inside
+	// newAccountMirror.
+	if store != nil && s.tsp != nil {
+		s.mu.Lock()
+		_, dup := s.accountMirrors[spaceId]
+		s.mu.Unlock()
+		if !dup {
+			if m := newAccountMirror(ctx, store, s.tsp, spaceId); m != nil {
+				s.mu.Lock()
+				if _, raced := s.accountMirrors[spaceId]; raced {
+					s.mu.Unlock()
+					m.stop()
+				} else {
+					s.accountMirrors[spaceId] = m
+					s.watchers.register(m)
+					s.mu.Unlock()
+				}
+			}
 		}
 	}
 	return objectId, nil
@@ -419,6 +455,20 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
 	}
+	// GC the space's account-values carrier in tech space — one derived
+	// tree, gone. Stop the mirror first so it doesn't race the drop.
+	// Best-effort: a failed drop leaves an orphan carrier whose records
+	// are never mirrored again (the space is deleted everywhere via the
+	// remoteStatus above).
+	s.mu.Lock()
+	m := s.accountMirrors[spaceId]
+	delete(s.accountMirrors, spaceId)
+	s.mu.Unlock()
+	if m != nil {
+		s.watchers.unregister(m)
+		m.stop()
+	}
+	_ = s.tsp.DropAccountValues(ctx, spaceId)
 	return nil
 }
 

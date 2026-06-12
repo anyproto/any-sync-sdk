@@ -64,7 +64,7 @@ func TestSDK_Aggregate(t *testing.T) {
 		t.Helper()
 		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 		require.NoError(t, err)
-		_, err = sp.Properties().SetBase(ctx, id, typeId, map[string]any{
+		_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{
 			titleProp: title, yearProp: year,
 		})
 		require.NoError(t, err)

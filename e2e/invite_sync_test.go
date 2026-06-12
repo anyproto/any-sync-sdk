@@ -104,7 +104,7 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	for _, title := range []string{"Casablanca", "Vertigo"} {
 		objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 		require.NoError(t, err)
-		_, err = sp.Properties().SetBase(ctx, objId, typeId, map[string]any{propId: title})
+		_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{propId: title})
 		require.NoError(t, err)
 		objs = append(objs, objFix{id: objId, title: title})
 	}
@@ -189,7 +189,7 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	//
 	// The value check belongs INSIDE this wait, not after it. Each
 	// object reaches Bob as two separate DAG changes — the `any.types`
-	// bootstrap and the `SetBase` value — both parked behind the type
+	// bootstrap and the `Properties().Set` value — both parked behind the type
 	// def's shortId (the DataVersion gate). When the type def lands they
 	// drain in one pass but apply non-atomically per object: the
 	// `any.types` replay creates the object's row (so it shows up in
@@ -223,7 +223,7 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 		}
 		lastVals = lastVals[:0]
 		for _, want := range objs {
-			rec, err := bobSpace.Properties().Get(ctx, want.id, space.PropertyReadOpts{})
+			rec, err := bobSpace.Properties().Get(ctx, want.id)
 			if err != nil || rec == nil {
 				return false
 			}
@@ -243,7 +243,7 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	// Re-assert the values for a clear failure message if the wait above
 	// is ever loosened — by here they are guaranteed present.
 	for _, want := range objs {
-		rec, err := bobSpace.Properties().Get(ctx, want.id, space.PropertyReadOpts{})
+		rec, err := bobSpace.Properties().Get(ctx, want.id)
 		require.NoError(t, err, "bob: Properties().Get(%s)", want.id)
 		require.NotNil(t, rec, "bob: nil property record for %s", want.id)
 		assert.Equal(t, want.title, rec.GetString(typeId, propId),

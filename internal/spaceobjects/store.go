@@ -270,13 +270,13 @@ func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.Prop
 
 	anyProps := make(map[string]types.PropInfo, len(anytype.Properties))
 	for _, p := range anytype.Properties {
-		anyProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind}
+		anyProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
 	}
 	static[anytype.TypeId] = anyProps
 
 	siProps := make(map[string]types.PropInfo, len(spaceindex.Properties))
 	for _, p := range spaceindex.Properties {
-		siProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind}
+		siProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
 	}
 	static[spaceindex.TypeId] = siProps
 
@@ -291,7 +291,7 @@ func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.Prop
 		}
 		props := make(map[string]types.PropInfo, len(t.Properties))
 		for _, p := range t.Properties {
-			props[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: propertyKindToSchema(p.Kind)}
+			props[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: propertyKindToSchema(p.Kind), Scope: p.Scope}
 		}
 		static[t.Id] = props
 	}
@@ -365,6 +365,13 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			}
 			if propertyKindToSchema(p.Kind) == schema.KindUnknown {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d] (%q): invalid Kind %d", i, t.Id, k, p.Id, p.Kind)
+			}
+			// Scope: zero (defaults to synced) or an explicit creatable
+			// class. Derived is reserved for SDK built-ins.
+			switch p.Scope {
+			case 0, schema.ScopeSynced, schema.ScopeAccount, schema.ScopeLocal:
+			default:
+				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d] (%q): invalid Scope %d (synced/account/local only)", i, t.Id, k, p.Id, p.Scope)
 			}
 			if _, dup := seenProps[p.Id]; dup {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: duplicate property Id %q", i, t.Id, k, p.Id)
@@ -810,17 +817,18 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // stays per-type-object.
 // objectsDatasetSchema is the per-space `objects` (properties) dataset
 // schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
-// synced) with the built-in `any` fields declared by class — ScopeAuto
-// auto-fields (author/createdAt/spaceId/id) as Derived (handler-only),
-// ScopeBase fields (name/description/…) as Synced.
+// synced) with the built-in `any` fields declared by their unified
+// schema.Scope class — derived auto-fields (author/createdAt/spaceId/
+// id) are handler-only, the rest synced.
+//
+// Note this declares the TOP-LEVEL field heads only (`any`, typeIds are
+// dynamic). Per-PROPERTY scope (synced/account/local on a user propId)
+// is enforced by SystemPropertiesHandler against the type Registry —
+// the dataset schema can't see second path segments.
 func objectsDatasetSchema() schema.Dataset {
 	fields := make([]schema.Field, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
-		cls := schema.ScopeSynced
-		if p.Scope == anytype.ScopeAuto {
-			cls = schema.ScopeDerived
-		}
-		fields = append(fields, schema.Field{Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: cls})
+		fields = append(fields, schema.Field{Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: p.Scope})
 	}
 	return schema.Dataset{Fields: fields, Dynamic: true}
 }

@@ -44,9 +44,13 @@ const HandlerVersion = "systemPropertyHandler-v1"
 // distinguish it from typetype.PropertyHandler (which governs
 // property definitions on type objects).
 //
-// Variant routing (`_base` / `_account` / `_device`) is handled by
-// the apply loop via RecordChange.Variant — the handler is variant-
-// agnostic and only validates kinds against the type Registry.
+// This handler serves the SYNCED route only — it runs on DAG-borne
+// changes (local writes via LocalWrite included). Account-scoped
+// values arrive via the tech-space mirror's injected applies and
+// local-scoped values via Object.LocalSet, neither of which invokes
+// dataset handlers; their validation is writer-side. The scope check
+// in validateField is what keeps the three routes path-disjoint (see
+// docs/scoped-properties-proposal.md).
 //
 // Two validation paths, split along the local/inbound line:
 //
@@ -85,8 +89,9 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 // space `objects` collection carries them. The stamps are derived
 // from the change envelope (Creator from the signing identity,
 // Timestamp from the change wire, SpaceId from the apply context),
-// not from caller input — these fields are ScopeAuto in the `any`
-// type, read-only by convention.
+// not from caller input — these fields are ScopeDerived in the `any`
+// type, read-only by contract (validateField rejects input ops on
+// them via the scope check).
 //
 // Validation is per-op drop, same as BeforeModify: ops that fail the
 // current schema are filtered out and the rest of the record still
@@ -333,7 +338,18 @@ func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight)
 
 // validateField is the shared per-(typeId, propId) check. Order:
 // membership (pre-flight only) → type resolvable → property declared →
-// kind. Returns the first violation as a *ValidationError, or nil.
+// scope → kind. Returns the first violation as a *ValidationError, or
+// nil.
+//
+// The scope check is the convergent guard that keeps version domains
+// path-disjoint: this handler only ever runs on the synced (DAG)
+// route, so any op targeting a property whose declared scope is not
+// ScopeSynced is dropped — account values arrive via the tech-space
+// mirror's injected applies and local values via LocalSet, neither of
+// which runs this handler. A malicious or buggy peer addressing an
+// account/local propId through the DAG is rejected identically on
+// every peer (the DataVersion gate parks changes whose schema hasn't
+// synced, so the registry lookup is never racing the definition).
 func (h *SystemPropertiesHandler) validateField(typeId, propId string, payload *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
 	if pf != nil {
 		if _, ok := pf.members[typeId]; !ok {
@@ -344,20 +360,27 @@ func (h *SystemPropertiesHandler) validateField(typeId, propId string, payload *
 	if !ok {
 		return &ValidationError{Reason: ReasonTypeUnknown, TypeId: typeId, PropId: propId}
 	}
-	declared, name, found := schema.KindUnknown, "", false
+	var info types.PropInfo
+	found := false
 	for _, p := range props {
 		if p.Id == propId {
-			declared, name, found = p.Kind, p.Name, true
+			info, found = p, true
 			break
 		}
 	}
 	if !found {
 		return &ValidationError{Reason: ReasonUnknownProperty, TypeId: typeId, PropId: propId, Known: props}
 	}
-	expected, got, ok := kindCheck(opType, declared, payload)
+	if sc := info.EffectiveScope(); sc != schema.ScopeSynced {
+		return &ValidationError{
+			Reason: ReasonScopeMismatch, TypeId: typeId, PropId: propId, PropName: info.Name,
+			DeclaredScope: sc, WriteRoute: schema.ScopeSynced,
+		}
+	}
+	expected, got, ok := kindCheck(opType, info.Kind, payload)
 	if !ok {
 		return &ValidationError{
-			Reason: ReasonKindMismatch, TypeId: typeId, PropId: propId, PropName: name,
+			Reason: ReasonKindMismatch, TypeId: typeId, PropId: propId, PropName: info.Name,
 			Expected: expected, Got: got,
 		}
 	}

@@ -515,40 +515,44 @@ Each handler may enforce:
 
 ---
 
-## 9. Property Variants (protocol)
+## 9. Property Scopes (protocol)
 
-The `objects` system collection stores one record per object with four property scopes: `auto`, `base`, `account`, `device` (see `06-data-structure.md`).
+Every property (and every declared dataset field) lives in exactly ONE
+scope, fixed on its DECLARATION — there are no per-value variants and
+no priority merge. See `docs/scoped-properties-proposal.md` for the
+full design; the protocol-relevant rules are:
 
-### 9.1 Where property writes come from
-- `base` — written via the regular CRDT pipeline on the **object itself** (one built-in dataset per object, handled by the `baseProperty` handler). Records use empty `id` in changes; the handler translates them into an update on the `objects` collection of the space
-- `account` — written to a dedicated dataset in the **rewriteObject** in tech space; handled by the `rewriteObject` handler
-- `device` — written locally, no any-sync change involved
+### 9.1 One path, one write route
+- `synced` — written via the regular CRDT pipeline on the object
+  itself. `_ver` entries for these paths hold the object tree's local
+  versionIds.
+- `account` — written to a carrier record in the account's private
+  tech space; a per-device watcher mirrors converged values into the
+  target record at the SAME paths, stamping the tech tree's local
+  versionIds.
+- `local` — written via `Object.LocalSet`, no DAG involved; versions
+  are locally-minted lexids (`NextVersion` of the path's current
+  version).
+- `derived` — handler-stamped, never writable by input ops.
 
-### 9.2 Per-variant `_ver`
-The `objects` record holds three independent `_ver` maps, one per overridable variant:
-```json
-{
-  "id": "objectId",
-  "name": "device name",
-  "_device":  { "name": "device name" },
-  "_account": { "name": "account name" },
-  "_base":    { "name": "base name" },
-  "_o_device":  { "name": "vLocal1" },
-  "_o_account": { "name": "vTech7"  },
-  "_o_base":    { "name": "vObj42"  }
-}
-```
-- `_o_device` is keyed by **local** version IDs (§9.4)
-- `_o_account` is keyed by tech space's `versionId`
-- `_o_base` is keyed by the object's own `versionId`
+### 9.2 One `_ver` tree, disjoint domains
+The record keeps its single `_ver` tree (§3). Version domains never
+compare because no two routes ever write the same path: a property's
+scope is pinned for its propId's life (first-write-wins on the
+definition, like `kind`), and the apply path enforces route-vs-scope —
+an inbound DAG op addressing an account/local-scoped propId is dropped
+per-op, identically on every peer (the DataVersion gate parks changes
+whose schema hasn't synced, so the scope lookup never races the
+definition).
 
-Version IDs from different scopes are **not comparable** — each `_o_*` lives in its own version space.
+VersionIds from different scopes are still **not comparable** — but
+nothing ever needs to compare them.
 
-### 9.3 Computed root
-After any variant changes, the handler recomputes affected root fields by picking the winning variant per priority `device > account > base`. The computed value lives at the root and is what queries see by default.
-
-### 9.4 Device version IDs
-Device writes never touch any-sync. The SDK keeps a local monotonic counter per (space, object) stored in any-store. Keys in `_o_device` use the counter with a distinct prefix (e.g., `"d#42"`).
+### 9.3 No computed root
+There is no merge step. The value at a path IS the value its one scope
+last wrote. Events carry one versionId per change (the domain of
+whatever route produced it) — the client recipe `_ver.<op.path> =
+event.versionId` is domain-agnostic and unchanged.
 
 ---
 
@@ -604,12 +608,11 @@ Terminal calls:
 
 ### 11.1 Projections
 
-By default the `_device` / `_account` / `_base` variant fields (for the `objects` collection) are stripped and tombstones are excluded. The caller sees the clean record with `_ver` attached in the same tree shape used internally — clients that mirror SDK state per field parse `_ver` using the same lookup rules as the SDK (the shape is documented in §3.1 and §3.2).
+By default tombstones are excluded. The caller sees the record verbatim with `_ver` attached in the same tree shape used internally — clients that mirror SDK state per field parse `_ver` using the same lookup rules as the SDK (the shape is documented in §3.1 and §3.2). Values of every property scope sit at their normal paths; there is nothing to strip or collapse.
 
 Opt-in flags:
 
-- **`WithRawVariants()`** — include the raw `_device` / `_account` / `_base` variant fields for `objects` collection records (normally the caller only sees the computed root values).
-- **`WithTombstones()`** — include tombstones in the result.
+- **`WithTombstones()`** (`ProjectionOpts.IncludeDeleted`) — include tombstones in the result.
 
 Defining a stable client-facing version accessor (single-path lookup, walker) is deferred to a later iteration. For now the tree shape documented in §3 is the contract.
 
@@ -715,8 +718,8 @@ Each `RemovedRecord` carries the id plus a `reason` so consumers can tell "the o
 
 Branch on `deleted` to drop the object for good. For `filtered-out` / `displaced`, a `Snapshot` / `Query.One` with the id still returns the doc (filtered-out ⇒ doesn't match the active filter; displaced ⇒ does).
 
-### 13.4 Property Variants in Events
-For the `objects` collection: `SubRecord.Doc` carries the merged post-apply value (computed root). Variant-level (`_device` / `_account` / `_base`) introspection is not exposed in v1; an advanced channel is deferred.
+### 13.4 Property Scopes in Events
+Account- and local-scoped writes flow through the same event stream as synced ones: one event per applied change, `VersionId` from that change's own domain (already the case for local writes today). Consumers don't need to know a path's scope to apply the ops.
 
 ### 13.5 Ordering
 - Events are emitted in `applyChange` order (strictly after tx commit).
@@ -742,8 +745,7 @@ Either error is the only recovery contract: the client resubscribes and the new 
 
 - Handler registration / lifecycle
 - Internal write flow (tree writes, reconciliation, re-indexing)
-- `_ver_device` / `_ver_account` / `_ver_base` internal structure (callers use `WithRawVariants()` if they need the raw scopes, otherwise they see computed root values)
-- Device-counter version IDs (callers see final versionIds in events, even for device writes which use their own internal counter)
+- Carrier-record internals of the account mirror (tech-space transport is invisible; callers see values at their normal paths)
 
 Note that `_ver` itself IS caller-facing — it ships with each queried record in the same tree shape the SDK stores it. Clients use the documented lookup rules (§3) to walk it. This is the full contract; there's no "internal vs external" representation split for `_ver` in v1.
 

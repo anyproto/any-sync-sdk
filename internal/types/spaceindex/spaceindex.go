@@ -41,32 +41,23 @@ const (
 	FieldSpaceType   = "spaceType"
 )
 
-// Scope mirrors anytype.Scope — distinguishes auto (read-only,
-// derived) from base-scope (CRDT-mutable) properties.
-type Scope uint8
-
-const (
-	ScopeAuto Scope = iota + 1
-	ScopeBase
-)
-
 // BuiltInProperty is one hardcoded property definition. Same shape
 // as anytype.BuiltInProperty so the types registry surfaces both
-// uniformly.
+// uniformly. Scope uses the unified schema.Scope taxonomy.
 type BuiltInProperty struct {
 	Id    string
 	Name  string
 	Kind  schema.Kind
-	Scope Scope
+	Scope schema.Scope
 }
 
 // Properties lists the spaceIndex type's hardcoded property
-// definitions in canonical display order. All four are base-scope
+// definitions in canonical display order. All four are synced
 // strings — `spaceType` is intentionally writable through the CRDT
 // (first writer wins in practice via the initial Create write).
 var Properties = []BuiltInProperty{
-	{Id: FieldName, Name: "Name", Kind: schema.KindString, Scope: ScopeBase},
-	{Id: FieldDescription, Name: "Description", Kind: schema.KindString, Scope: ScopeBase},
-	{Id: FieldIcon, Name: "Icon", Kind: schema.KindString, Scope: ScopeBase},
-	{Id: FieldSpaceType, Name: "Space type", Kind: schema.KindString, Scope: ScopeBase},
+	{Id: FieldName, Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced},
+	{Id: FieldDescription, Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced},
+	{Id: FieldIcon, Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced},
+	{Id: FieldSpaceType, Name: "Space type", Kind: schema.KindString, Scope: schema.ScopeSynced},
 }

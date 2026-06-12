@@ -44,15 +44,15 @@ func TestProperties_DetachConcurrentWriteReattach_Converges(t *testing.T) {
 	typesArr.SetArrayItem(0, a.NewString("userT"))
 
 	// Causally-first create: object implements userT and holds userT.p1.
-	create := makeChange(vCreate, testObjectId, "_base", true,
+	create := makeChange(vCreate, testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "types"}, Payload: typesArr},
 		crdt.Op{Type: crdt.OpSet, Path: []string{"userT", "p1"}, Payload: a.NewString("old")},
 	)
 	// Bob detaches userT. Alice writes a new value under userT — concurrent.
-	detach := makeChange(vDetach, testObjectId, "_base", false,
+	detach := makeChange(vDetach, testObjectId, false,
 		crdt.Op{Type: crdt.OpPull, Path: []string{typeAny, "types"}, Payload: a.NewString("userT")},
 	)
-	write := makeChange(vWrite, testObjectId, "_base", false,
+	write := makeChange(vWrite, testObjectId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{"userT", "p1"}, Payload: a.NewString("new")},
 	)
 
@@ -67,7 +67,7 @@ func TestProperties_DetachConcurrentWriteReattach_Converges(t *testing.T) {
 	}
 
 	hasUserT := func(rec *anyenc.Value) bool {
-		for _, v := range rec.GetArray("_base", typeAny, "types") {
+		for _, v := range rec.GetArray(typeAny, "types") {
 			if string(v.GetStringBytes()) == "userT" {
 				return true
 			}
@@ -77,7 +77,7 @@ func TestProperties_DetachConcurrentWriteReattach_Converges(t *testing.T) {
 	assertState := func(ctrl *crdt.Controller, who string, wantAttached bool) {
 		rec := ctrl.Get(ctx, properties.Dataset, testObjectId)
 		require.NotNil(t, rec, who)
-		assert.Equal(t, "new", rec.GetString("_base", "userT", "p1"), who+": orphan value converged to LWW winner")
+		assert.Equal(t, "new", rec.GetString("userT", "p1"), who+": orphan value converged to LWW winner")
 		assert.Equal(t, wantAttached, hasUserT(rec), who+": userT membership")
 	}
 
@@ -86,7 +86,7 @@ func TestProperties_DetachConcurrentWriteReattach_Converges(t *testing.T) {
 	assertState(peerB, "peerB", false)
 
 	// Re-attach userT on both peers — orphan resurfaces unchanged.
-	reattach := makeChange(next(), testObjectId, "_base", false,
+	reattach := makeChange(next(), testObjectId, false,
 		crdt.Op{Type: crdt.OpAddToSet, Path: []string{typeAny, "types"}, Payload: a.NewString("userT")},
 	)
 	require.NoError(t, peerA.ApplyChange(ctx, reattach))

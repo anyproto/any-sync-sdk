@@ -111,9 +111,20 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	if draft.Kind == 0 {
 		return "", errors.New("typesAPI: PropertyDraft.Kind required")
 	}
+	switch draft.Scope {
+	case 0, space.ScopeSynced, space.ScopeAccount, space.ScopeLocal:
+	default:
+		return "", fmt.Errorf("typesAPI: PropertyDraft.Scope must be synced/account/local (derived is reserved for built-ins); got %s", draft.Scope)
+	}
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
 	payload.Set(typetype.FieldKind, arena.NewString(propertyKindLabel(draft.Kind)))
+	if draft.Scope != 0 && draft.Scope != space.ScopeSynced {
+		// Synced is the implicit default — only non-default scopes are
+		// written, so pre-scope and default definitions stay byte-
+		// identical on the wire. Pinned post-create (schemaBearingFields).
+		payload.Set(typetype.FieldScope, arena.NewString(draft.Scope.String()))
+	}
 	if draft.Name != "" {
 		payload.Set(typetype.FieldName, arena.NewString(draft.Name))
 	}
@@ -379,9 +390,10 @@ func builtInAnyProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
 		out = append(out, space.PropertyDef{
-			Id:   p.Id,
-			Name: p.Name,
-			Kind: schemaKindToPropertyKind(p.Kind),
+			Id:    p.Id,
+			Name:  p.Name,
+			Kind:  schemaKindToPropertyKind(p.Kind),
+			Scope: p.Scope,
 		})
 	}
 	return out
@@ -394,9 +406,10 @@ func builtInSpaceIndexProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(spaceindex.Properties))
 	for _, p := range spaceindex.Properties {
 		out = append(out, space.PropertyDef{
-			Id:   p.Id,
-			Name: p.Name,
-			Kind: schemaKindToPropertyKind(p.Kind),
+			Id:    p.Id,
+			Name:  p.Name,
+			Kind:  schemaKindToPropertyKind(p.Kind),
+			Scope: p.Scope,
 		})
 	}
 	return out
@@ -413,11 +426,16 @@ func registeredTypeProperties(t handler.Type) []space.PropertyDef {
 	}
 	out := make([]space.PropertyDef, 0, len(t.Properties))
 	for _, p := range t.Properties {
-		out = append(out, space.PropertyDef{
-			Id:   p.Id,
-			Name: p.Name,
-			Kind: handlerKindToPropertyKind(p.Kind),
-		})
+		def := space.PropertyDef{
+			Id:    p.Id,
+			Name:  p.Name,
+			Kind:  handlerKindToPropertyKind(p.Kind),
+			Scope: p.Scope,
+		}
+		if def.Scope == 0 {
+			def.Scope = space.ScopeSynced
+		}
+		out = append(out, def)
 	}
 	return out
 }
@@ -455,9 +473,15 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 		Name:        v.GetString(typetype.FieldName),
 		Description: v.GetString(typetype.FieldDescription),
 		XKey:        v.GetString(typetype.FieldXKey),
+		// Absent scope (pre-scope and default-synced definitions) reads
+		// as synced — the historical behavior.
+		Scope: space.ScopeSynced,
 	}
 	if k, ok := schema.ParseKind(v.GetString(typetype.FieldKind)); ok {
 		def.Kind = schemaKindToPropertyKind(k)
+	}
+	if sc, ok := schema.ParseScope(v.GetString(typetype.FieldScope)); ok {
+		def.Scope = sc
 	}
 	if metaObj := v.GetObject(typetype.FieldMeta); metaObj != nil {
 		meta := map[string]string{}

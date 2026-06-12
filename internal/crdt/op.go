@@ -70,21 +70,6 @@ type RecordChange struct {
 	Id     string
 	Ops    []Op
 	Upsert bool
-
-	// Variant routes the ops into a top-level subdocument on the
-	// record (e.g. "_base", "_account", "_device"). Empty string
-	// means "no variant" — ops apply to the record root, the v1
-	// behavior every existing dataset uses. When non-empty, the
-	// apply loop ensures the subdocument exists, then runs ops
-	// against it; `_ver` stamps land inside that subdoc, so per-
-	// variant LWW comparisons stay structurally isolated.
-	//
-	// Tombstones (delete ops) and creation markers (`_ver.id`) live
-	// at the record root regardless of variant — deletion is a
-	// record-level event, not a variant-level one.
-	//
-	// See docs/06-data-structure.md § "Storage — Proposal 2".
-	Variant string
 }
 
 // Change is one batch — exactly one any-sync DAG change. Every op in the batch

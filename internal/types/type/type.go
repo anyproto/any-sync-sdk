@@ -55,6 +55,7 @@ const HandlerVersion = "typePropertyHandler-v1"
 const (
 	FieldKey         = "key"         // user-facing stable identifier (e.g. "actors")
 	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"
+	FieldScope       = "scope"       // "synced"/"account"/"local" — write/sync class, pinned
 	FieldName        = "name"        // human label, mutable
 	FieldDescription = "description" // mutable
 	FieldXKey        = "x-key"       // caller-side mapping key, mutable
@@ -72,9 +73,13 @@ const (
 // for life." `key` is included because storing-by-propId means the
 // key identifies the property's user-side identity; renaming would
 // silently break callers indexing by it (re-add for that case).
+// `scope` is pinned for the same reason kinds are: a propId's write
+// route and version domain must never change (changing scope = mint a
+// new property; see docs/scoped-properties-proposal.md).
 var schemaBearingFields = map[string]struct{}{
 	FieldKey:        {},
 	FieldKind:       {},
+	FieldScope:      {},
 	FieldItems:      {},
 	FieldProperties: {},
 }
@@ -82,6 +87,11 @@ var schemaBearingFields = map[string]struct{}{
 // ErrMissingKind indicates a property record was created without a
 // `kind` field. Wraps crdt.ErrValidation so callers can match either.
 var ErrMissingKind = errors.New("typetype: property record requires `kind`")
+
+// ErrBadScope indicates a property record declared an unknown scope
+// label, or the reserved "derived" scope (SDK built-ins only). Wraps
+// crdt.ErrValidation so callers can match either.
+var ErrBadScope = errors.New("typetype: property `scope` must be one of synced/account/local")
 
 // PropertyHandler validates ops on a type object's `properties`
 // dataset and projects shortId rows into the sibling shortIds dataset
@@ -93,10 +103,12 @@ type PropertyHandler struct{}
 func (PropertyHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates a creation: the record must declare a known
-// `kind`. Mints a shortId from the change's ChangeId and projects a
-// row into ShortIdsDataset. The apply loop stamps that row's `_ver`
-// with this change's VersionId — same versionId as the property
-// record itself, so the gate is consistent.
+// `kind`, and — when present — a creatable `scope` (synced / account /
+// local; absent means synced; "derived" is reserved for SDK built-ins).
+// Mints a shortId from the change's ChangeId and projects a row into
+// ShortIdsDataset. The apply loop stamps that row's `_ver` with this
+// change's VersionId — same versionId as the property record itself,
+// so the gate is consistent.
 func (PropertyHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
 	kindLabel, ok := extractKind(rec.Ops)
 	if !ok {
@@ -104,6 +116,12 @@ func (PropertyHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange,
 	}
 	if _, ok := schema.ParseKind(kindLabel); !ok {
 		return fmt.Errorf("%w: unsupported kind %q", crdt.ErrValidation, kindLabel)
+	}
+	if scopeLabel, present := extractField(rec.Ops, FieldScope); present {
+		sc, known := schema.ParseScope(scopeLabel)
+		if !known || sc == schema.ScopeDerived {
+			return fmt.Errorf("%w: %w (got %q)", crdt.ErrValidation, ErrBadScope, scopeLabel)
+		}
 	}
 	sink.Project(ShortIdsDataset, shortIdRow(ctx.Change.ChangeId, rec.Id, kindLabel))
 	return nil
@@ -134,14 +152,20 @@ func (PropertyHandler) BeforeDelete(ctx *crdt.ChangeCtx, rec *crdt.RecordChange,
 }
 
 // extractKind walks rec.Ops looking for a creation-shape op that
-// carries the `kind` field. Two valid shapes:
+// carries the `kind` field. See extractField for the valid shapes.
+func extractKind(ops []crdt.Op) (string, bool) {
+	return extractField(ops, FieldKind)
+}
+
+// extractField walks ops looking for a creation-shape $set carrying a
+// string value for `field`. Two valid shapes:
 //
-//   - Multi-field $set with empty Path and `kind` as a top-level key
+//   - Multi-field $set with empty Path and `field` as a top-level key
 //     in the payload object.
-//   - Single-field $set with Path = ["kind"] and a string payload.
+//   - Single-field $set with Path = [field] and a string payload.
 //
 // Returns the on-wire label (not parsed) and true if found.
-func extractKind(ops []crdt.Op) (string, bool) {
+func extractField(ops []crdt.Op, field string) (string, bool) {
 	for i := range ops {
 		op := &ops[i]
 		if op.Type != crdt.OpSet {
@@ -151,13 +175,13 @@ func extractKind(ops []crdt.Op) (string, bool) {
 			if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 				continue
 			}
-			v := op.Payload.Get(FieldKind)
+			v := op.Payload.Get(field)
 			if v != nil && v.Type() == anyenc.TypeString {
 				return string(v.GetStringBytes()), true
 			}
 			continue
 		}
-		if len(op.Path) == 1 && op.Path[0] == FieldKind {
+		if len(op.Path) == 1 && op.Path[0] == field {
 			if op.Payload != nil && op.Payload.Type() == anyenc.TypeString {
 				return string(op.Payload.GetStringBytes()), true
 			}

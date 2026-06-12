@@ -1017,8 +1017,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 
 	if creating {
 		// Stamp creation marker before BeforeCreate so handlers reading
-		// existing see _ver.id already in place. Marker stays at root
-		// regardless of variant — creation is record-level.
+		// existing see _ver.id already in place.
 		ver := a.NewObject()
 		ver.Set(IdField, a.NewString(string(ch.VersionId)))
 		existing.Set(VersionsKey, ver)
@@ -1041,13 +1040,9 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 				return existing, false, nil
 			}
 		}
-		target := variantTarget(a, existing, rc.Variant)
 		for i := range rc.Ops {
-			applyOp(a, target, *ch, rc.Ops[i])
+			applyOp(a, existing, *ch, rc.Ops[i])
 		}
-		// Derived ops are record-level by convention (author, createdAt,
-		// id-like markers), so they target root regardless of the
-		// triggering variant.
 		m.drainDerivedTo(a, existing, ch)
 	} else if isTombstone(existing) {
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
@@ -1061,7 +1056,6 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			lowerCreationMarker(a, existing, ch.VersionId)
 		}
 		ctx := &ChangeCtx{Change: ch, Before: existing}
-		target := variantTarget(a, existing, rc.Variant)
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
 			// Device-local writes are handler-exclusive (see Change.Local):
@@ -1075,9 +1069,8 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 					continue
 				}
 			}
-			applyOp(a, target, *ch, *op)
+			applyOp(a, existing, *ch, *op)
 		}
-		// Derived ops are record-level — see BeforeCreate path.
 		m.drainDerivedTo(a, existing, ch)
 	}
 
@@ -1123,9 +1116,8 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		lowerCreationMarker(a, existing, ch.VersionId)
 	}
 
-	target := variantTarget(a, existing, rc.Variant)
 	for i := range rc.Ops {
-		applyOp(a, target, *ch, rc.Ops[i])
+		applyOp(a, existing, *ch, rc.Ops[i])
 	}
 	stampAddSeq(a, existing, ch.AddSeq)
 	updateTraces(a, existing, *ch)
@@ -1133,10 +1125,9 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 	return existing, true, nil
 }
 
-// drainDerivedTo applies and clears Sink.derived against target. Caller
-// is responsible for picking target — same routing as the original ops
-// (root or variant subdoc). No-op when no handler is wired (sibling
-// path) or when nothing was emitted.
+// drainDerivedTo applies and clears Sink.derived against target (the
+// record root). No-op when no handler is wired (sibling path) or when
+// nothing was emitted.
 //
 // Captures the drained ops onto m.appliedDerived so the dispatcher can
 // project them onto the wire. Payloads live on the handler's own arena
@@ -1152,22 +1143,6 @@ func (m *recordModifier) drainDerivedTo(a *anyenc.Arena, target *anyenc.Value, c
 	}
 	m.appliedDerived = append(m.appliedDerived, m.sink.derived...)
 	m.sink.derived = m.sink.derived[:0]
-}
-
-// variantTarget returns the subdocument under root[variant], lazily
-// creating it as an empty object if absent. Empty variant means "no
-// routing" — return root itself, so existing variantless datasets
-// keep their current behavior with zero overhead.
-func variantTarget(a *anyenc.Arena, root *anyenc.Value, variant string) *anyenc.Value {
-	if variant == "" {
-		return root
-	}
-	sub := root.Get(variant)
-	if sub == nil || sub.Type() != anyenc.TypeObject {
-		sub = a.NewObject()
-		root.Set(variant, sub)
-	}
-	return sub
 }
 
 // Compile-time check that recordModifier satisfies query.Modifier.

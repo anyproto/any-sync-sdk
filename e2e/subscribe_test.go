@@ -127,7 +127,7 @@ func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 	t.Cleanup(func() { _ = wrongDsRes.Sub.Close() })
 
 	// Trigger one apply on the `objects` dataset.
-	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, objectId, typeId, map[string]any{
 		titleProp: "Casablanca",
 	})
 	require.NoError(t, err)
@@ -153,7 +153,7 @@ func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 	// subsequent write still feeds explicit.
 	require.NoError(t, sharedRes.Sub.Close())
 
-	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, objectId, typeId, map[string]any{
 		titleProp: "Vertigo",
 	})
 	require.NoError(t, err)
@@ -234,7 +234,7 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 	// Now write a property value on the SAME row. This is an UPDATE
 	// (BeforeCreate doesn't fire on an existing row); the SubRecord
 	// arrives in Updated, not Added.
-	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, objectId, typeId, map[string]any{
 		titleProp: "Casablanca",
 	})
 	require.NoError(t, err)

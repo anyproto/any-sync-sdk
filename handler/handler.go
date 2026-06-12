@@ -191,19 +191,25 @@ type Field = schema.Field
 // Leaf; nil means an unconstrained value.
 type FieldShape = schema.Schema
 
-// Scope is a dataset field's class: how it is written, versioned, and
-// synced. Use the Scope* constants.
+// Scope is the unified write/sync class shared by dataset fields and
+// property definitions: how a value is written, which version domain
+// stamps it, and how far it syncs. Use the Scope* constants.
 type Scope = schema.Scope
 
 const (
-	// ScopeSynced: user/DAG-written, change-versioned, synced across the
-	// account's devices (the default for undeclared dynamic fields).
+	// ScopeSynced: user/DAG-written, change-versioned, synced to
+	// everyone with space access (the default for undeclared dynamic
+	// fields and for property definitions that don't declare a scope).
 	ScopeSynced = schema.ScopeSynced
 	// ScopeDerived: handler-computed from the change, read-only to
 	// writers, converges across peers (e.g. creator / createdAt).
 	ScopeDerived = schema.ScopeDerived
 	// ScopeLocal: device-local, never synced (e.g. a per-device status).
 	ScopeLocal = schema.ScopeLocal
+	// ScopeAccount: synced across the same account's devices only, via
+	// the private tech space; invisible to other space members (e.g. a
+	// per-account read/unread flag).
+	ScopeAccount = schema.ScopeAccount
 )
 
 // Leaf builds an unconstrained scalar value shape for a PropertyKind —
@@ -281,9 +287,12 @@ const (
 // PropertyDecl is one property definition declared by an external
 // Type. Id is the on-record field key under `{typeId}`; Kind is the
 // value kind enforced on write; Name is an optional display label
-// surfaced through space.Types().Properties().
+// surfaced through space.Types().Properties(). Scope is the property's
+// write/sync class — zero value means ScopeSynced; ScopeDerived is
+// reserved for SDK built-ins and rejected at registration.
 type PropertyDecl struct {
-	Id   string
-	Name string
-	Kind PropertyKind
+	Id    string
+	Name  string
+	Kind  PropertyKind
+	Scope Scope
 }

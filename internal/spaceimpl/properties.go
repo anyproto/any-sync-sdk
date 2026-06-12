@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -11,29 +13,29 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// propertiesAPI implements space.PropertiesAPI for MVP — base-scope
-// only. SetAccount, SetDevice, AttachType, DetachType return errors
-// pending their dedicated subsystems (rewrite-object in tech space,
-// device-local store, etc.).
+// propertiesAPI implements space.PropertiesAPI. The synced route is
+// live; account and local routes land with their transports (tech-
+// space carrier / LocalSet wiring — see
+// docs/scoped-properties-proposal.md slices 3 and 4).
 type propertiesAPI struct {
 	parent *spaceImpl
 }
 
 func newPropertiesAPI(parent *spaceImpl) *propertiesAPI { return &propertiesAPI{parent: parent} }
 
-// Get returns the computed property record for objectId. MVP: returns
-// the raw record from the object's `properties` dataset (whose record
-// id is the objectId itself). Variant collapse is a no-op here
-// because we only write base-scope.
+// Get returns the property record for objectId, verbatim. Values of
+// every scope sit at their normal `{typeId}.{propId}` paths — there is
+// nothing to collapse or strip.
 //
 // Returns nil with no error if the object has no property record
 // yet (never written) or has been tombstoned. Pure any-store read —
 // no any-sync tree build, no cold restore.
-func (p *propertiesAPI) Get(ctx context.Context, objectId string, _ space.PropertyReadOpts) (*anyenc.Value, error) {
+func (p *propertiesAPI) Get(ctx context.Context, objectId string) (*anyenc.Value, error) {
 	coll, err := p.parent.store.SharedObjects(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("propertiesAPI: shared objects: %w", err)
@@ -57,10 +59,18 @@ func (p *propertiesAPI) Get(ctx context.Context, objectId string, _ space.Proper
 	return cloned.Value, nil
 }
 
-// SetBase merges the patch into the object's own `properties` record.
-// Patch keys are propIds; the resulting paths are
-// `{typeId}.{propId}`. Multi-field $set in a single change.
-func (p *propertiesAPI) SetBase(ctx context.Context, objectId, typeId string, patch map[string]any) (space.ModifyResult, error) {
+// Set merges the patch into the object's property record on the route
+// the keys' declared scope selects. Patch keys are propIds.
+//
+// Routing: every key's scope is resolved against the type registry; a
+// patch whose RESOLVED keys span more than one scope is rejected up
+// front (routes commit independently across different version domains
+// — there is no cross-route rollback). Keys that don't resolve
+// (unknown property, unknown type) don't pick a route; they fall
+// through to the selected route's strict validation, which produces
+// the precise agent-readable rejection (unknown_property /
+// type_unknown / scope_mismatch).
+func (p *propertiesAPI) Set(ctx context.Context, objectId, typeId string, patch map[string]any) (space.ModifyResult, error) {
 	if objectId == "" || typeId == "" {
 		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and typeId required")
 	}
@@ -68,6 +78,66 @@ func (p *propertiesAPI) SetBase(ctx context.Context, objectId, typeId string, pa
 		return space.ModifyResult{}, errors.New("propertiesAPI: empty patch")
 	}
 
+	route, err := resolveRoute(p.parent.store.Registry(), typeId, patch)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	switch route {
+	case schema.ScopeSynced:
+		return p.setSynced(ctx, objectId, typeId, patch)
+	case schema.ScopeLocal:
+		return space.ModifyResult{}, errors.New("propertiesAPI: local-scoped writes not implemented yet (scoped-properties slice 3)")
+	case schema.ScopeAccount:
+		return space.ModifyResult{}, errors.New("propertiesAPI: account-scoped writes not implemented yet (scoped-properties slice 4)")
+	}
+	return space.ModifyResult{}, fmt.Errorf("propertiesAPI: unroutable scope %s", route)
+}
+
+// resolveRoute picks the single write route for a patch: the declared
+// scope shared by every key that resolves in the registry. Returns
+// ScopeSynced when nothing resolves (nil registry bring-up mode,
+// unknown type, or all-unknown keys — the synced route's strict
+// PreValidate then owns the precise rejection). A mix of resolved
+// scopes is a caller error, reported with the per-scope key split so
+// the caller can re-issue one call per scope.
+func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (schema.Scope, error) {
+	props, ok := reg.PropsOf(typeId)
+	if !ok {
+		return schema.ScopeSynced, nil
+	}
+	byId := make(map[string]types.PropInfo, len(props))
+	for _, pi := range props {
+		byId[pi.Id] = pi
+	}
+	byScope := make(map[schema.Scope][]string)
+	for key := range patch {
+		pi, found := byId[key]
+		if !found {
+			continue
+		}
+		sc := pi.EffectiveScope()
+		byScope[sc] = append(byScope[sc], key)
+	}
+	if len(byScope) <= 1 {
+		for sc := range byScope {
+			return sc, nil
+		}
+		return schema.ScopeSynced, nil
+	}
+	parts := make([]string, 0, len(byScope))
+	for sc, keys := range byScope {
+		sort.Strings(keys)
+		parts = append(parts, fmt.Sprintf("%s: [%s]", sc, strings.Join(keys, ", ")))
+	}
+	sort.Strings(parts)
+	return 0, fmt.Errorf("propertiesAPI: patch spans multiple scopes — issue one Set per scope (%s)", strings.Join(parts, "; "))
+}
+
+// setSynced is the synced route: a multi-field $set in a single change
+// on the object's own CRDT. Patch keys are propIds; the resulting
+// paths are `{typeId}.{propId}`.
+func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, patch map[string]any) (space.ModifyResult, error) {
 	arena := &anyenc.Arena{}
 	multi := arena.NewObject()
 	for propId, val := range patch {
@@ -109,8 +179,8 @@ func (p *propertiesAPI) SetBase(ctx context.Context, objectId, typeId string, pa
 // the legacy hardcoded handler version, which the gate treats as
 // "no schema constraint" and lets through.
 //
-// Used by the writer paths (Properties.SetBase, Objects.Create
-// bootstrap) for the per-space `objects` dataset.
+// Used by the writer paths (Properties.Set synced route,
+// Objects.Create bootstrap) for the per-space `objects` dataset.
 func dataVersionForType(ctx context.Context, reg *types.LiveRegistry, typeId string) (string, error) {
 	if reg == nil || typeId == "" {
 		return properties.HandlerVersion, nil
@@ -126,22 +196,13 @@ func dataVersionForType(ctx context.Context, reg *types.LiveRegistry, typeId str
 	return types.EncodeDataVersion([]types.DataVersionPair{{TypeId: typeId, ShortId: shortId}}), nil
 }
 
-// SetAccount, SetDevice, AttachType, DetachType — deferred.
-
-func (p *propertiesAPI) SetAccount(_ context.Context, _, _ string, _ map[string]any) (space.ModifyResult, error) {
-	return space.ModifyResult{}, errors.New("propertiesAPI: SetAccount not implemented")
-}
-
-func (p *propertiesAPI) SetDevice(_ context.Context, _, _ string, _ map[string]any) error {
-	return errors.New("propertiesAPI: SetDevice not implemented")
-}
-
 // AttachType adds typeId to the object's any.types list, declaring that
 // the object implements the type. Idempotent ($addToSet — re-attaching
 // is a no-op). This is the sanctioned way to let an object host a type's
 // properties or datasets: the write-time membership checks
 // (SystemPropertiesHandler.PreValidate for properties, Modify for
-// datasets) require the type to be present here first.
+// datasets) require the type to be present here first. Type membership
+// is structural and shared, so this always rides the synced route.
 func (p *propertiesAPI) AttachType(ctx context.Context, objectId, typeId string) (space.ModifyResult, error) {
 	if objectId == "" || typeId == "" {
 		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and typeId required")

@@ -56,12 +56,12 @@ func TestSDK_ChangeIndex(t *testing.T) {
 	// Two objects, each with a property write.
 	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, idA, typeId, map[string]any{titleProp: "alpha"})
+	_, err = sp.Properties().Set(ctx, idA, typeId, map[string]any{titleProp: "alpha"})
 	require.NoError(t, err)
 
 	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, idB, typeId, map[string]any{titleProp: "beta"})
+	_, err = sp.Properties().Set(ctx, idB, typeId, map[string]any{titleProp: "beta"})
 	require.NoError(t, err)
 
 	// Live feed saw both objects (among other system writes). Drain
@@ -114,7 +114,7 @@ drain:
 	assert.GreaterOrEqual(t, maxSeq, idToSeq[idB])
 
 	// _addSeq is visible on the property record.
-	rec, err := sp.Properties().Get(ctx, idA, space.PropertyReadOpts{})
+	rec, err := sp.Properties().Get(ctx, idA)
 	require.NoError(t, err)
 	require.NotNil(t, rec)
 	assert.Greater(t, uint64(rec.GetInt("_addSeq")), uint64(0), "_addSeq stamped on property row")
@@ -154,7 +154,7 @@ func TestSDK_TombstoneVisibility(t *testing.T) {
 
 	id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, id, typeId, map[string]any{titleProp: "doomed"})
+	_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{titleProp: "doomed"})
 	require.NoError(t, err)
 
 	// Capture the live row's _addSeq before deletion.

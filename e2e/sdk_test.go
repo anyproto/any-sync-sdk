@@ -254,7 +254,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	require.NotEmpty(t, objectId)
 
 	// 5. Set property value (base scope).
-	res, err := sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
+	res, err := sp.Properties().Set(ctx, objectId, typeId, map[string]any{
 		titleProp: "Casablanca",
 	})
 	require.NoError(t, err)
@@ -263,7 +263,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 
 	// 6. Read it back. The record id is the objectId; values are
 	//    namespaced by typeId → propId.
-	rec, err := sp.Properties().Get(ctx, objectId, space.PropertyReadOpts{})
+	rec, err := sp.Properties().Get(ctx, objectId)
 	require.NoError(t, err)
 	require.NotNil(t, rec)
 	got := rec.GetString(typeId, titleProp)
@@ -365,7 +365,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 		Types: []string{typeId},
 	})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, objectId2, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, objectId2, typeId, map[string]any{
 		titleProp: "Vertigo",
 	})
 	require.NoError(t, err)
@@ -421,7 +421,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	assert.NotEqual(t, multiRes[0].ChangeId, multiRes[1].ChangeId,
 		"each batch should produce its own DAG change")
 
-	rec2, err := sp.Properties().Get(ctx, objectId, space.PropertyReadOpts{})
+	rec2, err := sp.Properties().Get(ctx, objectId)
 	require.NoError(t, err)
 	assert.Equal(t, "Casablanca II", rec2.GetString(typeId, titleProp))
 	assert.Equal(t, "Updated via ModifyMany", rec2.GetString("any", "description"))
@@ -458,7 +458,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	})
 	require.Error(t, err, "validation should fail the whole submission")
 
-	rec3, err := sp.Properties().Get(ctx, objectId, space.PropertyReadOpts{})
+	rec3, err := sp.Properties().Get(ctx, objectId)
 	require.NoError(t, err)
 	assert.Equal(t, "Updated via ModifyMany", rec3.GetString("any", "description"),
 		"prior successful description must be untouched after a failed ModifyMany")

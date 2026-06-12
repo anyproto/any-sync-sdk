@@ -34,24 +34,24 @@ func TestSystemPropertiesHandler_InboundIgnoresMembership(t *testing.T) {
 	// inbound $set on userT.p1 must still apply — membership is a
 	// local-write concern only.
 	require.NoError(t, ctrl.ApplyChange(ctx, makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{"userT", "p1"}, Payload: arena.NewString("orphan")},
 	)))
 
 	rec := ctrl.Get(ctx, properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, "orphan", rec.GetString("_base", "userT", "p1"),
+	assert.Equal(t, "orphan", rec.GetString("userT", "p1"),
 		"inbound write to an unimplemented type must land as orphan, not drop")
 
 	// The orphan value is real data the registry still validates by kind:
 	// a kind-mismatched inbound write to the same unimplemented type still
 	// drops per-op, proving the accept path is kind-checked, not blanket.
 	require.NoError(t, ctrl.ApplyChange(ctx, makeChange(
-		"v2", testObjectId, "_base", false,
+		"v2", testObjectId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{"userT", "p1"}, Payload: arena.NewNumberFloat64(5)},
 	)))
 	rec = ctrl.Get(ctx, properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, "orphan", rec.GetString("_base", "userT", "p1"),
+	assert.Equal(t, "orphan", rec.GetString("userT", "p1"),
 		"kind-mismatched inbound write drops; prior orphan string survives")
 }

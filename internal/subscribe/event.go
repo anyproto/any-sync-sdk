@@ -51,8 +51,7 @@ type Event struct {
 // Event. Id is the record id within Dataset (for shared per-space
 // datasets like "objects" this equals ObjectId).
 type EventRecord struct {
-	Id      string
-	Variant string
+	Id string
 	// Created is true when this change first materialised the record.
 	// The engine uses it (combined with sentinel/visibility state) to
 	// decide Added vs Updated emit semantics.
@@ -120,7 +119,7 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 		if i < len(recordIds) && recordIds[i] != "" {
 			rid = recordIds[i]
 		}
-		er := EventRecord{Id: rid, Variant: rc.Variant}
+		er := EventRecord{Id: rid}
 		if hasRecordDelete(rc.Ops) {
 			er.Deleted = true
 			out = append(out, er)
@@ -130,19 +129,15 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 		if postValue != nil {
 			post = postValue(i)
 		}
-		// Variant ops apply to a sub-document rooted at rc.Variant;
-		// the post-apply lookup we use targets the record root, so
-		// paths in the projected ops carry the variant prefix to match.
 		for _, op := range rc.Ops {
-			projected, ok := projectOp(op, rc.Variant, post)
+			projected, ok := projectOp(op, post)
 			if !ok {
 				continue
 			}
 			er.Ops = append(er.Ops, projected)
 		}
 		// Derived stamps are record-level (author / createdAt / _ver.id
-		// land at root regardless of which variant the triggering op
-		// used), so they project with an empty variant prefix.
+		// land alongside the input ops on the same record).
 		if i < len(derivedOps) {
 			for _, op := range derivedOps[i] {
 				if isCreationMarker(op) {
@@ -153,7 +148,7 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 					er.Created = true
 					continue
 				}
-				projected, ok := projectOp(op, "", post)
+				projected, ok := projectOp(op, post)
 				if !ok {
 					continue
 				}
@@ -194,12 +189,7 @@ func isCreationMarker(op crdt.Op) bool {
 // the op should be dropped from the projection (currently only used
 // for crdt.OpDelete, which is signalled by EventRecord.Deleted at
 // the record level).
-//
-// Variant prefixing: when the input op runs under a variant
-// (RecordChange.Variant != ""), the post-apply value at op.Path
-// lives under post[variant][path...]; we reflect that in the wire
-// path so the consumer's local copy has the same nested shape.
-func projectOp(op crdt.Op, variant string, post *anyenc.Value) (space.EventOp, bool) {
+func projectOp(op crdt.Op, post *anyenc.Value) (space.EventOp, bool) {
 	switch op.Type {
 	case crdt.OpDelete:
 		// Record-level — handled out-of-band via EventRecord.Deleted.
@@ -210,14 +200,14 @@ func projectOp(op crdt.Op, variant string, post *anyenc.Value) (space.EventOp, b
 		// call.
 		return space.EventOp{
 			Type:    op.Type,
-			Path:    prependVariant(variant, op.Path),
+			Path:    clonePath(op.Path),
 			Payload: clonePayload(op.Payload),
 		}, true
 	default:
 		// $inc / $addToSet / $pull / $incGated — derive the post-apply
 		// value at the op's path and emit a $set (or $unset when the
 		// op didn't actually land or the path went away).
-		path := prependVariant(variant, op.Path)
+		path := clonePath(op.Path)
 		val := lookupPath(post, path)
 		if val == nil {
 			return space.EventOp{
@@ -233,21 +223,14 @@ func projectOp(op crdt.Op, variant string, post *anyenc.Value) (space.EventOp, b
 	}
 }
 
-// prependVariant returns variant prepended to path when variant is
-// non-empty. Allocates a fresh slice so callers can't mutate the
-// input op's path.
-func prependVariant(variant string, path []string) []string {
-	if variant == "" {
-		if len(path) == 0 {
-			return nil
-		}
-		out := make([]string, len(path))
-		copy(out, path)
-		return out
+// clonePath copies an op path so callers can't mutate the input op's
+// slice through the projected event.
+func clonePath(path []string) []string {
+	if len(path) == 0 {
+		return nil
 	}
-	out := make([]string, 0, len(path)+1)
-	out = append(out, variant)
-	out = append(out, path...)
+	out := make([]string, len(path))
+	copy(out, path)
 	return out
 }
 

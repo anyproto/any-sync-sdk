@@ -74,11 +74,28 @@ func applySet(arena *anyenc.Arena, rec *anyenc.Value, ch Change, op Op) {
 }
 
 func gatedSet(arena *anyenc.Arena, rec *anyenc.Value, version VersionId, path []string, value *anyenc.Value) {
-	if GetRecordVersion(rec, path...) >= version {
+	gate, subtree := gateVersion(rec, path)
+	if subtree == nil {
+		if gate >= version {
+			return
+		}
+		setNested(arena, rec, path, cloneInto(arena, value))
+		SetRecordVersion(arena, rec, version, path...)
 		return
 	}
-	setNested(arena, rec, path, cloneInto(arena, value))
-	SetRecordVersion(arena, rec, version, path...)
+	// Finer-grained _ver entries exist below the path: a broad write has
+	// no single gate. Merge per-leaf — newer leaves survive, older parts
+	// are replaced, and a `*` default claims everything unenumerated.
+	merged, mergedVer, changed := mergeReplace(arena, rec.Get(path...), subtree, value, version)
+	if !changed {
+		return
+	}
+	if merged == nil {
+		unsetNested(rec, path)
+	} else {
+		setNested(arena, rec, path, merged)
+	}
+	setVersionNodeAt(arena, rec, mergedVer, path)
 }
 
 func applyUnset(arena *anyenc.Arena, rec *anyenc.Value, ch Change, op Op) {
@@ -97,11 +114,141 @@ func applyUnset(arena *anyenc.Arena, rec *anyenc.Value, ch Change, op Op) {
 }
 
 func gatedUnset(arena *anyenc.Arena, rec *anyenc.Value, version VersionId, path []string) {
-	if GetRecordVersion(rec, path...) >= version {
+	gate, subtree := gateVersion(rec, path)
+	if subtree == nil {
+		if gate >= version {
+			return
+		}
+		unsetNested(rec, path)
+		SetRecordVersion(arena, rec, version, path...)
 		return
 	}
-	unsetNested(rec, path)
-	SetRecordVersion(arena, rec, version, path...)
+	// Broad unset over finer-grained entries: same per-leaf merge as
+	// gatedSet, with no incoming value.
+	merged, mergedVer, changed := mergeReplace(arena, rec.Get(path...), subtree, nil, version)
+	if !changed {
+		return
+	}
+	if merged == nil {
+		unsetNested(rec, path)
+	} else {
+		setNested(arena, rec, path, merged)
+	}
+	setVersionNodeAt(arena, rec, mergedVer, path)
+}
+
+// mergeReplace computes the result of a broad $set (newVal != nil) or
+// $unset (newVal == nil) at version v over a position whose `_ver` entry
+// is an object — finer-grained writes exist below the target path, so
+// the write has no single gate and must merge per-leaf:
+//
+//   - existing parts whose version >= v survive with their values;
+//   - existing parts whose version < v are replaced by the incoming
+//     value (or removed when the incoming value doesn't cover them);
+//   - the merged `_ver` node carries `*: v`, claiming every path not
+//     explicitly enumerated, so a late-arriving older write to a key
+//     this peer never saw gates against the broad write's authority;
+//   - when nothing survives, the write takes whole-subtree authority:
+//     the value is replaced outright and `_ver` collapses to string v.
+//
+// A non-object incoming value lands only when nothing survives —
+// surviving newer leaves keep the position an object, mirroring how a
+// finer newer write splits a collapsed older ancestor, so both delivery
+// orders agree on the final shape.
+//
+// Returns the merged value (nil = position removed), the merged `_ver`
+// node (string or object), and changed=false when the write was fully
+// gated — callers must then leave the record untouched.
+func mergeReplace(arena *anyenc.Arena, oldVal, verNode, newVal *anyenc.Value, v VersionId) (*anyenc.Value, *anyenc.Value, bool) {
+	if def := verNode.Get(defaultKey); def != nil && def.Type() == anyenc.TypeString {
+		if VersionId(def.GetStringBytes()) >= v {
+			// The whole position is already claimed at >= v (explicit
+			// entries are never older than their level's default).
+			return oldVal, verNode, false
+		}
+	}
+	newIsObj := newVal != nil && newVal.Type() == anyenc.TypeObject
+
+	outVal := arena.NewObject()
+	outVer := arena.NewObject()
+	outVer.Set(defaultKey, arena.NewString(string(v)))
+	survivors := 0
+
+	verObj, _ := verNode.Object()
+	verObj.Visit(func(kb []byte, entry *anyenc.Value) {
+		k := string(kb)
+		if k == defaultKey {
+			return
+		}
+		var incoming *anyenc.Value
+		if newIsObj {
+			incoming = newVal.Get(k)
+		}
+		switch entry.Type() {
+		case anyenc.TypeString:
+			if VersionId(entry.GetStringBytes()) >= v {
+				// Survivor: keeps its current value and version.
+				if oldVal != nil {
+					if ov := oldVal.Get(k); ov != nil {
+						outVal.Set(k, ov)
+					}
+				}
+				outVer.Set(k, entry)
+				survivors++
+				return
+			}
+			// Superseded: the incoming value replaces it when present;
+			// the new `*` covers the version either way.
+			if incoming != nil {
+				outVal.Set(k, cloneInto(arena, incoming))
+			}
+		case anyenc.TypeObject:
+			var childOld *anyenc.Value
+			if oldVal != nil {
+				childOld = oldVal.Get(k)
+			}
+			cv, cver, _ := mergeReplace(arena, childOld, entry, incoming, v)
+			if cv != nil {
+				outVal.Set(k, cv)
+			}
+			if cver != nil {
+				if cver.Type() == anyenc.TypeString && VersionId(cver.GetStringBytes()) == v {
+					// Fully replaced child — covered by the new `*`.
+					return
+				}
+				outVer.Set(k, cver)
+				survivors++
+			}
+		}
+	})
+
+	// Incoming keys without an explicit `_ver` entry were covered by the
+	// old default, which is < v here — they land, covered by the new `*`.
+	if newIsObj {
+		nobj, _ := newVal.Object()
+		nobj.Visit(func(kb []byte, nv *anyenc.Value) {
+			k := string(kb)
+			if verNode.Get(k) != nil {
+				return // handled above
+			}
+			outVal.Set(k, cloneInto(arena, nv))
+		})
+	}
+
+	if survivors == 0 {
+		// Whole-subtree authority: collapsed version.
+		switch {
+		case newVal == nil:
+			return nil, arena.NewString(string(v)), true
+		case newIsObj:
+			return outVal, arena.NewString(string(v)), true
+		default:
+			return cloneInto(arena, newVal), arena.NewString(string(v)), true
+		}
+	}
+	// Survivors keep the position an object; a non-object incoming value
+	// is superseded per-leaf and does not land.
+	return outVal, outVer, true
 }
 
 // ----------------------------------------------------------------------------

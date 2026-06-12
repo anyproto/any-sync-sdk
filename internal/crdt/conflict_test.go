@@ -408,6 +408,12 @@ type seqStep struct {
 // (commutative set), $inc (commutative counter). $incGated is excluded — it
 // is intentionally non-convergent (LWW on the post-mutation value, see spec
 // §5.6) and tested separately.
+//
+// The mix deliberately includes the shapes that historically escaped this
+// fuzzer: multi-field $sets whose siblings share one version, broad
+// subtree $set/$unset racing per-leaf writes under the same path, and
+// fresh-field writes with mid-range versions (so broad or shared-version
+// writes at HIGHER versions exist when they arrive late in a permutation).
 func generateOpSequence(t *testing.T, arena *anyenc.Arena, g *versionGen, count int) []seqStep {
 	t.Helper()
 	steps := make([]seqStep, 0, count+1)
@@ -417,7 +423,7 @@ func generateOpSequence(t *testing.T, arena *anyenc.Arena, g *versionGen, count 
 	})})
 	for i := 0; i < count; i++ {
 		v := g.Next()
-		switch i % 4 {
+		switch i % 8 {
 		case 0:
 			steps = append(steps, seqStep{makeChange(v, "r1", Op{
 				Type: OpSet, Path: []string{"name"},
@@ -437,6 +443,36 @@ func generateOpSequence(t *testing.T, arena *anyenc.Arena, g *versionGen, count 
 			steps = append(steps, seqStep{makeChange(v, "r1", Op{
 				Type: OpInc, Path: []string{"hits"},
 				Payload: arena.NewNumberInt(1),
+			})})
+		case 4:
+			// Multi-field $set: two siblings share this change's version
+			// (one fresh per change, one contended across changes).
+			steps = append(steps, seqStep{makeChange(v, "r1", Op{
+				Type: OpSet,
+				Payload: recordPayload(arena, map[string]any{
+					"fresh-" + string(v): 1,
+					"shared":             "shared-" + string(v),
+				}),
+			})})
+		case 5:
+			// Broad subtree replace racing the per-leaf meta.color writes.
+			steps = append(steps, seqStep{makeChange(v, "r1", Op{
+				Type: OpSet, Path: []string{"meta"},
+				Payload: recordPayload(arena, map[string]any{
+					"color": "broad-" + string(v),
+					"size":  i,
+				}),
+			})})
+		case 6:
+			// Broad unset racing the same subtree.
+			steps = append(steps, seqStep{makeChange(v, "r1", Op{
+				Type: OpUnset, Path: []string{"meta"},
+			})})
+		case 7:
+			// Fresh top-level field with a mid-range version.
+			steps = append(steps, seqStep{makeChange(v, "r1", Op{
+				Type: OpSet, Path: []string{"late-" + string(v)},
+				Payload: arena.NewNumberInt(i),
 			})})
 		}
 	}
@@ -508,8 +544,8 @@ func repr(v any) string {
 // different orders and asserts every permutation lands on the same final
 // state.
 func TestConvergence_RandomPermutations(t *testing.T) {
-	const opCount = 12
-	const permutations = 25
+	const opCount = 24
+	const permutations = 50
 
 	arena := &anyenc.Arena{}
 	g := newVersionGen()

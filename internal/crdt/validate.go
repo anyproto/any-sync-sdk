@@ -63,6 +63,9 @@ func validateOpPaths(op Op) error {
 //   - No element may be empty ("a..b" style).
 //   - No element may contain "." (would silently shadow the dotted-path
 //     parsing used by the multi-field form and mongo convention).
+//   - No element may be "*" — it is the `_ver` defaultKey: a field named
+//     `*` would collide with the per-level default-version entry and
+//     corrupt gating for its whole sibling set.
 //   - The first element must not be `id` (immutable) or start with `_`
 //     (reserved for protocol-owned fields: `_ver`, `_deletedAt`, and any
 //     future system field).
@@ -76,6 +79,9 @@ func validatePath(path []string) error {
 		}
 		if strings.ContainsRune(elem, '.') {
 			return fmt.Errorf("%w: path element %d %q contains '.'", ErrInvalidPath, i, elem)
+		}
+		if elem == "*" {
+			return fmt.Errorf("%w: path element %d is %q (reserved for version-map defaults)", ErrInvalidPath, i, elem)
 		}
 	}
 	top := path[0]

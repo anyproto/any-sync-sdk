@@ -41,6 +41,7 @@ type queryImpl struct {
 	sort     query.Sort
 	limit    uint
 	offset   uint
+	opts     space.ProjectionOpts
 	parseErr error
 }
 
@@ -111,9 +112,13 @@ func (q *queryImpl) Offset(n int) space.Query {
 	return q
 }
 
-// Projection is a no-op in MVP. Variant collapse and meta-stripping
-// are tracked tasks; until they land, every record returns raw.
-func (q *queryImpl) Projection(_ space.ProjectionOpts) space.Query {
+// Projection records the requested options. Variant collapse and
+// meta-stripping are still no-ops (tracked tasks; every record returns
+// raw for those). IncludeDeleted is honored by the find path —
+// Iter / All / One gate the post-iteration tombstone skip on it, and
+// Count gates the pushed-down skip filter consistently.
+func (q *queryImpl) Projection(opts space.ProjectionOpts) space.Query {
+	q.opts = opts
 	return q
 }
 
@@ -442,8 +447,14 @@ func (q *queryImpl) countWithFilter(ctx context.Context, f query.Filter) (int, e
 	return coll.Find(f).Count(ctx)
 }
 
-// Count returns the match count.
+// Count returns the match count. The find path gates tombstones on
+// ProjectionOpts.IncludeDeleted the same way Iter does: by default the
+// _deletedAt-missing clause is pushed into the filter so deleted rows
+// don't count; with IncludeDeleted set, tombstones are counted too.
 func (q *queryImpl) Count(ctx context.Context) (int, error) {
+	if q.parseErr != nil {
+		return 0, q.parseErr
+	}
 	coll, err := q.collection(ctx)
 	if err != nil {
 		return 0, err
@@ -451,11 +462,14 @@ func (q *queryImpl) Count(ctx context.Context) (int, error) {
 	if coll == nil {
 		return 0, nil
 	}
-	built, err := q.build(coll)
-	if err != nil {
-		return 0, err
+	filter := q.filter
+	if !q.opts.IncludeDeleted {
+		filter, err = combineWithTombstoneSkip(filter)
+		if err != nil {
+			return 0, err
+		}
 	}
-	return built.Count(ctx)
+	return coll.Find(filter).Count(ctx)
 }
 
 // Iter opens a streaming iterator over the matching records.
@@ -475,7 +489,7 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &queryIterator{inner: asIter}, nil
+	return &queryIterator{inner: asIter, includeDeleted: q.opts.IncludeDeleted}, nil
 }
 
 // collection resolves the dataset's any-store collection. Returns
@@ -541,15 +555,19 @@ func (q *queryImpl) build(coll anystore.Collection) (anystore.Query, error) {
 // next Next() call. Caller-side races with Next() between Doc() and
 // use are the caller's problem (same contract as any-store).
 type queryIterator struct {
-	inner   anystore.Iterator
-	cur     *anyenc.Value
-	lastErr error
+	inner          anystore.Iterator
+	includeDeleted bool
+	cur            *anyenc.Value
+	lastErr        error
 }
 
 // Next advances past tombstones automatically — checks each doc and
 // skips ones with `_deletedAt` set. Any-store iterators don't expose
 // peek, so we have to consume to filter; that's fine, the cost is
-// proportional to deleted-row density.
+// proportional to deleted-row density. When includeDeleted is set
+// (ProjectionOpts.IncludeDeleted) the skip is disabled and tombstone
+// rows surface to the caller — used by consumer-side indexers to stream
+// deletions.
 func (i *queryIterator) Next() bool {
 	if i.inner == nil {
 		return false
@@ -561,7 +579,7 @@ func (i *queryIterator) Next() bool {
 			return true
 		}
 		v := doc.Value()
-		if v != nil && v.Get(crdt.DeletedAtField) != nil {
+		if !i.includeDeleted && v != nil && v.Get(crdt.DeletedAtField) != nil {
 			continue // tombstone
 		}
 		i.cur = v

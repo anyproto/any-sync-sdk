@@ -87,6 +87,14 @@ type PropertyDef struct {
 	// XKind is a free-form classification hint. Opaque to the SDK.
 	XKind string
 
+	// Meta is an opaque consumer-controlled flag map. The SDK stores
+	// and returns it verbatim and never interprets it — e.g. the `any`
+	// server's search indexer reads meta["index"] = "<scope>" to mark
+	// a property as full-text/vector indexable. Nil when unset.
+	// Deliberately not schema-bearing: mutable once UpdatePropertyMeta
+	// lands.
+	Meta map[string]string
+
 	Kind       PropertyKind  // first-write-wins; immutable
 	Items      *PropertyDef  // for arrays
 	Properties []PropertyDef // for objects
@@ -100,6 +108,7 @@ type PropertyDraft struct {
 	Description string
 	XKey        string
 	XKind       string
+	Meta        map[string]string // opaque consumer flags — see PropertyDef.Meta
 	Kind        PropertyKind
 	Items       *PropertyDraft
 	Properties  []PropertyDraft

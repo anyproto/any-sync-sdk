@@ -70,6 +70,12 @@ type ApplyResult struct {
 const (
 	IdField        = "id"
 	DeletedAtField = "_deletedAt"
+	// AddSeqField records any-sync's per-space AddSeq watermark for the
+	// change that last touched this record. Stamped by the apply path
+	// (not a handler), reserved by the `_` prefix so user writes can't
+	// collide. Backs the consumer-side change-index "records changed
+	// since N" scans.
+	AddSeqField = "_addSeq"
 )
 
 // Controller is the CRDT entrypoint for one any-sync object tree. It
@@ -84,6 +90,12 @@ const (
 // Not safe for concurrent use.
 type Controller struct {
 	objectId string
+	// spaceId scopes the per-object _meta row so the change-index query
+	// can filter "objects in THIS space" — the SDK DB is shared across
+	// spaces by default, and AddSeq numbering is per-space. Empty in
+	// unit tests (the row is then unscoped and invisible to the
+	// space-scoped query, which is fine for tests). Set via SetSpaceId.
+	spaceId  string
 	db       anystore.DB
 	handlers map[string]Handler
 	// versions and indexes are keyed by dataset name, populated from each
@@ -171,6 +183,9 @@ func NewControllerWithShared(ctx context.Context, objectId string, db anystore.D
 		return nil, fmt.Errorf("crdt: open meta collection: %w", err)
 	}
 	c.metaColl = metaColl
+	if err := ensureMetaIndexes(ctx, metaColl); err != nil {
+		return nil, fmt.Errorf("crdt: ensure meta indexes: %w", err)
+	}
 	if _, err := c.LoadAndSeedMeta(ctx, metaColl); err != nil {
 		return nil, fmt.Errorf("crdt: load meta: %w", err)
 	}
@@ -179,6 +194,17 @@ func NewControllerWithShared(ctx context.Context, objectId string, db anystore.D
 
 func (c *Controller) ObjectId() string  { return c.objectId }
 func (c *Controller) MaxAddSeq() uint64 { return c.maxAddSeq }
+
+// SetSpaceId scopes this controller's persisted _meta row to a space.
+// Call once right after construction, before the first apply, so the
+// change-index query can filter object rows by space. No-op on a nil
+// controller.
+func (c *Controller) SetSpaceId(spaceId string) {
+	if c == nil {
+		return
+	}
+	c.spaceId = spaceId
+}
 
 // SetMaxAddSeq seeds the watermark from persisted storage on restore.
 func (c *Controller) SetMaxAddSeq(seq uint64) { c.maxAddSeq = seq }
@@ -229,6 +255,9 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 		if err := ensureHandlerIndexes(ctx, reg.Indexes, coll); err != nil {
 			return fmt.Errorf("crdt: ensure indexes for %q: %w", name, err)
 		}
+		if err := ensureBuiltinIndexes(ctx, coll); err != nil {
+			return fmt.Errorf("crdt: ensure builtin indexes for %q: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -244,6 +273,18 @@ func ensureHandlerIndexes(ctx context.Context, indexes []anystore.IndexInfo, col
 		}
 	}
 	return nil
+}
+
+// builtinIndexes are ensured on every data collection (per-object and
+// shared) on top of the handler's own indexes. The ascending _addSeq
+// index backs the "records changed since N" scans the change-index feed
+// relies on.
+var builtinIndexes = []anystore.IndexInfo{{Name: "idx__addSeq", Fields: []string{AddSeqField}}}
+
+// ensureBuiltinIndexes ensures the apply-layer indexes that every data
+// collection gets regardless of which handler owns it. Idempotent.
+func ensureBuiltinIndexes(ctx context.Context, coll anystore.Collection) error {
+	return ensureHandlerIndexes(ctx, builtinIndexes, coll)
 }
 
 // collectionForWrite returns the on-disk collection for the dataset,
@@ -263,6 +304,9 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 	}
 	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
 		return nil, fmt.Errorf("crdt: ensure indexes for %q: %w", dataset, err)
+	}
+	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
+		return nil, fmt.Errorf("crdt: ensure builtin indexes for %q: %w", dataset, err)
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
@@ -293,6 +337,9 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 		return nil
 	}
 	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
+		return nil
+	}
+	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
 		return nil
 	}
 	c.collMu.Lock()
@@ -624,7 +671,7 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		newMaxAddSeq = ch.AddSeq
 	}
 	if c.metaColl != nil {
-		if err := PersistMeta(txCtx, c.metaColl, c.objectId, newMaxAddSeq, c.HandlerVersions()); err != nil {
+		if err := PersistMeta(txCtx, c.metaColl, c.objectId, newMaxAddSeq, c.HandlerVersions(), c.spaceId); err != nil {
 			_ = tx.Rollback()
 			return res, fmt.Errorf("crdt: persist meta: %w", err)
 		}
@@ -948,6 +995,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 	if hasDelete(rc.Ops) {
 		if isTombstone(existing) {
 			if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
+				stampAddSeq(a, existing, ch.AddSeq)
 				updateTraces(a, existing, *ch)
 				return existing, true, nil
 			}
@@ -1003,6 +1051,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		m.drainDerivedTo(a, existing, ch)
 	} else if isTombstone(existing) {
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
+			stampAddSeq(a, existing, ch.AddSeq)
 			updateTraces(a, existing, *ch)
 			return existing, true, nil
 		}
@@ -1032,6 +1081,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		m.drainDerivedTo(a, existing, ch)
 	}
 
+	stampAddSeq(a, existing, ch.AddSeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil
@@ -1047,6 +1097,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 	if hasDelete(rc.Ops) {
 		if isTombstone(existing) {
 			if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
+				stampAddSeq(a, existing, ch.AddSeq)
 				updateTraces(a, existing, *ch)
 				return existing, true, nil
 			}
@@ -1063,6 +1114,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		existing.Set(VersionsKey, ver)
 	} else if isTombstone(existing) {
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
+			stampAddSeq(a, existing, ch.AddSeq)
 			updateTraces(a, existing, *ch)
 			return existing, true, nil
 		}
@@ -1075,6 +1127,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 	for i := range rc.Ops {
 		applyOp(a, target, *ch, rc.Ops[i])
 	}
+	stampAddSeq(a, existing, ch.AddSeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil

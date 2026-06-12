@@ -61,6 +61,7 @@ const (
 	FieldItems       = "items"       // recursive sub-shape for arrays
 	FieldProperties  = "properties"  // recursive sub-shape for objects
 	FieldRequired    = "required"    // []string, mutable per docs/06
+	FieldMeta        = "meta"        // opaque consumer flag map (string→string), mutable
 )
 
 // schemaBearingFields are pinned for the life of the property record.

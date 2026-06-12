@@ -145,6 +145,14 @@ func (s *spaceImpl) Debug() space.DebugAPI {
 	return newDebugAPI(s)
 }
 
+// Changes returns the change-index surface (live feed + "changed since
+// N" query) for consumer-side incremental indexers. Constructed on
+// every call; the state lives on the spaceobjects.Store. See
+// space.ChangeIndexAPI.
+func (s *spaceImpl) Changes() space.ChangeIndexAPI {
+	return newChangeIndexAPI(s)
+}
+
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {

@@ -135,12 +135,10 @@ func TestSet_AutoCreatesRecordWithMultiField(t *testing.T) {
 	// Each enumerated field is gated at v1.
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "name"))
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "count"))
-	// Unmentioned fields inherit from the `*` default that compactVersions
-	// factors out of the multi-field create — every non-`id` sibling shared
-	// versionId v1, so the post-apply compaction step collapses them into
-	// {id: v1, *: v1}. Lookups for unenumerated paths now resolve to v1
-	// via the `*` default (spec §3.2).
-	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "anything"))
+	// Unmentioned fields stay unversioned — the create never wrote them,
+	// so a concurrent older write to a fresh field must not be gated.
+	// (Upserts merge per-field; only delete claims unenumerated paths.)
+	assert.Equal(t, VersionId(""), GetRecordVersion(rec, "anything"))
 }
 
 // Two multi-field $sets racing on the same id merge per-field via gating —
@@ -271,29 +269,52 @@ func TestSet_NestedPath(t *testing.T) {
 	assert.Equal(t, VersionId("v2"), GetRecordVersion(rec, "meta", "color"))
 }
 
-func TestSet_SubtreeReplaceGated(t *testing.T) {
-	st := newTestController(t)
+// A broad $set racing finer writes under the same subtree merges per-leaf:
+// newer leaves survive, older parts are replaced, and the broad write's
+// version claims every unenumerated key via `*`. Both delivery orders must
+// converge.
+func TestSet_SubtreeReplaceMergesPerLeaf(t *testing.T) {
 	arena := &anyenc.Arena{}
-
-	// insert + set meta.color at v5, then a $set replacing the whole meta at
-	// v3 should be skipped (v3 < v5, max in subtree = v5).
-	require.NoError(t, st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	create := makeUpsert("v1", "r1", Op{
 		Type:    OpSet,
 		Payload: recordPayload(arena, map[string]any{}),
-	})))
-	require.NoError(t, st.ApplyChange(ctx, makeChange("v5", "r1", Op{
+	})
+	leafColor := makeChange("v5", "r1", Op{
 		Type:    OpSet,
 		Path:    []string{"meta", "color"},
 		Payload: arena.NewString("red"),
-	})))
-	require.NoError(t, st.ApplyChange(ctx, makeChange("v3", "r1", Op{
+	})
+	broad := makeChange("v3", "r1", Op{
 		Type:    OpSet,
 		Path:    []string{"meta"},
-		Payload: recordPayload(arena, map[string]any{"color": "blue"}),
-	})))
+		Payload: recordPayload(arena, map[string]any{"color": "blue", "size": 10}),
+	})
 
-	rec := st.Get(ctx, testDS, "r1")
-	assert.Equal(t, "red", rec.GetString("meta", "color"))
+	check := func(t *testing.T, st *Controller) {
+		rec := st.Get(ctx, testDS, "r1")
+		require.NotNil(t, rec)
+		// color@v5 beats the broad write's color; size lands from the
+		// broad write (no newer leaf competed for it).
+		assert.Equal(t, "red", rec.GetString("meta", "color"))
+		assert.Equal(t, 10, rec.GetInt("meta", "size"))
+		assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "meta", "color"))
+		assert.Equal(t, VersionId("v3"), GetRecordVersion(rec, "meta", "size"))
+		// The broad write claims unenumerated keys under meta at v3: a
+		// late-arriving older write to a key this peer never saw is gated.
+		assert.Equal(t, VersionId("v3"), GetRecordVersion(rec, "meta", "unwritten"))
+	}
+
+	stA := newTestController(t)
+	for _, ch := range []Change{create, leafColor, broad} {
+		require.NoError(t, stA.ApplyChange(ctx, ch))
+	}
+	check(t, stA)
+
+	stB := newTestController(t)
+	for _, ch := range []Change{create, broad, leafColor} {
+		require.NoError(t, stB.ApplyChange(ctx, ch))
+	}
+	check(t, stB)
 }
 
 // ----------------------------------------------------------------------------
@@ -599,12 +620,12 @@ func TestDelete_StickyTombstoneRejectsAllOps(t *testing.T) {
 // _ver compaction (spec §3.2)
 // ----------------------------------------------------------------------------
 
-// TestCompact_MultiFieldCreateFactorsRoot verifies that the post-apply
-// compaction pass collapses an auto-created record whose non-`id` siblings
-// all share the change's versionId into the canonical {id: v, *: v} shape.
-// This is the behavior the subscriber-visible body and the DB-persisted
-// body share.
-func TestCompact_MultiFieldCreateFactorsRoot(t *testing.T) {
+// TestCompact_MultiFieldCreateStaysExplicit verifies that an auto-created
+// record keeps one explicit `_ver` entry per written field. The create
+// never claimed unenumerated fields (concurrent upserts merge per-field),
+// so no `*` default may appear — inventing one would gate out concurrent
+// older writes to fresh fields and diverge across peers.
+func TestCompact_MultiFieldCreateStaysExplicit(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}
 
@@ -621,22 +642,20 @@ func TestCompact_MultiFieldCreateFactorsRoot(t *testing.T) {
 	require.NotNil(t, rec)
 	ver := rec.Get(VersionsKey)
 	require.NotNil(t, ver)
-	// Canonical compacted shape: only `id` and `*` remain at root.
-	assert.Equal(t, 2, ver.GetObject().Len(), "_ver = %s", ver.MarshalTo(nil))
+	// id + the three written fields, all explicit; no `*`.
+	assert.Equal(t, 4, ver.GetObject().Len(), "_ver = %s", ver.MarshalTo(nil))
+	assert.Nil(t, ver.Get(defaultKey))
 	assert.Equal(t, VersionId("v1"), VersionId(ver.Get(IdField).GetStringBytes()))
-	assert.Equal(t, VersionId("v1"), VersionId(ver.Get(defaultKey).GetStringBytes()))
-	// Lookup still returns v1 for every previously-explicit path and for
-	// new fields (via the `*` default).
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "changeId"))
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "kind"))
 	assert.Equal(t, VersionId("v1"), GetRecordVersion(rec, "propId"))
+	assert.Equal(t, VersionId(""), GetRecordVersion(rec, "neverWritten"))
 }
 
-// TestCompact_TracesSurviveFactor verifies that the trace map remains
-// consistent after compaction: every trace key is still reachable
-// through the compacted `_ver` (the change's versionId is preserved
-// via the `*` default factored at the root).
-func TestCompact_TracesSurviveFactor(t *testing.T) {
+// TestCompact_TracesSurviveCompaction verifies that the trace map remains
+// consistent after compaction: every trace key is still reachable through
+// `_ver` (the change's versionId stays present via the explicit entries).
+func TestCompact_TracesSurviveCompaction(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}
 
@@ -654,7 +673,7 @@ func TestCompact_TracesSurviveFactor(t *testing.T) {
 	require.NotNil(t, rec)
 	tr := readTraces(rec)
 	require.NotNil(t, tr)
-	// Trace for v1 survives — v1 is still present via `*` after factoring.
+	// Trace for v1 survives — v1 is still present in `_ver`.
 	assert.Equal(t, []string{"session-A"}, tr["v1"])
 }
 
@@ -719,11 +738,11 @@ func TestCompact_DBBodyMatchesGet(t *testing.T) {
 	require.NotNil(t, a)
 	require.NotNil(t, b)
 	assert.Equal(t, a.Get(VersionsKey).MarshalTo(nil), b.Get(VersionsKey).MarshalTo(nil))
-	// And both equal the canonical factored shape.
+	// And both hold the explicit per-field shape (no invented `*`).
 	ver := a.Get(VersionsKey)
-	assert.Equal(t, 2, ver.GetObject().Len())
+	assert.Equal(t, 4, ver.GetObject().Len())
 	assert.NotNil(t, ver.Get(IdField))
-	assert.NotNil(t, ver.Get(defaultKey))
+	assert.Nil(t, ver.Get(defaultKey))
 }
 
 func TestSet_MultiFieldNestedPaths(t *testing.T) {

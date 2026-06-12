@@ -71,11 +71,11 @@ Out-of-order delivery is safe. There is no multi-head / conflict state — every
 - A **string** (a versionId) — collapsed: every subkey at and below this point shares this version
 - An **object** with explicit per-key entries plus an optional `*` default key. The `*` default holds the version inherited by any sibling not enumerated in the object — this is how expansion preserves precision when a finer write splits a previously-collapsed subtree. `*` is chosen because it only ever appears inside `_ver` subtrees (never in the user-facing record body), is visually distinct from real field names, and avoids anyenc's special empty-key byte encoding.
 
-Lookup descends `_ver` along the path; if it falls off into unenumerated territory, the closest ancestor's `*` default applies, otherwise the version is `""` (the empty string is the "no version" sentinel, smaller than any real versionId).
+Lookup descends `_ver` along the path; if it falls off into unenumerated territory, the `*` default at the node where the walk fell off applies, otherwise the version is `""` (the empty string is the "no version" sentinel, smaller than any real versionId). The node-local `*` is always sufficient because splitting a covered entry propagates the inherited version onto every created intermediate (§3.2).
 
 ### 3.2 `_ver` Collapsing Rules
 
-If every field under a subtree shares the same version, only the subtree root is tracked.
+Collapsing is **authority-bound**: a collapsed entry (a single string, or a `*` default inside an object) may exist only where a write had explicit whole-subtree authority — a whole-subtree `$set`/`$unset`, or `delete`. A write at a path claims that path and everything below it, nothing else:
 
 ```
 $set { "a.b.c": 1 }  at v5        →  _ver: { "a": { "b": { "c": "v5" } } }
@@ -83,7 +83,14 @@ $set { "a.b":   {c: 1, d: 2} } v5 →  _ver: { "a": { "b": "v5" } }
 $set { "a":     {b: {c:1}} }   v5 →  _ver: { "a": "v5" }
 ```
 
-When a broader write happens, it replaces any finer `_ver` entries under its path. When a finer write happens after a broader one, the finer path is expanded under the broader root only if the broader version is strictly older.
+Sibling fields that merely happen to share a version are NEVER factored into a `*` or collapsed into their parent. Inventing a default would claim a version for never-written fields, gate out concurrent lower-version writes to them on whichever peer compacted first, and diverge. Compaction performs only **lossless** rewrites — every lookup (explicit or unenumerated) returns the same version before and after:
+
+1. Inside an object with a `*`, explicit string entries equal to the `*` are dropped (lookup falls back to the same value).
+2. An object whose `*` is present and whose entries all equal it collapses to that single string.
+
+**Broad writes over finer entries merge per-leaf (no wholesale gate).** A `$set`/`$unset` at a path whose `_ver` entry is an object (finer writes exist below) is decomposed: each existing leaf with version ≥ the incoming version survives with its value; older parts are replaced (or removed when the incoming value doesn't cover them); the write stamps `*` at the subtree, claiming every unenumerated key. When nothing survives, the write takes whole-subtree authority and the entry collapses to its version. A non-object payload lands only when nothing survives — surviving newer leaves keep the position an object. This is what makes broad-replace vs per-leaf races converge in every delivery order; gating a broad write against an aggregate (e.g. the max leaf version) is delivery-order-dependent and forbidden.
+
+When a finer write splits a collapsed (or `*`-covered) entry, the inherited version is propagated as a `*` onto every intermediate object the split creates, so the broad write's coverage of unenumerated deeper siblings is preserved exactly.
 
 ### 3.3 Auto-creation via Upsert
 There is **no `insert` op**. Record creation is controlled by a per-`RecordChange` boolean flag `upsert`:
@@ -221,7 +228,8 @@ Every op that targets a field path is validated *before* the apply phase runs �
 1. **Path must be non-empty.** `$set` and `$unset` can have an empty `path` only when the multi-field form is in use (payload is an object of dotted keys).
 2. **No empty path segments.** `["a", "", "b"]` is rejected. In the multi-field form, a dotted key like `"a."` splits into `["a", ""]` and is also rejected.
 3. **No `.` inside a path segment.** A single-path op must supply its path as already-split components — `["meta.color"]` is rejected because it would silently clash with multi-field parsing. Write `["meta", "color"]` instead.
-4. **Top-level reservation.** The first segment may not be `id` (immutable) and may not start with `_` (all protocol-owned fields live under the underscore prefix: `_ver`, `_deletedAt`, and any future system field). Users choose their own field names from outside those namespaces.
+4. **No `*` path segment.** `*` is the `_ver` defaultKey (§3.1); a field named `*` would collide with the per-level default-version entry and corrupt gating for its whole sibling set.
+5. **Top-level reservation.** The first segment may not be `id` (immutable) and may not start with `_` (all protocol-owned fields live under the underscore prefix: `_ver`, `_deletedAt`, and any future system field). Users choose their own field names from outside those namespaces.
 
 Handlers can layer additional validation on top (e.g. schema shape, permissions).
 
@@ -243,7 +251,7 @@ Each entry of a multi-field `$set` is applied as an independent gated single-pat
 
 For each path, if `_ver[path] < versionId`, write value and set `_ver[path] = versionId`. Else skip that path.
 
-Writes targeting the immutable `id` field (single-path or as a key in the multi-field payload) are silently ignored.
+Writes targeting the immutable `id` field (single-path or as a key in the multi-field payload) reject the whole change at pre-apply validation (§3.1), consistent with the path rules in §5.0.
 
 ### 5.2 `$unset`
 ```json
@@ -431,21 +439,43 @@ lowerCreationMarker(rec, version):
 
 gatedSet(rec, v, path, value):
     if path[0] is reserved (id, _ver): return               // immutable / protocol-owned
-    if compareVersion(getOrder(rec, path), v) < 0:
-        writeValue(rec, path, value)
-        setOrder(rec, v, path)
+    (gate, subtree) = gateVersion(rec, path)
+    if subtree is nil:                       // single authoritative version for the path
+        if compareVersion(gate, v) < 0:
+            writeValue(rec, path, value)
+            setOrder(rec, v, path)
+        return
+    // Finer-grained _ver entries exist below the path: no single gate.
+    mergeReplace(rec, path, subtree, value, v)              // §3.2 per-leaf merge
 
 gatedUnset(rec, v, path):
     if path[0] is reserved: return
-    if compareVersion(getOrder(rec, path), v) < 0:
-        removeValue(rec, path)
-        setOrder(rec, v, path)
+    (gate, subtree) = gateVersion(rec, path)
+    if subtree is nil:
+        if compareVersion(gate, v) < 0:
+            removeValue(rec, path)
+            setOrder(rec, v, path)
+        return
+    mergeReplace(rec, path, subtree, nil, v)                // broad unset, same merge
+
+mergeReplace(rec, path, verSubtree, value, v):              // value nil = unset
+    // Per-leaf merge (§3.2): existing parts with version >= v survive
+    // with their values; older parts are replaced by `value` (or removed
+    // where it doesn't cover them); the merged _ver node carries `*: v`
+    // claiming every unenumerated key. Recurse into nested subtrees.
+    // No survivors → whole-subtree authority: write value outright,
+    // collapse _ver at path to the string v. A non-object value lands
+    // only when nothing survives.
 ```
+
+`gateVersion(rec, path)` walks `_ver` along the path and returns either a single authoritative version (an explicit string, a collapsed ancestor, the local `*` default, or `""` when untracked) or — when the entry AT the path is an object — the subtree itself, signalling that finer writes exist below and the per-leaf merge must run.
+
+`getOrder(rec, path)` is the gate for the commutative ops (`$addToSet`/`$pull`/`$inc`/`$incGated`): same walk as `gateVersion`, except that when the entry at the path is an object it returns the **maximum** version below it. The conservative aggregate is safe here because these ops never produce a per-leaf merge — they additionally type-check the existing value (array for set ops, number for counters), and a position with finer `_ver` entries below it holds an object, so the op skips regardless.
 
 `compareVersion(a, b)` returns `< 0` if `a < b`, `0` if equal, `> 0` if `a > b`. The empty string compares less than any non-empty version.
 
 ### 7.1 Collapse
-After each write that adds a finer `_ver` entry, walk up and collapse siblings that share the same version into their parent. Implementations may defer this for efficiency; correctness does not depend on aggressive collapsing.
+After each apply, rewrite `_ver` to its canonical compact form using only the lossless rules from §3.2 (drop explicit entries equal to their level's `*`; collapse a node whose `*` is present and whose entries all equal it). Never invent a `*` or collapse sibling enumerations that merely share a version — that claims authority no write had and breaks convergence. Implementations may defer compaction; correctness does not depend on it.
 
 ### 7.2 Write transaction
 All ops within one change are applied atomically (one any-store `WriteTx` in Phase 2). Events fire **after** the transaction commits. Validation is two-phase: every op in the change is validated first; if any handler rejects, the entire change is dropped before any mutation runs.

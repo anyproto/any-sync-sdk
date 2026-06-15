@@ -137,7 +137,7 @@ func TestE2E_AccountScopeSync(t *testing.T) {
 				return false
 			}
 			t.Logf("device B poll: row %s title=%q read=%v defsKnown=%v",
-				objectId, row.GetString(typeId, titleProp), row.Get(typeId, readProp) != nil, defsKnownOnB(ctx, spB, typeId, readProp))
+				objectId, row.GetString(typeId, titleProp), row.Get(typeId, readProp) != nil, defsKnownWithScope(ctx, spB, typeId, readProp, space.ScopeAccount))
 			return row.GetBool(typeId, readProp)
 		}
 	}
@@ -174,16 +174,18 @@ func TestE2E_AccountScopeSync(t *testing.T) {
 		"device B: live account value for a new object never arrived")
 }
 
-// defsKnownOnB reports whether the type's property definitions have
-// synced to this device (the mirror's scope resolver depends on them).
-func defsKnownOnB(ctx context.Context, sp space.Space, typeId, propId string) bool {
+// defsKnownWithScope reports whether the type's property definitions
+// have synced to this device AND propId resolves to the expected scope
+// — the precondition for Properties.Set to route a write correctly
+// (an unsynced def makes resolveRoute fall back to synced).
+func defsKnownWithScope(ctx context.Context, sp space.Space, typeId, propId string, want space.Scope) bool {
 	defs, err := sp.Types().Properties(ctx, typeId)
 	if err != nil {
 		return false
 	}
 	for _, d := range defs {
 		if d.Id == propId {
-			return d.Scope == space.ScopeAccount
+			return d.Scope == want
 		}
 	}
 	return false

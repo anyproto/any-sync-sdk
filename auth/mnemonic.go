@@ -38,6 +38,23 @@ func NewMnemonicProvider(cfg MnemonicConfig) (Provider, error) {
 	}, nil
 }
 
+// AccountId derives the StrKey-encoded account address ("A…") for a
+// mnemonic + account index without touching disk or booting the SDK.
+// It is the same string SDK.Account().Id() reports after opening with
+// the matching wallet — callers use it to address per-account storage
+// before a wallet file exists.
+func AccountId(mnemonic string, index uint32) (string, error) {
+	m := crypto.Mnemonic(mnemonic)
+	if _, err := m.Bytes(); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidMnemonic, err)
+	}
+	res, err := m.DeriveKeys(index)
+	if err != nil {
+		return "", fmt.Errorf("derive account key: %w", err)
+	}
+	return res.Identity.GetPublic().Account(), nil
+}
+
 // GenerateMnemonic returns a fresh 12-word BIP-39 mnemonic.
 func GenerateMnemonic() (string, error) {
 	m, err := crypto.NewMnemonicGenerator().WithWordCount(12)

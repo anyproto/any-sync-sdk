@@ -27,7 +27,34 @@ type FileProviderConfig struct {
 	// AES-256-GCM keyed by PBKDF2-HMAC-SHA256 (600k iterations,
 	// 16-byte salt). Leave empty for a plain-text wallet.
 	Passkey string
+
+	// Mnemonic, when non-empty, seeds wallet creation with an existing
+	// BIP-39 phrase instead of generating a fresh one — the restore /
+	// second-device path (the device key is still freshly generated).
+	// When the wallet file already exists the stored phrase must match,
+	// otherwise NewFileProvider returns ErrMnemonicMismatch.
+	Mnemonic string
+
+	// Index is the account derivation index used together with
+	// Mnemonic. Ignored when the wallet file already exists.
+	Index uint32
 }
+
+// ErrInvalidMnemonic wraps BIP-39 validation failures of a supplied
+// mnemonic phrase.
+var ErrInvalidMnemonic = errors.New("invalid mnemonic")
+
+// ErrMnemonicMismatch is returned when FileProviderConfig.Mnemonic is
+// set but an existing wallet file stores a different phrase.
+var ErrMnemonicMismatch = errors.New("wallet exists with a different mnemonic")
+
+// ErrPasskeyRequired is returned when the wallet file is encrypted but
+// no passkey was supplied.
+var ErrPasskeyRequired = errors.New("wallet is encrypted but no passkey provided")
+
+// ErrWrongPasskey is returned when the supplied passkey fails to
+// decrypt the wallet (or the file is corrupted).
+var ErrWrongPasskey = errors.New("decrypt wallet: wrong passkey or corrupted file")
 
 // FileProvider is a Provider backed by a JSON wallet file on disk.
 // Generated on first use, loaded on subsequent launches. Exposes
@@ -41,19 +68,25 @@ type FileProvider struct {
 }
 
 // NewFileProvider returns the default provider. On first use it
-// generates a fresh mnemonic + device key, writes them to Path, and
-// marks Created() true. On subsequent runs it loads the existing
-// wallet; Created() returns false.
+// generates a fresh mnemonic (or adopts cfg.Mnemonic when set) plus a
+// fresh device key, writes them to Path, and marks Created() true. On
+// subsequent runs it loads the existing wallet; Created() returns
+// false, and a set cfg.Mnemonic must match the stored phrase.
 func NewFileProvider(cfg FileProviderConfig) (*FileProvider, error) {
 	if cfg.Path == "" {
 		return nil, errors.New("wallet path is required")
 	}
 	path := cfg.Path
+	if cfg.Mnemonic != "" {
+		if _, err := crypto.Mnemonic(cfg.Mnemonic).Bytes(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidMnemonic, err)
+		}
+	}
 
 	w, err := loadWallet(path, cfg.Passkey)
 	created := false
 	if errors.Is(err, os.ErrNotExist) {
-		w, err = generateWallet()
+		w, err = generateWallet(cfg.Mnemonic, cfg.Index)
 		if err != nil {
 			return nil, err
 		}
@@ -63,6 +96,8 @@ func NewFileProvider(cfg FileProviderConfig) (*FileProvider, error) {
 		created = true
 	} else if err != nil {
 		return nil, err
+	} else if cfg.Mnemonic != "" && cfg.Mnemonic != w.Mnemonic {
+		return nil, ErrMnemonicMismatch
 	}
 
 	return &FileProvider{path: path, passkey: cfg.Passkey, w: w, created: created}, nil
@@ -130,10 +165,17 @@ const (
 	saltLen          = 16
 )
 
-func generateWallet() (*wallet, error) {
-	m, err := crypto.NewMnemonicGenerator().WithWordCount(12)
-	if err != nil {
-		return nil, err
+// generateWallet builds a fresh wallet. An empty mnemonic means
+// "generate one"; a supplied mnemonic is adopted as-is (already
+// validated by the caller). The device key is always fresh.
+func generateWallet(mnemonic string, index uint32) (*wallet, error) {
+	if mnemonic == "" {
+		m, err := crypto.NewMnemonicGenerator().WithWordCount(12)
+		if err != nil {
+			return nil, err
+		}
+		mnemonic = string(m)
+		index = 0
 	}
 	devPriv, _, err := crypto.GenerateRandomEd25519KeyPair()
 	if err != nil {
@@ -143,7 +185,7 @@ func generateWallet() (*wallet, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &wallet{Mnemonic: string(m), DeviceKey: devBytes}, nil
+	return &wallet{Mnemonic: mnemonic, DeviceKey: devBytes, Index: index}, nil
 }
 
 func loadWallet(path, passkey string) (*wallet, error) {
@@ -162,7 +204,7 @@ func loadWallet(path, passkey string) (*wallet, error) {
 	var p walletPayload
 	if env.Crypt != nil {
 		if passkey == "" {
-			return nil, errors.New("wallet is encrypted but no passkey provided")
+			return nil, ErrPasskeyRequired
 		}
 		plain, err := decryptPayload(env.Crypt, passkey)
 		if err != nil {
@@ -276,7 +318,7 @@ func decryptPayload(c *walletCrypt, passkey string) (walletPayload, error) {
 	}
 	pt, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {
-		return walletPayload{}, errors.New("decrypt wallet: wrong passkey or corrupted file")
+		return walletPayload{}, ErrWrongPasskey
 	}
 
 	var p walletPayload

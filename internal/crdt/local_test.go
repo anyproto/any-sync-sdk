@@ -38,14 +38,32 @@ func TestNextVersion_Monotonic(t *testing.T) {
 	assert.Greater(t, string(NextVersion("zzzz")), "zzzz")
 }
 
-// A synced change may not write a Local-class field.
+// assertFieldClassDropped applies ch through the remote/replay primitive
+// and asserts the single offending op was DROPPED with a validation
+// rejection rather than aborting the whole change — the "a remote change
+// that violates field-class is ignored, never fatal" contract that keeps
+// one bad historical change from wedging cold restore.
+func assertFieldClassDropped(t *testing.T, st *Controller, ch Change) {
+	t.Helper()
+	res, err := st.ApplyChangeWithResult(ctx, ch)
+	require.NoError(t, err, "remote field-class violation must be ignored, not fatal")
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrValidation)
+}
+
+// A synced change may not write a Local-class field: the client path
+// fails fast (ValidateChange), the remote path drops the op.
 func TestApply_SyncedRejectsLocalField(t *testing.T) {
 	st := newClassController(t)
 	arena := &anyenc.Arena{}
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1",
-		Op{Type: OpSet, Path: []string{"status"}, Payload: arena.NewString("offloaded")}))
-	require.Error(t, err)
-	assert.Nil(t, st.Get(ctx, testDS, "r1"))
+	ch := makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"status"}, Payload: arena.NewString("offloaded")})
+	require.Error(t, st.ValidateChange(ch))
+	assertFieldClassDropped(t, st, ch)
+	// The Local-class value never landed via the synced route.
+	if rec := st.Get(ctx, testDS, "r1"); rec != nil {
+		assert.Empty(t, rec.GetString("status"))
+	}
 }
 
 // A Change.Local may only write Local-class fields.
@@ -54,23 +72,27 @@ func TestApply_LocalRejectsSyncedField(t *testing.T) {
 	arena := &anyenc.Arena{}
 	ch := makeUpsert("v1", "r1", Op{Type: OpSet, Path: []string{"name"}, Payload: arena.NewString("x")})
 	ch.Local = true
-	require.Error(t, st.ApplyChange(ctx, ch))
+	assertFieldClassDropped(t, st, ch)
 }
 
 // Derived fields are handler-only — no input op may write them, synced or local.
 func TestApply_RejectsDerivedInputOp(t *testing.T) {
 	st := newClassController(t)
 	arena := &anyenc.Arena{}
-	require.Error(t, st.ApplyChange(ctx, makeUpsert("v1", "r1",
-		Op{Type: OpSet, Path: []string{"createdAt"}, Payload: arena.NewNumberInt(5)})))
+	ch := makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"createdAt"}, Payload: arena.NewNumberInt(5)})
+	require.Error(t, st.ValidateChange(ch))
+	assertFieldClassDropped(t, st, ch)
 }
 
 // On a non-Dynamic dataset, an undeclared field is rejected.
 func TestApply_RejectsUnknownFieldNonDynamic(t *testing.T) {
 	st := newClassController(t)
 	arena := &anyenc.Arena{}
-	require.Error(t, st.ApplyChange(ctx, makeUpsert("v1", "r1",
-		Op{Type: OpSet, Path: []string{"bogus"}, Payload: arena.NewString("x")})))
+	ch := makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"bogus"}, Payload: arena.NewString("x")})
+	require.Error(t, st.ValidateChange(ch))
+	assertFieldClassDropped(t, st, ch)
 }
 
 // A Dynamic dataset accepts undeclared fields as synced.
@@ -165,9 +187,10 @@ func TestApply_ScopeByKeyKeepsDeclaredEnforcement(t *testing.T) {
 	st := newScopeByKeyController(t)
 	arena := &anyenc.Arena{}
 
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1",
-		Op{Type: OpSet, Path: []string{"createdAt"}, Payload: arena.NewNumberFloat64(1)}))
-	require.Error(t, err, "derived field stays handler-only")
+	ch := makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"createdAt"}, Payload: arena.NewNumberFloat64(1)})
+	require.Error(t, st.ValidateChange(ch), "derived field stays handler-only")
+	assertFieldClassDropped(t, st, ch)
 }
 
 // ----------------------------------------------------------------------------
@@ -189,9 +212,9 @@ func TestApply_InjectedRouteClassification(t *testing.T) {
 	require.NoError(t, err)
 	arena := &anyenc.Arena{}
 
-	// Synced change cannot write the account field.
-	require.Error(t, st.ApplyChange(ctx, makeUpsert("v1", "r1",
-		Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewTrue()})))
+	// Synced change cannot write the account field — op dropped on apply.
+	assertFieldClassDropped(t, st, makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewTrue()}))
 
 	// Injected change writes it, at the supplied (tech) version.
 	ch := makeUpsert("tech-v7", "r1", Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewTrue()})
@@ -202,10 +225,10 @@ func TestApply_InjectedRouteClassification(t *testing.T) {
 	assert.True(t, rec.GetBool("read"))
 	assert.Equal(t, VersionId("tech-v7"), GetRecordVersion(rec, "read"))
 
-	// Injected change cannot write the synced field.
+	// Injected change cannot write the synced field — op dropped on apply.
 	ch2 := makeUpsert("tech-v8", "r1", Op{Type: OpSet, Path: []string{"name"}, Payload: arena.NewString("x")})
 	ch2.Injected = true
-	require.Error(t, st.ApplyChange(ctx, ch2))
+	assertFieldClassDropped(t, st, ch2)
 
 	// A stale injected replay gates to a no-op (idempotent mirror).
 	ch3 := makeUpsert("tech-v3", "r1", Op{Type: OpSet, Path: []string{"read"}, Payload: arena.NewFalse()})

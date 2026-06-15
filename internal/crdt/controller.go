@@ -511,6 +511,9 @@ func cloneValue(v *anyenc.Value) *anyenc.Value {
 //   - Dataset has a registered handler + collection.
 //   - ObjectId, when set, matches the controller.
 //   - Every op's path syntax legal.
+//   - Every op honors its dataset's field-class scope (a synced
+//     change may not write a local/derived field, etc.) — so a
+//     scope-violating change never reaches AddContent and the DAG.
 //   - Records that submit empty Id flag Upsert=true (the only
 //     legal way to get an auto-derived id).
 //
@@ -532,6 +535,9 @@ func (c *Controller) ValidateChange(ch Change) error {
 	if _, ok := c.handlers[ch.Dataset]; !ok {
 		return ErrUnknownDataset
 	}
+	ds := c.schemas[ch.Dataset]
+	scopeByKey := c.scopeByKey[ch.Dataset]
+	route := routeOf(&ch)
 	for i, rc := range ch.Records {
 		// Empty record id only resolves at apply time (when ChangeId
 		// is known); enforcing the Upsert requirement here keeps
@@ -540,7 +546,7 @@ func (c *Controller) ValidateChange(ch Change) error {
 			return fmt.Errorf("%w (record index %d)", ErrEmptyIdRequiresUpsert, i)
 		}
 		for _, op := range rc.Ops {
-			if err := validateOpPaths(op); err != nil {
+			if err := opContentValid(ds, route, scopeByKey, op); err != nil {
 				return errors.Join(ErrValidation, fmt.Errorf("record index %d op %s: %w", i, op.Type, err))
 			}
 		}
@@ -635,10 +641,6 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		}
 	}
 
-	// Path syntax: whole-change abort on failure (docs/types-properties-
-	// proposal.md § "Validation atomicity"). Handler validation moves
-	// into the Modify callback below.
-	//
 	// Field-class enforcement (the dataset schema is the source of truth):
 	//   - Derived fields are handler-only — no input op may write one;
 	//   - Local fields never sync — only a Change.Local may write one,
@@ -646,22 +648,56 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	//   - on a non-Dynamic dataset, an undeclared field is rejected.
 	// This keeps the classes disjoint, so a local field's locally-allocated
 	// version never competes with a synced field's any-sync OrderId.
+	//
+	// Local+Injected mutual exclusion is a constructed-change invariant
+	// (a DAG change is neither), so it stays a hard abort.
 	if ch.Local && ch.Injected {
 		return res, errors.Join(ErrValidation, errors.New("crdt: Local and Injected are mutually exclusive"))
 	}
+	// Per-op content validation (op-path syntax + field-class scope) is
+	// NON-fatal here: an invalid op is dropped and recorded in
+	// res.Rejections while the rest of the change still commits. This
+	// honors the replay contract (object.replayLocked) — a single bad
+	// historical change must not halt cold restore. Canonical case: a
+	// field that was synced-scope when an older peer wrote it, later
+	// reclassified local-scope; its historical synced $set now violates
+	// field-class and would otherwise wedge every boot. Local writers
+	// still fail fast — ValidateChange runs the same checks before
+	// AddContent, so a fresh scope-violating change never enters the DAG.
 	ds := c.schemas[ch.Dataset]
 	scopeByKey := c.scopeByKey[ch.Dataset]
 	route := routeOf(&ch)
-	for i, rc := range ch.Records {
-		for _, op := range rc.Ops {
-			if err := validateOpPaths(op); err != nil {
-				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: %w", resolvedIds[i], op.Type, err))
-			}
-			for _, field := range opFieldHeads(op) {
-				if err := classifyFieldWrite(ds, field, route, scopeByKey); err != nil {
-					return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s field %q: %w", resolvedIds[i], op.Type, field, err))
+	recordsCopied := false
+	for i := range ch.Records {
+		ops := ch.Records[i].Ops
+		kept := ops
+		filtered := false
+		for j, op := range ops {
+			if err := opContentValid(ds, route, scopeByKey, op); err != nil {
+				res.Rejections = append(res.Rejections, OpRejection{
+					RecordIndex: i,
+					OpIndex:     j,
+					RecordId:    resolvedIds[i],
+					Err:         errors.Join(ErrValidation, fmt.Errorf("op %s: %w", op.Type, err)),
+				})
+				if !filtered {
+					// Copy ops on first drop so we never mutate the caller's slice.
+					kept = append([]Op(nil), ops[:j]...)
+					filtered = true
 				}
+				continue
 			}
+			if filtered {
+				kept = append(kept, op)
+			}
+		}
+		if filtered {
+			// Copy the records slice on first drop, then swap in the trimmed ops.
+			if !recordsCopied {
+				ch.Records = append([]RecordChange(nil), ch.Records...)
+				recordsCopied = true
+			}
+			ch.Records[i].Ops = kept
 		}
 	}
 
@@ -784,6 +820,25 @@ func classifyFieldWrite(ds schema.Dataset, field string, route schema.Scope, sco
 	}
 	if sc != route {
 		return fmt.Errorf("%s field is not writable by the %s route", sc, route)
+	}
+	return nil
+}
+
+// opContentValid runs the per-op content checks — op-path syntax plus
+// dataset field-class (scope) enforcement — for an op arriving via
+// `route`. Shared by ValidateChange (local fail-fast: a failure keeps
+// the whole change out of the DAG) and ApplyChangeWithResult (replay /
+// inbound: a failure drops just the offending op so one bad change
+// can't wedge cold restore). Reserved heads are already screened by
+// validateOpPaths, so classifyFieldWrite only sees user field heads.
+func opContentValid(ds schema.Dataset, route schema.Scope, scopeByKey bool, op Op) error {
+	if err := validateOpPaths(op); err != nil {
+		return err
+	}
+	for _, field := range opFieldHeads(op) {
+		if err := classifyFieldWrite(ds, field, route, scopeByKey); err != nil {
+			return err
+		}
 	}
 	return nil
 }

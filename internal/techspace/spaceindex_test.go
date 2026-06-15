@@ -123,12 +123,16 @@ func TestSpaceIndexHandler_CreatedAtInputOpRejected(t *testing.T) {
 	require.NoError(t, ctrl.ApplyChange(context.Background(), ch))
 
 	// createdAt is ScopeDerived — a synced input op targeting it is
-	// rejected by the controller's scope enforcement.
-	err := ctrl.ApplyChange(context.Background(), makeChange(
+	// dropped by the controller's scope enforcement. On the apply/remote
+	// path the offending op is ignored (recorded as a rejection, never
+	// fatal), so a forged change can't take effect or wedge a peer.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
 		"v2", spaceId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldCreatedAt}, Payload: arena.NewNumberInt(1)},
 	))
-	require.ErrorIs(t, err, crdt.ErrValidation)
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
 
 	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
 	require.NotNil(t, rec)

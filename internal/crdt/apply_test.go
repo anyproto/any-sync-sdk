@@ -172,7 +172,7 @@ func TestSet_RejectsIdInMultiFieldPayload(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}
 
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	err := st.ValidateChange(makeUpsert("v1", "r1", Op{
 		Type: OpSet,
 		Payload: recordPayload(arena, map[string]any{
 			"id":   "wrong",
@@ -181,8 +181,8 @@ func TestSet_RejectsIdInMultiFieldPayload(t *testing.T) {
 	}))
 	require.ErrorIs(t, err, ErrValidation)
 	require.ErrorIs(t, err, ErrInvalidPath)
-	// State untouched: no record was created because the whole change
-	// dropped at the pre-apply validation pass.
+	// State untouched: the client gate rejected the change before any
+	// apply, so no record was created.
 	assert.Nil(t, st.Get(ctx, testDS, "r1"))
 }
 
@@ -195,7 +195,7 @@ func TestSet_RejectsExplicitIdPath(t *testing.T) {
 		Type:    OpSet,
 		Payload: recordPayload(arena, map[string]any{"name": "hi"}),
 	})))
-	err := st.ApplyChange(ctx, makeChange("v2", "r1", Op{
+	err := st.ValidateChange(makeChange("v2", "r1", Op{
 		Type:    OpSet,
 		Path:    []string{"id"},
 		Payload: arena.NewString("rewritten"),
@@ -1385,8 +1385,9 @@ func TestValidate_RejectsUnderscorePrefixedTopPath(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}
 
-	// Simulate user trying to forge a tombstone via _deletedAt.
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	// Simulate user (client) trying to forge a tombstone via _deletedAt —
+	// the client gate keeps it out of the DAG entirely.
+	err := st.ValidateChange(makeUpsert("v1", "r1", Op{
 		Type:    OpSet,
 		Path:    []string{"_deletedAt"},
 		Payload: arena.NewNumberInt(123),
@@ -1399,7 +1400,7 @@ func TestValidate_RejectsVerTopPath(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}
 
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	err := st.ValidateChange(makeUpsert("v1", "r1", Op{
 		Type:    OpSet,
 		Path:    []string{"_ver", "hacked"},
 		Payload: arena.NewString("x"),
@@ -1413,7 +1414,7 @@ func TestValidate_RejectsDotInPathElement(t *testing.T) {
 
 	// Callers must use nested path components, not literal dots, to avoid
 	// confusion with the dotted-string form accepted by multi-field $set.
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	err := st.ValidateChange(makeUpsert("v1", "r1", Op{
 		Type:    OpSet,
 		Path:    []string{"meta.color"},
 		Payload: arena.NewString("red"),
@@ -1425,7 +1426,7 @@ func TestValidate_RejectsEmptyPathElement(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}
 
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	err := st.ValidateChange(makeUpsert("v1", "r1", Op{
 		Type:    OpSet,
 		Path:    []string{"meta", "", "color"},
 		Payload: arena.NewString("red"),
@@ -1437,9 +1438,9 @@ func TestValidate_RejectsReservedKeyInMultiFieldSet(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}
 
-	// A multi-field $set payload with a reserved key must drop the whole
-	// change, not just silently skip the offending key.
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	// A multi-field $set payload with a reserved key must reject the whole
+	// op, not just silently skip the offending key.
+	err := st.ValidateChange(makeUpsert("v1", "r1", Op{
 		Type: OpSet,
 		Payload: recordPayload(arena, map[string]any{
 			"name":       "hi",
@@ -1455,13 +1456,36 @@ func TestValidate_RejectsEmptySegmentInDottedKey(t *testing.T) {
 	arena := &anyenc.Arena{}
 
 	// "meta." splits to ["meta", ""] — empty segment is rejected.
-	err := st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+	err := st.ValidateChange(makeUpsert("v1", "r1", Op{
 		Type: OpSet,
 		Payload: recordPayload(arena, map[string]any{
 			"meta.": "broken",
 		}),
 	}))
 	require.ErrorIs(t, err, ErrInvalidPath)
+}
+
+// A remote/replay change carrying an invalid op must NOT halt apply (it
+// would otherwise wedge cold restore): the bad op is dropped and recorded
+// in res.Rejections while a sibling valid op still lands. The client gate
+// (ValidateChange) is what keeps such a change out of the DAG in the first
+// place; once it's in a peer's DAG, every reader must tolerate it.
+func TestApply_DropsInvalidOpFromRemote(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	res, err := st.ApplyChangeWithResult(ctx, makeUpsert("v1", "r1",
+		Op{Type: OpSet, Path: []string{"_deletedAt"}, Payload: arena.NewNumberInt(123)},
+		Op{Type: OpSet, Path: []string{"name"}, Payload: arena.NewString("kept")},
+	))
+	require.NoError(t, err, "one bad op must not abort the whole change")
+	require.Len(t, res.Rejections, 1)
+	assert.Equal(t, 0, res.Rejections[0].OpIndex)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrInvalidPath)
+
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec, "forged tombstone op was dropped — record is live")
+	assert.Equal(t, "kept", rec.GetString("name"), "the sibling valid op still applied")
 }
 
 // ----------------------------------------------------------------------------

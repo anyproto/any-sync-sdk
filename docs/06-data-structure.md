@@ -3,60 +3,85 @@
 ## Vision
 Main interface for data retrieval: any-store queries + subscription to event flow. System collections: `spaces` (global), `objects` (per-space system collection for properties), plus per-object datasets. Some property values can be overridden at device level (local) or account level (tech space).
 
-## Object Properties (from `object-properties.txt`)
+## Object Properties
 
 Every object has properties — a map with required fields (`id`, `name`, `description`, `author`, optionally `[]types`). All objects in a space share one system collection `objects`: **one record per object**, `id` = any-sync objectId.
 
-### Property Types
-| Type | Source | Sync | Overridable |
-|------|--------|------|-------------|
-| **auto** | constants from any-sync / common context (`id`, `author`, `spaceId`) | N/A | no (read-only) |
-| **base** | stored in the object CRDT itself (changes use empty record `id`). Applied by a built-in `baseProperty` handler. Hardcoded rule: an object can only update its own record | synced with the object | yes |
-| **account** | derived object in tech space; special handler applies changes to the `objects` collection of the appropriate space | synced across account devices | yes |
-| **device** | device-level record in local DB | not synced | yes |
+### Property scopes (decision 2026-06-12 — scope on the declaration)
 
-Final set: **auto / base / account / device**.
+Scope is a fixed attribute of the property DEFINITION (and of declared
+dataset schema fields), from the unified `schema.Scope` taxonomy. A
+property lives in exactly one scope, pinned at creation like `kind`;
+changing scope = defining a new property (new propId). Full design and
+rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 
-### Conflict Resolution
-Any overridable field can exist in multiple types simultaneously — e.g., `isFavorite` can be `base`, `account`, and `device`. **Priority (common to all properties)**: `device > account > base`. Rationale:
-- `base` — the default, set by anyone with write access
-- `account` — "I want this different for my account, across all my devices"
-- `device` — "on this specific device, override everything else"
+| Scope | write route | version domain | syncs to | overridable |
+|------|------|------|------|------|
+| **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`) | triggering change | (computed convergently) | no (read-only) |
+| **synced** | the object's own CRDT change | object tree | everyone with access | n/a — no override stack |
+| **account** | carrier record in tech space + per-device mirror | tech tree | this account's devices | n/a |
+| **local** | `Object.LocalSet`, no DAG | local lexid | this device only | n/a |
 
-`auto` sits outside the priority — it's read-only and cannot be overridden.
+There is **no per-value override stack and no priority merge** — the
+earlier auto/base/account/device variant model (priority `device >
+account > base`, per-record `_base`/`_account`/`_device` bags, computed
+root) was rejected: ~80% of its complexity (row migration, root
+derivation, projection stripping, shadowed-write event semantics,
+three-domain `_ver` presentation) paid for the override stack alone.
+Wanting both a shared and a personal "favorite" means two properties;
+clients compose if they care.
 
-One priority for all properties (not per-property). Simpler, still lets clients read any individual variant when needed.
+### Storage
 
-### Storage — Proposal 2 (chosen)
+Values of every scope sit at their normal `{typeId}.{propId}` paths in
+the object's row — no reserved scope fields, no migration from the
+pre-scope layout (everything that existed was synced-scope). One `_ver`
+tree per record; version domains coexist because no two routes ever
+write the same path (the scope pin + apply-side route enforcement keep
+them disjoint — see CRDT spec §9).
+
 ```json
 {
   "id": "objectId",
-  "name": "device name",                    // computed per priority device > account > base
-  "isFavorite": true,
-  "_device":  { "name": "device name" },
-  "_account": { "name": "account name", "isFavorite": true },
-  "_base":    { "name": "base name" }
+  "any":            { "name": "Heat" },
+  "{movieTypeId}":  { "Y9Hxx5xmYmF": ["personA"], "EwyHGrtTdxB": 1995 },
+  "_ver":           { "id": "…", "any": { "name": "…" } }
 }
 ```
-- **Pros**: simple queries (`{isFavorite: true}`), per-variant access still possible, special filters possible when needed
-- **Cons mitigated**: any-store has s2 compression, so duplicated values won't inflate storage significantly
 
-Rejected:
-- **Proposal 1** (namespaces only) — query complexity is unacceptable
-- **Proposal 3** (any-store views) — requires a new feature in any-store, shouldn't block v1
+In a shared space, account- and local-scoped values reflect THIS
+account/device — queries filtering on them select per-account /
+per-device result sets ("my value" semantics). Two documented
+footguns: agents must not condition SHARED mutations on account/local
+values, and the local search index intentionally indexes the local
+view.
 
-### Handlers
-- **`SystemPropertiesHandler`** (was named `baseProperty` in earlier drafts) — built-in, runs on regular objects. Wired against the per-space `objects` collection via the Controller's shared-collection override: every write to dataset `objects` lands in one row keyed by the change's ObjectId. The "object can only update its own record" rule is enforced at the apply layer (`ch.ObjectId` is what the row id is set to, regardless of the inbound `RecordChange.Id`).
-- **`rewriteObject` handler** — built-in, lives in tech space. Watches the account-level rewrite object and applies `account` variants to the corresponding space's `objects` collection
-- Together these two handlers keep the computed root value in sync across `_device` / `_account` / `_base` writes
+### Handlers / enforcement
+- **`SystemPropertiesHandler`** serves the synced route only. Besides
+  kind validation it enforces route-vs-scope: an inbound DAG op whose
+  target propId is declared `account`/`local`/`derived` is dropped
+  per-op (convergent — the DataVersion gate parks changes whose schema
+  hasn't synced, so the lookup never races the definition).
+- **Account mirror** (tech-space watcher; see the proposal §"Account
+  transport"): applies converged carrier values into target rows as
+  injected applies stamping tech versionIds; unknown propIds are
+  skipped and retried by the state-based re-mirror on space load.
+- **Local route**: `Object.LocalSet`; validation is writer-side
+  (`Properties.Set` resolves scopes to route anyway).
+- Write API: one auto-routing `Properties.Set` — a patch resolving to
+  more than one scope is rejected (routes commit independently across
+  version domains; no cross-route rollback).
 
-### Not Expanding This Pattern to All CRDT Data (v1)
-We considered making the rewrite/override pattern a general CRDT feature (any record can have local/account/general variants). Decided against it:
-- Consistency is harder across many datasets
-- Garbage collection becomes complex (when can a variant be dropped?)
-- No product need — properties are the only case that requires this right now
+### Scopes on dataset fields
 
-Revisit later if a concrete use case appears.
+Dataset schema fields use the same taxonomy and may declare `account`
+(e.g. a per-account `read` flag on `chat_messages`) alongside the
+existing `synced`/`derived`/`local`. The account carrier keys records
+by `(objectId, dataset, recordId)` — the objects row is the degenerate
+case. This supersedes the earlier "Not Expanding This Pattern to All
+CRDT Data" decision: that rejection targeted the override/variant model
+(shadow-variant GC, merge consistency); a scope-declared field has no
+shadowing — it is just a field with a different write route.
 
 ## Types, Properties & Data Schemas
 
@@ -312,7 +337,7 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 - **Return values** — keep `anyenc.Value` as the unit; it already has typed getters and `.String()` → JSON
 - **Pagination** — TBD; start with what any-store offers (offset), revisit if needed
 - **Cross-collection queries** — probably needed eventually, **not in v1**
-- **Property variants in queries** — default projection **hides** `_device` / `_account` / `_base`. Caller can opt-in via a flag. Projection control may live at API level, not SDK level
+- **Property scopes in queries** — nothing to hide: values of every scope sit at their normal paths and reflect the local account/device view
 
 ### Subscriptions / Event Flow
 - **Single API: `Query.Subscribe(ctx, opts)`** — windowed live queries. Chain `Filter / Sort / Limit` then call `Subscribe` for a live `*QueryResult{Initial, Total, Sub}`, or `Snapshot(opts)` for the same shape without a live `Sub`. There is no separate raw-event firehose.
@@ -324,7 +349,7 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 - **Snapshot fence** — initial snapshot read runs UNDER `engine.mu`. Apply events that fire during the read queue on the lock and process correctly after the new sub is registered. No `VersionId` dedupe needed.
 - **Overflow / drift** — overflow = mailbox full; sub closes with `ErrSubscriptionOverflow`. Drift = more than `DriftBudgetPercent` (default 30) of `Limit` records left the held window without replacement; sub closes with `ErrSubscriptionDrifted`. Both signal "resubscribe to recover" — the resubscribe path is the only recovery contract (no silent drops, no per-event count).
 - **Total** — `QueryOpts.IncludeTotal` runs a single `Count(filter)` at snapshot time; not maintained on the live stream. Call `Snapshot` again for a refreshed count.
-- **Variant-level events** — opt-in advanced channel for `_device`/`_account`/`_base` internal events (debugging, settings UI). Not in v1.
+- **Scope-route events** — account/local writes flow through the same windowed event stream as synced ones, one versionId per event from that change's own domain.
 
 ### Storage Topology
 - **Flexible via `dbRouter`** — scope → DB instance. Allows starting with one shared DB (simpler, enables cross-space transactions) and moving to per-space DBs if performance dictates
@@ -332,7 +357,7 @@ Query result = merge(deviceLocal, accountLevel, defaults)
   - Shared DB: cross-space transactions possible, but space deletion is harder, and any-store has a single writer (contention risk)
   - Per-space DB: isolated, easier deletion, parallel writers; no cross-space transactions
 - **Needs performance testing** before locking in
-- **Device data** — lives in the same DB as synced data. Open question: do we need a local `versionId` for consistency between device-variant writes and sync events?
+- **Device data** — lives in the same DB as synced data; local-scope versions are locally-minted lexids in the same `_ver` tree (resolved — see CRDT spec §9).
 - **Device data persistence** — not backed up, does not survive app reinstall
 
 ### System Collections
@@ -361,11 +386,11 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 5. ~Subscription filter inside a document set?~ → `Query.Subscribe` takes the full chained `Filter`/`Sort`/`Limit`/`Offset`; no separate dataset narrowing knob.
 
 ### Property Events (cross-section)
-6. Events must carry property changes even though each variant (`_device` / `_account` / `_base`) has its own `_o` version. How is the event delta represented — as a change to the computed root, as a change to one of the `_*` variants, or both? This affects CRDT event format too.
-7. Order of events when multiple variants of the same property change in one batch — is this even possible in one batch?
+6. ~Event delta representation for property variants~ → resolved by scope-on-declaration: there are no variants; one event per applied change, ops at normal paths, versionId from the producing route's domain.
+7. ~Multiple variants of one property in one batch~ → impossible by construction (one property = one scope = one route; `Properties.Set` is single-scope per call).
 
 ### Storage Topology
-8. Local `versionId` for device-scope writes — do we need one to keep consistency between device-variant state and sync events? Or can we reuse the synced `versionId` somehow?
+8. ~Local `versionId` for device-scope writes~ → resolved: locally-minted lexids (`NextVersion`), disjoint by path from synced versions.
 9. `dbRouter` interface sketch — what's the scope key (spaceId? "device"? "tech"?)?
 10. When we move to per-space DBs, how does tech space integrate? Its own DB, or alongside regular spaces?
 
@@ -411,4 +436,4 @@ Query result = merge(deviceLocal, accountLevel, defaults)
     **Dedicated API.** Whatever we decide, `AttachType` / `DetachType` should be the only sanctioned mutation path — freeform `$set` on `any.types` makes some of the policies above (e.g. cascade-wipe, built-in guard) un-enforceable without inspecting every op.
 
 ### Dependencies
-15. Event format for property variants must be agreed with the CRDT section (question 6 above is the cross-section one to resolve)
+15. ~Event format for property variants~ → resolved with question 6 (scope-on-declaration; CRDT spec §9).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -12,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 
+	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -39,6 +41,11 @@ type Service struct {
 	open    atomic.Bool
 	spaceId string
 	indexId string
+
+	// avIds caches targetSpaceId → derived account-values carrier
+	// object id (see accountvalues.go). Guarded by avMu.
+	avMu  sync.Mutex
+	avIds map[string]string
 
 	// store backs the single index object. It is a "raw" spaceobjects
 	// Store (custom handlers, gate disabled) so the index inherits the
@@ -118,11 +125,16 @@ func (s *Service) Open(ctx context.Context) error {
 		Handlers: []crdt.HandlerReg{
 			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
 			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
+			// Account-values carrier (one derived object per target
+			// space) — see accountvalues.go. Dynamic: carrier records
+			// carry free-form typeId heads at the target rows' paths.
+			{Name: accountvalues.Dataset, Handler: crdt.DefaultHandler{}, Schema: accountvalues.Schema()},
 		},
 		DisableGate: true,
 		DataVersions: map[string]string{
-			SpaceIndexDataset: HandlerVersion,
-			ProfileDataset:    ProfileHandlerVersion,
+			SpaceIndexDataset:     HandlerVersion,
+			ProfileDataset:        ProfileHandlerVersion,
+			accountvalues.Dataset: accountvalues.HandlerVersion,
 		},
 	})
 
@@ -461,39 +473,84 @@ func (s *Service) Close(_ context.Context) error {
 	return nil
 }
 
-// SpaceRegistry adapter — the tech-space owns one tree (the index).
-// Anything else routes back through the app's broader SpaceRegistry
-// (set later when regular spaces gain their own one).
+// SpaceRegistry adapter — the tech-space hosts the index object plus
+// one account-values carrier object per target space, all served by
+// the same raw Store. Every tech-space tree routes through it so the
+// listener-bound, deferred-updater, cold-restored object is what the
+// tree syncer touches.
 
 var ErrSpaceRegistryUnknown = errors.New("techspace: unknown (spaceId, treeId)")
 
-// GetTree resolves the index tree via the Store's resident object.
-// Anything else under the tech space is unknown. The Store returns the
-// listener-bound, deferred-updater, cold-restored object (reloading it
-// if ocache evicted), so the synctree's AddRawChangesFromPeer path
-// fires Update → replayLocked and inbound index changes project live —
-// the cold-sync path that TestE2E_ColdSyncSameKey covers.
+// GetTree resolves any tech-space tree via the Store. The Store
+// returns the listener-bound, deferred-updater, cold-restored object
+// (reloading it if ocache evicted), so the synctree's
+// AddRawChangesFromPeer path fires Update → replayLocked and inbound
+// changes project live — for the index object (the cold-sync path
+// TestE2E_ColdSyncSameKey covers) AND the account-values carriers
+// (TestE2E_AccountScopeSync): restricting this to the index id used to
+// silently skip carrier trees in every headsync round, so account
+// values never crossed devices.
+//
+// Accepting arbitrary tree ids is safe: the tech space is owner-only —
+// every tree in it is this account's, and the raw Store registers the
+// full tech handler set (spaces/profile/account_values) on every
+// controller. An id any-sync can't resolve fails inside Store.Get and
+// the syncer skips it.
 func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
-	if spaceId != s.spaceId || treeId != s.indexId {
+	if spaceId != s.spaceId {
 		return nil, ErrSpaceRegistryUnknown
 	}
-	obj, err := s.indexObj(ctx)
+	obj, err := s.store.Get(ctx, treeId)
 	if err != nil {
 		return nil, err
 	}
 	tree := obj.Tree()
 	if tree == nil {
-		return nil, fmt.Errorf("techspace: index tree not bound")
+		return nil, fmt.Errorf("techspace: tree %s not bound", treeId)
 	}
 	return tree, nil
 }
 
-func (s *Service) PutTree(_ context.Context, _ string, _ treestorage.TreeStorageCreatePayload) error {
-	return ErrSpaceRegistryUnknown
+// PutTree binds a remote-delivered tech-space tree payload — a carrier
+// created by another of the account's devices that this device hasn't
+// derived yet. (The index object is always derived locally at Open, so
+// it never arrives this way, but accepting it is harmless: Derive and
+// PutTree converge on the same deterministic tree.)
+func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {
+	if spaceId != s.spaceId {
+		return ErrSpaceRegistryUnknown
+	}
+	_, err := s.store.PutTreeFromPayload(ctx, payload)
+	return err
 }
 
-func (s *Service) MarkTreeDeleted(_ context.Context, _, _ string) error { return nil }
+// MarkTreeDeleted is the soft-delete hook fired when the settings tree
+// announces a deletion — for the tech space that means a carrier
+// object dropped by another of the account's devices. Same contract as
+// the regular-space registry: drop the cached object so reads/mirrors
+// stop touching it; the storage delete follows via DeleteTree.
+// Unconditional like the regular path — dropping the index object
+// would merely force a reload on next use.
+func (s *Service) MarkTreeDeleted(_ context.Context, spaceId, treeId string) error {
+	if spaceId == s.spaceId && s.store != nil {
+		s.store.Drop(treeId)
+	}
+	return nil
+}
 
-func (s *Service) DeleteTree(_ context.Context, _, _ string) error {
-	return ErrSpaceRegistryUnknown
+// DeleteTree handles the deletion-manager's per-tree cleanup — fired
+// for carrier objects dropped on space leave/delete. Same contract as
+// the regular-space registry, with ONE deliberate exception: the index
+// tree is refused. It is the account's space list — storage-deleting
+// it is unrecoverable locally (the deterministic re-derive hits the
+// deleted-storage mark) and no SDK path ever legitimately requests it,
+// so a request can only be a bug we'd rather surface than obey.
+func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error {
+	if spaceId != s.spaceId {
+		return ErrSpaceRegistryUnknown
+	}
+	if treeId == s.indexId {
+		return fmt.Errorf("techspace: refusing to delete the index tree")
+	}
+	return s.store.DeleteTree(ctx, treeId)
 }

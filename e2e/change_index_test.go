@@ -16,7 +16,7 @@ import (
 // TestSDK_ChangeIndex exercises the consumer-side change-index surface:
 //
 //   - ChangedSince(0) lists every object that has applied a change,
-//     ascending by AddSeq, with _addSeq visible on the property record.
+//     ascending by ApplySeq, with _applySeq visible on the property record.
 //   - ChangedSince(cursor) returns only objects that moved past it.
 //   - Subscribe fires live on every applied change with (objectId,
 //     addSeq).
@@ -56,12 +56,12 @@ func TestSDK_ChangeIndex(t *testing.T) {
 	// Two objects, each with a property write.
 	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, idA, typeId, map[string]any{titleProp: "alpha"})
+	_, err = sp.Properties().Set(ctx, idA, typeId, map[string]any{titleProp: "alpha"})
 	require.NoError(t, err)
 
 	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, idB, typeId, map[string]any{titleProp: "beta"})
+	_, err = sp.Properties().Set(ctx, idB, typeId, map[string]any{titleProp: "beta"})
 	require.NoError(t, err)
 
 	// Live feed saw both objects (among other system writes). Drain
@@ -72,8 +72,8 @@ drain:
 	for {
 		select {
 		case e := <-events:
-			if e.AddSeq > seen[e.ObjectId] {
-				seen[e.ObjectId] = e.AddSeq
+			if e.ApplySeq > seen[e.ObjectId] {
+				seen[e.ObjectId] = e.ApplySeq
 			}
 		case <-drainDeadline:
 			break drain
@@ -82,15 +82,15 @@ drain:
 	assert.Contains(t, seen, idA, "live feed observed object A")
 	assert.Contains(t, seen, idB, "live feed observed object B")
 
-	// Catch-up pull: ChangedSince(0) lists both, ascending by AddSeq.
+	// Catch-up pull: ChangedSince(0) lists both, ascending by ApplySeq.
 	all, err := sp.Changes().ChangedSince(ctx, 0, 0)
 	require.NoError(t, err)
 	idToSeq := map[string]uint64{}
 	for i, c := range all {
 		if i > 0 {
-			assert.LessOrEqual(t, all[i-1].AddSeq, c.AddSeq, "ascending by AddSeq")
+			assert.LessOrEqual(t, all[i-1].ApplySeq, c.ApplySeq, "ascending by ApplySeq")
 		}
-		idToSeq[c.ObjectId] = c.AddSeq
+		idToSeq[c.ObjectId] = c.ApplySeq
 	}
 	require.Contains(t, idToSeq, idA)
 	require.Contains(t, idToSeq, idB)
@@ -108,13 +108,13 @@ drain:
 		assert.True(t, laterIds[idB], "B is past the cursor")
 	}
 
-	// MaxAddSeq is at least the highest object we saw.
-	maxSeq, err := sp.Changes().MaxAddSeq(ctx)
+	// MaxApplySeq is at least the highest object we saw.
+	maxSeq, err := sp.Changes().MaxApplySeq(ctx)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, maxSeq, idToSeq[idB])
 
 	// _addSeq is visible on the property record.
-	rec, err := sp.Properties().Get(ctx, idA, space.PropertyReadOpts{})
+	rec, err := sp.Properties().Get(ctx, idA)
 	require.NoError(t, err)
 	require.NotNil(t, rec)
 	assert.Greater(t, uint64(rec.GetInt("_addSeq")), uint64(0), "_addSeq stamped on property row")
@@ -154,7 +154,7 @@ func TestSDK_TombstoneVisibility(t *testing.T) {
 
 	id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, id, typeId, map[string]any{titleProp: "doomed"})
+	_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{titleProp: "doomed"})
 	require.NoError(t, err)
 
 	// Capture the live row's _addSeq before deletion.

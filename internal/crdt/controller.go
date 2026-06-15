@@ -64,6 +64,10 @@ type OpRejection struct {
 type ApplyResult struct {
 	Rejections []OpRejection
 	DerivedOps [][]Op
+	// ApplySeq is the per-space apply sequence allocated for this
+	// change (0 when the Controller has no allocator — unit tests).
+	// Forwarded to the change-index feed so consumers cursor on it.
+	ApplySeq uint64
 }
 
 // Reserved field names.
@@ -122,8 +126,17 @@ type Controller struct {
 	// RecordChange.Id), so all objects in the space project into one
 	// row each. Used for the per-space `objects` values collection.
 	shared    map[string]struct{}
-	metaColl  anystore.Collection // _meta — persisted maxAddSeq + handler versions
-	maxAddSeq uint64
+	// scopeByKey marks datasets whose undeclared field heads carry
+	// per-key scopes (HandlerReg.DynamicScopeByKey).
+	scopeByKey map[string]bool
+
+	metaColl    anystore.Collection // _meta — persisted maxAddSeq/maxApplySeq + handler versions
+	maxAddSeq   uint64
+	maxApplySeq uint64
+	// applySeqs mints the per-space apply sequence (shared across the
+	// space's Controllers). nil disables applySeq stamping (unit
+	// tests, callers without a consumer feed).
+	applySeqs *ApplySeqAllocator
 
 	// Pools for the per-RecordChange hot path. Both are scoped to this
 	// Controller to keep contention bounded; the apply loop is single-
@@ -209,6 +222,16 @@ func (c *Controller) SetSpaceId(spaceId string) {
 // SetMaxAddSeq seeds the watermark from persisted storage on restore.
 func (c *Controller) SetMaxAddSeq(seq uint64) { c.maxAddSeq = seq }
 
+// SetApplySeqAllocator wires the per-space apply-sequence allocator.
+// Call once right after construction, before the first apply. No-op on
+// a nil controller.
+func (c *Controller) SetApplySeqAllocator(a *ApplySeqAllocator) {
+	if c == nil {
+		return
+	}
+	c.applySeqs = a
+}
+
 // RegisterHandler adds a handler at runtime (for late-bound datasets).
 func (c *Controller) RegisterHandler(ctx context.Context, reg HandlerReg) error {
 	return c.registerHandler(ctx, reg)
@@ -243,6 +266,12 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 	c.versions[name] = version
 	c.indexes[name] = reg.Indexes
 	c.schemas[name] = reg.Schema
+	if reg.DynamicScopeByKey {
+		if c.scopeByKey == nil {
+			c.scopeByKey = make(map[string]bool)
+		}
+		c.scopeByKey[name] = true
+	}
 	// Per-object collections are opened lazily — on first write
 	// (creates) or on first read (no-create). This keeps unwritten
 	// datasets (e.g. typetype's `properties` / `shortIds` on regular
@@ -482,6 +511,9 @@ func cloneValue(v *anyenc.Value) *anyenc.Value {
 //   - Dataset has a registered handler + collection.
 //   - ObjectId, when set, matches the controller.
 //   - Every op's path syntax legal.
+//   - Every op honors its dataset's field-class scope (a synced
+//     change may not write a local/derived field, etc.) — so a
+//     scope-violating change never reaches AddContent and the DAG.
 //   - Records that submit empty Id flag Upsert=true (the only
 //     legal way to get an auto-derived id).
 //
@@ -503,6 +535,9 @@ func (c *Controller) ValidateChange(ch Change) error {
 	if _, ok := c.handlers[ch.Dataset]; !ok {
 		return ErrUnknownDataset
 	}
+	ds := c.schemas[ch.Dataset]
+	scopeByKey := c.scopeByKey[ch.Dataset]
+	route := routeOf(&ch)
 	for i, rc := range ch.Records {
 		// Empty record id only resolves at apply time (when ChangeId
 		// is known); enforcing the Upsert requirement here keeps
@@ -511,7 +546,7 @@ func (c *Controller) ValidateChange(ch Change) error {
 			return fmt.Errorf("%w (record index %d)", ErrEmptyIdRequiresUpsert, i)
 		}
 		for _, op := range rc.Ops {
-			if err := validateOpPaths(op); err != nil {
+			if err := opContentValid(ds, route, scopeByKey, op); err != nil {
 				return errors.Join(ErrValidation, fmt.Errorf("record index %d op %s: %w", i, op.Type, err))
 			}
 		}
@@ -606,10 +641,6 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		}
 	}
 
-	// Path syntax: whole-change abort on failure (docs/types-properties-
-	// proposal.md § "Validation atomicity"). Handler validation moves
-	// into the Modify callback below.
-	//
 	// Field-class enforcement (the dataset schema is the source of truth):
 	//   - Derived fields are handler-only — no input op may write one;
 	//   - Local fields never sync — only a Change.Local may write one,
@@ -617,17 +648,56 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	//   - on a non-Dynamic dataset, an undeclared field is rejected.
 	// This keeps the classes disjoint, so a local field's locally-allocated
 	// version never competes with a synced field's any-sync OrderId.
+	//
+	// Local+Injected mutual exclusion is a constructed-change invariant
+	// (a DAG change is neither), so it stays a hard abort.
+	if ch.Local && ch.Injected {
+		return res, errors.Join(ErrValidation, errors.New("crdt: Local and Injected are mutually exclusive"))
+	}
+	// Per-op content validation (op-path syntax + field-class scope) is
+	// NON-fatal here: an invalid op is dropped and recorded in
+	// res.Rejections while the rest of the change still commits. This
+	// honors the replay contract (object.replayLocked) — a single bad
+	// historical change must not halt cold restore. Canonical case: a
+	// field that was synced-scope when an older peer wrote it, later
+	// reclassified local-scope; its historical synced $set now violates
+	// field-class and would otherwise wedge every boot. Local writers
+	// still fail fast — ValidateChange runs the same checks before
+	// AddContent, so a fresh scope-violating change never enters the DAG.
 	ds := c.schemas[ch.Dataset]
-	for i, rc := range ch.Records {
-		for _, op := range rc.Ops {
-			if err := validateOpPaths(op); err != nil {
-				return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s: %w", resolvedIds[i], op.Type, err))
-			}
-			for _, field := range opFieldHeads(op) {
-				if err := classifyFieldWrite(ds, field, ch.Local); err != nil {
-					return res, errors.Join(ErrValidation, fmt.Errorf("record %q op %s field %q: %w", resolvedIds[i], op.Type, field, err))
+	scopeByKey := c.scopeByKey[ch.Dataset]
+	route := routeOf(&ch)
+	recordsCopied := false
+	for i := range ch.Records {
+		ops := ch.Records[i].Ops
+		kept := ops
+		filtered := false
+		for j, op := range ops {
+			if err := opContentValid(ds, route, scopeByKey, op); err != nil {
+				res.Rejections = append(res.Rejections, OpRejection{
+					RecordIndex: i,
+					OpIndex:     j,
+					RecordId:    resolvedIds[i],
+					Err:         errors.Join(ErrValidation, fmt.Errorf("op %s: %w", op.Type, err)),
+				})
+				if !filtered {
+					// Copy ops on first drop so we never mutate the caller's slice.
+					kept = append([]Op(nil), ops[:j]...)
+					filtered = true
 				}
+				continue
 			}
+			if filtered {
+				kept = append(kept, op)
+			}
+		}
+		if filtered {
+			// Copy the records slice on first drop, then swap in the trimmed ops.
+			if !recordsCopied {
+				ch.Records = append([]RecordChange(nil), ch.Records...)
+				recordsCopied = true
+			}
+			ch.Records[i].Ops = kept
 		}
 	}
 
@@ -637,6 +707,21 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		return res, fmt.Errorf("crdt: begin tx: %w", err)
 	}
 	txCtx := tx.Context()
+
+	// Allocate the apply sequence AFTER the WriteTx is held: any-store's
+	// single writer then serializes allocation order = commit order, so
+	// an ascending-cursor consumer can't observe seq N+1 before N
+	// committed. A rolled-back tx just skips its seq (gaps are fine).
+	// Replays of already-applied changes re-stamp (the modifier can't
+	// see whether ops gated to no-ops) — a spurious bump costs a
+	// consumer one idempotent re-chunk, never a miss.
+	if c.applySeqs != nil {
+		ch.ApplySeq, err = c.applySeqs.Next(txCtx)
+		if err != nil {
+			_ = tx.Rollback()
+			return res, fmt.Errorf("crdt: allocate applySeq: %w", err)
+		}
+	}
 
 	for i := range ch.Records {
 		id := resolvedIds[i]
@@ -661,17 +746,24 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		}
 	}
 
-	// Persist the watermark in the same WriteTx as the record
-	// mutations: maxAddSeq + record state move atomically. Without
-	// this, a crash between commit and a separate persist would
+	// Persist the watermarks in the same WriteTx as the record
+	// mutations: maxAddSeq/maxApplySeq + record state move atomically.
+	// Without this, a crash between commit and a separate persist would
 	// re-replay the change on next boot and (with the halt-on-error
-	// iter) potentially get stuck if anything errored mid-iter.
+	// iter) potentially get stuck if anything errored mid-iter. The
+	// in-tx persist is also what makes the applySeq allocator
+	// crash-safe without a counter row of its own — re-seeding reads
+	// the max persisted stamp.
 	newMaxAddSeq := c.maxAddSeq
 	if ch.AddSeq > newMaxAddSeq {
 		newMaxAddSeq = ch.AddSeq
 	}
+	newMaxApplySeq := c.maxApplySeq
+	if ch.ApplySeq > newMaxApplySeq {
+		newMaxApplySeq = ch.ApplySeq
+	}
 	if c.metaColl != nil {
-		if err := PersistMeta(txCtx, c.metaColl, c.objectId, newMaxAddSeq, c.HandlerVersions(), c.spaceId); err != nil {
+		if err := PersistMeta(txCtx, c.metaColl, c.objectId, newMaxAddSeq, newMaxApplySeq, c.HandlerVersions(), c.spaceId); err != nil {
 			_ = tx.Rollback()
 			return res, fmt.Errorf("crdt: persist meta: %w", err)
 		}
@@ -681,33 +773,71 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		return res, fmt.Errorf("crdt: commit: %w", err)
 	}
 
-	// Commit succeeded — advance the in-memory mirror.
+	// Commit succeeded — advance the in-memory mirrors.
 	c.maxAddSeq = newMaxAddSeq
+	c.maxApplySeq = newMaxApplySeq
+	res.ApplySeq = ch.ApplySeq
 	return res, nil
 }
 
-// classifyFieldWrite enforces the dataset field-class rules for an input
-// op writing `field` (a top-level field name) on a change whose Local
-// flag is `isLocal`. Reserved fields (id, _*) are already rejected by
+// routeOf maps a change's flags to the write route it arrived on —
+// the scope a field must declare for the write to be admissible.
+func routeOf(ch *Change) schema.Scope {
+	switch {
+	case ch.Local:
+		return schema.ScopeLocal
+	case ch.Injected:
+		return schema.ScopeAccount
+	default:
+		return schema.ScopeSynced
+	}
+}
+
+// classifyFieldWrite enforces the dataset field-class rules for an
+// input op writing `field` (a top-level field name) on a change that
+// arrived via `route` (synced DAG / LocalSet / the account mirror's
+// InjectedSet). Reserved fields (id, _*) are already rejected by
 // validateOpPaths, so this only sees user-facing field heads.
-func classifyFieldWrite(ds schema.Dataset, field string, isLocal bool) error {
+//
+// scopeByKey (HandlerReg.DynamicScopeByKey) exempts UNDECLARED heads
+// from the direction check: those datasets carry per-key scopes the
+// controller can't see (the objects dataset's per-property scope),
+// enforced by the dataset's handler (DAG route) and writer layer
+// (local/account routes). Declared heads stay fully enforced.
+func classifyFieldWrite(ds schema.Dataset, field string, route schema.Scope, scopeByKey bool) error {
 	sc, declared := ds.ScopeOf(field)
 	if !declared {
 		if !ds.Dynamic {
 			return fmt.Errorf("undeclared field on a non-dynamic dataset")
 		}
+		if scopeByKey {
+			return nil // per-key scope — owned by the dataset layer
+		}
 		sc = schema.ScopeSynced // dynamic datasets default undeclared fields to synced
 	}
-	switch sc {
-	case schema.ScopeDerived:
+	if sc == schema.ScopeDerived {
 		return fmt.Errorf("derived field is handler-only, not writable by an input op")
-	case schema.ScopeLocal:
-		if !isLocal {
-			return fmt.Errorf("local (device-only) field is not writable by a synced change")
-		}
-	default: // ScopeSynced
-		if isLocal {
-			return fmt.Errorf("synced field is not writable by a local change")
+	}
+	if sc != route {
+		return fmt.Errorf("%s field is not writable by the %s route", sc, route)
+	}
+	return nil
+}
+
+// opContentValid runs the per-op content checks — op-path syntax plus
+// dataset field-class (scope) enforcement — for an op arriving via
+// `route`. Shared by ValidateChange (local fail-fast: a failure keeps
+// the whole change out of the DAG) and ApplyChangeWithResult (replay /
+// inbound: a failure drops just the offending op so one bad change
+// can't wedge cold restore). Reserved heads are already screened by
+// validateOpPaths, so classifyFieldWrite only sees user field heads.
+func opContentValid(ds schema.Dataset, route schema.Scope, scopeByKey bool, op Op) error {
+	if err := validateOpPaths(op); err != nil {
+		return err
+	}
+	for _, field := range opFieldHeads(op) {
+		if err := classifyFieldWrite(ds, field, route, scopeByKey); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -996,6 +1126,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		if isTombstone(existing) {
 			if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 				stampAddSeq(a, existing, ch.AddSeq)
+				stampApplySeq(a, existing, ch.ApplySeq)
 				updateTraces(a, existing, *ch)
 				return existing, true, nil
 			}
@@ -1017,8 +1148,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 
 	if creating {
 		// Stamp creation marker before BeforeCreate so handlers reading
-		// existing see _ver.id already in place. Marker stays at root
-		// regardless of variant — creation is record-level.
+		// existing see _ver.id already in place.
 		ver := a.NewObject()
 		ver.Set(IdField, a.NewString(string(ch.VersionId)))
 		existing.Set(VersionsKey, ver)
@@ -1033,7 +1163,9 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			Payload: m.derivedArena().NewString(string(ch.VersionId)),
 		})
 
-		if !ch.Local {
+		// Local and Injected materializations are handler-exclusive —
+		// their validation is writer-side (Properties.Set / the mirror).
+		if !ch.Local && !ch.Injected {
 			ctx := &ChangeCtx{Change: ch, Before: nil}
 			if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
 				m.recordedErr = err
@@ -1041,13 +1173,9 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 				return existing, false, nil
 			}
 		}
-		target := variantTarget(a, existing, rc.Variant)
 		for i := range rc.Ops {
-			applyOp(a, target, *ch, rc.Ops[i])
+			applyOp(a, existing, *ch, rc.Ops[i])
 		}
-		// Derived ops are record-level by convention (author, createdAt,
-		// id-like markers), so they target root regardless of the
-		// triggering variant.
 		m.drainDerivedTo(a, existing, ch)
 	} else if isTombstone(existing) {
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
@@ -1061,12 +1189,12 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			lowerCreationMarker(a, existing, ch.VersionId)
 		}
 		ctx := &ChangeCtx{Change: ch, Before: existing}
-		target := variantTarget(a, existing, rc.Variant)
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
-			// Device-local writes are handler-exclusive (see Change.Local):
-			// no handler validation/derivation, just apply the gated set.
-			if !ch.Local {
+			// Local and Injected materializations are handler-exclusive
+			// (see Change.Local / Change.Injected): no handler
+			// validation/derivation, just the gated apply.
+			if !ch.Local && !ch.Injected {
 				if err := m.handler.BeforeModify(ctx, rc, op, m.sink); err != nil {
 					// Per-op drop; other ops in the same RecordChange
 					// still apply. Surface so the caller knows the
@@ -1075,13 +1203,13 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 					continue
 				}
 			}
-			applyOp(a, target, *ch, *op)
+			applyOp(a, existing, *ch, *op)
 		}
-		// Derived ops are record-level — see BeforeCreate path.
 		m.drainDerivedTo(a, existing, ch)
 	}
 
 	stampAddSeq(a, existing, ch.AddSeq)
+	stampApplySeq(a, existing, ch.ApplySeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil
@@ -1098,6 +1226,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		if isTombstone(existing) {
 			if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 				stampAddSeq(a, existing, ch.AddSeq)
+				stampApplySeq(a, existing, ch.ApplySeq)
 				updateTraces(a, existing, *ch)
 				return existing, true, nil
 			}
@@ -1123,20 +1252,19 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		lowerCreationMarker(a, existing, ch.VersionId)
 	}
 
-	target := variantTarget(a, existing, rc.Variant)
 	for i := range rc.Ops {
-		applyOp(a, target, *ch, rc.Ops[i])
+		applyOp(a, existing, *ch, rc.Ops[i])
 	}
 	stampAddSeq(a, existing, ch.AddSeq)
+	stampApplySeq(a, existing, ch.ApplySeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil
 }
 
-// drainDerivedTo applies and clears Sink.derived against target. Caller
-// is responsible for picking target — same routing as the original ops
-// (root or variant subdoc). No-op when no handler is wired (sibling
-// path) or when nothing was emitted.
+// drainDerivedTo applies and clears Sink.derived against target (the
+// record root). No-op when no handler is wired (sibling path) or when
+// nothing was emitted.
 //
 // Captures the drained ops onto m.appliedDerived so the dispatcher can
 // project them onto the wire. Payloads live on the handler's own arena
@@ -1152,22 +1280,6 @@ func (m *recordModifier) drainDerivedTo(a *anyenc.Arena, target *anyenc.Value, c
 	}
 	m.appliedDerived = append(m.appliedDerived, m.sink.derived...)
 	m.sink.derived = m.sink.derived[:0]
-}
-
-// variantTarget returns the subdocument under root[variant], lazily
-// creating it as an empty object if absent. Empty variant means "no
-// routing" — return root itself, so existing variantless datasets
-// keep their current behavior with zero overhead.
-func variantTarget(a *anyenc.Arena, root *anyenc.Value, variant string) *anyenc.Value {
-	if variant == "" {
-		return root
-	}
-	sub := root.Get(variant)
-	if sub == nil || sub.Type() != anyenc.TypeObject {
-		sub = a.NewObject()
-		root.Set(variant, sub)
-	}
-	return sub
 }
 
 // Compile-time check that recordModifier satisfies query.Modifier.

@@ -40,7 +40,7 @@ func newPropsController(t *testing.T, reg types.Registry) *crdt.Controller {
 	return ctrl
 }
 
-func makeChange(versionId crdt.VersionId, recId, variant string, upsert bool, ops ...crdt.Op) crdt.Change {
+func makeChange(versionId crdt.VersionId, recId string, upsert bool, ops ...crdt.Op) crdt.Change {
 	return crdt.Change{
 		ObjectId:    testObjectId,
 		Dataset:     properties.Dataset,
@@ -48,7 +48,7 @@ func makeChange(versionId crdt.VersionId, recId, variant string, upsert bool, op
 		VersionId:   versionId,
 		DataVersion: testDataVer,
 		Records: []crdt.RecordChange{
-			{Id: recId, Upsert: upsert, Variant: variant, Ops: ops},
+			{Id: recId, Upsert: upsert, Ops: ops},
 		},
 	}
 }
@@ -62,15 +62,15 @@ func defaultRegistry() *types.StubRegistry {
 }
 
 // ----------------------------------------------------------------------------
-// Variant routing — values land inside the named subdocument
+// Basic apply — values land at their normal root paths
 // ----------------------------------------------------------------------------
 
-func TestSystemPropertiesHandler_BaseVariantRouting(t *testing.T) {
+func TestSystemPropertiesHandler_RootApply(t *testing.T) {
 	ctrl := newPropsController(t, defaultRegistry())
 	arena := &anyenc.Arena{}
 
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("Hello")},
 	)))
 
@@ -80,47 +80,65 @@ func TestSystemPropertiesHandler_BaseVariantRouting(t *testing.T) {
 	// Top-level _ver.id is the creation marker.
 	assert.Equal(t, "v1", rec.GetString("_ver", "id"))
 
-	// Value lands inside _base, not at root.
-	assert.Equal(t, "Hello", rec.GetString("_base", typeAny, propName))
-	assert.Nil(t, rec.Get(typeAny, propName), "nothing at root for variant writes")
-
-	// _ver for the field lives inside the _base subdoc — read via the
-	// version helper so collapse/expansion is handled.
+	assert.Equal(t, "Hello", rec.GetString(typeAny, propName))
 	assert.Equal(t, crdt.VersionId("v1"),
-		crdt.GetRecordVersion(rec.Get("_base"), typeAny, propName))
+		crdt.GetRecordVersion(rec, typeAny, propName))
 }
 
-func TestSystemPropertiesHandler_VariantsAreIsolated(t *testing.T) {
-	ctrl := newPropsController(t, defaultRegistry())
+// ----------------------------------------------------------------------------
+// Scope enforcement — the DAG route only writes synced-scope props
+// ----------------------------------------------------------------------------
+
+const (
+	propRead = "p-read" // account-scoped boolean
+	propPin  = "p-pin"  // local-scoped boolean
+)
+
+func scopedRegistry() *types.StubRegistry {
+	r := defaultRegistry()
+	r.SetScoped(typeAny, propRead, schema.KindBoolean, schema.ScopeAccount)
+	r.SetScoped(typeAny, propPin, schema.KindBoolean, schema.ScopeLocal)
+	return r
+}
+
+// An inbound DAG change addressing an account- or local-scoped propId
+// is dropped per-op (the convergent guard keeping version domains
+// path-disjoint); sibling synced ops in the same change still land.
+func TestSystemPropertiesHandler_ScopeMismatchDrops(t *testing.T) {
+	ctrl := newPropsController(t, scopedRegistry())
 	arena := &anyenc.Arena{}
 
-	// Write the same field in three variants in three changes.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
-		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("base name")},
-	)))
-	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v2", testObjectId, "_account", false,
-		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("account name")},
-	)))
-	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v3", testObjectId, "_device", false,
-		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("device name")},
+		"v1", testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("ok")},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRead}, Payload: arena.NewTrue()},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propPin}, Payload: arena.NewTrue()},
 	)))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, "base name", rec.GetString("_base", typeAny, propName))
-	assert.Equal(t, "account name", rec.GetString("_account", typeAny, propName))
-	assert.Equal(t, "device name", rec.GetString("_device", typeAny, propName))
+	assert.Equal(t, "ok", rec.GetString(typeAny, propName), "synced op landed")
+	assert.Nil(t, rec.Get(typeAny, propRead), "account-scoped op dropped on the DAG route")
+	assert.Nil(t, rec.Get(typeAny, propPin), "local-scoped op dropped on the DAG route")
+}
 
-	// Each variant carries its own _ver — no cross-variant overlap.
-	assert.Equal(t, crdt.VersionId("v1"),
-		crdt.GetRecordVersion(rec.Get("_base"), typeAny, propName))
-	assert.Equal(t, crdt.VersionId("v2"),
-		crdt.GetRecordVersion(rec.Get("_account"), typeAny, propName))
-	assert.Equal(t, crdt.VersionId("v3"),
-		crdt.GetRecordVersion(rec.Get("_device"), typeAny, propName))
+// Derived built-ins are likewise unwritable by input ops.
+func TestSystemPropertiesHandler_DerivedScopeDrops(t *testing.T) {
+	r := defaultRegistry()
+	r.SetScoped(typeAny, "createdAt", schema.KindNumber, schema.ScopeDerived)
+	ctrl := newPropsController(t, r)
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "createdAt"}, Payload: arena.NewNumberFloat64(1)},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("ok")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(typeAny, "createdAt"), "derived-scoped op dropped")
+	assert.Equal(t, "ok", rec.GetString(typeAny, propName))
 }
 
 // ----------------------------------------------------------------------------
@@ -133,22 +151,22 @@ func TestSystemPropertiesHandler_KindMismatchDrops(t *testing.T) {
 
 	// Create with a valid name.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("ok")},
 	)))
 
 	// Modify: bundle a kind-mismatched op (number into a string field)
 	// with a valid op for `rating`. The bad op drops; the good one lands.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v2", testObjectId, "_base", false,
+		"v2", testObjectId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewNumberFloat64(42)},
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(7.5)},
 	)))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, "ok", rec.GetString("_base", typeAny, propName), "string name survives kind-mismatch attempt")
-	assert.Equal(t, 7.5, rec.GetFloat64("_base", typeAny, propRating), "number rating landed")
+	assert.Equal(t, "ok", rec.GetString(typeAny, propName), "string name survives kind-mismatch attempt")
+	assert.Equal(t, 7.5, rec.GetFloat64(typeAny, propRating), "number rating landed")
 }
 
 func TestSystemPropertiesHandler_UnknownPropertyDrops(t *testing.T) {
@@ -156,22 +174,22 @@ func TestSystemPropertiesHandler_UnknownPropertyDrops(t *testing.T) {
 	arena := &anyenc.Arena{}
 
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("ok")},
 	)))
 
 	// `unknown-prop` is not in the registry. Bundle with a valid op
 	// to verify per-op drop on modify (not whole-record).
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v2", testObjectId, "_base", false,
+		"v2", testObjectId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "unknown-prop"}, Payload: arena.NewString("nope")},
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(3)},
 	)))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Nil(t, rec.Get("_base", typeAny, "unknown-prop"), "unknown property dropped")
-	assert.Equal(t, float64(3), rec.GetFloat64("_base", typeAny, propRating))
+	assert.Nil(t, rec.Get(typeAny, "unknown-prop"), "unknown property dropped")
+	assert.Equal(t, float64(3), rec.GetFloat64(typeAny, propRating))
 }
 
 func TestSystemPropertiesHandler_CreatePerOpDrop(t *testing.T) {
@@ -182,15 +200,15 @@ func TestSystemPropertiesHandler_CreatePerOpDrop(t *testing.T) {
 	// op (string into a number field) is dropped, the valid op lands, and
 	// the record is created.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("ok")},
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")},
 	)))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, "ok", rec.GetString("_base", typeAny, propName), "valid op landed")
-	assert.Nil(t, rec.Get("_base", typeAny, propRating), "kind-mismatched op dropped")
+	assert.Equal(t, "ok", rec.GetString(typeAny, propName), "valid op landed")
+	assert.Nil(t, rec.Get(typeAny, propRating), "kind-mismatched op dropped")
 }
 
 func TestSystemPropertiesHandler_CreateSkippedWhenAllOpsDrop(t *testing.T) {
@@ -202,15 +220,15 @@ func TestSystemPropertiesHandler_CreateSkippedWhenAllOpsDrop(t *testing.T) {
 	// here since the change carries no envelope), so assert no property
 	// value landed under the type namespace.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")},
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "unknown-prop"}, Payload: arena.NewString("x")},
 	)))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	if rec != nil {
-		assert.Nil(t, rec.Get("_base", typeAny, propRating), "mismatched op dropped")
-		assert.Nil(t, rec.Get("_base", typeAny, "unknown-prop"), "unknown-prop op dropped")
+		assert.Nil(t, rec.Get(typeAny, propRating), "mismatched op dropped")
+		assert.Nil(t, rec.Get(typeAny, "unknown-prop"), "unknown-prop op dropped")
 	}
 }
 
@@ -223,17 +241,17 @@ func TestSystemPropertiesHandler_UnsetPasses(t *testing.T) {
 	arena := &anyenc.Arena{}
 
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
 	)))
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v2", testObjectId, "_base", false,
+		"v2", testObjectId, false,
 		crdt.Op{Type: crdt.OpUnset, Path: []string{typeAny, propName}},
 	)))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Nil(t, rec.Get("_base", typeAny, propName), "unset cleared the field")
+	assert.Nil(t, rec.Get(typeAny, propName), "unset cleared the field")
 }
 
 // ----------------------------------------------------------------------------
@@ -246,13 +264,13 @@ func TestSystemPropertiesHandler_NilRegistryPasses(t *testing.T) {
 
 	// No Registry → no kind check. Even gibberish (typeId, propId) lands.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
-		"v1", testObjectId, "_base", true,
+		"v1", testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{"not-a-type", "not-a-prop"}, Payload: arena.NewString("anything")},
 	)))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, "anything", rec.GetString("_base", "not-a-type", "not-a-prop"))
+	assert.Equal(t, "anything", rec.GetString("not-a-type", "not-a-prop"))
 }
 
 // ----------------------------------------------------------------------------
@@ -398,4 +416,21 @@ func TestPreValidate_NilRegistryPasses(t *testing.T) {
 	a := &anyenc.Arena{}
 	require.NoError(t, h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{"x", "y"}, a.NewString("z")), nil))
+}
+
+func TestPreValidate_ScopeMismatch(t *testing.T) {
+	r := preflightRegistry()
+	r.SetScoped(typeAny, propRead, schema.KindBoolean, schema.ScopeAccount)
+	h := properties.New(r)
+	a := &anyenc.Arena{}
+
+	err := h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{typeAny, propRead}, a.NewTrue()), nil)
+	require.ErrorIs(t, err, crdt.ErrValidation)
+	require.ErrorIs(t, err, properties.ErrScopeMismatch)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonScopeMismatch, ve.Reason)
+	assert.Equal(t, schema.ScopeAccount, ve.DeclaredScope)
+	assert.Equal(t, schema.ScopeSynced, ve.WriteRoute)
 }

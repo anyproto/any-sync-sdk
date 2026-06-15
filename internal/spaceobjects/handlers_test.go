@@ -58,7 +58,7 @@ func TestValidateExternalTypes(t *testing.T) {
 			},
 		},
 		{
-			name: "valid: pure-declaration type (no datasets, no properties)",
+			name:     "valid: pure-declaration type (no datasets, no properties)",
 			extTypes: []handler.Type{{Id: "tag"}},
 		},
 		{

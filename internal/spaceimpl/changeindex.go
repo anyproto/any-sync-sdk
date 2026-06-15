@@ -16,8 +16,8 @@ type changeIndexAPI struct {
 
 func newChangeIndexAPI(parent *spaceImpl) *changeIndexAPI { return &changeIndexAPI{parent: parent} }
 
-func (c *changeIndexAPI) MaxAddSeq(ctx context.Context) (uint64, error) {
-	return c.parent.store.MaxAddSeq(ctx)
+func (c *changeIndexAPI) MaxApplySeq(ctx context.Context) (uint64, error) {
+	return c.parent.store.MaxApplySeq(ctx)
 }
 
 func (c *changeIndexAPI) ChangedSince(ctx context.Context, since uint64, limit int) ([]space.ObjectChange, error) {
@@ -27,13 +27,13 @@ func (c *changeIndexAPI) ChangedSince(ctx context.Context, since uint64, limit i
 	}
 	out := make([]space.ObjectChange, len(rows))
 	for i, r := range rows {
-		out[i] = space.ObjectChange{ObjectId: r.ObjectId, AddSeq: r.AddSeq}
+		out[i] = space.ObjectChange{ObjectId: r.ObjectId, ApplySeq: r.ApplySeq}
 	}
 	return out, nil
 }
 
 func (c *changeIndexAPI) Subscribe(cb func(space.ObjectChange)) (cancel func()) {
 	return c.parent.store.SubscribeChanges(func(ev spaceobjects.ObjectChange) {
-		cb(space.ObjectChange{ObjectId: ev.ObjectId, AddSeq: ev.AddSeq})
+		cb(space.ObjectChange{ObjectId: ev.ObjectId, ApplySeq: ev.ApplySeq})
 	})
 }

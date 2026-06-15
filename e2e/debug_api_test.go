@@ -16,7 +16,7 @@ import (
 // TestSDK_DebugAPI covers the per-object debug snapshot end-to-end:
 //
 //   - Object() resolves an unknown id with an error.
-//   - After two writes (object create + SetBase) the tree has at
+//   - After two writes (object create + Properties().Set) the tree has at
 //     least 2 changes, one snapshot (the root), and one head.
 //   - LatestVersionId is the lexid OrderId of the head change.
 //   - MaxAddSeq advances as new local changes apply.
@@ -63,11 +63,11 @@ func TestSDK_DebugAPI(t *testing.T) {
 
 	// Two local writes — adds two changes to the object tree on
 	// top of the root (which is itself a snapshot).
-	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, objectId, typeId, map[string]any{
 		propId: "first",
 	})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, objectId, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, objectId, typeId, map[string]any{
 		propId: "second",
 	})
 	require.NoError(t, err)

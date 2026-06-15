@@ -35,8 +35,7 @@ func TestCodec_Roundtrip(t *testing.T) {
 				},
 			},
 			{
-				Id:      "space-2",
-				Variant: "_account",
+				Id: "space-2",
 				Ops: []crdt.Op{
 					{Type: crdt.OpUnset, Path: []string{"name"}},
 				},
@@ -74,7 +73,6 @@ func TestCodec_Roundtrip(t *testing.T) {
 	r1 := out.Records[1]
 	assert.Equal(t, "space-2", r1.Id)
 	assert.False(t, r1.Upsert)
-	assert.Equal(t, "_account", r1.Variant)
 	require.Len(t, r1.Ops, 1)
 	assert.Equal(t, crdt.OpUnset, r1.Ops[0].Type)
 	assert.Equal(t, []string{"name"}, r1.Ops[0].Path)

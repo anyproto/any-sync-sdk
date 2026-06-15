@@ -103,40 +103,25 @@ func run() error {
 	}
 	go pumpEvents(subRes.Sub)
 
-	// Account-scope override: rename the notebook just for this user
-	// across their devices. Routes through the tech space under the
-	// hood.
-	if _, err := sp.Properties().SetAccount(ctx, objectId, typeId, map[string]any{
-		"title": "My Research (account)",
+	// Property write: Set auto-routes by each key's declared scope —
+	// these props are synced-scope (the default), so this is one CRDT
+	// change on the object's own tree. Local-scoped (this device only)
+	// properties use the same call and never sync; account-scoped ones
+	// ride the tech space to this account's other devices. Declare
+	// scopes via PropertyDraft.Scope.
+	if _, err := sp.Properties().Set(ctx, objectId, typeId, map[string]any{
+		"title": "My Research",
 	}); err != nil {
-		return fmt.Errorf("set account: %w", err)
+		return fmt.Errorf("set properties: %w", err)
 	}
 
-	// Device-scope override: a local-only preference that does not
-	// sync. No VersionId — device writes are a local DB operation.
-	if err := sp.Properties().SetDevice(ctx, objectId, typeId, map[string]any{
-		"sortOrder": "newest",
-	}); err != nil {
-		return fmt.Errorf("set device: %w", err)
-	}
-
-	// Read the computed record. Priority device > account > base
-	// resolves which variant "wins" for each field.
-	computed, err := sp.Properties().Get(ctx, objectId, space.PropertyReadOpts{})
+	// Read the record. Values of every scope sit at their normal
+	// {typeId}.{propId} paths — no variants, no merging.
+	record, err := sp.Properties().Get(ctx, objectId)
 	if err != nil {
 		return fmt.Errorf("read properties: %w", err)
 	}
-	log.Printf("computed properties: %s", computed)
-
-	// Read with variants visible — useful for a "why is this value the
-	// way it is?" settings UI.
-	full, err := sp.Properties().Get(ctx, objectId, space.PropertyReadOpts{
-		IncludeVariants: true,
-	})
-	if err != nil {
-		return fmt.Errorf("read properties w/ variants: %w", err)
-	}
-	log.Printf("full properties: %s", full)
+	log.Printf("properties: %s", record)
 
 	// Write user data into a type-owned dataset. In v1 datasets are
 	// permissionless — "notes" here is free-form and its schema is

@@ -104,7 +104,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 				Types: []string{typeId},
 			})
 			require.NoError(t, err)
-			_, err = sp.Properties().SetBase(ctx, objId, typeId, map[string]any{
+			_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{
 				propId: title,
 			})
 			require.NoError(t, err)
@@ -184,7 +184,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 	// driven via QueryObjects().Subscribe: the per-space `objects`
 	// dataset writes fire for BOTH type creates (typesAPI.Create
 	// writes any.types=["__type__"] to objects) AND instance creates
-	// / SetBase. We register before re-checking and recheck on every
+	// / Properties().Set. We register before re-checking and recheck on every
 	// event arrival until the local snapshot satisfies the fixture.
 	for _, fix := range wantSpaces {
 		fix := fix
@@ -225,12 +225,12 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 						return false
 					}
 				}
-				// Property values must also be present — SetBase
+				// Property values must also be present — Properties().Set
 				// is a separate "objects" write from the create,
 				// so seeing the row id isn't enough.
 				for i, objId := range fix.ObjectIds {
 					wantTitle := fix.Name + []string{"-One", "-Two"}[i]
-					rec, err := sp.Properties().Get(ctx, objId, space.PropertyReadOpts{})
+					rec, err := sp.Properties().Get(ctx, objId)
 					if err != nil || rec == nil {
 						return false
 					}
@@ -266,7 +266,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 			// gate itself.
 			for i, objId := range fix.ObjectIds {
 				wantTitle := fix.Name + []string{"-One", "-Two"}[i]
-				rec, err := sp.Properties().Get(ctx, objId, space.PropertyReadOpts{})
+				rec, err := sp.Properties().Get(ctx, objId)
 				require.NoError(t, err, "device B: Properties().Get(%s)", objId)
 				require.NotNil(t, rec, "device B: nil property record for %s", objId)
 				assert.Equal(t, wantTitle, rec.GetString(fix.TypeId, fix.PropId),

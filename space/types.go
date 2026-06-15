@@ -1,6 +1,34 @@
 package space
 
-import "context"
+import (
+	"context"
+
+	"github.com/anyproto/any-sync-sdk/handler"
+)
+
+// Scope is the unified write/sync class shared by property definitions
+// and dataset schema fields — how a value is written, which version
+// domain stamps its `_ver` entries, and how far it syncs. A property
+// lives in exactly ONE scope, declared at creation and pinned for the
+// propId's life (like Kind); there is no per-value override stack.
+//
+// Aliased from the handler package so the whole SDK uses one type and
+// one label vocabulary (synced / derived / account / local).
+type Scope = handler.Scope
+
+const (
+	// ScopeSynced: written through the object's own CRDT, synced to
+	// everyone with space access. The default.
+	ScopeSynced = handler.ScopeSynced
+	// ScopeDerived: SDK-stamped (author / createdAt / …), read-only.
+	// Reserved for built-ins — user definitions cannot declare it.
+	ScopeDerived = handler.ScopeDerived
+	// ScopeAccount: synced across this account's devices only, via the
+	// private tech space; invisible to other space members.
+	ScopeAccount = handler.ScopeAccount
+	// ScopeLocal: this device only; never synced.
+	ScopeLocal = handler.ScopeLocal
+)
 
 // TypesAPI manages type objects and property definitions inside a space.
 //
@@ -99,10 +127,17 @@ type PropertyDef struct {
 	Items      *PropertyDef  // for arrays
 	Properties []PropertyDef // for objects
 	Required   []string      // for objects — CRDT-mutable additions
+
+	// Scope is the property's write/sync class (synced / account /
+	// local; derived on built-ins). First-write-wins like Kind —
+	// immutable for the propId's life. Definitions written before
+	// scopes existed read back as ScopeSynced.
+	Scope Scope
 }
 
-// PropertyDraft is the input to TypesAPI.AddProperty. Kind, Items, and
-// Properties are locked by the first write; the rest remain mutable.
+// PropertyDraft is the input to TypesAPI.AddProperty. Kind, Items,
+// Properties, and Scope are locked by the first write; the rest remain
+// mutable.
 type PropertyDraft struct {
 	Name        string
 	Description string
@@ -113,6 +148,12 @@ type PropertyDraft struct {
 	Items       *PropertyDraft
 	Properties  []PropertyDraft
 	Required    []string
+
+	// Scope is the property's write/sync class. Zero value means
+	// ScopeSynced. ScopeDerived is reserved for built-ins and rejected.
+	// Pinned by the first write — to change a property's scope, define
+	// a new property (which mints a new propId).
+	Scope Scope
 }
 
 // PropertyMetaUpdate carries optional updates to the CRDT-mutable meta

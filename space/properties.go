@@ -6,49 +6,46 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
-// PropertiesAPI reads and writes the per-object property record in
-// the space's `properties` system dataset.
+// PropertiesAPI reads and writes the per-object property record in the
+// space's shared `objects` collection (one row per object).
 //
-// Read path: Get returns a single record, with variants collapsed by
-// priority device > account > base to produce the computed root values.
-// Opt into variant visibility via PropertyReadOpts.
+// Every property lives in exactly ONE scope, declared on its
+// definition (see Scope / PropertyDraft.Scope). Values sit at their
+// normal `{typeId}.{propId}` paths regardless of scope — there are no
+// per-scope record fields and no read-time merging. What the scope
+// decides is the WRITE ROUTE and the version domain:
 //
-// Write path: three scope-specific setters. Patches are keyed by
-// either propId or x-key; the API resolves x-keys against the type's
-// current property definitions. Unknown keys are rejected.
+//   - synced  — the object's own CRDT change; syncs to everyone with
+//     access; VersionId is the object tree's orderId.
+//   - account — a carrier record in the account's private tech space,
+//     mirrored into this row on each of the account's devices;
+//     VersionId is the tech tree's orderId. Invisible to other members.
+//   - local   — written straight into this device's row, never synced;
+//     VersionId is a locally-minted lexid.
 //
-//   - SetBase    — routes through the target object's own CRDT. Syncs
-//     to everyone with access. Returns the VersionId of the resulting
-//     change.
-//   - SetAccount — routes through the tech space's rewrite object.
-//     Syncs to this account's other devices only. Returns the tech-space
-//     VersionId.
-//   - SetDevice  — local-only write. Not synced anywhere. No VersionId.
+// Read path: Get returns the row verbatim. In a shared space,
+// account/local-scoped values reflect THIS account/device — queries
+// and filters over them select per-account / per-device result sets.
 //
-// AttachType / DetachType modify the object's `any.types` list. Both
-// route through the target object's CRDT (base-scope metadata).
+// Write path: one auto-routing Set. The SDK resolves each patch key's
+// declared scope and issues the write on that scope's route. A patch
+// whose keys span MORE THAN ONE scope is rejected (routes commit
+// independently and cannot be rolled back together — callers issue one
+// call per scope instead). One call = one route = one VersionId domain
+// in the returned ModifyResult.
+//
+// AttachType / DetachType modify the object's `any.types` list. Type
+// membership is structural and shared, so both always route through
+// the object's own CRDT (synced).
 type PropertiesAPI interface {
-	Get(ctx context.Context, objectId string, opts PropertyReadOpts) (*anyenc.Value, error)
+	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
 
-	SetBase(ctx context.Context, objectId, typeId string, patch map[string]any) (ModifyResult, error)
-	SetAccount(ctx context.Context, objectId, typeId string, patch map[string]any) (ModifyResult, error)
-	SetDevice(ctx context.Context, objectId, typeId string, patch map[string]any) error
+	// Set merges the patch into the object's property record. Patch
+	// keys are propIds; all keys must resolve to the SAME declared
+	// scope. Unknown keys, kind mismatches, and mixed-scope patches
+	// are rejected before anything is written.
+	Set(ctx context.Context, objectId, typeId string, patch map[string]any) (ModifyResult, error)
 
 	AttachType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
 	DetachType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
-}
-
-// PropertyReadOpts controls which reserved fields appear in the
-// record returned by Get. The computed root values (collapsed by
-// priority) are always present.
-type PropertyReadOpts struct {
-	// IncludeVariants returns the _device, _account, _base namespaces
-	// alongside the computed root. Useful for "show me why this value
-	// is the way it is" debugging or settings UI.
-	IncludeVariants bool
-
-	// IncludeMeta returns _ver, _traces, _deletedAt. Needed if the
-	// caller wants per-field version info to reconcile optimistic
-	// state.
-	IncludeMeta bool
 }

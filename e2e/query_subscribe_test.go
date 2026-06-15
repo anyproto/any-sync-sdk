@@ -61,14 +61,14 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	// Seed two movies BEFORE subscribing — they show up in Initial.
 	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, idA, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, idA, typeId, map[string]any{
 		titleProp: "Aliens", yearProp: 1986,
 	})
 	require.NoError(t, err)
 
 	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, idB, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, idB, typeId, map[string]any{
 		titleProp: "Brazil", yearProp: 1985,
 	})
 	require.NoError(t, err)
@@ -132,7 +132,7 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	// demoted to sentinel.
 	idC, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
-	_, err = sp.Properties().SetBase(ctx, idC, typeId, map[string]any{
+	_, err = sp.Properties().Set(ctx, idC, typeId, map[string]any{
 		titleProp: "Dune Part Two", yearProp: 2024,
 	})
 	require.NoError(t, err)
@@ -400,7 +400,7 @@ func seedMovies(t *testing.T, ctx context.Context, sp space.Space, typeId, title
 	for _, title := range titles {
 		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 		require.NoError(t, err)
-		_, err = sp.Properties().SetBase(ctx, id, typeId, map[string]any{titleProp: title})
+		_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{titleProp: title})
 		require.NoError(t, err)
 		ids = append(ids, id)
 	}

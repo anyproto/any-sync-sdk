@@ -14,7 +14,7 @@ import (
 
 // Wire format for the bytes that go inside any-sync's
 // objecttree.Change.Data. anyenc-encoded object with short keys to keep
-// the on-wire payload small. Path/Type/Variant strings dominate; arenas
+// the on-wire payload small. Path/Type strings dominate; arenas
 // are pooled by the caller (Codec).
 //
 // Structure:
@@ -25,7 +25,7 @@ import (
 //	  t: [<traceIds...>],     // optional []string
 //	  r: [<record...>],       // []record
 //	}
-//	record: { i?:id, u?:upsert, x?:variant, o:[op...] }
+//	record: { i?:id, u?:upsert, o:[op...] }
 //	op:     { t:opType, p?:[path...], v?:payload }
 //
 // VersionId, ChangeId, AddSeq, ObjectId, SpaceId, Timestamp travel on
@@ -41,10 +41,9 @@ const (
 	keyTraceIds    = "t"
 	keyRecords     = "r"
 
-	keyRecordId      = "i"
-	keyRecordUpsert  = "u"
-	keyRecordVariant = "x"
-	keyRecordOps     = "o"
+	keyRecordId     = "i"
+	keyRecordUpsert = "u"
+	keyRecordOps    = "o"
 
 	keyOpType    = "t"
 	keyOpPath    = "p"
@@ -115,9 +114,6 @@ func encodeRecord(a *anyenc.Arena, rec *crdt.RecordChange) *anyenc.Value {
 	if rec.Upsert {
 		obj.Set(keyRecordUpsert, a.NewTrue())
 	}
-	if rec.Variant != "" {
-		obj.Set(keyRecordVariant, a.NewString(rec.Variant))
-	}
 	ops := a.NewArray()
 	for i := range rec.Ops {
 		ops.SetArrayItem(i, encodeOp(a, &rec.Ops[i]))
@@ -187,9 +183,8 @@ func (c *Codec) Decode(raw []byte) (crdt.Change, error) {
 
 func decodeRecord(v *anyenc.Value) crdt.RecordChange {
 	rec := crdt.RecordChange{
-		Id:      v.GetString(keyRecordId),
-		Upsert:  v.GetBool(keyRecordUpsert),
-		Variant: v.GetString(keyRecordVariant),
+		Id:     v.GetString(keyRecordId),
+		Upsert: v.GetBool(keyRecordUpsert),
 	}
 	if ops := v.GetArray(keyRecordOps); len(ops) > 0 {
 		rec.Ops = make([]crdt.Op, len(ops))

@@ -146,10 +146,15 @@ func (r *LiveRegistry) PropsOf(typeId string) ([]PropInfo, bool) {
 		if !ok {
 			continue
 		}
+		// Absent / unparsable scope reads as the zero value, which
+		// EffectiveScope normalizes to ScopeSynced — pre-scope
+		// definitions keep their historical behavior.
+		scope, _ := schema.ParseScope(v.GetString("scope"))
 		out = append(out, PropInfo{
-			Id:   v.GetString("id"),
-			Name: v.GetString("name"),
-			Kind: kind,
+			Id:    v.GetString("id"),
+			Name:  v.GetString("name"),
+			Kind:  kind,
+			Scope: scope,
 		})
 	}
 	if iter.Err() != nil {

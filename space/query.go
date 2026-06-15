@@ -121,19 +121,11 @@ type Iterator interface {
 	Close() error
 }
 
-// ProjectionOpts controls which reserved ("_"-prefixed) fields are
-// visible in results.
+// ProjectionOpts controls result visibility knobs. Reserved fields
+// (`_ver`, `_traces`, `_deletedAt`) are always present — `_ver` is
+// caller-facing by contract (clients reconcile optimistic state per
+// field against it; see the CRDT spec §3).
 type ProjectionOpts struct {
-	// IncludeVariants returns _device/_account/_base namespaces on
-	// property records. Default hides them; computed root values are
-	// always present.
-	IncludeVariants bool
-
-	// IncludeMeta returns _ver, _traces, _deletedAt. Default hides
-	// them unless the caller needs per-field version info (e.g. to
-	// reconcile optimistic state).
-	IncludeMeta bool
-
 	// IncludeDeleted returns tombstone rows (id, _deletedAt, _ver,
 	// _traces, _addSeq; content wiped) instead of skipping them.
 	// Honored by the find path (Iter / All / One / Count);

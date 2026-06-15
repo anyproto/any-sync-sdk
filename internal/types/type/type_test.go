@@ -280,3 +280,78 @@ func TestPropertyHandler_DeleteProjectsRemovalShortId(t *testing.T) {
 	assert.True(t, row.GetBool(typetype.ShortIdFieldRemoved))
 	assert.Equal(t, "v2", row.GetString("_ver", "id"))
 }
+
+// ----------------------------------------------------------------------------
+// Scope — create-time validation + post-create pin
+// ----------------------------------------------------------------------------
+
+func TestPropertyHandler_CreateWithScope(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-read"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "change-create-read", propId, true,
+		setMulti(arena, map[string]any{
+			typetype.FieldKind:  "boolean",
+			typetype.FieldScope: "account",
+		}),
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "account", rec.GetString(typetype.FieldScope))
+}
+
+func TestPropertyHandler_CreateRejectedOnBadScope(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	for _, bad := range []string{"derived", "global", "Account"} {
+		propId := "prop-" + bad
+		require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+			"v1", "change-"+bad, propId, true,
+			setMulti(arena, map[string]any{
+				typetype.FieldKind:  "string",
+				typetype.FieldScope: bad,
+			}),
+		)), "apply commits; the record drops via BeforeCreate rejection")
+		rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+		if rec != nil {
+			assert.Nil(t, rec.Get(typetype.FieldKind), "record with scope %q must not materialize fields", bad)
+		}
+	}
+}
+
+func TestPropertyHandler_ScopeEditDropped(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-pinned-scope"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "change-create-pinned", propId, true,
+		setMulti(arena, map[string]any{
+			typetype.FieldKind:  "string",
+			typetype.FieldScope: "local",
+		}),
+	)))
+
+	// Single-path edit drops.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", "change-edit-scope", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldScope}, Payload: arena.NewString("synced")},
+	)))
+	// Multi-field edit (with an otherwise-legal name change) drops whole-op.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", "change-edit-scope-multi", propId, false,
+		setMulti(arena, map[string]any{
+			typetype.FieldScope: "synced",
+			typetype.FieldName:  "Renamed",
+		}),
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "local", rec.GetString(typetype.FieldScope), "scope is pinned after first write")
+	assert.Equal(t, "", rec.GetString(typetype.FieldName), "multi-field op touching scope drops wholesale")
+}

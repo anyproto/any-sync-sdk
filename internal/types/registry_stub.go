@@ -8,6 +8,10 @@ import "github.com/anyproto/any-sync-sdk/internal/schema"
 type StubRegistry struct {
 	// Kinds[typeId][propId] = declared kind.
 	Kinds map[string]map[string]schema.Kind
+	// Scopes[typeId][propId] = declared scope. Optional — absent
+	// entries read as the zero value (ScopeSynced via
+	// PropInfo.EffectiveScope), matching pre-scope definitions.
+	Scopes map[string]map[string]schema.Scope
 }
 
 func (s StubRegistry) LookupKind(typeId, propId string) (schema.Kind, bool) {
@@ -32,7 +36,7 @@ func (s StubRegistry) TypeKnown(typeId string) bool {
 }
 
 // PropsOf returns the stub's declared properties for typeId. Names are
-// empty (the stub stores kinds only). ok mirrors TypeKnown.
+// empty (the stub stores kinds and scopes only). ok mirrors TypeKnown.
 func (s StubRegistry) PropsOf(typeId string) ([]PropInfo, bool) {
 	props, ok := s.Kinds[typeId]
 	if !ok {
@@ -40,7 +44,7 @@ func (s StubRegistry) PropsOf(typeId string) ([]PropInfo, bool) {
 	}
 	out := make([]PropInfo, 0, len(props))
 	for id, k := range props {
-		out = append(out, PropInfo{Id: id, Kind: k})
+		out = append(out, PropInfo{Id: id, Kind: k, Scope: s.Scopes[typeId][id]})
 	}
 	return out, true
 }
@@ -58,4 +62,16 @@ func (s *StubRegistry) Set(typeId, propId string, kind schema.Kind) {
 		s.Kinds[typeId] = make(map[string]schema.Kind)
 	}
 	s.Kinds[typeId][propId] = kind
+}
+
+// SetScoped adds or overwrites a property entry with an explicit scope.
+func (s *StubRegistry) SetScoped(typeId, propId string, kind schema.Kind, scope schema.Scope) {
+	s.Set(typeId, propId, kind)
+	if s.Scopes == nil {
+		s.Scopes = make(map[string]map[string]schema.Scope)
+	}
+	if _, ok := s.Scopes[typeId]; !ok {
+		s.Scopes[typeId] = make(map[string]schema.Scope)
+	}
+	s.Scopes[typeId][propId] = scope
 }

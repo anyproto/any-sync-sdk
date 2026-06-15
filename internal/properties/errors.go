@@ -20,6 +20,7 @@ const (
 	ReasonTypeUnknown        = "type_unknown"
 	ReasonUnknownProperty    = "unknown_property"
 	ReasonKindMismatch       = "kind_mismatch"
+	ReasonScopeMismatch      = "scope_mismatch"
 )
 
 // Per-reason sentinels. A ValidationError chains to exactly one of these
@@ -33,6 +34,7 @@ var (
 	ErrTypeUnknown        = errors.New("property write rejected: type schema is not resolvable on this peer")
 	ErrUnknownProperty    = errors.New("property write rejected: type has no such property")
 	ErrKindMismatch       = errors.New("property write rejected: value kind does not match the declared kind")
+	ErrScopeMismatch      = errors.New("property write rejected: write route does not match the property's declared scope")
 )
 
 // reasonErr maps a Reason discriminant to its sentinel. Unknown reasons
@@ -49,6 +51,8 @@ func reasonErr(reason string) error {
 		return ErrUnknownProperty
 	case ReasonKindMismatch:
 		return ErrKindMismatch
+	case ReasonScopeMismatch:
+		return ErrScopeMismatch
 	}
 	return nil
 }
@@ -71,6 +75,11 @@ type ValidationError struct {
 
 	Expected schema.Kind // declared kind (kind_mismatch)
 	Got      schema.Kind // supplied value's kind (kind_mismatch)
+
+	// DeclaredScope / WriteRoute discriminate a scope_mismatch: the
+	// property's pinned scope vs the route this write arrived on.
+	DeclaredScope schema.Scope
+	WriteRoute    schema.Scope
 
 	Known []types.PropInfo // declared properties of the type (unknown_property)
 	Types []string         // the object's any.types (type_not_implemented)
@@ -95,6 +104,9 @@ func (e *ValidationError) Error() string {
 	case ReasonKindMismatch:
 		return fmt.Sprintf("property write rejected: property %s on type %s expects %s, got %s",
 			e.propLabel(), e.typeLabel(), e.Expected, e.Got)
+	case ReasonScopeMismatch:
+		return fmt.Sprintf("property write rejected: property %s on type %s is %s-scoped and cannot be written through the %s route",
+			e.propLabel(), e.typeLabel(), e.DeclaredScope, e.WriteRoute)
 	}
 	return fmt.Sprintf("property write rejected: %s.%s", e.TypeId, e.PropId)
 }

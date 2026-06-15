@@ -339,6 +339,24 @@ func stampAddSeq(arena *anyenc.Arena, rec *anyenc.Value, addSeq uint64) {
 	rec.Set(AddSeqField, arena.NewNumberInt(int(addSeq)))
 }
 
+// stampApplySeq records the change's apply sequence on the record root
+// as _applySeq, advancing monotonically — the record-level twin of the
+// per-object maxApplySeq watermark, used by consumer-side chunkers to
+// scan "records changed since cursor N". Unlike _addSeq it advances on
+// EVERY apply source (DAG, account mirror, local writes). Zero (no
+// allocator wired) is a no-op.
+func stampApplySeq(arena *anyenc.Arena, rec *anyenc.Value, applySeq uint64) {
+	if rec == nil || applySeq == 0 {
+		return
+	}
+	if cur := rec.Get(ApplySeqField); cur != nil && cur.Type() == anyenc.TypeNumber {
+		if uint64(cur.GetInt()) >= applySeq {
+			return
+		}
+	}
+	rec.Set(ApplySeqField, arena.NewNumberInt(int(applySeq)))
+}
+
 // newRecord allocates an empty record with the _ver.id creation marker.
 func newRecord(arena *anyenc.Arena, id string, version VersionId) *anyenc.Value {
 	rec := arena.NewObject()
@@ -378,9 +396,11 @@ func newTombstone(arena *anyenc.Arena, id string, ch Change, existing *anyenc.Va
 			tomb.Set(TracesKey, cloneInto(arena, t))
 		}
 	}
-	// A delete is itself a change touching the object — carry the AddSeq
-	// onto the tombstone so it surfaces in "changed since N" scans.
+	// A delete is itself a change touching the object — carry the
+	// AddSeq/ApplySeq onto the tombstone so it surfaces in "changed
+	// since N" scans (consumer-side deletion streaming).
 	stampAddSeq(arena, tomb, ch.AddSeq)
+	stampApplySeq(arena, tomb, ch.ApplySeq)
 	return tomb
 }
 

@@ -70,21 +70,6 @@ type RecordChange struct {
 	Id     string
 	Ops    []Op
 	Upsert bool
-
-	// Variant routes the ops into a top-level subdocument on the
-	// record (e.g. "_base", "_account", "_device"). Empty string
-	// means "no variant" — ops apply to the record root, the v1
-	// behavior every existing dataset uses. When non-empty, the
-	// apply loop ensures the subdocument exists, then runs ops
-	// against it; `_ver` stamps land inside that subdoc, so per-
-	// variant LWW comparisons stay structurally isolated.
-	//
-	// Tombstones (delete ops) and creation markers (`_ver.id`) live
-	// at the record root regardless of variant — deletion is a
-	// record-level event, not a variant-level one.
-	//
-	// See docs/06-data-structure.md § "Storage — Proposal 2".
-	Variant string
 }
 
 // Change is one batch — exactly one any-sync DAG change. Every op in the batch
@@ -111,7 +96,14 @@ type Change struct {
 	ChangeId  string
 	VersionId VersionId
 	AddSeq    uint64
-	Records   []RecordChange
+	// ApplySeq is the per-space apply sequence the Controller allocates
+	// inside the apply transaction (never set by callers, never on the
+	// wire). Stamped on every written record as _applySeq and persisted
+	// as the per-object maxApplySeq — the consumer-feed watermark that,
+	// unlike AddSeq, also covers non-DAG applies (account mirror,
+	// device-local writes). Zero when the Controller has no allocator.
+	ApplySeq uint64
+	Records  []RecordChange
 	// DataVersion pins the change to a specific schema/handler version. Its
 	// meaning depends on the dataset:
 	//
@@ -165,11 +157,24 @@ type Change struct {
 	// Local marks a device-local materialization that does NOT flow
 	// through the any-sync DAG. Set by Object.LocalSet; never by a
 	// synced write or replay. When true the apply path: (1) skips the
-	// dataset handler (local fields are handler-exclusive), (2) requires
-	// every op path to be in the reserved local namespace (IsLocalPath),
-	// and the VersionId is locally allocated (NextVersion of the field's
-	// current version) rather than an any-sync OrderId. When false, the
-	// apply path rejects any op targeting a local-namespace path. The
-	// two field classes are disjoint by construction — see version.go.
+	// dataset handler (local fields are handler-exclusive), (2) only
+	// admits local-class fields (classifyFieldWrite), and the VersionId
+	// is locally allocated (NextVersion of the field's current version)
+	// rather than an any-sync OrderId. When false, the apply path
+	// rejects any op targeting a local-class field. The field classes
+	// are disjoint by construction — see version.go.
 	Local bool
+	// Injected marks the account mirror's materialization: like Local
+	// it does NOT flow through this object's DAG and skips the dataset
+	// handler, but the VersionId is CALLER-SUPPLIED — the tech-space
+	// carrier tree's orderId for the change that produced the value —
+	// rather than locally minted. Set by Object.InjectedSet; never by
+	// a synced write, replay, or LocalSet (Local and Injected are
+	// mutually exclusive). Only account-class fields (and undeclared
+	// heads of DynamicScopeByKey datasets, whose per-key scopes the
+	// mirror resolves itself) are writable on this route. Safe because
+	// account paths are written by exactly one writer per device (the
+	// mirror) sourcing one tech tree — versions stay monotonic per
+	// path. See docs/scoped-properties-proposal.md § Account transport.
+	Injected bool
 }

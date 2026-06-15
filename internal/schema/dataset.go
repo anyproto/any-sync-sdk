@@ -5,15 +5,23 @@ import (
 	"fmt"
 )
 
-// Scope is a dataset field's class — how the field is written, versioned,
-// and synced. It generalises the built-in ScopeAuto/ScopeBase markers
-// (see internal/types/any) into the single taxonomy the CRDT apply path
-// enforces and consumers discover.
+// Scope is the single write/sync taxonomy shared by dataset fields AND
+// property definitions: how a value is written, which version domain
+// stamps its `_ver` entries, and how far it syncs. One vocabulary
+// everywhere — dataset schema fields, property defs, and the x-scope
+// discovery keyword all use these labels.
+//
+// Each scope is a disjoint write route. A given field/property lives in
+// exactly ONE scope for its whole life (scope is pinned at declaration,
+// like a property's kind) — there is no per-value override stack. That
+// disjointness is what lets versions from different domains coexist in
+// one `_ver` tree: no two routes ever gate on the same path.
 type Scope uint8
 
 const (
-	// ScopeSynced: user/DAG-written, change-versioned, normal LWW.
-	// (Was ScopeBase.)
+	// ScopeSynced: user/DAG-written through the object's own tree,
+	// change-versioned, normal LWW, synced to everyone with access.
+	// (Docs historically called this "base".)
 	ScopeSynced Scope = iota + 1
 	// ScopeDerived: handler-computed from the change, change-versioned,
 	// converges across peers; never writable by an input op. (Was
@@ -21,7 +29,13 @@ const (
 	ScopeDerived
 	// ScopeLocal: materialised on-device via Object.LocalSet,
 	// lexid.Next-versioned, never synced. e.g. localStatus.
+	// (Docs historically called this "device".)
 	ScopeLocal
+	// ScopeAccount: synced across the SAME account's devices only, via a
+	// carrier record in the private tech space; a per-device watcher
+	// mirrors converged values into the target record, stamping the
+	// tech tree's versionIds. Invisible to other space members.
+	ScopeAccount
 )
 
 func (s Scope) String() string {
@@ -32,8 +46,26 @@ func (s Scope) String() string {
 		return "derived"
 	case ScopeLocal:
 		return "local"
+	case ScopeAccount:
+		return "account"
 	}
 	return "unknown"
+}
+
+// ParseScope parses a scope label. Returns (0, false) on an unknown
+// label — the runtime counterpart of MustScope for wire-read paths.
+func ParseScope(label string) (Scope, bool) {
+	switch label {
+	case "synced":
+		return ScopeSynced, true
+	case "derived":
+		return ScopeDerived, true
+	case "local":
+		return ScopeLocal, true
+	case "account":
+		return ScopeAccount, true
+	}
+	return 0, false
 }
 
 // Field is one declared dataset field: a JSON-Schema value shape plus its
@@ -134,13 +166,9 @@ func Leaf(k Kind) *Schema { return &Schema{Kind: k} }
 // MustScope parses a scope label, panicking on an unknown one. For static
 // declarations where the value is a compile-time constant.
 func MustScope(label string) Scope {
-	switch label {
-	case "synced":
-		return ScopeSynced
-	case "derived":
-		return ScopeDerived
-	case "local":
-		return ScopeLocal
+	s, ok := ParseScope(label)
+	if !ok {
+		panic(fmt.Sprintf("schema: unknown scope %q", label))
 	}
-	panic(fmt.Sprintf("schema: unknown scope %q", label))
+	return s
 }

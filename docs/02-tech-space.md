@@ -84,3 +84,26 @@ type spaceStorage struct {
 
 ### Dependencies
 5. Depends on Auth. Regular spaces depend on tech space for the space index. Opening a space triggers validation at a higher level.
+
+## Account-values carriers
+
+For every target space the account participates in, the tech space
+hosts one derived **account-values carrier object** (seed
+`builtin:accountValues/<spaceId>`, dataset `account_values`). It is
+the transport for account-scoped values — properties (and, later,
+dataset fields) declared `scope: account`, which sync across this
+account's devices but stay invisible to other space members.
+
+- One carrier record per target `(objectId, dataset, recordId)`,
+  record key `<objectId>:<dataset>:<recordId>`; the objects row is the
+  degenerate case. Record fields are the account-scoped paths VERBATIM
+  (`{typeId}.{propId}`), so the record's own `_ver` — including
+  entries retained by $unset — is the version source the per-space
+  mirror replays into target rows (injected applies, grouped by
+  carrier version).
+- Lifecycle is 1:1 with the target space: derived on first use
+  (mirror start or first account write), deleted whole on space
+  leave/delete. Records of a deleted target object are tombstoned by
+  whichever device observes the deletion first (idempotent).
+- Full contract: docs/scoped-properties-proposal.md § "Account
+  transport"; mirror implementation: internal/spaceimpl/accountmirror.go.

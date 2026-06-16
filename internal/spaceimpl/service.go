@@ -107,6 +107,15 @@ type Service struct {
 	// account-scoped values (see accountmirror.go).
 	accountMirrors map[string]*accountMirror
 
+	// memberWatchers holds one members poller per loaded spaceId. Like
+	// the spaceIndex/account watchers above it's a Service-level
+	// singleton: the SDK mints a fresh spaceImpl (and membersAPI) on
+	// every Get/Create/Derive, so without this the first members
+	// Subscribe/Query on each handle would spawn its own never-reaped
+	// watcher (two goroutines) — they only stop at SDK.Close. Keyed by
+	// spaceId so all handles for one space share a single watcher.
+	memberWatchers map[string]*memberWatcher
+
 	// watchers tracks every active members poller across all loaded
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
@@ -141,6 +150,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		spaceIndexIds:      make(map[string]string),
 		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
 		accountMirrors:     make(map[string]*accountMirror),
+		memberWatchers:     make(map[string]*memberWatcher),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	// Wire the Total source for the sync-status rollup. The rollup

@@ -123,6 +123,8 @@ func newAccountMirror(ctx context.Context, store *spaceobjects.Store, tsp *techs
 	return m
 }
 
+func (m *accountMirror) spaceID() string { return m.spaceId }
+
 func (m *accountMirror) stop() {
 	m.stopOnce.Do(func() {
 		if m.cancelRowEvts != nil {

@@ -95,3 +95,34 @@ func (s *storageProvider) SpaceExists(id string) bool {
 	_, err := os.Stat(s.dbPath(id))
 	return err == nil
 }
+
+// CloseSpaceStorage closes the provider's cached SpaceStorage for id
+// and drops it from the open map. Best-effort and idempotent: a space
+// that was never opened, or whose storage any-sync already closed on
+// space eviction, is a no-op. Callers evict the space from the cache
+// (App.EvictSpace) first so any-sync releases its own handle.
+func (s *storageProvider) CloseSpaceStorage(ctx context.Context, id string) error {
+	s.mu.Lock()
+	st, ok := s.open[id]
+	delete(s.open, id)
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	// any-sync may have already closed the underlying store on space
+	// eviction; a second Close is tolerated and its error ignored.
+	_ = st.Close(ctx)
+	return nil
+}
+
+// DeleteSpaceStorageFile closes a space's any-sync storage and removes
+// its on-disk DB file (`<root>/<spaceId>.db`). The bulk of a space's
+// local footprint — every object tree — lives here, so this is the
+// main disk-reclaim step of an offload. A missing file is not an error.
+func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string) error {
+	_ = s.CloseSpaceStorage(ctx, id)
+	if err := os.Remove(s.dbPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}

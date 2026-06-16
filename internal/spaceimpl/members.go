@@ -511,6 +511,8 @@ func (w *memberWatcher) remove(id int) {
 	w.mu.Unlock()
 }
 
+func (w *memberWatcher) spaceID() string { return w.api.s.id }
+
 func (w *memberWatcher) stop() {
 	select {
 	case <-w.stopCh:

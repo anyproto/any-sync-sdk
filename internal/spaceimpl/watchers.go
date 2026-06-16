@@ -13,6 +13,15 @@ type stopper interface {
 	stop()
 }
 
+// spaceScoped is the optional contract a watcher implements so the
+// registry can stop just the watchers belonging to one space — used by
+// the space-offload path. Watchers that don't implement it are left
+// alone by stopForSpace and only drained by stopAll on SDK shutdown.
+type spaceScoped interface {
+	stopper
+	spaceID() string
+}
+
 // watcherRegistry tracks every active per-space watcher in the
 // service. We can't keep them on spaceImpl alone — the SDK creates a
 // fresh spaceImpl per Get / Create / Derive call, so a Subscribe
@@ -54,6 +63,25 @@ func (r *watcherRegistry) stopAll() {
 	r.wm = nil
 	r.mu.Unlock()
 	for _, w := range ws {
+		w.stop()
+	}
+}
+
+// stopForSpace stops and unregisters every space-scoped watcher whose
+// spaceID matches, leaving other spaces' watchers untouched. Used by
+// the offload path to drain a single space's pollers. Blocks until each
+// matched watcher's goroutine drains.
+func (r *watcherRegistry) stopForSpace(spaceId string) {
+	r.mu.Lock()
+	var matched []stopper
+	for w := range r.wm {
+		if sw, ok := w.(spaceScoped); ok && sw.spaceID() == spaceId {
+			matched = append(matched, w)
+			delete(r.wm, w)
+		}
+	}
+	r.mu.Unlock()
+	for _, w := range matched {
 		w.stop()
 	}
 }

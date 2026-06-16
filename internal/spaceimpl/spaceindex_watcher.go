@@ -80,6 +80,8 @@ func newSpaceIndexWatcher(ctx context.Context, store *spaceobjects.Store, indexe
 	return w
 }
 
+func (w *spaceIndexWatcher) spaceID() string { return w.spaceId }
+
 func (w *spaceIndexWatcher) stop() {
 	w.stopOnce.Do(func() {
 		if w.sub != nil {

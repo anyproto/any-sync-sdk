@@ -40,9 +40,10 @@ type App struct {
 	streamPool   streampool.StreamPool
 	joining      aclclient.AclJoiningClient
 
-	sync    *spaceSyncHandler
-	tree    *treeManagerAdapter
-	storage *storageProvider
+	sync     *spaceSyncHandler
+	tree     *treeManagerAdapter
+	storage  *storageProvider
+	nodeConf nodeconf.Service
 
 	spaceCache ocache.OCache
 	headCache  *HeadCache
@@ -133,6 +134,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// filter inbound HeadsApply senders. nodeconf is registered above;
 	// fetch the component once here so the closure stays cheap.
 	nc := a.MustComponent(nodeconf.CName).(nodeconf.Service)
+	out.nodeConf = nc
 	out.syncStatus.SetNodeIdsFn(nc.NodeIds)
 	// Start the rollup loop. The loop ticks once per second, drains
 	// the dirty set, and dispatches SpaceSyncStatus events to
@@ -182,6 +184,11 @@ func (a *App) JoiningClient() aclclient.AclJoiningClient { return a.joining }
 // AccountKeys holds the decoded peer/sign keys.
 func (a *App) AccountKeys() *accountdata.AccountKeys { return a.keys }
 
+// NetworkId is the id of the any-sync network this app is bound to.
+// Needed to build the signed space-delete confirmation, which the
+// coordinator verifies against its own network id.
+func (a *App) NetworkId() string { return a.nodeConf.Configuration().NetworkId }
+
 // SetSpaceRegistry wires the tree manager to a space-level registry.
 // Called once by the space package after it builds its ocache.
 func (a *App) SetSpaceRegistry(r SpaceRegistry) { a.tree.SetRegistry(r) }
@@ -189,6 +196,13 @@ func (a *App) SetSpaceRegistry(r SpaceRegistry) { a.tree.SetRegistry(r) }
 // SpaceExists reports whether any-sync has local storage for spaceId.
 // Used by the space layer to decide between Open and Create paths.
 func (a *App) SpaceExists(spaceId string) bool { return a.storage.SpaceExists(spaceId) }
+
+// DeleteSpaceStorage closes and removes a space's any-sync on-disk
+// storage (`<DataDir>/anysync/<spaceId>.db`). Call after EvictSpace so
+// any-sync has released the space; part of the space-offload path.
+func (a *App) DeleteSpaceStorage(ctx context.Context, spaceId string) error {
+	return a.storage.DeleteSpaceStorageFile(ctx, spaceId)
+}
 
 // HeadCache exposes the per-space hash cache. Useful for tests and
 // the eventual SyncStatus integration; the spaceSyncHandler already

@@ -129,6 +129,15 @@ type Service struct {
 	seedCtx    context.Context
 	seedCancel context.CancelFunc
 	closing    bool
+
+	// Deletion reconciler: a background loop that drives locally-deleted
+	// spaces to the coordinator (signed SpaceDelete) and offloads spaces
+	// the coordinator reports gone. delKick wakes it immediately after a
+	// local Delete; otherwise it ticks on deletionReconcileInterval.
+	// delCancel/delWG are drained in Close before watchers.stopAll.
+	delCancel context.CancelFunc
+	delWG     sync.WaitGroup
+	delKick   chan struct{}
 }
 
 // New returns a Service ready to be returned via SDK.Spaces(). The
@@ -151,8 +160,10 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
 		accountMirrors:     make(map[string]*accountMirror),
 		memberWatchers:     make(map[string]*memberWatcher),
+		delKick:            make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
+	s.startDeletionReconciler()
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store
 	// to compute Synced/Total. nil-store cases (querying status for
@@ -458,27 +469,25 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	return info
 }
 
-// Delete is an account-wide soft-delete on the index: it writes the
-// SYNCED remoteStatus=deleted so every device drops the space. The row
-// is never physically removed (Status stays Deleted in List).
+// Delete removes a space. It is offline-first and returns as soon as the
+// local work is done — no network round trip on the call path:
+//  1. write the SYNCED remoteStatus=deleted tombstone (propagates the
+//     delete to the account's other devices, and is the durable intent
+//     the reconciler scans; also drives the Subscribe `Removed` event);
+//  2. offload all local state immediately (reclaim disk even offline);
+//  3. kick the deletion reconciler, which sends the signed SpaceDelete
+//     to the coordinator now (if online) or on a later tick (when it
+//     reconnects). Only owners' deletes reach the coordinator; for a
+//     non-owned space this offloads locally and the reconciler no-ops.
+//
+// The tech-space row is never physically removed — it stays in List with
+// Status = StatusDeleted as a sticky tombstone.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
 	}
-	// GC the space's account-values carrier in tech space — one derived
-	// tree, gone. Stop the mirror first so it doesn't race the drop.
-	// Best-effort: a failed drop leaves an orphan carrier whose records
-	// are never mirrored again (the space is deleted everywhere via the
-	// remoteStatus above).
-	s.mu.Lock()
-	m := s.accountMirrors[spaceId]
-	delete(s.accountMirrors, spaceId)
-	s.mu.Unlock()
-	if m != nil {
-		s.watchers.unregister(m)
-		m.stop()
-	}
-	_ = s.tsp.DropAccountValues(ctx, spaceId)
+	s.OffloadSpace(ctx, spaceId)
+	s.kickDeletionReconciler()
 	return nil
 }
 
@@ -800,6 +809,13 @@ func (s *Service) Close(_ context.Context) error {
 	s.mu.Unlock()
 	s.seedCancel()
 	s.seedWG.Wait()
+	// Stop the deletion reconciler before draining watchers — it may
+	// otherwise kick off an OffloadSpace (which stops watchers) during
+	// shutdown.
+	if s.delCancel != nil {
+		s.delCancel()
+	}
+	s.delWG.Wait()
 	s.watchers.stopAll()
 	return nil
 }

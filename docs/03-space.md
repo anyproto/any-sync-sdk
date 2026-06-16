@@ -115,7 +115,13 @@ type AclSpaceClient interface {
 - **Join request notifications** — a new ACL record is added; SDK reacts to ACL changes via event flow and surfaces pending requests to the caller (likely as `status=pending` in the members collection, TBD)
 
 ### Space Lifecycle
-- **Deletion (v1)** — regular spaces: delete all local data
+- **Deletion (v1)** — `Spaces().Delete(spaceId)` is offline-first and splits into a local half (synchronous) and a network half (deferred):
+  1. Writes the synced `remoteStatus=deleted` tombstone to the tech-space index — propagates the delete to the account's other devices and is the durable intent the deletion reconciler scans on restart.
+  2. **Offloads all local state immediately** — closes the per-space watchers and Store, evicts the any-sync space, drops every SDK CRDT collection for the space, removes the any-sync per-space DB file, and GCs the account-values carrier. Disk is reclaimed even offline.
+  3. Kicks the background **deletion reconciler**, which sends the signed `coordinator.SpaceDelete` confirmation — now if online, or on a later tick when connectivity returns. Owner-only: the coordinator rejects deletes from non-owners, so deleting a non-owned space offloads locally and the reconciler no-ops on the network call.
+  - The reconciler also runs the **inbound** direction: it polls the coordinator (`StatusCheckMany`) and, for any space the coordinator reports gone (deleted on another device, or an owner deleted a space you joined), marks it `deleted` locally and offloads.
+  - The tech-space row is never physically removed; it stays in `List` with `Status = StatusDeleted` (sticky tombstone).
+- **Consumer index wipe** — to drop your own derived indexes (search, UI caches) when a space is deleted, watch `Spaces().Subscribe` and purge your per-space state when a `spaceId` appears in `SpaceListEvent.Removed`. The SDK guarantees `Removed` fires for every offload (local delete and inbound-detected) because both set `remoteStatus=deleted`, which the subscription classifies as `Removed`. This is advisory/async — not ordered with the SDK's own offload.
 - **1-1 spaces** — in v1 scope, but with separate logic:
   - Not removable from the network (derived, always re-creatable)
   - Can only be deleted locally
@@ -135,7 +141,7 @@ type AclSpaceClient interface {
 
 ### Tech Space Integration
 - Space creation/join → SDK writes to tech space index (internal, atomic)
-- Space deletion → SDK updates tech space record to `status=deleted`
+- Space deletion → SDK updates tech space record to `status=deleted`, offloads local data, and the deletion reconciler sends the signed `coordinator.SpaceDelete` (see Space Lifecycle)
 - All writes go through SDK methods, never direct
 
 ### Space type strings (interim)

@@ -92,6 +92,44 @@ func TestRemotelyGone(t *testing.T) {
 	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusCreated))
 }
 
+// TestDecideReconcile exhaustively covers the reconcile decision: who
+// gets a coordinator SpaceDelete, who gets offloaded, and — critically —
+// who is left alone (so deletes aren't re-sent and member-owned spaces
+// aren't deleted network-wide).
+func TestDecideReconcile(t *testing.T) {
+	owner := coordinatorproto.SpacePermissions_SpacePermissionsOwner
+	reader := coordinatorproto.SpacePermissions_SpacePermissionsUnknown
+	st := func(s coordinatorproto.SpaceStatus, p coordinatorproto.SpacePermissions) *coordinatorproto.SpaceStatusPayload {
+		return &coordinatorproto.SpaceStatusPayload{Status: s, Permissions: p}
+	}
+	C := coordinatorproto.SpaceStatus_SpaceStatusCreated
+	P := coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
+	D := coordinatorproto.SpaceStatus_SpaceStatusDeleted
+	NX := coordinatorproto.SpaceStatus_SpaceStatusNotExists
+
+	cases := []struct {
+		name           string
+		locallyDeleted bool
+		st             *coordinatorproto.SpaceStatusPayload
+		want           reconcileAction
+	}{
+		{"owner deleted locally, still active -> send", true, st(C, owner), actionSendDelete},
+		{"owner deleted locally, already pending -> none (no resend)", true, st(P, owner), actionNone},
+		{"owner deleted locally, already deleted -> none", true, st(D, owner), actionNone},
+		{"member deleted locally, active -> none (cannot delete)", true, st(C, reader), actionNone},
+		{"active not-deleted owner -> none", false, st(C, owner), actionNone},
+		{"inbound pending, not deleted -> offload", false, st(P, owner), actionOffload},
+		{"inbound deleted, not deleted -> offload", false, st(D, reader), actionOffload},
+		{"inbound not-exists, not deleted -> offload", false, st(NX, owner), actionOffload},
+		{"nil status -> none", true, nil, actionNone},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, decideReconcile(c.locallyDeleted, c.st))
+		})
+	}
+}
+
 func TestOwnedByObject(t *testing.T) {
 	ids := map[string]struct{}{"objX": {}, "typeT": {}}
 	assert.True(t, ownedByObject("objX_blocks", ids))

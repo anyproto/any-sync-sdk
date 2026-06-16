@@ -16,8 +16,20 @@ var delLog = logger.NewNamed("sdk.spacedeletion")
 // deletionReconcileInterval is how often the reconciler polls the
 // coordinator absent an explicit kick. Matches anytype-heart's deletion
 // controller cadence — space deletion is not latency-sensitive, and a
-// local Delete kicks the loop immediately anyway.
-const deletionReconcileInterval = 180 * time.Second
+// local Delete kicks the loop immediately anyway. A var (not const) so
+// tests can shorten it to exercise the inbound-detection tick.
+var deletionReconcileInterval = 180 * time.Second
+
+// SetDeletionReconcileIntervalForTest overrides the reconcile poll
+// interval and returns a func that restores the previous value. Test
+// seam only — lets e2e exercise the inbound-detection tick without
+// waiting the full production interval. Call before opening the SDK
+// (the interval is read once when the loop starts).
+func SetDeletionReconcileIntervalForTest(d time.Duration) (restore func()) {
+	prev := deletionReconcileInterval
+	deletionReconcileInterval = d
+	return func() { deletionReconcileInterval = prev }
+}
 
 // startDeletionReconciler launches the background reconcile loop. Bound
 // to its own cancellable context; Close cancels it and drains delWG.
@@ -95,10 +107,8 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 	}
 	locallyDeleted := row.RemoteStatus == techspace.StatusDeleted
 
-	switch {
-	case locallyDeleted &&
-		st.Status == coordinatorproto.SpaceStatus_SpaceStatusCreated &&
-		st.Permissions == coordinatorproto.SpacePermissions_SpacePermissionsOwner:
+	switch decideReconcile(locallyDeleted, st) {
+	case actionSendDelete:
 		// We deleted locally but the coordinator still has the space
 		// active and we own it — send the signed delete. Idempotent: the
 		// coordinator moves it to PendingDeletion and later passes no-op.
@@ -108,7 +118,7 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 		}
 		delLog.Info("space delete sent to coordinator", zap.String("spaceId", row.Id))
 
-	case !locallyDeleted && remotelyGone(st.Status):
+	case actionOffload:
 		// The coordinator reports the space gone (deleted on another
 		// device, or the owner deleted a space we joined) but we haven't
 		// marked it locally. Set the synced tombstone — which also emits
@@ -120,6 +130,39 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 		}
 		delLog.Info("offloading remotely-deleted space", zap.String("spaceId", row.Id))
 		s.OffloadSpace(ctx, row.Id)
+	}
+}
+
+// reconcileAction is the decision reconcileOne acts on for one space.
+type reconcileAction int
+
+const (
+	actionNone reconcileAction = iota
+	// actionSendDelete: drive our local delete to the coordinator.
+	actionSendDelete
+	// actionOffload: the coordinator reports the space gone; offload it.
+	actionOffload
+)
+
+// decideReconcile is the pure reconcile decision, isolated for testing.
+// Owner-delete drive fires only when we deleted locally, we own the
+// space, and the coordinator still has it active (Created) — so a
+// space already moving through deletion (Pending/Started/Deleted) is a
+// no-op and never re-sent. Inbound offload fires only when we have NOT
+// deleted locally but the coordinator reports the space gone.
+func decideReconcile(locallyDeleted bool, st *coordinatorproto.SpaceStatusPayload) reconcileAction {
+	if st == nil {
+		return actionNone
+	}
+	switch {
+	case locallyDeleted &&
+		st.Status == coordinatorproto.SpaceStatus_SpaceStatusCreated &&
+		st.Permissions == coordinatorproto.SpacePermissions_SpacePermissionsOwner:
+		return actionSendDelete
+	case !locallyDeleted && remotelyGone(st.Status):
+		return actionOffload
+	default:
+		return actionNone
 	}
 }
 

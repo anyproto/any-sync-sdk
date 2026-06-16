@@ -41,6 +41,7 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	delete(s.spaceIndexIds, spaceId)
 	delete(s.spaceIndexWatchers, spaceId)
 	delete(s.accountMirrors, spaceId)
+	delete(s.memberWatchers, spaceId)
 	s.mu.Unlock()
 	if store != nil {
 		if err := store.Close(); err != nil {

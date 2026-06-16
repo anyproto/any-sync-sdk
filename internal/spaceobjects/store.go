@@ -881,7 +881,12 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
 		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
-		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		// `_ver.id` index backs LiveRegistry.LatestShortId, which reads the
+		// greatest `_ver.id` (Sort("-_ver.id").Limit(1)) to derive a type's
+		// DataVersion. `_ver.id` is stamped on every row, so the index is
+		// dense (never sparse) — a reverse-scan to the last key replaces a
+		// full-collection scan+sort as the shortIds dataset grows.
+		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}, Indexes: []anystore.IndexInfo{{Name: "idx__ver_id", Fields: []string{"_ver.id"}}}},
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {

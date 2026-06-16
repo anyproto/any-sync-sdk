@@ -78,6 +78,13 @@ Drift happens because today the object and filenode are coordinated by a third s
 }
 ```
 
+### Ownership shapes — payloads don't force a "file object", but allow one
+The owner of a payload is just an object, and that cuts two ways:
+- **Incidental payloads.** A page with images, an avatar on a member — the payloads are rows in the *content* object's `payloads` dataset. No per-file object is minted. This is the answer to problem #1: *don't create a file object for every small linked image.*
+- **Dedicated file object.** An important standalone file (a PDF in a library, a shared document) gets a dedicated object whose purpose is to own **exactly one payload**, carrying its own `name` / type / metadata so it's a first-class, referenceable, queryable entity.
+
+Both use the identical payloads mechanism — "file object" stops being a mandatory per-file wrapper and becomes a deliberate modeling choice. Size (inline vs filenode) is an **orthogonal** axis: a dedicated file object is usually filenode-backed, an incidental icon is usually micro-inline, but any combination is valid.
+
 ### Why this eliminates the distributed deletion race
 A payload row can only be created by syncing the object that owns it. A peer **cannot observe (and therefore delete) a payload before it has seen the parent object**. If the parent is tombstoned, the payload is tombstoned with it. The CRDT's causal DAG gives lifecycle safety for free — **no space-wide reference scan, no grace-period rescue.**
 
@@ -168,7 +175,11 @@ Decide v1 vs v1.1 from what the spike surfaces (esp. #4 and #5).
 ## Sketched SDK API
 ```go
 type Files interface {
+    // Attach a payload to an EXISTING owner (the page-with-images case).
     Attach(ctx, ownerObjectId string, reader io.Reader, opts AddOpts) (PayloadRef, error)
+    // CreateFileObject mints a dedicated file object owning exactly one payload
+    // (the standalone-PDF case): one call -> object + its single bound payload.
+    CreateFileObject(ctx, reader io.Reader, opts AddOpts) (objectId string, ref PayloadRef, err error)
     Open(ctx, fileId string, variant VariantKind) (io.ReadSeekCloser, error)
     Get(ctx, fileId string) (PayloadRecord, error)
     // Deletion is implicit: delete/tombstone the owner object (or its payload row).

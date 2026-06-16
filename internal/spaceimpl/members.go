@@ -273,11 +273,38 @@ func (m *membersAPI) applyProfiles(members []space.Member) {
 // running. Returns the watcher (or nil if construction failed —
 // caller should treat as no-op).
 func (m *membersAPI) ensureWatcher() *memberWatcher {
+	// Fast path: this handle already resolved its watcher.
 	m.watcherMu.Lock()
-	defer m.watcherMu.Unlock()
-	if m.watcher != nil {
-		return m.watcher
+	if w := m.watcher; w != nil {
+		m.watcherMu.Unlock()
+		return w
 	}
+	m.watcherMu.Unlock()
+
+	s := m.s.parent
+	if s == nil {
+		// No parent Service (test harnesses): fall back to a
+		// handle-local watcher with no shared dedup.
+		w, err := newMemberWatcher(context.Background(), m)
+		if err != nil {
+			return nil
+		}
+		m.setWatcher(w)
+		return w
+	}
+
+	// Service-level singleton: reuse the per-space watcher if a prior
+	// Get/Create/Derive handle already started it.
+	s.mu.Lock()
+	if w := s.memberWatchers[m.s.id]; w != nil {
+		s.mu.Unlock()
+		m.setWatcher(w)
+		return w
+	}
+	s.mu.Unlock()
+
+	// Construct outside the lock — newMemberWatcher opens the collection
+	// and does the initial ACL seed/reconcile (any-store latency).
 	w, err := newMemberWatcher(context.Background(), m)
 	if err != nil {
 		// If construction fails (e.g. db unavailable), surface lazily
@@ -285,11 +312,27 @@ func (m *membersAPI) ensureWatcher() *memberWatcher {
 		// until the next ensureWatcher call after the issue clears.
 		return nil
 	}
-	m.watcher = w
-	if m.s.parent != nil {
-		m.s.parent.watchers.register(w)
+	s.mu.Lock()
+	if existing := s.memberWatchers[m.s.id]; existing != nil {
+		// Race: another handle wired concurrently. Drop the loser so we
+		// don't leak its goroutines; its seed already ran and is harmless.
+		s.mu.Unlock()
+		w.stop()
+		w = existing
+	} else {
+		s.memberWatchers[m.s.id] = w
+		s.watchers.register(w)
+		s.mu.Unlock()
 	}
+	m.setWatcher(w)
 	return w
+}
+
+// setWatcher caches the resolved shared watcher on this handle.
+func (m *membersAPI) setWatcher(w *memberWatcher) {
+	m.watcherMu.Lock()
+	m.watcher = w
+	m.watcherMu.Unlock()
 }
 
 // memberFromAccountState lifts one any-sync AccountState into the

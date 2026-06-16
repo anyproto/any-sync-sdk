@@ -154,13 +154,13 @@ Every change carries optional `traceIds` — opaque caller-supplied correlation 
 - **Caller view** — SDK may wrap events into a simplified view for the client
 
 ## Full Spec
-See **`05a-crdt-spec.md`** for the complete specification (operations, change format, event format, application algorithm, property variants, conflict examples).
+See **`05a-crdt-spec.md`** for the complete specification (operations, change format, event format, application algorithm, property scopes, conflict examples).
 
 ## Grooming Questions (open)
 
 Most earlier questions are now resolved in the spec. Remaining:
 
-1. **Device version ID prefix** — format for local monotonic counters in `_ver_device` (spec §9.4)
+1. **Local version IDs** — `local`-scope writes mint lexids (`NextVersion` of the path's current version) rather than DAG orderIds (spec §9.1); confirm the generator/prefix is final
 2. **Final handler interface** — method names, error types, validation return shape (spec §8)
 3. **Session model** — deferred; to be added when we build the session-based own-write filtering
 

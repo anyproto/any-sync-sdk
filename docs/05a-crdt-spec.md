@@ -650,12 +650,13 @@ type ModifyResult struct {
 
 ### 12.1 Property-scope Writes
 
+One auto-routing setter; the SDK picks the write route from each propId's declared scope (§9):
+
 ```go
-SetDeviceProperty(objectId, fields) -> (ModifyResult, error)
-SetAccountProperty(objectId, fields) -> (ModifyResult, error)
+Set(objectId, typeId, patch) -> (ModifyResult, error)
 ```
 
-`base`-scope property writes go through regular `Modify()` targeting the base-property dataset.
+All keys in a `patch` must resolve to the SAME scope — mixed-scope patches are rejected, since the routes commit independently and cannot be rolled back together. `synced` props go through the regular `Modify()` pipeline on the object; `account` props through the tech-space carrier record; `local` props through `Object.LocalSet`. The returned `VersionId` is in whatever route's domain handled the write.
 
 ### 12.2 Batches
 A single `Modify` can target multiple records (as one batch) if the API supports it. Final API shape for multi-record batches is in §17.
@@ -832,7 +833,7 @@ Use `$inc` for counters. Use `$incGated` only when the absolute post-mutation va
 ## 17. Open Items
 
 ### Protocol
-1. Device version ID prefix — `"d#"`, `"~d-"`, or other (§9.4). This is a local-counter namespace for device-scoped writes that never touch any-sync; unrelated to any-sync orderIds.
+1. Local version ID generator — `local`-scope writes never touch any-sync; they mint lexids via `NextVersion` of the path's current version (§9.1), unrelated to any-sync orderIds. Confirm the generator/seed is final.
 2. Final handler interface — method names, error types (§8)
 
 ### External API

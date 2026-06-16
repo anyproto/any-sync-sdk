@@ -399,10 +399,8 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 12. Do we enumerate a minimum set of system collections for v1? (`spaces`, `objects`, `members` at least?)
 
 ### Write Methods
-13. What do the dedicated write methods look like for `device` and `account` scopes?
-    - `sdk.Properties.SetDevice(spaceId, objectId, {isFavorite: true})`?
-    - `sdk.Properties.SetAccount(...)`?
-14. Are device/account writes atomic with the event emission, or eventually consistent?
+13. ~What do the dedicated write methods look like for `device` and `account` scopes?~ → resolved: no per-scope methods. A single auto-routing `Properties.Set(ctx, objectId, typeId, patch)` resolves each propId's declared scope and writes on that route (`space/properties.go`); mixed-scope patches are rejected.
+14. ~Are device/account writes atomic with the event emission, or eventually consistent?~ → resolved by scope-on-declaration (§"Property Types", CRDT spec §9): `synced` commits through the object's CRDT, `account` through the tech-space carrier mirrored per-device, `local` straight into the device row. Each route emits one event in its own version domain; there is no cross-route atomicity (callers issue one `Set` per scope).
 
 ### Types & Property Lifecycle
 16. **What happens to property values when a user removes or adds a type on an object?** The current note ("values in that namespace become orphan data, read-tolerant") is a one-liner; we need a real answer covering the points below. Code-state anchors are inlined so we know what's already implemented vs. open design:

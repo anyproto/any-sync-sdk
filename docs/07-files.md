@@ -3,7 +3,7 @@
 ## TL;DR — the SDK2 file model
 
 1. **No server changes.** Keep `filenode` as a dumb, specialized, refcounted block heap. Do **not** push for "files as a native any-sync data type" — merging bulk binary into a tree-sync protocol chokes metadata sync behind gigabytes of video. The whole design lives in the SDK.
-2. **Payloads are a per-object `payloads` dataset, mirrored to a space-level index.** Each object optionally owns a **`payloads` dataset** (a page with images keeps them there) — synced, owned 1:1, tombstoned with the object. The apply path mirrors every payload row into a **local space-level `payloads` index** that the upload/GC/dedup workers scan in one place. Two physical tiers by size:
+2. **Payloads are a per-object `payloads` dataset, materialized into a common collection.** Each object optionally owns a **`payloads` dataset** (a page with images keeps them there) — synced, owned 1:1, tombstoned with the object. Each object's payload writes **materialize into one common space-level `payloads` collection via the Controller's shared-collection override — exactly how object properties materialize into the `objects` collection** — giving the upload/GC/dedup workers one convergent place to scan. Two physical tiers by size:
    - **Micro-payload (< 32 KB)** — envelope-encrypted bytes inline in the payload row. No `fileId`, no filenode.
    - **Real payload (≥ 32 KB)** — chunked, envelope-encrypted, pushed to filenode; the row carries `fileId` + variants + wrapped key + status.
 3. **Envelope encryption** (keep what anytype already does right): random per-file key encrypts the bytes → stable ciphertext → stable CID forever. Wrap the key under the space read key. ACL rotation re-wraps only the tiny key, never the blob. **Reuse the same key for identical plaintext** (found via `plaintextHash`) so identical content yields identical CIDs.
@@ -55,10 +55,11 @@ Drift happens because today the object and filenode are coordinated by a third s
 
 ### Where payloads live — per-object dataset + local space index
 - **Source of truth: a per-object `payloads` dataset.** An object opts in only if it has payloads (a page with images stores them there). It's a normal dataset written through the object's CRDT — so it's **synced, owned 1:1, and tombstoned together with the object** (delete the object → its `payloads` rows are tombstoned with it; sticky, convergent — see `05a-crdt-spec §3.4/§5.7`). This is what makes lifecycle safety free.
-- **Scan surface: a local space-level `payloads` index.** The apply path mirrors every payload row (and tombstone) into one local, regenerable index collection. The upload worker, GC, and dedup query this single place — they never fan out across every object's dataset. Because the index is a *local projection* of the synced datasets, there is **no second synced state to drift**; if it's ever wrong, rebuild it from the datasets.
+- **Scan surface: a common `payloads` collection, materialized like properties.** Wire the per-object `payloads` dataset through the Controller's **shared-collection override** — the same mechanism that coalesces every object's property writes into the one `objects` collection (`SystemPropertiesHandler`; see `06-data-structure`). Each object's payload changes materialize, keyed by payload id, into one common space-level `payloads` collection. The upload worker, GC, and dedup scan that single collection. Because it's produced by *applying the same synced CRDT changes on every peer*, it's **convergent by construction** — not a hand-maintained side-projection, so there's no drift to reconcile. Ownership stays 1:1: each row is written and tombstoned by exactly one object's CRDT.
 
 ```jsonc
-// per-object dataset: payloads   (mirrored into the local space-level index)
+// payloads — per-object dataset, materialized into the common space-level
+// `payloads` collection via the shared-collection override (like `objects`)
 {
   "id": "payload_uuid",
   "name": "report.pdf",             // human label (metadata; NOT an identity)
@@ -147,7 +148,7 @@ Rejected. State-sync protocols optimize for tiny, causally-linked, fully-replica
 ## Risks (ranked by blast radius)
 1. **Local block GC / network ordering (data loss).** Deleting a local block that a queued `BlocksBind` still needs, after the server already dropped it (`ErrCidsNotExist`), is unrecoverable. The local-GC count check MUST include the pending-bind set; worker re-pushes on `ErrCidsNotExist`; prefer bind-before-delete. *#1 production risk.*
 2. **Object duplication aliasing fileIds.** A future copy primitive must re-mint fileId + re-bind. A generic opaque clone is a footgun.
-3. **Index/dataset consistency.** The local `payloads` index must stay in lock-step with the per-object datasets (rebuild-on-doubt). A stale index → worker uploads/deletes wrong rows.
+3. **Cascade-on-delete.** Deleting an object must tombstone *all* its payload rows in the common collection (an object can own N payloads, unlike its single `objects` row). Materialization is convergent like properties, so there's no projection drift — but the delete path must emit the per-payload tombstones.
 4. **Key-reuse correctness.** Reuse the key only across *identical* plaintext (gate strictly on full `plaintextHash` + size). A partial match that reuses key+IV across *different* content breaks CFB confidentiality.
 
 ---
@@ -155,7 +156,7 @@ Rejected. State-sync protocols optimize for tiny, causally-linked, fully-replica
 ## Spike plan (chosen: prototype before committing v1 vs v1.1)
 A focused spike against the local any-sync network (`~/projects/local-infra`) to de-risk before slotting files into a release:
 1. **Bind/refcount round-trip:** push blocks under `fileId_A`, `BlocksBind` the same CIDs under `fileId_B` (no re-push), `FilesDelete(A)`, confirm blocks survive, `FilesDelete(B)`, confirm GC eligibility. (Validates the verified primitives end-to-end over the wire.)
-2. **`payloads` dataset + local index:** per-object `payloads` dataset, apply-path mirror into a space-level index, object-delete cascades tombstones to payload rows and the index.
+2. **`payloads` materialization:** per-object `payloads` dataset wired through the shared-collection override into a common collection (like properties → `objects`); object-delete cascades tombstones to *all* its payload rows.
 3. **Envelope + key-reuse dedup:** two payloads, same plaintext → same CIDs → second is bind-only.
 4. **Offline ordering torture test:** offline delete + recreate of the same content; verify the `ErrCidsNotExist` → re-push-from-local path and that local GC never strands blocks.
 5. **`blocks.db` perf:** thousands of 1 MB blobs in a shared blocks DB while live queries run on the metadata DB — confirm no query degradation; confirm `spaceId`-scoped delete.
@@ -182,7 +183,7 @@ type AddOpts struct {
 
 ## Open questions / decisions to confirm in implementation
 1. **Inline threshold (32 KB):** confirm against real asset-size histograms.
-2. **Apply-path mirror:** where the per-object `payloads` dataset → local space index projection hooks into the apply/subscription engine, and how object-delete cascades tombstones to payload rows.
+2. **Shared-collection materialization:** wire `payloads` through the Controller's shared-collection override (like `SystemPropertiesHandler` → `objects`); confirm object-delete cascades tombstones to *all* the object's payload rows.
 3. **Future copy primitive:** carry the "re-mint fileId + re-bind" constraint into whoever designs `DuplicateObject`.
 4. **`blocks.db` shape:** confirm one shared account-wide DB + `spaceId` tag (chosen) survives the perf spike vs a per-space instance.
 5. **Worker ordering:** bind-before-delete + re-push-on-`ErrCidsNotExist`; where the pending-bind set lives so local GC can consult it.
@@ -198,7 +199,7 @@ type AddOpts struct {
 
 ## Dependencies
 - **Space** — files live in a space; ACL/quota/encryption inherited.
-- **Data structure / datasets** — per-object `payloads` dataset + a local space-level index; blocks in a shared `blocks.db`.
+- **Data structure / datasets** — per-object `payloads` dataset materialized into a common collection via the shared-collection override (like properties → `objects`); blocks in a shared `blocks.db`.
 - **Sync status (`docs/09`)** — payload `status` is part of the general sync-status surface.
 - **filenode** — unchanged; driven via `commonfile` RPC. No new server data type required.
 
@@ -206,4 +207,4 @@ type AddOpts struct {
 
 ## History (superseded directions)
 - **v0 (rejected):** files as a first-class any-sync data type. Expensive cross-team server change; wrong workload fit; SDK-only gets the same wins with zero server changes.
-- **v1 (superseded):** space-level `files` collection referenced by many objects + two-phase epoch mark-and-sweep GC with a 7-day grace to absorb a premature-deletion race. Superseded by per-object-owned `payloads` (+ local space index) + SDK-minted fileId + filenode refcount, which removes the distributed mark-and-sweep entirely (the race can't occur under causal-DAG ownership) and trades it for a local `count(*)` block-GC check.
+- **v1 (superseded):** space-level `files` collection referenced by many objects + two-phase epoch mark-and-sweep GC with a 7-day grace to absorb a premature-deletion race. Superseded by per-object-owned `payloads` (materialized into a common collection via the shared-collection override, like properties) + SDK-minted fileId + filenode refcount, which removes the distributed mark-and-sweep entirely (the race can't occur under causal-DAG ownership) and trades it for a local `count(*)` block-GC check.

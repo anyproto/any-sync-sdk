@@ -255,6 +255,8 @@ $set "name" → "Hello"
 
 Each entry of a multi-field `$set` is applied as an independent gated single-path `$set` sharing the change's versionId. Use the multi-field form to "create" a record atomically (it's the closest analogue to the removed `insert` op): if the target id doesn't exist, the record is auto-created and every field lands as a single batch.
 
+Validation is likewise **per entry** on the inbound/replay path — both the controller's content checks (path syntax + field-class scope) and the handler's `BeforeModify` rules (pins, terminal-status, shape). A key that violates a rule is shed individually and recorded as a rejection while the op's valid siblings still apply; the whole op is dropped only when every key offends. This matters whenever a constraint tightened after the change was written: a field reclassified to another scope (e.g. spaceIndex `localStatus` synced→local), a field pinned, or a status turned terminal. An old create that bundled such a field with its still-valid siblings materializes the record minus the offending key rather than vanishing wholesale. (Writer-side `ValidateChange` stays whole-change strict — a fresh local change with any bad key is rejected before it reaches the DAG.)
+
 For each path, if `_ver[path] < versionId`, write value and set `_ver[path] = versionId`. Else skip that path.
 
 Writes targeting the immutable `id` field (single-path or as a key in the multi-field payload) reject the whole change at pre-apply validation (§3.1), consistent with the path rules in §5.0.
@@ -484,7 +486,14 @@ mergeReplace(rec, path, verSubtree, value, v):              // value nil = unset
 After each apply, rewrite `_ver` to its canonical compact form using only the lossless rules from §3.2 (drop explicit entries equal to their level's `*`; collapse a node whose `*` is present and whose entries all equal it). Never invent a `*` or collapse sibling enumerations that merely share a version — that claims authority no write had and breaks convergence. Implementations may defer compaction; correctness does not depend on it.
 
 ### 7.2 Write transaction
-All ops within one change are applied atomically (one any-store `WriteTx` in Phase 2). Events fire **after** the transaction commits. Validation is two-phase: every op in the change is validated first; if any handler rejects, the entire change is dropped before any mutation runs.
+All ops within one change are applied atomically (one any-store `WriteTx` in Phase 2). Events fire **after** the transaction commits.
+
+Validation is non-fatal on the inbound/replay path and operates at op (and, for the multi-field form, key) granularity, not whole-change. Two gates run:
+
+- **Content validation** (path syntax + field-class scope) — controller-level, before the handler.
+- **Handler validation** (`BeforeCreate`/`BeforeModify` — pins, terminal-status, shape) — per op on the modify path.
+
+An op that fails either gate is dropped and recorded as a rejection while the rest of the change still commits (watermark advances, causality preserved). Inside a multi-field `$set`/`$unset` the offending **key** is shed individually and the surviving keys still apply; the whole op is dropped only when every key fails. This is what keeps one bad historical change — or a constraint that tightened after a change was written (a field pinned/closed, a status turned terminal, a scope reclassified) — from wedging cold restore or silently losing the change's unrelated edits. Writer-side `ValidateChange` stays whole-change strict, so fresh local changes can't enter the DAG with a bad op in the first place.
 
 ---
 

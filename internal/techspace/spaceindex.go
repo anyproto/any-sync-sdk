@@ -194,10 +194,14 @@ func (SpaceIndexHandler) BeforeDelete(_ *crdt.ChangeCtx, _ *crdt.RecordChange, _
 }
 
 // rejectMultiField walks the payload of a multi-field $set/$unset and
-// drops the whole op if any key violates the immutability or terminal-
-// status rules. We reject the whole op (not just the offending key)
-// because anyenc payloads can't be edited in place mid-validate, and
-// callers shouldn't bundle constrained keys with unconstrained ones.
+// returns the first key that violates the immutability or terminal-status
+// rules. It reports per the WHOLE op (one error, first hit) — the crdt
+// apply loop turns that into per-key salvage: on rejection it re-probes
+// each key as a single-path op (which lands in BeforeModify's single-path
+// branch below), so only the offending key is shed and the op's valid
+// siblings still apply (crdt.recordModifier.beforeModifyApply). This
+// keeps an old create that bundled `type` with name/status from vanishing
+// when it replays through the modify path.
 func rejectMultiField(payload, before *anyenc.Value) error {
 	if payload == nil || payload.Type() != anyenc.TypeObject {
 		return nil

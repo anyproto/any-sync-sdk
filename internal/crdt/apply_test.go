@@ -1622,6 +1622,61 @@ func TestValidation_DropsOffendingOp(t *testing.T) {
 	assert.Equal(t, "red", rec.GetString("color")) // $set landed
 }
 
+// lockKeyHandler rejects any op (single-path or per-key of a multi-field
+// op) whose head field is "locked".
+type lockKeyHandler struct{ DefaultHandler }
+
+func (lockKeyHandler) BeforeModify(_ *ChangeCtx, _ *RecordChange, op *Op, _ *Sink) error {
+	if len(op.Path) == 0 {
+		var hit error
+		if op.Payload != nil && op.Payload.Type() == anyenc.TypeObject {
+			obj, _ := op.Payload.Object()
+			obj.Visit(func(k []byte, _ *anyenc.Value) {
+				if string(k) == "locked" {
+					hit = assert.AnError
+				}
+			})
+		}
+		return hit
+	}
+	if op.Path[0] == "locked" {
+		return assert.AnError
+	}
+	return nil
+}
+
+// A handler that rejects one field within a multi-field $set on the modify
+// path drops only that key — the bundled siblings still apply. This is the
+// handler-rule twin of field-class salvage: a constraint that tightened
+// after the change was written must not lose unrelated edits bundled with
+// the now-rejected field.
+func TestModify_MultiFieldHandlerRejectSalvagesSiblings(t *testing.T) {
+	arena := &anyenc.Arena{}
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: lockKeyHandler{DefaultHandler{}}, Schema: dynSchema})
+	require.NoError(t, err)
+
+	// Create the record so the next op runs through the modify path.
+	require.NoError(t, st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+		Type:    OpSet,
+		Payload: recordPayload(arena, map[string]any{"name": "hi"}),
+	})))
+	res, err := st.ApplyChangeWithResult(ctx, makeChange("v2", "r1", Op{
+		Type:    OpSet,
+		Payload: recordPayload(arena, map[string]any{"locked": "no", "free": "yes"}),
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1, "only the locked key rejected")
+	assert.Equal(t, 0, res.Rejections[0].OpIndex)
+
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec)
+	assert.Empty(t, rec.GetString("locked"), "rejected key never landed")
+	assert.Equal(t, "yes", rec.GetString("free"), "bundled sibling landed")
+}
+
 func TestUnknownDataset(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}

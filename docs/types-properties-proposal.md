@@ -133,6 +133,7 @@ No max/min comparison — known or unknown, nothing else.
 
 - **Pre-apply, per-op**: each op in a `RecordChange` is validated against the current schema before being applied.
 - **Per-op**: ops that fail schema validation are dropped silently; other ops in the same change still apply. If all ops in a record change are dropped, that record is skipped but the Change as a whole still commits (watermark advances, causality preserved).
+- **Per-key inside a multi-field `$set`/`$unset`**: dropping granularity goes one level finer than the op. A key that fails field-class (scope) or path validation is shed individually; the op's surviving keys still apply, and the op is dropped wholesale only when every key offends. This keeps a create that bundled a since-reclassified field (e.g. a synced field later moved to `local` scope) from disappearing on replay — the record materializes from its still-valid keys.
 - **Path syntax validation** (reserved `_*` prefix, empty path segments, dots inside segments) is separate and aborts the whole change — path issues indicate a protocol-level bug.
 - **Writer-side responsibility**: the SDK's write API prevalidates both path syntax and schema before submitting to the DAG. Per-op drops on receive are defensive — they exist for cross-peer bugs and removed-property replays, not for programmer mistakes in the local client.
 

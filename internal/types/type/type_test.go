@@ -219,10 +219,8 @@ func TestPropertyHandler_MultiFieldSchemaEditDropped(t *testing.T) {
 		}),
 	)))
 
-	// Multi-field $set whose payload includes `kind` → whole op
-	// dropped, since schemaBearingFields are pinned. (We could
-	// later split per-key, but pinning a whole multi-field op is
-	// the safer Phase-1 default.)
+	// Multi-field $set bundling pinned `kind` with an unconstrained
+	// `name`: per-key salvage sheds only the pinned key, the name lands.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v2", "ch-multi", propId, false,
 		setMulti(arena, map[string]any{
@@ -233,11 +231,8 @@ func TestPropertyHandler_MultiFieldSchemaEditDropped(t *testing.T) {
 
 	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
 	require.NotNil(t, rec)
-	assert.Equal(t, "string", rec.GetString(typetype.FieldKind))
-	// Per the rejection-is-whole-op rule, the bundled name change
-	// also doesn't land. Callers wanting display edits must avoid
-	// bundling them with schema-bearing keys.
-	assert.NotEqual(t, "AlsoChanged", rec.GetString(typetype.FieldName))
+	assert.Equal(t, "string", rec.GetString(typetype.FieldKind), "kind stayed pinned")
+	assert.Equal(t, "AlsoChanged", rec.GetString(typetype.FieldName), "bundled non-pinned key landed")
 }
 
 // ----------------------------------------------------------------------------
@@ -341,7 +336,8 @@ func TestPropertyHandler_ScopeEditDropped(t *testing.T) {
 		"v2", "change-edit-scope", propId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldScope}, Payload: arena.NewString("synced")},
 	)))
-	// Multi-field edit (with an otherwise-legal name change) drops whole-op.
+	// Multi-field edit bundling the pinned scope with a legal name change:
+	// per-key salvage sheds only the scope key, the name lands.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v3", "change-edit-scope-multi", propId, false,
 		setMulti(arena, map[string]any{
@@ -353,5 +349,5 @@ func TestPropertyHandler_ScopeEditDropped(t *testing.T) {
 	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
 	require.NotNil(t, rec)
 	assert.Equal(t, "local", rec.GetString(typetype.FieldScope), "scope is pinned after first write")
-	assert.Equal(t, "", rec.GetString(typetype.FieldName), "multi-field op touching scope drops wholesale")
+	assert.Equal(t, "Renamed", rec.GetString(typetype.FieldName), "bundled non-pinned key still landed")
 }

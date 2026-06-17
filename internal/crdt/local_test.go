@@ -136,6 +136,50 @@ func TestApply_LocalSetIsolatedFromSynced(t *testing.T) {
 	assert.Equal(t, "offloaded", rec.GetString("status"))
 }
 
+// A synced multi-field $set that bundles a Local-class field with synced
+// fields sheds ONLY the local key — the synced siblings still land. This
+// is the spaceIndex localStatus reclassification case: an old create
+// packed type/name/localStatus in one op; dropping the whole op would lose
+// the record. Only the offending key is reported in res.Rejections.
+func TestApply_SyncedMultiFieldDropsOnlyLocalKey(t *testing.T) {
+	st := newClassController(t)
+	arena := &anyenc.Arena{}
+
+	res, err := st.ApplyChangeWithResult(ctx, makeUpsert("v1", "r1", Op{
+		Type:    OpSet,
+		Payload: recordPayload(arena, map[string]any{"name": "real", "status": "offloaded"}),
+	}))
+	require.NoError(t, err, "a local key in a multi-field op must not abort the create")
+	require.Len(t, res.Rejections, 1, "only the local key is rejected")
+	assert.Equal(t, 0, res.Rejections[0].OpIndex)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrValidation)
+
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec, "the create materialized from its synced fields")
+	assert.Equal(t, "real", rec.GetString("name"), "synced sibling landed")
+	assert.Empty(t, rec.GetString("status"), "the Local-class key never landed via the synced route")
+}
+
+// When every key of a multi-field op offends, the whole op is dropped and
+// the record never materializes — same outcome as the single-field case.
+func TestApply_SyncedMultiFieldAllKeysOffendingDropsOp(t *testing.T) {
+	st := newClassController(t)
+	arena := &anyenc.Arena{}
+
+	res, err := st.ApplyChangeWithResult(ctx, makeUpsert("v1", "r1", Op{
+		Type:    OpSet,
+		Payload: recordPayload(arena, map[string]any{"status": "offloaded", "createdAt": 5}),
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 2, "both offending keys reported")
+	// Upsert still creates the record shell; the point is that no
+	// offending field landed (the op carried no salvageable content).
+	if rec := st.Get(ctx, testDS, "r1"); rec != nil {
+		assert.Empty(t, rec.GetString("status"))
+		assert.Zero(t, rec.GetInt("createdAt"))
+	}
+}
+
 // ----------------------------------------------------------------------------
 // DynamicScopeByKey — per-key-scoped dynamic datasets (the objects dataset)
 // ----------------------------------------------------------------------------

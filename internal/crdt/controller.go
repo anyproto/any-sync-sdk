@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -661,38 +662,47 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// historical change must not halt cold restore. Canonical case: a
 	// field that was synced-scope when an older peer wrote it, later
 	// reclassified local-scope; its historical synced $set now violates
-	// field-class and would otherwise wedge every boot. Local writers
+	// field-class and would otherwise wedge every boot. For a multi-field
+	// $set the offending field is shed key-by-key (filterOpFields) so the
+	// op's still-valid siblings survive — without this, an old create that
+	// packed the reclassified field in one op with its synced fields would
+	// drop wholesale and the record would never materialize. Local writers
 	// still fail fast — ValidateChange runs the same checks before
 	// AddContent, so a fresh scope-violating change never enters the DAG.
 	ds := c.schemas[ch.Dataset]
 	scopeByKey := c.scopeByKey[ch.Dataset]
 	route := routeOf(&ch)
 	recordsCopied := false
+	var filterArena anyenc.Arena // backs rewritten multi-field payloads; lives through apply
 	for i := range ch.Records {
 		ops := ch.Records[i].Ops
 		kept := ops
 		filtered := false
 		for j, op := range ops {
-			if err := opContentValid(ds, route, scopeByKey, op); err != nil {
+			outOp, rejErrs, drop := filterOpFields(&filterArena, ds, route, scopeByKey, op)
+			for _, e := range rejErrs {
 				res.Rejections = append(res.Rejections, OpRejection{
 					RecordIndex: i,
 					OpIndex:     j,
 					RecordId:    resolvedIds[i],
-					Err:         errors.Join(ErrValidation, fmt.Errorf("op %s: %w", op.Type, err)),
+					Err:         errors.Join(ErrValidation, fmt.Errorf("op %s: %w", op.Type, e)),
 				})
-				if !filtered {
-					// Copy ops on first drop so we never mutate the caller's slice.
-					kept = append([]Op(nil), ops[:j]...)
-					filtered = true
-				}
+			}
+			if (drop || len(rejErrs) > 0) && !filtered {
+				// A dropped or rewritten op forces a copy of the caller's
+				// ops slice so we never mutate it in place.
+				kept = append([]Op(nil), ops[:j]...)
+				filtered = true
+			}
+			if drop {
 				continue
 			}
 			if filtered {
-				kept = append(kept, op)
+				kept = append(kept, outOp)
 			}
 		}
 		if filtered {
-			// Copy the records slice on first drop, then swap in the trimmed ops.
+			// Copy the records slice on first change, then swap in the trimmed ops.
 			if !recordsCopied {
 				ch.Records = append([]RecordChange(nil), ch.Records...)
 				recordsCopied = true
@@ -841,6 +851,68 @@ func opContentValid(ds schema.Dataset, route schema.Scope, scopeByKey bool, op O
 		}
 	}
 	return nil
+}
+
+// filterOpFields runs the same per-op content checks as opContentValid,
+// but salvages the valid parts of a multi-field $set/$unset instead of
+// dropping the whole op. Each offending key is removed and reported in
+// rejErrs; the surviving keys are kept in a rewritten op (out). drop is
+// true only when the op carries no usable content — a single-path op
+// that violates any rule (nothing to salvage), or a multi-field op whose
+// every key offends.
+//
+// The canonical multi-field case is an old create that packed a
+// since-reclassified field in with its siblings: e.g. spaceIndex
+// localStatus, synced-scope when the create was written, later
+// reclassified ScopeLocal. Its historical synced $set bundled
+// type/name/remoteStatus/localStatus in one multi-field op; dropping the
+// whole op on replay would lose the record entirely, so only the
+// localStatus key is shed and the create still materializes. (localStatus
+// is device-local and rebuilt off the local route anyway.)
+//
+// arena backs the rewritten payload container. The surviving values are
+// referenced from the caller's change buffer — alive through apply, and
+// re-cloned into the modifier arena by applySet — so they are not copied.
+func filterOpFields(arena *anyenc.Arena, ds schema.Dataset, route schema.Scope, scopeByKey bool, op Op) (out Op, rejErrs []error, drop bool) {
+	// Only the multi-field form has sub-structure to salvage. Single-path
+	// ops, deletes, and malformed (non-object) multi-field payloads keep
+	// whole-op semantics via opContentValid.
+	isMultiField := (op.Type == OpSet || op.Type == OpUnset) && len(op.Path) == 0 &&
+		op.Payload != nil && op.Payload.Type() == anyenc.TypeObject
+	if !isMultiField {
+		if err := opContentValid(ds, route, scopeByKey, op); err != nil {
+			return op, []error{err}, true
+		}
+		return op, nil, false
+	}
+
+	kept := arena.NewObject()
+	survivors := 0
+	obj, _ := op.Payload.Object()
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		key := string(k)
+		segments := strings.Split(key, ".")
+		if err := validatePath(segments); err != nil {
+			rejErrs = append(rejErrs, fmt.Errorf("key %q: %w", key, err))
+			return
+		}
+		if err := classifyFieldWrite(ds, segments[0], route, scopeByKey); err != nil {
+			rejErrs = append(rejErrs, fmt.Errorf("key %q: %w", key, err))
+			return
+		}
+		kept.Set(key, v)
+		survivors++
+	})
+
+	if len(rejErrs) == 0 {
+		return op, nil, false // every key valid — keep the original op untouched
+	}
+	if survivors == 0 {
+		return op, rejErrs, true // nothing salvageable — drop the whole op
+	}
+	out = op
+	out.Payload = kept
+	return out, rejErrs, false
 }
 
 // applyRecordChange applies one RecordChange via UpsertId or UpdateId,
@@ -1194,16 +1266,11 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			// Local and Injected materializations are handler-exclusive
 			// (see Change.Local / Change.Injected): no handler
 			// validation/derivation, just the gated apply.
-			if !ch.Local && !ch.Injected {
-				if err := m.handler.BeforeModify(ctx, rc, op, m.sink); err != nil {
-					// Per-op drop; other ops in the same RecordChange
-					// still apply. Surface so the caller knows the
-					// change committed with a hole.
-					m.rejections = append(m.rejections, OpRejection{OpIndex: i, Err: err})
-					continue
-				}
+			if ch.Local || ch.Injected {
+				applyOp(a, existing, *ch, *op)
+				continue
 			}
-			applyOp(a, existing, *ch, *op)
+			m.beforeModifyApply(a, existing, ctx, op, i)
 		}
 		m.drainDerivedTo(a, existing, ch)
 	}
@@ -1213,6 +1280,62 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil
+}
+
+// beforeModifyApply runs the handler's BeforeModify gate and applies op
+// to existing when it passes, recording per-op rejections otherwise (the
+// rest of the RecordChange still applies — a drop leaves a hole, never a
+// fatal). For the multi-field $set/$unset form it salvages per-key: when
+// the handler rejects the combined op, each key is re-probed as the
+// independent single-path op it is defined to be (spec §5.1) and only the
+// rejected keys are shed — the surviving keys still apply.
+//
+// Without this, a handler constraint that tightened AFTER a change was
+// written — a field pinned/closed, a status turned terminal, or a field
+// reclassified to another scope — would drop the whole bundled op and
+// silently lose its unrelated sibling edits. Changing such rules is
+// routine, so the all-or-nothing drop would wedge otherwise-valid history
+// (e.g. an old spaceIndex create that packed `type` with name/status
+// replaying through the modify path). This is the handler-rule twin of
+// the field-class salvage filterOpFields does one layer up.
+//
+// Safe to call BeforeModify more than once: every handler's BeforeModify
+// is pure validation (no sink writes), so the combined-then-per-key
+// probing has no side effects, and each handler's single-path branch is
+// the per-key equivalent of its multi-field branch.
+func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Value, ctx *ChangeCtx, op *Op, opIndex int) {
+	isMultiField := (op.Type == OpSet || op.Type == OpUnset) && len(op.Path) == 0 &&
+		op.Payload != nil && op.Payload.Type() == anyenc.TypeObject
+
+	err := m.handler.BeforeModify(ctx, m.rec, op, m.sink)
+	if err == nil {
+		applyOp(a, existing, *m.ch, *op)
+		return
+	}
+	if !isMultiField {
+		// Single-path op (or malformed payload): nothing to salvage.
+		m.rejections = append(m.rejections, OpRejection{OpIndex: opIndex, Err: err})
+		return
+	}
+
+	// Combined op rejected: find the offending keys by probing each
+	// independently and apply the survivors as a trimmed multi-field op.
+	kept := a.NewObject()
+	survivors := 0
+	obj, _ := op.Payload.Object()
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		probe := Op{Type: op.Type, Path: strings.Split(string(k), "."), Payload: v}
+		if perr := m.handler.BeforeModify(ctx, m.rec, &probe, m.sink); perr != nil {
+			m.rejections = append(m.rejections, OpRejection{OpIndex: opIndex, Err: perr})
+			return
+		}
+		kept.Set(string(k), v)
+		survivors++
+	})
+	if survivors == 0 {
+		return
+	}
+	applyOp(a, existing, *m.ch, Op{Type: op.Type, Payload: kept})
 }
 
 // applySibling is the modifier path for a Sibling write — no handler, no

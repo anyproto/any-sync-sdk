@@ -77,6 +77,38 @@ func TestSpaceIndexHandler_CreateLands(t *testing.T) {
 	assert.Equal(t, "My Space", rec.GetString(techspace.FieldName))
 }
 
+// Regression: localStatus was reclassified ScopeLocal after spaces had
+// already been created. Old creates packed localStatus into ONE multi-field
+// $set with type/name/remoteStatus. On replay the synced route can't write a
+// Local-class field; before the per-key salvage fix the whole op dropped and
+// the space vanished from the index. Now only localStatus is shed and the
+// record still materializes from its synced fields.
+func TestSpaceIndexHandler_LegacyCreateWithLocalStatusStillLands(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-legacy"
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{
+			techspace.FieldType:         "private",
+			techspace.FieldName:         "Legacy Space",
+			techspace.FieldRemoteStatus: techspace.StatusActive,
+			techspace.FieldLocalStatus:  techspace.StatusActive,
+		}),
+	))
+	require.NoError(t, err, "a legacy local key must not abort the create on replay")
+	require.Len(t, res.Rejections, 1, "only the localStatus key is rejected")
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec, "the space materialized from its synced fields")
+	assert.Equal(t, "private", rec.GetString(techspace.FieldType))
+	assert.Equal(t, "Legacy Space", rec.GetString(techspace.FieldName))
+	assert.Equal(t, techspace.StatusActive, rec.GetString(techspace.FieldRemoteStatus))
+	assert.Empty(t, rec.GetString(techspace.FieldLocalStatus), "the Local-class field never landed via the synced route")
+}
+
 func TestSpaceIndexHandler_CreateRejectedWithoutType(t *testing.T) {
 	ctrl := newSpaceIndexController(t)
 	arena := &anyenc.Arena{}
@@ -211,6 +243,41 @@ func TestSpaceIndexHandler_TypeEditDropped(t *testing.T) {
 	assert.Equal(t, "Renamed", rec.GetString(techspace.FieldName), "non-pinned op landed")
 }
 
+// A multi-field op that bundles a pinned field (`type`) with an
+// unconstrained one (`name`) through the MODIFY path sheds only the pinned
+// key — the bundled name still lands. Before per-key salvage the handler
+// dropped the whole op, which is how legacy creates that re-asserted
+// type+name in one op vanished on replay through the modify branch.
+func TestSpaceIndexHandler_MultiFieldTypeBundleSalvagesSiblings(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-bundle"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{
+			techspace.FieldType: "private",
+			techspace.FieldName: "Old",
+		}),
+	)))
+	// Record now exists → this multi-field op runs through BeforeModify.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", spaceId, false,
+		setMulti(arena, map[string]string{
+			techspace.FieldType: "shared", // pinned — rejected
+			techspace.FieldName: "Renamed",
+		}),
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1, "only the pinned key is rejected")
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "private", rec.GetString(techspace.FieldType), "type stayed pinned")
+	assert.Equal(t, "Renamed", rec.GetString(techspace.FieldName), "bundled sibling landed")
+}
+
 func TestSpaceIndexHandler_StatusActiveToDeletedPasses(t *testing.T) {
 	ctrl := newSpaceIndexController(t)
 	arena := &anyenc.Arena{}
@@ -269,8 +336,8 @@ func TestSpaceIndexHandler_StatusOutOfDeletedDroppedMultiField(t *testing.T) {
 			techspace.FieldRemoteStatus: techspace.StatusDeleted,
 		}),
 	)))
-	// Multi-field $set whose payload includes localStatus → whole op
-	// dropped because the terminal-status rule fires on it.
+	// Multi-field $set bundling a terminal-status revival with a name edit:
+	// per-key salvage sheds only the revival, the name still lands.
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
 		"v2", spaceId, false,
 		setMulti(arena, map[string]string{
@@ -281,9 +348,10 @@ func TestSpaceIndexHandler_StatusOutOfDeletedDroppedMultiField(t *testing.T) {
 
 	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
 	require.NotNil(t, rec)
-	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldRemoteStatus))
-	// Bundled name change is also dropped — see rejectMultiField rationale.
-	assert.NotEqual(t, "Zombie", rec.GetString(techspace.FieldName))
+	assert.Equal(t, techspace.StatusDeleted, rec.GetString(techspace.FieldRemoteStatus),
+		"terminal status held against the revival key")
+	assert.Equal(t, "Zombie", rec.GetString(techspace.FieldName),
+		"bundled non-status key still landed")
 }
 
 // ----------------------------------------------------------------------------

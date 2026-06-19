@@ -13,6 +13,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
@@ -138,6 +139,19 @@ type Service struct {
 	delCancel context.CancelFunc
 	delWG     sync.WaitGroup
 	delKick   chan struct{}
+
+	// Join controller: a background loop that drives joiner-side
+	// post-acceptance loading. For each tech-space row with
+	// localStatus="joining" it runs an any-sync ACL waiter; on
+	// acceptance it loads the space and flips the row to active, on
+	// decline it marks it deleted. joinKick wakes it immediately after
+	// a local Join; otherwise it ticks on joinReconcileInterval.
+	// joinWaiters holds the live waiter per spaceId (guarded by mu),
+	// like memberWatchers. joinCancel/joinWG are drained in Close.
+	joinCancel  context.CancelFunc
+	joinWG      sync.WaitGroup
+	joinKick    chan struct{}
+	joinWaiters map[string]aclwaiter.AclWaiter
 }
 
 // New returns a Service ready to be returned via SDK.Spaces(). The
@@ -161,9 +175,12 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		accountMirrors:     make(map[string]*accountMirror),
 		memberWatchers:     make(map[string]*memberWatcher),
 		delKick:            make(chan struct{}, 1),
+		joinKick:           make(chan struct{}, 1),
+		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	s.startDeletionReconciler()
+	s.startJoinController()
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store
 	// to compute Synced/Total. nil-store cases (querying status for
@@ -764,7 +781,7 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 	if jc == nil {
 		return nil, errors.New("spaceimpl: Join: joining client unavailable")
 	}
-	_, err = jc.RequestJoin(ctx, inv.SpaceId, list.RequestJoinPayload{
+	aclHeadId, err := jc.RequestJoin(ctx, inv.SpaceId, list.RequestJoinPayload{
 		InviteKey: inv.InviteKey,
 		Metadata:  encodeMetadata(req.Metadata),
 	})
@@ -787,6 +804,13 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 			return nil, fmt.Errorf("spaceimpl: mark joining: %w", err)
 		}
 	}
+	// Persist the ACL head so the post-acceptance waiter can detect a
+	// decline, then kick the join controller to start waiting now (it
+	// would otherwise pick the row up on its next boot/tick pass).
+	if _, err := s.tsp.SetAclHeadId(ctx, inv.SpaceId, aclHeadId); err != nil {
+		return nil, fmt.Errorf("spaceimpl: record acl head: %w", err)
+	}
+	s.kickJoinController()
 	return nil, ErrJoinPending
 }
 
@@ -816,6 +840,14 @@ func (s *Service) Close(_ context.Context) error {
 		s.delCancel()
 	}
 	s.delWG.Wait()
+	// Stop the join controller and close any live ACL waiters before
+	// draining members watchers — onFinish loads a space (which starts
+	// watchers), so it must not run during shutdown.
+	if s.joinCancel != nil {
+		s.joinCancel()
+	}
+	s.joinWG.Wait()
+	s.stopJoinWaiters()
 	s.watchers.stopAll()
 	return nil
 }

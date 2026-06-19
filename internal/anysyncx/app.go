@@ -11,7 +11,9 @@ import (
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
+	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/nodeconfsource"
 	"github.com/anyproto/any-sync/net/peerservice"
@@ -183,6 +185,20 @@ func (a *App) JoiningClient() aclclient.AclJoiningClient { return a.joining }
 
 // AccountKeys holds the decoded peer/sign keys.
 func (a *App) AccountKeys() *accountdata.AccountKeys { return a.keys }
+
+// NewAclWaiter builds an any-sync ACL waiter bound to the running app:
+// a background poller over the network ACL (no local space storage
+// needed) that fires onFinish once the account gains permissions on
+// spaceId, or onReject once the join request is declined at/after
+// aclHeadId. The caller drives its lifecycle via Run(ctx) / Close(ctx).
+// Used by the joiner-side post-acceptance loader.
+func (a *App) NewAclWaiter(spaceId, aclHeadId string, onFinish, onReject func(list.AclList) error) (aclwaiter.AclWaiter, error) {
+	w := aclwaiter.New(spaceId, aclHeadId, onFinish, onReject)
+	if err := w.Init(a.a); err != nil {
+		return nil, fmt.Errorf("anysyncx: init acl waiter: %w", err)
+	}
+	return w, nil
+}
 
 // NetworkId is the id of the any-sync network this app is bound to.
 // Needed to build the signed space-delete confirmation, which the

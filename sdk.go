@@ -114,7 +114,19 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// are skipped too — Service.Join wrote those before any-sync
 	// storage exists.
 	for _, rec := range tsp.List(ctx) {
-		if rec.LocalStatus == techspace.StatusDeleted {
+		// Skip deletion tombstones. Both delete paths — local
+		// Service.Delete and inbound reconcile — record the delete via
+		// the SYNCED RemoteStatus field (LocalStatus is never set to
+		// "deleted"). Eager-loading a deleted space rebuilds its
+		// commonspace and storage and starts periodic headsync, which
+		// the node rejects with "space is deleted". If local storage
+		// still lingers (e.g. an offload that was interrupted, or one
+		// re-created by a previous build that eager-loaded tombstones),
+		// reclaim it now — OffloadSpace is idempotent and best-effort.
+		if rec.RemoteStatus == techspace.StatusDeleted || rec.LocalStatus == techspace.StatusDeleted {
+			if app.SpaceExists(rec.Id) {
+				spaces.OffloadSpace(ctx, rec.Id)
+			}
 			continue
 		}
 		if !app.SpaceExists(rec.Id) {

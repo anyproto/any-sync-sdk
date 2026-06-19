@@ -82,6 +82,10 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
+	// Resume any join left pending from a previous session now that the
+	// tech space is open (the join controller started in spaceimpl.New,
+	// before this point, so its initial scan saw an empty index).
+	spaces.ResumePendingJoins()
 
 	account := newAccountImpl(app, tsp, spaces)
 

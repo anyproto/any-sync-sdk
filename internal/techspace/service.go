@@ -277,6 +277,35 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 	return obj.LocalSet(ctx, change)
 }
 
+// SetAclHeadId records the ACL head id from RequestJoin on the joining
+// row via the local-set path (device-local; never enters the DAG). Read
+// back by the joiner-side post-acceptance waiter to detect a decline.
+func (s *Service) SetAclHeadId(ctx context.Context, spaceId, aclHeadId string) (object.WriteResult, error) {
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldAclHeadId},
+					Payload: arena.NewString(aclHeadId),
+				}},
+			},
+		},
+	}
+	return obj.LocalSet(ctx, change)
+}
+
 // SetRemoteStatus updates the SYNCED remoteStatus field — account-wide
 // state that propagates to every device. Used for account-wide delete
 // (status=StatusDeleted); the handler keeps deleted terminal.

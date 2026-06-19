@@ -159,18 +159,28 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	require.NoError(t, sp.ACL().AcceptRequest(ctx, joinReq.RecordId, space.PermissionWriter),
 		"alice: AcceptRequest")
 
-	// Bob waits for the active flip on his side. Members.Me() forces
-	// a tech-space load + ACL refresh on Bob, which is exactly what
-	// the cold-sync flow already validated for the same-key case.
-	bobSpace, err := bob.Spaces().Get(ctx, sp.Id())
-	if err != nil {
-		// Get may fail until the space-index entry has propagated.
-		// Poll briefly before giving up.
-		require.True(t, waitFor(ctx, 30*time.Second, 1*time.Second, func() bool {
-			bobSpace, err = bob.Spaces().Get(ctx, sp.Id())
-			return err == nil
-		}), "bob: Spaces().Get(%s) never succeeded", sp.Id())
+	// Bob's join controller drives the rest autonomously: its ACL
+	// waiter (kicked when Join ran) detects Alice's accept, pulls the
+	// space, and flips the tech-space row to active — no caller-side
+	// Get() retry loop. Wait for that flip to surface in List.
+	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+		_ = bob.Spaces().SyncSpaceList(ctx)
+		infos, listErr := bob.Spaces().List(ctx)
+		if listErr != nil {
+			return false
+		}
+		for _, si := range infos {
+			if si.Id == sp.Id() && si.Status == space.StatusActive {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("bob's space never flipped to active autonomously")
 	}
+	// Get now succeeds first try — the controller already loaded it.
+	bobSpace, err := bob.Spaces().Get(ctx, sp.Id())
+	require.NoError(t, err, "bob: Spaces().Get(%s) after autonomous flip", sp.Id())
 
 	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
 		_ = bobSpace.SyncHeads(ctx)

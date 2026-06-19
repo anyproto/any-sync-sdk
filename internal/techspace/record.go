@@ -40,6 +40,12 @@ type SpaceIndexRecord struct {
 	LocalStatus  string
 	RemoteStatus string
 
+	// AclHeadId is the ACL head id from RequestJoin, recorded on a
+	// joining row so the post-acceptance waiter can detect a decline.
+	// Device-local (FieldAclHeadId, ScopeLocal); empty on non-joining
+	// rows. Written via Service.SetAclHeadId after the row exists.
+	AclHeadId string
+
 	// CreatedAt is the added-to-account time in unix seconds, stamped by
 	// SpaceIndexHandler.BeforeCreate when the row first lands (see
 	// FieldCreatedAt). Zero on rows created before the field existed —
@@ -64,6 +70,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		IconCID:      v.GetString(FieldIcon),
 		LocalStatus:  v.GetString(FieldLocalStatus),
 		RemoteStatus: v.GetString(FieldRemoteStatus),
+		AclHeadId:    v.GetString(FieldAclHeadId),
 		// Float64 read — GetInt narrows through `int` and would truncate
 		// on 32-bit platforms; anyenc numbers are float64 on the wire.
 		CreatedAt:    int64(v.GetFloat64(FieldCreatedAt)),

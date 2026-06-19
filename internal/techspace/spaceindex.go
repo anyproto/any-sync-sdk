@@ -30,6 +30,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldSpaceType, Name: "Space type", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal},
+		{Id: FieldAclHeadId, Name: "Acl head id", Schema: str(), Scope: schema.ScopeLocal},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
 	}}
 }
@@ -72,6 +73,15 @@ const (
 	// account-wide delete signal (StatusDeleted) so every device drops
 	// the space; the handler keeps it terminal.
 	FieldRemoteStatus = "remoteStatus"
+	// FieldAclHeadId is a DEVICE-LOCAL field (schema.ScopeLocal): the ACL
+	// head id returned by RequestJoin, recorded on the joining row so the
+	// joiner-side post-acceptance waiter can detect a decline (the join
+	// record being removed at-or-after this head). Per-device like
+	// localStatus — a pending join is a local lifecycle concern, never
+	// synced. Written via Service.SetAclHeadId → Object.LocalSet; cleared
+	// implicitly once the row reaches active (no further reads). Absent on
+	// rows that never went through Join.
+	FieldAclHeadId = "aclHeadId"
 	// FieldSpaceType mirrors the in-space spaceIndex.spaceType app tag.
 	// Distinct from FieldType (the on-wire header type): not pinned, so
 	// the watcher can mirror the converged value.

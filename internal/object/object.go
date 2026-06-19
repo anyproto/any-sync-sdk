@@ -146,37 +146,47 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 	return o, nil
 }
 
-// Close detaches the tree listener and marks the Object closed.
-// Blocks on tree.Lock — that's the same lock LocalWrite, the
-// synchandler-driven Update, and the drain path all serialize on,
-// so waiting here is the natural "let in-flight applies finish"
-// barrier. Idempotent — second call is a no-op. ocache calls this
-// on Remove and on cache shutdown.
+// Close detaches the tree listener, marks the Object closed, and
+// closes the underlying tree. Blocks on tree.Lock — that's the same
+// lock LocalWrite, the synchandler-driven Update, and the drain path
+// all serialize on, so waiting here is the natural "let in-flight
+// applies finish" barrier. Idempotent — second call is a no-op.
+// ocache calls this on Remove and on cache shutdown.
 //
-// After Close, any-sync's tree may still hold this *Object in
-// memory (via SyncAll iteration holding the tree past eviction),
-// but its listener field is nil — Update / Rebuild callbacks no-op
-// on the synctree side, preventing stale apply against a freshly-
-// loaded peer Object.
+// The listener is nilled before the tree closes so any Update /
+// Rebuild that races the close (any-sync's tree may still hold this
+// *Object in memory via SyncAll iteration past eviction) no-ops
+// instead of driving a stale apply against a freshly-loaded peer
+// Object.
+//
+// tree.Close drives any-sync's OnClose hook
+// (objecttreebuilder.onClose → syncService.CloseReceiveQueue), which
+// reaps the per-object multiqueue receive-queue goroutine. Without
+// it that goroutine leaks for the process lifetime — eviction alone
+// never reaches the synctree. tree.Close re-acquires tree.Lock
+// internally, so it must run after the Unlock; the closed flag set
+// under the lock guarantees exactly one caller reaches it.
 func (o *Object) Close() error {
 	if o.tree == nil {
 		o.closed = true
 		return nil
 	}
 	o.tree.Lock()
-	defer o.tree.Unlock()
 	if o.closed {
+		o.tree.Unlock()
 		return nil
 	}
 	o.setListenerNilLocked()
 	o.closed = true
-	return nil
+	o.tree.Unlock()
+	return o.tree.Close()
 }
 
 // TryClose is the non-blocking variant ocache GC uses. Returns
 // (false, nil) when the tree is locked by an in-flight handler
 // (LocalWrite, inbound synchandler, drain). ocache retries on the
-// next tick.
+// next tick. On success it closes the tree to reap the receive-queue
+// goroutine — see Close for why the tree close runs unlocked.
 func (o *Object) TryClose(_ time.Duration) (bool, error) {
 	if o.tree == nil {
 		o.closed = true
@@ -185,13 +195,14 @@ func (o *Object) TryClose(_ time.Duration) (bool, error) {
 	if !o.tree.TryLock() {
 		return false, nil
 	}
-	defer o.tree.Unlock()
 	if o.closed {
+		o.tree.Unlock()
 		return true, nil
 	}
 	o.setListenerNilLocked()
 	o.closed = true
-	return true, nil
+	o.tree.Unlock()
+	return true, o.tree.Close()
 }
 
 // setListenerNilLocked sets the synctree listener to nil. Caller

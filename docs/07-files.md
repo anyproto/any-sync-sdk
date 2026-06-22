@@ -11,7 +11,7 @@
 7. **Blobs follow the same locality model as objects.** P2P is mDNS/LAN-only and rides the **same peer pool, discovery, and secure session as object-tree sync**. **S3 is to blobs what the sync-node is to objects** — the always-online backstop beyond the LAN.
 8. **Durability is a space-collective duty, not the author's.** The payload row (`contentHash` + key) syncs, so any write-member holding the bytes can `RequestUpload` + PUT them under the canonical `fileId`. Alice adds a file → Bob pulls it P2P → Alice's device dies before upload → **Bob makes it durable.**
 9. **Thumbnails are host-OS-generated, not Go**, and a tiny **blurhash rides inline in the change** so a preview shows the instant the message arrives — offline, before any byte transfer. One payload row, many variants (each its own blob).
-10. **Local bytes live in a content-addressed file directory** (`blocks/<spaceId>/<contentHash>`), not a database — any-store is dropped for blob storage. A tiny per-blob **index row stays in the per-space any-store** so GC and `BlobCheck` are indexed, not `stat()`-scanned.
+10. **Local bytes are tiered by size (measured).** Real blobs (≥ ~3.5 KB) live in a content-addressed file directory (`blocks/<spaceId>/<contentHash>`), not a database — in any-store they'd be overflow chains that fragment under churn (12× slower reads, measured). Sub-~3.5 KB blobs pack into any-store instead (one file each = the flatfs inode-waste trap: 33× space, 50× slower). A tiny per-blob **index row always stays in the per-space any-store** so GC and `BlobCheck` are indexed, not `stat()`-scanned. (See "Local block store — tiered by blob size".)
 
 ---
 
@@ -132,10 +132,12 @@ The blob exchange reuses the any-sync **peer pool, mDNS discovery, and secure se
   "fileId": "f_uuid",                 // SDK-minted broker binding id (refcount/quota unit)
   "placeholder": "blurhash:LEHV6n…",  // ~30 B, inline, rides the change → instant preview
 
-  // micro-payload (< 32 KB): inline ciphertext, no S3
+  // inline micro-payload: encrypted bytes ride in the row (no S3, no file dir).
+  // Ceiling ~3.5 KB = one any-store overflow page (see "Local block store");
+  // also weighed against permanent DAG weight — inline rides the change forever.
   "inline": { "bytes": "base64…", "wrappedKey": "…", "mime": "image/png" },
 
-  // real payload (>= 32 KB): one S3 blob per variant. `status` is PER VARIANT,
+  // real payload: one S3 blob per variant. `status` is PER VARIANT,
   // tracks DURABILITY only (never a read gate). `contentHash` = SHA-256 of the
   // whole encrypted (Streaming-AEAD) blob; `frame` = the AEAD frame size.
   "variants": {
@@ -199,10 +201,18 @@ Per-variant enables the chat case: `thumbnail: durable, original: local`, and th
 
 ### Garbage collection & deletion — per-file refcount + lifecycle-tombstone
 - **Server:** a `fileId` unbinds → decrement the `contentHash` refcount. At zero, set `deleted_at` / an S3 `State:Orphaned` object tag — **never a synchronous S3 DELETE**. An **S3 Lifecycle Policy** (e.g. 7-day) does the removal. This **absorbs the delete-while-uploading race** (a concurrent re-bind in the window cancels the tombstone) — the structural fix for what was the #1 risk in the proxy model.
-- **Local:** bytes are plain files; the per-blob index (in any-store) drives GC. `unlink` a blob only if its local binding count is 0 **and** the variant is `durable` (S3 has it). The local file dir is also the **P2P serving surface**, so a non-durable blob (incl. one merely *received* from a peer) is **retained** — it may be the last copy. Two classes: non-durable held until `durable`; durable = ordinary LRU cache.
+- **Local:** the per-blob index (in any-store) drives GC. For a **tier-3** blob (bytes in a file), `unlink` only if its local binding count is 0 **and** the variant is `durable` (S3 has it); the file dir is also the **P2P serving surface**, so a non-durable blob (incl. one merely *received* from a peer) is **retained** — it may be the last copy. For **tier-1/2** blobs (bytes in the row) GC is just the row delete, same predicate. Two classes: non-durable held until `durable`; durable = ordinary LRU cache.
 
-### Local block store — a content-addressed file directory, not a DB
-Bytes go to plain files at `blocks/<spaceId>/<contentHash>` — any-store is **not** used for blob storage. Files give zero B-tree write amplification, `seek`-based Range reads, trivial P2P serving, and `rm -rf blocks/<spaceId>/` teardown. A **tiny per-blob index row** (`contentHash, spaceId, size, last_accessed, durable`, refcount) lives in the per-space any-store so GC/`BlobCheck`/LRU are indexed queries, not filesystem `stat()` scans (mobile inode/handle limits). Metadata in any-store, bytes in files.
+### Local block store — tiered by blob size (measured)
+Where a blob's **bytes** live locally is chosen by size, from a spike benchmarking any-store v2 against `go-ds-flatfs` (the anytype local store) on a real 70 366-block / 5.4 GiB anytype flatfs plus synthetic sweeps (`_spikes/{blobbench,realbench,sweep}`). any-store v2 is a SQLite-derived B-tree with **4 KiB pages** and a **~1 KB inline-cell limit** (`maxLocal`); a value above it spills to a **4 KiB overflow chain** drawn from a freelist that **fragments under churn** — and there is **no vacuum/compact** to recover. The boundaries below are measured, not guessed.
+
+| tier | blob size | local home | why |
+|---|---|---|---|
+| **1 — tiny** | **< ~900 B** | **packed in any-store** | many docs share one 4 KiB leaf page; no overflow, **churn-immune** (~1.6 µs/doc cold). One file each is catastrophic: flatfs stores 20 749 sub-KiB blocks in **81 MiB for 2.4 MiB (33×)** and reads them ~50× slower. |
+| **2 — small** | **~900 B – ~3.5 KB** | **one overflow page in any-store** | a file each would waste an inode + a 4 KiB block (the flatfs anti-pattern). Bounded cost: **exactly one** overflow page ⇒ **one** random read (~17 µs) even if the freelist has fragmented; ~4.6 KiB/blob on disk. ~3.5 KB is the one-page ceiling (a 2nd page is needed at ~4.5 KB). |
+| **3 — real blob** | **≥ ~3.5 KB** | **plain file at `blocks/<spaceId>/<contentHash>`** | any-store is **not** used. Files give zero B-tree write amplification, `seek`-based Range reads, trivial P2P serving, `rm -rf blocks/<spaceId>/` teardown. In any-store a blob would be a **multi-page overflow chain that fragments under churn into IOPS-bound random reads — measured 12× slower (1.1 s vs 90 ms) on real 1–100 MiB files**; a contiguous file is immutable and never fragments. |
+
+A **per-blob index row** (`contentHash, spaceId, size, last_accessed, durable`, refcount) **always** lives in the per-space any-store so GC/`BlobCheck`/LRU are indexed queries, not filesystem `stat()` scans (mobile inode/handle limits). For tier-1/2 the bytes ride **in that row**; for tier-3 the row points at the file. **Metadata always in any-store; tier-3 bytes in files.** (Huge files are write-once, read-never archives — for them only storage/write cost matters, so tier-3 is unconditional above the threshold.)
 
 ### P2P blob exchange — whole-blob, member-only, on the object-sync channel
 A 2-method DRPC on the **same server / peer pool / mDNS discovery as object sync**:
@@ -277,11 +287,11 @@ type AddOpts struct {
     Variants map[VariantKind][]byte // from MediaProcessor, optional
 }
 ```
-- Micro-payload path is internal: `len(bytes) < InlineThreshold (32 KB)` → inline ciphertext on the row, no S3.
+- Micro-payload path is internal: `len(bytes) < InlineThreshold` → inline ciphertext on the row, no S3. **`InlineThreshold ≈ 3.5 KB`** (one any-store overflow page; see "Local block store — tiered by blob size").
 
 ## Open questions / decisions to confirm
 1. **AEAD frame size (~4 MB)** — seek/resume granularity vs CDN cache alignment vs tag overhead.
-2. **Inline threshold (32 KB)** — confirm against real asset sizes.
+2. **Inline threshold** — measured: any-store packs < ~900 B, stays one overflow page to ~3.5 KB, then multi-page + churn-fragments (`_spikes/sweep`). Storage side says **~3.5 KB**. Open part is the product call: a higher inline ceiling buys instant-offline availability at the cost of permanent DAG weight.
 3. **Cross-space dedup vs per-space salt** — product/security sign-off (cost vs metadata privacy).
 4. **Quota TTLs** — reservation expiry balancing overshoot vs soft-lock.
 5. **CloudFront/WAF policy** — TTLs, rate limits, signed-URL scope.
@@ -295,6 +305,7 @@ type AddOpts struct {
 - `anytype-heart/core/files/filestorage/rpcstore/store.go:205-244` — the client P2P pattern we align to (local → peer → node); `rpchandler.go:59-91` — client serves blocks, member-gated. We replace IPFS block-get with a whole-blob `BlobGet` on the same channel.
 - `any-sync` localdiscovery / peer pool / `peerStore.LocalPeerIds` — the mDNS discovery + secure session object sync uses; blob P2P rides it.
 - filenode v1 (`any-sync-filenode`) — the refcount/quota/ACL *ideas* we keep; the block-proxy/IPLD path we drop.
+- `_spikes/{blobbench,realbench,sweep}` — the local-storage spike behind "Local block store": any-store v2 vs flatfs on real anytype data + synthetic sweeps. Pins the size tiers (< ~900 B pack · ~900 B–3.5 KB one overflow page · ≥ 3.5 KB contiguous file) and the churn-fragmentation penalty (12× on real 1–100 MiB files). Each dir has a `FINDINGS.md`.
 
 ## Dependencies
 - **Space** — files live in a space; ACL/quota/encryption inherited.

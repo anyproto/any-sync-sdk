@@ -87,6 +87,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// before this point, so its initial scan saw an empty index).
 	spaces.ResumePendingJoins()
 
+	// Start the Layer-2 1-1 inbox subsystem now that the tech space is
+	// open: the receive notifier (coordinator push + poll → pending rows)
+	// and the send-retry loop. No-op when the inbox transport is
+	// unavailable; the out-of-band 1-1 path works without it.
+	spaces.StartOneToOneInbox(ctx)
+
 	account := newAccountImpl(app, tsp, spaces)
 
 	// Republish the locally-stored profile to identityRepo on every
@@ -127,7 +133,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		// still lingers (e.g. an offload that was interrupted, or one
 		// re-created by a previous build that eager-loaded tombstones),
 		// reclaim it now — OffloadSpace is idempotent and best-effort.
-		if rec.RemoteStatus == techspace.StatusDeleted || rec.LocalStatus == techspace.StatusDeleted {
+		// Includes the 1-1 synced offload marker (oneToOneDeleted) — a
+		// deleted 1-1 must be offloaded, not eager-loaded, on every device.
+		if rec.IsDeleted() {
 			if app.SpaceExists(rec.Id) {
 				spaces.OffloadSpace(ctx, rec.Id)
 			}

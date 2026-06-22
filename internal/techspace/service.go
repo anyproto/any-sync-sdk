@@ -306,6 +306,36 @@ func (s *Service) SetAclHeadId(ctx context.Context, spaceId, aclHeadId string) (
 	return obj.LocalSet(ctx, change)
 }
 
+// SetOneToOneInviteState writes the device-local 1-1 invite-send marker
+// (FieldOneToOneInviteState) via the local-set path — never enters the
+// DAG. Pass "toSend" to flag a pending notification, "" to clear it once
+// the coordinator confirms delivery.
+func (s *Service) SetOneToOneInviteState(ctx context.Context, spaceId, state string) (object.WriteResult, error) {
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldOneToOneInviteState},
+					Payload: arena.NewString(state),
+				}},
+			},
+		},
+	}
+	return obj.LocalSet(ctx, change)
+}
+
 // SetRemoteStatus updates the SYNCED remoteStatus field — account-wide
 // state that propagates to every device. Used for account-wide delete
 // (status=StatusDeleted); the handler keeps deleted terminal.

@@ -23,6 +23,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/inbox"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
@@ -152,6 +153,17 @@ type Service struct {
 	joinWG      sync.WaitGroup
 	joinKick    chan struct{}
 	joinWaiters map[string]aclwaiter.AclWaiter
+
+	// One-to-one inbox (Layer-2 discovery, docs/13). inboxNotifier is the
+	// receive worker (coordinator push + poll → RegisterIncoming); the
+	// invite* fields drive the send-retry loop that (re)delivers
+	// initiated-1-1 notifications. Wired and started by StartOneToOneInbox
+	// (from sdk.Open, after the tech space opens); drained in Close. Nil /
+	// inert when the inbox transport is unavailable.
+	inboxNotifier *inbox.Notifier
+	inviteCancel  context.CancelFunc
+	inviteWG      sync.WaitGroup
+	inviteKick    chan struct{}
 }
 
 // New returns a Service ready to be returned via SDK.Spaces(). The
@@ -177,6 +189,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		delKick:            make(chan struct{}, 1),
 		joinKick:           make(chan struct{}, 1),
 		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
+		inviteKick:         make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	s.startDeletionReconciler()
@@ -478,7 +491,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		Name:        r.Name,
 		Description: r.Description,
 		IconCID:     r.IconCID,
-		Status:      mapStatus(r.LocalStatus, r.RemoteStatus),
+		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
 	}
 	if r.CreatedAt > 0 {
 		info.CreatedAt = time.Unix(r.CreatedAt, 0)
@@ -499,7 +512,23 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 //
 // The tech-space row is never physically removed — it stays in List with
 // Status = StatusDeleted as a sticky tombstone.
+//
+// 1-1 spaces take a separate path: they are derived (re-creatable) and not
+// owned on the network, so deleting one must NOT remove it from the nodes.
+// Instead the SYNCED, non-terminal oneToOneDeleted marker propagates the
+// delete to the account's other devices — each offloads its local copy —
+// while the row stays re-creatable (a later OneToOne(peer) flips it back to
+// active). No coordinator SpaceDelete is ever sent.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Type == space.SpaceTypeOneToOne {
+		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.OneToOneDeletedStatus); err != nil {
+			return fmt.Errorf("spaceimpl: mark 1-1 deleted: %w", err)
+		}
+		s.OffloadSpace(ctx, spaceId)
+		// No coordinator kick: a 1-1 is never node-deleted. Other devices
+		// offload via their own reconciler when the synced marker arrives.
+		return nil
+	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
 	}
@@ -556,8 +585,9 @@ func (s *Service) toSpaceListEvent(ctx context.Context, ev space.SubscriptionEve
 			return
 		}
 		r := techspace.DecodeSpaceIndexRecord(rec.Doc)
-		if r.RemoteStatus == techspace.StatusDeleted {
-			// Account-wide delete (synced) → leaves the live list.
+		if r.RemoteStatus == techspace.StatusDeleted || r.RemoteStatus == techspace.OneToOneDeletedStatus {
+			// Account-wide delete (synced) → leaves the live list. The 1-1
+			// offload marker counts too (synced, surfaced as deleted).
 			out.Removed = append(out.Removed, r.Id)
 			return
 		}
@@ -714,32 +744,173 @@ func deriveSpaceTypeTag(t string) string {
 	return t
 }
 
-// OneToOne returns the derived 1-1 space with otherIdentity, creating
-// it locally if it does not yet exist. Same id regardless of which
-// side called first — both peers land on the same space.
+// oneToOnePendingLocalStatus is the DEVICE-LOCAL localStatus stamped on
+// an incoming 1-1 row awaiting approval. Like joiningLocalStatus,
+// discovery is per-device so the prompt is per-device — only the decline
+// is synced. Maps to space.StatusOneToOnePending.
+const oneToOnePendingLocalStatus = "oneToOnePending"
+
+// oneToOneDeclinedRemoteStatus is the SYNCED remoteStatus value written
+// when a 1-1 is declined. Sticky account-wide but — unlike
+// techspace.StatusDeleted — NOT terminal, so an explicit OneToOne(peer)
+// flips it back to active (un-decline). Maps to
+// space.StatusOneToOneDeclined.
+const oneToOneDeclinedRemoteStatus = "oneToOneDeclined"
+
+// OneToOne reaches out to — or explicitly accepts / un-declines — the 1-1
+// space shared with otherIdentity. Derives the shared space, materializes
+// its storage, and activates it locally (implicit self-approval). Same id
+// regardless of which side called first; idempotent. Overrides a prior
+// local decline.
 func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Space, error) {
 	keys := s.app.AccountKeys()
 	if keys == nil {
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
 	}
+	if otherIdentity == keys.SignKey.GetPublic().Account() {
+		return nil, errors.New("spaceimpl: OneToOne: cannot pair with self")
+	}
 	otherPk, err := decodeIdentity(otherIdentity)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
 	}
+	// DeriveOneToOneSpace creates the storage as a side effect (idempotent —
+	// ErrSpaceStorageExists is swallowed) and returns the derived id.
 	spaceId, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
 	}
-	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
-		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
-			Id:           spaceId,
-			Type:         space.SpaceTypeOneToOne,
-			SpaceType:    space.SpaceTypeOneToOne,
-			LocalStatus:  techspace.StatusActive,
-			RemoteStatus: techspace.StatusActive,
-		}); err != nil {
-			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+	sp, err := s.activateOneToOne(ctx, spaceId, otherIdentity)
+	if err != nil {
+		return nil, err
+	}
+	// Initiate path only: notify the peer via the inbox so their device
+	// surfaces the incoming 1-1 without an out-of-band exchange. Durable +
+	// retried (best-effort); Accept deliberately does NOT notify back.
+	s.markOneToOneInviteToSend(ctx, spaceId)
+	return sp, nil
+}
+
+// AcceptOneToOne approves an incoming pending 1-1 by space id: materializes
+// its storage and activates it. The peer identity is read off the row, so
+// the caller only needs the id surfaced in the space list. Also un-declines
+// a previously declined 1-1 (an explicit accept overrides the sticky
+// marker).
+func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Space, error) {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
+	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: unknown space %q", spaceId)
+	}
+	if rec.Type != space.SpaceTypeOneToOne {
+		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %q is not a 1-1 space", spaceId)
+	}
+	if rec.OneToOnePeer == "" {
+		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: row %q carries no peer identity", spaceId)
+	}
+	otherPk, err := decodeIdentity(rec.OneToOnePeer)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w", err)
+	}
+	// Pending rows carry no storage — materialize it now.
+	if _, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk); err != nil {
+		return nil, fmt.Errorf("spaceimpl: materialize 1-1: %w", err)
+	}
+	return s.activateOneToOne(ctx, spaceId, rec.OneToOnePeer)
+}
+
+// DeclineOneToOne rejects an incoming 1-1. Writes the synced, sticky
+// oneToOneDeclined marker so the request is suppressed on every device; an
+// explicit OneToOne(peer) later overrides it. Pending rows carry no
+// storage, so there is nothing to offload.
+func (s *Service) DeclineOneToOne(ctx context.Context, spaceId string) error {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return fmt.Errorf("spaceimpl: DeclineOneToOne: unknown space %q", spaceId)
+	}
+	if rec.Type != space.SpaceTypeOneToOne {
+		return fmt.Errorf("spaceimpl: DeclineOneToOne: %q is not a 1-1 space", spaceId)
+	}
+	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, oneToOneDeclinedRemoteStatus); err != nil {
+		return fmt.Errorf("spaceimpl: DeclineOneToOne: %w", err)
+	}
+	return nil
+}
+
+// RegisterIncoming records an incoming 1-1 request learned out-of-band (no
+// coordinator) as a device-local pending row for the user to approve. No
+// storage is materialized until AcceptOneToOne. displayHint is an optional
+// name/icon snapshot for the UI. No-op if a row for the derived space
+// already exists — respecting an active space or a sticky decline.
+func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, displayHint space.AccountMetadata) error {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return errors.New("spaceimpl: anysyncx app has no account keys")
+	}
+	if peerIdentity == keys.SignKey.GetPublic().Account() {
+		return errors.New("spaceimpl: RegisterIncoming: cannot pair with self")
+	}
+	otherPk, err := decodeIdentity(peerIdentity)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: RegisterIncoming: %w", err)
+	}
+	// Pure id derivation — must NOT create storage (pending is not
+	// materialized until accept).
+	spaceId, err := deriveOneToOneId(keys.SignKey, otherPk)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: RegisterIncoming: %w", err)
+	}
+	if _, ok := s.tsp.Get(ctx, spaceId); ok {
+		return nil
+	}
+	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+		Id:           spaceId,
+		Type:         space.SpaceTypeOneToOne,
+		SpaceType:    space.SpaceTypeOneToOne,
+		Name:         displayHint.Name,
+		Description:  displayHint.Description,
+		IconCID:      displayHint.IconCID,
+		OneToOnePeer: peerIdentity,
+	}); err != nil {
+		return fmt.Errorf("spaceimpl: RegisterIncoming: write index entry: %w", err)
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, spaceId, oneToOnePendingLocalStatus); err != nil {
+		return fmt.Errorf("spaceimpl: RegisterIncoming: mark pending: %w", err)
+	}
+	return nil
+}
+
+// activateOneToOne wires a 1-1 whose storage already exists and flips its
+// index row to active, clearing any pending (device-local) or declined
+// (synced) state. Shared by OneToOne (initiate) and AcceptOneToOne.
+// peerIdentity is recorded on a freshly-created row so any of the account's
+// devices can re-derive the space.
+func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity string) (space.Space, error) {
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok {
+		// SetRemoteStatus(active) overrides a synced decline
+		// (oneToOneDeclined is non-terminal); SetLocalStatus clears a
+		// device-local pending. Both no-op if already active.
+		if rec.RemoteStatus != techspace.StatusActive {
+			if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+				return nil, fmt.Errorf("spaceimpl: activate 1-1 remote: %w", err)
+			}
 		}
+		if rec.LocalStatus != techspace.StatusActive {
+			if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+				return nil, fmt.Errorf("spaceimpl: activate 1-1 local: %w", err)
+			}
+		}
+	} else if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+		Id:           spaceId,
+		Type:         space.SpaceTypeOneToOne,
+		SpaceType:    space.SpaceTypeOneToOne,
+		RemoteStatus: techspace.StatusActive,
+		OneToOnePeer: peerIdentity,
+	}); err != nil {
+		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 	}
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err
@@ -751,6 +922,18 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
 	s.goSeed(sp)
 	return sp, nil
+}
+
+// deriveOneToOneId computes the derived 1-1 space id from the account sign
+// key and the peer pubkey WITHOUT creating storage — unlike
+// SpaceService.DeriveOneToOneSpace, which materializes it. Used by
+// RegisterIncoming to record a pending row before the user accepts.
+func deriveOneToOneId(mySignKey crypto.PrivKey, peerPub crypto.PubKey) (string, error) {
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(mySignKey, peerPub)
+	if err != nil {
+		return "", err
+	}
+	return payload.SpaceHeaderWithId.Id, nil
 }
 
 // ErrJoinPending is returned by Join after a RequestToJoin invite was
@@ -833,6 +1016,9 @@ func (s *Service) Close(_ context.Context) error {
 	s.mu.Unlock()
 	s.seedCancel()
 	s.seedWG.Wait()
+	// Stop the 1-1 inbox notifier + send-retry loop before draining the
+	// rest — both write the tech space, which Close tears down after this.
+	s.stopOneToOneInbox()
 	// Stop the deletion reconciler before draining watchers — it may
 	// otherwise kick off an OffloadSpace (which stops watchers) during
 	// shutdown.
@@ -941,9 +1127,9 @@ func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error 
 // Compile-time check that we satisfy the registry contract.
 var _ anysyncx.SpaceRegistry = (*Service)(nil)
 
-// mapStatus collapses (localStatus, remoteStatus) into the public
+// mapStatus collapses (type, localStatus, remoteStatus) into the public
 // space.Status enum.
-func mapStatus(local, remote string) space.Status {
+func mapStatus(typ, local, remote string) space.Status {
 	switch {
 	case local == techspace.StatusDeleted:
 		// Device-local delete — the user removed this space on THIS device.
@@ -956,8 +1142,25 @@ func mapStatus(local, remote string) space.Status {
 	case remote == techspace.StatusDeleted:
 		// Account-wide delete (synced) — propagated to every device.
 		return space.StatusDeleted
+	case remote == techspace.OneToOneDeletedStatus:
+		// 1-1 delete (synced, non-terminal): offloaded everywhere but
+		// re-creatable. Surfaced as Deleted; checked before the
+		// declined/pending 1-1 cases.
+		return space.StatusDeleted
+	case remote == oneToOneDeclinedRemoteStatus:
+		// Synced, sticky 1-1 decline — account-wide (could be declined on
+		// another device). Checked before the pending/active cases.
+		return space.StatusOneToOneDeclined
+	case local == oneToOnePendingLocalStatus:
+		return space.StatusOneToOnePending
 	case local == joiningLocalStatus:
 		return space.StatusJoining
+	case typ == space.SpaceTypeOneToOne && local != techspace.StatusActive && remote != techspace.StatusActive:
+		// A 1-1 row that exists but carries no active/declined signal and no
+		// device-local pending: the row synced from the device that
+		// registered the request before this device set its own status.
+		// Surface it as an incoming request rather than Unknown.
+		return space.StatusOneToOnePending
 	case local == "" && remote == "":
 		// localStatus is device-local and absent means active; remote
 		// absent too means we have no info yet.

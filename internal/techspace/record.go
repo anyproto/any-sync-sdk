@@ -46,6 +46,16 @@ type SpaceIndexRecord struct {
 	// rows. Written via Service.SetAclHeadId after the row exists.
 	AclHeadId string
 
+	// OneToOnePeer is the other participant's account identity on a
+	// derived 1-1 row (FieldOneToOnePeer, synced). Required to materialize
+	// the 1-1 storage on accept. Empty on non-1-1 rows.
+	OneToOnePeer string
+
+	// OneToOneInviteState is the device-local send obligation marker
+	// (FieldOneToOneInviteState, ScopeLocal): "toSend" while this device
+	// still owes the peer an inbox notification, cleared once delivered.
+	OneToOneInviteState string
+
 	// CreatedAt is the added-to-account time in unix seconds, stamped by
 	// SpaceIndexHandler.BeforeCreate when the row first lands (see
 	// FieldCreatedAt). Zero on rows created before the field existed —
@@ -62,18 +72,20 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		return SpaceIndexRecord{}
 	}
 	return SpaceIndexRecord{
-		Id:           v.GetString("id"),
-		Type:         v.GetString(FieldType),
-		SpaceType:    v.GetString(FieldSpaceType),
-		Name:         v.GetString(FieldName),
-		Description:  v.GetString(FieldDescription),
-		IconCID:      v.GetString(FieldIcon),
-		LocalStatus:  v.GetString(FieldLocalStatus),
-		RemoteStatus: v.GetString(FieldRemoteStatus),
-		AclHeadId:    v.GetString(FieldAclHeadId),
+		Id:                  v.GetString("id"),
+		Type:                v.GetString(FieldType),
+		SpaceType:           v.GetString(FieldSpaceType),
+		Name:                v.GetString(FieldName),
+		Description:         v.GetString(FieldDescription),
+		IconCID:             v.GetString(FieldIcon),
+		LocalStatus:         v.GetString(FieldLocalStatus),
+		RemoteStatus:        v.GetString(FieldRemoteStatus),
+		AclHeadId:           v.GetString(FieldAclHeadId),
+		OneToOnePeer:        v.GetString(FieldOneToOnePeer),
+		OneToOneInviteState: v.GetString(FieldOneToOneInviteState),
 		// Float64 read — GetInt narrows through `int` and would truncate
 		// on 32-bit platforms; anyenc numbers are float64 on the wire.
-		CreatedAt:    int64(v.GetFloat64(FieldCreatedAt)),
+		CreatedAt: int64(v.GetFloat64(FieldCreatedAt)),
 	}
 }
 
@@ -108,6 +120,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	// Absence means active.
 	if r.RemoteStatus != "" {
 		obj.Set(FieldRemoteStatus, a.NewString(r.RemoteStatus))
+	}
+	if r.OneToOnePeer != "" {
+		obj.Set(FieldOneToOnePeer, a.NewString(r.OneToOnePeer))
 	}
 	// CreatedAt is intentionally NOT written here — it's handler-derived
 	// (ScopeDerived; BeforeCreate stamps it from the change timestamp)

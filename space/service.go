@@ -24,10 +24,29 @@ type Service interface {
 	// client-side.
 	DeriveId(ctx context.Context, req DeriveRequest) (string, error)
 
-	// OneToOne returns the derived 1-1 space shared with otherIdentity,
-	// creating it locally if it does not yet exist. Same id regardless
-	// of key order — both peers land on the same space.
+	// OneToOne reaches out to — or explicitly accepts / un-declines — the
+	// derived 1-1 space shared with otherIdentity. Materializes and
+	// activates it locally (implicit self-approval). Same id regardless of
+	// key order — both peers land on the same space. Idempotent; overrides
+	// a prior local decline.
 	OneToOne(ctx context.Context, otherIdentity string) (Space, error)
+
+	// AcceptOneToOne approves an incoming pending 1-1 by space id (as
+	// surfaced in List with Status == StatusOneToOnePending): materializes
+	// and activates it. The peer identity is read off the row, so the
+	// caller needn't re-derive it. Equivalent to OneToOne(peer).
+	AcceptOneToOne(ctx context.Context, spaceId string) (Space, error)
+
+	// DeclineOneToOne rejects an incoming 1-1. Writes a synced sticky
+	// marker so the request is suppressed on all the account's devices and
+	// never auto-resurfaces; a later explicit OneToOne(peer) overrides it.
+	DeclineOneToOne(ctx context.Context, spaceId string) error
+
+	// RegisterIncoming records an incoming 1-1 request learned out-of-band
+	// (no coordinator) as a pending row for the user to approve, without
+	// materializing storage. displayHint is an optional name/icon snapshot
+	// for the UI. No-op if a row for the derived space already exists.
+	RegisterIncoming(ctx context.Context, peerIdentity string, displayHint AccountMetadata) error
 
 	// Get returns an already-joined space by id. Fails if the space is
 	// unknown locally.

@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 var delLog = logger.NewNamed("sdk.spacedeletion")
@@ -80,6 +81,13 @@ func (s *Service) reconcileDeletions(ctx context.Context) {
 	if len(rows) == 0 {
 		return
 	}
+	// 1-1 offload runs FIRST and is coordinator-independent: a 1-1 delete
+	// propagates only through the synced oneToOneDeleted marker (never a
+	// node delete), so each device offloads its own copy when the marker
+	// arrives — including offline. Done before the coordinator call so an
+	// unreachable coordinator can't block it.
+	s.offloadDeletedOneToOnes(ctx, rows)
+
 	ids := make([]string, len(rows))
 	for i, r := range rows {
 		ids[i] = r.Id
@@ -97,6 +105,26 @@ func (s *Service) reconcileDeletions(ctx context.Context) {
 	}
 	for i, r := range rows {
 		s.reconcileOne(ctx, r, statuses[i])
+	}
+}
+
+// offloadDeletedOneToOnes offloads every 1-1 row carrying the synced
+// oneToOneDeleted marker that still has local storage. On the device that
+// issued the delete this is a no-op (already offloaded); on the account's
+// other devices it reclaims the local copy once the marker syncs in. Pure
+// local work — no coordinator round-trip.
+func (s *Service) offloadDeletedOneToOnes(ctx context.Context, rows []techspace.SpaceIndexRecord) {
+	for _, r := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		if r.Type != space.SpaceTypeOneToOne || r.RemoteStatus != techspace.OneToOneDeletedStatus {
+			continue
+		}
+		if s.app.SpaceExists(r.Id) {
+			delLog.Info("offloading deleted 1-1", zap.String("spaceId", r.Id))
+			s.OffloadSpace(ctx, r.Id)
+		}
 	}
 }
 

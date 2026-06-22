@@ -31,6 +31,8 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal},
 		{Id: FieldAclHeadId, Name: "Acl head id", Schema: str(), Scope: schema.ScopeLocal},
+		{Id: FieldOneToOneInviteState, Name: "One-to-one invite state", Schema: str(), Scope: schema.ScopeLocal},
+		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
 	}}
 }
@@ -86,6 +88,23 @@ const (
 	// Distinct from FieldType (the on-wire header type): not pinned, so
 	// the watcher can mirror the converged value.
 	FieldSpaceType = "spaceType"
+	// FieldOneToOneInviteState is a DEVICE-LOCAL field (schema.ScopeLocal)
+	// tracking whether this device still owes the peer an inbox
+	// notification for a 1-1 it initiated. Value "toSend" means the
+	// send-retry loop should (re)deliver the InboxPayloadOneToOneInvite;
+	// cleared (absent/"") once the coordinator confirms the send. Local
+	// because delivery is a per-device obligation — only the device that
+	// initiated owes the notification, and the obligation is meaningless
+	// after it's met. Written via Service.SetOneToOneInviteState.
+	FieldOneToOneInviteState = "oneToOneInviteState"
+	// FieldOneToOnePeer is the other participant's account identity on a
+	// derived 1-1 row (synced, account-wide). It is the one piece of state
+	// a spaceId does not encode invertibly, and it is required to
+	// materialize the space's storage (DeriveOneToOneSpace needs the peer
+	// pubkey). Stored on the pending row so AcceptOneToOne can build
+	// storage, and on active rows so any of the account's devices can
+	// re-derive. Empty on non-1-1 rows.
+	FieldOneToOnePeer = "oneToOnePeer"
 	// FieldCreatedAt is the added-to-account time: unix seconds, stamped
 	// by BeforeCreate from the creating change's timestamp when the row
 	// first lands locally (Create / Derive / OneToOne / Join all create
@@ -113,7 +132,25 @@ const (
 	StatusActive   = "active"
 	StatusArchived = "archived"
 	StatusDeleted  = "deleted"
+
+	// OneToOneDeletedStatus is the SYNCED remoteStatus written when a 1-1
+	// space is deleted. Unlike StatusDeleted it is NOT terminal and never
+	// drives a coordinator SpaceDelete: a derived 1-1 is not removed from
+	// the nodes, only offloaded on every device. It propagates the delete
+	// account-wide (each device offloads its local copy) yet stays
+	// re-creatable — a later OneToOne(peer) flips the row back to active.
+	// Surfaced to callers as space.StatusDeleted.
+	OneToOneDeletedStatus = "oneToOneDeleted"
 )
+
+// IsDeleted reports whether a row is in any deleted/offloaded state — the
+// account-wide tombstone (StatusDeleted on either status field) or the
+// 1-1 synced offload marker. Used by the boot eager-loader, the Subscribe
+// translator, and the deletion reconciler to treat both uniformly.
+func (r SpaceIndexRecord) IsDeleted() bool {
+	return r.RemoteStatus == StatusDeleted || r.LocalStatus == StatusDeleted ||
+		r.RemoteStatus == OneToOneDeletedStatus
+}
 
 // Sentinels — wrap crdt.ErrValidation in handler returns.
 var (

@@ -191,6 +191,45 @@ func TestNotifier_FetchErrorDoesNotAdvance(t *testing.T) {
 	assert.Equal(t, "", off)
 }
 
+// TestNotifier_OfflineThenOnlineDelivers simulates the receive side coming
+// online: the first pass fails to fetch (offline), the second pass
+// succeeds, and the message that was waiting is delivered with the cursor
+// advancing. This is the 1-1-discovery analogue of "Bob was offline when
+// Alice's invite landed in the inbox; it's delivered once he reconnects".
+func TestNotifier_OfflineThenOnlineDelivers(t *testing.T) {
+	ctx := context.Background()
+	senderPriv, _, _ := crypto.GenerateRandomEd25519KeyPair()
+	myPriv, myPub, _ := crypto.GenerateRandomEd25519KeyPair()
+	waiting := signedMsg(t, "m1", senderPriv, myPub, []byte("invite"))
+
+	online := false
+	var got []string
+	n := New(Deps{
+		Fetch: func(_ context.Context, _ string) ([]*coordinatorproto.InboxMessage, bool, error) {
+			if !online {
+				return nil, false, errors.New("offline")
+			}
+			return []*coordinatorproto.InboxMessage{waiting}, false, nil
+		},
+		MyKey:  myPriv,
+		DB:     testDB(t),
+		Handle: func(_ context.Context, m Message) error { got = append(got, string(m.Body)); return nil },
+	})
+
+	// Offline pass: nothing delivered, cursor unmoved.
+	n.drainOnce(ctx)
+	assert.Empty(t, got)
+	off, _ := n.loadCursor(ctx)
+	assert.Equal(t, "", off)
+
+	// Come online: the waiting invite is delivered and the cursor advances.
+	online = true
+	n.drainOnce(ctx)
+	assert.Equal(t, []string{"invite"}, got)
+	off, _ = n.loadCursor(ctx)
+	assert.Equal(t, "m1", off)
+}
+
 func TestNotifier_RunNotifyCloseLifecycle(t *testing.T) {
 	ctx := context.Background()
 	myPriv, _, _ := crypto.GenerateRandomEd25519KeyPair()

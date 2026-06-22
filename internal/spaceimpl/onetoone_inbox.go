@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/inbox"
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -163,12 +164,30 @@ func (s *Service) inviteRetryLoop(ctx context.Context) {
 	}
 }
 
-// reconcileInvites scans for 1-1 rows still owing a notification and
-// (re)sends each, clearing the marker on confirmed delivery. A send
-// failure (offline / coordinator down) leaves the marker set for the next
-// pass.
+// reconcileInvites runs one send-retry pass over the current rows, wiring
+// the real inbox send and tech-space marker-clear into the pure core.
 func (s *Service) reconcileInvites(ctx context.Context) {
-	for _, r := range s.tsp.List(ctx) {
+	clear := func(ctx context.Context, spaceId string) error {
+		_, err := s.tsp.SetOneToOneInviteState(ctx, spaceId, "")
+		return err
+	}
+	reconcileOneToOneInvites(ctx, s.tsp.List(ctx), s.sendOneToOneInvite, clear)
+}
+
+// reconcileOneToOneInvites is the pure send-retry core: for each 1-1 row
+// still owing a notification it sends and clears the marker on confirmed
+// delivery; a send failure (offline / coordinator down) leaves the marker
+// set so the NEXT pass retries — this is the offline-at-initiate →
+// delivered-once-online path. A malformed row (no peer) is cleared so the
+// loop doesn't spin on it. send/clear are injected so the behavior is
+// unit-testable without a live coordinator.
+func reconcileOneToOneInvites(
+	ctx context.Context,
+	rows []techspace.SpaceIndexRecord,
+	send func(ctx context.Context, receiverId string) error,
+	clear func(ctx context.Context, spaceId string) error,
+) {
+	for _, r := range rows {
 		if ctx.Err() != nil {
 			return
 		}
@@ -176,17 +195,17 @@ func (s *Service) reconcileInvites(ctx context.Context) {
 			continue
 		}
 		if r.OneToOnePeer == "" {
-			// Can't deliver without a peer identity — clear the marker so
-			// we don't spin on a malformed row.
-			_, _ = s.tsp.SetOneToOneInviteState(ctx, r.Id, "")
+			if err := clear(ctx, r.Id); err != nil {
+				inboxLog.Warn("clear malformed invite marker", zap.String("spaceId", r.Id), zap.Error(err))
+			}
 			continue
 		}
-		if err := s.sendOneToOneInvite(ctx, r.OneToOnePeer); err != nil {
+		if err := send(ctx, r.OneToOnePeer); err != nil {
 			inboxLog.Debug("send 1-1 invite (will retry)",
 				zap.String("spaceId", r.Id), zap.String("peer", r.OneToOnePeer), zap.Error(err))
 			continue
 		}
-		if _, err := s.tsp.SetOneToOneInviteState(ctx, r.Id, ""); err != nil {
+		if err := clear(ctx, r.Id); err != nil {
 			inboxLog.Warn("clear invite marker", zap.String("spaceId", r.Id), zap.Error(err))
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/anyproto/any-sync/accountservice"
 	"github.com/anyproto/any-sync/app"
@@ -15,7 +16,10 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+	"github.com/anyproto/any-sync/coordinator/inboxclient"
 	"github.com/anyproto/any-sync/coordinator/nodeconfsource"
+	"github.com/anyproto/any-sync/coordinator/subscribeclient"
 	"github.com/anyproto/any-sync/net/peerservice"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/rpc/server"
@@ -41,6 +45,14 @@ type App struct {
 	coord        coordinatorclient.CoordinatorClient
 	streamPool   streampool.StreamPool
 	joining      aclclient.AclJoiningClient
+	inbox        inboxclient.InboxClient
+
+	// inboxReceiver holds the live push callback installed by the inbox
+	// notifier. The forwarder registered before app.Start delegates to
+	// it; nil until the notifier calls OnInboxMessage, so early pushes
+	// (before the notifier starts) are dropped — the notifier's initial
+	// poll catches anything missed.
+	inboxReceiver atomic.Pointer[InboxMessageHandler]
 
 	sync     *spaceSyncHandler
 	tree     *treeManagerAdapter
@@ -99,6 +111,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(nodeconf.New()).
 		Register(secureservice.New())
 	registerTransports(a)
+	inbox := inboxclient.New()
 	a.Register(peerservice.New()).
 		Register(server.New()).
 		Register(stream).
@@ -112,26 +125,43 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(tree).
 		Register(syncqueues.New()).
 		Register(commonspace.New()).
-		Register(aclclient.NewAclJoiningClient())
+		Register(aclclient.NewAclJoiningClient()).
+		Register(subscribeclient.New()).
+		Register(inbox)
+
+	out := &App{
+		sync:       sync,
+		tree:       tree,
+		storage:    storage,
+		headCache:  newHeadCache(),
+		syncStatus: syncstatus.NewService(),
+		syncers:    map[string]*treeSyncerAdapter{},
+		keys:       keys,
+		inbox:      inbox,
+	}
+
+	// Install the push forwarder BEFORE Start: inboxClient.Run rejects a
+	// nil receiver. The forwarder delegates to the notifier's handler
+	// once it installs one via OnInboxMessage; until then pushes are
+	// dropped (the notifier's poll catches up). Set on `out` so the
+	// closure reads the same atomic the notifier writes.
+	if err := inbox.SetMessageReceiver(func(ev *coordinatorproto.NotifySubscribeEvent) {
+		if h := out.inboxReceiver.Load(); h != nil {
+			(*h)(ev)
+		}
+	}); err != nil {
+		return nil, fmt.Errorf("anysyncx: set inbox receiver: %w", err)
+	}
 
 	if err := a.Start(ctx); err != nil {
 		return nil, fmt.Errorf("anysyncx: app start: %w", err)
 	}
 
-	out := &App{
-		a:            a,
-		spaceService: a.MustComponent(commonspace.CName).(commonspace.SpaceService),
-		coord:        a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient),
-		streamPool:   a.MustComponent(streampool.CName).(streampool.StreamPool),
-		joining:      a.MustComponent(aclclient.CName).(aclclient.AclJoiningClient),
-		sync:         sync,
-		tree:         tree,
-		storage:      storage,
-		headCache:    newHeadCache(),
-		syncStatus:   syncstatus.NewService(),
-		syncers:      map[string]*treeSyncerAdapter{},
-		keys:         keys,
-	}
+	out.a = a
+	out.spaceService = a.MustComponent(commonspace.CName).(commonspace.SpaceService)
+	out.coord = a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
+	out.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
+	out.joining = a.MustComponent(aclclient.CName).(aclclient.AclJoiningClient)
 	// Wire the responsible-node resolver so per-space trackers can
 	// filter inbound HeadsApply senders. nodeconf is registered above;
 	// fetch the component once here so the closure stays cheap.
@@ -182,6 +212,30 @@ func (a *App) StreamPool() streampool.StreamPool { return a.streamPool }
 // RequestJoin / CancelJoin RPCs to the coordinator+nodes for a space
 // the caller is not yet a member of.
 func (a *App) JoiningClient() aclclient.AclJoiningClient { return a.joining }
+
+// InboxMessageHandler is the push callback the inbox notifier installs.
+// The body-less NotifySubscribeEvent only signals "new mail" — the
+// notifier's handler reacts by fetching.
+type InboxMessageHandler = func(*coordinatorproto.NotifySubscribeEvent)
+
+// InboxClient is the coordinator inbox transport (fetch / add-message).
+// Always non-nil in this build (the component is registered
+// unconditionally), but callers should treat a nil return as "inbox
+// unavailable" so a future coordinator-less deployment degrades to the
+// out-of-band 1-1 path.
+func (a *App) InboxClient() inboxclient.InboxClient { return a.inbox }
+
+// OnInboxMessage installs the push callback invoked when the coordinator
+// signals a new inbox message. Replaces any previous handler; pass nil
+// to detach (the notifier does this on Close). The forwarder registered
+// before app.Start reads this atomically.
+func (a *App) OnInboxMessage(h InboxMessageHandler) {
+	if h == nil {
+		a.inboxReceiver.Store(nil)
+		return
+	}
+	a.inboxReceiver.Store(&h)
+}
 
 // AccountKeys holds the decoded peer/sign keys.
 func (a *App) AccountKeys() *accountdata.AccountKeys { return a.keys }

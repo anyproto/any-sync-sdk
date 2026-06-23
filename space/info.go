@@ -57,6 +57,17 @@ const (
 	StatusLeaving    // local delete in flight
 	StatusDeleted    // marked as deleted locally
 	StatusRemoteDead // network says space no longer exists
+	// StatusOneToOnePending is an incoming 1-1 (direct) space awaiting
+	// local approval. The space is not materialized or synced until
+	// accepted — Accept it via Service.AcceptOneToOne / OneToOne, or
+	// reject it via Service.DeclineOneToOne. Device-local: discovery is
+	// per-device, so the prompt is approved/declined per device until a
+	// decline (which is synced account-wide).
+	StatusOneToOnePending
+	// StatusOneToOneDeclined is a 1-1 space the user declined. Synced and
+	// sticky across the account's devices: the request never re-surfaces
+	// from the discovery layer. An explicit OneToOne(peer) overrides it.
+	StatusOneToOneDeclined
 )
 
 // Permission mirrors any-sync's ACL permission ladder.

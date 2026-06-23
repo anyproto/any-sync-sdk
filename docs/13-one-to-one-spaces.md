@@ -264,25 +264,27 @@ re-derivable — only for notification.
 Per fetched `OneToOneInvite` message, **process first, advance cursor after**
 (fix #1):
 
-1. **Verify** `senderSignature` over the (still-encrypted) body with
-   `senderIdentity` (`senderIdentity.Verify(body, sig)`).
-2. **Decrypt** body with my account sign key → peer profile snapshot.
-3. **Bind identity** (fix #5): reject unless the decrypted profile's claimed
-   identity `== packet.SenderIdentity`. Heart trusts the self-declared profile
-   identity; we don't.
-4. `DeriveOneToOneSpace(myKey, senderPub)` → `spaceId`.
-5. **Dedup on message id** (fix #3): if this inbox message id is already in the
-   processed-id set, skip. Then reconcile the (possibly synced) row:
+1. **Verify** `senderSignature` over the (still-encrypted) body against
+   `senderIdentity` (`senderPub.Verify(body, sig)`).
+2. **Decrypt** body with my account sign key → display-hint profile
+   (name/icon). The body carries **no identity** — `packet.SenderIdentity`
+   (coordinator-verified) is the authoritative peer identity, so there is
+   nothing self-declared to spoof (fix #5; nothing to "bind").
+3. **Dispatch** to the handler: `RegisterIncoming(senderIdentity, hint)` →
+   `deriveOneToOneId` then reconcile the (possibly synced) row:
    - synced `oneToOneDeclined` present → **ignore** (sticky, account-wide —
-     could have been declined on another device).
-   - no row → add device-local `oneToOnePending` row + profile snapshot.
-   - `active` / `oneToOnePending` → idempotent refresh of the profile snapshot.
-6. Record the message id as processed **and** advance the cursor in the **same
-   tech-space transaction** as the row write, so a crash never strands a
-   half-applied message (fix #1, #2).
-7. A verify/decrypt/bind failure is **not** skipped-past silently: route it to a
-   dead-letter (logged + retained id) rather than advancing the cursor over it
-   as if delivered (fix #2).
+     could have been declined on another device);
+   - no row → add device-local `oneToOnePending` row + profile snapshot;
+   - `active` / `oneToOnePending` → idempotent (no-op / refresh). This
+     idempotence is why no separate processed-id ledger is needed (fix #3).
+4. **Advance the cursor per-message, AFTER the handler returns** (fix #1) — the
+   device-local cursor moves to this message's id only once it's handled, so a
+   crash mid-pass reprocesses the in-flight message (harmless: idempotent).
+5. **Failure split** (fix #2): a *content* failure (nil packet / bad sender /
+   bad signature / decrypt failure) is non-transient → log + advance past **that
+   message only** (skip; does NOT wedge). A *transient* failure (offline
+   `Fetch`, or the handler returning `ErrRetry` for a transient tech-space
+   write) → halt the cursor and retry the next pass.
 
 The worker only runs when a coordinator is present (`app.Coordinator() != nil`).
 Absent one, Layer 2 is simply off and the primitive stands alone.
@@ -298,21 +300,34 @@ design rule above:
    `handleMessages`; a crash or a handler error between them loses the message
    forever (the coordinator won't re-deliver). **Fix:** advance the cursor only
    after the message's side effect commits, in the same transaction.
-2. **Verify/decrypt failure skips *and* advances past the message.** Heart
-   `continue`s over a bad message while the offset is already the batch tail — a
-   *transient* decrypt failure becomes permanent loss. **Fix:** dead-letter, do
-   not advance over un-processed ids.
-3. **No message-level dedup.** Heart relies on deterministic space-id derivation
-   + the space ocache to avoid duplicate spaces, but still re-runs side effects
-   (`SpaceInitChat`, `AddIdentityProfile`, `SpaceViewSetData`) on every replay.
-   **Fix:** a processed-id set + fully idempotent receive.
+2. **Batch-tail advance loses good messages.** Heart `continue`s over a bad
+   message while the offset is already the *batch tail*, so the good messages
+   between a bad one and the tail are skipped along with it (never re-fetched).
+   **Fix:** advance the cursor **per-message**, and split by failure type — a
+   *content* failure (nil packet / bad sender / bad signature / decrypt) is
+   non-transient, so log it and skip past **that one message only** (advance);
+   a *transient* failure (offline fetch, or a handler `ErrRetry`) halts the
+   cursor and retries the next pass. This deliberately does NOT wedge on a
+   permanently-bad message: it is skipped, not looped forever. (Heart's other
+   sin — advancing before processing — is fix #1.)
+3. **Replay re-runs side effects.** Heart relies on deterministic space-id
+   derivation + the space ocache to avoid duplicate spaces, but still re-runs
+   side effects (`SpaceInitChat`, `AddIdentityProfile`, `SpaceViewSetData`) on
+   every replay. **Fix:** the receive handler is **fully idempotent**
+   (`RegisterIncoming` is a no-op on an existing row and honors a sticky
+   decline), so a re-delivered message is harmless. Combined with the
+   per-message cursor (fix #1) this needs no separate processed-id ledger — the
+   only replay is the single in-flight message after a crash, which the
+   idempotent handler absorbs.
 4. **Two triggers, no mutual exclusion.** Push callback and 30s poll both call
    the dispatch with the offset read released between fetch and process →
    double-process. **Fix:** single serialized worker; both triggers only kick.
-5. **No sender↔profile binding.** Signature authenticates the envelope sender
-   over ciphertext, but nothing checks the decrypted profile's claimed identity
-   against `SenderIdentity` — a sender can impersonate a third party in the
-   surfaced "incoming from X". **Fix:** bind in step 3.
+5. **Self-declared identity in the body.** Heart embeds the sender's identity
+   inside the (decrypted) profile body and trusts it, so a sender could
+   impersonate a third party in the surfaced "incoming from X". **Fix:** carry
+   **no identity in the body** — it is a display-hint-only profile; the peer
+   identity is solely the coordinator-verified `packet.SenderIdentity`. Nothing
+   to spoof, nothing to bind.
 6. **Send→status-flip not atomic.** Heart sends then writes `Sent` as a separate
    CRDT op; a crash between re-sends the invite. **Fix:** idempotent receiver +
    send-marker written only post-confirmation; re-send is harmless.
@@ -383,11 +398,11 @@ discovery surface for the UI.
 - `space/service.go` + `space/types.go` — new methods + `SpaceInfo.Status` value.
 - New `internal/inbox/` — a notifier built on any-sync's `inboxclient` +
   `subscribeclient` (registered in `internal/anysyncx/app.go`): single
-  serialized worker, push+poll funnel, verify/decrypt/bind, processed-id dedup,
-  device-local cursor. Started from `sdk.Open` (guarded by coordinator
-  presence), torn down in `Close`.
-- New `internal/inbox` cursor + processed-id persistence (account-values,
-  device-local).
+  serialized worker, push+poll funnel, verify/decrypt, per-message cursor
+  advance, idempotent dispatch (no processed-id ledger needed). Started from
+  `sdk.Open` (guarded by coordinator presence), torn down in `Close`.
+- New `internal/inbox` device-local cursor (a plain any-store collection in
+  sdk.db, never synced).
 
 The existing `joinController` (ACL-waiter based) is **not** reused — derived 1-1
 has an immutable ACL with no acceptance record for a waiter to observe. The
@@ -425,11 +440,12 @@ not an ACL head.
    retry (heart's `ToSend` shape, our `deletionController` structure) re-sends
    until the coordinator confirms; idempotent receiver makes re-sends harmless.
    Phase 2.
-5. **Dead-letter policy → split by failure type.** Infra failure (tech-space
-   write / DB busy) → retry, do **not** advance the cursor. Content failure
-   (verify / decrypt / identity-bind) is non-transient → dead-letter
-   immediately: loud log, retain the id, advance the cursor past it so the queue
-   can't wedge. No app-facing surface in v1.
+5. **Dead-letter policy → split by failure type.** Infra/transient failure
+   (offline `Fetch`, or a handler `ErrRetry` for a tech-space write) → retry, do
+   **not** advance the cursor. Content failure (nil packet / bad sender / bad
+   signature / decrypt) is non-transient → log loudly and advance the cursor
+   past **that one message** so the queue can't wedge (no infinite loop). No
+   app-facing surface in v1.
 6. **Inbox cursor → device-local account-values.** Each device fetches
    independently; the idempotent receive path makes that safe. (Fixes heart's
    synced-CRDT-offset divergence, fix #8.)
@@ -457,8 +473,8 @@ not an ACL head.
    "no server infra" half of requirement 2 entirely.
 2. **Inbox notifier (coordinator discovery):** register any-sync
    `inboxclient`/`subscribeclient`; build the single-worker notifier
-   (push+poll funnel, verify/decrypt/bind, processed-id dedup, device-local
-   cursor); send-on-initiate; wiring + lifecycle. Encryption is inherited from
+   (push+poll funnel, verify/decrypt, per-message cursor advance, idempotent
+   dispatch); send-on-initiate; wiring + lifecycle. Encryption is inherited from
    any-sync, not built here. e2e test against the local coordinator, including
    the bug-regression cases from "Heart bugs we fix" (crash-between-fetch-and-
    process, double-trigger replay, impersonated profile). Layered on top;

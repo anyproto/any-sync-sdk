@@ -335,10 +335,16 @@ design rule above:
    stream mailbox `Add` (unbounded block) — both in any-sync/heart shared code;
    we don't reintroduce them in our wrapper, and we freeze our handler set at
    construction.
-8. **Offset stored in a *synced* CRDT account object** → two devices diverge /
-   re-deliver across each other. **Fix:** the inbox cursor is **device-local**
-   (account-values). (Note: this is the *cursor*; the *decline* marker is
-   deliberately synced — a separate concern, see groom decisions.)
+8. **Offset stored in a *synced* CRDT account object.** Heart keeps the inbox
+   offset in a synced account object. The cursor is per-device *processing
+   position*, so a single shared value can't represent two devices at different
+   positions: CRDT last-writer-wins either jumps the lagging device past
+   messages it never processed (loss) or rewinds the leading device (re-delivery
+   ping-pong). **Fix:** the inbox cursor is **device-local** — a plain any-store
+   collection (`inbox_cursor`) in sdk.db that never enters the DAG and never
+   syncs. (This is the *cursor*; the *decline* marker is deliberately synced
+   because it is an account-wide user decision, not per-device state — a
+   separate concern, see groom decisions.)
 
 ### Out-of-band / p2p fallback (no server)
 
@@ -446,9 +452,11 @@ not an ACL head.
    signature / decrypt) is non-transient → log loudly and advance the cursor
    past **that one message** so the queue can't wedge (no infinite loop). No
    app-facing surface in v1.
-6. **Inbox cursor → device-local account-values.** Each device fetches
-   independently; the idempotent receive path makes that safe. (Fixes heart's
-   synced-CRDT-offset divergence, fix #8.)
+6. **Inbox cursor → device-local plain any-store collection** (`inbox_cursor`
+   in sdk.db, never synced — explicitly NOT account-values, which is synced).
+   Each device fetches and tracks its own position independently; the idempotent
+   receive path makes that safe. (Fixes heart's synced-CRDT-offset divergence,
+   fix #8.)
 7. **Profile freshness.** Pending row caches name/icon from the invite payload;
    always (re)resolve via the existing identityRepo background fetch
    (`members.go`) once active. Out-of-band `RegisterIncoming` with no snapshot

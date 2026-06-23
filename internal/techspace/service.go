@@ -126,6 +126,7 @@ func (s *Service) Open(ctx context.Context) error {
 			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
 			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
 			{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()},
+			{Name: IdentitiesDataset, Handler: IdentitiesHandler{}, Schema: IdentitiesSchema(), Indexes: IdentitiesIndexes()},
 			// Account-values carrier (one derived object per target
 			// space) — see accountvalues.go. Dynamic: carrier records
 			// carry free-form typeId heads at the target rows' paths.
@@ -136,6 +137,7 @@ func (s *Service) Open(ctx context.Context) error {
 			SpaceIndexDataset:     HandlerVersion,
 			ProfileDataset:        ProfileHandlerVersion,
 			InboxCursorDataset:    InboxCursorHandlerVersion,
+			IdentitiesDataset:     IdentitiesHandlerVersion,
 			accountvalues.Dataset: accountvalues.HandlerVersion,
 		},
 	})
@@ -450,6 +452,183 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 	}
 	_, err = obj.LocalWrite(ctx, change)
 	return err
+}
+
+// GetIdentity returns the full identities-directory record for an
+// account identity, or (zero, false) when we've never encountered it.
+func (s *Service) GetIdentity(ctx context.Context, identity string) (IdentityRecord, bool) {
+	if !s.open.Load() || identity == "" {
+		return IdentityRecord{}, false
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return IdentityRecord{}, false
+	}
+	v := obj.Controller().Get(ctx, IdentitiesDataset, identity)
+	if v == nil {
+		return IdentityRecord{}, false
+	}
+	return DecodeIdentityRecord(v), true
+}
+
+// ListIdentities returns every identities-directory row.
+func (s *Service) ListIdentities(ctx context.Context) []IdentityRecord {
+	if !s.open.Load() {
+		return nil
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return nil
+	}
+	rows := obj.Controller().Records(ctx, IdentitiesDataset)
+	out := make([]IdentityRecord, 0, len(rows))
+	for _, v := range rows {
+		out = append(out, DecodeIdentityRecord(v))
+	}
+	return out
+}
+
+// GetIdentityMetaKey returns the cached metadata symkey (string form, per
+// space.MarshalSymKey) for a contact identity, or "" + false when this
+// account has never received it. Account-scoped and SYNCED, so a key
+// learned on any device or in any space is available here.
+func (s *Service) GetIdentityMetaKey(ctx context.Context, identity string) (string, bool) {
+	rec, ok := s.GetIdentity(ctx, identity)
+	if !ok || rec.SymKey == "" {
+		return "", false
+	}
+	return rec.SymKey, true
+}
+
+// SetIdentityMetaKey caches a contact's metadata symkey (string form).
+// SYNCED (LocalWrite → DAG) so the account's other devices can decrypt
+// that contact's profile too. Write-once in practice (the contact's
+// deterministic key never changes); a no-op when already stored.
+func (s *Service) SetIdentityMetaKey(ctx context.Context, identity, symKey string) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	if identity == "" || symKey == "" {
+		return nil
+	}
+	if cur, ok := s.GetIdentityMetaKey(ctx, identity); ok && cur == symKey {
+		return nil
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     IdentitiesDataset,
+		DataVersion: IdentitiesHandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id:     identity,
+				Upsert: true,
+				Ops:    []crdt.Op{{Type: crdt.OpSet, Path: []string{FieldIdentitySymKey}, Payload: arena.NewString(symKey)}},
+			},
+		},
+	}
+	_, err = obj.LocalWrite(ctx, change)
+	return err
+}
+
+// SetIdentityProfile caches a contact's resolved identityRepo profile.
+// DEVICE-LOCAL (LocalSet → never synced): each device re-resolves from
+// the synced symkey + identityRepo. No-op when unchanged.
+func (s *Service) SetIdentityProfile(ctx context.Context, identity, name, description, iconCID string) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	if identity == "" {
+		return nil
+	}
+	if rec, ok := s.GetIdentity(ctx, identity); ok &&
+		rec.Name == name && rec.Description == description && rec.IconCID == iconCID {
+		return nil
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	payload := arena.NewObject()
+	payload.Set(FieldIdentityName, arena.NewString(name))
+	payload.Set(FieldIdentityDescription, arena.NewString(description))
+	payload.Set(FieldIdentityIcon, arena.NewString(iconCID))
+	change := crdt.Change{
+		Dataset:     IdentitiesDataset,
+		DataVersion: IdentitiesHandlerVersion,
+		Records: []crdt.RecordChange{
+			{Id: identity, Upsert: true, Ops: []crdt.Op{{Type: crdt.OpSet, Payload: payload}}},
+		},
+	}
+	_, err = obj.LocalSet(ctx, change)
+	return err
+}
+
+// AddIdentitySpace records that we've seen identity in spaceId.
+// DEVICE-LOCAL ($addToSet on the spaceIds set). No-op if already present.
+func (s *Service) AddIdentitySpace(ctx context.Context, identity, spaceId string) error {
+	if identity == "" || spaceId == "" {
+		return nil
+	}
+	if rec, ok := s.GetIdentity(ctx, identity); ok {
+		for _, id := range rec.SpaceIds {
+			if id == spaceId {
+				return nil
+			}
+		}
+	}
+	return s.identitySpaceOp(ctx, identity, spaceId, crdt.OpAddToSet)
+}
+
+// RemoveIdentitySpace drops spaceId from identity's sightings ($pull).
+// DEVICE-LOCAL. Used when a single member leaves a space.
+func (s *Service) RemoveIdentitySpace(ctx context.Context, identity, spaceId string) error {
+	if identity == "" || spaceId == "" {
+		return nil
+	}
+	return s.identitySpaceOp(ctx, identity, spaceId, crdt.OpPull)
+}
+
+func (s *Service) identitySpaceOp(ctx context.Context, identity, spaceId string, op crdt.OpType) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     IdentitiesDataset,
+		DataVersion: IdentitiesHandlerVersion,
+		Records: []crdt.RecordChange{
+			{Id: identity, Upsert: true, Ops: []crdt.Op{{Type: op, Path: []string{FieldIdentitySpaceIds}, Payload: arena.NewString(spaceId)}}},
+		},
+	}
+	_, err = obj.LocalSet(ctx, change)
+	return err
+}
+
+// RemoveSpaceFromIdentities drops spaceId from every identity's sightings
+// — used when the account leaves/offloads a space so spaceIds keeps
+// reflecting live memberships. DEVICE-LOCAL.
+func (s *Service) RemoveSpaceFromIdentities(ctx context.Context, spaceId string) error {
+	if spaceId == "" {
+		return nil
+	}
+	for _, rec := range s.ListIdentities(ctx) {
+		for _, id := range rec.SpaceIds {
+			if id == spaceId {
+				_ = s.RemoveIdentitySpace(ctx, rec.Identity, spaceId)
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // GetInboxCursor returns the SYNCED account-wide coordinator-inbox read

@@ -382,11 +382,19 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	// derived deterministically from the account key, so its repKey
 	// is the canonical per-account value (per docs/03-space.md
 	// § "Replication key").
+	// Owner metadata in the ACL root is the owner's metadata symkey only,
+	// so joiners learn the key and resolve the owner's profile from
+	// identityRepo (no inline name/icon on the ACL).
+	ownerMeta, err := encodeSelfSymKeyMetadata(keys.SignKey)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: derive metadata key: %w", err)
+	}
 	payload := spacepayloads.SpaceCreatePayload{
 		SigningKey:     keys.SignKey,
 		MasterKey:      keys.SignKey,
 		ReadKey:        readKey,
 		MetadataKey:    metadataKey,
+		Metadata:       ownerMeta,
 		SpaceType:      spaceType,
 		ReplicationKey: replicationKeyFromSpaceId(s.tsp.SpaceId()),
 	}
@@ -483,15 +491,35 @@ func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 // Shared by List and the Subscribe translator so both surface the same
 // shape.
 func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord) space.SpaceInfo {
+	// A 1-1 space's ACL "owner" is a synthetic shared key nobody holds
+	// (see docs/13), so resolveAuthor returns nothing meaningful. The
+	// useful value is the other participant's account identity, recorded
+	// on the row as OneToOnePeer; surface it as Author so clients can tell
+	// who a 1-1 is with — and resolve their profile — straight from
+	// List/Subscribe, without loading or even materializing the space.
+	author := r.OneToOnePeer
+	if r.Type != space.SpaceTypeOneToOne {
+		author = s.resolveAuthor(ctx, r.Id)
+	}
 	info := space.SpaceInfo{
 		Id:          r.Id,
 		Type:        r.Type,
 		SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
-		Author:      s.resolveAuthor(ctx, r.Id),
+		Author:      author,
 		Name:        r.Name,
 		Description: r.Description,
 		IconCID:     r.IconCID,
 		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+	}
+	// A 1-1 has no space-set name; show the friend's resolved profile from
+	// the identities directory (the row's name/icon stays as an out-of-band
+	// displayHint fallback when nothing is resolved yet).
+	if r.Type == space.SpaceTypeOneToOne && r.OneToOnePeer != "" {
+		if id, ok := s.tsp.GetIdentity(ctx, r.OneToOnePeer); ok && id.Name != "" {
+			info.Name = id.Name
+			info.Description = id.Description
+			info.IconCID = id.IconCID
+		}
 	}
 	if r.CreatedAt > 0 {
 		info.CreatedAt = time.Unix(r.CreatedAt, 0)
@@ -863,7 +891,13 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 	if err != nil {
 		return fmt.Errorf("spaceimpl: RegisterIncoming: %w", err)
 	}
-	if _, ok := s.tsp.Get(ctx, spaceId); ok {
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok {
+		// Existing row: respect an active space or sticky decline (no-op).
+		// For a still-pending row, (re)try resolving the peer's name — an
+		// earlier attempt may have run before the peer's symkey arrived.
+		if rec.LocalStatus == oneToOnePendingLocalStatus {
+			go s.resolveOneToOnePeerName(context.Background(), peerIdentity)
+		}
 		return nil
 	}
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
@@ -880,7 +914,50 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 	if _, err := s.tsp.SetLocalStatus(ctx, spaceId, oneToOnePendingLocalStatus); err != nil {
 		return fmt.Errorf("spaceimpl: RegisterIncoming: mark pending: %w", err)
 	}
+	// Resolve the peer's display name from identityRepo in the background:
+	// with symkey-only invites the pending row starts identity-only, so we
+	// fetch + decrypt the peer's profile and write name/icon onto the row.
+	go s.resolveOneToOnePeerName(context.Background(), peerIdentity)
 	return nil
+}
+
+// resolveOneToOnePeerName best-effort resolves a 1-1 peer's identityRepo
+// profile (decrypted with the cached metadata symkey) into the identities
+// directory and records the 1-1 space as a sighting, so the space list
+// (via recordToInfo) shows the friend by name rather than identity-only.
+// No-op when the symkey isn't cached yet, the coordinator is offline, the
+// profile is empty, or the row is no longer a non-declined 1-1.
+// Best-effort: meant to run in a goroutine; all failures are dropped (a
+// later RegisterIncoming retries once the key/coordinator are available).
+func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity string) {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return
+	}
+	otherPk, err := decodeIdentity(peerIdentity)
+	if err != nil {
+		return
+	}
+	spaceId, err := deriveOneToOneId(keys.SignKey, otherPk)
+	if err != nil {
+		return
+	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok || rec.Type != space.SpaceTypeOneToOne || rec.RemoteStatus == oneToOneDeclinedRemoteStatus {
+		return
+	}
+	// Record the sighting regardless of whether the profile resolves.
+	_ = s.tsp.AddIdentitySpace(ctx, peerIdentity, spaceId)
+
+	key := s.metadataSymKeyFor(ctx, peerIdentity)
+	if key == nil {
+		return
+	}
+	prof, ok := s.fetchIdentityProfile(ctx, peerIdentity, key)
+	if !ok || (prof.Name == "" && prof.Description == "" && prof.IconCID == "") {
+		return
+	}
+	_ = s.tsp.SetIdentityProfile(ctx, peerIdentity, prof.Name, prof.Description, prof.IconCID)
 }
 
 // activateOneToOne wires a 1-1 whose storage already exists and flips its
@@ -921,6 +998,9 @@ func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity st
 	}
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
 	s.goSeed(sp)
+	// Resolve the friend's name onto the active 1-1 row so the space list
+	// shows it (no-op until we hold their symkey; best-effort).
+	go s.resolveOneToOnePeerName(context.Background(), peerIdentity)
 	return sp, nil
 }
 
@@ -964,9 +1044,21 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 	if jc == nil {
 		return nil, errors.New("spaceimpl: Join: joining client unavailable")
 	}
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return nil, errors.New("spaceimpl: Join: anysyncx app has no account keys")
+	}
+	// The join record carries our metadata symkey only, not inline
+	// name/icon: co-members cache it and read our profile from
+	// identityRepo (which our account republishes on boot / UpdateMetadata).
+	// req.Metadata no longer flows into the ACL.
+	joinMeta, err := encodeSelfSymKeyMetadata(keys.SignKey)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: Join: derive metadata key: %w", err)
+	}
 	aclHeadId, err := jc.RequestJoin(ctx, inv.SpaceId, list.RequestJoinPayload{
 		InviteKey: inv.InviteKey,
-		Metadata:  encodeMetadata(req.Metadata),
+		Metadata:  joinMeta,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: RequestJoin: %w", err)

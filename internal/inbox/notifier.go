@@ -17,12 +17,9 @@ package inbox
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
-	anystore "github.com/anyproto/any-store/v2"
-	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/util/crypto"
@@ -69,24 +66,26 @@ type Deps struct {
 	// MyKey is the account private key used to decrypt message bodies
 	// (bodies are ECIES-encrypted to our account public key on send).
 	MyKey crypto.PrivKey
-	// DB is the SDK's device-local store (sdk.db) — the cursor lives in
-	// a plain collection here, never synced.
-	DB anystore.DB
 	// Handle receives each verified, decrypted message.
 	Handle Handler
+	// LoadCursor returns the persisted start offset ("" = from the
+	// beginning). SaveCursor persists an advanced offset (monotonic-
+	// forward). Both back onto the SYNCED, account-scoped tech-space
+	// cursor — so a fresh device seeds from the account's read position
+	// instead of replaying the whole inbox; everything below it is already
+	// represented by synced 1-1 rows (the correctness truth). Idempotent
+	// processing makes a synced cursor safe (see docs/13 § "Heart bugs we
+	// fix" #3).
+	LoadCursor func(ctx context.Context) (string, error)
+	SaveCursor func(ctx context.Context, offset string) error
+	// Warmup, if set, runs once before the first fetch — used to pull the
+	// tech space (cursor + rows) current so a fresh device seeds from the
+	// synced cursor rather than offset 0. Best-effort; errors are ignored.
+	Warmup func(ctx context.Context) error
 	// Interval is the poll fallback cadence. The push stream drives
 	// latency; this is the safety net for missed/disconnected pushes.
 	Interval time.Duration
-	// CursorKey namespaces the cursor doc, so distinct payload streams
-	// could keep independent offsets. Defaults to "onetoone".
-	CursorKey string
 }
-
-// cursorCollection is the device-local any-store collection holding the
-// fetch offset. Plain collection (not a CRDT controller), so it never
-// enters the DAG and never syncs across devices.
-const cursorCollection = "inbox_cursor"
-const fieldOffset = "offset"
 
 // Notifier owns the single serialized worker. Construct with New, drive
 // with Run; Notify kicks an immediate pass; Close stops and drains.
@@ -104,9 +103,6 @@ type Notifier struct {
 func New(d Deps) *Notifier {
 	if d.Interval <= 0 {
 		d.Interval = 60 * time.Second
-	}
-	if d.CursorKey == "" {
-		d.CursorKey = "onetoone"
 	}
 	return &Notifier{deps: d, kick: make(chan struct{}, 1)}
 }
@@ -153,6 +149,13 @@ func (n *Notifier) Close() {
 
 func (n *Notifier) loop(ctx context.Context) {
 	defer n.wg.Done()
+	// Warmup once: pull the tech space current so a fresh device seeds from
+	// the synced cursor instead of replaying the whole inbox. Best-effort.
+	if n.deps.Warmup != nil {
+		if err := n.deps.Warmup(ctx); err != nil {
+			log.Debug("inbox warmup", zap.Error(err))
+		}
+	}
 	t := time.NewTicker(n.deps.Interval)
 	defer t.Stop()
 	// Initial pass: catch messages that arrived while offline, plus any
@@ -170,12 +173,16 @@ func (n *Notifier) loop(ctx context.Context) {
 	}
 }
 
-// processAll drains the inbox from the persisted cursor. Fetch errors
-// (offline / coordinator down / inbox unimplemented) end the pass without
-// advancing — the next tick retries. A handler ErrRetry halts the cursor
-// at the offending message; content failures skip past it.
+// processAll drains the inbox from the persisted (synced, account-scoped)
+// cursor. Fetch errors (offline / coordinator down / inbox unimplemented)
+// end the pass without advancing — the next tick retries. A handler
+// ErrRetry halts the cursor at the offending message; content failures
+// skip past it. The cursor advances once PER BATCH (to the furthest
+// handled id) — a synced write, so per-batch keeps tech-space churn low;
+// idempotent processing makes per-batch crash-safe (a crash just re-runs
+// the batch and dedups against the rows).
 func (n *Notifier) processAll(ctx context.Context) {
-	offset, err := n.loadCursor(ctx)
+	offset, err := n.deps.LoadCursor(ctx)
 	if err != nil {
 		log.Warn("load cursor", zap.Error(err))
 		return
@@ -193,30 +200,34 @@ func (n *Notifier) processAll(ctx context.Context) {
 		if len(msgs) == 0 {
 			return
 		}
+		lastHandled := ""
+		halted := false
 		for _, msg := range msgs {
 			if ctx.Err() != nil {
-				return
+				halted = true
+				break
 			}
 			retry, derr := n.processOne(ctx, msg)
 			if retry {
-				// Transient — leave the cursor before this message and
-				// reprocess on the next pass. Halt the whole drain so we
-				// don't advance past it via a later message.
+				// Transient — halt before this message (advance only up to
+				// the last handled one) and reprocess on the next pass.
 				log.Warn("inbox handler retry; halting cursor",
 					zap.String("messageId", msg.Id), zap.Error(derr))
-				return
+				halted = true
+				break
 			}
-			// Success or content-skip: advance past this message.
-			offset = msg.Id
-			if err := n.saveCursor(ctx, offset); err != nil {
-				// Couldn't persist the advance — stop so we don't process
-				// the next message against an un-saved cursor (a crash
-				// would otherwise lose it). Retry next tick.
-				log.Warn("save cursor", zap.String("messageId", msg.Id), zap.Error(err))
-				return
-			}
+			// Success or content-skip: this message is handled.
+			lastHandled = msg.Id
 		}
-		if !hasMore {
+		// One synced cursor write per batch, to the furthest handled id.
+		if lastHandled != "" && lastHandled != offset {
+			if err := n.deps.SaveCursor(ctx, lastHandled); err != nil {
+				log.Warn("save cursor", zap.String("messageId", lastHandled), zap.Error(err))
+				return
+			}
+			offset = lastHandled
+		}
+		if halted || !hasMore {
 			return
 		}
 	}
@@ -272,34 +283,4 @@ func (n *Notifier) processOne(ctx context.Context, msg *coordinatorproto.InboxMe
 		return false, nil
 	}
 	return false, nil
-}
-
-func (n *Notifier) loadCursor(ctx context.Context) (string, error) {
-	coll, err := n.deps.DB.Collection(ctx, cursorCollection)
-	if err != nil {
-		return "", err
-	}
-	doc, err := coll.FindId(ctx, n.deps.CursorKey)
-	if err != nil {
-		if errors.Is(err, anystore.ErrDocNotFound) {
-			return "", nil
-		}
-		return "", err
-	}
-	return doc.Value().GetString(fieldOffset), nil
-}
-
-func (n *Notifier) saveCursor(ctx context.Context, offset string) error {
-	coll, err := n.deps.DB.Collection(ctx, cursorCollection)
-	if err != nil {
-		return err
-	}
-	a := &anyenc.Arena{}
-	doc := a.NewObject()
-	doc.Set("id", a.NewString(n.deps.CursorKey))
-	doc.Set(fieldOffset, a.NewString(offset))
-	if err := coll.UpsertOne(ctx, doc); err != nil {
-		return fmt.Errorf("inbox: upsert cursor: %w", err)
-	}
-	return nil
 }

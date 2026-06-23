@@ -28,3 +28,6 @@ Thumbs.db
 
 # sverklo per-project state (memory journal, etc.)
 .sverklo/
+
+# Local scratch / experiments (untracked benches + build artifacts)
+_spikes/

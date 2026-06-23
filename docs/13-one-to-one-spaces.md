@@ -95,9 +95,11 @@ multi-device behavior (groomed below) fall out correctly:
 | `oneToOneDeclined` | dedicated **synced** sticky marker     | No            | Yes — decline silences all devices |
 | `deleted`          | `RemoteStatus=deleted` (synced, local offload) | No   | Yes (sticky) |
 
-Why pending is device-local but declined is synced: discovery is **per-device**
-(each device runs its own inbox notifier with its own cursor), so the *pending*
-prompt naturally exists independently on each device. **Accept** materializes a
+Why pending is device-local but declined is synced: each device runs its own
+inbox notifier, so the *pending* prompt can arise independently on a device
+(the notifier shares one account-scoped read cursor, but the per-device
+`oneToOnePending` localStatus is set as each device materializes the prompt).
+**Accept** materializes a
 real space whose membership syncs through the normal tech-space list, so it
 reaches the other devices for free. **Decline** has no space to sync, so to
 silence the prompt account-wide (groom decision) it writes its own synced
@@ -277,9 +279,11 @@ Per fetched `OneToOneInvite` message, **process first, advance cursor after**
    - no row → add device-local `oneToOnePending` row + profile snapshot;
    - `active` / `oneToOnePending` → idempotent (no-op / refresh). This
      idempotence is why no separate processed-id ledger is needed (fix #3).
-4. **Advance the cursor per-message, AFTER the handler returns** (fix #1) — the
-   device-local cursor moves to this message's id only once it's handled, so a
-   crash mid-pass reprocesses the in-flight message (harmless: idempotent).
+4. **Advance the cursor AFTER handling, once PER BATCH** (fix #1) — the synced
+   account cursor (`SetInboxCursor`, monotonic-forward) moves to the furthest
+   handled id at the end of the batch. Per-batch (not per-message) because it is
+   a synced write; idempotent processing makes that crash-safe (a crash re-runs
+   the batch and dedups against the rows).
 5. **Failure split** (fix #2): a *content* failure (nil packet / bad sender /
    bad signature / decrypt failure) is non-transient → log + advance past **that
    message only** (skip; does NOT wedge). A *transient* failure (offline
@@ -313,12 +317,12 @@ design rule above:
 3. **Replay re-runs side effects.** Heart relies on deterministic space-id
    derivation + the space ocache to avoid duplicate spaces, but still re-runs
    side effects (`SpaceInitChat`, `AddIdentityProfile`, `SpaceViewSetData`) on
-   every replay. **Fix:** the receive handler is **fully idempotent**
-   (`RegisterIncoming` is a no-op on an existing row and honors a sticky
-   decline), so a re-delivered message is harmless. Combined with the
-   per-message cursor (fix #1) this needs no separate processed-id ledger — the
-   only replay is the single in-flight message after a crash, which the
-   idempotent handler absorbs.
+   every replay. **Fix:** the receive handler is **fully idempotent** — the
+   synced 1-1 row is the account-scoped "handled" marker, so `RegisterIncoming`
+   is a no-op on an existing row (active / pending / declined / deleted). A
+   re-delivered or replayed message is harmless. This needs no processed-id
+   ledger — the row IS the dedup key. **This idempotence is also what makes the
+   synced cursor (below) safe — it is the real fix that subsumes heart's #8.**
 4. **Two triggers, no mutual exclusion.** Push callback and 30s poll both call
    the dispatch with the offset read released between fetch and process →
    double-process. **Fix:** single serialized worker; both triggers only kick.
@@ -335,16 +339,23 @@ design rule above:
    stream mailbox `Add` (unbounded block) — both in any-sync/heart shared code;
    we don't reintroduce them in our wrapper, and we freeze our handler set at
    construction.
-8. **Offset stored in a *synced* CRDT account object.** Heart keeps the inbox
-   offset in a synced account object. The cursor is per-device *processing
-   position*, so a single shared value can't represent two devices at different
-   positions: CRDT last-writer-wins either jumps the lagging device past
-   messages it never processed (loss) or rewinds the leading device (re-delivery
-   ping-pong). **Fix:** the inbox cursor is **device-local** — a plain any-store
-   collection (`inbox_cursor`) in sdk.db that never enters the DAG and never
-   syncs. (This is the *cursor*; the *decline* marker is deliberately synced
-   because it is an account-wide user decision, not per-device state — a
-   separate concern, see groom decisions.)
+8. **Synced offset diverges — *only because heart's processing wasn't
+   idempotent*.** Heart keeps the inbox offset in a synced CRDT object, and a
+   lagging device's last-writer-wins write rewinds a leading device → re-delivery
+   → and because heart's receive *re-runs side effects* (#3), that re-delivery
+   duplicates work. The root cause is #3, not the syncing. **So we do NOT make
+   the cursor device-local** (an earlier draft did — it was treating the
+   symptom). Instead, the cursor is a **synced, account-scoped** value
+   (`InboxCursor` in the tech space): the coordinator inbox is per-receiver and
+   its messages are **immutable + ObjectID-ordered** (the offset is an ObjectID
+   hex; the server fetches `_id $gt offset` sorted `_id:1`), so the
+   furthest-processed offset is a single shared high-water-mark. Writes are
+   **monotonic-forward** (`max` via lexical hex compare in `SetInboxCursor`);
+   everything below it is already covered by synced 1-1 rows; and idempotent
+   processing (#3) makes any cross-device regression a harmless, deduplicated
+   re-fetch. A fresh device **seeds from this cursor instead of replaying the
+   whole inbox**. (The *decline* marker is separately synced because it is an
+   account-wide user decision — see groom decisions.)
 
 ### Out-of-band / p2p fallback (no server)
 
@@ -404,11 +415,14 @@ discovery surface for the UI.
 - `space/service.go` + `space/types.go` — new methods + `SpaceInfo.Status` value.
 - New `internal/inbox/` — a notifier built on any-sync's `inboxclient` +
   `subscribeclient` (registered in `internal/anysyncx/app.go`): single
-  serialized worker, push+poll funnel, verify/decrypt, per-message cursor
-  advance, idempotent dispatch (no processed-id ledger needed). Started from
+  serialized worker, push+poll funnel, verify/decrypt, per-batch cursor advance,
+  idempotent dispatch (no processed-id ledger needed). Cursor load/save +
+  warmup are injected (the notifier is storage-agnostic). Started from
   `sdk.Open` (guarded by coordinator presence), torn down in `Close`.
-- New `internal/inbox` device-local cursor (a plain any-store collection in
-  sdk.db, never synced).
+- New `internal/techspace/inboxcursor.go` — the **synced, account-scoped** inbox
+  cursor (`InboxCursor` dataset on the space-index tree; `GetInboxCursor` /
+  `SetInboxCursor` monotonic-forward). A fresh device seeds from it instead of
+  replaying the whole inbox.
 
 The existing `joinController` (ACL-waiter based) is **not** reused — derived 1-1
 has an immutable ACL with no acceptance record for a waiter to observe. The
@@ -452,11 +466,14 @@ not an ACL head.
    signature / decrypt) is non-transient → log loudly and advance the cursor
    past **that one message** so the queue can't wedge (no infinite loop). No
    app-facing surface in v1.
-6. **Inbox cursor → device-local plain any-store collection** (`inbox_cursor`
-   in sdk.db, never synced — explicitly NOT account-values, which is synced).
-   Each device fetches and tracks its own position independently; the idempotent
-   receive path makes that safe. (Fixes heart's synced-CRDT-offset divergence,
-   fix #8.)
+6. **Inbox cursor → SYNCED, account-scoped** (`InboxCursor` in the tech space),
+   monotonic-forward. "Processed is account-scoped" applies to the read position
+   too: a fresh device seeds from it instead of replaying the whole inbox.
+   *Revised from an earlier draft that made it device-local* — that was treating
+   the symptom of heart's #8, whose real cause is non-idempotent processing
+   (#3). The offset is a coordinator ObjectID hex (immutable, `_id`-ordered), so
+   `max` is computable and a synced high-water-mark merges safely; idempotent
+   processing makes any regression a harmless re-fetch.
 7. **Profile freshness.** Pending row caches name/icon from the invite payload;
    always (re)resolve via the existing identityRepo background fetch
    (`members.go`) once active. Out-of-band `RegisterIncoming` with no snapshot
@@ -562,8 +579,10 @@ against the live staging coordinator:
   coordinator push and a poll fallback both just `Notify()` (buffered-1 kick) —
   one writer, no lock. Per message: verify signature over the ciphertext against
   the coordinator-supplied `SenderIdentity`, decrypt with our account key,
-  dispatch. **Cursor advances per-message AFTER the handler commits** (device-
-  local plain any-store collection `inbox_cursor` in sdk.db, never synced). The
+  dispatch. **Cursor advances per-batch AFTER handling**, to the
+  **synced, account-scoped** `InboxCursor` in the tech space (monotonic-forward;
+  load/save injected so the notifier is storage-agnostic) — a fresh device seeds
+  from it instead of replaying the inbox. The
   dead-letter split is realized: a `Fetch` error or a handler `ErrRetry` halts
   the cursor (transient → retry next pass); a content failure (nil packet / bad
   sender / bad signature / decrypt failure) is logged and skipped past (non-

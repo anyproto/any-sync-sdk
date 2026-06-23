@@ -125,6 +125,7 @@ func (s *Service) Open(ctx context.Context) error {
 		Handlers: []crdt.HandlerReg{
 			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
 			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
+			{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()},
 			// Account-values carrier (one derived object per target
 			// space) — see accountvalues.go. Dynamic: carrier records
 			// carry free-form typeId heads at the target rows' paths.
@@ -134,6 +135,7 @@ func (s *Service) Open(ctx context.Context) error {
 		DataVersions: map[string]string{
 			SpaceIndexDataset:     HandlerVersion,
 			ProfileDataset:        ProfileHandlerVersion,
+			InboxCursorDataset:    InboxCursorHandlerVersion,
 			accountvalues.Dataset: accountvalues.HandlerVersion,
 		},
 	})
@@ -443,6 +445,56 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 				Id:     ProfileSelfId,
 				Upsert: true,
 				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: rec.encodeUpsert(arena)}},
+			},
+		},
+	}
+	_, err = obj.LocalWrite(ctx, change)
+	return err
+}
+
+// GetInboxCursor returns the SYNCED account-wide coordinator-inbox read
+// position (ObjectID-hex offset), or "" when nothing has been processed
+// yet (or the value hasn't synced to this device). Account-scoped: the
+// inbox notifier seeds from it so a fresh device skips already-processed
+// history.
+func (s *Service) GetInboxCursor(ctx context.Context) string {
+	if !s.open.Load() {
+		return ""
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return ""
+	}
+	return inboxCursorOffset(obj.Controller().Get(ctx, InboxCursorDataset, InboxCursorSelfId))
+}
+
+// SetInboxCursor advances the synced inbox read position to offset.
+// SYNCED (LocalWrite → enters the DAG, propagates to the account's other
+// devices). Monotonic-forward: a no-op when offset is not lexically
+// greater than the current value (ObjectID-hex compares in coordinator
+// order), so a stale write from a lagging device can't rewind the
+// account-wide cursor. Best-effort against the rare concurrent-write race
+// — a regression only costs a harmless, deduplicated re-fetch.
+func (s *Service) SetInboxCursor(ctx context.Context, offset string) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	if offset == "" || offset <= s.GetInboxCursor(ctx) {
+		return nil
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     InboxCursorDataset,
+		DataVersion: InboxCursorHandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id:     InboxCursorSelfId,
+				Upsert: true,
+				Ops:    []crdt.Op{{Type: crdt.OpSet, Path: []string{FieldInboxCursorOffset}, Payload: arena.NewString(offset)}},
 			},
 		},
 	}

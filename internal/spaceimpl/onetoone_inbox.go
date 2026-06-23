@@ -54,10 +54,17 @@ func (s *Service) StartOneToOneInbox(ctx context.Context) {
 		return
 	}
 	s.inboxNotifier = inbox.New(inbox.Deps{
-		Fetch:    ic.InboxFetch,
-		MyKey:    keys.SignKey,
-		DB:       s.db,
-		Handle:   s.handleInboxMessage,
+		Fetch:  ic.InboxFetch,
+		MyKey:  keys.SignKey,
+		Handle: s.handleInboxMessage,
+		// Account-scoped read position: load from / advance the synced
+		// tech-space cursor (monotonic-forward via SetInboxCursor). A fresh
+		// device seeds from it instead of replaying the whole inbox.
+		LoadCursor: func(ctx context.Context) (string, error) { return s.tsp.GetInboxCursor(ctx), nil },
+		SaveCursor: s.tsp.SetInboxCursor,
+		// Warmup: pull the tech space current before the first fetch so a
+		// fresh device seeds from the synced cursor, not offset 0.
+		Warmup:   func(ctx context.Context) error { return s.tsp.SyncHeads(ctx) },
 		Interval: inboxPollInterval,
 	})
 	// Coordinator push → kick the notifier. The event is body-less; the

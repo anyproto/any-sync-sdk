@@ -1151,6 +1151,14 @@ func mapStatus(typ, local, remote string) space.Status {
 		// Synced, sticky 1-1 decline — account-wide (could be declined on
 		// another device). Checked before the pending/active cases.
 		return space.StatusOneToOneDeclined
+	case typ == space.SpaceTypeOneToOne && remote == techspace.StatusActive:
+		// Account-scoped resolution wins over a device-local pending. A 1-1
+		// processed (accepted/initiated) on ANY device carries synced
+		// remote=active; a stale pending — e.g. an old inbox invite replayed
+		// on another/new device before the active row synced in — must not
+		// shadow it. "Processed is account-scoped": the synced row is the
+		// truth, the local pending is just this device's unresolved view.
+		return space.StatusActive
 	case local == oneToOnePendingLocalStatus:
 		return space.StatusOneToOnePending
 	case local == joiningLocalStatus:

@@ -11,6 +11,33 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+// TestMapStatus_AccountScopedResolutionBeatsLocalPending pins the
+// "processed is account-scoped" rule: when a 1-1 carries a synced
+// (account-wide) resolution AND a stale device-local pending — the case
+// where an old inbox invite was replayed on a new/other device before the
+// synced row arrived — the synced resolution wins, so the invite is never
+// re-surfaced as a pending prompt.
+func TestMapStatus_AccountScopedResolutionBeatsLocalPending(t *testing.T) {
+	const oneToOne = space.SpaceTypeOneToOne
+	pend := oneToOnePendingLocalStatus
+
+	// Synced resolution + stale local pending → resolution wins.
+	assert.Equal(t, space.StatusActive,
+		mapStatus(oneToOne, pend, techspace.StatusActive), "accepted account-wide → Active")
+	assert.Equal(t, space.StatusOneToOneDeclined,
+		mapStatus(oneToOne, pend, oneToOneDeclinedRemoteStatus), "declined account-wide → Declined")
+	assert.Equal(t, space.StatusDeleted,
+		mapStatus(oneToOne, pend, techspace.OneToOneDeletedStatus), "deleted account-wide → Deleted")
+
+	// A genuinely-unresolved incoming (pending, no synced resolution) still
+	// surfaces as a prompt.
+	assert.Equal(t, space.StatusOneToOnePending,
+		mapStatus(oneToOne, pend, ""), "unresolved incoming stays Pending")
+	// A bare synced 1-1 row (no local status yet) surfaces as Pending.
+	assert.Equal(t, space.StatusOneToOnePending,
+		mapStatus(oneToOne, "", ""), "bare 1-1 row → Pending")
+}
+
 // TestReconcileOneToOneInvites_OfflineThenOnline proves the send-side
 // offline→online path: a 1-1 invite marked toSend while the coordinator is
 // unreachable is NOT cleared (so it stays queued), and the next pass after

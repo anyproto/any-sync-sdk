@@ -155,6 +155,24 @@ func (a *App) GetSpace(ctx context.Context, id string) (SpaceHandle, error) {
 	return v.(SpaceHandle), nil
 }
 
+// PickSpace returns a handle only if the space is already resident in
+// the cache; it never triggers a load (ocache.Pick does not call the
+// LoadFunc). ok is false when the space is not loaded. Cheap read
+// paths such as Spaces().List must use this rather than GetSpace: a
+// commonspace.Init can block indefinitely when the responsible
+// sync-node is unreachable, and a per-row List load would hang the
+// whole call.
+func (a *App) PickSpace(ctx context.Context, id string) (SpaceHandle, bool) {
+	if a.spaceCache == nil {
+		return nil, false
+	}
+	v, err := a.spaceCache.Pick(ctx, id)
+	if err != nil {
+		return nil, false
+	}
+	return v.(SpaceHandle), true
+}
+
 // SyncHeads loads the space (through the cache) and forces an immediate
 // head-sync (diff) round on it. Used to converge on demand instead of
 // waiting for the periodic headsync timer.

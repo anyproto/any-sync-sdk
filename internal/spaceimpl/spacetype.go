@@ -61,12 +61,14 @@ func decodeDerivePayload(b []byte) (spaceType string, ok bool) {
 // SpaceHeaderPayload; for created spaces (no structured payload) it falls
 // back to the on-wire header SpaceType, which IS their type.
 //
-// Best-effort: returns "" on any load/parse failure. Loading the space is
-// required to read its header; callers should prefer the cached
-// tech-space record value and only fall back here when it is empty.
+// Best-effort: returns "" on any parse failure or when the space is not
+// already resident. Reading the header needs the space loaded, but this
+// runs on the cheap List/Info path, so it only peeks at an in-memory
+// space (PickSpace) and never triggers a load — callers should prefer
+// the cached tech-space record value and only fall back here.
 func (s *Service) spaceTypeFromHeader(ctx context.Context, spaceId string) string {
-	handle, err := s.app.GetSpace(ctx, spaceId)
-	if err != nil {
+	handle, ok := s.app.PickSpace(ctx, spaceId)
+	if !ok {
 		return ""
 	}
 	desc, err := handle.Inner().Description(ctx)
@@ -99,11 +101,14 @@ func (s *Service) resolveSpaceType(ctx context.Context, spaceId, cached string) 
 }
 
 // resolveAuthor returns the space owner's account identity from the ACL.
-// Best-effort: empty when the space/ACL is not loadable. Surfaced as
-// space.SpaceInfo.Author.
+// Best-effort: empty when the space is not already resident. This runs
+// on the cheap List/Info path, so it only peeks at an in-memory space
+// (PickSpace) and never triggers a load — a per-row GetSpace here would
+// hang List whenever a space's Init blocks on an unreachable sync-node.
+// Surfaced as space.SpaceInfo.Author.
 func (s *Service) resolveAuthor(ctx context.Context, spaceId string) string {
-	handle, err := s.app.GetSpace(ctx, spaceId)
-	if err != nil {
+	handle, ok := s.app.PickSpace(ctx, spaceId)
+	if !ok {
 		return ""
 	}
 	acl := handle.Inner().Acl()

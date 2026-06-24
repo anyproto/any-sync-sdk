@@ -31,7 +31,8 @@ type SpaceCreatePayload struct {
     MasterKey       crypto.PrivKey
     ReadKey         crypto.SymKey   // first read key for encryption
     MetadataKey     crypto.PrivKey
-    Metadata        []byte          // owner metadata (name, icon)
+    Metadata        []byte          // owner metadata: the owner's metadata symkey
+                                    // (NOT inline name/icon) — see docs/14-identities.md
     Options         *AclSpaceOptions
 }
 ```
@@ -109,8 +110,8 @@ type AclSpaceClient interface {
 - **Full ACL feature set** — SDK exposes all ACL operations available in any-sync (invite, accept/decline, remove, change permissions, ownership transfer, etc.). All 6 permission levels.
 - **API shape** — mirror `AclClient` one-to-one
 - **Invite format** — whatever any-sync requires (inherits format from any-sync, not reinvented)
-- **Metadata & member names** — built on any-sync's metadata key in ACL + `identityRepo` for encrypted user data. SDK wraps this, doesn't invent its own
-- **identityRepo integration** — handled internally by the SDK (background fetch, writes resolved data to any-store). Only public methods expose are for updating own metadata (probably at account level)
+- **Metadata & member names** — symkey-only model (see `docs/14-identities.md`): the ACL `RequestMetadata` carries each account's **metadata symkey**, not an inline name/icon; member names resolve from the encrypted `identityRepo` profile using that key. SDK wraps any-sync's metadata-key mechanism, doesn't invent its own
+- **identityRepo integration** — handled internally by the SDK (background fetch + decrypt, write-through to the account-global identities directory). Public surface: `account.UpdateMetadata` (own profile) and `sdk.Identities()` (the resolved directory)
 - **Members as a collection** — members are exposed as an any-store system collection with the same query/subscription rules as any other data. Callers read members via `Find()` + event flow
 - **Join request notifications** — a new ACL record is added; SDK reacts to ACL changes via event flow and surfaces pending requests to the caller (likely as `status=pending` in the members collection, TBD)
 

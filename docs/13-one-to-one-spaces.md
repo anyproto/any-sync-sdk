@@ -133,8 +133,10 @@ Rules:
   an explicit `RegisterIncoming(peerIdentity, displayHint)` for the out-of-band
   path — creates the row as `oneToOnePending` **without** deriving storage and
   **without** writing any synced field. The pending row carries the peer's
-  identity and a display snapshot (name/icon) from the notification payload, so
-  the UI renders "Alice wants to chat" without syncing anything.
+  account identity (surfaced as `SpaceInfo.Author`); the name/icon resolve from
+  identityRepo via the symkey the invite carried (or an out-of-band
+  `displayHint`), so the UI can render "Alice wants to chat" without syncing
+  anything.
 - **Accept** (`AcceptOneToOne(spaceId)`, or equivalently `OneToOne(peer)` again)
   flips Pending→active and runs materialization. Idempotent. The space's
   membership syncs through the normal tech-space list, so the account's other
@@ -251,8 +253,11 @@ When `OneToOne(peer)` runs *and a coordinator is configured*, after local
 activation the SDK posts one `InboxAddMessage(peerPubKey, …)`:
 
 - `payloadType = InboxPayloadOneToOneInvite`
-- `body` = the sender's identity profile snapshot (name/icon). any-sync encrypts
-  it to `peerPubKey` on send.
+- `body` = the sender's **metadata symkey** (the key that decrypts the
+  sender's identityRepo profile — see `docs/14-identities.md`). any-sync
+  ECIES-encrypts it to `peerPubKey` on send. The receiver caches the key and
+  resolves the name/icon from identityRepo; the body carries no name/icon
+  itself.
 
 Send is **best-effort** and gated by an idempotent local send-status (fix #6):
 flip the row to a `oneToOneInviteSent` marker only *after* a confirmed send, and
@@ -268,15 +273,18 @@ Per fetched `OneToOneInvite` message, **process first, advance cursor after**
 
 1. **Verify** `senderSignature` over the (still-encrypted) body against
    `senderIdentity` (`senderPub.Verify(body, sig)`).
-2. **Decrypt** body with my account sign key → display-hint profile
-   (name/icon). The body carries **no identity** — `packet.SenderIdentity`
+2. **Decrypt** body with my account sign key → the sender's metadata symkey.
+   The body carries **no identity** — `packet.SenderIdentity`
    (coordinator-verified) is the authoritative peer identity, so there is
-   nothing self-declared to spoof (fix #5; nothing to "bind").
+   nothing self-declared to spoof (fix #5; nothing to "bind"). Cache the
+   symkey in the identities directory (`SetIdentityMetaKey`) so the sender's
+   profile resolves from identityRepo.
 3. **Dispatch** to the handler: `RegisterIncoming(senderIdentity, hint)` →
    `deriveOneToOneId` then reconcile the (possibly synced) row:
    - synced `oneToOneDeclined` present → **ignore** (sticky, account-wide —
      could have been declined on another device);
-   - no row → add device-local `oneToOnePending` row + profile snapshot;
+   - no row → add device-local `oneToOnePending` row (identity-only; the
+     name resolves asynchronously from identityRepo via the cached symkey);
    - `active` / `oneToOnePending` → idempotent (no-op / refresh). This
      idempotence is why no separate processed-id ledger is needed (fix #3).
 4. **Advance the cursor AFTER handling, once PER BATCH** (fix #1) — the synced
@@ -329,9 +337,9 @@ design rule above:
 5. **Self-declared identity in the body.** Heart embeds the sender's identity
    inside the (decrypted) profile body and trusts it, so a sender could
    impersonate a third party in the surfaced "incoming from X". **Fix:** carry
-   **no identity in the body** — it is a display-hint-only profile; the peer
-   identity is solely the coordinator-verified `packet.SenderIdentity`. Nothing
-   to spoof, nothing to bind.
+   **no identity in the body** — it holds only the sender's metadata symkey;
+   the peer identity is solely the coordinator-verified `packet.SenderIdentity`.
+   Nothing to spoof, nothing to bind.
 6. **Send→status-flip not atomic.** Heart sends then writes `Sent` as a separate
    CRDT op; a crash between re-sends the invite. **Fix:** idempotent receiver +
    send-marker written only post-confirmation; re-send is harmless.
@@ -474,10 +482,12 @@ not an ACL head.
    (#3). The offset is a coordinator ObjectID hex (immutable, `_id`-ordered), so
    `max` is computable and a synced high-water-mark merges safely; idempotent
    processing makes any regression a harmless re-fetch.
-7. **Profile freshness.** Pending row caches name/icon from the invite payload;
-   always (re)resolve via the existing identityRepo background fetch
-   (`members.go`) once active. Out-of-band `RegisterIncoming` with no snapshot
-   shows identity-only until identityRepo resolves.
+7. **Profile freshness.** The inbox invite carries the sender's symkey, not a
+   name/icon snapshot, so a pending row starts identity-only and resolves the
+   name from identityRepo via the cached symkey (see
+   `docs/14-identities.md`). Out-of-band `RegisterIncoming(peer, displayHint)`
+   may seed an inline name/icon for immediate display; absent both a hint and
+   a coordinator it stays identity-only.
 
 ## Open questions
 
@@ -588,12 +598,15 @@ against the live staging coordinator:
   sender / bad signature / decrypt failure) is logged and skipped past (non-
   transient → no wedge). This is the concrete fix for heart bugs #1, #2, #4, #6,
   #8 from "Heart bugs we fix".
-- **Sender↔body trust (fix #5).** The body carries only a display-hint profile;
-  the authoritative peer identity is the coordinator-verified `SenderIdentity`,
-  never anything self-declared in the body — so there is nothing to spoof.
-- **Receive → pending.** `spaceimpl.handleInboxMessage` decodes the hint and
-  calls `RegisterIncoming(senderIdentity, hint)` → device-local pending row,
-  honoring a synced `oneToOneDeclined`. Idempotent, so re-delivery is harmless.
+- **Sender↔body trust (fix #5).** The body carries only the sender's metadata
+  symkey; the authoritative peer identity is the coordinator-verified
+  `SenderIdentity`, never anything self-declared in the body — so there is
+  nothing to spoof.
+- **Receive → pending.** `spaceimpl.handleInboxMessage` caches the sender's
+  symkey (`SetIdentityMetaKey`) and calls `RegisterIncoming(senderIdentity, {})`
+  → device-local pending row (identity-only), honoring a synced
+  `oneToOneDeclined`. A background resolve fills the name from identityRepo via
+  the cached symkey. Idempotent, so re-delivery is harmless.
 - **Send-on-initiate + retry (decision 4 / fix #6).** `OneToOne` (initiate path
   only — `Accept` never notifies back) stamps a device-local
   `FieldOneToOneInviteState = "toSend"` and kicks a send-retry loop
@@ -609,9 +622,11 @@ against the live staging coordinator:
   verify/decrypt/advance, bad-signature skip-and-advance, `ErrRetry` halt +
   reprocess, fetch-error no-advance, Run/Notify/Close lifecycle.
   `e2e/onetoone_inbox_test.go`: Alice `OneToOne(bob)` → Bob's notifier surfaces
-  the pending row with **no** out-of-band `RegisterIncoming`, display hint
-  intact, then accepts. Passed against staging (the coordinator implements the
-  inbox RPCs); skips gracefully if a network lacks inbox support.
+  the pending row with **no** out-of-band `RegisterIncoming` (the pending row
+  carries Alice's account identity as Author, and her name resolves from
+  identityRepo via the symkey the invite carried), then accepts. Passed against
+  staging (the coordinator implements the inbox RPCs); skips gracefully if a
+  network lacks inbox support.
 
 Open question 2 (dead-letter hard-stop escape hatch) remains as designed: a
 permanently-bad message at the cursor head is skipped past, never wedges; revisit

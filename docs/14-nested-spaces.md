@@ -259,7 +259,7 @@ real owner. Its powers:
 | Power | Holds child readKey? | Mechanism |
 |---|---|---|
 | Bears all limits | not required | coordinator charges legalOwner quota |
-| Remove a member | not required | authors `AclAccountRemove`; key rotation deferred to a key-holder (below) |
+| Remove a member | not required | authors `AclAccountRemoveNoRotate`; key rotation deferred to a key-holder (below) |
 | Delete the child | not required | coordinator `SpaceDelete` accepts legalOwner signature |
 | Read/write data | **only if** added to child ACL as Reader/Writer/Admin | normal membership; org opts in via `AclChildRegister.orgPermission` or a later join |
 
@@ -278,33 +278,71 @@ Problem: removing a member from an any-sync space normally requires rotating the
 read key (`AclReadKeyChange`) so the removed member loses **future** read
 access. If legalOwner holds no read key, it cannot perform that rotation.
 
-Design:
+This is the **one hard part** of the whole feature — verified against any-sync.
+Today `AclAccountRemove` is *welded* to a read-key rotation at three layers:
+its proto carries a non-optional `readKeyChange`
+(`aclrecordproto`: `AclAccountRemove.readKeyChange`); `applyAccountRemove`
+unconditionally calls `applyReadKeyChange`, which dereferences the new key
+(`list/aclstate.go` — a nil rotation **panics**); and `ValidateAccountRemove`
+requires the new key re-encrypted for *every* remaining member
+(`list/validator.go`). A keyless legalOwner can satisfy none of that. So the
+removal must be a **new, separate record type**, never a nil-`readKeyChange`
+`AclAccountRemove` (which would crash older clients).
 
-1. **Removal is authoritative immediately, rotation is deferred.** legalOwner
-   authors an `AclAccountRemove` for the target **without** a new read key
-   (an "unsealed" removal). The ACL + coordinator honor the membership change at
-   once: the removed member loses write acceptance and limit attribution
-   immediately. *(Authorization rule change in any-sync's ACL state machine:
-   the space's `legalOwner` may author `AclAccountRemove` even though it is not
-   a normal Admin/Owner of the child ACL.)*
-2. **Key-holders complete the cut-off.** The space now sits in an observable
-   state: *a removal whose read key was never rotated.* Any remaining member who
-   **does** hold the read key (an Admin, or the org itself if it joined) detects
-   this and performs the standard `AclReadKeyChange`, re-encrypting a fresh read
-   key for the reduced member set. This is the regeneration: existing mechanism,
-   triggered by observing the unsealed-removal state.
-3. **Window semantics.** Between (1) and (2) the removed member keeps the *old*
+Design — a two-phase split:
+
+1. **Phase A — keyless removal (legalOwner).** legalOwner authors a **new**
+   `AclAccountRemoveNoRotate { identities }` record — removal with **no** read
+   key. The ACL + coordinator honor the membership change at once: the removed
+   member drops to `None`, loses write acceptance and limit attribution
+   immediately. This needs three additions in any-sync:
+   - the new record variant in the `AclContentValue` oneof (additive; old
+     clients hit the tolerant unknown-content default and skip it, so they
+     don't crash — but they also keep treating the member as present until
+     phase B lands, which is the inherent window below);
+   - a **keyless-authorization track** in `AclState`, populated from the root's
+     `legalOwner` field, so the validator admits a `legalOwner`-authored removal
+     even though `Permissions(legalOwner)` is `None` (it is not a normal member);
+   - a **"removed-but-not-yet-rotated"** state marker the next phase keys on.
+2. **Phase B — a key-holder completes the cut-off.** The space now sits in the
+   observable *removed-but-not-rotated* state. A remaining member who **holds the
+   read key** authors a standard `AclReadKeyChange`, re-encrypting a fresh read
+   key for the reduced set. This composes cleanly with existing code: the removed
+   account is already `None`, so the standard rotation naturally excludes it —
+   **no change to the rotation record itself.** Who may author it:
+   - **Admins/Owner: already allowed, zero any-sync change.** Standalone
+     `AclReadKeyChange` is gated by `CanManageAccounts()` today
+     (`list/aclrecordbuilder.go` build path + `list/validator.go` validate path),
+     true for Admin/Owner. So "an admin observes the keyless removal and rotates"
+     works out of the box. **This is the default rotation responsibility.**
+   - **Editors (Writers): crypto already works; only the permission predicate
+     blocks them.** Writers *do* hold the read key (every rotation re-encrypts to
+     all non-`None` accounts, Writers included), so an editor can produce a valid
+     rotation — they are blocked solely by the `CanManageAccounts()` check.
+     Admitting them is a **scoped predicate relaxation** (also accept
+     `CanWrite()`) that **must be gated on "this rotation completes a pending
+     keyless removal"** — otherwise any editor could force-rotate the read key at
+     will (privilege-escalation / DoS). Treat editor-rotation as an opt-in for
+     orgs whose compartments may have no admin online, not the default.
+3. **Window semantics.** Between phase A and B the removed member keeps the *old*
    read key and can still decrypt data encrypted under it — exactly the normal
    any-sync property (rotation only protects *future* writes; it never reaches
    back). Membership/limits are correct immediately; forward secrecy is restored
-   when any key-holder rotates. We surface the "rotation pending" state so a
-   client can prompt/auto-rotate.
+   when a key-holder rotates. The SDK surfaces the "rotation pending" state so a
+   client (or the SDK's own worker) can act.
 4. **No key-holder left.** If every key-holding member is gone and only the
    keyless legalOwner remains, no one can rotate or read. legalOwner's remaining
    lever is **delete** (below) — the recovery escape hatch.
 
-Open: whether the SDK auto-rotates on detecting an unsealed removal (preferred)
-or requires an explicit client call. See open questions.
+**Effort (verified):** phase A (`AclAccountRemoveNoRotate` + keyless-auth track +
+pending-rotation state) is **L** — bounded surgery, but it breaks the
+removal↔rotation coupling, a security-critical invariant, so it is the real cost
+of the feature. Phase B is **free for admins**, **S–M for editors** (predicate
+relaxation + the pending-removal guard). The rotation record itself is unchanged.
+
+Open: whether the SDK auto-rotates on detecting a pending keyless removal
+(preferred — restores forward secrecy without UI, needs a key-holder online) or
+requires an explicit client call. See open questions.
 
 ### legalOwner delete
 
@@ -511,10 +549,14 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
    and route editor intent through an admin, or (b) add a "may register child"
    capability grantable to writers/editors via parent settings. Default to (a)
    for v1.
-4. **Auto-rotation policy.** Does the SDK auto-perform `AclReadKeyChange` on
-   detecting an unsealed legalOwner removal, or expose it for the client to
-   trigger? Auto is safer (forward secrecy restored without UI), but needs a
-   key-holder online. Lean auto, with a surfaced "pending" state as fallback.
+4. **Auto-rotation policy & responsibility.** Resolved on responsibility:
+   **admins/owner are the default rotators** (no any-sync change), with
+   **editor-rotation an opt-in behind a "completes a pending keyless removal"
+   guard** (predicate relaxation, S–M). Still open: does the SDK
+   **auto**-perform the `AclReadKeyChange` on detecting a pending keyless removal,
+   or expose it for the client to trigger? Auto is safer (forward secrecy
+   restored without UI) but needs a key-holder online. Lean auto, with a surfaced
+   "rotation pending" state as fallback.
 5. **Parent deletion → child fate.** Cascade delete all children, detach them to
    standalone (drop parent link — but it's signed into the id, so this means
    tombstone + re-create), or block parent delete while children exist. Likely
@@ -603,3 +645,9 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
     coordinator.
 12. **Compartment existence + membership are visible to org members; only data
     is key-gated.** No hidden compartments in v1.
+13. **Keyless removal = a new `AclAccountRemoveNoRotate` record** (never a
+    nil-`readKeyChange` `AclAccountRemove` — that crashes old clients), plus a
+    keyless-auth track in `AclState` and a pending-rotation marker. **Rotation is
+    completed by a key-holder: admins/owner by default (no any-sync change),
+    editors opt-in behind a "completes a pending keyless removal" guard.**
+    (Feasibility-verified against any-sync, 2026-06-25.)

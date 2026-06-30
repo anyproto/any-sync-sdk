@@ -21,17 +21,20 @@ Concrete byte/durability layer under `07b`'s derived-payloads composition. **Sup
   "id":          "{fileId}",          // = creating changeId; content-addressed, NEVER reused
   "rootCid":     "{cid}",             // UnixFS root; the node refcounts / GCs / signs THIS
   "size":        12345,               // hint only — quota uses the node's HEAD-measured size
-  "networkSign": "{fileNetworkId}/{sign(rootCid)}",  // node's existence+size receipt; absent until durable
+  "networkSign": "{fileNetworkId}/{sign(rootCid)}",  // existence+size receipt; absent until durable; absent for inline
   "author":      "{identity}",        // auto field from the change author
-  // ---- encrypted (member-only) ----
-  "key":         "{wrappedKey}",      // SEPARATE envelope field (cheap ACL rotation)
-  "name":        "image.png",
-  "sha256":      "{hash}",            // hash of the UNENCRYPTED file — the dedup key
-  "meta":        { "mime": "image/png", "size": [1024, 768] }
-  // (no manifest — the UnixFS DAG is reconstructable from rootCid alone)
+  // ---- one grouped encrypted field (member-only): better anyenc compression + a single decrypt ----
+  "enc":         "<AES-GCM sealed>"   // decrypts to { key, name, sha256, meta, inline? }
 }
+
+// enc, decrypted (member-only):
+//   { "key": "{wrappedKey}", "name": "image.png", "sha256": "{plaintext hash}",
+//     "meta": { "mime": "image/png", "size": [1024,768] },
+//     "inline": "base64…" }   // ONLY for files < 4 KB — no rootCid/S3/sign; rides the CRDT
 ```
-Only `rootCid` is node-visible; the whole DAG reconstructs from it, so the row stays pointer-sized and node refcount cardinality is ~1×.
+The encrypted fields are **grouped into one sealed `enc` value** (better anyenc compression + one decrypt per row). Only `rootCid` is node-visible; the whole DAG reconstructs from it, so the row stays pointer-sized and node refcount cardinality is ~1×.
+
+**Inline tier (< 4 KB).** A tiny file puts its encrypted bytes inside `enc` (`inline`) with **no `rootCid`, no S3, no `networkSign`** — it rides the CRDT and the filenode never sees it (no quota, no GC, no broker round-trip). Larger files use the `rootCid` / S3 path. (Supersedes the earlier 32 KB micro-payload threshold.)
 
 ## Durability states (derived from the sign + node knowledge)
 Registration is **unconditional** (a row is CRDT data — no node permission, and it's immediately P2P-servable). Only the S3 **backup** is gated. The state of a payload is derived, not a stored authority:
@@ -109,12 +112,14 @@ Byteless brokers, no central index:
 - **durable-bit / node-as-writer** — durability is a node *signature* the client records; the node never writes the CRDT.
 - **dark orphan** — register-row-before-PUT + `state=staging` lifecycle + promote-on-signed-row.
 - **quota spoof** — quota from the node's reservation + HEAD, never the cleartext `size`.
-- **wrappedKey rotation** — `key` is a separate re-wrappable envelope field.
+- **wrappedKey rotation** — `key` lives in the grouped `enc` blob (compression + single decrypt); whether to split it back out for cheaper ACL-rotation re-wrap is an open sub-decision (below).
 
 ## Still open / to build
 - **OPEN DECISION — RF storage:** one shared content-addressed bucket (RF = broker redundancy — recommended) vs RF physical byte copies (geo-redundancy; each node GCs its own copy, leader computes the orphan set).
 - **OPEN DECISION — limits granularity:** keep **per-identity** via the coordinator (allowances / reserve-check — recommended) vs move to **per-space** pricing (simplest for the fleet, but a product change).
 - **Selective sync by tree type** — the broker (embedding the SDK) head-syncs all but pulls/replays only `DataType = payloads` changes; needs an SDK option + a `DataType`-filtered change pull in any-sync.
+- **`wrappedKey` in `enc` vs separate** — grouped is best for compression/single-decrypt; separate is cheaper on ACL read-key rotation (re-wrap one tiny field, not the whole blob). Pick one.
+- **Inline threshold (4 KB)** — confirm the cutoff for the inline (`enc.inline`, no-S3) tier against real small-asset sizes.
 - **No-preload targeted range reader** for S3/CDN seek; **range-aware `BlobCheck`/`BlobGet`** for partial LAN holders.
 - **Row lease / status hint** so a `limited`/abandoned row is distinguishable in UI and tombstonable past TTL.
 - **Cross-owner move** (= bind + delete, new fileId) and **`Get(fileId)` without the owner** (no global fileId→owner index) — unindexed, same as v6.

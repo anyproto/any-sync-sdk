@@ -157,6 +157,7 @@ Short form (full exploration in `07-files.md`):
 - **Row lease / status hint** so a `limited`/abandoned row is distinguishable in UI and tombstonable past TTL.
 - **Cross-owner move** (= bind + delete, new fileId) and **`Get(fileId)` without the owner** (no global fileId→owner index) — unindexed, same as v6.
 - **Grace / staging TTLs** — pin the staging-expire (24–48 h) and the GC grace (7–14 d); account for AWS lifecycle tag-age semantics.
+- **Collective durability mechanics (next iteration)** — Alice adds a file, Bob pulls it P2P, Alice goes offline before backup → **Bob makes it durable.** Supported in principle (any holder drives-toward-durable; the node signs `rootCid` regardless of who PUTs; the node verifies the CARv2 hashes to `rootCid` before signing → no garbage; staging-object-exists short-circuits the herd; holders retain received-not-durable blocks). Open mechanics: (a) **write access** — Bob must record the `networkSign` into Alice's payload row in her derived `payloads` object → make the payloads object member-writable (at least the sign field); (b) **quota attribution** — Bob's upload debits the *space* allowance, but the coordinator's identity-total needs a rule for uploader ≠ author; (c) who runs the **drive-toward-durable worker** + its trigger/backoff.
 - **GATING SPIKE (deferred):** multi-writer + offline-branch + cascade on the real (derived-payload + node-cid-ledger) model — every spike so far is single-writer / linear-DAG.
 
 ## Cross-refs

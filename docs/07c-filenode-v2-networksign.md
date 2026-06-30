@@ -99,6 +99,7 @@ Byteless brokers, no central index:
 - **Leader = lower peerId** of the pair: owns GC, the in-memory reservation map, and (route here) `uploadRequest`/`requestSign`. The other node is **warm failover** (has the derived index from synced rows; takes over on leader death, losing only ephemeral reservations — staging-lifecycle + rows reconcile).
 - **GC** is best-effort: if the leader is down it waits (over-count + grace → only a brief storage leak, never data loss).
 - **No common index; evict inactive spaces.** The per-space index is a derived projection (truth = payload rows + S3), so a node tracks only its **active** responsible spaces and evicts after a few days idle, rebuilding from the rows (+ listing `state=staging`) on reactivation.
+- **The broker syncs only `payloads`.** It embeds the SDK with **selective sync by tree type**: full head-sync (it knows what exists), but it pulls/replays only `DataType = payloads` changes (cleartext header — no decrypt), never the space's other (encrypted) content. So the node sees the rows it needs and nothing more.
 - **Limits:** per-space accounting on the node; the **coordinator** owns the per-identity total (issues per-space allowances or answers a reserve-check at `uploadRequest`) — keeps the no-common-filenode-index property.
 - **Two transports, one addressing:** durable/WAN bytes over **HTTP S3/CloudFront**; LAN/local over a **separate P2P layer on any-sync connections** (`BlockGet`/`BlocksCheck`, member-gated, served from the holder's local pack via the cid→offset index). Blobs follow object-sync locality (mDNS peers + S3 backstop).
 
@@ -113,6 +114,7 @@ Byteless brokers, no central index:
 ## Still open / to build
 - **OPEN DECISION — RF storage:** one shared content-addressed bucket (RF = broker redundancy — recommended) vs RF physical byte copies (geo-redundancy; each node GCs its own copy, leader computes the orphan set).
 - **OPEN DECISION — limits granularity:** keep **per-identity** via the coordinator (allowances / reserve-check — recommended) vs move to **per-space** pricing (simplest for the fleet, but a product change).
+- **Selective sync by tree type** — the broker (embedding the SDK) head-syncs all but pulls/replays only `DataType = payloads` changes; needs an SDK option + a `DataType`-filtered change pull in any-sync.
 - **No-preload targeted range reader** for S3/CDN seek; **range-aware `BlobCheck`/`BlobGet`** for partial LAN holders.
 - **Row lease / status hint** so a `limited`/abandoned row is distinguishable in UI and tombstonable past TTL.
 - **Cross-owner move** (= bind + delete, new fileId) and **`Get(fileId)` without the owner** (no global fileId→owner index) — unindexed, same as v6.

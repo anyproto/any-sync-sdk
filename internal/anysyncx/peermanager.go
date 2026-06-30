@@ -72,8 +72,37 @@ func (m *spacePeerManager) Close(_ context.Context) error {
 	return nil
 }
 
+// subscribeRamp is the cold-start retry schedule: an eager send on Run
+// (before the ramp), then these delays. Covers the case where the eager
+// send loses on DNS / dial — once any peer becomes reachable the next
+// iteration hits it.
+var subscribeRamp = []time.Duration{
+	200 * time.Millisecond,
+	500 * time.Millisecond,
+	time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+}
+
+const (
+	// subscribeRefresh is the steady-state cadence once a node stream is
+	// up. A live stream keeps push flowing, so this only re-tags us in
+	// case a node forgets our subscription; it deliberately does not pin
+	// the periodic-pull cadence.
+	subscribeRefresh = 30 * time.Second
+	// subscribeChurn is the cadence used while no node stream is open. A
+	// dropped stream (node restart / connection reset) is our push
+	// channel going down; re-broadcasting this fast forces an immediate
+	// reopen — streamHandler.OpenStream re-primes the fresh stream with
+	// every registered space — instead of waiting a full subscribeRefresh
+	// "next tick" while pushes are silently missed.
+	subscribeChurn = 2 * time.Second
+)
+
 // subscribeLoop publishes SpaceSubscription_Subscribe to sync nodes:
-// once immediately on Run, then a fast-retry ramp, then a slow tick.
+// once immediately on Run, then a fast-retry ramp, then a health-driven
+// steady state.
 //
 // The eager first send is critical for cold-start convergence. Without
 // it, the order is "headsync.Sync → diff → KeepAlive at end of Sync":
@@ -86,33 +115,17 @@ func (m *spacePeerManager) Close(_ context.Context) error {
 // try. Documented separately because it converts what looks like a
 // 30s/3.4s flake into a deterministic ~3s convergence.
 //
-// The fast-retry ramp covers the case where the eager send loses on
-// DNS / dial — once any peer becomes reachable the next iteration
-// hits it. KeepAlive failures are silently swallowed; the loop keeps
-// trying.
-//
-// Beyond cold-start, a slow refresh tick keeps the tagging fresh
-// across stream churn (network blips, server restarts) without
-// pinning the periodic-pull cadence.
+// Beyond cold-start the cadence adapts to stream health (see
+// nextSubscribeDelay): a slow refresh while a node stream is live, a
+// fast churn cadence while none is — so a reopen+resubscribe follows a
+// dropped stream within subscribeChurn rather than a full
+// subscribeRefresh. KeepAlive failures are silently swallowed; the loop
+// keeps trying.
 func (m *spacePeerManager) subscribeLoop() {
 	m.broadcastSubscribe()
 
-	delays := []time.Duration{
-		200 * time.Millisecond,
-		500 * time.Millisecond,
-		time.Second,
-		2 * time.Second,
-		4 * time.Second,
-		8 * time.Second,
-	}
-	const slowTick = 30 * time.Second
 	for i := 0; ; i++ {
-		var d time.Duration
-		if i < len(delays) {
-			d = delays[i]
-		} else {
-			d = slowTick
-		}
+		d := nextSubscribeDelay(i, subscribeRamp, m.hasNodeStream())
 		select {
 		case <-m.runCtx.Done():
 			return
@@ -120,6 +133,30 @@ func (m *spacePeerManager) subscribeLoop() {
 		}
 		m.broadcastSubscribe()
 	}
+}
+
+// nextSubscribeDelay picks the wait before the next Subscribe broadcast.
+// During the cold-start ramp (attempt < len(ramp)) it follows the fixed
+// schedule regardless of health. After the ramp it returns
+// subscribeRefresh while a node stream is live and subscribeChurn while
+// none is. Pure so the cadence is unit-testable without a stream pool.
+func nextSubscribeDelay(attempt int, ramp []time.Duration, healthy bool) time.Duration {
+	if attempt < len(ramp) {
+		return ramp[attempt]
+	}
+	if healthy {
+		return subscribeRefresh
+	}
+	return subscribeChurn
+}
+
+// hasNodeStream reports whether at least one outbound stream to a sync
+// node is currently open. streamHandler.OpenStream tags every node
+// stream with nodeStreamTag; a zero count means our push channel is
+// down (the stream was removed on read/write failure), so we should
+// re-broadcast Subscribe on the fast churn cadence to force a reopen.
+func (m *spacePeerManager) hasNodeStream() bool {
+	return len(m.streamPool.Streams(nodeStreamTag)) > 0
 }
 
 // broadcastSubscribe is one Subscribe broadcast against m.runCtx with

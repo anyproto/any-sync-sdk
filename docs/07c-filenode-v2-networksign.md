@@ -59,6 +59,16 @@ A node-maintained, **persisted, incremental** view: `(spaceId, rootCid) → { li
 - **Over-count never under-count:** a crashed/late client leaks a blob (delayed GC), never loses data.
 - **Async mark-and-sweep backstop:** an S3 object older than the grace **and** not referenced by a valid sign in the ledger → delete. Reclaims unsigned-but-uploaded and sign-lost orphans without node-side pending state.
 
+## Operational model (the filenode-v2 fleet)
+filenode v2 holds **no bytes** — it is a broker (presign + sign + a derived per-space index). The fleet runs with **no central index**:
+
+- **Tracking = read the payload rows, not the signs.** Each node builds its per-space index (`rootCid → {refcount, size}`) from the node-readable payload rows (cleartext `rootCid`/`size`); it never reads back the signs it issued (the sign is the *client's* durability proof). The rows cover steady-state; the **in-flight window** (PUT to S3, row not yet synced) is covered only by the staging prefix + async mark-and-sweep.
+- **Sharding = consistent hash on `spaceId`** (same `nodeconf` mechanism as sync-nodes) → a space maps to RF responsible filenodes. **RF = broker redundancy over one shared, content-addressed S3 bucket**: bytes are stored once (S3 already gives durability), and per-file random keys mean `rootCid`s never collide across spaces, so per-space accounting/GC is safe. *(Open decision below: shared bucket vs RF physical byte copies for geo-redundancy.)*
+- **GC leader = the lowest (live) peerId** among the RF responsible nodes — deterministic, no coordination. If the leader is down, GC just waits: it's best-effort (over-count-never-under-count + grace), so a delayed sweep only leaks storage briefly, never loses data.
+- **No common index; evict inactive spaces.** The per-space index is a *derived projection* (node-derived reachability), not authoritative — the truth is the payload rows + S3. So a node tracks only its **active** responsible spaces and **evicts** a space's index after a few days idle, rebuilding from the payloads on reactivation (cheap, re-materializable). Quota is reconstructable (`Σ size`); in-flight reservations lost on eviction are reclaimed by staging-grace.
+- **Limits — per-space accounting on the node, identity total on the coordinator.** Each filenode meters its own spaces locally. The **coordinator** (already the payments + identity↔space authority) owns the per-identity total: it either issues per-space **allowances** summing to the identity cap (refilled on demand) or answers a reserve-check at `uploadRequest`. Keeps the no-common-filenode-index property. *(Open decision below.)*
+- **Two transports, one addressing.** Durable/WAN bytes go **client↔S3/CloudFront over HTTP**; LAN/local exchange is a **separate P2P layer over any-sync secure connections** — `BlockGet(cid)` / `BlocksCheck(cids)` DRPC (member-gated), the peer serving blocks from its local packed object via the cid→offset index. The client's block reader resolves each cid **local → peer (any-sync DRPC) → S3 (Range via the index)** — the `rpcstore` pattern on our packed/CARv2 model; blobs follow object-sync locality (mDNS peers over any-sync connections + S3 backstop).
+
 ## What v7 resolves (vs the prior reviews)
 - **D1 (cids drift)** — node reads cid/sign directly off the synced object; orphaning is node-derived from the cascade tombstone; **no client `$pull` anywhere.**
 - **D2 (node-readability)** — fixed at the schema level by partial encryption.
@@ -97,6 +107,9 @@ A **cid is an intra-file integrity + ordering coordinate, not a global address**
 - **Row lease / status** — distinguish a pending upload from a dead/abandoned-unsigned row; define who may tombstone an unsigned row past TTL.
 - **Cross-owner move** (= bind + delete; mints a new fileId; references break) and **`Get(fileId)` without the owner** (no global `fileId → owner` index) — unindexed, same as v6.
 - **Grace window** — port `07-files`' 7–14 d; account for AWS lifecycle tag-age (expiry counts from object *creation*, so effective grace can collapse below the configured window).
+- **OPEN DECISION — RF storage:** one shared content-addressed S3 bucket (RF = broker redundancy, bytes stored once — recommended) **vs** RF physical byte copies (geo-redundancy; each node GCs its own copy, leader computes the orphan set).
+- **OPEN DECISION — limits granularity:** keep **per-identity** via the coordinator (per-space allowances / reserve-check round-trip — recommended, least product change) **vs** move to **per-space** pricing (simplest for the sharded fleet, but a product change).
+- **No-preload targeted range reader** for S3/CDN seek (the spike finding) + **range-aware `BlobCheck`/`BlobGet`** for partial LAN holders.
 - **GATING SPIKE (deferred):** multi-writer + offline-branch + cascade on the *real* (derived-payload + node-cid-ledger) model — every spike so far is single-writer / linear-DAG, so the convergence + cascade + cross-owner-refcount claims are still unexercised.
 
 ## Cross-refs

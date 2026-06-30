@@ -156,6 +156,14 @@ func (h *spaceSyncHandler) ObjectSyncStream(stream spacesyncproto.DRPCSpaceSync_
 	return h.streamPool.ReadStream(stream, 100)
 }
 
+// nodeStreamTag tags every outbound stream we open to a sync node.
+// Client streams are otherwise untagged (spaceId tags only land if a
+// node echoes a SpaceSubscription, which it doesn't), so this constant
+// is what lets spacePeerManager ask "is my push channel to a node still
+// up?" via streamPool.Streams. It never collides with a spaceId tag —
+// spaceIds are base58 object ids.
+const nodeStreamTag = "anysyncx/node-stream"
+
 // streamHandler is the StreamPool's outgoing-side handler. It opens
 // ObjectSyncStream connections, primes them with the current set of
 // subscribed spaces, and decodes inbound HeadUpdate / SpaceSubscription
@@ -198,7 +206,9 @@ func (h *streamHandler) OpenStream(ctx context.Context, p peer.Peer) (drpc.Strea
 			return nil, nil, 0, sErr
 		}
 	}
-	return objectStream, nil, 100, nil
+	// Tag with nodeStreamTag so spacePeerManager can detect when this
+	// channel drops and re-subscribe promptly (see hasNodeStream).
+	return objectStream, []string{nodeStreamTag}, 100, nil
 }
 
 func (h *streamHandler) HandleMessage(ctx context.Context, _ string, msg drpc.Message) error {

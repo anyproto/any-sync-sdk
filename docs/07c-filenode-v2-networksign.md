@@ -114,6 +114,29 @@ Byteless brokers, no central index:
 - **quota spoof** — quota from the node's reservation + HEAD, never the cleartext `size`.
 - **wrappedKey rotation** — `key` lives in the grouped `enc` blob (compression + single decrypt); whether to split it back out for cheaper ACL-rotation re-wrap is an open sub-decision (below).
 
+## Tradeoffs (what v7 costs)
+Stated plainly so the approach is judged in balance, not just by its wins:
+- **A new server.** v2 needs a filenode-v2 fleet (v1 needed none). Far *simpler* (byteless broker), but still cross-team + ops.
+- **Eventual quota, not exact-at-write.** Reserve-confirm-expire + staging → a bounded overshoot window + abandoned-reservation handling, vs v1's inline-exact accounting.
+- **Metadata to the cloud.** S3/CloudFront see client IP ↔ `rootCid` and per-blob sizes; CloudFront hides client IPs from S3 but not from the edge. (The v1 proxy hid clients behind the node.)
+- **Integrity is structural, not in the cipher.** Whole-file CFB carries no tags; we rely on the merkle cids (each block verified vs its cid). Correct, but a reader that skips cid-verification loses it.
+- **Naive seek over-fetches.** The stock `DagReader` read-ahead pulls ~9 MiB for a 64 KiB seek (benchmarked); S3/CDN seek needs the targeted range reader.
+- **Two transports.** HTTP/S3 + any-sync P2P is more surface than one, though they share addressing + crypto.
+- **Live open decisions** (below): RF storage model, per-identity vs per-space limits, `wrappedKey` grouping, fleet/GC responsibility (grooming).
+
+## Alternatives considered (why not)
+Short form (full exploration in `07-files.md`):
+- **Files as a first-class any-sync type** (bytes sync through the tree protocol) — bulk binary chokes metadata sync; expensive cross-team change for ~0 gain.
+- **Bytes in the CRDT / inline everything** (KV or datasets hold all bytes) — tree bloat + KV re-encrypts on every ACL rotation. Kept only for the tiny **inline (<4 KB)** tier.
+- **IPFS + filenode block-proxy (approach A, anytype today)** — node proxies every byte; dual-scoped per-CID refcount bug class; status/block drift. Proxying ciphertext bought no security.
+- **Whole-blob + plain SHA-256 (no AEAD)** — CFB/CTR malleability lets a peer corrupt bytes mid-stream; integrity only verified at end-of-file.
+- **Network-level chunks + synced manifest (v3)** — rebuilds IPFS by hand (chunk-level refcount/GC/P2P) with no gain over A.
+- **Per-leaf AES-GCM frames** — changes the ciphertext + trust model, breaking IPFS/anytype block compatibility; we keep whole-file CFB + cid integrity.
+- **One S3 object per cid** — ~1000 PUTs/GB + presigned-URL + broker-load blow-up, for zero benefit (per-file random keys → no cross-file leaf sharing). → one CARv2 per file.
+- **Bespoke node-readable payload-index tree (alt C)** — unnecessary: the partially-encrypted `payloads` object *is* the node-readable index.
+- **Client-driven refcount / unbind RPCs** — RPC refcounting drifts offline-first; the node derives reachability from the synced rows instead.
+- **A common KV/Redis index across filenodes** — avoided: per-space derived index, evicted when idle, rebuilt from rows.
+
 ## Still open / to build
 - **OPEN DECISION — RF storage:** one shared content-addressed bucket (RF = broker redundancy — recommended) vs RF physical byte copies (geo-redundancy; each node GCs its own copy, leader computes the orphan set).
 - **OPEN DECISION — limits granularity:** keep **per-identity** via the coordinator (allowances / reserve-check — recommended) vs move to **per-space** pricing (simplest for the fleet, but a product change).

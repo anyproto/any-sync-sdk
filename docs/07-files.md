@@ -1,5 +1,8 @@
 # Files
 
+> **⚠️ Superseded for the byte layer — read [07c — filenode v2 + networkSign](07c-filenode-v2-networksign.md) first.**
+> The current design is **IPFS cids + one CARv2 per file + whole-file CFB + `networkSign`** (07c), with the composition in [07b](07b-files-derived-payloads.md). This doc is kept as the **deep byte-layer exploration** — the A-vs-B fork and the v0–v4 history. Its "S3-direct **whole-blob** + Streaming-AEAD" conclusion below was later **reverted to IPFS cids** (matches the proven anytype reader, keeps block compatibility); 07c's *Alternatives considered* has the compact why-not. The shared foundations here (envelope encryption, availability≠durability, collective durability, dedup) still hold.
+
 ## TL;DR — the SDK2 file model (S3-direct, whole-blob)
 
 1. **Drop IPFS. Filenode becomes a thin token broker; bytes go client↔S3 directly.** The node never proxies a byte — it checks ACL + quota and hands out **presigned S3 upload / CloudFront-signed download URLs**. Sound because blobs are already client-side **ciphertext**; proxying them adds *zero* confidentiality, only cost and a failure domain. (Expert-reviewed: "FORK.") Needs a new server, but a far simpler one (~3 RPCs, no block store).

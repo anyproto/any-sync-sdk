@@ -1,6 +1,6 @@
 # Files v6 — derived payloads children + partial encryption + filenode v2
 
-Latest direction. Main ideas only; rationale/benches live in `internal/spikes/filetree` (build tag `filetreespike`), `e2e/staging_cold_sync_test.go` (build tag `stagingcoldsync`), and the existing `_spikes/{blobbench,realbench,sweep}`. Sits above the byte/transport layer of `07-files.md` (envelope crypto, availability≠durability, collective durability are unchanged).
+The **composition layer** (current). Sits above the byte/durability layer in **[07c](07c-filenode-v2-networksign.md)** (the current byte layer; `07-files.md` is the deep byte-layer history). Main ideas only; rationale/benches live in `internal/spikes/filetree` (build tag `filetreespike`), `e2e/staging_cold_sync_test.go` (build tag `stagingcoldsync`), and `_spikes/{blobbench,realbench,sweep}`.
 
 ## 1. Composition — payloads bound to owners
 

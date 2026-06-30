@@ -26,10 +26,10 @@ Concrete protocol for the byte/durability layer. Elaborates `07b` §4 (filenode 
   "name":        "image.png",
   "sha256":      "{hash}",            // hash of the UNENCRYPTED file — the dedup key
   "meta":        { "mime": "image/png", "size": [1024, 768] },
-  "manifest":    ["{cid1}", "{cid2}", "…"]   // the chunk list, member-only (or derive from the root block)
+  // (no manifest field — the UnixFS DAG is reconstructable from rootCid alone)
 }
 ```
-Only the **root cid** is node-visible; the full chunk manifest stays member-side. (Inlining the whole `cids[]` cleartext was the one confirmed-true review finding — it bloats large-file rows and inflates node refcount cardinality ~1000×. The node only needs the root.)
+Only the **root cid** is node-visible; the whole DAG (intermediates + leaves) is reconstructable from it, so the row needs nothing else. (Inlining a cleartext `cids[]` was the one confirmed-true review finding — it bloats large-file rows and inflates node refcount cardinality ~1000×. The node only needs the root.)
 
 ## networkSign — the keystone
 - The node **signs the root cid** after verifying the upload; the **client records** it in the row. **No valid sign ⇒ the file is GC'd after grace.**
@@ -43,7 +43,7 @@ Only the **root cid** is node-visible; the full chunk manifest stays member-side
 2. Generate a **new sym key**, encrypt, produce IPFS cids (root + chunks).
 3. **Register the payloads row** (rootCid, size, encrypted fields) — *before* upload (makes every later crash reachable for GC).
 4. `uploadRequest(fileId, rootCid, size)` → node **reserves quota** (reserve-on-authorize + TTL) → a presigned POST (or multipart, frame-aligned parts for big files) for the **one packed object** to a `staging/` prefix.
-5. Client **PUTs the packed object** (`[root block][leaves…]`) directly to S3 (`staging/`).
+5. Client **PUTs the packed object** (a **CARv2** of the file's encrypted UnixFS DAG) directly to S3 (`staging/`).
 6. `requestSign(rootCid)` → node confirms presence (event-fed index) → **signs the root cid**, promotes `staging/ → durable/`, finalizes the reservation. Sign issuance is **idempotent / re-requestable** from the row's cids.
 7. Client **records `networkSign`** in the row.
 8. **BIND** (dedup hit): mint a new `fileId`, reuse the existing `rootCid` + sign + key.
@@ -69,19 +69,26 @@ A node-maintained, **persisted, incremental** view: `(spaceId, rootCid) → { li
 ## Physical S3 mapping & seek (decided)
 **One S3 object per file, keyed by `rootCid`** — a CAR-style `[root block][leaf₀][leaf₁]…`, or S3 multipart with frame-aligned parts. *Not* one object per leaf cid (that is ≈1000 PUTs/GB + ≈1000 presigned URLs/GB + broker load, for zero benefit). Adversarial review found **no in-scope scenario where packing loses anything**: every "global per-leaf resolution" win (cross-file dedup, swarm leaf-sharing, cross-file CDN reuse, DHT/gateway interop, delta/append) needs two files to share an identically-keyed ciphertext leaf, which the **per-file random key already makes impossible** — the leaf-sharing was zeroed by the crypto, not by the layout.
 
-**Format.** Each leaf is an **independently AES-GCM-encrypted frame** (nonce = frame index) → independently decryptable (so any byte is seekable) and self-verifying (`leaf cid = SHA-256(encrypted frame)`). The **root block** is the `rootCid → [leaf cid, size]…` map; `rootCid = SHA-256(root block)` commits to the whole file. (This makes the IPFS-cids layout and the v4 Streaming-AEAD frame layout the *same* on-disk format.)
+**Format — IPFS-compatible, matches the proven anytype-heart reader** (verified in code 2026-06-30):
+- **Whole-file AES-256-CFB stream, *then* chunked** (NOT per-leaf encryption). Encrypt the plaintext as one CFB stream → split the *ciphertext* into **1 MiB** leaves → a **balanced UnixFS DAG** (fanout 174, CIDv1 / dag-pb / sha2-256). `rootCid` = the UnixFS root. This is exactly `any-sync/commonfile/fileservice.AddFile`.
+- **Integrity is from the merkle cids, not the cipher.** Every block (leaf *and* intermediate) is verified against its cid before use; the chain roots at the signed `rootCid`. CFB carries no tags, but a tampered block fails its cid check → rejected before decrypt. (A per-leaf-AEAD format was considered and **rejected**: it changes the ciphertext bytes and the trust model, breaking IPFS / anytype block compatibility.)
+- **The DAG is the manifest** — reconstructable from `rootCid` alone (fetch root → read its `blocksizes` + child cids → descend). Nothing extra in the CRDT row.
 
-**Resolution — global at the file, integrity+seek at the leaf:**
+**Seek is a real DAG traversal** (stock `boxo` `DagReader`): to reach plaintext offset N, walk root → intermediate nodes → leaf, using each node's UnixFS `blocksizes` to pick the child, **fetching each node by cid**. So the packed object needs a `cid → offset` index over **every node, intermediates included** — exactly what **CARv2's index** gives. Decrypt at N is CFB-seekable: recover the IV from the single 16-byte ciphertext block at `N-16` (also reached by the traversal) and discard the sub-block remainder — never decrypt-from-start.
+
+**Resolution — global at the file, integrity+seek inside it:**
 | who | resolves | how |
 |---|---|---|
-| **filenode (Oracle)** | `rootCid → {refcount, size}` only | one presign / one HEAD / sign rootCid / GC by rootCid; never reads leaves (~0 bandwidth) |
-| **peers (P2P)** | `(rootCid, byte-range)` | multi-source = different ranges of one rootCid; each frame cid/GCM-verified; mDNS single-net, single-source + Range-resume + S3 fallback |
-| **CDN** | rootCid object + frame-aligned ranges | SDK aligns Range to frame boundaries → ranges shared across users; thumbnails are their own small rootCids (whole-object GET) |
-| **client/member** | leaf *i* | fetch+verify the root block once → `offset_i = header + i·(frame+tag)` → Range-GET → `SHA-256`-compare → decrypt (ciphertext-only verify → zero-knowledge audit intact) |
+| **filenode (Oracle)** | `rootCid → {refcount, size}` only | one presign / one HEAD / sign rootCid / GC by rootCid; never reads blocks (~0 bandwidth) |
+| **peers (P2P)** | `(rootCid, byte-range)` | multi-source = different ranges of one rootCid; each block cid-verified; mDNS single-net, single-source + Range-resume + S3 fallback |
+| **CDN** | rootCid object + ranges | thumbnails/previews are their own small rootCids (whole-object GET) |
+| **client/member** | any byte offset | traverse the DAG via the CARv2 index (root→intermediates→leaf, each fetched by Range + cid-verified) → CFB-decrypt with the preceding 16-byte block → ciphertext-only verify (zero-knowledge audit intact) |
 
-A **leaf cid is an intra-file integrity + ordering coordinate, not a global address** — never individually presigned or resolved across files. The manifest stays member-side (the S3 root block, or inline in the encrypted row for tiny files), so the CRDT row carries only `rootCid` and node refcount cardinality stays ~1×, not ~1000×.
+A **cid is an intra-file integrity + ordering coordinate, not a global address** — never individually presigned or resolved across files. So the CRDT row carries only `rootCid` and node refcount cardinality stays ~1×, not ~1000×.
 
-**Build alongside (not reasons to un-pack):** (a) make `BlobCheck`/`BlobGet` **range-aware** (held-range bitmap) so partial LAN holders can serve/repair; (b) **multipart frame-aligned parts** for large uploads → part-level resume; (c) keep the **root block re-derivable/cacheable** by any holder.
+**Build alongside (not reasons to un-pack):** (a) make `BlobCheck`/`BlobGet` **range-aware** so partial LAN holders can serve/repair; (b) **multipart** for large uploads → part-level resume; (c) keep the **CARv2 index re-derivable/cacheable** by any holder (one scan of the packed object rebuilds it); (d) a **no-preload targeted range reader** for S3/CDN seek — see the spike note below.
+
+**Validated by spike (`internal/spikes/carpack`, build tag `carpackspike`).** Real boxo balanced UnixFS DAG (1 MiB leaves, fanout 174, CIDv1/dag-pb) over whole-file AES-256-CFB ciphertext, packed into one CAR-style object with a `cid→offset` index, read back through the stock `boxo` `DagReader` + a seekable CFB decryptor. Findings (256 MiB, 2 DAG levels): pack/index overhead **~0.01%**; random-seek p50 **~0.53 ms**, **matching/beating one-file-per-cid** (so packing doesn't cost seek); cold index rebuild ~40 ms (CARv2 persists it → 0). **Caveat:** the stock `DagReader`'s read-ahead fetches **~9 MiB to serve a 64 KiB seek** (~9× the whole-leaf floor). Cheap on a local packed file (page cache), but over S3/CDN it must be replaced by a **targeted reader** that fetches only the path nodes + the covered leaves (and consider sub-MiB chunks if sub-leaf seeks dominate).
 
 **Revisit only if** (both reversible per-blob without touching `rootCid` / `networkSign` / the refcount unit / P2P keys / any CRDT state — packing is a physical mapping, not a one-way door): (1) the crypto moves to a **shared/convergent key + content-defined chunking** (backup / VM-image / generational workloads) where global per-leaf dedup finally pays — which needs a re-encode migration anyway; (2) a **non-SDK reader** (browser/WASM direct-to-S3, public CID gateway) where frame-aligned Range discipline can't be enforced (weak — E2E already forecloses public-gateway value).
 

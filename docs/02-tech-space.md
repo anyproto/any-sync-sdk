@@ -38,6 +38,18 @@ Probably a separate derived object with multiple record sets (namespaces) for di
 ### Chat Read Tracking (KV namespace)
 Read positions for chats, stored as key-value in tech space.
 
+### Identities directory (`identities` dataset)
+Account-global directory of every account identity seen across spaces, 1-1s,
+and inbox invites — backs `sdk.Identities()`. One row per identity, **mixing
+sync classes**: `symKey` is **synced** (a device needs it to decrypt that
+contact's identityRepo profile), while the resolved `name`/`description`/
+`iconCID` and the `spaceIds` sighting set are **device-local** (re-derived per
+device). See `docs/14-identities.md`.
+
+The tech space also hosts two account-scoped helper datasets: `profile` (the
+account's own profile, republished to identityRepo on boot) and `inboxCursor`
+(the synced 1-1 inbox read position — see `docs/13-one-to-one-spaces.md`).
+
 ## Current any-sync Implementation
 
 ### Derivation

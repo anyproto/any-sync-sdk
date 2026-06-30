@@ -256,11 +256,22 @@ func (a *aclAPI) AddAccounts(ctx context.Context, accounts []space.MemberAdd) er
 		if err != nil {
 			return fmt.Errorf("acl: account %d: %w", i, err)
 		}
-		out = append(out, list.AccountAdd{
+		// Symkey-only metadata: the ACL carries a member's own metadata
+		// symkey (m.Metadata name/icon is no longer written). An owner
+		// adding accounts directly can't produce another account's key,
+		// but if it has already learned that member's symkey (from a prior
+		// 1-1 or shared space), it forwards it here so the other members
+		// can resolve the added member's profile. Absent a cached key the
+		// record carries no metadata, and resolution waits until the key
+		// reaches this account another way.
+		add := list.AccountAdd{
 			Identity:    pk,
 			Permissions: toAclPermissions(m.Permission),
-			Metadata:    encodeMetadata(m.Metadata),
-		})
+		}
+		if enc, ok := a.s.tsp.GetIdentityMetaKey(ctx, m.Identity); ok {
+			add.Metadata = []byte(enc)
+		}
+		out = append(out, add)
 	}
 	cl, err := a.client(ctx)
 	if err != nil {
@@ -380,12 +391,41 @@ func fromAclPermissions(p list.AclPermissions) space.Permission {
 	}
 }
 
-// encodeMetadata flattens an AccountMetadata into the wire bytes that
-// land on the ACL record. Same NUL-separated layout as
-// space.EncodeAccountMetadata — kept as a thin alias so internal call
-// sites stay short.
-func encodeMetadata(m space.AccountMetadata) []byte { return space.EncodeAccountMetadata(m) }
+// encodeSelfSymKeyMetadata derives this account's metadata symkey and
+// returns its marshalled bytes for the ACL RequestMetadata / create
+// payload. The ACL carries ONLY the symkey, never inline name/icon —
+// co-members cache the key and resolve the profile from identityRepo
+// (see docs/13). any-sync encrypts these bytes at rest with the space
+// metadata key, so only members can read the symkey. Returns nil bytes
+// on derive/marshal failure (the member still joins; their profile just
+// stays unresolved until a later key arrival).
+func encodeSelfSymKeyMetadata(signKey crypto.PrivKey) ([]byte, error) {
+	k, err := space.DeriveAccountMetadataSymKey(signKey)
+	if err != nil {
+		return nil, err
+	}
+	s, err := space.MarshalSymKey(k)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(s), nil
+}
 
-// decodeMetadata is the inverse — public alias so internal callers
-// don't have to import the same helper from two places.
-func decodeMetadata(b []byte) space.AccountMetadata { return space.DecodeAccountMetadata(b) }
+// decodeSymKeyMetadata decrypts an active member's ACL RequestMetadata
+// (encrypted at rest with the space metadata key) and returns the
+// contact's metadata symkey string, "" when absent or the caller lacks
+// the metadata key.
+func decodeSymKeyMetadata(raw []byte, keys map[string]list.AclKeys, keyRecordId string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	k, ok := keys[keyRecordId]
+	if !ok || k.MetadataPrivKey == nil {
+		return ""
+	}
+	plain, err := k.MetadataPrivKey.Decrypt(raw)
+	if err != nil {
+		return ""
+	}
+	return string(plain)
+}

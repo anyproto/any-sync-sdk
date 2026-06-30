@@ -68,6 +68,12 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	if err := s.tsp.DropAccountValues(ctx, spaceId); err != nil {
 		offloadLog.Debug("drop account values", zap.String("spaceId", spaceId), zap.Error(err))
 	}
+
+	// 7. Prune this space from the identities directory so spaceIds keeps
+	// reflecting live memberships.
+	if err := s.tsp.RemoveSpaceFromIdentities(ctx, spaceId); err != nil {
+		offloadLog.Debug("prune identities", zap.String("spaceId", spaceId), zap.Error(err))
+	}
 }
 
 // dropSpaceCollections deletes every any-store collection belonging to

@@ -97,7 +97,7 @@ func (m *membersAPI) List(ctx context.Context) ([]space.Member, error) {
 		return nil, err
 	}
 	acl.RLock()
-	members := collectMembers(acl)
+	members, _ := collectMembers(acl)
 	acl.RUnlock()
 	m.applyProfiles(members)
 	return members, nil
@@ -114,11 +114,10 @@ func (m *membersAPI) Get(ctx context.Context, identity string) (space.Member, er
 	}
 	acl.RLock()
 	state := acl.AclState()
-	keys := state.Keys()
 	var found *space.Member
 	for _, acc := range state.CurrentAccounts() {
 		if acc.PubKey.Equals(pk) {
-			val := memberFromAccountState(acc, keys)
+			val := memberFromAccountState(acc)
 			found = &val
 			break
 		}
@@ -151,12 +150,11 @@ func (m *membersAPI) Me(ctx context.Context) (space.Member, error) {
 	}
 	acl.RLock()
 	state := acl.AclState()
-	keys := state.Keys()
 	me := state.Identity()
 	var found *space.Member
 	for _, acc := range state.CurrentAccounts() {
 		if acc.PubKey.Equals(me) {
-			val := memberFromAccountState(acc, keys)
+			val := memberFromAccountState(acc)
 			found = &val
 			break
 		}
@@ -175,8 +173,90 @@ func (m *membersAPI) JoinRequests(ctx context.Context) ([]space.JoinRequestInfo,
 		return nil, err
 	}
 	acl.RLock()
-	defer acl.RUnlock()
-	return collectJoinRequests(acl), nil
+	reqs, symKeys := collectJoinRequests(acl)
+	acl.RUnlock()
+	m.resolveJoinRequestProfiles(ctx, reqs, symKeys)
+	return reqs, nil
+}
+
+// resolveJoinRequestProfiles fills each request's name/icon from the
+// requester's identityRepo profile, decrypted with the symkey carried on
+// the (decrypted) join record. Profiles are cached in the shared member
+// watcher: a cache hit skips the network, a miss does ONE fetch and
+// stores the result (so repeat calls — and member views — reuse it). The
+// watcher's profile loop refreshes the cache over time. Best-effort: a
+// missing key or offline coordinator leaves that request identity-only.
+func (m *membersAPI) resolveJoinRequestProfiles(ctx context.Context, reqs []space.JoinRequestInfo, symKeys map[string]string) {
+	s := m.s.parent
+	if s == nil {
+		return
+	}
+	w := m.ensureWatcher()
+	for i := range reqs {
+		id := reqs[i].Identity
+		if w != nil {
+			if p, ok := w.cachedProfile(id); ok {
+				applyJoinProfile(&reqs[i], p)
+				continue
+			}
+		}
+		enc, ok := symKeys[id]
+		if !ok {
+			continue
+		}
+		key, err := space.UnmarshalSymKey(enc)
+		if err != nil {
+			continue
+		}
+		prof, ok := s.fetchIdentityProfile(ctx, id, key)
+		if !ok {
+			continue
+		}
+		applyJoinProfile(&reqs[i], prof)
+		if w != nil {
+			w.cacheProfile(id, prof)
+		}
+		// Write through to the identities directory.
+		_ = s.tsp.SetIdentityProfile(ctx, id, prof.Name, prof.Description, prof.IconCID)
+	}
+}
+
+// dedupStrings merges two id slices into one with duplicates removed.
+func dedupStrings(a, b []string) []string {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, s := range a {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	for _, s := range b {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// applyJoinProfile overlays non-empty profile fields onto a join request.
+func applyJoinProfile(r *space.JoinRequestInfo, p space.AccountMetadata) {
+	if p.Name != "" {
+		r.Name = p.Name
+	}
+	if p.Description != "" {
+		r.Description = p.Description
+	}
+	if p.IconCID != "" {
+		r.IconCID = p.IconCID
+	}
 }
 
 func (m *membersAPI) Invites(ctx context.Context) ([]space.InviteInfo, error) {
@@ -247,6 +327,25 @@ func (m *membersAPI) applyProfile(member *space.Member) {
 		return
 	}
 	applyProfile(member, p)
+}
+
+// cachedProfile returns the watcher's cached identityRepo profile for an
+// identity, if one has been fetched. Safe under the watcher lock.
+func (w *memberWatcher) cachedProfile(identity string) (space.AccountMetadata, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	p, ok := w.profiles[identity]
+	return p, ok
+}
+
+// cacheProfile stores a freshly fetched profile in the watcher cache so
+// later reads (member views and JoinRequests) reuse it instead of
+// re-fetching. Marks the snapshot dirty so the next tick applies it.
+func (w *memberWatcher) cacheProfile(identity string, p space.AccountMetadata) {
+	w.mu.Lock()
+	w.profiles[identity] = p
+	w.profilesDirty = true
+	w.mu.Unlock()
 }
 
 // applyProfiles is the slice equivalent of applyProfile.
@@ -335,104 +434,91 @@ func (m *membersAPI) setWatcher(w *memberWatcher) {
 	m.watcherMu.Unlock()
 }
 
-// memberFromAccountState lifts one any-sync AccountState into the
-// public Member shape, decrypting the request metadata using the
-// keys from the keyRecordId on the account state. Decryption falls
-// back to raw bytes if the caller doesn't hold the matching key
-// (e.g. a non-admin reading another member's record) — those
-// bytes won't decode into our flat AccountMetadata format, so the
-// fields stay empty.
-func memberFromAccountState(acc list.AccountState, keys map[string]list.AclKeys) space.Member {
-	md := decodeAccountMetadata(acc.RequestMetadata, keys, acc.KeyRecordId)
+// memberFromAccountState lifts one any-sync AccountState into the public
+// Member shape. The ACL holds only a member's metadata symkey, not their
+// name/icon — those are overlaid from the identityRepo profile cache by
+// applyProfile.
+func memberFromAccountState(acc list.AccountState) space.Member {
 	return space.Member{
-		Identity:    acc.PubKey.Account(),
-		Permission:  fromAclPermissions(acc.Permissions),
-		Status:      fromAclStatus(acc.Status),
-		Name:        md.Name,
-		Description: md.Description,
-		IconCID:     md.IconCID,
+		Identity:   acc.PubKey.Account(),
+		Permission: fromAclPermissions(acc.Permissions),
+		Status:     fromAclStatus(acc.Status),
 	}
 }
 
-// memberFromJoinRecord lifts a pending RequestRecord into a Member
-// with Status=Joining. JoinRecords(true) on the AclState already
-// decrypts in-place when the caller has the metadata key, so the
-// bytes here are plaintext on the owner/admin side.
+// memberFromJoinRecord lifts a pending RequestRecord into a Member with
+// Status=Joining. Name/icon come from the identityRepo overlay, not the
+// record (which carries only the requester's metadata symkey).
 func memberFromJoinRecord(r list.RequestRecord) space.Member {
-	md := decodeMetadata(r.RequestMetadata)
 	return space.Member{
 		Identity:        r.RequestIdentity.Account(),
 		Permission:      space.PermissionNone,
 		Status:          space.MemberStatusJoining,
-		Name:            md.Name,
-		Description:     md.Description,
-		IconCID:         md.IconCID,
 		RequestRecordId: r.RecordId,
 	}
 }
 
-// collectMembers snapshots the ACL into the union view: active
-// members from CurrentAccounts (including removed tombstones) plus
-// pending join requests. Caller holds the AclList read lock.
-func collectMembers(acl list.AclList) []space.Member {
+// collectMembers snapshots the ACL into the union view: active members
+// from CurrentAccounts (including removed tombstones) plus pending join
+// requests. The second return maps identity → metadata symkey string for
+// every member/requester whose symkey we could decrypt — the caller
+// caches these so each contact's profile resolves from identityRepo (and
+// so the account's other devices learn the key). Caller holds the
+// AclList read lock.
+func collectMembers(acl list.AclList) ([]space.Member, map[string]string) {
 	state := acl.AclState()
 	keys := state.Keys()
 	accounts := state.CurrentAccounts()
 	out := make([]space.Member, 0, len(accounts))
+	symKeys := make(map[string]string)
 	for _, acc := range accounts {
-		out = append(out, memberFromAccountState(acc, keys))
+		out = append(out, memberFromAccountState(acc))
+		if sk := decodeSymKeyMetadata(acc.RequestMetadata, keys, acc.KeyRecordId); sk != "" {
+			symKeys[acc.PubKey.Account()] = sk
+		}
 	}
-	// JoinRecords(true) decrypts metadata when the caller has the
-	// metadata key (owner / admin); fall back to ciphertext otherwise.
+	// JoinRecords(true) decrypts the request metadata when the caller
+	// holds the metadata key (owner / admin); the plaintext is the
+	// requester's symkey. JoinRecords(false) leaves it ciphertext (no
+	// symkey learned).
 	reqs, err := state.JoinRecords(true)
+	decrypted := err == nil
 	if err != nil {
 		reqs, _ = state.JoinRecords(false)
 	}
 	for _, r := range reqs {
 		out = append(out, memberFromJoinRecord(r))
+		if decrypted && len(r.RequestMetadata) > 0 {
+			symKeys[r.RequestIdentity.Account()] = string(r.RequestMetadata)
+		}
 	}
-	return out
+	return out, symKeys
 }
 
-// collectJoinRequests is the projection over collectMembers limited
-// to the Status=Joining rows.
-func collectJoinRequests(acl list.AclList) []space.JoinRequestInfo {
+// collectJoinRequests is the projection over collectMembers limited to
+// the Status=Joining rows. The second return maps requester identity →
+// metadata symkey string (from the decrypted join record) so the caller
+// can resolve each requester's name/icon from identityRepo — the record
+// itself no longer carries name/icon.
+func collectJoinRequests(acl list.AclList) ([]space.JoinRequestInfo, map[string]string) {
 	reqs, err := acl.AclState().JoinRecords(true)
+	decrypted := err == nil
 	if err != nil {
 		reqs, _ = acl.AclState().JoinRecords(false)
 	}
 	out := make([]space.JoinRequestInfo, 0, len(reqs))
+	symKeys := make(map[string]string)
 	for _, r := range reqs {
-		md := decodeMetadata(r.RequestMetadata)
+		id := r.RequestIdentity.Account()
 		out = append(out, space.JoinRequestInfo{
-			RecordId:    r.RecordId,
-			Identity:    r.RequestIdentity.Account(),
-			Name:        md.Name,
-			Description: md.Description,
-			IconCID:     md.IconCID,
+			RecordId: r.RecordId,
+			Identity: id,
 		})
+		if decrypted && len(r.RequestMetadata) > 0 {
+			symKeys[id] = string(r.RequestMetadata)
+		}
 	}
-	return out
-}
-
-// decodeAccountMetadata decrypts the request-metadata blob attached
-// to an account state, if the caller holds the metadata key for the
-// matching keyRecordId. Falls back silently to empty metadata when
-// decryption fails — readers without the key see no name/icon, which
-// is correct (they shouldn't be able to anyway).
-func decodeAccountMetadata(raw []byte, keys map[string]list.AclKeys, keyRecordId string) space.AccountMetadata {
-	if len(raw) == 0 {
-		return space.AccountMetadata{}
-	}
-	k, ok := keys[keyRecordId]
-	if !ok || k.MetadataPrivKey == nil {
-		return space.AccountMetadata{}
-	}
-	plain, err := k.MetadataPrivKey.Decrypt(raw)
-	if err != nil {
-		return space.AccountMetadata{}
-	}
-	return decodeMetadata(plain)
+	return out, symKeys
 }
 
 func fromAclStatus(s list.AclStatus) space.MemberStatus {
@@ -516,12 +602,23 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 	if acl, err := api.aclList(ctx); err == nil {
 		acl.RLock()
 		w.headId = acl.Head().Id
-		members := collectMembers(acl)
+		members, symKeys := collectMembers(acl)
 		acl.RUnlock()
 		for _, m := range members {
 			w.snapshot[m.Identity] = m
 		}
 		_ = w.reconcileCollection(ctx, nil, w.snapshot)
+		// Seed the identities directory for members present at watcher
+		// start. The first tick will early-return (head unchanged), so this
+		// work won't otherwise run for them: cache their symkeys and record
+		// the space sighting. Their profiles are then resolved by the
+		// profileLoop's initial run, which now finds the keys cached.
+		for id, sk := range symKeys {
+			_ = w.api.s.tsp.SetIdentityMetaKey(ctx, id, sk)
+		}
+		for id := range w.snapshot {
+			_ = w.api.s.tsp.AddIdentitySpace(ctx, id, w.api.s.id)
+		}
 		// Register as the syncacl AclUpdater so we tick immediately on
 		// every record add. The cast is safe — commonspace.Space.Acl()
 		// returns syncacl.SyncAcl, and our aclList() forwards that.
@@ -618,7 +715,7 @@ func (w *memberWatcher) tick() {
 		acl.RUnlock()
 		return
 	}
-	current := collectMembers(acl)
+	current, symKeys := collectMembers(acl)
 	state := acl.AclState()
 	meActive := false
 	if me := state.Identity(); me != nil {
@@ -640,6 +737,22 @@ func (w *memberWatcher) tick() {
 	// promptly after the owner's accept replicates.
 	if meActive {
 		w.maybeFlipTechSpaceJoining(ctx)
+	}
+
+	// Cache each member's metadata symkey into the synced account-scoped
+	// store before fetching profiles, so the decrypt path (and the
+	// account's other devices) can resolve their identityRepo profile.
+	// SetIdentityMetaKey no-ops on an unchanged value. Track identities
+	// whose key is NEW so we fetch their profile right away — a member
+	// present since watcher start (e.g. the owner, from a fresh joiner's
+	// view) isn't a "newcomer", so without this its profile would wait up
+	// to identityRepoPollInterval.
+	var newKeyIds []string
+	for id, sk := range symKeys {
+		if cur, ok := w.api.s.tsp.GetIdentityMetaKey(ctx, id); !ok || cur != sk {
+			newKeyIds = append(newKeyIds, id)
+		}
+		_ = w.api.s.tsp.SetIdentityMetaKey(ctx, id, sk)
 	}
 
 	w.mu.Lock()
@@ -688,14 +801,29 @@ func (w *memberWatcher) tick() {
 			})
 		}
 	}
-	if len(newcomers) > 0 {
-		go w.fetchProfilesFor(context.Background(), newcomers)
+	// On a membership change, record the space sighting for every current
+	// member in the identities directory (not just newcomers — a member
+	// present since watcher start, e.g. the owner from a fresh joiner's
+	// view, is never a newcomer). AddIdentitySpace no-ops when the sighting
+	// already exists; gated on headChanged so profile-only ticks skip it.
+	if headChanged {
+		spaceID := w.spaceID()
+		for id := range next {
+			_ = w.api.s.tsp.AddIdentitySpace(ctx, id, spaceID)
+		}
+	}
+	// Fetch profiles for both newcomers and members whose symkey just
+	// became available (deduped).
+	if fetch := dedupStrings(newcomers, newKeyIds); len(fetch) > 0 {
+		go w.fetchProfilesFor(context.Background(), fetch)
 	}
 	// Emit remove events for identities that disappeared.
 	for id, old := range prev {
 		if _, stillThere := next[id]; stillThere {
 			continue
 		}
+		// Prune the sighting — this member left the space.
+		_ = w.api.s.tsp.RemoveIdentitySpace(ctx, id, w.spaceID())
 		oldCopy := old
 		fanout(subs, space.MemberEvent{
 			Kind:     space.MemberEventRemoved,
@@ -868,21 +996,27 @@ func (w *memberWatcher) fetchProfilesFor(ctx context.Context, identities []strin
 		return
 	}
 
-	res, err := app.Coordinator().IdentityRepoGet(ctx, identities, []string{space.IdentityProfileKind})
-	if err != nil {
-		// Network errors are best-effort; the next tick will retry.
+	res := w.api.s.parent.identityRepoGet(ctx, identities)
+	if len(res) == 0 {
 		return
 	}
 
+	// Resolve each contact's decryption symkey before taking the lock —
+	// the lookup reads the tech-space cache and shouldn't run under w.mu.
+	symKeys := make(map[string]crypto.SymKey, len(res))
+	for _, dwi := range res {
+		symKeys[dwi.Identity] = w.api.s.parent.metadataSymKeyFor(ctx, dwi.Identity)
+	}
+
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	changed := false
+	resolved := make(map[string]space.AccountMetadata)
 	for _, dwi := range res {
 		pk, ok := pubKeys[dwi.Identity]
 		if !ok {
 			continue
 		}
-		profile, ok := decodeIdentityRepoProfile(dwi.Data, pk)
+		profile, ok := decodeIdentityRepoProfile(dwi.Data, pk, symKeys[dwi.Identity])
 		if !ok {
 			continue
 		}
@@ -890,17 +1024,27 @@ func (w *memberWatcher) fetchProfilesFor(ctx context.Context, identities []strin
 		if prev != profile {
 			w.profiles[dwi.Identity] = profile
 			changed = true
+			resolved[dwi.Identity] = profile
 		}
 	}
 	if changed {
 		w.profilesDirty = true
 	}
+	w.mu.Unlock()
+
+	// Write changed profiles through to the account-global identities
+	// directory (device-local) so the public Identities API and 1-1 list
+	// rows see them too. Outside the lock — these are tech-space writes.
+	for id, p := range resolved {
+		_ = w.api.s.tsp.SetIdentityProfile(ctx, id, p.Name, p.Description, p.IconCID)
+	}
 }
 
-// decodeIdentityRepoProfile finds the SDK-kind record in data,
-// verifies its signature against pk, and decodes the bytes. Returns
-// (zero, false) on missing record, bad signature, or parse failure.
-func decodeIdentityRepoProfile(data []*identityrepoproto.Data, pk crypto.PubKey) (space.AccountMetadata, bool) {
+// decodeIdentityRepoProfile finds the SDK-kind record in data, verifies
+// its signature against pk (over the ciphertext), and decrypts the bytes
+// with key. Returns (zero, false) on missing record, bad signature, a nil
+// key (we don't hold this contact's symkey yet), or decrypt failure.
+func decodeIdentityRepoProfile(data []*identityrepoproto.Data, pk crypto.PubKey, key crypto.SymKey) (space.AccountMetadata, bool) {
 	for _, d := range data {
 		if d == nil || d.Kind != space.IdentityProfileKind {
 			continue
@@ -909,7 +1053,133 @@ func decodeIdentityRepoProfile(data []*identityrepoproto.Data, pk crypto.PubKey)
 		if err != nil || !ok {
 			return space.AccountMetadata{}, false
 		}
-		return space.DecodeAccountMetadata(d.Data), true
+		return space.DecryptProfile(d.Data, key)
 	}
 	return space.AccountMetadata{}, false
+}
+
+// metadataSymKeyFor resolves the symkey that decrypts identity's
+// identityRepo profile: our own is derivable from the account key; a
+// contact's comes from the synced account-scoped identityMetaKeys cache
+// (populated from a shared space's ACL or a 1-1 invite). Returns nil when
+// we don't hold the contact's key yet — the profile then stays
+// unresolved until the key arrives.
+func (s *Service) metadataSymKeyFor(ctx context.Context, identity string) crypto.SymKey {
+	keys := s.app.AccountKeys()
+	if keys != nil && identity == keys.SignKey.GetPublic().Account() {
+		k, err := space.DeriveAccountMetadataSymKey(keys.SignKey)
+		if err != nil {
+			return nil
+		}
+		return k
+	}
+	enc, ok := s.tsp.GetIdentityMetaKey(ctx, identity)
+	if !ok {
+		return nil
+	}
+	k, err := space.UnmarshalSymKey(enc)
+	if err != nil {
+		return nil
+	}
+	return k
+}
+
+// fetchIdentityProfile pulls one identity's identityRepo profile from the
+// coordinator, verifies it, and decrypts it with key. Returns
+// (zero, false) when the coordinator is absent/offline, the record is
+// missing, or we don't hold the decryption key. Shared by the per-space
+// member fetcher and the pending-1-1 name resolver.
+func (s *Service) fetchIdentityProfile(ctx context.Context, identity string, key crypto.SymKey) (space.AccountMetadata, bool) {
+	if s.app == nil || s.app.Coordinator() == nil || key == nil {
+		return space.AccountMetadata{}, false
+	}
+	pk, err := crypto.DecodeAccountAddress(identity)
+	if err != nil {
+		return space.AccountMetadata{}, false
+	}
+	res, err := s.app.Coordinator().IdentityRepoGet(ctx, []string{identity}, []string{space.IdentityProfileKind})
+	if err != nil {
+		return space.AccountMetadata{}, false
+	}
+	for _, dwi := range res {
+		if dwi.Identity != identity {
+			continue
+		}
+		return decodeIdentityRepoProfile(dwi.Data, pk, key)
+	}
+	return space.AccountMetadata{}, false
+}
+
+// identityRepoMaxBatch is the coordinator's per-request identity cap for
+// identityRepo Pull (ErrThresholdReached beyond it). Larger requests are
+// split into chunks.
+const identityRepoMaxBatch = 350
+
+// identityRepoGet fetches identityRepo profiles for many identities,
+// chunked to the coordinator's per-request cap. Best-effort per chunk: a
+// failing chunk is skipped, not fatal to the rest.
+func (s *Service) identityRepoGet(ctx context.Context, identities []string) []*identityrepoproto.DataWithIdentity {
+	if s.app == nil || s.app.Coordinator() == nil {
+		return nil
+	}
+	var out []*identityrepoproto.DataWithIdentity
+	for start := 0; start < len(identities); start += identityRepoMaxBatch {
+		end := start + identityRepoMaxBatch
+		if end > len(identities) {
+			end = len(identities)
+		}
+		res, err := s.app.Coordinator().IdentityRepoGet(ctx, identities[start:end], []string{space.IdentityProfileKind})
+		if err != nil {
+			continue
+		}
+		out = append(out, res...)
+	}
+	return out
+}
+
+// ResolveIdentityProfiles batch-resolves every directory identity that
+// has a synced symkey but no locally-cached profile yet — the cold-sync
+// case: a fresh device receives many symkeys over tech-space sync but
+// holds no profiles (those are device-local). One IdentityRepoGet covers
+// the whole set instead of one call per identity. Best-effort; run in a
+// goroutine on boot.
+func (s *Service) ResolveIdentityProfiles(ctx context.Context) {
+	if s.app == nil || s.app.Coordinator() == nil {
+		return
+	}
+	type pending struct {
+		key crypto.SymKey
+		pk  crypto.PubKey
+	}
+	todo := make(map[string]pending)
+	ids := make([]string, 0)
+	for _, r := range s.tsp.ListIdentities(ctx) {
+		if r.SymKey == "" || r.Name != "" {
+			continue // no key, or already resolved
+		}
+		key, err := space.UnmarshalSymKey(r.SymKey)
+		if err != nil {
+			continue
+		}
+		pk, err := crypto.DecodeAccountAddress(r.Identity)
+		if err != nil {
+			continue
+		}
+		todo[r.Identity] = pending{key: key, pk: pk}
+		ids = append(ids, r.Identity)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	for _, dwi := range s.identityRepoGet(ctx, ids) {
+		p, ok := todo[dwi.Identity]
+		if !ok {
+			continue
+		}
+		prof, ok := decodeIdentityRepoProfile(dwi.Data, p.pk, p.key)
+		if !ok || (prof.Name == "" && prof.Description == "" && prof.IconCID == "") {
+			continue
+		}
+		_ = s.tsp.SetIdentityProfile(ctx, dwi.Identity, prof.Name, prof.Description, prof.IconCID)
+	}
 }

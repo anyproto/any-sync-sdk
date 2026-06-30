@@ -107,8 +107,14 @@ func (s *Service) handleInboxMessage(ctx context.Context, m inbox.Message) error
 		// Defensive: never register an incoming from ourselves.
 		return nil
 	}
-	hint := space.DecodeAccountMetadata(m.Body)
-	if err := s.RegisterIncoming(ctx, m.SenderIdentity, hint); err != nil {
+	// The body carries the sender's metadata symkey; cache it so their
+	// identityRepo profile (name/icon) resolves once the 1-1 is active.
+	// The authoritative identity is the coordinator-verified
+	// SenderIdentity, never anything self-declared in the body.
+	if symKey := string(m.Body); symKey != "" {
+		_ = s.tsp.SetIdentityMetaKey(ctx, m.SenderIdentity, symKey)
+	}
+	if err := s.RegisterIncoming(ctx, m.SenderIdentity, space.AccountMetadata{}); err != nil {
 		// RegisterIncoming swallows benign conditions (existing row, sticky
 		// decline) as nil; a real error here is a transient tech-space
 		// write. Ask the notifier to retry rather than drop the invite.
@@ -219,10 +225,11 @@ func reconcileOneToOneInvites(
 }
 
 // sendOneToOneInvite posts one InboxPayloadOneToOneInvite to receiverId.
-// The body is our own profile snapshot (display hint); any-sync encrypts
-// it to the receiver's account key and signs it on send. Best-effort —
-// the receiver can also discover the 1-1 out-of-band, and the space is
-// re-derivable regardless.
+// The body is our metadata symkey; any-sync encrypts it to the receiver's
+// account key and signs it on send. The receiver caches the key so our
+// identityRepo profile (name/icon) resolves. Best-effort — the receiver
+// can also discover the 1-1 out-of-band, and the space is re-derivable
+// regardless.
 func (s *Service) sendOneToOneInvite(ctx context.Context, receiverId string) error {
 	ic := s.app.InboxClient()
 	if ic == nil {
@@ -232,13 +239,13 @@ func (s *Service) sendOneToOneInvite(ctx context.Context, receiverId string) err
 	if err != nil {
 		return fmt.Errorf("spaceimpl: send invite: %w", err)
 	}
-	myId := s.app.AccountKeys().SignKey.GetPublic().Account()
+	keys := s.app.AccountKeys()
+	myId := keys.SignKey.GetPublic().Account()
 
-	var hint space.AccountMetadata
-	if prof, ok := s.tsp.GetProfile(ctx); ok {
-		hint = space.AccountMetadata{Name: prof.Name, Description: prof.Description, IconCID: prof.IconCID}
+	body, err := encodeSelfSymKeyMetadata(keys.SignKey)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: send invite: derive metadata key: %w", err)
 	}
-	body := space.EncodeAccountMetadata(hint)
 
 	msg := &coordinatorproto.InboxMessage{
 		Packet: &coordinatorproto.InboxPacket{

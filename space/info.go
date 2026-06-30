@@ -38,6 +38,13 @@ type SpaceInfo struct {
 	SpaceType string
 	// Author is the space owner's account identity, resolved from the
 	// ACL. Best-effort: empty when the ACL is not loadable.
+	//
+	// For a 1-1 (SpaceTypeOneToOne) space the ACL owner is a synthetic
+	// shared key nobody holds, so Author instead carries the OTHER
+	// participant's account identity — the friend this 1-1 is with.
+	// Available even while the space is only pending (not materialized),
+	// so clients can identify and resolve the friend's profile from the
+	// space list directly.
 	Author      string
 	Name        string
 	Description string

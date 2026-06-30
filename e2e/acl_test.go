@@ -260,6 +260,15 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	assert.Equal(t, joiner.Account().Id(), joinReq.Identity)
 	assert.NotEmpty(t, joinReq.RecordId)
 
+	// Owner resolves the requester's name from identityRepo — the join
+	// record carries only the joiner's metadata symkey, and the joiner
+	// published "Joiner Live Name" before requesting. Polled because
+	// identityRepo propagation is eventual.
+	require.Eventually(t, func() bool {
+		reqs, err := sp.Members().JoinRequests(ctx)
+		return err == nil && len(reqs) == 1 && reqs[0].Name == "Joiner Live Name"
+	}, 30*time.Second, 2*time.Second, "owner should resolve the requester's name from identityRepo")
+
 	// Wait for the watcher to fire Added(Joining) BEFORE accepting.
 	// Otherwise on a fast local stack the AcceptRequest can land between
 	// two 250ms ticks of the watcher, the head jumps directly to

@@ -82,9 +82,19 @@ func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
 			"Phase-1 out-of-band path is covered by TestE2E_OneToOne_ApproveIncoming (space %s)", id)
 	}
 
-	// Discovered via inbox alone. The display hint rode along.
+	// Discovered via inbox alone. The pending row surfaces Alice's account
+	// identity (as Author); her name is not in the invite (symkey-only).
 	assert.Equal(t, space.SpaceTypeOneToOne, pending.Type)
-	assert.Equal(t, "Alice", pending.Name, "invite body display hint should populate the pending row")
+	assert.Equal(t, alice.Account().Id(), pending.Author, "pending 1-1 must surface the friend identity")
+
+	// Pending-name resolution: the invite carried Alice's metadata symkey,
+	// which Bob's notifier cached; RegisterIncoming then resolves her
+	// identityRepo profile and writes the name onto the still-pending row —
+	// no accept or member watcher needed.
+	require.Eventually(t, func() bool {
+		si, ok := infoByID(t, ctx, bob, id)
+		return ok && si.Name == "Alice"
+	}, 60*time.Second, time.Second, "pending 1-1 should resolve Alice's name from identityRepo")
 
 	// Bob accepts → active.
 	bobSp, err := bob.Spaces().AcceptOneToOne(ctx, id)
@@ -93,4 +103,15 @@ func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
 	si, ok := infoByID(t, ctx, bob, id)
 	require.True(t, ok)
 	assert.Equal(t, space.StatusActive, si.Status)
+
+	// End-to-end key distribution: the invite carried Alice's metadata
+	// symkey, which Bob's notifier cached. Starting the members watcher
+	// makes it fetch Alice's identityRepo profile and decrypt it with that
+	// key, resolving her name. Subscribe starts the profile loop.
+	cancelSub := bobSp.Members().Subscribe(func(space.MemberEvent) {})
+	defer cancelSub()
+	require.Eventually(t, func() bool {
+		m, err := bobSp.Members().Get(ctx, alice.Account().Id())
+		return err == nil && m.Name == "Alice"
+	}, 60*time.Second, time.Second, "Alice's name should resolve from identityRepo via the cached invite symkey")
 }

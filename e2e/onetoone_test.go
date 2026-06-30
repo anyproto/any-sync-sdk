@@ -78,6 +78,9 @@ func TestE2E_OneToOne_DeclineSticky(t *testing.T) {
 	require.True(t, ok, "pending 1-1 row should exist")
 	assert.Equal(t, space.StatusOneToOnePending, si.Status)
 	assert.Equal(t, "Alice", si.Name)
+	// A 1-1 surfaces the friend's account identity as Author, even while
+	// only pending — clients identify who a 1-1 is with from the list.
+	assert.Equal(t, peerID, si.Author, "1-1 Author must be the friend identity")
 	id := si.Id
 
 	// Decline → declined.

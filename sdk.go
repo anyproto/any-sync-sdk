@@ -93,6 +93,11 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// unavailable; the out-of-band 1-1 path works without it.
 	spaces.StartOneToOneInbox(ctx)
 
+	// Cold-sync resolve: a fresh device syncs the identities directory's
+	// symkeys but no profiles (those are device-local). Batch-fetch the
+	// missing profiles from identityRepo in the background.
+	go spaces.ResolveIdentityProfiles(context.Background())
+
 	account := newAccountImpl(app, tsp, spaces)
 
 	// Republish the locally-stored profile to identityRepo on every
@@ -187,6 +192,10 @@ func (s *SDK) Close() error {
 
 // Spaces returns the space-level entrypoint.
 func (s *SDK) Spaces() space.Service { return s.spaces }
+
+// Identities returns the account-global directory of identities this
+// account has encountered (profiles + the spaces where each was seen).
+func (s *SDK) Identities() space.IdentitiesAPI { return spaceimpl.NewIdentitiesAPI(s.tsp) }
 
 // Account returns the account-level API.
 func (s *SDK) Account() AccountAPI { return s.account }
@@ -324,7 +333,19 @@ func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
 // callers can decide whether to surface it.
 func (a *accountImpl) pushToIdentityRepo(ctx context.Context, meta space.AccountMetadata) error {
 	keys := a.app.AccountKeys()
-	payload := space.EncodeAccountMetadata(meta)
+	symKey, err := space.DeriveAccountMetadataSymKey(keys.SignKey)
+	if err != nil {
+		return fmt.Errorf("anysyncsdk: derive metadata key: %w", err)
+	}
+	// Encrypt the profile with our account metadata symkey before upload —
+	// only contacts who have received the key (via a shared space's ACL or
+	// a 1-1 invite) can read it. The signature is over the CIPHERTEXT so
+	// the fetch path verifies before it decrypts (matches
+	// decodeIdentityRepoProfile).
+	payload, err := space.EncryptProfile(meta, symKey)
+	if err != nil {
+		return fmt.Errorf("anysyncsdk: encrypt profile: %w", err)
+	}
 	if len(payload) == 0 {
 		return nil
 	}

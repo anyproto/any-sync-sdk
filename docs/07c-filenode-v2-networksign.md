@@ -6,6 +6,7 @@ Concrete protocol for the byte/durability layer. Elaborates `07b` §4 (filenode 
 - **Addressing = IPFS merkle cids of the *ciphertext*** (per-chunk SHA-256, self-verifying). Chosen over whole-blob+Streaming-AEAD. Rationale: per-chunk integrity + partial-download resume. **Chunk-level dedup is NOT a reason** — per-file random keys mean identical plaintext shares zero ciphertext chunks; dedup is **whole-file** via the plaintext `sha256` + bind.
 - **No filenode byte-proxying.** Bytes go client↔S3 direct. Filenode v2 = ACL + quota + presign + **sign** (a pure Oracle).
 - **The node never writes the CRDT** — it signs, the client records. Not a write-member.
+- **One S3 object per file** (packed leaves, keyed by `rootCid`), not one object per leaf cid — see *Physical S3 mapping*. Adversarial review (5 lenses) found no in-scope case where packing loses anything: the per-file random key already zeroes cross-file leaf sharing.
 
 ## any-sync changes
 1. **Space header gets `fileprotoVersion`** (in the signed, immutable header). Old filenodes **error** on v2 spaces; new filenodes serve **only** v2. The SDK is greenfield → every space is v2 (no in-place migration); v1/v2 coexistence rides the existing handshake `ProtoVersion` + `NetworkCompatibilityStatus`. The version can't be stripped/downgraded without invalidating the owner signature.
@@ -41,8 +42,8 @@ Only the **root cid** is node-visible; the full chunk manifest stays member-side
 1. `sha256(plaintext)` → local-db lookup. **Hit → BIND** (step 8).
 2. Generate a **new sym key**, encrypt, produce IPFS cids (root + chunks).
 3. **Register the payloads row** (rootCid, size, encrypted fields) — *before* upload (makes every later crash reachable for GC).
-4. `uploadRequest(fileId, cids, sizes)` → node **reserves quota** (reserve-on-authorize + TTL) → batch presigned POST to a `staging/` prefix.
-5. Client **PUTs the ciphertext directly to S3** (`staging/`).
+4. `uploadRequest(fileId, rootCid, size)` → node **reserves quota** (reserve-on-authorize + TTL) → a presigned POST (or multipart, frame-aligned parts for big files) for the **one packed object** to a `staging/` prefix.
+5. Client **PUTs the packed object** (`[root block][leaves…]`) directly to S3 (`staging/`).
 6. `requestSign(rootCid)` → node confirms presence (event-fed index) → **signs the root cid**, promotes `staging/ → durable/`, finalizes the reservation. Sign issuance is **idempotent / re-requestable** from the row's cids.
 7. Client **records `networkSign`** in the row.
 8. **BIND** (dedup hit): mint a new `fileId`, reuse the existing `rootCid` + sign + key.
@@ -65,8 +66,24 @@ A node-maintained, **persisted, incremental** view: `(spaceId, rootCid) → { li
 - **M4 (dark orphan)** — register-row-before-PUT + no-sign⇒GC + staging prefix.
 - **M6/M7 (hot-cid churn / O(rows) cascade)** — no shared `refs[]` array; refcount work lives in the node ledger, decremented by tombstone.
 
-## Open sub-decision — physical S3 mapping
-The flow presigns one POST per cid (≈1000 PUTs/GB + 1000 presigned URLs at ~1 MB chunks → S3 request-fee explosion). **Recommended:** pack the chunks into **one S3 object** (a CAR file, or S3 multipart) keyed by `rootCid`; the client fetches chunks via **Range** within it. Keeps IPFS addressing + integrity + resume at ~1 PUT/file. *To confirm.*
+## Physical S3 mapping & seek (decided)
+**One S3 object per file, keyed by `rootCid`** — a CAR-style `[root block][leaf₀][leaf₁]…`, or S3 multipart with frame-aligned parts. *Not* one object per leaf cid (that is ≈1000 PUTs/GB + ≈1000 presigned URLs/GB + broker load, for zero benefit). Adversarial review found **no in-scope scenario where packing loses anything**: every "global per-leaf resolution" win (cross-file dedup, swarm leaf-sharing, cross-file CDN reuse, DHT/gateway interop, delta/append) needs two files to share an identically-keyed ciphertext leaf, which the **per-file random key already makes impossible** — the leaf-sharing was zeroed by the crypto, not by the layout.
+
+**Format.** Each leaf is an **independently AES-GCM-encrypted frame** (nonce = frame index) → independently decryptable (so any byte is seekable) and self-verifying (`leaf cid = SHA-256(encrypted frame)`). The **root block** is the `rootCid → [leaf cid, size]…` map; `rootCid = SHA-256(root block)` commits to the whole file. (This makes the IPFS-cids layout and the v4 Streaming-AEAD frame layout the *same* on-disk format.)
+
+**Resolution — global at the file, integrity+seek at the leaf:**
+| who | resolves | how |
+|---|---|---|
+| **filenode (Oracle)** | `rootCid → {refcount, size}` only | one presign / one HEAD / sign rootCid / GC by rootCid; never reads leaves (~0 bandwidth) |
+| **peers (P2P)** | `(rootCid, byte-range)` | multi-source = different ranges of one rootCid; each frame cid/GCM-verified; mDNS single-net, single-source + Range-resume + S3 fallback |
+| **CDN** | rootCid object + frame-aligned ranges | SDK aligns Range to frame boundaries → ranges shared across users; thumbnails are their own small rootCids (whole-object GET) |
+| **client/member** | leaf *i* | fetch+verify the root block once → `offset_i = header + i·(frame+tag)` → Range-GET → `SHA-256`-compare → decrypt (ciphertext-only verify → zero-knowledge audit intact) |
+
+A **leaf cid is an intra-file integrity + ordering coordinate, not a global address** — never individually presigned or resolved across files. The manifest stays member-side (the S3 root block, or inline in the encrypted row for tiny files), so the CRDT row carries only `rootCid` and node refcount cardinality stays ~1×, not ~1000×.
+
+**Build alongside (not reasons to un-pack):** (a) make `BlobCheck`/`BlobGet` **range-aware** (held-range bitmap) so partial LAN holders can serve/repair; (b) **multipart frame-aligned parts** for large uploads → part-level resume; (c) keep the **root block re-derivable/cacheable** by any holder.
+
+**Revisit only if** (both reversible per-blob without touching `rootCid` / `networkSign` / the refcount unit / P2P keys / any CRDT state — packing is a physical mapping, not a one-way door): (1) the crypto moves to a **shared/convergent key + content-defined chunking** (backup / VM-image / generational workloads) where global per-leaf dedup finally pays — which needs a re-encode migration anyway; (2) a **non-SDK reader** (browser/WASM direct-to-S3, public CID gateway) where frame-aligned Range discipline can't be enforced (weak — E2E already forecloses public-gateway value).
 
 ## Still open / to build
 - **wrappedKey isolation** — keep `key` its own envelope field (above); rotation re-wraps one tiny value per row, not the whole `meta` blob (insert-only DAG → a folded key would rewrite every row forever).

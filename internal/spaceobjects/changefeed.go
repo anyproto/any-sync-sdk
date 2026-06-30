@@ -136,6 +136,22 @@ func (s *Store) applySeqMeta(ctx context.Context) (anystore.Collection, error) {
 	return coll, nil
 }
 
+// EnsureApplySeq forces the one-off applySeq backfill eagerly. The
+// backfill takes a WriteTx, and applySeqMeta runs it inside a sync.Once.
+// Two code paths reach that Once with opposite lock orders: an apply
+// (Controller.ApplyChangeWithResult) already holds any-store's write
+// mutex and then calls the allocator's seed → applySeqMeta (wants the
+// Once); the consumer feed (ChangedObjects) takes the Once and then the
+// backfill's WriteTx wants the write mutex. Concurrently that
+// writeMu<->Once inversion deadlocks. Running the backfill here — once,
+// single-threaded at store load, before any apply holds the write mutex
+// or the feed reads concurrently — drains the Once so neither runtime
+// path ever performs the backfill WriteTx under a held lock.
+func (s *Store) EnsureApplySeq(ctx context.Context) error {
+	_, err := s.applySeqMeta(ctx)
+	return err
+}
+
 // metaCollection opens the shared _meta collection the change-index
 // query reads. Same collection the per-object Controllers persist their
 // watermark into.

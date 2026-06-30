@@ -1,117 +1,125 @@
-# Files v7 — filenode v2 + networkSign upload protocol
+# Files v7 — filenode v2 (S3-direct broker + networkSign)
 
-Concrete protocol for the byte/durability layer. Elaborates `07b` §4 (filenode v2) and **supersedes `07-files.md`'s whole-blob addressing choice with IPFS cids**. Validated *"build it"* by adversarial review (2026-06-30): of every attack on the core, one survived (full-manifest-in-row, addressed below). Sits under `07b`'s derived-payloads composition; envelope crypto / availability≠durability / collective durability from `07-files` are unchanged.
+Concrete byte/durability layer under `07b`'s derived-payloads composition. **Supersedes `07-files.md`'s whole-blob addressing with IPFS cids.** Validated *"build it"* by adversarial review; the seek/pack model is benchmarked (`internal/spikes/carpack`); the read path is matched to the verified anytype-heart implementation. Envelope crypto / availability≠durability / collective durability from `07-files` are unchanged.
 
 ## Decisions locked
-- **Addressing = IPFS merkle cids of the *ciphertext*** (per-chunk SHA-256, self-verifying). Chosen over whole-blob+Streaming-AEAD. Rationale: per-chunk integrity + partial-download resume. **Chunk-level dedup is NOT a reason** — per-file random keys mean identical plaintext shares zero ciphertext chunks; dedup is **whole-file** via the plaintext `sha256` + bind.
-- **No filenode byte-proxying.** Bytes go client↔S3 direct. Filenode v2 = ACL + quota + presign + **sign** (a pure Oracle).
-- **The node never writes the CRDT** — it signs, the client records. Not a write-member.
-- **One S3 object per file** (packed leaves, keyed by `rootCid`), not one object per leaf cid — see *Physical S3 mapping*. Adversarial review (5 lenses) found no in-scope case where packing loses anything: the per-file random key already zeroes cross-file leaf sharing.
+- **Addressing = IPFS merkle cids of the *ciphertext*** (1 MiB leaves, balanced UnixFS, fanout 174, CIDv1 / dag-pb / sha2-256). `rootCid` = the UnixFS root = the one global id. Chunk-level dedup is dead (per-file random key → no shared leaves); dedup is **whole-file** via `sha256` + bind.
+- **Whole-file AES-256-CFB, *then* chunked** — exactly `any-sync/commonfile/fileservice.AddFile`. Integrity is from the merkle cids (each block verified vs its cid), not cipher tags.
+- **One S3 object per file** = a **CARv2** of the encrypted DAG, keyed by `rootCid`. The node holds **no bytes**; bytes go **client ↔ S3 / CloudFront** directly.
+- **filenode v2 = a byteless broker**: ACL + quota + presign + `sign` (a pure Oracle — it never writes the CRDT).
+- **Fleet:** new nodeconf type **`NodeTypeFileV2`**; spaces sharded by **consistent hash, RF = 2**; the **lower-peerId** of the pair is the GC leader *and* the broker leader.
 
 ## any-sync changes
-1. **Space header gets `fileprotoVersion`** (in the signed, immutable header). Old filenodes **error** on v2 spaces; new filenodes serve **only** v2. The SDK is greenfield → every space is v2 (no in-place migration); v1/v2 coexistence rides the existing handshake `ProtoVersion` + `NetworkCompatibilityStatus`. The version can't be stripped/downgraded without invalidating the owner signature.
-2. **An object may own a derived child `payloads` object, partially encrypted** — cleartext (node-readable) `{fileId, rootCid, size, networkSign, author}`; encrypted (member-only) `{key, name, sha256, meta, manifest}`. Partial encryption is enforced at the schema level, so there is no schema-valid way to register an S3-backed cid the node can't see. Owner removed with its derived payload → **all peers (and the node) see orphaned files.**
+1. **Space header gets `fileprotoVersion`** (signed, immutable). Old filenodes **error** on v2 spaces; new filenodes serve **only** v2. The SDK is greenfield → every space is v2 (no migration); v1/v2 coexistence rides the existing handshake `ProtoVersion` + `NetworkCompatibilityStatus`. Can't be stripped without invalidating the owner signature.
+2. **`NodeTypeFileV2`** in the network config — the v2 filenode pool, chash-addressable like the sync/tree pools.
+3. **A derived child `payloads` object, partially encrypted** — cleartext (node-readable) `{fileId, rootCid, size, networkSign, author}`; encrypted (member-only) `{key, name, sha256, meta}`. Enforced at the schema level, so no S3-backed cid can hide from the node. Owner removed with its derived payload → all peers (and the node) see orphaned files.
 
 ## Payload row
 ```jsonc
 {
   // ---- cleartext (node-readable) ----
   "id":          "{fileId}",          // = creating changeId; content-addressed, NEVER reused
-  "rootCid":     "{cid}",             // the merkle root; the node refcounts / GCs THIS
-  "size":        12345,               // hint only — quota is the node's measured value, not this
-  "networkSign": "{fileNetworkId}/{sign(rootCid)}",   // the node's existence receipt (see below)
+  "rootCid":     "{cid}",             // UnixFS root; the node refcounts / GCs / signs THIS
+  "size":        12345,               // hint only — quota uses the node's HEAD-measured size
+  "networkSign": "{fileNetworkId}/{sign(rootCid)}",  // node's existence+size receipt; absent until durable
   "author":      "{identity}",        // auto field from the change author
   // ---- encrypted (member-only) ----
-  "key":         "{wrappedKey}",      // SEPARATE envelope field (cheap ACL rotation — do NOT fold into meta)
+  "key":         "{wrappedKey}",      // SEPARATE envelope field (cheap ACL rotation)
   "name":        "image.png",
   "sha256":      "{hash}",            // hash of the UNENCRYPTED file — the dedup key
-  "meta":        { "mime": "image/png", "size": [1024, 768] },
-  // (no manifest field — the UnixFS DAG is reconstructable from rootCid alone)
+  "meta":        { "mime": "image/png", "size": [1024, 768] }
+  // (no manifest — the UnixFS DAG is reconstructable from rootCid alone)
 }
 ```
-Only the **root cid** is node-visible; the whole DAG (intermediates + leaves) is reconstructable from it, so the row needs nothing else. (Inlining a cleartext `cids[]` was the one confirmed-true review finding — it bloats large-file rows and inflates node refcount cardinality ~1000×. The node only needs the root.)
+Only `rootCid` is node-visible; the whole DAG reconstructs from it, so the row stays pointer-sized and node refcount cardinality is ~1×.
+
+## Durability states (derived from the sign + node knowledge)
+Registration is **unconditional** (a row is CRDT data — no node permission, and it's immediately P2P-servable). Only the S3 **backup** is gated. The state of a payload is derived, not a stored authority:
+
+| state | condition | bytes on S3 | counts quota? | readable |
+|---|---|---|---|---|
+| **in-flight** | no sign, **node authorized** it (reservation / `staging` object exists) | staging | **yes** | P2P now; S3 once durable |
+| **durable** | row carries a **valid `networkSign`** | durable | **yes** | P2P + S3/CDN |
+| **limited** | no sign, node **refused** (`ErrLimitExceed`) — or not yet requested | none | **no (0)** | **P2P only** |
+
+The presence of a valid sign is the single authoritative durable/not-durable signal. `in-flight` vs `limited` is the node's own knowledge (did *it* issue an allowance); clients may carry a UI hint.
 
 ## networkSign — the keystone
-- The node **signs the root cid** after verifying the upload; the **client records** it in the row. **No valid sign ⇒ the file is GC'd after grace.**
-- **What it attests: an existence + size *receipt*** — "the node confirms `rootCid`'s bytes are durably stored, total size X," HEAD-confirmed against the cid set the node itself presigned. It is **not** a content-integrity attestation (integrity is delegated to content-addressing + the downloader) — so the node never reads chunk bytes and keeps ~0 bandwidth.
-- **Oracle property** — the node authors no CRDT change, so it is not a write-member; a key-compromised node can't rewrite space state. This is what makes durability a synced fact without the node touching the tree.
-- **BIND reuse is safe** — a new `fileId` for the same content carries the *existing* sign (the sign binds to `rootCid`, not `fileId`/user). Stripping/withholding it only harms the attacker (their file is non-durable, ignored by peers).
-- **Verify-before-sign is mandatory** — lazy signing lets a client mint a receipt for garbage cids and bypass quota. The node verifies via an **S3 `ObjectCreated`-event-fed index**, so step 6 is a DB lookup, not N synchronous `HEAD`s.
+- The node **signs the root cid** after verifying the upload; the **client records** it in the row. **No valid sign ⇒ not durable** (and any orphaned bytes are reclaimed).
+- **What it attests:** an **existence + size receipt** — "rootCid's bytes are durably stored, size X" (HEAD-confirmed against the cids the node presigned). **Not** content-integrity (that's content-addressing's job) → the node never reads chunk bytes (~0 bandwidth).
+- **Oracle property** — the node authors no CRDT change → not a write-member; a key-compromised node can't rewrite space state.
+- **It is the promotion trigger** (below) and the **anti-forgery gate** (it's the node's own verifiable signature; a client can't fake durability).
+- **BIND reuse is safe** — a new `fileId` for the same content carries the *existing* sign (binds to `rootCid`, not fileId/user). Stripping/withholding it only hurts the attacker.
 
 ## Upload flow
-1. `sha256(plaintext)` → local-db lookup. **Hit → BIND** (step 8).
-2. Generate a **new sym key**, encrypt, produce IPFS cids (root + chunks).
-3. **Register the payloads row** (rootCid, size, encrypted fields) — *before* upload (makes every later crash reachable for GC).
-4. `uploadRequest(fileId, rootCid, size)` → node **reserves quota** (reserve-on-authorize + TTL) → a presigned POST (or multipart, frame-aligned parts for big files) for the **one packed object** to a `staging/` prefix.
-5. Client **PUTs the packed object** (a **CARv2** of the file's encrypted UnixFS DAG) directly to S3 (`staging/`).
-6. `requestSign(rootCid)` → node confirms presence (event-fed index) → **signs the root cid**, promotes `staging/ → durable/`, finalizes the reservation. Sign issuance is **idempotent / re-requestable** from the row's cids.
-7. Client **records `networkSign`** in the row.
-8. **BIND** (dedup hit): mint a new `fileId`, reuse the existing `rootCid` + sign + key.
+1. `sha256(plaintext)` → local-db lookup. **Hit → BIND** (mint a new fileId, reuse the existing `rootCid` + sign + key; done).
+2. New random sym key → whole-file CFB → 1 MiB-leaf balanced UnixFS DAG → pack into a CARv2.
+3. **Register the payloads row** (rootCid, size, encrypted fields; no sign) — syncs; the file is now P2P-servable.
+4. `uploadRequest(spaceId, rootCid, size)` → node checks the space allowance (→ coordinator for the identity total). **If over limit → `ErrLimitExceed`** (row stays `limited`, P2P-only, retried later). Else **reserve** the bytes and return a presigned POST to `blob/{spaceId}/{rootCid}` tagged **`state=staging`**, with a `content-length-range` cap.
+5. Client **PUTs the CARv2 directly to S3** (`state=staging`).
+6. `requestSign(rootCid)` → node **HEAD-verifies** the staging object → **signs `rootCid`** (returns the sign; the object **stays `staging`**).
+7. Client **records the sign** in the row → row syncs.
+8. Node **observes the signed row** → **retags `state=durable`** (cheap, no copy) and **finalizes quota** from the HEAD size.
 
-## Node-side cid ledger — the single authority
-A node-maintained, **persisted, incremental** view: `(spaceId, rootCid) → { live_ref_count, size }`, +1 when a row references `rootCid`, −1 on tombstone. It is the *one* place that:
-- **observes the derived-child cascade tombstone** via node-readable deletion records (settings-tree `ObjectDelete` / `DeletionManager` / `HeadStorage.DeletedStatus`) — so it decrements **after** the rows/tree are reclaimed (the node indexes `objId → rootCids` before the tombstone);
-- is the **quota authority** — charged from the node's reservation + S3-HEAD-measured size, **never** the cleartext row `size`;
-- backs **GC** and the **fast verify-before-sign** lookup.
+## In-flight & quota accounting
+**Storage quota = `Σ durable (signed, HEAD-measured)` + `Σ authorized-in-flight`.** It counts what is in (or going to) S3 — *not* mere row existence — so `limited`/unrequested rows count **0** and never deepen a deficit.
 
-## GC / orphaning
-- Owner delete → derived payloads tombstoned → node decrements `rootCid` refs → an empty `rootCid` past grace → **S3 lifecycle-tombstone** (never a synchronous DELETE). A reappearing ref (offline re-attach inside grace) cancels it.
-- **Over-count never under-count:** a crashed/late client leaks a blob (delayed GC), never loses data.
-- **Async mark-and-sweep backstop:** an S3 object older than the grace **and** not referenced by a valid sign in the ledger → delete. Reclaims unsigned-but-uploaded and sign-lost orphans without node-side pending state.
+In-flight lives in three layers, no common index:
 
-## Operational model (the filenode-v2 fleet)
-filenode v2 holds **no bytes** — it is a broker (presign + sign + a derived per-space index). The fleet runs with **no central index**:
+| layer | where | role | survives restart? |
+|---|---|---|---|
+| existence / cleanup signal | the **sign-less payload rows** (the per-space derived index) | what exists; what's not yet durable | yes (synced CRDT) |
+| in-flight **bytes** | the **`state=staging` S3 objects** | the durable in-flight count (list to recount) | yes (S3-owned) |
+| authorize→PUT **race guard** | a small **in-memory reservation map on the leader** (lower peerId) | serialize concurrent `uploadRequest`s | no — rebuilt from staging + rows |
 
-- **Tracking = read the payload rows, not the signs.** Each node builds its per-space index (`rootCid → {refcount, size}`) from the node-readable payload rows (cleartext `rootCid`/`size`); it never reads back the signs it issued (the sign is the *client's* durability proof). The rows cover steady-state; the **in-flight window** (PUT to S3, row not yet synced) is covered only by the staging prefix + async mark-and-sweep.
-- **Sharding = consistent hash on `spaceId`** (same `nodeconf` mechanism as sync-nodes) → a space maps to RF responsible filenodes. **RF = broker redundancy over one shared, content-addressed S3 bucket**: bytes are stored once (S3 already gives durability), and per-file random keys mean `rootCid`s never collide across spaces, so per-space accounting/GC is safe. *(Open decision below: shared bucket vs RF physical byte copies for geo-redundancy.)*
-- **GC leader = the lowest (live) peerId** among the RF responsible nodes — deterministic, no coordination. If the leader is down, GC just waits: it's best-effort (over-count-never-under-count + grace), so a delayed sweep only leaks storage briefly, never loses data.
-- **No common index; evict inactive spaces.** The per-space index is a *derived projection* (node-derived reachability), not authoritative — the truth is the payload rows + S3. So a node tracks only its **active** responsible spaces and **evicts** a space's index after a few days idle, rebuilding from the payloads on reactivation (cheap, re-materializable). Quota is reconstructable (`Σ size`); in-flight reservations lost on eviction are reclaimed by staging-grace.
-- **Limits — per-space accounting on the node, identity total on the coordinator.** Each filenode meters its own spaces locally. The **coordinator** (already the payments + identity↔space authority) owns the per-identity total: it either issues per-space **allowances** summing to the identity cap (refilled on demand) or answers a reserve-check at `uploadRequest`. Keeps the no-common-filenode-index property. *(Open decision below.)*
-- **Two transports, one addressing.** Durable/WAN bytes go **client↔S3/CloudFront over HTTP**; LAN/local exchange is a **separate P2P layer over any-sync secure connections** — `BlockGet(cid)` / `BlocksCheck(cids)` DRPC (member-gated), the peer serving blocks from its local packed object via the cid→offset index. The client's block reader resolves each cid **local → peer (any-sync DRPC) → S3 (Range via the index)** — the `rpcstore` pattern on our packed/CARv2 model; blobs follow object-sync locality (mDNS peers over any-sync connections + S3 backstop).
+Cleanup is S3-owned: an **S3 Lifecycle rule expires `state=staging` after a TTL** (24–48 h). Promotion to `durable` happens **only** when the node sees the recorded+synced sign (step 8), so anything abandoned at any point — including *"requested the URL but never recorded the sign"* — stays `staging` and **auto-deletes**; the reservation TTL releases the held quota. No durable orphans from the upload path, no node-side pending ledger.
+
+## Over-limit (`limited`) — local-first by construction
+Quota limits the **cloud backup**, never creation or sharing:
+- The row registers regardless and is **served P2P** (`BlockGet`/`BlocksCheck` over any-sync connections don't touch node quota).
+- `uploadRequest` is refused (`ErrLimitExceed`, decided node→coordinator) → `limited`. It consumes **0** node/S3 quota (nothing uploaded), so registering limited files doesn't dig deeper.
+- **Stable, not GC'd** (no S3 bytes to remove); **retried** by drive-toward-durable when the user frees space or upgrades (coordinator raises the allowance) → `limited → durable`. Drain by priority (thumbnails/recent first).
+- **At-risk:** a `limited` file lives only on peer devices — if every holder goes offline before backup, it's lost. Surface *"Over limit — not backed up. Free space or upgrade."*
+
+## GC / deletion
+- **Reachability, server-side.** Owner deleted → derived payload tombstoned (node-visible via `settings ObjectDelete` / `DeletionManager`) → node decrements the `rootCid` ref → an empty `rootCid` past grace → **S3 lifecycle-tombstone** (never a synchronous DELETE; a re-appearing ref inside grace cancels it).
+- **Over-count never under-count** — a crashed/late client leaks a blob (delayed GC), never loses data.
+- **Async mark-and-sweep backstop** — a `durable` S3 object older than grace with no referencing signed row → delete. Catches the rare promoted-but-unreferenced case.
+
+## Physical S3 mapping & seek (decided, benchmarked)
+**One CARv2 per file, keyed by `rootCid`** (or S3 multipart for large uploads). Adversarial review found no in-scope case where packing loses anything (per-file random key already zeroes cross-file leaf sharing).
+
+- **Seek is a real DAG traversal** (stock `boxo` `DagReader`): to reach plaintext offset N, walk root → intermediates → leaf via UnixFS `blocksizes`, **fetching each node by cid**, so the packed object needs a `cid→offset` index over **every** node — exactly CARv2's index. Decrypt at N is CFB-seekable (recover the IV from the 16 ciphertext bytes before N; never decrypt-from-start).
+- **Resolution:** node resolves `rootCid` only (presign / HEAD / sign / GC); peers resolve `(rootCid, byte-range)`; the client resolves any block-cid **local → peer (any-sync DRPC) → S3 (Range via the index)**. A leaf cid is an intra-file integrity+ordering coordinate, never a global address.
+- **Spike (`internal/spikes/carpack`, tag `carpackspike`):** real boxo DAG + AES-CFB, packed to a CAR with a `cid→offset` index, read back via the stock `DagReader` + a seekable CFB decryptor. 256 MiB / 2 levels: pack+index overhead **~0.01%**, random-seek p50 **~0.53 ms** (matches/beats one-file-per-cid), cold index rebuild ~40 ms (CARv2 persists → 0). **Finding:** the stock `DagReader` read-ahead fetches **~9 MiB to serve a 64 KiB seek** — fine on a local file, but for S3/CDN seek build a **no-preload targeted range reader** (path nodes + covered leaves only).
+
+## Operational model (the `NodeTypeFileV2` fleet)
+Byteless brokers, no central index:
+- **Sharding:** consistent hash on `spaceId`, **RF = 2** → two responsible filenodes. **RF = broker redundancy over one shared, content-addressed S3 bucket** (bytes stored once; per-file random keys → `rootCid`s never collide across spaces → per-space GC safe).
+- **Leader = lower peerId** of the pair: owns GC, the in-memory reservation map, and (route here) `uploadRequest`/`requestSign`. The other node is **warm failover** (has the derived index from synced rows; takes over on leader death, losing only ephemeral reservations — staging-lifecycle + rows reconcile).
+- **GC** is best-effort: if the leader is down it waits (over-count + grace → only a brief storage leak, never data loss).
+- **No common index; evict inactive spaces.** The per-space index is a derived projection (truth = payload rows + S3), so a node tracks only its **active** responsible spaces and evicts after a few days idle, rebuilding from the rows (+ listing `state=staging`) on reactivation.
+- **Limits:** per-space accounting on the node; the **coordinator** owns the per-identity total (issues per-space allowances or answers a reserve-check at `uploadRequest`) — keeps the no-common-filenode-index property.
+- **Two transports, one addressing:** durable/WAN bytes over **HTTP S3/CloudFront**; LAN/local over a **separate P2P layer on any-sync connections** (`BlockGet`/`BlocksCheck`, member-gated, served from the holder's local pack via the cid→offset index). Blobs follow object-sync locality (mDNS peers + S3 backstop).
 
 ## What v7 resolves (vs the prior reviews)
-- **D1 (cids drift)** — node reads cid/sign directly off the synced object; orphaning is node-derived from the cascade tombstone; **no client `$pull` anywhere.**
+- **D1 (cids drift)** — node reads cid/sign off the synced object; orphaning is node-derived from the cascade tombstone; no client `$pull`.
 - **D2 (node-readability)** — fixed at the schema level by partial encryption.
-- **M3 (durable-bit / node-as-writer)** — durability is a node *signature* the client records; node never writes the CRDT.
-- **M4 (dark orphan)** — register-row-before-PUT + no-sign⇒GC + staging prefix.
-- **M6/M7 (hot-cid churn / O(rows) cascade)** — no shared `refs[]` array; refcount work lives in the node ledger, decremented by tombstone.
-
-## Physical S3 mapping & seek (decided)
-**One S3 object per file, keyed by `rootCid`** — a CAR-style `[root block][leaf₀][leaf₁]…`, or S3 multipart with frame-aligned parts. *Not* one object per leaf cid (that is ≈1000 PUTs/GB + ≈1000 presigned URLs/GB + broker load, for zero benefit). Adversarial review found **no in-scope scenario where packing loses anything**: every "global per-leaf resolution" win (cross-file dedup, swarm leaf-sharing, cross-file CDN reuse, DHT/gateway interop, delta/append) needs two files to share an identically-keyed ciphertext leaf, which the **per-file random key already makes impossible** — the leaf-sharing was zeroed by the crypto, not by the layout.
-
-**Format — IPFS-compatible, matches the proven anytype-heart reader** (verified in code 2026-06-30):
-- **Whole-file AES-256-CFB stream, *then* chunked** (NOT per-leaf encryption). Encrypt the plaintext as one CFB stream → split the *ciphertext* into **1 MiB** leaves → a **balanced UnixFS DAG** (fanout 174, CIDv1 / dag-pb / sha2-256). `rootCid` = the UnixFS root. This is exactly `any-sync/commonfile/fileservice.AddFile`.
-- **Integrity is from the merkle cids, not the cipher.** Every block (leaf *and* intermediate) is verified against its cid before use; the chain roots at the signed `rootCid`. CFB carries no tags, but a tampered block fails its cid check → rejected before decrypt. (A per-leaf-AEAD format was considered and **rejected**: it changes the ciphertext bytes and the trust model, breaking IPFS / anytype block compatibility.)
-- **The DAG is the manifest** — reconstructable from `rootCid` alone (fetch root → read its `blocksizes` + child cids → descend). Nothing extra in the CRDT row.
-
-**Seek is a real DAG traversal** (stock `boxo` `DagReader`): to reach plaintext offset N, walk root → intermediate nodes → leaf, using each node's UnixFS `blocksizes` to pick the child, **fetching each node by cid**. So the packed object needs a `cid → offset` index over **every node, intermediates included** — exactly what **CARv2's index** gives. Decrypt at N is CFB-seekable: recover the IV from the single 16-byte ciphertext block at `N-16` (also reached by the traversal) and discard the sub-block remainder — never decrypt-from-start.
-
-**Resolution — global at the file, integrity+seek inside it:**
-| who | resolves | how |
-|---|---|---|
-| **filenode (Oracle)** | `rootCid → {refcount, size}` only | one presign / one HEAD / sign rootCid / GC by rootCid; never reads blocks (~0 bandwidth) |
-| **peers (P2P)** | `(rootCid, byte-range)` | multi-source = different ranges of one rootCid; each block cid-verified; mDNS single-net, single-source + Range-resume + S3 fallback |
-| **CDN** | rootCid object + ranges | thumbnails/previews are their own small rootCids (whole-object GET) |
-| **client/member** | any byte offset | traverse the DAG via the CARv2 index (root→intermediates→leaf, each fetched by Range + cid-verified) → CFB-decrypt with the preceding 16-byte block → ciphertext-only verify (zero-knowledge audit intact) |
-
-A **cid is an intra-file integrity + ordering coordinate, not a global address** — never individually presigned or resolved across files. So the CRDT row carries only `rootCid` and node refcount cardinality stays ~1×, not ~1000×.
-
-**Build alongside (not reasons to un-pack):** (a) make `BlobCheck`/`BlobGet` **range-aware** so partial LAN holders can serve/repair; (b) **multipart** for large uploads → part-level resume; (c) keep the **CARv2 index re-derivable/cacheable** by any holder (one scan of the packed object rebuilds it); (d) a **no-preload targeted range reader** for S3/CDN seek — see the spike note below.
-
-**Validated by spike (`internal/spikes/carpack`, build tag `carpackspike`).** Real boxo balanced UnixFS DAG (1 MiB leaves, fanout 174, CIDv1/dag-pb) over whole-file AES-256-CFB ciphertext, packed into one CAR-style object with a `cid→offset` index, read back through the stock `boxo` `DagReader` + a seekable CFB decryptor. Findings (256 MiB, 2 DAG levels): pack/index overhead **~0.01%**; random-seek p50 **~0.53 ms**, **matching/beating one-file-per-cid** (so packing doesn't cost seek); cold index rebuild ~40 ms (CARv2 persists it → 0). **Caveat:** the stock `DagReader`'s read-ahead fetches **~9 MiB to serve a 64 KiB seek** (~9× the whole-leaf floor). Cheap on a local packed file (page cache), but over S3/CDN it must be replaced by a **targeted reader** that fetches only the path nodes + the covered leaves (and consider sub-MiB chunks if sub-leaf seeks dominate).
-
-**Revisit only if** (both reversible per-blob without touching `rootCid` / `networkSign` / the refcount unit / P2P keys / any CRDT state — packing is a physical mapping, not a one-way door): (1) the crypto moves to a **shared/convergent key + content-defined chunking** (backup / VM-image / generational workloads) where global per-leaf dedup finally pays — which needs a re-encode migration anyway; (2) a **non-SDK reader** (browser/WASM direct-to-S3, public CID gateway) where frame-aligned Range discipline can't be enforced (weak — E2E already forecloses public-gateway value).
+- **durable-bit / node-as-writer** — durability is a node *signature* the client records; the node never writes the CRDT.
+- **dark orphan** — register-row-before-PUT + `state=staging` lifecycle + promote-on-signed-row.
+- **quota spoof** — quota from the node's reservation + HEAD, never the cleartext `size`.
+- **wrappedKey rotation** — `key` is a separate re-wrappable envelope field.
 
 ## Still open / to build
-- **wrappedKey isolation** — keep `key` its own envelope field (above); rotation re-wraps one tiny value per row, not the whole `meta` blob (insert-only DAG → a folded key would rewrite every row forever).
-- **Row lease / status** — distinguish a pending upload from a dead/abandoned-unsigned row; define who may tombstone an unsigned row past TTL.
-- **Cross-owner move** (= bind + delete; mints a new fileId; references break) and **`Get(fileId)` without the owner** (no global `fileId → owner` index) — unindexed, same as v6.
-- **Grace window** — port `07-files`' 7–14 d; account for AWS lifecycle tag-age (expiry counts from object *creation*, so effective grace can collapse below the configured window).
-- **OPEN DECISION — RF storage:** one shared content-addressed S3 bucket (RF = broker redundancy, bytes stored once — recommended) **vs** RF physical byte copies (geo-redundancy; each node GCs its own copy, leader computes the orphan set).
-- **OPEN DECISION — limits granularity:** keep **per-identity** via the coordinator (per-space allowances / reserve-check round-trip — recommended, least product change) **vs** move to **per-space** pricing (simplest for the sharded fleet, but a product change).
-- **No-preload targeted range reader** for S3/CDN seek (the spike finding) + **range-aware `BlobCheck`/`BlobGet`** for partial LAN holders.
-- **GATING SPIKE (deferred):** multi-writer + offline-branch + cascade on the *real* (derived-payload + node-cid-ledger) model — every spike so far is single-writer / linear-DAG, so the convergence + cascade + cross-owner-refcount claims are still unexercised.
+- **OPEN DECISION — RF storage:** one shared content-addressed bucket (RF = broker redundancy — recommended) vs RF physical byte copies (geo-redundancy; each node GCs its own copy, leader computes the orphan set).
+- **OPEN DECISION — limits granularity:** keep **per-identity** via the coordinator (allowances / reserve-check — recommended) vs move to **per-space** pricing (simplest for the fleet, but a product change).
+- **No-preload targeted range reader** for S3/CDN seek; **range-aware `BlobCheck`/`BlobGet`** for partial LAN holders.
+- **Row lease / status hint** so a `limited`/abandoned row is distinguishable in UI and tombstonable past TTL.
+- **Cross-owner move** (= bind + delete, new fileId) and **`Get(fileId)` without the owner** (no global fileId→owner index) — unindexed, same as v6.
+- **Grace / staging TTLs** — pin the staging-expire (24–48 h) and the GC grace (7–14 d); account for AWS lifecycle tag-age semantics.
+- **GATING SPIKE (deferred):** multi-writer + offline-branch + cascade on the real (derived-payload + node-cid-ledger) model — every spike so far is single-writer / linear-DAG.
 
 ## Cross-refs
 - `07-files.md` — byte layer (envelope crypto, availability≠durability, collective durability). This doc supersedes its whole-blob addressing with IPFS cids.
 - `07b-files-derived-payloads.md` — v6 composition (owner binding, the tree-count wall, partial encryption, materialized views).
+- `internal/spikes/carpack` — the pack + seek benchmark.

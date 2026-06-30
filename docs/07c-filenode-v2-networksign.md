@@ -64,6 +64,8 @@ The presence of a valid sign is the single authoritative durable/not-durable sig
 7. Client **records the sign** in the row → row syncs.
 8. Node **observes the signed row** → **retags `state=durable`** (cheap, no copy) and **finalizes quota** from the HEAD size.
 
+> **Promotion must be a persistent retry queue, not a fire-and-forget reaction to the sync event** (expert-flagged data-loss hole). If `PutObjectTagging` fails after the signed row has synced, the object stays `staging` and the lifecycle rule deletes a *valid, signed* file → a dead file enshrined in the CRDT. The node must durably re-drive: any row with a valid sign whose object isn't `durable`-tagged is retried until it is.
+
 ## In-flight & quota accounting
 **Storage quota = `Σ durable (signed, HEAD-measured)` + `Σ authorized-in-flight`.** It counts what is in (or going to) S3 — *not* mere row existence — so `limited`/unrequested rows count **0** and never deepen a deficit.
 
@@ -83,6 +85,7 @@ Quota limits the **cloud backup**, never creation or sharing:
 - `uploadRequest` is refused (`ErrLimitExceed`, decided node→coordinator) → `limited`. It consumes **0** node/S3 quota (nothing uploaded), so registering limited files doesn't dig deeper.
 - **Stable, not GC'd** (no S3 bytes to remove); **retried** by drive-toward-durable when the user frees space or upgrades (coordinator raises the allowance) → `limited → durable`. Drain by priority (thumbnails/recent first).
 - **At-risk:** a `limited` file lives only on peer devices — if every holder goes offline before backup, it's lost. Surface *"Over limit — not backed up. Free space or upgrade."*
+- **Abuse cap (expert-flagged).** `limited` files cost no S3 quota, but their cleartext `payloads` rows are still synced + relayed by the node (and the node serves their P2P metadata) — a script could mint 100k `limited` rows and use the fleet as a free metadata/P2P tracker. So **cap the number of rows / bytes a `payloads` object (and a space) may consume on the node, independent of the S3 quota.**
 
 ## GC / deletion
 - **Reachability, server-side.** Owner deleted → derived payload tombstoned (node-visible via `settings ObjectDelete` / `DeletionManager`) → node decrements the `rootCid` ref → an empty `rootCid` past grace → **S3 lifecycle-tombstone** (never a synchronous DELETE; a re-appearing ref inside grace cancels it).
@@ -93,6 +96,7 @@ Quota limits the **cloud backup**, never creation or sharing:
 **One CARv2 per file, keyed by `rootCid`** (or S3 multipart for large uploads). Adversarial review found no in-scope case where packing loses anything (per-file random key already zeroes cross-file leaf sharing).
 
 - **Seek is a real DAG traversal** (stock `boxo` `DagReader`): to reach plaintext offset N, walk root → intermediates → leaf via UnixFS `blocksizes`, **fetching each node by cid**, so the packed object needs a `cid→offset` index over **every** node — exactly CARv2's index. Decrypt at N is CFB-seekable (recover the IV from the 16 ciphertext bytes before N; never decrypt-from-start).
+- **Two reader rules (expert-flagged):** (1) **verify before decrypt** — a block must be fully buffered and **cid-verified before any byte is fed to the CFB cipher** (the malleability mitigation only holds if no unverified bytes reach the decryptor). (2) **Cache the CARv2 index + upper DAG levels client-side** — a naive Range reader over an S3 CARv2 is 3–4 sequential HTTP round-trips per seek (~600–800 ms); caching the index + intermediate nodes is what makes media seek usable. **This is the biggest UX risk in the design.**
 - **Resolution:** node resolves `rootCid` only (presign / HEAD / sign / GC); peers resolve `(rootCid, byte-range)`; the client resolves any block-cid **local → peer (any-sync DRPC) → S3 (Range via the index)**. A leaf cid is an intra-file integrity+ordering coordinate, never a global address.
 - **Spike (`internal/spikes/carpack`, tag `carpackspike`):** real boxo DAG + AES-CFB, packed to a CAR with a `cid→offset` index, read back via the stock `DagReader` + a seekable CFB decryptor. 256 MiB / 2 levels: pack+index overhead **~0.01%**, random-seek p50 **~0.53 ms** (matches/beats one-file-per-cid), cold index rebuild ~40 ms (CARv2 persists → 0). **Finding:** the stock `DagReader` read-ahead fetches **~9 MiB to serve a 64 KiB seek** — fine on a local file, but for S3/CDN seek build a **no-preload targeted range reader** (path nodes + covered leaves only).
 
@@ -136,6 +140,12 @@ Short form (full exploration in `07-files.md`):
 - **Bespoke node-readable payload-index tree (alt C)** — unnecessary: the partially-encrypted `payloads` object *is* the node-readable index.
 - **Client-driven refcount / unbind RPCs** — RPC refcounting drifts offline-first; the node derives reachability from the synced rows instead.
 - **A common KV/Redis index across filenodes** — avoided: per-space derived index, evicted when idle, rebuilt from rows.
+
+## Production hardening (expert final review — "ship it, but nail these")
+1. **Reliable promotion** — `staging → durable` retag is a *persistent retry queue*, not fire-and-forget; a failed retag would let the lifecycle delete a valid signed file (silent data loss). *(see Upload flow)*
+2. **Node-side abuse cap** — bound the rows/bytes a `payloads` object/space consumes on the node, independent of S3 quota, so `limited` files can't turn the fleet into a free metadata/P2P tracker. *(see Over-limit)*
+3. **Client-side CARv2-index + DAG caching** — without it a media seek is 3–4 sequential HTTP round-trips; the biggest UX risk. *(see seek)*
+4. **Verify-before-decrypt** in the targeted range reader — no unverified bytes reach the CFB cipher. *(see seek)*
 
 ## Still open / to build
 - **OPEN DECISION — RF storage:** one shared content-addressed bucket (RF = broker redundancy — recommended) vs RF physical byte copies (geo-redundancy; each node GCs its own copy, leader computes the orphan set).

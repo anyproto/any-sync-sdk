@@ -226,6 +226,16 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
+	// Drain the one-off applySeq backfill BEFORE publishing the store, so
+	// no apply or consumer read ever triggers the backfill's WriteTx from
+	// inside the applySeqMeta sync.Once. That lazy path otherwise
+	// lock-order-inverts against any-store's write mutex (an apply holds
+	// writeMu then wants the Once; a concurrent ChangedObjects holds the
+	// Once then wants writeMu) and deadlocks. storeFor is single-threaded
+	// per space and its caller never holds the write mutex, so forcing the
+	// backfill here is the safe, race-free place. Best-effort: a transient
+	// error is cached by the Once and resurfaces on the next feed read.
+	_ = st.EnsureApplySeq(context.Background())
 	s.stores[spaceId] = st
 	s.mu.Unlock()
 	// Kick the drainer once so prior-session parked rows whose

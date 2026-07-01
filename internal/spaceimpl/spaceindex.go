@@ -117,6 +117,26 @@ func (s *spaceImpl) maybeLazySeedSpaceIndex(ctx context.Context) {
 		return
 	}
 
+	// The local copy has no spaceIndex namespace — but that does NOT mean
+	// the object is absent network-wide. A second device of the same
+	// account (every device is an owner) loading a space another device
+	// created races here: the spaceIndex object exists and may already be
+	// renamed, it just hasn't synced to this device yet. Re-seeding from
+	// THIS device's stale tech-space row would derive the same object id
+	// with a fresh OrderId and win LWW, reverting the real name on every
+	// device (the "rename never converges" flake). So sync first and
+	// re-check; only seed when the object is genuinely absent everywhere
+	// (a legacy pre-spaceIndex space, or an owner that crashed after
+	// CreateSpace but before the initial seed LocalWrite). If the sync
+	// fails we can't prove absence — skip and let the next load retry,
+	// rather than risk the clobber.
+	if err := s.app.SyncHeads(ctx, s.id); err != nil {
+		return
+	}
+	if spaceIndexHasNamespace(ctx, s.store, objectId) {
+		return
+	}
+
 	// Pull the tech-space row to source the initial values. This is
 	// the legacy migration path — the tech-space row is what the
 	// owner created with via the pre-spaceIndex code.

@@ -37,4 +37,11 @@ type DeriveObjectOpts struct {
 	// Types to attach on first materialization. Ignored on subsequent
 	// calls once the object exists.
 	Types []string
+
+	// ParentId derives the object as a child bound to this parent. The
+	// parent id is hashed into the child's derived id, so a child is
+	// re-derivable only with the same ParentId. Deleting the parent
+	// cascade-deletes the child's tree and excludes it from cold sync.
+	// Empty derives a top-level object.
+	ParentId string
 }

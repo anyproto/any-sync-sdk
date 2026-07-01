@@ -303,8 +303,8 @@ func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
 	assert.Empty(t, ev.Added)
 	assert.Empty(t, ev.Updated)
 
-	// The deleted object is gone from QueryObjects too — its row is now
-	// a tombstone, which queryIterator.Next skips.
+	// The deleted object is gone from QueryObjects too — its row was
+	// purged from local state (no tombstone is retained).
 	rows, err := sp.QueryObjects().All(ctx)
 	require.NoError(t, err)
 	for _, row := range rows {

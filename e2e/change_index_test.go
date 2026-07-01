@@ -120,12 +120,13 @@ drain:
 	assert.Greater(t, uint64(rec.GetInt("_addSeq")), uint64(0), "_addSeq stamped on property row")
 }
 
-// TestSDK_TombstoneVisibility checks the ProjectionOpts.IncludeDeleted
-// opt-in: by default a deleted object is hidden from the find path, but
-// Projection({IncludeDeleted: true}) surfaces the tombstone — content
-// wiped, _deletedAt set, _addSeq advanced past the create — so a
-// consumer-side indexer can stream deletions.
-func TestSDK_TombstoneVisibility(t *testing.T) {
+// TestSDK_ObjectDelete_PurgesLocalState asserts the deletion model:
+// deleting an object PURGES its local materialized state rather than
+// leaving a tombstone. any-sync's head storage is the durable,
+// cross-device record that the tree is deleted, so the SDK keeps no
+// object-level `_deletedAt` row — a deleted object is simply gone, and
+// IncludeDeleted (a record-level opt-in) surfaces nothing for it.
+func TestSDK_ObjectDelete_PurgesLocalState(t *testing.T) {
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -157,38 +158,30 @@ func TestSDK_TombstoneVisibility(t *testing.T) {
 	_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{titleProp: "doomed"})
 	require.NoError(t, err)
 
-	// Capture the live row's _addSeq before deletion.
 	live, err := sp.QueryObjects().Filter(map[string]any{"id": id}).One(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, live)
-	createSeq := uint64(live.GetInt("_addSeq"))
-	assert.Greater(t, createSeq, uint64(0), "_addSeq stamped on live row")
 
 	require.NoError(t, sp.Objects().Delete(ctx, id))
 
-	// Default find path hides the tombstone.
+	// The object is gone from the default find path.
 	_, err = sp.QueryObjects().Filter(map[string]any{"id": id}).One(ctx)
-	assert.ErrorIs(t, err, space.ErrNotFound, "deleted row hidden by default")
+	assert.ErrorIs(t, err, space.ErrNotFound, "deleted object gone from find path")
 	n, err := sp.QueryObjects().Filter(map[string]any{"id": id}).Count(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 0, n, "Count hides the tombstone by default")
+	assert.Equal(t, 0, n, "Count excludes the deleted object")
 
-	// IncludeDeleted surfaces the tombstone.
-	tomb, err := sp.QueryObjects().
+	// No tombstone is retained: IncludeDeleted surfaces nothing either —
+	// the row was purged, not tombstoned.
+	_, err = sp.QueryObjects().
 		Filter(map[string]any{"id": id}).
 		Projection(space.ProjectionOpts{IncludeDeleted: true}).
 		One(ctx)
-	require.NoError(t, err)
-	require.NotNil(t, tomb)
-	assert.NotNil(t, tomb.Get("_deletedAt"), "tombstone carries _deletedAt")
-	assert.Nil(t, tomb.Get(typeId), "content wiped on tombstone")
-	delSeq := uint64(tomb.GetInt("_addSeq"))
-	assert.Greater(t, delSeq, createSeq, "delete advances _addSeq past the create")
-
+	assert.ErrorIs(t, err, space.ErrNotFound, "purged object has no tombstone to surface")
 	nDel, err := sp.QueryObjects().
 		Filter(map[string]any{"id": id}).
 		Projection(space.ProjectionOpts{IncludeDeleted: true}).
 		Count(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, nDel, "Count surfaces the tombstone with IncludeDeleted")
+	assert.Equal(t, 0, nDel, "IncludeDeleted surfaces no purged object")
 }

@@ -25,12 +25,15 @@ import (
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -44,6 +47,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
+
+var storeLog = logger.NewNamed("sdk.spaceobjects")
 
 // ErrUnknownDataset is returned by DataVersion when the caller asks
 // for a dataset the store doesn't know how to version.
@@ -80,6 +85,9 @@ type CreateOpts struct {
 type DeriveOpts struct {
 	ChangeType    string
 	ChangePayload []byte
+	// ParentId binds the derived tree to a parent so any-sync cascade-
+	// deletes it with the parent. It is also hashed into the derived id.
+	ParentId string
 }
 
 // Store owns per-object Controllers and handed-out *object.Object
@@ -636,14 +644,23 @@ func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.Tree
 	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
 }
 
-// DeleteTree marks the underlying any-sync tree as deleted and drops
-// the cached *object.Object. Wired into the SpaceRegistry's
-// DeleteTree route so the deletion-manager's per-tree cleanup pass
-// removes both the any-sync storage flag and our in-memory state.
+// DeleteTree reflects an any-sync tree deletion into local state: it
+// tombstones the tree in any-sync storage, purges the object's
+// materialized state from the SDK DB, and evicts the cached object.
+// Wired into the SpaceRegistry's DeleteTree route so the deletion
+// manager's per-tree cleanup pass reclaims both any-sync storage and
+// our on-disk + in-memory state.
 //
-// any-store rows for the deleted object are NOT cleaned up — same
-// rationale as Drop: queries skip tombstones, ids are content-
-// addressable.
+// Ordering is deliberate: tree.Delete() runs FIRST, so any-sync marks
+// the tree deleted (a permanent, cross-device-authoritative flag) and
+// then rejects every further apply to it — the purge below therefore
+// cannot race a concurrent materialization of the same object.
+//
+// A purge failure is PROPAGATED, not swallowed: any-sync advances the
+// tree from Queued to Deleted only after this callback returns success,
+// so returning an error keeps it Queued and the deletion loop re-fires
+// the callback until the purge commits — the at-least-once self-heal for
+// a crash between tree.Delete() and the purge.
 func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	obj, err := s.Get(ctx, treeId)
 	if err != nil {
@@ -651,14 +668,274 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	}
 	tree := obj.Tree()
 	if tree == nil {
+		if err := s.purgeObject(ctx, treeId); err != nil {
+			return err
+		}
 		s.Drop(treeId)
 		return nil
 	}
 	if err := tree.Delete(); err != nil {
 		return fmt.Errorf("spaceobjects: tree.Delete %s: %w", treeId, err)
 	}
+	if err := s.purgeObject(ctx, treeId); err != nil {
+		return err
+	}
 	s.Drop(treeId)
 	return nil
+}
+
+// MarkTreeDeleted is the soft-delete callback any-sync fires when it
+// catches a settings-tree deletion for a tree not present in local
+// storage (a device that never synced the object, or a re-fired callback
+// after tree.Delete() already removed it). Purge any materialized state
+// and evict the cache; there is no local tree to tombstone. Like
+// DeleteTree, a purge failure is returned so the deletion loop re-fires
+// until it commits.
+func (s *Store) MarkTreeDeleted(ctx context.Context, treeId string) error {
+	if err := s.purgeObject(ctx, treeId); err != nil {
+		return err
+	}
+	s.Drop(treeId)
+	return nil
+}
+
+// purgeObject hard-removes an object's local projection from the SDK
+// DB — the shared `objects` row and every per-object dataset collection
+// (`<objectId>_<dataset>`) — stamps a durable deletion marker for the
+// consumer change-index feed, and notifies live subscribers + the account
+// mirror.
+//
+// The SDK keeps NO local `objects` tombstone: any-sync's head storage is
+// the durable, cross-device record that the tree is deleted (set once,
+// never cleared, no inbound path resurrects it), so the row simply ceases
+// to exist. Instead the object's `_meta` row (deliberately KEPT) is stamped
+// del=true with a fresh applySeq, so the deletion surfaces through the
+// change-index feed as ObjectChange{Deleted:true} — the consumer's durable
+// eviction signal (see PersistDeletionMark). The `_meta` row is kept
+// anyway: the applySeq allocator seeds from max(applySeq) over these rows,
+// so removing the highest-applySeq row would rewind the allocator.
+//
+// Atomicity: the `objects` row removal AND the del-stamp commit in ONE
+// WriteTx, mirroring the apply path (record + watermark move together). A
+// crash before commit persists neither; any-sync keeps the tree Queued
+// (it advances Queued->Deleted only after the callback returns success) and
+// re-fires on restart. There is no window where the row is gone but the
+// deletion unannounced, nor announced but the row still live.
+//
+// Device-local: no DAG or ACL write; idempotent (a second call with the
+// row already gone removes nothing and fires no Removed event).
+//
+// Error contract: the correctness-critical steps — removing the shared
+// `objects` row and stamping the deletion — RETURN an error on failure so
+// the caller propagates it and any-sync re-fires the callback until the
+// purge commits (a stale row would surface a deleted object as live; a
+// missing stamp would leave it forever in a consumer's index). The
+// per-object data-collection drop and the notifications stay best-effort.
+func (s *Store) purgeObject(ctx context.Context, objectId string) error {
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: purge open shared objects %s: %w", objectId, err)
+	}
+	metaColl, err := s.metaCollection(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: purge open _meta %s: %w", objectId, err)
+	}
+
+	tx, err := s.db.WriteTx(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: purge tx %s: %w", objectId, err)
+	}
+	removed, seq, stamped, perr := s.purgeRowInTx(tx.Context(), coll, metaColl, objectId)
+	if perr != nil {
+		_ = tx.Rollback()
+		return perr
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("spaceobjects: purge commit %s: %w", objectId, err)
+	}
+
+	// Best-effort from here — disk reclaim + notifications, not correctness.
+	s.dropObjectCollections(ctx, objectId)
+	s.fireDeletionEvents(objectId, removed, stamped, seq)
+	return nil
+}
+
+// purgeRowInTx removes the shared `objects` row for objectId (if present)
+// and stamps its kept `_meta` row as deleted with a fresh applySeq — all
+// inside the caller's WriteTx. Returns whether a live row was removed, the
+// stamped applySeq, and whether a del-stamp was written. Stamps whenever the
+// object was materialized in the feed: a live `objects` row (removed) OR a
+// base-dataset-only object with a scoped `_meta` row. A never-materialized
+// id (a delete callback for an object this device never had) stamps nothing.
+func (s *Store) purgeRowInTx(txCtx context.Context, coll, metaColl anystore.Collection, objectId string) (removed bool, seq uint64, stamped bool, err error) {
+	if _, ferr := coll.FindId(txCtx, objectId); ferr == nil {
+		if derr := coll.DeleteId(txCtx, objectId); derr != nil {
+			return false, 0, false, fmt.Errorf("spaceobjects: purge remove row %s: %w", objectId, derr)
+		}
+		removed = true
+	} else if !errors.Is(ferr, anystore.ErrDocNotFound) {
+		return false, 0, false, fmt.Errorf("spaceobjects: purge read row %s: %w", objectId, ferr)
+	}
+
+	stamp := removed
+	if !stamp {
+		ok, merr := crdt.MetaExists(txCtx, metaColl, objectId, s.spaceId)
+		if merr != nil {
+			return false, 0, false, fmt.Errorf("spaceobjects: purge meta check %s: %w", objectId, merr)
+		}
+		stamp = ok
+	}
+	if stamp {
+		if seq, err = s.applySeqs.Next(txCtx); err != nil {
+			return false, 0, false, fmt.Errorf("spaceobjects: purge alloc applySeq %s: %w", objectId, err)
+		}
+		if err = crdt.PersistDeletionMark(txCtx, metaColl, objectId, s.spaceId, seq); err != nil {
+			return false, 0, false, fmt.Errorf("spaceobjects: purge stamp del %s: %w", objectId, err)
+		}
+		stamped = true
+	}
+	return removed, seq, stamped, nil
+}
+
+// fireDeletionEvents emits the best-effort notifications after a committed
+// purge: the live query engine + row-event Removed (only when a live row was
+// actually removed, so a redundant purge fires nothing), and the
+// change-index deletion entry (when a del-stamp was written).
+func (s *Store) fireDeletionEvents(objectId string, removed, stamped bool, seq uint64) {
+	if removed {
+		if s.engine != nil {
+			s.engine.NotifyDeleted(s.spaceId, properties.Dataset, objectId)
+		}
+		if s.rowEvents != nil && s.rowEvents.hasSubscribers() {
+			s.rowEvents.dispatch(RowEvent{ObjectId: objectId, Deleted: true})
+		}
+	}
+	if stamped && s.changeSubs.hasSubscribers() {
+		s.changeSubs.dispatch(ObjectChange{ObjectId: objectId, ApplySeq: seq, Deleted: true})
+	}
+}
+
+// PurgeObjects hard-removes the local projection for a batch of objectIds in
+// ONE WriteTx (row removal + del-stamp per materialized id), then reclaims
+// per-object collections listing collection names ONCE, drops the cache, and
+// emits one deletion feed entry per stamped id. Used by the startup
+// deletion-reconcile to purge many stale rows off the SDK.Open path without
+// the O(N x all-collections) cost of per-id purgeObject. Ids with neither a
+// live `objects` row nor a scoped `_meta` row (never materialized here) are
+// skipped. Idempotent.
+func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
+	if len(objectIds) == 0 {
+		return nil
+	}
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: batch purge open shared objects: %w", err)
+	}
+	metaColl, err := s.metaCollection(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: batch purge open _meta: %w", err)
+	}
+
+	tx, err := s.db.WriteTx(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: batch purge tx: %w", err)
+	}
+	txCtx := tx.Context()
+	type purgedRow struct {
+		id      string
+		seq     uint64
+		removed bool
+		stamped bool
+	}
+	var purged []purgedRow
+	for _, id := range objectIds {
+		removed, seq, stamped, perr := s.purgeRowInTx(txCtx, coll, metaColl, id)
+		if perr != nil {
+			_ = tx.Rollback()
+			return perr
+		}
+		if removed || stamped {
+			purged = append(purged, purgedRow{id, seq, removed, stamped})
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("spaceobjects: batch purge commit: %w", err)
+	}
+
+	// Best-effort tail — list collection names ONCE for the whole batch.
+	names, nerr := s.db.GetCollectionNames(ctx)
+	if nerr != nil {
+		storeLog.Warn("batch purge: list collections", zap.Error(nerr))
+	}
+	for _, p := range purged {
+		if nerr == nil {
+			s.dropObjectCollectionsNamed(ctx, p.id, names)
+		}
+		s.Drop(p.id)
+		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
+	}
+	return nil
+}
+
+// dropObjectCollections drops every `<objectId>_<dataset>` collection
+// owned by objectId — mirroring the per-object sweep the space offload
+// path performs, scoped to a single object. The id segment is matched
+// exactly (up to the first `_`) so an object whose id merely shares a
+// prefix is never touched.
+func (s *Store) dropObjectCollections(ctx context.Context, objectId string) {
+	names, err := s.db.GetCollectionNames(ctx)
+	if err != nil {
+		storeLog.Warn("purge: list collections", zap.String("treeId", objectId), zap.Error(err))
+		return
+	}
+	s.dropObjectCollectionsNamed(ctx, objectId, names)
+}
+
+// dropObjectCollectionsNamed drops every `<objectId>_<dataset>` collection
+// found in the pre-listed names slice. The batch purge lists collection
+// names once and calls this per id, avoiding an O(N x all-collections)
+// re-listing.
+func (s *Store) dropObjectCollectionsNamed(ctx context.Context, objectId string, names []string) {
+	for _, name := range names {
+		i := strings.IndexByte(name, '_')
+		if i <= 0 || name[:i] != objectId {
+			continue
+		}
+		coll, err := s.db.OpenCollection(ctx, name)
+		if err != nil {
+			if !errors.Is(err, anystore.ErrCollectionNotFound) {
+				storeLog.Warn("purge: open collection", zap.String("coll", name), zap.Error(err))
+			}
+			continue
+		}
+		if err := coll.Drop(ctx); err != nil {
+			storeLog.Warn("purge: drop collection", zap.String("coll", name), zap.Error(err))
+		}
+	}
+}
+
+// TreeDeleted reports whether any-sync's head storage records treeId as
+// deleted — the permanent, cross-device-authoritative deletion flag
+// (set once, never cleared, no inbound path resurrects the tree). Lets
+// consumers tell a deleted object (whose local row was hard-removed)
+// apart from one that was never materialized.
+func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return false, err
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return false, nil
+	}
+	entry, err := st.HeadStorage().GetEntry(ctx, treeId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return entry.DeletedStatus != headstorage.DeletedStatusNotDeleted, nil
 }
 
 // Get returns the *object.Object for objectId, lazy-loading on first
@@ -722,6 +999,7 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
 		IsEncrypted:   true,
+		ParentId:      opts.ParentId,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: DeriveTree: %w", err)

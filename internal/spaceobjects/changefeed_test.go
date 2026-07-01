@@ -33,7 +33,7 @@ func TestChangeRegistry_DispatchAndCancel(t *testing.T) {
 
 	s.changeSubs.dispatch(ObjectChange{ObjectId: "o1", ApplySeq: 7})
 	s.changeSubs.dispatch(ObjectChange{ObjectId: "o2", ApplySeq: 8})
-	require.Equal(t, []ObjectChange{{"o1", 7}, {"o2", 8}}, got)
+	require.Equal(t, []ObjectChange{{ObjectId: "o1", ApplySeq: 7}, {ObjectId: "o2", ApplySeq: 8}}, got)
 
 	cancel()
 	assert.False(t, s.changeSubs.hasSubscribers())
@@ -60,7 +60,7 @@ func TestStoreChangedObjects_DelegatesToMeta(t *testing.T) {
 
 	changed, err := s.ChangedObjects(ctx, 0, 0)
 	require.NoError(t, err)
-	require.Equal(t, []ObjectChange{{"o1", 5}, {"o2", 15}}, changed)
+	require.Equal(t, []ObjectChange{{ObjectId: "o1", ApplySeq: 5}, {ObjectId: "o2", ApplySeq: 15}}, changed)
 
 	max, err := s.MaxApplySeq(ctx)
 	require.NoError(t, err)
@@ -68,5 +68,5 @@ func TestStoreChangedObjects_DelegatesToMeta(t *testing.T) {
 
 	since, err := s.ChangedObjects(ctx, 5, 0)
 	require.NoError(t, err)
-	require.Equal(t, []ObjectChange{{"o2", 15}}, since)
+	require.Equal(t, []ObjectChange{{ObjectId: "o2", ApplySeq: 15}}, since)
 }

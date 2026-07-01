@@ -298,6 +298,14 @@ func (m *accountMirror) readTargetRow(ctx context.Context, objectId string) (*an
 	doc, err := coll.FindId(ctx, objectId)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
+			// A deleted object's row is hard-removed (the SDK keeps no
+			// tombstone), so an absent row is ambiguous — the object was
+			// either deleted or never materialized. any-sync's head storage
+			// is the durable deletion record: consult it so the carrier is
+			// GC'd for a real deletion and kept as a replay trigger otherwise.
+			if deleted, dErr := m.store.TreeDeleted(ctx, objectId); dErr == nil && deleted {
+				return nil, targetTombstoned
+			}
 			return nil, targetAbsent
 		}
 		return nil, targetAbsent

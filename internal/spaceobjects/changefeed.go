@@ -14,9 +14,14 @@ import (
 // watermark. Consumers use it to mark the object dirty for re-indexing.
 // ApplySeq covers every apply source — DAG changes, the account
 // mirror's injected applies, device-local writes.
+//
+// Deleted is true when the object was purged (object deletion): the entry
+// carries a fresh applySeq strictly greater than the object's last content
+// change, so the consumer evicts it in the same ordered stream as edits.
 type ObjectChange struct {
 	ObjectId string
 	ApplySeq uint64
+	Deleted  bool
 }
 
 // changeRegistry is the synchronous callback firehose backing the
@@ -104,7 +109,7 @@ func (s *Store) ChangedObjects(ctx context.Context, since uint64, limit int) ([]
 	}
 	out := make([]ObjectChange, len(rows))
 	for i, r := range rows {
-		out[i] = ObjectChange{ObjectId: r.ObjectId, ApplySeq: r.ApplySeq}
+		out[i] = ObjectChange{ObjectId: r.ObjectId, ApplySeq: r.ApplySeq, Deleted: r.Deleted}
 	}
 	return out, nil
 }
@@ -148,8 +153,33 @@ func (s *Store) applySeqMeta(ctx context.Context) (anystore.Collection, error) {
 // or the feed reads concurrently — drains the Once so neither runtime
 // path ever performs the backfill WriteTx under a held lock.
 func (s *Store) EnsureApplySeq(ctx context.Context) error {
-	_, err := s.applySeqMeta(ctx)
+	coll, err := s.applySeqMeta(ctx)
+	if err != nil {
+		return err
+	}
+	// Drain the allocator seed now (single-threaded at store load) so the
+	// purge path can allocate a fresh applySeq inside its WriteTx without
+	// ever running seedFn (which would open collections / take locks) under
+	// a held write tx.
+	if err := s.applySeqs.Seed(ctx); err != nil {
+		return err
+	}
+	// Mint the per-space generation eagerly so `space:<id>.gen` exists before
+	// any consumer reads it and before the first purge.
+	_, err = crdt.LoadOrInitGeneration(ctx, coll, s.spaceId)
 	return err
+}
+
+// Generation returns the per-space rebuild epoch (minted at store load via
+// EnsureApplySeq). A consumer whose stored generation differs must reset its
+// cursor to 0 and full-reindex — an sdk.db rebuild renumbered the applySeq
+// axis, so deletions are re-established by absence from a live snapshot.
+func (s *Store) Generation(ctx context.Context) (string, error) {
+	coll, err := s.metaCollection(ctx)
+	if err != nil {
+		return "", err
+	}
+	return crdt.LoadOrInitGeneration(ctx, coll, s.spaceId)
 }
 
 // metaCollection opens the shared _meta collection the change-index

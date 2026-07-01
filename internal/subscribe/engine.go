@@ -175,6 +175,30 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 	}
 }
 
+// NotifyDeleted emits a synthetic delete event for objectId in the
+// given dataset scope, so live subscriptions drop the row and report
+// RemoveDeleted — without an underlying CRDT apply.
+//
+// The delete-callback path (spaceobjects.Store.DeleteTree, fired when
+// any-sync catches a settings-tree deletion) uses this: it removes the
+// materialized row directly, device-local, instead of writing a CRDT
+// tombstone into the tree that is being reclaimed. The post-value
+// lookup is a constant nil — a deleted record carries no post-apply
+// doc, and applyRecord skips the lookup for Deleted records anyway.
+//
+// The emitted SubscriptionEvent carries an empty VersionId (there is no
+// underlying DAG change to draw an orderId from). A Removed{RemoveDeleted}
+// therefore cannot be version-fenced — consumers must not drop a Removed
+// via the VersionId replay fence; act on it directly.
+func (e *Engine) NotifyDeleted(spaceId, dataset, objectId string) {
+	e.OnApply(Event{
+		SpaceId:  spaceId,
+		Dataset:  dataset,
+		ObjectId: objectId,
+		Records:  []EventRecord{{Id: objectId, Deleted: true}},
+	}, func(int) *anyenc.Value { return nil })
+}
+
 // closeSub removes a sub from the engine. Called via Sub.Close.
 func (e *Engine) closeSub(s *querySub) {
 	e.mu.Lock()

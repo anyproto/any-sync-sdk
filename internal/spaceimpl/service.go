@@ -1204,15 +1204,16 @@ func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestora
 }
 
 // MarkTreeDeleted is the soft-delete hook fired when the settings
-// tree announces a deletion. Drops the cached object so a future
-// load reflects the deleted state. Tech-space defers to its own
-// no-op adapter (the index tree itself is never marked deleted).
+// tree announces a deletion for a tree not present in local storage.
+// Reflects the deletion in local materialized state and drops the
+// cached object so a future load reflects the deleted state.
+// Tech-space defers to its own adapter (the index tree itself is
+// never marked deleted).
 func (s *Service) MarkTreeDeleted(ctx context.Context, spaceId, treeId string) error {
 	if spaceId == s.tsp.SpaceId() {
 		return s.tsp.MarkTreeDeleted(ctx, spaceId, treeId)
 	}
-	s.storeFor(spaceId).Drop(treeId)
-	return nil
+	return s.storeFor(spaceId).MarkTreeDeleted(ctx, treeId)
 }
 
 // DeleteTree performs the per-tree cleanup the deletion-manager

@@ -126,12 +126,17 @@ type Iterator interface {
 // caller-facing by contract (clients reconcile optimistic state per
 // field against it; see the CRDT spec §3).
 type ProjectionOpts struct {
-	// IncludeDeleted returns tombstone rows (id, _deletedAt, _ver,
-	// _traces, _addSeq; content wiped) instead of skipping them.
-	// Honored by the find path (Iter / All / One / Count);
-	// Snapshot/Subscribe keep skipping tombstones (the windowed live
-	// view is unchanged). Use it to stream deletions for incremental
-	// re-indexing — a tombstone surfaced this way carries the delete's
-	// _addSeq, so it shows up in a changed-since scan past the cursor.
+	// IncludeDeleted returns record-level tombstone rows (id, _deletedAt,
+	// _ver, _traces, _addSeq; content wiped) instead of skipping them —
+	// e.g. a deleted record inside a still-live object's dataset. Honored
+	// by the find path (Iter / All / One / Count); Snapshot/Subscribe keep
+	// skipping tombstones (the windowed live view is unchanged).
+	//
+	// Note: a deleted OBJECT is NOT a tombstone. Its whole local
+	// projection is purged (any-sync's head storage is the durable,
+	// cross-device delete record), so IncludeDeleted surfaces nothing for
+	// it on QueryObjects. Observe object deletions via
+	// QueryObjects().Subscribe (a Removed{RemoveDeleted} event), or by
+	// reconciling against any-sync's deleted-tree set.
 	IncludeDeleted bool
 }

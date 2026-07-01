@@ -2,8 +2,12 @@ package crdt
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -27,6 +31,26 @@ const (
 	// change backfills the field — the accepted "index from now on"
 	// behaviour).
 	metaSpaceIdKey = "sp"
+
+	// metaDeletedKey marks a per-object row as purged (object deletion).
+	// Stamped in the same WriteTx as the shared-`objects` row removal,
+	// bumping the row's applySeq to a fresh value, so the deletion surfaces
+	// through the change-index feed as ObjectChange{Deleted:true} at an
+	// applySeq strictly greater than the object's last content change.
+	// Sticky: once set, never cleared (a deleted tree id is content-
+	// addressable and any-sync permanently burns it, so the id never reuses).
+	metaDeletedKey = "del"
+
+	// metaDeletedHeadKey / metaReconcileVerKey are the deletion-reconcile
+	// gate on the `space:<id>` row: the settings-tree head last reconciled
+	// (dh) and the reconcile-logic version last applied (dv). See spacesync.
+	metaDeletedHeadKey  = "dh"
+	metaReconcileVerKey = "dv"
+
+	// metaGenerationKey is the per-space rebuild epoch on the `space:<id>`
+	// row. An sdk.db wipe drops the row, so the epoch changes — the signal a
+	// consumer uses to detect a renumbered applySeq axis and full-reindex.
+	metaGenerationKey = "gen"
 
 	// spaceMetaKeyPrefix namespaces space-scoped rows inside the same
 	// _meta collection. Colon is not a valid char in any-sync's
@@ -114,10 +138,12 @@ func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string,
 
 // ObjectSeq pairs an object id with its persisted max applySeq.
 // Returned by QueryChangedObjects for the consumer-side change-index
-// feed.
+// feed. Deleted is true when the row is a purged-object marker (the
+// consumer evicts it) rather than a content change.
 type ObjectSeq struct {
 	ObjectId string
 	ApplySeq uint64
+	Deleted  bool
 }
 
 // QueryChangedObjects returns the objects in spaceId whose persisted max
@@ -163,6 +189,7 @@ func QueryChangedObjects(ctx context.Context, coll anystore.Collection, spaceId 
 		out = append(out, ObjectSeq{
 			ObjectId: v.GetString(IdField),
 			ApplySeq: uint64(v.GetInt(metaApplySeqKey)),
+			Deleted:  v.GetBool(metaDeletedKey),
 		})
 	}
 	return out, nil
@@ -327,4 +354,113 @@ func PersistSpaceMaxAddSeq(ctx context.Context, coll anystore.Collection, spaceI
 	})
 	_, err := coll.UpsertId(ctx, SpaceMetaKey(spaceId), mod)
 	return err
+}
+
+// LoadSpaceDeletedGate reads the persisted deletion-reconcile gate for a
+// space — the settings-tree head last reconciled (dh) and the
+// reconcile-logic version last applied (dv). Returns ("", 0) when no row
+// exists (fresh/rebuilt sdk.db), a guaranteed mismatch that forces exactly
+// one reconcile sweep.
+func LoadSpaceDeletedGate(ctx context.Context, coll anystore.Collection, spaceId string) (head string, ver int, err error) {
+	doc, err := coll.FindId(ctx, SpaceMetaKey(spaceId))
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return "", 0, nil
+		}
+		return "", 0, err
+	}
+	v := doc.Value()
+	return v.GetString(metaDeletedHeadKey), v.GetInt(metaReconcileVerKey), nil
+}
+
+// PersistSpaceDeletedGate writes the deletion-reconcile gate. Sets only
+// dh/dv via ModifyFunc so the forward-catchup watermark "q" and the
+// generation "gen" on the same space:<id> row are preserved. Called ONLY
+// after a fully successful reconcile sweep.
+func PersistSpaceDeletedGate(ctx context.Context, coll anystore.Collection, spaceId, head string, ver int) error {
+	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		v.Set(metaDeletedHeadKey, a.NewString(head))
+		v.Set(metaReconcileVerKey, a.NewNumberInt(ver))
+		return v, true, nil
+	})
+	_, err := coll.UpsertId(ctx, SpaceMetaKey(spaceId), mod)
+	return err
+}
+
+// PersistDeletionMark stamps the object's kept _meta row as deleted, in
+// place: del=true, as=applySeq (a fresh seq > the object's last content
+// applySeq), and re-asserts sp so a sparse-history object is guaranteed
+// visible to the change-index query. Leaves q/hv intact. Call inside the
+// same WriteTx as the shared-`objects` row removal so the deletion is
+// announced atomically with the purge.
+func PersistDeletionMark(ctx context.Context, coll anystore.Collection, objectId, spaceId string, applySeq uint64) error {
+	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		v.Set(metaDeletedKey, a.NewTrue())
+		v.Set(metaApplySeqKey, a.NewNumberInt(int(applySeq)))
+		v.Set(metaSpaceIdKey, a.NewString(spaceId))
+		return v, true, nil
+	})
+	_, err := coll.UpsertId(ctx, objectId, mod)
+	return err
+}
+
+// MetaExists reports whether a space-scoped per-object _meta row exists —
+// i.e. the object was ever materialized/indexed in this space. Gates the
+// del-stamp for objects that were fed but never got a shared `objects` row
+// (base-dataset-only). Read with the caller's (tx) ctx.
+func MetaExists(ctx context.Context, coll anystore.Collection, objectId, spaceId string) (bool, error) {
+	doc, err := coll.FindId(ctx, objectId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return doc.Value().GetString(metaSpaceIdKey) == spaceId, nil
+}
+
+// LoadOrInitGeneration returns the per-space rebuild epoch on the
+// space:<id> row, minting a fresh UUID when the row (or the gen field) is
+// absent — an sdk.db wipe drops the row, so the epoch changes and signals a
+// renumbered applySeq axis to consumers. Idempotent; call once at store
+// load (single-threaded) to mint eagerly, and on every consumer read.
+func LoadOrInitGeneration(ctx context.Context, coll anystore.Collection, spaceId string) (string, error) {
+	if doc, err := coll.FindId(ctx, SpaceMetaKey(spaceId)); err == nil {
+		if g := doc.Value().GetString(metaGenerationKey); g != "" {
+			return g, nil
+		}
+	} else if !errors.Is(err, anystore.ErrDocNotFound) {
+		return "", err
+	}
+	gen := newObjectID()
+	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		if v.GetString(metaGenerationKey) != "" { // raced another opener — keep theirs
+			return v, false, nil
+		}
+		v.Set(metaGenerationKey, a.NewString(gen))
+		return v, true, nil
+	})
+	if _, err := coll.UpsertId(ctx, SpaceMetaKey(spaceId), mod); err != nil {
+		return "", err
+	}
+	// Re-read: a lost race means the persisted value is another opener's id.
+	if doc, err := coll.FindId(ctx, SpaceMetaKey(spaceId)); err == nil {
+		if g := doc.Value().GetString(metaGenerationKey); g != "" {
+			return g, nil
+		}
+	}
+	return gen, nil
+}
+
+// newObjectID mints a bson-style 12-byte ObjectID — 4-byte big-endian unix
+// seconds + 8 random bytes — hex-encoded to a 24-char string. Same shape
+// any-store uses for its own document/instance ids (its objectid package is
+// internal, so we mint our own with stdlib crypto/rand, no extra dep).
+// Time-ordered and unique; used as the per-space generation epoch, which
+// only needs inequality across rebuilds.
+func newObjectID() string {
+	var b [12]byte
+	binary.BigEndian.PutUint32(b[0:4], uint32(time.Now().Unix()))
+	_, _ = rand.Read(b[4:])
+	return hex.EncodeToString(b[:])
 }

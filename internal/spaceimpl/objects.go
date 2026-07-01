@@ -102,6 +102,7 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 	obj, err := o.parent.store.Derive(ctx, spaceobjects.DeriveOpts{
 		ChangeType:    "object",
 		ChangePayload: opts.Seed,
+		ParentId:      opts.ParentId,
 	})
 	if err != nil {
 		return "", err
@@ -120,34 +121,24 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 	return objectId, nil
 }
 
-// Delete tombstones the object, then marks it deleted via the space's
-// settings tree and drops our cached state.
+// Delete records the deletion in the any-sync settings tree — the
+// authoritative, synced deletion record — and reclaims the object's local
+// state.
 //
-// The CRDT `delete` op below runs first, while the tree is still
-// live: the apply pipeline tombstones the object's `objects` record
-// (Query's tombstone filter then hides it) and fires the Deleted
-// subscription event via afterApply. The any-sync settings-tree write
-// then fans the deletion out to peers; the local any-store tombstone
-// row stays until a future cleanup pass — Query skips it, and ids are
-// content-addressable so reuse can't happen.
+// The settings-tree write propagates the deletion to every device and
+// cascades to any bound children; each device's DeleteTree/MarkTreeDeleted
+// callback then purges its own local projection. We also reclaim locally
+// and synchronously so the object leaves local queries immediately: the
+// store.DeleteTree call tombstones the object's own tree FIRST (so any-sync
+// rejects any further apply and no concurrent inbound change can
+// re-materialize the row) and then purges. It is best-effort — the async
+// settings-tree cascade is authoritative and re-runs it (a no-op once the
+// tree is deleted). No CRDT tombstone is written; any-sync's head storage
+// is the durable, cross-device record that the tree is deleted.
 func (o *objectService) Delete(ctx context.Context, objectId string) error {
 	if objectId == "" {
 		return errors.New("spaceimpl: Objects.Delete requires objectId")
 	}
-	obj, err := o.parent.store.Get(ctx, objectId)
-	if err != nil {
-		return fmt.Errorf("spaceimpl: get object %s: %w", objectId, err)
-	}
-	if _, err := obj.LocalWrite(ctx, crdt.Change{
-		Dataset:     properties.Dataset,
-		DataVersion: properties.HandlerVersion,
-		Records: []crdt.RecordChange{
-			{Id: objectId, Ops: []crdt.Op{{Type: crdt.OpDelete}}},
-		},
-	}); err != nil {
-		return fmt.Errorf("spaceimpl: tombstone %s: %w", objectId, err)
-	}
-
 	handle, err := o.parent.app.GetSpace(ctx, o.parent.id)
 	if err != nil {
 		return fmt.Errorf("spaceimpl: get space: %w", err)
@@ -155,7 +146,9 @@ func (o *objectService) Delete(ctx context.Context, objectId string) error {
 	if err := handle.Inner().DeleteTree(ctx, objectId); err != nil {
 		return fmt.Errorf("spaceimpl: DeleteTree %s: %w", objectId, err)
 	}
-	o.parent.store.Drop(objectId)
+	// Best-effort local reclaim; whichever of this call and the async
+	// cascade runs first tombstones the tree, the other no-ops on it.
+	_ = o.parent.store.DeleteTree(ctx, objectId)
 	return nil
 }
 

@@ -22,9 +22,16 @@ import "context"
 // per-object watermarks are backfilled applySeq := addSeq once per
 // space, and the allocator seeds past the historical maximum, so a
 // cursor persisted in AddSeq units stays valid on the applySeq axis.
+//
+// Deleted is true when the object was purged (object deletion): the entry
+// carries a fresh ApplySeq strictly greater than the object's last content
+// change, so it evicts in the same ordered stream as edits. Consuming
+// Deleted is MANDATORY for eviction — a deleted object never re-appears as
+// a content change.
 type ObjectChange struct {
 	ObjectId string
 	ApplySeq uint64
+	Deleted  bool
 }
 
 // ChangeIndexAPI is the surface a consumer-side indexer (full-text /
@@ -41,6 +48,20 @@ type ObjectChange struct {
 // liveness, and on startup (or after a missed event) calls ChangedSince
 // from its saved cursor to backfill. Changes to any of the object's
 // datasets count, whatever route they arrived on.
+//
+// Object DELETION IS reported through this feed. A deleted object's
+// projection is purged (the SDK keeps no `objects` tombstone; any-sync's
+// head storage is the durable delete record), but the purge stamps the
+// object's kept `_meta` row with a fresh ApplySeq, so it surfaces once as
+// ObjectChange{Deleted:true} at an ApplySeq strictly greater than its last
+// content change. The consumer reads change.Deleted and evicts. Once
+// Deleted surfaces, any-sync guarantees no later content change follows, so
+// per-object consumer state may be dropped.
+//
+// Rebuild: applySeq is peer-local and renumbers if the SDK store is rebuilt
+// (e.g. its DB was wiped). Generation changes exactly then; a consumer whose
+// stored Generation differs MUST reset its cursor to 0 and full-reindex from
+// a live snapshot (QueryObjects), which re-establishes deletions by absence.
 type ChangeIndexAPI interface {
 	// MaxApplySeq returns the current upper bound of the cursor — the
 	// highest per-object applySeq persisted in this space. 0 when
@@ -65,4 +86,12 @@ type ChangeIndexAPI interface {
 	// re-running ChangedSince from the consumer's persisted cursor. Do
 	// not treat the callback as a durable queue.
 	Subscribe(cb func(ObjectChange)) (cancel func())
+
+	// Generation is a per-space epoch that changes iff the SDK store was
+	// rebuilt (the applySeq axis renumbered). It is stable across normal
+	// restarts. A consumer persists it alongside its cursor; when the
+	// returned value differs from the stored one (or the stored cursor
+	// exceeds MaxApplySeq, an older-backup restore), it must reset the
+	// cursor to 0 and full-reindex from a live QueryObjects snapshot.
+	Generation(ctx context.Context) (string, error)
 }

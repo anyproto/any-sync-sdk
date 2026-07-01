@@ -12,6 +12,11 @@
 // trees whose LastAddSeq exceeds it and force-load each (the existing
 // per-object ColdRestore path then catches them up). Persist the
 // snapshot at the end so the fast path no-ops on the next boot.
+//
+// Run covers only CREATES/UPDATES (force-load trees whose head advanced).
+// The deletion-reconcile backstop for the SDK-DB rebuild case lives in
+// ReconcileDeletions (reconcile.go): a settings-head-gated pass that purges
+// any local row for a tree any-sync has flipped to Deleted.
 package spacesync
 
 import (

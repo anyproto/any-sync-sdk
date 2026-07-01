@@ -41,6 +41,13 @@ type ObjectChange struct {
 // liveness, and on startup (or after a missed event) calls ChangedSince
 // from its saved cursor to backfill. Changes to any of the object's
 // datasets count, whatever route they arrived on.
+//
+// Object DELETION is not reported through this feed. A deleted object's
+// projection is purged (the SDK keeps no object tombstone; any-sync's
+// head storage is the durable delete record), so it never re-appears in
+// ChangedSince and fires no change event. Observe object deletions via
+// QueryObjects().Subscribe (a Removed{RemoveDeleted} event), or evict on
+// re-query miss, or reconcile against any-sync's deleted-tree set.
 type ChangeIndexAPI interface {
 	// MaxApplySeq returns the current upper bound of the cursor — the
 	// highest per-object applySeq persisted in this space. 0 when

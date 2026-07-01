@@ -25,12 +25,15 @@ import (
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -44,6 +47,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
+
+var storeLog = logger.NewNamed("sdk.spaceobjects")
 
 // ErrUnknownDataset is returned by DataVersion when the caller asks
 // for a dataset the store doesn't know how to version.
@@ -80,6 +85,9 @@ type CreateOpts struct {
 type DeriveOpts struct {
 	ChangeType    string
 	ChangePayload []byte
+	// ParentId binds the derived tree to a parent so any-sync cascade-
+	// deletes it with the parent. It is also hashed into the derived id.
+	ParentId string
 }
 
 // Store owns per-object Controllers and handed-out *object.Object
@@ -636,14 +644,17 @@ func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.Tree
 	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
 }
 
-// DeleteTree marks the underlying any-sync tree as deleted and drops
-// the cached *object.Object. Wired into the SpaceRegistry's
-// DeleteTree route so the deletion-manager's per-tree cleanup pass
-// removes both the any-sync storage flag and our in-memory state.
+// DeleteTree reflects an any-sync tree deletion into local state: it
+// tombstones the tree in any-sync storage, purges the object's
+// materialized state from the SDK DB, and evicts the cached object.
+// Wired into the SpaceRegistry's DeleteTree route so the deletion
+// manager's per-tree cleanup pass reclaims both any-sync storage and
+// our on-disk + in-memory state.
 //
-// any-store rows for the deleted object are NOT cleaned up — same
-// rationale as Drop: queries skip tombstones, ids are content-
-// addressable.
+// Ordering is deliberate: tree.Delete() runs FIRST, so any-sync marks
+// the tree deleted (a permanent, cross-device-authoritative flag) and
+// then rejects every further apply to it — the purge below therefore
+// cannot race a concurrent materialization of the same object.
 func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	obj, err := s.Get(ctx, treeId)
 	if err != nil {
@@ -651,14 +662,129 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	}
 	tree := obj.Tree()
 	if tree == nil {
+		s.purgeObject(ctx, treeId)
 		s.Drop(treeId)
 		return nil
 	}
 	if err := tree.Delete(); err != nil {
 		return fmt.Errorf("spaceobjects: tree.Delete %s: %w", treeId, err)
 	}
+	s.purgeObject(ctx, treeId)
 	s.Drop(treeId)
 	return nil
+}
+
+// MarkTreeDeleted is the soft-delete callback any-sync fires when it
+// catches a settings-tree deletion for a tree that is not present in
+// local storage (e.g. a device that never synced the object). Purge
+// any materialized state and evict the cache; there is no local tree
+// to tombstone.
+func (s *Store) MarkTreeDeleted(ctx context.Context, treeId string) {
+	s.purgeObject(ctx, treeId)
+	s.Drop(treeId)
+}
+
+// purgeObject hard-removes an object's local projection from the SDK
+// DB — the shared `objects` row and every per-object dataset collection
+// (`<objectId>_<dataset>`) — and notifies live subscribers + the account
+// mirror.
+//
+// The SDK keeps NO local tombstone for a deleted object: any-sync's
+// head storage is the durable, cross-device record that the tree is
+// deleted (set once, never cleared, and no inbound path can resurrect
+// it), so the row simply ceases to exist. Consumers that must tell a
+// deleted object from a never-materialized one read that flag via
+// TreeDeleted.
+//
+// The object's `_meta` row is deliberately KEPT. It is a tiny per-object
+// watermark (addSeq/applySeq/handler versions); the space's applySeq
+// allocator seeds from max(applySeq) over these rows, so removing the
+// row of the highest-applySeq object would rewind the allocator on the
+// next restart and cause applySeq reuse. Stale rows for deleted objects
+// are inert (the object is gone), matching the space-offload policy.
+//
+// Device-local: no DAG or ACL write. Idempotent and best-effort —
+// failures are logged, never returned, and a second call (row already
+// gone) is a no-op that fires no event.
+func (s *Store) purgeObject(ctx context.Context, objectId string) {
+	removed := false
+	if coll, err := s.SharedObjects(ctx); err != nil {
+		storeLog.Warn("purge: open shared objects", zap.String("treeId", objectId), zap.Error(err))
+	} else if _, ferr := coll.FindId(ctx, objectId); ferr == nil {
+		if derr := coll.DeleteId(ctx, objectId); derr != nil {
+			storeLog.Warn("purge: remove objects row", zap.String("treeId", objectId), zap.Error(derr))
+		} else {
+			removed = true
+		}
+	} else if !errors.Is(ferr, anystore.ErrDocNotFound) {
+		storeLog.Warn("purge: read objects row", zap.String("treeId", objectId), zap.Error(ferr))
+	}
+
+	s.dropObjectCollections(ctx, objectId)
+
+	// Fire only when we actually removed a live row — a redundant purge
+	// (the row was already gone) must not emit a second Removed event.
+	if removed {
+		if s.engine != nil {
+			s.engine.NotifyDeleted(s.spaceId, properties.Dataset, objectId)
+		}
+		if s.rowEvents != nil && s.rowEvents.hasSubscribers() {
+			s.rowEvents.dispatch(RowEvent{ObjectId: objectId, Deleted: true})
+		}
+	}
+}
+
+// dropObjectCollections drops every `<objectId>_<dataset>` collection
+// owned by objectId — mirroring the per-object sweep the space offload
+// path performs, scoped to a single object. The id segment is matched
+// exactly (up to the first `_`) so an object whose id merely shares a
+// prefix is never touched.
+func (s *Store) dropObjectCollections(ctx context.Context, objectId string) {
+	names, err := s.db.GetCollectionNames(ctx)
+	if err != nil {
+		storeLog.Warn("purge: list collections", zap.String("treeId", objectId), zap.Error(err))
+		return
+	}
+	for _, name := range names {
+		i := strings.IndexByte(name, '_')
+		if i <= 0 || name[:i] != objectId {
+			continue
+		}
+		coll, err := s.db.OpenCollection(ctx, name)
+		if err != nil {
+			if !errors.Is(err, anystore.ErrCollectionNotFound) {
+				storeLog.Warn("purge: open collection", zap.String("coll", name), zap.Error(err))
+			}
+			continue
+		}
+		if err := coll.Drop(ctx); err != nil {
+			storeLog.Warn("purge: drop collection", zap.String("coll", name), zap.Error(err))
+		}
+	}
+}
+
+// TreeDeleted reports whether any-sync's head storage records treeId as
+// deleted — the permanent, cross-device-authoritative deletion flag
+// (set once, never cleared, no inbound path resurrects the tree). Lets
+// consumers tell a deleted object (whose local row was hard-removed)
+// apart from one that was never materialized.
+func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return false, err
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return false, nil
+	}
+	entry, err := st.HeadStorage().GetEntry(ctx, treeId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return entry.DeletedStatus != headstorage.DeletedStatusNotDeleted, nil
 }
 
 // Get returns the *object.Object for objectId, lazy-loading on first
@@ -722,6 +848,7 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
 		IsEncrypted:   true,
+		ParentId:      opts.ParentId,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: DeriveTree: %w", err)

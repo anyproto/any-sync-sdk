@@ -3,12 +3,14 @@ package anysyncx
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/anyproto/any-sync/app"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/commonspace/sync/objectsync/objectmessages"
@@ -16,8 +18,11 @@ import (
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/net/streampool/streamhandler"
+	"go.uber.org/zap"
 	"storj.io/drpc"
 )
+
+var streamLog = logger.NewNamed("anysyncx.streamhandler")
 
 // SpaceSyncHandlerCName is registered as our app component name. Has
 // to be unique across the app — any-sync's commonspace registers
@@ -88,6 +93,19 @@ func (h *spaceSyncHandler) getSpace(spaceId string) (commonspace.Space, error) {
 		return nil, fmt.Errorf("anysyncx: space %s not registered", spaceId)
 	}
 	return sp, nil
+}
+
+// snapshotSpaces returns the currently-registered spaces. Used by the
+// stream handler to run a recovery head-sync after a node stream
+// (re)opens.
+func (h *spaceSyncHandler) snapshotSpaces() []commonspace.Space {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]commonspace.Space, 0, len(h.spaces))
+	for _, sp := range h.spaces {
+		out = append(out, sp)
+	}
+	return out
 }
 
 func (h *spaceSyncHandler) ObjectSyncRequestStream(msg *spacesyncproto.ObjectSyncMessage, stream spacesyncproto.DRPCSpaceSync_ObjectSyncRequestStreamStream) error {
@@ -171,7 +189,20 @@ const nodeStreamTag = "anysyncx/node-stream"
 type streamHandler struct {
 	syncHandler *spaceSyncHandler
 	streamPool  streampool.StreamPool
+	// resyncing coalesces concurrent recovery head-syncs: every node
+	// stream (re)open triggers kickResync, but only one pass runs at a
+	// time. See kickResync.
+	resyncing atomic.Bool
 }
+
+// resyncDebounce lets the burst of node-stream reopens that follow a
+// dropped connection settle before the recovery head-sync runs, so the
+// three per-node OpenStream callbacks coalesce into a single pass.
+const resyncDebounce = 300 * time.Millisecond
+
+// resyncTimeout bounds each per-space recovery head-sync so one
+// unreachable node can't wedge the recovery goroutine.
+const resyncTimeout = 20 * time.Second
 
 func newStreamHandler(sh *spaceSyncHandler) *streamHandler {
 	return &streamHandler{syncHandler: sh}
@@ -193,7 +224,8 @@ func (h *streamHandler) OpenStream(ctx context.Context, p peer.Peer) (drpc.Strea
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	if ids := h.syncHandler.RegisteredSpaceIds(); len(ids) > 0 {
+	ids := h.syncHandler.RegisteredSpaceIds()
+	if len(ids) > 0 {
 		sub := &spacesyncproto.SpaceSubscription{
 			SpaceIds: ids,
 			Action:   spacesyncproto.SpaceSubscriptionAction_Subscribe,
@@ -206,32 +238,90 @@ func (h *streamHandler) OpenStream(ctx context.Context, p peer.Peer) (drpc.Strea
 			return nil, nil, 0, sErr
 		}
 	}
+	// A push (HeadUpdate) is fire-and-forget: any-sync's streampool tears
+	// the whole shared node stream down on the first read/write/handle
+	// error (net/streampool/stream.go readLoop's deferred streamClose), so
+	// a change pushed while this channel was down between the drop and this
+	// reopen is lost — only the ~30s periodic headsync would otherwise
+	// recover it. Kick a recovery head-sync now that the channel is back so
+	// missed pushes converge promptly instead of on the next diff tick.
+	h.kickResync()
 	// Tag with nodeStreamTag so spacePeerManager can detect when this
 	// channel drops and re-subscribe promptly (see hasNodeStream).
 	return objectStream, []string{nodeStreamTag}, 100, nil
 }
 
+// kickResync schedules one recovery head-sync pass across all registered
+// spaces. Concurrent (re)opens — e.g. the three per-node streams
+// reopening after a connection reset — coalesce into a single pass via
+// the resyncing guard, and a short debounce lets that burst settle
+// first. Best-effort and fully detached from the caller: head-sync is
+// the same diff the periodic timer runs, just triggered on reconnect.
+func (h *streamHandler) kickResync() {
+	if !h.resyncing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer h.resyncing.Store(false)
+		time.Sleep(resyncDebounce)
+		for _, sp := range h.syncHandler.snapshotSpaces() {
+			ctx, cancel := context.WithTimeout(context.Background(), resyncTimeout)
+			if err := sp.SyncHeads(ctx); err != nil {
+				streamLog.Debug("resync head-sync", zap.String("spaceId", sp.Id()), zap.Error(err))
+			}
+			cancel()
+		}
+	}()
+}
+
+// HandleMessage processes one inbound stream message. It NEVER returns a
+// non-nil error: any-sync's streampool readLoop tears the whole shared
+// node stream down the moment a handler errors (net/streampool/stream.go:
+// readLoop's deferred streamClose). That stream multiplexes the push
+// subscriptions for every space, so killing it over one unprocessable
+// message drops realtime delivery for all of them until a fresh stream
+// reopens — and any change pushed in that window is lost, recoverable
+// only by the ~30s periodic diff. Recoverable conditions (a HeadUpdate
+// for a space we've offloaded or not yet registered, a malformed control
+// frame) are therefore logged and swallowed; the change is reconciled by
+// head-sync. The errors are logged at debug because they are expected
+// during normal churn (offload, lazy load).
 func (h *streamHandler) HandleMessage(ctx context.Context, _ string, msg drpc.Message) error {
 	headUpdate, ok := msg.(*objectmessages.HeadUpdate)
 	if !ok {
-		return errors.New("anysyncx: unexpected stream message type")
+		streamLog.Debug("unexpected stream message type", zap.String("type", fmt.Sprintf("%T", msg)))
+		return nil
 	}
 	// Empty SpaceId — subscription control message.
 	if headUpdate.SpaceId() == "" {
 		var sub spacesyncproto.SpaceSubscription
 		if err := sub.UnmarshalVT(headUpdate.Bytes); err != nil {
-			return err
+			streamLog.Debug("decode subscription control", zap.Error(err))
+			return nil
 		}
 		if sub.Action == spacesyncproto.SpaceSubscriptionAction_Subscribe {
-			return h.streamPool.AddTagsCtx(ctx, sub.SpaceIds...)
+			if err := h.streamPool.AddTagsCtx(ctx, sub.SpaceIds...); err != nil {
+				streamLog.Debug("add stream tags", zap.Error(err))
+			}
+			return nil
 		}
-		return h.streamPool.RemoveTagsCtx(ctx, sub.SpaceIds...)
+		if err := h.streamPool.RemoveTagsCtx(ctx, sub.SpaceIds...); err != nil {
+			streamLog.Debug("remove stream tags", zap.Error(err))
+		}
+		return nil
 	}
 	sp, err := h.syncHandler.getSpace(headUpdate.SpaceId())
 	if err != nil {
-		return err
+		// Space not registered (offloaded, or a stale push for a space this
+		// device never loaded). Swallow — head-sync reconciles if we later
+		// load it.
+		streamLog.Debug("head update for unregistered space", zap.String("spaceId", headUpdate.SpaceId()))
+		return nil
 	}
-	return sp.HandleMessage(ctx, headUpdate)
+	if err := sp.HandleMessage(ctx, headUpdate); err != nil {
+		streamLog.Debug("apply head update", zap.String("spaceId", headUpdate.SpaceId()), zap.Error(err))
+	}
+	return nil
 }
 
 func (h *streamHandler) NewReadMessage() drpc.Message { return &objectmessages.HeadUpdate{} }

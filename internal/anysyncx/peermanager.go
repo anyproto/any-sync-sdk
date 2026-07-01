@@ -170,20 +170,23 @@ func (m *spacePeerManager) broadcastSubscribe() {
 
 func (m *spacePeerManager) Name() string { return peermanager.CName }
 
-// GetResponsiblePeers returns a single node peer per call. As a client we
-// only need to diff-sync against one node per cycle; pool.GetOneOf reuses
-// a live connection when possible and otherwise dials a random node from
-// the configured set.
+// GetResponsiblePeers returns ALL of the space's responsible node peers,
+// not just one. any-sync's diffsyncer loops over the returned peers, so
+// returning every responsible node makes head-sync resilient to a single
+// node that is transiently failing a diff for this space — e.g. a node
+// whose mongo storage returns a retryable WriteConflict during the
+// head-sync write. Pinning to one node (pool.GetOneOf, which stickily
+// reuses the already-connected peer) meant that if THAT node kept
+// erroring for a space, the space's trees (ACL + spaceIndex + objects)
+// never synced on this device at all — the intermittent "joiner never
+// sees the space / metadata" stall. Trying every responsible node costs
+// a few extra cheap in-sync hash compares per cycle; the actual tree
+// transfer still happens once, from whichever node answers.
+//
+// Mirrors GetNodePeers (used for broadcast) — both fan out to the full
+// responsible set.
 func (m *spacePeerManager) GetResponsiblePeers(ctx context.Context) ([]peer.Peer, error) {
-	nodeIds := m.nodeConf.NodeIds(m.spaceId)
-	if len(nodeIds) == 0 {
-		return nil, nil
-	}
-	p, err := m.pool.GetOneOf(ctx, nodeIds)
-	if err != nil {
-		return nil, err
-	}
-	return []peer.Peer{p}, nil
+	return m.GetNodePeers(ctx)
 }
 
 func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error) {

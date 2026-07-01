@@ -324,6 +324,9 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 			s.spaceIndexWatchers[spaceId] = w
 			s.watchers.register(w)
 			s.mu.Unlock()
+			// Materialise the object so a device that only derived its id
+			// (a cold joiner) pulls its existing content and mirrors it.
+			s.goLoadSpaceIndex(store, w, objectId)
 		}
 	}
 
@@ -1138,6 +1141,85 @@ func (s *Service) Close(_ context.Context) error {
 	s.stopJoinWaiters()
 	s.watchers.stopAll()
 	return nil
+}
+
+// spaceIndexLoad* bound the background retry that materialises a
+// not-yet-synced spaceIndex object (see goLoadSpaceIndex).
+const (
+	spaceIndexLoadAttempts = 15
+	spaceIndexLoadBackoff  = time.Second
+	spaceIndexLoadTimeout  = 15 * time.Second
+)
+
+// goLoadSpaceIndex materialises the spaceIndex object in the background
+// so a device that only derived its id — a cold joiner, or any device
+// whose live push for the object was missed — pulls the object's
+// existing content from the node and mirrors it.
+//
+// ensureSpaceIndexWiring only DERIVES the object id (DeriveTree computes
+// the id without building the tree) and subscribes a watcher. On the
+// creating owner the object is already loaded (seedSpaceIndexOnCreate →
+// store.Derive), so its content is present and the watcher's initial
+// reconcile mirrors it. A joiner (or any non-creating device) has no
+// local tree: store.Get builds it via BuildSyncTreeOrGetRemote — pulling
+// the existing content off the node and cold-restoring it into the store
+// — which the reconcile then mirrors, and which binds the SDK listener so
+// subsequent metadata changes (push or diff) fan out to the watcher.
+// Without this the watcher subscribes to an object that never loads,
+// never fires an apply event, and never mirrors — the intermittent
+// "joiner never sees the space name / rename" flake, since convergence
+// otherwise depended on headsync happening to load the tree in time.
+//
+// Retries with backoff to cover replication lag right after a join;
+// bounded and best-effort — the live push / periodic headsync remains
+// the backstop. Tracked by seedWG / bound to seedCtx so Close drains it.
+func (s *Service) goLoadSpaceIndex(store *spaceobjects.Store, w *spaceIndexWatcher, objectId string) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.seedWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.seedWG.Done()
+		for attempt := 0; attempt < spaceIndexLoadAttempts; attempt++ {
+			select {
+			case <-s.seedCtx.Done():
+				return
+			default:
+			}
+			ctx, cancel := context.WithTimeout(s.seedCtx, spaceIndexLoadTimeout)
+			// Fast path: the object is already materialised locally (the
+			// creating owner seeded it, or a prior sync loaded it) — just
+			// reconcile, no network.
+			if spaceIndexHasNamespace(ctx, store, objectId) {
+				w.reconcileOnce(ctx)
+				cancel()
+				return
+			}
+			// Force a head-sync: its SyncAll resolves the spaceIndex tree
+			// through the registry (GetTree → store.Get → build via
+			// BuildSyncTreeOrGetRemote with the SDK listener bound), which
+			// pulls the object's content off the node and projects it —
+			// firing the watcher. A background store.Get alone does not
+			// drive the peer exchange, so head-sync is the load primitive.
+			_ = s.app.SyncHeads(ctx, w.spaceId)
+			loaded := spaceIndexHasNamespace(ctx, store, objectId)
+			if loaded {
+				w.reconcileOnce(ctx)
+			}
+			cancel()
+			if loaded {
+				return
+			}
+			select {
+			case <-s.seedCtx.Done():
+				return
+			case <-time.After(spaceIndexLoadBackoff):
+			}
+		}
+	}()
 }
 
 // goSeed launches the spaceIndex lazy-seed in the background, tracked by

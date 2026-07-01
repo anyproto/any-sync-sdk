@@ -11,6 +11,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
@@ -190,6 +191,17 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 // datasets (DatasetOwner returns false) — property-namespace membership
 // is enforced separately by SystemPropertiesHandler.PreValidate. Local
 // write-time only; inbound apply stays read-tolerant.
+// checkPublicDataset rejects writes to SDK-internal datasets through
+// the public Modify/ModifyMany/Delete surface. The payloads dataset is
+// written only by the SDK's files layer (its change shapes are fixed
+// and its object class ships changes unencrypted).
+func checkPublicDataset(dataset string) error {
+	if dataset == payloads.Dataset {
+		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
+	}
+	return nil
+}
+
 func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
 	owner, ok := s.store.DatasetOwner(dataset)
 	if !ok {
@@ -220,6 +232,9 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	}
 	if batch.Dataset == "" {
 		return space.ModifyResult{}, errors.New("spaceimpl: Dataset required")
+	}
+	if err := checkPublicDataset(batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
 	}
 	dataVersion, err := s.store.DataVersion(batch.Dataset)
 	if err != nil {
@@ -279,6 +294,10 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	changes := make([]crdt.Change, len(batches))
 	var validationErrs []error
 	for i, b := range batches {
+		if err := checkPublicDataset(b.Dataset); err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
+			continue
+		}
 		dataVersion, err := s.store.DataVersion(b.Dataset)
 		if err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
@@ -321,6 +340,9 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.ModifyResult, error) {
 	if len(batch.RecordIds) == 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: DeleteBatch.RecordIds empty")
+	}
+	if err := checkPublicDataset(batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
 	}
 	dataVersion, err := s.store.DataVersion(batch.Dataset)
 	if err != nil {

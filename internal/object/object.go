@@ -6,13 +6,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 )
+
+var log = logger.NewNamed("sdk.object")
 
 // ErrTreeNotSet is retained for callers that historically distinguished
 // "tree not yet bound" from other errors. The current constructor
@@ -69,6 +73,21 @@ type ApplyGate func(ctx context.Context, ch *crdt.Change, rawPayload []byte) (pr
 // "auto" fields on the wire.
 type AfterApply func(ctx context.Context, o *Object, ch *crdt.Change, res *crdt.ApplyResult)
 
+// PlaintextSpec declares a plaintext (node-readable) object class: an
+// object whose tree changes are written UNencrypted at the any-sync
+// level (ShouldBeEncrypted:false → ReadKeyId=="" on the wire), so a
+// reader without the space read key — e.g. a filenode-v2 broker —
+// can materialize them. Field-level secrecy inside such changes is
+// the dataset layer's job (an SDK-sealed field, see internal/payloads).
+//
+// Datasets is the write allowlist. LocalWrite hard-errors on any other
+// dataset (nothing leaks into the DAG); the inbound replay path
+// tolerantly skips them (a peer can't smuggle rows into `objects`
+// etc. through a plaintext tree).
+type PlaintextSpec struct {
+	Datasets map[string]struct{}
+}
+
 type Object struct {
 	signKey    crypto.PrivKey
 	codec      *Codec
@@ -77,6 +96,11 @@ type Object struct {
 	spaceId    string
 	gate       ApplyGate
 	afterApply AfterApply
+	// plaintextSpecs maps a tree-root ChangeType to its plaintext
+	// class declaration. The root's ChangeType is immutable, signed,
+	// and cleartext, so keyed and keyless readers resolve the same
+	// class. Empty/nil map = every object is a regular encrypted one.
+	plaintextSpecs map[string]PlaintextSpec
 
 	// tree's own lock (synctree.Lock) is the single mutex guarding
 	// all writes into the Controller: LocalWrite, replayLocked (via
@@ -97,6 +121,10 @@ type Config struct {
 	Allocator  *VersionAllocator
 	Gate       ApplyGate
 	AfterApply AfterApply
+	// PlaintextSpecs declares which tree-root ChangeTypes are plaintext
+	// object classes and which datasets they may carry. Optional — nil
+	// means every object writes encrypted changes.
+	PlaintextSpecs map[string]PlaintextSpec
 }
 
 // TreeFunc constructs the any-sync ObjectTree for the new Object,
@@ -127,13 +155,14 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 		return nil, errors.New("object: New: nil TreeFunc")
 	}
 	o := &Object{
-		signKey:    cfg.SignKey,
-		codec:      NewCodec(),
-		alloc:      cfg.Allocator,
-		ctrl:       cfg.Controller,
-		spaceId:    cfg.SpaceId,
-		gate:       cfg.Gate,
-		afterApply: cfg.AfterApply,
+		signKey:        cfg.SignKey,
+		codec:          NewCodec(),
+		alloc:          cfg.Allocator,
+		ctrl:           cfg.Controller,
+		spaceId:        cfg.SpaceId,
+		gate:           cfg.Gate,
+		afterApply:     cfg.AfterApply,
+		plaintextSpecs: cfg.PlaintextSpecs,
 	}
 	tree, err := treeFunc(o)
 	if err != nil {
@@ -223,6 +252,13 @@ func (o *Object) setListenerNilLocked() {
 func (o *Object) ApplyDecoded(ctx context.Context, ch crdt.Change) error {
 	o.tree.Lock()
 	defer o.tree.Unlock()
+	// Defense-in-depth for the drain path: replayLocked already skips
+	// non-allowlisted datasets on plaintext objects before parking, so
+	// a parked change violating the allowlist shouldn't exist — but a
+	// drain must never be the hole that materializes one.
+	if err := checkPlaintextDataset(o.plaintextSpecFor(o.tree), ch.Dataset); err != nil {
+		return err
+	}
 	_, err := o.applyDecodedLocked(ctx, ch)
 	return err
 }
@@ -296,6 +332,40 @@ func (o *Object) stampObjectMetaFromTree(ch *crdt.Change, tree objecttree.Object
 			ch.Creator = tc.Identity.Account()
 		}
 	}
+}
+
+// plaintextSpecFor resolves the object's plaintext class from the
+// tree root's ChangeType. The tree is passed explicitly (not read from
+// o.tree) because inbound replay may fire from the synctree build
+// listener before o.tree is wired — same reason as
+// stampObjectMetaFromTree. Returns nil for regular encrypted objects,
+// a nil tree, or a root without change info (defensive: an
+// unresolvable root must never silently downgrade to plaintext).
+func (o *Object) plaintextSpecFor(tree objecttree.ObjectTree) *PlaintextSpec {
+	if len(o.plaintextSpecs) == 0 || tree == nil {
+		return nil
+	}
+	info := tree.ChangeInfo()
+	if info == nil {
+		return nil
+	}
+	if spec, ok := o.plaintextSpecs[info.ChangeType]; ok {
+		return &spec
+	}
+	return nil
+}
+
+// checkPlaintextDataset returns the allowlist violation for writing
+// dataset on a plaintext object, or nil when the write is fine (also
+// for regular encrypted objects, spec == nil).
+func checkPlaintextDataset(spec *PlaintextSpec, dataset string) error {
+	if spec == nil {
+		return nil
+	}
+	if _, ok := spec.Datasets[dataset]; ok {
+		return nil
+	}
+	return fmt.Errorf("object: dataset %q is not allowed on a plaintext object — its changes ship unencrypted", dataset)
 }
 
 // Tree returns the bound tree, or nil if SetTree hasn't run.
@@ -374,6 +444,16 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 		return WriteResult{}, errors.New("object: closed")
 	}
 
+	// Plaintext-class objects ship their changes UNencrypted, so only
+	// the class's allowlisted datasets may enter the DAG — a write to
+	// any other dataset (`objects` properties, an app dataset) would
+	// leak its cleartext to the nodes. Hard error BEFORE AddContent:
+	// nothing leaks and nothing junk syncs.
+	spec := o.plaintextSpecFor(o.tree)
+	if err := checkPlaintextDataset(spec, ch.Dataset); err != nil {
+		return WriteResult{}, err
+	}
+
 	// Writer-side schema pre-flight: strict validation against the
 	// current record state, BEFORE the change enters the DAG. A failure
 	// here returns an agent-readable error and keeps the malformed
@@ -400,10 +480,13 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	// replayLocked sets decoded.Timestamp = full.Timestamp on the
 	// inbound side. ts() preserves caller-supplied positive values.
 	ch.Timestamp = ts(ch.Timestamp)
+	// Plaintext-class changes go out with ShouldBeEncrypted:false —
+	// any-sync stamps ReadKeyId=="" and writes Data verbatim, which is
+	// what lets a keyless reader (filenode-v2 broker) materialize them.
 	res, err := o.tree.AddContent(ctx, objecttree.SignableChangeContent{
 		Data:              payload,
 		Key:               o.signKey,
-		ShouldBeEncrypted: true,
+		ShouldBeEncrypted: spec == nil,
 		DataType:          ch.Dataset,
 		Timestamp:         ch.Timestamp,
 	})
@@ -596,6 +679,13 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	rootId := tree.Id()
 	from := o.ctrl.MaxAddSeq()
 
+	// Inbound side of the plaintext-class dataset allowlist: changes
+	// on non-allowlisted datasets are skipped tolerantly (WARN, keep
+	// iterating) — a peer must not be able to smuggle rows into
+	// `objects` etc. through a plaintext tree. Local writes are the
+	// strict side (LocalWrite hard-errors before AddContent).
+	spec := o.plaintextSpecFor(tree)
+
 	// captured outside the iterate closure so we can surface fatal
 	// errors past IterateAfterAddSeq's bool return.
 	var fatalErr error
@@ -635,6 +725,13 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		decoded.AddSeq = ch.AddSeq
 		decoded.Timestamp = ch.Timestamp
 		decoded.VersionId = crdt.VersionId(ch.OrderId)
+		if err := checkPlaintextDataset(spec, decoded.Dataset); err != nil {
+			log.Warn("skipping inbound change on plaintext object",
+				zap.String("objectId", rootId),
+				zap.String("changeId", ch.Id),
+				zap.String("dataset", decoded.Dataset))
+			return true
+		}
 		// Stamp ObjectAuthor / ObjectCreatedAt / Creator from the tree
 		// we're iterating — applyDecodedLocked's o.stampObjectMeta
 		// reads o.tree, which is nil when this replay fires from the

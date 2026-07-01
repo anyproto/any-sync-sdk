@@ -160,6 +160,13 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		if err := spacesync.Run(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
 			_ = err
 		}
+		// Backstop the sdk.db-rebuild deletion gap: purge any local row for
+		// an object any-sync has flipped to Deleted (and stamp the consumer
+		// deletion feed). Best-effort; runs after Run so it also cleans
+		// anything the forward catch-up or a lazy Get re-materialized.
+		if err := spacesync.ReconcileDeletions(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
+			_ = err
+		}
 	}
 
 	return &SDK{

@@ -50,6 +50,26 @@ func NewApplySeqAllocator(seedFn func(ctx context.Context) (uint64, error)) *App
 	return &ApplySeqAllocator{seedFn: seedFn}
 }
 
+// Seed forces the one-off lazy seed now, so no later Next runs seedFn
+// while a WriteTx is held (the purge path allocates inside its tx). Call
+// once at store load, single-threaded. Idempotent.
+func (a *ApplySeqAllocator) Seed(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.seeded {
+		return nil
+	}
+	if a.seedFn != nil {
+		seed, err := a.seedFn(ctx)
+		if err != nil {
+			return err
+		}
+		a.last = seed
+	}
+	a.seeded = true
+	return nil
+}
+
 // Next returns the next apply sequence, seeding on first use.
 func (a *ApplySeqAllocator) Next(ctx context.Context) (uint64, error) {
 	a.mu.Lock()

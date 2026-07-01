@@ -655,6 +655,12 @@ func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.Tree
 // the tree deleted (a permanent, cross-device-authoritative flag) and
 // then rejects every further apply to it — the purge below therefore
 // cannot race a concurrent materialization of the same object.
+//
+// A purge failure is PROPAGATED, not swallowed: any-sync advances the
+// tree from Queued to Deleted only after this callback returns success,
+// so returning an error keeps it Queued and the deletion loop re-fires
+// the callback until the purge commits — the at-least-once self-heal for
+// a crash between tree.Delete() and the purge.
 func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	obj, err := s.Get(ctx, treeId)
 	if err != nil {
@@ -662,26 +668,35 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	}
 	tree := obj.Tree()
 	if tree == nil {
-		s.purgeObject(ctx, treeId)
+		if err := s.purgeObject(ctx, treeId); err != nil {
+			return err
+		}
 		s.Drop(treeId)
 		return nil
 	}
 	if err := tree.Delete(); err != nil {
 		return fmt.Errorf("spaceobjects: tree.Delete %s: %w", treeId, err)
 	}
-	s.purgeObject(ctx, treeId)
+	if err := s.purgeObject(ctx, treeId); err != nil {
+		return err
+	}
 	s.Drop(treeId)
 	return nil
 }
 
 // MarkTreeDeleted is the soft-delete callback any-sync fires when it
-// catches a settings-tree deletion for a tree that is not present in
-// local storage (e.g. a device that never synced the object). Purge
-// any materialized state and evict the cache; there is no local tree
-// to tombstone.
-func (s *Store) MarkTreeDeleted(ctx context.Context, treeId string) {
-	s.purgeObject(ctx, treeId)
+// catches a settings-tree deletion for a tree not present in local
+// storage (a device that never synced the object, or a re-fired callback
+// after tree.Delete() already removed it). Purge any materialized state
+// and evict the cache; there is no local tree to tombstone. Like
+// DeleteTree, a purge failure is returned so the deletion loop re-fires
+// until it commits.
+func (s *Store) MarkTreeDeleted(ctx context.Context, treeId string) error {
+	if err := s.purgeObject(ctx, treeId); err != nil {
+		return err
+	}
 	s.Drop(treeId)
+	return nil
 }
 
 // purgeObject hard-removes an object's local projection from the SDK
@@ -703,23 +718,33 @@ func (s *Store) MarkTreeDeleted(ctx context.Context, treeId string) {
 // next restart and cause applySeq reuse. Stale rows for deleted objects
 // are inert (the object is gone), matching the space-offload policy.
 //
-// Device-local: no DAG or ACL write. Idempotent and best-effort —
-// failures are logged, never returned, and a second call (row already
-// gone) is a no-op that fires no event.
-func (s *Store) purgeObject(ctx context.Context, objectId string) {
+// Device-local: no DAG or ACL write; idempotent (a second call with the
+// row already gone is a no-op that fires no event).
+//
+// Error contract: the correctness-critical step — removing the shared
+// `objects` row — RETURNS an error on failure so the caller propagates
+// it and any-sync re-fires the callback until the purge commits (a stale
+// row would otherwise surface a deleted object as live, since we keep no
+// tombstone). The per-object data-collection drop and the notifications
+// stay best-effort: a failed data drop is a disk leak, not a query
+// correctness issue (the object is already gone), and must not block the
+// deletion from being marked complete.
+func (s *Store) purgeObject(ctx context.Context, objectId string) error {
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: purge open shared objects %s: %w", objectId, err)
+	}
 	removed := false
-	if coll, err := s.SharedObjects(ctx); err != nil {
-		storeLog.Warn("purge: open shared objects", zap.String("treeId", objectId), zap.Error(err))
-	} else if _, ferr := coll.FindId(ctx, objectId); ferr == nil {
+	if _, ferr := coll.FindId(ctx, objectId); ferr == nil {
 		if derr := coll.DeleteId(ctx, objectId); derr != nil {
-			storeLog.Warn("purge: remove objects row", zap.String("treeId", objectId), zap.Error(derr))
-		} else {
-			removed = true
+			return fmt.Errorf("spaceobjects: purge remove row %s: %w", objectId, derr)
 		}
+		removed = true
 	} else if !errors.Is(ferr, anystore.ErrDocNotFound) {
-		storeLog.Warn("purge: read objects row", zap.String("treeId", objectId), zap.Error(ferr))
+		return fmt.Errorf("spaceobjects: purge read row %s: %w", objectId, ferr)
 	}
 
+	// Best-effort from here — disk reclaim + notifications, not correctness.
 	s.dropObjectCollections(ctx, objectId)
 
 	// Fire only when we actually removed a live row — a redundant purge
@@ -732,6 +757,7 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) {
 			s.rowEvents.dispatch(RowEvent{ObjectId: objectId, Deleted: true})
 		}
 	}
+	return nil
 }
 
 // dropObjectCollections drops every `<objectId>_<dataset>` collection

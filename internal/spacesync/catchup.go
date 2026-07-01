@@ -12,6 +12,23 @@
 // trees whose LastAddSeq exceeds it and force-load each (the existing
 // per-object ColdRestore path then catches them up). Persist the
 // snapshot at the end so the fast path no-ops on the next boot.
+//
+// TODO(SYN-20 follow-up): deletion-reconcile backstop. Today this package
+// reconciles only CREATES/UPDATES (force-load trees whose head advanced).
+// Deletions rely on any-sync's Queued->Deleted callback retry, which is
+// now error-propagating (spaceobjects.Store.purgeObject returns on a
+// failed row removal), so a crash between tree.Delete() and the purge
+// self-heals: the tree stays Queued and the deletion loop re-fires the
+// callback on the next boot. The remaining gap is the SDK-DB REBUILD
+// case — if our materialized store is wiped/rebuilt while any-sync's head
+// storage still marks trees Deleted, no callback re-fires (any-sync
+// already flipped those to Deleted) and the forward catch-up won't touch
+// them, so a deleted object could re-materialize. Mirror anytype-heart's
+// reindexDeletedObjects: a checksum/version-gated pass that iterates head
+// storage IterateEntries{Deleted:true} and calls the purge sink for each
+// still-materialized id, guarded by a persisted counter so it runs once
+// per SDK-DB generation (or on a deliberate version bump), NOT every boot.
+// Pair it with the existing Store.TreeDeleted point-check.
 package spacesync
 
 import (

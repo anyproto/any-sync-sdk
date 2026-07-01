@@ -1213,8 +1213,7 @@ func (s *Service) MarkTreeDeleted(ctx context.Context, spaceId, treeId string) e
 	if spaceId == s.tsp.SpaceId() {
 		return s.tsp.MarkTreeDeleted(ctx, spaceId, treeId)
 	}
-	s.storeFor(spaceId).MarkTreeDeleted(ctx, treeId)
-	return nil
+	return s.storeFor(spaceId).MarkTreeDeleted(ctx, treeId)
 }
 
 // DeleteTree performs the per-tree cleanup the deletion-manager

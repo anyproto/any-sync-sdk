@@ -3,6 +3,7 @@ package upload
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
@@ -267,6 +268,113 @@ func TestAddBindDonorGoneFallsThrough(t *testing.T) {
 	require.True(t, second.Durable)
 	// Fresh random key ⇒ fresh ciphertext ⇒ a different root.
 	require.NotEqual(t, first.RootCid, second.RootCid)
+}
+
+type fakeQueue struct {
+	entries map[string]bool // "kind/space/file" → pending
+	log     []string
+}
+
+func newFakeQueue() *fakeQueue { return &fakeQueue{entries: map[string]bool{}} }
+
+func (q *fakeQueue) Enqueue(_ context.Context, kind, spaceId, fileId string) error {
+	q.entries[kind+"/"+spaceId+"/"+fileId] = true
+	q.log = append(q.log, "enqueue "+kind+"/"+fileId)
+	return nil
+}
+
+func (q *fakeQueue) Remove(_ context.Context, kind, spaceId, fileId string) error {
+	delete(q.entries, kind+"/"+spaceId+"/"+fileId)
+	q.log = append(q.log, "remove "+kind+"/"+fileId)
+	return nil
+}
+
+func TestAddEnqueuesBeforeDurablePhase(t *testing.T) {
+	br := &fakeBroker{}
+	s, _ := newService(t, br)
+	q := newFakeQueue()
+	s.SetQueue(q)
+	reg := newFakeRegistrar()
+
+	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(testContent(20_000)), AddOpts{})
+	require.NoError(t, err)
+	require.True(t, res.Durable)
+	// Enqueued before the attempt, removed after the success.
+	require.Equal(t, []string{"enqueue durable/" + res.FileId, "remove durable/" + res.FileId}, q.log)
+	require.Empty(t, q.entries)
+}
+
+func TestAddLimitLeavesJobForTheQueue(t *testing.T) {
+	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
+	s, _ := newService(t, br)
+	q := newFakeQueue()
+	s.SetQueue(q)
+	reg := newFakeRegistrar()
+
+	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 20_000), AddOpts{})
+	require.NoError(t, err)
+	require.False(t, res.Durable)
+	require.True(t, q.entries["durable/"+spaceId+"/"+res.FileId], "the refused upload stays queued")
+
+	// Headroom appears (quota raised): one queue-driven attempt drains
+	// the job to durable.
+	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
+	row := reg.rows["owner1/"+res.FileId]
+	require.NotEmpty(t, row.NetworkSign, "DriveDurable must record the receipt")
+
+	// Now idempotent.
+	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
+}
+
+type offlineBroker struct {
+	fakeBroker
+}
+
+func (b *offlineBroker) Upload(ctx context.Context, spaceId string, items []*fileprotov2.UploadRequestItem) (*fileprotov2.UploadResponse, error) {
+	b.uploads++
+	return nil, errors.New("dial: network unreachable")
+}
+
+// TestAddOfflineReturnsFast pins the offline-first contract: with no
+// network, Attach registers the file and returns immediately — one
+// transport failure defers straight to the persistent queue, never an
+// inline retry loop.
+func TestAddOfflineReturnsFast(t *testing.T) {
+	br := &offlineBroker{}
+	s, _ := newService(t, br)
+	s.durableWait = time.Minute // must NOT be consumed
+	q := newFakeQueue()
+	s.SetQueue(q)
+	reg := newFakeRegistrar()
+
+	start := time.Now()
+	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 20_000), AddOpts{})
+	require.NoError(t, err)
+	require.False(t, res.Durable)
+	require.Less(t, time.Since(start), 2*time.Second, "offline attach must not block on the network")
+	require.Equal(t, 1, br.uploads, "exactly one transport attempt")
+	require.True(t, q.entries["durable/"+spaceId+"/"+res.FileId], "backup deferred to the queue")
+
+	row := reg.rows["owner1/"+res.FileId]
+	require.NotEmpty(t, row.RootCid, "registration is local-first, network-independent")
+}
+
+func TestDriveDurableLimited(t *testing.T) {
+	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{
+		fileprotov2.ErrCode_ErrLimitExceeded, // Attach attempt
+		fileprotov2.ErrCode_ErrLimitExceeded, // queue attempt
+	}}
+	s, _ := newService(t, br)
+	reg := newFakeRegistrar()
+	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 20_000), AddOpts{})
+	require.NoError(t, err)
+	err = s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId)
+	require.ErrorIs(t, err, ErrLimited, "the queue needs the typed refusal to park the job")
+}
+
+func bytesReaderOf(t *testing.T, n int) *bytes.Reader {
+	t.Helper()
+	return bytes.NewReader(testContent(n))
 }
 
 func TestAddSpoolSpill(t *testing.T) {

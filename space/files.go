@@ -37,6 +37,73 @@ type Files interface {
 	// Get returns the file's current info (member-only fields like
 	// Name/Mime are empty for a keyless reader).
 	Get(ctx context.Context, fileId string) (FileInfo, error)
+
+	// Status derives the file's durability state on read: durable
+	// (verified receipt on the row, inline included), in-flight
+	// (registered; backup pending or being driven), or limited (the
+	// network refused backup for storage limit; retried on a slow
+	// cadence and on Retry).
+	Status(ctx context.Context, fileId string) (FileStatus, error)
+
+	// SubscribeStatus delivers FileStatus events for this space's
+	// files on LOCAL transitions — attach, backup progress/failure,
+	// pin completion, manual retries. (Remote flips — another device
+	// finishing a backup — are visible via Status/Get reads; a synced
+	// event feed arrives with the SYN-30 files view.) The returned
+	// function unsubscribes.
+	SubscribeStatus(cb func(FileStatus)) (unsubscribe func())
+
+	// Stats returns this space's aggregate durability counts (UI
+	// badges: "n files not backed up").
+	Stats(ctx context.Context) (FileStats, error)
+
+	// Pin schedules a full background fetch of the file's content into
+	// the local store (survives restarts; on-demand reads stay the
+	// default without it).
+	Pin(ctx context.Context, fileId string) error
+
+	// Retry makes the file's pending background work due immediately —
+	// a limited file after a quota raise, or any stalled backup. No-op
+	// with no pending work; re-enqueues the backup when the row is
+	// unsigned and the bytes are local.
+	Retry(ctx context.Context, fileId string) error
+}
+
+// FileSyncState is the durability state of one file.
+type FileSyncState string
+
+const (
+	// FileStateDurable — a verified network receipt is recorded (or the
+	// file is inline and rides the CRDT).
+	FileStateDurable FileSyncState = "durable"
+	// FileStateInFlight — registered, backup not confirmed yet (queued,
+	// uploading, or driven by another device).
+	FileStateInFlight FileSyncState = "inflight"
+	// FileStateLimited — the network refused backup (storage limit).
+	FileStateLimited FileSyncState = "limited"
+)
+
+// FileStatus is the point-in-time durability + availability view of
+// one file.
+type FileStatus struct {
+	FileId   string
+	ObjectId string
+	State    FileSyncState
+	// Cached reports a complete local copy (inline always true).
+	Cached bool
+	// Attempts counts failed background attempts since the last
+	// success/enqueue; 0 when no work is pending.
+	Attempts int
+	// LastErr is the last background-attempt failure ("" when none).
+	LastErr string
+}
+
+// FileStats are per-space aggregate counts.
+type FileStats struct {
+	Total    int
+	Durable  int
+	InFlight int
+	Limited  int
 }
 
 // Variant selects which representation of a file to open. Variants

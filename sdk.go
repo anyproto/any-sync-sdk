@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/files/broker"
 	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
@@ -27,11 +28,12 @@ import (
 // SDK is the top-level handle held by middleware for the lifetime of
 // use. Constructed by Open; torn down by Close.
 type SDK struct {
-	app     *anysyncx.App
-	db      anystore.DB
-	tsp     *techspace.Service
-	spaces  *spaceimpl.Service
-	account *accountImpl
+	app        *anysyncx.App
+	db         anystore.DB
+	tsp        *techspace.Service
+	spaces     *spaceimpl.Service
+	account    *accountImpl
+	filesQueue *status.Queue
 }
 
 // Open brings up the SDK: initializes auth, opens storage, boots any-sync,
@@ -98,7 +100,19 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 			}
 			return info.PublicReadBaseUrl, nil
 		})
-	spaces.SetFiles(upload.New(filesStore, filesBroker), fetch.New(filesStore, baseURL), filesStore)
+	filesUpload := upload.New(filesStore, filesBroker)
+	// The persistent files work queue (SYN-29): drive-toward-durable
+	// retries + Pin background fetches, surviving restarts. Runs after
+	// spaces exist (jobs resolve rows through them); closed first.
+	filesQueue, err := status.NewQueue(ctx, db, spaces.RunFileJob, spaces.OnFileJobChange)
+	if err != nil {
+		_ = db.Close()
+		_ = app.Close(ctx)
+		return nil, fmt.Errorf("anysyncsdk: open files queue: %w", err)
+	}
+	filesUpload.SetQueue(filesQueue)
+	spaces.SetFiles(filesUpload, fetch.New(filesStore, baseURL), filesStore, filesQueue)
+	filesQueue.Run()
 	// Wire spaceimpl.Service as the space registry so any-sync's
 	// treemanager-driven callbacks (deletion-manager DeleteTree,
 	// space-sync PutTree, head-sync GetTree for arbitrary trees)
@@ -122,11 +136,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// local-only inside tsp.Open.)
 	if cfg.Headless {
 		return &SDK{
-			app:     app,
-			db:      db,
-			tsp:     tsp,
-			spaces:  spaces,
-			account: account,
+			app:        app,
+			db:         db,
+			tsp:        tsp,
+			spaces:     spaces,
+			account:    account,
+			filesQueue: filesQueue,
 		}, nil
 	}
 
@@ -216,18 +231,22 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	return &SDK{
-		app:     app,
-		db:      db,
-		tsp:     tsp,
-		spaces:  spaces,
-		account: account,
+		app:        app,
+		db:         db,
+		tsp:        tsp,
+		spaces:     spaces,
+		account:    account,
+		filesQueue: filesQueue,
 	}, nil
 }
 
-// Close tears down the SDK: closes loaded spaces, the tech space, the
-// SDK DB, and finally the any-sync app.
+// Close tears down the SDK: stops the files queue, closes loaded
+// spaces, the tech space, the SDK DB, and finally the any-sync app.
 func (s *SDK) Close() error {
 	ctx := context.Background()
+	if s.filesQueue != nil {
+		s.filesQueue.Close()
+	}
 	if s.spaces != nil {
 		_ = s.spaces.Close(ctx)
 	}

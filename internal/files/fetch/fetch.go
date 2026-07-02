@@ -80,12 +80,14 @@ func (s *Service) Open(ctx context.Context, spaceId string, root cid.Cid, key []
 	if !h.Complete() {
 		rc, rcErr := s.remote(ctx, spaceId, root, durable)
 		if rcErr != nil && s.peer == nil {
-			// No rung can fill the holes: reads over missing sections
-			// would only surface ErrBlockMissing later; fail loud now.
-			_ = h.Close()
-			return nil, rcErr
+			// Offline-first: the locally-present ranges of a partial
+			// file stay readable with no network. Only a read that
+			// actually hits a hole surfaces the fetch error.
+			holeErr := rcErr
+			fetchFn = func(context.Context, cid.Cid) ([]byte, error) { return nil, holeErr }
+		} else {
+			fetchFn = remoteFetcher(spaceId, h, s.peer, rc)
 		}
-		fetchFn = remoteFetcher(spaceId, h, s.peer, rc)
 	}
 
 	dr, err := newDagReader(ctx, h.NodeGetter(fetchFn), root)

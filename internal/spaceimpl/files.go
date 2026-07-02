@@ -9,6 +9,7 @@ import (
 
 	"github.com/ipfs/go-cid"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
@@ -47,6 +48,16 @@ func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opt
 	})
 	if err != nil {
 		return space.FileInfo{}, err
+	}
+	if res.Inline {
+		// Full-tier attaches emit through the queue transitions; inline
+		// never touches the queue, so emit its (terminal) status here.
+		f.s.parent.fileStatusSubs.dispatch(f.s.id, space.FileStatus{
+			FileId:   res.FileId,
+			ObjectId: objectId,
+			State:    space.FileStateDurable,
+			Cached:   true,
+		})
 	}
 	return space.FileInfo{
 		FileId:   res.FileId,
@@ -119,6 +130,108 @@ func (f *filesAPI) Get(ctx context.Context, fileId string) (space.FileInfo, erro
 		}
 	}
 	return info, nil
+}
+
+// Status derives the file's durability state on read. See space.Files.
+func (f *filesAPI) Status(ctx context.Context, fileId string) (space.FileStatus, error) {
+	return f.s.fileStatus(ctx, fileId)
+}
+
+// SubscribeStatus registers a local-transition listener. See
+// space.Files.
+func (f *filesAPI) SubscribeStatus(cb func(space.FileStatus)) (unsubscribe func()) {
+	return f.s.parent.fileStatusSubs.add(f.s.id, cb)
+}
+
+// Stats aggregates this space's durability counts. See space.Files.
+func (f *filesAPI) Stats(ctx context.Context) (space.FileStats, error) {
+	var stats space.FileStats
+	limited := map[string]bool{}
+	if q := f.s.parent.fqueue; q != nil {
+		jobs, err := q.ListSpace(ctx, f.s.id)
+		if err != nil {
+			return space.FileStats{}, err
+		}
+		for _, j := range jobs {
+			if j.Kind == status.KindDurable && j.Limited {
+				limited[j.FileId] = true
+			}
+		}
+	}
+	view := f.s.Payloads()
+	objIds, err := view.ListObjects(ctx)
+	if err != nil {
+		return space.FileStats{}, err
+	}
+	for _, objId := range objIds {
+		rows, err := view.ListRows(ctx, objId)
+		if err != nil {
+			return space.FileStats{}, err
+		}
+		for _, row := range rows {
+			stats.Total++
+			switch {
+			case row.RootCid == "" || row.NetworkSign != "":
+				stats.Durable++
+			case limited[row.FileId]:
+				stats.Limited++
+			default:
+				stats.InFlight++
+			}
+		}
+	}
+	return stats, nil
+}
+
+// Pin schedules a persistent full background fetch. See space.Files.
+func (f *filesAPI) Pin(ctx context.Context, fileId string) error {
+	q := f.s.parent.fqueue
+	if q == nil {
+		return errors.New("files: not configured")
+	}
+	row, err := f.s.PayloadsInternal().FindRow(ctx, fileId)
+	if err != nil {
+		return err
+	}
+	if row.Inline() {
+		return nil // rides the row; nothing to fetch
+	}
+	return q.Enqueue(ctx, status.KindPin, f.s.id, fileId)
+}
+
+// Retry makes the file's pending background work due immediately,
+// re-enqueueing the backup when the row is unsigned with complete
+// local bytes. See space.Files.
+func (f *filesAPI) Retry(ctx context.Context, fileId string) error {
+	q := f.s.parent.fqueue
+	if q == nil {
+		return errors.New("files: not configured")
+	}
+	row, err := f.s.PayloadsInternal().FindRow(ctx, fileId)
+	if err != nil {
+		return err
+	}
+	kickedDurable, err := q.KickJob(ctx, status.KindDurable, f.s.id, fileId)
+	if err != nil {
+		return err
+	}
+	if _, err = q.KickJob(ctx, status.KindPin, f.s.id, fileId); err != nil {
+		return err
+	}
+	if kickedDurable || row.Inline() || row.NetworkSign != "" {
+		return nil
+	}
+	// Unsigned with no pending job (e.g. the row predates the queue or
+	// its job was lost): re-enqueue when we hold the bytes to drive it.
+	root, err := cid.Decode(row.RootCid)
+	if err != nil {
+		return err
+	}
+	info, err := f.s.parent.filesStore().Info(ctx, f.s.id, root)
+	if err != nil || info.State != filestore.StateComplete {
+		return nil // nothing local to upload; SYN-24 P2P may change this
+	}
+	return q.Enqueue(ctx, status.KindDurable, f.s.id, fileId)
 }
 
 // inlineReader serves an inline-tier file from the unsealed row.

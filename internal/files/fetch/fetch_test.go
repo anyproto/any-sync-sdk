@@ -184,6 +184,42 @@ func TestResumeAcrossReopen(t *testing.T) {
 	require.Equal(t, store.StateComplete, info.State)
 }
 
+// TestPartialReadableOffline pins the offline-first contract: the
+// locally-present ranges of a partial file serve with no network; only
+// a read that hits a hole surfaces the unavailability.
+func TestPartialReadableOffline(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, plain := buildSource(t, 5_000_000)
+	base, _ := serveCar(t, root, car)
+
+	st := newStore(t)
+	online := New(st, staticBase(base))
+	f, err := online.Open(ctx, spaceId, root, key, true, "file1")
+	require.NoError(t, err)
+	head := make([]byte, 1_500_000)
+	_, err = io.ReadFull(f, head)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	offline := New(st, staticBase("")) // network gone
+	f2, err := offline.Open(ctx, spaceId, root, key, true, "file1")
+	require.NoError(t, err, "a partial file must open offline")
+	got := make([]byte, 1_000_000)
+	_, err = io.ReadFull(f2, got)
+	require.NoError(t, err, "locally-present range must read offline")
+	require.True(t, bytes.Equal(plain[:len(got)], got))
+
+	// A hole surfaces the unavailability lazily — at the seek (the CFB
+	// decryptor recovers the IV from the preceding ciphertext block) or
+	// at the read, never at Open.
+	_, holeErr := f2.Seek(4_000_000, io.SeekStart)
+	if holeErr == nil {
+		_, holeErr = io.ReadFull(f2, got[:4096])
+	}
+	require.ErrorIs(t, holeErr, ErrNotAvailable)
+	require.NoError(t, f2.Close())
+}
+
 func TestOfflineOffloadedThenRefetch(t *testing.T) {
 	ctx := context.Background()
 	car, root, key, plain := buildSource(t, 2_000_000)

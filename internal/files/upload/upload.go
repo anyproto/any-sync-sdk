@@ -39,10 +39,12 @@ const (
 	// defaultMemSpool is the spool's in-memory threshold; larger inputs
 	// spill to a temp file in the store scratch dir.
 	defaultMemSpool = 8 << 20
-	// defaultDurableWait bounds the durable phase when the caller's ctx
-	// has no sooner deadline. First contact for a space makes the broker
-	// pull the space + ACL from the tree nodes, which takes retries.
-	defaultDurableWait = 3 * time.Minute
+	// defaultDurableWait bounds the INLINE durable phase of Attach when
+	// the caller's ctx has no sooner deadline. It only covers the
+	// happy-ish online case (including a short broker activation
+	// window); anything longer is the persistent queue's job — Attach
+	// must never hold the caller hostage to the network.
+	defaultDurableWait = 45 * time.Second
 	// durableRetryDelay separates durable-phase attempts.
 	durableRetryDelay = 2 * time.Second
 	// fileKeySize is the per-file AES-256 key length.
@@ -65,6 +67,19 @@ type Registrar interface {
 	SetNetworkSign(ctx context.Context, ownerId, fileId, sign string) error
 	Row(ctx context.Context, ownerId, fileId string) (payloads.Row, error)
 }
+
+// Enqueuer is the SYN-29 persistent-queue seam. The durable job is
+// enqueued BEFORE the inline durable phase runs and removed on its
+// success, so a crash mid-upload leaves a persisted job instead of a
+// forgotten unsigned row. Nil = no queue (tests).
+type Enqueuer interface {
+	Enqueue(ctx context.Context, kind, spaceId, fileId string) error
+	Remove(ctx context.Context, kind, spaceId, fileId string) error
+}
+
+// KindDurable is the drive-toward-durable job kind (mirrors the queue
+// package constant; declared here so upload does not import it).
+const KindDurable = "durable"
 
 // RegisterOpts mirrors the payloads registration input.
 type RegisterOpts struct {
@@ -96,12 +111,16 @@ type Result struct {
 type Service struct {
 	store  *store.Store
 	broker Broker
+	queue  Enqueuer // nil until SetQueue
 
 	// test knobs; production uses the defaults above
 	memSpool    int64
 	durableWait time.Duration
 	retryDelay  time.Duration
 }
+
+// SetQueue wires the persistent retry queue (sdk.Open, once).
+func (s *Service) SetQueue(q Enqueuer) { s.queue = q }
 
 // New builds the Service over the local store and the broker client.
 func New(st *store.Store, br Broker) *Service {
@@ -244,6 +263,13 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 	}
 
 	res := Result{FileId: fileId, RootCid: root.String(), Size: sp.Size()}
+	// Enqueue-before-attempt: a crash anywhere in the durable phase
+	// leaves a persisted job, not a forgotten unsigned row.
+	if s.queue != nil {
+		if err = s.queue.Enqueue(ctx, KindDurable, spaceId, fileId); err != nil {
+			return Result{}, err
+		}
+	}
 	sign, err := s.makeDurable(ctx, spaceId, root, info.Size)
 	if err != nil {
 		log.Info("durable phase deferred", zap.String("fileId", fileId),
@@ -253,8 +279,49 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 	if err = reg.SetNetworkSign(ctx, ownerId, fileId, sign); err != nil {
 		return Result{}, err
 	}
+	if s.queue != nil {
+		if err = s.queue.Remove(ctx, KindDurable, spaceId, fileId); err != nil {
+			return Result{}, err
+		}
+	}
 	res.Durable = true
 	return res, nil
+}
+
+// DriveDurable runs ONE durable-phase attempt for an already
+// registered row (the SYN-29 queue worker path — the queue owns the
+// backoff, so no inner retry loop). No-op when the row is already
+// durable or inline; ErrLimited on a limit refusal.
+func (s *Service) DriveDurable(ctx context.Context, reg Registrar, spaceId, ownerId, fileId string) error {
+	row, err := reg.Row(ctx, ownerId, fileId)
+	if err != nil {
+		return err
+	}
+	if row.NetworkSign != "" || row.Inline() {
+		return nil
+	}
+	root, err := cid.Decode(row.RootCid)
+	if err != nil {
+		return fmt.Errorf("fileupload: row %s rootCid: %w", fileId, err)
+	}
+	h, err := s.store.Open(ctx, spaceId, root)
+	if err != nil {
+		return fmt.Errorf("fileupload: drive %s: %w", fileId, err)
+	}
+	complete := h.Complete()
+	size, err := h.Size()
+	_ = h.Close()
+	if err != nil {
+		return err
+	}
+	if !complete {
+		return fmt.Errorf("fileupload: drive %s: local bytes incomplete", fileId)
+	}
+	sign, _, err := s.durableAttempt(ctx, spaceId, root, size)
+	if err != nil {
+		return err
+	}
+	return reg.SetNetworkSign(ctx, ownerId, fileId, sign)
 }
 
 // makeDurable drives one root through Upload → presigned PUT →
@@ -291,15 +358,19 @@ func (s *Service) makeDurable(ctx context.Context, spaceId string, root cid.Cid,
 }
 
 // durableAttempt is one pass of the durable phase. retryable marks
-// outcomes worth another attempt (space not yet active on the broker,
-// routing hiccups, network errors); ErrLimited and verification
-// failures are terminal.
+// outcomes worth another INLINE attempt — that is only the per-item
+// business codes of the broker's lazy space activation window, i.e.
+// cases where we ARE talking to the network. Transport-level failures
+// (offline, node down, S3 unreachable) are never retried inline: the
+// app is offline-first, so they defer to the persistent queue
+// immediately instead of stalling the caller. ErrLimited and
+// verification failures are terminal.
 func (s *Service) durableAttempt(ctx context.Context, spaceId string, root cid.Cid, carSize int64) (sign string, retryable bool, err error) {
 	upResp, err := s.broker.Upload(ctx, spaceId, []*fileprotov2.UploadRequestItem{
 		{RootCid: root.Bytes(), Size: uint64(carSize)},
 	})
 	if err != nil {
-		return "", true, err
+		return "", false, err
 	}
 	if len(upResp.Results) != 1 {
 		return "", false, fmt.Errorf("fileupload: upload returned %d results for 1 item", len(upResp.Results))
@@ -315,12 +386,12 @@ func (s *Service) durableAttempt(ctx context.Context, spaceId string, root cid.C
 	putErr := s.broker.Put(ctx, upResp.Results[0].Upload, io.NewSectionReader(h, 0, carSize), carSize)
 	_ = h.Close()
 	if putErr != nil {
-		return "", true, putErr
+		return "", false, putErr
 	}
 
 	signResp, err := s.broker.RequestSign(ctx, spaceId, [][]byte{root.Bytes()})
 	if err != nil {
-		return "", true, err
+		return "", false, err
 	}
 	if len(signResp.Results) != 1 {
 		return "", false, fmt.Errorf("fileupload: sign returned %d results for 1 item", len(signResp.Results))

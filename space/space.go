@@ -155,4 +155,23 @@ type Space interface {
 	// operation does not need it — periodic and reactive sync keep the
 	// space up to date on their own.
 	SyncHeads(ctx context.Context) error
+
+	// TreeHeads returns the space's current sync frontier: the head
+	// change ids of every live (non-deleted) tree known locally — one
+	// entry per tree, materialized trees and heads-only stubs alike
+	// (under selective sync every tree head-syncs even when its
+	// content is not pulled), including system trees such as settings.
+	// A causal-attestation primitive for embedders: a peer holding
+	// every head of another peer's entry has seen at least that peer's
+	// change set for the tree. Used by the filenode-v2 broker's GC
+	// gate (CheckRefs).
+	TreeHeads(ctx context.Context) ([]TreeHeads, error)
+}
+
+// TreeHeads is one tree's current heads as reported by
+// Space.TreeHeads: the frontier element for that tree. Heads are
+// change ids.
+type TreeHeads struct {
+	TreeId string
+	Heads  []string
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/valyala/fastjson"
 
@@ -129,6 +130,29 @@ func (s *spaceImpl) Members() space.MembersAPI { return s.members }
 // completes and returns its error verbatim.
 func (s *spaceImpl) SyncHeads(ctx context.Context) error {
 	return s.app.SyncHeads(ctx, s.id)
+}
+
+// TreeHeads reads the space frontier straight from any-sync's
+// headstorage: one entry per live (non-deleted) tree — materialized
+// trees and heads-only selective-sync stubs alike, system trees
+// (settings) included. See space.Space.TreeHeads.
+func (s *spaceImpl) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
+	handle, err := s.app.GetSpace(ctx, s.id)
+	if err != nil {
+		return nil, err
+	}
+	hs := handle.Inner().Storage().HeadStorage()
+	var out []space.TreeHeads
+	if err = hs.IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
+		out = append(out, space.TreeHeads{
+			TreeId: e.Id,
+			Heads:  append([]string(nil), e.Heads...),
+		})
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("spaceimpl: iterate heads: %w", err)
+	}
+	return out, nil
 }
 
 // SyncStatus returns the per-space sync-status accessor backed by the

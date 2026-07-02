@@ -20,6 +20,19 @@ type Config struct {
 	Network Network
 	Sync    Sync
 
+	// Headless runs the SDK as an embedded backend service rather than
+	// a user-facing client. Open skips the account-facing boot work —
+	// profile republish, the 1-1 inbox subsystem, identity-profile
+	// resolution, pending-join resume, and the eager space-loading loop
+	// — and the tech space stays strictly local: it is still derived and
+	// opened (it is the space registry Get depends on) but is never
+	// pushed to the network and never requests a coordinator receipt.
+	// Spaces are opened on demand via Get after Track.
+	//
+	// This is the embedding mode of the filenode-v2 broker, usually
+	// combined with Sync.TreeTypes. Regular app embedders leave it false.
+	Headless bool `yaml:"headless"`
+
 	// Types is the optional list of caller-defined types extending
 	// the SDK's built-in catalog. Each Type binds a typeId to the
 	// dataset handlers it owns; every handler's Dataset() name must

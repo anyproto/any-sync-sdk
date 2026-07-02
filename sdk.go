@@ -82,6 +82,25 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
+	account := newAccountImpl(app, tsp, spaces)
+
+	// Headless: skip the account-facing boot work below — profile
+	// republish, the 1-1 inbox, identity resolution, pending-join
+	// resume, and the eager space-loading loop. A broker tracks foreign
+	// spaces and opens them on demand via Get; nothing account-shaped
+	// exists to resume, and eager-loading every tracked space defeats
+	// open/close-on-demand. (The tech space itself was already pinned
+	// local-only inside tsp.Open.)
+	if cfg.Headless {
+		return &SDK{
+			app:     app,
+			db:      db,
+			tsp:     tsp,
+			spaces:  spaces,
+			account: account,
+		}, nil
+	}
+
 	// Resume any join left pending from a previous session now that the
 	// tech space is open (the join controller started in spaceimpl.New,
 	// before this point, so its initial scan saw an empty index).
@@ -97,8 +116,6 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// symkeys but no profiles (those are device-local). Batch-fetch the
 	// missing profiles from identityRepo in the background.
 	go spaces.ResolveIdentityProfiles(context.Background())
-
-	account := newAccountImpl(app, tsp, spaces)
 
 	// Republish the locally-stored profile to identityRepo on every
 	// boot. Heart's ownProfileSubscription does the equivalent (reads

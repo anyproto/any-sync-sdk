@@ -8,6 +8,7 @@ require (
 	github.com/anyproto/any-sync v0.12.14-0.20260702084117-29a86c893480
 	github.com/anyproto/lexid v0.0.6
 	github.com/cheggaaa/mb/v3 v3.0.2
+	github.com/ipfs/go-cid v0.6.1
 	github.com/mr-tron/base58 v1.3.0
 	github.com/stretchr/testify v1.11.1
 	github.com/valyala/fastjson v1.6.10
@@ -47,7 +48,6 @@ require (
 	github.com/huandu/skiplist v1.2.1 // indirect
 	github.com/ipfs/boxo v0.41.0 // indirect
 	github.com/ipfs/go-block-format v0.2.3 // indirect
-	github.com/ipfs/go-cid v0.6.1 // indirect
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect

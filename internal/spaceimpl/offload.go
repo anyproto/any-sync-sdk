@@ -7,6 +7,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/app/ocache"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -28,31 +29,9 @@ var offloadLog = logger.NewNamed("sdk.spaceoffload")
 // reclaimed on the next attempt and never resurrected (the row stays
 // deleted).
 func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
-	// 1. Stop this space's watchers (members poller, spaceIndex watcher,
-	// account mirror) so nothing writes to the store or carrier while we
-	// tear them down.
-	s.watchers.stopForSpace(spaceId)
-
-	// 2. Close + forget the per-space Store and its allocator/wiring.
-	s.mu.Lock()
-	store := s.stores[spaceId]
-	delete(s.stores, spaceId)
-	delete(s.allocs, spaceId)
-	delete(s.spaceIndexIds, spaceId)
-	delete(s.spaceIndexWatchers, spaceId)
-	delete(s.accountMirrors, spaceId)
-	delete(s.memberWatchers, spaceId)
-	s.mu.Unlock()
-	if store != nil {
-		if err := store.Close(); err != nil {
-			offloadLog.Warn("close store", zap.String("spaceId", spaceId), zap.Error(err))
-		}
-	}
-
-	// 3. Evict the any-sync commonspace handle (closes its storage too).
-	if err := s.app.EvictSpace(ctx, spaceId); err != nil {
-		offloadLog.Warn("evict space", zap.String("spaceId", spaceId), zap.Error(err))
-	}
+	// 1–3. Stop watchers, close + forget the Store, evict the any-sync
+	// space — the shared close-without-delete teardown Evict also uses.
+	s.closeSpaceRuntime(ctx, spaceId)
 
 	// 4. Drop every SDK CRDT collection for the space from the shared DB.
 	if err := s.dropSpaceCollections(ctx, spaceId); err != nil {
@@ -73,6 +52,59 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	// reflecting live memberships.
 	if err := s.tsp.RemoveSpaceFromIdentities(ctx, spaceId); err != nil {
 		offloadLog.Debug("prune identities", zap.String("spaceId", spaceId), zap.Error(err))
+	}
+}
+
+// Evict closes a space without deleting anything: watchers stop, the
+// Store and the any-sync commonspace handle are released. Disk state —
+// the any-sync per-space DB and every SDK CRDT collection — stays, so a
+// later Get reopens the space from local storage (and any-sync resumes
+// syncing it). Idempotent: evicting a space that isn't open is a no-op.
+//
+// The tech space is refused — it is the registry Get itself depends on.
+func (s *Service) Evict(ctx context.Context, spaceId string) error {
+	if spaceId == "" {
+		return errors.New("spaceimpl: Evict: spaceId required")
+	}
+	if spaceId == s.tsp.SpaceId() {
+		return errors.New("spaceimpl: Evict: cannot evict the tech space")
+	}
+	s.closeSpaceRuntime(ctx, spaceId)
+	return nil
+}
+
+// closeSpaceRuntime tears down the in-memory side of one space — the
+// shared steps of Evict (which stops here) and OffloadSpace (which goes
+// on to reclaim disk):
+//
+//  1. stop this space's watchers (members poller, spaceIndex watcher,
+//     account mirror) so nothing writes to the store while it closes;
+//  2. close + forget the per-space Store and its allocator/wiring;
+//  3. evict the any-sync commonspace handle (closes its storage too).
+//
+// Idempotent and best-effort: every step tolerates already-gone state,
+// so re-running on a closed (or never-opened) space is a no-op. Errors
+// are logged, not propagated.
+func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
+	s.watchers.stopForSpace(spaceId)
+
+	s.mu.Lock()
+	store := s.stores[spaceId]
+	delete(s.stores, spaceId)
+	delete(s.allocs, spaceId)
+	delete(s.spaceIndexIds, spaceId)
+	delete(s.spaceIndexWatchers, spaceId)
+	delete(s.accountMirrors, spaceId)
+	delete(s.memberWatchers, spaceId)
+	s.mu.Unlock()
+	if store != nil {
+		if err := store.Close(); err != nil {
+			offloadLog.Warn("close store", zap.String("spaceId", spaceId), zap.Error(err))
+		}
+	}
+
+	if err := s.app.EvictSpace(ctx, spaceId); err != nil && !errors.Is(err, ocache.ErrNotExists) {
+		offloadLog.Warn("evict space", zap.String("spaceId", spaceId), zap.Error(err))
 	}
 }
 

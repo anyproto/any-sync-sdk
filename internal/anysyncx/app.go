@@ -73,6 +73,10 @@ type App struct {
 	syncers   map[string]*treeSyncerAdapter
 
 	keys *accountdata.AccountKeys
+
+	// selectiveTreeTypes is cfg.Sync.TreeTypes — the selective-sync
+	// tree-type allowlist. Empty = sync and materialize everything.
+	selectiveTreeTypes []string
 }
 
 // New brings up the any-sync app. Order matters: keys first (provider
@@ -130,14 +134,15 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(inbox)
 
 	out := &App{
-		sync:       sync,
-		tree:       tree,
-		storage:    storage,
-		headCache:  newHeadCache(),
-		syncStatus: syncstatus.NewService(),
-		syncers:    map[string]*treeSyncerAdapter{},
-		keys:       keys,
-		inbox:      inbox,
+		sync:               sync,
+		tree:               tree,
+		storage:            storage,
+		headCache:          newHeadCache(),
+		syncStatus:         syncstatus.NewService(),
+		syncers:            map[string]*treeSyncerAdapter{},
+		keys:               keys,
+		inbox:              inbox,
+		selectiveTreeTypes: cfg.Sync.TreeTypes,
 	}
 
 	// Install the push forwarder BEFORE Start: inboxClient.Run rejects a
@@ -262,6 +267,10 @@ func (a *App) NetworkId() string { return a.nodeConf.Configuration().NetworkId }
 // SetSpaceRegistry wires the tree manager to a space-level registry.
 // Called once by the space package after it builds its ocache.
 func (a *App) SetSpaceRegistry(r SpaceRegistry) { a.tree.SetRegistry(r) }
+
+// SelectiveTreeTypes is the selective-sync tree-type allowlist
+// (cfg.Sync.TreeTypes). Empty = sync and materialize everything.
+func (a *App) SelectiveTreeTypes() []string { return a.selectiveTreeTypes }
 
 // SpaceExists reports whether any-sync has local storage for spaceId.
 // Used by the space layer to decide between Open and Create paths.

@@ -7,6 +7,7 @@ import (
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/treesyncer"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/spacestate"
@@ -63,6 +64,10 @@ type treeSyncerAdapter struct {
 	onRound PeerRoundCallback
 }
 
+// Compile-time check: the adapter implements any-sync's optional
+// PullFilter extension (selective sync by tree type).
+var _ treesyncer.PullFilter = (*treeSyncerAdapter)(nil)
+
 func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCallback) *treeSyncerAdapter {
 	return &treeSyncerAdapter{
 		spaceId:  spaceId,
@@ -93,6 +98,18 @@ func (t *treeSyncerAdapter) Close(_ context.Context) error { return nil }
 func (t *treeSyncerAdapter) StartSync()               {}
 func (t *treeSyncerAdapter) StopSync()                {}
 func (t *treeSyncerAdapter) ShouldSync(_ string) bool { return true }
+
+// ShouldPull implements any-sync's optional treesyncer.PullFilter: it is
+// consulted by objectsync when a head update arrives for a tree that
+// does not exist locally, and delegates the decision to the registry
+// (selective sync by tree type). A nil registry — boot-order edge —
+// pulls as usual; the fetch path re-checks via its tree validator.
+func (t *treeSyncerAdapter) ShouldPull(ctx context.Context, objectId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool {
+	if t.registry == nil {
+		return true
+	}
+	return t.registry.ShouldPullTree(ctx, t.spaceId, objectId, root, heads)
+}
 
 // SyncAll resolves each tree id through the SpaceRegistry so its
 // listener is bound, then asks the resulting SyncTree to ping the

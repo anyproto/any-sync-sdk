@@ -71,4 +71,16 @@ type Network struct {
 type Sync struct {
 	DialTimeout     time.Duration
 	ChangeBatchSize int
+
+	// TreeTypes enables selective sync by tree type. Empty or nil (the
+	// default) syncs and materializes everything. Non-empty, the SDK
+	// still head-syncs every space in full — all tree ids and heads are
+	// known and the sync diff converges — but downloads, stores and
+	// materializes only trees whose root changeType is in the list;
+	// other trees are recorded as heads-only stubs. ACL, settings and
+	// key-value data are always fully synced, as is the tech space.
+	//
+	// This is the embedding mode of the filenode-v2 broker, which passes
+	// the payloads tree type only. Regular app embedders leave it empty.
+	TreeTypes []string
 }

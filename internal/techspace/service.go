@@ -110,6 +110,14 @@ func (s *Service) Open(ctx context.Context) error {
 	}
 	s.spaceId = spaceId
 
+	// Headless: the tech space is a private registry of tracked foreign
+	// spaces, strictly local to this device — never announced to sync
+	// nodes, never pushed, never coordinator-signed. Marked BEFORE the
+	// first load below (the peer manager is chosen at NewSpace time).
+	if s.app.Headless() {
+		s.app.MarkSpaceLocalOnly(spaceId)
+	}
+
 	if !s.app.SpaceExists(spaceId) {
 		if _, err := s.app.SpaceService().DeriveSpace(ctx, spaceCfg); err != nil {
 			return fmt.Errorf("techspace: derive: %w", err)

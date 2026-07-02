@@ -77,6 +77,15 @@ type App struct {
 	// selectiveTreeTypes is cfg.Sync.TreeTypes — the selective-sync
 	// tree-type allowlist. Empty = sync and materialize everything.
 	selectiveTreeTypes []string
+
+	// headless is cfg.Headless — embedded-backend mode. The flag itself
+	// only gates boot behavior in sdk.Open and the tech space's
+	// local-only marking; the enforcement lives in localOnly.
+	headless bool
+
+	// localOnly pins spaces to this device — no node subscribe, no
+	// push, no coordinator receipt. See localOnlySpaces.
+	localOnly *localOnlySpaces
 }
 
 // New brings up the any-sync app. Order matters: keys first (provider
@@ -104,12 +113,13 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	sync := newSpaceSyncHandler()
 	stream := newStreamHandler(sync)
 	tree := newTreeManager()
+	localOnly := newLocalOnlySpaces()
 
 	a := new(app.App)
 	a.Register(cfgAdapter).
 		Register(accountAdapter).
 		Register(debugstat.New()).
-		Register(newCredentialProvider()).
+		Register(newCredentialProvider(localOnly)).
 		Register(nodeconfstore.New()).
 		Register(nodeconfsource.New()).
 		Register(nodeconf.New()).
@@ -122,7 +132,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(streampool.New()).
 		Register(sync).
 		Register(pool.New()).
-		Register(newPeerManagerProvider()).
+		Register(newPeerManagerProvider(localOnly)).
 		Register(coordinatorclient.New()).
 		Register(nodeclient.New()).
 		Register(storage).
@@ -143,6 +153,8 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		keys:               keys,
 		inbox:              inbox,
 		selectiveTreeTypes: cfg.Sync.TreeTypes,
+		headless:           cfg.Headless,
+		localOnly:          localOnly,
 	}
 
 	// Install the push forwarder BEFORE Start: inboxClient.Run rejects a
@@ -271,6 +283,17 @@ func (a *App) SetSpaceRegistry(r SpaceRegistry) { a.tree.SetRegistry(r) }
 // SelectiveTreeTypes is the selective-sync tree-type allowlist
 // (cfg.Sync.TreeTypes). Empty = sync and materialize everything.
 func (a *App) SelectiveTreeTypes() []string { return a.selectiveTreeTypes }
+
+// Headless reports whether the SDK runs in embedded-backend mode
+// (cfg.Headless). See config.Config.Headless for the contract.
+func (a *App) Headless() bool { return a.headless }
+
+// MarkSpaceLocalOnly pins spaceId to this device: its peer manager
+// resolves no peers (no node subscribe, no diff-sync, no push) and the
+// credential provider refuses to request a coordinator receipt for it.
+// Must be called before the space is first loaded — the peer manager is
+// chosen at NewSpace time. Used by the tech space in headless mode.
+func (a *App) MarkSpaceLocalOnly(spaceId string) { a.localOnly.mark(spaceId) }
 
 // SpaceExists reports whether any-sync has local storage for spaceId.
 // Used by the space layer to decide between Open and Create paths.

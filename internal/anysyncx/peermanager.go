@@ -15,17 +15,48 @@ import (
 )
 
 // peerManagerProvider creates per-space peer managers. any-sync calls
-// NewPeerManager once per space at NewSpace time.
-type peerManagerProvider struct{}
+// NewPeerManager once per space at NewSpace time. Local-only spaces
+// (see localOnlySpaces) get an inert manager instead of the node-backed
+// one, so nothing about them ever reaches the network.
+type peerManagerProvider struct {
+	localOnly *localOnlySpaces
+}
 
-func newPeerManagerProvider() *peerManagerProvider { return &peerManagerProvider{} }
+func newPeerManagerProvider(localOnly *localOnlySpaces) *peerManagerProvider {
+	return &peerManagerProvider{localOnly: localOnly}
+}
 
 func (p *peerManagerProvider) Init(_ *app.App) error { return nil }
 func (p *peerManagerProvider) Name() string          { return peermanager.CName }
 
 func (p *peerManagerProvider) NewPeerManager(_ context.Context, spaceId string) (peermanager.PeerManager, error) {
+	if p.localOnly.has(spaceId) {
+		return &localPeerManager{}, nil
+	}
 	return &spacePeerManager{spaceId: spaceId}, nil
 }
+
+// localPeerManager is the peer manager of a local-only space: it
+// resolves no peers and sends nothing, so headsync has nobody to diff
+// against — no node subscribe, no SpaceMissing, no push. All sends
+// succeed as no-ops (the write is durable locally; there is simply no
+// audience).
+type localPeerManager struct{}
+
+func (m *localPeerManager) Init(_ *app.App) error { return nil }
+func (m *localPeerManager) Name() string          { return peermanager.CName }
+
+func (m *localPeerManager) GetResponsiblePeers(_ context.Context) ([]peer.Peer, error) {
+	return nil, nil
+}
+func (m *localPeerManager) GetNodePeers(_ context.Context) ([]peer.Peer, error) { return nil, nil }
+func (m *localPeerManager) BroadcastMessage(_ context.Context, _ drpc.Message) error {
+	return nil
+}
+func (m *localPeerManager) SendMessage(_ context.Context, _ string, _ drpc.Message) error {
+	return nil
+}
+func (m *localPeerManager) KeepAlive(_ context.Context) {}
 
 // spacePeerManager resolves nodes via nodeconf and ships messages
 // through the StreamPool for reactive push-based sync.

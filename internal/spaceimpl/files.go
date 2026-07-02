@@ -76,6 +76,9 @@ func (f *filesAPI) Open(ctx context.Context, fileId string, variant space.Varian
 		return nil, err
 	}
 	if row.Sealed {
+		if row.UnsealErr != nil {
+			return nil, fmt.Errorf("files: row %s cannot be unsealed (poisoned or malformed): %w", fileId, row.UnsealErr)
+		}
 		return nil, errors.New("files: no space key (cannot decrypt)")
 	}
 	if row.Inline() {

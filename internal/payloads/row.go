@@ -42,6 +42,12 @@ type Row struct {
 	// Sealed is true until Unseal succeeds. A keyless reader keeps
 	// Sealed rows — that's the broker view, not an error.
 	Sealed bool
+	// UnsealErr records why a KEYED unseal failed (GCM rejection —
+	// the writer stamped a kid that doesn't match the sealing key —
+	// or a malformed enc). The row stays Sealed. Kept per-row so one
+	// poisoned row (any write-permitted member can produce one)
+	// degrades to an unreadable row instead of failing every listing.
+	UnsealErr error
 }
 
 // Inline reports whether the row is an inline-tier file (no rootCid,
@@ -73,13 +79,19 @@ func RowFromValue(v *anyenc.Value) (Row, error) {
 
 // Unseal opens the row's enc blob via the provider. On ErrNoKey the
 // row simply stays Sealed (the keyless-reader view) and no error is
-// returned; any other failure (corrupt blob, wrong key) propagates.
+// returned. A row whose blob cannot be opened WITH a key — GCM
+// rejects the ciphertext, the enc shape is malformed — stays Sealed
+// with UnsealErr set and also returns nil: the row data is poisoned,
+// not the read (mirrors any-sync tolerating unreadable changes).
+// Only environment failures (the provider failing to resolve keys)
+// propagate as errors.
 func (r *Row) Unseal(ctx context.Context, kp KeyProvider) error {
 	if !r.Sealed || kp == nil {
 		return nil
 	}
 	if r.EncKid == "" || len(r.encCt) == 0 {
-		return errors.New("payloads: row has no sealed enc")
+		r.UnsealErr = errors.New("payloads: row has no sealed enc")
+		return nil
 	}
 	key, err := kp.KeyById(ctx, r.EncKid)
 	if err != nil {
@@ -90,7 +102,8 @@ func (r *Row) Unseal(ctx context.Context, kp KeyProvider) error {
 	}
 	enc, err := UnsealEnc(key, r.encCt)
 	if err != nil {
-		return err
+		r.UnsealErr = err
+		return nil
 	}
 	r.Enc = enc
 	r.Sealed = false

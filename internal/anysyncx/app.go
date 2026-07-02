@@ -276,6 +276,11 @@ func (a *App) NewAclWaiter(spaceId, aclHeadId string, onFinish, onReject func(li
 // coordinator verifies against its own network id.
 func (a *App) NetworkId() string { return a.nodeConf.Configuration().NetworkId }
 
+// FileV2Peers is the current fileV2 fleet (nodeconf.NodeTypeFileV2).
+// The files broker routes its RPCs and verifies custody receipts
+// against these peers.
+func (a *App) FileV2Peers() []string { return a.nodeConf.FileV2Peers() }
+
 // Pool exposes the any-sync peer pool (dial by peerId, addresses
 // resolved from the nodeconf). Lets embedders/e2e speak node-side
 // protocols (e.g. fileprotov2) over a connection that carries this

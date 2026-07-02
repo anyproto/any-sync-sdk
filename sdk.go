@@ -13,6 +13,9 @@ import (
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/files/broker"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/spacesync"
@@ -71,6 +74,18 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 
 	tsp := techspace.New(app, db)
 	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
+
+	// Files byte layer (SYN-25/27): CARv2s under <DataDir>/files (a
+	// sibling of anysync/ and sdk.db — cfg.Storage.DataDir was
+	// re-pointed to anysync/ above), metadata in the shared SDK DB.
+	filesRoot := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "files")
+	filesStore, err := filestore.New(ctx, filesRoot, db)
+	if err != nil {
+		_ = db.Close()
+		_ = app.Close(ctx)
+		return nil, fmt.Errorf("anysyncsdk: open files store: %w", err)
+	}
+	spaces.SetFiles(upload.New(filesStore, broker.New(app.Pool(), app.FileV2Peers, app.NetworkId())))
 	// Wire spaceimpl.Service as the space registry so any-sync's
 	// treemanager-driven callbacks (deletion-manager DeleteTree,
 	// space-sync PutTree, head-sync GetTree for arbitrary trees)

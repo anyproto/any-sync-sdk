@@ -24,6 +24,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/inbox"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -90,6 +91,11 @@ type Service struct {
 	// storeFor — each type's handlers are applied alongside the
 	// built-in catalog.
 	extTypes []handler.Type
+
+	// files is the SDK-level upload orchestrator behind every space's
+	// Files() surface. Set once by SetFiles right after construction
+	// (sdk.Open); nil only in tests that never touch files.
+	files *upload.Service
 
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
@@ -212,6 +218,10 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 	}
 	return s
 }
+
+// SetFiles wires the SDK-level files upload service. Called once from
+// sdk.Open before any Space handle is handed out.
+func (s *Service) SetFiles(f *upload.Service) { s.files = f }
 
 // storeFor returns the per-space spaceobjects.Store, building it on
 // first access. The allocator is also lazily created and shared

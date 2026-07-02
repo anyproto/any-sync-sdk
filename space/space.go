@@ -56,6 +56,11 @@ type Space interface {
 	// space key. See PayloadsView.
 	Payloads() PayloadsView
 
+	// Files is the file surface: attach content to objects, with the
+	// storage tiers (inline / content-addressed + node backup) hidden.
+	// See Files.
+	Files() Files
+
 	// Debug returns the diagnostic surface for this space. See
 	// DebugAPI — not a stable interface, intended for tooling and
 	// inspection.

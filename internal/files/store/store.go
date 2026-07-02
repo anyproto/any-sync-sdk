@@ -58,6 +58,7 @@ const (
 	fieldRefs     = "refs"
 	fieldAccess   = "la"
 	fieldFileId   = "fileId"
+	fieldOwner    = "owner"
 	idField       = "id"
 )
 
@@ -119,6 +120,12 @@ func (s *Store) sweepTmp() {
 	for _, e := range ents {
 		_ = os.Remove(filepath.Join(dir, e.Name()))
 	}
+}
+
+// TmpDir is the store's scratch directory (same filesystem as the
+// CARs, swept on open). The upload spool spills oversized inputs here.
+func (s *Store) TmpDir() string {
+	return filepath.Join(s.root, "tmp")
 }
 
 // carPath is the final location of a stored file.
@@ -320,16 +327,26 @@ func (s *Store) DeleteSpace(ctx context.Context, spaceId string) error {
 	return os.RemoveAll(filepath.Join(s.root, spaceId))
 }
 
-// RecordContent stores the per-space sha256 → (root, fileId) dedup
-// mapping consulted by the upload BIND path. Dedup is strictly
+// ContentRef is one dedup-index entry: the file already registered
+// for a plaintext sha256 in this space. OwnerId locates the payloads
+// row (the BIND path needs the donor row's wrapped key + networkSign).
+type ContentRef struct {
+	Root    cid.Cid
+	FileId  string
+	OwnerId string
+}
+
+// RecordContent stores the per-space sha256 → (root, fileId, ownerId)
+// dedup mapping consulted by the upload BIND path. Dedup is strictly
 // per-space: a cross-space hit would share a rootCid across spaces and
 // break per-space GC on the node.
-func (s *Store) RecordContent(ctx context.Context, spaceId string, sha256 []byte, root cid.Cid, fileId string) error {
+func (s *Store) RecordContent(ctx context.Context, spaceId string, sha256 []byte, root cid.Cid, fileId, ownerId string) error {
 	id := spaceId + "/" + fmt.Sprintf("%x", sha256)
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set(fieldSpaceId, a.NewString(spaceId))
 		v.Set(fieldRoot, a.NewString(root.String()))
 		v.Set(fieldFileId, a.NewString(fileId))
+		v.Set(fieldOwner, a.NewString(ownerId))
 		return v, true, nil
 	})
 	_, err := s.dedup.UpsertId(ctx, id, mod)
@@ -337,21 +354,25 @@ func (s *Store) RecordContent(ctx context.Context, spaceId string, sha256 []byte
 }
 
 // LookupContent resolves a plaintext sha256 to an already-registered
-// (root, fileId) in this space.
-func (s *Store) LookupContent(ctx context.Context, spaceId string, sha256 []byte) (root cid.Cid, fileId string, ok bool, err error) {
+// file in this space.
+func (s *Store) LookupContent(ctx context.Context, spaceId string, sha256 []byte) (ref ContentRef, ok bool, err error) {
 	doc, err := s.dedup.FindId(ctx, spaceId+"/"+fmt.Sprintf("%x", sha256))
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
-			return cid.Undef, "", false, nil
+			return ContentRef{}, false, nil
 		}
-		return cid.Undef, "", false, err
+		return ContentRef{}, false, err
 	}
 	v := doc.Value()
-	root, err = cid.Decode(string(v.GetStringBytes(fieldRoot)))
+	root, err := cid.Decode(string(v.GetStringBytes(fieldRoot)))
 	if err != nil {
-		return cid.Undef, "", false, err
+		return ContentRef{}, false, err
 	}
-	return root, string(v.GetStringBytes(fieldFileId)), true, nil
+	return ContentRef{
+		Root:    root,
+		FileId:  string(v.GetStringBytes(fieldFileId)),
+		OwnerId: string(v.GetStringBytes(fieldOwner)),
+	}, true, nil
 }
 
 // updateExisting applies fn to an existing row in one atomic UpdateId;

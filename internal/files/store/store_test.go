@@ -324,19 +324,20 @@ func TestDedupIndex(t *testing.T) {
 	info := addFile(t, s, plain, key)
 	sha := bytes.Repeat([]byte{7}, 32)
 
-	_, _, ok, err := s.LookupContent(ctx, spaceId, sha)
+	_, ok, err := s.LookupContent(ctx, spaceId, sha)
 	require.NoError(t, err)
 	require.False(t, ok)
 
-	require.NoError(t, s.RecordContent(ctx, spaceId, sha, info.Root, "file9"))
-	root, fileId, ok, err := s.LookupContent(ctx, spaceId, sha)
+	require.NoError(t, s.RecordContent(ctx, spaceId, sha, info.Root, "file9", "owner9"))
+	ref, ok, err := s.LookupContent(ctx, spaceId, sha)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Equal(t, info.Root, root)
-	require.Equal(t, "file9", fileId)
+	require.Equal(t, info.Root, ref.Root)
+	require.Equal(t, "file9", ref.FileId)
+	require.Equal(t, "owner9", ref.OwnerId)
 
 	// Per-space scope: another space sees nothing.
-	_, _, ok, err = s.LookupContent(ctx, "other.space", sha)
+	_, ok, err = s.LookupContent(ctx, "other.space", sha)
 	require.NoError(t, err)
 	require.False(t, ok)
 }
@@ -346,12 +347,12 @@ func TestDeleteSpace(t *testing.T) {
 	s := newStore(t)
 	plain, key := testPayload(t, 80_000)
 	info := addFile(t, s, plain, key)
-	require.NoError(t, s.RecordContent(ctx, spaceId, bytes.Repeat([]byte{1}, 32), info.Root, "f"))
+	require.NoError(t, s.RecordContent(ctx, spaceId, bytes.Repeat([]byte{1}, 32), info.Root, "f", "o"))
 
 	require.NoError(t, s.DeleteSpace(ctx, spaceId))
 	_, err := s.Info(ctx, spaceId, info.Root)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, _, ok, err := s.LookupContent(ctx, spaceId, bytes.Repeat([]byte{1}, 32))
+	_, ok, err := s.LookupContent(ctx, spaceId, bytes.Repeat([]byte{1}, 32))
 	require.NoError(t, err)
 	require.False(t, ok)
 	_, err = os.Stat(filepath.Join(s.root, spaceId))

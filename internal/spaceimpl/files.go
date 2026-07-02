@@ -234,6 +234,38 @@ func (f *filesAPI) Retry(ctx context.Context, fileId string) error {
 	return q.Enqueue(ctx, status.KindDurable, f.s.id, fileId)
 }
 
+// Offload drops the file's local bytes (refetchable-only). See
+// space.Files.
+func (f *filesAPI) Offload(ctx context.Context, fileId string) error {
+	row, err := f.s.PayloadsInternal().FindRow(ctx, fileId)
+	if err != nil {
+		return err
+	}
+	if row.Inline() {
+		return nil // rides the row; nothing local to drop
+	}
+	if row.NetworkSign == "" {
+		return fmt.Errorf("files: offload %s: not backed up — local bytes are the only copy", fileId)
+	}
+	root, err := cid.Decode(row.RootCid)
+	if err != nil {
+		return err
+	}
+	if err = f.s.parent.filesStore().Offload(ctx, f.s.id, root); err != nil {
+		if errors.Is(err, filestore.ErrNotFound) {
+			return nil // nothing local (never fetched here)
+		}
+		return err
+	}
+	f.s.parent.fileStatusSubs.dispatch(f.s.id, space.FileStatus{
+		FileId:   row.Id,
+		ObjectId: row.ObjectId,
+		State:    space.FileStateDurable,
+		Cached:   false,
+	})
+	return nil
+}
+
 // inlineReader serves an inline-tier file from the unsealed row.
 type inlineReader struct {
 	*bytes.Reader

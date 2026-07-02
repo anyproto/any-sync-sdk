@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/files/broker"
 	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/files/gc"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
@@ -34,6 +35,33 @@ type SDK struct {
 	spaces     *spaceimpl.Service
 	account    *accountImpl
 	filesQueue *status.Queue
+	filesGC    *gc.Service
+}
+
+// FileCacheSize returns the local bytes currently held by file content
+// across all spaces (complete + partial copies; inline files hold no
+// cache bytes).
+func (s *SDK) FileCacheSize(ctx context.Context) (int64, error) {
+	return s.filesGC.CacheSize(ctx)
+}
+
+// FreeUpFileCache reclaims local file bytes until at least `bytes` are
+// freed, least-recently-used first, dropping only content that is safe
+// to drop (backed up on the network — a later Open refetches — or no
+// longer referenced by any file). Returns the bytes actually freed,
+// which is less than requested when nothing else is safely evictable.
+func (s *SDK) FreeUpFileCache(ctx context.Context, bytes int64) (freed int64, err error) {
+	return s.filesGC.FreeUp(ctx, bytes)
+}
+
+// SweepFileCache runs one file-cache safety pass: prunes references of
+// deleted files, deletes content no file references anymore (past a
+// grace period), and drops long-untouched partial downloads of
+// backed-up files. Never touches content that is not safely
+// refetchable. This is the manual trigger; the same pass runs
+// periodically only when cfg.Files.GCInterval is set.
+func (s *SDK) SweepFileCache(ctx context.Context) error {
+	return s.filesGC.Sweep(ctx)
 }
 
 // Open brings up the SDK: initializes auth, opens storage, boots any-sync,
@@ -113,6 +141,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	filesUpload.SetQueue(filesQueue)
 	spaces.SetFiles(filesUpload, fetch.New(filesStore, baseURL), filesStore, filesQueue)
 	filesQueue.Run()
+	// Cache reclamation (SYN-26): fully embedder-driven —
+	// FileCacheSize/FreeUpFileCache/SweepFileCache and per-file
+	// Offload. The periodic safety sweep runs ONLY when configured
+	// (cfg.Files.GCInterval > 0); the default is no background GC.
+	filesGC := gc.New(filesStore, spaces)
+	filesGC.Run(cfg.Files.GCInterval)
 	// Wire spaceimpl.Service as the space registry so any-sync's
 	// treemanager-driven callbacks (deletion-manager DeleteTree,
 	// space-sync PutTree, head-sync GetTree for arbitrary trees)
@@ -142,6 +176,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 			spaces:     spaces,
 			account:    account,
 			filesQueue: filesQueue,
+			filesGC:    filesGC,
 		}, nil
 	}
 
@@ -237,6 +272,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		spaces:     spaces,
 		account:    account,
 		filesQueue: filesQueue,
+		filesGC:    filesGC,
 	}, nil
 }
 
@@ -244,6 +280,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 // spaces, the tech space, the SDK DB, and finally the any-sync app.
 func (s *SDK) Close() error {
 	ctx := context.Background()
+	if s.filesGC != nil {
+		s.filesGC.Close()
+	}
 	if s.filesQueue != nil {
 		s.filesQueue.Close()
 	}

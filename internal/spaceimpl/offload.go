@@ -43,12 +43,20 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 		offloadLog.Warn("delete storage", zap.String("spaceId", spaceId), zap.Error(err))
 	}
 
-	// 6. Drop the account-values carrier tree in tech space.
+	// 6. Drop the space's file CARs + metadata wholesale (the per-space
+	// store layout exists for exactly this one recursive remove).
+	if s.fstore != nil {
+		if err := s.fstore.DeleteSpace(ctx, spaceId); err != nil {
+			offloadLog.Warn("delete file store", zap.String("spaceId", spaceId), zap.Error(err))
+		}
+	}
+
+	// 7. Drop the account-values carrier tree in tech space.
 	if err := s.tsp.DropAccountValues(ctx, spaceId); err != nil {
 		offloadLog.Debug("drop account values", zap.String("spaceId", spaceId), zap.Error(err))
 	}
 
-	// 7. Prune this space from the identities directory so spaceIds keeps
+	// 8. Prune this space from the identities directory so spaceIds keeps
 	// reflecting live memberships.
 	if err := s.tsp.RemoveSpaceFromIdentities(ctx, spaceId); err != nil {
 		offloadLog.Debug("prune identities", zap.String("spaceId", spaceId), zap.Error(err))

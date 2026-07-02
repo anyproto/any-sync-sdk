@@ -122,6 +122,24 @@ func (s *Service) OnFileJobChange(job status.Job, _ bool) {
 	s.fileStatusSubs.dispatch(job.SpaceId, st)
 }
 
+// FileDurable is the gc.RowResolver: whether fileId still has a live
+// row in spaceId and whether that row carries a receipt. An
+// unloadable space is an error — the GC retains on it (conservative).
+func (s *Service) FileDurable(ctx context.Context, spaceId, fileId string) (durable, exists bool, err error) {
+	sp, err := s.Get(ctx, spaceId)
+	if err != nil {
+		return false, false, err
+	}
+	row, err := sp.(*spaceImpl).PayloadsInternal().FindRow(ctx, fileId)
+	if errors.Is(err, space.ErrNotFound) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return row.NetworkSign != "", true, nil
+}
+
 // fileStatus derives one file's FileStatus on read: the row decides
 // durable; a pending queue job refines in-flight vs limited and
 // carries attempt diagnostics.

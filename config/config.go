@@ -79,6 +79,13 @@ type Files struct {
 	// fileV2 nodes and caches it. Set it for private deployments that
 	// front the object store themselves.
 	PublicReadBaseUrl string `yaml:"publicReadBaseUrl"`
+
+	// GCInterval enables the periodic file-cache safety sweep (prune
+	// refs of deleted files, delete unreferenced content past grace,
+	// drop stale partials) at the given cadence. ZERO — the default —
+	// means NO automatic sweep: reclamation is fully embedder-driven
+	// via SDK.SweepFileCache / FreeUpFileCache / Files().Offload.
+	GCInterval time.Duration `yaml:"gcInterval"`
 }
 
 // Network is the any-sync network configuration. v1 is deliberately

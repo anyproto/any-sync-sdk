@@ -67,6 +67,14 @@ type Files interface {
 	// with no pending work; re-enqueues the backup when the row is
 	// unsigned and the bytes are local.
 	Retry(ctx context.Context, fileId string) error
+
+	// Offload drops the file's local bytes, keeping the file itself —
+	// a later Open transparently refetches from the network. Refused
+	// unless the file is backed up (never drops the only copy); inline
+	// files are a no-op. Content shared with other files (dedup) loses
+	// its local bytes for all of them — each stays refetchable; Pin a
+	// sibling to keep it hot.
+	Offload(ctx context.Context, fileId string) error
 }
 
 // FileSyncState is the durability state of one file.

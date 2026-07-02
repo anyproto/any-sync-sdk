@@ -104,6 +104,12 @@ func New(ctx context.Context, rootDir string, db anystore.DB) (*Store, error) {
 	}); err != nil {
 		return nil, err
 	}
+	if err = files.EnsureIndex(ctx, anystore.IndexInfo{
+		Name:   "idx_files_local_la",
+		Fields: []string{fieldAccess},
+	}); err != nil {
+		return nil, err
+	}
 	dedup, err := db.Collection(ctx, DedupCollection)
 	if err != nil {
 		return nil, fmt.Errorf("filestore: open %s: %w", DedupCollection, err)
@@ -193,6 +199,44 @@ func (s *Store) ListSpace(ctx context.Context, spaceId string) ([]Info, error) {
 		out = append(out, info)
 	}
 	return out, nil
+}
+
+// IterateAll streams metadata for every stored file across all spaces
+// (accounting and GC scans) — never materializes the whole set, which
+// can be hundreds of thousands of rows. fn returns false to stop.
+// Callers must not mutate the store from inside fn.
+func (s *Store) IterateAll(ctx context.Context, fn func(Info) (bool, error)) error {
+	return s.iterate(ctx, s.files.Find(nil), fn)
+}
+
+// IterateLRU streams metadata least-recently-used first (backed by the
+// last-access index) — the eviction scan's order. Same contract as
+// IterateAll.
+func (s *Store) IterateLRU(ctx context.Context, fn func(Info) (bool, error)) error {
+	return s.iterate(ctx, s.files.Find(nil).Sort(fieldAccess), fn)
+}
+
+func (s *Store) iterate(ctx context.Context, q anystore.Query, fn func(Info) (bool, error)) error {
+	iter, err := q.Iter(ctx)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return err
+		}
+		info, err := infoFromValue(doc.Value())
+		if err != nil {
+			return err
+		}
+		cont, err := fn(info)
+		if err != nil || !cont {
+			return err
+		}
+	}
+	return nil
 }
 
 func infoFromValue(v *anyenc.Value) (Info, error) {

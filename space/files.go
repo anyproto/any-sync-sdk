@@ -2,7 +2,27 @@ package space
 
 import (
 	"context"
+	"errors"
 	"io"
+)
+
+// Typed file errors — match with errors.Is, never by message.
+var (
+	// ErrFileNotAvailable — the file's content is neither local nor
+	// fetchable right now: the file is not backed up yet (the P2P rung
+	// lands later), the network advertises no public read base, or a
+	// read hit a not-yet-fetched range while offline.
+	ErrFileNotAvailable = errors.New("space: file content not available")
+
+	// ErrFileNotBackedUp — Offload refused: the local bytes are the
+	// only copy of a file whose backup hasn't completed, and the SDK
+	// never drops the only copy.
+	ErrFileNotBackedUp = errors.New("space: file not backed up")
+
+	// ErrFileVariantInvalid — Attach variant options are inconsistent:
+	// Variant/VariantOf not set together, or the original is bound to
+	// a different object.
+	ErrFileVariantInvalid = errors.New("space: invalid file variant options")
 )
 
 // Files is the per-space file surface (files v2, docs/07c). Files

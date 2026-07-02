@@ -95,14 +95,14 @@ func (f *filesAPI) validateVariant(ctx context.Context, objectId string, opts sp
 		return nil
 	}
 	if opts.Variant == space.VariantOriginal || opts.VariantOf == "" {
-		return errors.New("files: Variant and VariantOf must be set together")
+		return fmt.Errorf("files: Variant and VariantOf must be set together: %w", space.ErrFileVariantInvalid)
 	}
 	orig, err := f.s.PayloadsInternal().FindRow(ctx, opts.VariantOf)
 	if err != nil {
 		return fmt.Errorf("files: variant original %s: %w", opts.VariantOf, err)
 	}
 	if orig.ObjectId != objectId {
-		return fmt.Errorf("files: variant must attach to the original's object %s, not %s", orig.ObjectId, objectId)
+		return fmt.Errorf("files: variant must attach to the original's object %s, not %s: %w", orig.ObjectId, objectId, space.ErrFileVariantInvalid)
 	}
 	return nil
 }
@@ -364,7 +364,7 @@ func (f *filesAPI) Offload(ctx context.Context, fileId string) error {
 		return nil // rides the row; nothing local to drop
 	}
 	if row.NetworkSign == "" {
-		return fmt.Errorf("files: offload %s: not backed up — local bytes are the only copy", fileId)
+		return fmt.Errorf("files: offload %s — local bytes are the only copy: %w", fileId, space.ErrFileNotBackedUp)
 	}
 	root, err := cid.Decode(row.RootCid)
 	if err != nil {

@@ -21,6 +21,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/files/crypt"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 const spaceId = "space.test"
@@ -246,6 +247,7 @@ func TestNotDurableNotLocal(t *testing.T) {
 	svc := New(st, staticBase("http://unused.test"))
 	_, err := svc.Open(ctx, spaceId, root, key, false, "file1")
 	require.ErrorIs(t, err, ErrNotAvailable)
+	require.ErrorIs(t, err, space.ErrFileNotAvailable, "consumers match the public sentinel")
 }
 
 func TestNoPublicBase(t *testing.T) {
@@ -255,6 +257,7 @@ func TestNoPublicBase(t *testing.T) {
 	svc := New(st, staticBase(""))
 	_, err := svc.Open(ctx, spaceId, root, key, true, "file1")
 	require.ErrorIs(t, err, ErrNotAvailable)
+	require.ErrorIs(t, err, space.ErrFileNotAvailable)
 }
 
 func TestWrongObjectAtURL(t *testing.T) {

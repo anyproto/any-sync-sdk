@@ -78,10 +78,10 @@ func TestE2E_FilesV2_Surface(t *testing.T) {
 	// --- Variant contract enforcement.
 	_, err = sp.Files().Attach(ctx, owner1, bytes.NewReader(thumb),
 		space.AttachOpts{Variant: "thumbnail"})
-	require.ErrorContains(t, err, "must be set together")
+	require.ErrorIs(t, err, space.ErrFileVariantInvalid)
 	_, err = sp.Files().Attach(ctx, owner2, bytes.NewReader(thumb),
 		space.AttachOpts{Variant: "thumbnail", VariantOf: origInfo.FileId})
-	require.ErrorContains(t, err, "original's object", "variants bind to the original's object")
+	require.ErrorIs(t, err, space.ErrFileVariantInvalid, "variants bind to the original's object")
 
 	// --- Open by (originalId, variant).
 	fr, err := sp.Files().Open(ctx, origInfo.FileId, "thumbnail")

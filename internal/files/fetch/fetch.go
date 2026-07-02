@@ -24,12 +24,14 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/carfile"
 	"github.com/anyproto/any-sync-sdk/internal/files/crypt"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // ErrNotAvailable — the content is not local and cannot be fetched:
 // the file is not durable (P2P arrives with SYN-24) or the network has
-// no public read base.
-var ErrNotAvailable = errors.New("filefetch: content not available")
+// no public read base. Wraps the public sentinel so SDK consumers
+// match it with errors.Is(err, space.ErrFileNotAvailable).
+var ErrNotAvailable = fmt.Errorf("filefetch: %w", space.ErrFileNotAvailable)
 
 // BaseURL resolves the network's public read base ("" = none). The
 // SDK wires a persisted-cache provider over the broker Info RPC.

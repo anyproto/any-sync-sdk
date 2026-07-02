@@ -7,6 +7,8 @@ github.com/anyproto/any-store v0.4.7 h1:329NWY/xUzGdwKSqFgjAFaPAVkTJbR+WdJirPrvT
 github.com/anyproto/any-store v0.4.7/go.mod h1:8cqb52gjZSaYnlybugqpSqSG1RQygY96D2vWMbSJsLo=
 github.com/anyproto/any-store/v2 v2.0.0-alpha.15 h1:kN05bbALbL1apB4sjqMyGW7Ijl/y1aDRR6GGxMC1ARI=
 github.com/anyproto/any-store/v2 v2.0.0-alpha.15/go.mod h1:FM6cz8iU3Eiy8hy+ht3lpJnDK7/V2g4boC/fzEQRfz4=
+github.com/anyproto/any-sync v0.12.14-0.20260701235255-93a00425281e h1:kC3uVyMiws/Q79Vdk9KohXHzSkEGGMAvYHGul2IADE0=
+github.com/anyproto/any-sync v0.12.14-0.20260701235255-93a00425281e/go.mod h1:HObtLnsHG20r8rYfwDkpHF7FHzLMjQ/USGhEDLPBVc8=
 github.com/anyproto/go-bip39 v1.0.0 h1:T6/7WowKYDeyuX/QyXtt98ZX0XXaoOh17M/LFF2M5yk=
 github.com/anyproto/go-bip39 v1.0.0/go.mod h1:l0rcxmXRyiWAYzE1noMAc4qbeNrbhUwxM3rqSO9ILwo=
 github.com/anyproto/go-chash v0.1.0 h1:I9meTPjXFRfXZHRJzjOHC/XF7Q5vzysKkiT/grsogXY=

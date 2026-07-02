@@ -89,6 +89,12 @@ func Run(ctx context.Context, app *anysyncx.App, db anystore.DB, store *spaceobj
 	}
 
 	for _, id := range toLoad {
+		// Selective mode: skip-marked trees exist only as heads-only
+		// stubs — there is nothing to restore, and Get would fire a
+		// pointless remote probe.
+		if skipped, serr := store.IsTreeSkipped(ctx, id); serr == nil && skipped {
+			continue
+		}
 		// Best-effort: a failure here (schema not present yet → parked
 		// in _detached, decode error, etc.) does NOT halt the pass.
 		// Per-object _meta already encodes per-object progress, and

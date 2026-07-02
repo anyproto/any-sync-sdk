@@ -17,6 +17,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/util/crypto"
@@ -1225,6 +1226,18 @@ func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error 
 		return s.tsp.DeleteTree(ctx, spaceId, treeId)
 	}
 	return s.storeFor(spaceId).DeleteTree(ctx, treeId)
+}
+
+// ShouldPullTree is the selective-sync pull decision for a
+// locally-missing tree announced by a head update. The tech space is
+// always fully synced; regular spaces delegate to their Store, which
+// classifies by the update's root changeType and, when declining,
+// refreshes the tree's heads-only stub so the sync diff converges.
+func (s *Service) ShouldPullTree(ctx context.Context, spaceId, treeId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool {
+	if spaceId == s.tsp.SpaceId() {
+		return true
+	}
+	return s.storeFor(spaceId).ShouldPullTree(ctx, treeId, root, heads)
 }
 
 // Compile-time check that we satisfy the registry contract.

@@ -190,6 +190,11 @@ type Store struct {
 	// with customHandlers — the gate is a registry/type-system concept
 	// the tech space doesn't participate in.
 	disableGate bool
+
+	// selective is the selective-sync tree-type allowlist (root
+	// changeType → allowed). Nil/empty = sync everything. See
+	// selective.go for the full mechanism.
+	selective map[string]struct{}
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -236,6 +241,11 @@ type StoreConfig struct {
 	Handlers     []crdt.HandlerReg
 	DisableGate  bool
 	DataVersions map[string]string
+
+	// SelectiveTypes is the selective-sync tree-type allowlist. Only
+	// the regular-space path (NewStore) sets it — the tech space is
+	// always fully synced. See selective.go.
+	SelectiveTypes []string
 }
 
 // NewStore constructs a regular type/properties-backed Store. The
@@ -247,8 +257,13 @@ type StoreConfig struct {
 // ValidateExternalTypes — call it before NewStore at the SDK
 // boundary so collisions are caught at Open time.
 func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type) *Store {
+	var selectiveTypes []string
+	if app != nil {
+		selectiveTypes = app.SelectiveTreeTypes()
+	}
 	return NewStoreWithConfig(StoreConfig{
 		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes,
+		SelectiveTypes: selectiveTypes,
 	})
 }
 
@@ -269,6 +284,12 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		rowEvents:      newRowEventRegistry(),
 		customHandlers: cfg.Handlers,
 		disableGate:    cfg.DisableGate,
+	}
+	if len(cfg.SelectiveTypes) > 0 {
+		s.selective = make(map[string]struct{}, len(cfg.SelectiveTypes))
+		for _, t := range cfg.SelectiveTypes {
+			s.selective[t] = struct{}{}
+		}
 	}
 	if cfg.Handlers != nil {
 		// Raw mode: no registry, no built-in dataset versions; the
@@ -778,6 +799,7 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 
 	// Best-effort from here — disk reclaim + notifications, not correctness.
 	s.dropObjectCollections(ctx, objectId)
+	_ = s.unmarkSkipped(ctx, objectId)
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil
 }
@@ -895,6 +917,13 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		}
 		s.Drop(p.id)
 		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
+	}
+	if s.SelectiveMode() {
+		// Skip markers exist for ids that never materialized, so sweep
+		// the full input list, not just the purged rows.
+		for _, id := range objectIds {
+			_ = s.unmarkSkipped(ctx, id)
+		}
 	}
 	return nil
 }
@@ -1157,7 +1186,25 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 		}
 		// fall through to BuildTree on ErrTreeExists
 	}
-	tree, err := tb.BuildTree(ctx, objectId, objecttreebuilder.BuildTreeOpts{Listener: listener})
+	opts := objecttreebuilder.BuildTreeOpts{Listener: listener}
+	if s.SelectiveMode() {
+		// Probe-first: a remote fetch of an unknown tree asks for root +
+		// heads only; the validator classifies by root changeType before
+		// anything is persisted. Local trees are unaffected (probe only
+		// applies when tree storage misses).
+		opts.Probe = true
+		opts.TreeValidator = s.selectiveTreeValidator(true)
+	}
+	tree, err := tb.BuildTree(ctx, objectId, opts)
+	if errors.Is(err, errProbeSelectedType) {
+		// Selected type — fetch for real. The validator re-checks the
+		// type (a different peer may serve this request) and then
+		// delegates to any-sync's default validation.
+		tree, err = tb.BuildTree(ctx, objectId, objecttreebuilder.BuildTreeOpts{
+			Listener:      listener,
+			TreeValidator: s.selectiveTreeValidator(false),
+		})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: BuildTree %s: %w", objectId, err)
 	}

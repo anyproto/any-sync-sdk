@@ -6,6 +6,7 @@ import (
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/object/treemanager"
 )
@@ -36,6 +37,15 @@ type SpaceRegistry interface {
 
 	// DeleteTree removes a tree's local state.
 	DeleteTree(ctx context.Context, spaceId, treeId string) error
+
+	// ShouldPullTree decides whether a locally-missing tree announced by
+	// a head update should be fetched (selective sync by tree type —
+	// SYN-18). root is the tree's raw root change carried by the update;
+	// heads are the sender's current heads. Implementations returning
+	// false are expected to record the heads so the sync diff converges
+	// without the tree's change bodies. Full-sync deployments always
+	// return true.
+	ShouldPullTree(ctx context.Context, spaceId, treeId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool
 }
 
 // treeManagerAdapter implements treemanager.TreeManager by routing
@@ -47,9 +57,9 @@ type treeManagerAdapter struct {
 
 func newTreeManager() *treeManagerAdapter { return &treeManagerAdapter{} }
 
-func (t *treeManagerAdapter) Init(_ *app.App) error { return nil }
-func (t *treeManagerAdapter) Name() string          { return treemanager.CName }
-func (t *treeManagerAdapter) Run(_ context.Context) error  { return nil }
+func (t *treeManagerAdapter) Init(_ *app.App) error         { return nil }
+func (t *treeManagerAdapter) Name() string                  { return treemanager.CName }
+func (t *treeManagerAdapter) Run(_ context.Context) error   { return nil }
 func (t *treeManagerAdapter) Close(_ context.Context) error { return nil }
 
 // SetRegistry wires in the SpaceRegistry. Must be called once before

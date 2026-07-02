@@ -31,9 +31,10 @@ type PayloadsAPI struct {
 	keys *aclKeyProvider
 }
 
-// Payloads returns the internal payloads surface. Not part of the
-// public space.Space interface.
-func (s *spaceImpl) Payloads() *PayloadsAPI {
+// PayloadsInternal returns the internal payloads surface (typed rows,
+// register/sign writes). Not part of the public space.Space interface —
+// the public read-only view is Space.Payloads (payloads_view.go).
+func (s *spaceImpl) PayloadsInternal() *PayloadsAPI {
 	return &PayloadsAPI{s: s, keys: &aclKeyProvider{s: s}}
 }
 

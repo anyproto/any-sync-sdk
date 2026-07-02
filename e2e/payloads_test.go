@@ -18,12 +18,13 @@ import (
 
 // payloadsSurface reaches the SDK-internal payloads API on a space
 // handle (not part of the public space.Space interface — SYN-30 adds
-// the public Files surface).
+// the public Files surface; the public READ-ONLY view is
+// space.Space.Payloads).
 func payloadsSurface(t *testing.T, sp space.Space) *spaceimpl.PayloadsAPI {
 	t.Helper()
-	pa, ok := sp.(interface{ Payloads() *spaceimpl.PayloadsAPI })
+	pa, ok := sp.(interface{ PayloadsInternal() *spaceimpl.PayloadsAPI })
 	require.True(t, ok, "space impl must expose the internal Payloads API")
-	return pa.Payloads()
+	return pa.PayloadsInternal()
 }
 
 // TestE2E_Payloads covers SYN-21 end-to-end on a real network: the

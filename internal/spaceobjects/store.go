@@ -1088,6 +1088,57 @@ func (s *Store) HasTree(ctx context.Context, treeId string) (bool, error) {
 	return true, nil
 }
 
+// TreeIdsByChangeType returns the ids of every materialized tree in
+// this space whose root changeType equals changeType. The root is the
+// typed source of truth — signed, content-addressed (the tree id is the
+// cid of the root bytes) and cleartext, so keyed and keyless readers
+// classify identically and a peer can't relabel a tree into the result.
+//
+// Two-phase like the spacesync catch-up: collect ids while the
+// headstorage iterator is open, classify after. Trees whose root can't
+// be read are skipped — heads-only stubs (selective sync) have no
+// change rows by construction, and an unreadable root is not evidence
+// of the requested type.
+func (s *Store) TreeIdsByChangeType(ctx context.Context, changeType string) ([]string, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return nil, errors.New("spaceobjects: space storage unavailable")
+	}
+	var candidates []string
+	if err := st.HeadStorage().IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
+		if e.DeletedStatus != headstorage.DeletedStatusNotDeleted {
+			return true, nil
+		}
+		candidates = append(candidates, e.Id)
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: iterate heads entries: %w", err)
+	}
+	var out []string
+	for _, id := range candidates {
+		ts, err := st.TreeStorage(ctx, id)
+		if err != nil {
+			continue
+		}
+		rootCh, err := ts.Root(ctx)
+		if err != nil {
+			continue
+		}
+		root, err := parseVerifiedRoot(rootCh.RawTreeChangeWithId())
+		if err != nil {
+			continue
+		}
+		if root.ChangeType == changeType {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
 // Derive makes a deterministic object on the space. Idempotent — a
 // second Derive with the same opts.ChangePayload returns the same
 // objectId. If the tree already exists locally, ocache's per-id

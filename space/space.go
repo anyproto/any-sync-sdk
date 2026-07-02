@@ -51,6 +51,11 @@ type Space interface {
 	// search). See ChangeIndexAPI.
 	Changes() ChangeIndexAPI
 
+	// Payloads is the read-only view over the space's file payloads
+	// index — the cleartext row fields only, readable without any
+	// space key. See PayloadsView.
+	Payloads() PayloadsView
+
 	// Debug returns the diagnostic surface for this space. See
 	// DebugAPI — not a stable interface, intended for tooling and
 	// inspection.

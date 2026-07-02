@@ -11,13 +11,18 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // RunFileJob executes one queue job (the status.Runner wired by
-// sdk.Open). A job whose row disappeared (deleted file) succeeds
-// vacuously so the queue drops it.
+// sdk.Open). A job whose space or row disappeared (deleted) succeeds
+// vacuously so the queue drops it — it must never resurrect a deleted
+// space's storage by loading it.
 func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
+	if rec, ok := s.tsp.Get(ctx, job.SpaceId); !ok || rec.IsDeleted() {
+		return nil
+	}
 	sp, err := s.Get(ctx, job.SpaceId)
 	if err != nil {
 		return err
@@ -122,22 +127,52 @@ func (s *Service) OnFileJobChange(job status.Job, _ bool) {
 	s.fileStatusSubs.dispatch(job.SpaceId, st)
 }
 
-// FileDurable is the gc.RowResolver: whether fileId still has a live
-// row in spaceId and whether that row carries a receipt. An
-// unloadable space is an error — the GC retains on it (conservative).
-func (s *Service) FileDurable(ctx context.Context, spaceId, fileId string) (durable, exists bool, err error) {
+// SpaceFiles is the gc.RowResolver bulk surface: fileId → durable for
+// every live file row of the space, one pass over its payloads
+// objects. An unloadable space is an error — GC retains on it.
+func (s *Service) SpaceFiles(ctx context.Context, spaceId string) (map[string]bool, error) {
 	sp, err := s.Get(ctx, spaceId)
 	if err != nil {
-		return false, false, err
+		return nil, err
 	}
-	row, err := sp.(*spaceImpl).PayloadsInternal().FindRow(ctx, fileId)
-	if errors.Is(err, space.ErrNotFound) {
-		return false, false, nil
-	}
+	impl := sp.(*spaceImpl)
+	pa := impl.PayloadsInternal()
+	objIds, err := impl.store.TreeIdsByChangeType(ctx, payloads.ChangeType)
 	if err != nil {
-		return false, false, err
+		return nil, err
 	}
-	return row.NetworkSign != "", true, nil
+	out := map[string]bool{}
+	for _, objId := range objIds {
+		rows, err := pa.listRowsIn(ctx, objId)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			out[row.Id] = row.NetworkSign != ""
+		}
+	}
+	return out, nil
+}
+
+// ResolveIntent is the gc.RowResolver heal hook: find a live row of
+// ownerId whose rootCid is root (the attach crash window left the row
+// without its CAR ref).
+func (s *Service) ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) (fileId string, ok bool, err error) {
+	sp, err := s.Get(ctx, spaceId)
+	if err != nil {
+		return "", false, err
+	}
+	rows, err := sp.(*spaceImpl).PayloadsInternal().ListRows(ctx, ownerId)
+	if err != nil {
+		return "", false, err
+	}
+	rootStr := root.String()
+	for _, row := range rows {
+		if row.RootCid == rootStr {
+			return row.Id, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // fileStatus derives one file's FileStatus on read: the row decides

@@ -193,6 +193,21 @@ func (q *Queue) KickJob(ctx context.Context, kind, spaceId, fileId string) (bool
 	return true, nil
 }
 
+// RemoveSpace drops every pending job of a space (space deletion —
+// nothing left to drive).
+func (q *Queue) RemoveSpace(ctx context.Context, spaceId string) error {
+	jobs, err := q.ListSpace(ctx, spaceId)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if err := q.Remove(ctx, job.Kind, job.SpaceId, job.FileId); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ListSpace returns the pending jobs of one space (aggregate counts).
 func (q *Queue) ListSpace(ctx context.Context, spaceId string) ([]Job, error) {
 	filter := query.Key{Path: []string{fieldSpace}, Filter: query.NewComp(query.CompOpEq, spaceId)}

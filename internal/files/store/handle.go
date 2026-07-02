@@ -180,12 +180,18 @@ func (h *Handle) ReadBlock(ctx context.Context, c cid.Cid) ([]byte, error) {
 
 // WriteBlock verifies and lands a fetched block, persisting the bitmap
 // advance. When the last section arrives the file is synced and the
-// row flips to complete. A no-op once the row left the partial state
-// (another handle finished it, or the store offloaded/deleted it).
+// row flips to complete. Once the row left the partial state (another
+// handle finished it, or the store offloaded/deleted it) nothing is
+// persisted — but the block is STILL verified: readers use WriteBlock
+// as the verify-before-use gate for fetched bytes, and that gate must
+// hold whatever the row's state raced to.
 func (h *Handle) WriteBlock(ctx context.Context, c cid.Cid, data []byte) error {
 	h.entry.mu.Lock()
 	defer h.entry.mu.Unlock()
 	if h.entry.state != StatePartial {
+		if err := carfile.Verify(c, data); err != nil {
+			return fmt.Errorf("filestore: block %s: %w", c, err)
+		}
 		return nil
 	}
 	i, err := h.car.WriteBlock(c, data)

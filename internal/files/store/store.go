@@ -437,6 +437,26 @@ func (s *Store) SetKV(ctx context.Context, key, value string) error {
 	return err
 }
 
+// DeleteKV removes one value; missing keys are a no-op.
+func (s *Store) DeleteKV(ctx context.Context, key string) error {
+	err := s.kv.DeleteId(ctx, key)
+	if errors.Is(err, anystore.ErrDocNotFound) {
+		return nil
+	}
+	return err
+}
+
+// IntentKey is the KV key of an attach-intent marker: written (with
+// the owning objectId as value) BEFORE a file's row is registered and
+// cleared once the CAR ref + retry job landed. GC treats a marked
+// root as pinned and heals a stale marker by re-linking the row the
+// crash orphaned — without it, a kill between the row write and the
+// ref write would leave the only copy of a never-uploaded file
+// unreferenced and GC would delete it.
+func IntentKey(spaceId string, root cid.Cid) string {
+	return "intent/" + spaceId + "/" + root.String()
+}
+
 // GetKV reads one value; ok is false when the key was never set.
 func (s *Store) GetKV(ctx context.Context, key string) (value string, ok bool, err error) {
 	doc, err := s.kv.FindId(ctx, key)

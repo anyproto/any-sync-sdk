@@ -140,13 +140,13 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 	filesUpload.SetQueue(filesQueue)
 	spaces.SetFiles(filesUpload, fetch.New(filesStore, baseURL), filesStore, filesQueue)
-	filesQueue.Run()
 	// Cache reclamation (SYN-26): fully embedder-driven —
 	// FileCacheSize/FreeUpFileCache/SweepFileCache and per-file
 	// Offload. The periodic safety sweep runs ONLY when configured
 	// (cfg.Files.GCInterval > 0); the default is no background GC.
-	filesGC := gc.New(filesStore, spaces)
-	filesGC.Run(cfg.Files.GCInterval)
+	filesGC := gc.New(filesStore, spaces, func(ctx context.Context, spaceId, fileId string) error {
+		return filesQueue.Enqueue(ctx, status.KindDurable, spaceId, fileId)
+	})
 	// Wire spaceimpl.Service as the space registry so any-sync's
 	// treemanager-driven callbacks (deletion-manager DeleteTree,
 	// space-sync PutTree, head-sync GetTree for arbitrary trees)
@@ -159,6 +159,10 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
+	// Start the background workers only after the last fallible Open
+	// step — a failed Open must not leak goroutines polling a closed DB.
+	filesQueue.Run()
+	filesGC.Run(cfg.Files.GCInterval)
 	account := newAccountImpl(app, tsp, spaces)
 
 	// Headless: skip the account-facing boot work below — profile

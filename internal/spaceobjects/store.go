@@ -76,6 +76,21 @@ var plaintextSpecs = map[string]object.PlaintextSpec{
 	payloads.ChangeType: {Datasets: map[string]struct{}{payloads.Dataset: {}}},
 }
 
+// validateEncryptionClass pins the tree-encryption invariant: a tree
+// ships unencrypted IFF its root ChangeType is a registered plaintext
+// class. Enforced at every create/derive so a callsite can neither
+// ship cleartext for an encrypted-class type nor (since the flag is
+// baked into the root bytes) silently fork a derived id by
+// disagreeing with the class registry.
+func validateEncryptionClass(changeType string, unencrypted bool) error {
+	_, plaintext := plaintextSpecs[changeType]
+	if unencrypted != plaintext {
+		return fmt.Errorf("spaceobjects: ChangeType %q: Unencrypted=%v but plaintext-class registration=%v — the flag must match the class",
+			changeType, unencrypted, plaintext)
+	}
+	return nil
+}
+
 // SpaceObjectsCollection is the on-disk collection name for the
 // per-space values collection. Holds one row per object (regular
 // AND type — types are just objects too with `any.name = "Movie"`
@@ -1015,6 +1030,9 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 // land on the root any-sync change; for the MVP they're informational
 // only.
 func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return nil, err
+	}
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
@@ -1051,6 +1069,9 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 // participate in the id). Read paths use this to resolve lazily-
 // created objects and treat a missing tree as "no rows yet".
 func (s *Store) DeriveId(ctx context.Context, opts DeriveOpts) (string, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return "", err
+	}
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return "", fmt.Errorf("spaceobjects: get space: %w", err)
@@ -1144,6 +1165,9 @@ func (s *Store) TreeIdsByChangeType(ctx context.Context, changeType string) ([]s
 // objectId. If the tree already exists locally, ocache's per-id
 // LoadFunc serialization deduplicates parallel callers.
 func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return nil, err
+	}
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)

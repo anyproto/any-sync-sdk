@@ -197,4 +197,13 @@ func TestQueueListSpaceAndRemove(t *testing.T) {
 	kicked, err := q.KickJob(ctx, KindDurable, "sp1", "missing")
 	require.NoError(t, err)
 	assert.False(t, kicked)
+
+	// Space deletion drops every remaining job of that space only.
+	require.NoError(t, q.RemoveSpace(ctx, "sp1"))
+	jobs, err = q.ListSpace(ctx, "sp1")
+	require.NoError(t, err)
+	assert.Empty(t, jobs)
+	jobs, err = q.ListSpace(ctx, "sp2")
+	require.NoError(t, err)
+	assert.Len(t, jobs, 1)
 }

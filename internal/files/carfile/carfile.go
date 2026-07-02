@@ -194,6 +194,13 @@ func parseFrame(frame []byte) (data []byte, c cid.Cid, err error) {
 	return frame[vn+cn:], c, nil
 }
 
+// Verify re-hashes data with the cid's own prefix and compares — the
+// standalone verification gate for callers that consume a block
+// without persisting it.
+func Verify(c cid.Cid, data []byte) error {
+	return verifyBlock(c, data)
+}
+
 // verifyBlock re-hashes data with the cid's own prefix and compares.
 func verifyBlock(c cid.Cid, data []byte) error {
 	sum, err := c.Prefix().Sum(data)

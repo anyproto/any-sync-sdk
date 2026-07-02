@@ -279,6 +279,63 @@ func TestWrongObjectAtURL(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
+// TestWrongObjectDoesNotTouchExistingFile pins that a wrong object at
+// a file's public URL is rejected before ANYTHING is written — in
+// particular it must not merge into (or delete) another local file
+// that happens to be the served object.
+func TestWrongObjectDoesNotTouchExistingFile(t *testing.T) {
+	ctx := context.Background()
+	_, wantRoot, key, _ := buildSource(t, 150_000)
+	otherCar, otherRoot, _, _ := buildSource(t, 160_000)
+
+	st := newStore(t)
+	// File B is a legitimate complete local file.
+	baseB, _ := serveCar(t, otherRoot, otherCar)
+	require.NoError(t, New(st, staticBase(baseB)).Fetch(ctx, spaceId, otherRoot, true, "fileB"))
+
+	// A misconfigured CDN serves B's bytes at A's URL.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "", time.Unix(0, 0), bytes.NewReader(otherCar))
+	}))
+	t.Cleanup(srv.Close)
+	_, err := New(st, staticBase(srv.URL)).Open(ctx, spaceId, wantRoot, key, true, "fileA")
+	require.ErrorContains(t, err, "wanted "+wantRoot.String())
+
+	// B is untouched: complete, refs intact.
+	info, err := st.Info(ctx, spaceId, otherRoot)
+	require.NoError(t, err)
+	require.Equal(t, store.StateComplete, info.State)
+	require.Equal(t, []string{"fileB"}, info.Refs)
+}
+
+// Test206WithoutContentRange pins that a proxy answering 206 without a
+// parseable Content-Range yields a clean error, never a slice-bounds
+// panic from treating a truncated probe as the whole object.
+func Test206WithoutContentRange(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, _ := buildSource(t, 3_000_000) // index offset far past the probe
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Serve the requested range but strip the Content-Range header.
+		rec := httptest.NewRecorder()
+		http.ServeContent(rec, r, "", time.Unix(0, 0), bytes.NewReader(car))
+		for k, vs := range rec.Header() {
+			if k == "Content-Range" {
+				continue
+			}
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+
+	st := newStore(t)
+	_, err := New(st, staticBase(srv.URL)).Open(ctx, spaceId, root, key, true, "file1")
+	require.ErrorContains(t, err, "Content-Range")
+}
+
 func TestPromotionWindow404(t *testing.T) {
 	restore := promotionDelay
 	promotionDelay = 10 * time.Millisecond

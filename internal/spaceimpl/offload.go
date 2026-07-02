@@ -44,10 +44,17 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	}
 
 	// 6. Drop the space's file CARs + metadata wholesale (the per-space
-	// store layout exists for exactly this one recursive remove).
+	// store layout exists for exactly this one recursive remove), and
+	// its pending file jobs — an orphaned job would retry against the
+	// deleted space forever.
 	if s.fstore != nil {
 		if err := s.fstore.DeleteSpace(ctx, spaceId); err != nil {
 			offloadLog.Warn("delete file store", zap.String("spaceId", spaceId), zap.Error(err))
+		}
+	}
+	if s.fqueue != nil {
+		if err := s.fqueue.RemoveSpace(ctx, spaceId); err != nil {
+			offloadLog.Warn("drop file jobs", zap.String("spaceId", spaceId), zap.Error(err))
 		}
 	}
 

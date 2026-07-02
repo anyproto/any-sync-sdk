@@ -197,6 +197,11 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 		len(donor.Enc.Key) == 0 || !bytes.Equal(donor.Enc.SHA256, sp.SHA256()) {
 		return Result{}, false, nil
 	}
+	// Same crash-window guard as addFull: the row must never exist
+	// without its CAR ref (the donor's ref alone dies with the donor).
+	if err = s.store.SetKV(ctx, store.IntentKey(spaceId, ref.Root), ownerId); err != nil {
+		return Result{}, false, err
+	}
 	fileId, err := reg.RegisterFile(ctx, ownerId, RegisterOpts{
 		RootCid:     donor.RootCid,
 		Size:        sp.Size(),
@@ -216,11 +221,22 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 	if err = s.store.AddRefs(ctx, spaceId, ref.Root, fileId); err != nil {
 		return Result{}, false, err
 	}
+	durable := donor.NetworkSign != ""
+	if !durable && s.queue != nil {
+		// The donor's pending job signs only the donor's row; a row
+		// bound to a not-yet-durable donor needs its own drive.
+		if err = s.queue.Enqueue(ctx, KindDurable, spaceId, fileId); err != nil {
+			return Result{}, false, err
+		}
+	}
+	if err = s.store.DeleteKV(ctx, store.IntentKey(spaceId, ref.Root)); err != nil {
+		return Result{}, false, err
+	}
 	return Result{
 		FileId:  fileId,
 		RootCid: donor.RootCid,
 		Size:    sp.Size(),
-		Durable: donor.NetworkSign != "",
+		Durable: durable,
 		Bound:   true,
 	}, true, nil
 }
@@ -252,6 +268,15 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 	}
 	root := info.Root
 
+	// Intent marker BEFORE the row write: the process can die between
+	// any two of the following writes, and a registered row whose CAR
+	// is unreferenced (and unqueued) must never look like garbage to
+	// GC. The marker pins the root; the GC's sweep heals a stale one
+	// by re-linking the row through the owner recorded here.
+	if err = s.store.SetKV(ctx, store.IntentKey(spaceId, root), ownerId); err != nil {
+		return Result{}, err
+	}
+
 	fileId, err := reg.RegisterFile(ctx, ownerId, RegisterOpts{
 		RootCid: root.String(),
 		Size:    sp.Size(),
@@ -281,6 +306,10 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		if err = s.queue.Enqueue(ctx, KindDurable, spaceId, fileId); err != nil {
 			return Result{}, err
 		}
+	}
+	// Row, ref and job all landed: the intent marker has done its job.
+	if err = s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
+		return Result{}, err
 	}
 	sign, err := s.makeDurable(ctx, spaceId, root, info.Size)
 	if err != nil {

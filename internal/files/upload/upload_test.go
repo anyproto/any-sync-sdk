@@ -73,8 +73,9 @@ func (b *fakeBroker) VerifyReceipt(_ *fileprotov2.NetworkSignReceipt, _ string, 
 }
 
 type fakeRegistrar struct {
-	n    int
-	rows map[string]payloads.Row
+	n            int
+	rows         map[string]payloads.Row
+	failRegister bool
 }
 
 func newFakeRegistrar() *fakeRegistrar {
@@ -82,6 +83,9 @@ func newFakeRegistrar() *fakeRegistrar {
 }
 
 func (r *fakeRegistrar) RegisterFile(_ context.Context, ownerId string, opts RegisterOpts) (string, error) {
+	if r.failRegister {
+		return "", errors.New("register failed")
+	}
 	r.n++
 	id := fmt.Sprintf("file-%d", r.n)
 	r.rows[ownerId+"/"+id] = payloads.Row{
@@ -375,6 +379,68 @@ func TestDriveDurableLimited(t *testing.T) {
 func bytesReaderOf(t *testing.T, n int) *bytes.Reader {
 	t.Helper()
 	return bytes.NewReader(testContent(n))
+}
+
+// TestAddIntentMarkerLifecycle pins the attach crash-window guard: the
+// intent marker exists exactly while the CAR could be orphaned — set
+// before the row write, cleared once ref + retry job landed.
+func TestAddIntentMarkerLifecycle(t *testing.T) {
+	ctx := context.Background()
+	br := &fakeBroker{}
+	s, st := newService(t, br)
+	s.SetQueue(newFakeQueue())
+	reg := newFakeRegistrar()
+
+	// Success: no marker survives.
+	res, err := s.Add(ctx, reg, spaceId, "owner1", bytesReaderOf(t, 20_000), AddOpts{})
+	require.NoError(t, err)
+	root, err := cid.Decode(res.RootCid)
+	require.NoError(t, err)
+	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
+	require.NoError(t, err)
+	require.False(t, marked, "marker cleared after ref+job landed")
+
+	// Registration failure (standing in for a crash after the marker):
+	// the finalized CAR stays marked so GC pins and heals it.
+	reg.failRegister = true
+	_, err = s.Add(ctx, reg, spaceId, "owner2", bytesReaderOf(t, 21_000), AddOpts{})
+	require.Error(t, err)
+	var orphanRoot cid.Cid
+	require.NoError(t, st.IterateAll(ctx, func(info store.Info) (bool, error) {
+		if len(info.Refs) == 0 {
+			orphanRoot = info.Root
+			return false, nil
+		}
+		return true, nil
+	}))
+	require.True(t, orphanRoot.Defined(), "the finalized CAR exists unreferenced")
+	owner, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, orphanRoot))
+	require.NoError(t, err)
+	require.True(t, marked, "the orphan stays intent-marked for the sweep to heal")
+	require.Equal(t, "owner2", owner)
+}
+
+// TestAddBindUnsignedDonorEnqueues pins that a row bound to a
+// not-yet-durable donor gets its own drive-toward-durable job (the
+// donor's job signs only the donor's row).
+func TestAddBindUnsignedDonorEnqueues(t *testing.T) {
+	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
+	s, _ := newService(t, br)
+	q := newFakeQueue()
+	s.SetQueue(q)
+	reg := newFakeRegistrar()
+	content := testContent(40_000)
+
+	donor, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	require.False(t, donor.Durable)
+
+	bound, err := s.Add(context.Background(), reg, spaceId, "owner2", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	require.True(t, bound.Bound)
+	require.False(t, bound.Durable)
+	require.True(t, q.entries["durable/"+spaceId+"/"+donor.FileId], "donor job pending")
+	require.True(t, q.entries["durable/"+spaceId+"/"+bound.FileId], "bound row needs its own job")
 }
 
 func TestAddVariantTags(t *testing.T) {

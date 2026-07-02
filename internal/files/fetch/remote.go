@@ -80,7 +80,14 @@ func (r *remoteCar) get(ctx context.Context, off, length int64) (data []byte, to
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
+		// RFC 9110 requires Content-Range on a 206; the object size
+		// drives the index-tail read, so a guess is not acceptable —
+		// underestimating it makes seed treat a truncated probe as the
+		// whole object.
 		total = parseContentRangeTotal(resp.Header.Get("Content-Range"))
+		if total <= 0 {
+			return nil, 0, fmt.Errorf("filefetch: GET %s: 206 without a parseable Content-Range", r.url)
+		}
 	case http.StatusOK:
 		// Whole-object answer (server ignored Range): only acceptable
 		// from offset 0; the body is the entire object.

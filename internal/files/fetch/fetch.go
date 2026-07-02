@@ -155,6 +155,17 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 	if err != nil {
 		return nil, err
 	}
+	// Reject a wrong object BEFORE anything is written: if the served
+	// object's root matched a different local file, CreateSparse would
+	// merge into (and any cleanup would then destroy) that unrelated
+	// file's state.
+	probeRoot, err := carfile.PeekRoot(head)
+	if err != nil {
+		return nil, fmt.Errorf("filefetch: remote head: %w", err)
+	}
+	if !probeRoot.Equals(root) {
+		return nil, fmt.Errorf("filefetch: object at public url has root %s, wanted %s", probeRoot, root)
+	}
 	hdr, err := carfile.ParseHeader(head)
 	if err != nil {
 		return nil, fmt.Errorf("filefetch: remote head: %w", err)
@@ -163,6 +174,9 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 	var idx []byte
 	if int64(len(head)) >= total {
 		// The probe swallowed the whole object.
+		if idxOff > int64(len(head)) {
+			return nil, fmt.Errorf("filefetch: object claims %d total bytes but its index starts at %d", total, idxOff)
+		}
 		head = head[:total]
 		idx = head[idxOff:]
 		head = head[:idxOff]
@@ -171,13 +185,8 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 			return nil, err
 		}
 	}
-	info, err := s.store.CreateSparse(ctx, spaceId, head, idx, ref)
-	if err != nil {
+	if _, err = s.store.CreateSparse(ctx, spaceId, head, idx, ref); err != nil {
 		return nil, err
-	}
-	if !info.Root.Equals(root) {
-		_ = s.store.Delete(ctx, spaceId, info.Root)
-		return nil, fmt.Errorf("filefetch: object at public url has root %s, wanted %s", info.Root, root)
 	}
 	return s.store.Open(ctx, spaceId, root)
 }

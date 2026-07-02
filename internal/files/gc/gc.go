@@ -43,28 +43,62 @@ var (
 	StalePartialTTL = 7 * 24 * time.Hour
 )
 
-// RowResolver answers whether a fileId still has a live payloads row
-// in its space and whether that row carries a network receipt.
-// Implemented by the space layer; conservative errors (space not
-// loadable) make the sweep retain.
+// RowResolver is the space layer's row surface for GC. Conservative
+// errors (space not loadable) make the passes retain.
 type RowResolver interface {
-	FileDurable(ctx context.Context, spaceId, fileId string) (durable, exists bool, err error)
+	// SpaceFiles returns fileId → durable (receipt present) for every
+	// live file row of the space, in ONE pass over its payloads
+	// objects. GC resolves refs against this map — a per-fileId lookup
+	// would cost a full tree scan for every dead ref.
+	SpaceFiles(ctx context.Context, spaceId string) (map[string]bool, error)
+	// ResolveIntent finds a live row of ownerId whose rootCid is root —
+	// the heal for the attach crash window (row written, ref/job not).
+	// ok=false when no such row exists (the crash preceded the row).
+	ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) (fileId string, ok bool, err error)
 }
+
+// Enqueue schedules a drive-toward-durable job for a healed row
+// (wired to the files work queue; nil in tests that don't care).
+type Enqueue func(ctx context.Context, spaceId, fileId string) error
 
 // Service owns cache accounting, the budget sweep and the safety GC.
 // One per SDK.
 type Service struct {
-	store  *store.Store
-	rows   RowResolver
-	cancel context.CancelFunc
-	done   chan struct{}
+	store   *store.Store
+	rows    RowResolver
+	enqueue Enqueue
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
 // New builds the Service. Nothing runs automatically: reclamation is
 // embedder-driven (Sweep / FreeUp / per-file Offload); Run starts the
 // periodic sweep only when the embedder configured a cadence.
-func New(st *store.Store, rows RowResolver) *Service {
-	return &Service{store: st, rows: rows}
+func New(st *store.Store, rows RowResolver, enqueue Enqueue) *Service {
+	return &Service{store: st, rows: rows, enqueue: enqueue}
+}
+
+// rowsCache memoizes SpaceFiles per GC run (one listing per space per
+// pass, however many CARs the pass touches).
+type rowsCache struct {
+	rows RowResolver
+	m    map[string]map[string]bool
+}
+
+func newRowsCache(rows RowResolver) *rowsCache {
+	return &rowsCache{rows: rows, m: map[string]map[string]bool{}}
+}
+
+func (c *rowsCache) space(ctx context.Context, spaceId string) (map[string]bool, error) {
+	if files, ok := c.m[spaceId]; ok {
+		return files, nil
+	}
+	files, err := c.rows.SpaceFiles(ctx, spaceId)
+	if err != nil {
+		return nil, err
+	}
+	c.m[spaceId] = files
+	return files, nil
 }
 
 // Run starts the periodic safety sweep at the given cadence. No-op
@@ -132,19 +166,26 @@ func (s *Service) FreeUp(ctx context.Context, want int64) (freed int64, err erro
 		actions []evictAction
 	)
 	now := time.Now()
+	cache := newRowsCache(s.rows)
 	err = s.store.IterateLRU(ctx, func(info store.Info) (bool, error) {
 		if info.State != store.StateComplete && info.State != store.StatePartial {
 			return true, nil
 		}
-		evictable, referenced, rerr := s.classify(ctx, info)
+		evictable, referenced, rerr := s.classify(ctx, cache, info)
 		if rerr != nil || !evictable {
 			return true, nil
 		}
-		if !referenced && now.Sub(info.LastAccess) <= UnreferencedGrace {
-			// A ref may be about to land (an Attach between the CAR
-			// finalize and the row write — the process can die between
-			// any two lines). The safety sweep reaps it after grace.
-			return true, nil
+		if !referenced {
+			if now.Sub(info.LastAccess) <= UnreferencedGrace {
+				// A ref may be about to land (an Attach between the CAR
+				// finalize and the row write — the process can die
+				// between any two lines). The sweep reaps it after grace.
+				return true, nil
+			}
+			if _, marked, kerr := s.store.GetKV(ctx, store.IntentKey(info.SpaceId, info.Root)); kerr != nil || marked {
+				// An attach intent pins the root; Sweep owns healing it.
+				return true, nil
+			}
 		}
 		actions = append(actions, evictAction{
 			spaceId: info.SpaceId, root: info.Root, size: info.Size, referenced: referenced,
@@ -178,6 +219,11 @@ type sweepAction struct {
 	deadRefs  []string // refs whose rows are gone → prune
 	remove    bool     // unreferenced past grace → delete the CAR + row
 	stalePart bool     // durable partial past TTL → offload
+	// intentOwner is set (instead of remove) for an unreferenced CAR
+	// carrying an attach-intent marker past grace: resolve the owner's
+	// rows and either re-link the crash-orphaned row or, when no row
+	// exists, clear the marker and delete the CAR.
+	intentOwner string
 }
 
 // Sweep is the automatic safety pass: prune refs whose rows are gone,
@@ -186,37 +232,47 @@ type sweepAction struct {
 // CARs and never drops non-durable bytes.
 func (s *Service) Sweep(ctx context.Context) error {
 	now := time.Now()
+	cache := newRowsCache(s.rows)
 	var actions []sweepAction
 	err := s.store.IterateAll(ctx, func(info store.Info) (bool, error) {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
+		files, rerr := cache.space(ctx, info.SpaceId)
+		if rerr != nil {
+			return true, nil // conservative: unresolvable space retains
+		}
 		var (
-			act     = sweepAction{spaceId: info.SpaceId, root: info.Root}
-			live    int
-			durable bool
+			act        = sweepAction{spaceId: info.SpaceId, root: info.Root}
+			live       int
+			allDurable = true
 		)
 		for _, fileId := range info.Refs {
-			d, exists, rerr := s.rows.FileDurable(ctx, info.SpaceId, fileId)
-			if rerr != nil {
-				return true, nil // conservative: unresolvable space retains
-			}
+			durable, exists := files[fileId]
 			if !exists {
 				act.deadRefs = append(act.deadRefs, fileId)
 				continue
 			}
 			live++
-			if d {
-				durable = true
+			if !durable {
+				allDurable = false
 			}
 		}
 		switch {
 		case live == 0 && now.Sub(info.LastAccess) > UnreferencedGrace:
-			act.remove = true
-		case info.State == store.StatePartial && durable && now.Sub(info.LastAccess) > StalePartialTTL:
+			if owner, marked, kerr := s.store.GetKV(ctx, store.IntentKey(info.SpaceId, info.Root)); kerr == nil && marked {
+				act.intentOwner = owner
+			} else if kerr == nil {
+				act.remove = true
+			}
+		case info.State == store.StatePartial && live > 0 && allDurable &&
+			now.Sub(info.LastAccess) > StalePartialTTL:
+			// EVERY live ref must be refetchable: dropping bytes while
+			// one unsigned ref remains would strand that file (its own
+			// row gates the remote rung).
 			act.stalePart = true
 		}
-		if act.remove || act.stalePart || len(act.deadRefs) > 0 {
+		if act.remove || act.stalePart || act.intentOwner != "" || len(act.deadRefs) > 0 {
 			actions = append(actions, act)
 		}
 		return true, nil
@@ -234,6 +290,8 @@ func (s *Service) Sweep(ctx context.Context) error {
 			}
 		}
 		switch {
+		case act.intentOwner != "":
+			s.healIntent(ctx, act.spaceId, act.intentOwner, act.root)
 		case act.remove:
 			if err := s.store.Delete(ctx, act.spaceId, act.root); err != nil {
 				log.Warn("gc delete failed", zap.String("root", act.root.String()), zap.Error(err))
@@ -247,16 +305,48 @@ func (s *Service) Sweep(ctx context.Context) error {
 	return nil
 }
 
+// healIntent resolves a stale attach-intent: the process died between
+// the row write and the ref/job writes. A surviving row is re-linked
+// (ref + durable job) and the marker cleared; no row means the crash
+// preceded the row — clear the marker and delete the orphaned CAR.
+func (s *Service) healIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) {
+	fileId, ok, err := s.rows.ResolveIntent(ctx, spaceId, ownerId, root)
+	if err != nil {
+		return // conservative: retry next sweep
+	}
+	if ok {
+		if err = s.store.AddRefs(ctx, spaceId, root, fileId); err != nil {
+			log.Warn("intent heal: re-ref failed", zap.String("root", root.String()), zap.Error(err))
+			return
+		}
+		if s.enqueue != nil {
+			if err = s.enqueue(ctx, spaceId, fileId); err != nil {
+				log.Warn("intent heal: enqueue failed", zap.String("fileId", fileId), zap.Error(err))
+				return
+			}
+		}
+		log.Info("intent heal: re-linked crash-orphaned file",
+			zap.String("fileId", fileId), zap.String("root", root.String()))
+	} else if err = s.store.Delete(ctx, spaceId, root); err != nil {
+		log.Warn("intent heal: delete failed", zap.String("root", root.String()), zap.Error(err))
+		return
+	}
+	if err = s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
+		log.Warn("intent heal: clear marker failed", zap.String("root", root.String()), zap.Error(err))
+	}
+}
+
 // classify resolves a CAR's live refs: evictable when every live ref
 // is durable (refetchable) or none are left; referenced reports
 // whether any live ref remains (offload vs delete).
-func (s *Service) classify(ctx context.Context, info store.Info) (evictable, referenced bool, err error) {
+func (s *Service) classify(ctx context.Context, cache *rowsCache, info store.Info) (evictable, referenced bool, err error) {
+	files, err := cache.space(ctx, info.SpaceId)
+	if err != nil {
+		return false, true, err
+	}
 	live := 0
 	for _, fileId := range info.Refs {
-		durable, exists, rerr := s.rows.FileDurable(ctx, info.SpaceId, fileId)
-		if rerr != nil {
-			return false, true, rerr
-		}
+		durable, exists := files[fileId]
 		if !exists {
 			continue
 		}

@@ -317,6 +317,33 @@ func TestRefsAndDelete(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
+// TestWriteBlockVerifiesWhenNotPersistable pins the verify-before-use
+// gate: readers hand fetched bytes to WriteBlock for verification, and
+// that must hold even when the row's state raced away from partial
+// (offload/delete) and nothing can be persisted.
+func TestWriteBlockVerifiesWhenNotPersistable(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	plain, key := testPayload(t, 50_000)
+	info := addFile(t, s, plain, key)
+
+	h, err := s.Open(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	defer h.Close()
+	c := h.Section(0).Cid
+	good, err := h.ReadBlock(ctx, c)
+	require.NoError(t, err)
+
+	// Another actor offloads while the handle is open: the shared
+	// rowState leaves partial/complete.
+	require.NoError(t, s.Offload(ctx, spaceId, info.Root))
+
+	require.Error(t, h.WriteBlock(ctx, c, []byte("corrupted fetch body")),
+		"unverifiable bytes must be rejected even when not persisted")
+	require.NoError(t, h.WriteBlock(ctx, c, good),
+		"genuine bytes still pass the gate")
+}
+
 func TestDedupIndex(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)

@@ -25,11 +25,24 @@ const spaceId = "space.test"
 
 type rowFact struct{ durable, exists bool }
 
-type fakeRows struct{ m map[string]rowFact }
+type fakeRows struct {
+	m       map[string]rowFact
+	intents map[string]string // ownerId/rootCid → resolvable fileId
+}
 
-func (f *fakeRows) FileDurable(_ context.Context, _ string, fileId string) (bool, bool, error) {
-	e := f.m[fileId]
-	return e.durable, e.exists, nil
+func (f *fakeRows) SpaceFiles(_ context.Context, _ string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for id, e := range f.m {
+		if e.exists {
+			out[id] = e.durable
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeRows) ResolveIntent(_ context.Context, _ string, ownerId string, root cid.Cid) (string, bool, error) {
+	fileId, ok := f.intents[ownerId+"/"+root.String()]
+	return fileId, ok, nil
 }
 
 func newStore(t *testing.T) *store.Store {
@@ -105,7 +118,7 @@ func TestCacheSize(t *testing.T) {
 	st := newStore(t)
 	a := addFile(t, st, 100_000, "fa")
 	b := addFile(t, st, 200_000, "fb")
-	svc := New(st, &fakeRows{m: map[string]rowFact{}})
+	svc := New(st, &fakeRows{m: map[string]rowFact{}}, nil)
 
 	total, err := svc.CacheSize(ctx)
 	require.NoError(t, err)
@@ -127,7 +140,7 @@ func TestFreeUpLRUOrder(t *testing.T) {
 		"fold":   {durable: true, exists: true},
 		"ffresh": {durable: true, exists: true},
 	}}
-	svc := New(st, rows)
+	svc := New(st, rows, nil)
 
 	freed, err := svc.FreeUp(ctx, 1) // any positive budget evicts exactly the LRU head
 	require.NoError(t, err)
@@ -140,7 +153,7 @@ func TestFreeUpRetainsNotDurable(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)
 	info := addFile(t, st, 90_000, "f1")
-	svc := New(st, &fakeRows{m: map[string]rowFact{"f1": {durable: false, exists: true}}})
+	svc := New(st, &fakeRows{m: map[string]rowFact{"f1": {durable: false, exists: true}}}, nil)
 
 	freed, err := svc.FreeUp(ctx, 1<<30)
 	require.NoError(t, err)
@@ -156,7 +169,7 @@ func TestFreeUpUnreferenced(t *testing.T) {
 
 	// Fresh unreferenced CARs survive (an Attach may be mid-flight).
 	setClocks(t, time.Hour, StalePartialTTL)
-	svc := New(st, rows)
+	svc := New(st, rows, nil)
 	freed, err := svc.FreeUp(ctx, 1<<30)
 	require.NoError(t, err)
 	assert.Zero(t, freed)
@@ -167,6 +180,100 @@ func TestFreeUpUnreferenced(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, info.Size, freed)
 	assert.Equal(t, "gone", stateOf(t, st, info.Root))
+}
+
+// addOrphanCar lands a complete CAR with NO refs — the state a crash
+// between Finalize and RegisterFile/AddRefs leaves behind.
+func addOrphanCar(t *testing.T, st *store.Store, size int) store.Info {
+	t.Helper()
+	ctx := context.Background()
+	info := addFile(t, st, size, "tmp-ref")
+	_, err := st.RemoveRef(ctx, spaceId, info.Root, "tmp-ref")
+	require.NoError(t, err)
+	out, err := st.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	require.Empty(t, out.Refs)
+	return out
+}
+
+func TestSweepIntentHealsCrashOrphan(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	info := addOrphanCar(t, st, 90_000)
+	// The attach died between RegisterFile and AddRefs/Enqueue: intent
+	// marker present, row exists but unreferenced and unqueued.
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root), "owner1"))
+	rows := &fakeRows{
+		m:       map[string]rowFact{"fhealed": {durable: false, exists: true}},
+		intents: map[string]string{"owner1/" + info.Root.String(): "fhealed"},
+	}
+	var enqueued []string
+	setClocks(t, -time.Second, StalePartialTTL)
+	svc := New(st, rows, func(_ context.Context, _ string, fileId string) error {
+		enqueued = append(enqueued, fileId)
+		return nil
+	})
+	require.NoError(t, svc.Sweep(ctx))
+
+	healed, err := st.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err, "the CAR must survive — it is the only copy")
+	assert.Equal(t, []string{"fhealed"}, healed.Refs, "row re-linked")
+	assert.Equal(t, []string{"fhealed"}, enqueued, "backup re-queued")
+	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, info.Root))
+	require.NoError(t, err)
+	assert.False(t, marked, "marker cleared after heal")
+
+	// Idempotent: a second sweep leaves the healed state alone.
+	require.NoError(t, svc.Sweep(ctx))
+	healed, err = st.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"fhealed"}, healed.Refs)
+}
+
+func TestSweepIntentWithoutRowDeletes(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	info := addOrphanCar(t, st, 90_000)
+	// The crash preceded the row write: marker with nothing to heal.
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root), "owner1"))
+	setClocks(t, -time.Second, StalePartialTTL)
+	svc := New(st, &fakeRows{m: map[string]rowFact{}}, nil)
+	require.NoError(t, svc.Sweep(ctx))
+
+	assert.Equal(t, "gone", stateOf(t, st, info.Root))
+	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, info.Root))
+	require.NoError(t, err)
+	assert.False(t, marked)
+}
+
+func TestFreeUpRetainsIntentMarked(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	info := addOrphanCar(t, st, 90_000)
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root), "owner1"))
+	setClocks(t, -time.Second, StalePartialTTL) // even past grace
+	svc := New(st, &fakeRows{m: map[string]rowFact{}}, nil)
+
+	freed, err := svc.FreeUp(ctx, 1<<30)
+	require.NoError(t, err)
+	assert.Zero(t, freed, "an intent-marked root is pinned; Sweep owns healing it")
+	assert.Equal(t, store.StateComplete, stateOf(t, st, info.Root))
+}
+
+func TestSweepStalePartialRequiresAllRefsDurable(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	part := addPartial(t, st, 130_000, "fsigned")
+	require.NoError(t, st.AddRefs(ctx, spaceId, part.Root, "funsigned"))
+	rows := &fakeRows{m: map[string]rowFact{
+		"fsigned":   {durable: true, exists: true},
+		"funsigned": {durable: false, exists: true}, // e.g. a BIND row not yet driven
+	}}
+	setClocks(t, UnreferencedGrace, -time.Second) // partial is "stale"
+	svc := New(st, rows, nil)
+	require.NoError(t, svc.Sweep(ctx))
+	assert.Equal(t, store.StatePartial, stateOf(t, st, part.Root),
+		"one unsigned live ref must pin the bytes")
 }
 
 func TestSweep(t *testing.T) {
@@ -189,7 +296,7 @@ func TestSweep(t *testing.T) {
 		"fpinned": {durable: false, exists: true},
 	}}
 	setClocks(t, -time.Second, -time.Second) // everything is "old"
-	svc := New(st, rows)
+	svc := New(st, rows, nil)
 	require.NoError(t, svc.Sweep(ctx))
 
 	sharedInfo, err := st.Info(ctx, spaceId, shared.Root)

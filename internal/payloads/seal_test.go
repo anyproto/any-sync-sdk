@@ -85,6 +85,32 @@ func TestSealUnseal_Inline(t *testing.T) {
 	assert.Equal(t, want.Name, got.Name)
 }
 
+// TestSealUnseal_VariantTags pins the variant fields' round-trip (the
+// sibling-row relationship lives only in the sealed meta).
+func TestSealUnseal_VariantTags(t *testing.T) {
+	kp := newFakeProvider(t, "kid-1")
+	key, err := kp.KeyById(context.Background(), "kid-1")
+	require.NoError(t, err)
+
+	want := testEncPayload()
+	want.Variant = "thumbnail"
+	want.VariantOf = "origFileId"
+	ct, err := SealEnc(key, want)
+	require.NoError(t, err)
+	got, err := UnsealEnc(key, ct)
+	require.NoError(t, err)
+	assert.Equal(t, "thumbnail", got.Variant)
+	assert.Equal(t, "origFileId", got.VariantOf)
+
+	// Absent on originals.
+	ct, err = SealEnc(key, testEncPayload())
+	require.NoError(t, err)
+	got, err = UnsealEnc(key, ct)
+	require.NoError(t, err)
+	assert.Empty(t, got.Variant)
+	assert.Empty(t, got.VariantOf)
+}
+
 // TestUnseal_WrongKeyFails pins that GCM authentication rejects a
 // ciphertext under the wrong key — a corrupt row surfaces as an
 // error, never as garbage plaintext.

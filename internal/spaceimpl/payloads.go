@@ -256,12 +256,33 @@ func (p *PayloadsAPI) getRowIn(ctx context.Context, payloadsObjId, fileId string
 	return p.rowFromValue(ctx, v)
 }
 
-// FindRow resolves a bare fileId to its row by scanning the space's
-// payloads objects (locally we always saw the row; the network stays
-// unindexed). The SYN-30 queryable files view will subsume this scan.
+// fileIndexKey is the local-only fileId → payloads-object mapping in
+// the files-store KV (07c keeps the network unindexed; locally we saw
+// every row). Written on Attach, backfilled on scan hits.
+func fileIndexKey(spaceId, fileId string) string {
+	return "fidx/" + spaceId + "/" + fileId
+}
+
+// FindRow resolves a bare fileId to its row: the local index first
+// (one KV read + one row read), falling back to a scan of the space's
+// payloads objects for rows that arrived via sync, and backfilling the
+// index on the hit.
 func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row, error) {
 	if fileId == "" {
 		return payloads.Row{}, errors.New("payloads: fileId required")
+	}
+	kv := p.s.parent.filesStore()
+	if kv != nil {
+		if objId, ok, err := kv.GetKV(ctx, fileIndexKey(p.s.id, fileId)); err == nil && ok {
+			row, err := p.getRowIn(ctx, objId, fileId)
+			if err == nil {
+				return row, nil
+			}
+			if !errors.Is(err, space.ErrNotFound) {
+				return payloads.Row{}, err
+			}
+			// Stale index entry (row moved/deleted): fall through.
+		}
 	}
 	objIds, err := p.s.store.TreeIdsByChangeType(ctx, payloads.ChangeType)
 	if err != nil {
@@ -270,6 +291,9 @@ func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row,
 	for _, objId := range objIds {
 		row, err := p.getRowIn(ctx, objId, fileId)
 		if err == nil {
+			if kv != nil {
+				_ = kv.SetKV(ctx, fileIndexKey(p.s.id, fileId), objId)
+			}
 			return row, nil
 		}
 		if !errors.Is(err, space.ErrNotFound) {
@@ -289,7 +313,13 @@ func (p *PayloadsAPI) ListRows(ctx context.Context, ownerId string) ([]payloads.
 	if !ok {
 		return nil, nil
 	}
-	vals, err := newQuery(p.s.store, objId, payloads.Dataset).All(ctx)
+	return p.listRowsIn(ctx, objId)
+}
+
+// listRowsIn reads every live row of one payloads object by its id
+// (the flat-listing path walks objects without knowing their owners).
+func (p *PayloadsAPI) listRowsIn(ctx context.Context, payloadsObjId string) ([]payloads.Row, error) {
+	vals, err := newQuery(p.s.store, payloadsObjId, payloads.Dataset).All(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -70,15 +70,25 @@ type EncPayload struct {
 	// Inline holds the file bytes for the inline tier (< InlineMaxSize),
 	// which has no rootCid / S3 / networkSign and rides the CRDT.
 	Inline []byte
+	// Variant tags this row as an alternate representation (e.g.
+	// "thumbnail") of VariantOf. Variants are ordinary sibling rows —
+	// own tier, own durability, own refcount; the relationship lives
+	// only here in the sealed meta, so the network sees N independent
+	// files.
+	Variant string
+	// VariantOf is the fileId of the original this row is a variant of.
+	VariantOf string
 }
 
 // Sealed enc-plaintext wire keys.
 const (
-	encKey    = "key"
-	encName   = "name"
-	encSHA256 = "sha256"
-	encMime   = "mime"
-	encInline = "inline"
+	encKey       = "key"
+	encName      = "name"
+	encSHA256    = "sha256"
+	encMime      = "mime"
+	encInline    = "inline"
+	encVariant   = "variant"
+	encVariantOf = "variantOf"
 )
 
 // SealEnc serialises p and seals it with key (AES-256-GCM, nonce
@@ -105,6 +115,12 @@ func SealEnc(key crypto.SymKey, p EncPayload) ([]byte, error) {
 	if len(p.Inline) > 0 {
 		obj.Set(encInline, a.NewBinary(p.Inline))
 	}
+	if p.Variant != "" {
+		obj.Set(encVariant, a.NewString(p.Variant))
+	}
+	if p.VariantOf != "" {
+		obj.Set(encVariantOf, a.NewString(p.VariantOf))
+	}
 	return key.Encrypt(obj.MarshalTo(nil))
 }
 
@@ -122,10 +138,12 @@ func UnsealEnc(key crypto.SymKey, ct []byte) (EncPayload, error) {
 		return EncPayload{}, fmt.Errorf("payloads: unseal parse: %w", err)
 	}
 	return EncPayload{
-		Key:    append([]byte(nil), v.GetBytes(encKey)...),
-		Name:   v.GetString(encName),
-		SHA256: append([]byte(nil), v.GetBytes(encSHA256)...),
-		Mime:   v.GetString(encMime),
-		Inline: append([]byte(nil), v.GetBytes(encInline)...),
+		Key:       append([]byte(nil), v.GetBytes(encKey)...),
+		Name:      v.GetString(encName),
+		SHA256:    append([]byte(nil), v.GetBytes(encSHA256)...),
+		Mime:      v.GetString(encMime),
+		Inline:    append([]byte(nil), v.GetBytes(encInline)...),
+		Variant:   v.GetString(encVariant),
+		VariantOf: v.GetString(encVariantOf),
 	}, nil
 }

@@ -377,6 +377,28 @@ func bytesReaderOf(t *testing.T, n int) *bytes.Reader {
 	return bytes.NewReader(testContent(n))
 }
 
+func TestAddVariantTags(t *testing.T) {
+	br := &fakeBroker{}
+	s, _ := newService(t, br)
+	reg := newFakeRegistrar()
+
+	// Inline variant (a tiny thumbnail).
+	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 500),
+		AddOpts{Name: "thumb.jpg", Variant: "thumbnail", VariantOf: "origId"})
+	require.NoError(t, err)
+	row := reg.rows["owner1/"+res.FileId]
+	require.Equal(t, "thumbnail", row.Enc.Variant)
+	require.Equal(t, "origId", row.Enc.VariantOf)
+
+	// Full-tier variant.
+	res, err = s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 30_000),
+		AddOpts{Variant: "preview", VariantOf: "origId"})
+	require.NoError(t, err)
+	row = reg.rows["owner1/"+res.FileId]
+	require.Equal(t, "preview", row.Enc.Variant)
+	require.Equal(t, "origId", row.Enc.VariantOf)
+}
+
 func TestAddSpoolSpill(t *testing.T) {
 	br := &fakeBroker{}
 	s, st := newService(t, br)

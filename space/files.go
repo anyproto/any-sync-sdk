@@ -75,6 +75,33 @@ type Files interface {
 	// its local bytes for all of them — each stays refetchable; Pin a
 	// sibling to keep it hot.
 	Offload(ctx context.Context, fileId string) error
+
+	// List returns the space's files as typed infos. Opts.ObjectId
+	// restricts to one object's files (the fast path — one indexed
+	// lookup). The unfiltered listing walks every file in the space:
+	// fine for human-scale spaces, but a consumer tracking a very
+	// large space should page with Opts.Limit or drive Query/Changes
+	// instead of re-listing.
+	List(ctx context.Context, opts FileListOpts) ([]FileInfo, error)
+
+	// Query returns the generic query surface (filter / sort /
+	// subscribe — see space.Query) over the payload rows of ONE
+	// object's files. Rows expose the cleartext fields (fileId,
+	// rootCid, size, networkSign, objectId); the member-only meta
+	// stays sealed — use Get/List for typed access to it.
+	//
+	// ErrNotFound until the object's first file is attached (the
+	// backing dataset materializes with the first Attach) — fall back
+	// to List/Changes until then.
+	Query(objectId string) (Query, error)
+}
+
+// FileListOpts filters List.
+type FileListOpts struct {
+	// ObjectId restricts the listing to files bound to one object.
+	ObjectId string
+	// Limit caps the result (0 = unlimited). Applied after ObjectId.
+	Limit int
 }
 
 // FileSyncState is the durability state of one file.
@@ -139,6 +166,15 @@ type AttachOpts struct {
 	Name string
 	// Mime is the content-type hint.
 	Mime string
+	// Variant + VariantOf attach this content as an alternate
+	// representation of an existing file on the SAME object (the
+	// embedder produces the bytes — e.g. a thumbnail it rendered).
+	// The variant is an ordinary sibling file with its own tier,
+	// durability and lifecycle; Open(originalId, variant) resolves it.
+	// Both must be set together; VariantOf must reference a file bound
+	// to the same objectId.
+	Variant   Variant
+	VariantOf string
 }
 
 // FileInfo describes one attached file.
@@ -165,4 +201,8 @@ type FileInfo struct {
 	Mime string
 	// Cached reports a complete local copy (always true for inline).
 	Cached bool
+	// Variant/VariantOf tag alternate representations (member-only;
+	// empty for originals and keyless readers).
+	Variant   Variant
+	VariantOf string
 }

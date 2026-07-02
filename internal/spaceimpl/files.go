@@ -42,12 +42,25 @@ func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opt
 	if !ok {
 		return space.FileInfo{}, fmt.Errorf("files: attach to %s: %w", objectId, space.ErrNotFound)
 	}
-	res, err := files.Add(ctx, payloadsRegistrar{p: f.s.PayloadsInternal()}, f.s.id, objectId, r, upload.AddOpts{
-		Name: opts.Name,
-		Mime: opts.Mime,
+	if err = f.validateVariant(ctx, objectId, opts); err != nil {
+		return space.FileInfo{}, err
+	}
+	pa := f.s.PayloadsInternal()
+	res, err := files.Add(ctx, payloadsRegistrar{p: pa}, f.s.id, objectId, r, upload.AddOpts{
+		Name:      opts.Name,
+		Mime:      opts.Mime,
+		Variant:   string(opts.Variant),
+		VariantOf: opts.VariantOf,
 	})
 	if err != nil {
 		return space.FileInfo{}, err
+	}
+	// Seed the local fileId → payloads-object index so Get/Open resolve
+	// with one lookup instead of a scan.
+	if kv := f.s.parent.filesStore(); kv != nil {
+		if payloadsObjId, derr := pa.ObjectId(ctx, objectId); derr == nil {
+			_ = kv.SetKV(ctx, fileIndexKey(f.s.id, res.FileId), payloadsObjId)
+		}
 	}
 	if res.Inline {
 		// Full-tier attaches emit through the queue transitions; inline
@@ -60,24 +73,43 @@ func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opt
 		})
 	}
 	return space.FileInfo{
-		FileId:   res.FileId,
-		ObjectId: objectId,
-		RootCid:  res.RootCid,
-		Size:     res.Size,
-		Inline:   res.Inline,
-		Durable:  res.Durable,
-		Name:     opts.Name,
-		Mime:     opts.Mime,
-		Cached:   true, // just written (inline rides the row itself)
+		FileId:    res.FileId,
+		ObjectId:  objectId,
+		RootCid:   res.RootCid,
+		Size:      res.Size,
+		Inline:    res.Inline,
+		Durable:   res.Durable,
+		Name:      opts.Name,
+		Mime:      opts.Mime,
+		Cached:    true, // just written (inline rides the row itself)
+		Variant:   opts.Variant,
+		VariantOf: opts.VariantOf,
 	}, nil
 }
 
-// Open returns a seekable plaintext reader over the file. See
-// space.Files.
-func (f *filesAPI) Open(ctx context.Context, fileId string, variant space.Variant) (space.FileReader, error) {
-	if variant != space.VariantOriginal {
-		return nil, fmt.Errorf("files: variant %q: %w (variants land with SYN-30)", variant, space.ErrNotFound)
+// validateVariant enforces the variant attach contract: both fields
+// together, and the original must be a file of the SAME object (that
+// keeps sibling resolution a one-collection scan).
+func (f *filesAPI) validateVariant(ctx context.Context, objectId string, opts space.AttachOpts) error {
+	if opts.Variant == space.VariantOriginal && opts.VariantOf == "" {
+		return nil
 	}
+	if opts.Variant == space.VariantOriginal || opts.VariantOf == "" {
+		return errors.New("files: Variant and VariantOf must be set together")
+	}
+	orig, err := f.s.PayloadsInternal().FindRow(ctx, opts.VariantOf)
+	if err != nil {
+		return fmt.Errorf("files: variant original %s: %w", opts.VariantOf, err)
+	}
+	if orig.ObjectId != objectId {
+		return fmt.Errorf("files: variant must attach to the original's object %s, not %s", orig.ObjectId, objectId)
+	}
+	return nil
+}
+
+// Open returns a seekable plaintext reader over the file (or one of
+// its variants). See space.Files.
+func (f *filesAPI) Open(ctx context.Context, fileId string, variant space.Variant) (space.FileReader, error) {
 	fetchSvc := f.s.parent.fetch
 	if fetchSvc == nil {
 		return nil, errors.New("files: not configured")
@@ -86,9 +118,19 @@ func (f *filesAPI) Open(ctx context.Context, fileId string, variant space.Varian
 	if err != nil {
 		return nil, err
 	}
+	if variant != space.VariantOriginal {
+		if row, err = f.resolveVariant(ctx, row, variant); err != nil {
+			return nil, err
+		}
+	}
+	return f.openRow(ctx, row)
+}
+
+// openRow builds the reader pipeline for one resolved row.
+func (f *filesAPI) openRow(ctx context.Context, row payloads.Row) (space.FileReader, error) {
 	if row.Sealed {
 		if row.UnsealErr != nil {
-			return nil, fmt.Errorf("files: row %s cannot be unsealed (poisoned or malformed): %w", fileId, row.UnsealErr)
+			return nil, fmt.Errorf("files: row %s cannot be unsealed (poisoned or malformed): %w", row.Id, row.UnsealErr)
 		}
 		return nil, errors.New("files: no space key (cannot decrypt)")
 	}
@@ -96,13 +138,29 @@ func (f *filesAPI) Open(ctx context.Context, fileId string, variant space.Varian
 		return newInlineReader(row.Enc.Inline), nil
 	}
 	if len(row.Enc.Key) == 0 {
-		return nil, fmt.Errorf("files: row %s has no file key", fileId)
+		return nil, fmt.Errorf("files: row %s has no file key", row.Id)
 	}
 	root, err := cid.Decode(row.RootCid)
 	if err != nil {
-		return nil, fmt.Errorf("files: row %s rootCid: %w", fileId, err)
+		return nil, fmt.Errorf("files: row %s rootCid: %w", row.Id, err)
 	}
-	return fetchSvc.Open(ctx, f.s.id, root, row.Enc.Key, row.NetworkSign != "", fileId)
+	return f.s.parent.fetch.Open(ctx, f.s.id, root, row.Enc.Key, row.NetworkSign != "", row.Id)
+}
+
+// resolveVariant finds the sibling row tagged {variantOf: orig,
+// variant} among the original object's files (variants always bind to
+// the same object — enforced at Attach).
+func (f *filesAPI) resolveVariant(ctx context.Context, orig payloads.Row, variant space.Variant) (payloads.Row, error) {
+	rows, err := f.s.PayloadsInternal().ListRows(ctx, orig.ObjectId)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	for _, r := range rows {
+		if !r.Sealed && r.Enc.VariantOf == orig.Id && r.Enc.Variant == string(variant) {
+			return r, nil
+		}
+	}
+	return payloads.Row{}, fmt.Errorf("files: no %q variant of %s: %w", variant, orig.Id, space.ErrNotFound)
 }
 
 // Get returns the file's info. See space.Files.
@@ -111,16 +169,24 @@ func (f *filesAPI) Get(ctx context.Context, fileId string) (space.FileInfo, erro
 	if err != nil {
 		return space.FileInfo{}, err
 	}
+	return f.rowToInfo(ctx, row), nil
+}
+
+// rowToInfo maps a typed row to the public FileInfo, resolving local
+// availability from the store.
+func (f *filesAPI) rowToInfo(ctx context.Context, row payloads.Row) space.FileInfo {
 	info := space.FileInfo{
-		FileId:   row.Id,
-		ObjectId: row.ObjectId,
-		RootCid:  row.RootCid,
-		Size:     row.Size,
-		Inline:   row.Inline(),
-		Durable:  row.Inline() || row.NetworkSign != "",
-		Name:     row.Enc.Name,
-		Mime:     row.Enc.Mime,
-		Cached:   row.Inline(),
+		FileId:    row.Id,
+		ObjectId:  row.ObjectId,
+		RootCid:   row.RootCid,
+		Size:      row.Size,
+		Inline:    row.Inline(),
+		Durable:   row.Inline() || row.NetworkSign != "",
+		Name:      row.Enc.Name,
+		Mime:      row.Enc.Mime,
+		Cached:    row.Inline(),
+		Variant:   space.Variant(row.Enc.Variant),
+		VariantOf: row.Enc.VariantOf,
 	}
 	if !row.Inline() {
 		if root, err := cid.Decode(row.RootCid); err == nil {
@@ -129,7 +195,60 @@ func (f *filesAPI) Get(ctx context.Context, fileId string) (space.FileInfo, erro
 			}
 		}
 	}
-	return info, nil
+	return info
+}
+
+// List returns the space's files. See space.Files.
+func (f *filesAPI) List(ctx context.Context, opts space.FileListOpts) ([]space.FileInfo, error) {
+	pa := f.s.PayloadsInternal()
+	var out []space.FileInfo
+	appendRows := func(rows []payloads.Row) bool {
+		for _, row := range rows {
+			out = append(out, f.rowToInfo(ctx, row))
+			if opts.Limit > 0 && len(out) >= opts.Limit {
+				return false
+			}
+		}
+		return true
+	}
+	if opts.ObjectId != "" {
+		rows, err := pa.ListRows(ctx, opts.ObjectId)
+		if err != nil {
+			return nil, err
+		}
+		appendRows(rows)
+		return out, nil
+	}
+	objIds, err := f.s.store.TreeIdsByChangeType(ctx, payloads.ChangeType)
+	if err != nil {
+		return nil, err
+	}
+	for _, objId := range objIds {
+		rows, err := pa.listRowsIn(ctx, objId)
+		if err != nil {
+			return nil, err
+		}
+		if !appendRows(rows) {
+			break
+		}
+	}
+	return out, nil
+}
+
+// Query returns the generic query surface over one object's payload
+// rows. See space.Files.
+func (f *filesAPI) Query(objectId string) (space.Query, error) {
+	ctx := context.Background() // local reads only (derive + existence)
+	objId, ok, err := f.s.PayloadsInternal().existingObjectId(ctx, objectId)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// The payloads object materializes with the first Attach; there
+		// is no collection to query (or subscribe to) before that.
+		return nil, fmt.Errorf("files: %s has no files yet: %w", objectId, space.ErrNotFound)
+	}
+	return f.s.Query(objId, payloads.Dataset), nil
 }
 
 // Status derives the file's durability state on read. See space.Files.

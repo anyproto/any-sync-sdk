@@ -89,10 +89,16 @@ type RegisterOpts struct {
 	Enc         payloads.EncPayload
 }
 
-// AddOpts carries caller metadata for one file.
+// AddOpts carries caller metadata for one file. All fields ride in
+// the sealed (member-only) part of the row.
 type AddOpts struct {
 	Name string
 	Mime string
+	// Variant/VariantOf tag this file as an alternate representation
+	// (e.g. a thumbnail) of an existing file. Validated by the caller
+	// (spaceimpl) — this layer just seals them.
+	Variant   string
+	VariantOf string
 }
 
 // Result reports one completed Add.
@@ -163,10 +169,12 @@ func (s *Service) addInline(ctx context.Context, reg Registrar, ownerId string, 
 	fileId, err := reg.RegisterFile(ctx, ownerId, RegisterOpts{
 		Size: sp.Size(),
 		Enc: payloads.EncPayload{
-			Name:   opts.Name,
-			SHA256: sp.SHA256(),
-			Mime:   opts.Mime,
-			Inline: sp.Bytes(),
+			Name:      opts.Name,
+			SHA256:    sp.SHA256(),
+			Mime:      opts.Mime,
+			Inline:    sp.Bytes(),
+			Variant:   opts.Variant,
+			VariantOf: opts.VariantOf,
 		},
 	})
 	if err != nil {
@@ -194,10 +202,12 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 		Size:        sp.Size(),
 		NetworkSign: donor.NetworkSign,
 		Enc: payloads.EncPayload{
-			Key:    donor.Enc.Key,
-			Name:   opts.Name,
-			SHA256: sp.SHA256(),
-			Mime:   opts.Mime,
+			Key:       donor.Enc.Key,
+			Name:      opts.Name,
+			SHA256:    sp.SHA256(),
+			Mime:      opts.Mime,
+			Variant:   opts.Variant,
+			VariantOf: opts.VariantOf,
 		},
 	})
 	if err != nil {
@@ -246,10 +256,12 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		RootCid: root.String(),
 		Size:    sp.Size(),
 		Enc: payloads.EncPayload{
-			Key:    key,
-			Name:   opts.Name,
-			SHA256: sp.SHA256(),
-			Mime:   opts.Mime,
+			Key:       key,
+			Name:      opts.Name,
+			SHA256:    sp.SHA256(),
+			Mime:      opts.Mime,
+			Variant:   opts.Variant,
+			VariantOf: opts.VariantOf,
 		},
 	})
 	if err != nil {

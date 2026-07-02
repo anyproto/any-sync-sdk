@@ -276,6 +276,12 @@ func (a *App) NewAclWaiter(spaceId, aclHeadId string, onFinish, onReject func(li
 // coordinator verifies against its own network id.
 func (a *App) NetworkId() string { return a.nodeConf.Configuration().NetworkId }
 
+// Pool exposes the any-sync peer pool (dial by peerId, addresses
+// resolved from the nodeconf). Lets embedders/e2e speak node-side
+// protocols (e.g. fileprotov2) over a connection that carries this
+// account's identity in the handshake.
+func (a *App) Pool() pool.Pool { return a.a.MustComponent(pool.CName).(pool.Pool) }
+
 // SetSpaceRegistry wires the tree manager to a space-level registry.
 // Called once by the space package after it builds its ocache.
 func (a *App) SetSpaceRegistry(r SpaceRegistry) { a.tree.SetRegistry(r) }

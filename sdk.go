@@ -8,6 +8,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
+	"github.com/anyproto/any-sync/net/pool"
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
@@ -223,6 +224,12 @@ func (s *SDK) Identities() space.IdentitiesAPI { return spaceimpl.NewIdentitiesA
 
 // Account returns the account-level API.
 func (s *SDK) Account() AccountAPI { return s.account }
+
+// PoolInternal exposes the any-sync peer pool (dial by peerId with this
+// account's identity in the handshake). Same-module internal surface —
+// mirrors the PayloadsInternal pattern — used by the e2e suite to speak
+// node-side protocols (e.g. fileprotov2 against a fileV2 broker).
+func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
 
 // AccountAPI exposes account-level operations outside any space.
 type AccountAPI interface {

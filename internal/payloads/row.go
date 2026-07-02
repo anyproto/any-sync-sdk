@@ -28,6 +28,9 @@ type Row struct {
 	// Author is the account that registered the file (derived from the
 	// creating change's signer).
 	Author string
+	// ObjectId is the object the file is bound to (cleartext parent
+	// reference — the derived payloads-object id stays internal).
+	ObjectId string
 	// EncKid is the ACL key-record id the `enc` blob was sealed under
 	// (cleartext — needed to pick the unseal key after ACL rotation).
 	EncKid string
@@ -58,6 +61,7 @@ func RowFromValue(v *anyenc.Value) (Row, error) {
 		Size:        int64(v.GetFloat64(FieldSize)),
 		NetworkSign: v.GetString(FieldNetworkSign),
 		Author:      v.GetString(FieldAuthor),
+		ObjectId:    v.GetString(FieldObjectId),
 		EncKid:      v.GetString(FieldEnc, EncKeyId),
 		Sealed:      true,
 	}

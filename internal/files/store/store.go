@@ -38,12 +38,15 @@ const (
 	// DedupCollection is the per-space whole-file dedup index:
 	// {id: "<spaceId>/<sha256 hex>", root, fileId}.
 	DedupCollection = "files_dedup"
+	// KVCollection holds small files-subsystem state ({id, v}) — e.g.
+	// the persisted publicReadBaseUrl per network.
+	KVCollection = "files_kv"
 )
 
 // Row states.
 const (
-	StatePartial  = "partial"  // sparse skeleton, bitmap tracks arrived sections
-	StateComplete = "complete" // every section present and verified
+	StatePartial  = "partial"   // sparse skeleton, bitmap tracks arrived sections
+	StateComplete = "complete"  // every section present and verified
 	StateOffload  = "offloaded" // row kept, bytes dropped (refetchable)
 )
 
@@ -80,6 +83,7 @@ type Store struct {
 	db    anystore.DB
 	files anystore.Collection
 	dedup anystore.Collection
+	kv    anystore.Collection
 	rows  *rowRegistry
 }
 
@@ -104,7 +108,11 @@ func New(ctx context.Context, rootDir string, db anystore.DB) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("filestore: open %s: %w", DedupCollection, err)
 	}
-	s := &Store{root: rootDir, db: db, files: files, dedup: dedup, rows: newRowRegistry()}
+	kv, err := db.Collection(ctx, KVCollection)
+	if err != nil {
+		return nil, fmt.Errorf("filestore: open %s: %w", KVCollection, err)
+	}
+	s := &Store{root: rootDir, db: db, files: files, dedup: dedup, kv: kv, rows: newRowRegistry()}
 	s.sweepTmp()
 	return s, nil
 }
@@ -373,6 +381,28 @@ func (s *Store) LookupContent(ctx context.Context, spaceId string, sha256 []byte
 		FileId:  string(v.GetStringBytes(fieldFileId)),
 		OwnerId: string(v.GetStringBytes(fieldOwner)),
 	}, true, nil
+}
+
+// SetKV persists one small files-subsystem value.
+func (s *Store) SetKV(ctx context.Context, key, value string) error {
+	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		v.Set("v", a.NewString(value))
+		return v, true, nil
+	})
+	_, err := s.kv.UpsertId(ctx, key, mod)
+	return err
+}
+
+// GetKV reads one value; ok is false when the key was never set.
+func (s *Store) GetKV(ctx context.Context, key string) (value string, ok bool, err error) {
+	doc, err := s.kv.FindId(ctx, key)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return string(doc.Value().GetStringBytes("v")), true, nil
 }
 
 // updateExisting applies fn to an existing row in one atomic UpdateId;

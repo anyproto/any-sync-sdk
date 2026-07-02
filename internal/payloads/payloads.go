@@ -62,6 +62,7 @@ const (
 	FieldSize        = "size"        // number; plaintext byte size
 	FieldNetworkSign = "networkSign" // string; absent until durable; requires rootCid
 	FieldAuthor      = "author"      // string; derived from the change signer
+	FieldObjectId    = "objectId"    // string; the object this file is bound to (cleartext so the files view can filter by parent)
 	FieldEnc         = "enc"         // object {kid, ct}; sealed member-only secrets
 )
 
@@ -80,6 +81,7 @@ func Schema() schema.Dataset {
 		{Id: FieldSize, Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeSynced},
 		{Id: FieldNetworkSign, Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
 		{Id: FieldAuthor, Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeDerived},
+		{Id: FieldObjectId, Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
 		{Id: FieldEnc, Schema: &schema.Schema{Kind: schema.KindObject}, Scope: schema.ScopeSynced},
 	}}
 }

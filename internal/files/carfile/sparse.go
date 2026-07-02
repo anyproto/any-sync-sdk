@@ -80,6 +80,14 @@ func CreateSparse(path string, head, idx []byte) (root cid.Cid, present []int, e
 	return file.Root(), present, nil
 }
 
+// ParseHeader validates a fetched head range (the first bytes of a
+// remote CARv2 — 4 KiB always suffices) and returns the v2 header, so
+// a remote fetcher can locate the index region (Header.IndexOffset to
+// the object end) with one more Range read.
+func ParseHeader(head []byte) (carv2.Header, error) {
+	return parseHead(head)
+}
+
 // PeekRoot parses the root cid out of a fetched head range without
 // touching disk.
 func PeekRoot(head []byte) (cid.Cid, error) {

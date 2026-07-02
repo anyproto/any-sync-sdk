@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/config"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/files/broker"
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
@@ -75,9 +76,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	tsp := techspace.New(app, db)
 	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
 
-	// Files byte layer (SYN-25/27): CARv2s under <DataDir>/files (a
+	// Files byte layer (SYN-25/27/28): CARv2s under <DataDir>/files (a
 	// sibling of anysync/ and sdk.db — cfg.Storage.DataDir was
 	// re-pointed to anysync/ above), metadata in the shared SDK DB.
+	// Uploads go through the fileV2 broker; downloads are public-read
+	// first ({base}/blob/…), with the base resolved once via the broker
+	// Info RPC and persisted (or pinned by cfg.Files.PublicReadBaseUrl).
 	filesRoot := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "files")
 	filesStore, err := filestore.New(ctx, filesRoot, db)
 	if err != nil {
@@ -85,7 +89,16 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open files store: %w", err)
 	}
-	spaces.SetFiles(upload.New(filesStore, broker.New(app.Pool(), app.FileV2Peers, app.NetworkId())))
+	filesBroker := broker.New(app.Pool(), app.FileV2Peers, app.NetworkId())
+	baseURL := fetch.NewBaseURL(filesStore, app.NetworkId(), cfg.Files.PublicReadBaseUrl,
+		func(ctx context.Context) (string, error) {
+			info, err := filesBroker.Info(ctx)
+			if err != nil {
+				return "", err
+			}
+			return info.PublicReadBaseUrl, nil
+		})
+	spaces.SetFiles(upload.New(filesStore, filesBroker), fetch.New(filesStore, baseURL), filesStore)
 	// Wire spaceimpl.Service as the space registry so any-sync's
 	// treemanager-driven callbacks (deletion-manager DeleteTree,
 	// space-sync PutTree, head-sync GetTree for arbitrary trees)

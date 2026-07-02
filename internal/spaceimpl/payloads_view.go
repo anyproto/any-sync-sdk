@@ -57,6 +57,7 @@ func (v *payloadsView) ListRows(ctx context.Context, payloadsObjectId string) ([
 			Size:        row.Size,
 			NetworkSign: row.NetworkSign,
 			Author:      row.Author,
+			ObjectId:    row.ObjectId,
 			Sealed:      row.Sealed,
 		})
 	}

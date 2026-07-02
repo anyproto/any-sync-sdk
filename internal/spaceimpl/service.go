@@ -24,6 +24,8 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/inbox"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -92,10 +94,12 @@ type Service struct {
 	// built-in catalog.
 	extTypes []handler.Type
 
-	// files is the SDK-level upload orchestrator behind every space's
-	// Files() surface. Set once by SetFiles right after construction
-	// (sdk.Open); nil only in tests that never touch files.
-	files *upload.Service
+	// files/fetch/fstore are the SDK-level byte-layer services behind
+	// every space's Files() surface. Set once by SetFiles right after
+	// construction (sdk.Open); nil only in tests that never touch files.
+	files  *upload.Service
+	fetch  *fetch.Service
+	fstore *filestore.Store
 
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
@@ -219,9 +223,15 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 	return s
 }
 
-// SetFiles wires the SDK-level files upload service. Called once from
-// sdk.Open before any Space handle is handed out.
-func (s *Service) SetFiles(f *upload.Service) { s.files = f }
+// SetFiles wires the SDK-level files byte-layer services. Called once
+// from sdk.Open before any Space handle is handed out.
+func (s *Service) SetFiles(up *upload.Service, fe *fetch.Service, st *filestore.Store) {
+	s.files, s.fetch, s.fstore = up, fe, st
+}
+
+// filesStore returns the local payload store (nil-safe accessor for
+// the Files surface).
+func (s *Service) filesStore() *filestore.Store { return s.fstore }
 
 // storeFor returns the per-space spaceobjects.Store, building it on
 // first access. The allocator is also lazily created and shared

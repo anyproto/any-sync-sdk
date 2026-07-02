@@ -19,6 +19,7 @@ type Config struct {
 	Storage Storage
 	Network Network
 	Sync    Sync
+	Files   Files
 
 	// Headless runs the SDK as an embedded backend service rather than
 	// a user-facing client. Open skips the account-facing boot work —
@@ -68,6 +69,17 @@ const (
 // AnyStoreTuning is a placeholder for future any-store options (cache
 // sizes, WAL mode, etc.). Zero-value means defaults.
 type AnyStoreTuning struct{}
+
+// Files tunes the files byte layer. All zero-valued fields fall back
+// to SDK defaults.
+type Files struct {
+	// PublicReadBaseUrl overrides the network-advertised public read
+	// base for durable file downloads ({base}/blob/{spaceId}/{rootCid}).
+	// Normally left empty: the SDK resolves it once from the network's
+	// fileV2 nodes and caches it. Set it for private deployments that
+	// front the object store themselves.
+	PublicReadBaseUrl string `yaml:"publicReadBaseUrl"`
+}
 
 // Network is the any-sync network configuration. v1 is deliberately
 // conservative — callers pass a serialized nodeconf blob and we decode

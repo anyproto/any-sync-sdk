@@ -99,6 +99,21 @@ func (h *Handle) Size() (int64, error) {
 // NumBlocks returns the number of blocks in the file.
 func (h *Handle) NumBlocks() int { return h.car.NumSections() }
 
+// Section returns the i-th section's geometry (cid, absolute offset,
+// frame size) — identical in the local file and the remote object, so
+// the fetch path plans Range reads from it.
+func (h *Handle) Section(i int) carfile.Section { return h.car.Section(i) }
+
+// SectionIndex resolves a cid to its section number.
+func (h *Handle) SectionIndex(c cid.Cid) (int, bool) { return h.car.Lookup(c) }
+
+// HasSection reports whether section i has arrived.
+func (h *Handle) HasSection(i int) bool {
+	h.entry.mu.Lock()
+	defer h.entry.mu.Unlock()
+	return h.hasLocked(i)
+}
+
 // Complete reports whether every section is present.
 func (h *Handle) Complete() bool {
 	h.entry.mu.Lock()

@@ -142,6 +142,7 @@ func (p *PayloadsAPI) RegisterFiles(ctx context.Context, ownerId string, files [
 			row.Set(payloads.FieldRootCid, arena.NewString(opts.RootCid))
 		}
 		row.Set(payloads.FieldSize, arena.NewNumberFloat64(float64(opts.Size)))
+		row.Set(payloads.FieldObjectId, arena.NewString(ownerId))
 		if opts.NetworkSign != "" {
 			row.Set(payloads.FieldNetworkSign, arena.NewString(opts.NetworkSign))
 		}
@@ -227,7 +228,14 @@ func (p *PayloadsAPI) GetRow(ctx context.Context, ownerId, fileId string) (paylo
 	if !ok {
 		return payloads.Row{}, space.ErrNotFound
 	}
-	coll, err := resolveCollection(ctx, p.s.store, objId, payloads.Dataset)
+	return p.getRowIn(ctx, objId, fileId)
+}
+
+// getRowIn reads one row directly from a payloads object (already
+// resolved — the bare-fileId lookup path scans objects without knowing
+// the owner). space.ErrNotFound for a missing or tombstoned row.
+func (p *PayloadsAPI) getRowIn(ctx context.Context, payloadsObjId, fileId string) (payloads.Row, error) {
+	coll, err := resolveCollection(ctx, p.s.store, payloadsObjId, payloads.Dataset)
 	if err != nil {
 		return payloads.Row{}, err
 	}
@@ -246,6 +254,29 @@ func (p *PayloadsAPI) GetRow(ctx context.Context, ownerId, fileId string) (paylo
 		return payloads.Row{}, space.ErrNotFound
 	}
 	return p.rowFromValue(ctx, v)
+}
+
+// FindRow resolves a bare fileId to its row by scanning the space's
+// payloads objects (locally we always saw the row; the network stays
+// unindexed). The SYN-30 queryable files view will subsume this scan.
+func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row, error) {
+	if fileId == "" {
+		return payloads.Row{}, errors.New("payloads: fileId required")
+	}
+	objIds, err := p.s.store.TreeIdsByChangeType(ctx, payloads.ChangeType)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	for _, objId := range objIds {
+		row, err := p.getRowIn(ctx, objId, fileId)
+		if err == nil {
+			return row, nil
+		}
+		if !errors.Is(err, space.ErrNotFound) {
+			return payloads.Row{}, err
+		}
+	}
+	return payloads.Row{}, space.ErrNotFound
 }
 
 // ListRows returns every live row of the owner's payloads object,

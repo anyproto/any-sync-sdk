@@ -50,6 +50,10 @@ type PayloadRow struct {
 	// creating change's signer).
 	Author string
 
+	// ObjectId is the object the file is bound to (the cleartext parent
+	// reference).
+	ObjectId string
+
 	// Sealed reports whether the row's member-only secrets remain
 	// closed to this identity. True for a keyless reader (the broker
 	// view — not an error); false when the local account holds the

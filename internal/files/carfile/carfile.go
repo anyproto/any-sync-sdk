@@ -168,6 +168,14 @@ func (f *File) ReadBlock(i int) ([]byte, error) {
 	return data, nil
 }
 
+// ParseFrame splits one raw section frame (uvarint || cid || data) into
+// its cid and data — the remote fetch path decodes Range-read frames
+// with it before handing each block to WriteBlock for verification.
+func ParseFrame(frame []byte) (c cid.Cid, data []byte, err error) {
+	data, c, err = parseFrame(frame)
+	return c, data, err
+}
+
 // parseFrame splits a section frame into its cid and data. The frame
 // must be exactly one whole section (trailing bytes are an error, so a
 // wrong-length write can't hide).

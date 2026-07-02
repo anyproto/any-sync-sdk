@@ -66,7 +66,7 @@ func (Handler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.
 		return fmt.Errorf("payloads: multi-field $set on an existing row")
 	}
 	switch op.Path[0] {
-	case FieldRootCid, FieldSize, FieldEnc:
+	case FieldRootCid, FieldSize, FieldEnc, FieldObjectId:
 		// Create-time facts. Immutable once present; a late fill on a
 		// row that somehow lacks one (cross-version tolerance) is
 		// allowed.
@@ -199,7 +199,10 @@ func recordShape(rec *crdt.RecordChange) (writeShape, error) {
 //   - rootCid: optional non-empty string; ABSENT means the inline
 //     tier, which requires size < InlineMaxSize and no networkSign;
 //   - networkSign: optional (a BIND reuses an existing sign at
-//     create), requires rootCid.
+//     create), requires rootCid;
+//   - objectId: optional non-empty string (the parent object; optional
+//     for cross-version tolerance — rows written before the field
+//     existed sync in without it).
 func validateCreatePayload(v *anyenc.Value) error {
 	if v == nil || v.Type() != anyenc.TypeObject {
 		return fmt.Errorf("payloads: create payload must be an object")
@@ -208,7 +211,7 @@ func validateCreatePayload(v *anyenc.Value) error {
 	var badKey error
 	obj.Visit(func(k []byte, _ *anyenc.Value) {
 		switch string(k) {
-		case FieldRootCid, FieldSize, FieldNetworkSign, FieldEnc:
+		case FieldRootCid, FieldSize, FieldNetworkSign, FieldEnc, FieldObjectId:
 		default:
 			if badKey == nil {
 				badKey = fmt.Errorf("payloads: create payload has unknown field %q", string(k))
@@ -232,6 +235,12 @@ func validateCreatePayload(v *anyenc.Value) error {
 	}
 	if ct := enc.Get(EncKeyCiphertext); ct == nil || ct.Type() != anyenc.TypeBinary || len(ct.GetBytes()) == 0 {
 		return fmt.Errorf("payloads: enc.ct must be non-empty binary")
+	}
+
+	if oid := v.Get(FieldObjectId); oid != nil {
+		if oid.Type() != anyenc.TypeString || len(oid.GetStringBytes()) == 0 {
+			return fmt.Errorf("payloads: objectId must be a non-empty string")
+		}
 	}
 
 	rootCid := v.Get(FieldRootCid)

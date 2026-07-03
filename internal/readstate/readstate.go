@@ -506,6 +506,19 @@ func (e *Engine) markLocked(ctx context.Context, objectId string, changeIds []st
 	if err != nil {
 		return MarkResult{}, err
 	}
+	// Fast path for idempotent re-merges (startup reconcile replays
+	// every published frontier): all ids already covered → one state
+	// read, no row scan, no writes.
+	todo := changeIds[:0:0]
+	for _, id := range changeIds {
+		if _, ok := st.frontier[id]; !ok {
+			todo = append(todo, id)
+		}
+	}
+	if len(todo) == 0 {
+		return MarkResult{Frontier: setToSlice(st.frontier)}, nil
+	}
+	changeIds = todo
 	entries, err := e.loadEntries(ctx, objectId, "")
 	if err != nil {
 		return MarkResult{}, err
@@ -858,6 +871,21 @@ func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) 
 		})
 	}
 	return out, nil
+}
+
+// WriteTx runs fn inside a write transaction on the engine's DB —
+// the tx opener for callers outside the apply path (marks, merges,
+// reconcile). fn's error rolls the tx back and is returned.
+func (e *Engine) WriteTx(ctx context.Context, fn func(txCtx context.Context) error) error {
+	tx, err := e.db.WriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	if err = fn(tx.Context()); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func setToSlice(set map[string]struct{}) []string {

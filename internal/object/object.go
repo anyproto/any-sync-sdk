@@ -291,9 +291,14 @@ func (o *Object) stampObjectMetaFromTree(ch *crdt.Change, tree objecttree.Object
 	if ch.ObjectAuthor == "" && root.Identity != nil {
 		ch.ObjectAuthor = root.Identity.Account()
 	}
-	if ch.Creator == "" && ch.ChangeId != "" {
-		if tc, err := tree.GetChange(ch.ChangeId); err == nil && tc != nil && tc.Identity != nil {
-			ch.Creator = tc.Identity.Account()
+	if (ch.Creator == "" || ch.PrevIds == nil) && ch.ChangeId != "" {
+		if tc, err := tree.GetChange(ch.ChangeId); err == nil && tc != nil {
+			if ch.Creator == "" && tc.Identity != nil {
+				ch.Creator = tc.Identity.Account()
+			}
+			if ch.PrevIds == nil {
+				ch.PrevIds = tc.PreviousIds
+			}
 		}
 	}
 }

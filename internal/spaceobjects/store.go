@@ -40,6 +40,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
@@ -156,6 +157,14 @@ type Store struct {
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *rowEventRegistry
+
+	// readTracking maps a tracked dataset to its registration;
+	// readState is the per-space read/unread engine. Both nil/empty
+	// when nothing in this space opted into tracking. selfIdentity is
+	// the account id self-authored changes are matched against.
+	readTracking map[string]*crdt.ReadTracking
+	readState    *readstate.Engine
+	selfIdentity string
 
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
@@ -276,6 +285,13 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 		return crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
 	})
+	if s.signKey != nil {
+		s.selfIdentity = s.signKey.GetPublic().Account()
+	}
+	s.readTracking = buildReadTracking(s.extTypes, s.customHandlers)
+	if len(s.readTracking) > 0 {
+		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
+	}
 	s.cache = ocache.New(
 		s.loadObject,
 		ocache.WithTTL(objectCacheTTL),
@@ -1142,6 +1158,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		}
 		ctrl.SetSpaceId(s.spaceId)
 		ctrl.SetApplySeqAllocator(s.applySeqs)
+		ctrl.SetApplyHook(s.readApplyHook())
 		return ctrl, nil
 	}
 	coll, err := s.SharedObjects(ctx)
@@ -1177,5 +1194,6 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	ctrl.SetSpaceId(s.spaceId)
 	ctrl.SetApplySeqAllocator(s.applySeqs)
+	ctrl.SetApplyHook(s.readApplyHook())
 	return ctrl, nil
 }

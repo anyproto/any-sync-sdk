@@ -190,12 +190,14 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		if err := spacesync.ReconcileDeletions(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
 			_ = err
 		}
-		// Replay published read frontiers through the idempotent merge —
-		// covers marks made by other devices while this one was offline
-		// and live-hook drops. Cheap when nothing changed.
-		if err := readSync.Reconcile(ctx, rec.Id); err != nil {
-			_ = err
-		}
+	}
+
+	// Replay published read frontiers through the idempotent merge —
+	// covers marks made by other devices while this one was offline and
+	// live-hook drops. One pass over the tech-space store for ALL
+	// spaces; cheap when nothing changed.
+	if err := readSync.ReconcileAll(ctx); err != nil {
+		_ = err
 	}
 
 	return &SDK{

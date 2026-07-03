@@ -3,6 +3,7 @@ package readsync
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -215,4 +216,65 @@ func TestReconcile_RepublishesDivergentFrontier(t *testing.T) {
 	var val frontierValue
 	require.NoError(t, json.Unmarshal(raw, &val))
 	assert.Equal(t, []string{"c2"}, val.Heads)
+}
+
+func TestMarkReadUpTo_ChunksLargeSets(t *testing.T) {
+	f := newFixture(t)
+	const n = markChunkSize + 500
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		for i := 0; i < n; i++ {
+			prev := []string{fmt.Sprintf("c%06d", i-1)}
+			if i == 0 {
+				prev = nil
+			}
+			if err := f.eng.TrackChange(txCtx, readstate.Track{
+				ObjectId: testObj, ChangeId: fmt.Sprintf("c%06d", i),
+				VersionId: fmt.Sprintf("v%06d", i), PrevIds: prev, ApplySeq: uint64(i + 1),
+				RecordIds: []string{"r"}, Tags: []string{"message"}, Tracked: true,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+
+	res, err := f.MarkReadUpTo(ctx, testSpace, testObj, "")
+	require.NoError(t, err)
+	assert.Len(t, res.Removed, n, "all chunks aggregated")
+
+	entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+
+	// Published once, with the final frontier.
+	f.kv.mu.Lock()
+	raw := f.kv.sets[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	require.NotNil(t, raw)
+	var val frontierValue
+	require.NoError(t, json.Unmarshal(raw, &val))
+	assert.Equal(t, []string{fmt.Sprintf("c%06d", n-1)}, val.Heads)
+
+	// The per-object lock map evicted on release.
+	f.Service.mu.Lock()
+	assert.Empty(t, f.Service.objMu)
+	f.Service.mu.Unlock()
+}
+
+func TestReconcileAll_SinglePassRoutesBySpace(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c1"}),
+	}
+	// Untracked-space keys are skipped without error.
+	f.kv.rows[kvKey("space-untracked", "objX")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("space-untracked", "objX"), "peer-other", []string{"zz"}),
+	}
+
+	require.NoError(t, f.ReconcileAll(ctx))
+
+	entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
 }

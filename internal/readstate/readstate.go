@@ -34,6 +34,7 @@ package readstate
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -617,6 +618,7 @@ func (e *Engine) markLocked(ctx context.Context, objectId string, changeIds []st
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
 	}
+	e.compactFrontier(ctx, objectId, st)
 	if err = e.persistState(ctx, objectId, st); err != nil {
 		return MarkResult{}, err
 	}
@@ -664,10 +666,43 @@ func (e *Engine) markNoEntries(ctx context.Context, objectId string, st *objStat
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
 	}
+	e.compactFrontier(ctx, objectId, st)
 	if err := e.persistState(ctx, objectId, st); err != nil {
 		return MarkResult{}, err
 	}
 	return MarkResult{Frontier: setToSlice(st.frontier), Pending: pending, StateSeq: st.stateSeq}, nil
+}
+
+// maxFrontierSize caps the persisted (and published) frontier. Growth
+// comes from merging other devices' independently-reduced frontiers;
+// members accumulate because reduction only fires via covered rows.
+const maxFrontierSize = 64
+
+// compactFrontier drops the oldest members (smallest local versionId,
+// resolved via the gap resolver; unresolvable members drop first) when
+// the frontier exceeds the cap. Locally safe: membership is only a
+// classify shortcut and a walk stop — coverage of applied changes is
+// the watermark's job. The published-coverage trade-off: a dropped
+// member that was NOT an ancestor of the remaining set shrinks what
+// other devices mark read, costing them a bounded re-read, never
+// corruption; oldest-first makes that case rare.
+func (e *Engine) compactFrontier(ctx context.Context, objectId string, st *objState) {
+	if len(st.frontier) <= maxFrontierSize {
+		return
+	}
+	type member struct{ id, v string }
+	members := make([]member, 0, len(st.frontier))
+	for id := range st.frontier {
+		_, v, ok, err := e.resolveGap(ctx, objectId, id)
+		if err != nil || !ok {
+			v = ""
+		}
+		members = append(members, member{id: id, v: v})
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].v < members[j].v })
+	for _, m := range members[:len(members)-maxFrontierSize] {
+		delete(st.frontier, m.id)
+	}
 }
 
 func (e *Engine) resolveGap(ctx context.Context, objectId, changeId string) ([]string, string, bool, error) {
@@ -680,19 +715,35 @@ func (e *Engine) resolveGap(ctx context.Context, objectId, changeId string) ([]s
 // MarkReadUpTo covers every unread change with versionId <= upTo
 // ("" = everything). Range coverage needs no ancestry walk.
 func (e *Engine) MarkReadUpTo(ctx context.Context, objectId, upTo string) (MarkResult, error) {
+	res, _, err := e.MarkReadUpToChunk(ctx, objectId, upTo, 0)
+	return res, err
+}
+
+// MarkReadUpToChunk is MarkReadUpTo bounded to at most maxEntries
+// covered entries (0 = unbounded); done=false means more remain below
+// upTo. Covering a versionId prefix is a valid frontier advance
+// (forward-only marking), so a caller can commit each chunk in its own
+// tx and a crash mid-way just resumes — the huge-ReadAll path uses
+// this to keep transactions bounded.
+func (e *Engine) MarkReadUpToChunk(ctx context.Context, objectId, upTo string, maxEntries int) (MarkResult, bool, error) {
 	if err := e.collections(ctx); err != nil {
-		return MarkResult{}, err
+		return MarkResult{}, true, err
 	}
 	st, err := e.loadState(ctx, objectId)
 	if err != nil {
-		return MarkResult{}, err
+		return MarkResult{}, true, err
 	}
 	covered, err := e.loadEntries(ctx, objectId, upTo)
 	if err != nil {
-		return MarkResult{}, err
+		return MarkResult{}, true, err
+	}
+	done := true
+	if maxEntries > 0 && len(covered) > maxEntries {
+		covered = covered[:maxEntries]
+		done = false
 	}
 	if len(covered) == 0 {
-		return MarkResult{Frontier: setToSlice(st.frontier)}, nil
+		return MarkResult{Frontier: setToSlice(st.frontier)}, true, nil
 	}
 
 	// Frontier additions: covered ids not referenced as prevIds by
@@ -712,22 +763,23 @@ func (e *Engine) MarkReadUpTo(ctx context.Context, objectId, upTo string) (MarkR
 	}
 
 	if err = e.removeEntries(ctx, st, covered); err != nil {
-		return MarkResult{}, err
+		return MarkResult{}, done, err
 	}
 	if e.seq == nil {
-		return MarkResult{}, errors.New("readstate: no seq allocator")
+		return MarkResult{}, done, errors.New("readstate: no seq allocator")
 	}
 	stateSeq, err := e.seq(ctx)
 	if err != nil {
-		return MarkResult{}, err
+		return MarkResult{}, done, err
 	}
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
 	}
+	e.compactFrontier(ctx, objectId, st)
 	if err = e.persistState(ctx, objectId, st); err != nil {
-		return MarkResult{}, err
+		return MarkResult{}, done, err
 	}
-	return MarkResult{Removed: covered, Frontier: setToSlice(st.frontier), StateSeq: st.stateSeq}, nil
+	return MarkResult{Removed: covered, Frontier: setToSlice(st.frontier), StateSeq: st.stateSeq}, done, nil
 }
 
 // MergeHeads applies another device's published frontier. Identical

@@ -130,6 +130,9 @@ type Store struct {
 	sharedColl anystore.Collection // per-space `objects` collection, lazy-opened
 	detached   anystore.Collection // per-space `_detached` collection, lazy-opened
 
+	// drainMu serializes Drain passes — see Store.Drain.
+	drainMu sync.Mutex
+
 	// drainer runs Store.Drain asynchronously off the apply path —
 	// afterApply hooks push pairs in, the drainer consumes them and
 	// coalesces bursts into single Drain passes. See drainer.go.

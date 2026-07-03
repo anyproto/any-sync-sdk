@@ -339,12 +339,17 @@ state in ~2 ms, and the everyday "open chat, read all" on a hundred
 unread costs under a millisecond including the commit. The 10 k-unread
 ReadAll (93 ms, one tx) is the chunking case below.
 
-Two guards for pathological sizes: `ReadAll` over a huge unread set
-commits in chunks (forward-only marking makes any prefix of the
-closure a valid frontier advance, so a crash mid-way just resumes),
-and unread-row insertion amortizes into the apply tx, so a cold
-restore of a chat with a large unread backlog pays one row per tracked
-change, not a post-hoc scan.
+Three guards for pathological sizes, all implemented: `ReadAll` over a
+huge unread set commits in bounded chunks of 2048 (forward-only
+marking makes any versionId prefix a valid frontier advance, so a
+crash mid-way just resumes, and the frontier publishes once at the
+end); the frontier itself is capped at 64 members (over the cap, the
+oldest by local versionId drop first — locally safe since coverage of
+applied changes is the watermark's job, and the published-coverage
+trade-off costs another device at most a bounded re-read); and a
+first-sight object's initial restore skips tracking entirely (the seed
+covers everything present), so a fresh joiner pays no per-change
+bookkeeping for pre-join history.
 
 ## What is deliberately absent (heart lessons)
 
@@ -368,9 +373,7 @@ change, not a post-hoc scan.
 - Whether `subscribe.Event` should also carry the unread flag inline
   for live-query consumers, or the transition feed stays the only
   surface (start: feed-only).
-- Frontier compaction: closure keeps the frontier minimal for marked
-  lineages, but long-lived concurrent branches can grow it; decide a
-  cap + fallback (re-derive minimal cut from unread rows).
+
 - KV key privacy: keys are visible to nodes (values encrypted).
   objectIds are already visible to nodes via trees; confirm no
   hashing needed (heart hashes with an ACL-salt).

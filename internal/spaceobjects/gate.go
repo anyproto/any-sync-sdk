@@ -196,8 +196,13 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 
 // Drain scans the detached collection, re-checks each parked
 // change's pending list, and replays any that are now satisfied.
-// Idempotent — call as often as you like.
+// Idempotent — call as often as you like: passes are serialized, so
+// two callers can't both collect a row before either unparks it and
+// double-replay it (a replayed change re-tracks as unread if the user
+// read it between the deliveries).
 func (s *Store) Drain(ctx context.Context) error {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
 	var ready []DetachedRow
 	if err := s.IterDetached(ctx, func(row DetachedRow) bool {
 		all, err := s.allPendingKnown(ctx, row.Pending)

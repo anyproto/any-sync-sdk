@@ -409,3 +409,57 @@ func TestTrack_UntrackedChangeResolvesPending(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, pending)
 }
+
+func TestMarkReadUpToChunk_BoundedRounds(t *testing.T) {
+	f := newFixture(t)
+	for i := 1; i <= 10; i++ {
+		prev := []string{fmt.Sprintf("c%d", i-1)}
+		if i == 1 {
+			prev = nil
+		}
+		f.track(t, mkTrack("obj", fmt.Sprintf("c%d", i), fmt.Sprintf("v%02d", i), prev, "message"))
+	}
+	total := 0
+	rounds := 0
+	for {
+		res, done, err := f.MarkReadUpToChunk(ctx, "obj", "", 3)
+		require.NoError(t, err)
+		total += len(res.Removed)
+		rounds++
+		if done {
+			break
+		}
+		// Every chunk is a durable, valid frontier advance.
+		require.NotEmpty(t, res.Frontier)
+	}
+	assert.Equal(t, 10, total)
+	assert.Equal(t, 4, rounds) // 3+3+3+1
+	entries, _, err := f.UnreadEntries(ctx, "obj")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+	counts, err := f.Counts(ctx, "obj")
+	require.NoError(t, err)
+	assert.Empty(t, counts)
+}
+
+func TestCompactFrontier_CapsOldest(t *testing.T) {
+	f := newFixture(t)
+	// Fully-read object; merge maxFrontierSize+16 known heads so the
+	// no-entries path accumulates frontier members past the cap.
+	var ids []string
+	for i := 0; i < maxFrontierSize+16; i++ {
+		id := fmt.Sprintf("h%03d", i)
+		f.changes[id] = fakeChange{v: fmt.Sprintf("v%03d", i)}
+		ids = append(ids, id)
+	}
+	_, err := f.MarkRead(ctx, "obj", ids)
+	require.NoError(t, err)
+
+	heads, _, err := f.Frontier(ctx, "obj")
+	require.NoError(t, err)
+	require.Len(t, heads, maxFrontierSize)
+	// The oldest (smallest versionId) members were dropped.
+	for _, h := range heads {
+		assert.GreaterOrEqual(t, h, "h016")
+	}
+}

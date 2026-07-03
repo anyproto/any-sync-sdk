@@ -70,9 +70,11 @@ type Service struct {
 	selfPeerId string
 
 	// objMu serializes merges and marks per object — the engine holds
-	// no locks of its own.
+	// no locks of its own. Entries are reference-counted and evicted
+	// on last release, so the map doesn't grow with every object ever
+	// touched.
 	mu    sync.Mutex
-	objMu map[string]*sync.Mutex
+	objMu map[string]*objLock
 
 	queue  chan mergeJob
 	stop   chan struct{}
@@ -90,7 +92,7 @@ func New(engineFor EngineFor, kvStore KVStore, selfPeerId string) *Service {
 		engineFor:  engineFor,
 		kvStore:    kvStore,
 		selfPeerId: selfPeerId,
-		objMu:      map[string]*sync.Mutex{},
+		objMu:      map[string]*objLock{},
 		queue:      make(chan mergeJob, 256),
 		stop:       make(chan struct{}),
 	}
@@ -104,16 +106,30 @@ func (s *Service) Close() {
 	s.worker.Wait()
 }
 
+type objLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 func (s *Service) lockObject(objectId string) func() {
 	s.mu.Lock()
-	m := s.objMu[objectId]
-	if m == nil {
-		m = &sync.Mutex{}
-		s.objMu[objectId] = m
+	l := s.objMu[objectId]
+	if l == nil {
+		l = &objLock{}
+		s.objMu[objectId] = l
 	}
+	l.refs++
 	s.mu.Unlock()
-	m.Lock()
-	return m.Unlock
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(s.objMu, objectId)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // MarkRead covers the given changes (and ancestry) locally, then
@@ -126,12 +142,49 @@ func (s *Service) MarkRead(ctx context.Context, spaceId, objectId string, change
 	})
 }
 
+// markChunkSize bounds one MarkReadUpTo transaction. Forward-only
+// marking makes a versionId-prefix chunk a valid frontier advance, so
+// each chunk commits durably and a crash mid-way resumes on retry.
+const markChunkSize = 2048
+
 // MarkReadUpTo covers everything at or below upTo in local display
-// order ("" = all), then publishes.
+// order ("" = all) in bounded per-chunk transactions, then publishes
+// the final frontier once.
 func (s *Service) MarkReadUpTo(ctx context.Context, spaceId, objectId, upTo string) (readstate.MarkResult, error) {
-	return s.mark(ctx, spaceId, objectId, func(eng *readstate.Engine, txCtx context.Context) (readstate.MarkResult, error) {
-		return eng.MarkReadUpTo(txCtx, objectId, upTo)
-	})
+	eng := s.engineFor(spaceId)
+	if eng == nil {
+		return readstate.MarkResult{}, ErrUntracked
+	}
+	unlock := s.lockObject(objectId)
+	defer unlock()
+	var agg readstate.MarkResult
+	for {
+		var (
+			res  readstate.MarkResult
+			done bool
+		)
+		err := eng.WriteTx(ctx, func(txCtx context.Context) error {
+			var opErr error
+			res, done, opErr = eng.MarkReadUpToChunk(txCtx, objectId, upTo, markChunkSize)
+			return opErr
+		})
+		if err != nil {
+			return agg, err
+		}
+		agg.Removed = append(agg.Removed, res.Removed...)
+		agg.Frontier = res.Frontier
+		if res.StateSeq != 0 {
+			agg.StateSeq = res.StateSeq
+		}
+		if done {
+			break
+		}
+	}
+	if agg.StateSeq != 0 {
+		s.publish(ctx, spaceId, objectId, agg.Frontier)
+		eng.NotifyState(objectId, agg.StateSeq)
+	}
+	return agg, nil
 }
 
 func (s *Service) mark(ctx context.Context, spaceId, objectId string, op func(*readstate.Engine, context.Context) (readstate.MarkResult, error)) (readstate.MarkResult, error) {
@@ -257,28 +310,40 @@ func (s *Service) merge(ctx context.Context, job mergeJob) {
 // rebuild), Reconcile republishes — so boot is the healing pass for
 // both directions of divergence.
 func (s *Service) Reconcile(ctx context.Context, spaceId string) error {
-	eng := s.engineFor(spaceId)
-	if eng == nil {
+	if s.engineFor(spaceId) == nil {
 		return nil
 	}
+	return s.reconcile(ctx, spaceId)
+}
+
+// ReconcileAll is the boot form: ONE pass over the tech-space store
+// covering every space (keys route by their embedded spaceId; spaces
+// without a tracked engine are skipped), instead of a full store scan
+// per space.
+func (s *Service) ReconcileAll(ctx context.Context) error {
+	return s.reconcile(ctx, "")
+}
+
+func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 	store, err := s.kvStore(ctx)
 	if err != nil {
 		return err
 	}
-	prefix := keyPrefix + spaceId + "/"
 	// Republishing writes to the same store Iterate is reading — do it
 	// after the iteration, never from inside the callback.
 	type repub struct {
+		spaceId  string
 		objectId string
 		heads    []string
 	}
 	var repubs []repub
 	err = store.Iterate(ctx, func(decryptor keyvaluestorage.Decryptor, key string, values []innerstorage.KeyValue) (bool, error) {
-		if !strings.HasPrefix(key, prefix) {
+		spaceId, objectId, ok := parseKey(key)
+		if !ok || (onlySpaceId != "" && spaceId != onlySpaceId) {
 			return true, nil
 		}
-		_, objectId, ok := parseKey(key)
-		if !ok {
+		eng := s.engineFor(spaceId)
+		if eng == nil {
 			return true, nil
 		}
 		var ownHeads []string
@@ -306,7 +371,7 @@ func (s *Service) Reconcile(ctx context.Context, spaceId string) error {
 			return false, ferr
 		}
 		if len(heads) > 0 && !sameSet(heads, ownHeads) {
-			repubs = append(repubs, repub{objectId: objectId, heads: heads})
+			repubs = append(repubs, repub{spaceId: spaceId, objectId: objectId, heads: heads})
 		}
 		return true, nil
 	})
@@ -314,7 +379,7 @@ func (s *Service) Reconcile(ctx context.Context, spaceId string) error {
 		return err
 	}
 	for _, r := range repubs {
-		s.publish(ctx, spaceId, r.objectId, r.heads)
+		s.publish(ctx, r.spaceId, r.objectId, r.heads)
 	}
 	return nil
 }

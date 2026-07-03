@@ -59,11 +59,35 @@ const (
 	FieldName        = "name"        // human label, mutable
 	FieldDescription = "description" // mutable
 	FieldXKey        = "x-key"       // caller-side mapping key, mutable
+	FieldXKind       = "x-kind"      // free-form classification hint, mutable
 	FieldItems       = "items"       // recursive sub-shape for arrays
 	FieldProperties  = "properties"  // recursive sub-shape for objects
 	FieldRequired    = "required"    // []string, mutable per docs/06
 	FieldMeta        = "meta"        // opaque consumer flag map (string→string), mutable
+	FieldFormat      = "format"      // value-format object — see the FormatKey* sub-keys
 )
+
+// Sub-keys of the `format` object. `format.type` is pinned like `kind`
+// (it constrains the kind); `format.ui` and `format.filter` are mutable
+// string leaves. The filter is a mongo-style condition stored as its
+// JSON text — a string leaf so concurrent edits replace each other as a
+// unit instead of field-merging two conditions into garbage.
+const (
+	FormatKeyType   = "type"   // "links"/"date"/"datetime"/"tags" — pinned
+	FormatKeyUi     = "ui"     // presentation hint, opaque string, mutable
+	FormatKeyFilter = "filter" // condition JSON text, opaque string, mutable
+)
+
+// formatTypeKindLabel maps each known format-type label to the `kind`
+// label it requires. The SDK checks only this structural coupling —
+// format semantics (ui vocabulary, filter syntax, value shapes) are a
+// consumer concern.
+var formatTypeKindLabel = map[string]string{
+	"links":    "array",
+	"date":     "string",
+	"datetime": "string",
+	"tags":     "array",
+}
 
 // schemaBearingFields are pinned for the life of the property record.
 // Edits to any of these on an existing record drop the offending op.
@@ -84,6 +108,29 @@ var schemaBearingFields = map[string]struct{}{
 	FieldProperties: {},
 }
 
+// isPinnedPath reports whether a write targeting `path` touches pinned
+// state. Two cases:
+//
+//   - The head segment is a schema-bearing field — the whole subtree is
+//     pinned (the historical top-level rule).
+//   - The path is `format` or descends into `format.type`. A broad
+//     write to `format` itself is pinned because replacing the object
+//     replaces `type`, and BeforeModify has no prior state to prove it
+//     didn't change; mutations must target the `format.ui` /
+//     `format.filter` leaves.
+func isPinnedPath(path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	if _, locked := schemaBearingFields[path[0]]; locked {
+		return true
+	}
+	if path[0] == FieldFormat {
+		return len(path) == 1 || path[1] == FormatKeyType
+	}
+	return false
+}
+
 // ErrMissingKind indicates a property record was created without a
 // `kind` field. Wraps crdt.ErrValidation so callers can match either.
 var ErrMissingKind = errors.New("typetype: property record requires `kind`")
@@ -92,6 +139,21 @@ var ErrMissingKind = errors.New("typetype: property record requires `kind`")
 // label, or the reserved "derived" scope (SDK built-ins only). Wraps
 // crdt.ErrValidation so callers can match either.
 var ErrBadScope = errors.New("typetype: property `scope` must be one of synced/account/local")
+
+// ErrBadFormatType indicates a property record declared an unknown
+// `format.type` label. Wraps crdt.ErrValidation.
+var ErrBadFormatType = errors.New("typetype: property `format.type` must be one of links/date/datetime/tags")
+
+// ErrBadFormatShape indicates a structurally malformed `format`: not an
+// object at create, a missing/non-string `type`, a non-string `ui` /
+// `filter`, dotted `format.*` keys in a creation change, or a non-$set/
+// $unset op on a format leaf. Wraps crdt.ErrValidation.
+var ErrBadFormatShape = errors.New("typetype: property `format` must be an object with string `type`/`ui`/`filter`")
+
+// ErrFormatKindMismatch indicates the declared `format.type` requires a
+// different `kind` (links/tags ⇒ array; date/datetime ⇒ string). Wraps
+// crdt.ErrValidation.
+var ErrFormatKindMismatch = errors.New("typetype: property `format.type` is incompatible with `kind`")
 
 // PropertyHandler validates ops on a type object's `properties`
 // dataset and projects shortId rows into the sibling shortIds dataset
@@ -123,23 +185,139 @@ func (PropertyHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange,
 			return fmt.Errorf("%w: %w (got %q)", crdt.ErrValidation, ErrBadScope, scopeLabel)
 		}
 	}
+	if err := validateFormatCreate(rec.Ops, kindLabel); err != nil {
+		return err
+	}
 	sink.Project(ShortIdsDataset, shortIdRow(ctx.Change.ChangeId, rec.Id, kindLabel))
 	return nil
 }
 
-// BeforeModify rejects edits to schema-bearing fields on an existing
-// record (`key`, `kind`, `items`, `properties`). Display-only edits
-// (`name`, `description`, `x-key`, `required`) pass through.
-// Not an "important" change — no shortId minting.
-func (PropertyHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
-	if len(op.Path) == 0 {
-		// Multi-field $set/$unset — guard each top-level key.
-		return rejectIfMultiFieldTouchesSchema(op.Payload)
+// validateFormatCreate checks the structure of a `format` declaration in
+// a creation change. Format must arrive as a whole object under the
+// `format` key (the canonical shape AddProperty emits) — dotted
+// `format.*` keys and deep-path ops are rejected so there is exactly one
+// creation shape to validate. Inside the object: `type` must be a known
+// label whose required kind matches the record's `kind`; `ui` and
+// `filter` must be strings when present. Note `tags` passes here — an
+// inbound definition from a newer SDK stays valid — while the local
+// AddProperty pre-flight still rejects it until the tag table lands.
+//
+// Semantics (ui vocabulary, filter syntax) are deliberately NOT checked
+// — see the package doc on the structure/semantics split.
+func validateFormatCreate(ops []crdt.Op, kindLabel string) error {
+	format, err := extractFormatObject(ops)
+	if err != nil {
+		return err
 	}
-	if _, locked := schemaBearingFields[op.Path[0]]; locked {
-		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, op.Path[0])
+	if format == nil {
+		return nil
+	}
+	typeVal := format.Get(FormatKeyType)
+	if typeVal == nil || typeVal.Type() != anyenc.TypeString {
+		return fmt.Errorf("%w: %w: missing or non-string `format.type`", crdt.ErrValidation, ErrBadFormatShape)
+	}
+	typeLabel := string(typeVal.GetStringBytes())
+	requiredKind, known := formatTypeKindLabel[typeLabel]
+	if !known {
+		return fmt.Errorf("%w: %w (got %q)", crdt.ErrValidation, ErrBadFormatType, typeLabel)
+	}
+	if kindLabel != requiredKind {
+		return fmt.Errorf("%w: %w: format %q requires kind %q, got %q",
+			crdt.ErrValidation, ErrFormatKindMismatch, typeLabel, requiredKind, kindLabel)
+	}
+	for _, key := range []string{FormatKeyUi, FormatKeyFilter} {
+		if v := format.Get(key); v != nil && v.Type() != anyenc.TypeString {
+			return fmt.Errorf("%w: %w: `format.%s` must be a string", crdt.ErrValidation, ErrBadFormatShape, key)
+		}
 	}
 	return nil
+}
+
+// extractFormatObject walks creation ops looking for the `format`
+// object, mirroring extractField's two accepted shapes (multi-field
+// $set payload key, or single-field $set with Path = ["format"]). Any
+// other op shape touching format — dotted `format.*` payload keys, a
+// deeper path, a non-object value — is an error rather than a silent
+// skip, so a creation can't smuggle format state past validation.
+func extractFormatObject(ops []crdt.Op) (*anyenc.Value, error) {
+	var format *anyenc.Value
+	for i := range ops {
+		op := &ops[i]
+		if len(op.Path) > 0 {
+			if op.Path[0] != FieldFormat {
+				continue
+			}
+			if op.Type != crdt.OpSet || len(op.Path) != 1 || op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+				return nil, fmt.Errorf("%w: %w: format must be created as a whole object", crdt.ErrValidation, ErrBadFormatShape)
+			}
+			format = op.Payload
+			continue
+		}
+		if op.Type != crdt.OpSet || op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+			continue
+		}
+		obj, _ := op.Payload.Object()
+		var shapeErr error
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			if shapeErr != nil {
+				return
+			}
+			key := string(k)
+			if key == FieldFormat {
+				if v.Type() != anyenc.TypeObject {
+					shapeErr = fmt.Errorf("%w: %w: `format` must be an object", crdt.ErrValidation, ErrBadFormatShape)
+					return
+				}
+				format = v
+				return
+			}
+			if strings.HasPrefix(key, FieldFormat+".") {
+				shapeErr = fmt.Errorf("%w: %w: dotted key %q not allowed at create", crdt.ErrValidation, ErrBadFormatShape, key)
+			}
+		})
+		if shapeErr != nil {
+			return nil, shapeErr
+		}
+	}
+	return format, nil
+}
+
+// BeforeModify rejects edits to pinned state on an existing record:
+// the schema-bearing fields (`key`, `kind`, `scope`, `items`,
+// `properties`), broad `format` replaces, and `format.type`. Display
+// edits (`name`, `description`, `x-key`, `required`) and the mutable
+// format leaves (`format.ui`, `format.filter` — string $set / $unset
+// only) pass through. Not an "important" change — no shortId minting.
+func (PropertyHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
+	if len(op.Path) == 0 {
+		// Multi-field $set/$unset — guard each key.
+		return rejectIfMultiFieldTouchesPinned(op)
+	}
+	if isPinnedPath(op.Path) {
+		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, strings.Join(op.Path, "."))
+	}
+	if op.Path[0] == FieldFormat {
+		return checkFormatLeafOp(op.Type, op.Path, op.Payload)
+	}
+	return nil
+}
+
+// checkFormatLeafOp validates a mutation of a non-pinned format leaf
+// (`format.ui` / `format.filter`): only string $set and $unset are
+// admitted, keeping the leaves scalar strings for all writers. The
+// string contents stay opaque — semantics are a consumer concern.
+func checkFormatLeafOp(opType crdt.OpType, path []string, payload *anyenc.Value) error {
+	switch opType {
+	case crdt.OpUnset:
+		return nil
+	case crdt.OpSet:
+		if payload == nil || payload.Type() != anyenc.TypeString {
+			return fmt.Errorf("%w: %w: %q must be a string", crdt.ErrValidation, ErrBadFormatShape, strings.Join(path, "."))
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %w: op %s not allowed on %q", crdt.ErrValidation, ErrBadFormatShape, opType, strings.Join(path, "."))
+	}
 }
 
 // BeforeDelete classifies the removal as an "important" change and
@@ -190,34 +368,31 @@ func extractField(ops []crdt.Op, field string) (string, bool) {
 	return "", false
 }
 
-// rejectIfMultiFieldTouchesSchema scans a multi-field $set/$unset
-// payload for keys in schemaBearingFields. Returns an error wrapping
-// crdt.ErrValidation on the first hit; nil otherwise.
+// rejectIfMultiFieldTouchesPinned scans a multi-field $set/$unset
+// payload for keys whose dotted path is pinned (isPinnedPath), and —
+// for $set — enforces the string shape on format leaves. Returns an
+// error wrapping crdt.ErrValidation on the first hit; nil otherwise.
 //
-// Dotted-path keys (e.g. "items.kind") count as touching the
-// top-level field that owns the schema-bearing prefix.
-func rejectIfMultiFieldTouchesSchema(payload *anyenc.Value) error {
-	if payload == nil || payload.Type() != anyenc.TypeObject {
+// Dotted-path keys (e.g. "items.kind", "format.type") count as
+// touching the pinned path that owns them.
+func rejectIfMultiFieldTouchesPinned(op *crdt.Op) error {
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return nil
 	}
-	obj, _ := payload.Object()
-	var hit string
-	obj.Visit(func(k []byte, _ *anyenc.Value) {
-		if hit != "" {
+	obj, _ := op.Payload.Object()
+	var hit error
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if hit != nil {
 			return
 		}
-		key := string(k)
-		// Top-level field is everything before the first '.'.
-		head := key
-		if i := strings.IndexByte(head, '.'); i >= 0 {
-			head = head[:i]
+		path := strings.Split(string(k), ".")
+		if isPinnedPath(path) {
+			hit = fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, string(k))
+			return
 		}
-		if _, locked := schemaBearingFields[head]; locked {
-			hit = head
+		if path[0] == FieldFormat {
+			hit = checkFormatLeafOp(op.Type, path, v)
 		}
 	})
-	if hit != "" {
-		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, hit)
-	}
-	return nil
+	return hit
 }

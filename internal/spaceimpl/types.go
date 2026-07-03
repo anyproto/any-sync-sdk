@@ -2,6 +2,7 @@ package spaceimpl
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -108,6 +109,10 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	if _, ok := t.findRegisteredType(typeId); ok {
 		return "", fmt.Errorf("typesAPI: %q is a registered type — properties are statically declared", typeId)
 	}
+	filterJSON, err := validateFormatDraft(&draft)
+	if err != nil {
+		return "", err
+	}
 	if draft.Kind == 0 {
 		return "", errors.New("typesAPI: PropertyDraft.Kind required")
 	}
@@ -119,6 +124,17 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
 	payload.Set(typetype.FieldKind, arena.NewString(propertyKindLabel(draft.Kind)))
+	if draft.Format != nil {
+		formatObj := arena.NewObject()
+		formatObj.Set(typetype.FormatKeyType, arena.NewString(draft.Format.Type.String()))
+		if draft.Format.UI != "" {
+			formatObj.Set(typetype.FormatKeyUi, arena.NewString(draft.Format.UI))
+		}
+		if filterJSON != "" {
+			formatObj.Set(typetype.FormatKeyFilter, arena.NewString(filterJSON))
+		}
+		payload.Set(typetype.FieldFormat, formatObj)
+	}
 	if draft.Scope != 0 && draft.Scope != space.ScopeSynced {
 		// Synced is the implicit default — only non-default scopes are
 		// written, so pre-scope and default definitions stay byte-
@@ -133,6 +149,9 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	}
 	if draft.XKey != "" {
 		payload.Set(typetype.FieldXKey, arena.NewString(draft.XKey))
+	}
+	if draft.XKind != "" {
+		payload.Set(typetype.FieldXKind, arena.NewString(draft.XKind))
 	}
 	if len(draft.Meta) > 0 {
 		metaObj := arena.NewObject()
@@ -435,6 +454,14 @@ func registeredTypeProperties(t handler.Type) []space.PropertyDef {
 		if def.Scope == 0 {
 			def.Scope = space.ScopeSynced
 		}
+		if p.Format != nil {
+			def.Format = &space.PropertyFormat{
+				// handler.FormatType tracks space.FormatType 1:1.
+				Type:   space.FormatType(p.Format.Type),
+				UI:     p.Format.UI,
+				Filter: p.Format.Filter,
+			}
+		}
 		out = append(out, def)
 	}
 	return out
@@ -473,6 +500,7 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 		Name:        v.GetString(typetype.FieldName),
 		Description: v.GetString(typetype.FieldDescription),
 		XKey:        v.GetString(typetype.FieldXKey),
+		XKind:       v.GetString(typetype.FieldXKind),
 		// Absent scope (pre-scope and default-synced definitions) reads
 		// as synced — the historical behavior.
 		Scope: space.ScopeSynced,
@@ -482,6 +510,15 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 	}
 	if sc, ok := schema.ParseScope(v.GetString(typetype.FieldScope)); ok {
 		def.Scope = sc
+	}
+	// A format whose type label this SDK doesn't know (written by a
+	// newer SDK) reads back as nil Format — read tolerance.
+	if ft, ok := space.ParseFormatType(v.GetString(typetype.FieldFormat, typetype.FormatKeyType)); ok {
+		def.Format = &space.PropertyFormat{
+			Type:   ft,
+			UI:     v.GetString(typetype.FieldFormat, typetype.FormatKeyUi),
+			Filter: v.GetString(typetype.FieldFormat, typetype.FormatKeyFilter),
+		}
 	}
 	if metaObj := v.GetObject(typetype.FieldMeta); metaObj != nil {
 		meta := map[string]string{}
@@ -521,8 +558,160 @@ func (t *typesAPI) RemoveProperty(_ context.Context, _, _ string) error {
 	return errors.New("typesAPI: RemoveProperty not implemented")
 }
 
-func (t *typesAPI) UpdatePropertyMeta(_ context.Context, _, _ string, _ space.PropertyMetaUpdate) error {
-	return errors.New("typesAPI: UpdatePropertyMeta not implemented")
+// UpdatePropertyMeta mutates the CRDT-mutable definition fields via a
+// single multi-field $set/$unset change on the type object's defs
+// dataset. A nil pointer leaves the field unchanged; a pointer to ""
+// unsets it. Format leaves are written as `format.ui` / `format.filter`
+// dotted paths — never a broad `format` replace, which the handler pins
+// (it could smuggle a `format.type` change). Setting a format leaf on a
+// property that never declared a format is rejected: `format.type` is
+// pinned-absent, and a leaf write would materialize a type-less format
+// object.
+//
+// Like all mutable definition metadata the strings are stored opaquely
+// — no ui-vocabulary or filter-syntax validation (a consumer concern).
+func (t *typesAPI) UpdatePropertyMeta(ctx context.Context, typeId, propId string, update space.PropertyMetaUpdate) error {
+	if _, ok := t.findRegisteredType(typeId); ok {
+		return fmt.Errorf("typesAPI: %q is a registered type — properties are statically declared", typeId)
+	}
+	arena := &anyenc.Arena{}
+	setObj := arena.NewObject()
+	unsetObj := arena.NewObject()
+	var sets, unsets int
+	stage := func(field string, v *string) {
+		if v == nil {
+			return
+		}
+		if *v == "" {
+			unsetObj.Set(field, arena.NewNull())
+			unsets++
+			return
+		}
+		setObj.Set(field, arena.NewString(*v))
+		sets++
+	}
+	stage(typetype.FieldName, update.Name)
+	stage(typetype.FieldDescription, update.Description)
+	stage(typetype.FieldXKey, update.XKey)
+	stage(typetype.FieldXKind, update.XKind)
+	stage(typetype.FieldFormat+"."+typetype.FormatKeyUi, update.FormatUI)
+	stage(typetype.FieldFormat+"."+typetype.FormatKeyFilter, update.FormatFilter)
+	if sets+unsets == 0 {
+		return nil
+	}
+
+	// Existence pre-flight: with Upsert=false a modify against an
+	// unknown propId would silently no-op; and format-leaf writes are
+	// only legal on records that pinned a format.type at creation.
+	def, err := t.findPropertyDef(ctx, typeId, propId)
+	if err != nil {
+		return err
+	}
+	if (update.FormatUI != nil || update.FormatFilter != nil) && def.Format == nil {
+		return fmt.Errorf("typesAPI: property %s has no format — format.ui/format.filter require one declared at AddProperty", propId)
+	}
+
+	var ops []crdt.Op
+	if sets > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: setObj})
+	}
+	if unsets > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Payload: unsetObj})
+	}
+	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
+	if err != nil {
+		return err
+	}
+	obj, err := t.parent.store.Get(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	if _, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     typetype.DatasetPropertyDefs,
+		DataVersion: dataVersion,
+		Records: []crdt.RecordChange{{
+			Id:  propId,
+			Ops: ops,
+		}},
+	}); err != nil {
+		return fmt.Errorf("typesAPI: update property meta: %w", err)
+	}
+	return nil
+}
+
+// findPropertyDef reads one property definition off the type's defs
+// dataset. Returns space.ErrNotFound for unknown ids or tombstones.
+func (t *typesAPI) findPropertyDef(ctx context.Context, typeId, propId string) (space.PropertyDef, error) {
+	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return space.PropertyDef{}, space.ErrNotFound
+		}
+		return space.PropertyDef{}, fmt.Errorf("typesAPI: open defs %s: %w", typeId, err)
+	}
+	doc, err := coll.FindId(ctx, propId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return space.PropertyDef{}, space.ErrNotFound
+		}
+		return space.PropertyDef{}, fmt.Errorf("typesAPI: find def %s: %w", propId, err)
+	}
+	v := doc.Value()
+	if v == nil || v.Get(crdt.DeletedAtField) != nil {
+		return space.PropertyDef{}, space.ErrNotFound
+	}
+	return decodePropertyDef(v), nil
+}
+
+// validateFormatDraft pre-flights draft.Format before the definition
+// write: the format type must be a known enum value (FormatTags is
+// rejected until the space-level tag table lands), the declared Kind —
+// defaulted from the format type when zero — must satisfy the
+// format→kind coupling (links ⇒ array of string; date/datetime ⇒
+// string), and Filter is serialized to its JSON text. Returns the
+// filter JSON to store ("" = none).
+//
+// Structure only: UI and the filter contents are stored opaquely — the
+// SDK does not validate ui vocabulary or filter syntax (a consumer
+// concern, e.g. the `any` server).
+func validateFormatDraft(draft *space.PropertyDraft) (filterJSON string, err error) {
+	f := draft.Format
+	if f == nil {
+		return "", nil
+	}
+	var requiredKind space.PropertyKind
+	switch f.Type {
+	case space.FormatLinks:
+		requiredKind = space.PropertyKindArray
+	case space.FormatDate, space.FormatDatetime:
+		requiredKind = space.PropertyKindString
+	case space.FormatTags:
+		return "", errors.New("typesAPI: format `tags` is not supported yet (space-level tag table pending)")
+	default:
+		return "", fmt.Errorf("typesAPI: unknown PropertyFormatDraft.Type %d", f.Type)
+	}
+	if draft.Kind == 0 {
+		draft.Kind = requiredKind
+	} else if draft.Kind != requiredKind {
+		return "", fmt.Errorf("typesAPI: format %q requires Kind %s; got %s",
+			f.Type, propertyKindLabel(requiredKind), propertyKindLabel(draft.Kind))
+	}
+	if requiredKind == space.PropertyKindArray && draft.Items != nil && draft.Items.Kind != space.PropertyKindString {
+		return "", fmt.Errorf("typesAPI: format %q requires string array items; got %s",
+			f.Type, propertyKindLabel(draft.Items.Kind))
+	}
+	switch filter := f.Filter.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return filter, nil
+	default:
+		raw, err := json.Marshal(filter)
+		if err != nil {
+			return "", fmt.Errorf("typesAPI: marshal PropertyFormatDraft.Filter: %w", err)
+		}
+		return string(raw), nil
+	}
 }
 
 // propertyKindLabel maps the public PropertyKind enum to the on-wire

@@ -289,10 +289,36 @@ const (
 // value kind enforced on write; Name is an optional display label
 // surfaced through space.Types().Properties(). Scope is the property's
 // write/sync class — zero value means ScopeSynced; ScopeDerived is
-// reserved for SDK built-ins and rejected at registration.
+// reserved for SDK built-ins and rejected at registration. Format is
+// an optional value-format annotation surfaced through
+// space.Types().Properties(); the SDK stores it as declared and does
+// not validate values against it.
 type PropertyDecl struct {
-	Id    string
-	Name  string
-	Kind  PropertyKind
-	Scope Scope
+	Id     string
+	Name   string
+	Kind   PropertyKind
+	Scope  Scope
+	Format *PropertyFormat
+}
+
+// FormatType mirrors space.FormatType 1:1 (links / date / datetime /
+// tags) so callers declaring types via config.Config.Types don't need
+// to import the space package. The zero value means "no format".
+type FormatType uint8
+
+const (
+	FormatLinks FormatType = iota + 1
+	FormatDate
+	FormatDatetime
+	FormatTags
+)
+
+// PropertyFormat mirrors space.PropertyFormat: Type declares the value
+// convention, UI is an opaque presentation hint, Filter is the JSON
+// text of a mongo-style condition over candidate objects. All opaque
+// to the SDK beyond the Type→Kind coupling.
+type PropertyFormat struct {
+	Type   FormatType
+	UI     string
+	Filter string
 }

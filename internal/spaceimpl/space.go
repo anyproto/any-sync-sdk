@@ -153,6 +153,12 @@ func (s *spaceImpl) Changes() space.ChangeIndexAPI {
 	return newChangeIndexAPI(s)
 }
 
+// ReadState exposes the read/unread tracking surface —
+// space.ReadStateAPI.
+func (s *spaceImpl) ReadState() space.ReadStateAPI {
+	return newReadStateAPI(s)
+}
+
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {

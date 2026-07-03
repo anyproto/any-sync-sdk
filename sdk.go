@@ -121,6 +121,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		app.AccountKeys().PeerKey.GetPublic().PeerId(),
 	)
 	app.OnKeyValues(tsp.SpaceId(), readSync.OnKeyValues)
+	spaces.SetReadSync(readSync)
 
 	// Republish the locally-stored profile to identityRepo on every
 	// boot. Heart's ownProfileSubscription does the equivalent (reads

@@ -135,6 +135,13 @@ type Engine struct {
 	seq     SeqFunc
 	resolve Resolver
 
+	// subs are the best-effort state pings (objectId, stateSeq).
+	// Callers fire NotifyState AFTER their tx commits — never from
+	// inside one — so a subscriber's ChangedSince pull sees the data.
+	subMu   sync.Mutex
+	subs    map[int]func(objectId string, stateSeq uint64)
+	nextSub int
+
 	openOnce sync.Once
 	openErr  error
 	unread   anystore.Collection
@@ -871,6 +878,41 @@ func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) 
 		})
 	}
 	return out, nil
+}
+
+// SubscribeState registers a best-effort ping fired after a committed
+// read-state change (new unread, mark, merge). cb runs synchronously
+// on the notifying path — keep it small. Cancel is idempotent. A
+// dropped ping is recovered by pulling TransitionsSince from the
+// consumer's cursor.
+func (e *Engine) SubscribeState(cb func(objectId string, stateSeq uint64)) (cancel func()) {
+	e.subMu.Lock()
+	defer e.subMu.Unlock()
+	if e.subs == nil {
+		e.subs = map[int]func(string, uint64){}
+	}
+	id := e.nextSub
+	e.nextSub++
+	e.subs[id] = cb
+	return func() {
+		e.subMu.Lock()
+		defer e.subMu.Unlock()
+		delete(e.subs, id)
+	}
+}
+
+// NotifyState fires the subscribed pings. Call AFTER the tx that
+// produced stateSeq committed.
+func (e *Engine) NotifyState(objectId string, stateSeq uint64) {
+	e.subMu.Lock()
+	cbs := make([]func(string, uint64), 0, len(e.subs))
+	for _, cb := range e.subs {
+		cbs = append(cbs, cb)
+	}
+	e.subMu.Unlock()
+	for _, cb := range cbs {
+		cb(objectId, stateSeq)
+	}
 }
 
 // WriteTx runs fn inside a write transaction on the engine's DB —

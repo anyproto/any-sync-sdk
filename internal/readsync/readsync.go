@@ -152,6 +152,7 @@ func (s *Service) mark(ctx context.Context, spaceId, objectId string, op func(*r
 	}
 	if res.StateSeq != 0 {
 		s.publish(ctx, spaceId, objectId, res.Frontier)
+		eng.NotifyState(objectId, res.StateSeq)
 	}
 	return res, nil
 }
@@ -229,12 +230,18 @@ func (s *Service) merge(ctx context.Context, job mergeJob) {
 	}
 	unlock := s.lockObject(job.objectId)
 	defer unlock()
+	var res readstate.MarkResult
 	err := eng.WriteTx(ctx, func(txCtx context.Context) error {
-		_, mergeErr := eng.MergeHeads(txCtx, job.objectId, job.heads)
+		var mergeErr error
+		res, mergeErr = eng.MergeHeads(txCtx, job.objectId, job.heads)
 		return mergeErr
 	})
 	if err != nil {
 		log.Warn("merge frontier", zap.String("objectId", job.objectId), zap.Error(err))
+		return
+	}
+	if res.StateSeq != 0 {
+		eng.NotifyState(job.objectId, res.StateSeq)
 	}
 }
 

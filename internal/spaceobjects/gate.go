@@ -112,6 +112,15 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
 		}
 
+		// Read-state ping: the apply hook already recorded any unread
+		// entry inside the committed tx; this fires the best-effort
+		// subscriber notification. Over-notifies (an apply whose
+		// classification changed nothing still pings) — consumers pull
+		// TransitionsSince and see an empty diff.
+		if s.readState != nil && s.readTracking[ch.Dataset] != nil && !ch.Local && !ch.Injected {
+			s.readState.NotifyState(ch.ObjectId, applySeqOf(res))
+		}
+
 		// Row lifecycle events for the objects collection: creation is
 		// detected via the synthetic _ver.id derived op the apply path
 		// emits exactly once per record; deletion via a delete op in the

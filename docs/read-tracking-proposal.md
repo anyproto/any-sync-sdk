@@ -302,6 +302,28 @@ design. N = changes in the chat, C = number of chats.
 | startup reconcile | init per chat regardless of activity | gated on per-device KV stamps — untouched chats cost one stamp compare, no rows read |
 | memory per chat (open / closed) | O(N) / 0 (but reopening pays O(N) again) | 0 / 0 |
 
+### Measured (shipped engine)
+
+Scenario benchmarks against the real `internal/readstate` engine
+(linear chat-shaped DAGs, per-op transactions with real commits, Ryzen
+9950X; bench source is throwaway — rebuild from this table's shapes if
+needed):
+
+| scenario | cost |
+|---|---|
+| inbound tracked message, marginal cost inside the apply tx (batched) | 7.5 µs |
+| inbound tracked message when it pays its own commit (worst case) | 51 µs (fsync floor) |
+| self-authored message (frontier advance, no row) | 13 µs |
+| ReadAll, U = 10 / 100 / 1 000 / 10 000 unread | 121 µs / 764 µs / 8.6 ms / 93 ms |
+| partial mark: 500 of 1 000 unread by versionId cutoff | 4.3 ms |
+| boot reconcile per chat, nothing new (fast path, one state read) | 2.3 µs → 1 000 idle chats ≈ 2.4 ms |
+| per-tag counters read from the engine | 1.6 µs per chat (the chat list itself reads the materialized row properties — no engine call at all) |
+
+The two numbers that define UX: a 1 000-chat account boots its read
+state in ~2 ms, and the everyday "open chat, read all" on a hundred
+unread costs under a millisecond including the commit. The 10 k-unread
+ReadAll (93 ms, one tx) is the chunking case below.
+
 Two guards for pathological sizes: `ReadAll` over a huge unread set
 commits in chunks (forward-only marking makes any prefix of the
 closure a valid frontier advance, so a crash mid-way just resumes),

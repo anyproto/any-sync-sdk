@@ -18,8 +18,11 @@ type ReadClassification struct {
 
 // ReadClassifier classifies one record change for read tracking. It
 // runs on the apply path for every change on an opted-in dataset —
-// keep it pure and cheap (no I/O, no locks); it sees the same
-// ChangeCtx the Before* hooks do. Self-authored changes are born read
+// keep it pure and cheap (no I/O, no locks). It receives the change
+// envelope only: classification runs after the record loop, so
+// ChangeCtx.Before is ALWAYS nil here (unlike the Before* hooks) —
+// classify from the ops and the envelope (Upsert, Creator, paths),
+// never from prior record state. Self-authored changes are born read
 // regardless of the verdict; the classifier still runs for them so a
 // supersede Key can clear entries (own un-react clears the unread
 // reaction another device tracked).

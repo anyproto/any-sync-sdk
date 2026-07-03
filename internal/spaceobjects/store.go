@@ -166,6 +166,9 @@ type Store struct {
 	readState    *readstate.Engine
 	selfIdentity string
 	readMat      *readMaterializer
+	// readSeedPending marks objects mid-first-restore: the apply hook
+	// skips tracking for them (the seed covers everything present).
+	readSeedPending sync.Map
 
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
@@ -1047,10 +1050,12 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		return nil, err
 	}
 	payload := loadPayloadFromCtx(ctx)
-	hadReadState := true
-	if s.readState != nil {
-		if has, hsErr := s.readState.HasState(ctx, objectId); hsErr == nil {
-			hadReadState = has
+	seedPending := false
+	if s.readSeedable() {
+		if seeded, sErr := s.readState.Seeded(ctx, objectId); sErr == nil && !seeded {
+			seedPending = true
+			s.readSeedPending.Store(objectId, struct{}{})
+			defer s.readSeedPending.Delete(objectId)
 		}
 	}
 	var gate object.ApplyGate
@@ -1073,7 +1078,9 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err := obj.ColdRestore(ctx); err != nil {
 		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
 	}
-	s.seedReadState(ctx, objectId, hadReadState)
+	if seedPending {
+		s.seedReadState(ctx, obj, objectId)
+	}
 	return obj, nil
 }
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 )
 
@@ -72,6 +73,14 @@ func (s *Store) readApplyHook() crdt.ApplyHook {
 		if rt == nil || rt.Classify == nil || ch.Local || ch.Injected || ch.ChangeId == "" {
 			return nil
 		}
+		if _, restoring := s.readSeedPending.Load(ch.ObjectId); restoring {
+			// First restore of a first-sight object: everything present
+			// gets seeded read right after, so tracking each historical
+			// change (insert + transition, then delete + transition)
+			// would be pure write amplification. The seed's frontier
+			// covers this change instead.
+			return nil
+		}
 		var (
 			tags       []string
 			trackedIds []string
@@ -110,9 +119,9 @@ func (s *Store) readApplyHook() crdt.ApplyHook {
 				return err
 			}
 		}
-		if !tracked && key == "" {
-			return nil
-		}
+		// Untracked keyless changes still go through TrackChange: it
+		// no-ops cheaply, but must see the change to resolve a pending
+		// head another device marked before this change synced here.
 		return s.readState.TrackChange(txCtx, readstate.Track{
 			ObjectId:     ch.ObjectId,
 			Dataset:      ch.Dataset,
@@ -139,24 +148,39 @@ func containsString(ss []string, s string) bool {
 	return false
 }
 
-// seedReadState implements ReadSeedAtFirstSight: when an object loads
-// for the first time with no persisted read state (none written
-// locally, none merged from another device), everything present after
-// the initial restore is marked read — a fresh joiner starts clean.
-// hadState is captured BEFORE the restore ran, because restoring a
-// tracked object writes the state row itself. No-op when any tracked
-// dataset asked for ReadSeedAllUnread.
-func (s *Store) seedReadState(ctx context.Context, objectId string, hadState bool) {
-	if s.readState == nil || hadState {
-		return
+// readSeedable reports whether first-sight seeding applies in this
+// space (every tracked dataset opted for ReadSeedAtFirstSight).
+func (s *Store) readSeedable() bool {
+	if s.readState == nil || len(s.readTracking) == 0 {
+		return false
 	}
 	for _, rt := range s.readTracking {
 		if rt.Seed != crdt.ReadSeedAtFirstSight {
-			return
+			return false
 		}
 	}
+	return true
+}
+
+// seedReadState implements ReadSeedAtFirstSight: on an object's first
+// tracked load, everything present becomes read — the frontier is set
+// to the tree heads captured after the restore, and the seed is
+// recorded durably (engine seeded bit), so a crash on either side of
+// the restore re-seeds on the next load instead of skipping forever.
+// Idempotent via the seeded bit; pending remote heads survive.
+func (s *Store) seedReadState(ctx context.Context, obj *object.Object, objectId string) {
+	if !s.readSeedable() {
+		return
+	}
+	tree := obj.Tree()
+	if tree == nil {
+		return
+	}
+	tree.Lock()
+	heads := append([]string(nil), tree.Heads()...)
+	tree.Unlock()
 	err := s.readState.WriteTx(ctx, func(txCtx context.Context) error {
-		_, seedErr := s.readState.MarkReadUpTo(txCtx, objectId, "")
+		_, seedErr := s.readState.SeedFrontier(txCtx, objectId, heads)
 		return seedErr
 	})
 	if err != nil {

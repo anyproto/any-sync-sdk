@@ -176,3 +176,43 @@ func TestReconcile_ReplaysPublishedFrontiers(t *testing.T) {
 	// Second run is the idempotent fast path — still clean.
 	require.NoError(t, f.Reconcile(ctx, testSpace))
 }
+
+func TestReconcile_MergesOwnRowAfterRebuild(t *testing.T) {
+	f := newFixture(t)
+	// Fresh DB (rebuild): the unread entry exists, and the only KV row
+	// is OUR OWN previously-published frontier. It must count.
+	f.trackUnread(t, "c1", "v01", nil)
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+	}
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "own published frontier restores read state after a rebuild")
+}
+
+func TestReconcile_RepublishesDivergentFrontier(t *testing.T) {
+	f := newFixture(t)
+	// Local frontier advanced (a mark whose publish was lost): KV has
+	// a stale own row.
+	f.trackUnread(t, "c1", "v01", nil)
+	f.trackUnread(t, "c2", "v02", []string{"c1"})
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}), // stale
+	}
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	raw := f.kv.sets[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	require.NotNil(t, raw, "divergent frontier republished at reconcile")
+	var val frontierValue
+	require.NoError(t, json.Unmarshal(raw, &val))
+	assert.Equal(t, []string{"c2"}, val.Heads)
+}

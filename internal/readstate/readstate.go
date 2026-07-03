@@ -63,6 +63,7 @@ const (
 	fPending  = "ph"
 	fCounters = "cnt"
 	fDataset  = "ds"
+	fSeeded   = "sd"
 )
 
 // SeqFunc allocates the next per-space stateSeq. Wired to the space's
@@ -198,6 +199,10 @@ type objState struct {
 	pending  map[string]struct{}
 	counters map[string]int
 	stateSeq uint64
+	// seeded records that first-sight seeding ran for this object —
+	// durable, so a crash between restore and seed re-seeds on the
+	// next load instead of silently skipping.
+	seeded bool
 }
 
 func (e *Engine) loadState(ctx context.Context, objectId string) (*objState, error) {
@@ -227,6 +232,7 @@ func (e *Engine) loadState(ctx context.Context, objectId string) (*objState, err
 		})
 	}
 	st.stateSeq = uint64(v.GetInt(fStateSeq))
+	st.seeded = v.GetBool(fSeeded)
 	return st, nil
 }
 
@@ -243,6 +249,9 @@ func (e *Engine) persistState(ctx context.Context, objectId string, st *objState
 		}
 		v.Set(fCounters, cnt)
 		v.Set(fStateSeq, a.NewNumberInt(int(st.stateSeq)))
+		if st.seeded {
+			v.Set(fSeeded, a.NewTrue())
+		}
 		return v, true, nil
 	})
 	_, err := e.state.UpsertId(ctx, objectId, mod)
@@ -537,6 +546,13 @@ func (e *Engine) markLocked(ctx context.Context, objectId string, changeIds []st
 	if err != nil {
 		return MarkResult{}, err
 	}
+	if len(entries) == 0 {
+		// Nothing to cover — never walk (with no unread rows the
+		// versionId prune has no floor and a walk would chase prevIds
+		// to the root). Known ids join the frontier, unknown ids park
+		// as pending.
+		return e.markNoEntries(ctx, objectId, st, changeIds, stateSeq)
+	}
 	byId := make(map[string]*Entry, len(entries))
 	minUnreadV := ""
 	for i := range entries {
@@ -665,6 +681,48 @@ func (e *Engine) markLocked(ctx context.Context, objectId string, changeIds []st
 	}, nil
 }
 
+// markNoEntries is markLocked's fully-read fast path: no unread rows
+// exist, so marking only updates the frontier and pending sets.
+func (e *Engine) markNoEntries(ctx context.Context, objectId string, st *objState, changeIds []string, stateSeq uint64) (MarkResult, error) {
+	changed := false
+	var pending []string
+	for _, id := range changeIds {
+		_, _, ok, err := e.resolveGap(ctx, objectId, id)
+		if err != nil {
+			return MarkResult{}, err
+		}
+		if ok {
+			st.frontier[id] = struct{}{}
+			changed = true
+			continue
+		}
+		if _, dup := st.pending[id]; !dup {
+			st.pending[id] = struct{}{}
+			pending = append(pending, id)
+			changed = true
+		}
+	}
+	if !changed {
+		return MarkResult{Frontier: setToSlice(st.frontier)}, nil
+	}
+	if stateSeq == 0 {
+		if e.seq == nil {
+			return MarkResult{}, errors.New("readstate: no seq allocator")
+		}
+		var err error
+		if stateSeq, err = e.seq(ctx); err != nil {
+			return MarkResult{}, err
+		}
+	}
+	if stateSeq > st.stateSeq {
+		st.stateSeq = stateSeq
+	}
+	if err := e.persistState(ctx, objectId, st); err != nil {
+		return MarkResult{}, err
+	}
+	return MarkResult{Frontier: setToSlice(st.frontier), Pending: pending, StateSeq: st.stateSeq}, nil
+}
+
 func (e *Engine) resolveGap(ctx context.Context, objectId, changeId string) ([]string, string, bool, error) {
 	if e.resolve == nil {
 		return nil, "", false, nil
@@ -758,7 +816,6 @@ func (e *Engine) ClearRecords(ctx context.Context, objectId string, recordIds []
 	}
 	var trs []Transition
 	dirty := false
-	arena := &anyenc.Arena{}
 	for _, en := range entries {
 		var kept []string
 		for _, r := range en.RecordIds {
@@ -785,7 +842,6 @@ func (e *Engine) ClearRecords(ctx context.Context, objectId string, recordIds []
 			return err
 		}
 	}
-	arena.Reset()
 	if !dirty {
 		return nil
 	}
@@ -848,8 +904,12 @@ func (e *Engine) Frontier(ctx context.Context, objectId string) (heads, pending 
 	return setToSlice(st.frontier), setToSlice(st.pending), nil
 }
 
-// TransitionsSince returns transitions with stateSeq > since, ascending,
-// capped at limit (0 = no cap).
+// TransitionsSince returns transitions with stateSeq > since,
+// ascending. limit (0 = no cap) is a soft cap: every transition of one
+// mark/merge shares a stateSeq, and a batch is never split — the
+// result may exceed limit up to the batch boundary, so a consumer
+// persisting the last StateSeq as its cursor can never lose the tail
+// of a batch.
 func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) ([]Transition, error) {
 	if err := e.collections(ctx); err != nil {
 		return nil, err
@@ -858,11 +918,7 @@ func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) 
 		query.Key{Path: []string{fSpace}, Filter: query.NewComp(query.CompOpEq, e.spaceId)},
 		query.Key{Path: []string{fStateSeq}, Filter: query.NewComp(query.CompOpGt, int(since))},
 	}
-	q := e.log.Find(filter).Sort(fSpace, fStateSeq)
-	if limit > 0 {
-		q = q.Limit(uint(limit))
-	}
-	it, err := q.Iter(ctx)
+	it, err := e.log.Find(filter).Sort(fSpace, fStateSeq).Iter(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -874,7 +930,7 @@ func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) 
 			return nil, err
 		}
 		v := doc.Value()
-		out = append(out, Transition{
+		tr := Transition{
 			ObjectId:  string(v.GetStringBytes(fObject)),
 			Dataset:   string(v.GetStringBytes(fDataset)),
 			ChangeId:  string(v.GetStringBytes(fChange)),
@@ -883,7 +939,11 @@ func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) 
 			Tags:      valueStrings(v, fTags),
 			Unread:    v.GetBool(fUnread),
 			StateSeq:  uint64(v.GetInt(fStateSeq)),
-		})
+		}
+		if limit > 0 && len(out) >= limit && tr.StateSeq != out[len(out)-1].StateSeq {
+			break
+		}
+		out = append(out, tr)
 	}
 	return out, nil
 }
@@ -923,17 +983,67 @@ func (e *Engine) NotifyState(objectId string, stateSeq uint64) {
 	}
 }
 
-// HasState reports whether the object has a persisted read-state row
-// (frontier / counters / pending) — i.e. whether this account has any
-// recorded read state for it, locally or merged from another device.
-func (e *Engine) HasState(ctx context.Context, objectId string) (bool, error) {
+// Seeded reports whether first-sight seeding already ran for the
+// object. Durable: only SeedFrontier sets it, in the same tx as the
+// seed itself, so the answer survives crashes on either side.
+func (e *Engine) Seeded(ctx context.Context, objectId string) (bool, error) {
 	if err := e.collections(ctx); err != nil {
 		return false, err
 	}
-	if _, err := e.state.FindId(ctx, objectId); err != nil {
-		if errors.Is(err, anystore.ErrDocNotFound) {
-			return false, nil
+	st, err := e.loadState(ctx, objectId)
+	if err != nil {
+		return false, err
+	}
+	return st.seeded, nil
+}
+
+// SeedFrontier performs first-sight seeding: sets the frontier to the
+// given heads (everything at or behind them is read), drops any
+// unread entries that slipped in around the restore (their became-
+// read transitions surface on the feed), preserves pending remote
+// heads, and records the seed durably — all in the caller's tx.
+// Idempotent: a second call on a seeded object is a no-op. Returns
+// whether the seed ran.
+func (e *Engine) SeedFrontier(ctx context.Context, objectId string, heads []string) (bool, error) {
+	if err := e.collections(ctx); err != nil {
+		return false, err
+	}
+	st, err := e.loadState(ctx, objectId)
+	if err != nil {
+		return false, err
+	}
+	if st.seeded {
+		return false, nil
+	}
+	entries, err := e.loadEntries(ctx, objectId, "")
+	if err != nil {
+		return false, err
+	}
+	var trs []Transition
+	if err = e.removeEntries(ctx, st, entries, &trs); err != nil {
+		return false, err
+	}
+	st.frontier = map[string]struct{}{}
+	for _, h := range heads {
+		st.frontier[h] = struct{}{}
+	}
+	st.seeded = true
+	if len(trs) > 0 {
+		if e.seq == nil {
+			return false, errors.New("readstate: no seq allocator")
 		}
+		stateSeq, serr := e.seq(ctx)
+		if serr != nil {
+			return false, serr
+		}
+		if stateSeq > st.stateSeq {
+			st.stateSeq = stateSeq
+		}
+		if err = e.appendTransitions(ctx, st.stateSeq, trs); err != nil {
+			return false, err
+		}
+	}
+	if err = e.persistState(ctx, objectId, st); err != nil {
 		return false, err
 	}
 	return true, nil

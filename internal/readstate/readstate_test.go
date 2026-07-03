@@ -22,8 +22,9 @@ type fakeChange struct {
 
 type fixture struct {
 	*Engine
-	seq     uint64
-	changes map[string]fakeChange // resolver backing: "all changes on device"
+	seq      uint64
+	changes  map[string]fakeChange // resolver backing: "all changes on device"
+	resolves int
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -36,6 +37,7 @@ func newFixture(t *testing.T) *fixture {
 		f.seq++
 		return f.seq, nil
 	}, func(_ context.Context, _, changeId string) ([]string, string, bool, error) {
+		f.resolves++
 		ch, ok := f.changes[changeId]
 		if !ok {
 			return nil, "", false, nil
@@ -291,4 +293,114 @@ func entryIds(entries []Entry) []string {
 		out = append(out, en.ChangeId)
 	}
 	return out
+}
+
+func TestSeedFrontier_DurableAndIdempotent(t *testing.T) {
+	f := newFixture(t)
+	f.track(t, mkTrack("obj", "c1", "v01", nil, "message"))
+
+	// Simulate a pending remote head so we can assert it survives.
+	_, err := f.MarkRead(ctx, "obj", []string{"future"})
+	require.NoError(t, err)
+
+	seeded, err := f.Seeded(ctx, "obj")
+	require.NoError(t, err)
+	assert.False(t, seeded)
+
+	ran, err := f.SeedFrontier(ctx, "obj", []string{"c1"})
+	require.NoError(t, err)
+	assert.True(t, ran)
+
+	entries, _, err := f.UnreadEntries(ctx, "obj")
+	require.NoError(t, err)
+	assert.Empty(t, entries, "seed drops unread entries")
+	counts, err := f.Counts(ctx, "obj")
+	require.NoError(t, err)
+	assert.Empty(t, counts)
+	heads, pending, err := f.Frontier(ctx, "obj")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c1"}, heads)
+	assert.Equal(t, []string{"future"}, pending, "pending remote heads survive the seed")
+
+	seeded, err = f.Seeded(ctx, "obj")
+	require.NoError(t, err)
+	assert.True(t, seeded)
+
+	// Second seed is a no-op even with new heads.
+	ran, err = f.SeedFrontier(ctx, "obj", []string{"c9"})
+	require.NoError(t, err)
+	assert.False(t, ran)
+	heads, _, err = f.Frontier(ctx, "obj")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c1"}, heads)
+}
+
+func TestTransitionsSince_NeverSplitsSameSeqBatch(t *testing.T) {
+	f := newFixture(t)
+	for i := 1; i <= 5; i++ {
+		tr := mkTrack("obj", fmt.Sprintf("c%d", i), fmt.Sprintf("v%02d", i), nil, "message")
+		tr.ApplySeq = uint64(i)
+		f.track(t, tr)
+	}
+	// One ReadAll → 5 became-read transitions sharing one stateSeq.
+	_, err := f.MarkReadUpTo(ctx, "obj", "")
+	require.NoError(t, err)
+
+	trs, err := f.TransitionsSince(ctx, 5, 2)
+	require.NoError(t, err)
+	require.Len(t, trs, 5, "a same-stateSeq batch is returned whole even past the limit")
+	for _, tr := range trs {
+		assert.False(t, tr.Unread)
+		assert.Equal(t, trs[0].StateSeq, tr.StateSeq)
+	}
+	// Cursor discipline now works: nothing hides behind the batch.
+	trs, err = f.TransitionsSince(ctx, trs[0].StateSeq, 2)
+	require.NoError(t, err)
+	assert.Empty(t, trs)
+}
+
+func TestMarkRead_FullyReadObjectDoesNotWalk(t *testing.T) {
+	f := newFixture(t)
+	for i := 1; i <= 4; i++ {
+		prev := []string{fmt.Sprintf("c%d", i-1)}
+		if i == 1 {
+			prev = nil
+		}
+		f.track(t, mkTrack("obj", fmt.Sprintf("c%d", i), fmt.Sprintf("v%02d", i), prev, "message"))
+	}
+	_, err := f.MarkReadUpTo(ctx, "obj", "")
+	require.NoError(t, err)
+
+	// Another device's frontier names c3 (read here, not our frontier
+	// head). With zero unread rows the mark must not walk ancestry —
+	// at most one resolver lookup for the marked id itself.
+	f.resolves = 0
+	res, err := f.MarkRead(ctx, "obj", []string{"c3"})
+	require.NoError(t, err)
+	assert.Empty(t, res.Removed)
+	assert.LessOrEqual(t, f.resolves, 1, "no ancestor walk on a fully-read object")
+	heads, _, err := f.Frontier(ctx, "obj")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"c3", "c4"}, heads)
+}
+
+func TestTrack_UntrackedChangeResolvesPending(t *testing.T) {
+	f := newFixture(t)
+	f.track(t, mkTrack("obj", "c1", "v01", nil, "message"))
+	// Another device marked head c2 before it synced here.
+	_, err := f.MarkRead(ctx, "obj", []string{"c2"})
+	require.NoError(t, err)
+
+	// c2 arrives as an UNTRACKED change (e.g. an edit) — it must still
+	// resolve the pending head and cover c1.
+	edit := mkTrack("obj", "c2", "v02", []string{"c1"})
+	edit.Tracked = false
+	f.track(t, edit)
+
+	entries, _, err := f.UnreadEntries(ctx, "obj")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+	_, pending, err := f.Frontier(ctx, "obj")
+	require.NoError(t, err)
+	assert.Empty(t, pending)
 }

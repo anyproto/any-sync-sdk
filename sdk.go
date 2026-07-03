@@ -189,12 +189,6 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		// anything the forward catch-up or a lazy Get re-materialized.
 		if err := spacesync.ReconcileDeletions(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
 			_ = err
-			// Replay published read frontiers through the idempotent merge —
-			// covers marks made by other devices while this one was offline
-			// and live-hook drops. Cheap when nothing changed.
-			if err := readSync.Reconcile(ctx, rec.Id); err != nil {
-				_ = err
-			}
 		}
 		// Replay published read frontiers through the idempotent merge —
 		// covers marks made by other devices while this one was offline

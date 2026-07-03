@@ -249,6 +249,13 @@ func (s *Service) merge(ctx context.Context, job mergeJob) {
 // idempotent merge — the durable complement to the best-effort live
 // hook. Call on boot after the space's store is up. Already-merged
 // frontiers cost one state read each (engine fast path).
+//
+// Own-device rows are merged too: after a local DB rebuild our own
+// published frontier is the record of this device's reads. And when
+// the local frontier has advanced past our published row (a publish
+// that failed after its mark committed, or marks made before a
+// rebuild), Reconcile republishes — so boot is the healing pass for
+// both directions of divergence.
 func (s *Service) Reconcile(ctx context.Context, spaceId string) error {
 	eng := s.engineFor(spaceId)
 	if eng == nil {
@@ -259,7 +266,14 @@ func (s *Service) Reconcile(ctx context.Context, spaceId string) error {
 		return err
 	}
 	prefix := keyPrefix + spaceId + "/"
-	return store.Iterate(ctx, func(decryptor keyvaluestorage.Decryptor, key string, values []innerstorage.KeyValue) (bool, error) {
+	// Republishing writes to the same store Iterate is reading — do it
+	// after the iteration, never from inside the callback.
+	type repub struct {
+		objectId string
+		heads    []string
+	}
+	var repubs []repub
+	err = store.Iterate(ctx, func(decryptor keyvaluestorage.Decryptor, key string, values []innerstorage.KeyValue) (bool, error) {
 		if !strings.HasPrefix(key, prefix) {
 			return true, nil
 		}
@@ -267,10 +281,8 @@ func (s *Service) Reconcile(ctx context.Context, spaceId string) error {
 		if !ok {
 			return true, nil
 		}
+		var ownHeads []string
 		for _, kv := range values {
-			if kv.PeerId == s.selfPeerId {
-				continue
-			}
 			raw, decErr := decryptor(kv)
 			if decErr != nil {
 				log.Warn("reconcile: decrypt", zap.String("key", key), zap.Error(decErr))
@@ -281,13 +293,46 @@ func (s *Service) Reconcile(ctx context.Context, spaceId string) error {
 				log.Warn("reconcile: decode", zap.String("key", key), zap.Error(decErr))
 				continue
 			}
+			if kv.PeerId == s.selfPeerId {
+				ownHeads = val.Heads
+			}
 			if len(val.Heads) == 0 {
 				continue
 			}
 			s.merge(ctx, mergeJob{spaceId: spaceId, objectId: objectId, heads: val.Heads})
 		}
+		heads, _, ferr := eng.Frontier(ctx, objectId)
+		if ferr != nil {
+			return false, ferr
+		}
+		if len(heads) > 0 && !sameSet(heads, ownHeads) {
+			repubs = append(repubs, repub{objectId: objectId, heads: heads})
+		}
 		return true, nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, r := range repubs {
+		s.publish(ctx, spaceId, r.objectId, r.heads)
+	}
+	return nil
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	for _, s := range b {
+		if _, ok := set[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ErrUntracked is returned by marks on a space with no tracked datasets.

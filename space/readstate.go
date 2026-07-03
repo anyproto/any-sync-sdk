@@ -52,7 +52,10 @@ type ReadStateAPI interface {
 	Subscribe(cb func(objectId string, stateSeq uint64)) (cancel func())
 
 	// ChangedSince returns transitions with StateSeq > since,
-	// ascending, capped at limit (0 = no cap).
+	// ascending. limit (0 = no cap) is a soft cap: all transitions of
+	// one mark share a StateSeq and a batch is never split, so the
+	// result may exceed limit up to the batch boundary — persisting
+	// the last StateSeq as the cursor can never lose a batch tail.
 	ChangedSince(ctx context.Context, since uint64, limit int) ([]ReadTransition, error)
 
 	// UnreadSnapshot returns the object's full current unread set

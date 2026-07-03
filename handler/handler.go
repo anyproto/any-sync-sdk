@@ -212,6 +212,12 @@ const (
 	ScopeAccount = schema.ScopeAccount
 )
 
+// ParseScope parses a scope's wire label ("synced" / "derived" /
+// "local" / "account") — the inverse of Scope.String. Returns
+// (0, false) on an unknown label. Re-exported so HTTP layers share
+// the schema.Scope label vocabulary.
+func ParseScope(label string) (Scope, bool) { return schema.ParseScope(label) }
+
 // Leaf builds an unconstrained scalar value shape for a PropertyKind —
 // convenience for declaring simple Field shapes.
 func Leaf(k PropertyKind) *FieldShape { return schema.Leaf(schema.Kind(k)) }

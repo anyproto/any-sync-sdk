@@ -30,6 +30,11 @@ const (
 	ScopeLocal = handler.ScopeLocal
 )
 
+// ParseScope parses a scope's wire label ("synced" / "derived" /
+// "local" / "account") — the inverse of Scope.String. Returns
+// (0, false) on an unknown label.
+func ParseScope(label string) (Scope, bool) { return handler.ParseScope(label) }
+
 // TypesAPI manages type objects and property definitions inside a space.
 //
 // A type is an object with `type = type`. Each type defines properties

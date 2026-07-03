@@ -77,11 +77,11 @@ func TestTrack_InsertCountersTransitions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int{"message": 1, "mention": 1}, counts)
 
-	trs, err := f.TransitionsSince(ctx, 0, 0)
+	dirty, err := f.ChangedSince(ctx, 0, 0)
 	require.NoError(t, err)
-	require.Len(t, trs, 1)
-	assert.True(t, trs[0].Unread)
-	assert.Equal(t, uint64(7), trs[0].StateSeq)
+	require.Len(t, dirty, 1)
+	assert.Equal(t, "obj", dirty[0].ObjectId)
+	assert.Equal(t, uint64(7), dirty[0].StateSeq)
 }
 
 func TestTrack_SelfAuthoredAdvancesFrontier(t *testing.T) {
@@ -256,35 +256,38 @@ func TestClearRecords_DeleteDropsAndSheds(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int{"message": 1}, counts)
 
-	trs, err := f.TransitionsSince(ctx, 1000, 0)
+	// The clear advanced the object's dirty watermark past the inserts.
+	dirty, err := f.ChangedSince(ctx, 1, 0)
 	require.NoError(t, err)
-	// c1's became-read transition surfaced through the feed.
-	var readTrs []Transition
-	for _, tr := range trs {
-		if !tr.Unread {
-			readTrs = append(readTrs, tr)
-		}
-	}
-	require.Len(t, readTrs, 1)
-	assert.Equal(t, "c1", readTrs[0].ChangeId)
+	require.Len(t, dirty, 1)
+	assert.Equal(t, "obj", dirty[0].ObjectId)
 }
 
-func TestTransitionsSince_CursorPaging(t *testing.T) {
+func TestChangedSince_DirtyObjectsCursor(t *testing.T) {
 	f := newFixture(t)
 	for i := 1; i <= 3; i++ {
-		tr := mkTrack("obj", fmt.Sprintf("c%d", i), fmt.Sprintf("v%02d", i), nil, "message")
+		tr := mkTrack(fmt.Sprintf("obj%d", i), fmt.Sprintf("c%d", i), fmt.Sprintf("v%02d", i), nil, "message")
 		tr.ApplySeq = uint64(i * 10)
 		f.track(t, tr)
 	}
-	trs, err := f.TransitionsSince(ctx, 10, 0)
+	dirty, err := f.ChangedSince(ctx, 10, 0)
 	require.NoError(t, err)
-	require.Len(t, trs, 2)
-	assert.Equal(t, uint64(20), trs[0].StateSeq)
-	assert.Equal(t, uint64(30), trs[1].StateSeq)
+	require.Len(t, dirty, 2)
+	assert.Equal(t, uint64(20), dirty[0].StateSeq)
+	assert.Equal(t, uint64(30), dirty[1].StateSeq)
 
-	trs, err = f.TransitionsSince(ctx, 10, 1)
+	dirty, err = f.ChangedSince(ctx, 10, 1)
 	require.NoError(t, err)
-	require.Len(t, trs, 1)
+	require.Len(t, dirty, 1)
+
+	// An object marked later reappears past the consumer's cursor —
+	// one row per object, always at its latest watermark.
+	_, err = f.MarkReadUpTo(ctx, "obj1", "")
+	require.NoError(t, err)
+	dirty, err = f.ChangedSince(ctx, 30, 0)
+	require.NoError(t, err)
+	require.Len(t, dirty, 1)
+	assert.Equal(t, "obj1", dirty[0].ObjectId)
 }
 
 func entryIds(entries []Entry) []string {
@@ -335,28 +338,30 @@ func TestSeedFrontier_DurableAndIdempotent(t *testing.T) {
 	assert.Equal(t, []string{"c1"}, heads)
 }
 
-func TestTransitionsSince_NeverSplitsSameSeqBatch(t *testing.T) {
+func TestChangedSince_MarkAdvancesWatermarkOnce(t *testing.T) {
 	f := newFixture(t)
 	for i := 1; i <= 5; i++ {
 		tr := mkTrack("obj", fmt.Sprintf("c%d", i), fmt.Sprintf("v%02d", i), nil, "message")
 		tr.ApplySeq = uint64(i)
 		f.track(t, tr)
 	}
-	// One ReadAll → 5 became-read transitions sharing one stateSeq.
-	_, err := f.MarkReadUpTo(ctx, "obj", "")
+	res, err := f.MarkReadUpTo(ctx, "obj", "")
 	require.NoError(t, err)
 
-	trs, err := f.TransitionsSince(ctx, 5, 2)
+	// One dirty element regardless of how many entries the mark
+	// covered; the consumer re-pulls the (now empty) snapshot.
+	dirty, err := f.ChangedSince(ctx, 5, 0)
 	require.NoError(t, err)
-	require.Len(t, trs, 5, "a same-stateSeq batch is returned whole even past the limit")
-	for _, tr := range trs {
-		assert.False(t, tr.Unread)
-		assert.Equal(t, trs[0].StateSeq, tr.StateSeq)
-	}
-	// Cursor discipline now works: nothing hides behind the batch.
-	trs, err = f.TransitionsSince(ctx, trs[0].StateSeq, 2)
+	require.Len(t, dirty, 1)
+	assert.Equal(t, res.StateSeq, dirty[0].StateSeq)
+	entries, _, err := f.UnreadEntries(ctx, "obj")
 	require.NoError(t, err)
-	assert.Empty(t, trs)
+	assert.Empty(t, entries)
+
+	// Cursor past the mark: clean.
+	dirty, err = f.ChangedSince(ctx, res.StateSeq, 0)
+	require.NoError(t, err)
+	assert.Empty(t, dirty)
 }
 
 func TestMarkRead_FullyReadObjectDoesNotWalk(t *testing.T) {

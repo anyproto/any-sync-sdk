@@ -72,9 +72,9 @@ func newReadTrackedType() handler.Type {
 //  1. Owner's own messages are born read (no unread on owner).
 //  2. Member joins AFTER two messages exist → first-sight seed: both
 //     start read on the member.
-//  3. A new owner message goes unread on the member: transitions feed,
-//     UnreadSnapshot, per-record `unread` flag, and the materialized
-//     `unreadCount` row property all agree.
+//  3. A new owner message goes unread on the member: the dirty-object
+//     feed, UnreadSnapshot, per-record `unread` flag, and the
+//     materialized `unreadCount` row property all agree.
 //  4. The member's own reply stays read for the member but goes unread
 //     for the owner (identity-based, not device-based).
 //  5. A second member device converges to READ after device one calls
@@ -238,9 +238,9 @@ func TestE2E_ReadTracking(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, snap, 1)
 	require.Equal(t, []string{"m3"}, snap[0].RecordIds)
-	trs, err := mSp.ReadState().ChangedSince(ctx, 0, 0)
+	dirtyObjs, err := mSp.ReadState().ChangedSince(ctx, 0, 0)
 	require.NoError(t, err)
-	require.NotEmpty(t, trs, "member: transitions feed has entries")
+	require.NotEmpty(t, dirtyObjs, "member: dirty-object feed has entries")
 	// The materialized row property agrees.
 	if !waitFor(ctx, 60*time.Second, time.Second, func() bool {
 		row, rerr := mSp.Properties().Get(ctx, objId)

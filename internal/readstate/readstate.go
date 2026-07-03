@@ -8,8 +8,10 @@
 //
 //   - _read_unread — one row per unread change, deleted when read.
 //   - _read_state  — one row per tracked object: frontier heads,
-//     pending remote heads, per-tag counters, last stateSeq.
-//   - _read_log    — read/unread transitions, the ChangedSince feed.
+//     pending remote heads, per-tag counters, and the object's last
+//     stateSeq — the dirty-object feed (ChangedSince) reads THIS
+//     table; there is no transitions log. A consumer re-pulls the
+//     object's unread snapshot and diffs against what it holds.
 //
 // All mutating methods take the caller's tx context: the apply path
 // calls Track inside the same WriteTx as the record mutations, so an
@@ -32,7 +34,6 @@ package readstate
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -43,7 +44,6 @@ import (
 const (
 	UnreadCollectionName = "_read_unread"
 	StateCollectionName  = "_read_state"
-	LogCollectionName    = "_read_log"
 )
 
 const (
@@ -58,7 +58,6 @@ const (
 	fPrevIds  = "p"
 	fKey      = "k"
 	fStateSeq = "ss"
-	fUnread   = "un"
 	fFrontier = "h"
 	fPending  = "ph"
 	fCounters = "cnt"
@@ -112,16 +111,11 @@ type Entry struct {
 	StateSeq  uint64
 }
 
-// Transition is one feed element: a change that became unread or read.
-type Transition struct {
-	ObjectId  string
-	Dataset   string
-	ChangeId  string
-	VersionId string
-	RecordIds []string
-	Tags      []string
-	Unread    bool
-	StateSeq  uint64
+// ObjectState is one dirty-object feed element: an object whose read
+// state changed, at the stateSeq that change advanced it to.
+type ObjectState struct {
+	ObjectId string
+	StateSeq uint64
 }
 
 // MarkResult reports what a mark/merge covered.
@@ -151,7 +145,6 @@ type Engine struct {
 	openErr  error
 	unread   anystore.Collection
 	state    anystore.Collection
-	log      anystore.Collection
 }
 
 func New(db anystore.DB, spaceId string, seq SeqFunc, resolve Resolver) *Engine {
@@ -179,12 +172,8 @@ func (e *Engine) collections(ctx context.Context) error {
 		if e.openErr != nil {
 			return
 		}
-		e.state, e.openErr = open(StateCollectionName)
-		if e.openErr != nil {
-			return
-		}
-		e.log, e.openErr = open(LogCollectionName,
-			anystore.IndexInfo{Name: "idx__read_log_sp_ss", Fields: []string{fSpace, fStateSeq}},
+		e.state, e.openErr = open(StateCollectionName,
+			anystore.IndexInfo{Name: "idx__read_state_sp_ss", Fields: []string{fSpace, fStateSeq}},
 		)
 	})
 	return e.openErr
@@ -350,32 +339,6 @@ func (e *Engine) insertEntry(ctx context.Context, t Track) error {
 	return e.unread.UpsertOne(ctx, v)
 }
 
-func (e *Engine) appendTransitions(ctx context.Context, stateSeq uint64, trs []Transition) error {
-	arena := &anyenc.Arena{}
-	for _, tr := range trs {
-		v := arena.NewObject()
-		v.Set("id", arena.NewString(fmt.Sprintf("%s:%020d:%s", e.spaceId, stateSeq, tr.ChangeId)))
-		v.Set(fSpace, arena.NewString(e.spaceId))
-		v.Set(fStateSeq, arena.NewNumberInt(int(stateSeq)))
-		v.Set(fObject, arena.NewString(tr.ObjectId))
-		v.Set(fDataset, arena.NewString(tr.Dataset))
-		v.Set(fChange, arena.NewString(tr.ChangeId))
-		v.Set(fVersion, arena.NewString(tr.VersionId))
-		v.Set(fRecords, stringsValue(arena, tr.RecordIds))
-		v.Set(fTags, stringsValue(arena, tr.Tags))
-		if tr.Unread {
-			v.Set(fUnread, arena.NewTrue())
-		} else {
-			v.Set(fUnread, arena.NewFalse())
-		}
-		if err := e.log.UpsertOne(ctx, v); err != nil {
-			return err
-		}
-		arena.Reset()
-	}
-	return nil
-}
-
 // Track records one classified change from the apply path. Must run
 // inside the apply's WriteTx (pass tx.Context()).
 func (e *Engine) TrackChange(ctx context.Context, t Track) error {
@@ -387,7 +350,6 @@ func (e *Engine) TrackChange(ctx context.Context, t Track) error {
 		return err
 	}
 	dirty := false
-	var trs []Transition
 
 	// Supersede: a new entry (or an untracked change) with a key
 	// replaces/clears the previous same-key entry.
@@ -397,7 +359,7 @@ func (e *Engine) TrackChange(ctx context.Context, t Track) error {
 			return err
 		}
 		if old != nil {
-			if err = e.removeEntries(ctx, st, []Entry{*old}, &trs); err != nil {
+			if err = e.removeEntries(ctx, st, []Entry{*old}); err != nil {
 				return err
 			}
 			dirty = true
@@ -411,10 +373,6 @@ func (e *Engine) TrackChange(ctx context.Context, t Track) error {
 		if err = e.insertEntry(ctx, t); err != nil {
 			return err
 		}
-		trs = append(trs, Transition{
-			ObjectId: t.ObjectId, Dataset: t.Dataset, ChangeId: t.ChangeId,
-			VersionId: t.VersionId, RecordIds: t.RecordIds, Tags: t.Tags, Unread: true,
-		})
 		for _, tag := range t.Tags {
 			st.counters[tag]++
 		}
@@ -447,9 +405,6 @@ func (e *Engine) TrackChange(ctx context.Context, t Track) error {
 	if dirty {
 		if t.ApplySeq > st.stateSeq {
 			st.stateSeq = t.ApplySeq
-		}
-		if err = e.appendTransitions(ctx, st.stateSeq, trs); err != nil {
-			return err
 		}
 		if err = e.persistState(ctx, t.ObjectId, st); err != nil {
 			return err
@@ -491,9 +446,9 @@ func (e *Engine) findByKey(ctx context.Context, objectId, key string) (*Entry, e
 	return &entry, nil
 }
 
-// removeEntries deletes rows, adjusts counters, and queues became-read
-// transitions. It does not touch the frontier.
-func (e *Engine) removeEntries(ctx context.Context, st *objState, entries []Entry, trs *[]Transition) error {
+// removeEntries deletes rows and adjusts counters. It does not touch
+// the frontier.
+func (e *Engine) removeEntries(ctx context.Context, st *objState, entries []Entry) error {
 	for _, en := range entries {
 		if err := e.unread.DeleteId(ctx, unreadRowId(en.ObjectId, en.ChangeId)); err != nil {
 			if errors.Is(err, anystore.ErrDocNotFound) {
@@ -506,10 +461,6 @@ func (e *Engine) removeEntries(ctx context.Context, st *objState, entries []Entr
 				st.counters[tag]--
 			}
 		}
-		*trs = append(*trs, Transition{
-			ObjectId: en.ObjectId, Dataset: en.Dataset, ChangeId: en.ChangeId,
-			VersionId: en.VersionId, RecordIds: en.RecordIds, Tags: en.Tags, Unread: false,
-		})
 	}
 	return nil
 }
@@ -650,8 +601,7 @@ func (e *Engine) markLocked(ctx context.Context, objectId string, changeIds []st
 		st.pending[id] = struct{}{}
 	}
 
-	var trs []Transition
-	if err = e.removeEntries(ctx, st, covered, &trs); err != nil {
+	if err = e.removeEntries(ctx, st, covered); err != nil {
 		return MarkResult{}, err
 	}
 
@@ -666,9 +616,6 @@ func (e *Engine) markLocked(ctx context.Context, objectId string, changeIds []st
 	}
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
-	}
-	if err = e.appendTransitions(ctx, st.stateSeq, trs); err != nil {
-		return MarkResult{}, err
 	}
 	if err = e.persistState(ctx, objectId, st); err != nil {
 		return MarkResult{}, err
@@ -764,8 +711,7 @@ func (e *Engine) MarkReadUpTo(ctx context.Context, objectId, upTo string) (MarkR
 		}
 	}
 
-	var trs []Transition
-	if err = e.removeEntries(ctx, st, covered, &trs); err != nil {
+	if err = e.removeEntries(ctx, st, covered); err != nil {
 		return MarkResult{}, err
 	}
 	if e.seq == nil {
@@ -777,9 +723,6 @@ func (e *Engine) MarkReadUpTo(ctx context.Context, objectId, upTo string) (MarkR
 	}
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
-	}
-	if err = e.appendTransitions(ctx, st.stateSeq, trs); err != nil {
-		return MarkResult{}, err
 	}
 	if err = e.persistState(ctx, objectId, st); err != nil {
 		return MarkResult{}, err
@@ -814,7 +757,6 @@ func (e *Engine) ClearRecords(ctx context.Context, objectId string, recordIds []
 	if err != nil {
 		return err
 	}
-	var trs []Transition
 	dirty := false
 	for _, en := range entries {
 		var kept []string
@@ -828,7 +770,7 @@ func (e *Engine) ClearRecords(ctx context.Context, objectId string, recordIds []
 		}
 		dirty = true
 		if len(kept) == 0 {
-			if err = e.removeEntries(ctx, st, []Entry{en}, &trs); err != nil {
+			if err = e.removeEntries(ctx, st, []Entry{en}); err != nil {
 				return err
 			}
 			continue
@@ -855,9 +797,6 @@ func (e *Engine) ClearRecords(ctx context.Context, objectId string, recordIds []
 	}
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
-	}
-	if err = e.appendTransitions(ctx, st.stateSeq, trs); err != nil {
-		return err
 	}
 	return e.persistState(ctx, objectId, st)
 }
@@ -904,13 +843,12 @@ func (e *Engine) Frontier(ctx context.Context, objectId string) (heads, pending 
 	return setToSlice(st.frontier), setToSlice(st.pending), nil
 }
 
-// TransitionsSince returns transitions with stateSeq > since,
-// ascending. limit (0 = no cap) is a soft cap: every transition of one
-// mark/merge shares a stateSeq, and a batch is never split — the
-// result may exceed limit up to the batch boundary, so a consumer
-// persisting the last StateSeq as its cursor can never lose the tail
-// of a batch.
-func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) ([]Transition, error) {
+// ChangedSince returns objects whose read state advanced past since,
+// ascending by stateSeq, capped at limit (0 = no cap). One element per
+// object (this reads the per-object state rows, not a log): the
+// consumer re-pulls UnreadEntries for each dirty object and diffs
+// against what it holds. Page by passing the last StateSeq back.
+func (e *Engine) ChangedSince(ctx context.Context, since uint64, limit int) ([]ObjectState, error) {
 	if err := e.collections(ctx); err != nil {
 		return nil, err
 	}
@@ -918,32 +856,26 @@ func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) 
 		query.Key{Path: []string{fSpace}, Filter: query.NewComp(query.CompOpEq, e.spaceId)},
 		query.Key{Path: []string{fStateSeq}, Filter: query.NewComp(query.CompOpGt, int(since))},
 	}
-	it, err := e.log.Find(filter).Sort(fSpace, fStateSeq).Iter(ctx)
+	q := e.state.Find(filter).Sort(fSpace, fStateSeq)
+	if limit > 0 {
+		q = q.Limit(uint(limit))
+	}
+	it, err := q.Iter(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer it.Close()
-	var out []Transition
+	var out []ObjectState
 	for it.Next() {
 		doc, err := it.Doc()
 		if err != nil {
 			return nil, err
 		}
 		v := doc.Value()
-		tr := Transition{
-			ObjectId:  string(v.GetStringBytes(fObject)),
-			Dataset:   string(v.GetStringBytes(fDataset)),
-			ChangeId:  string(v.GetStringBytes(fChange)),
-			VersionId: string(v.GetStringBytes(fVersion)),
-			RecordIds: valueStrings(v, fRecords),
-			Tags:      valueStrings(v, fTags),
-			Unread:    v.GetBool(fUnread),
-			StateSeq:  uint64(v.GetInt(fStateSeq)),
-		}
-		if limit > 0 && len(out) >= limit && tr.StateSeq != out[len(out)-1].StateSeq {
-			break
-		}
-		out = append(out, tr)
+		out = append(out, ObjectState{
+			ObjectId: string(v.GetStringBytes("id")),
+			StateSeq: uint64(v.GetInt(fStateSeq)),
+		})
 	}
 	return out, nil
 }
@@ -1019,8 +951,7 @@ func (e *Engine) SeedFrontier(ctx context.Context, objectId string, heads []stri
 	if err != nil {
 		return false, err
 	}
-	var trs []Transition
-	if err = e.removeEntries(ctx, st, entries, &trs); err != nil {
+	if err = e.removeEntries(ctx, st, entries); err != nil {
 		return false, err
 	}
 	st.frontier = map[string]struct{}{}
@@ -1028,7 +959,9 @@ func (e *Engine) SeedFrontier(ctx context.Context, objectId string, heads []stri
 		st.frontier[h] = struct{}{}
 	}
 	st.seeded = true
-	if len(trs) > 0 {
+	// Bump the dirty-feed watermark only when the seed actually flipped
+	// entries — seeding an untouched object is not consumer-visible.
+	if len(entries) > 0 {
 		if e.seq == nil {
 			return false, errors.New("readstate: no seq allocator")
 		}
@@ -1038,9 +971,6 @@ func (e *Engine) SeedFrontier(ctx context.Context, objectId string, heads []stri
 		}
 		if stateSeq > st.stateSeq {
 			st.stateSeq = stateSeq
-		}
-		if err = e.appendTransitions(ctx, st.stateSeq, trs); err != nil {
-			return false, err
 		}
 	}
 	if err = e.persistState(ctx, objectId, st); err != nil {

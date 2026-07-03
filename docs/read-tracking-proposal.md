@@ -46,8 +46,10 @@ history — a carrier tree's DAG would grow forever.
 - counters per `(objectId, tag)` — maintained transactionally
   (increment on unread insert, decrement on closure removal), so
   counter reads are O(1) with no tree or row scan.
-- transitions log: `{objectId, changeId, unread bool, stateSeq}`,
-  pruned by age/size; backs the diff feed (below).
+- NO transitions log: the feed is dirty-OBJECT, read straight off the
+  per-object state rows (stateSeq watermark, `(sp, ss)`-indexed) — it
+  never grows and never needs pruning. Consumers re-pull the object's
+  unread snapshot and diff against what they hold.
 - pending remote heads: KV heads not yet present in the local tree
   (`notFound`), persisted so a crash between KV arrival and tree sync
   loses nothing; resolved when the change applies.
@@ -88,8 +90,8 @@ the frontier → read (no row); otherwise insert an unread row with the
 classifier's tags and bump counters. Untracked datasets pay nothing.
 
 **Record deletion** clears every unread row referencing the deleted
-recordIds in the same tx (counters and flags drop, consumers get
-`Unread:false` transitions) — the delete change itself is typically
+recordIds in the same tx (counters and flags drop, the object surfaces
+on the dirty feed) — the delete change itself is typically
 not tracked; a deleted unread message must simply stop counting.
 Whole-object deletion purges the object's readstate rows and its KV
 key alongside the SYN-20 purge.
@@ -118,7 +120,7 @@ costs 27 ms CPU + 58 MB *before* storage I/O and decryption, per
 object, and heart keeps that resident per open chat forever. Mark
 implementation: one indexed range scan of the object's unread rows →
 in-memory BFS over `prevIds` from the marked ids → delete covered
-rows, adjust counters, advance frontier, append transitions — one tx.
+rows, adjust counters, advance frontier and its watermark — one tx.
 The persist cost is fsync-bound (~1 ms floor), same budget as any
 apply.
 
@@ -132,23 +134,36 @@ Same contract as `space.ChangeIndexAPI`, which the `any` app already
 consumes in its indexer (Subscribe for liveness, `ChangedSince` from a
 persisted cursor for durability, `Generation` for epoch resets):
 
+The feed is dirty-OBJECT, not per-change: reads delete their state, so
+itemizing them would require an append-only log with retention policy
+and pruned-cursor edge cases. Since consumers hold their rendered set
+anyway (a UI its window, an indexer its flags), "this object changed,
+re-pull and diff" carries the same information with zero growth —
+exactly how the change-index feed already works. New-unread stays
+itemizable for free (live unread rows carry their stateSeq).
+
 ```go
-type ReadTransition struct {
+type ObjectReadState struct {
+    ObjectId string
+    StateSeq uint64 // cursor axis — persist the last seen value
+}
+
+type UnreadChange struct { // snapshot element
     ObjectId  string
+    Dataset   string
     ChangeId  string
     VersionId crdt.VersionId // consumer's local sort/join key (== _ver.id for created records)
     AddSeq    uint64
     ApplySeq  uint64
     RecordIds []string
     Tags      []string
-    Unread    bool   // true = became unread, false = became read
-    StateSeq  uint64 // cursor axis
+    StateSeq  uint64
 }
 
 type ReadStateAPI interface {
     Subscribe(cb func(objectId string, stateSeq uint64)) (cancel func())
-    ChangedSince(ctx context.Context, since uint64, limit int) ([]ReadTransition, error)
-    UnreadSnapshot(ctx context.Context, objectId string) ([]ReadTransition, uint64, error)
+    ChangedSince(ctx context.Context, since uint64, limit int) ([]ObjectReadState, error)
+    UnreadSnapshot(ctx context.Context, objectId string) ([]UnreadChange, uint64, error)
     UnreadCounts(ctx context.Context, objectId string) (map[string]int, error) // per tag
     MarkRead(ctx context.Context, objectId string, changeIds []string) error
     // MarkReadUpTo marks every unread change with versionId <= upTo
@@ -178,10 +193,10 @@ UnreadSnapshot.
 `StateSeq` comes off the per-space applySeq allocator: transitions
 caused by an apply reuse that apply's ApplySeq; transitions caused by
 a KV merge or local MarkRead allocate fresh from the same axis. One
-monotonic cursor, one Generation story. The transitions log is pruned;
-a consumer whose cursor fell off the retained window resyncs from
-`UnreadSnapshot` — the same recovery contract as subscription
-overflow.
+monotonic cursor, one Generation story. Nothing prunes and nothing can
+fall off: the feed reads per-object state rows, so a stale cursor just
+returns more dirty objects; only a Generation change forces the full
+`UnreadSnapshot` resync.
 
 A record-creating change's `versionId` equals the record's `_ver.id`,
 so chat joins transitions to messages (ordered by `_ver.id`) with no
@@ -350,7 +365,6 @@ change, not a post-hoc scan.
 
 ## Open questions
 
-- Transitions-log retention bounds (age vs count); pruning cadence.
 - Whether `subscribe.Event` should also carry the unread flag inline
   for live-query consumers, or the transition feed stays the only
   surface (start: feed-only).

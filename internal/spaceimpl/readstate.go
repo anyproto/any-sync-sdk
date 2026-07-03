@@ -30,32 +30,23 @@ func (r *readStateAPI) Subscribe(cb func(objectId string, stateSeq uint64)) (can
 	return eng.SubscribeState(cb)
 }
 
-func (r *readStateAPI) ChangedSince(ctx context.Context, since uint64, limit int) ([]space.ReadTransition, error) {
+func (r *readStateAPI) ChangedSince(ctx context.Context, since uint64, limit int) ([]space.ObjectReadState, error) {
 	eng := r.engine()
 	if eng == nil {
 		return nil, space.ErrReadTrackingDisabled
 	}
-	trs, err := eng.TransitionsSince(ctx, since, limit)
+	states, err := eng.ChangedSince(ctx, since, limit)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]space.ReadTransition, len(trs))
-	for i, tr := range trs {
-		out[i] = space.ReadTransition{
-			ObjectId:  tr.ObjectId,
-			Dataset:   tr.Dataset,
-			ChangeId:  tr.ChangeId,
-			VersionId: crdt.VersionId(tr.VersionId),
-			RecordIds: tr.RecordIds,
-			Tags:      tr.Tags,
-			Unread:    tr.Unread,
-			StateSeq:  tr.StateSeq,
-		}
+	out := make([]space.ObjectReadState, len(states))
+	for i, st := range states {
+		out[i] = space.ObjectReadState{ObjectId: st.ObjectId, StateSeq: st.StateSeq}
 	}
 	return out, nil
 }
 
-func (r *readStateAPI) UnreadSnapshot(ctx context.Context, objectId string) ([]space.ReadTransition, uint64, error) {
+func (r *readStateAPI) UnreadSnapshot(ctx context.Context, objectId string) ([]space.UnreadChange, uint64, error) {
 	eng := r.engine()
 	if eng == nil {
 		return nil, 0, space.ErrReadTrackingDisabled
@@ -64,9 +55,9 @@ func (r *readStateAPI) UnreadSnapshot(ctx context.Context, objectId string) ([]s
 	if err != nil {
 		return nil, 0, err
 	}
-	out := make([]space.ReadTransition, len(entries))
+	out := make([]space.UnreadChange, len(entries))
 	for i, en := range entries {
-		out[i] = space.ReadTransition{
+		out[i] = space.UnreadChange{
 			ObjectId:  en.ObjectId,
 			Dataset:   en.Dataset,
 			ChangeId:  en.ChangeId,
@@ -75,7 +66,6 @@ func (r *readStateAPI) UnreadSnapshot(ctx context.Context, objectId string) ([]s
 			ApplySeq:  en.ApplySeq,
 			RecordIds: en.RecordIds,
 			Tags:      en.Tags,
-			Unread:    true,
 			StateSeq:  en.StateSeq,
 		}
 	}

@@ -7,19 +7,28 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 )
 
-// ReadTransition is one element of the read-state feed: a change on a
-// tracked dataset that became unread (Unread=true) or read. The feed
-// is the durable diff a consumer replays from its cursor; a typical
-// messenger UI never touches it — per-record flags and counters ride
-// the normal query/subscribe flow instead.
-type ReadTransition struct {
+// ObjectReadState is one element of the read-state feed: an object
+// whose read state changed (new unread, a mark, a cross-device merge,
+// a delete clearing entries), at the StateSeq that change advanced it
+// to. The feed carries no per-change detail — the consumer re-pulls
+// UnreadSnapshot for the object and diffs against what it holds.
+type ObjectReadState struct {
+	ObjectId string
+	// StateSeq is the cursor axis — same per-space monotonic domain
+	// as ObjectChange.ApplySeq. Persist the last seen value and pass
+	// it back to ChangedSince.
+	StateSeq uint64
+}
+
+// UnreadChange is one currently-unread change in an object's snapshot.
+type UnreadChange struct {
 	ObjectId string
 	// Dataset the change applied to (a tracked dataset).
 	Dataset string
 	// ChangeId is the DAG change (cross-peer identity); VersionId is
 	// its peer-local order key — for a record-creating change it
-	// equals the record's `_ver.id`, so transitions join to records
-	// with no extra lookup.
+	// equals the record's `_ver.id`, so entries join to records with
+	// no extra lookup.
 	ChangeId  string
 	VersionId crdt.VersionId
 	AddSeq    uint64
@@ -28,10 +37,8 @@ type ReadTransition struct {
 	// classifier's labels ("message", "mention", ...).
 	RecordIds []string
 	Tags      []string
-	Unread    bool
-	// StateSeq is the cursor axis — same per-space monotonic domain
-	// as ObjectChange.ApplySeq. Persist the last seen value and pass
-	// it back to ChangedSince.
+	// StateSeq is the feed watermark at which this entry became
+	// unread.
 	StateSeq uint64
 }
 
@@ -43,25 +50,27 @@ type ReadTransition struct {
 //
 // Same consumption contract as ChangeIndexAPI: Subscribe is a
 // best-effort liveness ping; ChangedSince from a persisted cursor is
-// the durable catch-up; a cursor that fell off the pruned feed (or a
-// Generation change) means resync from UnreadSnapshot.
+// the durable catch-up returning dirty OBJECTS (state, not a log — it
+// never grows and never prunes); UnreadSnapshot is both the per-object
+// pull after a dirty mark and the full resync after a Generation
+// change.
 type ReadStateAPI interface {
 	// Subscribe fires after a committed read-state change for an
 	// object. cb runs synchronously on the notifying path — keep it
 	// small or hand off.
 	Subscribe(cb func(objectId string, stateSeq uint64)) (cancel func())
 
-	// ChangedSince returns transitions with StateSeq > since,
-	// ascending. limit (0 = no cap) is a soft cap: all transitions of
-	// one mark share a StateSeq and a batch is never split, so the
-	// result may exceed limit up to the batch boundary — persisting
-	// the last StateSeq as the cursor can never lose a batch tail.
-	ChangedSince(ctx context.Context, since uint64, limit int) ([]ReadTransition, error)
+	// ChangedSince returns objects whose read state advanced past
+	// since, ascending by StateSeq, capped at limit (0 = no cap) —
+	// one element per object. Re-pull UnreadSnapshot per dirty object
+	// and diff against your held set.
+	ChangedSince(ctx context.Context, since uint64, limit int) ([]ObjectReadState, error)
 
 	// UnreadSnapshot returns the object's full current unread set
-	// (ascending by VersionId) and the current stateSeq — the cold
+	// (ascending by VersionId) and the object's current stateSeq —
+	// the per-object pull after a ChangedSince hit, and the cold
 	// start / resync entry point.
-	UnreadSnapshot(ctx context.Context, objectId string) ([]ReadTransition, uint64, error)
+	UnreadSnapshot(ctx context.Context, objectId string) ([]UnreadChange, uint64, error)
 
 	// UnreadCounts returns the object's per-tag unread counters.
 	UnreadCounts(ctx context.Context, objectId string) (map[string]int, error)

@@ -1168,7 +1168,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d)})
+			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d), ReadTracking: d.ReadTracking})
 		}
 	}
 	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)

@@ -273,6 +273,15 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 // synced route, as does a strict-mode miss on an absent record
 // (ErrStrictSkipAbsent).
 func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
+	// The shared objects dataset is DynamicScopeByKey: the apply layer
+	// exempts its undeclared heads from the route check and relies on
+	// the WRITER to enforce per-property scope + kind — which for the
+	// local route is PropertiesAPI.Set (validateRoutedPatch). Letting a
+	// generic local batch through here would bypass that validation
+	// and write synced property paths into the local version domain.
+	if batch.Dataset == properties.Dataset {
+		return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: local-scope writes to the %s dataset go through Properties().Set (per-property scope enforcement)", properties.Dataset)
+	}
 	if len(batch.TraceIds) > 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: Modify: TraceIds ride the any-sync change and are not supported on the local scope")
 	}

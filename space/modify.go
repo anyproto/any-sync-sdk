@@ -31,7 +31,9 @@ type ModifyBatch struct {
 	// local fields annotate synced records, they don't create them
 	// (a strict-mode miss surfaces as an ErrStrictSkipAbsent
 	// rejection). TraceIds are rejected (they ride the any-sync
-	// change).
+	// change). The shared `objects` dataset is rejected too: its
+	// per-property scopes are enforced by the writer, so local
+	// property values go through PropertiesAPI.Set.
 	//
 	// ScopeAccount and ScopeDerived are rejected: derived is
 	// handler-only, and the account transport for dataset records is

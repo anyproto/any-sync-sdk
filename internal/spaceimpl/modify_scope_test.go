@@ -68,6 +68,17 @@ func TestModify_ScopeGuards(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Upsert")
 	})
+
+	t.Run("local: objects dataset rejected", func(t *testing.T) {
+		// The shared objects dataset is per-key scoped; its local
+		// writer is PropertiesAPI.Set, which validates per-property
+		// scope + kind. The generic route must not bypass that.
+		b := scopedBatch(space.ScopeLocal)
+		b.Dataset = "objects"
+		_, err := s.Modify(ctx, b)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "Properties().Set")
+	})
 }
 
 func TestModifyMany_ScopedBatchRejected(t *testing.T) {

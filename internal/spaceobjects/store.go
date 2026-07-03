@@ -165,6 +165,7 @@ type Store struct {
 	readTracking map[string]*crdt.ReadTracking
 	readState    *readstate.Engine
 	selfIdentity string
+	readMat      *readMaterializer
 
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
@@ -291,6 +292,9 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s.readTracking = buildReadTracking(s.extTypes, s.customHandlers)
 	if len(s.readTracking) > 0 {
 		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
+		if needsReadMaterializer(s.readTracking) {
+			s.readMat = newReadMaterializer(s)
+		}
 	}
 	s.cache = ocache.New(
 		s.loadObject,
@@ -430,6 +434,9 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
+	if s.readMat != nil {
+		s.readMat.close()
+	}
 	derr := s.drainer.Close()
 	if s.cache != nil {
 		_ = s.cache.Close()

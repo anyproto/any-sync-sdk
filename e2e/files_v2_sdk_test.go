@@ -33,7 +33,7 @@ import (
 //  4. attaching the same content to another object BINDs: same
 //     rootCid, donor's receipt reused, durable with no second upload.
 func TestE2E_FilesV2_SDKAttach(t *testing.T) {
-	netYaml, fileV2Peer, _ := loadLocalFilesV2Network(t)
+	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")
 	}
@@ -97,7 +97,7 @@ func TestE2E_FilesV2_SDKAttach(t *testing.T) {
 
 	rootBytes := mustCidBytes(t, info.RootCid)
 	var dlResp *fileprotov2.RequestDownloadResponse
-	require.NoError(t, doFileV2(ctx, sdk, fileV2Peer, func(cl fileprotov2.DRPCFileV2Client) error {
+	require.NoError(t, doFileV2(ctx, sdk, fileV2Peers, func(cl fileprotov2.DRPCFileV2Client) error {
 		var err error
 		dlResp, err = cl.RequestDownload(ctx, &fileprotov2.RequestDownloadRequest{
 			SpaceId: sp.Id(), RootCids: [][]byte{rootBytes},

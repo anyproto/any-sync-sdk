@@ -38,9 +38,14 @@ func encodeReceipt(r Receipt) []byte {
 }
 
 func TestVerifyReceipt(t *testing.T) {
-	priv, pub, err := crypto.GenerateRandomEd25519KeyPair()
+	// The fleet signing key is deliberately distinct from the signing
+	// node's peer key — the real deployment shape: one shared account
+	// (signing) key across the fleet, per-node transport peerIds.
+	fleetPriv, fleetPub, err := crypto.GenerateRandomEd25519KeyPair()
 	require.NoError(t, err)
-	signer := pub.PeerId()
+	nodePriv, nodePub, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	fileNetworkId := fleetPub.Network()
 	root := testRoot(t)
 
 	base := Receipt{
@@ -49,26 +54,48 @@ func TestVerifyReceipt(t *testing.T) {
 		RootCid:      root.Bytes(),
 		Size:         12345,
 		SignedAt:     1_750_000_000,
-		SignerPeerId: signer,
+		SignerPeerId: nodePub.PeerId(),
 	}
 	sign := func(r Receipt) *fileprotov2.NetworkSignReceipt {
 		payload := encodeReceipt(r)
-		sig, err := priv.Sign(payload)
+		sig, err := fleetPriv.Sign(payload)
 		require.NoError(t, err)
 		return &fileprotov2.NetworkSignReceipt{ReceiptPayload: payload, Signature: sig}
 	}
 	params := VerifyParams{
-		NetworkId:  "net1",
-		SpaceId:    "space1",
-		Root:       root,
-		ObjectSize: 12345,
-		FleetPeers: []string{"otherPeer", signer},
+		NetworkId:     "net1",
+		SpaceId:       "space1",
+		Root:          root,
+		ObjectSize:    12345,
+		FileNetworkId: fileNetworkId,
 	}
 
 	t.Run("valid", func(t *testing.T) {
 		got, err := VerifyReceipt(sign(base), params)
 		require.NoError(t, err)
-		require.Equal(t, NetworkSign(signer, sign(base).Signature), got)
+		require.Equal(t, NetworkSign(fileNetworkId, sign(base).Signature), got)
+	})
+
+	t.Run("signerPeerId is audit-only", func(t *testing.T) {
+		r := base
+		r.SignerPeerId = "12D3KooWreplacedNodeNotInAnyFleet"
+		_, err := VerifyReceipt(sign(r), params)
+		require.NoError(t, err)
+	})
+
+	t.Run("no fileNetworkId", func(t *testing.T) {
+		p := params
+		p.FileNetworkId = ""
+		_, err := VerifyReceipt(sign(base), p)
+		require.ErrorIs(t, err, ErrNoFileNetworkId)
+	})
+
+	t.Run("signed by peer key, not fleet key", func(t *testing.T) {
+		payload := encodeReceipt(base)
+		sig, err := nodePriv.Sign(payload)
+		require.NoError(t, err)
+		_, err = VerifyReceipt(&fileprotov2.NetworkSignReceipt{ReceiptPayload: payload, Signature: sig}, params)
+		require.ErrorContains(t, err, "signature invalid")
 	})
 
 	t.Run("tampered payload", func(t *testing.T) {
@@ -76,13 +103,6 @@ func TestVerifyReceipt(t *testing.T) {
 		rcpt.ReceiptPayload[len(rcpt.ReceiptPayload)-1] ^= 0xff
 		_, err := VerifyReceipt(rcpt, params)
 		require.Error(t, err)
-	})
-
-	t.Run("signer not in fleet", func(t *testing.T) {
-		p := params
-		p.FleetPeers = []string{"otherPeer"}
-		_, err := VerifyReceipt(sign(base), p)
-		require.ErrorContains(t, err, "not a fileV2 fleet peer")
 	})
 
 	t.Run("wrong network", func(t *testing.T) {
@@ -127,7 +147,7 @@ func TestVerifyReceipt(t *testing.T) {
 		payload := encodeReceipt(base)
 		payload = protowire.AppendTag(payload, 9, protowire.BytesType)
 		payload = protowire.AppendString(payload, "future extension")
-		sig, err := priv.Sign(payload)
+		sig, err := fleetPriv.Sign(payload)
 		require.NoError(t, err)
 		_, err = VerifyReceipt(&fileprotov2.NetworkSignReceipt{ReceiptPayload: payload, Signature: sig}, params)
 		require.NoError(t, err)

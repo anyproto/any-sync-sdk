@@ -23,7 +23,7 @@ import (
 // directly. Skips when the network advertises no public base (private
 // deployment) — the CDN-stand-in e2e covers that mode.
 func TestE2E_FilesV2_RealPublicRead(t *testing.T) {
-	netYaml, fileV2Peer, _ := loadLocalFilesV2Network(t)
+	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")
 	}
@@ -43,7 +43,7 @@ func TestE2E_FilesV2_RealPublicRead(t *testing.T) {
 	// Gate on the network actually advertising a public base.
 	var info *fileprotov2.InfoResponse
 	require.True(t, waitFor(ctx, 60*time.Second, time.Second, func() bool {
-		return doFileV2(ctx, sdkA, fileV2Peer, func(cl fileprotov2.DRPCFileV2Client) error {
+		return doFileV2(ctx, sdkA, fileV2Peers, func(cl fileprotov2.DRPCFileV2Client) error {
 			var err error
 			info, err = cl.Info(ctx, &fileprotov2.InfoRequest{})
 			return err

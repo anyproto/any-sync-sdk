@@ -22,7 +22,7 @@ import (
 // drives a persistent queue-executed background fetch to a complete
 // local copy on the second device.
 func TestE2E_FilesV2_StatusAndPin(t *testing.T) {
-	netYaml, fileV2Peer, _ := loadLocalFilesV2Network(t)
+	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")
 	}
@@ -74,7 +74,7 @@ func TestE2E_FilesV2_StatusAndPin(t *testing.T) {
 	assert.Equal(t, space.FileStats{Total: 2, Durable: 2}, statsA)
 
 	// --- Device B behind the CDN stand-in.
-	cdn := newBlobCDN(t, ctx, sdkA, fileV2Peer, spA.Id())
+	cdn := newBlobCDN(t, ctx, sdkA, fileV2Peers, spA.Id())
 	t.Cleanup(cdn.Close)
 	cfgB := config.Config{
 		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},

@@ -119,7 +119,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open files store: %w", err)
 	}
-	filesBroker := broker.New(app.Pool(), app.FileV2Peers, app.NetworkId())
+	filesBroker := broker.New(app.Pool(), app.FileV2Peers, app.NetworkId(), app.FileNetworkId)
 	baseURL := fetch.NewBaseURL(filesStore, app.NetworkId(), cfg.Files.PublicReadBaseUrl,
 		func(ctx context.Context) (string, error) {
 			info, err := filesBroker.Info(ctx)

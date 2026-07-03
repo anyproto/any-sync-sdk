@@ -37,7 +37,7 @@ import (
 // the same override a private deployment would use. B's SDK performs
 // plain ranged GETs only: zero broker round-trips on the read path.
 func TestE2E_FilesV2_SDKDownload(t *testing.T) {
-	netYaml, fileV2Peer, _ := loadLocalFilesV2Network(t)
+	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")
 	}
@@ -82,7 +82,7 @@ func TestE2E_FilesV2_SDKDownload(t *testing.T) {
 	_ = spA.SyncHeads(ctx)
 
 	// --- Synthetic CDN over the private object store.
-	cdn := newBlobCDN(t, ctx, sdkA, fileV2Peer, spA.Id())
+	cdn := newBlobCDN(t, ctx, sdkA, fileV2Peers, spA.Id())
 	t.Cleanup(cdn.Close)
 
 	// --- Device B: fresh storage, same account, CDN as public base.
@@ -171,7 +171,7 @@ type blobCDN struct {
 	requests int
 }
 
-func newBlobCDN(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK, fileV2Peer, spaceId string) *blobCDN {
+func newBlobCDN(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK, fileV2Peers []string, spaceId string) *blobCDN {
 	c := &blobCDN{cache: map[string][]byte{}}
 	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
@@ -189,7 +189,7 @@ func newBlobCDN(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK, fileV2Pe
 				http.NotFound(w, r)
 				return
 			}
-			data, err = c.resolve(ctx, sdk, fileV2Peer, spaceId, root)
+			data, err = c.resolve(ctx, sdk, fileV2Peers, spaceId, root)
 			if err != nil {
 				t.Logf("blobCDN: resolve %s: %v", parts[2], err)
 				http.NotFound(w, r)
@@ -204,9 +204,9 @@ func newBlobCDN(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK, fileV2Pe
 	return c
 }
 
-func (c *blobCDN) resolve(ctx context.Context, sdk *anysyncsdk.SDK, peerId, spaceId string, root cid.Cid) ([]byte, error) {
+func (c *blobCDN) resolve(ctx context.Context, sdk *anysyncsdk.SDK, peers []string, spaceId string, root cid.Cid) ([]byte, error) {
 	var resp *fileprotov2.RequestDownloadResponse
-	err := doFileV2(ctx, sdk, peerId, func(cl fileprotov2.DRPCFileV2Client) error {
+	err := doFileV2(ctx, sdk, peers, func(cl fileprotov2.DRPCFileV2Client) error {
 		var err error
 		resp, err = cl.RequestDownload(ctx, &fileprotov2.RequestDownloadRequest{
 			SpaceId: spaceId, RootCids: [][]byte{root.Bytes()},

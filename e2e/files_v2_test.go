@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/commonfile/fileproto/fileprotov2"
+	"github.com/anyproto/any-sync/commonfile/fileproto/fileprotov2/fileprotov2err"
+	"github.com/anyproto/any-sync/net/rpc/rpcerr"
 	"github.com/anyproto/any-sync/util/crypto"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
@@ -34,7 +37,17 @@ import (
 // network descriptor at e2e/local.yml (override the path with
 // ANYSYNC_E2E_LOCAL_NETWORK) — see local-infra's README for the
 // one-command local network.
-func loadLocalFilesV2Network(t *testing.T) (yamlBytes []byte, fileV2PeerId, networkId string) {
+func loadLocalFilesV2Network(t *testing.T) (yamlBytes []byte, fileV2Peers []string, networkId string) {
+	t.Helper()
+	yamlBytes, fileV2Peers, networkId, _ = loadLocalFilesV2NetworkFull(t)
+	return
+}
+
+// loadLocalFilesV2NetworkFull also returns the network's fileNetworkId
+// — the fleet receipt-signing identity durability receipts verify
+// against (required: a files-v2 network config without it can never
+// flip a file durable).
+func loadLocalFilesV2NetworkFull(t *testing.T) (yamlBytes []byte, fileV2Peers []string, networkId, fileNetworkId string) {
 	t.Helper()
 	if os.Getenv("ANYSYNC_E2E_LOCAL") != "1" {
 		t.Skip("files-v2 e2e: set ANYSYNC_E2E_LOCAL=1 (and provide e2e/local.yml) to run against a local network")
@@ -48,22 +61,27 @@ func loadLocalFilesV2Network(t *testing.T) (yamlBytes []byte, fileV2PeerId, netw
 		t.Skipf("files-v2 e2e: local network config not readable at %s: %v", path, err)
 	}
 	var conf struct {
-		NetworkId string `yaml:"networkId"`
-		Nodes     []struct {
+		NetworkId     string `yaml:"networkId"`
+		FileNetworkId string `yaml:"fileNetworkId"`
+		Nodes         []struct {
 			PeerId string   `yaml:"peerId"`
 			Types  []string `yaml:"types"`
 		} `yaml:"nodes"`
 	}
 	require.NoError(t, yaml.Unmarshal(data, &conf))
+	require.NotEmpty(t, conf.FileNetworkId,
+		"files-v2 e2e: %s carries no fileNetworkId (the fleet receipt-signing identity) — regenerate it with local-infra", path)
 	for _, n := range conf.Nodes {
 		for _, typ := range n.Types {
 			if typ == "fileV2" {
-				return data, n.PeerId, conf.NetworkId
+				fileV2Peers = append(fileV2Peers, n.PeerId)
 			}
 		}
 	}
-	t.Fatalf("files-v2 e2e: no fileV2 node in %s", path)
-	return nil, "", ""
+	if len(fileV2Peers) == 0 {
+		t.Fatalf("files-v2 e2e: no fileV2 node in %s", path)
+	}
+	return data, fileV2Peers, conf.NetworkId, conf.FileNetworkId
 }
 
 // TestE2E_FilesV2 proves the v2 files flow end-to-end against a live
@@ -83,7 +101,7 @@ func loadLocalFilesV2Network(t *testing.T) (yamlBytes []byte, fileV2PeerId, netw
 //     the whole pipeline, not just the direct RPCs;
 //  4. RequestDownload → signed GET → bytes round-trip equal.
 func TestE2E_FilesV2(t *testing.T) {
-	netYaml, fileV2Peer, networkId := loadLocalFilesV2Network(t)
+	netYaml, fileV2Peers, networkId, fileNetworkId := loadLocalFilesV2NetworkFull(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")
 	}
@@ -143,7 +161,7 @@ func TestE2E_FilesV2(t *testing.T) {
 	// advertises.
 	var info *fileprotov2.InfoResponse
 	require.True(t, waitFor(ctx, 60*time.Second, time.Second, func() bool {
-		callErr := doFileV2(ctx, sdk, fileV2Peer, func(cl fileprotov2.DRPCFileV2Client) error {
+		callErr := doFileV2(ctx, sdk, fileV2Peers, func(cl fileprotov2.DRPCFileV2Client) error {
 			var err error
 			info, err = cl.Info(ctx, &fileprotov2.InfoRequest{})
 			return err
@@ -165,7 +183,7 @@ func TestE2E_FilesV2(t *testing.T) {
 	uploads := map[string]*fileprotov2.PresignedUpload{}
 	require.True(t, waitFor(ctx, 180*time.Second, 2*time.Second, func() bool {
 		var resp *fileprotov2.UploadResponse
-		callErr := doFileV2(ctx, sdk, fileV2Peer, func(cl fileprotov2.DRPCFileV2Client) error {
+		callErr := doFileV2(ctx, sdk, fileV2Peers, func(cl fileprotov2.DRPCFileV2Client) error {
 			var err error
 			resp, err = cl.Upload(ctx, &fileprotov2.UploadRequest{SpaceId: sp.Id(), Items: items})
 			return err
@@ -192,10 +210,10 @@ func TestE2E_FilesV2(t *testing.T) {
 	httpPut(t, ctx, uploads[string(cidB.Bytes())], blobB)
 
 	// --- RequestSign: receipts for both roots, verified against the
-	// fleet signing pubkey (single-node fleet: signingKey == the fileV2
-	// node's peer key, so the pubkey is embedded in its peerId).
+	// fleet signing pubkey (fileNetworkId — the fleet-shared account
+	// identity, deliberately distinct from any node's peerId).
 	var signResp *fileprotov2.RequestSignResponse
-	require.NoError(t, doFileV2(ctx, sdk, fileV2Peer, func(cl fileprotov2.DRPCFileV2Client) error {
+	require.NoError(t, doFileV2(ctx, sdk, fileV2Peers, func(cl fileprotov2.DRPCFileV2Client) error {
 		var err error
 		signResp, err = cl.RequestSign(ctx, &fileprotov2.RequestSignRequest{
 			SpaceId:  sp.Id(),
@@ -205,7 +223,7 @@ func TestE2E_FilesV2(t *testing.T) {
 	}))
 	require.Len(t, signResp.Results, 2)
 
-	fleetPub, err := crypto.DecodePeerId(fileV2Peer)
+	fleetPub, err := crypto.DecodeNetworkId(fileNetworkId)
 	require.NoError(t, err)
 
 	wantSizes := map[string]uint64{
@@ -224,9 +242,11 @@ func TestE2E_FilesV2(t *testing.T) {
 		assert.Equal(t, sp.Id(), rp.spaceId, "receipt spaceId")
 		assert.Equal(t, res.RootCid, rp.rootCid, "receipt rootCid")
 		assert.Equal(t, wantSizes[string(res.RootCid)], rp.size, "receipt size = HEAD-measured PUT size")
-		assert.Equal(t, fileV2Peer, rp.signerPeerId, "receipt signerPeerId")
+		// signerPeerId is audit-only: with a multi-node fleet any
+		// responsible node may have answered.
+		assert.NotEmpty(t, rp.signerPeerId, "receipt signerPeerId (audit)")
 		assert.InDelta(t, float64(time.Now().Unix()), float64(rp.signedAt), 600, "receipt signedAt")
-		signs[string(res.RootCid)] = rp.signerPeerId + "/" + base64.StdEncoding.EncodeToString(res.Receipt.Signature)
+		signs[string(res.RootCid)] = fileNetworkId + "/" + base64.StdEncoding.EncodeToString(res.Receipt.Signature)
 	}
 
 	// Record the receipts on the rows and push, so the broker's index
@@ -246,9 +266,14 @@ func TestE2E_FilesV2(t *testing.T) {
 	lastLog := time.Now()
 	require.True(t, waitFor(ctx, 240*time.Second, 2*time.Second, func() bool {
 		var resp *fileprotov2.SpaceInfoResponse
-		callErr := doFileV2(ctx, sdk, fileV2Peer, func(cl fileprotov2.DRPCFileV2Client) error {
+		callErr := doFileV2(ctx, sdk, fileV2Peers, func(cl fileprotov2.DRPCFileV2Client) error {
 			var err error
 			resp, err = cl.SpaceInfo(ctx, &fileprotov2.SpaceInfoRequest{SpaceIds: []string{sp.Id()}})
+			if err == nil && len(resp.Results) == 1 && resp.Results[0].Code == fileprotov2.ErrCode_ErrNotResponsible {
+				// mixed-batch RPC: NotResponsible arrives per-item —
+				// surface it so doFileV2 fails over to the next peer
+				return fileprotov2err.ErrNotResponsible
+			}
 			return err
 		})
 		if callErr != nil || len(resp.Results) != 1 {
@@ -271,7 +296,7 @@ func TestE2E_FilesV2(t *testing.T) {
 
 	// --- RequestDownload → signed GET → byte-for-byte round-trip.
 	var dlResp *fileprotov2.RequestDownloadResponse
-	require.NoError(t, doFileV2(ctx, sdk, fileV2Peer, func(cl fileprotov2.DRPCFileV2Client) error {
+	require.NoError(t, doFileV2(ctx, sdk, fileV2Peers, func(cl fileprotov2.DRPCFileV2Client) error {
 		var err error
 		dlResp, err = cl.RequestDownload(ctx, &fileprotov2.RequestDownloadRequest{
 			SpaceId:  sp.Id(),
@@ -301,14 +326,30 @@ func TestE2E_FilesV2(t *testing.T) {
 // doFileV2 dials the fileV2 broker through the SDK's peer pool (the
 // connection carries the account identity, which the broker checks
 // against the space ACL) and runs fn with a FileV2 drpc client.
-func doFileV2(ctx context.Context, sdk *anysyncsdk.SDK, peerId string, fn func(cl fileprotov2.DRPCFileV2Client) error) error {
-	pr, err := sdk.PoolInternal().Get(ctx, peerId)
-	if err != nil {
+// Fleet-aware: peers are tried in order, failing over on the
+// NotResponsible routing signal (whole-RPC, or surfaced by fn from a
+// per-item code) — the same discipline as the SDK's broker client.
+func doFileV2(ctx context.Context, sdk *anysyncsdk.SDK, peers []string, fn func(cl fileprotov2.DRPCFileV2Client) error) error {
+	var lastErr error
+	for _, peerId := range peers {
+		pr, err := sdk.PoolInternal().Get(ctx, peerId)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		err = pr.DoDrpc(ctx, func(conn drpc.Conn) error {
+			return fn(fileprotov2.NewDRPCFileV2Client(conn))
+		})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if errors.Is(rpcerr.Unwrap(err), fileprotov2err.ErrNotResponsible) {
+			continue
+		}
 		return err
 	}
-	return pr.DoDrpc(ctx, func(conn drpc.Conn) error {
-		return fn(fileprotov2.NewDRPCFileV2Client(conn))
-	})
+	return lastErr
 }
 
 // rawCidV1 computes the CIDv1 (raw codec, sha2-256) of data — the real

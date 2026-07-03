@@ -21,7 +21,7 @@ import (
 // transparent refetch on Open → SDK-level FreeUpFileCache reclaims the
 // cache again, byte-accurately.
 func TestE2E_FilesV2_OffloadAndFreeUp(t *testing.T) {
-	netYaml, fileV2Peer, _ := loadLocalFilesV2Network(t)
+	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")
 	}
@@ -59,7 +59,7 @@ func TestE2E_FilesV2_OffloadAndFreeUp(t *testing.T) {
 	require.True(t, fi.Durable)
 	_ = spA.SyncHeads(ctx)
 
-	cdn := newBlobCDN(t, ctx, sdkA, fileV2Peer, spA.Id())
+	cdn := newBlobCDN(t, ctx, sdkA, fileV2Peers, spA.Id())
 	t.Cleanup(cdn.Close)
 	cfgB := config.Config{
 		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},

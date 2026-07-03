@@ -30,16 +30,19 @@ var ErrNoFileNodes = errors.New("filebroker: no fileV2 nodes in network config")
 // Client speaks fileprotov2 to the network's fileV2 fleet. Safe for
 // concurrent use.
 type Client struct {
-	pool      pool.Pool
-	peers     func() []string
-	networkId string
-	hc        *http.Client
+	pool          pool.Pool
+	peers         func() []string
+	networkId     string
+	fileNetworkId func() string
+	hc            *http.Client
 }
 
 // New builds a Client. peers must return the current fileV2 fleet
-// (nodeconf.FileV2Peers — a func so nodeconf reloads are picked up).
-func New(p pool.Pool, peers func() []string, networkId string) *Client {
-	return &Client{pool: p, peers: peers, networkId: networkId, hc: http.DefaultClient}
+// (nodeconf.FileV2Peers) and fileNetworkId the fleet's receipt-signing
+// identity (nodeconf.Configuration().FileNetworkId) — both funcs so
+// nodeconf reloads are picked up.
+func New(p pool.Pool, peers func() []string, networkId string, fileNetworkId func() string) *Client {
+	return &Client{pool: p, peers: peers, networkId: networkId, fileNetworkId: fileNetworkId, hc: http.DefaultClient}
 }
 
 // NetworkId returns the network the client verifies receipts against.
@@ -144,14 +147,14 @@ func (c *Client) Put(ctx context.Context, up *fileprotov2.PresignedUpload, body 
 }
 
 // VerifyReceipt validates a durable-custody receipt for (spaceId,
-// root, objectSize) against this network's fleet and returns the
-// networkSign row value ("{signerPeerId}/{base64(signature)}").
+// root, objectSize) against this network's fleet key and returns the
+// networkSign row value ("{fileNetworkId}/{base64(signature)}").
 func (c *Client) VerifyReceipt(rcpt *fileprotov2.NetworkSignReceipt, spaceId string, root cid.Cid, objectSize uint64) (string, error) {
 	return VerifyReceipt(rcpt, VerifyParams{
-		NetworkId:  c.networkId,
-		SpaceId:    spaceId,
-		Root:       root,
-		ObjectSize: objectSize,
-		FleetPeers: c.peers(),
+		NetworkId:     c.networkId,
+		SpaceId:       spaceId,
+		Root:          root,
+		ObjectSize:    objectSize,
+		FileNetworkId: c.fileNetworkId(),
 	})
 }

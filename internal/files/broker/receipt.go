@@ -12,6 +12,12 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
+// ErrNoFileNetworkId — the network configuration carries no
+// fileNetworkId, so durability receipts cannot be verified. Files can
+// be registered and uploaded but never flip durable until the network
+// config publishes the fleet key.
+var ErrNoFileNetworkId = errors.New("filebroker: no fileNetworkId in network config")
+
 // Receipt is the decoded durable-custody receipt payload. Mirrors
 // filenode2's receiptproto.ReceiptPayload wire contract; decoded with
 // protowire (field-number-stable) so the SDK carries no dependency on
@@ -23,7 +29,7 @@ type Receipt struct {
 	RootCid      []byte // 3
 	Size         uint64 // 4
 	SignedAt     int64  // 5
-	SignerPeerId string // 6
+	SignerPeerId string // 6 — audit/debug only, no part in verification
 }
 
 // ParseReceiptPayload decodes the receipt payload. Unknown fields are
@@ -84,14 +90,22 @@ type VerifyParams struct {
 	// ObjectSize is the stored S3 object size (the CAR file size, which
 	// the node HEAD-measures after the PUT). 0 skips the size check.
 	ObjectSize uint64
-	// FleetPeers is the current fileV2 fleet; the signer must be one of
-	// them (receipt signatures verify against the signer's peer key).
-	FleetPeers []string
+	// FileNetworkId is the identity of the fileV2 fleet's shared
+	// receipt-signing key (network string encoding, from
+	// nodeconf.Configuration().FileNetworkId). Receipts verify against
+	// this one stable key — never against the signing node's peerId, so
+	// receipts stay valid across fleet churn, scaling and shard moves.
+	FileNetworkId string
 }
 
-// VerifyReceipt checks the signature and every attested field, and
-// returns the networkSign row value ("{signerPeerId}/{base64(sig)}").
+// VerifyReceipt checks the signature against the fleet key and every
+// attested field, and returns the networkSign row value
+// ("{fileNetworkId}/{base64(sig)}"). The payload's signerPeerId is
+// audit/debug metadata only.
 func VerifyReceipt(rcpt *fileprotov2.NetworkSignReceipt, p VerifyParams) (string, error) {
+	if p.FileNetworkId == "" {
+		return "", ErrNoFileNetworkId
+	}
 	if rcpt == nil || len(rcpt.ReceiptPayload) == 0 || len(rcpt.Signature) == 0 {
 		return "", errors.New("filebroker: empty receipt")
 	}
@@ -99,26 +113,16 @@ func VerifyReceipt(rcpt *fileprotov2.NetworkSignReceipt, p VerifyParams) (string
 	if err != nil {
 		return "", fmt.Errorf("filebroker: receipt payload: %w", err)
 	}
-	fleet := false
-	for _, id := range p.FleetPeers {
-		if id == r.SignerPeerId {
-			fleet = true
-			break
-		}
-	}
-	if !fleet {
-		return "", fmt.Errorf("filebroker: receipt signer %s is not a fileV2 fleet peer", r.SignerPeerId)
-	}
-	pub, err := crypto.DecodePeerId(r.SignerPeerId)
+	fleetKey, err := crypto.DecodeNetworkId(p.FileNetworkId)
 	if err != nil {
-		return "", fmt.Errorf("filebroker: receipt signer peerId: %w", err)
+		return "", fmt.Errorf("filebroker: fileNetworkId: %w", err)
 	}
-	ok, err := pub.Verify(rcpt.ReceiptPayload, rcpt.Signature)
+	ok, err := fleetKey.Verify(rcpt.ReceiptPayload, rcpt.Signature)
 	if err != nil {
 		return "", err
 	}
 	if !ok {
-		return "", errors.New("filebroker: receipt signature invalid")
+		return "", fmt.Errorf("filebroker: receipt signature invalid (fileNetworkId=%s, signerPeerId=%s)", p.FileNetworkId, r.SignerPeerId)
 	}
 	if r.NetworkId != p.NetworkId {
 		return "", fmt.Errorf("filebroker: receipt networkId %q != %q", r.NetworkId, p.NetworkId)
@@ -132,10 +136,11 @@ func VerifyReceipt(rcpt *fileprotov2.NetworkSignReceipt, p VerifyParams) (string
 	if p.ObjectSize != 0 && r.Size != p.ObjectSize {
 		return "", fmt.Errorf("filebroker: receipt size %d != stored object size %d", r.Size, p.ObjectSize)
 	}
-	return NetworkSign(r.SignerPeerId, rcpt.Signature), nil
+	return NetworkSign(p.FileNetworkId, rcpt.Signature), nil
 }
 
-// NetworkSign formats the payloads-row receipt value.
-func NetworkSign(signerPeerId string, signature []byte) string {
-	return signerPeerId + "/" + base64.StdEncoding.EncodeToString(signature)
+// NetworkSign formats the payloads-row receipt value
+// ("{fileNetworkId}/{sign}", 07c).
+func NetworkSign(fileNetworkId string, signature []byte) string {
+	return fileNetworkId + "/" + base64.StdEncoding.EncodeToString(signature)
 }

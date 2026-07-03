@@ -62,6 +62,7 @@ const (
 	fFrontier = "h"
 	fPending  = "ph"
 	fCounters = "cnt"
+	fDataset  = "ds"
 )
 
 // SeqFunc allocates the next per-space stateSeq. Wired to the space's
@@ -78,6 +79,7 @@ type Resolver func(ctx context.Context, objectId, changeId string) (prevIds []st
 // Track is the apply-path input: one tracked change, classified.
 type Track struct {
 	ObjectId  string
+	Dataset   string
 	ChangeId  string
 	VersionId string
 	AddSeq    uint64
@@ -97,6 +99,7 @@ type Track struct {
 // Entry is one unread change as persisted.
 type Entry struct {
 	ObjectId  string
+	Dataset   string
 	ChangeId  string
 	VersionId string
 	AddSeq    uint64
@@ -111,6 +114,7 @@ type Entry struct {
 // Transition is one feed element: a change that became unread or read.
 type Transition struct {
 	ObjectId  string
+	Dataset   string
 	ChangeId  string
 	VersionId string
 	RecordIds []string
@@ -278,6 +282,7 @@ func valueStrings(v *anyenc.Value, key string) []string {
 func entryFromDoc(v *anyenc.Value) Entry {
 	return Entry{
 		ObjectId:  string(v.GetStringBytes(fObject)),
+		Dataset:   string(v.GetStringBytes(fDataset)),
 		ChangeId:  string(v.GetStringBytes(fChange)),
 		VersionId: string(v.GetStringBytes(fVersion)),
 		AddSeq:    uint64(v.GetInt(fAddSeq)),
@@ -321,6 +326,7 @@ func (e *Engine) insertEntry(ctx context.Context, t Track) error {
 	v.Set("id", arena.NewString(unreadRowId(t.ObjectId, t.ChangeId)))
 	v.Set(fSpace, arena.NewString(e.spaceId))
 	v.Set(fObject, arena.NewString(t.ObjectId))
+	v.Set(fDataset, arena.NewString(t.Dataset))
 	v.Set(fChange, arena.NewString(t.ChangeId))
 	v.Set(fVersion, arena.NewString(t.VersionId))
 	v.Set(fAddSeq, arena.NewNumberInt(int(t.AddSeq)))
@@ -343,6 +349,7 @@ func (e *Engine) appendTransitions(ctx context.Context, stateSeq uint64, trs []T
 		v.Set(fSpace, arena.NewString(e.spaceId))
 		v.Set(fStateSeq, arena.NewNumberInt(int(stateSeq)))
 		v.Set(fObject, arena.NewString(tr.ObjectId))
+		v.Set(fDataset, arena.NewString(tr.Dataset))
 		v.Set(fChange, arena.NewString(tr.ChangeId))
 		v.Set(fVersion, arena.NewString(tr.VersionId))
 		v.Set(fRecords, stringsValue(arena, tr.RecordIds))
@@ -396,8 +403,8 @@ func (e *Engine) TrackChange(ctx context.Context, t Track) error {
 			return err
 		}
 		trs = append(trs, Transition{
-			ObjectId: t.ObjectId, ChangeId: t.ChangeId, VersionId: t.VersionId,
-			RecordIds: t.RecordIds, Tags: t.Tags, Unread: true,
+			ObjectId: t.ObjectId, Dataset: t.Dataset, ChangeId: t.ChangeId,
+			VersionId: t.VersionId, RecordIds: t.RecordIds, Tags: t.Tags, Unread: true,
 		})
 		for _, tag := range t.Tags {
 			st.counters[tag]++
@@ -491,8 +498,8 @@ func (e *Engine) removeEntries(ctx context.Context, st *objState, entries []Entr
 			}
 		}
 		*trs = append(*trs, Transition{
-			ObjectId: en.ObjectId, ChangeId: en.ChangeId, VersionId: en.VersionId,
-			RecordIds: en.RecordIds, Tags: en.Tags, Unread: false,
+			ObjectId: en.ObjectId, Dataset: en.Dataset, ChangeId: en.ChangeId,
+			VersionId: en.VersionId, RecordIds: en.RecordIds, Tags: en.Tags, Unread: false,
 		})
 	}
 	return nil
@@ -869,6 +876,7 @@ func (e *Engine) TransitionsSince(ctx context.Context, since uint64, limit int) 
 		v := doc.Value()
 		out = append(out, Transition{
 			ObjectId:  string(v.GetStringBytes(fObject)),
+			Dataset:   string(v.GetStringBytes(fDataset)),
 			ChangeId:  string(v.GetStringBytes(fChange)),
 			VersionId: string(v.GetStringBytes(fVersion)),
 			RecordIds: valueStrings(v, fRecords),
@@ -913,6 +921,22 @@ func (e *Engine) NotifyState(objectId string, stateSeq uint64) {
 	for _, cb := range cbs {
 		cb(objectId, stateSeq)
 	}
+}
+
+// HasState reports whether the object has a persisted read-state row
+// (frontier / counters / pending) — i.e. whether this account has any
+// recorded read state for it, locally or merged from another device.
+func (e *Engine) HasState(ctx context.Context, objectId string) (bool, error) {
+	if err := e.collections(ctx); err != nil {
+		return false, err
+	}
+	if _, err := e.state.FindId(ctx, objectId); err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // WriteTx runs fn inside a write transaction on the engine's DB —

@@ -43,6 +43,7 @@ func (r *readStateAPI) ChangedSince(ctx context.Context, since uint64, limit int
 	for i, tr := range trs {
 		out[i] = space.ReadTransition{
 			ObjectId:  tr.ObjectId,
+			Dataset:   tr.Dataset,
 			ChangeId:  tr.ChangeId,
 			VersionId: crdt.VersionId(tr.VersionId),
 			RecordIds: tr.RecordIds,
@@ -67,6 +68,7 @@ func (r *readStateAPI) UnreadSnapshot(ctx context.Context, objectId string) ([]s
 	for i, en := range entries {
 		out[i] = space.ReadTransition{
 			ObjectId:  en.ObjectId,
+			Dataset:   en.Dataset,
 			ChangeId:  en.ChangeId,
 			VersionId: crdt.VersionId(en.VersionId),
 			AddSeq:    en.AddSeq,

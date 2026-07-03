@@ -14,6 +14,8 @@ import (
 // the normal query/subscribe flow instead.
 type ReadTransition struct {
 	ObjectId string
+	// Dataset the change applied to (a tracked dataset).
+	Dataset string
 	// ChangeId is the DAG change (cross-peer identity); VersionId is
 	// its peer-local order key — for a record-creating change it
 	// equals the record's `_ver.id`, so transitions join to records

@@ -3,6 +3,8 @@ package spaceobjects
 import (
 	"context"
 
+	"go.uber.org/zap"
+
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
@@ -113,6 +115,7 @@ func (s *Store) readApplyHook() crdt.ApplyHook {
 		}
 		return s.readState.TrackChange(txCtx, readstate.Track{
 			ObjectId:     ch.ObjectId,
+			Dataset:      ch.Dataset,
 			ChangeId:     ch.ChangeId,
 			VersionId:    string(ch.VersionId),
 			AddSeq:       ch.AddSeq,
@@ -134,4 +137,29 @@ func containsString(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// seedReadState implements ReadSeedAtFirstSight: when an object loads
+// for the first time with no persisted read state (none written
+// locally, none merged from another device), everything present after
+// the initial restore is marked read — a fresh joiner starts clean.
+// hadState is captured BEFORE the restore ran, because restoring a
+// tracked object writes the state row itself. No-op when any tracked
+// dataset asked for ReadSeedAllUnread.
+func (s *Store) seedReadState(ctx context.Context, objectId string, hadState bool) {
+	if s.readState == nil || hadState {
+		return
+	}
+	for _, rt := range s.readTracking {
+		if rt.Seed != crdt.ReadSeedAtFirstSight {
+			return
+		}
+	}
+	err := s.readState.WriteTx(ctx, func(txCtx context.Context) error {
+		_, seedErr := s.readState.MarkReadUpTo(txCtx, objectId, "")
+		return seedErr
+	})
+	if err != nil {
+		storeLog.Warn("seed read state", zap.String("objectId", objectId), zap.Error(err))
+	}
 }

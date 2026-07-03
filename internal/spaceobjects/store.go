@@ -1040,6 +1040,12 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		return nil, err
 	}
 	payload := loadPayloadFromCtx(ctx)
+	hadReadState := true
+	if s.readState != nil {
+		if has, hsErr := s.readState.HasState(ctx, objectId); hsErr == nil {
+			hadReadState = has
+		}
+	}
 	var gate object.ApplyGate
 	if !s.disableGate {
 		gate = s.gateFor(objectId)
@@ -1060,6 +1066,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err := obj.ColdRestore(ctx); err != nil {
 		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
 	}
+	s.seedReadState(ctx, objectId, hadReadState)
 	return obj, nil
 }
 

@@ -7,10 +7,10 @@ import (
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
-	"github.com/anyproto/any-sync/app/logger"
-	"go.uber.org/zap"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
+	"github.com/anyproto/any-sync/app/logger"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"

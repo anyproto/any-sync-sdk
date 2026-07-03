@@ -137,6 +137,10 @@ type HandlerReg struct {
 	// direction check is skipped for undeclared heads; DECLARED fields
 	// (e.g. the derived author/createdAt/spaceId) stay fully enforced.
 	DynamicScopeByKey bool
+
+	// ReadTracking opts the dataset into read/unread tracking; nil =
+	// untracked. See readtracking.go.
+	ReadTracking *ReadTracking
 }
 
 // LocalPreValidator is an optional interface a Handler may implement

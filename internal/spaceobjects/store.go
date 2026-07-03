@@ -40,6 +40,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
@@ -129,6 +130,9 @@ type Store struct {
 	sharedColl anystore.Collection // per-space `objects` collection, lazy-opened
 	detached   anystore.Collection // per-space `_detached` collection, lazy-opened
 
+	// drainMu serializes Drain passes — see Store.Drain.
+	drainMu sync.Mutex
+
 	// drainer runs Store.Drain asynchronously off the apply path —
 	// afterApply hooks push pairs in, the drainer consumes them and
 	// coalesces bursts into single Drain passes. See drainer.go.
@@ -156,6 +160,21 @@ type Store struct {
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *rowEventRegistry
+
+	// readTracking maps a tracked dataset to its registration;
+	// readState is the per-space read/unread engine. Both nil/empty
+	// when nothing in this space opted into tracking. selfIdentity is
+	// the account id self-authored changes are matched against.
+	readTracking map[string]*crdt.ReadTracking
+	readState    *readstate.Engine
+	selfIdentity string
+	readMat      *readMaterializer
+	// readSeedPending marks objects mid-first-restore: the apply hook
+	// skips tracking for them (the seed covers everything present).
+	readSeedPending sync.Map
+	// seedHeads consults the account's published frontiers before
+	// first-sight seeding — see SetSeedHeadsProvider.
+	seedHeads SeedHeadsProvider
 
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
@@ -276,6 +295,16 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 		return crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
 	})
+	if s.signKey != nil {
+		s.selfIdentity = s.signKey.GetPublic().Account()
+	}
+	s.readTracking = buildReadTracking(s.extTypes, s.customHandlers)
+	if len(s.readTracking) > 0 {
+		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
+		if needsReadMaterializer(s.readTracking) {
+			s.readMat = newReadMaterializer(s)
+		}
+	}
 	s.cache = ocache.New(
 		s.loadObject,
 		ocache.WithTTL(objectCacheTTL),
@@ -414,6 +443,9 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
+	if s.readMat != nil {
+		s.readMat.close()
+	}
 	derr := s.drainer.Close()
 	if s.cache != nil {
 		_ = s.cache.Close()
@@ -1024,6 +1056,23 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		return nil, err
 	}
 	payload := loadPayloadFromCtx(ctx)
+	// First tracked load: prefer the account's published read state
+	// (tech-space KV usually syncs before chat trees) — restore with
+	// tracking ON and merge the published frontiers after. Only when
+	// nothing was published does first-sight seeding apply, with
+	// tracking skipped during the restore (the seed covers it all).
+	seedPending := false
+	var publishedSets [][]string
+	if s.readSeedable() {
+		if seeded, sErr := s.readState.Seeded(ctx, objectId); sErr == nil && !seeded {
+			seedPending = true
+			publishedSets = s.publishedSeedHeads(ctx, objectId)
+			if len(publishedSets) == 0 {
+				s.readSeedPending.Store(objectId, struct{}{})
+				defer s.readSeedPending.Delete(objectId)
+			}
+		}
+	}
 	var gate object.ApplyGate
 	if !s.disableGate {
 		gate = s.gateFor(objectId)
@@ -1043,6 +1092,13 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	}
 	if err := obj.ColdRestore(ctx); err != nil {
 		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
+	}
+	if seedPending {
+		if len(publishedSets) > 0 {
+			s.seedFromPublished(ctx, objectId, publishedSets)
+		} else {
+			s.seedReadState(ctx, obj, objectId)
+		}
 	}
 	return obj, nil
 }
@@ -1142,6 +1198,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		}
 		ctrl.SetSpaceId(s.spaceId)
 		ctrl.SetApplySeqAllocator(s.applySeqs)
+		ctrl.SetApplyHook(s.readApplyHook())
 		return ctrl, nil
 	}
 	coll, err := s.SharedObjects(ctx)
@@ -1168,7 +1225,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d)})
+			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d), ReadTracking: d.ReadTracking})
 		}
 	}
 	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
@@ -1177,5 +1234,6 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	ctrl.SetSpaceId(s.spaceId)
 	ctrl.SetApplySeqAllocator(s.applySeqs)
+	ctrl.SetApplyHook(s.readApplyHook())
 	return ctrl, nil
 }

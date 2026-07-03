@@ -172,6 +172,9 @@ type Store struct {
 	// readSeedPending marks objects mid-first-restore: the apply hook
 	// skips tracking for them (the seed covers everything present).
 	readSeedPending sync.Map
+	// seedHeads consults the account's published frontiers before
+	// first-sight seeding — see SetSeedHeadsProvider.
+	seedHeads SeedHeadsProvider
 
 	// customHandlers, when non-nil, makes this a "raw" store: every
 	// controller registers EXACTLY these handlers (no shared `objects`
@@ -1053,12 +1056,21 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		return nil, err
 	}
 	payload := loadPayloadFromCtx(ctx)
+	// First tracked load: prefer the account's published read state
+	// (tech-space KV usually syncs before chat trees) — restore with
+	// tracking ON and merge the published frontiers after. Only when
+	// nothing was published does first-sight seeding apply, with
+	// tracking skipped during the restore (the seed covers it all).
 	seedPending := false
+	var publishedSets [][]string
 	if s.readSeedable() {
 		if seeded, sErr := s.readState.Seeded(ctx, objectId); sErr == nil && !seeded {
 			seedPending = true
-			s.readSeedPending.Store(objectId, struct{}{})
-			defer s.readSeedPending.Delete(objectId)
+			publishedSets = s.publishedSeedHeads(ctx, objectId)
+			if len(publishedSets) == 0 {
+				s.readSeedPending.Store(objectId, struct{}{})
+				defer s.readSeedPending.Delete(objectId)
+			}
 		}
 	}
 	var gate object.ApplyGate
@@ -1082,7 +1094,11 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
 	}
 	if seedPending {
-		s.seedReadState(ctx, obj, objectId)
+		if len(publishedSets) > 0 {
+			s.seedFromPublished(ctx, objectId, publishedSets)
+		} else {
+			s.seedReadState(ctx, obj, objectId)
+		}
 	}
 	return obj, nil
 }

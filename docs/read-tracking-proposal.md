@@ -291,11 +291,26 @@ while the object was untracked or unloaded.
 
 ## Seeding
 
-On first track of an object with no stored frontier: default
-`SeedReadAtJoin` — everything up to the account's ACL join point is
-read (a fresh joiner starts clean; heart does the equivalent with a
-bespoke tree hook). `SeedAllUnread` for datasets where full history
-matters. Both are one-time closure computations at registration.
+On an object's first tracked load, the seed consults the account's
+published frontiers FIRST (tech-space KV — it usually syncs before
+chat trees do):
+
+- **Frontiers published** → merge them instead of seeding: the restore
+  tracks history normally and the merges flip exactly what the account
+  already read — a fresh device of an established account lands on the
+  REAL read state (a message the phone hasn't read stays unread here
+  too; Telegram-correct). Costs insert+cover bookkeeping for the
+  covered history, once per object per fresh device.
+- **Nothing published** → `ReadSeedAtFirstSight` (default): frontier
+  := tree heads, everything present starts read, and tracking is
+  skipped during the restore (no per-change bookkeeping). Recorded
+  durably via a seeded bit written in the seed's own tx, so a crash on
+  either side of the restore re-seeds instead of skipping.
+- `ReadSeedAllUnread` for datasets where full history matters.
+
+Residual race: an object loading before its KV key synced falls back
+to first-sight and diverges until the next mark — boot ordering (tech
+space first) makes this window small.
 
 ## Performance model: many big chats
 

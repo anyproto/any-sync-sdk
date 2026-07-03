@@ -463,3 +463,27 @@ func TestCompactFrontier_CapsOldest(t *testing.T) {
 		assert.GreaterOrEqual(t, h, "h016")
 	}
 }
+
+func TestMarkSeeded_KeepsEntriesAndFrontier(t *testing.T) {
+	f := newFixture(t)
+	f.track(t, mkTrack("obj", "c1", "v01", nil, "message"))
+
+	require.NoError(t, f.MarkSeeded(ctx, "obj"))
+	seeded, err := f.Seeded(ctx, "obj")
+	require.NoError(t, err)
+	assert.True(t, seeded)
+
+	// Unlike SeedFrontier, entries survive — the published-frontier
+	// merges decide what flips.
+	entries, _, err := f.UnreadEntries(ctx, "obj")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	// A later SeedFrontier is a no-op (already seeded).
+	ran, err := f.SeedFrontier(ctx, "obj", []string{"c1"})
+	require.NoError(t, err)
+	assert.False(t, ran)
+	entries, _, err = f.UnreadEntries(ctx, "obj")
+	require.NoError(t, err)
+	assert.Len(t, entries, 1)
+}

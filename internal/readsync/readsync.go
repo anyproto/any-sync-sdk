@@ -229,6 +229,41 @@ func (s *Service) publish(ctx context.Context, spaceId, objectId string, heads [
 	}
 }
 
+// PublishedFrontiers returns every device's published frontier for the
+// object — own rows included (a rebuilt device's previous publishes
+// are valid coverage). nil when nothing was published. Used by the
+// first-load seed to prefer the account's real read state over
+// first-sight seeding.
+func (s *Service) PublishedFrontiers(ctx context.Context, spaceId, objectId string) ([][]string, error) {
+	store, err := s.kvStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var sets [][]string
+	err = store.GetAll(ctx, kvKey(spaceId, objectId), func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error {
+		for _, kv := range values {
+			raw, decErr := decryptor(kv)
+			if decErr != nil {
+				log.Warn("published frontiers: decrypt", zap.String("key", kv.Key), zap.Error(decErr))
+				continue
+			}
+			var val frontierValue
+			if decErr = json.Unmarshal(raw, &val); decErr != nil {
+				log.Warn("published frontiers: decode", zap.String("key", kv.Key), zap.Error(decErr))
+				continue
+			}
+			if len(val.Heads) > 0 {
+				sets = append(sets, val.Heads)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sets, nil
+}
+
 // OnKeyValues is the live hook for the tech space's applied KV writes
 // (wire via App.OnKeyValues). Runs on any-sync's apply path — it only
 // decodes and enqueues; merging happens on the service worker.

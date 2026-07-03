@@ -81,6 +81,10 @@ func newReadTrackedType() handler.Type {
 //     MarkReadUpTo("") — the frontier travels via the tech-space KV;
 //     device two never acts.
 //  6. Deleting an unread message clears it without reading.
+//  7. A THIRD member device boots after device one published its read
+//     state: it lands on the account's real read state via the synced
+//     frontier (the new message stays unread) instead of first-sight
+//     seeding everything read.
 func TestE2E_ReadTracking(t *testing.T) {
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
@@ -330,5 +334,45 @@ func TestE2E_ReadTracking(t *testing.T) {
 		return unreadCount(mSp) == 0
 	}) {
 		t.Fatalf("member: deleting m6 never cleared its unread state")
+	}
+
+	// ---- (7) Third member device: seeding consults the published
+	// frontier. Device one read through m5 (step 5) and never reads
+	// m7; a brand-new device must show exactly m7 unread — the
+	// account's real state — not first-sight-seed it read.
+	send(sp, "m7", "unread on fresh device")
+	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = mSp.SyncHeads(ctx)
+		found, unread := getMsg(mSp, "m7")
+		return found && unread
+	}) {
+		t.Fatalf("member dev1: m7 never became unread")
+	}
+
+	member3 := open("member3", sameAccountFreshDevice(t, memberProvider))
+	var m3Sp space.Space
+	if !waitFor(ctx, 2*time.Minute, time.Second, func() bool {
+		_ = member3.Spaces().SyncSpaceList(ctx)
+		infos, listErr := member3.Spaces().List(ctx)
+		if listErr != nil {
+			return false
+		}
+		for _, si := range infos {
+			if si.Id == sp.Id() && si.Status == space.StatusActive {
+				m3Sp, listErr = member3.Spaces().Get(ctx, sp.Id())
+				return listErr == nil
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("member device 3: space never active")
+	}
+	if !waitFor(ctx, 2*time.Minute, time.Second, func() bool {
+		_ = m3Sp.SyncHeads(ctx)
+		f5, u5 := getMsg(m3Sp, "m5")
+		f7, u7 := getMsg(m3Sp, "m7")
+		return f5 && !u5 && f7 && u7 && unreadCount(m3Sp) == 1
+	}) {
+		t.Fatalf("member device 3 never landed on the account's real read state (m7 unread, rest read)")
 	}
 }

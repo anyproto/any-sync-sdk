@@ -981,6 +981,25 @@ func (e *Engine) Seeded(ctx context.Context, objectId string) (bool, error) {
 	return st.seeded, nil
 }
 
+// MarkSeeded records first-sight seeding as done WITHOUT touching
+// entries or frontier — the consult-KV seed path uses it: the
+// account's published frontiers, merged separately in the same tx,
+// are the real seed. Idempotent.
+func (e *Engine) MarkSeeded(ctx context.Context, objectId string) error {
+	if err := e.collections(ctx); err != nil {
+		return err
+	}
+	st, err := e.loadState(ctx, objectId)
+	if err != nil {
+		return err
+	}
+	if st.seeded {
+		return nil
+	}
+	st.seeded = true
+	return e.persistState(ctx, objectId, st)
+}
+
 // SeedFrontier performs first-sight seeding: sets the frontier to the
 // given heads (everything at or behind them is read), drops any
 // unread entries that slipped in around the restore (their became-

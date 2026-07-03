@@ -233,6 +233,15 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
+	// Resolve the read-sync service lazily: stores can be created
+	// before sdk.Open injects it, and untracked spaces never call it.
+	st.SetSeedHeadsProvider(func(ctx context.Context, objectId string) ([][]string, error) {
+		rs := s.readSync()
+		if rs == nil {
+			return nil, nil
+		}
+		return rs.PublishedFrontiers(ctx, spaceId, objectId)
+	})
 	// Drain the one-off applySeq backfill BEFORE publishing the store, so
 	// no apply or consumer read ever triggers the backfill's WriteTx from
 	// inside the applySeqMeta sync.Once. That lazy path otherwise

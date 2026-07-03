@@ -148,6 +148,17 @@ func containsString(ss []string, s string) bool {
 	return false
 }
 
+// SeedHeadsProvider returns the account's published read frontiers
+// for an object (one set per device row, own rows included), nil when
+// none. Injected by the space layer from the read-sync service —
+// consulted before first-sight seeding so a fresh device lands on the
+// account's REAL read state whenever it already synced (the tech
+// space usually syncs before chat trees do).
+type SeedHeadsProvider func(ctx context.Context, objectId string) ([][]string, error)
+
+// SetSeedHeadsProvider wires the provider. Call before objects load.
+func (s *Store) SetSeedHeadsProvider(p SeedHeadsProvider) { s.seedHeads = p }
+
 // readSeedable reports whether first-sight seeding applies in this
 // space (every tracked dataset opted for ReadSeedAtFirstSight).
 func (s *Store) readSeedable() bool {
@@ -160,6 +171,21 @@ func (s *Store) readSeedable() bool {
 		}
 	}
 	return true
+}
+
+// publishedSeedHeads consults the account's published frontiers for
+// the object. nil = none synced yet (or no provider) → first-sight
+// seeding applies.
+func (s *Store) publishedSeedHeads(ctx context.Context, objectId string) [][]string {
+	if s.seedHeads == nil {
+		return nil
+	}
+	sets, err := s.seedHeads(ctx, objectId)
+	if err != nil {
+		storeLog.Warn("seed: published frontiers", zap.String("objectId", objectId), zap.Error(err))
+		return nil
+	}
+	return sets
 }
 
 // seedReadState implements ReadSeedAtFirstSight: on an object's first
@@ -185,5 +211,38 @@ func (s *Store) seedReadState(ctx context.Context, obj *object.Object, objectId 
 	})
 	if err != nil {
 		storeLog.Warn("seed read state", zap.String("objectId", objectId), zap.Error(err))
+	}
+}
+
+// seedFromPublished is the consult-KV seed path: the restore tracked
+// the object's history as unread (no skip), and the account's
+// published frontiers now flip everything the account already read —
+// the device lands exactly on the account's read state; the remainder
+// stays genuinely unread. Costs insert+cover for the covered history,
+// paid once per object on a fresh device, in exchange for accurate
+// per-message unread instead of the everything-read approximation.
+func (s *Store) seedFromPublished(ctx context.Context, objectId string, sets [][]string) {
+	var last uint64
+	err := s.readState.WriteTx(ctx, func(txCtx context.Context) error {
+		if err := s.readState.MarkSeeded(txCtx, objectId); err != nil {
+			return err
+		}
+		for _, heads := range sets {
+			res, err := s.readState.MergeHeads(txCtx, objectId, heads)
+			if err != nil {
+				return err
+			}
+			if res.StateSeq != 0 {
+				last = res.StateSeq
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		storeLog.Warn("seed from published frontiers", zap.String("objectId", objectId), zap.Error(err))
+		return
+	}
+	if last != 0 {
+		s.readState.NotifyState(objectId, last)
 	}
 }

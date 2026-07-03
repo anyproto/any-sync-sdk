@@ -278,3 +278,30 @@ func TestReconcileAll_SinglePassRoutesBySpace(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 }
+
+func (f *fakeKV) GetAll(_ context.Context, key string, get func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error) error {
+	f.mu.Lock()
+	values := f.rows[key]
+	f.mu.Unlock()
+	return get(plainDecryptor, values)
+}
+
+func TestPublishedFrontiers_AllDeviceRows(t *testing.T) {
+	f := newFixture(t)
+	assert.Empty(t, mustFrontiers(t, f, testObj), "no rows yet")
+
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c2"}),
+	}
+	sets := mustFrontiers(t, f, testObj)
+	require.Len(t, sets, 2, "own rows count too")
+	assert.ElementsMatch(t, [][]string{{"c1"}, {"c2"}}, sets)
+}
+
+func mustFrontiers(t *testing.T, f *fixture, objectId string) [][]string {
+	t.Helper()
+	sets, err := f.PublishedFrontiers(ctx, testSpace, objectId)
+	require.NoError(t, err)
+	return sets
+}

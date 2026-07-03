@@ -204,6 +204,21 @@ direction check is skipped for them (declared derived heads stay
 enforced); per-prop enforcement lives in the handler (DAG route) and
 `Set` (local/account routes).
 
+**Dataset records (landed 2026-07-03).** The local route is public for
+dataset records too: `ModifyBatch.Scope = ScopeLocal` routes the batch
+through `Object.LocalSet` (`spaceimpl.modifyLocal`) — the same
+materialization techspace uses for `localStatus` / `identities`,
+opened to declared local-scope dataset fields (e.g. a read-tracking
+`unread` flag on `chat_messages`). Single-scope per call, like
+`Properties.Set`. Strict by construction: explicit record ids, no
+Upsert (local fields annotate synced records, never create them), no
+TraceIds. Scope enforcement is the apply layer's `classifyFieldWrite`
+(route=local): wrong-scope ops surface as `ModifyResult.Rejections`,
+absent records as `ErrStrictSkipAbsent` rejections. `ModifyMany` and
+`Delete` stay synced-only. Contract test:
+`e2e/local_scope_records_test.go` (the dataset-record sibling of
+`local_scope_test.go`).
+
 **Sidecar deferred.** The expert-recommended local sidecar collection
 (`(objectId, dataset, recordId) → {values, vers}` as the durable source
 of truth, row value a materialization) only matters for the

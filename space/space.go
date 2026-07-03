@@ -51,6 +51,11 @@ type Space interface {
 	// search). See ChangeIndexAPI.
 	Changes() ChangeIndexAPI
 
+	// ReadState tracks read/unread changes for datasets registered
+	// with handler.Dataset.ReadTracking. Methods return
+	// ErrReadTrackingDisabled when nothing in the space opted in.
+	ReadState() ReadStateAPI
+
 	// Debug returns the diagnostic surface for this space. See
 	// DebugAPI — not a stable interface, intended for tooling and
 	// inspection.

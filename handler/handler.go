@@ -173,7 +173,31 @@ type Dataset struct {
 	// meaningful discovery document; set Dynamic to keep a free-form
 	// keyspace explicit.
 	Schema Schema
+
+	// ReadTracking opts the dataset into read/unread tracking: the
+	// Classify callback tags each applied change, the SDK maintains
+	// the per-object unread set / frontier / counters, and marking is
+	// forward-only (Space read-state API). Optional; nil = untracked.
+	// Fields named in RecordFlags must be declared local-scope in
+	// Schema. See docs/read-tracking-proposal.md.
+	ReadTracking *ReadTracking
 }
+
+// Read-tracking registration types, re-exported from the CRDT layer.
+type (
+	ReadTracking       = crdt.ReadTracking
+	ReadClassification = crdt.ReadClassification
+	ReadClassifier     = crdt.ReadClassifier
+	ReadSeedMode       = crdt.ReadSeedMode
+)
+
+const (
+	// ReadSeedAtFirstSight marks everything present at the object's
+	// first tracked load as read; only later changes count as unread.
+	ReadSeedAtFirstSight = crdt.ReadSeedAtFirstSight
+	// ReadSeedAllUnread starts with the whole tracked history unread.
+	ReadSeedAllUnread = crdt.ReadSeedAllUnread
+)
 
 // Schema is a dataset's field-schema declaration: the set of declared
 // Fields plus whether the keyspace is Dynamic (free-form keys allowed,
@@ -211,6 +235,12 @@ const (
 	// per-account read/unread flag).
 	ScopeAccount = schema.ScopeAccount
 )
+
+// ParseScope parses a scope's wire label ("synced" / "derived" /
+// "local" / "account") — the inverse of Scope.String. Returns
+// (0, false) on an unknown label. Re-exported so HTTP layers share
+// the schema.Scope label vocabulary.
+func ParseScope(label string) (Scope, bool) { return schema.ParseScope(label) }
 
 // Leaf builds an unconstrained scalar value shape for a PropertyKind —
 // convenience for declaring simple Field shapes.

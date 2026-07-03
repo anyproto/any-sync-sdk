@@ -64,6 +64,11 @@ type App struct {
 
 	syncStatus *syncstatus.Service
 
+	// kvHandlers fans applied key-value writes out per space — see
+	// kvdispatcher.go. Guarded by kvMu.
+	kvMu       sync.RWMutex
+	kvHandlers map[string][]*kvHandlerReg
+
 	// syncers indexes the per-space treeSyncerAdapter so the debug
 	// surface can read per-peer SyncAll stats by spaceId. Populated
 	// from newTreeSyncerForSpace; never removed (adapter lives as

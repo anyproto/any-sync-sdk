@@ -52,8 +52,8 @@ type spaceWrapper struct {
 	app *App
 }
 
-func (s *spaceWrapper) Id() string                  { return s.id }
-func (s *spaceWrapper) Inner() commonspace.Space    { return s.cs }
+func (s *spaceWrapper) Id() string               { return s.id }
+func (s *spaceWrapper) Inner() commonspace.Space { return s.cs }
 
 func (s *spaceWrapper) SyncHeads(ctx context.Context) error { return s.cs.SyncHeads(ctx) }
 
@@ -100,6 +100,7 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 	cs, err := a.spaceService.NewSpace(ctx, id, commonspace.Deps{
 		SyncStatus: tracker,
 		TreeSyncer: a.newTreeSyncerForSpace(id),
+		Indexer:    a.newKVDispatcher(id),
 	})
 	if err != nil {
 		if errors.Is(err, spacestorage.ErrSpaceStorageMissing) {

@@ -131,9 +131,23 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	tree := newTreeManager()
 	localOnly := newLocalOnlySpaces()
 	peerStore := p2p.NewPeerStore()
+	// advertisedSpaceIds is the set the p2p exchange discloses and
+	// serves: every locally-stored space EXCEPT local-only ones, which
+	// are pinned to this device and must never reach the network (see
+	// localOnlySpaces).
+	advertisedSpaceIds := func() []string {
+		all := storage.AllSpaceIds()
+		out := all[:0]
+		for _, id := range all {
+			if !localOnly.has(id) {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
 	// A handshaked local peer's space set changed — head-sync whatever
 	// we share with it right away rather than on the next diff tick.
-	exchange := p2p.NewExchange(keys.PeerId, peerStore, storage.AllSpaceIds, func(_ string, spaceIds []string) {
+	exchange := p2p.NewExchange(keys.PeerId, peerStore, advertisedSpaceIds, func(_ string, spaceIds []string) {
 		sync.SyncSpaces(spaceIds)
 	})
 	p2pSrv := newP2PServer(cfg.P2P, cfg.Storage.DataDir)
@@ -235,6 +249,9 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	nc := a.MustComponent(nodeconf.CName).(nodeconf.Service)
 	out.nodeConf = nc
 	out.syncStatus.SetNodeIdsFn(nc.NodeIds)
+	// Connected LAN peers are responsible senders too, so a space
+	// synced purely over the LAN still advances to Synced.
+	out.syncStatus.SetLocalPeerIdsFn(peerStore.LocalPeerIds)
 	// Peer presence for sync status: live-connection counts via the
 	// non-dialing pool.Pick, refreshed when the p2p peer store or the
 	// discovery possibility changes. (The "Phase 3 peer-presence
@@ -393,6 +410,23 @@ func (a *App) SelectiveTreeTypes() []string { return a.selectiveTreeTypes }
 // Headless reports whether the SDK runs in embedded-backend mode
 // (cfg.Headless). See config.Config.Headless for the contract.
 func (a *App) Headless() bool { return a.headless }
+
+// IsLocalOnly reports whether spaceId is pinned to this device. The
+// p2p-facing sync handlers use it to refuse serving or advertising
+// local-only spaces even if a peer names one directly.
+func (a *App) IsLocalOnly(spaceId string) bool { return a.localOnly.has(spaceId) }
+
+// LocalPeerHasSpace reports whether a LAN peer advertised sharing
+// spaceId in the exchange. The SpacePush handler uses it to bound
+// which spaces a peer may seed onto this device.
+func (a *App) LocalPeerHasSpace(peerId, spaceId string) bool {
+	for _, id := range a.peerStore.SpaceIds(peerId) {
+		if id == spaceId {
+			return true
+		}
+	}
+	return false
+}
 
 // MarkSpaceLocalOnly pins spaceId to this device: its peer manager
 // resolves no peers (no node subscribe, no diff-sync, no push) and the

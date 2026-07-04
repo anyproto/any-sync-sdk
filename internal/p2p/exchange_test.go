@@ -29,8 +29,10 @@ func TestSpaceExchangeInbound(t *testing.T) {
 	ps := &fakePeerService{}
 	ex.peerService = ps
 
+	// The peer connected FROM an ephemeral source port (51000); its
+	// real listen port is the advertised 4242.
 	ctx := peer.CtxWithPeerId(context.Background(), "remote-peer")
-	ctx = peer.CtxWithPeerAddr(ctx, "quic://192.168.1.5:4242")
+	ctx = peer.CtxWithPeerAddr(ctx, "quic://192.168.1.5:51000")
 
 	resp, err := ex.SpaceExchange(ctx, &clientspaceproto.SpaceExchangeRequest{
 		SpaceIds: []string{"shared1"},
@@ -42,8 +44,9 @@ func TestSpaceExchangeInbound(t *testing.T) {
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{"mine1", "mine2"}, resp.SpaceIds)
 
-	// The proven dial-back address comes first, deduped against the
-	// advertised list; everything carries the quic scheme.
+	// The observed IP is paired with the ADVERTISED port (not the
+	// ephemeral 51000), deduped against the advertised list; everything
+	// carries the quic scheme.
 	require.Equal(t, []string{"quic://192.168.1.5:4242", "quic://10.0.0.7:4242"}, ps.addrs["remote-peer"])
 	require.ElementsMatch(t, []string{"remote-peer"}, store.LocalPeerIds("shared1"))
 	require.Equal(t, []string{"shared1"}, kicked)
@@ -59,6 +62,31 @@ func TestSpaceExchangeInboundNoLocalServer(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"mine"}, resp.SpaceIds)
 	require.Empty(t, store.AllLocalPeers())
+}
+
+func TestSpaceExchangeRejectsBadAddresses(t *testing.T) {
+	store := NewPeerStore()
+	ex := NewExchange("self", store, func() []string { return nil }, nil)
+	ps := &fakePeerService{}
+	ex.peerService = ps
+	ctx := peer.CtxWithPeerId(context.Background(), "p")
+
+	// Out-of-range port: no addresses recorded at all.
+	_, err := ex.SpaceExchange(ctx, &clientspaceproto.SpaceExchangeRequest{
+		SpaceIds:    []string{"s"},
+		LocalServer: &clientspaceproto.LocalServer{Ips: []string{"10.0.0.1"}, Port: 70000},
+	})
+	require.NoError(t, err)
+	require.Empty(t, ps.addrs["p"])
+	require.Empty(t, store.AllLocalPeers())
+
+	// Garbage / hostname IPs are dropped; only literal IPs survive.
+	_, err = ex.SpaceExchange(ctx, &clientspaceproto.SpaceExchangeRequest{
+		SpaceIds:    []string{"s"},
+		LocalServer: &clientspaceproto.LocalServer{Ips: []string{"evil.example.com", "not-an-ip", "10.0.0.2"}, Port: 4242},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"quic://10.0.0.2:4242"}, ps.addrs["p"])
 }
 
 func TestSpaceExchangeRefusesOwnPeerId(t *testing.T) {

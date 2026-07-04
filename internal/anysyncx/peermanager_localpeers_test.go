@@ -118,15 +118,41 @@ func TestGetResponsiblePeersNodeErrorWhenNobodyReachable(t *testing.T) {
 	require.ErrorIs(t, err, errPeerUnreachable)
 }
 
-func TestGetLocalPeersRemovesUnreachable(t *testing.T) {
+func TestGetLocalPeersRemovesUnreachableAfterStrikes(t *testing.T) {
 	local := &fakeLocalPeers{ids: []string{"dead", "lp1"}}
 	m := newTestManager(nil, local, map[string]peer.Peer{
 		"lp1": fakePeer{id: "lp1"},
 	})
+	// A single dial miss must NOT evict — a peer briefly restarting its
+	// QUIC session would otherwise be stranded until its next mDNS
+	// re-announce.
+	for i := 0; i < localDialStrikes-1; i++ {
+		peers, err := m.GetResponsiblePeers(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, []string{"lp1"}, peerIds(peers))
+		require.Empty(t, local.removed, "evicted too early on strike %d", i+1)
+	}
+	// The strike that reaches the threshold evicts.
 	peers, err := m.GetResponsiblePeers(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, []string{"lp1"}, peerIds(peers))
 	require.Equal(t, []string{"dead"}, local.removed)
+}
+
+func TestGetLocalPeersStrikeResetsOnSuccess(t *testing.T) {
+	local := &fakeLocalPeers{ids: []string{"flaky"}}
+	reachable := map[string]peer.Peer{}
+	m := newTestManager(nil, local, reachable)
+	// Two misses, then it comes back (resets), then two more misses —
+	// must not evict because the streak never reaches the threshold.
+	_, _ = m.GetResponsiblePeers(context.Background()) // miss 1
+	_, _ = m.GetResponsiblePeers(context.Background()) // miss 2
+	reachable["flaky"] = fakePeer{id: "flaky"}
+	_, _ = m.GetResponsiblePeers(context.Background()) // success → reset
+	delete(reachable, "flaky")
+	_, _ = m.GetResponsiblePeers(context.Background()) // miss 1 again
+	_, _ = m.GetResponsiblePeers(context.Background()) // miss 2 again
+	require.Empty(t, local.removed)
 }
 
 func TestGetLocalPeersKeepsPeerOnCancelledContext(t *testing.T) {

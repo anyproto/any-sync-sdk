@@ -80,16 +80,45 @@ func (h *spaceSyncHandler) UnregisterSpace(spaceId string) {
 	delete(h.spaces, spaceId)
 }
 
-// RegisteredSpaceIds returns a snapshot for the stream-handler subscription
-// preamble.
+// RegisteredSpaceIds returns a snapshot for the stream-handler
+// subscription preamble. Local-only spaces are excluded: the preamble
+// goes out on every stream (node and LAN peer alike), and a local-only
+// space must never be advertised to anyone.
 func (h *spaceSyncHandler) RegisteredSpaceIds() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	ids := make([]string, 0, len(h.spaces))
 	for id := range h.spaces {
+		if h.isLocalOnly(id) {
+			continue
+		}
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// servable reports whether an inbound peer RPC may touch spaceId: the
+// space must be registered and NOT local-only. Local-only spaces are
+// device-pinned — refuse to serve them even if a peer names the id
+// directly (defense in depth beyond leaving them out of the exchange).
+func (h *spaceSyncHandler) servable(spaceId string) (commonspace.Space, bool) {
+	if h.isLocalOnly(spaceId) {
+		return nil, false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	sp, ok := h.spaces[spaceId]
+	return sp, ok
+}
+
+// isLocalOnly consults the app's local-only set; false during the
+// brief boot window before the app back-reference is installed (no
+// peer RPCs are served then anyway).
+func (h *spaceSyncHandler) isLocalOnly(spaceId string) bool {
+	if app := h.app.Load(); app != nil {
+		return app.IsLocalOnly(spaceId)
+	}
+	return false
 }
 
 func (h *spaceSyncHandler) getSpace(spaceId string) (commonspace.Space, error) {
@@ -116,14 +145,19 @@ func (h *spaceSyncHandler) snapshotSpaces() []commonspace.Space {
 }
 
 func (h *spaceSyncHandler) ObjectSyncRequestStream(msg *spacesyncproto.ObjectSyncMessage, stream spacesyncproto.DRPCSpaceSync_ObjectSyncRequestStreamStream) error {
-	sp, err := h.getSpace(msg.SpaceId)
-	if err != nil {
-		return err
+	sp, ok := h.servable(msg.SpaceId)
+	if !ok {
+		return fmt.Errorf("anysyncx: space %s not servable", msg.SpaceId)
 	}
 	return sp.HandleStreamSyncRequest(stream.Context(), msg, stream)
 }
 
 func (h *spaceSyncHandler) HeadSync(ctx context.Context, req *spacesyncproto.HeadSyncRequest) (*spacesyncproto.HeadSyncResponse, error) {
+	// Refuse local-only spaces before the head-cache fast path too —
+	// otherwise a peer could probe a device-pinned space's hash.
+	if h.isLocalOnly(req.SpaceId) {
+		return nil, spacesyncproto.ErrSpaceMissing
+	}
 	if resp := h.tryHeadCache(req); resp != nil {
 		return resp, nil
 	}
@@ -193,8 +227,8 @@ func (h *spaceSyncHandler) ObjectSyncStream(stream spacesyncproto.DRPCSpaceSync_
 // (loaded) spaces only — an unloaded space means we can't vouch for
 // its state either.
 func (h *spaceSyncHandler) SpacePull(ctx context.Context, req *spacesyncproto.SpacePullRequest) (*spacesyncproto.SpacePullResponse, error) {
-	sp, err := h.getSpace(req.Id)
-	if err != nil {
+	sp, ok := h.servable(req.Id)
+	if !ok {
 		return nil, spacesyncproto.ErrSpaceMissing
 	}
 	desc, err := sp.Description(ctx)
@@ -215,9 +249,32 @@ func (h *spaceSyncHandler) SpacePull(ctx context.Context, req *spacesyncproto.Sp
 
 // SpacePush accepts a space payload from a peer whose diff-sync found
 // we're missing it, creating local storage and loading the space.
+//
+// A push creates a persistent .db file, so it's only honored for a
+// space the pushing peer actually advertised sharing in the exchange
+// (peerStore record) and that is not local-only. This bounds the
+// creation surface to what a peer claimed rather than any arbitrary id.
+// It does NOT fully stop a determined unauthenticated peer from
+// advertising many fake ids — closing that needs the authenticated
+// exchange (tracked follow-up).
 func (h *spaceSyncHandler) SpacePush(ctx context.Context, req *spacesyncproto.SpacePushRequest) (*spacesyncproto.SpacePushResponse, error) {
 	app := h.app.Load()
 	if app == nil || req.Payload == nil || req.Payload.SpaceHeader == nil {
+		return nil, spacesyncproto.ErrUnexpected
+	}
+	spaceId := req.Payload.SpaceHeader.GetId()
+	if h.isLocalOnly(spaceId) {
+		return nil, spacesyncproto.ErrSpaceIsDeleted
+	}
+	peerId, err := peer.CtxPeerId(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Only accept a NEW space from a peer that advertised sharing it.
+	// A space we already store needs no push.
+	if !app.SpaceExists(spaceId) && !app.LocalPeerHasSpace(peerId, spaceId) {
+		streamLog.Warn("space push refused: peer did not advertise this space",
+			zap.String("peerId", peerId), zap.String("spaceId", spaceId))
 		return nil, spacesyncproto.ErrUnexpected
 	}
 	description := commonspace.SpaceDescription{
@@ -228,8 +285,8 @@ func (h *spaceSyncHandler) SpacePush(ctx context.Context, req *spacesyncproto.Sp
 		SpaceSettingsId:      req.Payload.SpaceSettingsPayloadId,
 	}
 	ctx = context.WithValue(ctx, commonspace.AddSpaceCtxKey, description)
-	if _, err := app.GetSpace(ctx, description.SpaceHeader.GetId()); err != nil {
-		streamLog.Warn("space push: load", zap.String("spaceId", description.SpaceHeader.GetId()), zap.Error(err))
+	if _, err := app.GetSpace(ctx, spaceId); err != nil {
+		streamLog.Warn("space push: load", zap.String("spaceId", spaceId), zap.Error(err))
 		return nil, spacesyncproto.ErrUnexpected
 	}
 	return &spacesyncproto.SpacePushResponse{}, nil
@@ -237,8 +294,8 @@ func (h *spaceSyncHandler) SpacePush(ctx context.Context, req *spacesyncproto.Sp
 
 // StoreDiff serves the key-value store diff to a syncing peer.
 func (h *spaceSyncHandler) StoreDiff(ctx context.Context, req *spacesyncproto.StoreDiffRequest) (*spacesyncproto.StoreDiffResponse, error) {
-	sp, err := h.getSpace(req.SpaceId)
-	if err != nil {
+	sp, ok := h.servable(req.SpaceId)
+	if !ok {
 		return nil, spacesyncproto.ErrSpaceMissing
 	}
 	return sp.KeyValue().HandleStoreDiffRequest(ctx, req)
@@ -250,8 +307,8 @@ func (h *spaceSyncHandler) StoreElements(stream spacesyncproto.DRPCSpaceSync_Sto
 	if err != nil {
 		return fmt.Errorf("anysyncx: store elements recv: %w", err)
 	}
-	sp, err := h.getSpace(msg.SpaceId)
-	if err != nil {
+	sp, ok := h.servable(msg.SpaceId)
+	if !ok {
 		return spacesyncproto.ErrSpaceMissing
 	}
 	return sp.KeyValue().HandleStoreElementsRequest(stream.Context(), stream)

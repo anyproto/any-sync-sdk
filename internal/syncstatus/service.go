@@ -51,6 +51,12 @@ type Service struct {
 	// tests; then every sender is treated as responsible.
 	nodeIds NodeIdsFn
 
+	// localPeerIds resolves the connected LAN-peer list per space.
+	// Local peers are responsible senders too (a space synced purely
+	// over the LAN must still drain pending heads and advance to
+	// Synced). nil ⇒ no local peers considered.
+	localPeerIds NodeIdsFn
+
 	// totalFn supplies the per-space regular-object count for the
 	// rollup. May be nil in tests / Phase 1 — then Total reports 0.
 	totalFn TotalFn
@@ -163,6 +169,15 @@ func (s *Service) SetNodeIdsFn(fn NodeIdsFn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nodeIds = fn
+}
+
+// SetLocalPeerIdsFn wires the connected-LAN-peer resolver so local
+// peers count as responsible senders. Pass the p2p peer store's
+// LocalPeerIds method.
+func (s *Service) SetLocalPeerIdsFn(fn NodeIdsFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.localPeerIds = fn
 }
 
 // SetTotalFn wires the per-space regular-object count source. Pass
@@ -363,14 +378,26 @@ func rollupsEqual(a, b space.SpaceSyncStatus) bool {
 // (test-friendly default).
 func (s *Service) isResponsibleSender(spaceId, senderId string) bool {
 	s.mu.Lock()
-	fn := s.nodeIds
+	nodeFn := s.nodeIds
+	localFn := s.localPeerIds
 	s.mu.Unlock()
-	if fn == nil {
+	// No node resolver wired = test mode: every sender responsible.
+	if nodeFn == nil {
 		return true
 	}
-	for _, id := range fn(spaceId) {
+	for _, id := range nodeFn(spaceId) {
 		if id == senderId {
 			return true
+		}
+	}
+	// A connected LAN peer sharing this space is also a responsible
+	// sender — otherwise a space synced only over the LAN never drains
+	// pending heads and sync status is stuck "syncing" forever.
+	if localFn != nil {
+		for _, id := range localFn(spaceId) {
+			if id == senderId {
+				return true
+			}
 		}
 	}
 	return false

@@ -125,7 +125,13 @@ func (d *Discovery) Run(_ context.Context) error {
 	}
 	port, started := d.portFn()
 	if !started {
-		// No listener — we could browse but nobody could dial back.
+		// No inbound listener (e.g. a forced p2p.Port was already taken
+		// at boot) — browsing is pointless because no peer could dial
+		// back. p2p reports NotPossible for the process lifetime; the
+		// listener is bound once at startup and not retried, so this is
+		// terminal until restart. Logged loudly so the cause is clear
+		// (the possibility enum has no dedicated "listener failed").
+		log.Warn("p2p discovery not starting: inbound listener is down (check p2p.Port for a conflict)")
 		d.setPossibility(sdkp2p.PossibilityNoInterfaces)
 		return nil
 	}

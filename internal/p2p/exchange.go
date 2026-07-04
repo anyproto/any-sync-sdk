@@ -3,8 +3,10 @@ package p2p
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"slices"
+	"strconv"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/logger"
@@ -151,19 +153,39 @@ func (e *Exchange) SpaceExchange(ctx context.Context, req *clientspaceproto.Spac
 				zap.String("peerId", peerId))
 			return nil, fmt.Errorf("p2p: remote peer uses this device's own peer id %s (shared device key?)", peerId)
 		}
+		port := int(req.LocalServer.Port)
+		if port <= 0 || port > 65535 {
+			log.Info("space exchange with invalid port; ignoring addresses",
+				zap.String("peerId", peerId), zap.Int32("port", req.LocalServer.Port))
+			return &clientspaceproto.SpaceExchangeResponse{SpaceIds: e.allSpaceIds()}, nil
+		}
 		var addrs []string
+		// The IP the peer connected FROM is the one proven to route, but
+		// its port is the dialer's ephemeral source port — nobody listens
+		// there. Pair that observed IP with the peer's ADVERTISED listen
+		// port instead so dial-back after a drop reaches a live socket.
 		if peerAddr := peer.CtxPeerAddr(ctx); peerAddr != "" {
-			// The address the peer connected from is the one proven to
-			// route — put it first.
-			if u, uErr := url.Parse(peerAddr); uErr == nil && u.Host != "" {
-				addrs = append(addrs, u.Host)
+			if u, uErr := url.Parse(peerAddr); uErr == nil {
+				if host, _, sErr := net.SplitHostPort(u.Host); sErr == nil {
+					if ip := net.ParseIP(host); ip != nil {
+						addrs = appendAddr(addrs, ip, port)
+					}
+				}
 			}
 		}
-		for _, ip := range req.LocalServer.Ips {
-			addr := fmt.Sprintf("%s:%d", ip, req.LocalServer.Port)
-			if !slices.Contains(addrs, addr) {
-				addrs = append(addrs, addr)
+		for _, raw := range req.LocalServer.Ips {
+			ip := net.ParseIP(raw)
+			if ip == nil {
+				// Reject anything that isn't a literal IP — no hostnames,
+				// no garbage that could displace good addresses or point
+				// us at an arbitrary host.
+				continue
 			}
+			addrs = appendAddr(addrs, ip, port)
+		}
+		if len(addrs) == 0 {
+			log.Info("space exchange with no usable addresses", zap.String("peerId", peerId))
+			return &clientspaceproto.SpaceExchangeResponse{SpaceIds: e.allSpaceIds()}, nil
 		}
 		e.peerService.SetPeerAddrs(peerId, addSchema(addrs))
 		e.store.UpdateLocalPeer(peerId, req.SpaceIds)
@@ -173,6 +195,16 @@ func (e *Exchange) SpaceExchange(ctx context.Context, req *clientspaceproto.Spac
 		}
 	}
 	return &clientspaceproto.SpaceExchangeResponse{SpaceIds: e.allSpaceIds()}, nil
+}
+
+// appendAddr adds "ip:port" to addrs unless already present. IP is a
+// validated net.IP; JoinHostPort brackets IPv6 correctly.
+func appendAddr(addrs []string, ip net.IP, port int) []string {
+	a := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+	if slices.Contains(addrs, a) {
+		return addrs
+	}
+	return append(addrs, a)
 }
 
 // addSchema pins the quic transport on each addr. Without an explicit

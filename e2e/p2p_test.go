@@ -221,6 +221,28 @@ func TestE2E_P2POfflineSync(t *testing.T) {
 	require.Len(t, debugA.Peers, 1)
 	assert.True(t, debugA.Peers[0].Connected)
 	assert.Contains(t, debugA.Peers[0].SpaceIds, spaceId)
+
+	// Edit-after-restore: a write on B must converge to A over the LAN
+	// AND drive B's own sync status back to Synced. This guards the
+	// responsible-sender fix — a LAN peer counts as responsible, so
+	// pending heads drain even with no node reachable. Without it B
+	// would sit in "syncing" forever.
+	objId2, err := spB.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	require.NoError(t, err)
+	_, err = spB.Properties().Set(ctx, objId2, typeId, map[string]any{propId: "from-B"})
+	require.NoError(t, err)
+
+	spA, err := sdkA.Spaces().Get(ctx, spaceId)
+	require.NoError(t, err)
+	require.True(t, waitFor(ctx, 60*time.Second, 250*time.Millisecond, func() bool {
+		_ = spA.SyncHeads(ctx)
+		rec, rErr := spA.Properties().Get(ctx, objId2)
+		return rErr == nil && rec != nil && rec.GetString(typeId, propId) == "from-B"
+	}), "device A never received B's edit over p2p")
+
+	require.True(t, waitFor(ctx, 30*time.Second, 250*time.Millisecond, func() bool {
+		return sdkB.Spaces().Status(spaceId).State == space.SyncStateSynced
+	}), "device B sync status never reached Synced over LAN; last=%+v", sdkB.Spaces().Status(spaceId))
 }
 
 // TestE2E_P2PRealMDNS is the same offline two-device scenario but over

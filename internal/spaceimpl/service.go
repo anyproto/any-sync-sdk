@@ -192,6 +192,7 @@ type Service struct {
 	// (from sdk.Open, after the tech space opens); drained in Close. Nil /
 	// inert when the inbox transport is unavailable.
 	inboxNotifier *inbox.Notifier
+	inviteCtx     context.Context
 	inviteCancel  context.CancelFunc
 	inviteWG      sync.WaitGroup
 	inviteKick    chan struct{}
@@ -525,8 +526,17 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 //
 // Mirrors the eager-load that Create / Derive / OneToOne already do.
 func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) {
-	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
 		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
+	}
+	// A not-yet-accepted direct-add invite must not be materialized by a
+	// read path — "nothing is downloaded until accepted" is the whole
+	// materialization gate. AcceptInvite flips the row to active before
+	// it loads, so every legitimate load passes this guard.
+	if rec.RemoteStatus == techspace.InvitePendingRemoteStatus ||
+		rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus {
+		return nil, fmt.Errorf("spaceimpl: space %q is a pending direct-add invite; AcceptInvite it first", spaceId)
 	}
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
@@ -1198,22 +1208,40 @@ func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space
 	if rec.IsDeleted() {
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is deleted", spaceId)
 	}
+	if rec.LocalStatus == joiningLocalStatus {
+		// A token-join awaiting owner approval rides the same
+		// remote=active row shape (Join stamps it at request time);
+		// accepting it here would clobber the joining marker and tear
+		// down its ACL waiter, silencing an eventual owner decline.
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is awaiting join approval, not a direct-add invite", spaceId)
+	}
 	switch rec.RemoteStatus {
 	case techspace.InvitePendingRemoteStatus, techspace.InviteDeclinedRemoteStatus:
-		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
-			return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w", err)
-		}
 	case techspace.StatusActive:
-		// Idempotent re-accept / resume of an interrupted load.
+		// Idempotent re-accept / resume of an interrupted load — but only
+		// from a plain active/loading row; any other device-local
+		// lifecycle (offloaded, …) is not this API's business.
+		switch rec.LocalStatus {
+		case "", techspace.StatusActive, inviteLoadingLocalStatus:
+		default:
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is not invite-pending", spaceId)
+		}
 	default:
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is not invite-pending", spaceId)
 	}
-	// Persist the loading obligation BEFORE attempting the load: if we
-	// crash mid-pull, the join controller resumes from this marker at
-	// next boot.
+	// Persist the loading obligation BEFORE the synced accept flip: a
+	// crash between the two writes must leave a resumable marker, never a
+	// durable account-wide accept nobody finishes. loadAcceptedInvite
+	// completes the remote flip when it finds the marker with the row
+	// still invite-pending.
 	if rec.LocalStatus != techspace.StatusActive {
 		if _, err := s.tsp.SetLocalStatus(ctx, spaceId, inviteLoadingLocalStatus); err != nil {
 			return nil, fmt.Errorf("spaceimpl: AcceptInvite: mark loading: %w", err)
+		}
+	}
+	if rec.RemoteStatus != techspace.StatusActive {
+		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w", err)
 		}
 	}
 	sp, err := s.Get(ctx, spaceId)

@@ -62,13 +62,23 @@ carry pending to the other devices.
 
 - The inbox handler **no-clobbers**: an existing row (active
   membership, sticky decline, terminal delete, duplicate delivery)
-  means no-op. No storage is materialized while pending.
-- `AcceptInvite` flips the synced status first (the durable accept),
-  stamps the device-local `inviteLoading` status, then tries one
-  bounded load. If content isn't pullable yet it returns
-  `ErrInviteAcceptPending` and the join controller finishes the load in
-  the background (resumed at boot — same machinery as post-join
-  loading, minus the ACL waiter: the account is already a member).
+  means no-op. It pulls the tech space current (`SyncHeads`) before the
+  check so a duplicate delivery on a lagging device sees another
+  device's registration/accept instead of re-writing pending over it.
+  No storage is materialized while pending — `Service.Get` refuses to
+  load rows in the invite-pending/declined states, so no read path
+  (List handle probes, direct Get) can defeat the gate.
+- `AcceptInvite` stamps the device-local `inviteLoading` marker FIRST,
+  then flips the synced status to active, then tries one bounded load.
+  The order is load-bearing: a crash between the writes leaves the
+  resumable marker, and the background load finishes the interrupted
+  synced flip — never a durable accept nobody completes. If content
+  isn't pullable it returns `ErrInviteAcceptPending` and the join
+  controller finishes in the background (`loadAcceptedInvite`, resumed
+  at boot; no ACL waiter — the account is already a member). The loop
+  re-reads the row each attempt and stops on a synced decline or a
+  delete, so `Delete` is the cleanup path for an accept that can never
+  complete (spoofed spaceId, membership revoked before accept).
 - `DeclineInvite` writes the sticky marker only. **No ACL write** — the
   account stays a member on paper (self-remove is a follow-up); the
   sender gets no signal (v1, same as 1-1).

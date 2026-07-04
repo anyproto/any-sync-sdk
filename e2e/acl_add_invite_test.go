@@ -118,6 +118,11 @@ func TestE2E_DirectAdd_InboxInvite(t *testing.T) {
 	assert.Equal(t, space.SpaceTypeRegular, bobPending.Type)
 	assert.Equal(t, "TeamSpace", carolPending.Name)
 
+	// The materialization gate: a pending invite cannot be loaded by a
+	// read path — only AcceptInvite may materialize it.
+	_, err = bob.Spaces().Get(ctx, sp.Id())
+	require.Error(t, err, "Get on a pending invite must refuse to materialize the space")
+
 	// Bob accepts. Either the bounded synchronous load succeeds, or it
 	// returns ErrInviteAcceptPending and the join controller finishes in
 	// the background — both are success paths.

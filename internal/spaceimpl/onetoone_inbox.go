@@ -74,8 +74,11 @@ func (s *Service) StartOneToOneInbox(ctx context.Context) {
 			s.inboxNotifier.Notify()
 		}
 	})
-	s.inboxNotifier.Run(ctx)
+	// Start the send-retry loop (which also publishes inviteCtx) BEFORE
+	// the notifier: the first fetched message can dispatch immediately,
+	// and handleRegularInvite reads inviteCtx.
 	s.startInviteRetry()
+	s.inboxNotifier.Run(ctx)
 }
 
 // stopOneToOneInbox tears down the inbox subsystem. Called from Close
@@ -153,6 +156,14 @@ func (s *Service) handleRegularInvite(ctx context.Context, m inbox.Message) erro
 	if body.SymKey != "" {
 		_ = s.tsp.SetIdentityMetaKey(ctx, m.SenderIdentity, body.SymKey)
 	}
+	// Pull the tech space current before the no-clobber check: a
+	// duplicate delivery processed on THIS device (per-device cursor lag)
+	// while ANOTHER device already registered — and possibly accepted —
+	// the row must see that row, not re-write invitePending over the
+	// accept under CRDT LWW. We are online (an inbox fetch just
+	// succeeded), so this is a cheap round; failure falls through to the
+	// local view.
+	_ = s.tsp.SyncHeads(ctx)
 	if _, ok := s.tsp.Get(ctx, body.SpaceId); ok {
 		return nil
 	}
@@ -170,7 +181,16 @@ func (s *Service) handleRegularInvite(ctx context.Context, m inbox.Message) erro
 	}); err != nil {
 		return fmt.Errorf("%w: register direct-add invite: %v", inbox.ErrRetry, err)
 	}
-	go s.resolveInviteSenderProfile(context.Background(), m.SenderIdentity, body.SpaceId)
+	// Tracked + cancellable like every other background tech-space
+	// writer: bound to the inbox subsystem's ctx and drained by
+	// stopOneToOneInbox before the tech space is torn down.
+	if s.inviteCtx != nil {
+		s.inviteWG.Add(1)
+		go func() {
+			defer s.inviteWG.Done()
+			s.resolveInviteSenderProfile(s.inviteCtx, m.SenderIdentity, body.SpaceId)
+		}()
+	}
 	inboxLog.Debug("registered direct-add invite",
 		zap.String("spaceId", body.SpaceId), zap.String("sender", m.SenderIdentity))
 	return nil
@@ -205,6 +225,12 @@ func (s *Service) markRegularInvitesToSend(ctx context.Context, spaceId string, 
 	if s.app.InboxClient() == nil {
 		return
 	}
+	// The caller's ctx may arrive nearly exhausted (AddAccounts can burn
+	// most of a request deadline in its log-not-ready retries). These are
+	// fast local writes recording a durable obligation for an ACL add
+	// that already happened — losing them to an expiring request
+	// deadline would silently drop the notification forever.
+	ctx = context.WithoutCancel(ctx)
 	var self string
 	if keys := s.app.AccountKeys(); keys != nil {
 		self = keys.SignKey.GetPublic().Account()
@@ -243,10 +269,12 @@ func (s *Service) markOneToOneInviteToSend(ctx context.Context, spaceId string) 
 }
 
 // startInviteRetry launches the send-retry loop bound to its own
-// cancellable context. Drained by stopOneToOneInbox via inviteWG.
+// cancellable context. Drained by stopOneToOneInbox via inviteWG. The
+// ctx is kept on the Service so other inbox-subsystem goroutines
+// (sender-profile resolution) share its lifetime.
 func (s *Service) startInviteRetry() {
 	ctx, cancel := context.WithCancel(context.Background())
-	s.inviteCancel = cancel
+	s.inviteCtx, s.inviteCancel = ctx, cancel
 	s.inviteWG.Add(1)
 	go s.inviteRetryLoop(ctx)
 }

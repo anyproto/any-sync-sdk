@@ -160,6 +160,21 @@ type LocalPreValidator interface {
 	PreValidate(ch *Change, before *anyenc.Value) error
 }
 
+// RecordGetter resolves a record's CURRENT value by explicit id (nil
+// when absent or the id is empty). Handed to LocalPreValidatorMulti so
+// a batch validator can read per-record pre-state.
+type RecordGetter func(id string) *anyenc.Value
+
+// LocalPreValidatorMulti is the batch-friendly variant of
+// LocalPreValidator: instead of one pre-resolved `before`, the handler
+// receives a getter and resolves pre-state per record — required for
+// changes carrying N explicit-id records (e.g. recording N networkSigns
+// in one change). When a handler implements both interfaces the
+// Controller prefers this one.
+type LocalPreValidatorMulti interface {
+	PreValidateMulti(ch *Change, get RecordGetter) error
+}
+
 // DefaultHandler is a no-op handler accepting every op. Useful as a base
 // for tests and as a convenient embed; the dataset name / version /
 // indexes live on the HandlerReg, not here.

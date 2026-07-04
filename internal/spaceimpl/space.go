@@ -6,11 +6,13 @@ import (
 	"fmt"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
@@ -130,6 +132,29 @@ func (s *spaceImpl) SyncHeads(ctx context.Context) error {
 	return s.app.SyncHeads(ctx, s.id)
 }
 
+// TreeHeads reads the space frontier straight from any-sync's
+// headstorage: one entry per live (non-deleted) tree — materialized
+// trees and heads-only selective-sync stubs alike, system trees
+// (settings) included. See space.Space.TreeHeads.
+func (s *spaceImpl) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
+	handle, err := s.app.GetSpace(ctx, s.id)
+	if err != nil {
+		return nil, err
+	}
+	hs := handle.Inner().Storage().HeadStorage()
+	var out []space.TreeHeads
+	if err = hs.IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
+		out = append(out, space.TreeHeads{
+			TreeId: e.Id,
+			Heads:  append([]string(nil), e.Heads...),
+		})
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("spaceimpl: iterate heads: %w", err)
+	}
+	return out, nil
+}
+
 // SyncStatus returns the per-space sync-status accessor backed by the
 // account-level syncstatus.Service held on anysyncx.App. The accessor
 // is a thin pointer wrapper — safe to construct on every call (no
@@ -196,6 +221,17 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 // datasets (DatasetOwner returns false) — property-namespace membership
 // is enforced separately by SystemPropertiesHandler.PreValidate. Local
 // write-time only; inbound apply stays read-tolerant.
+// checkPublicDataset rejects writes to SDK-internal datasets through
+// the public Modify/ModifyMany/Delete surface. The payloads dataset is
+// written only by the SDK's files layer (its change shapes are fixed
+// and its object class ships changes unencrypted).
+func checkPublicDataset(dataset string) error {
+	if dataset == payloads.Dataset {
+		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
+	}
+	return nil
+}
+
 func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
 	owner, ok := s.store.DatasetOwner(dataset)
 	if !ok {
@@ -228,6 +264,9 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	}
 	if batch.Dataset == "" {
 		return space.ModifyResult{}, errors.New("spaceimpl: Dataset required")
+	}
+	if err := checkPublicDataset(batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
 	}
 	switch batch.Scope {
 	case 0, space.ScopeSynced:
@@ -363,6 +402,10 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	changes := make([]crdt.Change, len(batches))
 	var validationErrs []error
 	for i, b := range batches {
+		if err := checkPublicDataset(b.Dataset); err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
+			continue
+		}
 		dataVersion, err := s.store.DataVersion(b.Dataset)
 		if err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
@@ -405,6 +448,9 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.ModifyResult, error) {
 	if len(batch.RecordIds) == 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: DeleteBatch.RecordIds empty")
+	}
+	if err := checkPublicDataset(batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
 	}
 	dataVersion, err := s.store.DataVersion(batch.Dataset)
 	if err != nil {

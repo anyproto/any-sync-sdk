@@ -595,6 +595,17 @@ func (c *Controller) PreValidateLocal(ctx context.Context, ch *Change) error {
 	if !ok {
 		return nil
 	}
+	// Multi-record validators resolve pre-state per record via the
+	// getter — the batch-friendly path (a change carrying N explicit-id
+	// records gets each one's current value, not just the first's).
+	if pvm, ok := h.(LocalPreValidatorMulti); ok {
+		return pvm.PreValidateMulti(ch, func(id string) *anyenc.Value {
+			if id == "" {
+				return nil
+			}
+			return c.Get(ctx, ch.Dataset, id)
+		})
+	}
 	pv, ok := h.(LocalPreValidator)
 	if !ok {
 		return nil

@@ -17,12 +17,17 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/files/status"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/inbox"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/readsync"
@@ -96,6 +101,19 @@ type Service struct {
 	// storeFor — each type's handlers are applied alongside the
 	// built-in catalog.
 	extTypes []handler.Type
+
+	// files/fetch/fstore/fqueue are the SDK-level byte-layer services
+	// behind every space's Files() surface. Set once by SetFiles right
+	// after construction (sdk.Open); nil only in tests that never
+	// touch files.
+	files  *upload.Service
+	fetch  *fetch.Service
+	fstore *filestore.Store
+	fqueue *status.Queue
+
+	// fileStatusSubs fans queue transitions + local attach events out
+	// to per-space Files().SubscribeStatus callbacks.
+	fileStatusSubs fileSubs
 
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
@@ -218,6 +236,16 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 	}
 	return s
 }
+
+// SetFiles wires the SDK-level files byte-layer services. Called once
+// from sdk.Open before any Space handle is handed out.
+func (s *Service) SetFiles(up *upload.Service, fe *fetch.Service, st *filestore.Store, q *status.Queue) {
+	s.files, s.fetch, s.fstore, s.fqueue = up, fe, st, q
+}
+
+// filesStore returns the local payload store (nil-safe accessor for
+// the Files surface).
+func (s *Service) filesStore() *filestore.Store { return s.fstore }
 
 // storeFor returns the per-space spaceobjects.Store, building it on
 // first access. The allocator is also lazily created and shared
@@ -1255,6 +1283,18 @@ func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error 
 		return s.tsp.DeleteTree(ctx, spaceId, treeId)
 	}
 	return s.storeFor(spaceId).DeleteTree(ctx, treeId)
+}
+
+// ShouldPullTree is the selective-sync pull decision for a
+// locally-missing tree announced by a head update. The tech space is
+// always fully synced; regular spaces delegate to their Store, which
+// classifies by the update's root changeType and, when declining,
+// refreshes the tree's heads-only stub so the sync diff converges.
+func (s *Service) ShouldPullTree(ctx context.Context, spaceId, treeId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool {
+	if spaceId == s.tsp.SpaceId() {
+		return true
+	}
+	return s.storeFor(spaceId).ShouldPullTree(ctx, treeId, root, heads)
 }
 
 // Compile-time check that we satisfy the registry contract.

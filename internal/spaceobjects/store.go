@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	anystorev1 "github.com/anyproto/any-store"
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
@@ -39,6 +40,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -63,6 +65,31 @@ var builtinDataVersions = map[string]string{
 	properties.Dataset:           properties.HandlerVersion,
 	typetype.DatasetPropertyDefs: typetype.HandlerVersion,
 	typetype.ShortIdsDataset:     "shortIds-v1",
+	payloads.Dataset:             payloads.HandlerVersion,
+}
+
+// plaintextSpecs declares the plaintext (node-readable) object
+// classes, keyed by tree-root ChangeType. A payloads object ships its
+// changes unencrypted and may carry ONLY the payloads dataset —
+// LocalWrite hard-errors on anything else and inbound replay skips it
+// (see object.PlaintextSpec).
+var plaintextSpecs = map[string]object.PlaintextSpec{
+	payloads.ChangeType: {Datasets: map[string]struct{}{payloads.Dataset: {}}},
+}
+
+// validateEncryptionClass pins the tree-encryption invariant: a tree
+// ships unencrypted IFF its root ChangeType is a registered plaintext
+// class. Enforced at every create/derive so a callsite can neither
+// ship cleartext for an encrypted-class type nor (since the flag is
+// baked into the root bytes) silently fork a derived id by
+// disagreeing with the class registry.
+func validateEncryptionClass(changeType string, unencrypted bool) error {
+	_, plaintext := plaintextSpecs[changeType]
+	if unencrypted != plaintext {
+		return fmt.Errorf("spaceobjects: ChangeType %q: Unencrypted=%v but plaintext-class registration=%v — the flag must match the class",
+			changeType, unencrypted, plaintext)
+	}
+	return nil
 }
 
 // SpaceObjectsCollection is the on-disk collection name for the
@@ -79,6 +106,11 @@ const SpaceObjectsCollection = "objects"
 type CreateOpts struct {
 	ChangeType    string
 	ChangePayload []byte
+	// Unencrypted creates a plaintext (node-readable) tree: the root
+	// payload carries IsEncrypted:false and the object's ChangeType
+	// must be a registered plaintext class (object.PlaintextSpec) so
+	// every change ships unencrypted. Regular objects leave it false.
+	Unencrypted bool
 }
 
 // DeriveOpts is the input to Store.Derive. ChangePayload is the seed
@@ -89,6 +121,11 @@ type DeriveOpts struct {
 	// ParentId binds the derived tree to a parent so any-sync cascade-
 	// deletes it with the parent. It is also hashed into the derived id.
 	ParentId string
+	// Unencrypted derives a plaintext (node-readable) tree — see
+	// CreateOpts.Unencrypted. NOTE: the flag participates in the
+	// derived root bytes, so it changes the derived object id; every
+	// deriver of a given plaintext object must pass the same value.
+	Unencrypted bool
 }
 
 // Store owns per-object Controllers and handed-out *object.Object
@@ -187,6 +224,11 @@ type Store struct {
 	// with customHandlers — the gate is a registry/type-system concept
 	// the tech space doesn't participate in.
 	disableGate bool
+
+	// selective is the selective-sync tree-type allowlist (root
+	// changeType → allowed). Nil/empty = sync everything. See
+	// selective.go for the full mechanism.
+	selective map[string]struct{}
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -233,6 +275,11 @@ type StoreConfig struct {
 	Handlers     []crdt.HandlerReg
 	DisableGate  bool
 	DataVersions map[string]string
+
+	// SelectiveTypes is the selective-sync tree-type allowlist. Only
+	// the regular-space path (NewStore) sets it — the tech space is
+	// always fully synced. See selective.go.
+	SelectiveTypes []string
 }
 
 // NewStore constructs a regular type/properties-backed Store. The
@@ -244,8 +291,13 @@ type StoreConfig struct {
 // ValidateExternalTypes — call it before NewStore at the SDK
 // boundary so collisions are caught at Open time.
 func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type) *Store {
+	var selectiveTypes []string
+	if app != nil {
+		selectiveTypes = app.SelectiveTreeTypes()
+	}
 	return NewStoreWithConfig(StoreConfig{
 		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes,
+		SelectiveTypes: selectiveTypes,
 	})
 }
 
@@ -266,6 +318,12 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		rowEvents:      newRowEventRegistry(),
 		customHandlers: cfg.Handlers,
 		disableGate:    cfg.DisableGate,
+	}
+	if len(cfg.SelectiveTypes) > 0 {
+		s.selective = make(map[string]struct{}, len(cfg.SelectiveTypes))
+		for _, t := range cfg.SelectiveTypes {
+			s.selective[t] = struct{}{}
+		}
 	}
 	if cfg.Handlers != nil {
 		// Raw mode: no registry, no built-in dataset versions; the
@@ -788,6 +846,7 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 
 	// Best-effort from here — disk reclaim + notifications, not correctness.
 	s.dropObjectCollections(ctx, objectId)
+	_ = s.unmarkSkipped(ctx, objectId)
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil
 }
@@ -906,6 +965,13 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		s.Drop(p.id)
 		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
 	}
+	if s.SelectiveMode() {
+		// Skip markers exist for ids that never materialized, so sweep
+		// the full input list, not just the purged rows.
+		for _, id := range objectIds {
+			_ = s.unmarkSkipped(ctx, id)
+		}
+	}
 	return nil
 }
 
@@ -962,12 +1028,20 @@ func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
 	}
 	entry, err := st.HeadStorage().GetEntry(ctx, treeId)
 	if err != nil {
-		if errors.Is(err, anystore.ErrDocNotFound) {
+		if isDocNotFound(err) {
 			return false, nil
 		}
 		return false, err
 	}
 	return entry.DeletedStatus != headstorage.DeletedStatusNotDeleted, nil
+}
+
+// isDocNotFound matches any-store's document-not-found across BOTH
+// major versions: any-sync's storage returns any-store v1's instance,
+// the SDK's own DB returns v2's — same text, different error values,
+// so a single errors.Is silently misses one of them.
+func isDocNotFound(err error) bool {
+	return errors.Is(err, anystore.ErrDocNotFound) || errors.Is(err, anystorev1.ErrDocNotFound)
 }
 
 // Get returns the *object.Object for objectId, lazy-loading on first
@@ -988,6 +1062,9 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 // land on the root any-sync change; for the MVP they're informational
 // only.
 func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return nil, err
+	}
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
@@ -1001,7 +1078,7 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
-		IsEncrypted:   true,
+		IsEncrypted:   !opts.Unencrypted,
 		Seed:          seed,
 		// Timestamp is the creation moment baked into the immutable
 		// root change. SystemPropertiesHandler reads it back via
@@ -1017,11 +1094,112 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
 }
 
+// DeriveId computes the deterministic objectId Derive(opts) would
+// produce, WITHOUT creating or loading anything. Pure: DeriveTree
+// only builds the root change in memory (all inputs — including
+// Unencrypted and ParentId — are baked into the root bytes, so they
+// participate in the id). Read paths use this to resolve lazily-
+// created objects and treat a missing tree as "no rows yet".
+func (s *Store) DeriveId(ctx context.Context, opts DeriveOpts) (string, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return "", err
+	}
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return "", fmt.Errorf("spaceobjects: get space: %w", err)
+	}
+	payload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, objecttree.ObjectTreeDerivePayload{
+		ChangeType:    opts.ChangeType,
+		ChangePayload: opts.ChangePayload,
+		SpaceId:       s.spaceId,
+		IsEncrypted:   !opts.Unencrypted,
+		ParentId:      opts.ParentId,
+	})
+	if err != nil {
+		return "", fmt.Errorf("spaceobjects: DeriveTree: %w", err)
+	}
+	return payload.RootRawChange.Id, nil
+}
+
+// HasTree reports whether the tree exists in local storage (deleted
+// trees count as existing — TreeDeleted distinguishes them).
+func (s *Store) HasTree(ctx context.Context, treeId string) (bool, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return false, err
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return false, nil
+	}
+	if _, err := st.HeadStorage().GetEntry(ctx, treeId); err != nil {
+		if isDocNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// TreeIdsByChangeType returns the ids of every materialized tree in
+// this space whose root changeType equals changeType. The root is the
+// typed source of truth — signed, content-addressed (the tree id is the
+// cid of the root bytes) and cleartext, so keyed and keyless readers
+// classify identically and a peer can't relabel a tree into the result.
+//
+// Two-phase like the spacesync catch-up: collect ids while the
+// headstorage iterator is open, classify after. Trees whose root can't
+// be read are skipped — heads-only stubs (selective sync) have no
+// change rows by construction, and an unreadable root is not evidence
+// of the requested type.
+func (s *Store) TreeIdsByChangeType(ctx context.Context, changeType string) ([]string, error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return nil, errors.New("spaceobjects: space storage unavailable")
+	}
+	var candidates []string
+	if err := st.HeadStorage().IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
+		if e.DeletedStatus != headstorage.DeletedStatusNotDeleted {
+			return true, nil
+		}
+		candidates = append(candidates, e.Id)
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: iterate heads entries: %w", err)
+	}
+	var out []string
+	for _, id := range candidates {
+		ts, err := st.TreeStorage(ctx, id)
+		if err != nil {
+			continue
+		}
+		rootCh, err := ts.Root(ctx)
+		if err != nil {
+			continue
+		}
+		root, err := parseVerifiedRoot(rootCh.RawTreeChangeWithId())
+		if err != nil {
+			continue
+		}
+		if root.ChangeType == changeType {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
 // Derive makes a deterministic object on the space. Idempotent — a
 // second Derive with the same opts.ChangePayload returns the same
 // objectId. If the tree already exists locally, ocache's per-id
 // LoadFunc serialization deduplicates parallel callers.
 func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return nil, err
+	}
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
@@ -1030,7 +1208,7 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
-		IsEncrypted:   true,
+		IsEncrypted:   !opts.Unencrypted,
 		ParentId:      opts.ParentId,
 	})
 	if err != nil {
@@ -1078,12 +1256,13 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		gate = s.gateFor(objectId)
 	}
 	obj, err := object.New(object.Config{
-		SpaceId:    s.spaceId,
-		SignKey:    s.signKey,
-		Controller: ctrl,
-		Allocator:  s.alloc,
-		Gate:       gate,
-		AfterApply: s.afterApplyFor(),
+		SpaceId:        s.spaceId,
+		SignKey:        s.signKey,
+		Controller:     ctrl,
+		Allocator:      s.alloc,
+		Gate:           gate,
+		AfterApply:     s.afterApplyFor(),
+		PlaintextSpecs: plaintextSpecs,
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
 	})
@@ -1138,7 +1317,25 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 		}
 		// fall through to BuildTree on ErrTreeExists
 	}
-	tree, err := tb.BuildTree(ctx, objectId, objecttreebuilder.BuildTreeOpts{Listener: listener})
+	opts := objecttreebuilder.BuildTreeOpts{Listener: listener}
+	if s.SelectiveMode() {
+		// Probe-first: a remote fetch of an unknown tree asks for root +
+		// heads only; the validator classifies by root changeType before
+		// anything is persisted. Local trees are unaffected (probe only
+		// applies when tree storage misses).
+		opts.Probe = true
+		opts.TreeValidator = s.selectiveTreeValidator(true)
+	}
+	tree, err := tb.BuildTree(ctx, objectId, opts)
+	if errors.Is(err, errProbeSelectedType) {
+		// Selected type — fetch for real. The validator re-checks the
+		// type (a different peer may serve this request) and then
+		// delegates to any-sync's default validation.
+		tree, err = tb.BuildTree(ctx, objectId, objecttreebuilder.BuildTreeOpts{
+			Listener:      listener,
+			TreeValidator: s.selectiveTreeValidator(false),
+		})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: BuildTree %s: %w", objectId, err)
 	}
@@ -1222,6 +1419,13 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		// dense (never sparse) — a reverse-scan to the last key replaces a
 		// full-collection scan+sort as the shortIds dataset grows.
 		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}, Indexes: []anystore.IndexInfo{{Name: "idx__ver_id", Fields: []string{"_ver.id"}}}},
+		// `payloads` — the node-readable per-file index. Registered on
+		// every controller (uniform handler set), but only payloads
+		// objects (plaintext class, see plaintextSpecs) ever write it:
+		// LocalWrite on a regular object could technically carry it,
+		// which is harmless (encrypted change, empty collection) and
+		// fenced off at the public Modify API anyway.
+		{Name: payloads.Dataset, Handler: payloads.Handler{}, Schema: payloads.Schema()},
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {

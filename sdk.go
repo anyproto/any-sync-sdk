@@ -9,10 +9,17 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
+	"github.com/anyproto/any-sync/net/pool"
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/files/broker"
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/files/gc"
+	"github.com/anyproto/any-sync-sdk/internal/files/status"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/readsync"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
@@ -25,12 +32,40 @@ import (
 // SDK is the top-level handle held by middleware for the lifetime of
 // use. Constructed by Open; torn down by Close.
 type SDK struct {
-	app      *anysyncx.App
-	db       anystore.DB
-	tsp      *techspace.Service
-	spaces   *spaceimpl.Service
-	account  *accountImpl
-	readSync *readsync.Service
+	app        *anysyncx.App
+	db         anystore.DB
+	tsp        *techspace.Service
+	spaces     *spaceimpl.Service
+	account    *accountImpl
+	filesQueue *status.Queue
+	filesGC    *gc.Service
+	readSync   *readsync.Service
+}
+
+// FileCacheSize returns the local bytes currently held by file content
+// across all spaces (complete + partial copies; inline files hold no
+// cache bytes).
+func (s *SDK) FileCacheSize(ctx context.Context) (int64, error) {
+	return s.filesGC.CacheSize(ctx)
+}
+
+// FreeUpFileCache reclaims local file bytes until at least `bytes` are
+// freed, least-recently-used first, dropping only content that is safe
+// to drop (backed up on the network — a later Open refetches — or no
+// longer referenced by any file). Returns the bytes actually freed,
+// which is less than requested when nothing else is safely evictable.
+func (s *SDK) FreeUpFileCache(ctx context.Context, bytes int64) (freed int64, err error) {
+	return s.filesGC.FreeUp(ctx, bytes)
+}
+
+// SweepFileCache runs one file-cache safety pass: prunes references of
+// deleted files, deletes content no file references anymore (past a
+// grace period), and drops long-untouched partial downloads of
+// backed-up files. Never touches content that is not safely
+// refetchable. This is the manual trigger; the same pass runs
+// periodically only when cfg.Files.GCInterval is set.
+func (s *SDK) SweepFileCache(ctx context.Context) error {
+	return s.filesGC.Sweep(ctx)
 }
 
 // Open brings up the SDK: initializes auth, opens storage, boots any-sync,
@@ -74,6 +109,48 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 
 	tsp := techspace.New(app, db)
 	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
+
+	// Files byte layer (SYN-25/27/28): CARv2s under <DataDir>/files (a
+	// sibling of anysync/ and sdk.db — cfg.Storage.DataDir was
+	// re-pointed to anysync/ above), metadata in the shared SDK DB.
+	// Uploads go through the fileV2 broker; downloads are public-read
+	// first ({base}/blob/…), with the base resolved once via the broker
+	// Info RPC and persisted (or pinned by cfg.Files.PublicReadBaseUrl).
+	filesRoot := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "files")
+	filesStore, err := filestore.New(ctx, filesRoot, db)
+	if err != nil {
+		_ = db.Close()
+		_ = app.Close(ctx)
+		return nil, fmt.Errorf("anysyncsdk: open files store: %w", err)
+	}
+	filesBroker := broker.New(app.Pool(), app.FileV2Peers, app.NetworkId(), app.FileNetworkId)
+	baseURL := fetch.NewBaseURL(filesStore, app.NetworkId(), cfg.Files.PublicReadBaseUrl,
+		func(ctx context.Context) (string, error) {
+			info, err := filesBroker.Info(ctx)
+			if err != nil {
+				return "", err
+			}
+			return info.PublicReadBaseUrl, nil
+		})
+	filesUpload := upload.New(filesStore, filesBroker)
+	// The persistent files work queue (SYN-29): drive-toward-durable
+	// retries + Pin background fetches, surviving restarts. Runs after
+	// spaces exist (jobs resolve rows through them); closed first.
+	filesQueue, err := status.NewQueue(ctx, db, spaces.RunFileJob, spaces.OnFileJobChange)
+	if err != nil {
+		_ = db.Close()
+		_ = app.Close(ctx)
+		return nil, fmt.Errorf("anysyncsdk: open files queue: %w", err)
+	}
+	filesUpload.SetQueue(filesQueue)
+	spaces.SetFiles(filesUpload, fetch.New(filesStore, baseURL), filesStore, filesQueue)
+	// Cache reclamation (SYN-26): fully embedder-driven —
+	// FileCacheSize/FreeUpFileCache/SweepFileCache and per-file
+	// Offload. The periodic safety sweep runs ONLY when configured
+	// (cfg.Files.GCInterval > 0); the default is no background GC.
+	filesGC := gc.New(filesStore, spaces, func(ctx context.Context, spaceId, fileId string) error {
+		return filesQueue.Enqueue(ctx, status.KindDurable, spaceId, fileId)
+	})
 	// Wire spaceimpl.Service as the space registry so any-sync's
 	// treemanager-driven callbacks (deletion-manager DeleteTree,
 	// space-sync PutTree, head-sync GetTree for arbitrary trees)
@@ -86,6 +163,31 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
+	// Start the background workers only after the last fallible Open
+	// step — a failed Open must not leak goroutines polling a closed DB.
+	filesQueue.Run()
+	filesGC.Run(cfg.Files.GCInterval)
+	account := newAccountImpl(app, tsp, spaces)
+
+	// Headless: skip the account-facing boot work below — profile
+	// republish, the 1-1 inbox, identity resolution, pending-join
+	// resume, and the eager space-loading loop. A broker tracks foreign
+	// spaces and opens them on demand via Get; nothing account-shaped
+	// exists to resume, and eager-loading every tracked space defeats
+	// open/close-on-demand. (The tech space itself was already pinned
+	// local-only inside tsp.Open.)
+	if cfg.Headless {
+		return &SDK{
+			app:        app,
+			db:         db,
+			tsp:        tsp,
+			spaces:     spaces,
+			account:    account,
+			filesQueue: filesQueue,
+			filesGC:    filesGC,
+		}, nil
+	}
+
 	// Resume any join left pending from a previous session now that the
 	// tech space is open (the join controller started in spaceimpl.New,
 	// before this point, so its initial scan saw an empty index).
@@ -101,8 +203,6 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// symkeys but no profiles (those are device-local). Batch-fetch the
 	// missing profiles from identityRepo in the background.
 	go spaces.ResolveIdentityProfiles(context.Background())
-
-	account := newAccountImpl(app, tsp, spaces)
 
 	// Read-state sync: merge other devices' published read frontiers
 	// (tech-space KV) into the per-space readstate engines, and publish
@@ -201,21 +301,29 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	return &SDK{
-		app:      app,
-		db:       db,
-		tsp:      tsp,
-		spaces:   spaces,
-		account:  account,
-		readSync: readSync,
+		app:        app,
+		db:         db,
+		tsp:        tsp,
+		spaces:     spaces,
+		account:    account,
+		filesQueue: filesQueue,
+		filesGC:    filesGC,
+		readSync:   readSync,
 	}, nil
 }
 
-// Close tears down the SDK: closes loaded spaces, the tech space, the
-// SDK DB, and finally the any-sync app.
+// Close tears down the SDK: stops the files queue, closes loaded
+// spaces, the tech space, the SDK DB, and finally the any-sync app.
 func (s *SDK) Close() error {
 	ctx := context.Background()
 	if s.readSync != nil {
 		s.readSync.Close()
+	}
+	if s.filesGC != nil {
+		s.filesGC.Close()
+	}
+	if s.filesQueue != nil {
+		s.filesQueue.Close()
 	}
 	if s.spaces != nil {
 		_ = s.spaces.Close(ctx)
@@ -241,6 +349,12 @@ func (s *SDK) Identities() space.IdentitiesAPI { return spaceimpl.NewIdentitiesA
 
 // Account returns the account-level API.
 func (s *SDK) Account() AccountAPI { return s.account }
+
+// PoolInternal exposes the any-sync peer pool (dial by peerId with this
+// account's identity in the handshake). Same-module internal surface —
+// mirrors the PayloadsInternal pattern — used by the e2e suite to speak
+// node-side protocols (e.g. fileprotov2 against a fileV2 broker).
+func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
 
 // AccountAPI exposes account-level operations outside any space.
 type AccountAPI interface {

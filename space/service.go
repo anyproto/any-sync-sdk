@@ -52,6 +52,27 @@ type Service interface {
 	// unknown locally.
 	Get(ctx context.Context, spaceId string) (Space, error)
 
+	// Track registers a foreign spaceId in the local space index without
+	// joining it, so a later Get can open it — any-sync bootstraps the
+	// space from its responsible nodes when local storage is missing.
+	// The caller does not become a member and holds no keys: synced
+	// content stays sealed. Idempotent; a no-op when the id is already
+	// indexed (including own/joined spaces — Track never downgrades a
+	// membership row).
+	//
+	// The broker path (headless + selective sync): Track the spaceId,
+	// Get it, read the payloads index via Space.Payloads.
+	Track(ctx context.Context, spaceId string) error
+
+	// Evict closes a space without deleting anything: per-space watchers
+	// stop, the in-memory store and the any-sync space are released. All
+	// disk state stays — a later Get reopens the space from local
+	// storage. Idempotent; evicting a space that isn't open is a no-op.
+	//
+	// This is close-on-demand for embedders that hold many spaces (the
+	// filenode-v2 broker); Delete is the destructive sibling.
+	Evict(ctx context.Context, spaceId string) error
+
 	// List returns a point-in-time snapshot of all known spaces.
 	// Mirror of the tech space's space index.
 	List(ctx context.Context) ([]SpaceInfo, error)

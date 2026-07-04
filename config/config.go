@@ -19,6 +19,20 @@ type Config struct {
 	Storage Storage
 	Network Network
 	Sync    Sync
+	Files   Files
+
+	// Headless runs the SDK as an embedded backend service rather than
+	// a user-facing client. Open skips the account-facing boot work —
+	// profile republish, the 1-1 inbox subsystem, identity-profile
+	// resolution, pending-join resume, and the eager space-loading loop
+	// — and the tech space stays strictly local: it is still derived and
+	// opened (it is the space registry Get depends on) but is never
+	// pushed to the network and never requests a coordinator receipt.
+	// Spaces are opened on demand via Get after Track.
+	//
+	// This is the embedding mode of the filenode-v2 broker, usually
+	// combined with Sync.TreeTypes. Regular app embedders leave it false.
+	Headless bool `yaml:"headless"`
 
 	// Types is the optional list of caller-defined types extending
 	// the SDK's built-in catalog. Each Type binds a typeId to the
@@ -56,6 +70,24 @@ const (
 // sizes, WAL mode, etc.). Zero-value means defaults.
 type AnyStoreTuning struct{}
 
+// Files tunes the files byte layer. All zero-valued fields fall back
+// to SDK defaults.
+type Files struct {
+	// PublicReadBaseUrl overrides the network-advertised public read
+	// base for durable file downloads ({base}/blob/{spaceId}/{rootCid}).
+	// Normally left empty: the SDK resolves it once from the network's
+	// fileV2 nodes and caches it. Set it for private deployments that
+	// front the object store themselves.
+	PublicReadBaseUrl string `yaml:"publicReadBaseUrl"`
+
+	// GCInterval enables the periodic file-cache safety sweep (prune
+	// refs of deleted files, delete unreferenced content past grace,
+	// drop stale partials) at the given cadence. ZERO — the default —
+	// means NO automatic sweep: reclamation is fully embedder-driven
+	// via SDK.SweepFileCache / FreeUpFileCache / Files().Offload.
+	GCInterval time.Duration `yaml:"gcInterval"`
+}
+
 // Network is the any-sync network configuration. v1 is deliberately
 // conservative — callers pass a serialized nodeconf blob and we decode
 // it inside anysyncx so any-sync type changes don't leak into the
@@ -71,4 +103,16 @@ type Network struct {
 type Sync struct {
 	DialTimeout     time.Duration
 	ChangeBatchSize int
+
+	// TreeTypes enables selective sync by tree type. Empty or nil (the
+	// default) syncs and materializes everything. Non-empty, the SDK
+	// still head-syncs every space in full — all tree ids and heads are
+	// known and the sync diff converges — but downloads, stores and
+	// materializes only trees whose root changeType is in the list;
+	// other trees are recorded as heads-only stubs. ACL, settings and
+	// key-value data are always fully synced, as is the tech space.
+	//
+	// This is the embedding mode of the filenode-v2 broker, which passes
+	// the payloads tree type only. Regular app embedders leave it empty.
+	TreeTypes []string
 }

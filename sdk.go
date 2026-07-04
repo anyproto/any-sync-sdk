@@ -16,6 +16,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/files/broker"
 	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/files/filep2p"
 	"github.com/anyproto/any-sync-sdk/internal/files/gc"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
@@ -144,7 +145,17 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return nil, fmt.Errorf("anysyncsdk: open files queue: %w", err)
 	}
 	filesUpload.SetQueue(filesQueue)
-	spaces.SetFiles(filesUpload, fetch.New(filesStore, baseURL), filesStore, filesQueue)
+	filesFetch := fetch.New(filesStore, baseURL)
+	// P2P files (SYN-48): serve our stored CAR objects to LAN peers and
+	// prefer a LAN peer over the public GET when fetching. Rides the
+	// existing p2p toggle; the peer store + DRPC server come from the app.
+	if app.P2PEnabled() {
+		filesFetch.SetPeer(filep2p.NewSource(app.Pool(), app.PeerStore()))
+		// The server was registered on the DRPC mux during app start
+		// (as a component, to avoid a serving race); hand it the store now.
+		app.SetFileStore(filesStore)
+	}
+	spaces.SetFiles(filesUpload, filesFetch, filesStore, filesQueue)
 	// Cache reclamation (SYN-26): fully embedder-driven —
 	// FileCacheSize/FreeUpFileCache/SweepFileCache and per-file
 	// Offload. The periodic safety sweep runs ONLY when configured

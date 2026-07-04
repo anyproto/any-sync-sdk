@@ -50,6 +50,10 @@ func New(st *store.Store, base BaseURL) *Service {
 	return &Service{store: st, base: base, hc: http.DefaultClient}
 }
 
+// SetPeer wires the LAN p2p source, consulted before the public GET.
+// Call once during SDK boot; nil leaves fetches public-read only.
+func (s *Service) SetPeer(p PeerSource) { s.peer = p }
+
 // File is an open verified-plaintext view of one stored file.
 type File struct {
 	r    io.ReadSeeker
@@ -80,15 +84,15 @@ func (s *Service) Open(ctx context.Context, spaceId string, root cid.Cid, key []
 
 	var fetchFn func(ctx context.Context, c cid.Cid) ([]byte, error)
 	if !h.Complete() {
-		rc, rcErr := s.remote(ctx, spaceId, root, durable)
-		if rcErr != nil && s.peer == nil {
+		src, srcErr := s.source(ctx, spaceId, root, durable)
+		if srcErr != nil {
 			// Offline-first: the locally-present ranges of a partial
 			// file stay readable with no network. Only a read that
 			// actually hits a hole surfaces the fetch error.
-			holeErr := rcErr
+			holeErr := srcErr
 			fetchFn = func(context.Context, cid.Cid) ([]byte, error) { return nil, holeErr }
 		} else {
-			fetchFn = remoteFetcher(spaceId, h, s.peer, rc)
+			fetchFn = remoteFetcher(spaceId, h, src)
 		}
 	}
 
@@ -120,11 +124,11 @@ func (s *Service) Fetch(ctx context.Context, spaceId string, root cid.Cid, durab
 	if h.Complete() {
 		return nil
 	}
-	rc, err := s.remote(ctx, spaceId, root, durable)
-	if err != nil && s.peer == nil {
+	src, err := s.source(ctx, spaceId, root, durable)
+	if err != nil {
 		return err
 	}
-	fetchFn := remoteFetcher(spaceId, h, s.peer, rc)
+	fetchFn := remoteFetcher(spaceId, h, src)
 	for _, c := range h.MissingBlocks() {
 		if h.HasBlock(c) {
 			continue // a coalesced read already landed it
@@ -149,11 +153,11 @@ func (s *Service) Fetch(ctx context.Context, spaceId string, root cid.Cid, durab
 // must match the requested root — a wrong object at the URL is
 // rejected before anything is recorded.
 func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durable bool, ref string) (*store.Handle, error) {
-	rc, err := s.remote(ctx, spaceId, root, durable)
+	src, err := s.source(ctx, spaceId, root, durable)
 	if err != nil {
 		return nil, err
 	}
-	head, total, err := rc.readProbe(ctx)
+	head, total, err := src.ReadProbe(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +187,7 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 		idx = head[idxOff:]
 		head = head[:idxOff]
 	} else {
-		if idx, err = rc.readRange(ctx, idxOff, total-idxOff); err != nil {
+		if idx, err = src.ReadRange(ctx, idxOff, total-idxOff); err != nil {
 			return nil, err
 		}
 	}
@@ -193,11 +197,35 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 	return s.store.Open(ctx, spaceId, root)
 }
 
-// remote builds the public-object range reader; ErrNotAvailable when
+// source builds the CAR object reader for a fetch: a LAN peer that holds
+// the file (preferred — free, works offline) laddered over the public
+// HTTP object (durable files only). Returns ErrNotAvailable only when
+// NEITHER is available (not durable / no public base AND no peer holds
+// it). The peer is tried first per read with a bounded deadline and
+// demoted to HTTP on the first failure (see ladderedCar).
+func (s *Service) source(ctx context.Context, spaceId string, root cid.Cid, durable bool) (CarSource, error) {
+	httpRC, httpErr := s.httpSource(ctx, spaceId, root, durable)
+	var peerSrc CarSource
+	if s.peer != nil {
+		if ps, ok := s.peer.SourceFor(ctx, spaceId, root); ok {
+			peerSrc = ps
+		}
+	}
+	switch {
+	case peerSrc != nil:
+		return &ladderedCar{peer: peerSrc, http: httpRC}, nil // http may be nil
+	case httpRC != nil:
+		return httpRC, nil
+	default:
+		return nil, httpErr
+	}
+}
+
+// httpSource builds the public-object range reader; ErrNotAvailable when
 // the file is not durable or the network has no public read base.
-func (s *Service) remote(ctx context.Context, spaceId string, root cid.Cid, durable bool) (*remoteCar, error) {
+func (s *Service) httpSource(ctx context.Context, spaceId string, root cid.Cid, durable bool) (*remoteCar, error) {
 	if !durable {
-		return nil, fmt.Errorf("%w: not durable and not local (P2P fetch lands with SYN-24)", ErrNotAvailable)
+		return nil, fmt.Errorf("%w: not durable", ErrNotAvailable)
 	}
 	base, err := s.base(ctx)
 	if err != nil {

@@ -118,6 +118,25 @@ func (s *spaceImpl) localIdentityActive(ctx context.Context) bool {
 	return false
 }
 
+// canWrite reports whether this account currently has write permission
+// in the space ACL. Used to gate durability takeover — only a writer may
+// upload a downloaded file to the file nodes. Best-effort: any load/read
+// failure returns false (we simply don't take over).
+func (s *spaceImpl) canWrite(ctx context.Context) bool {
+	handle, err := s.app.GetSpace(ctx, s.id)
+	if err != nil {
+		return false
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return false
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	state := acl.AclState()
+	return state.Permissions(state.Identity()).CanWrite()
+}
+
 func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
 func (s *spaceImpl) Types() space.TypesAPI           { return s.types }
 func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }

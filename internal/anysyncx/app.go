@@ -34,6 +34,8 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
+	"github.com/anyproto/any-sync-sdk/internal/files/filep2p"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/p2p"
 	"github.com/anyproto/any-sync-sdk/internal/syncstatus"
 	sdkp2p "github.com/anyproto/any-sync-sdk/p2p"
@@ -62,9 +64,10 @@ type App struct {
 	tree      *treeManagerAdapter
 	storage   *storageProvider
 	nodeConf  nodeconf.Service
-	peerStore *p2p.PeerStore
-	p2pServer *p2pServer
-	discovery *p2p.Discovery
+	peerStore     *p2p.PeerStore
+	p2pServer     *p2pServer
+	discovery     *p2p.Discovery
+	fileP2PServer *filep2p.Server
 
 	// p2pEnabled is cfg.P2P.IsEnabled(), captured for the status
 	// surfaces.
@@ -203,7 +206,25 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		// pool, exchange, spaces) is already running.
 		Register(discovery)
 
+	// The p2p file server registers its FileP2P handler on the DRPC mux
+	// during Init (before the accept loop), so it must be a component —
+	// registering after Start would race concurrent serving. Its file
+	// store is injected later (SetFileStore), once sdk.Open builds it.
+	var fileP2PServer *filep2p.Server
+	if cfg.P2P.IsEnabled() {
+		fileP2PServer = filep2p.NewServer(func(peerId, spaceId string) bool {
+			for _, id := range peerStore.SpaceIds(peerId) {
+				if id == spaceId {
+					return true
+				}
+			}
+			return false
+		})
+		a.Register(fileP2PServer)
+	}
+
 	out := &App{
+		fileP2PServer:      fileP2PServer,
 		sync:               sync,
 		tree:               tree,
 		storage:            storage,
@@ -398,6 +419,28 @@ func (a *App) FileNetworkId() string { return a.nodeConf.Configuration().FileNet
 // protocols (e.g. fileprotov2) over a connection that carries this
 // account's identity in the handshake.
 func (a *App) Pool() pool.Pool { return a.a.MustComponent(pool.CName).(pool.Pool) }
+
+// PeerStore exposes the p2p local-peer registry (which LAN peers share
+// which spaces). Used by the files p2p source for peer selection.
+func (a *App) PeerStore() *p2p.PeerStore { return a.peerStore }
+
+// DRPCServer is the inbound DRPC mux. The files p2p server registers its
+// read-only FileP2P handler here after the file store is built.
+func (a *App) DRPCServer() server.DRPCServer {
+	return a.a.MustComponent(server.CName).(server.DRPCServer)
+}
+
+// P2PEnabled reports whether the local-network layer is on (cfg.P2P).
+func (a *App) P2PEnabled() bool { return a.p2pEnabled }
+
+// SetFileStore injects the file store into the p2p file server, enabling
+// it to serve stored CAR objects to LAN peers. Called by sdk.Open once
+// the store is built. No-op when p2p is disabled.
+func (a *App) SetFileStore(st *filestore.Store) {
+	if a.fileP2PServer != nil {
+		a.fileP2PServer.SetStore(st)
+	}
+}
 
 // SetSpaceRegistry wires the tree manager to a space-level registry.
 // Called once by the space package after it builds its ocache.

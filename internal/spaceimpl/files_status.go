@@ -57,7 +57,22 @@ func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
 		if err != nil {
 			return err
 		}
-		return s.fetch.Fetch(ctx, job.SpaceId, root, row.NetworkSign != "", job.FileId)
+		if err := s.fetch.Fetch(ctx, job.SpaceId, root, row.NetworkSign != "", job.FileId); err != nil {
+			return err
+		}
+		// Durability takeover (SYN-48): we now hold the complete file. If
+		// it is NOT durable — its creator never uploaded it to the file
+		// nodes (e.g. we pulled it from that peer over the LAN and the
+		// peer then went offline) — and we have write rights, take over:
+		// enqueue a durable job so the file survives the creator leaving.
+		// The KindDurable runner re-reads the row and no-ops if someone
+		// else made it durable first, so concurrent writers are safe.
+		if row.NetworkSign == "" && impl.canWrite(ctx) {
+			if s.fqueue != nil {
+				_ = s.fqueue.Enqueue(ctx, status.KindDurable, job.SpaceId, job.FileId)
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("files: unknown job kind %q", job.Kind)
 	}

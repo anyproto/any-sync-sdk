@@ -112,6 +112,15 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
 		}
 
+		// Read-state ping: the apply hook already recorded any unread
+		// entry inside the committed tx; this fires the best-effort
+		// subscriber notification. Over-notifies (an apply whose
+		// classification changed nothing still pings) — consumers pull
+		// TransitionsSince and see an empty diff.
+		if s.readState != nil && s.readTracking[ch.Dataset] != nil && !ch.Local && !ch.Injected {
+			s.readState.NotifyState(ch.ObjectId, applySeqOf(res))
+		}
+
 		// Row lifecycle events for the objects collection: creation is
 		// detected via the synthetic _ver.id derived op the apply path
 		// emits exactly once per record; deletion via a delete op in the
@@ -187,8 +196,13 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 
 // Drain scans the detached collection, re-checks each parked
 // change's pending list, and replays any that are now satisfied.
-// Idempotent — call as often as you like.
+// Idempotent — call as often as you like: passes are serialized, so
+// two callers can't both collect a row before either unparks it and
+// double-replay it (a replayed change re-tracks as unread if the user
+// read it between the deliveries).
 func (s *Store) Drain(ctx context.Context) error {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
 	var ready []DetachedRow
 	if err := s.IterDetached(ctx, func(row DetachedRow) bool {
 		all, err := s.allPendingKnown(ctx, row.Pending)

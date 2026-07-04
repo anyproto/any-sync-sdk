@@ -12,6 +12,34 @@ type ModifyBatch struct {
 	// travel through any-sync in a dedicated field so the whole space
 	// can be queried by trace. Empty slice means no trace.
 	TraceIds []string
+
+	// Scope selects the write route for the whole batch. A write call
+	// is single-scope — routes commit in different version domains and
+	// there is no cross-route rollback (same rule as PropertiesAPI.Set).
+	// Zero value = ScopeSynced: the object's own DAG change, synced to
+	// every member. The default, and the only route ModifyMany and
+	// Delete support.
+	//
+	// ScopeLocal is the device-local materialization route: no DAG
+	// change, never syncs, VersionId minted by the local lexid
+	// allocator; the write flows through Query/Subscribe like any
+	// apply. Every op must target a field the dataset schema declares
+	// ScopeLocal — ops on fields of any other scope are refused by the
+	// apply layer's scope enforcement and surface in
+	// ModifyResult.Rejections, like handler rejections on the synced
+	// route. Records must already exist: explicit ids, no Upsert —
+	// local fields annotate synced records, they don't create them
+	// (a strict-mode miss surfaces as an ErrStrictSkipAbsent
+	// rejection). TraceIds are rejected (they ride the any-sync
+	// change). The shared `objects` dataset is rejected too: its
+	// per-property scopes are enforced by the writer, so local
+	// property values go through PropertiesAPI.Set.
+	//
+	// ScopeAccount and ScopeDerived are rejected: derived is
+	// handler-only, and the account transport for dataset records is
+	// not wired yet — the account mirror handles objects rows only
+	// (docs/scoped-properties-proposal.md § Account transport).
+	Scope Scope
 }
 
 // RecordModify groups ops applied to one record id.

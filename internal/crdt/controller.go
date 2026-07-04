@@ -139,6 +139,10 @@ type Controller struct {
 	// tests, callers without a consumer feed).
 	applySeqs *ApplySeqAllocator
 
+	// applyHook runs inside the apply WriteTx after the record loop —
+	// the read-tracking classification seam. nil disables it.
+	applyHook ApplyHook
+
 	// Pools for the per-RecordChange hot path. Both are scoped to this
 	// Controller to keep contention bounded; the apply loop is single-
 	// threaded today, so contention should be effectively zero.
@@ -231,6 +235,23 @@ func (c *Controller) SetApplySeqAllocator(a *ApplySeqAllocator) {
 		return
 	}
 	c.applySeqs = a
+}
+
+// ApplyHook runs inside the apply WriteTx after every record of a
+// change has applied, before the watermark persist and commit — a
+// returned error rolls the whole change back. recordIds are the
+// resolved per-record ids (ChangeId sugar applied, shared-dataset
+// collapse done). The read-tracking classification closure installs
+// here so unread entries are atomic with the change.
+type ApplyHook func(txCtx context.Context, ch *Change, recordIds []string, res *ApplyResult) error
+
+// SetApplyHook wires the in-tx apply hook. Call once right after
+// construction, before the first apply. No-op on a nil controller.
+func (c *Controller) SetApplyHook(h ApplyHook) {
+	if c == nil {
+		return
+	}
+	c.applyHook = h
 }
 
 // RegisterHandler adds a handler at runtime (for late-bound datasets).
@@ -764,6 +785,13 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 				res.DerivedOps = make([][]Op, len(ch.Records))
 			}
 			res.DerivedOps[i] = recDerived
+		}
+	}
+
+	if c.applyHook != nil {
+		if err := c.applyHook(txCtx, &ch, resolvedIds, &res); err != nil {
+			_ = tx.Rollback()
+			return res, fmt.Errorf("crdt: apply hook: %w", err)
 		}
 	}
 

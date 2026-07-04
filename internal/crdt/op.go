@@ -96,6 +96,12 @@ type Change struct {
 	ChangeId  string
 	VersionId VersionId
 	AddSeq    uint64
+	// PrevIds are the DAG parents of this change (the any-sync change's
+	// PreviousIds), stamped by the apply pipeline next to Creator. Empty
+	// on Local/Injected changes (no DAG) and on hand-built test changes.
+	// Consumed by read tracking: unread entries persist them so the
+	// mark-read ancestor closure never needs the tree.
+	PrevIds []string
 	// ApplySeq is the per-space apply sequence the Controller allocates
 	// inside the apply transaction (never set by callers, never on the
 	// wire). Stamped on every written record as _applySeq and persisted

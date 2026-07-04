@@ -178,6 +178,12 @@ func (s *spaceImpl) Changes() space.ChangeIndexAPI {
 	return newChangeIndexAPI(s)
 }
 
+// ReadState exposes the read/unread tracking surface —
+// space.ReadStateAPI.
+func (s *spaceImpl) ReadState() space.ReadStateAPI {
+	return newReadStateAPI(s)
+}
+
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {
@@ -248,8 +254,10 @@ func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, datase
 }
 
 // Modify resolves the target object via the per-space store, builds a
-// crdt.Change from the public batch, and submits it through the
-// Object's local-write path. Returns the bundled identifiers.
+// crdt.Change from the public batch, and submits it on the route the
+// batch's Scope selects: the Object's local-write (DAG) path for
+// synced (the default), Object.LocalSet for local. Returns the
+// bundled identifiers.
 func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
 	if batch.ObjectId == "" {
 		return space.ModifyResult{}, errors.New("spaceimpl: ObjectId required")
@@ -259,6 +267,14 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	}
 	if err := checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
+	}
+	switch batch.Scope {
+	case 0, space.ScopeSynced:
+		// The DAG route below.
+	case space.ScopeLocal:
+		return s.modifyLocal(ctx, batch)
+	default:
+		return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: scope %s is not writable via Modify (synced and local only)", batch.Scope)
 	}
 	dataVersion, err := s.store.DataVersion(batch.Dataset)
 	if err != nil {
@@ -285,6 +301,68 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	return modifyResultFromWrite(res), nil
 }
 
+// modifyLocal is the ScopeLocal route of Modify: the batch is
+// materialised straight into the object's rows via Object.LocalSet —
+// no DAG change, nothing syncs; VersionIds come from the local lexid
+// allocator and the write flows through Query/Subscribe like any
+// apply (the techspace localStatus / identities pattern, opened to
+// public datasets).
+//
+// Strict by construction: local fields annotate records that already
+// exist on the synced route, so record creation is refused up front
+// (explicit ids, no Upsert) rather than minting a local-only record
+// no other device would ever see. Scope enforcement itself lives in
+// the apply layer (classifyFieldWrite, route=local): ops targeting
+// fields the schema doesn't declare ScopeLocal come back in
+// ModifyResult.Rejections, exactly like handler rejections on the
+// synced route, as does a strict-mode miss on an absent record
+// (ErrStrictSkipAbsent).
+func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
+	// The shared objects dataset is DynamicScopeByKey: the apply layer
+	// exempts its undeclared heads from the route check and relies on
+	// the WRITER to enforce per-property scope + kind — which for the
+	// local route is PropertiesAPI.Set (validateRoutedPatch). Letting a
+	// generic local batch through here would bypass that validation
+	// and write synced property paths into the local version domain.
+	if batch.Dataset == properties.Dataset {
+		return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: local-scope writes to the %s dataset go through Properties().Set (per-property scope enforcement)", properties.Dataset)
+	}
+	if len(batch.TraceIds) > 0 {
+		return space.ModifyResult{}, errors.New("spaceimpl: Modify: TraceIds ride the any-sync change and are not supported on the local scope")
+	}
+	for i := range batch.Records {
+		if batch.Records[i].Id == "" {
+			return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes require explicit record ids", i)
+		}
+		if batch.Records[i].Upsert {
+			return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes cannot create records (Upsert unsupported)", i)
+		}
+	}
+	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := s.checkDatasetMembership(ctx, batch.ObjectId, batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	obj, err := s.store.Get(ctx, batch.ObjectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	change, err := buildChange(batch, dataVersion)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	res, err := obj.LocalSet(ctx, change)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	return modifyResultFromWrite(res), nil
+}
+
 // ModifyMany pre-validates every batch up-front (against the
 // target object's controller) and only proceeds with the actual
 // AddContent + apply pipeline if all pass. A validation error on
@@ -304,6 +382,12 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		if batches[i].ObjectId != objectId {
 			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d ObjectId %q differs from batch 0 %q (cross-object batches not supported)",
 				i, batches[i].ObjectId, objectId)
+		}
+	}
+	for i := range batches {
+		if batches[i].Scope != 0 && batches[i].Scope != space.ScopeSynced {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: scope %s not supported (synced only) — issue scoped batches through Modify",
+				i, batches[i].Scope)
 		}
 	}
 

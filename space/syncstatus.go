@@ -7,11 +7,11 @@ import "time"
 //
 // Rollup priority (highest match wins, see Service.Status):
 //
-//   1. Error   — incompatible network / needs update
-//   2. Offline — no responsible node reachable
-//   3. Syncing — at least one tracked tree has pending heads
-//   4. Synced  — every tracked tree converged with a responsible node
-//   5. Unknown — bootstrap; no hooks fired yet, no peers polled yet
+//  1. Error   — incompatible network / needs update
+//  2. Offline — no responsible node reachable
+//  3. Syncing — at least one tracked tree has pending heads
+//  4. Synced  — every tracked tree converged with a responsible node
+//  5. Unknown — bootstrap; no hooks fired yet, no peers polled yet
 type SyncState uint8
 
 const (

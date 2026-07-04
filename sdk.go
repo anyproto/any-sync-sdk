@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/net/pool"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
+	"github.com/anyproto/any-sync-sdk/internal/readsync"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/spacesync"
@@ -36,6 +39,7 @@ type SDK struct {
 	account    *accountImpl
 	filesQueue *status.Queue
 	filesGC    *gc.Service
+	readSync   *readsync.Service
 }
 
 // FileCacheSize returns the local bytes currently held by file content
@@ -200,6 +204,25 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// missing profiles from identityRepo in the background.
 	go spaces.ResolveIdentityProfiles(context.Background())
 
+	// Read-state sync: merge other devices' published read frontiers
+	// (tech-space KV) into the per-space readstate engines, and publish
+	// local marks. Live hook + idempotent per-space Reconcile below.
+	readSync := readsync.New(
+		func(spaceId string) *readstate.Engine {
+			st := spaces.StoreFor(spaceId)
+			if st == nil {
+				return nil
+			}
+			return st.ReadState()
+		},
+		func(ctx context.Context) (keyvaluestorage.Storage, error) {
+			return app.KeyValueStore(ctx, tsp.SpaceId())
+		},
+		app.AccountKeys().PeerKey.GetPublic().PeerId(),
+	)
+	app.OnKeyValues(tsp.SpaceId(), readSync.OnKeyValues)
+	spaces.SetReadSync(readSync)
+
 	// Republish the locally-stored profile to identityRepo on every
 	// boot. Heart's ownProfileSubscription does the equivalent (reads
 	// the local profile object, calls IdentityRepoPut). Without this,
@@ -269,6 +292,14 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		}
 	}
 
+	// Replay published read frontiers through the idempotent merge —
+	// covers marks made by other devices while this one was offline and
+	// live-hook drops. One pass over the tech-space store for ALL
+	// spaces; cheap when nothing changed.
+	if err := readSync.ReconcileAll(ctx); err != nil {
+		_ = err
+	}
+
 	return &SDK{
 		app:        app,
 		db:         db,
@@ -277,6 +308,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		account:    account,
 		filesQueue: filesQueue,
 		filesGC:    filesGC,
+		readSync:   readSync,
 	}, nil
 }
 
@@ -284,6 +316,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 // spaces, the tech space, the SDK DB, and finally the any-sync app.
 func (s *SDK) Close() error {
 	ctx := context.Background()
+	if s.readSync != nil {
+		s.readSync.Close()
+	}
 	if s.filesGC != nil {
 		s.filesGC.Close()
 	}

@@ -30,6 +30,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/inbox"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/readsync"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
@@ -89,6 +90,12 @@ type Service struct {
 	tsp     *techspace.Service
 	indexer space.Indexer
 	db      anystore.DB
+
+	// readSyncSvc is the SDK-level read-state sync service, injected
+	// by sdk.Open after construction (it needs the tech space open).
+	// Guarded by readSyncMu; nil until SetReadSync.
+	readSyncMu  sync.RWMutex
+	readSyncSvc *readsync.Service
 
 	// extTypes carry through to every per-space Store created by
 	// storeFor — each type's handlers are applied alongside the
@@ -254,6 +261,15 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
+	// Resolve the read-sync service lazily: stores can be created
+	// before sdk.Open injects it, and untracked spaces never call it.
+	st.SetSeedHeadsProvider(func(ctx context.Context, objectId string) ([][]string, error) {
+		rs := s.readSync()
+		if rs == nil {
+			return nil, nil
+		}
+		return rs.PublishedFrontiers(ctx, spaceId, objectId)
+	})
 	// Drain the one-off applySeq backfill BEFORE publishing the store, so
 	// no apply or consumer read ever triggers the backfill's WriteTx from
 	// inside the applySeqMeta sync.Once. That lazy path otherwise
@@ -277,6 +293,20 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // spacesync catch-up driver invoked from SDK.Open) that need the
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
+
+// SetReadSync injects the SDK-level read-state sync service. Called
+// once from sdk.Open after the tech space is up.
+func (s *Service) SetReadSync(rs *readsync.Service) {
+	s.readSyncMu.Lock()
+	s.readSyncSvc = rs
+	s.readSyncMu.Unlock()
+}
+
+func (s *Service) readSync() *readsync.Service {
+	s.readSyncMu.RLock()
+	defer s.readSyncMu.RUnlock()
+	return s.readSyncSvc
+}
 
 // accountMirror returns the live account-values mirror for spaceId,
 // or nil before the space's wiring ran. Used by Properties.Set's

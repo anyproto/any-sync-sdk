@@ -75,6 +75,16 @@ const (
 	// sticky across the account's devices: the request never re-surfaces
 	// from the discovery layer. An explicit OneToOne(peer) overrides it.
 	StatusOneToOneDeclined
+	// StatusInvitePending is a regular space another account added us to
+	// directly (ACL AddAccounts). We are already a full ACL member;
+	// approval is a local materialization gate — nothing is downloaded
+	// until accepted. Synced account-wide (any device can act on it).
+	// Accept via Service.AcceptInvite, reject via Service.DeclineInvite.
+	StatusInvitePending
+	// StatusInviteDeclined is a direct-add invite the user declined.
+	// Synced, sticky, non-terminal: a later AcceptInvite overrides it. No
+	// ACL write happens on decline — the account remains an ACL member.
+	StatusInviteDeclined
 )
 
 // Permission mirrors any-sync's ACL permission ladder.

@@ -179,6 +179,12 @@ type Service struct {
 	joinKick    chan struct{}
 	joinWaiters map[string]aclwaiter.AclWaiter
 
+	// pendingLoads dedups the join controller's accepted-invite load
+	// goroutines per spaceId (guarded by mu) — rows with
+	// localStatus="inviteLoading" need a pull-until-available load but no
+	// ACL waiter (the account is already a member).
+	pendingLoads map[string]struct{}
+
 	// One-to-one inbox (Layer-2 discovery, docs/13). inboxNotifier is the
 	// receive worker (coordinator push + poll → RegisterIncoming); the
 	// invite* fields drive the send-retry loop that (re)delivers
@@ -214,6 +220,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		delKick:            make(chan struct{}, 1),
 		joinKick:           make(chan struct{}, 1),
 		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
+		pendingLoads:       make(map[string]struct{}),
 		inviteKick:         make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
@@ -1162,6 +1169,99 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 // approval. Maps to space.StatusJoining via mapStatus.
 const joiningLocalStatus = "joining"
 
+// inviteLoadingLocalStatus is the DEVICE-LOCAL localStatus stamped by
+// AcceptInvite while this device is still pulling the accepted space's
+// content. Crash-recoverable: the join controller's boot/tick pass
+// resumes the load (no ACL waiter — the account is already a member);
+// loadJoinedSpace clears it to active. Maps to StatusActive via
+// mapStatus' default — the synced accept already happened, loading is a
+// device detail, and the account's other devices show Active too.
+const inviteLoadingLocalStatus = "inviteLoading"
+
+// AcceptInvite approves a direct-add invite by space id: flips the
+// SYNCED row status to active (every device converges — declined is
+// non-terminal, so this also un-declines) and loads the space. The
+// account is already an ACL member, so unlike Join there is nothing to
+// wait for on the ACL — just a pull-until-available load. One bounded
+// synchronous attempt is made; if the content isn't pullable yet
+// (add still propagating, offline) it returns (nil,
+// ErrInviteAcceptPending) and the join controller finishes the load
+// durably in the background.
+func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space, error) {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: unknown space %q", spaceId)
+	}
+	if rec.Type == space.SpaceTypeOneToOne {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %q is a 1-1 space — use AcceptOneToOne", spaceId)
+	}
+	if rec.IsDeleted() {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is deleted", spaceId)
+	}
+	switch rec.RemoteStatus {
+	case techspace.InvitePendingRemoteStatus, techspace.InviteDeclinedRemoteStatus:
+		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w", err)
+		}
+	case techspace.StatusActive:
+		// Idempotent re-accept / resume of an interrupted load.
+	default:
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is not invite-pending", spaceId)
+	}
+	// Persist the loading obligation BEFORE attempting the load: if we
+	// crash mid-pull, the join controller resumes from this marker at
+	// next boot.
+	if rec.LocalStatus != techspace.StatusActive {
+		if _, err := s.tsp.SetLocalStatus(ctx, spaceId, inviteLoadingLocalStatus); err != nil {
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: mark loading: %w", err)
+		}
+	}
+	sp, err := s.Get(ctx, spaceId)
+	if err != nil {
+		// Content not pullable yet (or offline). The join controller owns
+		// the retry; the accept itself is already durable.
+		s.kickJoinController()
+		return nil, ErrInviteAcceptPending
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: flip active: %w", err)
+	}
+	s.kickJoinController() // reap any pending-load bookkeeping
+	return sp, nil
+}
+
+// ErrInviteAcceptPending is returned by AcceptInvite when the accept was
+// recorded (synced account-wide) but the space content is not pullable
+// yet. Loading continues durably in the background and across restarts;
+// callers poll List/Get or Subscribe for the flip to StatusActive.
+var ErrInviteAcceptPending = errors.New("spaceimpl: invite accepted; space load pending")
+
+// DeclineInvite rejects a direct-add invite. Writes the synced, sticky
+// InviteDeclined marker so the request is suppressed on every device; a
+// later AcceptInvite overrides it (non-terminal). No ACL write happens —
+// the account stays a member on the space's ACL — and nothing was
+// materialized, so there is nothing to offload.
+func (s *Service) DeclineInvite(ctx context.Context, spaceId string) error {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return fmt.Errorf("spaceimpl: DeclineInvite: unknown space %q", spaceId)
+	}
+	if rec.Type == space.SpaceTypeOneToOne {
+		return fmt.Errorf("spaceimpl: DeclineInvite: %q is a 1-1 space — use DeclineOneToOne", spaceId)
+	}
+	switch rec.RemoteStatus {
+	case techspace.InviteDeclinedRemoteStatus:
+		return nil // idempotent
+	case techspace.InvitePendingRemoteStatus:
+	default:
+		return fmt.Errorf("spaceimpl: DeclineInvite: space %q is not invite-pending", spaceId)
+	}
+	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.InviteDeclinedRemoteStatus); err != nil {
+		return fmt.Errorf("spaceimpl: DeclineInvite: %w", err)
+	}
+	return nil
+}
+
 // Close stops per-space subsystems the SDK owns directly — currently
 // just members watchers (one polling goroutine each). The any-sync
 // side of each space is owned by the App's space cache and torn down
@@ -1324,6 +1424,10 @@ func mapStatus(typ, local, remote string) space.Status {
 		// Synced, sticky 1-1 decline — account-wide (could be declined on
 		// another device). Checked before the pending/active cases.
 		return space.StatusOneToOneDeclined
+	case remote == techspace.InviteDeclinedRemoteStatus:
+		// Synced, sticky direct-add decline — account-wide, non-terminal
+		// (AcceptInvite overrides).
+		return space.StatusInviteDeclined
 	case typ == space.SpaceTypeOneToOne && remote == techspace.StatusActive:
 		// Account-scoped resolution wins over a device-local pending. A 1-1
 		// processed (accepted/initiated) on ANY device carries synced
@@ -1334,6 +1438,12 @@ func mapStatus(typ, local, remote string) space.Status {
 		return space.StatusActive
 	case local == oneToOnePendingLocalStatus:
 		return space.StatusOneToOnePending
+	case remote == techspace.InvitePendingRemoteStatus:
+		// Synced direct-add pending: the account was added to the space's
+		// ACL and no device has accepted or declined yet. Before the
+		// joining/local cases — until the accept commits the synced active
+		// flip, the account-wide truth is still "pending".
+		return space.StatusInvitePending
 	case local == joiningLocalStatus:
 		return space.StatusJoining
 	case typ == space.SpaceTypeOneToOne && local != techspace.StatusActive && remote != techspace.StatusActive:

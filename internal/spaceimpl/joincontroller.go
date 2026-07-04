@@ -80,12 +80,18 @@ func (s *Service) joinLoop(ctx context.Context) {
 // reconcileJoins owns the waiter lifecycle. It starts an ACL waiter for
 // each joining row that lacks one, and stops the waiter for any space
 // that has left the joining state (accepted→active or declined→deleted,
-// or its load completed). Single-threaded: only joinLoop calls it.
+// or its load completed). It also resumes accepted-invite loads
+// (localStatus="inviteLoading" — pull-until-available, no ACL waiter;
+// the account is already a member). Single-threaded: only joinLoop
+// calls it.
 func (s *Service) reconcileJoins(ctx context.Context) {
 	joining := make(map[string]techspace.SpaceIndexRecord)
 	for _, r := range s.tsp.List(ctx) {
 		if r.LocalStatus == joiningLocalStatus {
 			joining[r.Id] = r
+		}
+		if r.LocalStatus == inviteLoadingLocalStatus {
+			s.startPendingLoad(ctx, r.Id)
 		}
 	}
 
@@ -112,6 +118,34 @@ func (s *Service) reconcileJoins(ctx context.Context) {
 		}
 		s.startJoinWaiter(ctx, rec)
 	}
+}
+
+// startPendingLoad spawns (at most one per spaceId) background load for
+// an accepted direct-add invite left unloaded — AcceptInvite crashed or
+// went offline mid-pull, or the accept happened moments ago and its
+// synchronous attempt failed. Reuses loadJoinedSpace: Get with backoff,
+// then flip localStatus to active.
+func (s *Service) startPendingLoad(ctx context.Context, spaceId string) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	if _, running := s.pendingLoads[spaceId]; running {
+		s.mu.Unlock()
+		return
+	}
+	s.pendingLoads[spaceId] = struct{}{}
+	s.mu.Unlock()
+	s.joinWG.Add(1)
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.pendingLoads, spaceId)
+			s.mu.Unlock()
+		}()
+		s.loadJoinedSpace(ctx, spaceId)
+	}()
 }
 
 // startJoinWaiter builds and runs an ACL waiter for one joining space.

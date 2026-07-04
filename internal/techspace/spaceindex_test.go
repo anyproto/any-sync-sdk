@@ -380,3 +380,58 @@ func TestSpaceIndexHandler_DeleteOpRejected(t *testing.T) {
 	require.NotNil(t, rec, "record must survive a rejected delete op")
 	assert.Equal(t, "Survivor", rec.GetString(techspace.FieldName))
 }
+
+// ----------------------------------------------------------------------------
+// Direct-add invite statuses (SYN-46) — non-terminal, decodable.
+// ----------------------------------------------------------------------------
+
+// The invitePending → active and inviteDeclined → active transitions must
+// pass the handler: only StatusDeleted is terminal, and Accept flips
+// either invite state back to active.
+func TestSpaceIndexHandler_InviteStatusesNonTerminal(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-invited"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{
+			techspace.FieldType:         "private",
+			techspace.FieldRemoteStatus: techspace.InvitePendingRemoteStatus,
+		}),
+	)))
+	// Decline...
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.InviteDeclinedRemoteStatus)},
+	)))
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, techspace.InviteDeclinedRemoteStatus, rec.GetString(techspace.FieldRemoteStatus))
+
+	// ...then accept-from-declined (non-terminal) lands.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusActive)},
+	)))
+	rec = ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, techspace.StatusActive, rec.GetString(techspace.FieldRemoteStatus))
+}
+
+// DecodeSpaceIndexRecord reads the device-local direct-add notify outbox
+// (InviteNotifyPending array) off a stored value.
+func TestSpaceIndexRecord_DecodeInviteNotifyPending(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldType, arena.NewString("private"))
+	pending := arena.NewArray()
+	pending.SetArrayItem(0, arena.NewString("bob"))
+	pending.SetArrayItem(1, arena.NewString("carol"))
+	v.Set(techspace.FieldInviteNotifyPending, pending)
+
+	rec := techspace.DecodeSpaceIndexRecord(v)
+	assert.Equal(t, "s1", rec.Id)
+	assert.ElementsMatch(t, []string{"bob", "carol"}, rec.InviteNotifyPending)
+}

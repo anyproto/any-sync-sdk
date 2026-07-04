@@ -56,6 +56,12 @@ type SpaceIndexRecord struct {
 	// still owes the peer an inbox notification, cleared once delivered.
 	OneToOneInviteState string
 
+	// InviteNotifyPending is the device-local direct-add send outbox
+	// (FieldInviteNotifyPending, ScopeLocal): identities this device still
+	// owes a RegularInvite inbox notification after AddAccounts. Entries
+	// are cleared one-by-one on confirmed delivery.
+	InviteNotifyPending []string
+
 	// CreatedAt is the added-to-account time in unix seconds, stamped by
 	// SpaceIndexHandler.BeforeCreate when the row first lands (see
 	// FieldCreatedAt). Zero on rows created before the field existed —
@@ -71,7 +77,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 	if v == nil {
 		return SpaceIndexRecord{}
 	}
-	return SpaceIndexRecord{
+	r := SpaceIndexRecord{
 		Id:                  v.GetString("id"),
 		Type:                v.GetString(FieldType),
 		SpaceType:           v.GetString(FieldSpaceType),
@@ -87,6 +93,15 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		// on 32-bit platforms; anyenc numbers are float64 on the wire.
 		CreatedAt: int64(v.GetFloat64(FieldCreatedAt)),
 	}
+	if arr := v.GetArray(FieldInviteNotifyPending); len(arr) > 0 {
+		r.InviteNotifyPending = make([]string, 0, len(arr))
+		for _, e := range arr {
+			if s := e.GetStringBytes(); len(s) > 0 {
+				r.InviteNotifyPending = append(r.InviteNotifyPending, string(s))
+			}
+		}
+	}
+	return r
 }
 
 // EncodeCreate packs a fresh SpaceIndexRecord into the multi-field

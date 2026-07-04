@@ -48,6 +48,23 @@ type Service interface {
 	// for the UI. No-op if a row for the derived space already exists.
 	RegisterIncoming(ctx context.Context, peerIdentity string, displayHint AccountMetadata) error
 
+	// AcceptInvite approves a direct-add invite (a space surfaced in List
+	// with Status == StatusInvitePending or StatusInviteDeclined — the
+	// account is already an ACL member; accept is a local materialization
+	// gate). Flips the synced status to active (all the account's devices
+	// converge) and loads the space. When the content isn't pullable yet
+	// it returns ErrInviteAcceptPending and loading continues durably in
+	// the background (crash/restart-safe); poll Get or Subscribe for the
+	// flip. Idempotent; overrides a prior decline.
+	AcceptInvite(ctx context.Context, spaceId string) (Space, error)
+
+	// DeclineInvite rejects a direct-add invite. Writes a synced sticky
+	// marker so the request is suppressed on all the account's devices; a
+	// later AcceptInvite overrides it. No ACL write happens — the account
+	// remains a member on the space's ACL. Nothing was materialized, so
+	// nothing is removed.
+	DeclineInvite(ctx context.Context, spaceId string) error
+
 	// Get returns an already-joined space by id. Fails if the space is
 	// unknown locally.
 	Get(ctx context.Context, spaceId string) (Space, error)

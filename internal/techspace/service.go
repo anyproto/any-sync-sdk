@@ -348,6 +348,53 @@ func (s *Service) SetOneToOneInviteState(ctx context.Context, spaceId, state str
 	return obj.LocalSet(ctx, change)
 }
 
+// AddInviteNotify queues identity into the device-local direct-add send
+// outbox on spaceId's row ($addToSet on FieldInviteNotifyPending; no-op
+// when already queued). Local-set path — never enters the DAG.
+func (s *Service) AddInviteNotify(ctx context.Context, spaceId, identity string) error {
+	if spaceId == "" || identity == "" {
+		return nil
+	}
+	if rec, ok := s.Get(ctx, spaceId); ok {
+		for _, id := range rec.InviteNotifyPending {
+			if id == identity {
+				return nil
+			}
+		}
+	}
+	return s.inviteNotifyOp(ctx, spaceId, identity, crdt.OpAddToSet)
+}
+
+// ClearInviteNotify removes identity from spaceId's send outbox ($pull)
+// once the coordinator confirms delivery — or when the entry is
+// permanently undeliverable. Local-set path.
+func (s *Service) ClearInviteNotify(ctx context.Context, spaceId, identity string) error {
+	if spaceId == "" || identity == "" {
+		return nil
+	}
+	return s.inviteNotifyOp(ctx, spaceId, identity, crdt.OpPull)
+}
+
+func (s *Service) inviteNotifyOp(ctx context.Context, spaceId, identity string, op crdt.OpType) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{Id: spaceId, Ops: []crdt.Op{{Type: op, Path: []string{FieldInviteNotifyPending}, Payload: arena.NewString(identity)}}},
+		},
+	}
+	_, err = obj.LocalSet(ctx, change)
+	return err
+}
+
 // SetRemoteStatus updates the SYNCED remoteStatus field — account-wide
 // state that propagates to every device. Used for account-wide delete
 // (status=StatusDeleted); the handler keeps deleted terminal.

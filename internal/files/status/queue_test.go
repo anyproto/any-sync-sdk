@@ -207,3 +207,34 @@ func TestQueueListSpaceAndRemove(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, jobs, 1)
 }
+
+func TestEnqueueDelayedSchedulesFuture(t *testing.T) {
+	ctx := context.Background()
+	rec := &recorder{}
+	q, _ := newQueue(t, rec)
+
+	require.NoError(t, q.EnqueueDelayed(ctx, KindDurable, "sp", "f1", time.Hour))
+	job, ok, err := q.Get(ctx, KindDurable, "sp", "f1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, job.NextAt.After(time.Now().Add(30*time.Minute)), "job is scheduled well into the future")
+
+	// It must NOT run while not due.
+	time.Sleep(150 * time.Millisecond)
+	require.Zero(t, rec.runCount("durable/sp/f1"), "delayed job ran before it was due")
+}
+
+func TestEnqueueDelayedKeepsExistingSchedule(t *testing.T) {
+	ctx := context.Background()
+	rec := &recorder{}
+	q, _ := newQueue(t, rec)
+
+	// An existing due-now durable job (e.g. the creator's) must not be
+	// pushed into the future by a downloader's delayed enqueue.
+	require.NoError(t, q.Enqueue(ctx, KindDurable, "sp", "f1"))
+	require.NoError(t, q.EnqueueDelayed(ctx, KindDurable, "sp", "f1", time.Hour))
+	job, ok, err := q.Get(ctx, KindDurable, "sp", "f1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, job.NextAt.After(time.Now().Add(time.Minute)), "existing due job must keep its schedule")
+}

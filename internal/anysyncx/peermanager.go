@@ -19,11 +19,19 @@ import (
 // (see localOnlySpaces) get an inert manager instead of the node-backed
 // one, so nothing about them ever reaches the network.
 type peerManagerProvider struct {
-	localOnly *localOnlySpaces
+	localOnly  *localOnlySpaces
+	localPeers localPeerSource
 }
 
-func newPeerManagerProvider(localOnly *localOnlySpaces) *peerManagerProvider {
-	return &peerManagerProvider{localOnly: localOnly}
+// localPeerSource is the slice of p2p.PeerStore the peer manager needs;
+// an interface so manager tests can fake it.
+type localPeerSource interface {
+	LocalPeerIds(spaceId string) []string
+	RemoveLocalPeer(peerId string)
+}
+
+func newPeerManagerProvider(localOnly *localOnlySpaces, localPeers localPeerSource) *peerManagerProvider {
+	return &peerManagerProvider{localOnly: localOnly, localPeers: localPeers}
 }
 
 func (p *peerManagerProvider) Init(_ *app.App) error { return nil }
@@ -33,7 +41,7 @@ func (p *peerManagerProvider) NewPeerManager(_ context.Context, spaceId string) 
 	if p.localOnly.has(spaceId) {
 		return &localPeerManager{}, nil
 	}
-	return &spacePeerManager{spaceId: spaceId}, nil
+	return &spacePeerManager{spaceId: spaceId, localPeers: p.localPeers}, nil
 }
 
 // localPeerManager is the peer manager of a local-only space: it
@@ -59,12 +67,16 @@ func (m *localPeerManager) SendMessage(_ context.Context, _ string, _ drpc.Messa
 func (m *localPeerManager) KeepAlive(_ context.Context) {}
 
 // spacePeerManager resolves nodes via nodeconf and ships messages
-// through the StreamPool for reactive push-based sync.
+// through the StreamPool for reactive push-based sync. Local-network
+// peers that share this space (from the p2p peer store) are folded
+// into the responsible/broadcast sets, so head-sync and pushes run
+// over the LAN too — including while every node is unreachable.
 type spacePeerManager struct {
 	spaceId         string
 	nodeConf        nodeconf.Service
 	pool            pool.Pool
 	streamPool      streampool.StreamPool
+	localPeers      localPeerSource
 	subscribeMsgRaw []byte
 
 	runCtx    context.Context
@@ -201,20 +213,54 @@ func (m *spacePeerManager) broadcastSubscribe() {
 
 func (m *spacePeerManager) Name() string { return peermanager.CName }
 
-// GetResponsiblePeers returns a single node peer per call. As a client we
-// only need to diff-sync against one node per cycle; pool.GetOneOf reuses
-// a live connection when possible and otherwise dials a random node from
-// the configured set.
+// GetResponsiblePeers returns a single node peer (as a client we only
+// need to diff-sync against one node per cycle; pool.GetOneOf reuses a
+// live connection when possible) plus every connectable local-network
+// peer that shares this space. When all nodes are unreachable but a
+// local peer is up, the local peers alone are returned — that is what
+// keeps a space syncing over the LAN while offline. The node error
+// only surfaces when there is nobody at all to sync with.
 func (m *spacePeerManager) GetResponsiblePeers(ctx context.Context) ([]peer.Peer, error) {
-	nodeIds := m.nodeConf.NodeIds(m.spaceId)
-	if len(nodeIds) == 0 {
-		return nil, nil
+	var (
+		peers   []peer.Peer
+		nodeErr error
+	)
+	if nodeIds := m.nodeConf.NodeIds(m.spaceId); len(nodeIds) > 0 {
+		p, err := m.pool.GetOneOf(ctx, nodeIds)
+		if err != nil {
+			nodeErr = err
+		} else {
+			peers = append(peers, p)
+		}
 	}
-	p, err := m.pool.GetOneOf(ctx, nodeIds)
-	if err != nil {
-		return nil, err
+	peers = append(peers, m.getLocalPeers(ctx)...)
+	if len(peers) == 0 && nodeErr != nil {
+		return nil, nodeErr
 	}
-	return []peer.Peer{p}, nil
+	return peers, nil
+}
+
+// getLocalPeers dials the local-network peers known to share this
+// space. A peer that fails to dial is dropped from the peer store —
+// discovery's periodic resweep re-adds it when it reappears — so stale
+// LAN entries self-heal instead of being retried forever.
+func (m *spacePeerManager) getLocalPeers(ctx context.Context) []peer.Peer {
+	if m.localPeers == nil {
+		return nil
+	}
+	var out []peer.Peer
+	for _, id := range m.localPeers.LocalPeerIds(m.spaceId) {
+		p, err := m.pool.Get(ctx, id)
+		if err != nil {
+			// Don't punish the peer for our own cancelled context.
+			if ctx.Err() == nil {
+				m.localPeers.RemoveLocalPeer(id)
+			}
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error) {
@@ -250,8 +296,20 @@ func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error
 // same reason.
 func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message) error {
 	return m.streamPool.Send(m.runCtx, msg, func(ctx context.Context) ([]peer.Peer, error) {
-		return m.GetNodePeers(ctx)
+		return m.getBroadcastPeers(ctx)
 	})
+}
+
+// getBroadcastPeers is the push audience: every node peer plus every
+// connectable local peer sharing this space. GetNodePeers stays
+// nodes-only on purpose — callers asking for "the nodes" (e.g. the
+// space-delete flow) must not get LAN devices.
+func (m *spacePeerManager) getBroadcastPeers(ctx context.Context) ([]peer.Peer, error) {
+	peers, err := m.GetNodePeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return append(peers, m.getLocalPeers(ctx)...), nil
 }
 
 func (m *spacePeerManager) SendMessage(ctx context.Context, peerId string, msg drpc.Message) error {

@@ -19,6 +19,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/gc"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/p2p"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/readsync"
@@ -355,6 +356,12 @@ func (s *SDK) Account() AccountAPI { return s.account }
 // mirrors the PayloadsInternal pattern — used by the e2e suite to speak
 // node-side protocols (e.g. fileprotov2 against a fileV2 broker).
 func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
+
+// P2PStatus reports the local-network layer: listener state, discovery
+// possibility, and every known LAN peer with its shared spaces and
+// live-connection flag. Per-space p2p state lives in SpaceSyncStatus
+// (P2P / LocalPeers); this is the account-wide debug view.
+func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 
 // AccountAPI exposes account-level operations outside any space.
 type AccountAPI interface {

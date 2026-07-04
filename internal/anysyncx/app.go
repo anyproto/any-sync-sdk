@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/anyproto/any-sync/accountservice"
 	"github.com/anyproto/any-sync/app"
@@ -33,7 +34,10 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
+	"github.com/anyproto/any-sync-sdk/internal/p2p"
 	"github.com/anyproto/any-sync-sdk/internal/syncstatus"
+	sdkp2p "github.com/anyproto/any-sync-sdk/p2p"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // App is the running any-sync app plus the components downstream
@@ -54,10 +58,17 @@ type App struct {
 	// poll catches anything missed.
 	inboxReceiver atomic.Pointer[InboxMessageHandler]
 
-	sync     *spaceSyncHandler
-	tree     *treeManagerAdapter
-	storage  *storageProvider
-	nodeConf nodeconf.Service
+	sync      *spaceSyncHandler
+	tree      *treeManagerAdapter
+	storage   *storageProvider
+	nodeConf  nodeconf.Service
+	peerStore *p2p.PeerStore
+	p2pServer *p2pServer
+	discovery *p2p.Discovery
+
+	// p2pEnabled is cfg.P2P.IsEnabled(), captured for the status
+	// surfaces.
+	p2pEnabled bool
 
 	spaceCache ocache.OCache
 	headCache  *HeadCache
@@ -119,6 +130,29 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	stream := newStreamHandler(sync)
 	tree := newTreeManager()
 	localOnly := newLocalOnlySpaces()
+	peerStore := p2p.NewPeerStore()
+	// A handshaked local peer's space set changed — head-sync whatever
+	// we share with it right away rather than on the next diff tick.
+	exchange := p2p.NewExchange(keys.PeerId, peerStore, storage.AllSpaceIds, func(_ string, spaceIds []string) {
+		sync.SyncSpaces(spaceIds)
+	})
+	p2pSrv := newP2PServer(cfg.P2P, cfg.Storage.DataDir)
+	discovery := p2p.NewDiscovery(cfg.P2P, keys.PeerId, func() (int, bool) {
+		return p2pSrv.Port(), p2pSrv.Started()
+	}, exchange)
+	exchange.SetOwnAddressesFn(func() sdkp2p.OwnAddresses {
+		return p2p.CurrentOwnAddresses(p2pSrv.Port())
+	})
+	// When this device's own space set changes (create, p2p pull,
+	// delete) re-handshake known LAN peers so they fold us into the
+	// affected spaces' peer sets promptly.
+	storage.SetOnSetChange(func() {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			exchange.Broadcast(ctx)
+		}()
+	})
 
 	a := new(app.App)
 	a.Register(cfgAdapter).
@@ -137,7 +171,8 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(streampool.New()).
 		Register(sync).
 		Register(pool.New()).
-		Register(newPeerManagerProvider(localOnly)).
+		Register(p2pSrv).
+		Register(newPeerManagerProvider(localOnly, peerStore)).
 		Register(coordinatorclient.New()).
 		Register(nodeclient.New()).
 		Register(storage).
@@ -146,12 +181,22 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(commonspace.New()).
 		Register(aclclient.NewAclJoiningClient()).
 		Register(subscribeclient.New()).
-		Register(inbox)
+		Register(inbox).
+		Register(peerStore).
+		Register(exchange).
+		// Discovery is registered last: by the time it announces and
+		// starts handshaking, every component it can trigger (server,
+		// pool, exchange, spaces) is already running.
+		Register(discovery)
 
 	out := &App{
 		sync:               sync,
 		tree:               tree,
 		storage:            storage,
+		peerStore:          peerStore,
+		p2pServer:          p2pSrv,
+		discovery:          discovery,
+		p2pEnabled:         cfg.P2P.IsEnabled(),
 		headCache:          newHeadCache(),
 		syncStatus:         syncstatus.NewService(),
 		syncers:            map[string]*treeSyncerAdapter{},
@@ -190,14 +235,54 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	nc := a.MustComponent(nodeconf.CName).(nodeconf.Service)
 	out.nodeConf = nc
 	out.syncStatus.SetNodeIdsFn(nc.NodeIds)
+	// Peer presence for sync status: live-connection counts via the
+	// non-dialing pool.Pick, refreshed when the p2p peer store or the
+	// discovery possibility changes. (The "Phase 3 peer-presence
+	// reader" slot from docs/09-sync-status-proposal.md.)
+	poolComp := a.MustComponent(pool.CName).(pool.Pool)
+	pickable := func(id string) bool {
+		_, err := poolComp.Pick(context.Background(), id)
+		return err == nil
+	}
+	out.syncStatus.SetPeerCountsFn(func(spaceId string) (networkPeers, localPeers int) {
+		for _, id := range nc.NodeIds(spaceId) {
+			if pickable(id) {
+				networkPeers++
+			}
+		}
+		for _, id := range peerStore.LocalPeerIds(spaceId) {
+			if pickable(id) {
+				localPeers++
+			}
+		}
+		return
+	})
+	out.syncStatus.SetP2PStateFn(func(spaceId string) space.P2PState {
+		return p2pStateFor(out.p2pEnabled, discovery.Possibility(), peerStore.LocalPeerIds(spaceId), pickable)
+	})
+	peerStore.AddObserver(func(_ string, before, after []string, _ bool) {
+		seen := map[string]struct{}{}
+		for _, id := range append(append([]string{}, before...), after...) {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out.syncStatus.Refresh(id)
+		}
+	})
+	discovery.RegisterPossibilityHook(func(sdkp2p.Possibility) {
+		out.syncStatus.RefreshAll()
+	})
 	// Start the rollup loop. The loop ticks once per second, drains
 	// the dirty set, and dispatches SpaceSyncStatus events to
 	// account-wide subscribers. Close() cancels via syncStatus.Close.
 	out.syncStatus.Run(context.Background())
 	out.spaceCache = out.newSpaceCache()
 	// Wire the head cache into the sync handler so HeadSync's fast
-	// path sees the same map updated by space loads.
+	// path sees the same map updated by space loads, and the app
+	// back-reference the peer-facing SpacePush handler loads through.
 	sync.headCache = out.headCache
+	sync.app.Store(out)
 	return out, nil
 }
 
@@ -377,6 +462,50 @@ func (a *App) PeerSyncStats(spaceId string) []PeerSyncSnapshot {
 		return nil
 	}
 	return ts.Stats()
+}
+
+// p2pStateFor resolves a space's local-network state. Pure so it's
+// unit-testable without the app graph.
+func p2pStateFor(enabled bool, poss sdkp2p.Possibility, localPeerIds []string, pickable func(string) bool) space.P2PState {
+	if !enabled || poss == sdkp2p.PossibilityNoInterfaces {
+		return space.P2PStateNotPossible
+	}
+	if poss == sdkp2p.PossibilityRestricted {
+		return space.P2PStateRestricted
+	}
+	for _, id := range localPeerIds {
+		if pickable(id) {
+			return space.P2PStateConnected
+		}
+	}
+	return space.P2PStateNotConnected
+}
+
+// P2PStatus is the account-wide local-network snapshot for the debug
+// surface: listener state, discovery possibility, and every peer in
+// the local peer store with its live-connection flag.
+func (a *App) P2PStatus() sdkp2p.Status {
+	pickable := func(id string) bool {
+		_, err := a.Pool().Pick(context.Background(), id)
+		return err == nil
+	}
+	allPeers := a.peerStore.AllLocalPeers()
+	st := sdkp2p.Status{
+		PeerId:          a.keys.PeerId,
+		Enabled:         a.p2pEnabled,
+		ListenerStarted: a.p2pServer.Started(),
+		Port:            a.p2pServer.Port(),
+		Possibility:     a.discovery.Possibility(),
+		State:           p2pStateFor(a.p2pEnabled, a.discovery.Possibility(), allPeers, pickable),
+	}
+	for _, peerId := range allPeers {
+		st.Peers = append(st.Peers, sdkp2p.PeerStatus{
+			PeerId:    peerId,
+			SpaceIds:  a.peerStore.SpaceIds(peerId),
+			Connected: pickable(peerId),
+		})
+	}
+	return st
 }
 
 // loadAccountKeys decodes the raw seeds from the auth.Provider into

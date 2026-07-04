@@ -7,6 +7,7 @@ require (
 	github.com/anyproto/any-store/v2 v2.0.0-alpha.16
 	github.com/anyproto/any-sync v0.13.0-alpha.3
 	github.com/anyproto/lexid v0.0.6
+	github.com/brutella/dnssd v1.2.14
 	github.com/cheggaaa/mb/v3 v3.0.2
 	github.com/ipfs/boxo v0.41.0
 	github.com/ipfs/go-block-format v0.2.3
@@ -77,6 +78,7 @@ require (
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-libp2p v0.48.0 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
+	github.com/miekg/dns v1.1.72 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/multiformats/go-base32 v0.1.0 // indirect
 	github.com/multiformats/go-base36 v0.2.0 // indirect
@@ -101,6 +103,8 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/tetratelabs/wazero v1.10.1 // indirect
+	github.com/vishvananda/netlink v1.2.1-beta.2 // indirect
+	github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae // indirect
 	github.com/whyrusleeping/cbor v0.0.0-20171005072247-63513f603b11 // indirect
 	github.com/whyrusleeping/cbor-gen v0.3.1 // indirect
 	github.com/whyrusleeping/chunker v0.0.0-20181014151217-fe64bd25879f // indirect
@@ -116,6 +120,7 @@ require (
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
 	golang.org/x/image v0.21.0 // indirect
+	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect

@@ -29,61 +29,123 @@ type CarSource interface {
 	ReadProbe(ctx context.Context) (head []byte, total int64, err error)
 }
 
-// PeerSource selects a LAN peer that holds a file in full and returns a
-// CarSource that reads the file's CAR object from it. (nil, false) — no
-// peer found / p2p disabled — means the fetch uses the public GET only.
-// The returned source is consulted BEFORE the public GET (peers are
-// free, egress is not); it must be cheap and bounded (one FileCheck
-// round) so it never spikes latency when no peer has the file.
+// PeerSource selects a LAN peer that holds a file in full. It returns a
+// CarSource that reads the file's CAR object from that peer, plus a ban
+// hook the fetcher calls when the peer serves INVALID bytes (so a bad
+// peer is not re-selected). ok=false — no peer holds the file / p2p
+// disabled — means the fetch uses the public GET only. Selection must be
+// cheap and bounded (one FileCheck round) so it never spikes latency
+// when no peer has the file.
 type PeerSource interface {
-	SourceFor(ctx context.Context, spaceId string, root cid.Cid) (CarSource, bool)
+	SourceFor(ctx context.Context, spaceId string, root cid.Cid) (src CarSource, ban func(), ok bool)
 }
 
 // peerPreferDeadline bounds each peer read. On a healthy LAN a ~1 MiB
 // range returns in a few ms; this generous cap means a stalling peer
-// costs at most one deadline per file before we demote it to HTTP.
+// costs at most one deadline before we demote it to HTTP for this fetch.
 const peerPreferDeadline = 800 * time.Millisecond
 
-// ladderedCar prefers a LAN peer, falling back to HTTP. The FIRST peer
-// failure demotes the peer for the rest of this file (the struct is
-// per-fetch), so a stall is paid at most once, never per block — and on
-// a healthy LAN the peer serves the whole file with zero HTTP egress.
-type ladderedCar struct {
-	peer     CarSource
-	http     CarSource // nil for a non-durable file with no public object
-	demoted  bool
+// fetchSources are the ordered CAR sources for one fetch: a LAN peer
+// (preferred — free, offline-capable) laddered over the public HTTP
+// object. Either may be nil. It carries the validation-aware fallback so
+// a lying peer is caught and skipped rather than corrupting the fetch:
+//
+//   - peer read succeeds AND validates → use it (zero HTTP egress);
+//   - peer serves INVALID bytes (validate fails) → ban the peer and fall
+//     back to HTTP (a bad peer must never make a durable file unreadable);
+//   - peer read errors (timeout / transport) → demote for the rest of
+//     this fetch when HTTP exists (no ban — could be transient/slow);
+//     with no HTTP fallback, surface the error and keep the peer for the
+//     next block (it is the only source).
+//
+// One fetchSources per fetch; not shared across goroutines.
+type fetchSources struct {
+	peer    CarSource
+	http    CarSource // nil for a non-durable file with no public object
+	banPeer func()    // bans the peer for future selection; nil-safe
+	peerOff bool       // peer demoted/banned for the rest of this fetch
 }
 
-func (l *ladderedCar) ReadRange(ctx context.Context, off, length int64) ([]byte, error) {
-	if l.peer != nil && !l.demoted {
+func (fs *fetchSources) available() bool { return fs.peer != nil || fs.http != nil }
+
+// readRange fetches exactly [off, off+length), preferring the peer.
+// validate (may be nil) rejects bytes the peer served that fail an
+// integrity check (e.g. the wanted block's cid) — triggering the ban +
+// HTTP fallback. HTTP bytes are validated too (a broken CDN is an error,
+// not a silent corruption).
+func (fs *fetchSources) readRange(ctx context.Context, off, length int64, validate func([]byte) error) ([]byte, error) {
+	if fs.peer != nil && !fs.peerOff {
 		pctx, cancel := context.WithTimeout(ctx, peerPreferDeadline)
-		data, err := l.peer.ReadRange(pctx, off, length)
+		data, err := fs.peer.ReadRange(pctx, off, length)
 		cancel()
-		if err == nil {
+		switch {
+		case err == nil && (validate == nil || validate(data) == nil):
 			return data, nil
+		case err == nil:
+			// Peer served invalid content: ban it and never trust it again.
+			if fs.banPeer != nil {
+				fs.banPeer()
+			}
+			fs.peerOff = true
+		case fs.http != nil:
+			// Transient peer error but we have a fallback: demote for the
+			// rest of this fetch (no ban — it may just be slow).
+			fs.peerOff = true
+		default:
+			// Transient error and the peer is our only source: fail this
+			// block, keep the peer for the next (matches per-block retry).
+			return nil, err
 		}
-		l.demoted = true // stop using this peer for the rest of the file
 	}
-	if l.http == nil {
+	if fs.http == nil {
 		return nil, ErrNotAvailable
 	}
-	return l.http.ReadRange(ctx, off, length)
+	data, err := fs.http.ReadRange(ctx, off, length)
+	if err != nil {
+		return nil, err
+	}
+	if validate != nil {
+		if verr := validate(data); verr != nil {
+			return nil, verr
+		}
+	}
+	return data, nil
 }
 
-func (l *ladderedCar) ReadProbe(ctx context.Context) ([]byte, int64, error) {
-	if l.peer != nil && !l.demoted {
+// readProbe fetches the head range + object size, with the same
+// peer→HTTP validation ladder as readRange.
+func (fs *fetchSources) readProbe(ctx context.Context, validate func([]byte) error) (head []byte, total int64, err error) {
+	if fs.peer != nil && !fs.peerOff {
 		pctx, cancel := context.WithTimeout(ctx, peerPreferDeadline)
-		head, total, err := l.peer.ReadProbe(pctx)
+		head, total, err = fs.peer.ReadProbe(pctx)
 		cancel()
-		if err == nil {
+		switch {
+		case err == nil && (validate == nil || validate(head) == nil):
 			return head, total, nil
+		case err == nil:
+			if fs.banPeer != nil {
+				fs.banPeer()
+			}
+			fs.peerOff = true
+		case fs.http != nil:
+			fs.peerOff = true
+		default:
+			return nil, 0, err
 		}
-		l.demoted = true
 	}
-	if l.http == nil {
+	if fs.http == nil {
 		return nil, 0, ErrNotAvailable
 	}
-	return l.http.ReadProbe(ctx)
+	head, total, err = fs.http.ReadProbe(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	if validate != nil {
+		if verr := validate(head); verr != nil {
+			return nil, 0, verr
+		}
+	}
+	return head, total, nil
 }
 
 // remoteFetcher builds the miss-handler for Handle.NodeGetter: resolve
@@ -92,9 +154,14 @@ func (l *ladderedCar) ReadProbe(ctx context.Context) ([]byte, int64, error) {
 // every fetched block. Only the requested block is returned — the
 // NodeGetter persists it via WriteBlock; the coalesced extras are
 // persisted here so they're local by the time the reader reaches them.
-func remoteFetcher(spaceId string, h *store.Handle, rc CarSource) func(ctx context.Context, c cid.Cid) ([]byte, error) {
+//
+// The wanted block (the first section of the range) is verified inside
+// the readRange call, so a peer that serves wrong bytes is banned and
+// the range is refetched over HTTP — a bad peer can neither corrupt the
+// store nor make a durable file unreadable.
+func remoteFetcher(spaceId string, h *store.Handle, fs *fetchSources) func(ctx context.Context, c cid.Cid) ([]byte, error) {
 	return func(ctx context.Context, c cid.Cid) ([]byte, error) {
-		if rc == nil {
+		if fs == nil || !fs.available() {
 			return nil, ErrNotAvailable
 		}
 		i, ok := h.SectionIndex(c)
@@ -112,7 +179,22 @@ func remoteFetcher(spaceId string, h *store.Handle, rc CarSource) func(ctx conte
 			end = sec.Offset + sec.Size
 			last = j
 		}
-		data, err := rc.ReadRange(ctx, first.Offset, end-first.Offset)
+		// validate the wanted block (first frame of the range) against
+		// its cid — this is what makes a lying peer fall through to HTTP.
+		validate := func(data []byte) error {
+			if int64(len(data)) < first.Size {
+				return fmt.Errorf("filefetch: short range for %s", c)
+			}
+			bc, _, err := carfile.ParseFrame(data[:first.Size])
+			if err != nil {
+				return fmt.Errorf("filefetch: wanted frame: %w", err)
+			}
+			if !bytes.Equal(bc.Hash(), c.Hash()) {
+				return fmt.Errorf("filefetch: range holds %s, wanted %s", bc, c)
+			}
+			return nil
+		}
+		data, err := fs.readRange(ctx, first.Offset, end-first.Offset, validate)
 		if err != nil {
 			return nil, err
 		}
@@ -129,11 +211,8 @@ func remoteFetcher(spaceId string, h *store.Handle, rc CarSource) func(ctx conte
 				continue // a bad extra is just not persisted; refetched on demand
 			}
 			if j == i {
-				if !bytes.Equal(bc.Hash(), c.Hash()) {
-					return nil, fmt.Errorf("filefetch: section %d holds %s, wanted %s", j, bc, c)
-				}
-				want = bdata
-				continue // the NodeGetter persists the wanted block
+				want = bdata // already cid-verified by validate
+				continue     // the NodeGetter persists the wanted block
 			}
 			_ = h.WriteBlock(ctx, bc, bdata) // verifies; failure = not persisted
 		}

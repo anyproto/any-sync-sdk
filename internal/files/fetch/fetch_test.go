@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	mrand "math/rand"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/carfile"
 	"github.com/anyproto/any-sync-sdk/internal/files/crypt"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -364,4 +366,173 @@ func TestPromotionWindow404(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 	require.True(t, bytes.Equal(plain, got))
+}
+
+// --- P2P peer-source ladder tests (SYN-48) --------------------------------
+
+// fakeCar serves ranges of a CAR object, optionally lying or failing, so
+// we can exercise the peer→HTTP validation ladder.
+type fakeCar struct {
+	car      []byte
+	fail     bool  // every read errors (transient/transport failure)
+	lieBelow int64 // corrupt ReadRange whose offset is < this (0 = never)
+	lieProbe bool  // corrupt bytes returned by ReadProbe
+}
+
+func (f *fakeCar) ReadRange(_ context.Context, off, length int64) ([]byte, error) {
+	if f.fail {
+		return nil, errors.New("peer down")
+	}
+	end := off + length
+	if end > int64(len(f.car)) {
+		end = int64(len(f.car))
+	}
+	out := append([]byte(nil), f.car[off:end]...)
+	if f.lieBelow > 0 && off < f.lieBelow {
+		for i := range out {
+			out[i] ^= 0xff
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCar) ReadProbe(_ context.Context) ([]byte, int64, error) {
+	if f.fail {
+		return nil, 0, errors.New("peer down")
+	}
+	n := int64(4096)
+	if n > int64(len(f.car)) {
+		n = int64(len(f.car))
+	}
+	head := append([]byte(nil), f.car[:n]...)
+	if f.lieProbe {
+		for i := range head {
+			head[i] ^= 0xff
+		}
+	}
+	return head, int64(len(f.car)), nil
+}
+
+type fakePeerSource struct {
+	car    *fakeCar
+	banned *bool
+	absent bool
+}
+
+func (p *fakePeerSource) SourceFor(context.Context, string, cid.Cid) (CarSource, func(), bool) {
+	if p.absent {
+		return nil, nil, false
+	}
+	return p.car, func() {
+		if p.banned != nil {
+			*p.banned = true
+		}
+	}, true
+}
+
+// A healthy peer serves the whole file; HTTP egress must be zero.
+func TestPeerPreferredNoHTTPEgress(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, plain := buildSource(t, 3_200_000)
+	base, requests := serveCar(t, root, car)
+
+	st := newStore(t)
+	svc := New(st, staticBase(base))
+	svc.SetPeer(&fakePeerSource{car: &fakeCar{car: car}})
+
+	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	require.NoError(t, err)
+	got, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.True(t, bytes.Equal(plain, got))
+	require.Zero(t, requests.Load(), "a healthy peer serves the whole file with no HTTP egress")
+}
+
+// A peer that lies on DATA ranges (honest probe) is caught by the wanted-
+// block cid check, banned, and the fetch completes over HTTP — the store
+// is never corrupted and the file stays readable.
+func TestLyingPeerFallsBackToHTTPAndBans(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, plain := buildSource(t, 3_200_000)
+	base, requests := serveCar(t, root, car)
+
+	// Corrupt only the block region (offsets below the index) — the peer
+	// serves an honest CARv2 structure (head + index) so seeding works,
+	// then lies on block bytes, which the wanted-block cid check catches.
+	hdr, err := carfile.ParseHeader(car)
+	require.NoError(t, err)
+
+	st := newStore(t)
+	svc := New(st, staticBase(base))
+	banned := false
+	svc.SetPeer(&fakePeerSource{car: &fakeCar{car: car, lieBelow: int64(hdr.IndexOffset)}, banned: &banned})
+
+	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	require.NoError(t, err, "a lying peer must not fail the fetch — HTTP serves it")
+	got, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.True(t, bytes.Equal(plain, got), "content is correct despite the lying peer")
+	require.True(t, banned, "a peer serving invalid bytes must be banned")
+	require.Greater(t, requests.Load(), int64(0), "HTTP fallback was used")
+
+	// The store is intact: a full fetch completes and the local CAR
+	// equals the real object byte-for-byte (no corruption landed).
+	require.NoError(t, svc.Fetch(ctx, spaceId, root, true, "file1"))
+	h, err := st.Open(ctx, spaceId, root)
+	require.NoError(t, err)
+	info, _ := st.Info(ctx, spaceId, root)
+	local, err := io.ReadAll(io.NewSectionReader(h, 0, info.Size))
+	require.NoError(t, err)
+	require.NoError(t, h.Close())
+	require.True(t, bytes.Equal(car, local), "no corrupt bytes persisted")
+}
+
+// A peer that lies on the PROBE (wrong root) is caught by seed's root
+// check, banned, and seeding continues over HTTP.
+func TestLyingPeerProbeFallsBack(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, plain := buildSource(t, 800_000)
+	base, _ := serveCar(t, root, car)
+
+	st := newStore(t)
+	svc := New(st, staticBase(base))
+	banned := false
+	svc.SetPeer(&fakePeerSource{car: &fakeCar{car: car, lieProbe: true}, banned: &banned})
+
+	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	require.NoError(t, err)
+	got, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.True(t, bytes.Equal(plain, got))
+	require.True(t, banned, "a peer lying on the probe must be banned")
+}
+
+// A NON-durable file (no HTTP object) whose only peer fails must return a
+// clean error — never a nil-pointer panic (the typed-nil http regression).
+func TestNonDurablePeerFailsGracefully(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, _ := buildSource(t, 800_000)
+
+	st := newStore(t)
+	svc := New(st, staticBase("")) // no public base
+	svc.SetPeer(&fakePeerSource{car: &fakeCar{car: car, fail: true}})
+
+	// The regression: with a typed-nil HTTP source, the demote path
+	// dereferenced nil and panicked. It must return a clean error.
+	_, err := svc.Open(ctx, spaceId, root, key, false, "file1") // durable=false
+	require.Error(t, err, "no usable source → error, not panic")
+}
+
+// A non-durable file with no peer at all also fails gracefully.
+func TestNonDurableNoPeerGraceful(t *testing.T) {
+	ctx := context.Background()
+	_, root, key, _ := buildSource(t, 800_000)
+	st := newStore(t)
+	svc := New(st, staticBase(""))
+	svc.SetPeer(&fakePeerSource{absent: true})
+	_, err := svc.Open(ctx, spaceId, root, key, false, "file1")
+	require.ErrorIs(t, err, space.ErrFileNotAvailable)
 }

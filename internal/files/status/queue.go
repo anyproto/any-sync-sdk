@@ -124,12 +124,6 @@ func (q *Queue) Kick() {
 // Enqueue adds (or refreshes) a job due immediately. Re-enqueueing an
 // existing job resets its schedule but keeps its attempt count.
 func (q *Queue) Enqueue(ctx context.Context, kind, spaceId, fileId string) error {
-	if kind != KindDurable && kind != KindPin {
-		return fmt.Errorf("filestatus: unknown job kind %q", kind)
-	}
-	if spaceId == "" || fileId == "" {
-		return errors.New("filestatus: spaceId and fileId required")
-	}
 	job := Job{Kind: kind, SpaceId: spaceId, FileId: fileId}
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set(fieldKind, a.NewString(kind))
@@ -140,10 +134,9 @@ func (q *Queue) Enqueue(ctx context.Context, kind, spaceId, fileId string) error
 		v.Del(fieldLastErr)
 		return v, true, nil
 	})
-	if _, err := q.coll.UpsertId(ctx, job.id(), mod); err != nil {
+	if err := q.upsert(ctx, job, mod); err != nil {
 		return err
 	}
-	q.notify(job, false)
 	q.Kick()
 	return nil
 }
@@ -156,12 +149,6 @@ func (q *Queue) Enqueue(ctx context.Context, kind, spaceId, fileId string) error
 // NetworkSign re-check — avoiding two devices uploading the same file
 // at once. The worker's periodic scan picks it up when due, so no Kick.
 func (q *Queue) EnqueueDelayed(ctx context.Context, kind, spaceId, fileId string, delay time.Duration) error {
-	if kind != KindDurable && kind != KindPin {
-		return fmt.Errorf("filestatus: unknown job kind %q", kind)
-	}
-	if spaceId == "" || fileId == "" {
-		return errors.New("filestatus: spaceId and fileId required")
-	}
 	if delay < 0 {
 		delay = 0
 	}
@@ -180,6 +167,18 @@ func (q *Queue) EnqueueDelayed(ctx context.Context, kind, spaceId, fileId string
 		v.Set(fieldNext, a.NewNumberFloat64(next))
 		return v, true, nil
 	})
+	return q.upsert(ctx, job, mod)
+}
+
+// upsert validates the job identity, applies mod, and notifies. Shared
+// by Enqueue / EnqueueDelayed.
+func (q *Queue) upsert(ctx context.Context, job Job, mod query.ModifyFunc) error {
+	if job.Kind != KindDurable && job.Kind != KindPin {
+		return fmt.Errorf("filestatus: unknown job kind %q", job.Kind)
+	}
+	if job.SpaceId == "" || job.FileId == "" {
+		return errors.New("filestatus: spaceId and fileId required")
+	}
 	if _, err := q.coll.UpsertId(ctx, job.id(), mod); err != nil {
 		return err
 	}

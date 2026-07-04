@@ -157,20 +157,23 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 	if err != nil {
 		return nil, err
 	}
-	head, total, err := src.ReadProbe(ctx)
+	// Validate the probed head's root against the requested root INSIDE
+	// the ladder: a peer (or CDN) serving a wrong/garbage object is
+	// rejected and — for the peer — banned + fallen back to HTTP, before
+	// anything is written. A wrong object merged via CreateSparse would
+	// corrupt an unrelated local file's state.
+	head, total, err := src.readProbe(ctx, func(head []byte) error {
+		probeRoot, perr := carfile.PeekRoot(head)
+		if perr != nil {
+			return fmt.Errorf("filefetch: remote head: %w", perr)
+		}
+		if !probeRoot.Equals(root) {
+			return fmt.Errorf("filefetch: object has root %s, wanted %s", probeRoot, root)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	// Reject a wrong object BEFORE anything is written: if the served
-	// object's root matched a different local file, CreateSparse would
-	// merge into (and any cleanup would then destroy) that unrelated
-	// file's state.
-	probeRoot, err := carfile.PeekRoot(head)
-	if err != nil {
-		return nil, fmt.Errorf("filefetch: remote head: %w", err)
-	}
-	if !probeRoot.Equals(root) {
-		return nil, fmt.Errorf("filefetch: object at public url has root %s, wanted %s", probeRoot, root)
 	}
 	hdr, err := carfile.ParseHeader(head)
 	if err != nil {
@@ -187,7 +190,7 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 		idx = head[idxOff:]
 		head = head[:idxOff]
 	} else {
-		if idx, err = src.ReadRange(ctx, idxOff, total-idxOff); err != nil {
+		if idx, err = src.readRange(ctx, idxOff, total-idxOff, nil); err != nil {
 			return nil, err
 		}
 	}
@@ -203,22 +206,25 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 // NEITHER is available (not durable / no public base AND no peer holds
 // it). The peer is tried first per read with a bounded deadline and
 // demoted to HTTP on the first failure (see ladderedCar).
-func (s *Service) source(ctx context.Context, spaceId string, root cid.Cid, durable bool) (CarSource, error) {
-	httpRC, httpErr := s.httpSource(ctx, spaceId, root, durable)
-	var peerSrc CarSource
-	if s.peer != nil {
-		if ps, ok := s.peer.SourceFor(ctx, spaceId, root); ok {
-			peerSrc = ps
-		}
-	}
-	switch {
-	case peerSrc != nil:
-		return &ladderedCar{peer: peerSrc, http: httpRC}, nil // http may be nil
-	case httpRC != nil:
-		return httpRC, nil
-	default:
+func (s *Service) source(ctx context.Context, spaceId string, root cid.Cid, durable bool) (*fetchSources, error) {
+	fs := &fetchSources{}
+	// A typed-nil *remoteCar must NOT be stored in the CarSource
+	// interface field (it would read as non-nil); assign only when real.
+	if httpRC, httpErr := s.httpSource(ctx, spaceId, root, durable); httpRC != nil {
+		fs.http = httpRC
+	} else if s.peer == nil {
+		// No peer to try and no HTTP: surface why HTTP is unavailable.
 		return nil, httpErr
 	}
+	if s.peer != nil {
+		if src, ban, ok := s.peer.SourceFor(ctx, spaceId, root); ok {
+			fs.peer, fs.banPeer = src, ban
+		}
+	}
+	if !fs.available() {
+		return nil, ErrNotAvailable
+	}
+	return fs, nil
 }
 
 // httpSource builds the public-object range reader; ErrNotAvailable when

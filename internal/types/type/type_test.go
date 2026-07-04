@@ -318,6 +318,223 @@ func TestPropertyHandler_CreateRejectedOnBadScope(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// Format — create-time structure validation + sub-path pinning
+// ----------------------------------------------------------------------------
+
+// setMultiFormat builds a multi-field creation $set carrying kind and a
+// `format` object with the given sub-keys (nil-valued keys are skipped).
+func setMultiFormat(arena *anyenc.Arena, kind string, formatFields map[string]*anyenc.Value) crdt.Op {
+	obj := arena.NewObject()
+	obj.Set(typetype.FieldKind, arena.NewString(kind))
+	format := arena.NewObject()
+	for k, v := range formatFields {
+		if v != nil {
+			format.Set(k, v)
+		}
+	}
+	obj.Set(typetype.FieldFormat, format)
+	return crdt.Op{Type: crdt.OpSet, Payload: obj}
+}
+
+func TestPropertyHandler_CreateWithFormat(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-related"
+	const changeId = "ch-create-related"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", changeId, propId, true,
+		setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType:   arena.NewString("links"),
+			typetype.FormatKeyUi:     arena.NewString("multiselect"),
+			typetype.FormatKeyFilter: arena.NewString(`{"type":{"$in":["page"]}}`),
+		}),
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "links", rec.GetString(typetype.FieldFormat, typetype.FormatKeyType))
+	assert.Equal(t, "multiselect", rec.GetString(typetype.FieldFormat, typetype.FormatKeyUi))
+	assert.Equal(t, `{"type":{"$in":["page"]}}`, rec.GetString(typetype.FieldFormat, typetype.FormatKeyFilter))
+
+	// Format creation is not "important" beyond the add itself — the
+	// usual create shortId row is still minted.
+	row := ctrl.Get(context.Background(), typetype.ShortIdsDataset, crdt.DeriveRecordId(changeId))
+	require.NotNil(t, row, "create with format must still project a shortId")
+}
+
+func TestPropertyHandler_CreateWithFormatRejections(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	cases := []struct {
+		name string
+		op   crdt.Op
+	}{
+		{"unknown format.type", setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("rainbow"),
+		})},
+		{"missing format.type", setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyUi: arena.NewString("select"),
+		})},
+		{"kind mismatch links/string", setMultiFormat(arena, "string", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("links"),
+		})},
+		{"kind mismatch datetime/array", setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("datetime"),
+		})},
+		{"non-string ui", setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("links"),
+			typetype.FormatKeyUi:   arena.NewNumberFloat64(7),
+		})},
+		{"non-string filter", setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType:   arena.NewString("links"),
+			typetype.FormatKeyFilter: arena.NewObject(),
+		})},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			propId := "prop-bad-format-" + tc.name
+			require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+				crdt.VersionId("v"+string(rune('1'+i))), "ch-"+tc.name, propId, true, tc.op,
+			)))
+			rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+			if rec != nil {
+				assert.Nil(t, rec.Get(typetype.FieldKind), "record %q must not materialize", tc.name)
+			}
+		})
+	}
+}
+
+func TestPropertyHandler_CreateTagsToleratedInbound(t *testing.T) {
+	// `tags` is rejected by the local AddProperty pre-flight until the
+	// tag table lands, but the handler admits it so definitions from
+	// newer SDKs replicate.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-tags"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create-tags", propId, true,
+		setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("tags"),
+		}),
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "tags", rec.GetString(typetype.FieldFormat, typetype.FormatKeyType))
+}
+
+func TestPropertyHandler_CreateRejectsDottedFormatKeys(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-dotted"
+	obj := arena.NewObject()
+	obj.Set(typetype.FieldKind, arena.NewString("array"))
+	obj.Set("format.type", arena.NewString("links"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-dotted", propId, true,
+		crdt.Op{Type: crdt.OpSet, Payload: obj},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	if rec != nil {
+		assert.Nil(t, rec.Get(typetype.FieldKind), "dotted format.* creation must drop the record")
+	}
+}
+
+func TestPropertyHandler_FormatLeafEditsPassTypeEditsDrop(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-format-edit"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("links"),
+			typetype.FormatKeyUi:   arena.NewString("select"),
+		}),
+	)))
+
+	// Leaf edit via single dotted path — passes.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", "ch-ui-edit", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldFormat, typetype.FormatKeyUi}, Payload: arena.NewString("multiselect")},
+	)))
+	// Leaf edit via multi-field dotted key — passes.
+	filterEdit := arena.NewObject()
+	filterEdit.Set("format.filter", arena.NewString(`{"type":"person"}`))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", "ch-filter-edit", propId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: filterEdit},
+	)))
+
+	// format.type edit — dropped in every shape.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", "ch-type-edit-path", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldFormat, typetype.FormatKeyType}, Payload: arena.NewString("tags")},
+	)))
+	typeEdit := arena.NewObject()
+	typeEdit.Set("format.type", arena.NewString("tags"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v5", "ch-type-edit-multi", propId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: typeEdit},
+	)))
+	// Broad `format` replace — dropped (could smuggle a type change).
+	broad := arena.NewObject()
+	broad.Set(typetype.FormatKeyType, arena.NewString("tags"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v6", "ch-broad-replace", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldFormat}, Payload: broad},
+	)))
+	// Non-string leaf value — dropped.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v7", "ch-ui-nonstring", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldFormat, typetype.FormatKeyUi}, Payload: arena.NewNumberFloat64(1)},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "links", rec.GetString(typetype.FieldFormat, typetype.FormatKeyType), "type pinned through all edit shapes")
+	assert.Equal(t, "multiselect", rec.GetString(typetype.FieldFormat, typetype.FormatKeyUi), "ui leaf edit landed")
+	assert.Equal(t, `{"type":"person"}`, rec.GetString(typetype.FieldFormat, typetype.FormatKeyFilter), "filter leaf edit landed")
+}
+
+func TestPropertyHandler_ConcurrentFormatLeafEditsMerge(t *testing.T) {
+	// Two writers touching different format leaves: per-leaf `_ver`
+	// tracking must let both land regardless of arrival order.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-concurrent"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiFormat(arena, "array", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("links"),
+		}),
+	)))
+
+	// "Concurrent" edits: the ui edit carries the LATER versionId but is
+	// applied FIRST; the filter edit arrives after with an earlier
+	// versionId. Distinct leaves — both must survive.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", "ch-ui", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldFormat, typetype.FormatKeyUi}, Payload: arena.NewString("select")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", "ch-filter", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldFormat, typetype.FormatKeyFilter}, Payload: arena.NewString(`{"a":1}`)},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "select", rec.GetString(typetype.FieldFormat, typetype.FormatKeyUi))
+	assert.Equal(t, `{"a":1}`, rec.GetString(typetype.FieldFormat, typetype.FormatKeyFilter))
+}
+
 func TestPropertyHandler_ScopeEditDropped(t *testing.T) {
 	ctrl := newTypeController(t)
 	arena := &anyenc.Arena{}

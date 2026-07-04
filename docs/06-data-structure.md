@@ -144,8 +144,9 @@ One record per definition. Shape:
 | `name` | string (human label) | CRDT-mutable |
 | `description` | string | CRDT-mutable |
 | `x-key` | string (caller-side mapping key) | CRDT-mutable |
-| `x-refType` | string (typeId) | CRDT-mutable |
+| `x-refType` | string (typeId) | superseded by `format` (never implemented) |
 | `x-kind` | string | CRDT-mutable |
+| `format` | object `{type, ui, filter}` | `format.type` first-write-wins; `format.ui` / `format.filter` CRDT-mutable |
 | `enum` | array | additive (client-soft) |
 | `items` | object | recursive sub-shape (arrays) |
 | `properties` | object | recursive sub-shape (objects) |
@@ -183,13 +184,30 @@ Array-typed:
 
 any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": {"type":"string"}}`). Concurrent additions of different sub-fields merge; edits to the same sub-field follow field-level LWW.
 
-**`x-refType`** — value metadata, not validation. Says "this id points to an object implementing this type". Works on `string` fields and `items` of arrays. Reference integrity (existence / type-implementation check) is lazy / read-time, not CRDT-apply-time.
+**`x-refType`** — superseded by `format` before it was ever implemented. Its use case ("this value points to objects of this type") is now expressed as `format: {type: "links", filter: {"type": {"$in": ["…"]}}}`. Kept in the table for historical context only.
+
+### Property formats
+
+`format` annotates a property with a value convention beyond its structural kind:
+
+```json
+{ "id": "3XEMVWA6EK", "name": "related", "kind": "array",
+  "format": { "type": "links", "ui": "multiselect",
+              "filter": "{\"type\":{\"$in\":[\"page\"]}}" } }
+```
+
+- `format.type` — `links` (array of `any://<objectId>` URI strings), `date` (`2006-01-02` string), `datetime` (RFC 3339 string), `tags` (array of tag record ids — reserved until the space-level tag table lands). Pinned by the first write, like `kind`, because it constrains the kind (`links`/`tags` ⇒ `array` of `string`; `date`/`datetime` ⇒ `string`).
+- `format.ui` — presentation hint (`select` / `multiselect` / `link` / `links`). Opaque string to the SDK; CRDT-mutable leaf.
+- `format.filter` — mongo-style condition over candidate objects, stored as its JSON **text** (a string leaf, so concurrent edits replace each other as a unit instead of field-merging two conditions). Opaque to the SDK; CRDT-mutable leaf.
+
+Validation split: the SDK enforces only structure at definition-write time (known `format.type`, the format→kind coupling, `ui`/`filter` are strings; format must be created as a whole object — dotted `format.*` creation keys are rejected). Semantics — ui vocabulary, filter syntax, and whether values actually match the format (a datetime parses, a link is a well-formed `any://` URI) — are a consumer concern (the `any` server validates them at its API boundary). Like `x-refType` before it, a format is value **metadata, not apply-time value validation**: reference integrity stays lazy/read-time.
 
 ### Immutability rules
 
 **CRDT-hard (enforced at apply on every peer, convergent)**
 
 - **Per-record first-write-wins on `id` and `type`.** `id` is immutable (it's the record id); `type` is locked by the first write to the record. Each property is its own island — no cross-record binding, no silent-ignore rules between different property records.
+- **`format.type` is pinned at sub-path granularity.** Edits to `format.type` and broad replaces of the whole `format` object drop at apply (a broad replace could smuggle a type change past a handler that has no prior state); the `format.ui` / `format.filter` leaves stay writable.
 
 **Client-soft (SDK refuses to emit; honest clients comply, misbehaving peers bounded by read-tolerance)**
 
@@ -201,7 +219,7 @@ any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": 
 
 **Freely mutable**
 
-- `name`, `description`, `x-key`, `x-kind`, `x-refType`, sub-field additions, enum additions, constraint loosening.
+- `name`, `description`, `x-key`, `x-kind`, `format.ui`, `format.filter` (string leaves only), sub-field additions, enum additions, constraint loosening.
 
 ### Same-name properties are not a conflict
 

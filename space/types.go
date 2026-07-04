@@ -72,9 +72,9 @@ type TypesAPI interface {
 	RemoveProperty(ctx context.Context, typeId, propId string) error
 
 	// UpdatePropertyMeta mutates the CRDT-mutable fields (Name,
-	// Description, XKey, XKind). Type-shape fields (Kind, Items,
-	// Properties) are immutable per first-write-wins on the property
-	// record.
+	// Description, XKey, XKind, Format.UI, Format.Filter). Type-shape
+	// fields (Kind, Items, Properties, Scope, Format.Type) are
+	// immutable per first-write-wins on the property record.
 	UpdatePropertyMeta(ctx context.Context, typeId, propId string, update PropertyMetaUpdate) error
 }
 
@@ -138,6 +138,43 @@ type PropertyDef struct {
 	// immutable for the propId's life. Definitions written before
 	// scopes existed read back as ScopeSynced.
 	Scope Scope
+
+	// Format is the property's value-format annotation (links / date /
+	// datetime / …). Nil for definitions that never declared one —
+	// including everything written before formats existed. Format.Type
+	// is pinned like Kind; UI and Filter are CRDT-mutable. A definition
+	// carrying a format type this SDK version doesn't know reads back
+	// as nil (read tolerance).
+	Format *PropertyFormat
+}
+
+// PropertyFormat is the live format annotation on a PropertyDef.
+//
+// The SDK validates only the structure (Type is a known enum because it
+// constrains Kind; UI and Filter are strings) — it never interprets UI
+// values or Filter contents. Semantic validation (UI enums, filter
+// syntax, value shapes) is a consumer concern, e.g. the `any` server.
+type PropertyFormat struct {
+	// Type declares the value convention — see FormatType. Pinned by
+	// the first write, like Kind.
+	Type FormatType
+	// UI is a presentation hint (e.g. "select", "multiselect", "link",
+	// "links"). Opaque to the SDK, like XKind. CRDT-mutable.
+	UI string
+	// Filter is a mongo-style condition over candidate objects, stored
+	// as its JSON text. Opaque to the SDK. Empty means "no filter".
+	// CRDT-mutable — concurrent edits replace each other as a unit.
+	Filter string
+}
+
+// PropertyFormatDraft is the format input on a PropertyDraft.
+type PropertyFormatDraft struct {
+	Type FormatType
+	UI   string
+	// Filter accepts the JSON text of a condition (stored verbatim) or
+	// any JSON-marshalable value (map/struct), which is serialized to
+	// its JSON text. The SDK does not parse or validate the condition.
+	Filter any
 }
 
 // PropertyDraft is the input to TypesAPI.AddProperty. Kind, Items,
@@ -159,6 +196,14 @@ type PropertyDraft struct {
 	// Pinned by the first write — to change a property's scope, define
 	// a new property (which mints a new propId).
 	Scope Scope
+
+	// Format optionally declares the value convention. Format.Type
+	// constrains Kind (links/tags ⇒ array of string; date/datetime ⇒
+	// string) and, when Kind is zero, defaults it. Format.Type is
+	// pinned by the first write; UI and Filter stay mutable via
+	// UpdatePropertyMeta. FormatTags is reserved until the space-level
+	// tags table lands and is rejected.
+	Format *PropertyFormatDraft
 }
 
 // PropertyMetaUpdate carries optional updates to the CRDT-mutable meta
@@ -169,6 +214,13 @@ type PropertyMetaUpdate struct {
 	Description *string
 	XKey        *string
 	XKind       *string
+
+	// FormatUI / FormatFilter update the mutable format leaves. Only
+	// valid on a property that declared a format at creation —
+	// format.type itself is pinned and cannot be added, changed, or
+	// removed here.
+	FormatUI     *string
+	FormatFilter *string
 }
 
 // PropertyKind mirrors the JSON-Schema-subset types supported on
@@ -188,3 +240,59 @@ const (
 	PropertyKindArray
 	PropertyKindObject
 )
+
+// FormatType declares a property's value convention beyond its
+// structural Kind. Formats are annotations: the SDK checks only that
+// the declared format is compatible with the Kind — it never validates
+// values against the format (that's a consumer concern, e.g. the `any`
+// server checks that a datetime value parses).
+//
+// Value conventions per format:
+//   - FormatLinks:    array of "any://<objectId>" URI strings (see the
+//     anyuri package)
+//   - FormatDate:     "2006-01-02" date string
+//   - FormatDatetime: RFC 3339 datetime string
+//   - FormatTags:     array of tag record ids referencing the space's
+//     tag table — reserved, not accepted by AddProperty yet
+//
+// The zero value means "no format declared".
+type FormatType uint8
+
+const (
+	FormatLinks FormatType = iota + 1
+	FormatDate
+	FormatDatetime
+	FormatTags
+)
+
+// String returns the on-wire label ("links", "date", "datetime",
+// "tags"), or "" for the zero/unknown value.
+func (f FormatType) String() string {
+	switch f {
+	case FormatLinks:
+		return "links"
+	case FormatDate:
+		return "date"
+	case FormatDatetime:
+		return "datetime"
+	case FormatTags:
+		return "tags"
+	}
+	return ""
+}
+
+// ParseFormatType decodes the on-wire format label. Returns false on an
+// unknown label.
+func ParseFormatType(s string) (FormatType, bool) {
+	switch s {
+	case "links":
+		return FormatLinks, true
+	case "date":
+		return FormatDate, true
+	case "datetime":
+		return FormatDatetime, true
+	case "tags":
+		return FormatTags, true
+	}
+	return 0, false
+}

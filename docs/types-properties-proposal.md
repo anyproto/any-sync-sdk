@@ -46,7 +46,7 @@
 **Type** — an object with `type = type`. Type-object's own properties are **hardcoded**. Built-ins (`any`, …) ship with the SDK.
 
 A type defines:
-- **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`. More fields (e.g. `required`, `default`, `enum`) may be added later, when a concrete need appears.
+- **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`, and optionally `format` (a `{type, ui, filter}` object annotating the value convention — see docs/06 § "Property formats"). More fields (e.g. `required`, `default`, `enum`) may be added later, when a concrete need appears.
 - **Optionally, versioned data schemas** for the object's datasets.
 
 Objects may implement **many types**, which coexist. No extension/inheritance in v1.
@@ -105,7 +105,8 @@ The `typePropertyHandler` (the built-in handler for type objects' `properties` d
 - **Add a property** — allowed. Mints a new shortId.
 - **Remove a property** — allowed. Mints a new shortId. Existing record data in any-store is **not** cleaned up; subsequent writes touching that property are dropped op-by-op (unknown-property rule).
 - **Modify an existing property's schema-bearing fields** (`kind`, `items`, `properties`) — **rejected at write time**. Kinds are pinned for life. To change a property's shape, remove it and re-add it as a new shortId; old-writer ops then either match (same kind by coincidence) or drop cleanly.
-- **Modify display-only fields** (future: `displayName`, `description`, etc.) — allowed, does not mint a shortId.
+- **Modify a pinned sub-path** — same rejection, at sub-path granularity: `format.type` (and broad replaces of the whole `format` object, which could smuggle a type change) drop at write time, while the `format.ui` / `format.filter` string leaves stay freely mutable. First-write-wins therefore covers whole fields (`kind`, `scope`, …) *and* declared sub-paths.
+- **Modify display-only fields** (`name`, `description`, `x-key`, `x-kind`, `format.ui`, `format.filter`) — allowed, does not mint a shortId.
 
 Effect: old-writer data against the current schema always type-matches on still-present properties (kind never changed) or drops cleanly on removed properties. No snapshot of historical schemas needed; **validation always runs against the current (latest merged) schema**.
 

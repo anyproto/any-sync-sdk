@@ -32,6 +32,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal},
 		{Id: FieldAclHeadId, Name: "Acl head id", Schema: str(), Scope: schema.ScopeLocal},
 		{Id: FieldOneToOneInviteState, Name: "One-to-one invite state", Schema: str(), Scope: schema.ScopeLocal},
+		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
 		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
 	}}
@@ -97,6 +98,15 @@ const (
 	// initiated owes the notification, and the obligation is meaningless
 	// after it's met. Written via Service.SetOneToOneInviteState.
 	FieldOneToOneInviteState = "oneToOneInviteState"
+	// FieldInviteNotifyPending is a DEVICE-LOCAL array (schema.ScopeLocal)
+	// of account identities this device still owes a RegularInvite inbox
+	// notification for, after a successful ACL AddAccounts on this space.
+	// Entries are removed one-by-one on confirmed delivery (or when
+	// permanently undeliverable). Local because delivery is a per-device
+	// obligation — only the device that ran AddAccounts owes it. The
+	// many-receiver generalization of FieldOneToOneInviteState. Written via
+	// Service.AddInviteNotify / ClearInviteNotify.
+	FieldInviteNotifyPending = "inviteNotifyPending"
 	// FieldOneToOnePeer is the other participant's account identity on a
 	// derived 1-1 row (synced, account-wide). It is the one piece of state
 	// a spaceId does not encode invertibly, and it is required to
@@ -141,6 +151,20 @@ const (
 	// re-creatable — a later OneToOne(peer) flips the row back to active.
 	// Surfaced to callers as space.StatusDeleted.
 	OneToOneDeletedStatus = "oneToOneDeleted"
+
+	// InvitePendingRemoteStatus is the SYNCED remoteStatus on a regular
+	// space another account added us to directly (ACL AddAccounts). We are
+	// already a full ACL member; approval is a local materialization gate.
+	// Synced — unlike the device-local 1-1 pending — because the synced
+	// inbox cursor means only ONE of our devices processes the invite
+	// message, so the row itself must carry pending to the others. NOT
+	// terminal: AcceptInvite flips it to active, DeclineInvite to declined.
+	InvitePendingRemoteStatus = "invitePending"
+	// InviteDeclinedRemoteStatus is the SYNCED, sticky, NON-terminal
+	// remoteStatus written when a direct-add invite is declined. Suppresses
+	// the request on every device; a later AcceptInvite overrides it. No
+	// ACL write happens on decline — the account stays an ACL member.
+	InviteDeclinedRemoteStatus = "inviteDeclined"
 )
 
 // IsDeleted reports whether a row is in any deleted/offloaded state — the

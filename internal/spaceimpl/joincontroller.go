@@ -80,12 +80,18 @@ func (s *Service) joinLoop(ctx context.Context) {
 // reconcileJoins owns the waiter lifecycle. It starts an ACL waiter for
 // each joining row that lacks one, and stops the waiter for any space
 // that has left the joining state (accepted→active or declined→deleted,
-// or its load completed). Single-threaded: only joinLoop calls it.
+// or its load completed). It also resumes accepted-invite loads
+// (localStatus="inviteLoading" — pull-until-available, no ACL waiter;
+// the account is already a member). Single-threaded: only joinLoop
+// calls it.
 func (s *Service) reconcileJoins(ctx context.Context) {
 	joining := make(map[string]techspace.SpaceIndexRecord)
 	for _, r := range s.tsp.List(ctx) {
 		if r.LocalStatus == joiningLocalStatus {
 			joining[r.Id] = r
+		}
+		if r.LocalStatus == inviteLoadingLocalStatus {
+			s.startPendingLoad(ctx, r.Id)
 		}
 	}
 
@@ -111,6 +117,90 @@ func (s *Service) reconcileJoins(ctx context.Context) {
 			continue
 		}
 		s.startJoinWaiter(ctx, rec)
+	}
+}
+
+// startPendingLoad spawns (at most one per spaceId) background load for
+// an accepted direct-add invite left unloaded — AcceptInvite crashed or
+// went offline mid-pull, or the accept happened moments ago and its
+// synchronous attempt failed.
+func (s *Service) startPendingLoad(ctx context.Context, spaceId string) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	if _, running := s.pendingLoads[spaceId]; running {
+		s.mu.Unlock()
+		return
+	}
+	s.pendingLoads[spaceId] = struct{}{}
+	s.mu.Unlock()
+	s.joinWG.Add(1)
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.pendingLoads, spaceId)
+			s.mu.Unlock()
+		}()
+		s.loadAcceptedInvite(ctx, spaceId)
+	}()
+}
+
+// loadAcceptedInvite drives an accepted direct-add invite to loaded.
+// Unlike loadJoinedSpace it re-reads the row every attempt, because the
+// row can move under a long-running retry:
+//
+//   - deleted (locally or synced) — the user's cleanup path for an
+//     accept that can never complete (e.g. a spoofed spaceId, or the
+//     owner removed us before we accepted): stop, never resurrect.
+//   - declined on another device (synced) — the decline won; clear this
+//     device's loading marker and stop.
+//   - still invitePending — the accept was interrupted between the
+//     loading marker and the synced flip; finish the flip here so the
+//     accept becomes account-wide durable.
+//
+// Bound to the join controller's context: on shutdown it returns with
+// the row still "inviteLoading" and the next session's boot pass
+// resumes it.
+func (s *Service) loadAcceptedInvite(ctx context.Context, spaceId string) {
+	defer s.joinWG.Done()
+	backoff := time.Second
+	const maxBackoff = 20 * time.Second
+	for {
+		rec, ok := s.tsp.Get(ctx, spaceId)
+		if !ok || rec.IsDeleted() {
+			return
+		}
+		if rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus {
+			if _, err := s.tsp.SetLocalStatus(ctx, spaceId, ""); err != nil {
+				joinLog.Warn("clear loading marker on declined invite",
+					zap.String("spaceId", spaceId), zap.Error(err))
+			}
+			return
+		}
+		if rec.RemoteStatus == techspace.InvitePendingRemoteStatus {
+			if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+				joinLog.Warn("finish interrupted accept",
+					zap.String("spaceId", spaceId), zap.Error(err))
+			}
+		}
+		if _, err := s.Get(ctx, spaceId); err == nil {
+			if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err == nil {
+				s.kickJoinController()
+				return
+			} else {
+				joinLog.Warn("flip accepted invite active", zap.String("spaceId", spaceId), zap.Error(err))
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff = backoff * 3 / 2; backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 	}
 }
 

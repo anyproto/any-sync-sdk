@@ -49,8 +49,15 @@ type ACL interface {
 	RemoveAccounts(ctx context.Context, identities []string) error
 
 	// AddAccounts adds members directly without an invite/request
-	// round-trip. Useful for server-side flows where the owner already
-	// holds the joiner's identity.
+	// round-trip — the whole batch lands in ONE ACL record. Useful
+	// wherever the caller already holds the joiners' identities.
+	//
+	// When the coordinator inbox transport is available, each added
+	// account is also notified durably (queued + retried across
+	// restarts): the space surfaces on their devices as
+	// StatusInvitePending for them to AcceptInvite / DeclineInvite.
+	// Without the transport (headless deployments) the ACL write still
+	// happens but no notification is sent.
 	AddAccounts(ctx context.Context, accounts []MemberAdd) error
 
 	// OwnershipChange transfers ownership to newOwner; the old owner's

@@ -74,13 +74,22 @@ func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 // found". This is a transient startup race on a freshly-created space,
 // so we retry with a short backoff instead of surfacing it to callers.
 func addRecordWaitingForLog(ctx context.Context, cl aclclient.AclSpaceClient, rec *consensusproto.RawRecord) error {
+	return callWaitingForLog(ctx, func() error { return cl.AddRecord(ctx, rec) })
+}
+
+// callWaitingForLog runs an ACL publish call with the log-not-ready
+// retry described on addRecordWaitingForLog. call is re-invoked whole on
+// each attempt — for client methods without a build/publish split (e.g.
+// AddAccounts) the record is rebuilt per attempt, which is fine: prior
+// attempts were rejected, so no duplicate can land.
+func callWaitingForLog(ctx context.Context, call func() error) error {
 	const (
 		maxAttempts = 35
 		backoff     = time.Second
 	)
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		if err := cl.AddRecord(ctx, rec); err != nil {
+		if err := call(); err != nil {
 			lastErr = err
 			if !isLogNotReady(err) {
 				return err
@@ -250,6 +259,12 @@ func (a *aclAPI) AddAccounts(ctx context.Context, accounts []space.MemberAdd) er
 	if len(accounts) == 0 {
 		return errors.New("acl: AddAccounts: empty accounts")
 	}
+	// Same precondition as CreateInvite: the ACL record is rejected until
+	// the coordinator knows the space ("space not exists" / log not
+	// found), so register it shareable first. Idempotent + retried.
+	if err := ensureShareable(ctx, a.s); err != nil {
+		return err
+	}
 	out := make([]list.AccountAdd, 0, len(accounts))
 	for i, m := range accounts {
 		pk, err := decodeIdentity(m.Identity)
@@ -277,7 +292,21 @@ func (a *aclAPI) AddAccounts(ctx context.Context, accounts []space.MemberAdd) er
 	if err != nil {
 		return err
 	}
-	return cl.AddAccounts(ctx, list.AccountsAddPayload{Additions: out})
+	if err := callWaitingForLog(ctx, func() error {
+		return cl.AddAccounts(ctx, list.AccountsAddPayload{Additions: out})
+	}); err != nil {
+		return err
+	}
+	// Membership is effective; notify the added accounts via the
+	// coordinator inbox (durable, retried) so the space surfaces on their
+	// devices as invite-pending. Queue failures are logged, never fail
+	// the add.
+	identities := make([]string, 0, len(accounts))
+	for _, m := range accounts {
+		identities = append(identities, m.Identity)
+	}
+	a.s.parent.markRegularInvitesToSend(ctx, a.s.id, identities)
+	return nil
 }
 
 func (a *aclAPI) OwnershipChange(ctx context.Context, newOwner string, oldOwnerPerm space.Permission) error {

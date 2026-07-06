@@ -60,14 +60,19 @@ its own membership and read key (see "ACL granularity via compartments" below).
    appending one ACL record to the parent; the coordinator validates and signs.
    No owner approval record in the loop. (Grooming answer: self-service for
    admins+.)
-4. **legalOwner = the parent's current owner, derived.** legalOwner is not a
-   stored identity: it is *defined as* the current owner of `parentSpaceId`,
-   resolved from the parent ACL head at every validation point. A parent
-   ownership transfer (`AclOwnershipChange` — shipped in any-sync v0.13)
-   therefore re-targets every child's legalOwner automatically, with no
-   fan-out. When the org itself creates the child, the org is **real owner and
-   legalOwner simultaneously** (and may join the child's ACL as
-   reader/writer/admin to gain real data access).
+4. **legalOwner = the parent's current owner — hybrid: derived where
+   infrastructure enforces, stored where clients validate.** For powers the
+   coordinator enforces anyway (child deletion, quota attribution, SpaceSign
+   validation) legalOwner is resolved **fresh** from the parent ACL head at
+   decision time. For powers exercised as child-ACL records that every client
+   must validate (keyless removal) the child ACL pins the legalOwner **public
+   key** at genesis and advances it via `AclLegalOwnerUpdate`, a record
+   carrying a signature-induction proof (below). A parent ownership transfer
+   (`AclOwnershipChange` — shipped in any-sync v0.13) is honored by the
+   coordinator immediately and by each child lazily; the window is
+   fail-closed (see the authority model). When the org itself creates the
+   child, the org is **real owner and legalOwner simultaneously** (and may
+   join the child's ACL as reader/writer/admin to gain real data access).
 
 ## The flow (end to end)
 
@@ -77,7 +82,8 @@ member of orgSpace (Admin+)                    coordinator                 nodes
  1. create child header                              │                       │
     SpaceHeader{ parentSpaceId = orgId,              │                       │
                  identity = me, ... }  (signed by me)│                       │
-    + child AclRoot{ parentRef = <set in step 2> }   │                       │
+    + child AclRoot{ parentRef = <set in step 2>,    │                       │
+                     legalOwner = orgOwner pubkey }  │                       │
         │                                            │                       │
  2. register child in org ACL  ──────────────────────┼──> (parent ACL sync)  │
     append AclChildRegister{ childSpaceId,           │                       │
@@ -87,8 +93,8 @@ member of orgSpace (Admin+)                    coordinator                 nodes
         │                                            │                       │
  3. SpaceSign(childId, header, parentAclRecordId) ──>│  validates:           │
         │                                            │   • parentSpaceId real │
-        │                                            │   • legalOwner := owner│
-        │                                            │     of parent (derived)│
+        │                                            │   • legalOwner == owner│
+        │                                            │     of parent (fresh)  │
         │                                            │   • registration record│
         │                                            │     exists in parent   │
         │                                            │     ACL, references    │
@@ -139,8 +145,13 @@ ACL.
 - **`AclSpaceOptionsChange`** (owner-only record, shipped in v0.13): the update
   mechanism the new parent-settings toggles ride on — no new settings machinery.
 - **`AclOwnershipChange`** (shipped in v0.13): parent ownership transfer is a
-  real record; the derived-legalOwner rule below absorbs it with zero extra
-  work.
+  real record; the hybrid legalOwner rule below consumes it directly — the
+  coordinator observes it immediately, and its raw signed payload doubles as
+  the offline proof inside `AclLegalOwnerUpdate`.
+- **Coordinator `aclService.OwnerPubKey(spaceId)`** (any-sync-coordinator):
+  resolves any space's current owner from live ACL state; already used in
+  production to track ownership transfers. The derivation half of the hybrid
+  is a call to an existing API.
 
 ### Required any-sync changes (TODO — tracked here)
 
@@ -171,27 +182,26 @@ ACL.
    compat). (A `SpaceNesting` sub-message can be used instead if more nesting
    metadata is needed later; one string is enough for v1.)
 
-2. **`AclRoot` gains `parentRef` — and deliberately NOT a stored legalOwner.**
+2. **`AclRoot` gains `parentRef` + a pinned legalOwner public key.**
    ```proto
    message AclRoot {
      // ... existing fields 1..11 (through oneToOneInfo=10, options=11) ...
      AclParentRef parentRef = 12; // pointer to the registration record in the parent ACL
+     bytes legalOwner = 13;       // pubkey of the parent's owner AT GENESIS; advanced via AclLegalOwnerUpdate
    }
    message AclParentRef {
      string parentSpaceId   = 1; // == SpaceHeader.parentSpaceId (redundant, binds the ACL to the header)
      string parentAclRecordId = 2; // the AclChildRegister record id in the parent ACL
    }
    ```
-   The legalOwner identity is **derived, not stored**: legalOwner ≙ the
-   current owner of `parentSpaceId`, resolved from the parent ACL head
-   wherever it is checked. Storing the identity was rejected (grooming
-   2026-07-06): any-sync now ships `AclOwnershipChange`, so a parent ownership
-   transfer would strand every child with a stale pinned legalOwner;
-   derivation re-targets all children atomically and needs no fan-out record.
-   The cost: a child ACL is no longer standalone-validatable for
-   legalOwner-authored records — its validator needs the parent ACL (change 7
-   below). For a top-level space `parentRef` is empty and everything behaves
-   as today.
+   The stored key serves **client-side validation only** — it is the trust
+   anchor of the signature-induction chain (change 3), letting any child
+   member (including external seats, which never replicate the parent)
+   validate legalOwner-authored records against the child's own causal
+   timeline, with no cross-ACL lookup. The coordinator never trusts it: at
+   SpaceSign it verifies the pinned key equals the parent's *current* owner
+   (fresh read), and every later infra decision re-derives. For a top-level
+   space both fields are empty and everything behaves as today.
 
 3. **New ACL record types** (`AclContentValue` oneof — variants 1..16 are
    taken as of v0.13 (`accountsAdd`, `inviteJoin`, `ownershipChange`,
@@ -204,10 +214,26 @@ ACL.
      AclUserPermissions orgPermission = 3; // permission the org grants ITSELF in the child, if any (None = no data access)
    }
    message AclChildRegisterRevoke { string childSpaceId = 1; } // optional: de-list a child
+
+   // authored in the CHILD by the parent's NEW owner after an ownership
+   // transfer — advances the child's stored legalOwner by signature induction
+   message AclLegalOwnerUpdate {
+     repeated bytes ownershipChanges = 1; // raw signed AclOwnershipChange record(s) from the parent, in order
+   }
    ```
-   Both are authored in the **parent**. There is no legalOwner-change record:
-   legalOwner is derived from the parent's current owner, so the shipped
-   `AclOwnershipChange` in the parent already re-targets it.
+   The register records are authored in the **parent**; `AclLegalOwnerUpdate`
+   in the **child**. Validating the update is pure **signature induction**:
+   the first embedded parent `AclOwnershipChange` must be signed by the
+   child's currently stored legalOwner key; each subsequent one by the owner
+   the previous one named; the last one names the new stored legalOwner.
+   Intermediate parent history (rotations, invites, joins) never alters
+   signing authority, so it is skipped entirely — the proof is O(number of
+   transfers), ~300 bytes each, verifiable fully offline. Replay guard: the
+   child remembers the CIDs of consumed `AclOwnershipChange` payloads (the
+   CID is recomputable from the embedded bytes) and rejects re-use, so cycled
+   ownership (A→B→A) cannot be replayed by a malicious ex-owner. Updates are
+   **lazy**: the new parent owner pushes one only when it actually needs to
+   exercise a keyless power in that child.
 
 4. **Coordinator `SpaceSign` extension.** Request carries a pointer to the
    parent registration record; server-side validation does the nested checks
@@ -228,24 +254,57 @@ ACL.
    at child member-add, the coordinator charges/checks the **legalOwner's**
    `AccountLimits` (sharedSpacesLimit, spaceMembersRead/Write) instead of the
    creator's. Top-level spaces keep charging the owner. New error reuse:
-   `SpaceLimitReached` / `Forbidden`.
+   `SpaceLimitReached` / `Forbidden`. (Verified 2026-07-06: limits are
+   identity-keyed in the coordinator's store and the key is swappable, but
+   there is **no sign-time `sharedSpacesLimit` check today** — it runs only in
+   the make-shareable path. The child-sign limit check is net-new logic, not
+   a retarget of an existing one.)
 
 6. **Coordinator `SpaceDelete` accepts a legalOwner-signed deletion** for a
    child, in addition to the owner-signed path. (See "legalOwner delete" below.)
 
-7. **Cross-ACL legalOwner resolution.** Because legalOwner is derived,
-   validating a legalOwner-authored record in the *child* ACL (the keyless
-   removal below) requires knowing the *parent's* current owner. The
-   coordinator always has both ACLs. For consensus/tree nodes the natural
-   answer is **routing children to their parent's node set** — `parentSpaceId`
-   is a first-class header field, so placement can key on it — making every
-   validator of the child also a host of the parent ACL. Client-side
-   validators that don't replicate the parent (notably external-seat members,
-   who are not org members) need a defined fallback — see open question 12.
+7. **Child placement: inherit the parent's replicationKey.** Node placement
+   consistent-hashes only the replicationKey suffix of the spaceId
+   (`nodeconf.ReplKey`), and nothing enforces key uniqueness (1-1 spaces
+   already share deterministically derived keys) — so a child that copies its
+   parent's `ReplicationKey` into its header co-locates on the parent's node
+   partition with **zero routing changes** (verified). Chosen to minimize the
+   number of node connections a client needs to sync an org: one partition
+   serves the parent and all its compartments. Validation does NOT depend on
+   this — nodes skip ACL content validation entirely (acceptor-trust), the
+   coordinator has global ACL access, and clients validate via the stored key
+   + signature induction. Accepted costs, to monitor: (a) a very large org
+   concentrates its whole load on one partition — a hard-to-rebalance hotspot
+   if a whale outgrows it; (b) all of an org's spaceIds share a visible
+   suffix, making org membership/size publicly linkable. If either bites,
+   later children can switch to independent keys without breaking anything —
+   co-location is an optimization, never a correctness dependency.
 
 > The coordinator lives in the separate `any-sync-coordinator` repo; only the
 > proto (in `any-sync`) is visible here. All server-side validation/accounting
 > work is a coordinator-repo task, tracked from this doc.
+
+### Feasibility spot-checks (2026-07-06, against the live repos)
+
+- **Header compat:** verification runs over the raw stored header bytes (never
+  re-marshals) and vtproto preserves unknown fields — `parentSpaceId = 10` is
+  fully backward-compatible on the wire; old peers store and forward it inert.
+- **Placement:** `nodeconf` routes purely on the replicationKey suffix of the
+  spaceId, with no uniqueness enforcement — replicationKey inheritance
+  (change 7) needs zero routing code.
+- **Where ACL content validation actually runs:** exactly two places — the
+  coordinator submit path (full validator + a post-validation hook, with
+  `OwnerPubKey(anySpaceId)` available) and clients. Sync nodes skip content
+  validation and verify only the consensus acceptor signature; consensus
+  nodes are head-CAS log stores with no ACL state machine at all. The
+  keyless-removal validation therefore only needs the coordinator (has
+  cross-ACL access) and clients (self-contained via the stored key).
+- **Coordinator:** `SpaceSign` has a clean insertion point after header
+  verification; the modern `SpaceDelete` path authorizes via an identity
+  predicate (localized change to accept the parent's owner); limits are
+  identity-keyed and the billed identity is swappable — but a sign-time
+  `sharedSpacesLimit` check is net-new (today it runs only at
+  make-shareable).
 
 ## Coordinator validation at child `SpaceSign`
 
@@ -255,11 +314,11 @@ addition to the normal space-sign checks:
 
 1. **Parent exists & is healthy.** `header.parentSpaceId` resolves to a real,
    non-deleted space the coordinator knows.
-2. **legalOwner resolution.** The coordinator resolves legalOwner := the
-   current owner identity of `parentSpaceId` (read from the parent ACL head)
-   and uses it for the limit checks below. There is nothing to compare — the
-   child does not carry a legalOwner identity. *(Grooming 2026-07-06: derived,
-   not stored.)*
+2. **legalOwner check.** The coordinator resolves the current owner identity
+   of `parentSpaceId` **fresh** from the parent ACL head (bypassing any owner
+   cache) and verifies the child `AclRoot.legalOwner` pins exactly that key.
+   (Verified: the coordinator's `aclService.OwnerPubKey(spaceId)` already
+   exists and is used in production to track ownership transfers.)
 3. **Registration record is real and consistent.** `parentAclRecordId` exists in
    the parent ACL, is an `AclChildRegister`, has `childSpaceId == childId`, and
    its `childAclRootCid` matches the child's actual ACL root CID.
@@ -280,9 +339,17 @@ the member cannot author beyond its real permission level.
 
 ## legalOwner — authority model
 
-`legalOwner` is not a stored identity: it is **derived** — always the parent's
-current owner, resolved from the parent ACL head at each validation point. A
-parent `AclOwnershipChange` re-targets every child automatically. Its powers:
+legalOwner ≙ the parent's current owner, tracked through a **hybrid** split by
+trust domain. Powers enforced by infrastructure (delete, quota, sign) are
+checked by the coordinator against a **fresh derivation** from the parent ACL
+head. Powers exercised as child-ACL records that clients must validate (the
+keyless removal) are checked against the **stored legalOwner key** in the
+child ACL, advanced by `AclLegalOwnerUpdate`. The window between a parent
+ownership transfer and a child's update is **fail-closed**: the ex-owner still
+passes client validation but the coordinator (fresh derivation) rejects her
+records at submit; the new owner passes the coordinator but must first prove
+himself to clients via the update record. Neither can act unilaterally. Its
+powers:
 
 | Power | Holds child readKey? | Mechanism |
 |---|---|---|
@@ -328,11 +395,11 @@ Design — a two-phase split:
      clients hit the tolerant unknown-content default and skip it, so they
      don't crash — but they also keep treating the member as present until
      phase B lands, which is the inherent window below);
-   - a **keyless-authorization track** in `AclState`, populated by resolving
-     the parent's current owner (cross-ACL: the child's validator consults the
-     parent ACL head — required change 7), so the validator admits a
-     legalOwner-authored removal even though `Permissions(legalOwner)` is
-     `None` (it is not a normal member);
+   - a **keyless-authorization track** in `AclState`, populated from the
+     child's stored legalOwner key (`AclRoot.legalOwner` + any
+     `AclLegalOwnerUpdate` records) — fully self-contained, no cross-ACL
+     lookup — so the validator admits a legalOwner-authored removal even
+     though `Permissions(legalOwner)` is `None` (it is not a normal member);
    - a **"removed-but-not-yet-rotated"** state marker the next phase keys on.
 2. **Phase B — a key-holder completes the cut-off.** The space now sits in the
    observable *removed-but-not-rotated* state. A remaining member who **holds the
@@ -367,10 +434,13 @@ Design — a two-phase split:
 **Effort (verified):** phase A (`AclAccountRemoveNoRotate` + keyless-auth track +
 pending-rotation state) is **L** — bounded surgery, but it breaks the
 removal↔rotation coupling, a security-critical invariant, so it is the real cost
-of the feature. Derived legalOwner adds the cross-ACL resolution (required
-change 7) on top, so call phase A **L–XL** overall. Phase B is **free for
-admins**, **S–M for editors** (predicate relaxation + the pending-removal
-guard). The rotation record itself is unchanged.
+of the feature. `AclLegalOwnerUpdate` (signature-induction validation +
+consumed-CID replay guard) adds **S–M** on top, and everything stays inside
+the child's own validator — no cross-ACL plumbing (verified: the core content
+validator has no external-context hook, and with the stored key it doesn't
+need one). Phase B is **free for admins**, **S–M for editors** (predicate
+relaxation + the pending-removal guard). The rotation record itself is
+unchanged.
 
 Open: whether the SDK auto-rotates on detecting a pending keyless removal
 (preferred — restores forward secrecy without UI, needs a key-holder online) or
@@ -517,7 +587,11 @@ surface:
   to.
 - **External seats** (phase later): an org-settings allowance + a member-add that
   flags an external (non-org) identity, gated by the coordinator against
-  `externalSeatsLimit`.
+  `externalSeatsLimit`. Discovery for externals ("which compartments am I in")
+  is a dedicated **coordinator endpoint** backed by its limits/billing data —
+  externals never read the parent ACL. The coordinator gains only DoS power
+  here: a forged entry fails the client's own ACL validation of the
+  compartment, and an omitted one is indistinguishable from a network failure.
 
 Effective-access composition ("show me everything member X can reach across the
 org") is a **client concern** over `Children` + per-compartment membership, not
@@ -614,11 +688,12 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
    chain need to be defined if so. Default v1: single level (children cannot
    have children), enforced by the coordinator (reject a child whose
    `parentSpaceId` itself has a non-empty `parentSpaceId`).
-7. **legalOwner change after root — RESOLVED (2026-07-06): by derivation.**
-   legalOwner is never stored; it is always the parent's current owner. The
-   shipped `AclOwnershipChange` in the parent re-targets every child
-   automatically — no fan-out, no `AclLegalOwnerChange` record. The residual
-   problem moved to cross-ACL resolution (required change 7, Q12).
+7. **legalOwner change after root — RESOLVED (2026-07-06): hybrid.** The
+   coordinator always derives fresh, so infra-enforced powers re-target the
+   moment the parent's `AclOwnershipChange` lands. The child's stored key is
+   advanced lazily by `AclLegalOwnerUpdate` with a signature-induction proof;
+   the interim window is fail-closed (authority model). No proactive fan-out
+   is ever required.
 8. **Cross-compartment references / shared objects.** Objects are space-bound, so
    compartments partition data with no overlap. Do we need a cross-space
    reference primitive (link an object in compartment A from compartment B,
@@ -636,14 +711,14 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
 11. **Effective-access query.** Whether the SDK ever offers a server-free
     "everything identity X can reach across this org" helper, or leaves the
     union-of-compartments composition entirely to clients (v1 default: clients).
-12. **Cross-ACL resolution for validators without the parent ACL.** Derived
-    legalOwner means a child's validator must know the parent's current owner.
-    Nodes: solved by routing children to the parent's node set (required
-    change 7) — the exact placement rule needs design. Clients: org members
-    replicate the parent anyway, but **external-seat members are not org
-    members** — how do they validate a keyless removal? Options: accept the
-    node-anchored view (externals trust the hosting node set), or embed a
-    signed parent-ACL segment proof in the record. Decide before phase 2.
+12. **Cross-ACL resolution — RESOLVED (2026-07-06) by the hybrid model.**
+    Clients (external seats included) validate legalOwner-authored records
+    against the child's stored key + `AclLegalOwnerUpdate` signature
+    induction — no parent replication needed. Nodes were never a problem:
+    they skip ACL content validation and trust acceptor signatures
+    (verified). The coordinator derives fresh. replicationKey inheritance
+    (required change 7) co-locates the org on one partition purely as a
+    client connection-count optimization, never a validation dependency.
 
 ## Phasing (proposed)
 
@@ -655,8 +730,8 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
    org quota, member caps enforced, forged-authority rejected.
 2. **Keyless legalOwner governance.** Member-created children where org is
    legalOwner-only (no key); `AclAccountRemoveNoRotate` by legalOwner +
-   key-holder rotation (auto + pending-state surfacing); cross-ACL legalOwner
-   resolution (required change 7 / Q12); legalOwner
+   key-holder rotation (auto + pending-state surfacing); `AclLegalOwnerUpdate`
+   with signature induction + replay guard; legalOwner
    `SpaceDelete`; `deleteRestricted` override. e2e: member creates child under
    org quota with org keyless; org removes a member, a key-holding admin
    rotates; org deletes the child without ever reading it.
@@ -686,7 +761,8 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
    `AccountLimits`; creator's personal quota is untouched.
 4. **legalOwner = the parent's real owner**, verified by the coordinator at
    child `SpaceSign` against the parent ACL. Registrant must hold Admin+ in the
-   parent. *(Refined by decision 14: derived at every check, never stored.)*
+   parent. *(Refined by decision 14: hybrid — coordinator derives fresh,
+   clients validate the child's stored key.)*
 5. **Child registration is self-service for Admin+**, gated only by coordinator
    validation — no per-child human approval record.
 6. **Org may opt into data access** by taking a Reader/Writer/Admin role in the
@@ -713,15 +789,24 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
     editors opt-in behind a "completes a pending keyless removal" guard.**
     (Feasibility-verified against any-sync, 2026-06-25.)
 
-## Grooming decisions (2026-07-06 — re-groom against v0.13)
+## Grooming decisions (2026-07-06 — re-groom against v0.13 + feasibility review)
 
-14. **legalOwner is derived, never stored.** The child `AclRoot` carries only
-    `parentRef`; legalOwner ≙ the parent's current owner, resolved from the
-    parent ACL head at every validation point. Chosen over a pinned identity
-    because `AclOwnershipChange` shipped in any-sync — a parent ownership
-    transfer must re-target all children atomically, with no fan-out record.
-    `AclLegalOwnerChange` is dropped. Accepted cost: cross-ACL resolution
-    (required change 7, open question 12).
+14. **legalOwner is hybrid: coordinator derives fresh, clients validate a
+    stored key.** Infra-enforced powers (delete, quota, sign) always resolve
+    the parent's current owner live (`OwnerPubKey` exists). Client-validated
+    powers (keyless removal) check the child's pinned
+    `AclRoot.legalOwner` key, advanced by `AclLegalOwnerUpdate` — a record
+    embedding the raw signed parent `AclOwnershipChange` payload(s), verified
+    by signature induction from the pinned key (O(transfers), ~300 B each,
+    offline-verifiable, consumed-CID replay guard), pushed lazily. The
+    transfer window is fail-closed: ex-owner passes clients but the
+    coordinator rejects; new owner passes the coordinator but must prove
+    itself to clients first. (Supersedes the same-day pure-derivation
+    decision after the feasibility review + external design consult: pure
+    derivation had no workable client-side story for external seats, and pure
+    storage would need proactive fan-out; hash-chain proofs were rejected —
+    content-addressed links need full record preimages, megabytes for an old
+    org.)
 15. **Parent settings split by kind.** Behavioral toggles →
     `AclSpaceOptions` fields (changed via the shipped, owner-only
     `AclSpaceOptionsChange`); numeric limits (max children, member caps,
@@ -739,3 +824,20 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
     `inviteChange`, `ownershipChange`, `spaceOptionsChange`, …); doc
     renumbered `14-` → `16-` (`14-identities.md`, `15-direct-add-invites.md`
     now exist).
+18. **Children inherit the parent's replicationKey.** Verified trivial (node
+    placement hashes only the spaceId suffix, uniqueness unenforced). Chosen
+    to minimize client connection count: one node partition serves the whole
+    org. Accepted, monitored costs: whale-org partition hotspot + public
+    linkability of an org's spaceIds. Escape hatch: co-location is never a
+    correctness dependency, so later children can switch to independent keys.
+19. **External-seat compartment discovery = coordinator endpoint** backed by
+    limits/billing data; externals never read the parent ACL. Infra gains
+    only DoS power — forged entries fail client-side ACL validation.
+20. **Feasibility verified across the four repos (2026-07-06).** Coordinator:
+    `OwnerPubKey` exists, `SpaceSign` has a clean insertion point, sign-time
+    `sharedSpacesLimit` is net-new, `SpaceDelete` auth is a localized
+    predicate change. any-sync: header field is wire-compatible (raw-bytes
+    verification), `AclRoot` 12/13 free, removal↔rotation weld confirmed.
+    Nodes: sync nodes skip ACL content validation (acceptor-trust), consensus
+    nodes have no ACL state machine — the keyless-removal check only needs
+    the coordinator + clients.

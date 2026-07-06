@@ -52,6 +52,9 @@ type SpaceInfo struct {
 	Status      Status
 	OwnRole     Permission
 	CreatedAt   time.Time
+	// ParentSpaceId is set on child (nested) spaces: the parent this space
+	// is governed by. Empty for top-level spaces.
+	ParentSpaceId string
 }
 
 // Status is the combined local+remote state of a space.

@@ -2,6 +2,7 @@ package anysyncx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,8 @@ import (
 	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/coordinator/inboxclient"
@@ -62,6 +65,7 @@ type App struct {
 
 	sync          *spaceSyncHandler
 	tree          *treeManagerAdapter
+	credProvider  *credentialProvider
 	storage       *storageProvider
 	discoveryKeys *discoveryKeySource
 	nodeConf      nodeconf.Service
@@ -183,11 +187,12 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		}()
 	})
 
+	credProvider := newCredentialProvider(localOnly)
 	a := new(app.App)
 	a.Register(cfgAdapter).
 		Register(accountAdapter).
 		Register(debugstat.New()).
-		Register(newCredentialProvider(localOnly)).
+		Register(credProvider).
 		Register(nodeconfstore.New()).
 		Register(nodeconfsource.New()).
 		Register(nodeconf.New()).
@@ -239,6 +244,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		fileP2PServer:      fileP2PServer,
 		sync:               sync,
 		tree:               tree,
+		credProvider:       credProvider,
 		storage:            storage,
 		discoveryKeys:      discoveryKeys,
 		peerStore:          peerStore,
@@ -662,3 +668,26 @@ func loadAccountKeys(ctx context.Context, p auth.Provider) (*accountdata.Account
 
 // quiet "imported and not used" if accountservice changes.
 var _ = accountservice.CName
+
+// SetChildCredentialResolver installs the nested-spaces resolver the credential provider uses
+// to attach the parent registration record id to a child space's SpaceSign request.
+func (a *App) SetChildCredentialResolver(r ChildCredentialResolver) {
+	a.credProvider.setChildResolver(r)
+}
+
+// CreateSpaceFromStoragePayload persists a pre-built space-creation payload, mirroring
+// commonspace.SpaceService.CreateSpace but for payloads whose ids the caller needed in advance
+// (nested spaces: the child must be registered in the parent acl before its first push).
+func (a *App) CreateSpaceFromStoragePayload(ctx context.Context, payload spacestorage.SpaceStorageCreatePayload) (id string, err error) {
+	if err = spacepayloads.ValidateSpaceStorageCreatePayload(payload); err != nil {
+		return
+	}
+	store, err := a.storage.CreateSpaceStorage(ctx, payload)
+	if err != nil {
+		if errors.Is(err, spacestorage.ErrSpaceStorageExists) {
+			return payload.SpaceHeaderWithId.Id, nil
+		}
+		return
+	}
+	return store.Id(), store.Close(ctx)
+}

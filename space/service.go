@@ -65,6 +65,21 @@ type Service interface {
 	// nothing is removed.
 	DeclineInvite(ctx context.Context, spaceId string) error
 
+	// CreateChild creates a space nested under req.ParentSpaceId (nested
+	// spaces, docs/16). The caller must hold Admin+ in the parent. The full
+	// flow: build the child header (parentSpaceId + the parent's replication
+	// key) with the parent's current owner pinned as legalOwner, append the
+	// AclChildRegister record to the parent acl (coordinator-gated — requires
+	// the network), create local storage; the push then obtains a receipt
+	// via SpaceSign carrying the registration record id. Child quota is
+	// charged to the parent owner's limits, not the caller's.
+	CreateChild(ctx context.Context, req CreateChildRequest) (Space, error)
+
+	// Children lists the child spaces registered under parentSpaceId, read
+	// from the parent acl's AclChildRegister records (revoked ones included,
+	// flagged). The caller must have the parent space locally.
+	Children(ctx context.Context, parentSpaceId string) ([]ChildRef, error)
+
 	// Get returns an already-joined space by id. Fails if the space is
 	// unknown locally.
 	Get(ctx context.Context, spaceId string) (Space, error)
@@ -155,6 +170,37 @@ type CreateRequest struct {
 	// type would otherwise produce a space the coordinator refuses
 	// to sync.
 	SpaceType string
+}
+
+// CreateChildRequest is the input to Service.CreateChild.
+type CreateChildRequest struct {
+	// ParentSpaceId is the space this child is governed by. Required.
+	ParentSpaceId string
+
+	Name        string
+	Description string
+	IconCID     string
+	// SpaceType follows the same rules as CreateRequest.SpaceType.
+	SpaceType string
+
+	// OrgPermission is the role the parent grants ITSELF in the child,
+	// recorded on the registration. PermissionNone (default) = keyless
+	// governance only: the parent owner can remove members and delete the
+	// child but cannot read it.
+	OrgPermission Permission
+}
+
+// ChildRef is one child registration in a parent space's acl.
+type ChildRef struct {
+	ChildSpaceId   string
+	ChildAclRootId string
+	// RecordId is the AclChildRegister record id in the parent acl —
+	// the pointer the coordinator validates at child SpaceSign.
+	RecordId string
+	// Author is the account identity that registered the child.
+	Author        string
+	OrgPermission Permission
+	Revoked       bool
 }
 
 // JoinRequest is the input to Service.Join.

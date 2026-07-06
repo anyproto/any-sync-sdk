@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/anyproto/any-store v0.4.7
 	github.com/anyproto/any-store/v2 v2.0.0-alpha.16
-	github.com/anyproto/any-sync v0.13.0-alpha.5
+	github.com/anyproto/any-sync v0.13.0-alpha.5.0.20260706161749-7279fde5cca4
 	github.com/anyproto/lexid v0.0.6
 	github.com/brutella/dnssd v1.2.14
 	github.com/cheggaaa/mb/v3 v3.0.2
@@ -21,6 +21,7 @@ require (
 	github.com/valyala/fastjson v1.6.10
 	github.com/zeebo/xxh3 v1.1.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/crypto v0.53.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	storj.io/drpc v1.0.0
@@ -117,7 +118,6 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
 	golang.org/x/image v0.21.0 // indirect
 	golang.org/x/mod v0.37.0 // indirect

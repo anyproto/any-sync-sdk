@@ -13,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -127,14 +128,18 @@ func isLogNotReady(err error) bool {
 // Total retry window ≈ 35s — long enough to clear the worst case of
 // peer-connect-then-syncperiod-tick.
 func ensureShareable(ctx context.Context, s *spaceImpl) error {
+	return ensureShareableCoord(ctx, s.app, s.id)
+}
+
+func ensureShareableCoord(ctx context.Context, app *anysyncx.App, spaceId string) error {
 	const (
 		maxAttempts = 35
 		backoff     = time.Second
 	)
-	coord := s.app.Coordinator()
+	coord := app.Coordinator()
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		if err := coord.SpaceMakeShareable(ctx, s.id); err != nil {
+		if err := coord.SpaceMakeShareable(ctx, spaceId); err != nil {
 			lastErr = err
 			if !isSpaceNotPushedYet(err) {
 				return fmt.Errorf("acl: make shareable: %w", err)

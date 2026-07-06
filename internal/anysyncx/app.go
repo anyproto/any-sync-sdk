@@ -60,10 +60,11 @@ type App struct {
 	// poll catches anything missed.
 	inboxReceiver atomic.Pointer[InboxMessageHandler]
 
-	sync      *spaceSyncHandler
-	tree      *treeManagerAdapter
-	storage   *storageProvider
-	nodeConf  nodeconf.Service
+	sync          *spaceSyncHandler
+	tree          *treeManagerAdapter
+	storage       *storageProvider
+	discoveryKeys *discoveryKeySource
+	nodeConf      nodeconf.Service
 	peerStore     *p2p.PeerStore
 	p2pServer     *p2pServer
 	discovery     *p2p.Discovery
@@ -169,8 +170,12 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	})
 	// When this device's own space set changes (create, p2p pull,
 	// delete) re-handshake known LAN peers so they fold us into the
-	// affected spaces' peer sets promptly.
+	// affected spaces' peer sets promptly. Reset the discovery-key
+	// negative cache first: a just-pulled space (fresh join) failed
+	// derivation moments ago at request time, and its ACL — read key
+	// included — arrives with the pull.
 	storage.SetOnSetChange(func() {
+		discoveryKeys.ResetNegative()
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -235,6 +240,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		sync:               sync,
 		tree:               tree,
 		storage:            storage,
+		discoveryKeys:      discoveryKeys,
 		peerStore:          peerStore,
 		p2pServer:          p2pSrv,
 		discovery:          discovery,
@@ -469,10 +475,15 @@ func (a *App) SetKnownSpaceIdsFn(fn func() []string) {
 }
 
 // BroadcastP2P re-runs the LAN handshake with every known local peer —
-// called when the known-space set grows (tech-space index synced a new
-// row) so a fresh device starts probing for the space right away
-// instead of on the next discovery resweep.
+// called when the tech-space index changes (new row synced, a joining
+// row flipped active) so a fresh device starts probing for the space
+// right away instead of on the next discovery resweep. The index change
+// is also a "key may be derivable now" signal, so the discovery-key
+// negative cache is reset first — without that, a fresh join's failed
+// request-time derivation would suppress the space from the handshake
+// for up to negativeRetryAfter even though its ACL has synced in.
 func (a *App) BroadcastP2P() {
+	a.discoveryKeys.ResetNegative()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

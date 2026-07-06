@@ -19,10 +19,13 @@ import (
 var dkLog = logger.NewNamed("anysyncx.discoverykeys")
 
 // negativeRetryAfter is how long a failed derivation (no ACL yet, no
-// read key for us yet) is remembered before retrying. Keys appear when
-// our join is accepted or the ACL syncs in, so retry on a short leash;
-// successful derivations are cached forever (the first read key never
-// rotates).
+// read key for us yet) is remembered before retrying. It shields the
+// periodic discovery resweep from rebuilding a space's ACL every pass;
+// event-driven re-handshakes (space set or tech-space index changed)
+// call ResetNegative first, so a key that just became derivable — a
+// fresh join's ACL synced in — is picked up immediately instead of
+// after the cache expires. Successful derivations are cached forever
+// (the first read key never rotates).
 const negativeRetryAfter = time.Minute
 
 // discoveryKeySource derives and caches the per-space LAN discovery
@@ -85,6 +88,19 @@ func (d *discoveryKeySource) get(ctx context.Context, spaceId string) []byte {
 	delete(d.failedAt, spaceId)
 	d.derived[spaceId] = key
 	return key
+}
+
+// ResetNegative drops every negative-cache entry so the next
+// DiscoveryKeys call re-attempts derivation. Called before an
+// event-driven re-handshake: the event (space pulled, index row
+// changed) is exactly the signal that a previously underivable key may
+// now exist, and honoring the negative cache there is what delayed a
+// fresh join's LAN advertisement by up to negativeRetryAfter plus a
+// discovery resweep.
+func (d *discoveryKeySource) ResetNegative() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	clear(d.failedAt)
 }
 
 // accountDiscoveryInfo domain-separates the account-derived discovery

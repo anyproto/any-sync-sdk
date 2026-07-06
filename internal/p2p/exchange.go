@@ -26,25 +26,35 @@ const exchangeCName = "sdk.p2p.exchange"
 
 var log = logger.NewNamed("sdk.p2p")
 
-// Exchange runs the symmetric SpaceExchange handshake with discovered
-// local peers: both sides learn each other's dialable addresses and
-// full space-id lists, recorded in the PeerStore. Reuses any-sync's
-// clientspaceproto wire shape (same one anytype-heart speaks).
+// Exchange runs the SpaceExchangeV2 handshake with discovered local
+// peers: both sides learn each other's dialable addresses and which
+// spaces they SHARE, recorded in the PeerStore. Reuses any-sync's
+// clientspaceproto wire shape.
 //
-// SECURITY: the handshake is unauthenticated-by-space — any LAN peer
-// that completes the secure-channel handshake learns ALL space ids on
-// this device. Accepted for now (space ids grant no data access; sync
-// still enforces ACLs); replacing this with a space-scoped exchange is
-// a tracked follow-up.
+// Peers exchange per-space HMAC tokens keyed by a member-only discovery
+// key and learn only the INTERSECTION of their space sets. A matching
+// token proves the sender's membership, so strangers on the LAN learn
+// nothing, can't track a device across sessions, and can't poison the
+// peer store with spaces they don't hold. Spaces whose discovery key
+// isn't derivable yet (ACL not synced) are skipped until it is.
+//
+// The legacy plaintext SpaceExchange v1 is NOT supported: the SDK never
+// calls it, and the inbound handler refuses it — full space-id lists
+// must never leave this device, and there is no fallback an attacker
+// could downgrade to. Pre-v2 peers simply don't pair over LAN.
 type Exchange struct {
 	peerService peerService
 	pool        dialPool
 	store       *PeerStore
 	selfPeerId  string
 	allSpaceIds func() []string
-	// onPeerUpdated fires after a handshake recorded a peer's space
-	// set — the app layer uses it to kick an immediate head-sync of
-	// the shared spaces instead of waiting for the periodic diff.
+	// discoveryKeys resolves per-space discovery keys (spaceId → key)
+	// for the v2 token exchange; spaces absent from the result are not
+	// covered by the exchange. See anysyncx.discoveryKeySource.
+	discoveryKeys func(ctx context.Context, spaceIds []string) map[string][]byte
+	// onPeerUpdated fires after a handshake recorded a peer's shared
+	// space set — the app layer uses it to kick an immediate head-sync
+	// of the shared spaces instead of waiting for the periodic diff.
 	onPeerUpdated func(peerId string, spaceIds []string)
 	// ownAddrs supplies this device's current announce (LAN IPs +
 	// port) for proactive re-handshakes; see Broadcast.
@@ -61,8 +71,8 @@ type dialPool interface {
 	Get(ctx context.Context, id string) (peer.Peer, error)
 }
 
-func NewExchange(selfPeerId string, store *PeerStore, allSpaceIds func() []string, onPeerUpdated func(peerId string, spaceIds []string)) *Exchange {
-	return &Exchange{selfPeerId: selfPeerId, store: store, allSpaceIds: allSpaceIds, onPeerUpdated: onPeerUpdated}
+func NewExchange(selfPeerId string, store *PeerStore, allSpaceIds func() []string, discoveryKeys func(ctx context.Context, spaceIds []string) map[string][]byte, onPeerUpdated func(peerId string, spaceIds []string)) *Exchange {
+	return &Exchange{selfPeerId: selfPeerId, store: store, allSpaceIds: allSpaceIds, discoveryKeys: discoveryKeys, onPeerUpdated: onPeerUpdated}
 }
 
 func (e *Exchange) Init(a *app.App) error {
@@ -105,18 +115,38 @@ func (e *Exchange) Broadcast(ctx context.Context) {
 }
 
 // handshake dials a peer whose addresses are already registered and
-// runs one SpaceExchange round, recording the result.
+// runs one SpaceExchangeV2 round, recording the result. A peer too old
+// to serve v2 just fails here (logged) — there is no v1 fallback.
 func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnAddresses) {
 	p, err := e.pool.Get(ctx, peerId)
 	if err != nil {
 		log.Info("dial local peer", zap.String("peerId", peerId), zap.Error(err))
 		return
 	}
-	var resp *clientspaceproto.SpaceExchangeResponse
+	spaceIds := e.allSpaceIds()
+	keys := e.discoveryKeys(ctx, spaceIds)
+	nonce, err := clientspaceproto.NewNonceV2()
+	if err != nil {
+		log.Error("space exchange v2: nonce", zap.Error(err))
+		return
+	}
+	tokens := make([][]byte, 0, len(keys))
+	for _, spaceId := range spaceIds {
+		if key, ok := keys[spaceId]; ok {
+			tokens = append(tokens, clientspaceproto.RequestTokenV2(key, nonce, e.selfPeerId, peerId))
+		}
+	}
+	tokens, err = clientspaceproto.PadTokensV2(tokens)
+	if err != nil {
+		log.Error("space exchange v2: pad", zap.Error(err))
+		return
+	}
+	var resp *clientspaceproto.SpaceExchangeV2Response
 	err = p.DoDrpc(ctx, func(conn drpc.Conn) error {
 		var dErr error
-		resp, dErr = clientspaceproto.NewDRPCClientSpaceClient(conn).SpaceExchange(ctx, &clientspaceproto.SpaceExchangeRequest{
-			SpaceIds: e.allSpaceIds(),
+		resp, dErr = clientspaceproto.NewDRPCClientSpaceClient(conn).SpaceExchangeV2(ctx, &clientspaceproto.SpaceExchangeV2Request{
+			Nonce:       nonce,
+			SpaceTokens: tokens,
 			LocalServer: &clientspaceproto.LocalServer{
 				Ips:  own.Addrs,
 				Port: int32(own.Port),
@@ -125,76 +155,153 @@ func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnA
 		return dErr
 	})
 	if err != nil {
-		log.Info("space exchange", zap.String("peerId", peerId), zap.Error(err))
+		log.Info("space exchange v2", zap.String("peerId", peerId), zap.Error(err))
 		return
 	}
-	log.Debug("space exchange done", zap.String("peerId", peerId), zap.Int("spaces", len(resp.SpaceIds)))
-	e.store.UpdateLocalPeer(peerId, resp.SpaceIds)
+	received := tokenSet(resp.SpaceTokens)
+	var shared []string
+	for _, spaceId := range spaceIds {
+		key, ok := keys[spaceId]
+		if !ok {
+			continue
+		}
+		if _, ok = received[string(clientspaceproto.ResponseTokenV2(key, nonce, e.selfPeerId, peerId))]; ok {
+			shared = append(shared, spaceId)
+		}
+	}
+	log.Debug("space exchange v2 done", zap.String("peerId", peerId), zap.Int("shared", len(shared)))
+	e.store.UpdateLocalPeer(peerId, shared)
 	if e.onPeerUpdated != nil {
-		e.onPeerUpdated(peerId, resp.SpaceIds)
+		e.onPeerUpdated(peerId, shared)
 	}
 }
 
-// SpaceExchange is the inbound side of the handshake. Mirrors the
-// outbound: record the caller's addresses (preferring the one it
-// actually dialed us from) and space set, return our own space ids.
-func (e *Exchange) SpaceExchange(ctx context.Context, req *clientspaceproto.SpaceExchangeRequest) (*clientspaceproto.SpaceExchangeResponse, error) {
-	if req.LocalServer != nil {
-		peerId, err := peer.CtxPeerId(ctx)
-		if err != nil {
-			return nil, err
+// SpaceExchange refuses the legacy plaintext v1 handshake: it would
+// hand our full space-id list to any LAN peer, and serving it at all
+// would give an active attacker a downgrade target. The method exists
+// only because the DRPC service interface requires it.
+func (e *Exchange) SpaceExchange(_ context.Context, _ *clientspaceproto.SpaceExchangeRequest) (*clientspaceproto.SpaceExchangeResponse, error) {
+	return nil, fmt.Errorf("p2p: legacy SpaceExchange is not supported; use SpaceExchangeV2")
+}
+
+// SpaceExchangeV2 is the inbound side of the token handshake: compute
+// this device's expected request token for every space it holds a
+// discovery key for, intersect with what the caller sent, and answer
+// with membership proofs for the intersection only — keyed by the
+// caller's nonce, so they can't be precomputed or replayed.
+func (e *Exchange) SpaceExchangeV2(ctx context.Context, req *clientspaceproto.SpaceExchangeV2Request) (*clientspaceproto.SpaceExchangeV2Response, error) {
+	peerId, err := e.callerPeerId(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(req.Nonce) != clientspaceproto.NonceSizeV2 {
+		return nil, fmt.Errorf("p2p: space exchange v2: bad nonce size %d", len(req.Nonce))
+	}
+	if len(req.SpaceTokens) > clientspaceproto.MaxTokensV2 {
+		return nil, fmt.Errorf("p2p: space exchange v2: too many tokens (%d)", len(req.SpaceTokens))
+	}
+	received := tokenSet(req.SpaceTokens)
+
+	spaceIds := e.allSpaceIds()
+	keys := e.discoveryKeys(ctx, spaceIds)
+	var (
+		shared     []string
+		respTokens [][]byte
+	)
+	for _, spaceId := range spaceIds {
+		key, ok := keys[spaceId]
+		if !ok {
+			continue
 		}
-		if peerId == e.selfPeerId {
-			// Another device presenting OUR peer id means two devices
-			// share a device key (e.g. a copied wallet file). They can
-			// never pair — discovery filters "self" by peerId — so make
-			// the misconfiguration loud instead of silently ignoring it.
-			log.Error("space exchange from a peer with OUR OWN peer id — two devices share a device key; refusing",
-				zap.String("peerId", peerId))
-			return nil, fmt.Errorf("p2p: remote peer uses this device's own peer id %s (shared device key?)", peerId)
+		if _, ok = received[string(clientspaceproto.RequestTokenV2(key, req.Nonce, peerId, e.selfPeerId))]; ok {
+			shared = append(shared, spaceId)
+			respTokens = append(respTokens, clientspaceproto.ResponseTokenV2(key, req.Nonce, peerId, e.selfPeerId))
 		}
-		port := int(req.LocalServer.Port)
-		if port <= 0 || port > 65535 {
-			log.Info("space exchange with invalid port; ignoring addresses",
-				zap.String("peerId", peerId), zap.Int32("port", req.LocalServer.Port))
-			return &clientspaceproto.SpaceExchangeResponse{SpaceIds: e.allSpaceIds()}, nil
+	}
+	// A request without LocalServer is a plain probe: answer the proofs
+	// (they cost the caller a valid membership token per space) but
+	// record nothing.
+	if req.LocalServer != nil && e.recordPeerAddrs(ctx, peerId, req.LocalServer) {
+		e.store.UpdateLocalPeer(peerId, shared)
+		log.Debug("space exchange v2 received", zap.String("peerId", peerId), zap.Int("shared", len(shared)))
+		if e.onPeerUpdated != nil {
+			e.onPeerUpdated(peerId, shared)
 		}
-		var addrs []string
-		// The IP the peer connected FROM is the one proven to route, but
-		// its port is the dialer's ephemeral source port — nobody listens
-		// there. Pair that observed IP with the peer's ADVERTISED listen
-		// port instead so dial-back after a drop reaches a live socket.
-		if peerAddr := peer.CtxPeerAddr(ctx); peerAddr != "" {
-			if u, uErr := url.Parse(peerAddr); uErr == nil {
-				if host, _, sErr := net.SplitHostPort(u.Host); sErr == nil {
-					if ip := net.ParseIP(host); ip != nil {
-						addrs = appendAddr(addrs, ip, port)
-					}
+	}
+	return &clientspaceproto.SpaceExchangeV2Response{SpaceTokens: respTokens}, nil
+}
+
+// callerPeerId extracts the authenticated peer id of the caller and
+// refuses a remote presenting OUR peer id — two devices sharing a
+// device key (e.g. a copied wallet file). They can never pair —
+// discovery filters "self" by peerId — so make the misconfiguration
+// loud instead of silently ignoring it.
+func (e *Exchange) callerPeerId(ctx context.Context) (string, error) {
+	peerId, err := peer.CtxPeerId(ctx)
+	if err != nil {
+		return "", err
+	}
+	if peerId == e.selfPeerId {
+		log.Error("space exchange from a peer with OUR OWN peer id — two devices share a device key; refusing",
+			zap.String("peerId", peerId))
+		return "", fmt.Errorf("p2p: remote peer uses this device's own peer id %s (shared device key?)", peerId)
+	}
+	return peerId, nil
+}
+
+// recordPeerAddrs validates the caller's announced LAN addresses and
+// registers them with the peer service, preferring the address it
+// actually dialed us from. Returns false when nothing usable was
+// announced — the caller's space set is then not recorded either.
+func (e *Exchange) recordPeerAddrs(ctx context.Context, peerId string, localServer *clientspaceproto.LocalServer) bool {
+	port := int(localServer.Port)
+	if port <= 0 || port > 65535 {
+		log.Info("space exchange with invalid port; ignoring addresses",
+			zap.String("peerId", peerId), zap.Int32("port", localServer.Port))
+		return false
+	}
+	var addrs []string
+	// The IP the peer connected FROM is the one proven to route, but
+	// its port is the dialer's ephemeral source port — nobody listens
+	// there. Pair that observed IP with the peer's ADVERTISED listen
+	// port instead so dial-back after a drop reaches a live socket.
+	if peerAddr := peer.CtxPeerAddr(ctx); peerAddr != "" {
+		if u, uErr := url.Parse(peerAddr); uErr == nil {
+			if host, _, sErr := net.SplitHostPort(u.Host); sErr == nil {
+				if ip := net.ParseIP(host); ip != nil {
+					addrs = appendAddr(addrs, ip, port)
 				}
 			}
 		}
-		for _, raw := range req.LocalServer.Ips {
-			ip := net.ParseIP(raw)
-			if ip == nil {
-				// Reject anything that isn't a literal IP — no hostnames,
-				// no garbage that could displace good addresses or point
-				// us at an arbitrary host.
-				continue
-			}
-			addrs = appendAddr(addrs, ip, port)
+	}
+	for _, raw := range localServer.Ips {
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			// Reject anything that isn't a literal IP — no hostnames,
+			// no garbage that could displace good addresses or point
+			// us at an arbitrary host.
+			continue
 		}
-		if len(addrs) == 0 {
-			log.Info("space exchange with no usable addresses", zap.String("peerId", peerId))
-			return &clientspaceproto.SpaceExchangeResponse{SpaceIds: e.allSpaceIds()}, nil
-		}
-		e.peerService.SetPeerAddrs(peerId, addSchema(addrs))
-		e.store.UpdateLocalPeer(peerId, req.SpaceIds)
-		log.Debug("space exchange received", zap.String("peerId", peerId), zap.Int("spaces", len(req.SpaceIds)))
-		if e.onPeerUpdated != nil {
-			e.onPeerUpdated(peerId, req.SpaceIds)
+		addrs = appendAddr(addrs, ip, port)
+	}
+	if len(addrs) == 0 {
+		log.Info("space exchange with no usable addresses", zap.String("peerId", peerId))
+		return false
+	}
+	e.peerService.SetPeerAddrs(peerId, addSchema(addrs))
+	return true
+}
+
+// tokenSet indexes received tokens for O(1) matching. Undersized
+// entries are dropped (real tokens are exactly TokenSizeV2 bytes).
+func tokenSet(tokens [][]byte) map[string]struct{} {
+	set := make(map[string]struct{}, len(tokens))
+	for _, t := range tokens {
+		if len(t) == clientspaceproto.TokenSizeV2 {
+			set[string(t)] = struct{}{}
 		}
 	}
-	return &clientspaceproto.SpaceExchangeResponse{SpaceIds: e.allSpaceIds()}, nil
+	return set
 }
 
 // appendAddr adds "ip:port" to addrs unless already present. IP is a

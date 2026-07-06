@@ -16,8 +16,8 @@ const peerStoreCName = "sdk.p2p.peerstore"
 type Observer func(peerId string, before, after []string, removed bool)
 
 // PeerStore tracks local-network peers and which spaces each of them
-// has, as learned from the SpaceExchange handshake. Bidirectional
-// in-memory index: space→peers feeds the per-space peer manager and
+// SHARES with us, as learned from the SpaceExchangeV2 handshake.
+// Bidirectional in-memory index: space→peers feeds the per-space peer manager and
 // sync status; peer→spaces makes updates and removals cheap. Cleared
 // on restart — the LAN is rediscovered from scratch.
 type PeerStore struct {

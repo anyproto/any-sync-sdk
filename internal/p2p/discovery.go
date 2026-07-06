@@ -54,7 +54,7 @@ type discoveryEvent struct {
 }
 
 // Discovery announces this device on the LAN and browses for other SDK
-// peers, feeding each sighting to the Notifier (the SpaceExchange
+// peers, feeding each sighting to the Notifier (the SpaceExchangeV2
 // handshake).
 //
 // Concurrency model, deliberately simpler than anytype-heart's:

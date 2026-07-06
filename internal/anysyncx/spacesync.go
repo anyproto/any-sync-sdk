@@ -216,8 +216,8 @@ func (h *spaceSyncHandler) ObjectSyncStream(stream spacesyncproto.DRPCSpaceSync_
 }
 
 // The four handlers below serve OTHER PEERS, not sync nodes — they
-// exist for p2p: a LAN peer that learned a space id via SpaceExchange
-// pulls the space from us (SpacePull), our diffsyncer seeds a peer
+// exist for p2p: a LAN peer that knows a space id (e.g. from its own
+// account data) pulls the space from us (SpacePull), our diffsyncer seeds a peer
 // that reported the space missing (SpacePush), and the key-value
 // stores diff/exchange directly (StoreDiff / StoreElements). Sync
 // nodes never call these on a client.
@@ -252,11 +252,11 @@ func (h *spaceSyncHandler) SpacePull(ctx context.Context, req *spacesyncproto.Sp
 //
 // A push creates a persistent .db file, so it's only honored for a
 // space the pushing peer actually advertised sharing in the exchange
-// (peerStore record) and that is not local-only. This bounds the
-// creation surface to what a peer claimed rather than any arbitrary id.
-// It does NOT fully stop a determined unauthenticated peer from
-// advertising many fake ids — closing that needs the authenticated
-// exchange (tracked follow-up).
+// (peerStore record) and that is not local-only. With the v2 token
+// exchange an advertisement is a proof of space membership, so only
+// members can seed a space onto this device; for legacy v1 peers the
+// claim is unproven and this check merely bounds the creation surface
+// to what the peer named — that residual hole closes when v1 ages out.
 func (h *spaceSyncHandler) SpacePush(ctx context.Context, req *spacesyncproto.SpacePushRequest) (*spacesyncproto.SpacePushResponse, error) {
 	app := h.app.Load()
 	if app == nil || req.Payload == nil || req.Payload.SpaceHeader == nil {

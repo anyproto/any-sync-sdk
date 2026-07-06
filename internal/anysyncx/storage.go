@@ -109,7 +109,7 @@ func (s *storageProvider) CreateSpaceStorage(ctx context.Context, payload spaces
 }
 
 // AllSpaceIds lists every space with local any-sync storage, derived
-// from the `<root>/<spaceId>.db` layout. Used by the p2p SpaceExchange
+// from the `<root>/<spaceId>.db` layout. Used by the p2p SpaceExchangeV2
 // handshake to tell local peers what this device can sync.
 func (s *storageProvider) AllSpaceIds() []string {
 	entries, err := os.ReadDir(s.root)

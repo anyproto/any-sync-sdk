@@ -148,9 +148,14 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		}
 		return out
 	}
-	// A handshaked local peer's space set changed — head-sync whatever
-	// we share with it right away rather than on the next diff tick.
-	exchange := p2p.NewExchange(keys.PeerId, peerStore, advertisedSpaceIds, func(_ string, spaceIds []string) {
+	// Discovery keys for the v2 token exchange: derived from each
+	// space's first ACL read key, cached in memory. Spaces whose ACL
+	// isn't readable yet are skipped until it syncs in.
+	discoveryKeys := newDiscoveryKeySource(storage, keys)
+	// A handshaked local peer's shared space set changed — head-sync
+	// whatever we share with it right away rather than on the next
+	// diff tick.
+	exchange := p2p.NewExchange(keys.PeerId, peerStore, advertisedSpaceIds, discoveryKeys.DiscoveryKeys, func(_ string, spaceIds []string) {
 		sync.SyncSpaces(spaceIds)
 	})
 	p2pSrv := newP2PServer(cfg.P2P, cfg.Storage.DataDir)

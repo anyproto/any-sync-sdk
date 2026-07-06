@@ -28,6 +28,7 @@ import (
 //     row, demoted to sentinel) — no any-store query fires.
 //   - Sub.Close() releases the mailbox cleanly (Err() == nil).
 func TestSDK_QuerySubscribe(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -194,6 +195,7 @@ func addedIds(rs []space.SubRecord) []string {
 // still in the database — no data is lost, no records leak across
 // sub instances.
 func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -248,6 +250,7 @@ func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
 // resubscribed snapshot must reflect every record written before
 // shutdown — cold-restore through any-store, no events replayed.
 func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -313,6 +316,7 @@ func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
 // that a follow-up Subscribe rebuilds a correct snapshot — the
 // resubscribe path is the engine's primary recovery contract.
 func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

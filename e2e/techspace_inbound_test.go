@@ -20,6 +20,7 @@ import (
 // a Removed event on B. This is the real-time guarantee the migration
 // off the bespoke read-drain was about.
 func TestE2E_TechSpaceLiveSubscribe(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

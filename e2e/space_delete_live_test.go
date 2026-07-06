@@ -32,6 +32,7 @@ import (
 // Requires a running any-sync network; set ANYSYNC_LOCAL_NETWORK to its
 // node-config YAML to run. Skipped otherwise (e.g. CI without infra).
 func TestE2E_OwnerDeletePropagatesToMember(t *testing.T) {
+	t.Parallel()
 	netPath := os.Getenv("ANYSYNC_LOCAL_NETWORK")
 	if netPath == "" {
 		t.Skip("set ANYSYNC_LOCAL_NETWORK to the node-config YAML to run this live test")

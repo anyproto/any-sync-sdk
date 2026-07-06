@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"sync"
 	"testing"
@@ -98,8 +99,8 @@ func (d lanDriver) Browse(ctx context.Context, _ string, found func(sdkp2p.Disco
 
 // TestE2E_P2POfflineSync proves the whole p2p slice with NO reachable
 // network: one account on two devices, an unreachable nodeconf
-// (e2e/local.yml points at dead loopback ports), and the fake LAN
-// driver. Device A creates a space + object; device B must discover A
+// (loadLocalNetwork rewrites local.yml to dead loopback ports), and
+// the fake LAN driver. Device A creates a space + object; device B must discover A
 // over the virtual LAN, handshake via SpaceExchange, fold A into its
 // peer managers, and converge — while sync status reports the p2p
 // connection and zero network peers.
@@ -330,9 +331,31 @@ func TestE2E_P2PDisabled(t *testing.T) {
 	assert.Empty(t, st.Peers)
 }
 
-// loadLocalNetwork reads the checked-in unreachable nodeconf (dead
-// loopback ports). Unlike staging.yml it is part of the repo, so the
-// offline p2p tests never skip.
+// loadLocalNetwork returns the checked-in nodeconf with every node
+// address rewritten to a freshly-released loopback port, so the
+// offline p2p tests get a network that is guaranteed unreachable.
+// local.yml alone doesn't guarantee that: it doubles as the LIVE
+// config for the local dev network (files-v2 e2e), so when that
+// network is running its ports answer and "offline" assertions break.
+// A just-released port refuses connections instantly, and even if
+// something re-binds it the secure handshake fails on the peer-id
+// mismatch — no node can ever become a network peer. Unlike
+// staging.yml the file is part of the repo, so these tests never skip.
 func loadLocalNetwork() ([]byte, error) {
-	return os.ReadFile("local.yml")
+	yaml, err := os.ReadFile("local.yml")
+	if err != nil {
+		return nil, err
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	deadPort := l.Addr().(*net.TCPAddr).Port
+	if err = l.Close(); err != nil {
+		return nil, err
+	}
+	dead := []byte("127.0.0.1:" + strconv.Itoa(deadPort))
+	return loopbackAddrRe.ReplaceAll(yaml, dead), nil
 }
+
+var loopbackAddrRe = regexp.MustCompile(`127\.0\.0\.1:\d+`)

@@ -25,6 +25,7 @@ import (
 // test skips rather than fails — Layer-2 discovery is optional, and
 // Phase-1 (out-of-band) is covered separately.
 func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

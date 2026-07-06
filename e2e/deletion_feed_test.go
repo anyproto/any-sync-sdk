@@ -26,6 +26,7 @@ import (
 //     per-space storage) the deleted object stays absent, and Generation()
 //     changes so a consumer knows to reset its cursor.
 func TestSDK_DeletionFeed_AndRebuild(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

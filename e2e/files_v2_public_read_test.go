@@ -23,6 +23,7 @@ import (
 // directly. Skips when the network advertises no public base (private
 // deployment) — the CDN-stand-in e2e covers that mode.
 func TestE2E_FilesV2_RealPublicRead(t *testing.T) {
+	t.Parallel()
 	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")

@@ -73,6 +73,7 @@ func newBlocksType() handler.Type {
 //  6. Alice waits up to 2 minutes for the record to disappear from
 //     her Query — the actual regression check.
 func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

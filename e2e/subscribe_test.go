@@ -76,6 +76,7 @@ func subRecordFor(ev space.SubscriptionEvent, id string) (*space.SubRecord, stri
 // mismatched (wrong object, wrong dataset) subscriptions stay silent;
 // closing one subscription leaves the others working.
 func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -179,6 +180,7 @@ func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 // between user-supplied and auto fields — same wire — so a fresh row
 // reconstructs in one event.
 func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -261,6 +263,7 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 // see a Removed entry for the row, and a follow-up QueryObjects no
 // longer returns it.
 func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

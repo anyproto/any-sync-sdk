@@ -25,6 +25,7 @@ import (
 // the public PayloadsView. Then B Evicts the space (close WITHOUT
 // delete) and Gets it again — the rows reopen from local disk.
 func TestE2E_BrokerEmbed(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available at %s: %v", confPath, err)

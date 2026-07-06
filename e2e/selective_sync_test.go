@@ -36,6 +36,7 @@ import (
 // the client then falls back to aborting each classify-fetch after its
 // first batch, so this test exercises the compat path as well.
 func TestE2E_SelectiveSyncPayloads(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available at %s: %v", confPath, err)

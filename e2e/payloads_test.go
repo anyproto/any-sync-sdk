@@ -34,6 +34,7 @@ func payloadsSurface(t *testing.T, sp space.Space) *spaceimpl.PayloadsAPI {
 // Modify surface is fenced, and a second device of the same account
 // cold-syncs the rows and unseals them.
 func TestE2E_Payloads(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available at %s: %v", confPath, err)

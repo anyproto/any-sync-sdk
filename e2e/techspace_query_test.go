@@ -19,6 +19,7 @@ import (
 // Query(objectId, dataset) mechanism regular spaces use, keyed by
 // SpaceIndexObjectId(), with filters — no bespoke List call.
 func TestE2E_TechSpaceGenericQuery(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

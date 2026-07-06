@@ -37,6 +37,7 @@ import (
 // the same override a private deployment would use. B's SDK performs
 // plain ranged GETs only: zero broker round-trips on the read path.
 func TestE2E_FilesV2_SDKDownload(t *testing.T) {
+	t.Parallel()
 	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")

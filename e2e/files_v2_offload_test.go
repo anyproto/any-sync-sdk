@@ -21,6 +21,7 @@ import (
 // transparent refetch on Open → SDK-level FreeUpFileCache reclaims the
 // cache again, byte-accurately.
 func TestE2E_FilesV2_OffloadAndFreeUp(t *testing.T) {
+	t.Parallel()
 	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")

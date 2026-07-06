@@ -24,6 +24,7 @@ import (
 //     disappears from the SDK's query surface (any-sync drives the deletion
 //     callback for the child; the store tombstones its materialized row).
 func TestSDK_Objects_DeriveUnderParent(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

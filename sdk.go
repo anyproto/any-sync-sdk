@@ -16,9 +16,11 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/files/broker"
 	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/files/filep2p"
 	"github.com/anyproto/any-sync-sdk/internal/files/gc"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/p2p"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/readsync"
@@ -143,7 +145,17 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return nil, fmt.Errorf("anysyncsdk: open files queue: %w", err)
 	}
 	filesUpload.SetQueue(filesQueue)
-	spaces.SetFiles(filesUpload, fetch.New(filesStore, baseURL), filesStore, filesQueue)
+	filesFetch := fetch.New(filesStore, baseURL)
+	// P2P files (SYN-48): serve our stored CAR objects to LAN peers and
+	// prefer a LAN peer over the public GET when fetching. Rides the
+	// existing p2p toggle; the peer store + DRPC server come from the app.
+	if app.P2PEnabled() {
+		filesFetch.SetPeer(filep2p.NewSource(app.Pool(), app.PeerStore()))
+		// The server was registered on the DRPC mux during app start
+		// (as a component, to avoid a serving race); hand it the store now.
+		app.SetFileStore(filesStore)
+	}
+	spaces.SetFiles(filesUpload, filesFetch, filesStore, filesQueue)
 	// Cache reclamation (SYN-26): fully embedder-driven —
 	// FileCacheSize/FreeUpFileCache/SweepFileCache and per-file
 	// Offload. The periodic safety sweep runs ONLY when configured
@@ -355,6 +367,12 @@ func (s *SDK) Account() AccountAPI { return s.account }
 // mirrors the PayloadsInternal pattern — used by the e2e suite to speak
 // node-side protocols (e.g. fileprotov2 against a fileV2 broker).
 func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
+
+// P2PStatus reports the local-network layer: listener state, discovery
+// possibility, and every known LAN peer with its shared spaces and
+// live-connection flag. Per-space p2p state lives in SpaceSyncStatus
+// (P2P / LocalPeers); this is the account-wide debug view.
+func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 
 // AccountAPI exposes account-level operations outside any space.
 type AccountAPI interface {

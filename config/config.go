@@ -20,6 +20,7 @@ type Config struct {
 	Network Network
 	Sync    Sync
 	Files   Files
+	P2P     P2P
 
 	// Headless runs the SDK as an embedded backend service rather than
 	// a user-facing client. Open skips the account-facing boot work —
@@ -87,6 +88,31 @@ type Files struct {
 	// via SDK.SweepFileCache / FreeUpFileCache / Files().Offload.
 	GCInterval time.Duration `yaml:"gcInterval"`
 }
+
+// P2P controls local-network peer discovery and sync. The SDK
+// announces itself over mDNS on the LAN, discovers other devices
+// running the same network, and syncs shared spaces with them
+// directly — including while sync nodes are unreachable.
+type P2P struct {
+	// Enabled is an opt-out: nil (the default) means enabled. False
+	// disables the QUIC listener and discovery entirely; sync status
+	// then reports P2PStateNotPossible for every space.
+	Enabled *bool `yaml:"enabled"`
+
+	// Port fixes the QUIC listen port. Zero — the default — reuses the
+	// port persisted under DataDir from the previous run, or binds an
+	// ephemeral one on first start (and persists it).
+	Port int `yaml:"port"`
+
+	// ServiceName is the mDNS service type used for announce/browse.
+	// Empty means the SDK default. Override only to isolate networks —
+	// e.g. e2e tests use a unique per-run name so developer machines on
+	// the same LAN don't discover each other.
+	ServiceName string `yaml:"serviceName"`
+}
+
+// IsEnabled resolves the opt-out tristate: nil = enabled.
+func (p P2P) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
 
 // Network is the any-sync network configuration. v1 is deliberately
 // conservative — callers pass a serialized nodeconf blob and we decode

@@ -480,3 +480,33 @@ func TestAddSpoolSpill(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, ents, "spool temp must be removed")
 }
+
+// TestDriveDurableSkipsWhenPeerMadeItDurable is the P2P durability-takeover
+// edge case: device A attaches a file while the file nodes are unreachable
+// (local CAR built, NOT durable). Another device (B) then fetches it over
+// the LAN and makes it durable, and B's receipt syncs into A's row. When
+// A's still-queued durable job later fires, it must NOT re-upload — the
+// NetworkSign re-read in DriveDurable makes it a no-op.
+func TestDriveDurableSkipsWhenPeerMadeItDurable(t *testing.T) {
+	ctx := context.Background()
+	// A limit refusal defers durability without a retry loop: A's local
+	// CAR is complete but the row stays non-durable.
+	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
+	s, _ := newService(t, br)
+	reg := newFakeRegistrar()
+
+	res, err := s.Add(ctx, reg, spaceId, "owner1", bytes.NewReader(testContent(80_000)), AddOpts{Name: "x.bin"})
+	require.NoError(t, err)
+	require.False(t, res.Durable, "no reachable node → deferred")
+	uploadsAfterAdd := br.uploads
+
+	// Device B made it durable; its receipt lands in A's row via CRDT sync.
+	require.NoError(t, reg.SetNetworkSign(ctx, "owner1", res.FileId, "peerB-receipt"))
+
+	// A's queued durable job fires now — must be a no-op (no re-upload).
+	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner1", res.FileId))
+	require.Equal(t, uploadsAfterAdd, br.uploads,
+		"A must not re-upload a file a peer already made durable")
+	require.Equal(t, "peerB-receipt", reg.rows["owner1/"+res.FileId].NetworkSign,
+		"the peer's receipt must be preserved, not overwritten")
+}

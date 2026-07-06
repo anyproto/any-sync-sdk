@@ -25,6 +25,16 @@ type NodeIdsFn func(spaceId string) []string
 // case (matches a freshly-created space and is harmless for v1).
 type TotalFn func(spaceId string) int
 
+// PeerCountsFn reports live-connection counts for spaceId: responsible
+// sync nodes and local-network peers sharing the space. Wired from
+// anysyncx (non-dialing pool.Pick reads). nil ⇒ both report 0.
+type PeerCountsFn func(spaceId string) (networkPeers, localPeers int)
+
+// P2PStateFn resolves the per-space local-network state. Wired from
+// anysyncx over discovery possibility + the p2p peer store. nil ⇒
+// P2PStateUnknown.
+type P2PStateFn func(spaceId string) space.P2PState
+
 // Service is the per-account sync-status registry. Owns one Tracker
 // per space (lazy via For) plus the account-wide subscriber registry
 // fed by Service.SubscribeStatus.
@@ -41,9 +51,20 @@ type Service struct {
 	// tests; then every sender is treated as responsible.
 	nodeIds NodeIdsFn
 
+	// localPeerIds resolves the connected LAN-peer list per space.
+	// Local peers are responsible senders too (a space synced purely
+	// over the LAN must still drain pending heads and advance to
+	// Synced). nil ⇒ no local peers considered.
+	localPeerIds NodeIdsFn
+
 	// totalFn supplies the per-space regular-object count for the
 	// rollup. May be nil in tests / Phase 1 — then Total reports 0.
 	totalFn TotalFn
+
+	// peerCountsFn / p2pStateFn supply the peer-presence slice of the
+	// rollup. May be nil in tests — counts then read 0 / Unknown.
+	peerCountsFn PeerCountsFn
+	p2pStateFn   P2PStateFn
 
 	// spaceSubs is the account-wide subscriber registry for
 	// SpaceSyncStatus events. Fired by the rollup loop.
@@ -150,12 +171,36 @@ func (s *Service) SetNodeIdsFn(fn NodeIdsFn) {
 	s.nodeIds = fn
 }
 
+// SetLocalPeerIdsFn wires the connected-LAN-peer resolver so local
+// peers count as responsible senders. Pass the p2p peer store's
+// LocalPeerIds method.
+func (s *Service) SetLocalPeerIdsFn(fn NodeIdsFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.localPeerIds = fn
+}
+
 // SetTotalFn wires the per-space regular-object count source. Pass
 // a closure over spaceobjects.Store from the space layer.
 func (s *Service) SetTotalFn(fn TotalFn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.totalFn = fn
+}
+
+// SetPeerCountsFn wires the live-connection counters (nodes + local
+// peers). Pass a closure over pool.Pick from anysyncx.
+func (s *Service) SetPeerCountsFn(fn PeerCountsFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.peerCountsFn = fn
+}
+
+// SetP2PStateFn wires the per-space local-network state resolver.
+func (s *Service) SetP2PStateFn(fn P2PStateFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.p2pStateFn = fn
 }
 
 // SetExcludedTreesFn wires the per-space non-user-visible tree
@@ -200,9 +245,12 @@ func (s *Service) For(spaceId string) *Tracker {
 func (s *Service) Status(spaceId string) space.SpaceSyncStatus {
 	t := s.trackerNoCreate(spaceId)
 	out := space.SpaceSyncStatus{SpaceId: spaceId}
+	out.NetworkPeers, out.LocalPeers = s.peerCountsFor(spaceId)
+	out.P2P = s.p2pStateFor(spaceId)
 	if t == nil {
-		// Unknown space — return zero with the id stamped. State
-		// stays Unknown until somebody touches the tracker.
+		// Unknown space — return the presence fields with the id
+		// stamped. State stays Unknown until somebody touches the
+		// tracker.
 		return out
 	}
 	out.LastSyncedAt = t.LastSyncedAt()
@@ -216,9 +264,30 @@ func (s *Service) Status(spaceId string) space.SpaceSyncStatus {
 	} else {
 		out.Synced = out.Total - pending
 	}
-	out.NetworkPeers = 0 // Phase 3 — peer-presence reader
 	out.State = computeRollup(out, pending)
 	return out
+}
+
+// peerCountsFor reads the configured PeerCountsFn. Zeros when unwired.
+func (s *Service) peerCountsFor(spaceId string) (networkPeers, localPeers int) {
+	s.mu.Lock()
+	fn := s.peerCountsFn
+	s.mu.Unlock()
+	if fn == nil {
+		return 0, 0
+	}
+	return fn(spaceId)
+}
+
+// p2pStateFor reads the configured P2PStateFn. Unknown when unwired.
+func (s *Service) p2pStateFor(spaceId string) space.P2PState {
+	s.mu.Lock()
+	fn := s.p2pStateFn
+	s.mu.Unlock()
+	if fn == nil {
+		return space.P2PStateUnknown
+	}
+	return fn(spaceId)
 }
 
 // SubscribeStatus registers cb for SpaceSyncStatus transitions.
@@ -270,6 +339,26 @@ func (s *Service) refresh(spaceId string) {
 	s.dirtyMu.Unlock()
 }
 
+// Refresh marks spaceId dirty from outside the tracker path — used by
+// the p2p wiring when a local peer's space set or the discovery
+// possibility changes, so subscribers get a presence event without a
+// tree transition.
+func (s *Service) Refresh(spaceId string) { s.refresh(spaceId) }
+
+// RefreshAll marks every tracked space dirty. Used on account-wide
+// presence changes (discovery possibility flips).
+func (s *Service) RefreshAll() {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.trackers))
+	for id := range s.trackers {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		s.refresh(id)
+	}
+}
+
 // rollupsEqual reports whether two SpaceSyncStatus values would
 // project to the same wire event. Excludes LastSyncedAt — that's a
 // continuously-moving timestamp that would force a dispatch on every
@@ -279,7 +368,9 @@ func rollupsEqual(a, b space.SpaceSyncStatus) bool {
 		a.State == b.State &&
 		a.Synced == b.Synced &&
 		a.Total == b.Total &&
-		a.NetworkPeers == b.NetworkPeers
+		a.NetworkPeers == b.NetworkPeers &&
+		a.LocalPeers == b.LocalPeers &&
+		a.P2P == b.P2P
 }
 
 // isResponsibleSender reports whether senderId is in spaceId's
@@ -287,14 +378,26 @@ func rollupsEqual(a, b space.SpaceSyncStatus) bool {
 // (test-friendly default).
 func (s *Service) isResponsibleSender(spaceId, senderId string) bool {
 	s.mu.Lock()
-	fn := s.nodeIds
+	nodeFn := s.nodeIds
+	localFn := s.localPeerIds
 	s.mu.Unlock()
-	if fn == nil {
+	// No node resolver wired = test mode: every sender responsible.
+	if nodeFn == nil {
 		return true
 	}
-	for _, id := range fn(spaceId) {
+	for _, id := range nodeFn(spaceId) {
 		if id == senderId {
 			return true
+		}
+	}
+	// A connected LAN peer sharing this space is also a responsible
+	// sender — otherwise a space synced only over the LAN never drains
+	// pending heads and sync status is stuck "syncing" forever.
+	if localFn != nil {
+		for _, id := range localFn(spaceId) {
+			if id == senderId {
+				return true
+			}
 		}
 	}
 	return false

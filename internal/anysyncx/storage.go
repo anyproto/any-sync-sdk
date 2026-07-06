@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	anystorev1 "github.com/anyproto/any-store"
@@ -21,6 +22,21 @@ type storageProvider struct {
 
 	mu   sync.Mutex
 	open map[string]spacestorage.SpaceStorage
+
+	// onSetChange fires (async-safe, may be nil) after the set of
+	// stored spaces changes — create or delete. The p2p exchange uses
+	// it to re-advertise this device's space list to LAN peers.
+	onSetChange func()
+}
+
+// SetOnSetChange installs the space-set change callback. Call during
+// app assembly, before any create/delete can happen.
+func (s *storageProvider) SetOnSetChange(fn func()) { s.onSetChange = fn }
+
+func (s *storageProvider) notifySetChange() {
+	if s.onSetChange != nil {
+		s.onSetChange()
+	}
 }
 
 func newStorageProvider(root string) *storageProvider {
@@ -88,7 +104,27 @@ func (s *storageProvider) CreateSpaceStorage(ctx context.Context, payload spaces
 	s.mu.Lock()
 	s.open[id] = st
 	s.mu.Unlock()
+	s.notifySetChange()
 	return st, nil
+}
+
+// AllSpaceIds lists every space with local any-sync storage, derived
+// from the `<root>/<spaceId>.db` layout. Used by the p2p SpaceExchangeV2
+// handshake to tell local peers what this device can sync.
+func (s *storageProvider) AllSpaceIds() []string {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(name, ".db"))
+	}
+	return ids
 }
 
 func (s *storageProvider) SpaceExists(id string) bool {
@@ -124,5 +160,6 @@ func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string)
 	if err := os.Remove(s.dbPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	s.notifySetChange()
 	return nil
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/net/streampool/streamhandler"
+	"github.com/anyproto/any-sync/nodeconf"
 	"go.uber.org/zap"
 	"storj.io/drpc"
 )
@@ -44,6 +45,12 @@ type spaceSyncHandler struct {
 	spaces     map[string]commonspace.Space
 	streamPool streampool.StreamPool
 	headCache  *HeadCache
+
+	// app is the back-reference used by the peer-facing handlers
+	// (SpacePull / SpacePush) that must load spaces through the cache.
+	// Wired right after app start; nil for the brief boot window —
+	// handlers treat that as "space missing" and the peer retries.
+	app atomic.Pointer[App]
 }
 
 func newSpaceSyncHandler() *spaceSyncHandler {
@@ -73,16 +80,45 @@ func (h *spaceSyncHandler) UnregisterSpace(spaceId string) {
 	delete(h.spaces, spaceId)
 }
 
-// RegisteredSpaceIds returns a snapshot for the stream-handler subscription
-// preamble.
+// RegisteredSpaceIds returns a snapshot for the stream-handler
+// subscription preamble. Local-only spaces are excluded: the preamble
+// goes out on every stream (node and LAN peer alike), and a local-only
+// space must never be advertised to anyone.
 func (h *spaceSyncHandler) RegisteredSpaceIds() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	ids := make([]string, 0, len(h.spaces))
 	for id := range h.spaces {
+		if h.isLocalOnly(id) {
+			continue
+		}
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// servable reports whether an inbound peer RPC may touch spaceId: the
+// space must be registered and NOT local-only. Local-only spaces are
+// device-pinned — refuse to serve them even if a peer names the id
+// directly (defense in depth beyond leaving them out of the exchange).
+func (h *spaceSyncHandler) servable(spaceId string) (commonspace.Space, bool) {
+	if h.isLocalOnly(spaceId) {
+		return nil, false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	sp, ok := h.spaces[spaceId]
+	return sp, ok
+}
+
+// isLocalOnly consults the app's local-only set; false during the
+// brief boot window before the app back-reference is installed (no
+// peer RPCs are served then anyway).
+func (h *spaceSyncHandler) isLocalOnly(spaceId string) bool {
+	if app := h.app.Load(); app != nil {
+		return app.IsLocalOnly(spaceId)
+	}
+	return false
 }
 
 func (h *spaceSyncHandler) getSpace(spaceId string) (commonspace.Space, error) {
@@ -109,14 +145,19 @@ func (h *spaceSyncHandler) snapshotSpaces() []commonspace.Space {
 }
 
 func (h *spaceSyncHandler) ObjectSyncRequestStream(msg *spacesyncproto.ObjectSyncMessage, stream spacesyncproto.DRPCSpaceSync_ObjectSyncRequestStreamStream) error {
-	sp, err := h.getSpace(msg.SpaceId)
-	if err != nil {
-		return err
+	sp, ok := h.servable(msg.SpaceId)
+	if !ok {
+		return fmt.Errorf("anysyncx: space %s not servable", msg.SpaceId)
 	}
 	return sp.HandleStreamSyncRequest(stream.Context(), msg, stream)
 }
 
 func (h *spaceSyncHandler) HeadSync(ctx context.Context, req *spacesyncproto.HeadSyncRequest) (*spacesyncproto.HeadSyncResponse, error) {
+	// Refuse local-only spaces before the head-cache fast path too —
+	// otherwise a peer could probe a device-pinned space's hash.
+	if h.isLocalOnly(req.SpaceId) {
+		return nil, spacesyncproto.ErrSpaceMissing
+	}
 	if resp := h.tryHeadCache(req); resp != nil {
 		return resp, nil
 	}
@@ -174,6 +215,105 @@ func (h *spaceSyncHandler) ObjectSyncStream(stream spacesyncproto.DRPCSpaceSync_
 	return h.streamPool.ReadStream(stream, 100)
 }
 
+// The four handlers below serve OTHER PEERS, not sync nodes — they
+// exist for p2p: a LAN peer that knows a space id (e.g. from its own
+// account data) pulls the space from us (SpacePull), our diffsyncer seeds a peer
+// that reported the space missing (SpacePush), and the key-value
+// stores diff/exchange directly (StoreDiff / StoreElements). Sync
+// nodes never call these on a client.
+
+// SpacePull serves a space's bootstrap payload (header + ACL root +
+// settings) to a peer that has its id but no storage. Registered
+// (loaded) spaces only — an unloaded space means we can't vouch for
+// its state either.
+func (h *spaceSyncHandler) SpacePull(ctx context.Context, req *spacesyncproto.SpacePullRequest) (*spacesyncproto.SpacePullResponse, error) {
+	sp, ok := h.servable(req.Id)
+	if !ok {
+		return nil, spacesyncproto.ErrSpaceMissing
+	}
+	desc, err := sp.Description(ctx)
+	if err != nil {
+		streamLog.Warn("space pull: description", zap.String("spaceId", req.Id), zap.Error(err))
+		return nil, spacesyncproto.ErrUnexpected
+	}
+	return &spacesyncproto.SpacePullResponse{
+		Payload: &spacesyncproto.SpacePayload{
+			SpaceHeader:            desc.SpaceHeader,
+			AclPayloadId:           desc.AclId,
+			AclPayload:             desc.AclPayload,
+			SpaceSettingsPayload:   desc.SpaceSettingsPayload,
+			SpaceSettingsPayloadId: desc.SpaceSettingsId,
+		},
+	}, nil
+}
+
+// SpacePush accepts a space payload from a peer whose diff-sync found
+// we're missing it, creating local storage and loading the space.
+//
+// A push creates a persistent .db file, so it's only honored for a
+// space the pushing peer actually advertised sharing in the exchange
+// (peerStore record) and that is not local-only. With the v2 token
+// exchange an advertisement is a proof of space membership, so only
+// members can seed a space onto this device; for legacy v1 peers the
+// claim is unproven and this check merely bounds the creation surface
+// to what the peer named — that residual hole closes when v1 ages out.
+func (h *spaceSyncHandler) SpacePush(ctx context.Context, req *spacesyncproto.SpacePushRequest) (*spacesyncproto.SpacePushResponse, error) {
+	app := h.app.Load()
+	if app == nil || req.Payload == nil || req.Payload.SpaceHeader == nil {
+		return nil, spacesyncproto.ErrUnexpected
+	}
+	spaceId := req.Payload.SpaceHeader.GetId()
+	if h.isLocalOnly(spaceId) {
+		return nil, spacesyncproto.ErrSpaceIsDeleted
+	}
+	peerId, err := peer.CtxPeerId(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Only accept a NEW space from a peer that advertised sharing it.
+	// A space we already store needs no push.
+	if !app.SpaceExists(spaceId) && !app.LocalPeerHasSpace(peerId, spaceId) {
+		streamLog.Warn("space push refused: peer did not advertise this space",
+			zap.String("peerId", peerId), zap.String("spaceId", spaceId))
+		return nil, spacesyncproto.ErrUnexpected
+	}
+	description := commonspace.SpaceDescription{
+		SpaceHeader:          req.Payload.SpaceHeader,
+		AclId:                req.Payload.AclPayloadId,
+		AclPayload:           req.Payload.AclPayload,
+		SpaceSettingsPayload: req.Payload.SpaceSettingsPayload,
+		SpaceSettingsId:      req.Payload.SpaceSettingsPayloadId,
+	}
+	ctx = context.WithValue(ctx, commonspace.AddSpaceCtxKey, description)
+	if _, err := app.GetSpace(ctx, spaceId); err != nil {
+		streamLog.Warn("space push: load", zap.String("spaceId", spaceId), zap.Error(err))
+		return nil, spacesyncproto.ErrUnexpected
+	}
+	return &spacesyncproto.SpacePushResponse{}, nil
+}
+
+// StoreDiff serves the key-value store diff to a syncing peer.
+func (h *spaceSyncHandler) StoreDiff(ctx context.Context, req *spacesyncproto.StoreDiffRequest) (*spacesyncproto.StoreDiffResponse, error) {
+	sp, ok := h.servable(req.SpaceId)
+	if !ok {
+		return nil, spacesyncproto.ErrSpaceMissing
+	}
+	return sp.KeyValue().HandleStoreDiffRequest(ctx, req)
+}
+
+// StoreElements exchanges key-value elements with a syncing peer.
+func (h *spaceSyncHandler) StoreElements(stream spacesyncproto.DRPCSpaceSync_StoreElementsStream) error {
+	msg, err := stream.Recv()
+	if err != nil {
+		return fmt.Errorf("anysyncx: store elements recv: %w", err)
+	}
+	sp, ok := h.servable(msg.SpaceId)
+	if !ok {
+		return spacesyncproto.ErrSpaceMissing
+	}
+	return sp.KeyValue().HandleStoreElementsRequest(stream.Context(), stream)
+}
+
 // nodeStreamTag tags every outbound stream we open to a sync node.
 // Client streams are otherwise untagged (spaceId tags only land if a
 // node echoes a SpaceSubscription, which it doesn't), so this constant
@@ -182,6 +322,11 @@ func (h *spaceSyncHandler) ObjectSyncStream(stream spacesyncproto.DRPCSpaceSync_
 // spaceIds are base58 object ids.
 const nodeStreamTag = "anysyncx/node-stream"
 
+// p2pStreamTag marks outbound streams to local-network peers instead.
+// Kept distinct so hasNodeStream health checks aren't fooled into
+// "healthy" by a LAN stream while every node is unreachable.
+const p2pStreamTag = "anysyncx/p2p-stream"
+
 // streamHandler is the StreamPool's outgoing-side handler. It opens
 // ObjectSyncStream connections, primes them with the current set of
 // subscribed spaces, and decodes inbound HeadUpdate / SpaceSubscription
@@ -189,6 +334,7 @@ const nodeStreamTag = "anysyncx/node-stream"
 type streamHandler struct {
 	syncHandler *spaceSyncHandler
 	streamPool  streampool.StreamPool
+	nodeConf    nodeconf.Service
 	// resyncing coalesces concurrent recovery head-syncs: every node
 	// stream (re)open triggers kickResync, but only one pass runs at a
 	// time. See kickResync.
@@ -210,6 +356,7 @@ func newStreamHandler(sh *spaceSyncHandler) *streamHandler {
 
 func (h *streamHandler) Init(a *app.App) error {
 	h.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
+	h.nodeConf = a.MustComponent(nodeconf.CName).(nodeconf.Service)
 	return nil
 }
 
@@ -246,9 +393,42 @@ func (h *streamHandler) OpenStream(ctx context.Context, p peer.Peer) (drpc.Strea
 	// recover it. Kick a recovery head-sync now that the channel is back so
 	// missed pushes converge promptly instead of on the next diff tick.
 	h.kickResync()
-	// Tag with nodeStreamTag so spacePeerManager can detect when this
-	// channel drops and re-subscribe promptly (see hasNodeStream).
-	return objectStream, []string{nodeStreamTag}, 100, nil
+	// Tag node streams so spacePeerManager can detect when the push
+	// channel to the node fleet drops and re-subscribe promptly (see
+	// hasNodeStream). Streams to local-network peers get their own tag
+	// so they never masquerade as node health.
+	tag := p2pStreamTag
+	if len(h.nodeConf.NodeTypes(p.Id())) > 0 {
+		tag = nodeStreamTag
+	}
+	return objectStream, []string{tag}, 100, nil
+}
+
+// SyncSpaces kicks a detached head-sync for whichever of the given
+// spaceIds are currently registered. The p2p exchange calls this when
+// a local peer's space set changes, so shared spaces converge with the
+// new peer immediately instead of on the next periodic diff tick.
+func (h *spaceSyncHandler) SyncSpaces(spaceIds []string) {
+	h.mu.RLock()
+	var sps []commonspace.Space
+	for _, id := range spaceIds {
+		if sp, ok := h.spaces[id]; ok {
+			sps = append(sps, sp)
+		}
+	}
+	h.mu.RUnlock()
+	if len(sps) == 0 {
+		return
+	}
+	go func() {
+		for _, sp := range sps {
+			ctx, cancel := context.WithTimeout(context.Background(), resyncTimeout)
+			if err := sp.SyncHeads(ctx); err != nil {
+				streamLog.Debug("p2p kick head-sync", zap.String("spaceId", sp.Id()), zap.Error(err))
+			}
+			cancel()
+		}
+	}()
 }
 
 // kickResync schedules one recovery head-sync pass across all registered

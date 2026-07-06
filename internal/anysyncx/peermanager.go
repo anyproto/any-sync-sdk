@@ -2,6 +2,7 @@ package anysyncx
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/anyproto/any-sync/app"
@@ -19,11 +20,19 @@ import (
 // (see localOnlySpaces) get an inert manager instead of the node-backed
 // one, so nothing about them ever reaches the network.
 type peerManagerProvider struct {
-	localOnly *localOnlySpaces
+	localOnly  *localOnlySpaces
+	localPeers localPeerSource
 }
 
-func newPeerManagerProvider(localOnly *localOnlySpaces) *peerManagerProvider {
-	return &peerManagerProvider{localOnly: localOnly}
+// localPeerSource is the slice of p2p.PeerStore the peer manager needs;
+// an interface so manager tests can fake it.
+type localPeerSource interface {
+	LocalPeerIds(spaceId string) []string
+	RemoveLocalPeer(peerId string)
+}
+
+func newPeerManagerProvider(localOnly *localOnlySpaces, localPeers localPeerSource) *peerManagerProvider {
+	return &peerManagerProvider{localOnly: localOnly, localPeers: localPeers}
 }
 
 func (p *peerManagerProvider) Init(_ *app.App) error { return nil }
@@ -33,7 +42,7 @@ func (p *peerManagerProvider) NewPeerManager(_ context.Context, spaceId string) 
 	if p.localOnly.has(spaceId) {
 		return &localPeerManager{}, nil
 	}
-	return &spacePeerManager{spaceId: spaceId}, nil
+	return &spacePeerManager{spaceId: spaceId, localPeers: p.localPeers}, nil
 }
 
 // localPeerManager is the peer manager of a local-only space: it
@@ -59,16 +68,23 @@ func (m *localPeerManager) SendMessage(_ context.Context, _ string, _ drpc.Messa
 func (m *localPeerManager) KeepAlive(_ context.Context) {}
 
 // spacePeerManager resolves nodes via nodeconf and ships messages
-// through the StreamPool for reactive push-based sync.
+// through the StreamPool for reactive push-based sync. Local-network
+// peers that share this space (from the p2p peer store) are folded
+// into the responsible/broadcast sets, so head-sync and pushes run
+// over the LAN too — including while every node is unreachable.
 type spacePeerManager struct {
 	spaceId         string
 	nodeConf        nodeconf.Service
 	pool            pool.Pool
 	streamPool      streampool.StreamPool
+	localPeers      localPeerSource
 	subscribeMsgRaw []byte
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
+
+	strikesMu   sync.Mutex
+	dialStrikes map[string]int
 }
 
 func (m *spacePeerManager) Init(a *app.App) error {
@@ -201,20 +217,82 @@ func (m *spacePeerManager) broadcastSubscribe() {
 
 func (m *spacePeerManager) Name() string { return peermanager.CName }
 
-// GetResponsiblePeers returns a single node peer per call. As a client we
-// only need to diff-sync against one node per cycle; pool.GetOneOf reuses
-// a live connection when possible and otherwise dials a random node from
-// the configured set.
+// GetResponsiblePeers returns a single node peer (as a client we only
+// need to diff-sync against one node per cycle; pool.GetOneOf reuses a
+// live connection when possible) plus every connectable local-network
+// peer that shares this space. When all nodes are unreachable but a
+// local peer is up, the local peers alone are returned — that is what
+// keeps a space syncing over the LAN while offline. The node error
+// only surfaces when there is nobody at all to sync with.
 func (m *spacePeerManager) GetResponsiblePeers(ctx context.Context) ([]peer.Peer, error) {
-	nodeIds := m.nodeConf.NodeIds(m.spaceId)
-	if len(nodeIds) == 0 {
-		return nil, nil
+	var (
+		peers   []peer.Peer
+		nodeErr error
+	)
+	if nodeIds := m.nodeConf.NodeIds(m.spaceId); len(nodeIds) > 0 {
+		p, err := m.pool.GetOneOf(ctx, nodeIds)
+		if err != nil {
+			nodeErr = err
+		} else {
+			peers = append(peers, p)
+		}
 	}
-	p, err := m.pool.GetOneOf(ctx, nodeIds)
-	if err != nil {
-		return nil, err
+	peers = append(peers, m.getLocalPeers(ctx)...)
+	if len(peers) == 0 && nodeErr != nil {
+		return nil, nodeErr
 	}
-	return []peer.Peer{p}, nil
+	return peers, nil
+}
+
+// localDialStrikes is how many CONSECUTIVE dial failures a LAN peer
+// must accumulate before we drop it from the peer store. A single miss
+// (the peer briefly restarting its QUIC session on an interface change)
+// must not evict it — the re-handshake resweep only re-adds peers still
+// in the store, so a premature eviction can strand a peer until its
+// next mDNS re-announce.
+const localDialStrikes = 3
+
+// getLocalPeers dials the local-network peers known to share this
+// space. A peer is dropped from the store only after localDialStrikes
+// consecutive failures; a success resets its counter.
+func (m *spacePeerManager) getLocalPeers(ctx context.Context) []peer.Peer {
+	if m.localPeers == nil {
+		return nil
+	}
+	var out []peer.Peer
+	for _, id := range m.localPeers.LocalPeerIds(m.spaceId) {
+		p, err := m.pool.Get(ctx, id)
+		if err != nil {
+			// Don't punish the peer for our own cancelled context.
+			if ctx.Err() != nil {
+				continue
+			}
+			if m.strike(id) >= localDialStrikes {
+				m.localPeers.RemoveLocalPeer(id)
+				m.clearStrikes(id)
+			}
+			continue
+		}
+		m.clearStrikes(id)
+		out = append(out, p)
+	}
+	return out
+}
+
+func (m *spacePeerManager) strike(peerId string) int {
+	m.strikesMu.Lock()
+	defer m.strikesMu.Unlock()
+	if m.dialStrikes == nil {
+		m.dialStrikes = map[string]int{}
+	}
+	m.dialStrikes[peerId]++
+	return m.dialStrikes[peerId]
+}
+
+func (m *spacePeerManager) clearStrikes(peerId string) {
+	m.strikesMu.Lock()
+	defer m.strikesMu.Unlock()
+	delete(m.dialStrikes, peerId)
 }
 
 func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error) {
@@ -250,8 +328,20 @@ func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error
 // same reason.
 func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message) error {
 	return m.streamPool.Send(m.runCtx, msg, func(ctx context.Context) ([]peer.Peer, error) {
-		return m.GetNodePeers(ctx)
+		return m.getBroadcastPeers(ctx)
 	})
+}
+
+// getBroadcastPeers is the push audience: every node peer plus every
+// connectable local peer sharing this space. GetNodePeers stays
+// nodes-only on purpose — callers asking for "the nodes" (e.g. the
+// space-delete flow) must not get LAN devices.
+func (m *spacePeerManager) getBroadcastPeers(ctx context.Context) ([]peer.Peer, error) {
+	peers, err := m.GetNodePeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return append(peers, m.getLocalPeers(ctx)...), nil
 }
 
 func (m *spacePeerManager) SendMessage(ctx context.Context, peerId string, msg drpc.Message) error {
@@ -271,10 +361,18 @@ func (m *spacePeerManager) SendMessage(ctx context.Context, peerId string, msg d
 // opened (e.g. by coordinator/nodeconf traffic) would otherwise wait
 // for the next headsync periodic pull (SyncPeriod=30s) to see ACL
 // updates. Called by diffsyncer at the end of every headsync cycle.
+//
+// Targets NODES ONLY: the subscribe keeps node streams tagged, but LAN
+// peer streams are already subscribed by streamHandler.OpenStream's
+// preamble when they open. Sending it to local peers would flood them
+// on the fast churn cadence (which runs whenever no node stream is up —
+// i.e. exactly the offline-LAN scenario) for no benefit.
 func (m *spacePeerManager) KeepAlive(ctx context.Context) {
 	if len(m.subscribeMsgRaw) == 0 {
 		return
 	}
 	msg := &spacesyncproto.ObjectSyncMessage{Payload: m.subscribeMsgRaw}
-	_ = m.BroadcastMessage(ctx, msg)
+	_ = m.streamPool.Send(m.runCtx, msg, func(ctx context.Context) ([]peer.Peer, error) {
+		return m.GetNodePeers(ctx)
+	})
 }

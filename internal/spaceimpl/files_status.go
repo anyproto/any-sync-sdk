@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	mrand "math/rand"
 	"sync"
+	"time"
 
 	"github.com/ipfs/go-cid"
 
@@ -14,6 +16,19 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+// Durability-takeover stagger: a downloader waits this long (base +
+// jitter) before uploading a non-durable file, so an online creator or
+// another downloader usually makes it durable first and the delayed job
+// no-ops. The jitter also spreads multiple downloaders apart.
+const (
+	takeoverBaseDelay = 45 * time.Second
+	takeoverJitter    = 45 * time.Second
+)
+
+func takeoverDelay() time.Duration {
+	return takeoverBaseDelay + time.Duration(mrand.Int63n(int64(takeoverJitter)))
+}
 
 // RunFileJob executes one queue job (the status.Runner wired by
 // sdk.Open). A job whose space or row disappeared (deleted) succeeds
@@ -57,7 +72,27 @@ func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
 		if err != nil {
 			return err
 		}
-		return s.fetch.Fetch(ctx, job.SpaceId, root, row.NetworkSign != "", job.FileId)
+		if err := s.fetch.Fetch(ctx, job.SpaceId, root, row.NetworkSign != "", job.FileId); err != nil {
+			return err
+		}
+		// Durability takeover (SYN-48): we now hold the complete file. If
+		// it is NOT durable — its creator never uploaded it to the file
+		// nodes (e.g. we pulled it from that peer over the LAN and the
+		// peer then went offline) — and we have write rights, take over
+		// so the file survives the creator leaving.
+		//
+		// We are a DOWNLOADER, not the creator (the creator's own durable
+		// job was enqueued immediately at attach). So DELAY, with jitter:
+		// if the creator (or another downloader) is online it uploads
+		// first, our delayed job then no-ops on its NetworkSign re-check,
+		// and we avoid two devices uploading the same file at once. Only
+		// when nobody else made it durable within the window do we upload.
+		if row.NetworkSign == "" && impl.canWrite(ctx) {
+			if s.fqueue != nil {
+				_ = s.fqueue.EnqueueDelayed(ctx, status.KindDurable, job.SpaceId, job.FileId, takeoverDelay())
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("files: unknown job kind %q", job.Kind)
 	}

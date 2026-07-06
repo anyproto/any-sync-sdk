@@ -38,7 +38,7 @@ type remoteCar struct {
 // readRange fetches [off, off+length). A short read only happens at
 // the object end; the caller knows the geometry, so short is an error
 // except during the head probe (readProbe).
-func (r *remoteCar) readRange(ctx context.Context, off, length int64) ([]byte, error) {
+func (r *remoteCar) ReadRange(ctx context.Context, off, length int64) ([]byte, error) {
 	data, _, err := r.get(ctx, off, length)
 	if err != nil {
 		return nil, err
@@ -51,7 +51,7 @@ func (r *remoteCar) readRange(ctx context.Context, off, length int64) ([]byte, e
 
 // readProbe fetches the head range and the total object size, retrying
 // through the staging→blob promotion window on 404.
-func (r *remoteCar) readProbe(ctx context.Context) (head []byte, total int64, err error) {
+func (r *remoteCar) ReadProbe(ctx context.Context) (head []byte, total int64, err error) {
 	for attempt := 0; ; attempt++ {
 		head, total, err = r.get(ctx, 0, headProbeLen)
 		if err == nil || !errors.Is(err, ErrRemoteGone) || attempt >= promotionRetries {

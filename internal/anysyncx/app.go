@@ -67,6 +67,7 @@ type App struct {
 	peerStore     *p2p.PeerStore
 	p2pServer     *p2pServer
 	discovery     *p2p.Discovery
+	exchange      *p2p.Exchange
 	fileP2PServer *filep2p.Server
 
 	// p2pEnabled is cfg.P2P.IsEnabled(), captured for the status
@@ -158,6 +159,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	exchange := p2p.NewExchange(keys.PeerId, peerStore, advertisedSpaceIds, discoveryKeys.DiscoveryKeys, func(_ string, spaceIds []string) {
 		sync.SyncSpaces(spaceIds)
 	})
+	exchange.SetAccountKeysFn(discoveryKeys.AccountDiscoveryKeys)
 	p2pSrv := newP2PServer(cfg.P2P, cfg.Storage.DataDir)
 	discovery := p2p.NewDiscovery(cfg.P2P, keys.PeerId, func() (int, bool) {
 		return p2pSrv.Port(), p2pSrv.Started()
@@ -236,6 +238,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		peerStore:          peerStore,
 		p2pServer:          p2pSrv,
 		discovery:          discovery,
+		exchange:           exchange,
 		p2pEnabled:         cfg.P2P.IsEnabled(),
 		headCache:          newHeadCache(),
 		syncStatus:         syncstatus.NewService(),
@@ -445,6 +448,36 @@ func (a *App) SetFileStore(st *filestore.Store) {
 	if a.fileP2PServer != nil {
 		a.fileP2PServer.SetStore(st)
 	}
+}
+
+// SetKnownSpaceIdsFn wires the p2p exchange's probe source: the space
+// ids this account knows of (tech-space index), regardless of whether
+// they are stored locally. Local-only spaces are filtered out here —
+// they must never reach the exchange in any form. Called once by
+// sdk.Open after the tech space is up.
+func (a *App) SetKnownSpaceIdsFn(fn func() []string) {
+	a.exchange.SetKnownSpaceIdsFn(func() []string {
+		ids := fn()
+		out := ids[:0]
+		for _, id := range ids {
+			if !a.localOnly.has(id) {
+				out = append(out, id)
+			}
+		}
+		return out
+	})
+}
+
+// BroadcastP2P re-runs the LAN handshake with every known local peer —
+// called when the known-space set grows (tech-space index synced a new
+// row) so a fresh device starts probing for the space right away
+// instead of on the next discovery resweep.
+func (a *App) BroadcastP2P() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		a.exchange.Broadcast(ctx)
+	}()
 }
 
 // SetSpaceRegistry wires the tree manager to a space-level registry.

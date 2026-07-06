@@ -2,6 +2,7 @@ package spaceimpl
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -12,7 +13,9 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/syncacl"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -551,6 +554,8 @@ func fromAclStatus(s list.AclStatus) space.MemberStatus {
 // Started on the first Subscribe or Query (via membersAPI.ensureWatcher).
 // Runs until Service.Close. Subscribers are stored in a map keyed by
 // an int counter for O(1) remove.
+var memberLog = logger.NewNamed("sdk.members")
+
 type memberWatcher struct {
 	api  *membersAPI
 	coll anystore.Collection
@@ -737,6 +742,13 @@ func (w *memberWatcher) tick() {
 	// promptly after the owner's accept replicates.
 	if meActive {
 		w.maybeFlipTechSpaceJoining(ctx)
+	}
+
+	// Complete a pending keyless removal (nested spaces): when the
+	// legalOwner removed a member without a rotation, the first
+	// key-holding device that may rotate restores forward secrecy.
+	if headChanged {
+		w.maybeCompleteKeylessRemoval(ctx)
 	}
 
 	// Cache each member's metadata symkey into the synced account-scoped
@@ -1182,4 +1194,62 @@ func (s *Service) ResolveIdentityProfiles(ctx context.Context) {
 		}
 		_ = s.tsp.SetIdentityProfile(ctx, dwi.Identity, prof.Name, prof.Description, prof.IconCID)
 	}
+}
+
+// maybeCompleteKeylessRemoval authors the standard read-key rotation that
+// completes a pending AclAccountRemoveNoRotate (docs/16 phase B). Admins and
+// the owner always may; Writers only when the space opted in via
+// AclSpaceOptions.editorsCanCompleteKeylessRotation. Losing a race with
+// another device is fine — its rotation clears the pending state and this
+// build/publish fails on the stale prev id.
+func (w *memberWatcher) maybeCompleteKeylessRemoval(ctx context.Context) {
+	acl, err := w.api.aclList(ctx)
+	if err != nil {
+		return
+	}
+	keys := w.api.s.app.AccountKeys()
+	if keys == nil {
+		return
+	}
+	acl.RLock()
+	st := acl.AclState()
+	pending := st.HasPendingKeylessRemovals()
+	perms := st.Permissions(keys.SignKey.GetPublic())
+	opts := st.CurrentOptions()
+	acl.RUnlock()
+	if !pending {
+		return
+	}
+	canRotate := perms.CanManageAccounts() ||
+		(opts != nil && opts.EditorsCanCompleteKeylessRotation && perms.CanWrite())
+	if !canRotate {
+		return
+	}
+	readKey, err := crypto.NewRandomAES()
+	if err != nil {
+		return
+	}
+	metadataKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		return
+	}
+	acl.Lock()
+	rec, err := acl.RecordBuilder().BuildReadKeyChange(list.ReadKeyChangePayload{
+		MetadataKey: metadataKey,
+		ReadKey:     readKey,
+	})
+	acl.Unlock()
+	if err != nil {
+		memberLog.Debug("keyless-removal rotation build failed", zap.String("spaceId", w.api.s.id), zap.Error(err))
+		return
+	}
+	handle, err := w.api.s.app.GetSpace(ctx, w.api.s.id)
+	if err != nil {
+		return
+	}
+	if err := handle.Inner().AclClient().AddRecord(ctx, rec); err != nil {
+		memberLog.Debug("keyless-removal rotation publish failed", zap.String("spaceId", w.api.s.id), zap.Error(err))
+		return
+	}
+	memberLog.Info("completed pending keyless removal with a read-key rotation", zap.String("spaceId", w.api.s.id))
 }

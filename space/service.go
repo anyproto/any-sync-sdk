@@ -80,6 +80,18 @@ type Service interface {
 	// flagged). The caller must have the parent space locally.
 	Children(ctx context.Context, parentSpaceId string) ([]ChildRef, error)
 
+	// RemoveMemberAsLegalOwner removes identity from childSpaceId acting as
+	// its legalOwner (the parent's current owner) — no read key required.
+	// The removal is authoritative immediately; forward secrecy is restored
+	// when a key-holding member (or the SDK's auto-rotation on their device)
+	// completes the standard read-key rotation. The child needn't be known
+	// locally — it is tracked and bootstrapped on demand.
+	RemoveMemberAsLegalOwner(ctx context.Context, childSpaceId, identity string) error
+
+	// DeleteChildAsLegalOwner deletes childSpaceId on the network acting as
+	// its legalOwner — no read access required; overrides deleteRestricted.
+	DeleteChildAsLegalOwner(ctx context.Context, childSpaceId string) error
+
 	// Get returns an already-joined space by id. Fails if the space is
 	// unknown locally.
 	Get(ctx context.Context, spaceId string) (Space, error)

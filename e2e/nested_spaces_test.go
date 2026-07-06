@@ -140,3 +140,111 @@ func waitInviteAccepted(t *testing.T, ctx context.Context, who *anysyncsdk.SDK, 
 	}
 	return nil, context.DeadlineExceeded
 }
+
+// TestE2E_NestedSpaces_KeylessGovernance exercises phase 2 of docs/16: a
+// member-created child governed by a keyless org owner — the org removes a
+// member without holding the child's read key, a key-holding admin device
+// completes the rotation automatically, and the org deletes another child it
+// cannot read.
+func TestE2E_NestedSpaces_KeylessGovernance(t *testing.T) {
+	t.Parallel()
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+	t.Logf("using any-sync network config from %s", confPath)
+	if testing.Short() {
+		t.Skip("nested-spaces e2e needs a live coordinator; rerun without -short")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	openSDK := func(name string) *anysyncsdk.SDK {
+		t.Helper()
+		cfg := config.Config{
+			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Network: config.Network{NodeConfYAML: yaml},
+		}
+		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+		require.NoError(t, err, "%s: Open", name)
+		t.Cleanup(func() { _ = sdk.Close() })
+		return sdk
+	}
+
+	orgOwner := openSDK("orgOwner")
+	admin := openSDK("admin")   // org member, creates the child
+	member := openSDK("member") // added to the child, then removed keylessly
+
+	// org with an admin member
+	org, err := orgOwner.Spaces().Create(ctx, space.CreateRequest{Name: "Org"})
+	require.NoError(t, err)
+	err = org.ACL().AddAccounts(ctx, []space.MemberAdd{
+		{Identity: admin.Account().Id(), Permission: space.PermissionAdmin},
+	})
+	if isNoNetworkErr(err) {
+		t.Skipf("network unreachable: %v", err)
+	}
+	require.NoError(t, err)
+	adminOrg, err := waitInviteAccepted(t, ctx, admin, org.Id())
+	if adminOrg == nil {
+		t.Skipf("admin never received the org invite: %v", err)
+	}
+
+	// the admin creates a child — org owner is legalOwner-only, holds no key
+	child, err := admin.Spaces().CreateChild(ctx, space.CreateChildRequest{
+		ParentSpaceId: org.Id(),
+		Name:          "Team",
+	})
+	if err != nil {
+		t.Skipf("CreateChild failed — coordinator likely predates nested spaces: %v", err)
+	}
+
+	// the child gets a member
+	err = child.ACL().AddAccounts(ctx, []space.MemberAdd{
+		{Identity: member.Account().Id(), Permission: space.PermissionWriter},
+	})
+	require.NoError(t, err)
+	memberChild, err := waitInviteAccepted(t, ctx, member, child.Id())
+	if memberChild == nil {
+		t.Skipf("member never received the child invite: %v", err)
+	}
+
+	// the ORG OWNER — not a member of the child — removes the member keylessly
+	err = orgOwner.Spaces().RemoveMemberAsLegalOwner(ctx, child.Id(), member.Account().Id())
+	require.NoError(t, err, "keyless removal by the legalOwner")
+
+	// the admin's device observes the pending removal and rotates automatically
+	deadline := time.Now().Add(2 * time.Minute)
+	rotated := false
+	for time.Now().Before(deadline) {
+		pending, err := child.ACL().PendingKeylessRemovals(ctx)
+		if err == nil && len(pending) == 0 {
+			// pending cleared — check the member is actually out
+			members, err := child.Members().List(ctx)
+			if err == nil {
+				out := true
+				for _, m := range members {
+					if m.Identity == member.Account().Id() && m.Permission != space.PermissionNone {
+						out = false
+					}
+				}
+				if out {
+					rotated = true
+					break
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	assert.True(t, rotated, "auto-rotation should clear the pending keyless removal")
+
+	// the org owner deletes a second child it cannot read
+	child2, err := admin.Spaces().CreateChild(ctx, space.CreateChildRequest{
+		ParentSpaceId: org.Id(),
+		Name:          "Doomed",
+	})
+	require.NoError(t, err)
+	err = orgOwner.Spaces().DeleteChildAsLegalOwner(ctx, child2.Id())
+	require.NoError(t, err, "legalOwner delete of an unreadable child")
+}

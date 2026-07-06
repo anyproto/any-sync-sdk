@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/util/crypto"
@@ -195,4 +196,161 @@ func (s *Service) resolveChildCredential(ctx context.Context, parentSpaceId, chi
 // (the caller may not hold a spaceImpl, e.g. the parent in CreateChild).
 func ensureShareableId(ctx context.Context, app *anysyncx.App, spaceId string) error {
 	return ensureShareableCoord(ctx, app, spaceId)
+}
+
+// RemoveMemberAsLegalOwner removes identity from childSpaceId acting as its
+// legalOwner (the parent's current owner) — no read key required (docs/16).
+// Writes AclAccountRemoveNoRotate; the read-key rotation completing the
+// cut-off is authored by a key-holding member (see the auto-rotation hook in
+// the member watcher). When the child's stored legalOwner lags a parent
+// ownership transfer, the required AclLegalOwnerUpdate is pushed lazily first.
+func (s *Service) RemoveMemberAsLegalOwner(ctx context.Context, childSpaceId, identity string) error {
+	target, err := crypto.DecodeAccountAddress(identity)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: RemoveMemberAsLegalOwner: bad identity: %w", err)
+	}
+	handle, err := s.childHandleForGovernance(ctx, childSpaceId)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureLegalOwnerCurrent(ctx, handle); err != nil {
+		return err
+	}
+	acl := handle.Inner().Acl()
+	acl.Lock()
+	rec, err := acl.RecordBuilder().BuildAccountRemoveNoRotate(list.AccountRemoveNoRotatePayload{
+		Identities: []crypto.PubKey{target},
+	})
+	acl.Unlock()
+	if err != nil {
+		return fmt.Errorf("spaceimpl: RemoveMemberAsLegalOwner: build: %w", err)
+	}
+	if err := addRecordWaitingForLog(ctx, handle.Inner().AclClient(), rec); err != nil {
+		return fmt.Errorf("spaceimpl: RemoveMemberAsLegalOwner: publish: %w", err)
+	}
+	return nil
+}
+
+// DeleteChildAsLegalOwner deletes childSpaceId on the network acting as its
+// legalOwner — no read access required; overrides deleteRestricted (docs/16).
+// When the child is known locally the normal offline-first Delete flow runs
+// (its reconciler retry is accepted by the coordinator's legalOwner path);
+// otherwise the coordinator is told directly.
+func (s *Service) DeleteChildAsLegalOwner(ctx context.Context, childSpaceId string) error {
+	if _, ok := s.tsp.Get(ctx, childSpaceId); ok {
+		return s.Delete(ctx, childSpaceId)
+	}
+	return s.app.SpaceDelete(ctx, childSpaceId)
+}
+
+// childHandleForGovernance opens a child space for a keyless legalOwner
+// action: the space may be entirely unknown locally (the org never joined
+// it), so it is tracked first and bootstrapped from the network.
+func (s *Service) childHandleForGovernance(ctx context.Context, childSpaceId string) (anysyncx.SpaceHandle, error) {
+	if _, ok := s.tsp.Get(ctx, childSpaceId); !ok {
+		if err := s.Track(ctx, childSpaceId); err != nil {
+			return nil, fmt.Errorf("spaceimpl: track child %s: %w", childSpaceId, err)
+		}
+	}
+	handle, err := s.app.GetSpace(ctx, childSpaceId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: load child %s: %w", childSpaceId, err)
+	}
+	return handle, nil
+}
+
+// ensureLegalOwnerCurrent pushes the lazy AclLegalOwnerUpdate when the
+// child's stored legalOwner key lags the caller (the parent's current owner):
+// the proof chain is assembled from the parent acl's raw AclOwnershipChange
+// records by signature induction (docs/16, grooming decision 14).
+func (s *Service) ensureLegalOwnerCurrent(ctx context.Context, handle anysyncx.SpaceHandle) error {
+	ourKey := s.app.AccountKeys().SignKey.GetPublic()
+	acl := handle.Inner().Acl()
+	acl.RLock()
+	stored := acl.AclState().LegalOwner()
+	parentSpaceId := acl.AclState().ParentSpaceId()
+	acl.RUnlock()
+	if stored == nil {
+		return fmt.Errorf("spaceimpl: space %s is not a child space", handle.Inner().Id())
+	}
+	if stored.Equals(ourKey) {
+		return nil
+	}
+	proofs, err := s.assembleLegalOwnerProofs(ctx, parentSpaceId, stored, ourKey)
+	if err != nil {
+		return err
+	}
+	acl.Lock()
+	rec, err := acl.RecordBuilder().BuildLegalOwnerUpdate(list.LegalOwnerUpdatePayload{OwnershipChanges: proofs})
+	acl.Unlock()
+	if err != nil {
+		return fmt.Errorf("spaceimpl: build legal owner update: %w", err)
+	}
+	if err := addRecordWaitingForLog(ctx, handle.Inner().AclClient(), rec); err != nil {
+		return fmt.Errorf("spaceimpl: publish legal owner update: %w", err)
+	}
+	return nil
+}
+
+// assembleLegalOwnerProofs walks the parent acl's ownership-change records and
+// returns the raw signed record bytes forming the induction chain from key
+// `from` to key `to`.
+func (s *Service) assembleLegalOwnerProofs(ctx context.Context, parentSpaceId string, from, to crypto.PubKey) ([][]byte, error) {
+	parentHandle, err := s.app.GetSpace(ctx, parentSpaceId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: load parent %s: %w", parentSpaceId, err)
+	}
+	type hop struct {
+		recordId string
+		author   crypto.PubKey
+		newOwner crypto.PubKey
+	}
+	var hops []hop
+	parentAcl := parentHandle.Inner().Acl()
+	parentAcl.RLock()
+	for _, rec := range parentAcl.Records() {
+		data, ok := rec.Model.(*aclrecordproto.AclData)
+		if !ok {
+			continue
+		}
+		for _, content := range data.GetAclContent() {
+			oc := content.GetOwnershipChange()
+			if oc == nil {
+				continue
+			}
+			newOwner, err := crypto.UnmarshalEd25519PublicKeyProto(oc.NewOwnerIdentity)
+			if err != nil {
+				continue
+			}
+			hops = append(hops, hop{recordId: rec.Id, author: rec.Identity, newOwner: newOwner})
+		}
+	}
+	parentAcl.RUnlock()
+
+	aclStorage, err := parentHandle.Inner().Storage().AclStorage()
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: parent acl storage: %w", err)
+	}
+	var (
+		proofs   [][]byte
+		expected = from
+	)
+	for _, h := range hops {
+		if !h.author.Equals(expected) {
+			continue
+		}
+		storageRec, err := aclStorage.Get(ctx, h.recordId)
+		if err != nil {
+			return nil, fmt.Errorf("spaceimpl: read parent acl record %s: %w", h.recordId, err)
+		}
+		proofs = append(proofs, storageRec.RawRecord)
+		expected = h.newOwner
+		if expected.Equals(to) {
+			break
+		}
+	}
+	if !expected.Equals(to) {
+		return nil, fmt.Errorf("spaceimpl: no ownership chain from the child's stored legal owner to this account in parent %s", parentSpaceId)
+	}
+	return proofs, nil
 }

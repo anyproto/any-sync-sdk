@@ -463,3 +463,21 @@ func decodeSymKeyMetadata(raw []byte, keys map[string]list.AclKeys, keyRecordId 
 	}
 	return string(plain)
 }
+
+// PendingKeylessRemovals lists identities removed via AclAccountRemoveNoRotate
+// that still await a completing read-key rotation.
+func (a *aclAPI) PendingKeylessRemovals(ctx context.Context) ([]string, error) {
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return nil, fmt.Errorf("acl: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	acl.RLock()
+	defer acl.RUnlock()
+	pending := acl.AclState().PendingKeylessRemovals()
+	out := make([]string, 0, len(pending))
+	for _, pk := range pending {
+		out = append(out, pk.Account())
+	}
+	return out, nil
+}

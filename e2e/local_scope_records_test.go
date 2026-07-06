@@ -54,6 +54,7 @@ func newNotesType() handler.Type {
 // provably caught up past the local write, so if the local value were
 // ever going to sync it would be present. It must be absent.
 func TestE2E_LocalScopeDatasetRecords(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

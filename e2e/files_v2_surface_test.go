@@ -22,6 +22,7 @@ import (
 // Open(originalId, variant), the typed List (per-object fast path +
 // flat + limit), and the generic Query over one object's rows.
 func TestE2E_FilesV2_Surface(t *testing.T) {
+	t.Parallel()
 	netYaml, _, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")

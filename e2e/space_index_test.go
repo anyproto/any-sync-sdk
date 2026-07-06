@@ -29,6 +29,7 @@ func strPtr(s string) *string { return &s }
 // Skips when staging is unavailable; uses the shared seed provider
 // for a one-shot SDK boot.
 func TestSpaceIndex_RoundTrip(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -118,6 +119,7 @@ func TestSpaceIndex_RoundTrip(t *testing.T) {
 // any-sync config. Mirrors the test scaffolding from
 // invite_sync_test.TestE2E_AliceBobInviteAndContent.
 func TestE2E_SpaceIndexMultiPeerConvergence(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

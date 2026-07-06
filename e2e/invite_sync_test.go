@@ -41,6 +41,7 @@ import (
 // the join flow needs at minimum two headsync ticks (Alice sees
 // request, Bob sees acceptance).
 func TestE2E_AliceBobInviteAndContent(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

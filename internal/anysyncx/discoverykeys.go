@@ -2,6 +2,8 @@ package anysyncx
 
 import (
 	"context"
+	"crypto/sha256"
+	"io"
 	"sync"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/recordverifier"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/hkdf"
 )
 
 var dkLog = logger.NewNamed("anysyncx.discoverykeys")
@@ -82,6 +85,35 @@ func (d *discoveryKeySource) get(ctx context.Context, spaceId string) []byte {
 	delete(d.failedAt, spaceId)
 	d.derived[spaceId] = key
 	return key
+}
+
+// accountDiscoveryInfo domain-separates the account-derived discovery
+// key from every other HKDF use of the account signing key.
+var accountDiscoveryInfo = []byte("anysync-sdk:p2p:account-discovery:v1")
+
+// AccountDiscoveryKeys derives the ACCOUNT-scoped discovery keys used
+// by the exchange's probe tokens: HKDF(accountSignKey, spaceId). Every
+// device of the account can derive it for any spaceId WITHOUT the
+// space's ACL — that's the whole point (LAN cold restore: the fresh
+// device knows the id from the tech-space index but hasn't pulled the
+// space yet). Deterministic and cheap; derivation failures skip the
+// space (the exchange simply doesn't probe it).
+func (d *discoveryKeySource) AccountDiscoveryKeys(_ context.Context, spaceIds []string) map[string][]byte {
+	raw, err := d.keys.SignKey.Raw()
+	if err != nil {
+		dkLog.Error("account discovery key: sign key raw", zap.Error(err))
+		return nil
+	}
+	out := make(map[string][]byte, len(spaceIds))
+	for _, spaceId := range spaceIds {
+		key := make([]byte, 32)
+		if _, err = io.ReadFull(hkdf.New(sha256.New, raw, []byte(spaceId), accountDiscoveryInfo), key); err != nil {
+			dkLog.Error("account discovery key: hkdf", zap.String("spaceId", spaceId), zap.Error(err))
+			continue
+		}
+		out[spaceId] = key
+	}
+	return out
 }
 
 // derive reads the space's ACL from storage and extracts the first read

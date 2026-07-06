@@ -22,6 +22,7 @@ import (
 // drives a persistent queue-executed background fetch to a complete
 // local copy on the second device.
 func TestE2E_FilesV2_StatusAndPin(t *testing.T) {
+	t.Parallel()
 	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")

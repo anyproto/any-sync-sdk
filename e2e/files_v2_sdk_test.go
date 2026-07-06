@@ -33,6 +33,7 @@ import (
 //  4. attaching the same content to another object BINDs: same
 //     rootCid, donor's receipt reused, durable with no second upload.
 func TestE2E_FilesV2_SDKAttach(t *testing.T) {
+	t.Parallel()
 	netYaml, fileV2Peers, _ := loadLocalFilesV2Network(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")

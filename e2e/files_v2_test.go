@@ -101,6 +101,7 @@ func loadLocalFilesV2NetworkFull(t *testing.T) (yamlBytes []byte, fileV2Peers []
 //     the whole pipeline, not just the direct RPCs;
 //  4. RequestDownload → signed GET → bytes round-trip equal.
 func TestE2E_FilesV2(t *testing.T) {
+	t.Parallel()
 	netYaml, fileV2Peers, networkId, fileNetworkId := loadLocalFilesV2NetworkFull(t)
 	if testing.Short() {
 		t.Skip("files-v2 e2e is slow; rerun without -short")

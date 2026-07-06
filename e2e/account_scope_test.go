@@ -41,6 +41,7 @@ func sameAccountFreshDevice(t *testing.T, p *fixedSeedProvider) *fixedSeedProvid
 //     already online — the live mirror path (carrier events) must
 //     deliver it without a space reload.
 func TestE2E_AccountScopeSync(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

@@ -25,6 +25,7 @@ import (
 //   - Identities().Subscribe streams the resolution;
 //   - deleting the space prunes the spaceId from the directory.
 func TestE2E_Identities_DirectoryResolveAndPrune(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

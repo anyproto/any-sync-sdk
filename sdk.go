@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/net/pool"
@@ -27,6 +29,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/spacesync"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -42,6 +45,10 @@ type SDK struct {
 	filesQueue *status.Queue
 	filesGC    *gc.Service
 	readSync   *readsync.Service
+	// stopP2PIndexWatch stops the tech-space index watcher that kicks
+	// LAN re-handshakes when the known-space set grows; nil when p2p
+	// is disabled or in headless mode.
+	stopP2PIndexWatch func()
 }
 
 // FileCacheSize returns the local bytes currently held by file content
@@ -312,22 +319,85 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = err
 	}
 
+	// LAN cold restore: let the p2p exchange probe for spaces this
+	// account knows of but hasn't pulled yet, and re-handshake known
+	// LAN peers whenever the tech-space index grows (a fresh device
+	// learns a space id and wants a pull source right away).
+	var stopP2PIndexWatch func()
+	if app.P2PEnabled() {
+		app.SetKnownSpaceIdsFn(func() []string {
+			recs := tsp.List(context.Background())
+			ids := make([]string, 0, len(recs))
+			for _, rec := range recs {
+				if !rec.IsDeleted() {
+					ids = append(ids, rec.Id)
+				}
+			}
+			return ids
+		})
+		stopP2PIndexWatch = watchSpaceIndexForP2P(tsp, app)
+	}
+
 	return &SDK{
-		app:        app,
-		db:         db,
-		tsp:        tsp,
-		spaces:     spaces,
-		account:    account,
-		filesQueue: filesQueue,
-		filesGC:    filesGC,
-		readSync:   readSync,
+		app:               app,
+		db:                db,
+		tsp:               tsp,
+		spaces:            spaces,
+		account:           account,
+		filesQueue:        filesQueue,
+		filesGC:           filesGC,
+		readSync:          readSync,
+		stopP2PIndexWatch: stopP2PIndexWatch,
 	}, nil
+}
+
+// watchSpaceIndexForP2P subscribes to the tech-space `spaces` dataset
+// and kicks a LAN re-handshake on every change, coalesced — the mirror
+// of spaceimpl's spaceIndexWatcher pattern. Best-effort: on mailbox
+// overflow the sub closes and the watcher exits; the periodic
+// discovery resweep still refreshes handshakes at its own cadence.
+func watchSpaceIndexForP2P(tsp *techspace.Service, app *anysyncx.App) (stop func()) {
+	sub, err := tsp.SubEngine().Subscribe(subscribe.SubConfig{
+		Scope: subscribe.Scope{
+			Shared:   false,
+			ObjectId: tsp.IndexObjectId(),
+			Dataset:  techspace.SpaceIndexDataset,
+		},
+	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
+	if err != nil || sub == nil {
+		return func() {}
+	}
+	stopCh := make(chan struct{})
+	go func() {
+		mb := sub.Events()
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			if _, err := mb.Wait(context.Background()); err != nil {
+				return // ErrClosed on stop / overflow
+			}
+			app.BroadcastP2P()
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = sub.Close()
+			close(stopCh)
+		})
+	}
 }
 
 // Close tears down the SDK: stops the files queue, closes loaded
 // spaces, the tech space, the SDK DB, and finally the any-sync app.
 func (s *SDK) Close() error {
 	ctx := context.Background()
+	if s.stopP2PIndexWatch != nil {
+		s.stopP2PIndexWatch()
+	}
 	if s.readSync != nil {
 		s.readSync.Close()
 	}

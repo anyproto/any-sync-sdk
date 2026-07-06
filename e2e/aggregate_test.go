@@ -26,6 +26,7 @@ import (
 //     surface space.ErrAggGroupLimitExceeded.
 //   - A non-materialised dataset aggregates to empty, not an error.
 func TestSDK_Aggregate(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

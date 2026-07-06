@@ -35,6 +35,7 @@ import (
 // device A to TTL its space cache or quit while device B is still
 // trying to fetch.
 func TestE2E_ColdSyncSameKey(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

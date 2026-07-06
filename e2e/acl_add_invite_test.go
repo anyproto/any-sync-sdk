@@ -26,6 +26,7 @@ import (
 // notification never reaches the receivers the test skips rather than
 // fails, mirroring TestE2E_OneToOne_InboxDiscovery.
 func TestE2E_DirectAdd_InboxInvite(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

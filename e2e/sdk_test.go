@@ -41,6 +41,7 @@ func (p *fixedSeedProvider) DeviceKey(_ context.Context) ([]byte, error)  { retu
 // Network reachability is NOT required: CreateSpace writes locally
 // first; coordinator push happens lazily and is best-effort here.
 func TestSDK_OpenCreateList(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -137,6 +138,7 @@ func findSpace(infos []space.SpaceInfo, id string) *space.SpaceInfo {
 // the same DataDir, the tech space and its space-index rehydrate via
 // cold-restore: the previously created space shows up in List.
 func TestSDK_OpenSurvivesRestart(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -189,6 +191,7 @@ func TestSDK_OpenSurvivesRestart(t *testing.T) {
 // invariants (auto-derived propId equals shortId(changeId), bind
 // shows up in any.types).
 func TestSDK_TypesAndProperties(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

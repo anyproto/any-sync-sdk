@@ -21,6 +21,7 @@ import (
 //   - Subscribe fires live on every applied change with (objectId,
 //     addSeq).
 func TestSDK_ChangeIndex(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -127,6 +128,7 @@ drain:
 // object-level `_deletedAt` row — a deleted object is simply gone, and
 // IncludeDeleted (a record-level opt-in) surfaces nothing for it.
 func TestSDK_ObjectDelete_PurgesLocalState(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

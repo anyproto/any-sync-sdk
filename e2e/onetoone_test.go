@@ -50,6 +50,7 @@ func firstOneToOne(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK) (spac
 //	RegisterIncoming again → still declined (sticky, no re-prompt)
 //	OneToOne(peer) → overrides to active (un-decline)
 func TestE2E_OneToOne_DeclineSticky(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -110,6 +111,7 @@ func TestE2E_OneToOne_DeclineSticky(t *testing.T) {
 // space (the marker is not terminal, unlike a regular delete). Serverless
 // — no cross-account sync needed.
 func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -162,6 +164,7 @@ func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
 // convergence rides the tech-space sync, so the propagation assertion is
 // best-effort (skips if tech-space doesn't converge in time).
 func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -236,6 +239,7 @@ func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
 // space (symmetric derivation), approves it, and then converges on
 // Alice's content. Slow — needs cross-account replication.
 func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

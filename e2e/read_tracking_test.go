@@ -86,6 +86,7 @@ func newReadTrackedType() handler.Type {
 //     frontier (the new message stays unread) instead of first-sight
 //     seeding everything read.
 func TestE2E_ReadTracking(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

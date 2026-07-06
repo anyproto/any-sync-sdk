@@ -29,6 +29,7 @@ import (
 // assertions that neither device's local value ever bleeds into the
 // other.
 func TestE2E_LocalScopeIsolation(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -134,14 +135,28 @@ func TestE2E_LocalScopeIsolation(t *testing.T) {
 
 	// ---- Device-local independence, both directions ----
 	// B writes its OWN local value (the opposite bool) and a synced
-	// clock value back toward A. The type DEFS sync on a separate tree
-	// from the object, so wait for the local-scoped def to resolve on
-	// B first — otherwise resolveRoute would fall back to synced and B's
-	// write would corrupt the shared value (and silently defeat the
-	// test's premise).
+	// clock value back toward A. Two prerequisites sync independently
+	// of the title value observed above, so wait for both explicitly:
+	// the type DEFS travel on a separate tree (without the local-scoped
+	// def, resolveRoute would fall back to synced and B's write would
+	// corrupt the shared value), and the object's any.types membership
+	// travels on its own change (without it, the strict local-write
+	// gate rejects the synced Set with type_not_implemented).
 	require.Eventually(t, func() bool {
-		return defsKnownWithScope(ctx, spB, typeId, pinProp, space.ScopeLocal)
-	}, 2*time.Minute, 3*time.Second, "device B: local-scoped def never resolved")
+		if !defsKnownWithScope(ctx, spB, typeId, pinProp, space.ScopeLocal) {
+			return false
+		}
+		row, gerr := spB.Properties().Get(ctx, objId)
+		if gerr != nil || row == nil {
+			return false
+		}
+		for _, v := range row.GetArray("any", "types") {
+			if string(v.GetStringBytes()) == typeId {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Minute, 3*time.Second, "device B: local-scoped def or type membership never resolved")
 	_, err = spB.Properties().Set(ctx, objId, typeId, map[string]any{pinProp: false})
 	require.NoError(t, err, "device B: own local-scope Set")
 	_, err = spB.Properties().Set(ctx, objId, typeId, map[string]any{titleProp: "second"})

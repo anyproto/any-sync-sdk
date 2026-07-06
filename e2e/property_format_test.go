@@ -24,6 +24,7 @@ import (
 //   - UpdatePropertyMeta mutates the ui/filter leaves; format.type
 //     stays pinned; formatless properties reject format-leaf updates.
 func TestSDK_PropertyFormat(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)

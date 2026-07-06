@@ -248,3 +248,123 @@ func TestE2E_NestedSpaces_KeylessGovernance(t *testing.T) {
 	err = orgOwner.Spaces().DeleteChildAsLegalOwner(ctx, child2.Id())
 	require.NoError(t, err, "legalOwner delete of an unreadable child")
 }
+
+// TestE2E_NestedSpaces_Compartments exercises phase 4 of docs/16 — the
+// compartment pattern: one child space per access scope, self-governed
+// membership via direct-add, need-to-know (the org owner governs compartments
+// it cannot read), and a member's effective view = the union of the
+// compartments they belong to.
+func TestE2E_NestedSpaces_Compartments(t *testing.T) {
+	t.Parallel()
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+	t.Logf("using any-sync network config from %s", confPath)
+	if testing.Short() {
+		t.Skip("nested-spaces e2e needs a live coordinator; rerun without -short")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	openSDK := func(name string) *anysyncsdk.SDK {
+		t.Helper()
+		cfg := config.Config{
+			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Network: config.Network{NodeConfYAML: yaml},
+		}
+		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+		require.NoError(t, err, "%s: Open", name)
+		t.Cleanup(func() { _ = sdk.Close() })
+		return sdk
+	}
+
+	orgOwner := openSDK("orgOwner")
+	deptAdmin := openSDK("deptAdmin") // org Admin, creates + runs the compartments
+	bob := openSDK("bob")             // org member, belongs to eng only
+
+	org, err := orgOwner.Spaces().Create(ctx, space.CreateRequest{Name: "Org"})
+	require.NoError(t, err)
+	err = org.ACL().AddAccounts(ctx, []space.MemberAdd{
+		{Identity: deptAdmin.Account().Id(), Permission: space.PermissionAdmin},
+		{Identity: bob.Account().Id(), Permission: space.PermissionWriter},
+	})
+	if isNoNetworkErr(err) {
+		t.Skipf("network unreachable: %v", err)
+	}
+	require.NoError(t, err)
+	adminOrg, err := waitInviteAccepted(t, ctx, deptAdmin, org.Id())
+	if adminOrg == nil {
+		t.Skipf("deptAdmin never received the org invite: %v", err)
+	}
+	if sp, _ := waitInviteAccepted(t, ctx, bob, org.Id()); sp == nil {
+		t.Skip("bob never received the org invite")
+	}
+
+	// two compartments, created by the dept admin: the org owner is
+	// legalOwner-only on both (orgPermission=None) — need-to-know
+	eng, err := deptAdmin.Spaces().CreateChild(ctx, space.CreateChildRequest{
+		ParentSpaceId: org.Id(),
+		Name:          "eng",
+	})
+	if err != nil {
+		t.Skipf("CreateChild failed — coordinator likely predates nested spaces: %v", err)
+	}
+	fin, err := deptAdmin.Spaces().CreateChild(ctx, space.CreateChildRequest{
+		ParentSpaceId: org.Id(),
+		Name:          "finance",
+	})
+	require.NoError(t, err)
+
+	// content in each compartment
+	engType, err := eng.Types().Create(ctx, space.TypeCreateParams{Name: "Doc"})
+	require.NoError(t, err)
+	_, err = eng.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{engType}})
+	require.NoError(t, err)
+	finType, err := fin.Types().Create(ctx, space.TypeCreateParams{Name: "Ledger"})
+	require.NoError(t, err)
+	_, err = fin.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{finType}})
+	require.NoError(t, err)
+
+	// compartment membership is self-governed by its admin via direct-add:
+	// bob joins eng ONLY
+	err = eng.ACL().AddAccounts(ctx, []space.MemberAdd{
+		{Identity: bob.Account().Id(), Permission: space.PermissionWriter},
+	})
+	require.NoError(t, err)
+	bobEng, err := waitInviteAccepted(t, ctx, bob, eng.Id())
+	if bobEng == nil {
+		t.Skipf("bob never received the eng invite: %v", err)
+	}
+
+	// bob's effective view: eng content is readable...
+	readDeadline := time.Now().Add(90 * time.Second)
+	var sawEngContent bool
+	for time.Now().Before(readDeadline) {
+		_ = bobEng.SyncHeads(ctx)
+		if docs, err := bobEng.QueryObjects().All(ctx); err == nil && len(docs) > 0 {
+			sawEngContent = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	assert.True(t, sawEngContent, "bob should read eng content")
+
+	// ...finance is not: bob isn't a member and holds no key
+	finMembers, err := fin.Members().List(ctx)
+	require.NoError(t, err)
+	for _, m := range finMembers {
+		assert.NotEqual(t, bob.Account().Id(), m.Identity, "bob must not be a finance member")
+	}
+
+	// both compartments are REGISTERED visibly — existence is not hidden
+	children, err := orgOwner.Spaces().Children(ctx, org.Id())
+	require.NoError(t, err)
+	assert.Len(t, children, 2)
+
+	// the org owner governs a compartment it cannot read: keyless removal
+	// of bob from eng
+	err = orgOwner.Spaces().RemoveMemberAsLegalOwner(ctx, eng.Id(), bob.Account().Id())
+	require.NoError(t, err, "org owner keyless removal from an unreadable compartment")
+}

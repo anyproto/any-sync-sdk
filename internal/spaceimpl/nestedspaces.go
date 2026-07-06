@@ -49,6 +49,7 @@ func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest)
 	parentAcl := parentHandle.Inner().Acl()
 	parentAcl.RLock()
 	legalOwner, err := parentAcl.AclState().OwnerPubKey()
+	parentAclRootId := parentAcl.Id()
 	parentAcl.RUnlock()
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: CreateChild: resolve parent owner: %w", err)
@@ -76,9 +77,10 @@ func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest)
 		// The child inherits the PARENT's replication key: the whole org
 		// co-locates on one node partition, so a client syncs an org over
 		// one connection set (docs/16, grooming decision 18).
-		ReplicationKey: replicationKeyFromSpaceId(req.ParentSpaceId),
-		ParentSpaceId:  req.ParentSpaceId,
-		LegalOwner:     legalOwner,
+		ReplicationKey:  replicationKeyFromSpaceId(req.ParentSpaceId),
+		ParentSpaceId:   req.ParentSpaceId,
+		LegalOwner:      legalOwner,
+		ParentAclRootId: parentAclRootId,
 	}
 	storagePayload, err := spacepayloads.StoragePayloadForSpaceCreateV1(payload)
 	if err != nil {
@@ -205,6 +207,9 @@ func ensureShareableId(ctx context.Context, app *anysyncx.App, spaceId string) e
 // the member watcher). When the child's stored legalOwner lags a parent
 // ownership transfer, the required AclLegalOwnerUpdate is pushed lazily first.
 func (s *Service) RemoveMemberAsLegalOwner(ctx context.Context, childSpaceId, identity string) error {
+	if s.app.AccountKeys() == nil {
+		return errors.New("spaceimpl: RemoveMemberAsLegalOwner: anysyncx app has no account keys")
+	}
 	target, err := crypto.DecodeAccountAddress(identity)
 	if err != nil {
 		return fmt.Errorf("spaceimpl: RemoveMemberAsLegalOwner: bad identity: %w", err)
@@ -327,30 +332,49 @@ func (s *Service) assembleLegalOwnerProofs(ctx context.Context, parentSpaceId st
 	}
 	parentAcl.RUnlock()
 
+	// Build the chain backward from `to`, always taking the LATEST unused hop that ends at
+	// the current target. This picks the most recent transfers, so proofs already consumed by
+	// an earlier AclLegalOwnerUpdate (which the SDK cannot observe — the consumed set is
+	// unexported) are naturally avoided, and cycled ownership (A->B->A->B) resolves to the
+	// current suffix instead of wedging on a stale earliest match.
+	target := to
+	used := make([]bool, len(hops))
+	var idxChain []int // target->from order
+	for !target.Equals(from) {
+		found := -1
+		for i := len(hops) - 1; i >= 0; i-- {
+			if used[i] {
+				continue
+			}
+			if hops[i].newOwner.Equals(target) {
+				found = i
+				break
+			}
+		}
+		if found == -1 {
+			return nil, fmt.Errorf("spaceimpl: no ownership chain from the child's stored legal owner to this account in parent %s", parentSpaceId)
+		}
+		used[found] = true
+		idxChain = append(idxChain, found)
+		target = hops[found].author
+		if len(idxChain) > len(hops) {
+			return nil, fmt.Errorf("spaceimpl: ownership chain did not converge in parent %s", parentSpaceId)
+		}
+	}
+
 	aclStorage, err := parentHandle.Inner().Storage().AclStorage()
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: parent acl storage: %w", err)
 	}
-	var (
-		proofs   [][]byte
-		expected = from
-	)
-	for _, h := range hops {
-		if !h.author.Equals(expected) {
-			continue
-		}
-		storageRec, err := aclStorage.Get(ctx, h.recordId)
+	// emit in induction order (from -> to): reverse of the backward walk
+	proofs := make([][]byte, 0, len(idxChain))
+	for i := len(idxChain) - 1; i >= 0; i-- {
+		recordId := hops[idxChain[i]].recordId
+		storageRec, err := aclStorage.Get(ctx, recordId)
 		if err != nil {
-			return nil, fmt.Errorf("spaceimpl: read parent acl record %s: %w", h.recordId, err)
+			return nil, fmt.Errorf("spaceimpl: read parent acl record %s: %w", recordId, err)
 		}
 		proofs = append(proofs, storageRec.RawRecord)
-		expected = h.newOwner
-		if expected.Equals(to) {
-			break
-		}
-	}
-	if !expected.Equals(to) {
-		return nil, fmt.Errorf("spaceimpl: no ownership chain from the child's stored legal owner to this account in parent %s", parentSpaceId)
 	}
 	return proofs, nil
 }

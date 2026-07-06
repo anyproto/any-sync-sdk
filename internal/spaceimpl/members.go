@@ -708,6 +708,9 @@ func (w *memberWatcher) tick() {
 	}
 	acl.RLock()
 	head := acl.Head().Id
+	// A pending keyless removal must keep being retried until a rotation lands, even when
+	// the head hasn't moved (a failed publish at boot would otherwise never re-attempt).
+	pendingRotation := acl.AclState().HasPendingKeylessRemovals()
 	w.mu.Lock()
 	headChanged := head != w.headId
 	dirty := w.profilesDirty
@@ -716,7 +719,7 @@ func (w *memberWatcher) tick() {
 	// profile-loop sets profilesDirty when it pulls fresh data so
 	// snapshots get rebuilt with new overrides even if AclList head
 	// hasn't moved.
-	if !headChanged && !dirty {
+	if !headChanged && !dirty && !pendingRotation {
 		acl.RUnlock()
 		return
 	}
@@ -747,7 +750,10 @@ func (w *memberWatcher) tick() {
 	// Complete a pending keyless removal (nested spaces): when the
 	// legalOwner removed a member without a rotation, the first
 	// key-holding device that may rotate restores forward secrecy.
-	if headChanged {
+	// Retried every tick while pending — a boot-time publish failure
+	// (node not yet connected) is re-attempted on the next poll tick
+	// rather than waiting for an unrelated ACL record to move the head.
+	if pendingRotation {
 		w.maybeCompleteKeylessRemoval(ctx)
 	}
 

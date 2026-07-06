@@ -598,7 +598,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		Description:   r.Description,
 		IconCID:       r.IconCID,
 		Status:        mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
-		ParentSpaceId: r.ParentSpaceId,
+		ParentSpaceId: s.resolveParentSpaceId(ctx, r.Id, r.ParentSpaceId),
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band

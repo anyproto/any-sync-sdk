@@ -124,3 +124,24 @@ func (s *Service) resolveAuthor(ctx context.Context, spaceId string) string {
 	}
 	return ""
 }
+
+// resolveParentSpaceId returns the child (nested) space's declared parent from
+// the ACL when the tech-space row doesn't carry it. Only the creator's own
+// device writes FieldParentSpaceId at CreateChild; joiners/tracked rows learn
+// it here from the loaded ACL root. Best-effort, non-loading (PickSpace).
+func (s *Service) resolveParentSpaceId(ctx context.Context, spaceId, cached string) string {
+	if cached != "" {
+		return cached
+	}
+	handle, ok := s.app.PickSpace(ctx, spaceId)
+	if !ok {
+		return ""
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return ""
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	return acl.AclState().ParentSpaceId()
+}

@@ -248,10 +248,13 @@ ACL.
    live consensus-watched ACL and rejects any `AclLegalOwnerUpdate` /
    keyless-removal not authored by the parent's *current* owner. Treat the
    client-side induction as replay-hardened defense-in-depth against a
-   malicious *node*, not as a self-sufficient authority proof. Fully closing
-   the offline gap would require an acceptor-inclusion proof on each embedded
-   record — not available today (the client `ValidateFull` path's
-   `VerifyAcceptor` is a no-op); tracked as an open question.
+   malicious *node*, not as a self-sufficient authority proof. Relying on the
+   coordinator here is **accepted** (open question 13): the coordinator is a
+   handshake-verified network member that already validates every incoming ACL
+   record, so this reuses the network's existing trust in it rather than
+   introducing a new trusted party. (Closing the offline gap fully would need
+   an acceptor-inclusion proof on each embedded record — the `ValidateFull`
+   `VerifyAcceptor` is a no-op today — an any-sync change; not planned.)
 
 4. **Coordinator `SpaceSign` extension.** Request carries a pointer to the
    parent registration record; server-side validation does the nested checks
@@ -737,19 +740,23 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
     (verified). The coordinator derives fresh. replicationKey inheritance
     (required change 7) co-locates the org on one partition purely as a
     client connection-count optimization, never a validation dependency.
-13. **legalOwner authority under malicious infrastructure.** The client-side
+13. **legalOwner authority under malicious infrastructure — RESOLVED
+    (2026-07-07): accept trusted-coordinator governance.** The client-side
     signature induction is defense-in-depth, not an authority proof: it does
     not verify that the embedded ownership-change records were accepted into
     the parent's consensus log, so the current stored legalOwner can advance
     the child's key off-chain. The coordinator's current-owner check (over its
-    live consensus-watched parent ACL) is the authoritative boundary, so
-    legalOwner governance is safe under a trusted coordinator but NOT a pure
-    cryptographic guarantee against a malicious coordinator. Decide for v1:
-    accept trusted-coordinator governance (likely), or require an
-    acceptor-inclusion proof on each embedded record — the latter needs the
-    client `ValidateFull` verifier to check the consensus acceptor signature
-    (today a no-op), an any-sync change and a re-groom. (See the trust-boundary
-    note under required change 3.)
+    live consensus-watched parent ACL) is the authoritative boundary. This is
+    **consistent with the existing network trust model, not a new assumption**:
+    the coordinator is a handshake-verified network member and already
+    validates every incoming ACL record before it reaches consensus, so
+    legalOwner governance relies on trust the network already places in the
+    coordinator — it does not introduce a new trusted party. Accepted for v1;
+    no acceptor-inclusion proof required. (If a future deployment ever needs
+    legalOwner governance to hold against a malicious coordinator, the path is
+    an acceptor-inclusion proof on each embedded record — the client
+    `ValidateFull` verifier checking the consensus acceptor signature, today a
+    no-op — an any-sync change and a re-groom. Not planned.)
 
 ## Phasing (proposed)
 

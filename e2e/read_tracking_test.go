@@ -20,13 +20,23 @@ import (
 // as "message", deletes/edits untracked; the SDK materializes the
 // per-record `unread` flag and the `unreadCount` row property.
 const (
-	rtDataset     = "rt_chat"
-	rtDataVersion = "rt_chat-v1"
-	rtTypeId      = "rt-chat-type"
-	rtTagMessage  = "message"
-	rtFieldUnread = "unread"
-	rtPropCount   = "unreadCount"
+	rtDataset      = "rt_chat"
+	rtDataVersion  = "rt_chat-v1"
+	rtTypeId       = "rt-chat-type"
+	rtTagMessage   = "message"
+	rtTagReaction  = "reaction"
+	rtFieldCreator = "creator"
+	rtFieldUnread  = "unread"
+	rtPropCount    = "unreadCount"
 )
+
+// rtAudienceSelf builds the audience filter "the target record was
+// created by this replica's account" — the identity-relative verdict
+// reactions use so only the reacted-to message's author gets badged.
+func rtAudienceSelf(self string) query.Filter {
+	return query.Key{Path: []string{rtFieldCreator},
+		Filter: query.NewComp(query.CompOpEq, self)}
+}
 
 func newReadTrackedType() handler.Type {
 	return handler.Type{
@@ -43,10 +53,27 @@ func newReadTrackedType() handler.Type {
 				},
 			},
 			ReadTracking: &handler.ReadTracking{
-				Classify: func(_ *handler.ChangeCtx, rec *handler.RecordChange) handler.ReadClassification {
+				Classify: func(ctx *handler.ChangeCtx, rec *handler.RecordChange) handler.ReadClassification {
 					for i := range rec.Ops {
-						if rec.Ops[i].Type == handler.OpDelete {
+						op := &rec.Ops[i]
+						switch op.Type {
+						case handler.OpDelete:
 							return handler.ReadClassification{}
+						case handler.OpSet, handler.OpUnset:
+							// reactions.<reactorId> — audience-restricted:
+							// counts unread only for the message's author.
+							if len(op.Path) == 2 && op.Path[0] == "reactions" {
+								key := "reaction:" + op.Path[1] + ":" + rec.Id
+								if op.Type == handler.OpSet {
+									return handler.ReadClassification{
+										Track:    true,
+										Tags:     []string{rtTagReaction},
+										Key:      key,
+										Audience: rtAudienceSelf(ctx.SelfIdentity),
+									}
+								}
+								return handler.ReadClassification{Key: key}
+							}
 						}
 					}
 					if rec.Upsert {
@@ -85,6 +112,10 @@ func newReadTrackedType() handler.Type {
 //     state: it lands on the account's real read state via the synced
 //     frontier (the new message stays unread) instead of first-sight
 //     seeding everything read.
+//  8. Audience-restricted entries: a reaction (classified with an
+//     Audience filter on the target's `creator`) counts unread only
+//     for the reacted-to message's author — a reaction on someone
+//     else's message syncs without badging; un-react supersedes.
 func TestE2E_ReadTracking(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -126,7 +157,13 @@ func TestE2E_ReadTracking(t *testing.T) {
 	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{rtTypeId}})
 	require.NoError(t, err)
 
-	send := func(from space.Space, msgId, text string) {
+	ownerId := owner.Account().Id()
+	require.NotEmpty(t, ownerId)
+
+	// send stamps `creator` alongside the text — the immutable
+	// creation stamp the reaction audience filter (step 8) resolves
+	// against.
+	send := func(from space.Space, msgId, text, creator string) {
 		t.Helper()
 		_, err := from.Modify(ctx, space.ModifyBatch{
 			ObjectId: objId,
@@ -134,13 +171,16 @@ func TestE2E_ReadTracking(t *testing.T) {
 			Records: []space.RecordModify{{
 				Id:     msgId,
 				Upsert: true,
-				Ops:    []space.Op{{Type: space.OpSet, Path: "text", Value: text}},
+				Ops: []space.Op{
+					{Type: space.OpSet, Path: "text", Value: text},
+					{Type: space.OpSet, Path: rtFieldCreator, Value: creator},
+				},
 			}},
 		})
 		require.NoError(t, err, "send %s", msgId)
 	}
-	send(sp, "m1", "hello")
-	send(sp, "m2", "world")
+	send(sp, "m1", "hello", ownerId)
+	send(sp, "m2", "world", ownerId)
 
 	// (1) Self-authored: nothing unread on the owner.
 	counts, err := sp.ReadState().UnreadCounts(ctx, objId)
@@ -149,6 +189,8 @@ func TestE2E_ReadTracking(t *testing.T) {
 
 	// ---- Member joins (invite → request → accept → active) ----
 	member := open("member", memberProvider)
+	memberId := member.Account().Id()
+	require.NotEmpty(t, memberId)
 
 	var inv space.Invite
 	if !waitFor(ctx, 30*time.Second, time.Second, func() bool {
@@ -231,7 +273,7 @@ func TestE2E_ReadTracking(t *testing.T) {
 	require.Empty(t, snap, "member: unread snapshot empty after seed")
 
 	// (3) New owner message → unread on the member, everywhere.
-	send(sp, "m3", "post-join")
+	send(sp, "m3", "post-join", ownerId)
 	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
 		_ = mSp.SyncHeads(ctx)
 		found, unread := getMsg(mSp, "m3")
@@ -256,7 +298,7 @@ func TestE2E_ReadTracking(t *testing.T) {
 
 	// (4) The member's own reply: read for the member, unread for the
 	// owner (identity, not device).
-	send(mSp, "m4", "reply")
+	send(mSp, "m4", "reply", memberId)
 	require.Equal(t, 1, unreadCount(mSp), "member: own reply stays read")
 	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
 		_ = sp.SyncHeads(ctx)
@@ -297,7 +339,7 @@ func TestE2E_ReadTracking(t *testing.T) {
 	}
 
 	// A fresh owner message goes unread on BOTH member devices.
-	send(sp, "m5", "for both devices")
+	send(sp, "m5", "for both devices", ownerId)
 	for name, s := range map[string]space.Space{"m-dev1": mSp, "m-dev2": m2Sp} {
 		s := s
 		if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
@@ -321,7 +363,7 @@ func TestE2E_ReadTracking(t *testing.T) {
 	}
 
 	// (6) Deleting an unread message clears it without reading.
-	send(sp, "m6", "to be deleted")
+	send(sp, "m6", "to be deleted", ownerId)
 	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
 		_ = mSp.SyncHeads(ctx)
 		return unreadCount(mSp) == 1
@@ -341,7 +383,7 @@ func TestE2E_ReadTracking(t *testing.T) {
 	// frontier. Device one read through m5 (step 5) and never reads
 	// m7; a brand-new device must show exactly m7 unread — the
 	// account's real state — not first-sight-seed it read.
-	send(sp, "m7", "unread on fresh device")
+	send(sp, "m7", "unread on fresh device", ownerId)
 	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
 		_ = mSp.SyncHeads(ctx)
 		found, unread := getMsg(mSp, "m7")
@@ -375,5 +417,71 @@ func TestE2E_ReadTracking(t *testing.T) {
 		return f5 && !u5 && f7 && u7 && unreadCount(m3Sp) == 1
 	}) {
 		t.Fatalf("member device 3 never landed on the account's real read state (m7 unread, rest read)")
+	}
+
+	// ---- (8) Audience-restricted entries (ReadClassification.Audience):
+	// a reaction counts unread ONLY on the replica whose account
+	// authored the reacted-to record. m4 is the member's message, m1
+	// the owner's own — the owner reacting to each must badge the
+	// member exactly once.
+	react := func(from space.Space, msgId, reactor string, on bool) {
+		t.Helper()
+		opType := space.OpSet
+		if !on {
+			opType = space.OpUnset
+		}
+		_, rerr := from.Modify(ctx, space.ModifyBatch{
+			ObjectId: objId,
+			Dataset:  rtDataset,
+			Records: []space.RecordModify{{
+				Id:  msgId,
+				Ops: []space.Op{{Type: opType, Path: "reactions." + reactor, Value: 1}},
+			}},
+		})
+		require.NoError(t, rerr, "react %s on %s", reactor, msgId)
+	}
+	reactionCount := func(from space.Space) int {
+		c, cerr := from.ReadState().UnreadCounts(ctx, objId)
+		if cerr != nil {
+			return -1
+		}
+		return c[rtTagReaction]
+	}
+
+	// Owner reacts to the member's m4 → unread reaction on the member.
+	react(sp, "m4", "slot-a", true)
+	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = mSp.SyncHeads(ctx)
+		return reactionCount(mSp) == 1
+	}) {
+		t.Fatalf("member: reaction on the member's message never counted unread")
+	}
+
+	// Owner reacts to its OWN m1: the member is not the audience — the
+	// change syncs (reaction visible on the record) but never counts.
+	react(sp, "m1", "slot-b", true)
+	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = mSp.SyncHeads(ctx)
+		doc, qerr := mSp.Query(objId, rtDataset).Filter(query.Key{
+			Path:   []string{"id"},
+			Filter: query.NewComp(query.CompOpEq, "m1"),
+		}).One(ctx)
+		return qerr == nil && doc.Get("reactions", "slot-b") != nil
+	}) {
+		t.Fatalf("member: owner's reaction on m1 never synced")
+	}
+	require.Equal(t, 1, reactionCount(mSp),
+		"member: a reaction on the owner's own message must not badge the member")
+	require.Equal(t, 0, reactionCount(sp),
+		"owner: self-authored reactions are born read")
+
+	// Un-react m4: the supersede key clears the member's pending entry
+	// without any read call.
+	react(sp, "m4", "slot-a", false)
+	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = mSp.SyncHeads(ctx)
+		return reactionCount(mSp) == 0
+	}) {
+		t.Fatalf("member: un-react never cleared the unread reaction")
 	}
 }

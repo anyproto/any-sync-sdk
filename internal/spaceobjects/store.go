@@ -1395,7 +1395,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 		}
 		ctrl.SetSpaceId(s.spaceId)
 		ctrl.SetApplySeqAllocator(s.applySeqs)
-		ctrl.SetApplyHook(s.readApplyHook())
+		ctrl.SetApplyHook(s.readApplyHook(ctrl))
 		return ctrl, nil
 	}
 	coll, err := s.SharedObjects(ctx)
@@ -1438,6 +1438,6 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	ctrl.SetSpaceId(s.spaceId)
 	ctrl.SetApplySeqAllocator(s.applySeqs)
-	ctrl.SetApplyHook(s.readApplyHook())
+	ctrl.SetApplyHook(s.readApplyHook(ctrl))
 	return ctrl, nil
 }

@@ -79,15 +79,29 @@ ReadTracking: &handler.ReadTracking{
 }
 
 type Classification struct {
-    Track bool
-    Tags  []string
-    Key   string // optional supersede key
+    Track    bool
+    Tags     []string
+    Key      string       // optional supersede key
+    Audience query.Filter // optional audience restriction, see below
 }
 ```
 
 Per applied change on a tracked dataset: self-authored or covered by
 the frontier → read (no row); otherwise insert an unread row with the
 classifier's tags and bump counters. Untracked datasets pay nothing.
+
+**Audience-restricted entries.** A verdict may carry `Audience`, a
+typed any-store filter the engine matches against the TARGET record
+(one in-tx point read, post-apply). The entry tracks only on replicas
+where the record matches; everywhere else the change applies untracked
+— the Key still supersedes/clears. Read state is device-local, so
+per-replica divergence here is by design. The classifier builds
+identity-relative filters from `ChangeCtx.SelfIdentity` (populated on
+the classify path only — handler validation stays replica-independent).
+Canonical use: a reaction badges only the reacted-to message's author
+(`creator == SelfIdentity`). Audience filters must consult only
+fields immutable post-create (derived creation stamps), or replays
+diverge.
 
 **Record deletion** clears every unread row referencing the deleted
 recordIds in the same tx (counters and flags drop, the object surfaces

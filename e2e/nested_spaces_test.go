@@ -63,9 +63,7 @@ func TestE2E_NestedSpaces_CreateChild(t *testing.T) {
 	if isNoNetworkErr(err) {
 		t.Skipf("network unreachable on CreateChild: %v", err)
 	}
-	if err != nil {
-		t.Skipf("CreateChild failed — coordinator likely predates nested spaces: %v", err)
-	}
+	require.NoError(t, err, "CreateChild (needs a nested-spaces coordinator)")
 	require.NotEqual(t, org.Id(), child.Id())
 
 	// the registration is visible
@@ -100,9 +98,7 @@ func TestE2E_NestedSpaces_CreateChild(t *testing.T) {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	if shareableErr != nil {
-		t.Logf("child never became shareable: %v", shareableErr)
-	}
+	require.NoError(t, shareableErr, "child never became shareable — the coordinator did not accept the nested SpaceSign")
 
 	// a Writer in the org cannot register children
 	err = org.ACL().AddAccounts(ctx, []space.MemberAdd{
@@ -114,9 +110,8 @@ func TestE2E_NestedSpaces_CreateChild(t *testing.T) {
 	require.NoError(t, err, "owner: add writer to org")
 
 	writerOrg, err := waitInviteAccepted(t, ctx, writer, org.Id())
-	if writerOrg == nil {
-		t.Skipf("writer never received the org invite: %v", err)
-	}
+	require.NoError(t, err, "writer must receive the org invite")
+	require.NotNil(t, writerOrg)
 	_, err = writer.Spaces().CreateChild(ctx, space.CreateChildRequest{
 		ParentSpaceId: org.Id(),
 		Name:          "Should fail",
@@ -187,18 +182,18 @@ func TestE2E_NestedSpaces_KeylessGovernance(t *testing.T) {
 	}
 	require.NoError(t, err)
 	adminOrg, err := waitInviteAccepted(t, ctx, admin, org.Id())
-	if adminOrg == nil {
-		t.Skipf("admin never received the org invite: %v", err)
-	}
+	require.NoError(t, err, "admin must receive the org invite")
+	require.NotNil(t, adminOrg)
 
 	// the admin creates a child — org owner is legalOwner-only, holds no key
 	child, err := admin.Spaces().CreateChild(ctx, space.CreateChildRequest{
 		ParentSpaceId: org.Id(),
 		Name:          "Team",
 	})
-	if err != nil {
-		t.Skipf("CreateChild failed — coordinator likely predates nested spaces: %v", err)
+	if isNoNetworkErr(err) {
+		t.Skipf("network unreachable on CreateChild: %v", err)
 	}
+	require.NoError(t, err, "CreateChild (needs a nested-spaces coordinator)")
 
 	// the child gets a member
 	err = child.ACL().AddAccounts(ctx, []space.MemberAdd{
@@ -206,9 +201,8 @@ func TestE2E_NestedSpaces_KeylessGovernance(t *testing.T) {
 	})
 	require.NoError(t, err)
 	memberChild, err := waitInviteAccepted(t, ctx, member, child.Id())
-	if memberChild == nil {
-		t.Skipf("member never received the child invite: %v", err)
-	}
+	require.NoError(t, err, "member must receive the child invite")
+	require.NotNil(t, memberChild)
 
 	// the ORG OWNER — not a member of the child — removes the member keylessly
 	err = orgOwner.Spaces().RemoveMemberAsLegalOwner(ctx, child.Id(), member.Account().Id())
@@ -239,14 +233,147 @@ func TestE2E_NestedSpaces_KeylessGovernance(t *testing.T) {
 	}
 	assert.True(t, rotated, "auto-rotation should clear the pending keyless removal")
 
-	// the org owner deletes a second child it cannot read
+	// the org owner deletes a second child it cannot read. The coordinator only
+	// learns of a child at its first push (SpaceSign), so retry until the fresh
+	// child is deletable rather than racing that registration.
 	child2, err := admin.Spaces().CreateChild(ctx, space.CreateChildRequest{
 		ParentSpaceId: org.Id(),
 		Name:          "Doomed",
 	})
 	require.NoError(t, err)
-	err = orgOwner.Spaces().DeleteChildAsLegalOwner(ctx, child2.Id())
-	require.NoError(t, err, "legalOwner delete of an unreadable child")
+	var delErr error
+	for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); {
+		delErr = orgOwner.Spaces().DeleteChildAsLegalOwner(ctx, child2.Id())
+		if delErr == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	require.NoError(t, delErr, "legalOwner delete of an unreadable child")
+}
+
+// TestE2E_NestedSpaces_LegalOwnerTransfer exercises the lazy legal-owner
+// induction (docs/16, grooming decision 14): the org's ownership moves after a
+// child was created, so the child's stored legalOwner names the EX-owner. The
+// new owner's keyless removal must first assemble the ownership-proof chain and
+// publish AclLegalOwnerUpdate; the ex-owner — still the child's STORED
+// legalOwner — must be rejected by the coordinator's current-owner gate.
+func TestE2E_NestedSpaces_LegalOwnerTransfer(t *testing.T) {
+	t.Parallel()
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+	t.Logf("using any-sync network config from %s", confPath)
+	if testing.Short() {
+		t.Skip("nested-spaces e2e needs a live coordinator; rerun without -short")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	openSDK := func(name string) *anysyncsdk.SDK {
+		t.Helper()
+		cfg := config.Config{
+			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Network: config.Network{NodeConfYAML: yaml},
+		}
+		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+		require.NoError(t, err, "%s: Open", name)
+		t.Cleanup(func() { _ = sdk.Close() })
+		return sdk
+	}
+
+	oldOwner := openSDK("oldOwner")
+	newOwner := openSDK("newOwner")
+	admin := openSDK("admin")   // org member, creates the child
+	member := openSDK("member") // removed keylessly by the NEW owner
+
+	org, err := oldOwner.Spaces().Create(ctx, space.CreateRequest{Name: "Org"})
+	require.NoError(t, err)
+	err = org.ACL().AddAccounts(ctx, []space.MemberAdd{
+		{Identity: newOwner.Account().Id(), Permission: space.PermissionAdmin},
+		{Identity: admin.Account().Id(), Permission: space.PermissionAdmin},
+	})
+	if isNoNetworkErr(err) {
+		t.Skipf("network unreachable: %v", err)
+	}
+	require.NoError(t, err)
+	newOwnerOrg, err := waitInviteAccepted(t, ctx, newOwner, org.Id())
+	require.NoError(t, err, "newOwner must receive the org invite")
+	require.NotNil(t, newOwnerOrg)
+	adminOrg, err := waitInviteAccepted(t, ctx, admin, org.Id())
+	require.NoError(t, err, "admin must receive the org invite")
+	require.NotNil(t, adminOrg)
+
+	// child created while oldOwner rules: its acl root pins oldOwner as legalOwner
+	child, err := admin.Spaces().CreateChild(ctx, space.CreateChildRequest{
+		ParentSpaceId: org.Id(),
+		Name:          "Team",
+	})
+	if isNoNetworkErr(err) {
+		t.Skipf("network unreachable on CreateChild: %v", err)
+	}
+	require.NoError(t, err, "CreateChild (needs a nested-spaces coordinator)")
+	err = child.ACL().AddAccounts(ctx, []space.MemberAdd{
+		{Identity: member.Account().Id(), Permission: space.PermissionWriter},
+	})
+	require.NoError(t, err)
+	memberChild, err := waitInviteAccepted(t, ctx, member, child.Id())
+	require.NoError(t, err, "member must receive the child invite")
+	require.NotNil(t, memberChild)
+
+	// org ownership moves oldOwner -> newOwner; wait until the new owner's
+	// device sees itself as the org owner (it reads the chain locally when
+	// assembling the legal-owner proofs)
+	require.NoError(t, org.ACL().OwnershipChange(ctx, newOwner.Account().Id(), space.PermissionAdmin))
+	ownershipSeen := false
+	for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); {
+		members, err := newOwnerOrg.Members().List(ctx)
+		if err == nil {
+			for _, m := range members {
+				if m.Identity == newOwner.Account().Id() && m.Permission == space.PermissionOwner {
+					ownershipSeen = true
+				}
+			}
+		}
+		if ownershipSeen {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	require.True(t, ownershipSeen, "newOwner must observe the org ownership transfer")
+
+	// the EX-owner is still the child's STORED legalOwner, so its client-side
+	// state happily builds the removal — the coordinator's current-owner gate
+	// must reject it
+	err = oldOwner.Spaces().RemoveMemberAsLegalOwner(ctx, child.Id(), member.Account().Id())
+	require.Error(t, err, "an ex-owner must not govern the child")
+
+	// the NEW owner is not the stored legalOwner yet: this exercises the full
+	// induction — assemble proofs, publish AclLegalOwnerUpdate, then remove
+	err = newOwner.Spaces().RemoveMemberAsLegalOwner(ctx, child.Id(), member.Account().Id())
+	require.NoError(t, err, "keyless removal by the new owner after the induction update")
+
+	// the removal is authoritative on the child acl: the admin's device
+	// observes the member leaving the active set
+	memberOut := false
+	for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); {
+		members, err := child.Members().List(ctx)
+		if err == nil {
+			memberOut = true
+			for _, m := range members {
+				if m.Identity == member.Account().Id() && m.Permission != space.PermissionNone {
+					memberOut = false
+				}
+			}
+			if memberOut {
+				break
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	assert.True(t, memberOut, "member must be removed from the child after the legalOwner-transfer removal")
 }
 
 // TestE2E_NestedSpaces_Compartments exercises phase 4 of docs/16 — the
@@ -295,12 +422,11 @@ func TestE2E_NestedSpaces_Compartments(t *testing.T) {
 	}
 	require.NoError(t, err)
 	adminOrg, err := waitInviteAccepted(t, ctx, deptAdmin, org.Id())
-	if adminOrg == nil {
-		t.Skipf("deptAdmin never received the org invite: %v", err)
-	}
-	if sp, _ := waitInviteAccepted(t, ctx, bob, org.Id()); sp == nil {
-		t.Skip("bob never received the org invite")
-	}
+	require.NoError(t, err, "deptAdmin must receive the org invite")
+	require.NotNil(t, adminOrg)
+	bobOrg, err := waitInviteAccepted(t, ctx, bob, org.Id())
+	require.NoError(t, err, "bob must receive the org invite")
+	require.NotNil(t, bobOrg)
 
 	// two compartments, created by the dept admin: the org owner is
 	// legalOwner-only on both (orgPermission=None) — need-to-know
@@ -308,9 +434,10 @@ func TestE2E_NestedSpaces_Compartments(t *testing.T) {
 		ParentSpaceId: org.Id(),
 		Name:          "eng",
 	})
-	if err != nil {
-		t.Skipf("CreateChild failed — coordinator likely predates nested spaces: %v", err)
+	if isNoNetworkErr(err) {
+		t.Skipf("network unreachable on CreateChild: %v", err)
 	}
+	require.NoError(t, err, "CreateChild (needs a nested-spaces coordinator)")
 	fin, err := deptAdmin.Spaces().CreateChild(ctx, space.CreateChildRequest{
 		ParentSpaceId: org.Id(),
 		Name:          "finance",
@@ -334,9 +461,8 @@ func TestE2E_NestedSpaces_Compartments(t *testing.T) {
 	})
 	require.NoError(t, err)
 	bobEng, err := waitInviteAccepted(t, ctx, bob, eng.Id())
-	if bobEng == nil {
-		t.Skipf("bob never received the eng invite: %v", err)
-	}
+	require.NoError(t, err, "bob must receive the eng invite")
+	require.NotNil(t, bobEng)
 
 	// bob's effective view: eng content is readable...
 	readDeadline := time.Now().Add(90 * time.Second)

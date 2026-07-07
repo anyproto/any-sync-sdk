@@ -281,7 +281,25 @@ func (s *Service) ensureLegalOwnerCurrent(ctx context.Context, handle anysyncx.S
 	if stored.Equals(ourKey) {
 		return nil
 	}
-	proofs, err := s.assembleLegalOwnerProofs(ctx, parentSpaceId, stored, ourKey)
+	// Only the parent's CURRENT owner may advance the child's legalOwner. Without this the
+	// SDK would happily assemble a chain for anyone a hop path exists to (e.g. an ex-owner via
+	// a stale ownership hop) and submit it — the coordinator rejects it (author must be the
+	// current owner), but building it wastes a round trip and can consume/wedge the chain.
+	parentHandle, err := s.app.GetSpace(ctx, parentSpaceId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: load parent %s: %w", parentSpaceId, err)
+	}
+	parentAcl := parentHandle.Inner().Acl()
+	parentAcl.RLock()
+	currentOwner, ownerErr := parentAcl.AclState().OwnerPubKey()
+	parentAcl.RUnlock()
+	if ownerErr != nil {
+		return fmt.Errorf("spaceimpl: resolve parent owner: %w", ownerErr)
+	}
+	if !currentOwner.Equals(ourKey) {
+		return fmt.Errorf("spaceimpl: not the current owner of parent %s; only it may act as legalOwner", parentSpaceId)
+	}
+	proofs, err := s.assembleLegalOwnerProofs(ctx, parentHandle, stored, ourKey)
 	if err != nil {
 		return err
 	}
@@ -300,11 +318,7 @@ func (s *Service) ensureLegalOwnerCurrent(ctx context.Context, handle anysyncx.S
 // assembleLegalOwnerProofs walks the parent acl's ownership-change records and
 // returns the raw signed record bytes forming the induction chain from key
 // `from` to key `to`.
-func (s *Service) assembleLegalOwnerProofs(ctx context.Context, parentSpaceId string, from, to crypto.PubKey) ([][]byte, error) {
-	parentHandle, err := s.app.GetSpace(ctx, parentSpaceId)
-	if err != nil {
-		return nil, fmt.Errorf("spaceimpl: load parent %s: %w", parentSpaceId, err)
-	}
+func (s *Service) assembleLegalOwnerProofs(ctx context.Context, parentHandle anysyncx.SpaceHandle, from, to crypto.PubKey) ([][]byte, error) {
 	type hop struct {
 		recordId string
 		author   crypto.PubKey
@@ -312,31 +326,42 @@ func (s *Service) assembleLegalOwnerProofs(ctx context.Context, parentSpaceId st
 	}
 	var hops []hop
 	parentAcl := parentHandle.Inner().Acl()
+	parentAclRootId := parentAcl.Id()
 	parentAcl.RLock()
 	for _, rec := range parentAcl.Records() {
 		data, ok := rec.Model.(*aclrecordproto.AclData)
 		if !ok {
 			continue
 		}
-		for _, content := range data.GetAclContent() {
-			oc := content.GetOwnershipChange()
-			if oc == nil {
-				continue
-			}
-			newOwner, err := crypto.UnmarshalEd25519PublicKeyProto(oc.NewOwnerIdentity)
-			if err != nil {
-				continue
-			}
-			hops = append(hops, hop{recordId: rec.Id, author: rec.Identity, newOwner: newOwner})
+		// mirror the validator: a usable proof is a record with EXACTLY one content that is an
+		// ownership change bound to this parent acl. A batched or mis-stamped record is not a
+		// valid proof, so it must not be indexed as a hop (else picking it emits a rejected chain).
+		contents := data.GetAclContent()
+		if len(contents) != 1 {
+			continue
 		}
+		oc := contents[0].GetOwnershipChange()
+		if oc == nil {
+			continue
+		}
+		if oc.AclRootId != parentAclRootId {
+			continue
+		}
+		newOwner, err := crypto.UnmarshalEd25519PublicKeyProto(oc.NewOwnerIdentity)
+		if err != nil {
+			continue
+		}
+		hops = append(hops, hop{recordId: rec.Id, author: rec.Identity, newOwner: newOwner})
 	}
 	parentAcl.RUnlock()
 
-	// Build the chain backward from `to`, always taking the LATEST unused hop that ends at
-	// the current target. This picks the most recent transfers, so proofs already consumed by
-	// an earlier AclLegalOwnerUpdate (which the SDK cannot observe — the consumed set is
-	// unexported) are naturally avoided, and cycled ownership (A->B->A->B) resolves to the
-	// current suffix instead of wedging on a stale earliest match.
+	// Build the chain backward from `to`, always taking the LATEST unused hop that ends at the
+	// current target. This picks the most recent transfers, so an already-consumed proof (the
+	// consumed set is the CIDs of proofs embedded in the child's own prior AclLegalOwnerUpdate
+	// records) is naturally avoided in a legitimate linear ownership history, and cycled
+	// ownership (A->B->A->B) resolves to the current suffix instead of a stale earliest match.
+	// The caller (ensureLegalOwnerCurrent) already verified we are the parent's current owner,
+	// so the needed chain is always the post-last-update suffix.
 	target := to
 	used := make([]bool, len(hops))
 	var idxChain []int // target->from order
@@ -352,13 +377,13 @@ func (s *Service) assembleLegalOwnerProofs(ctx context.Context, parentSpaceId st
 			}
 		}
 		if found == -1 {
-			return nil, fmt.Errorf("spaceimpl: no ownership chain from the child's stored legal owner to this account in parent %s", parentSpaceId)
+			return nil, fmt.Errorf("spaceimpl: no ownership chain from the child's stored legal owner to this account in parent %s", parentHandle.Inner().Id())
 		}
 		used[found] = true
 		idxChain = append(idxChain, found)
 		target = hops[found].author
 		if len(idxChain) > len(hops) {
-			return nil, fmt.Errorf("spaceimpl: ownership chain did not converge in parent %s", parentSpaceId)
+			return nil, fmt.Errorf("spaceimpl: ownership chain did not converge in parent %s", parentHandle.Inner().Id())
 		}
 	}
 

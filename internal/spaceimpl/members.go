@@ -26,6 +26,11 @@ import (
 // without burning CPU.
 const memberPollInterval = 250 * time.Millisecond
 
+// keylessRotationRetryInterval throttles retrying the read-key rotation that completes a
+// pending keyless removal (nested spaces) so a persistent pending state doesn't publish
+// every poll tick.
+const keylessRotationRetryInterval = 10 * time.Second
+
 // identityRepoPollInterval governs how often the watcher refreshes
 // every member's profile from identityRepo. Network call to the
 // coordinator — a low rate is fine; profile updates are rare and
@@ -582,6 +587,9 @@ type memberWatcher struct {
 	// 1 so coalesced kicks don't block the syncacl write path.
 	kickCh chan struct{}
 
+	// lastKeylessRotation throttles maybeCompleteKeylessRemoval's publish attempts (guarded by mu)
+	lastKeylessRotation time.Time
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -711,18 +719,26 @@ func (w *memberWatcher) tick() {
 	// A pending keyless removal must keep being retried until a rotation lands, even when
 	// the head hasn't moved (a failed publish at boot would otherwise never re-attempt).
 	pendingRotation := acl.AclState().HasPendingKeylessRemovals()
+	acl.RUnlock()
 	w.mu.Lock()
 	headChanged := head != w.headId
 	dirty := w.profilesDirty
 	w.mu.Unlock()
-	// Skip the rest of the tick when nothing changed — the
-	// profile-loop sets profilesDirty when it pulls fresh data so
-	// snapshots get rebuilt with new overrides even if AclList head
-	// hasn't moved.
-	if !headChanged && !dirty && !pendingRotation {
-		acl.RUnlock()
+
+	// Attempt to complete a pending keyless removal (nested spaces) independently of the
+	// snapshot rebuild, with backoff so a persistent pending state (e.g. no key-holding admin
+	// online) doesn't publish or churn every poll tick.
+	if pendingRotation {
+		w.maybeCompleteKeylessRemoval(ctx)
+	}
+
+	// Skip the snapshot rebuild when nothing member-visible changed. A pending rotation alone
+	// must NOT force the full collectMembers/profile work on every tick — only head/profile
+	// movement does.
+	if !headChanged && !dirty {
 		return
 	}
+	acl.RLock()
 	current, symKeys := collectMembers(acl)
 	state := acl.AclState()
 	meActive := false
@@ -745,16 +761,6 @@ func (w *memberWatcher) tick() {
 	// promptly after the owner's accept replicates.
 	if meActive {
 		w.maybeFlipTechSpaceJoining(ctx)
-	}
-
-	// Complete a pending keyless removal (nested spaces): when the
-	// legalOwner removed a member without a rotation, the first
-	// key-holding device that may rotate restores forward secrecy.
-	// Retried every tick while pending — a boot-time publish failure
-	// (node not yet connected) is re-attempted on the next poll tick
-	// rather than waiting for an unrelated ACL record to move the head.
-	if pendingRotation {
-		w.maybeCompleteKeylessRemoval(ctx)
 	}
 
 	// Cache each member's metadata symkey into the synced account-scoped
@@ -1209,6 +1215,17 @@ func (s *Service) ResolveIdentityProfiles(ctx context.Context) {
 // another device is fine — its rotation clears the pending state and this
 // build/publish fails on the stale prev id.
 func (w *memberWatcher) maybeCompleteKeylessRemoval(ctx context.Context) {
+	// Backoff: the 250ms poll would otherwise re-publish (or re-evaluate) every tick while a
+	// pending removal persists — e.g. an unreachable node, or no key-holding admin on this
+	// device. Throttle to keylessRotationRetryInterval between attempts.
+	w.mu.Lock()
+	if !w.lastKeylessRotation.IsZero() && time.Since(w.lastKeylessRotation) < keylessRotationRetryInterval {
+		w.mu.Unlock()
+		return
+	}
+	w.lastKeylessRotation = time.Now()
+	w.mu.Unlock()
+
 	acl, err := w.api.aclList(ctx)
 	if err != nil {
 		return

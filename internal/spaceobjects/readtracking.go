@@ -3,6 +3,7 @@ package spaceobjects
 import (
 	"context"
 
+	"github.com/anyproto/any-store/v2/query"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -63,8 +64,11 @@ func (s *Store) readResolver() readstate.Resolver {
 
 // readApplyHook is the in-tx classification seam installed on every
 // controller (crdt.ApplyHook). Nil when the space tracks nothing, so
-// untracked spaces pay a single nil check per apply.
-func (s *Store) readApplyHook() crdt.ApplyHook {
+// untracked spaces pay a single nil check per apply. The controller is
+// captured at install time so audience-restricted verdicts
+// (ReadClassification.Audience) can point-read the target record
+// inside the same tx.
+func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 	if len(s.readTracking) == 0 || s.readState == nil {
 		return nil
 	}
@@ -88,7 +92,7 @@ func (s *Store) readApplyHook() crdt.ApplyHook {
 			key        string
 			tracked    bool
 		)
-		cctx := &crdt.ChangeCtx{Change: ch}
+		cctx := &crdt.ChangeCtx{Change: ch, SelfIdentity: s.selfIdentity}
 		for i := range ch.Records {
 			rec := &ch.Records[i]
 			for _, op := range rec.Ops {
@@ -104,6 +108,12 @@ func (s *Store) readApplyHook() crdt.ApplyHook {
 				key = cl.Key
 			}
 			if !cl.Track {
+				continue
+			}
+			if cl.Audience != nil && !recordMatchesAudience(txCtx, ctrl, ch.Dataset, recordIds[i], cl.Audience) {
+				// Audience-restricted entry whose target record doesn't
+				// match on this replica: applies untracked here — the
+				// key above still supersedes/clears.
 				continue
 			}
 			tracked = true
@@ -137,6 +147,24 @@ func (s *Store) readApplyHook() crdt.ApplyHook {
 			SelfAuthored: ch.Creator != "" && ch.Creator == s.selfIdentity,
 		})
 	}
+}
+
+// recordMatchesAudience resolves an audience-restricted verdict: one
+// in-tx point read of the (already-applied) target record, matched
+// in-memory against the verdict's typed filter. Missing record ⇒
+// nobody's audience. Deterministic across replays because changes
+// apply in DAG causal order (the record's create precedes anything
+// that targets it) and audience filters consult immutable fields by
+// contract.
+func recordMatchesAudience(ctx context.Context, ctrl *crdt.Controller, dataset, recordId string, f query.Filter) bool {
+	if ctrl == nil {
+		return false
+	}
+	doc := ctrl.Get(ctx, dataset, recordId)
+	if doc == nil {
+		return false
+	}
+	return f.Ok(doc, nil)
 }
 
 func containsString(ss []string, s string) bool {

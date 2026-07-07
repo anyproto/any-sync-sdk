@@ -1,5 +1,7 @@
 package crdt
 
+import "github.com/anyproto/any-store/v2/query"
+
 // ReadClassification is a ReadClassifier's verdict for one applied
 // record change. Track=false records no unread entry, but a non-empty
 // Key still clears a previously-tracked same-key entry (a reaction
@@ -14,6 +16,27 @@ type ReadClassification struct {
 	// the same key replaces (Track=true) or clears (Track=false) the
 	// prior unread entry.
 	Key string
+	// Audience optionally restricts WHO counts this entry unread: the
+	// entry tracks only on replicas where the target record (post-
+	// apply) matches this typed any-store filter. On every other
+	// account the change applies as untracked — a Key still
+	// supersedes/clears. nil = everyone (except the change author, who
+	// is always born read). Build identity-relative conditions from
+	// ChangeCtx.SelfIdentity, e.g. "count a reaction only for the
+	// reacted-to message's author":
+	//
+	//	query.Key{Path: []string{"creator"},
+	//	    Filter: query.NewCompValue(query.CompOpEq, arena.NewString(ctx.SelfIdentity))}
+	//
+	// This is the sanctioned way for a verdict to depend on record
+	// state the classifier cannot see (ChangeCtx.Before is nil there):
+	// the engine resolves it with one in-tx point read of the record
+	// after the change applied. A missing record tracks for nobody.
+	// The filter must only consult fields immutable post-create
+	// (derived-scope creation stamps qualify; freely-edited fields do
+	// not) so the verdict is replay-deterministic. Ignored when
+	// Track=false.
+	Audience query.Filter
 }
 
 // ReadClassifier classifies one record change for read tracking. It
@@ -22,7 +45,9 @@ type ReadClassification struct {
 // envelope only: classification runs after the record loop, so
 // ChangeCtx.Before is ALWAYS nil here (unlike the Before* hooks) —
 // classify from the ops and the envelope (Upsert, Creator, paths),
-// never from prior record state. Self-authored changes are born read
+// never from prior record state; when the verdict must depend on the
+// stored record (e.g. "count only for the record's author"), return
+// an Audience filter and the engine resolves it. Self-authored changes are born read
 // regardless of the verdict; the classifier still runs for them so a
 // supersede Key can clear entries (own un-react clears the unread
 // reaction another device tracked).

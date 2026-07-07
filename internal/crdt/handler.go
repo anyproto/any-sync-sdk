@@ -41,6 +41,14 @@ var ErrValidation = errors.New("crdt: validation rejected")
 type ChangeCtx struct {
 	Change *Change
 	Before *anyenc.Value
+	// SelfIdentity is this replica's account identity
+	// (PubKey.Account() encoding). Populated ONLY on the read-tracking
+	// classify path — read state is device-local, so identity-relative
+	// verdicts (ReadClassification.Audience) are sound there. It stays
+	// zero in the Before* handler hooks on purpose: handler validation
+	// runs on every replica for the same change and must be
+	// replica-independent, or CRDT replicas diverge.
+	SelfIdentity string
 }
 
 // Sibling describes a write the handler wants applied to a different

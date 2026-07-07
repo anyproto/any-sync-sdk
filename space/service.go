@@ -65,6 +65,42 @@ type Service interface {
 	// nothing is removed.
 	DeclineInvite(ctx context.Context, spaceId string) error
 
+	// CreateChild creates a space nested under req.ParentSpaceId (nested
+	// spaces, docs/16). The caller must hold Admin+ in the parent. The full
+	// flow: build the child header (parentSpaceId + the parent's replication
+	// key) with the parent's current owner pinned as legalOwner, append the
+	// AclChildRegister record to the parent acl (coordinator-gated — requires
+	// the network), create local storage; the push then obtains a receipt
+	// via SpaceSign carrying the registration record id. Child quota is
+	// charged to the parent owner's limits, not the caller's.
+	CreateChild(ctx context.Context, req CreateChildRequest) (Space, error)
+
+	// Children lists the child spaces registered under parentSpaceId, read
+	// from the parent acl's AclChildRegister records (revoked ones included,
+	// flagged). The caller must have the parent space locally.
+	Children(ctx context.Context, parentSpaceId string) ([]ChildRef, error)
+
+	// RevokeChild marks childSpaceId's registration in parentSpaceId's acl
+	// as revoked (Admin+ in the parent required). A revoked child no longer
+	// obtains receipts at SpaceSign and disappears from Children as an
+	// active entry; the child space itself is not deleted — pair with
+	// DeleteChildAsLegalOwner for a full teardown. Used to clean up a
+	// registration whose child never materialized (e.g. CreateChild died
+	// between the acl write and local creation).
+	RevokeChild(ctx context.Context, parentSpaceId, childSpaceId string) error
+
+	// RemoveMemberAsLegalOwner removes identity from childSpaceId acting as
+	// its legalOwner (the parent's current owner) — no read key required.
+	// The removal is authoritative immediately; forward secrecy is restored
+	// when a key-holding member (or the SDK's auto-rotation on their device)
+	// completes the standard read-key rotation. The child needn't be known
+	// locally — it is tracked and bootstrapped on demand.
+	RemoveMemberAsLegalOwner(ctx context.Context, childSpaceId, identity string) error
+
+	// DeleteChildAsLegalOwner deletes childSpaceId on the network acting as
+	// its legalOwner — no read access required; overrides deleteRestricted.
+	DeleteChildAsLegalOwner(ctx context.Context, childSpaceId string) error
+
 	// Get returns an already-joined space by id. Fails if the space is
 	// unknown locally.
 	Get(ctx context.Context, spaceId string) (Space, error)
@@ -155,6 +191,39 @@ type CreateRequest struct {
 	// type would otherwise produce a space the coordinator refuses
 	// to sync.
 	SpaceType string
+}
+
+// CreateChildRequest is the input to Service.CreateChild.
+type CreateChildRequest struct {
+	// ParentSpaceId is the space this child is governed by. Required.
+	ParentSpaceId string
+
+	Name        string
+	Description string
+	IconCID     string
+	// SpaceType follows the same rules as CreateRequest.SpaceType.
+	SpaceType string
+
+	// OrgPermission is reserved for the role the parent grants ITSELF in the
+	// child. Only PermissionNone (the default) is accepted today — keyless
+	// governance: the parent owner can remove members and delete the child
+	// but cannot read it. Any other value is rejected, because no code path
+	// yet adds the org to the child acl or gives it a read key, so a non-None
+	// registration would claim access the org does not have.
+	OrgPermission Permission
+}
+
+// ChildRef is one child registration in a parent space's acl.
+type ChildRef struct {
+	ChildSpaceId   string
+	ChildAclRootId string
+	// RecordId is the AclChildRegister record id in the parent acl —
+	// the pointer the coordinator validates at child SpaceSign.
+	RecordId string
+	// Author is the account identity that registered the child.
+	Author        string
+	OrgPermission Permission
+	Revoked       bool
 }
 
 // JoinRequest is the input to Service.Join.

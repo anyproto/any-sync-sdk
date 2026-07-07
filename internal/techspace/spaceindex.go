@@ -34,6 +34,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldOneToOneInviteState, Name: "One-to-one invite state", Schema: str(), Scope: schema.ScopeLocal},
 		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
 		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldParentSpaceId, Name: "Parent space id", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
 	}}
 }
@@ -89,6 +90,9 @@ const (
 	// Distinct from FieldType (the on-wire header type): not pinned, so
 	// the watcher can mirror the converged value.
 	FieldSpaceType = "spaceType"
+	// FieldParentSpaceId is set on child (nested) spaces: the declared parent space id,
+	// mirrored from the signed header. Empty for top-level spaces.
+	FieldParentSpaceId = "parentSpaceId"
 	// FieldOneToOneInviteState is a DEVICE-LOCAL field (schema.ScopeLocal)
 	// tracking whether this device still owes the peer an inbox
 	// notification for a 1-1 it initiated. Value "toSend" means the

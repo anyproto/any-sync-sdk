@@ -2,6 +2,7 @@ package spaceimpl
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -12,7 +13,9 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/syncacl"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -22,6 +25,11 @@ import (
 // for changes. Cheap (one RLock + map lookup); 250 ms feels live to a UI
 // without burning CPU.
 const memberPollInterval = 250 * time.Millisecond
+
+// keylessRotationRetryInterval throttles retrying the read-key rotation that completes a
+// pending keyless removal (nested spaces) so a persistent pending state doesn't publish
+// every poll tick.
+const keylessRotationRetryInterval = 10 * time.Second
 
 // identityRepoPollInterval governs how often the watcher refreshes
 // every member's profile from identityRepo. Network call to the
@@ -92,6 +100,10 @@ func (m *membersAPI) aclList(ctx context.Context) (list.AclList, error) {
 // overrides from identityRepo (cached on the running watcher) are
 // applied on top — the same view Subscribe / Query expose.
 func (m *membersAPI) List(ctx context.Context) ([]space.Member, error) {
+	// listing counts as observing: it starts the watcher so background member work
+	// (profile refresh, keyless-removal auto-rotation) runs on any device that reads
+	// membership, not only on subscribers
+	m.ensureWatcher()
 	acl, err := m.aclList(ctx)
 	if err != nil {
 		return nil, err
@@ -551,6 +563,8 @@ func fromAclStatus(s list.AclStatus) space.MemberStatus {
 // Started on the first Subscribe or Query (via membersAPI.ensureWatcher).
 // Runs until Service.Close. Subscribers are stored in a map keyed by
 // an int counter for O(1) remove.
+var memberLog = logger.NewNamed("sdk.members")
+
 type memberWatcher struct {
 	api  *membersAPI
 	coll anystore.Collection
@@ -576,6 +590,9 @@ type memberWatcher struct {
 	// immediately rather than waiting up to memberPollInterval. Buffered
 	// 1 so coalesced kicks don't block the syncacl write path.
 	kickCh chan struct{}
+
+	// lastKeylessRotation throttles maybeCompleteKeylessRemoval's publish attempts (guarded by mu)
+	lastKeylessRotation time.Time
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -703,18 +720,29 @@ func (w *memberWatcher) tick() {
 	}
 	acl.RLock()
 	head := acl.Head().Id
+	// A pending keyless removal must keep being retried until a rotation lands, even when
+	// the head hasn't moved (a failed publish at boot would otherwise never re-attempt).
+	pendingRotation := acl.AclState().HasPendingKeylessRemovals()
+	acl.RUnlock()
 	w.mu.Lock()
 	headChanged := head != w.headId
 	dirty := w.profilesDirty
 	w.mu.Unlock()
-	// Skip the rest of the tick when nothing changed — the
-	// profile-loop sets profilesDirty when it pulls fresh data so
-	// snapshots get rebuilt with new overrides even if AclList head
-	// hasn't moved.
+
+	// Attempt to complete a pending keyless removal (nested spaces) independently of the
+	// snapshot rebuild, with backoff so a persistent pending state (e.g. no key-holding admin
+	// online) doesn't publish or churn every poll tick.
+	if pendingRotation {
+		w.maybeCompleteKeylessRemoval(ctx)
+	}
+
+	// Skip the snapshot rebuild when nothing member-visible changed. A pending rotation alone
+	// must NOT force the full collectMembers/profile work on every tick — only head/profile
+	// movement does.
 	if !headChanged && !dirty {
-		acl.RUnlock()
 		return
 	}
+	acl.RLock()
 	current, symKeys := collectMembers(acl)
 	state := acl.AclState()
 	meActive := false
@@ -1182,4 +1210,73 @@ func (s *Service) ResolveIdentityProfiles(ctx context.Context) {
 		}
 		_ = s.tsp.SetIdentityProfile(ctx, dwi.Identity, prof.Name, prof.Description, prof.IconCID)
 	}
+}
+
+// maybeCompleteKeylessRemoval authors the standard read-key rotation that
+// completes a pending AclAccountRemoveNoRotate (docs/16 phase B). Admins and
+// the owner always may; Writers only when the space opted in via
+// AclSpaceOptions.editorsCanCompleteKeylessRotation. Losing a race with
+// another device is fine — its rotation clears the pending state and this
+// build/publish fails on the stale prev id.
+func (w *memberWatcher) maybeCompleteKeylessRemoval(ctx context.Context) {
+	// Backoff: the 250ms poll would otherwise re-publish (or re-evaluate) every tick while a
+	// pending removal persists — e.g. an unreachable node, or no key-holding admin on this
+	// device. Throttle to keylessRotationRetryInterval between attempts.
+	w.mu.Lock()
+	if !w.lastKeylessRotation.IsZero() && time.Since(w.lastKeylessRotation) < keylessRotationRetryInterval {
+		w.mu.Unlock()
+		return
+	}
+	w.lastKeylessRotation = time.Now()
+	w.mu.Unlock()
+
+	acl, err := w.api.aclList(ctx)
+	if err != nil {
+		return
+	}
+	keys := w.api.s.app.AccountKeys()
+	if keys == nil {
+		return
+	}
+	acl.RLock()
+	st := acl.AclState()
+	pending := st.HasPendingKeylessRemovals()
+	perms := st.Permissions(keys.SignKey.GetPublic())
+	opts := st.CurrentOptions()
+	acl.RUnlock()
+	if !pending {
+		return
+	}
+	canRotate := perms.CanManageAccounts() ||
+		(opts != nil && opts.EditorsCanCompleteKeylessRotation && perms.CanWrite())
+	if !canRotate {
+		return
+	}
+	readKey, err := crypto.NewRandomAES()
+	if err != nil {
+		return
+	}
+	metadataKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		return
+	}
+	acl.Lock()
+	rec, err := acl.RecordBuilder().BuildReadKeyChange(list.ReadKeyChangePayload{
+		MetadataKey: metadataKey,
+		ReadKey:     readKey,
+	})
+	acl.Unlock()
+	if err != nil {
+		memberLog.Debug("keyless-removal rotation build failed", zap.String("spaceId", w.api.s.id), zap.Error(err))
+		return
+	}
+	handle, err := w.api.s.app.GetSpace(ctx, w.api.s.id)
+	if err != nil {
+		return
+	}
+	if err := handle.Inner().AclClient().AddRecord(ctx, rec); err != nil {
+		memberLog.Debug("keyless-removal rotation publish failed", zap.String("spaceId", w.api.s.id), zap.Error(err))
+		return
+	}
+	memberLog.Info("completed pending keyless removal with a read-key rotation", zap.String("spaceId", w.api.s.id))
 }

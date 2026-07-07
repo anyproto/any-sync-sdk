@@ -13,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -127,14 +128,18 @@ func isLogNotReady(err error) bool {
 // Total retry window ≈ 35s — long enough to clear the worst case of
 // peer-connect-then-syncperiod-tick.
 func ensureShareable(ctx context.Context, s *spaceImpl) error {
+	return ensureShareableCoord(ctx, s.app, s.id)
+}
+
+func ensureShareableCoord(ctx context.Context, app *anysyncx.App, spaceId string) error {
 	const (
 		maxAttempts = 35
 		backoff     = time.Second
 	)
-	coord := s.app.Coordinator()
+	coord := app.Coordinator()
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		if err := coord.SpaceMakeShareable(ctx, s.id); err != nil {
+		if err := coord.SpaceMakeShareable(ctx, spaceId); err != nil {
 			lastErr = err
 			if !isSpaceNotPushedYet(err) {
 				return fmt.Errorf("acl: make shareable: %w", err)
@@ -457,4 +462,26 @@ func decodeSymKeyMetadata(raw []byte, keys map[string]list.AclKeys, keyRecordId 
 		return ""
 	}
 	return string(plain)
+}
+
+// PendingKeylessRemovals lists identities removed via AclAccountRemoveNoRotate
+// that still await a completing read-key rotation.
+func (a *aclAPI) PendingKeylessRemovals(ctx context.Context) ([]string, error) {
+	// observing removal state IS observing members: the auto-rotation that completes
+	// a keyless removal lives in the member watcher, so a device that only polls this
+	// call must still drive the rotation rather than watch the pending set forever
+	a.s.members.ensureWatcher()
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return nil, fmt.Errorf("acl: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	acl.RLock()
+	defer acl.RUnlock()
+	pending := acl.AclState().PendingKeylessRemovals()
+	out := make([]string, 0, len(pending))
+	for _, pk := range pending {
+		out = append(out, pk.Account())
+	}
+	return out, nil
 }

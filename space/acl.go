@@ -75,6 +75,17 @@ type ACL interface {
 	// StopSharing drops every non-owner member, revokes every invite,
 	// and rotates the read key in one batch. Owner only.
 	StopSharing(ctx context.Context) error
+
+	// PendingKeylessRemovals lists identities removed by the legalOwner via
+	// the keyless path and not yet covered by a read-key rotation (nested
+	// spaces). Non-empty means forward secrecy is pending — a key-holding
+	// member should rotate. The SDK's member watcher auto-rotates on an
+	// admin/owner device once it is observing the space's members (i.e.
+	// after a Members().List/Subscribe/Query on that device); a client that
+	// wants the guarantee to hold unconditionally should either subscribe to
+	// members on its admin devices or call an explicit rotation when this
+	// returns non-empty.
+	PendingKeylessRemovals(ctx context.Context) ([]string, error)
 }
 
 // PermissionChange is one entry in a batch ChangePermissions call.

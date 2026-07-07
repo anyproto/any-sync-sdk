@@ -46,6 +46,10 @@ type SpaceIndexRecord struct {
 	// rows. Written via Service.SetAclHeadId after the row exists.
 	AclHeadId string
 
+	// ParentSpaceId is the declared parent of a child (nested) space, mirrored
+	// from the signed header (FieldParentSpaceId, synced). Empty for top-level spaces.
+	ParentSpaceId string
+
 	// OneToOnePeer is the other participant's account identity on a
 	// derived 1-1 row (FieldOneToOnePeer, synced). Required to materialize
 	// the 1-1 storage on accept. Empty on non-1-1 rows.
@@ -81,6 +85,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		Id:                  v.GetString("id"),
 		Type:                v.GetString(FieldType),
 		SpaceType:           v.GetString(FieldSpaceType),
+		ParentSpaceId:       v.GetString(FieldParentSpaceId),
 		Name:                v.GetString(FieldName),
 		Description:         v.GetString(FieldDescription),
 		IconCID:             v.GetString(FieldIcon),
@@ -118,6 +123,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	}
 	if r.SpaceType != "" {
 		obj.Set(FieldSpaceType, a.NewString(r.SpaceType))
+	}
+	if r.ParentSpaceId != "" {
+		obj.Set(FieldParentSpaceId, a.NewString(r.ParentSpaceId))
 	}
 	if r.Name != "" {
 		obj.Set(FieldName, a.NewString(r.Name))

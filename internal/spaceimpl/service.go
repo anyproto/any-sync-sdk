@@ -225,6 +225,9 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		inviteKick:         make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
+	// nested spaces: SpaceSign for a child needs the registration record id
+	// from the parent acl (resolved on demand — restart-safe)
+	app.SetChildCredentialResolver(s.resolveChildCredential)
 	s.startDeletionReconciler()
 	s.startJoinController()
 	// Wire the Total source for the sync-status rollup. The rollup
@@ -587,14 +590,15 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		author = s.resolveAuthor(ctx, r.Id)
 	}
 	info := space.SpaceInfo{
-		Id:          r.Id,
-		Type:        r.Type,
-		SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
-		Author:      author,
-		Name:        r.Name,
-		Description: r.Description,
-		IconCID:     r.IconCID,
-		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		Id:            r.Id,
+		Type:          r.Type,
+		SpaceType:     s.resolveSpaceType(ctx, r.Id, r.SpaceType),
+		Author:        author,
+		Name:          r.Name,
+		Description:   r.Description,
+		IconCID:       r.IconCID,
+		Status:        mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		ParentSpaceId: s.resolveParentSpaceId(ctx, r.Id, r.ParentSpaceId),
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band

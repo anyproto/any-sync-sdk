@@ -467,6 +467,10 @@ func decodeSymKeyMetadata(raw []byte, keys map[string]list.AclKeys, keyRecordId 
 // PendingKeylessRemovals lists identities removed via AclAccountRemoveNoRotate
 // that still await a completing read-key rotation.
 func (a *aclAPI) PendingKeylessRemovals(ctx context.Context) ([]string, error) {
+	// observing removal state IS observing members: the auto-rotation that completes
+	// a keyless removal lives in the member watcher, so a device that only polls this
+	// call must still drive the rotation rather than watch the pending set forever
+	a.s.members.ensureWatcher()
 	handle, err := a.s.app.GetSpace(ctx, a.s.id)
 	if err != nil {
 		return nil, fmt.Errorf("acl: load space: %w", err)

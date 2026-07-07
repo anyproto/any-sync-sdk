@@ -100,6 +100,10 @@ func (m *membersAPI) aclList(ctx context.Context) (list.AclList, error) {
 // overrides from identityRepo (cached on the running watcher) are
 // applied on top — the same view Subscribe / Query expose.
 func (m *membersAPI) List(ctx context.Context) ([]space.Member, error) {
+	// listing counts as observing: it starts the watcher so background member work
+	// (profile refresh, keyless-removal auto-rotation) runs on any device that reads
+	// membership, not only on subscribers
+	m.ensureWatcher()
 	acl, err := m.aclList(ctx)
 	if err != nil {
 		return nil, err

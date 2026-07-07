@@ -80,6 +80,15 @@ type Service interface {
 	// flagged). The caller must have the parent space locally.
 	Children(ctx context.Context, parentSpaceId string) ([]ChildRef, error)
 
+	// RevokeChild marks childSpaceId's registration in parentSpaceId's acl
+	// as revoked (Admin+ in the parent required). A revoked child no longer
+	// obtains receipts at SpaceSign and disappears from Children as an
+	// active entry; the child space itself is not deleted — pair with
+	// DeleteChildAsLegalOwner for a full teardown. Used to clean up a
+	// registration whose child never materialized (e.g. CreateChild died
+	// between the acl write and local creation).
+	RevokeChild(ctx context.Context, parentSpaceId, childSpaceId string) error
+
 	// RemoveMemberAsLegalOwner removes identity from childSpaceId acting as
 	// its legalOwner (the parent's current owner) — no read key required.
 	// The removal is authoritative immediately; forward secrecy is restored
@@ -195,10 +204,12 @@ type CreateChildRequest struct {
 	// SpaceType follows the same rules as CreateRequest.SpaceType.
 	SpaceType string
 
-	// OrgPermission is the role the parent grants ITSELF in the child,
-	// recorded on the registration. PermissionNone (default) = keyless
-	// governance only: the parent owner can remove members and delete the
-	// child but cannot read it.
+	// OrgPermission is reserved for the role the parent grants ITSELF in the
+	// child. Only PermissionNone (the default) is accepted today — keyless
+	// governance: the parent owner can remove members and delete the child
+	// but cannot read it. Any other value is rejected, because no code path
+	// yet adds the org to the child acl or gives it a read key, so a non-None
+	// registration would claim access the org does not have.
 	OrgPermission Permission
 }
 

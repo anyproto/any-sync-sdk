@@ -6,29 +6,35 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+var nestedLog = logger.NewNamed("sdk.nestedspaces")
+
 // CreateChild creates a space nested under req.ParentSpaceId (docs/16). The
 // order matters: the registration record must land in the parent acl before
 // the child's first push, because the coordinator only signs a nested space's
 // receipt against an existing AclChildRegister. Local storage is created after
-// the registration so a crash in between leaves only a harmless acl record
-// (re-running CreateChild mints a fresh child id; the stale registration can
-// be revoked).
+// the registration; when a step past the publish fails, the registration is
+// revoked best-effort (a retry mints a fresh child id, so a live registration
+// for the dead id would otherwise be a phantom child every org member sees —
+// only a process crash inside the window can still leave one, and RevokeChild
+// is the manual remedy).
 func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest) (space.Space, error) {
 	if req.ParentSpaceId == "" {
 		return nil, errors.New("spaceimpl: CreateChild: ParentSpaceId is required")
 	}
-	if req.OrgPermission == space.PermissionOwner {
-		return nil, errors.New("spaceimpl: CreateChild: the parent cannot own the child")
+	if req.OrgPermission != space.PermissionNone {
+		return nil, errors.New("spaceimpl: CreateChild: OrgPermission is reserved and must be PermissionNone (keyless governance)")
 	}
 	keys := s.app.AccountKeys()
 	if keys == nil {
@@ -105,15 +111,25 @@ func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest)
 	if err := addRecordWaitingForLog(ctx, parentHandle.Inner().AclClient(), regRec); err != nil {
 		return nil, fmt.Errorf("spaceimpl: CreateChild: register in parent acl: %w", err)
 	}
+	// from here the registration is a synced parent-acl record: any failure below
+	// must revoke it, or the dead child id stays visible to the whole org forever
+	fail := func(cause error) (space.Space, error) {
+		revokeCtx := context.WithoutCancel(ctx)
+		if rerr := s.RevokeChild(revokeCtx, req.ParentSpaceId, childId); rerr != nil {
+			nestedLog.Warn("CreateChild: failed to revoke orphan registration",
+				zap.String("childId", childId), zap.String("parentSpaceId", req.ParentSpaceId), zap.Error(rerr))
+		}
+		return nil, cause
+	}
 	parentAcl.RLock()
 	_, registered := parentAcl.AclState().ChildRegistration(childId)
 	parentAcl.RUnlock()
 	if !registered {
-		return nil, errors.New("spaceimpl: CreateChild: registration not visible after publish")
+		return fail(errors.New("spaceimpl: CreateChild: registration not visible after publish"))
 	}
 
 	if _, err := s.app.CreateSpaceFromStoragePayload(ctx, storagePayload); err != nil {
-		return nil, fmt.Errorf("spaceimpl: CreateChild: create storage: %w", err)
+		return fail(fmt.Errorf("spaceimpl: CreateChild: create storage: %w", err))
 	}
 
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
@@ -126,17 +142,17 @@ func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest)
 		ParentSpaceId: req.ParentSpaceId,
 		RemoteStatus:  techspace.StatusActive,
 	}); err != nil {
-		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+		return fail(fmt.Errorf("spaceimpl: write index entry: %w", err))
 	}
 	if _, err := s.tsp.SetLocalStatus(ctx, childId, techspace.StatusActive); err != nil {
-		return nil, fmt.Errorf("spaceimpl: set local status: %w", err)
+		return fail(fmt.Errorf("spaceimpl: set local status: %w", err))
 	}
 	if _, err := s.app.GetSpace(ctx, childId); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	store := s.storeFor(childId)
 	if _, err := s.ensureSpaceIndexWiring(ctx, childId); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if err := s.seedSpaceIndexOnCreate(ctx, store, childId, space.CreateRequest{
 		Name:        req.Name,
@@ -144,9 +160,31 @@ func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest)
 		IconCID:     req.IconCID,
 		SpaceType:   req.SpaceType,
 	}, spaceType); err != nil {
-		return nil, fmt.Errorf("spaceimpl: seed spaceIndex: %w", err)
+		return fail(fmt.Errorf("spaceimpl: seed spaceIndex: %w", err))
 	}
 	return newSpace(childId, s.app, s.tsp, store, s), nil
+}
+
+// RevokeChild marks childSpaceId's registration in parentSpaceId's acl as
+// revoked. The registration is the coordinator's receipt gate and the source
+// of Children, so this is both the cleanup for a half-created child and the
+// first half of decommissioning a live one.
+func (s *Service) RevokeChild(ctx context.Context, parentSpaceId, childSpaceId string) error {
+	handle, err := s.app.GetSpace(ctx, parentSpaceId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: RevokeChild: load parent: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	acl.Lock()
+	rec, err := acl.RecordBuilder().BuildChildRegisterRevoke(childSpaceId)
+	acl.Unlock()
+	if err != nil {
+		return fmt.Errorf("spaceimpl: RevokeChild: build: %w", err)
+	}
+	if err := addRecordWaitingForLog(ctx, handle.Inner().AclClient(), rec); err != nil {
+		return fmt.Errorf("spaceimpl: RevokeChild: publish: %w", err)
+	}
+	return nil
 }
 
 // Children lists the child registrations in parentSpaceId's acl.

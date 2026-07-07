@@ -1,10 +1,15 @@
-# Nested Spaces (parent / child) — TODO / DESIGN DRAFT
+# Nested Spaces (parent / child)
 
-> **Status: TODO.** This is a grooming/research document, not an implemented
-> feature. It records the design direction, the required any-sync and
-> coordinator changes, the SDK surface, and the open questions. Nothing here is
-> built yet. Decisions dated below are grooming decisions, subject to revision
-> when implementation starts.
+> **Status: IMPLEMENTED.** The design below is built and tested across
+> any-sync (branch `cheggaaa/nested-spaces`, ACL machinery + validation),
+> any-sync-coordinator (branch `cheggaaa/nested-spaces`, trust gate, billing,
+> external-seat pool) and this SDK (branch `cheggaaa/nested-spaces-sdk`,
+> client surface + e2e). Where the implementation refined the original
+> sketch, this document describes the implementation (proto shapes in
+> "Required changes" match the shipped `.proto` files). One deliberate gap:
+> `orgPermission` is **reserved** and must be `None` — see the legalOwner
+> powers table. Decisions dated below are grooming decisions kept for
+> historical context.
 
 ## Naming
 
@@ -82,12 +87,13 @@ member of orgSpace (Admin+)                    coordinator                 nodes
  1. create child header                              │                       │
     SpaceHeader{ parentSpaceId = orgId,              │                       │
                  identity = me, ... }  (signed by me)│                       │
-    + child AclRoot{ parentRef = <set in step 2>,    │                       │
-                     legalOwner = orgOwner pubkey }  │                       │
+    + child AclRoot{ parentSpaceId = orgId,          │                       │
+                     legalOwner = orgOwner pubkey,   │                       │
+                     parentAclRootId = org acl root }│                       │
         │                                            │                       │
  2. register child in org ACL  ──────────────────────┼──> (parent ACL sync)  │
     append AclChildRegister{ childSpaceId,           │                       │
-        childAclRootCid, permissionsGranted }        │                       │
+        childAclRootId, orgPermission=None }         │                       │
     authored by me, requires Admin+ in orgSpace      │                       │
         │  (record id = parentAclRecordId)           │                       │
         │                                            │                       │
@@ -182,26 +188,39 @@ ACL.
    compat). (A `SpaceNesting` sub-message can be used instead if more nesting
    metadata is needed later; one string is enough for v1.)
 
-2. **`AclRoot` gains `parentRef` + a pinned legalOwner public key.**
+2. **`AclRoot` gains three flat fields: the parent link, a pinned legalOwner
+   public key and the parent ACL root id.**
    ```proto
    message AclRoot {
      // ... existing fields 1..11 (through oneToOneInfo=10, options=11) ...
-     AclParentRef parentRef = 12; // pointer to the registration record in the parent ACL
-     bytes legalOwner = 13;       // pubkey of the parent's owner AT GENESIS; advanced via AclLegalOwnerUpdate
-   }
-   message AclParentRef {
-     string parentSpaceId   = 1; // == SpaceHeader.parentSpaceId (redundant, binds the ACL to the header)
-     string parentAclRecordId = 2; // the AclChildRegister record id in the parent ACL
+     string parentSpaceId   = 12; // == SpaceHeader.parentSpaceId (redundant, binds the ACL to the header)
+     bytes  legalOwner      = 13; // pubkey of the parent's owner AT GENESIS; advanced via AclLegalOwnerUpdate
+     string parentAclRootId = 14; // the PARENT's acl root record id — binding scope for legalOwner proofs
    }
    ```
-   The stored key serves **client-side validation only** — it is the trust
-   anchor of the signature-induction chain (change 3), letting any child
-   member (including external seats, which never replicate the parent)
+   All three are set together (a child) or all empty (a top-level space,
+   full backward compat). There is **no on-chain pointer to the registration
+   record**: the `AclChildRegister` record id is supplied out-of-band at
+   `SpaceSign` (`SpaceSignRequest.parentAclRecordId = 6`) and verified
+   **coordinator-side only** against the parent's live ACL — the child's
+   chain does not embed it because the registration necessarily lands
+   *after* the child ACL root is built (the root's cid is what the
+   registration binds to, not vice versa).
+
+   `parentAclRootId` pins the identity of the parent's ACL at genesis. It is
+   what scopes `AclLegalOwnerUpdate` proofs to *this* parent (see change 3):
+   without it, a signed `AclOwnershipChange` lifted from any other space
+   owned by the same key would advance the child's legalOwner — the
+   cross-space replay below.
+
+   The stored `legalOwner` key serves **client-side validation only** — it is
+   the trust anchor of the signature-induction chain (change 3), letting any
+   child member (including external seats, which never replicate the parent)
    validate legalOwner-authored records against the child's own causal
    timeline, with no cross-ACL lookup. The coordinator never trusts it: at
    SpaceSign it verifies the pinned key equals the parent's *current* owner
-   (fresh read), and every later infra decision re-derives. For a top-level
-   space both fields are empty and everything behaves as today.
+   (fresh read), verifies `parentAclRootId == the parent acl's actual root id`
+   (anti-pinning), and every later infra decision re-derives.
 
 3. **New ACL record types** (`AclContentValue` oneof — variants 1..16 are
    taken as of v0.13 (`accountsAdd`, `inviteJoin`, `ownershipChange`,
@@ -210,8 +229,12 @@ ACL.
    // appended to the PARENT (org) ACL — registers a child under it
    message AclChildRegister {
      string childSpaceId    = 1;
-     bytes  childAclRootCid = 2;   // binds the registration to a specific child ACL root
-     AclUserPermissions orgPermission = 3; // permission the org grants ITSELF in the child, if any (None = no data access)
+     string childAclRootId = 2;    // binds the registration to a specific child ACL root record
+     // RESERVED — must be None. Intended as the permission the org grants ITSELF
+     // in the child, but no code path yet adds the org to the child acl or
+     // encrypts the read key to it, so any non-None value would record an access
+     // claim nothing honors; the validator rejects it until the grant is built.
+     AclUserPermissions orgPermission = 3;
    }
    message AclChildRegisterRevoke { string childSpaceId = 1; } // optional: de-list a child
 
@@ -219,6 +242,16 @@ ACL.
    // transfer — advances the child's stored legalOwner by signature induction
    message AclLegalOwnerUpdate {
      repeated bytes ownershipChanges = 1; // raw signed AclOwnershipChange record(s) from the parent, in order
+   }
+   ```
+   To make those proofs scopable, the pre-existing `AclOwnershipChange`
+   (shipped in v0.13) gains a binding field, stamped by the builder on every
+   transfer:
+   ```proto
+   message AclOwnershipChange {
+     bytes newOwnerIdentity = 1;
+     AclUserPermissions oldOwnerPermissions = 2;
+     string aclRootId = 3; // NEW — the acl root record id of the acl this transfer belongs to
    }
    ```
    The register records are authored in the **parent**; `AclLegalOwnerUpdate`
@@ -229,12 +262,31 @@ ACL.
    Intermediate parent history (rotations, invites, joins) never alters
    signing authority, so it is skipped entirely — the proof is O(number of
    transfers), ~300 bytes each, and self-contained (a validator needs only
-   the child's stored key, not the parent ACL). Replay guard: the child
-   remembers the CIDs of consumed `AclOwnershipChange` payloads (the CID is
-   recomputable from the embedded bytes) and rejects re-use, so cycled
-   ownership (A→B→A) cannot be replayed by a malicious ex-owner. Updates are
-   **lazy**: the new parent owner pushes one only when it actually needs to
-   exercise a keyless power in that child.
+   the child's stored key, not the parent ACL).
+
+   Two replay threats are closed here:
+
+   - **Same-space replay (cycled ownership).** The child remembers the cids
+     of consumed proofs and rejects re-use, so after A→B→A a malicious
+     ex-owner B cannot re-present the old A→B record to reclaim the child.
+     The consumed-set key is the cid of the **signed payload**, not of the
+     whole embedded `RawRecord` envelope — acceptor fields sit outside the
+     author signature, so an envelope-keyed guard could be bypassed by
+     re-serializing a consumed proof with a mutated acceptor field (same
+     valid signature, fresh cid).
+   - **Cross-space lift.** A transfer is only a valid proof for children of
+     the acl it happened in: the validator requires each embedded
+     `AclOwnershipChange.aclRootId` to equal the child's pinned
+     `parentAclRootId` (change 2). Without this, stored legalOwner Alice
+     transferring some unrelated space Q to Mallory would hand Mallory a
+     signed record that advances *this* child's legalOwner. The validator
+     also rejects a transfer whose `aclRootId` names a foreign acl at the
+     point it is accepted into its own acl, so mis-stamped records never
+     enter a log in the first place (empty stays accepted for records
+     predating the field).
+
+   Updates are **lazy**: the new parent owner pushes one only when it
+   actually needs to exercise a keyless power in that child.
 
    **Trust boundary (important — this is defense-in-depth, not a proof of
    authority).** The induction verifies the *signature chain* and the
@@ -342,7 +394,7 @@ addition to the normal space-sign checks:
    exists and is used in production to track ownership transfers.)
 3. **Registration record is real and consistent.** `parentAclRecordId` exists in
    the parent ACL, is an `AclChildRegister`, has `childSpaceId == childId`, and
-   its `childAclRootCid` matches the child's actual ACL root CID.
+   its `childAclRootId` matches the child's actual ACL root record id.
 4. **Registrant has authority.** The author of that registration record holds
    **Admin+** (or the parent-settings-configured threshold) in the parent ACL at
    the record's position. *(Grooming answer — "validate real space owner /
@@ -377,13 +429,14 @@ powers:
 | Bears all limits | not required | coordinator charges legalOwner quota |
 | Remove a member | not required | authors `AclAccountRemoveNoRotate`; key rotation deferred to a key-holder (below) |
 | Delete the child | not required | coordinator `SpaceDelete` accepts legalOwner signature |
-| Read/write data | **only if** added to child ACL as Reader/Writer/Admin | normal membership; org opts in via `AclChildRegister.orgPermission` or a later join |
+| Read/write data | **only if** added to child ACL as Reader/Writer/Admin | normal membership via a later join/direct-add; `AclChildRegister.orgPermission` is RESERVED (must be None) — the registration-time self-grant is not implemented |
 
 Two configurations fall out of the grooming answers:
 
-- **Member-created child:** org = legalOwner only. Org has no read key unless it
-  added itself (`orgPermission >= Reader`). This is the "company governs but
-  doesn't read employee data" case.
+- **Member-created child:** org = legalOwner only. Org has no read key unless a
+  child admin later adds it as a member (the registration-time
+  `orgPermission >= Reader` self-grant is reserved, not implemented). This is
+  the "company governs but doesn't read employee data" case.
 - **Org-created child:** the org creates the child itself ⇒ org is **real owner
   and legalOwner at once**, holds all keys, full data access. No special keyless
   path is exercised.
@@ -597,7 +650,8 @@ per-child normal ACL operations, used as a pattern. The only genuinely new
 surface:
 
 - **Compartment creation** = `CreateChildSpace(orgId, …)` with `orgPermission =
-  None` (org governs but takes no seat/read access in the compartment).
+  None` — the only accepted value today (org governs but takes no seat/read
+  access in the compartment).
 - **Compartment membership** = **direct-add** (`ACL().AddAccounts`,
   `docs/15-direct-add-invites.md`) as the primary path — org members added by
   identity, local-gate approval — operated on the child by the child's own
@@ -626,8 +680,8 @@ an SDK method in v1.
 // full flow: build child header with parentSpaceId, append the AclChildRegister
 // record to the parent ACL, request the coordinator SpaceSign, push. legalOwner
 // is implicit — always the parent's current owner, never passed or stored.
-// orgPermission grants the org itself a role in the child (None = org gets no
-// data access / keyless governance).
+// orgPermission is RESERVED and must be None (keyless governance): the org
+// self-grant is not implemented, and non-None values are rejected.
 CreateChildSpace(ctx, parentSpaceId string, p ChildSpacePayload) (Space, error)
 
 // Children lists the child spaces registered under parentSpaceId (read from the
@@ -665,8 +719,8 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
   hard ceiling. Mitigation knobs live in parent settings.
 - **legalOwner over-reach.** legalOwner can remove members and delete — by
   design. It **cannot** silently read data it was never keyed into: gaining read
-  access requires an ACL record (`orgPermission`/join) that is visible to all
-  members. The keyless-removal window is the only subtlety and matches normal
+  access requires an ACL record (a join/direct-add; the `orgPermission`
+  self-grant is reserved) that is visible to all members. The keyless-removal window is the only subtlety and matches normal
   any-sync rotation semantics.
 - **Orphaned children on parent delete.** Deleting the parent must define child
   fate (cascade delete? re-parent? detach to standalone?). Open question.
@@ -804,7 +858,8 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
 5. **Child registration is self-service for Admin+**, gated only by coordinator
    validation — no per-child human approval record.
 6. **Org may opt into data access** by taking a Reader/Writer/Admin role in the
-   child (`AclChildRegister.orgPermission` or a later join). When the org
+   child via a later join/direct-add (the `AclChildRegister.orgPermission`
+   registration-time self-grant is reserved, not implemented). When the org
    creates the child itself, it is real owner + legalOwner at once.
 7. **Org space owner-as-separate-identity is deferred** (brief point 1); org
    space is a normal space for now.

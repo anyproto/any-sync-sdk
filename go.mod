@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/anyproto/any-store v0.4.7
 	github.com/anyproto/any-store/v2 v2.0.0-alpha.16
-	github.com/anyproto/any-sync v0.13.0-alpha.5.0.20260707134432-0dd5035b2633
+	github.com/anyproto/any-sync v0.13.0-alpha.5.0.20260707151954-0499748aa6a1
 	github.com/anyproto/lexid v0.0.6
 	github.com/brutella/dnssd v1.2.14
 	github.com/cheggaaa/mb/v3 v3.0.2

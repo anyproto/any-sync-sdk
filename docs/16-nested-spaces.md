@@ -228,12 +228,30 @@ ACL.
    the previous one named; the last one names the new stored legalOwner.
    Intermediate parent history (rotations, invites, joins) never alters
    signing authority, so it is skipped entirely — the proof is O(number of
-   transfers), ~300 bytes each, verifiable fully offline. Replay guard: the
-   child remembers the CIDs of consumed `AclOwnershipChange` payloads (the
-   CID is recomputable from the embedded bytes) and rejects re-use, so cycled
+   transfers), ~300 bytes each, and self-contained (a validator needs only
+   the child's stored key, not the parent ACL). Replay guard: the child
+   remembers the CIDs of consumed `AclOwnershipChange` payloads (the CID is
+   recomputable from the embedded bytes) and rejects re-use, so cycled
    ownership (A→B→A) cannot be replayed by a malicious ex-owner. Updates are
    **lazy**: the new parent owner pushes one only when it actually needs to
    exercise a keyless power in that child.
+
+   **Trust boundary (important — this is defense-in-depth, not a proof of
+   authority).** The induction verifies the *signature chain* and the
+   `aclRootId` binding, but it does NOT prove the embedded ownership-change
+   records were ever accepted into the parent's consensus log — a validator
+   holding only the child's key cannot check parent-log inclusion (an
+   external-seat member does not replicate the parent at all). So the current
+   stored legalOwner can mint a *fresh, never-accepted* ownership change and
+   advance the child's stored key to any identity; the offline check accepts
+   it. The **authoritative** guard is the coordinator: it holds the parent's
+   live consensus-watched ACL and rejects any `AclLegalOwnerUpdate` /
+   keyless-removal not authored by the parent's *current* owner. Treat the
+   client-side induction as replay-hardened defense-in-depth against a
+   malicious *node*, not as a self-sufficient authority proof. Fully closing
+   the offline gap would require an acceptor-inclusion proof on each embedded
+   record — not available today (the client `ValidateFull` path's
+   `VerifyAcceptor` is a no-op); tracked as an open question.
 
 4. **Coordinator `SpaceSign` extension.** Request carries a pointer to the
    parent registration record; server-side validation does the nested checks
@@ -719,6 +737,19 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
     (verified). The coordinator derives fresh. replicationKey inheritance
     (required change 7) co-locates the org on one partition purely as a
     client connection-count optimization, never a validation dependency.
+13. **legalOwner authority under malicious infrastructure.** The client-side
+    signature induction is defense-in-depth, not an authority proof: it does
+    not verify that the embedded ownership-change records were accepted into
+    the parent's consensus log, so the current stored legalOwner can advance
+    the child's key off-chain. The coordinator's current-owner check (over its
+    live consensus-watched parent ACL) is the authoritative boundary, so
+    legalOwner governance is safe under a trusted coordinator but NOT a pure
+    cryptographic guarantee against a malicious coordinator. Decide for v1:
+    accept trusted-coordinator governance (likely), or require an
+    acceptor-inclusion proof on each embedded record — the latter needs the
+    client `ValidateFull` verifier to check the consensus acceptor signature
+    (today a no-op), an any-sync change and a re-groom. (See the trust-boundary
+    note under required change 3.)
 
 ## Phasing (proposed)
 
@@ -798,10 +829,14 @@ rotation worker) can act on it. `SpaceInfo` may gain `ParentSpaceId` /
     `AclRoot.legalOwner` key, advanced by `AclLegalOwnerUpdate` — a record
     embedding the raw signed parent `AclOwnershipChange` payload(s), verified
     by signature induction from the pinned key (O(transfers), ~300 B each,
-    offline-verifiable, consumed-CID replay guard), pushed lazily. The
-    transfer window is fail-closed: ex-owner passes clients but the
-    coordinator rejects; new owner passes the coordinator but must prove
-    itself to clients first. (Supersedes the same-day pure-derivation
+    self-contained + consumed-CID replay guard), pushed lazily. The client
+    induction is **defense-in-depth, not an authority proof** — it does not
+    verify parent-log inclusion, so the current stored legalOwner can mint a
+    fresh off-chain proof; the coordinator's current-owner check (over its
+    live consensus-watched parent ACL) is the authoritative boundary (see the
+    trust-boundary note under change 3). The transfer window is fail-closed:
+    ex-owner passes clients but the coordinator rejects; new owner passes the
+    coordinator but must prove itself to clients first. (Supersedes the same-day pure-derivation
     decision after the feasibility review + external design consult: pure
     derivation had no workable client-side story for external seats, and pure
     storage would need proactive fan-out; hash-chain proofs were rejected —

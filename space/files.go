@@ -96,6 +96,22 @@ type Files interface {
 	// sibling to keep it hot.
 	Offload(ctx context.Context, fileId string) error
 
+	// Delete removes the file: its payload row is deleted in one synced
+	// CRDT change (every member sees the file disappear), pending
+	// background work is cancelled, and the local content ref is
+	// released so cache GC reclaims the bytes (unreferenced CARs age
+	// out past the safety-sweep grace period — deletion never races a
+	// settling sync). Deleting an original also deletes its variant
+	// rows — they are unresolvable without it; a keyless reader (who
+	// cannot see VariantOf) deletes only the addressed row. Content
+	// shared with a surviving row (dedup/BIND) is untouched: each row
+	// holds its own ref. The network copy is NOT reclaimed here —
+	// fileprotov2 has no delete RPC yet; the broker's row-driven
+	// accounting stops counting the rows once the deletion syncs.
+	// ErrNotFound when no such file exists (Delete is not idempotent
+	// over the wire — a second call fails like any other read).
+	Delete(ctx context.Context, fileId string) error
+
 	// List returns the space's files as typed infos. Opts.ObjectId
 	// restricts to one object's files (the fast path — one indexed
 	// lookup). The unfiltered listing walks every file in the space:

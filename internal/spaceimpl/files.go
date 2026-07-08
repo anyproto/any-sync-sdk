@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/ipfs/go-cid"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
@@ -15,6 +17,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+var filesLog = logger.NewNamed("sdk.files")
 
 // filesAPI implements space.Files over the SDK-level upload service
 // and this space's payloads surface.
@@ -383,6 +387,77 @@ func (f *filesAPI) Offload(ctx context.Context, fileId string) error {
 		Cached:   false,
 	})
 	return nil
+}
+
+// Delete removes the file's payload row (and its variant rows) in one
+// synced change, then best-effort cleans the local side: pending queue
+// jobs, the fileId → payloads-object index entry, and this row's
+// content ref (an unreferenced CAR ages out via the safety sweep — the
+// bytes are never dropped inline here). See space.Files.
+func (f *filesAPI) Delete(ctx context.Context, fileId string) error {
+	pa := f.s.PayloadsInternal()
+	row, err := pa.FindRow(ctx, fileId)
+	if err != nil {
+		return err
+	}
+	// Cascade to variants: sibling rows of the same object tagged
+	// VariantOf = fileId. Resolvable only with the space key (VariantOf
+	// lives in the sealed meta) — a keyless reader deletes just the
+	// addressed row, and the sweep prunes the orphans' refs if their
+	// rows are later deleted too.
+	victims := []payloads.Row{row}
+	rows, err := pa.ListRows(ctx, row.ObjectId)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		if !r.Sealed && r.Enc.VariantOf == fileId {
+			victims = append(victims, r)
+		}
+	}
+	ids := make([]string, 0, len(victims))
+	for _, r := range victims {
+		ids = append(ids, r.Id)
+	}
+	if err = pa.DeleteRows(ctx, row.ObjectId, ids); err != nil {
+		return err
+	}
+	for _, r := range victims {
+		f.cleanupDeleted(ctx, r)
+	}
+	return nil
+}
+
+// cleanupDeleted drops one deleted row's local leftovers. Best-effort:
+// every step is healed by the safety sweep (dead refs pruned,
+// unreferenced CARs deleted past grace), so a failure logs and moves on
+// rather than failing a deletion whose synced part already landed.
+func (f *filesAPI) cleanupDeleted(ctx context.Context, row payloads.Row) {
+	if q := f.s.parent.fqueue; q != nil {
+		if err := q.Remove(ctx, status.KindDurable, f.s.id, row.Id); err != nil {
+			filesLog.Warn("delete: remove durable job", zap.String("fileId", row.Id), zap.Error(err))
+		}
+		if err := q.Remove(ctx, status.KindPin, f.s.id, row.Id); err != nil {
+			filesLog.Warn("delete: remove pin job", zap.String("fileId", row.Id), zap.Error(err))
+		}
+	}
+	st := f.s.parent.filesStore()
+	if st == nil {
+		return
+	}
+	if err := st.DeleteKV(ctx, fileIndexKey(f.s.id, row.Id)); err != nil {
+		filesLog.Warn("delete: clear file index", zap.String("fileId", row.Id), zap.Error(err))
+	}
+	if row.Inline() {
+		return
+	}
+	root, err := cid.Decode(row.RootCid)
+	if err != nil {
+		return
+	}
+	if _, err = st.RemoveRef(ctx, f.s.id, root, row.Id); err != nil && !errors.Is(err, filestore.ErrNotFound) {
+		filesLog.Warn("delete: release content ref", zap.String("fileId", row.Id), zap.Error(err))
+	}
 }
 
 // inlineReader serves an inline-tier file from the unsealed row.

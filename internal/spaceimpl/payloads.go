@@ -217,6 +217,40 @@ func (p *PayloadsAPI) SetNetworkSigns(ctx context.Context, ownerId string, signs
 	return err
 }
 
+// DeleteRows removes rows from the owner's payloads object as ONE
+// change (the delete write shape — payloads.Handler tombstones each
+// record; the deletion syncs like any other change). The rows must
+// exist as far as the caller knows — a delete of an already-deleted
+// row is absorbed by the CRDT, not an error here.
+func (p *PayloadsAPI) DeleteRows(ctx context.Context, ownerId string, fileIds []string) error {
+	if len(fileIds) == 0 {
+		return errors.New("payloads: no fileIds")
+	}
+	obj, ok, err := p.existingObject(ctx, ownerId)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("payloads: owner %s has no payloads object", ownerId)
+	}
+	records := make([]crdt.RecordChange, 0, len(fileIds))
+	for _, fileId := range fileIds {
+		if fileId == "" {
+			return errors.New("payloads: fileId required")
+		}
+		records = append(records, crdt.RecordChange{
+			Id:  fileId,
+			Ops: []crdt.Op{{Type: crdt.OpDelete}},
+		})
+	}
+	_, err = obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     payloads.Dataset,
+		DataVersion: payloads.HandlerVersion,
+		Records:     records,
+	})
+	return err
+}
+
 // GetRow returns one typed row, unsealed when the caller holds the
 // space key (Sealed stays true otherwise). space.ErrNotFound when the
 // owner has no payloads object, no such row, or a tombstoned row.
@@ -281,7 +315,10 @@ func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row,
 			if !errors.Is(err, space.ErrNotFound) {
 				return payloads.Row{}, err
 			}
-			// Stale index entry (row moved/deleted): fall through.
+			// Stale index entry (row moved/deleted — a remote delete
+			// never cleans this KV): drop it and fall through to the
+			// scan, which re-backfills on a hit.
+			_ = kv.DeleteKV(ctx, fileIndexKey(p.s.id, fileId))
 		}
 	}
 	objIds, err := p.s.store.TreeIdsByChangeType(ctx, payloads.ChangeType)

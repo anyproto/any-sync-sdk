@@ -190,6 +190,10 @@ Callers discover incoming requests by `Subscribe`/`List` filtering on
 `Status == OneToOnePending`, then call `AcceptOneToOne` / `DeclineOneToOne`.
 Members of an active 1-1 are read through the normal members collection
 (`docs/03-space.md`), which reads the two Writers from the immutable ACL.
+The synthetic `sharedPk` owner (above) is filtered out of every member
+view — `Members().List` / `Get` / `Query` / `Subscribe` all surface only
+the two real writers, matching "ignored in business logic." (Filter:
+`AclState.IsOneToOne()` + `OwnerPubKey()` in `collectMembers`.)
 
 ## Layer 2 — discovery via coordinator inbox
 

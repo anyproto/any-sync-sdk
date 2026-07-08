@@ -141,6 +141,18 @@ func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, space.StatusActive, si.Status)
 
+	// The members view must surface exactly the two real writers (us +
+	// the peer) — the synthetic ACL owner (sharedPk, ECDH-derived, held
+	// by nobody) is filtered out, per docs/13-one-to-one-spaces.md. See
+	// SYN-63: it used to leak as a nameless third "owner" member.
+	members, err := sp.Members().List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, members, 2, "1-1 members must be exactly the two writers")
+	for _, m := range members {
+		assert.NotEqual(t, space.PermissionOwner, m.Permission,
+			"synthetic 1-1 owner must not surface in the members list")
+	}
+
 	// Delete → surfaced as Deleted (synced offload marker), row still listed.
 	require.NoError(t, sdk.Spaces().Delete(ctx, id))
 	si, ok = infoByID(t, ctx, sdk, id)

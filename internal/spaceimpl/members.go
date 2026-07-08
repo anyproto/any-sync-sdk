@@ -114,8 +114,14 @@ func (m *membersAPI) Get(ctx context.Context, identity string) (space.Member, er
 	}
 	acl.RLock()
 	state := acl.AclState()
+	syntheticOwner := syntheticOneToOneOwner(state)
 	var found *space.Member
 	for _, acc := range state.CurrentAccounts() {
+		// The synthetic 1-1 owner is not a real member — a Get on its
+		// (unguessable) id resolves to not-found, same as any non-member.
+		if syntheticOwner != nil && acc.PubKey.Equals(syntheticOwner) {
+			continue
+		}
 		if acc.PubKey.Equals(pk) {
 			val := memberFromAccountState(acc)
 			found = &val
@@ -458,6 +464,27 @@ func memberFromJoinRecord(r list.RequestRecord) space.Member {
 	}
 }
 
+// syntheticOneToOneOwner returns the ACL's synthetic 1-1 owner key when
+// the space is a 1-1, else nil. A 1-1 ACL carries a synthetic owner
+// (sharedPk, derived via ECDH from both peers' account keys) purely to
+// satisfy any-sync's "every ACL has an owner" invariant — nobody holds
+// its private key and it has no identity profile. It is ignored in
+// business logic (docs/13-one-to-one-spaces.md), so member views exclude
+// it and surface only the two real writers. Best-effort: if the space is
+// a 1-1 but the owner key can't be read, returns nil (no filtering) —
+// the raw view is a strictly better failure than a panic. Caller holds
+// the AclList read lock.
+func syntheticOneToOneOwner(state *list.AclState) crypto.PubKey {
+	if !state.IsOneToOne() {
+		return nil
+	}
+	owner, err := state.OwnerPubKey()
+	if err != nil {
+		return nil
+	}
+	return owner
+}
+
 // collectMembers snapshots the ACL into the union view: active members
 // from CurrentAccounts (including removed tombstones) plus pending join
 // requests. The second return maps identity → metadata symkey string for
@@ -471,7 +498,11 @@ func collectMembers(acl list.AclList) ([]space.Member, map[string]string) {
 	accounts := state.CurrentAccounts()
 	out := make([]space.Member, 0, len(accounts))
 	symKeys := make(map[string]string)
+	syntheticOwner := syntheticOneToOneOwner(state)
 	for _, acc := range accounts {
+		if syntheticOwner != nil && acc.PubKey.Equals(syntheticOwner) {
+			continue
+		}
 		out = append(out, memberFromAccountState(acc))
 		if sk := decodeSymKeyMetadata(acc.RequestMetadata, keys, acc.KeyRecordId); sk != "" {
 			symKeys[acc.PubKey.Account()] = sk

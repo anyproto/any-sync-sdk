@@ -68,6 +68,56 @@ func genHistoryWorkload(numChanges, numRecords int, withDeletes bool) []Change {
 	return changes
 }
 
+// genChatWorkload builds a chat-shaped change sequence: creates dominate
+// (~75% — every message is a new record with a ~120-char text body), the
+// rest are edits/reactions skewed to recent messages. Under this profile
+// the scratch store grows to ~0.75 records per change, so replay cost is
+// dominated by row inserts rather than LWW gating.
+func genChatWorkload(numChanges int) []Change {
+	g := newVersionGen()
+	rng := rand.New(rand.NewSource(43))
+	arena := &anyenc.Arena{}
+	text := func(i int) string {
+		return fmt.Sprintf("message %d: %s", i,
+			"lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore")
+	}
+	changes := make([]Change, 0, numChanges)
+	created := 0
+	for i := 0; i < numChanges; i++ {
+		var ch Change
+		if created == 0 || rng.Intn(4) != 0 { // ~75% new messages
+			id := fmt.Sprintf("msg-%d", created)
+			created++
+			ch = makeUpsert(g.Next(), id, Op{
+				Type: OpSet,
+				Payload: recordPayload(arena, map[string]any{
+					"author":    fmt.Sprintf("peer-%d", rng.Intn(8)),
+					"text":      text(i),
+					"createdAt": 1700000000 + i,
+				}),
+			})
+		} else { // edit or reaction on a recent message
+			recent := created - 1 - rng.Intn(min(created, 50))
+			id := fmt.Sprintf("msg-%d", recent)
+			if rng.Intn(2) == 0 {
+				ch = makeChange(g.Next(), id, Op{
+					Type: OpSet, Path: []string{"text"},
+					Payload: arena.NewString(text(i) + " (edited)"),
+				})
+			} else {
+				ch = makeChange(g.Next(), id, Op{
+					Type: OpAddToSet, Path: []string{"reactions"},
+					Payload: arena.NewString(fmt.Sprintf("u%d:+1", rng.Intn(8))),
+				})
+			}
+		}
+		ch.ChangeId = fmt.Sprintf("cid-%d", i)
+		ch.AddSeq = uint64(i + 1)
+		changes = append(changes, ch)
+	}
+	return changes
+}
+
 func newScratchController(tb testing.TB) (*Controller, func()) {
 	tb.Helper()
 	st, _, done := newScratchControllerDB(tb)
@@ -189,6 +239,37 @@ func BenchmarkHistoryReplay_SingleRecordFiltered(b *testing.B) {
 			}
 		}
 		done()
+	}
+}
+
+// BenchmarkHistoryReplay_ChatBatchedTx is the chat-shaped counterpart of
+// FullObjectBatchedTx: creates dominate, so the scratch store ends up with
+// ~0.75 records per change (insert-bound, RAM-heavy) instead of the
+// editor profile's 1 record per ~100 changes (gating-bound).
+func BenchmarkHistoryReplay_ChatBatchedTx(b *testing.B) {
+	for _, n := range []int{10_000, 100_000} {
+		b.Run(fmt.Sprintf("changes=%d", n), func(b *testing.B) {
+			changes := genChatWorkload(n)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				st, db, done := newScratchControllerDB(b)
+				tx, err := db.WriteTx(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for _, ch := range changes {
+					if err := st.ApplyChange(tx.Context(), ch); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := tx.Commit(); err != nil {
+					b.Fatal(err)
+				}
+				done()
+			}
+			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "changes/s")
+		})
 	}
 }
 

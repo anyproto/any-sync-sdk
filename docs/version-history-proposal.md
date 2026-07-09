@@ -412,8 +412,16 @@ index rows; nothing extra is stored.
 
 ## 8. Feasibility numbers
 
-`internal/crdt/history_replay_bench_test.go`, workload = 1 create per
-~100 changes (5-field records) + single-field `$set`/`$inc` modifies.
+`internal/crdt/history_replay_bench_test.go`, two workload profiles
+bracketing the real shapes:
+
+- **editor** — 1 create per ~100 changes (1k records under 100k
+  changes), 99% single-field `$set`/`$inc` edits: few records edited
+  many times; replay cost is LWW gating on existing rows.
+- **chat** — ~75% creates (every message a new ~120-char-text record),
+  25% recent-skewed edits/reactions: ~0.75 records per change; replay
+  cost is row inserts and scratch-store growth.
+
 Measures Controller apply only — decrypt (AES) + anyenc decode add on
 top, but cold-restore experience puts them in the same order of
 magnitude, not 10×. Two machines: desktop (Ryzen 9 9950X, NVMe) and
@@ -421,11 +429,20 @@ laptop (ThinkPad, Ryzen 7 PRO 5850U) as the representative low end.
 
 | Scenario | Desktop | Laptop |
 |---|---|---|
-| Full replay, one tx per change | ~45k changes/s (100k → 2.2 s) | ~23k changes/s (100k → 4.4 s) |
-| Full replay, **one outer tx**, in-memory | ~165–226k changes/s (1k → 4.4 ms, 100k → 0.6 s) | ~84–115k changes/s (1k → 8.9 ms, 100k → 1.2 s) |
-| Same, **disk-backed** scratch (commit + checkpoint) | ≈ in-memory (within noise) | ≈ in-memory (~3% slower) |
+| editor: full replay, one tx per change | ~45k changes/s (100k → 2.2 s) | ~23k changes/s (100k → 4.4 s) |
+| editor: full replay, **one outer tx**, in-memory | ~165–226k changes/s (1k → 4.4 ms, 100k → 0.6 s) | ~84–115k changes/s (1k → 8.9 ms, 100k → 1.2 s) |
+| **chat**: full replay, one outer tx, in-memory | ~114k changes/s (100k → 0.88 s) | ~62k changes/s (100k → 1.6 s) |
+| editor, **disk-backed** scratch (commit + checkpoint) | ≈ in-memory (within noise) | ≈ in-memory (~3% slower) |
 | Single record filtered (59 of 100k changes) | **1.6 ms** | **4.2 ms** |
 | Cache hit: open persisted view + read record | 0.10 ms | 0.22 ms |
+
+The chat profile is ~45% slower per change (insert-bound) and its
+scratch projection is proportionally larger (~75k records per 100k
+changes) — the memory guardrail in §9 and the record-scope fast path
+matter most exactly there. A million-change chat extrapolates to
+~9 s / ~16 s full-object replay — reinforcing that chat history UX
+should ride `RecordAt`/timelines (milliseconds) and anchors (§4.3),
+not full-object `ViewAt`.
 
 Read: on-demand `ViewAt` is interactive (≪100 ms) for objects up to
 ~10k changes even on the laptop, and acceptable (~1.2 s + decode

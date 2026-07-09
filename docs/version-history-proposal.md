@@ -143,8 +143,23 @@ that don't touch M cannot influence M's bytes.
 (`internal/crdt/history_replay_bench_test.go`) verifies byte-identical
 records (including `_ver`) between full and filtered replay over a
 randomized 20k-change workload with creates, mixed ops, and deletes.
-Before shipping, extend it into a fuzz across delivery orders and
-branch-heavy DAGs.
+The delivery-order / branch-shape fuzz
+(`internal/crdt/history_filtered_fuzz_test.go`) extends this:
+soundness (filtered subsequence of order D vs full replay of D) holds
+under arbitrary permutations; cross-order convergence is asserted
+across causally valid interleavings of concurrent branches. Two
+convergence caveats the fuzz surfaced, asserted around rather than
+hidden:
+
+- **Tombstone `_ver` residue is delivery-order-dependent**: a sticky
+  delete arriving before a higher-versioned concurrent edit keeps the
+  edit's version in `_ver.*`; visible state (deleted) still converges.
+  Harmless for history (diffs classify by `_deletedAt`), but historic
+  views of tombstones may differ in `_ver` bytes across devices.
+- **`$inc` concurrent with `$set` on the same field diverges by
+  construction** (inc applies relative to whatever value was current
+  at its apply time). Pre-existing projection-level property, not a
+  history-engine defect — flagged for grooming (05a spec follow-up).
 
 **Caveats that bound the fast path:**
 

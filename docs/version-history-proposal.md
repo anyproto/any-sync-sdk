@@ -193,11 +193,48 @@ unusually well with the causal-cut choice:
   deletable at will, always reconstructible from the DAG; LRU by size
   cap. No correctness obligations, no write-path coupling.
 
+**Proactive anchors for big objects.** The demand-driven cache can be
+extended with *anchor* entries placed deliberately along the history
+axis of large objects (change count from `_meta` above a threshold):
+materializations at roughly every K-th change, so that ANY future
+history call — `ViewAt`, per-version record timelines, diffs — replays
+from the nearest cached ancestor instead of from the root. Mechanics
+are identical to cache entries (immutable, keyed by cut heads +
+projection key, evictable); only the trigger differs:
+
+- **Stepping stones, not background jobs**: seed anchors as a
+  by-product of history work already running — the first `ViewAt` on a
+  big object persists intermediate cuts it passes through anyway; the
+  history-index backfill (§4.4), which already walks every change, can
+  drop anchors at its batch boundaries for near-free. No idle workers
+  (mobile battery, §4.4 rationale applies).
+- **Reuse condition** is `anchorHeads ⊆ ancestors(Y)` — checked with
+  the same metadata-only walk the record fast path already needs
+  (§4.2), so a timeline walk touches the DAG structure once and then
+  pays only O(delta) replays per step.
+
+One trap to avoid: it is tempting to seed an anchor by simply copying
+the **live projection** (it already materializes `causal(current
+heads)`, no replay needed). But the live rows also carry non-DAG state
+— `local`- and `account`-scope property values, `_applySeq` — that a
+pure DAG replay would not produce, so a copied anchor would leak
+"today's" local values into historical views. Either strip
+non-`synced`-scope paths on copy (the schema knows each path's scope),
+or build anchors by replay only. Related contract decision: `ViewAt`
+presents the **synced** scope only — local/account-scope values have
+no history in this object's DAG, so historical views exclude them
+rather than showing misleading current values.
+
+Note the naming collision to keep out of the API: these anchors are
+purely **local projection checkpoints** — unrelated to any-sync tree
+snapshots (`IsSnapshot` changes), which are wire-level, affect sync
+and the history horizon (§9), and are a separate future decision.
+
 This subsumes the "materialized checkpoints" idea (§10) in a
-demand-driven form: entries appear because someone actually viewed a
-version, not on a write-path schedule. v1 can ship without it (pure
-in-memory views) and add the disk cache behind the same `ViewAt`
-signature when needed.
+demand-driven form: entries appear because someone actually used
+history on the object, not on a write-path schedule. v1 can ship
+without any of it (pure in-memory views) and add the disk cache, then
+anchors, behind the same `ViewAt` signature when needed.
 
 ### 4.4 Engine B: persistent history index
 

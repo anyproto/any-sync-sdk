@@ -120,7 +120,7 @@ Wired and tested:
 Not wired yet:
 - `Space.SyncStatus` — interface is a stub (`Overall`, `Object`, `Peers`, `Subscribe`)
 - `Service.Subscribe` (space-list events)
-- `TypesAPI.Delete` / `RemoveProperty` / `UpdatePropertyMeta`
+- `TypesAPI.Delete` (`RemoveProperty` and `PatchProperty` are wired; `Delete` still a stub)
 - `PropertiesAPI.SetAccount` / `SetDevice` / `AttachType` / `DetachType`
 - Versioning APIs / change history (`internal/versioning` is doc-only)
 - Files / blobs (deferred; see `docs/07-files.md`)

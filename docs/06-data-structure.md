@@ -196,7 +196,8 @@ any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": 
               "filter": "{\"type\":{\"$in\":[\"page\"]}}" } }
 ```
 
-- `format.type` — `links` (array of `any://<objectId>` URI strings), `date` (`2006-01-02` string), `datetime` (RFC 3339 string), `tags` (array of tag record ids — reserved until the space-level tag table lands). Pinned by the first write, like `kind`, because it constrains the kind (`links`/`tags` ⇒ `array` of `string`; `date`/`datetime` ⇒ `string`).
+- `format.type` — `links` (array of `any://<objectId>` URI strings), `date` (`2006-01-02` string), `datetime` (RFC 3339 string), `select` (one option key — string), `multiselect` (array of option keys), `tags` (array of tag record ids — reserved until the space-level tag table lands). Pinned by the first write, like `kind`, because it constrains the kind (`links`/`tags`/`multiselect` ⇒ `array` of `string`; `date`/`datetime`/`select` ⇒ `string`).
+- `format.options` — for `select`/`multiselect`: a map keyed by each option's stable key (the stored value) → `{name, color, pos, meta?}` (string leaves; `pos` is a lexid order key). CRDT-mutable per path via `PatchProperty` (`format.options.<key>.*`); the key itself is immutable (re-add after delete to reuse). `format.meta` is an opaque format-level string bag. The SDK stores both opaquely and does NOT enforce value↔option-key membership.
 - `format.ui` — presentation hint (`select` / `multiselect` / `link` / `links`). Opaque string to the SDK; CRDT-mutable leaf.
 - `format.filter` — mongo-style condition over candidate objects, stored as its JSON **text** (a string leaf, so concurrent edits replace each other as a unit instead of field-merging two conditions). Opaque to the SDK; CRDT-mutable leaf.
 

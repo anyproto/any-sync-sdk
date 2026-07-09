@@ -4,7 +4,6 @@ import "context"
 
 // SetMetadataRequest is the input to Space.SetMetadata. Pointer
 // semantics: nil = leave-unchanged; non-nil empty string = set-empty.
-// Mirrors PropertyMetaUpdate's per-field patching shape.
 type SetMetadataRequest struct {
 	Name        *string
 	Description *string

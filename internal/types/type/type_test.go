@@ -503,6 +503,47 @@ func TestPropertyHandler_FormatLeafEditsPassTypeEditsDrop(t *testing.T) {
 	assert.Equal(t, `{"type":"person"}`, rec.GetString(typetype.FieldFormat, typetype.FormatKeyFilter), "filter leaf edit landed")
 }
 
+func TestPropertyHandler_SelectOptionLeafEdits(t *testing.T) {
+	// Option leaves (format.options.<key>.{name,color,pos}) are ordinary
+	// string format leaves: a multi-field $set adds an option atomically,
+	// and an $unset of the option path removes the whole subtree.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-select"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiFormat(arena, "string", map[string]*anyenc.Value{
+			typetype.FormatKeyType: arena.NewString("select"),
+		}),
+	)))
+
+	// Add an option via a multi-field $set of string leaves — lands.
+	add := arena.NewObject()
+	add.Set("format.options.high.name", arena.NewString("High"))
+	add.Set("format.options.high.color", arena.NewString("red"))
+	add.Set("format.options.high.pos", arena.NewString("a0"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", "ch-add-opt", propId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: add},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "High", rec.GetString(typetype.FieldFormat, typetype.FormatKeyOptions, "high", typetype.OptionKeyName))
+	assert.Equal(t, "red", rec.GetString(typetype.FieldFormat, typetype.FormatKeyOptions, "high", typetype.OptionKeyColor))
+	assert.Equal(t, "a0", rec.GetString(typetype.FieldFormat, typetype.FormatKeyOptions, "high", typetype.OptionKeyPos))
+
+	// Delete the option subtree via $unset — removed, no tombstone.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", "ch-del-opt", propId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{typetype.FieldFormat, typetype.FormatKeyOptions, "high"}},
+	)))
+	rec = ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(typetype.FieldFormat, typetype.FormatKeyOptions, "high"), "option subtree removed")
+}
+
 func TestPropertyHandler_ConcurrentFormatLeafEditsMerge(t *testing.T) {
 	// Two writers touching different format leaves: per-leaf `_ver`
 	// tracking must let both land regardless of arrival order.

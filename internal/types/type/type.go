@@ -72,10 +72,25 @@ const (
 // string leaves. The filter is a mongo-style condition stored as its
 // JSON text — a string leaf so concurrent edits replace each other as a
 // unit instead of field-merging two conditions into garbage.
+//
+// `format.options` (select / multiselect enumerated choices) and
+// `format.meta` (format-level config) are mutable nested objects. Their
+// leaves are all string paths — format.options.<key>.{name,color,pos}
+// and format.options.<key>.meta.<k> and format.meta.<k> — so they ride
+// the same string-leaf CRDT rule as ui/filter (per-path $set/$unset,
+// concurrent adds of distinct keys converge).
 const (
-	FormatKeyType   = "type"   // "links"/"date"/"datetime"/"tags" — pinned
-	FormatKeyUi     = "ui"     // presentation hint, opaque string, mutable
-	FormatKeyFilter = "filter" // condition JSON text, opaque string, mutable
+	FormatKeyType    = "type"    // "links"/"date"/"datetime"/"tags"/"select"/"multiselect" — pinned
+	FormatKeyUi      = "ui"      // presentation hint, opaque string, mutable
+	FormatKeyFilter  = "filter"  // condition JSON text, opaque string, mutable
+	FormatKeyOptions = "options" // select/multiselect option set (key → {name,color,pos,meta}), mutable
+	FormatKeyMeta    = "meta"    // format-level config bag (string→string), mutable
+
+	// Option leaf sub-keys under format.options.<key>.
+	OptionKeyName  = "name"  // display label, mutable string
+	OptionKeyColor = "color" // presentation color, mutable string
+	OptionKeyPos   = "pos"   // lexid display-order key, mutable string
+	OptionKeyMeta  = "meta"  // per-option opaque bag (string→string), mutable
 )
 
 // formatTypeKindLabel maps each known format-type label to the `kind`
@@ -83,10 +98,12 @@ const (
 // format semantics (ui vocabulary, filter syntax, value shapes) are a
 // consumer concern.
 var formatTypeKindLabel = map[string]string{
-	"links":    "array",
-	"date":     "string",
-	"datetime": "string",
-	"tags":     "array",
+	"links":       "array",
+	"date":        "string",
+	"datetime":    "string",
+	"tags":        "array",
+	"select":      "string",
+	"multiselect": "array",
 }
 
 // schemaBearingFields are pinned for the life of the property record.
@@ -131,6 +148,12 @@ func isPinnedPath(path []string) bool {
 	return false
 }
 
+// IsPinnedPath is the exported form of isPinnedPath, so the space layer
+// (PatchProperty) can reject writes to pinned state client-side and
+// fail the whole patch fast, rather than relying on the handler's
+// per-op drop (which would partially apply a mixed patch).
+func IsPinnedPath(path []string) bool { return isPinnedPath(path) }
+
 // ErrMissingKind indicates a property record was created without a
 // `kind` field. Wraps crdt.ErrValidation so callers can match either.
 var ErrMissingKind = errors.New("typetype: property record requires `kind`")
@@ -142,7 +165,7 @@ var ErrBadScope = errors.New("typetype: property `scope` must be one of synced/a
 
 // ErrBadFormatType indicates a property record declared an unknown
 // `format.type` label. Wraps crdt.ErrValidation.
-var ErrBadFormatType = errors.New("typetype: property `format.type` must be one of links/date/datetime/tags")
+var ErrBadFormatType = errors.New("typetype: property `format.type` must be one of links/date/datetime/tags/select/multiselect")
 
 // ErrBadFormatShape indicates a structurally malformed `format`: not an
 // object at create, a missing/non-string `type`, a non-string `ui` /

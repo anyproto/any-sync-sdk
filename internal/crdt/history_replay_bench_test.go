@@ -3,6 +3,7 @@ package crdt
 import (
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -75,7 +76,22 @@ func newScratchController(tb testing.TB) (*Controller, func()) {
 
 func newScratchControllerDB(tb testing.TB) (*Controller, anystore.DB, func()) {
 	tb.Helper()
-	db, err := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true})
+	return newScratchControllerMode(tb, true)
+}
+
+// newScratchControllerMode opens the scratch store either in memory
+// (transient view) or on disk (persisted materialization / cache).
+func newScratchControllerMode(tb testing.TB, inMemory bool) (*Controller, anystore.DB, func()) {
+	tb.Helper()
+	var (
+		db  anystore.DB
+		err error
+	)
+	if inMemory {
+		db, err = anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true})
+	} else {
+		db, err = anystore.Open(ctx, filepath.Join(tb.TempDir(), "scratch.db"), nil)
+	}
 	require.NoError(tb, err)
 	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}, Schema: dynSchema})
 	require.NoError(tb, err)
@@ -109,29 +125,41 @@ func BenchmarkHistoryReplay_FullObject(b *testing.B) {
 // history replay engine would actually run — one commit for the whole
 // reconstruction instead of one per change.
 func BenchmarkHistoryReplay_FullObjectBatchedTx(b *testing.B) {
-	for _, n := range []int{1_000, 10_000, 100_000} {
-		b.Run(fmt.Sprintf("changes=%d", n), func(b *testing.B) {
-			changes := genHistoryWorkload(n, n/100+1, false)
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				st, db, done := newScratchControllerDB(b)
-				tx, err := db.WriteTx(ctx)
-				if err != nil {
-					b.Fatal(err)
-				}
-				for _, ch := range changes {
-					if err := st.ApplyChange(tx.Context(), ch); err != nil {
+	for _, mode := range []struct {
+		name     string
+		inMemory bool
+	}{{"mem", true}, {"disk", false}} {
+		for _, n := range []int{1_000, 10_000, 100_000} {
+			b.Run(fmt.Sprintf("%s/changes=%d", mode.name, n), func(b *testing.B) {
+				changes := genHistoryWorkload(n, n/100+1, false)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					st, db, done := newScratchControllerMode(b, mode.inMemory)
+					tx, err := db.WriteTx(ctx)
+					if err != nil {
 						b.Fatal(err)
 					}
+					for _, ch := range changes {
+						if err := st.ApplyChange(tx.Context(), ch); err != nil {
+							b.Fatal(err)
+						}
+					}
+					if err := tx.Commit(); err != nil {
+						b.Fatal(err)
+					}
+					if !mode.inMemory {
+						// Persisted-cache scenario: count the WAL checkpoint
+						// into the file, not just the commit.
+						if err := db.Flush(ctx, 0, anystore.FlushModeCheckpointFull); err != nil {
+							b.Fatal(err)
+						}
+					}
+					done()
 				}
-				if err := tx.Commit(); err != nil {
-					b.Fatal(err)
-				}
-				done()
-			}
-			b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "changes/s")
-		})
+				b.ReportMetric(float64(n)*float64(b.N)/b.Elapsed().Seconds(), "changes/s")
+			})
+		}
 	}
 }
 
@@ -161,6 +189,45 @@ func BenchmarkHistoryReplay_SingleRecordFiltered(b *testing.B) {
 			}
 		}
 		done()
+	}
+}
+
+// BenchmarkHistoryCache_HitOpenAndRead measures the cache-hit path for a
+// persisted materialization: the 100k-change view was already replayed to a
+// disk file; a hit = open the file, read one record, close. Compare against
+// the cold replay cost in BenchmarkHistoryReplay_FullObjectBatchedTx.
+func BenchmarkHistoryCache_HitOpenAndRead(b *testing.B) {
+	changes := genHistoryWorkload(100_000, 1_000, false)
+	path := filepath.Join(b.TempDir(), "view-cache.db")
+	db, err := anystore.Open(ctx, path, nil)
+	require.NoError(b, err)
+	st, err := NewController(ctx, "obj1", db, HandlerReg{Name: testDS, Handler: DefaultHandler{}, Schema: dynSchema})
+	require.NoError(b, err)
+	tx, err := db.WriteTx(ctx)
+	require.NoError(b, err)
+	for _, ch := range changes {
+		require.NoError(b, st.ApplyChange(tx.Context(), ch))
+	}
+	require.NoError(b, tx.Commit())
+	require.NoError(b, db.Close())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cdb, err := anystore.Open(ctx, path, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		coll, err := cdb.OpenCollection(ctx, "obj1_"+testDS)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := coll.FindId(ctx, "rec-500"); err != nil {
+			b.Fatal(err)
+		}
+		if err := cdb.Close(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

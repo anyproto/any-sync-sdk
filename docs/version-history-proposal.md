@@ -130,7 +130,7 @@ Notes:
 
 Per-record history at chat scale ("timeline of message M in a
 1M-change object") cannot afford full-object replay per version. The
-fast path: fetch from the index (§4.3) only the changes whose payload
+fast path: fetch from the index (§4.4) only the changes whose payload
 touches record M, intersect with the ancestor set of the requested
 cut, and replay just those onto a scratch value.
 
@@ -166,7 +166,40 @@ cursor, and test membership per candidate change. Per-version cost is
 then just the filtered replay (~1.6 ms measured for a 59-change
 record; §8).
 
-### 4.3 Engine B: persistent history index
+### 4.3 Persisted materializations as a view cache
+
+Replaying into a **disk-backed** scratch store costs the same as
+in-memory (§8: within noise on both machines — one batched commit +
+checkpoint, sequential writes). That makes persisting a
+materialization essentially free at build time, and it composes
+unusually well with the causal-cut choice:
+
+- **Cache entries are immutable.** `causal(ChangeId)` never changes,
+  so a materialization keyed by `(objectId, version, projectionKey)`
+  never needs invalidation — only eviction. `projectionKey` =
+  DataVersion + registered handler versions, so a re-index naturally
+  orphans stale entries instead of serving them.
+- **Hits are ~5000× cheaper than cold replay** for a 100k-change
+  object: open file + read ≈ 0.1–0.2 ms vs 0.6–1.2 s (§8). A user
+  scrubbing back and forth between versions pays the replay once per
+  version.
+- **Incremental build.** To view Y when a cached X with
+  `X ∈ causal(Y)` exists: copy X's file, replay only
+  `causal(Y) \ causal(X)` on top (the projection rows carry their
+  `_ver` maps, so resuming is exactly the cold-restore-from-watermark
+  pattern). A timeline walk (v1, v2, v3…) becomes O(delta) per step
+  instead of O(history).
+- **It is only a cache.** One file per entry in a cache directory,
+  deletable at will, always reconstructible from the DAG; LRU by size
+  cap. No correctness obligations, no write-path coupling.
+
+This subsumes the "materialized checkpoints" idea (§10) in a
+demand-driven form: entries appear because someone actually viewed a
+version, not on a write-path schedule. v1 can ship without it (pure
+in-memory views) and add the disk cache behind the same `ViewAt`
+signature when needed.
+
+### 4.4 Engine B: persistent history index
 
 Normalized collections (not multikey arrays — "all changes touching
 record X in order" must be an index range scan, not an array-unpack
@@ -262,7 +295,7 @@ records' before/after copies.
 
 - The record-level `_traces` map is **not** a history mechanism — it is
   GC'd down to versionIds still live in `_ver`. History-grade trace
-  queries come from `_history_traces` (§4.3), populated at apply time
+  queries come from `_history_traces` (§4.4), populated at apply time
   from the decoded payload. E2EE means this local index is the *only*
   viable spot — server-side indexing would require moving traceIds out
   of the encrypted payload.
@@ -342,20 +375,25 @@ index rows; nothing extra is stored.
 
 ## 8. Feasibility numbers
 
-`internal/crdt/history_replay_bench_test.go`, Ryzen 9 9950X, in-memory
-any-store, workload = 1 create per ~100 changes (5-field records) +
-single-field `$set`/`$inc` modifies. Measures Controller apply only —
-decrypt (AES) + anyenc decode add on top, but cold-restore experience
-puts them in the same order of magnitude, not 10×.
+`internal/crdt/history_replay_bench_test.go`, workload = 1 create per
+~100 changes (5-field records) + single-field `$set`/`$inc` modifies.
+Measures Controller apply only — decrypt (AES) + anyenc decode add on
+top, but cold-restore experience puts them in the same order of
+magnitude, not 10×. Two machines: desktop (Ryzen 9 9950X, NVMe) and
+laptop (ThinkPad, Ryzen 7 PRO 5850U) as the representative low end.
 
-| Scenario | Result |
-|---|---|
-| Full replay, one tx per change | ~45k changes/s (100k changes → 2.2 s) |
-| Full replay, **one outer tx** | ~165–226k changes/s — 1k → 4.4 ms, 10k → 46 ms, 100k → 0.6 s |
-| Single record filtered (59 of 100k changes) | **1.6 ms** |
+| Scenario | Desktop | Laptop |
+|---|---|---|
+| Full replay, one tx per change | ~45k changes/s (100k → 2.2 s) | ~23k changes/s (100k → 4.4 s) |
+| Full replay, **one outer tx**, in-memory | ~165–226k changes/s (1k → 4.4 ms, 100k → 0.6 s) | ~84–115k changes/s (1k → 8.9 ms, 100k → 1.2 s) |
+| Same, **disk-backed** scratch (commit + checkpoint) | ≈ in-memory (within noise) | ≈ in-memory (~3% slower) |
+| Single record filtered (59 of 100k changes) | **1.6 ms** | **4.2 ms** |
+| Cache hit: open persisted view + read record | 0.10 ms | 0.22 ms |
 
 Read: on-demand `ViewAt` is interactive (≪100 ms) for objects up to
-~10k changes and acceptable (~0.6 s + decode overhead) at 100k.
+~10k changes even on the laptop, and acceptable (~1.2 s + decode
+overhead) at 100k. Persisting the materialization is free at build
+time and turns repeat views into sub-millisecond opens (§4.3).
 Million-change objects (chats) are exactly the ones where users want
 *record* history, and the filtered path is ~1000× cheaper there.
 Checkpointing (§10) stays deferred until telemetry shows p95 objects
@@ -398,12 +436,11 @@ where full-object `ViewAt` actually hurts.
   fast path serves the same need at read time.
 - **Local-prefix cut semantics** — unstable across devices *and*
   across rebuilds on one device (lexid rebalance). Rejected (§3.2).
-- **Materialized checkpoints of the projection** (persisted
-  every-K-changes copies to bound replay) — deferred, not rejected.
-  Only warranted for full-object views of 1M-change objects, which
-  telemetry may show nobody asks for (record scope dominates there).
-  If needed later: checkpoint = copy of projection rows + watermark;
-  replay resumes from it exactly like cold restore does from `_meta`.
+- **Write-path materialized checkpoints** (persisted every-K-changes
+  copies maintained on apply) — superseded by the demand-driven view
+  cache (§4.3): same replay-bounding effect, zero write-path cost,
+  entries only for versions someone actually viewed, plain eviction
+  instead of a maintenance protocol.
 - **Server-side trace index (unencrypted traceIds on the wire)** — not
   needed for any listed requirement; privacy cost (correlation tokens
   visible to nodes). Deferred as an explicit product decision.
@@ -421,7 +458,7 @@ where full-object `ViewAt` actually hurts.
   `BuildEmptyData`), `Storage.Get/GetAfterOrder`, and full-epoch key
   derivation cover everything. Nice-to-haves, not blockers: a
   descending `GetAfterOrder` twin (we page via the SDK index instead);
-  exposing a rebuild-generation signal for §4.3's OrderId re-stamp
+  exposing a rebuild-generation signal for §4.4's OrderId re-stamp
   (can be derived by comparing stored vs live OrderIds lazily).
 - **any-store: none.** InMemory mode, context-tx composition, and the
   typed query package already suffice. (A structural diff util could
@@ -443,4 +480,6 @@ where full-object `ViewAt` actually hurts.
    stale-flag + lazy backfill; `ListChanges` with filters and cursor
    pagination.
 5. **Traces + coalescing** on top of the index.
-6. Defer: checkpoints, server-side traces, any per-change GC story.
+6. Defer: the persisted view cache (§4.3 — add behind the same
+   `ViewAt` signature when repeat-view telemetry warrants), server-side
+   traces, any per-change GC story.

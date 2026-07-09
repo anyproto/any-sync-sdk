@@ -332,8 +332,9 @@ type PropertyDecl struct {
 }
 
 // FormatType mirrors space.FormatType 1:1 (links / date / datetime /
-// tags) so callers declaring types via config.Config.Types don't need
-// to import the space package. The zero value means "no format".
+// tags / select / multiselect) so callers declaring types via
+// config.Config.Types don't need to import the space package. The zero
+// value means "no format".
 type FormatType uint8
 
 const (
@@ -341,6 +342,8 @@ const (
 	FormatDate
 	FormatDatetime
 	FormatTags
+	FormatSelect
+	FormatMultiselect
 )
 
 // PropertyFormat mirrors space.PropertyFormat: Type declares the value

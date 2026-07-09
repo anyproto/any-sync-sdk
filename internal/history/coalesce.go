@@ -69,6 +69,9 @@ func Coalesce(entries []ChangeMeta, opts CoalesceOpts) []ChangeMeta {
 			group := head // head entry represents the group
 			group.GroupSize = oldest - i + 1
 			group.PrevIds = entries[oldest].PrevIds
+			// Cursoring resumes AFTER the oldest member, so a trimmed
+			// coalesced page never re-lists part of a group.
+			group.OrderId = entries[oldest].OrderId
 			group.Touched = unionTouched(entries[i : oldest+1])
 			group.TraceIds = unionTraces(entries[i : oldest+1])
 			out = append(out, group)

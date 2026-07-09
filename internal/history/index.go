@@ -479,6 +479,56 @@ func nextCursor(out []ChangeMeta, hasMore bool) string {
 	return out[len(out)-1].OrderId
 }
 
+// TouchedChangeIds returns every ChangeId known to touch (dataset,
+// recordId) on the object — the RecordAt fast-path pre-filter. Bounded
+// by maxTouchedChangeIds; a record touched more often than that falls
+// back to the decode-and-filter path (nil, nil).
+func (ix *Index) TouchedChangeIds(ctx context.Context, objectId, dataset, recordId string) ([]string, error) {
+	iter, err := ix.recs.Find(map[string]any{
+		"sp": ix.spaceId, "obj": objectId, "ds": dataset, "rec": recordId,
+	}).Iter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("history: touched change ids: %w", err)
+	}
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		if derr != nil {
+			return nil, derr
+		}
+		if changeId, _, ok := splitSideId(string(doc.Value().GetStringBytes("id"))); ok {
+			out = append(out, changeId)
+		}
+		if len(out) > maxTouchedChangeIds {
+			return nil, nil
+		}
+	}
+	return out, nil
+}
+
+// maxTouchedChangeIds caps the fast-path pre-filter list; beyond it the
+// id set itself is heavy enough that decode-and-filter is comparable.
+const maxTouchedChangeIds = 100_000
+
+// HasState reports whether the object is known to the index at all —
+// a meta row (stale marker / completed backfill) or at least one
+// change row. Objects predating the history feature have neither and
+// need a backfill before their history can be served.
+func (ix *Index) HasState(ctx context.Context, objectId string) (bool, error) {
+	if _, err := ix.meta.FindId(ctx, objectId); err == nil {
+		return true, nil
+	} else if !errors.Is(err, anystore.ErrDocNotFound) {
+		return false, err
+	}
+	iter, err := ix.changes.Find(map[string]any{"sp": ix.spaceId, "obj": objectId}).Limit(1).Iter(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer iter.Close()
+	return iter.Next(), nil
+}
+
 // splitSideId splits "changeId/suffix" (recs: recordId; traces:
 // traceId). ChangeIds are CIDs and never contain '/', so the first
 // separator wins.

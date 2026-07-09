@@ -197,6 +197,12 @@ func (s *spaceImpl) Changes() space.ChangeIndexAPI {
 	return newChangeIndexAPI(s)
 }
 
+// History returns the version-history surface for this space. See
+// space.HistoryAPI and docs/version-history-proposal.md.
+func (s *spaceImpl) History() space.HistoryAPI {
+	return newHistoryAPI(s)
+}
+
 // ReadState exposes the read/unread tracking surface —
 // space.ReadStateAPI.
 func (s *spaceImpl) ReadState() space.ReadStateAPI {

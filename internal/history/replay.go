@@ -123,29 +123,59 @@ func BuildView(ctx context.Context, p ViewParams) (*View, error) {
 	return view, nil
 }
 
-func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.HistoryTree, p ViewParams) (*View, error) {
+// scratchController opens the scratch shared collections and builds a
+// fresh Controller for a replay. No applySeq allocator and no apply
+// hook: scratch rows carry no _applySeq and feed no read-tracking —
+// replay artifacts stay out.
+func scratchController(ctx context.Context, db anystore.DB, p ViewParams) (*crdt.Controller, []string, error) {
 	shared := crdt.SharedCollections{}
 	for _, name := range p.SharedDatasets {
 		coll, err := db.Collection(ctx, name)
 		if err != nil {
-			return nil, fmt.Errorf("history: open scratch shared collection %s: %w", name, err)
+			return nil, nil, fmt.Errorf("history: open scratch shared collection %s: %w", name, err)
 		}
 		shared[name] = coll
 	}
-	// No applySeq allocator and no apply hook: scratch rows carry no
-	// _applySeq and feed no read-tracking — replay artifacts stay out.
 	ctrl, err := crdt.NewControllerWithShared(ctx, p.ObjectId, db, shared, p.Regs...)
 	if err != nil {
-		return nil, fmt.Errorf("history: scratch controller: %w", err)
+		return nil, nil, fmt.Errorf("history: scratch controller: %w", err)
 	}
-
-	known := make(map[string]struct{}, len(p.Regs))
 	datasets := make([]string, 0, len(p.Regs))
 	for _, reg := range p.Regs {
-		known[reg.Name] = struct{}{}
 		datasets = append(datasets, reg.Name)
 	}
 	sort.Strings(datasets)
+	return ctrl, datasets, nil
+}
+
+// BuildEmptyView returns a view of the empty projection — the causal
+// past of a first change's (absent) parents. Heads are ignored.
+func BuildEmptyView(ctx context.Context, p ViewParams) (*View, error) {
+	db, err := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true})
+	if err != nil {
+		return nil, fmt.Errorf("history: open scratch store: %w", err)
+	}
+	ctrl, datasets, err := scratchController(ctx, db, p)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if p.Dataset != "" {
+		datasets = []string{p.Dataset}
+	}
+	return &View{ObjectId: p.ObjectId, Version: "", db: db, ctrl: ctrl, datasets: datasets}, nil
+}
+
+func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.HistoryTree, p ViewParams) (*View, error) {
+	ctrl, datasets, err := scratchController(ctx, db, p)
+	if err != nil {
+		return nil, err
+	}
+
+	known := make(map[string]struct{}, len(p.Regs))
+	for _, reg := range p.Regs {
+		known[reg.Name] = struct{}{}
+	}
 
 	maxRecords := p.MaxRecords
 	if maxRecords <= 0 {

@@ -39,6 +39,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/history"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
@@ -229,6 +230,17 @@ type Store struct {
 	// changeType → allowed). Nil/empty = sync everything. See
 	// selective.go for the full mechanism.
 	selective map[string]struct{}
+
+	// historyOnce lazily opens the per-space version-history index
+	// (history.Index) on first use — apply hook or History() query.
+	historyOnce     sync.Once
+	historyIndex    *history.Index
+	historyIndexErr error
+	// historySkipIndex marks objects mid-cold-restore: the apply hook
+	// skips history-index rows for them (the object is marked stale
+	// and lazily backfilled instead — proposal §4.4 cold path). Same
+	// pattern as readSeedPending.
+	historySkipIndex sync.Map
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -1269,8 +1281,24 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err != nil {
 		return nil, err
 	}
+	// First materialization (fresh controller, no watermark): the cold
+	// restore may drain the whole tree — skip per-change history-index
+	// rows (protected perf path, proposal §4.4) and mark the object
+	// stale for lazy backfill if anything was actually restored.
+	firstRestore := ctrl.MaxAddSeq() == 0
+	if firstRestore {
+		s.historySkipIndex.Store(objectId, struct{}{})
+		defer s.historySkipIndex.Delete(objectId)
+	}
 	if err := obj.ColdRestore(ctx); err != nil {
 		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
+	}
+	if firstRestore && ctrl.MaxAddSeq() > 0 {
+		if ix, ixErr := s.HistoryIndex(ctx); ixErr == nil {
+			if mErr := ix.MarkStale(ctx, objectId); mErr != nil {
+				storeLog.Warn("history: mark stale failed", zap.String("objectId", objectId), zap.Error(mErr))
+			}
+		}
 	}
 	if seedPending {
 		if len(publishedSets) > 0 {
@@ -1385,24 +1413,40 @@ func objectsDatasetSchema() schema.Dataset {
 }
 
 func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Controller, error) {
+	regs, sharedNames, err := s.buildRegs()
+	if err != nil {
+		return nil, err
+	}
+	shared := crdt.SharedCollections{}
+	for _, name := range sharedNames {
+		coll, cerr := s.SharedObjects(ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		shared[name] = coll
+	}
+	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
+	if err != nil {
+		return nil, err
+	}
+	ctrl.SetSpaceId(s.spaceId)
+	ctrl.SetApplySeqAllocator(s.applySeqs)
+	ctrl.SetApplyHook(s.composedApplyHook(ctrl))
+	return ctrl, nil
+}
+
+// buildRegs returns the handler registrations every controller in this
+// store runs, plus the dataset names that project into a per-space
+// shared collection (row id = ObjectId). Shared collections are NOT
+// opened here — the live path opens the space one (SharedObjects), the
+// history replay path opens scratch ones (proposal §4.1).
+func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 	if s.customHandlers != nil {
 		// Raw mode: exactly the caller's handlers, each on its own
 		// per-object collection (<objectId>_<dataset>). No shared
 		// `objects` collection, no built-in regs.
-		ctrl, err := crdt.NewController(ctx, objectId, s.db, s.customHandlers...)
-		if err != nil {
-			return nil, err
-		}
-		ctrl.SetSpaceId(s.spaceId)
-		ctrl.SetApplySeqAllocator(s.applySeqs)
-		ctrl.SetApplyHook(s.readApplyHook(ctrl))
-		return ctrl, nil
+		return s.customHandlers, nil, nil
 	}
-	coll, err := s.SharedObjects(ctx)
-	if err != nil {
-		return nil, err
-	}
-	shared := crdt.SharedCollections{properties.Dataset: coll}
 	regs := []crdt.HandlerReg{
 		// DynamicScopeByKey: undeclared heads (`any`, typeIds) carry
 		// per-PROPERTY scopes resolved from the type registry — the
@@ -1429,15 +1473,88 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d), ReadTracking: d.ReadTracking})
+			regs = append(regs, crdt.HandlerReg{
+				Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d),
+				ReadTracking:          d.ReadTracking,
+				SkipHistory:           d.SkipHistory,
+				DisableFilteredReplay: d.DisableFilteredReplay,
+			})
 		}
 	}
-	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
-	if err != nil {
-		return nil, err
+	return regs, []string{properties.Dataset}, nil
+}
+
+// HistoryReplayRegs returns a fresh handler-reg set plus the shared
+// dataset names for a history scratch replay (history.ViewParams).
+// Fresh per call: handlers like properties.New hold registry pointers
+// and must not be shared with live controllers' mutable state.
+func (s *Store) HistoryReplayRegs() ([]crdt.HandlerReg, []string, error) {
+	return s.buildRegs()
+}
+
+// HistoryIndex lazily opens the per-space version-history index. The
+// skip list is derived from the registered datasets' SkipHistory flags.
+func (s *Store) HistoryIndex(ctx context.Context) (*history.Index, error) {
+	s.historyOnce.Do(func() {
+		regs, _, err := s.buildRegs()
+		if err != nil {
+			s.historyIndexErr = err
+			return
+		}
+		var skip []string
+		for _, reg := range regs {
+			if reg.SkipHistory {
+				skip = append(skip, reg.Name)
+			}
+		}
+		s.historyIndex, s.historyIndexErr = history.OpenIndex(ctx, s.db, s.spaceId, skip)
+	})
+	return s.historyIndex, s.historyIndexErr
+}
+
+// composedApplyHook chains the read-tracking hook and the history-index
+// hook. Nil when both are disabled so untracked spaces keep paying a
+// single nil check per apply.
+func (s *Store) composedApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
+	read := s.readApplyHook(ctrl)
+	hist := s.historyApplyHook()
+	switch {
+	case read == nil && hist == nil:
+		return nil
+	case hist == nil:
+		return read
+	case read == nil:
+		return hist
 	}
-	ctrl.SetSpaceId(s.spaceId)
-	ctrl.SetApplySeqAllocator(s.applySeqs)
-	ctrl.SetApplyHook(s.readApplyHook(ctrl))
-	return ctrl, nil
+	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, res *crdt.ApplyResult) error {
+		if err := read(txCtx, ch, recordIds, res); err != nil {
+			return err
+		}
+		return hist(txCtx, ch, recordIds, res)
+	}
+}
+
+// historyApplyHook writes warm-path history-index rows in the apply tx
+// (proposal §4.4). Objects mid-cold-restore are skipped — they're
+// marked stale and lazily backfilled instead. Index failures never
+// fail the apply: history is best-effort metadata, and a genuine
+// storage fault will surface through the apply tx itself.
+func (s *Store) historyApplyHook() crdt.ApplyHook {
+	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, _ *crdt.ApplyResult) error {
+		if ch.ChangeId == "" || ch.Local || ch.Injected {
+			return nil
+		}
+		if _, restoring := s.historySkipIndex.Load(ch.ObjectId); restoring {
+			return nil
+		}
+		ix, err := s.HistoryIndex(txCtx)
+		if err != nil {
+			storeLog.Warn("history index unavailable; skipping row", zap.Error(err))
+			return nil
+		}
+		if err := ix.IndexChange(txCtx, ch, recordIds); err != nil {
+			storeLog.Warn("history index row failed", zap.String("changeId", ch.ChangeId), zap.Error(err))
+		}
+		return nil
+	}
 }

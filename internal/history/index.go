@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -33,9 +34,11 @@ const (
 // (proposal §4.4: ~1000 changes per tx).
 const DefaultBackfillBatch = 1000
 
-// ErrHistoryIndexBuilding — a history query touched an object whose
-// index is stale and the (lazy) backfill has not completed yet.
-var ErrHistoryIndexBuilding = errors.New("history: index backfill in progress")
+// NOTE: v1 runs stale-index backfills synchronously inside the first
+// history query (spaceimpl ensureFresh). The proposal's async contract
+// (an ErrHistoryIndexBuilding + progress callback) is deferred until
+// backfill latency proves to matter — no dead error variable until
+// then.
 
 // Index is the per-space history index. Safe for use from apply hooks:
 // any-store's single writer serializes concurrent object applies.
@@ -224,7 +227,6 @@ func (ix *Index) Backfill(ctx context.Context, tree objecttree.ReadableObjectTre
 		batchSize = DefaultBackfillBatch
 	}
 	codec := object.NewCodec()
-	rootId := tree.Id()
 
 	var (
 		batch    []crdt.Change
@@ -252,28 +254,21 @@ func (ix *Index) Backfill(ctx context.Context, tree objecttree.ReadableObjectTre
 		return tx.Commit()
 	}
 
-	convert := func(ch *objecttree.Change, decrypted []byte) (any, error) {
-		if ch.Id == rootId || len(decrypted) == 0 {
-			return nil, nil
-		}
-		decoded, decodeErr := codec.Decode(decrypted)
-		if decodeErr != nil {
-			return nil, nil
-		}
-		return &decoded, nil
-	}
+	objectAuthor, objectCreatedAt := rootMeta(tree)
 	iter := func(ch *objecttree.Change) bool {
 		decoded, ok := ch.Model.(*crdt.Change)
 		if !ok || decoded == nil {
 			return true
 		}
-		decoded.ObjectId = objectId
-		decoded.ChangeId = ch.Id
-		decoded.VersionId = crdt.VersionId(ch.OrderId)
-		decoded.Timestamp = ch.Timestamp
-		decoded.PrevIds = ch.PreviousIds
-		if ch.Identity != nil {
-			decoded.Creator = ch.Identity.Account()
+		stampEnvelope(decoded, ch, objectId, objectAuthor, objectCreatedAt)
+		// Op payloads alias the codec's parser buffer and are only
+		// valid until the NEXT Decode — this batch outlives many
+		// Decodes, so drop them now. Index rows read op types and
+		// record ids only; a nil Payload can never be misread later.
+		for i := range decoded.Records {
+			for j := range decoded.Records[i].Ops {
+				decoded.Records[i].Ops[j].Payload = nil
+			}
 		}
 		batch = append(batch, *decoded)
 		if len(batch) >= batchSize {
@@ -285,7 +280,7 @@ func (ix *Index) Backfill(ctx context.Context, tree objecttree.ReadableObjectTre
 		return true
 	}
 
-	if err := tree.IterateRoot(convert, iter); err != nil {
+	if err := tree.IterateRoot(decodeConvert(codec, tree.Id()), iter); err != nil {
 		return mapTreeErr(err)
 	}
 	if fatalErr != nil {
@@ -325,10 +320,13 @@ type ChangeMeta struct {
 	Touched   []TouchedRecord
 	// PrevIds power list-time coalescing; internal, not part of the
 	// public surface.
-	PrevIds   []string
-	OrderId   string // internal pagination key; never an identity
-	Truncated bool   // history horizon reached (stamped by the API layer)
-	GroupSize int    // 1 unless coalesced
+	PrevIds []string
+	OrderId string // internal pagination key; never an identity
+	// Truncated is RESERVED (always false today): the SDK writes no
+	// tree snapshots, so full history is always local. See the public
+	// space.ChangeMeta.Truncated doc.
+	Truncated bool
+	GroupSize int // 1 unless coalesced
 }
 
 // DefaultListLimit / MaxListLimit bound ListChanges pages.
@@ -425,16 +423,26 @@ func (ix *Index) listViaJoin(ctx context.Context, side anystore.Collection, cond
 	}
 	defer iter.Close()
 
+	// One bookkeeping rule: lastO tracks the `o` of the last PROCESSED
+	// side row, and the scan "has more" the moment we stop before the
+	// iterator is naturally exhausted — either because the page filled
+	// or because the fetch window (fetch rows + 1 sentinel) still had
+	// rows left. The next cursor is then always lastO: resuming
+	// strictly below the last processed row can neither skip nor
+	// relist, and a window whose rows were all rejected by the author
+	// filter continues instead of terminating early.
 	var (
 		out     []ChangeMeta
 		lastO   string
+		scanned int
 		hasMore bool
 	)
 	for iter.Next() {
-		if len(out) >= limit {
-			hasMore = true
+		if len(out) >= limit || scanned >= fetch {
+			hasMore = true // unprocessed rows remain past this page/window
 			break
 		}
+		scanned++
 		doc, derr := iter.Doc()
 		if derr != nil {
 			return nil, "", derr
@@ -458,17 +466,9 @@ func (ix *Index) listViaJoin(ctx context.Context, side anystore.Collection, cond
 		}
 		out = append(out, meta)
 	}
-	if !hasMore && iter.Next() {
-		hasMore = true
-	}
 	if !hasMore {
 		return out, "", nil
 	}
-	if len(out) > 0 {
-		return out, out[len(out)-1].OrderId, nil
-	}
-	// Author filter ate the whole page: hand back the scan position so
-	// the caller can continue instead of terminating early.
 	return out, lastO, nil
 }
 
@@ -533,12 +533,7 @@ func (ix *Index) HasState(ctx context.Context, objectId string) (bool, error) {
 // traceId). ChangeIds are CIDs and never contain '/', so the first
 // separator wins.
 func splitSideId(id string) (changeId, suffix string, ok bool) {
-	for i := 0; i < len(id); i++ {
-		if id[i] == '/' {
-			return id[:i], id[i+1:], true
-		}
-	}
-	return "", "", false
+	return strings.Cut(id, "/")
 }
 
 func changeMetaFromRow(row *anyenc.Value) ChangeMeta {

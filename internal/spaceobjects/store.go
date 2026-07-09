@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	anystorev1 "github.com/anyproto/any-store"
@@ -231,16 +232,27 @@ type Store struct {
 	// selective.go for the full mechanism.
 	selective map[string]struct{}
 
-	// historyOnce lazily opens the per-space version-history index
-	// (history.Index) on first use — apply hook or History() query.
-	historyOnce     sync.Once
-	historyIndex    *history.Index
-	historyIndexErr error
+	// historyIx is the per-space version-history index once opened.
+	// Published via atomic pointer so the apply hook reads it without
+	// taking historyMu — the opener may block on the any-store writer
+	// (collection DDL) while an apply holds it, and an apply hook
+	// waiting on historyMu in that state would ABBA-deadlock.
+	historyIx atomic.Pointer[history.Index]
+	// historyMu serializes index opens only. Open failures are NOT
+	// cached — the next HistoryIndex call retries, so a transient
+	// fault never disables history for the Store's lifetime.
+	historyMu sync.Mutex
 	// historySkipIndex marks objects mid-cold-restore: the apply hook
 	// skips history-index rows for them (the object is marked stale
 	// and lazily backfilled instead — proposal §4.4 cold path). Same
 	// pattern as readSeedPending.
 	historySkipIndex sync.Map
+	// historyPendingStale collects objectIds whose index rows were
+	// skipped or failed while the index was unavailable (or whose
+	// in-tx MarkStale failed). Flushed to MarkStale on every
+	// successful HistoryIndex call so the lazy backfill repairs the
+	// gap instead of it becoming permanent.
+	historyPendingStale sync.Map
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -1297,7 +1309,12 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		if ix, ixErr := s.HistoryIndex(ctx); ixErr == nil {
 			if mErr := ix.MarkStale(ctx, objectId); mErr != nil {
 				storeLog.Warn("history: mark stale failed", zap.String("objectId", objectId), zap.Error(mErr))
+				s.historyPendingStale.Store(objectId, struct{}{})
 			}
+		} else if !errors.Is(ixErr, ErrHistoryUnavailable) {
+			// Index not openable right now: queue the mark so the next
+			// successful open repairs it.
+			s.historyPendingStale.Store(objectId, struct{}{})
 		}
 	}
 	if seedPending {
@@ -1417,6 +1434,16 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	if err != nil {
 		return nil, err
 	}
+	// Open the history index eagerly, outside any apply tx, so the
+	// apply hook only ever reads the atomic pointer (see HistoryIndex
+	// for why opening in-tx is unsafe). A failure here is tolerated —
+	// the hook defers to the stale/backfill path and the next open
+	// retries.
+	if s.customHandlers == nil {
+		if _, ixErr := s.HistoryIndex(ctx); ixErr != nil {
+			storeLog.Warn("history index open failed; deferring to backfill", zap.Error(ixErr))
+		}
+	}
 	shared := crdt.SharedCollections{}
 	for _, name := range sharedNames {
 		coll, cerr := s.SharedObjects(ctx)
@@ -1492,24 +1519,68 @@ func (s *Store) HistoryReplayRegs() ([]crdt.HandlerReg, []string, error) {
 	return s.buildRegs()
 }
 
-// HistoryIndex lazily opens the per-space version-history index. The
-// skip list is derived from the registered datasets' SkipHistory flags.
+// ErrHistoryUnavailable — this store has no history index (raw-mode /
+// tech-space stores carry internal bookkeeping only, no history
+// surface).
+var ErrHistoryUnavailable = errors.New("spaceobjects: history index unavailable for this store")
+
+// HistoryIndex returns the per-space version-history index, opening it
+// on first use. The skip list is derived from the registered datasets'
+// SkipHistory flags. Open failures are returned but NOT cached — the
+// next call retries. Every successful call also flushes pending stale
+// marks recorded while the index was unavailable.
+//
+// Never call this from inside an apply WriteTx (the collection DDL
+// would nest in — and be reverted with — the apply tx while the opened
+// handles survive in memory); the apply hook reads the atomic pointer
+// instead and defers indexing via historyPendingStale until an
+// out-of-tx caller (newController, a history query) has opened it.
 func (s *Store) HistoryIndex(ctx context.Context) (*history.Index, error) {
-	s.historyOnce.Do(func() {
-		regs, _, err := s.buildRegs()
-		if err != nil {
-			s.historyIndexErr = err
-			return
-		}
-		var skip []string
-		for _, reg := range regs {
-			if reg.SkipHistory {
-				skip = append(skip, reg.Name)
+	if s.customHandlers != nil {
+		return nil, ErrHistoryUnavailable
+	}
+	ix := s.historyIx.Load()
+	if ix == nil {
+		s.historyMu.Lock()
+		if ix = s.historyIx.Load(); ix == nil {
+			regs, _, err := s.buildRegs()
+			if err != nil {
+				s.historyMu.Unlock()
+				return nil, err
 			}
+			var skip []string
+			for _, reg := range regs {
+				if reg.SkipHistory {
+					skip = append(skip, reg.Name)
+				}
+			}
+			ix, err = history.OpenIndex(ctx, s.db, s.spaceId, skip)
+			if err != nil {
+				s.historyMu.Unlock()
+				return nil, err
+			}
+			s.historyIx.Store(ix)
 		}
-		s.historyIndex, s.historyIndexErr = history.OpenIndex(ctx, s.db, s.spaceId, skip)
+		s.historyMu.Unlock()
+	}
+	s.flushPendingStale(ctx, ix)
+	return ix, nil
+}
+
+// flushPendingStale marks every deferred object stale so the lazy
+// backfill repairs rows the warm path could not write. Entries that
+// fail to mark stay queued for the next flush.
+func (s *Store) flushPendingStale(ctx context.Context, ix *history.Index) {
+	s.historyPendingStale.Range(func(key, _ any) bool {
+		objectId := key.(string)
+		if err := ix.MarkStale(ctx, objectId); err != nil {
+			storeLog.Warn("history: pending stale mark failed",
+				zap.String("objectId", objectId), zap.Error(err))
+			return true
+		}
+		s.historyPendingStale.Delete(objectId)
+		return true
 	})
-	return s.historyIndex, s.historyIndexErr
 }
 
 // composedApplyHook chains the read-tracking hook and the history-index
@@ -1535,11 +1606,18 @@ func (s *Store) composedApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 }
 
 // historyApplyHook writes warm-path history-index rows in the apply tx
-// (proposal §4.4). Objects mid-cold-restore are skipped — they're
-// marked stale and lazily backfilled instead. Index failures never
-// fail the apply: history is best-effort metadata, and a genuine
-// storage fault will surface through the apply tx itself.
+// (proposal §4.4). Nil for raw-mode stores (tech space): their objects
+// are internal bookkeeping with no history surface, and indexing them
+// would grow a permanent index nobody can query. Objects mid-cold-
+// restore are skipped — they're marked stale and lazily backfilled
+// instead. Index failures never fail the apply (history is best-effort
+// metadata; a genuine storage fault surfaces through the apply tx
+// itself) but they DO mark the object stale so the lazy backfill
+// closes the gap instead of it becoming permanent.
 func (s *Store) historyApplyHook() crdt.ApplyHook {
+	if s.customHandlers != nil {
+		return nil
+	}
 	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, _ *crdt.ApplyResult) error {
 		if ch.ChangeId == "" || ch.Local || ch.Injected {
 			return nil
@@ -1547,13 +1625,24 @@ func (s *Store) historyApplyHook() crdt.ApplyHook {
 		if _, restoring := s.historySkipIndex.Load(ch.ObjectId); restoring {
 			return nil
 		}
-		ix, err := s.HistoryIndex(txCtx)
-		if err != nil {
-			storeLog.Warn("history index unavailable; skipping row", zap.Error(err))
+		// Atomic read only — never open the index from inside the
+		// apply tx (see HistoryIndex). Not open yet: defer to the
+		// stale/backfill path.
+		ix := s.historyIx.Load()
+		if ix == nil {
+			s.historyPendingStale.Store(ch.ObjectId, struct{}{})
 			return nil
 		}
 		if err := ix.IndexChange(txCtx, ch, recordIds); err != nil {
-			storeLog.Warn("history index row failed", zap.String("changeId", ch.ChangeId), zap.Error(err))
+			storeLog.Warn("history index row failed; marking object stale",
+				zap.String("changeId", ch.ChangeId), zap.Error(err))
+			// In-tx mark: atomic with the apply. If the tx is already
+			// poisoned this fails too — queue for the next flush (a
+			// poisoned tx also rolls back the apply, which re-replays
+			// and re-indexes the change anyway).
+			if mErr := ix.MarkStale(txCtx, ch.ObjectId); mErr != nil {
+				s.historyPendingStale.Store(ch.ObjectId, struct{}{})
+			}
 		}
 		return nil
 	}

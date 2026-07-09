@@ -38,6 +38,18 @@ type fakeEntry struct {
 func (f *fakeHistoryTree) Id() string               { return f.id }
 func (f *fakeHistoryTree) Root() *objecttree.Change { return f.root }
 
+func (f *fakeHistoryTree) GetChange(id string) (*objecttree.Change, error) {
+	if id == f.id {
+		return f.root, nil
+	}
+	for _, e := range f.entries {
+		if e.ch.Id == id {
+			return e.ch, nil
+		}
+	}
+	return nil, fmt.Errorf("fake tree: change %s not found", id)
+}
+
 func (f *fakeHistoryTree) IterateRoot(convert objecttree.ChangeConvertFunc, iterate objecttree.ChangeIterateFunc) error {
 	for _, e := range f.entries {
 		if convert != nil {
@@ -86,12 +98,19 @@ func (b *treeBuilder) add(dataset string, rec crdt.RecordChange) string {
 	payload, err := b.codec.Encode(&ch)
 	require.NoError(b.t, err)
 	changeId := fmt.Sprintf("cid-%03d", b.seq)
+	// Linear chain: each change's sole parent is its predecessor (the
+	// root for the first) — what the ancestor walk and coalescing see.
+	prev := b.tree.id
+	if b.seq > 1 {
+		prev = fmt.Sprintf("cid-%03d", b.seq-1)
+	}
 	b.tree.entries = append(b.tree.entries, fakeEntry{
 		ch: &objecttree.Change{
-			Id:        changeId,
-			OrderId:   fmt.Sprintf("o%03d", b.seq),
-			AddSeq:    uint64(b.seq),
-			Timestamp: 1700000000 + int64(b.seq),
+			Id:          changeId,
+			OrderId:     fmt.Sprintf("o%03d", b.seq),
+			AddSeq:      uint64(b.seq),
+			Timestamp:   1700000000 + int64(b.seq),
+			PreviousIds: []string{prev},
 		},
 		payload: payload,
 	})

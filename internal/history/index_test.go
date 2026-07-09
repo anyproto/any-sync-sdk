@@ -148,6 +148,52 @@ func TestListFilters(t *testing.T) {
 	require.Error(t, err)
 }
 
+// Regression: an author-filtered record/trace listing whose over-fetch
+// window contains fewer than `limit` author matches must return a
+// continuation cursor, not "" — older matching changes live beyond the
+// window (review finding: early termination + unreachable lastO branch).
+func TestListViaJoinAuthorFilterPagination(t *testing.T) {
+	ctx := context.Background()
+	ix := newTestIndex(t)
+
+	// 30 changes touching rec "n1": only the 3 OLDEST are by author-a,
+	// the 27 newest by author-b. With limit=2 the first window
+	// (fetch=8) is all author-b.
+	for i := 1; i <= 3; i++ {
+		indexOne(t, ix, idxChange(i, "notes", "n1"))
+	}
+	for i := 4; i <= 30; i++ {
+		indexOne(t, ix, idxChange(i, "notes", "n1", func(c *crdt.Change) { c.Creator = "author-b" }))
+	}
+
+	f := Filter{ObjectId: "obj-1", Dataset: "notes", RecordId: "n1", Author: "author-a"}
+	var (
+		got    []ChangeMeta
+		cursor string
+		pages  int
+	)
+	for {
+		page, next, err := ix.ListChanges(ctx, f, 2, cursor)
+		require.NoError(t, err)
+		got = append(got, page...)
+		pages++
+		require.Less(t, pages, 30, "pagination must terminate")
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	require.Len(t, got, 3, "all author-a changes reachable across windows")
+	assert.Equal(t, "cid-003", got[0].Version)
+	assert.Equal(t, "cid-001", got[2].Version)
+
+	// Sanity: unfiltered join listing still paginates exactly.
+	all, next, err := ix.ListChanges(ctx, Filter{ObjectId: "obj-1", Dataset: "notes", RecordId: "n1"}, 30, "")
+	require.NoError(t, err)
+	assert.Empty(t, next)
+	assert.Len(t, all, 30)
+}
+
 func TestIndexSkips(t *testing.T) {
 	ctx := context.Background()
 	ix := newTestIndex(t, "presence")

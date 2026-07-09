@@ -41,8 +41,6 @@ func (h *historyAPI) viewParams(ctx context.Context, objectId string) (*object.O
 	}
 	return obj, history.ViewParams{
 		ObjectId:       objectId,
-		Storage:        tree.Storage(),
-		Acl:            tree.AclList(),
 		Regs:           regs,
 		SharedDatasets: sharedNames,
 	}, nil
@@ -55,6 +53,25 @@ func hasVersion(tree objecttree.ObjectTree, version space.Version) bool {
 	tree.Lock()
 	defer tree.Unlock()
 	return tree.HasChanges(version)
+}
+
+// buildTreeLocked builds a history tree over the LIVE tree's storage
+// under that tree's lock. The build is the only storage-touching phase
+// of a history operation; holding the lock (a) serializes access to
+// the storage's shared, non-thread-safe anyenc parser with the apply
+// path, and (b) fences ocache eviction for the scan's duration —
+// Object.TryClose needs the same lock, and tree.Close would close the
+// storage the scan reads. Iteration afterwards walks the in-memory
+// history tree and needs no lock. Empty heads = full tree (backfill).
+func buildTreeLocked(tree objecttree.ObjectTree, heads []string) (objecttree.HistoryTree, error) {
+	tree.Lock()
+	defer tree.Unlock()
+	return objecttree.BuildNonVerifiableHistoryTree(objecttree.HistoryTreeParams{
+		Storage:         tree.Storage(),
+		AclList:         tree.AclList(),
+		Heads:           heads,
+		IncludeBeforeId: true,
+	})
 }
 
 // ensureFresh lazily backfills the object's index when it is stale
@@ -74,13 +91,11 @@ func (h *historyAPI) ensureFresh(ctx context.Context, ix *history.Index, obj *ob
 			return nil
 		}
 	}
-	tree := obj.Tree()
 	// Full-tree walk (empty Heads = every change), decrypting through
 	// the object's key machinery; batched tx writes inside Backfill.
-	histTree, err := objecttree.BuildNonVerifiableHistoryTree(objecttree.HistoryTreeParams{
-		Storage: tree.Storage(),
-		AclList: tree.AclList(),
-	})
+	// Synchronous by design in v1 — the async/progress contract is
+	// deferred (see internal/history/index.go note).
+	histTree, err := buildTreeLocked(obj.Tree(), nil)
 	if err != nil {
 		return mapHistoryErr(err)
 	}
@@ -160,7 +175,12 @@ func (h *historyAPI) ViewAt(ctx context.Context, objectId string, version space.
 	if !hasVersion(obj.Tree(), version) {
 		return nil, fmt.Errorf("%w: %s", space.ErrVersionNotFound, version)
 	}
+	tree, err := buildTreeLocked(obj.Tree(), []string{version})
+	if err != nil {
+		return nil, mapHistoryErr(err)
+	}
 	params.Heads = []string{version}
+	params.Tree = tree
 	view, err := history.BuildView(ctx, params)
 	if err != nil {
 		return nil, mapHistoryErr(err)
@@ -190,13 +210,16 @@ func (h *historyAPI) RecordAt(ctx context.Context, objectId, dataset, recordId s
 		}
 	}
 
+	tree, err := buildTreeLocked(obj.Tree(), []string{version})
+	if err != nil {
+		return nil, mapHistoryErr(err)
+	}
 	rec, err := history.RecordAt(ctx, history.RecordAtParams{
 		ObjectId:         objectId,
 		Dataset:          dataset,
 		RecordId:         recordId,
 		Version:          version,
-		Storage:          params.Storage,
-		Acl:              params.Acl,
+		Tree:             tree,
 		Regs:             params.Regs,
 		SharedDatasets:   params.SharedDatasets,
 		TouchedChangeIds: touched,
@@ -220,12 +243,18 @@ func (h *historyAPI) Diff(ctx context.Context, objectId string, base, version sp
 		return space.DiffResult{}, fmt.Errorf("%w: %s", space.ErrVersionNotFound, version)
 	}
 
-	// base == "": per-change effect diff against version's parents.
+	// One locked build of version's history tree serves everything
+	// below: PrevIds resolution, the ancestor walk, and the replay.
+	versionTree, err := buildTreeLocked(tree, []string{version})
+	if err != nil {
+		return space.DiffResult{}, mapHistoryErr(err)
+	}
+
+	// base == "": per-change effect diff against version's parents,
+	// resolved off the (private) history tree — no live-tree lock.
 	baseHeads := []string{base}
 	if base == "" {
-		tree.Lock()
-		ch, gerr := tree.GetChange(version)
-		tree.Unlock()
+		ch, gerr := versionTree.GetChange(version)
 		if gerr != nil || ch == nil {
 			return space.DiffResult{}, fmt.Errorf("%w: %s", space.ErrVersionNotFound, version)
 		}
@@ -233,36 +262,23 @@ func (h *historyAPI) Diff(ctx context.Context, objectId string, base, version sp
 	} else if !hasVersion(tree, base) {
 		return space.DiffResult{}, fmt.Errorf("%w: %s", space.ErrVersionNotFound, base)
 	}
+	if len(baseHeads) == 1 && baseHeads[0] == tree.Id() {
+		baseHeads = nil // first content change: diff against the empty projection
+	}
 
 	params.Dataset = f.Dataset
+	filter := history.DiffFilter{Dataset: f.Dataset, RecordIds: f.RecordIds}
 
-	var baseView *history.View
-	if len(baseHeads) == 0 || (len(baseHeads) == 1 && baseHeads[0] == tree.Id()) {
-		// First content change: its parent is the root (no CRDT
-		// payload) — diff against the empty projection.
-		baseView, err = history.BuildEmptyView(ctx, params)
-	} else {
-		bp := params
-		bp.Heads = baseHeads
-		baseView, err = history.BuildView(ctx, bp)
+	// Single-replay fast path (proposal §5): base is an ancestor of
+	// version in the common "what changed since" case and always for
+	// effect diffs (PrevIds are ancestors by construction).
+	rp := params
+	rp.Tree = versionTree
+	res, err := history.DiffRange(ctx, rp, baseHeads, version, filter)
+	if errors.Is(err, history.ErrNotAncestor) {
+		// Concurrent versions: two-way diff of the two causal pasts.
+		res, err = h.diffConcurrent(ctx, tree, params, baseHeads, version, filter)
 	}
-	if err != nil {
-		return space.DiffResult{}, mapHistoryErr(err)
-	}
-	defer baseView.Close()
-
-	vp := params
-	vp.Heads = []string{version}
-	versionView, err := history.BuildView(ctx, vp)
-	if err != nil {
-		return space.DiffResult{}, mapHistoryErr(err)
-	}
-	defer versionView.Close()
-
-	res, err := history.DiffViews(ctx, baseView, versionView, history.DiffFilter{
-		Dataset:   f.Dataset,
-		RecordIds: f.RecordIds,
-	})
 	if err != nil {
 		return space.DiffResult{}, mapHistoryErr(err)
 	}
@@ -280,6 +296,39 @@ func (h *historyAPI) Diff(ctx context.Context, objectId string, base, version sp
 		out.Datasets = append(out.Datasets, pd)
 	}
 	return out, nil
+}
+
+// diffConcurrent handles the neither-is-ancestor case (proposal §5):
+// two full views, two-way structural diff. Rare — a caller comparing
+// two concurrent branches explicitly.
+func (h *historyAPI) diffConcurrent(ctx context.Context, tree objecttree.ObjectTree, params history.ViewParams, baseHeads []string, version space.Version, filter history.DiffFilter) (history.DiffResult, error) {
+	baseTree, err := buildTreeLocked(tree, baseHeads)
+	if err != nil {
+		return history.DiffResult{}, err
+	}
+	bp := params
+	bp.Heads = baseHeads
+	bp.Tree = baseTree
+	baseView, err := history.BuildView(ctx, bp)
+	if err != nil {
+		return history.DiffResult{}, err
+	}
+	defer baseView.Close()
+
+	versionTree, err := buildTreeLocked(tree, []string{version})
+	if err != nil {
+		return history.DiffResult{}, err
+	}
+	vp := params
+	vp.Heads = []string{version}
+	vp.Tree = versionTree
+	versionView, err := history.BuildView(ctx, vp)
+	if err != nil {
+		return history.DiffResult{}, err
+	}
+	defer versionView.Close()
+
+	return history.DiffViews(ctx, baseView, versionView, filter)
 }
 
 // historicalView adapts history.View to the public interface.

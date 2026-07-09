@@ -94,8 +94,14 @@ type ChangeMeta struct {
 	Dataset   string
 	TraceIds  []string
 	Touched   []TouchedRecord
-	Truncated bool // oldest listable entry hit the history horizon
-	GroupSize int  // 1 unless coalesced
+	// Truncated marks the oldest listable entry when the history
+	// horizon was hit. RESERVED: always false today — the SDK never
+	// writes tree snapshots, so full history is always local. It
+	// becomes meaningful with the future snapshot/GC contract
+	// (proposal §9); until then only ViewAt/Diff can surface
+	// ErrHistoryTruncated (ACL gaps).
+	Truncated bool
+	GroupSize int // 1 unless coalesced
 }
 
 // TouchedRecord names one record a change touched with its op kinds

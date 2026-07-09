@@ -59,6 +59,15 @@ type ViewParams struct {
 	Storage objecttree.Storage
 	Acl     list.AclList
 
+	// Tree, when set, is a pre-built history tree at Heads and Storage/
+	// Acl are ignored for tree building. Callers reading a LIVE tree's
+	// storage should build under that tree's lock and pass the result
+	// here: the build is the only storage-touching phase, the storage
+	// parser is not thread-safe outside the lock, and holding the lock
+	// also fences ocache eviction (TryClose→tree.Close closes the
+	// shared storage) for the duration of the scan.
+	Tree objecttree.HistoryTree
+
 	// Regs is the object's current handler set — the same registrations
 	// its live Controller runs, so derived fields recompute identically.
 	Regs []crdt.HandlerReg
@@ -97,18 +106,21 @@ func BuildView(ctx context.Context, p ViewParams) (*View, error) {
 	if len(p.Heads) == 0 {
 		return nil, errors.New("history: BuildView: at least one cut head required")
 	}
-	if p.Storage == nil || p.Acl == nil {
-		return nil, errors.New("history: BuildView: Storage and Acl required")
-	}
-
-	tree, err := objecttree.BuildNonVerifiableHistoryTree(objecttree.HistoryTreeParams{
-		Storage:         p.Storage,
-		AclList:         p.Acl,
-		Heads:           p.Heads,
-		IncludeBeforeId: true,
-	})
-	if err != nil {
-		return nil, mapTreeErr(err)
+	tree := p.Tree
+	if tree == nil {
+		if p.Storage == nil || p.Acl == nil {
+			return nil, errors.New("history: BuildView: Tree or Storage+Acl required")
+		}
+		var err error
+		tree, err = objecttree.BuildNonVerifiableHistoryTree(objecttree.HistoryTreeParams{
+			Storage:         p.Storage,
+			AclList:         p.Acl,
+			Heads:           p.Heads,
+			IncludeBeforeId: true,
+		})
+		if err != nil {
+			return nil, mapTreeErr(err)
+		}
 	}
 
 	db, err := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true})
@@ -183,20 +195,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 	}
 
 	codec := object.NewCodec() // per-replay: the codec arena is not concurrency-safe
-
-	// Root-change metadata is constant across the tree; stamp it on
-	// every decoded change so handler hooks (author/createdAt) derive
-	// the same values as the live projection.
-	var (
-		objectAuthor    string
-		objectCreatedAt int64
-	)
-	if root := tree.Root(); root != nil {
-		objectCreatedAt = root.Timestamp
-		if root.Identity != nil {
-			objectAuthor = root.Identity.Account()
-		}
-	}
+	objectAuthor, objectCreatedAt := rootMeta(tree)
 
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
@@ -204,22 +203,8 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 	}
 	txCtx := tx.Context()
 
-	rootId := tree.Id()
 	records := 0
 	var fatalErr error
-
-	convert := func(ch *objecttree.Change, decrypted []byte) (any, error) {
-		if ch.Id == rootId || len(decrypted) == 0 {
-			return nil, nil
-		}
-		decoded, decodeErr := codec.Decode(decrypted)
-		if decodeErr != nil {
-			// Non-CRDT payload (settings change, foreign data type) —
-			// skip, same tolerance as the live replay path.
-			return nil, nil
-		}
-		return &decoded, nil
-	}
 
 	iter := func(ch *objecttree.Change) bool {
 		decoded, ok := ch.Model.(*crdt.Change)
@@ -234,20 +219,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 			// as the live schema gate's parked changes (proposal §9).
 			return true
 		}
-		decoded.ObjectId = p.ObjectId
-		decoded.ChangeId = ch.Id
-		decoded.AddSeq = ch.AddSeq
-		decoded.Timestamp = ch.Timestamp
-		// Live OrderIds are preserved by the history tree, so _ver maps
-		// come out identical to what the live projection held when only
-		// these changes existed (proposal §4.1).
-		decoded.VersionId = crdt.VersionId(ch.OrderId)
-		decoded.PrevIds = ch.PreviousIds
-		decoded.ObjectAuthor = objectAuthor
-		decoded.ObjectCreatedAt = objectCreatedAt
-		if ch.Identity != nil {
-			decoded.Creator = ch.Identity.Account()
-		}
+		stampEnvelope(decoded, ch, p.ObjectId, objectAuthor, objectCreatedAt)
 
 		records += len(decoded.Records)
 		if records > maxRecords {
@@ -265,7 +237,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 		return true
 	}
 
-	if err := tree.IterateRoot(convert, iter); err != nil {
+	if err := tree.IterateRoot(decodeConvert(codec, tree.Id()), iter); err != nil {
 		_ = tx.Rollback()
 		return nil, mapTreeErr(err)
 	}

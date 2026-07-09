@@ -35,6 +35,11 @@ type RecordAtParams struct {
 	// SharedDatasets — same contract as ViewParams.SharedDatasets.
 	SharedDatasets []string
 
+	// Tree — same contract as ViewParams.Tree: a pre-built history
+	// tree at Version (built under the live tree's lock when the
+	// storage is shared with a live tree).
+	Tree objecttree.HistoryTree
+
 	// TouchedChangeIds optionally pre-filters iteration to the changes
 	// known to touch (Dataset, RecordId) — fed from the history index
 	// (§4.4). The causal-past intersection happens implicitly: the
@@ -58,13 +63,13 @@ func RecordAt(ctx context.Context, p RecordAtParams) (*anyenc.Value, error) {
 	}
 	if filteredReplayDisabled(p.Regs, p.Dataset) {
 		view, err := BuildView(ctx, ViewParams{
-			ObjectId: p.ObjectId,
-			Heads:    []string{p.Version},
-			Dataset:  p.Dataset,
-			Storage:  p.Storage,
-			Acl:      p.Acl,
-			Regs:     p.Regs,
-
+			ObjectId:       p.ObjectId,
+			Heads:          []string{p.Version},
+			Dataset:        p.Dataset,
+			Storage:        p.Storage,
+			Acl:            p.Acl,
+			Tree:           p.Tree,
+			Regs:           p.Regs,
 			SharedDatasets: p.SharedDatasets,
 		})
 		if err != nil {
@@ -74,14 +79,21 @@ func RecordAt(ctx context.Context, p RecordAtParams) (*anyenc.Value, error) {
 		return view.Record(ctx, p.Dataset, p.RecordId), nil
 	}
 
-	tree, err := objecttree.BuildNonVerifiableHistoryTree(objecttree.HistoryTreeParams{
-		Storage:         p.Storage,
-		AclList:         p.Acl,
-		Heads:           []string{p.Version},
-		IncludeBeforeId: true,
-	})
-	if err != nil {
-		return nil, mapTreeErr(err)
+	tree := p.Tree
+	if tree == nil {
+		if p.Storage == nil || p.Acl == nil {
+			return nil, errors.New("history: RecordAt: Tree or Storage+Acl required")
+		}
+		var err error
+		tree, err = objecttree.BuildNonVerifiableHistoryTree(objecttree.HistoryTreeParams{
+			Storage:         p.Storage,
+			AclList:         p.Acl,
+			Heads:           []string{p.Version},
+			IncludeBeforeId: true,
+		})
+		if err != nil {
+			return nil, mapTreeErr(err)
+		}
 	}
 	return recordFromTree(ctx, tree, p)
 }
@@ -115,16 +127,7 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 	}
 
 	codec := object.NewCodec()
-	var (
-		objectAuthor    string
-		objectCreatedAt int64
-	)
-	if root := tree.Root(); root != nil {
-		objectCreatedAt = root.Timestamp
-		if root.Identity != nil {
-			objectAuthor = root.Identity.Account()
-		}
-	}
+	objectAuthor, objectCreatedAt := rootMeta(tree)
 
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
@@ -132,13 +135,10 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 	}
 	txCtx := tx.Context()
 
-	rootId := tree.Id()
 	var fatalErr error
 
+	baseConvert := decodeConvert(codec, tree.Id())
 	convert := func(ch *objecttree.Change, decrypted []byte) (any, error) {
-		if ch.Id == rootId || len(decrypted) == 0 {
-			return nil, nil
-		}
 		// Index-fed mode: skip the decode for changes known not to
 		// touch the record — this is where the fast path wins.
 		if touched != nil {
@@ -146,10 +146,11 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 				return nil, nil
 			}
 		}
-		decoded, decodeErr := codec.Decode(decrypted)
-		if decodeErr != nil {
-			return nil, nil
+		m, cerr := baseConvert(ch, decrypted)
+		if cerr != nil || m == nil {
+			return nil, cerr
 		}
+		decoded := m.(*crdt.Change)
 		if decoded.Dataset != p.Dataset {
 			return nil, nil
 		}
@@ -159,10 +160,10 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 		// Fallback mode: apply only changes whose payload names the
 		// record. (Index-fed changes already passed this test at index
 		// time; re-checking is harmless and guards a stale index row.)
-		if !touchesRecord(&decoded, p.RecordId) {
+		if !touchesRecord(decoded, p.RecordId) {
 			return nil, nil
 		}
-		return &decoded, nil
+		return decoded, nil
 	}
 
 	iter := func(ch *objecttree.Change) bool {
@@ -170,17 +171,7 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 		if !ok || decoded == nil {
 			return true
 		}
-		decoded.ObjectId = p.ObjectId
-		decoded.ChangeId = ch.Id
-		decoded.AddSeq = ch.AddSeq
-		decoded.Timestamp = ch.Timestamp
-		decoded.VersionId = crdt.VersionId(ch.OrderId)
-		decoded.PrevIds = ch.PreviousIds
-		decoded.ObjectAuthor = objectAuthor
-		decoded.ObjectCreatedAt = objectCreatedAt
-		if ch.Identity != nil {
-			decoded.Creator = ch.Identity.Account()
-		}
+		stampEnvelope(decoded, ch, p.ObjectId, objectAuthor, objectCreatedAt)
 		// The whole change applies (not just the target's RecordChange):
 		// that is exactly the workload the soundness test verifies, and
 		// sibling rows in the scratch are invisible to this API — it

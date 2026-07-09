@@ -253,23 +253,31 @@ anchors, behind the same `ViewAt` signature when needed.
 
 ### 4.4 Engine B: persistent history index
 
-Normalized collections (not multikey arrays — "all changes touching
-record X in order" must be an index range scan, not an array-unpack
-scan), living in the space DB alongside `_meta`, space-scoped with an
-`sp` field exactly like `_meta` (shared-topology safe). Names follow
-the underscore convention:
+Normalized rows (not multikey arrays — "all changes touching record X
+in order" must be a range scan, not an array-unpack scan). Change and
+record rows live in PER-OBJECT collections mirroring the
+`<objectId>_<dataset>` projection layout, with **OrderId as the
+primary key**: lexids are monotonic per tree, so inserts are
+append-ordered (no random-CID btree splits), descending listings are
+reverse PK scans with no secondary indexes at all, and an object's
+history is dropped by the same `<objectId>_*` purge sweep that drops
+its dataset collections. The double-underscore suffix keeps the
+namespace disjoint from datasets ("_"-prefixed dataset names are
+rejected at registration):
 
-- `_history` — one row per change:
-  `{id: changeId, sp, obj, o: orderId, ds, author, ts, traces: [..],
-  n: recordCount}`; indexes `(sp, obj, o)`, `(sp, o)`.
-- `_history_recs` — one row per (change, record):
-  `{id: changeId + "/" + recordId, sp, obj, ds, rec, o}`; index
-  `(sp, obj, ds, rec, o)`.
-- `_history_traces` — one row per (change, trace):
-  `{id: changeId + "/" + traceId, sp, tr, o, obj}`; index `(sp, tr, o)`.
-
-(`_history_recs`/`_history_traces` rows can be folded into multikey
-indexes later if any-store grows them; start normalized.)
+- `<objectId>__history` — one row per change, PK `id = orderId`:
+  `{id: o, c: changeId, ds, author, ts, n: recordCount, prev: [..],
+  traces: [..], recs: [{rec, k}]}`.
+- `<objectId>__history_recs` — one row per (change, record), PK
+  `id = recordId + NUL + orderId` — the record's history is a PK
+  prefix range scan, ordered by o: `{id, o, c: changeId}`.
+- `_history_traces` — space-level (the trace query is space-wide by
+  requirement), one row per (change, trace), PK
+  `id = sp + NUL + traceId + NUL + o + NUL + objectId` (OrderIds are
+  only unique per tree, hence the object tail — which also rides the
+  pagination cursor): `{id, o, obj, c: changeId}`.
+- `_history_meta` — space-level per-object index state:
+  `{id: objectId, sp, stale}`.
 
 **Write paths:**
 
@@ -297,13 +305,15 @@ views (matches the user's mental model of "document history").
 DAG changes still retain everything — flipping the flag later just
 requires a backfill.
 
-**OrderId staleness.** Index rows store `orderId` as the sort key, but
-lexids can be rebalanced on tree rebuilds. Handle like the schema
-gate handles generations: persist the tree's rebuild generation in
-`_meta`; on mismatch, mark the object's index rows order-stale and
-re-stamp `o` lazily via a metadata-only walk (ChangeIds are the stable
-join key; no decryption needed). Rebuild-with-rebalance is rare, so
-this is a cold path.
+**OrderId staleness.** Index rows key on `orderId` (it is the primary
+key). VERIFIED non-issue in current any-sync (v0.13): storage OrderIds
+are write-once — `updateHeads` only assigns where `OrderId == ""`,
+loads restamp from storage verbatim, and no renumber/rebalance path
+exists for persisted changes. Should a future any-sync introduce
+rebalancing, handle it like the schema gate handles generations:
+persist the tree's rebuild generation, mark the object's index
+order-stale on mismatch, and rebuild via the ordinary backfill
+(ChangeIds are the stable join key; no decryption needed).
 
 ## 5. Diff engine
 

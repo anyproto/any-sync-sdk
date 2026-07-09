@@ -194,6 +194,42 @@ func TestListViaJoinAuthorFilterPagination(t *testing.T) {
 	assert.Len(t, all, 30)
 }
 
+// OrderIds are only unique per tree: two objects easily mint identical
+// early lexids. The trace route's cursor carries the object tail so
+// paginating a space-wide trace never skips a same-o row from another
+// object.
+func TestListByTraceCursorAcrossObjects(t *testing.T) {
+	ctx := context.Background()
+	ix := newTestIndex(t)
+
+	// Same o ("o001") on two different objects, same trace.
+	for _, obj := range []string{"obj-a", "obj-b", "obj-c"} {
+		ch := idxChange(1, "notes", "n1", func(c *crdt.Change) {
+			c.ObjectId = obj
+			c.ChangeId = "cid-" + obj
+			c.TraceIds = []string{"tr-x"}
+		})
+		indexOne(t, ix, ch)
+	}
+
+	var got []string
+	cursor := ""
+	for {
+		page, next, err := ix.ListChanges(ctx, Filter{TraceId: "tr-x"}, 1, cursor)
+		require.NoError(t, err)
+		for _, m := range page {
+			got = append(got, m.Version)
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+		require.Less(t, len(got), 10, "must terminate")
+	}
+	assert.ElementsMatch(t, []string{"cid-obj-a", "cid-obj-b", "cid-obj-c"}, got,
+		"no same-o row skipped across objects")
+}
+
 func TestIndexSkips(t *testing.T) {
 	ctx := context.Background()
 	ix := newTestIndex(t, "presence")

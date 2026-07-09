@@ -483,6 +483,13 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			if d.Name == "" {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: empty Name", i, t.Id, j)
 			}
+			if strings.HasPrefix(d.Name, "_") {
+				// The "_" prefix is reserved for internal collections
+				// (`<objectId>__history*`, `_meta`, `_detached`, …) —
+				// a dataset named "_history" would collide with the
+				// per-object history collections.
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: name %q is reserved (\"_\" prefix)", i, t.Id, j, d.Name)
+			}
 			if d.DataVersion == "" {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d] (%q): empty DataVersion", i, t.Id, j, d.Name)
 			}
@@ -869,7 +876,15 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	}
 
 	// Best-effort from here — disk reclaim + notifications, not correctness.
+	// dropObjectCollections sweeps every `<objectId>_*` collection, which
+	// includes the per-object history collections; the space-level history
+	// leftovers (trace rows, stale-flag row) need their own purge.
 	s.dropObjectCollections(ctx, objectId)
+	if ix := s.historyIx.Load(); ix != nil {
+		if perr := ix.PurgeObject(ctx, objectId); perr != nil {
+			storeLog.Warn("purge: history index cleanup", zap.String("treeId", objectId), zap.Error(perr))
+		}
+	}
 	_ = s.unmarkSkipped(ctx, objectId)
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil

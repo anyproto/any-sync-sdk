@@ -6,13 +6,17 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/app"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/treesyncer"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/spacestate"
 	"github.com/anyproto/any-sync/net/peer"
+	"go.uber.org/zap"
 )
+
+var tsLog = logger.NewNamed("anysyncx.treesyncer")
 
 // PeerSyncSnapshot is the latest per-peer headsync result the
 // adapter has observed. Returned by Stats() — debug surface only.
@@ -21,7 +25,13 @@ type PeerSyncSnapshot struct {
 	LastSyncAt time.Time
 	New        int
 	Changed    int
-	LastErr    string
+	// Pending is the space-wide parked-tree count at the time of this
+	// round (see treeSyncerAdapter.pending) — nonzero means some trees'
+	// GetTree failed and is awaiting retry. Same value on every peer's
+	// row of the same round; kept per-row so the debug surface needs no
+	// second query.
+	Pending int
+	LastErr string
 }
 
 // treeSyncerAdapter is registered by anysyncx as the per-space
@@ -62,6 +72,21 @@ type treeSyncerAdapter struct {
 	// onRound is the optional space-level "round done" callback —
 	// fires on every SyncAll. nil-safe.
 	onRound PeerRoundCallback
+
+	// pendingMu guards pending: tree ids whose GetTree failed during a
+	// SyncAll round. The any-sync fetch may write a tree's changes to
+	// storage BEFORE our GetTree materialization fails (round deadline,
+	// transient build error) — after which every later headsync diff
+	// sees converged heads and never offers the id again, leaving the
+	// CRDT projection permanently behind storage with no error anywhere.
+	// Parking the id here and retrying on subsequent SyncAll calls
+	// (diffsyncer invokes SyncAll every headsync period even with an
+	// empty diff) closes that gap. Ids clear on the first successful
+	// GetTree; entries are never dropped on failure — giving up would
+	// re-create the silent divergence, and the per-round Warn keeps a
+	// stuck id visible.
+	pendingMu sync.Mutex
+	pending   map[string]struct{}
 }
 
 // Compile-time check: the adapter implements any-sync's optional
@@ -74,6 +99,7 @@ func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCall
 		registry: registry,
 		stats:    map[string]PeerSyncSnapshot{},
 		onRound:  onRound,
+		pending:  map[string]struct{}{},
 	}
 }
 
@@ -123,16 +149,41 @@ func (t *treeSyncerAdapter) ShouldPull(ctx context.Context, objectId string, roo
 // SDK boot ordering, and silently bypassing it would re-create the
 // listener-loss bug this method exists to fix.
 func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, missing []string) (err error) {
-	defer t.record(p.Id(), len(missing), len(existing), err)
+	defer func() { t.record(p.Id(), len(missing), len(existing), err) }()
 	if t.registry == nil {
 		return ErrSpaceRegistryUnset
 	}
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
-	for _, ids := range [][]string{missing, existing} {
+	seen := make(map[string]struct{}, len(missing)+len(existing))
+	for _, ids := range [][]string{missing, existing, t.pendingIds()} {
 		for _, id := range ids {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			if ctx.Err() != nil {
+				// Round budget exhausted: park everything unresolved for
+				// the next round instead of burning through the rest
+				// with guaranteed failures.
+				t.markPending(id)
+				continue
+			}
 			tree, regErr := t.registry.GetTree(peerCtx, t.spaceId, id)
 			if regErr != nil {
+				// See the pending field doc: the fetch may already have
+				// landed in storage, so this id may never show up in a
+				// diff again — park it or the controller replay is lost
+				// for the process lifetime.
+				t.markPending(id)
+				tsLog.Warn("tree sync failed; parked for retry",
+					zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+					zap.String("peerId", p.Id()), zap.Error(regErr))
 				continue
+			}
+			if t.clearPending(id) {
+				tsLog.Info("parked tree recovered",
+					zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+					zap.String("peerId", p.Id()))
 			}
 			if st, ok := tree.(synctree.SyncTree); ok {
 				_ = st.SyncWithPeer(ctx, p)
@@ -143,6 +194,38 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 	return nil
 }
 
+// pendingIds snapshots the parked-tree set for a retry sweep.
+func (t *treeSyncerAdapter) pendingIds() []string {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	if len(t.pending) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(t.pending))
+	for id := range t.pending {
+		out = append(out, id)
+	}
+	return out
+}
+
+func (t *treeSyncerAdapter) markPending(id string) {
+	t.pendingMu.Lock()
+	t.pending[id] = struct{}{}
+	t.pendingMu.Unlock()
+}
+
+// clearPending removes id from the parked set, reporting whether it
+// was there (a recovery, worth logging) or not (the common case).
+func (t *treeSyncerAdapter) clearPending(id string) bool {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	if _, ok := t.pending[id]; !ok {
+		return false
+	}
+	delete(t.pending, id)
+	return true
+}
+
 // record stores the latest per-peer snapshot and fires the
 // onRound callback. Overwrites any prior row for peerId — only
 // the most recent round is retained.
@@ -150,11 +233,15 @@ func (t *treeSyncerAdapter) record(peerId string, newCount, changedCount int, er
 	if peerId == "" {
 		return
 	}
+	t.pendingMu.Lock()
+	pendingCount := len(t.pending)
+	t.pendingMu.Unlock()
 	snap := PeerSyncSnapshot{
 		PeerId:     peerId,
 		LastSyncAt: time.Now(),
 		New:        newCount,
 		Changed:    changedCount,
+		Pending:    pendingCount,
 	}
 	if err != nil {
 		snap.LastErr = err.Error()

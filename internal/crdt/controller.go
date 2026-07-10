@@ -418,6 +418,21 @@ func (c *Controller) Collection(ctx context.Context, dataset string) anystore.Co
 	return c.collectionForRead(ctx, dataset)
 }
 
+// RecordGetter returns a ChangeCtx.Get implementation bound to ctx —
+// the one wrapper both the handler-hook and read-tracking classify
+// seams share. When ctx carries a WriteTx (the apply path), reads
+// reuse that tx (any-store's getReadTx), so calling it from inside a
+// Modify callback or an ApplyHook is safe. Empty ids resolve to nil
+// without a store round-trip.
+func (c *Controller) RecordGetter(ctx context.Context) func(dataset, id string) *anyenc.Value {
+	return func(dataset, id string) *anyenc.Value {
+		if id == "" {
+			return nil
+		}
+		return c.Get(ctx, dataset, id)
+	}
+}
+
 // Get returns the record by id from the dataset, or nil if absent.
 //
 // The returned *anyenc.Value is cloned off any-store's pooled doc
@@ -765,9 +780,12 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		}
 	}
 
+	// One getter for the whole change — backs ChangeCtx.Get in every
+	// record's handler hooks (in-tx reads; see RecordGetter).
+	getter := c.RecordGetter(txCtx)
 	for i := range ch.Records {
 		id := resolvedIds[i]
-		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i])
+		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i], getter)
 		if err != nil {
 			_ = tx.Rollback()
 			return res, err
@@ -962,19 +980,9 @@ func filterOpFields(arena *anyenc.Arena, ds schema.Dataset, route schema.Scope, 
 // modifier stamped beyond rc.Ops (handler-emitted derived ops,
 // _ver.id creation marker), which the dispatcher merges into the
 // EventRecord.
-func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange) ([]OpRejection, []Op, error) {
+func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange, getter func(dataset, id string) *anyenc.Value) ([]OpRejection, []Op, error) {
 	sink := c.sinkPool.Get().(*Sink)
 	mod := c.modifierPool.Get().(*recordModifier)
-	// The getter closes over the tx-carrying ctx: reads from inside the
-	// Modify callback reuse the outer WriteTx (any-store getReadTx), so
-	// no re-entrancy hazard — see ChangeCtx.Get for the determinism
-	// contract handlers must honor.
-	getter := func(dataset, recordId string) *anyenc.Value {
-		if recordId == "" {
-			return nil
-		}
-		return c.Get(ctx, dataset, recordId)
-	}
 	mod.set(handler, ch, id, rc, sink, getter)
 
 	defer func() {

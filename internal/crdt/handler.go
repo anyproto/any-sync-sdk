@@ -49,6 +49,35 @@ type ChangeCtx struct {
 	// runs on every replica for the same change and must be
 	// replica-independent, or CRDT replicas diverge.
 	SelfIdentity string
+
+	// Get resolves the CURRENT value of a record in one of this
+	// object's datasets by explicit id — nil when the record is absent,
+	// the id is empty, or the invoker wired no reader (hand-built test
+	// contexts). Reads happen inside the apply WriteTx, so a record
+	// created earlier in the same change is visible. Tombstones are
+	// returned as-is (check _deletedAt); their content fields are wiped.
+	//
+	// Determinism contract for Before* hooks: the hook runs on every
+	// replica for the same change and its output must not diverge, so a
+	// handler may consult ONLY fields that are immutable post-create
+	// (derived creation stamps such as creator/createdAt qualify;
+	// freely-edited fields do not) and only on records that are causal
+	// ancestors of the triggering change — the writer saw them, so
+	// every replica applies them first. Known accepted edge: a record
+	// deleted CONCURRENTLY with the triggering change loses its fields
+	// on the tombstone, so a replica that applied the delete first
+	// reads nil-equivalent state; derived output disagrees between
+	// replicas on that race, which is tolerable only because derived
+	// ops are local re-derivation, never synced payload.
+	Get func(dataset, id string) *anyenc.Value
+
+	// RecordId is the resolved id of the record being classified.
+	// Populated ONLY on the read-tracking classify path (like
+	// SelfIdentity) — a create with an auto-derived id carries an empty
+	// RecordChange.Id, and a classifier that wants to point-read the
+	// just-applied record via Get needs the real id. Zero in the
+	// Before* handler hooks.
+	RecordId string
 }
 
 // Sibling describes a write the handler wants applied to a different
@@ -97,7 +126,9 @@ func (s *Sink) reset() {
 // Handler is the lifecycle behavior for one dataset. Hooks fire inside
 // any-store's Modify callback so handlers can read pre-state from
 // ctx.Before and emit derived or sibling writes via sink without an extra
-// DB round-trip.
+// DB round-trip. Cross-record reads go through ctx.Get, subject to its
+// determinism contract (immutable fields of causal ancestors only) —
+// hooks run on every replica and must not diverge.
 //
 // Per-op error returns from BeforeModify drop just the offending op; other
 // ops in the same RecordChange still apply. BeforeCreate / BeforeDelete are

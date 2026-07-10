@@ -3,6 +3,7 @@ package spaceobjects
 import (
 	"context"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
 	"go.uber.org/zap"
 
@@ -92,9 +93,21 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			key        string
 			tracked    bool
 		)
-		cctx := &crdt.ChangeCtx{Change: ch, SelfIdentity: s.selfIdentity}
+		cctx := &crdt.ChangeCtx{Change: ch, SelfIdentity: s.selfIdentity,
+			// Classifiers may point-read the POST-apply record (the
+			// hook runs after the record loop, same tx) — e.g. a
+			// derived field a handler just stamped. Same read
+			// recordMatchesAudience does; verdicts stay device-local,
+			// so self-relative use of post-apply state is sound.
+			Get: func(dataset, recordId string) *anyenc.Value {
+				if ctrl == nil || recordId == "" {
+					return nil
+				}
+				return ctrl.Get(txCtx, dataset, recordId)
+			}}
 		for i := range ch.Records {
 			rec := &ch.Records[i]
+			cctx.RecordId = recordIds[i]
 			for _, op := range rec.Ops {
 				if op.Type == crdt.OpDelete {
 					deletedIds = append(deletedIds, recordIds[i])

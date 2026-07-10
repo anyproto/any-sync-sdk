@@ -499,34 +499,104 @@ An op that fails either gate is dropped and recorded as a rejection while the re
 
 ## 8. Handlers
 
-A handler owns a dataset. It defines:
+A handler is pure per-dataset behavior — lifecycle hooks the apply
+path invokes from inside the write transaction (§7.2). Its dataset
+name, wire `DataVersion`, indexes, field schema, and read-tracking
+opt-in are NOT methods on the handler; they are declared alongside it
+at registration (§8.1).
 
 ```go
 type Handler interface {
-    Dataset() string                   // dataset name
-    Version() int                      // handler version (for re-indexing)
-    Validate(op Operation) error       // permission / shape check
-    Apply(tx WriteTx, change Change) error
+    Init(ctx context.Context) error    // once at registration; nil for stateless handlers
+
+    BeforeCreate(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
+    BeforeModify(ctx *ChangeCtx, rec *RecordChange, op *Op, sink *Sink) error
+    BeforeDelete(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
 }
 ```
 
+All three `Before*` hooks may be no-ops (`DefaultHandler` is the
+embeddable no-op base). Error semantics follow §7.2's op-granular
+rejection rule: a `BeforeModify` error drops just the offending op
+(with per-key salvage for the multi-field form); `BeforeCreate` /
+`BeforeDelete` errors drop the whole RecordChange. Rejections wrap
+`ErrValidation` and surface in the apply result; the change itself
+still commits to the tree.
+
+**ChangeCtx** carries the change envelope (`VersionId`, `Timestamp`,
+`Creator` — the per-change signer — vs `ObjectAuthor`, the constant
+root signer) and `Before`, the target record's pre-op state, which
+evolves across ops in the same RecordChange (nil in `BeforeCreate`).
+`Get(dataset, id)` (v0.1.7) point-reads another record of the same
+object inside the apply tx; because hooks run on every replica and
+must not diverge, handlers may consult only fields immutable
+post-create (derived creation stamps) on records that are causal
+ancestors of the triggering change. `SelfIdentity` and `RecordId` are
+populated only on the read-tracking classify path (see
+read-tracking-proposal.md) — handler validation stays
+replica-independent by construction.
+
+**Sink** is how hooks write: `Derive(op)` queues a same-record derived
+op folded into the same store write (inheriting the change's
+VersionId — server-stamped fields like `creator`/`createdAt` land this
+way, converging under the standard LWW gate), and
+`Project(dataset, rec)` queues a sibling write to another dataset on
+the same object, applied in the same transaction.
+
 ### 8.1 Registration
-Handlers are registered at SDK init:
+
+Consumers register handlers through the type catalog at `sdk.Open`:
+`config.Config.Types` takes `handler.Type` entries, each owning zero
+or more `handler.Dataset` registrations:
+
 ```go
-sdk.RegisterHandler(handler)
+handler.Dataset{
+    Name:         "chat_messages",      // unique across the whole catalog
+    DataVersion:  "chat_messages-v2",   // stamped on every change; peers gate on it
+    Handler:      messagesHandler{},
+    Schema:       …,                    // field classes (§9); zero value = Dynamic
+    Indexes:      …,                    // ensured on the dataset's collection
+    ReadTracking: …,                    // optional unread-tracking opt-in
+}
 ```
-Registration is not compile-time — the set of handlers can differ across app versions. (Ties into Versioning section.)
+
+Internally (and for the tech space's raw mode) the same bundle is a
+`crdt.HandlerReg`, which additionally carries the handler `Version`
+persisted per collection for re-index decisions. The Controller also
+exposes `RegisterHandler` for late-bound datasets at runtime.
+Registration is not compile-time — the set of handlers can differ
+across app versions (ties into §Versioning / docs/08-versioning.md).
 
 ### 8.2 Unknown Datasets
-Changes arriving for datasets with no registered handler are **persisted in any-sync** (they were already accepted into the tree) but **not applied** to any-store. When a handler is later registered, the Versioning flow triggers a replay.
 
-Dataset is effectively invisible to queries until a handler exists, but data is preserved.
+Changes arriving for datasets with no registered handler are
+**persisted in any-sync** (they were already accepted into the tree)
+but **not applied** to any-store — the apply path returns
+`ErrUnknownDataset` and the projection skips them. The dataset is
+effectively invisible to queries until a handler exists, but data is
+preserved; a later registration rebuilds the projection through the
+versioning/replay flow (handler `Version` is persisted per collection
+precisely so a bump — or a first registration — can trigger
+re-indexing).
 
 ### 8.3 Validation
-Each handler may enforce:
-- Shape rules (schema validation; permissionless in v1, handler-defined later)
-- Per-record permissions (e.g., "only the author of a chat message can edit it") — identity comes from the signing key on the change
-- Reject invalid changes: validation errors logged; change dropped from any-store state but stays in the tree
+
+Handler hooks are the SECOND of the two apply-time gates described in
+§7.2 (content/scope validation runs first, at the controller). Typical
+handler enforcement:
+
+- Shape rules beyond the declared Schema (required fields, size
+  limits, allow-listed op paths).
+- Per-record permissions — e.g. "only the author of a chat message
+  can edit it": compare `ctx.Change.Creator` (the change's signer)
+  against a derived creation stamp on `ctx.Before`.
+- Disposition follows §7.2: inbound/replay rejections drop the op (or
+  record) and are recorded, never fatal; the writer-side
+  `ValidateChange` path stays whole-change strict so a fresh local
+  change can't enter the DAG with a bad op. Handlers needing stricter
+  local-only checks with caller-readable errors implement the
+  optional `LocalPreValidator` / `LocalPreValidatorMulti` interfaces,
+  which run only on the local-write path before the change is minted.
 
 ---
 

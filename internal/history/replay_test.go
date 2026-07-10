@@ -28,6 +28,7 @@ type fakeHistoryTree struct {
 	id      string
 	root    *objecttree.Change
 	entries []fakeEntry
+	walked  bool
 }
 
 type fakeEntry struct {
@@ -50,9 +51,23 @@ func (f *fakeHistoryTree) GetChange(id string) (*objecttree.Change, error) {
 	return nil, fmt.Errorf("fake tree: change %s not found", id)
 }
 
+// IterateRoot enforces the real objecttree contract the engines must
+// live with: IterateFrom caches each change's decoded Model and drops
+// its raw Data, so a second convert-walk cannot re-decode — it would
+// replay cached models whose Op.Payload values alias the first walk's
+// codec arena (memory that walk's later decodes already overwrote).
+// The real tree corrupts silently; the fake fails loudly. Engines are
+// single-pass per tree; tests needing another walk clone via freshTree
+// (production builds a new history tree per engine call).
 func (f *fakeHistoryTree) IterateRoot(convert objecttree.ChangeConvertFunc, iterate objecttree.ChangeIterateFunc) error {
+	if convert != nil {
+		if f.walked {
+			return errors.New("fake tree: second convert-walk over one history tree — stale arena-aliased payloads; use freshTree per engine call")
+		}
+		f.walked = true
+	}
 	for _, e := range f.entries {
-		if convert != nil {
+		if e.ch.Model == nil && convert != nil {
 			m, err := convert(e.ch, e.payload)
 			if err != nil {
 				return err
@@ -64,6 +79,21 @@ func (f *fakeHistoryTree) IterateRoot(convert objecttree.ChangeConvertFunc, iter
 		}
 	}
 	return nil
+}
+
+// freshTree returns an independently walkable tree over the first n
+// entries (n <= 0: all) — fresh Change structs, no cached models.
+func (f *fakeHistoryTree) freshTree(n int) *fakeHistoryTree {
+	if n <= 0 || n > len(f.entries) {
+		n = len(f.entries)
+	}
+	out := &fakeHistoryTree{id: f.id, root: f.root, entries: make([]fakeEntry, n)}
+	for i, e := range f.entries[:n] {
+		chCopy := *e.ch
+		chCopy.Model = nil
+		out.entries[i] = fakeEntry{ch: &chCopy, payload: e.payload}
+	}
+	return out
 }
 
 const testObjectId = "obj-hist"

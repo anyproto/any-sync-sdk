@@ -39,7 +39,7 @@ func TestRecordAtFallbackMatchesFullView(t *testing.T) {
 	want := full.Record(ctx, "notes", "n1")
 	require.NotNil(t, want)
 
-	got, err := recordFromTree(ctx, b.tree, recordAtParams("n1", nil))
+	got, err := recordFromTree(ctx, b.tree.freshTree(0), recordAtParams("n1", nil))
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, want.String(), got.String())
@@ -58,14 +58,14 @@ func TestRecordAtWithTouchedList(t *testing.T) {
 	require.NoError(t, err)
 
 	// Exact index-fed list — decode of non-touching changes skipped.
-	indexed, err := recordFromTree(ctx, b.tree, recordAtParams("n1", []string{c1, c3}))
+	indexed, err := recordFromTree(ctx, b.tree.freshTree(0), recordAtParams("n1", []string{c1, c3}))
 	require.NoError(t, err)
 	require.NotNil(t, indexed)
 	assert.Equal(t, fallback.String(), indexed.String())
 
 	// A stale index row naming a non-touching change is re-checked and
 	// ignored, not applied.
-	stale, err := recordFromTree(ctx, b.tree, recordAtParams("n1", []string{c1, c3, "cid-002"}))
+	stale, err := recordFromTree(ctx, b.tree.freshTree(0), recordAtParams("n1", []string{c1, c3, "cid-002"}))
 	require.NoError(t, err)
 	require.NotNil(t, stale)
 	assert.Equal(t, fallback.String(), stale.String())
@@ -81,7 +81,7 @@ func TestRecordAtAbsentAndTombstone(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, got)
 
-	dead, err := recordFromTree(ctx, b.tree, recordAtParams("n1", nil))
+	dead, err := recordFromTree(ctx, b.tree.freshTree(0), recordAtParams("n1", nil))
 	require.NoError(t, err)
 	require.NotNil(t, dead)
 	assert.NotNil(t, dead.Get(crdt.DeletedAtField))

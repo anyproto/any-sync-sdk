@@ -60,13 +60,13 @@ func TestDiffRangeMatchesDiffViews(t *testing.T) {
 	assert.Equal(t, fx.cutBase, got.Base)
 	assert.Equal(t, fx.cutVersion, got.Version)
 
-	// Reference: two independent views, diffed.
-	baseTree := &fakeHistoryTree{id: fx.tree.id, root: fx.tree.root, entries: fx.tree.entries[:fx.prefixLen]}
-	baseView, err := buildScratch(t, baseTree, ViewParams{
+	// Reference: two independent views, each over a fresh tree (a
+	// walked tree cannot be walked again — see fakeHistoryTree).
+	baseView, err := buildScratch(t, fx.tree.freshTree(fx.prefixLen), ViewParams{
 		ObjectId: testObjectId, Heads: []string{fx.cutBase}, Regs: testRegs(),
 	})
 	require.NoError(t, err)
-	versionView, err := buildScratch(t, versionTree, ViewParams{
+	versionView, err := buildScratch(t, fx.tree.freshTree(0), ViewParams{
 		ObjectId: testObjectId, Heads: []string{fx.cutVersion}, Regs: testRegs(),
 	})
 	require.NoError(t, err)
@@ -99,7 +99,7 @@ func TestDiffRangeEffectDiff(t *testing.T) {
 	// Parents of editN1 = [cutBase] (linear chain). The tree passed to
 	// DiffRange is always built AT the version cut (the fake serves
 	// whatever it holds), so truncate to editN1's prefix.
-	editTree := &fakeHistoryTree{id: fx.tree.id, root: fx.tree.root, entries: fx.tree.entries[:fx.prefixLen+1]}
+	editTree := fx.tree.freshTree(fx.prefixLen + 1)
 	res, err := DiffRange(ctx, rangeParams(editTree), []string{fx.cutBase}, fx.editN1, DiffFilter{})
 	require.NoError(t, err)
 	require.Len(t, res.Datasets, 1)
@@ -141,7 +141,7 @@ func TestDiffRangeFilters(t *testing.T) {
 	require.Len(t, res.Datasets[0].Records, 1)
 	assert.Equal(t, "n1", res.Datasets[0].Records[0].Id)
 
-	_, err = DiffRange(ctx, rangeParams(fx.tree), []string{fx.cutBase}, fx.cutVersion,
+	_, err = DiffRange(ctx, rangeParams(fx.tree.freshTree(0)), []string{fx.cutBase}, fx.cutVersion,
 		DiffFilter{RecordIds: []string{"n1"}})
 	require.Error(t, err, "record ids without dataset")
 }

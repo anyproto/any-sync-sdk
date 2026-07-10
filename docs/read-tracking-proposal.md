@@ -67,8 +67,9 @@ A dataset opts in at registration (`handler.Dataset`):
 ReadTracking: &handler.ReadTracking{
     // Classify runs per applied record change. Track=false skips the
     // change (edits, typing indicators, plain deletes). Tags label
-    // the unread entry: chat returns "message", "mention" (text
-    // mentions me), "reaction" (op under reactions.*). Key is an
+    // the unread entry: chat returns "message", "mention" (the derived
+    // mentions array names me — text links and reply fold-ins alike),
+    // "reaction" (op under reactions.*). Key is an
     // optional supersede key: a new unread entry with the same key
     // REPLACES the previous one, and Track=false with a Key CLEARS
     // it — one rule covers reaction toggles (react → un-react leaves
@@ -102,6 +103,27 @@ Canonical use: a reaction badges only the reacted-to message's author
 (`creator == SelfIdentity`). Audience filters must consult only
 fields immutable post-create (derived creation stamps), or replays
 diverge.
+
+**Post-apply point reads (shipped with chat mentions).** An `Audience`
+filter gates the WHOLE verdict — every tag — so it cannot express
+"message for everyone + mention for the mentioned account". For that
+the classifier itself point-reads the post-apply record via
+`ChangeCtx.Get` + `ChangeCtx.RecordId` (both populated on the classify
+path; classification runs after the record loop in the same tx, so
+handler-derived fields are visible). Verdicts are device-local, so
+combining `SelfIdentity` with post-apply state is sound; incremental
+replays reapply from the persisted watermark, so state at
+re-classification matches the original run.
+
+**Rejections never classify.** The classify hook narrows each record
+change to the ops the apply step actually landed
+(`ApplyResult.Rejections`): a handler-rejected op never mutated the
+record, so it must not create, clear, or supersede unread state — a
+rejected delete must not wipe the victim's unread entries, a rejected
+edit must not forge or clear keyed entries. Whole-record rejections
+skip the record; a partially-salvaged multi-field op is dropped from
+classification conservatively (a rejection can only suppress tracking,
+never forge it).
 
 **Record deletion** clears every unread row referencing the deleted
 recordIds in the same tx (counters and flags drop, the object surfaces

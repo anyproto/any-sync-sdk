@@ -105,3 +105,53 @@ func TestHistoryIndexOpenRetries(t *testing.T) {
 	require.NoError(t, err, "second open must retry, not return a cached error")
 	require.NotNil(t, ix)
 }
+
+// A purge that runs before the index is open (or that fails) must not
+// leak the object's space-level history rows: it queues, supersedes
+// any pending stale mark, and the next successful HistoryIndex open
+// replays it.
+func TestHistoryPurgeDefersUntilIndexOpen(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-existing rows for the object: one traced change + a stale
+	// meta row, written through an independently opened index handle.
+	pre, err := history.OpenIndex(ctx, db, "sp-test", nil)
+	require.NoError(t, err)
+	ch := &crdt.Change{
+		SpaceId:   "sp-test",
+		ObjectId:  "obj-x",
+		Dataset:   "notes",
+		ChangeId:  "cid-1",
+		VersionId: "o1",
+		TraceIds:  []string{"trace-x"},
+		Records:   []crdt.RecordChange{{Id: "r1", Upsert: true, Ops: []crdt.Op{{Type: crdt.OpSet}}}},
+	}
+	require.NoError(t, pre.IndexChange(ctx, ch, []string{"r1"}))
+	require.NoError(t, pre.MarkStale(ctx, "obj-x"))
+
+	s := &Store{db: db, spaceId: "sp-test"}
+	s.historyPendingStale.Store("obj-x", struct{}{})
+
+	// Purge with no index published: queued, stale mark superseded.
+	s.purgeHistoryRows(ctx, "obj-x")
+	_, pendingPurge := s.historyPendingPurge.Load("obj-x")
+	assert.True(t, pendingPurge, "purge queued while index unavailable")
+	_, pendingStale := s.historyPendingStale.Load("obj-x")
+	assert.False(t, pendingStale, "deleted object must not be re-marked stale")
+
+	// First successful open flushes the queued purge.
+	ix, err := s.HistoryIndex(ctx)
+	require.NoError(t, err)
+	_, still := s.historyPendingPurge.Load("obj-x")
+	assert.False(t, still, "pending purge consumed")
+
+	stale, err := ix.IsStale(ctx, "obj-x")
+	require.NoError(t, err)
+	assert.False(t, stale, "meta row purged")
+	byTrace, _, err := ix.ListChanges(ctx, history.Filter{TraceId: "trace-x"}, 10, "")
+	require.NoError(t, err)
+	assert.Empty(t, byTrace, "trace rows purged")
+}

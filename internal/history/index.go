@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -254,7 +256,7 @@ func (ix *Index) clearStale(ctx context.Context, objectId string) error {
 // dataset collections; traces have no per-object key prefix, so they
 // need this scan (purge is rare, the traces collection is sparse).
 func (ix *Index) PurgeObject(ctx context.Context, objectId string) error {
-	iter, err := ix.traces.Find(map[string]any{"obj": objectId}).Iter(ctx)
+	iter, err := ix.traces.Find(query.Key{Path: []string{"obj"}, Filter: query.NewComp(query.CompOpEq, objectId)}).Iter(ctx)
 	if err != nil {
 		return err
 	}
@@ -406,7 +408,9 @@ const (
 // never appear after children; timestamps are display-only). cursor is
 // the opaque value returned by the previous page ("" = start) and is
 // only meaningful with the same filter. Returns the page and the next
-// cursor ("" = exhausted).
+// cursor ("" = exhausted). Filter fields combine as AND: the most
+// selective field picks the scan route, the rest apply as residual
+// checks on that route.
 func (ix *Index) ListChanges(ctx context.Context, f Filter, limit int, cursor string) ([]ChangeMeta, string, error) {
 	if f.ObjectId == "" && f.TraceId == "" {
 		return nil, "", errors.New("history: ListChanges requires ObjectId (or TraceId for a space-wide trace scan)")
@@ -431,6 +435,17 @@ func (ix *Index) ListChanges(ctx context.Context, f Filter, limit int, cursor st
 	}
 }
 
+// idRange builds the typed PK range condition lo < id < hi — the
+// prefix-scan shape every join route uses.
+func idRange(lo, hi string) query.Filter {
+	return query.And{
+		query.Key{Path: idPath, Filter: query.NewComp(query.CompOpGt, lo)},
+		query.Key{Path: idPath, Filter: query.NewComp(query.CompOpLt, hi)},
+	}
+}
+
+var idPath = []string{"id"}
+
 // listDirect pages an object's `__history` collection: a reverse
 // primary-key scan (PK = OrderId), residual ds/author filters applied
 // by the query engine.
@@ -439,15 +454,15 @@ func (ix *Index) listDirect(ctx context.Context, f Filter, limit int, cursor str
 	if err != nil || coll == nil {
 		return nil, "", err
 	}
-	cond := map[string]any{}
+	cond := query.And{}
 	if f.Dataset != "" {
-		cond["ds"] = f.Dataset
+		cond = append(cond, query.Key{Path: []string{"ds"}, Filter: query.NewComp(query.CompOpEq, f.Dataset)})
 	}
 	if f.Author != "" {
-		cond["author"] = f.Author
+		cond = append(cond, query.Key{Path: []string{"author"}, Filter: query.NewComp(query.CompOpEq, f.Author)})
 	}
 	if cursor != "" {
-		cond["id"] = map[string]any{"$lt": cursor}
+		cond = append(cond, query.Key{Path: idPath, Filter: query.NewComp(query.CompOpLt, cursor)})
 	}
 	iter, err := coll.Find(cond).Sort("-id").Limit(uint(limit + 1)).Iter(ctx)
 	if err != nil {
@@ -479,7 +494,8 @@ func (ix *Index) listDirect(ctx context.Context, f Filter, limit int, cursor str
 // listByRecord pages the object's `__history_recs` collection by the
 // record's PK prefix (rows are `rec\0o`, so the range is ordered by o)
 // and joins each hit to its `__history` row by o. Cursor = last
-// processed row's o.
+// processed row's o. Dataset and TraceId apply as residual checks on
+// the joined row (the recs PK carries neither).
 func (ix *Index) listByRecord(ctx context.Context, f Filter, limit int, cursor string) ([]ChangeMeta, string, error) {
 	recs, err := ix.recsColl(ctx, f.ObjectId, false)
 	if err != nil || recs == nil {
@@ -494,7 +510,7 @@ func (ix *Index) listByRecord(ctx context.Context, f Filter, limit int, cursor s
 	if cursor != "" {
 		upper = f.RecordId + keySep + cursor
 	}
-	cond := map[string]any{"id": map[string]any{"$gt": f.RecordId + keySep, "$lt": upper}}
+	cond := idRange(f.RecordId+keySep, upper)
 
 	join := func(row *anyenc.Value) (ChangeMeta, bool, error) {
 		doc, ferr := hist.FindId(ctx, string(row.GetStringBytes("o")))
@@ -508,6 +524,9 @@ func (ix *Index) listByRecord(ctx context.Context, f Filter, limit int, cursor s
 		if meta.Dataset != f.Dataset {
 			return ChangeMeta{}, false, nil // same record id in another dataset
 		}
+		if f.TraceId != "" && !slices.Contains(meta.TraceIds, f.TraceId) {
+			return ChangeMeta{}, false, nil
+		}
 		return meta, true, nil
 	}
 	return ix.pageJoin(ctx, recs, cond, f, limit, join, func(row *anyenc.Value) string {
@@ -518,14 +537,15 @@ func (ix *Index) listByRecord(ctx context.Context, f Filter, limit int, cursor s
 // listByTrace pages the space-level traces collection by the trace's
 // PK prefix and joins each hit to its object's `__history` row.
 // OrderIds are only unique per tree, so the cursor is `o\0objectId` —
-// the PK tail after the trace prefix.
+// the PK tail after the trace prefix. ObjectId, Dataset and Author
+// apply as residual checks on the joined row.
 func (ix *Index) listByTrace(ctx context.Context, f Filter, limit int, cursor string) ([]ChangeMeta, string, error) {
 	prefix := ix.spaceId + keySep + f.TraceId + keySep
 	upper := ix.spaceId + keySep + f.TraceId + keySepEnd
 	if cursor != "" {
 		upper = prefix + cursor
 	}
-	cond := map[string]any{"id": map[string]any{"$gt": prefix, "$lt": upper}}
+	cond := idRange(prefix, upper)
 
 	hists := map[string]anystore.Collection{} // per-object join targets
 	join := func(row *anyenc.Value) (ChangeMeta, bool, error) {
@@ -554,6 +574,9 @@ func (ix *Index) listByTrace(ctx context.Context, f Filter, limit int, cursor st
 			return ChangeMeta{}, false, ferr
 		}
 		meta := changeMetaFromRow(doc.Value(), obj)
+		if f.Dataset != "" && meta.Dataset != f.Dataset {
+			return ChangeMeta{}, false, nil
+		}
 		meta.OrderId = o + keySep + obj // trace-route cursor tail
 		return meta, true, nil
 	}
@@ -572,14 +595,14 @@ func (ix *Index) listByTrace(ctx context.Context, f Filter, limit int, cursor st
 func (ix *Index) pageJoin(
 	ctx context.Context,
 	side anystore.Collection,
-	cond map[string]any,
+	cond query.Filter,
 	f Filter,
 	limit int,
 	join func(row *anyenc.Value) (ChangeMeta, bool, error),
 	cursorKey func(row *anyenc.Value) string,
 ) ([]ChangeMeta, string, error) {
 	fetch := limit
-	if f.Author != "" || f.ObjectId != "" {
+	if f.Author != "" || f.ObjectId != "" || f.Dataset != "" || f.TraceId != "" {
 		// Post-join filters may reject rows: over-fetch the window.
 		fetch = limit * 4
 	}
@@ -625,19 +648,25 @@ func (ix *Index) pageJoin(
 	return out, lastKey, nil
 }
 
-// TouchedChangeIds returns every ChangeId known to touch (dataset,
-// recordId) on the object — the RecordAt fast-path pre-filter, straight
-// off the record's PK prefix range. Bounded by maxTouchedChangeIds; a
-// record touched more often than that falls back to the
-// decode-and-filter path (nil, nil).
+// TouchedChangeIds returns every ChangeId known to touch recordId on
+// the object — the RecordAt fast-path pre-filter, straight off the
+// record's PK prefix range. The set may be a superset across datasets
+// (the recs PK carries no dataset); that is sound — the replay
+// re-checks dataset and record per change. What must NOT happen is a
+// non-empty set MISSING changes of the requested dataset, so datasets
+// opted out of history (SkipHistory — never indexed) return (nil, nil)
+// and take the decode-and-filter fallback. Bounded by
+// maxTouchedChangeIds; a record touched more often than that also
+// falls back.
 func (ix *Index) TouchedChangeIds(ctx context.Context, objectId, dataset, recordId string) ([]string, error) {
+	if ix.SkipsDataset(dataset) {
+		return nil, nil
+	}
 	recs, err := ix.recsColl(ctx, objectId, false)
 	if err != nil || recs == nil {
 		return nil, err
 	}
-	iter, err := recs.Find(map[string]any{
-		"id": map[string]any{"$gt": recordId + keySep, "$lt": recordId + keySepEnd},
-	}).Iter(ctx)
+	iter, err := recs.Find(idRange(recordId+keySep, recordId+keySepEnd)).Iter(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("history: touched change ids: %w", err)
 	}

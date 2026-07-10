@@ -308,3 +308,90 @@ func TestListLimitClamps(t *testing.T) {
 	_, _, err = ix.ListChanges(ctx, Filter{ObjectId: "obj-1"}, MaxListLimit+500, "")
 	require.NoError(t, err)
 }
+
+// Combined filters must AND across scan routes: the route picks the
+// scan, the remaining fields apply as residual checks (regression:
+// RecordId used to silently drop TraceId, and the trace route ignored
+// Dataset).
+func TestListCombinedFilters(t *testing.T) {
+	ctx := context.Background()
+	ix := newTestIndex(t)
+	indexOne(t, ix, idxChange(1, "notes", "n1"))
+	indexOne(t, ix, idxChange(2, "notes", "n1", func(c *crdt.Change) { c.TraceIds = []string{"trace-x"} }))
+	indexOne(t, ix, idxChange(3, "notes", "n2", func(c *crdt.Change) { c.TraceIds = []string{"trace-x"} }))
+	indexOne(t, ix, idxChange(4, "tasks", "t1", func(c *crdt.Change) { c.TraceIds = []string{"trace-x"} }))
+
+	// record + trace: only n1's traced change.
+	out, cur, err := ix.ListChanges(ctx, Filter{
+		ObjectId: "obj-1", Dataset: "notes", RecordId: "n1", TraceId: "trace-x",
+	}, 10, "")
+	require.NoError(t, err)
+	assert.Empty(t, cur)
+	require.Len(t, out, 1)
+	assert.Equal(t, "cid-002", out[0].Version)
+
+	// trace + dataset: the tasks change carrying the trace is excluded.
+	out, cur, err = ix.ListChanges(ctx, Filter{TraceId: "trace-x", Dataset: "notes"}, 10, "")
+	require.NoError(t, err)
+	assert.Empty(t, cur)
+	require.Len(t, out, 2)
+	assert.Equal(t, "cid-003", out[0].Version)
+	assert.Equal(t, "cid-002", out[1].Version)
+
+	// trace + dataset + record: all three routes' fields at once.
+	out, _, err = ix.ListChanges(ctx, Filter{
+		ObjectId: "obj-1", Dataset: "tasks", RecordId: "t1", TraceId: "trace-x",
+	}, 10, "")
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	assert.Equal(t, "cid-004", out[0].Version)
+}
+
+// A page window whose rows are all rejected by residual filters must
+// keep paging via the returned cursor instead of terminating early.
+func TestListCombinedFiltersPagesPastRejects(t *testing.T) {
+	ctx := context.Background()
+	ix := newTestIndex(t)
+	// 30 untraced changes on n1, then 1 traced one at the oldest end.
+	indexOne(t, ix, idxChange(1, "notes", "n1", func(c *crdt.Change) { c.TraceIds = []string{"trace-x"} }))
+	for i := 2; i <= 31; i++ {
+		indexOne(t, ix, idxChange(i, "notes", "n1"))
+	}
+
+	var got []ChangeMeta
+	cur := ""
+	for {
+		page, next, err := ix.ListChanges(ctx, Filter{
+			ObjectId: "obj-1", Dataset: "notes", RecordId: "n1", TraceId: "trace-x",
+		}, 2, cur)
+		require.NoError(t, err)
+		got = append(got, page...)
+		if next == "" {
+			break
+		}
+		cur = next
+	}
+	require.Len(t, got, 1)
+	assert.Equal(t, "cid-001", got[0].Version)
+}
+
+// TouchedChangeIds must never feed the RecordAt pre-filter for a
+// SkipHistory dataset: its changes are absent from the index, so a
+// non-nil set would exclude them all from the filtered replay
+// (regression: recordId collisions across datasets returned the other
+// dataset's set).
+func TestTouchedChangeIdsSkipHistoryFallsBack(t *testing.T) {
+	ctx := context.Background()
+	ix := newTestIndex(t, "presence")
+	// Indexed dataset shares the record id with the skipped one.
+	indexOne(t, ix, idxChange(1, "notes", "shared-id"))
+
+	touched, err := ix.TouchedChangeIds(ctx, "obj-1", "presence", "shared-id")
+	require.NoError(t, err)
+	assert.Nil(t, touched, "skip-history dataset must take the decode-and-filter fallback")
+
+	// The indexed dataset still gets its pre-filter.
+	touched, err = ix.TouchedChangeIds(ctx, "obj-1", "notes", "shared-id")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"cid-001"}, touched)
+}

@@ -253,6 +253,13 @@ type Store struct {
 	// successful HistoryIndex call so the lazy backfill repairs the
 	// gap instead of it becoming permanent.
 	historyPendingStale sync.Map
+	// historyPendingPurge collects objectIds whose space-level history
+	// rows (trace rows, _history_meta) could not be purged — index
+	// unavailable at purge time, or the purge itself failed. Flushed
+	// on every successful HistoryIndex call, same contract as
+	// historyPendingStale; without it a purge skipped once would leak
+	// the rows forever.
+	historyPendingPurge sync.Map
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -880,11 +887,7 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	// includes the per-object history collections; the space-level history
 	// leftovers (trace rows, stale-flag row) need their own purge.
 	s.dropObjectCollections(ctx, objectId)
-	if ix := s.historyIx.Load(); ix != nil {
-		if perr := ix.PurgeObject(ctx, objectId); perr != nil {
-			storeLog.Warn("purge: history index cleanup", zap.String("treeId", objectId), zap.Error(perr))
-		}
-	}
+	s.purgeHistoryRows(ctx, objectId)
 	_ = s.unmarkSkipped(ctx, objectId)
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil
@@ -1001,6 +1004,7 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		if nerr == nil {
 			s.dropObjectCollectionsNamed(ctx, p.id, names)
 		}
+		s.purgeHistoryRows(ctx, p.id)
 		s.Drop(p.id)
 		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
 	}
@@ -1543,7 +1547,8 @@ var ErrHistoryUnavailable = errors.New("spaceobjects: history index unavailable 
 // on first use. The skip list is derived from the registered datasets'
 // SkipHistory flags. Open failures are returned but NOT cached — the
 // next call retries. Every successful call also flushes pending stale
-// marks recorded while the index was unavailable.
+// marks and deferred history purges recorded while the index was
+// unavailable.
 //
 // Never call this from inside an apply WriteTx (the collection DDL
 // would nest in — and be reverted with — the apply tx while the opened
@@ -1579,6 +1584,7 @@ func (s *Store) HistoryIndex(ctx context.Context) (*history.Index, error) {
 		s.historyMu.Unlock()
 	}
 	s.flushPendingStale(ctx, ix)
+	s.flushPendingPurge(ctx, ix)
 	return ix, nil
 }
 
@@ -1594,6 +1600,42 @@ func (s *Store) flushPendingStale(ctx context.Context, ix *history.Index) {
 			return true
 		}
 		s.historyPendingStale.Delete(objectId)
+		return true
+	})
+}
+
+// purgeHistoryRows removes a deleted object's space-level history rows
+// (trace rows, _history_meta), queueing a retry when the index is
+// unavailable or the purge fails. A queued purge supersedes any queued
+// stale mark — a deleted object must not be re-marked for backfill.
+func (s *Store) purgeHistoryRows(ctx context.Context, objectId string) {
+	s.historyPendingStale.Delete(objectId)
+	ix := s.historyIx.Load()
+	if ix == nil {
+		s.historyPendingPurge.Store(objectId, struct{}{})
+		return
+	}
+	if err := ix.PurgeObject(ctx, objectId); err != nil {
+		storeLog.Warn("purge: history index cleanup", zap.String("treeId", objectId), zap.Error(err))
+		s.historyPendingPurge.Store(objectId, struct{}{})
+		return
+	}
+	s.historyPendingPurge.Delete(objectId)
+}
+
+// flushPendingPurge retries deferred history purges. Runs AFTER
+// flushPendingStale so a pending purge also removes any meta row a
+// stale flush just (re)wrote for the same object. Entries that fail
+// stay queued.
+func (s *Store) flushPendingPurge(ctx context.Context, ix *history.Index) {
+	s.historyPendingPurge.Range(func(key, _ any) bool {
+		objectId := key.(string)
+		if err := ix.PurgeObject(ctx, objectId); err != nil {
+			storeLog.Warn("history: pending purge failed",
+				zap.String("objectId", objectId), zap.Error(err))
+			return true
+		}
+		s.historyPendingPurge.Delete(objectId)
 		return true
 	})
 }

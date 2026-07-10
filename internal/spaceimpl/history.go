@@ -74,22 +74,26 @@ func buildTreeLocked(tree objecttree.ObjectTree, heads []string) (objecttree.His
 	})
 }
 
-// ensureFresh lazily backfills the object's index when it is stale
-// (cold restore skipped the warm path) or unknown (object predates the
-// history feature). Inline and batched; §4.4.
-func (h *historyAPI) ensureFresh(ctx context.Context, ix *history.Index, obj *object.Object, objectId string) error {
+// indexFresh reports whether the object's index can be served as-is:
+// not stale (cold restore skipped the warm path) and known (object
+// does not predate the history feature).
+func (h *historyAPI) indexFresh(ctx context.Context, ix *history.Index, objectId string) (bool, error) {
 	stale, err := ix.IsStale(ctx, objectId)
+	if err != nil || stale {
+		return false, err
+	}
+	return ix.HasState(ctx, objectId)
+}
+
+// ensureFresh lazily backfills the object's index when it is not
+// fresh. Inline and batched; §4.4.
+func (h *historyAPI) ensureFresh(ctx context.Context, ix *history.Index, obj *object.Object, objectId string) error {
+	fresh, err := h.indexFresh(ctx, ix, objectId)
 	if err != nil {
 		return err
 	}
-	if !stale {
-		known, kerr := ix.HasState(ctx, objectId)
-		if kerr != nil {
-			return kerr
-		}
-		if known {
-			return nil
-		}
+	if fresh {
+		return nil
 	}
 	// Full-tree walk (empty Heads = every change), decrypting through
 	// the object's key machinery; batched tx writes inside Backfill.
@@ -200,12 +204,14 @@ func (h *historyAPI) RecordAt(ctx context.Context, objectId, dataset, recordId s
 		return nil, fmt.Errorf("%w: %s", space.ErrVersionNotFound, version)
 	}
 
-	// Index-fed pre-filter when available; nil (decode-and-filter
-	// fallback) when the index can't serve — RecordAt stays correct
-	// either way, only the constant factor changes.
+	// Index-fed pre-filter, but only off an already-fresh index; nil
+	// (decode-and-filter fallback) otherwise — RecordAt stays correct
+	// either way, only the constant factor changes. Deliberately NOT
+	// ensureFresh: a synchronous full-tree backfill costs more than
+	// the fallback replay it would optimize.
 	var touched []string
 	if ix, ixErr := h.parent.store.HistoryIndex(ctx); ixErr == nil {
-		if fErr := h.ensureFresh(ctx, ix, obj, objectId); fErr == nil {
+		if fresh, fErr := h.indexFresh(ctx, ix, objectId); fErr == nil && fresh {
 			touched, _ = ix.TouchedChangeIds(ctx, objectId, dataset, recordId)
 		}
 	}
@@ -277,7 +283,10 @@ func (h *historyAPI) Diff(ctx context.Context, objectId string, base, version sp
 	res, err := history.DiffRange(ctx, rp, baseHeads, version, filter)
 	if errors.Is(err, history.ErrNotAncestor) {
 		// Concurrent versions: two-way diff of the two causal pasts.
-		res, err = h.diffConcurrent(ctx, tree, params, baseHeads, version, filter)
+		// versionTree is reusable here — ErrNotAncestor comes from the
+		// ancestor walk, which runs before DiffRange's (single-walk)
+		// iteration ever starts.
+		res, err = h.diffConcurrent(ctx, tree, params, baseHeads, versionTree, version, filter)
 	}
 	if err != nil {
 		return space.DiffResult{}, mapHistoryErr(err)
@@ -300,8 +309,10 @@ func (h *historyAPI) Diff(ctx context.Context, objectId string, base, version sp
 
 // diffConcurrent handles the neither-is-ancestor case (proposal §5):
 // two full views, two-way structural diff. Rare — a caller comparing
-// two concurrent branches explicitly.
-func (h *historyAPI) diffConcurrent(ctx context.Context, tree objecttree.ObjectTree, params history.ViewParams, baseHeads []string, version space.Version, filter history.DiffFilter) (history.DiffResult, error) {
+// two concurrent branches explicitly. versionTree is the caller's
+// already-built (and not yet walked) history tree at version, so only
+// the base cut pays a locked storage scan.
+func (h *historyAPI) diffConcurrent(ctx context.Context, tree objecttree.ObjectTree, params history.ViewParams, baseHeads []string, versionTree objecttree.HistoryTree, version space.Version, filter history.DiffFilter) (history.DiffResult, error) {
 	baseTree, err := buildTreeLocked(tree, baseHeads)
 	if err != nil {
 		return history.DiffResult{}, err
@@ -315,10 +326,6 @@ func (h *historyAPI) diffConcurrent(ctx context.Context, tree objecttree.ObjectT
 	}
 	defer baseView.Close()
 
-	versionTree, err := buildTreeLocked(tree, []string{version})
-	if err != nil {
-		return history.DiffResult{}, err
-	}
 	vp := params
 	vp.Heads = []string{version}
 	vp.Tree = versionTree

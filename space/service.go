@@ -107,6 +107,26 @@ type Service interface {
 	// in List with Status = StatusDeleted.
 	Delete(ctx context.Context, spaceId string) error
 
+	// SetSettings patches the account-private per-space client settings
+	// — a free-form object on the space's tech-space row, synced across
+	// the account's devices (owner-only ACL: other space members never
+	// see it). Each set entry lands as its own $set at settings.<key>
+	// and each unset key as a $unset, all in one change — so devices
+	// editing DIFFERENT keys converge without clobbering each other;
+	// the same key is per-key LWW.
+	//
+	// Keys are the caller's vocabulary: non-empty, dot-free (one level
+	// under `settings` in v1). Values are scalars — string, bool, or
+	// any numeric type (stored as float64, JSON semantics). At least
+	// one set or unset entry is required; a key may not appear in both.
+	// The spaceId must be known to the account (any row in List,
+	// deleted included — a tombstone's settings stay editable).
+	//
+	// Read back via List / Get → SpaceInfo.Settings, or live via the
+	// raw spaces-dataset query (Query(SpaceIndexObjectId(), "spaces"))
+	// where the subtree appears under the row's `settings` field.
+	SetSettings(ctx context.Context, spaceId string, set map[string]any, unset []string) error
+
 	// Subscribe delivers space-list changes (added / updated / removed).
 	// Returns a cancel function.
 	Subscribe(cb func(SpaceListEvent)) (cancel func())

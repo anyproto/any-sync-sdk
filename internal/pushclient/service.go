@@ -9,13 +9,17 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/util/crypto"
 	"github.com/anyproto/anytype-push-server/pushclient/pushapi"
 	"github.com/mr-tron/base58"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+var log = logger.NewNamed("pushclient")
 
 // KeysProvider resolves a space's push keys from its ACL: the derived
 // push signing key (from the first metadata key — fixed for the
@@ -124,6 +128,15 @@ func (s *Service) RemoveSpace(ctx context.Context, spaceId string) error {
 // SubscribeAll replaces the account's ENTIRE topic set (full replace —
 // see space.PushAPI). Topics for every space are signed with that
 // space's push key and submitted in one request.
+//
+// Per-space degrade, not all-or-nothing: a space whose push keys can't
+// be derived (removed from the ACL → read key rotated away, storage
+// not yet materialized, never-completable invite) is SKIPPED with a
+// warning instead of failing the call — one bad space must not freeze
+// the account's whole subscription state. Because the request is a
+// full replace, skipping also unsubscribes the keyless space's stale
+// topics — matching heart, whose keyless spaces contribute no topics
+// (spaceTopicsCollection.SetSpaceViewStatus early-returns on nil keys).
 func (s *Service) SubscribeAll(ctx context.Context, subs []space.PushSpaceTopics) error {
 	if err := s.configured(); err != nil {
 		return err
@@ -132,7 +145,9 @@ func (s *Service) SubscribeAll(ctx context.Context, subs []space.PushSpaceTopics
 	for _, sub := range subs {
 		spaceKey, _, err := s.keys.PushKeys(ctx, sub.SpaceId)
 		if err != nil {
-			return fmt.Errorf("pushclient: space %q: %w", sub.SpaceId, err)
+			log.Warn("pushclient: subscribeAll: skipping space without derivable push keys",
+				zap.String("spaceId", sub.SpaceId), zap.Error(err))
+			continue
 		}
 		topics, err := buildTopics(spaceKey, sub.Topics)
 		if err != nil {

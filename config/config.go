@@ -97,6 +97,12 @@ type P2P struct {
 	// Enabled is an opt-out: nil (the default) means enabled. False
 	// disables the QUIC listener and discovery entirely; sync status
 	// then reports P2PStateNotPossible for every space.
+	//
+	// Headless mode (see Config.Headless) flips the default: a nil
+	// Enabled resolves to disabled there, since an embedded backend has
+	// no reason to announce over mDNS or accept LAN peers. A headless
+	// broker that genuinely wants local-network sync must opt back in
+	// with Enabled = &true; an explicit &false stays off in both modes.
 	Enabled *bool `yaml:"enabled"`
 
 	// Port fixes the QUIC listen port. Zero — the default — reuses the
@@ -113,6 +119,20 @@ type P2P struct {
 
 // IsEnabled resolves the opt-out tristate: nil = enabled.
 func (p P2P) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+
+// ResolveP2P returns the effective P2P config for this Config, applying
+// the headless default: in headless mode a nil (unset) Enabled resolves
+// to disabled, because an embedded backend has no reason to announce
+// over mDNS or accept LAN peers. An explicit Enabled — &true or &false —
+// is always honored, so a headless broker can opt back into local sync.
+func (c Config) ResolveP2P() P2P {
+	p := c.P2P
+	if c.Headless && p.Enabled == nil {
+		off := false
+		p.Enabled = &off
+	}
+	return p
+}
 
 // Network is the any-sync network configuration. v1 is deliberately
 // conservative — callers pass a serialized nodeconf blob and we decode

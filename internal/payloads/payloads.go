@@ -40,10 +40,25 @@ const HandlerVersion = "payloads-v1"
 // node-readable and restricted to this dataset.
 const ChangeType = "payloads"
 
-// WellKnownDeriveSeed is the ChangePayload seed of every payloads
-// object. Combined with ParentId (the owner object) it derives the
-// same deterministic child id on every peer.
+// WellKnownDeriveSeed is the ChangePayload seed of a payloads object
+// whose owner is a SIGNED object. Combined with ParentId (the owner
+// object) it derives the same deterministic child id on every peer, and
+// binds the payloads object to the owner so any-sync cascade-deletes it
+// with the owner.
 const WellKnownDeriveSeed = "builtin:payloads"
+
+// DerivedOwnerSeed is the ChangePayload seed of a payloads object whose
+// owner is a DERIVED object. any-sync rejects a derived object as a tree
+// parent (objecttree.ErrDerivedParent), so the payloads object can't take
+// the parented WellKnownDeriveSeed shape signed owners get. It is derived
+// UNPARENTED instead, with the ownerId folded into the seed so each
+// derived owner still resolves to its own deterministic, per-owner
+// payloads id (an unparented tree has no ParentId to carry that
+// uniqueness). The two are coupled: unparented + owner-in-seed must move
+// together, or every derived owner would collide on a single id.
+func DerivedOwnerSeed(ownerId string) string {
+	return WellKnownDeriveSeed + "/" + ownerId
+}
 
 // InlineMaxSize is the inline-tier cutoff: a file strictly smaller
 // than this rides inside `enc` (Inline bytes) with no rootCid / S3 /

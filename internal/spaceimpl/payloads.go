@@ -53,15 +53,57 @@ type RegisterFileOpts struct {
 }
 
 // payloadsDeriveOpts is the one true derivation of a payloads object —
-// every caller must agree on every field (Unencrypted included) or
-// the derived ids diverge.
-func payloadsDeriveOpts(ownerId string) spaceobjects.DeriveOpts {
-	return spaceobjects.DeriveOpts{
+// every caller must agree on every field (Unencrypted included) or the
+// derived ids diverge. ownerDerived selects the shape by the owner's
+// class:
+//
+//   - signed owner  → ParentId=ownerId, seed=WellKnownDeriveSeed: the
+//     payloads object is the owner's child, cascade-deleted with it;
+//   - derived owner → ParentId="", seed=DerivedOwnerSeed(ownerId): any-
+//     sync rejects a derived object as a parent (ErrDerivedParent), so
+//     the payloads object is unparented, with the ownerId folded into the
+//     seed for per-owner uniqueness.
+//
+// The ParentId and seed edits are COUPLED — the derived branch must clear
+// ParentId AND fold ownerId into the seed together, or every derived
+// owner would collide on one id. Signed-owner ids are byte-for-byte the
+// same as before this branch existed (nothing to migrate).
+func payloadsDeriveOpts(ownerId string, ownerDerived bool) spaceobjects.DeriveOpts {
+	opts := spaceobjects.DeriveOpts{
 		ChangeType:    payloads.ChangeType,
 		ChangePayload: []byte(payloads.WellKnownDeriveSeed),
 		ParentId:      ownerId,
 		Unencrypted:   true,
 	}
+	if ownerDerived {
+		opts.ChangePayload = []byte(payloads.DerivedOwnerSeed(ownerId))
+		opts.ParentId = ""
+	}
+	return opts
+}
+
+// readDeriveOpts resolves the payloads derivation for an owner on the READ
+// paths (ObjectId, existingObjectId). It reads the owner's class when the
+// owner tree is present; when the owner is ABSENT it assumes the derived
+// (unparented) shape — the only shape whose payloads object can be present
+// locally without its owner (any-sync orders only parented trees, so a
+// peer may hold the content-bearing payloads tree without a content-less
+// derived owner). Both read paths must agree here so a given owner always
+// resolves to one id, on every peer, owner present or not.
+//
+// The WRITE path (RegisterFiles) deliberately does NOT use this: it needs
+// the owner's true class (the owner is always present there — Attach checks
+// HasTree first), so it never guesses "derived" and can't create a
+// mis-shaped payloads object for a signed owner that merely hasn't synced.
+func (p *PayloadsAPI) readDeriveOpts(ctx context.Context, ownerId string) (spaceobjects.DeriveOpts, error) {
+	ownerDerived, present, err := p.s.store.TreeIsDerived(ctx, ownerId)
+	if err != nil {
+		return spaceobjects.DeriveOpts{}, err
+	}
+	if !present {
+		ownerDerived = true
+	}
+	return payloadsDeriveOpts(ownerId, ownerDerived), nil
 }
 
 // ObjectId resolves the deterministic payloads-object id for an owner
@@ -70,7 +112,11 @@ func (p *PayloadsAPI) ObjectId(ctx context.Context, ownerId string) (string, err
 	if ownerId == "" {
 		return "", errors.New("payloads: ownerId required")
 	}
-	return p.s.store.DeriveId(ctx, payloadsDeriveOpts(ownerId))
+	opts, err := p.readDeriveOpts(ctx, ownerId)
+	if err != nil {
+		return "", err
+	}
+	return p.s.store.DeriveId(ctx, opts)
 }
 
 // RegisterFile is the single-file convenience over RegisterFiles.
@@ -123,9 +169,16 @@ func (p *PayloadsAPI) RegisterFiles(ctx context.Context, ownerId string, files [
 		return nil, "", err
 	}
 
+	// Resolve the owner's class so the payloads object is derived with
+	// the right shape (a derived owner can't be a parent). The owner tree
+	// is present here — Attach verifies it before any registration.
+	ownerDerived, _, err := p.s.store.TreeIsDerived(ctx, ownerId)
+	if err != nil {
+		return nil, "", err
+	}
 	// Lazy ensure: Derive is idempotent (deterministic id, per-id
 	// load lock), so first-use creation and reuse are the same call.
-	obj, err := p.s.store.Derive(ctx, payloadsDeriveOpts(ownerId))
+	obj, err := p.s.store.Derive(ctx, payloadsDeriveOpts(ownerId, ownerDerived))
 	if err != nil {
 		return nil, "", fmt.Errorf("payloads: derive payloads object: %w", err)
 	}
@@ -385,13 +438,22 @@ func (p *PayloadsAPI) rowFromValue(ctx context.Context, v *anyenc.Value) (payloa
 	return row, nil
 }
 
-// existingObjectId resolves the owner's payloads object id and whether
-// its tree exists locally — read paths never create it.
+// existingObjectId resolves the owner's payloads object id and whether its
+// tree exists locally — read paths never create it. Resolution follows
+// readDeriveOpts (owner class when present; the derived/unparented shape
+// when the owner is absent), so a peer holding the payloads tree but not a
+// content-less derived owner still finds its rows. HasTree then decides
+// whether anything is actually there — an owner that never had files,
+// signed or derived, reads as no-rows.
 func (p *PayloadsAPI) existingObjectId(ctx context.Context, ownerId string) (string, bool, error) {
 	if ownerId == "" {
 		return "", false, errors.New("payloads: ownerId required")
 	}
-	objId, err := p.s.store.DeriveId(ctx, payloadsDeriveOpts(ownerId))
+	opts, err := p.readDeriveOpts(ctx, ownerId)
+	if err != nil {
+		return "", false, err
+	}
+	objId, err := p.s.store.DeriveId(ctx, opts)
 	if err != nil {
 		return "", false, err
 	}

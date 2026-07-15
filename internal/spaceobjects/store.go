@@ -1036,6 +1036,36 @@ func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
 	return entry.DeletedStatus != headstorage.DeletedStatusNotDeleted, nil
 }
 
+// TreeIsDerived reports whether treeId is a DERIVED object — the root's
+// IsDerived flag, mirrored into head storage at tree-storage creation
+// (see objecttree.createTreeStorage) — and whether the tree is present
+// in local storage. A tree absent locally reports (false, false, nil):
+// its class can't be read, so the caller can't classify it.
+//
+// Distinguishing a derived owner from a signed one is what lets its
+// payloads child pick a derivation: any-sync rejects a derived object as
+// a tree parent (ErrDerivedParent), so a derived owner's payloads object
+// is derived unparented (see payloads.DerivedOwnerSeed) while a signed
+// owner's stays parented. Mirrors TreeDeleted's head-storage lookup.
+func (s *Store) TreeIsDerived(ctx context.Context, treeId string) (isDerived bool, present bool, err error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return false, false, err
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return false, false, nil
+	}
+	entry, err := st.HeadStorage().GetEntry(ctx, treeId)
+	if err != nil {
+		if isDocNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	return entry.IsDerived, true, nil
+}
+
 // isDocNotFound matches any-store's document-not-found across BOTH
 // major versions: any-sync's storage returns any-store v1's instance,
 // the SDK's own DB returns v2's — same text, different error values,

@@ -181,6 +181,22 @@ type Dataset struct {
 	// Fields named in RecordFlags must be declared local-scope in
 	// Schema. See docs/read-tracking-proposal.md.
 	ReadTracking *ReadTracking
+
+	// SkipHistory keeps this dataset out of the version-history index:
+	// no index rows are written and the dataset is invisible in
+	// Space.History() listings. For chatty machine-written datasets
+	// (presence-like state) whose permanent index would leak disk for
+	// history nobody asks for. DAG changes still retain everything —
+	// flipping the flag later just requires an index backfill. See
+	// docs/version-history-proposal.md §4.4.
+	SkipHistory bool
+
+	// DisableFilteredReplay opts the dataset out of the record-scope
+	// history fast path (History().RecordAt), forcing the full-object
+	// slow path. Set it when the dataset's Handler reads OTHER records
+	// during apply — the fast path is sound only for record-local
+	// hooks. See docs/version-history-proposal.md §4.2.
+	DisableFilteredReplay bool
 }
 
 // Read-tracking registration types, re-exported from the CRDT layer.

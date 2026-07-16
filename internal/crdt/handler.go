@@ -149,6 +149,22 @@ type HandlerReg struct {
 	// ReadTracking opts the dataset into read/unread tracking; nil =
 	// untracked. See readtracking.go.
 	ReadTracking *ReadTracking
+
+	// DisableFilteredReplay opts the dataset out of the record-filtered
+	// history fast path (docs/version-history-proposal.md §4.2). The
+	// fast path is sound only while apply hooks stay record-local —
+	// a handler that reads OTHER records during apply must set this,
+	// forcing per-record history through the full-object slow path.
+	DisableFilteredReplay bool
+
+	// SkipHistory keeps this dataset out of the persistent history
+	// index (docs/version-history-proposal.md §4.4): no index rows are
+	// written and the dataset is invisible in history listings. For
+	// chatty machine-written datasets (presence-like state) whose
+	// permanent index would leak disk for history nobody asks for.
+	// DAG changes still retain everything — flipping the flag later
+	// just requires a backfill.
+	SkipHistory bool
 }
 
 // LocalPreValidator is an optional interface a Handler may implement

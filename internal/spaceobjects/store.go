@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	anystorev1 "github.com/anyproto/any-store"
@@ -39,6 +40,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/history"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
@@ -229,6 +231,35 @@ type Store struct {
 	// changeType → allowed). Nil/empty = sync everything. See
 	// selective.go for the full mechanism.
 	selective map[string]struct{}
+
+	// historyIx is the per-space version-history index once opened.
+	// Published via atomic pointer so the apply hook reads it without
+	// taking historyMu — the opener may block on the any-store writer
+	// (collection DDL) while an apply holds it, and an apply hook
+	// waiting on historyMu in that state would ABBA-deadlock.
+	historyIx atomic.Pointer[history.Index]
+	// historyMu serializes index opens only. Open failures are NOT
+	// cached — the next HistoryIndex call retries, so a transient
+	// fault never disables history for the Store's lifetime.
+	historyMu sync.Mutex
+	// historySkipIndex marks objects mid-cold-restore: the apply hook
+	// skips history-index rows for them (the object is marked stale
+	// and lazily backfilled instead — proposal §4.4 cold path). Same
+	// pattern as readSeedPending.
+	historySkipIndex sync.Map
+	// historyPendingStale collects objectIds whose index rows were
+	// skipped or failed while the index was unavailable (or whose
+	// in-tx MarkStale failed). Flushed to MarkStale on every
+	// successful HistoryIndex call so the lazy backfill repairs the
+	// gap instead of it becoming permanent.
+	historyPendingStale sync.Map
+	// historyPendingPurge collects objectIds whose space-level history
+	// rows (trace rows, _history_meta) could not be purged — index
+	// unavailable at purge time, or the purge itself failed. Flushed
+	// on every successful HistoryIndex call, same contract as
+	// historyPendingStale; without it a purge skipped once would leak
+	// the rows forever.
+	historyPendingPurge sync.Map
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -458,6 +489,13 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			}
 			if d.Name == "" {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: empty Name", i, t.Id, j)
+			}
+			if strings.HasPrefix(d.Name, "_") {
+				// The "_" prefix is reserved for internal collections
+				// (`<objectId>__history*`, `_meta`, `_detached`, …) —
+				// a dataset named "_history" would collide with the
+				// per-object history collections.
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: name %q is reserved (\"_\" prefix)", i, t.Id, j, d.Name)
 			}
 			if d.DataVersion == "" {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d] (%q): empty DataVersion", i, t.Id, j, d.Name)
@@ -845,7 +883,11 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	}
 
 	// Best-effort from here — disk reclaim + notifications, not correctness.
+	// dropObjectCollections sweeps every `<objectId>_*` collection, which
+	// includes the per-object history collections; the space-level history
+	// leftovers (trace rows, stale-flag row) need their own purge.
 	s.dropObjectCollections(ctx, objectId)
+	s.purgeHistoryRows(ctx, objectId)
 	_ = s.unmarkSkipped(ctx, objectId)
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil
@@ -962,6 +1004,7 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		if nerr == nil {
 			s.dropObjectCollectionsNamed(ctx, p.id, names)
 		}
+		s.purgeHistoryRows(ctx, p.id)
 		s.Drop(p.id)
 		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
 	}
@@ -1299,8 +1342,29 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err != nil {
 		return nil, err
 	}
+	// First materialization (fresh controller, no watermark): the cold
+	// restore may drain the whole tree — skip per-change history-index
+	// rows (protected perf path, proposal §4.4) and mark the object
+	// stale for lazy backfill if anything was actually restored.
+	firstRestore := ctrl.MaxAddSeq() == 0
+	if firstRestore {
+		s.historySkipIndex.Store(objectId, struct{}{})
+		defer s.historySkipIndex.Delete(objectId)
+	}
 	if err := obj.ColdRestore(ctx); err != nil {
 		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
+	}
+	if firstRestore && ctrl.MaxAddSeq() > 0 {
+		if ix, ixErr := s.HistoryIndex(ctx); ixErr == nil {
+			if mErr := ix.MarkStale(ctx, objectId); mErr != nil {
+				storeLog.Warn("history: mark stale failed", zap.String("objectId", objectId), zap.Error(mErr))
+				s.historyPendingStale.Store(objectId, struct{}{})
+			}
+		} else if !errors.Is(ixErr, ErrHistoryUnavailable) {
+			// Index not openable right now: queue the mark so the next
+			// successful open repairs it.
+			s.historyPendingStale.Store(objectId, struct{}{})
+		}
 	}
 	if seedPending {
 		if len(publishedSets) > 0 {
@@ -1415,24 +1479,50 @@ func objectsDatasetSchema() schema.Dataset {
 }
 
 func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Controller, error) {
+	regs, sharedNames, err := s.buildRegs()
+	if err != nil {
+		return nil, err
+	}
+	// Open the history index eagerly, outside any apply tx, so the
+	// apply hook only ever reads the atomic pointer (see HistoryIndex
+	// for why opening in-tx is unsafe). A failure here is tolerated —
+	// the hook defers to the stale/backfill path and the next open
+	// retries.
+	if s.customHandlers == nil {
+		if _, ixErr := s.HistoryIndex(ctx); ixErr != nil {
+			storeLog.Warn("history index open failed; deferring to backfill", zap.Error(ixErr))
+		}
+	}
+	shared := crdt.SharedCollections{}
+	for _, name := range sharedNames {
+		coll, cerr := s.SharedObjects(ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		shared[name] = coll
+	}
+	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
+	if err != nil {
+		return nil, err
+	}
+	ctrl.SetSpaceId(s.spaceId)
+	ctrl.SetApplySeqAllocator(s.applySeqs)
+	ctrl.SetApplyHook(s.composedApplyHook(ctrl))
+	return ctrl, nil
+}
+
+// buildRegs returns the handler registrations every controller in this
+// store runs, plus the dataset names that project into a per-space
+// shared collection (row id = ObjectId). Shared collections are NOT
+// opened here — the live path opens the space one (SharedObjects), the
+// history replay path opens scratch ones (proposal §4.1).
+func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 	if s.customHandlers != nil {
 		// Raw mode: exactly the caller's handlers, each on its own
 		// per-object collection (<objectId>_<dataset>). No shared
 		// `objects` collection, no built-in regs.
-		ctrl, err := crdt.NewController(ctx, objectId, s.db, s.customHandlers...)
-		if err != nil {
-			return nil, err
-		}
-		ctrl.SetSpaceId(s.spaceId)
-		ctrl.SetApplySeqAllocator(s.applySeqs)
-		ctrl.SetApplyHook(s.readApplyHook(ctrl))
-		return ctrl, nil
+		return s.customHandlers, nil, nil
 	}
-	coll, err := s.SharedObjects(ctx)
-	if err != nil {
-		return nil, err
-	}
-	shared := crdt.SharedCollections{properties.Dataset: coll}
 	regs := []crdt.HandlerReg{
 		// DynamicScopeByKey: undeclared heads (`any`, typeIds) carry
 		// per-PROPERTY scopes resolved from the type registry — the
@@ -1459,15 +1549,188 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d), ReadTracking: d.ReadTracking})
+			regs = append(regs, crdt.HandlerReg{
+				Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d),
+				ReadTracking:          d.ReadTracking,
+				SkipHistory:           d.SkipHistory,
+				DisableFilteredReplay: d.DisableFilteredReplay,
+			})
 		}
 	}
-	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
-	if err != nil {
-		return nil, err
+	return regs, []string{properties.Dataset}, nil
+}
+
+// HistoryReplayRegs returns a fresh handler-reg set plus the shared
+// dataset names for a history scratch replay (history.ViewParams).
+// Fresh per call: handlers like properties.New hold registry pointers
+// and must not be shared with live controllers' mutable state.
+func (s *Store) HistoryReplayRegs() ([]crdt.HandlerReg, []string, error) {
+	return s.buildRegs()
+}
+
+// ErrHistoryUnavailable — this store has no history index (raw-mode /
+// tech-space stores carry internal bookkeeping only, no history
+// surface).
+var ErrHistoryUnavailable = errors.New("spaceobjects: history index unavailable for this store")
+
+// HistoryIndex returns the per-space version-history index, opening it
+// on first use. The skip list is derived from the registered datasets'
+// SkipHistory flags. Open failures are returned but NOT cached — the
+// next call retries. Every successful call also flushes pending stale
+// marks and deferred history purges recorded while the index was
+// unavailable.
+//
+// Never call this from inside an apply WriteTx (the collection DDL
+// would nest in — and be reverted with — the apply tx while the opened
+// handles survive in memory); the apply hook reads the atomic pointer
+// instead and defers indexing via historyPendingStale until an
+// out-of-tx caller (newController, a history query) has opened it.
+func (s *Store) HistoryIndex(ctx context.Context) (*history.Index, error) {
+	if s.customHandlers != nil {
+		return nil, ErrHistoryUnavailable
 	}
-	ctrl.SetSpaceId(s.spaceId)
-	ctrl.SetApplySeqAllocator(s.applySeqs)
-	ctrl.SetApplyHook(s.readApplyHook(ctrl))
-	return ctrl, nil
+	ix := s.historyIx.Load()
+	if ix == nil {
+		s.historyMu.Lock()
+		if ix = s.historyIx.Load(); ix == nil {
+			regs, _, err := s.buildRegs()
+			if err != nil {
+				s.historyMu.Unlock()
+				return nil, err
+			}
+			var skip []string
+			for _, reg := range regs {
+				if reg.SkipHistory {
+					skip = append(skip, reg.Name)
+				}
+			}
+			ix, err = history.OpenIndex(ctx, s.db, s.spaceId, skip)
+			if err != nil {
+				s.historyMu.Unlock()
+				return nil, err
+			}
+			s.historyIx.Store(ix)
+		}
+		s.historyMu.Unlock()
+	}
+	s.flushPendingStale(ctx, ix)
+	s.flushPendingPurge(ctx, ix)
+	return ix, nil
+}
+
+// flushPendingStale marks every deferred object stale so the lazy
+// backfill repairs rows the warm path could not write. Entries that
+// fail to mark stay queued for the next flush.
+func (s *Store) flushPendingStale(ctx context.Context, ix *history.Index) {
+	s.historyPendingStale.Range(func(key, _ any) bool {
+		objectId := key.(string)
+		if err := ix.MarkStale(ctx, objectId); err != nil {
+			storeLog.Warn("history: pending stale mark failed",
+				zap.String("objectId", objectId), zap.Error(err))
+			return true
+		}
+		s.historyPendingStale.Delete(objectId)
+		return true
+	})
+}
+
+// purgeHistoryRows removes a deleted object's space-level history rows
+// (trace rows, _history_meta), queueing a retry when the index is
+// unavailable or the purge fails. A queued purge supersedes any queued
+// stale mark — a deleted object must not be re-marked for backfill.
+func (s *Store) purgeHistoryRows(ctx context.Context, objectId string) {
+	s.historyPendingStale.Delete(objectId)
+	ix := s.historyIx.Load()
+	if ix == nil {
+		s.historyPendingPurge.Store(objectId, struct{}{})
+		return
+	}
+	if err := ix.PurgeObject(ctx, objectId); err != nil {
+		storeLog.Warn("purge: history index cleanup", zap.String("treeId", objectId), zap.Error(err))
+		s.historyPendingPurge.Store(objectId, struct{}{})
+		return
+	}
+	s.historyPendingPurge.Delete(objectId)
+}
+
+// flushPendingPurge retries deferred history purges. Runs AFTER
+// flushPendingStale so a pending purge also removes any meta row a
+// stale flush just (re)wrote for the same object. Entries that fail
+// stay queued.
+func (s *Store) flushPendingPurge(ctx context.Context, ix *history.Index) {
+	s.historyPendingPurge.Range(func(key, _ any) bool {
+		objectId := key.(string)
+		if err := ix.PurgeObject(ctx, objectId); err != nil {
+			storeLog.Warn("history: pending purge failed",
+				zap.String("objectId", objectId), zap.Error(err))
+			return true
+		}
+		s.historyPendingPurge.Delete(objectId)
+		return true
+	})
+}
+
+// composedApplyHook chains the read-tracking hook and the history-index
+// hook. Nil when both are disabled so untracked spaces keep paying a
+// single nil check per apply.
+func (s *Store) composedApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
+	read := s.readApplyHook(ctrl)
+	hist := s.historyApplyHook()
+	switch {
+	case read == nil && hist == nil:
+		return nil
+	case hist == nil:
+		return read
+	case read == nil:
+		return hist
+	}
+	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, res *crdt.ApplyResult) error {
+		if err := read(txCtx, ch, recordIds, res); err != nil {
+			return err
+		}
+		return hist(txCtx, ch, recordIds, res)
+	}
+}
+
+// historyApplyHook writes warm-path history-index rows in the apply tx
+// (proposal §4.4). Nil for raw-mode stores (tech space): their objects
+// are internal bookkeeping with no history surface, and indexing them
+// would grow a permanent index nobody can query. Objects mid-cold-
+// restore are skipped — they're marked stale and lazily backfilled
+// instead. Index failures never fail the apply (history is best-effort
+// metadata; a genuine storage fault surfaces through the apply tx
+// itself) but they DO mark the object stale so the lazy backfill
+// closes the gap instead of it becoming permanent.
+func (s *Store) historyApplyHook() crdt.ApplyHook {
+	if s.customHandlers != nil {
+		return nil
+	}
+	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, _ *crdt.ApplyResult) error {
+		if ch.ChangeId == "" || ch.Local || ch.Injected {
+			return nil
+		}
+		if _, restoring := s.historySkipIndex.Load(ch.ObjectId); restoring {
+			return nil
+		}
+		// Atomic read only — never open the index from inside the
+		// apply tx (see HistoryIndex). Not open yet: defer to the
+		// stale/backfill path.
+		ix := s.historyIx.Load()
+		if ix == nil {
+			s.historyPendingStale.Store(ch.ObjectId, struct{}{})
+			return nil
+		}
+		if err := ix.IndexChange(txCtx, ch, recordIds); err != nil {
+			storeLog.Warn("history index row failed; marking object stale",
+				zap.String("changeId", ch.ChangeId), zap.Error(err))
+			// In-tx mark: atomic with the apply. If the tx is already
+			// poisoned this fails too — queue for the next flush (a
+			// poisoned tx also rolls back the apply, which re-replays
+			// and re-indexes the change anyway).
+			if mErr := ix.MarkStale(txCtx, ch.ObjectId); mErr != nil {
+				s.historyPendingStale.Store(ch.ObjectId, struct{}{})
+			}
+		}
+		return nil
+	}
 }

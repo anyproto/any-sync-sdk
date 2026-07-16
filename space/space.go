@@ -50,6 +50,12 @@ type Space interface {
 	// search). See ChangeIndexAPI.
 	Changes() ChangeIndexAPI
 
+	// History exposes version history: list an object's changes (who
+	// changed what, when), view objects/records at past versions, and
+	// diff versions. See HistoryAPI and
+	// docs/version-history-proposal.md.
+	History() HistoryAPI
+
 	// Payloads is the read-only view over the space's file payloads
 	// index — the cleartext row fields only, readable without any
 	// space key. See PayloadsView.

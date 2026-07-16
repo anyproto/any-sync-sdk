@@ -118,7 +118,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// under a huge WAL that must be replayed on every open. Idle
 	// checkpointing keeps it bounded; the sentinel adds a quick-check
 	// after unclean shutdowns.
+	// 64 MB process-global page-buffer pool (mirrors the sqlite-side
+	// preallocation for the v1 space stores). Idempotent; the page size
+	// must match the store's (v2 default, 4 KiB).
+	anystore.InitPageBuffer(4096, (1<<26)/4096)
 	db, err := anystore.Open(ctx, sdkDBPath, &anystore.Config{
+		UseGlobalPageBuffer: true,
 		Durability: anystore.DurabilityConfig{
 			AutoFlush: true,
 			IdleAfter: 20 * time.Second,

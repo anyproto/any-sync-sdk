@@ -161,8 +161,12 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		sync.SyncSpaces(spaceIds)
 	})
 	exchange.SetAccountKeysFn(discoveryKeys.AccountDiscoveryKeys)
-	p2pSrv := newP2PServer(cfg.P2P, cfg.Storage.DataDir)
-	discovery := p2p.NewDiscovery(cfg.P2P, keys.PeerId, func() (int, bool) {
+	// Resolve the effective p2p config. Headless mode defaults p2p off
+	// (see Config.ResolveP2P): an embedded backend has no reason to
+	// announce itself over mDNS or accept LAN peers.
+	p2pCfg := cfg.ResolveP2P()
+	p2pSrv := newP2PServer(p2pCfg, cfg.Storage.DataDir)
+	discovery := p2p.NewDiscovery(p2pCfg, keys.PeerId, func() (int, bool) {
 		return p2pSrv.Port(), p2pSrv.Started()
 	}, exchange)
 	exchange.SetOwnAddressesFn(func() sdkp2p.OwnAddresses {
@@ -223,7 +227,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// registering after Start would race concurrent serving. Its file
 	// store is injected later (SetFileStore), once sdk.Open builds it.
 	var fileP2PServer *filep2p.Server
-	if cfg.P2P.IsEnabled() {
+	if p2pCfg.IsEnabled() {
 		fileP2PServer = filep2p.NewServer(func(peerId, spaceId string) bool {
 			for _, id := range peerStore.SpaceIds(peerId) {
 				if id == spaceId {
@@ -245,7 +249,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		p2pServer:          p2pSrv,
 		discovery:          discovery,
 		exchange:           exchange,
-		p2pEnabled:         cfg.P2P.IsEnabled(),
+		p2pEnabled:         p2pCfg.IsEnabled(),
 		headCache:          newHeadCache(),
 		syncStatus:         syncstatus.NewService(),
 		syncers:            map[string]*treeSyncerAdapter{},

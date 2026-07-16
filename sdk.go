@@ -24,6 +24,7 @@ import (
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/p2p"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
+	"github.com/anyproto/any-sync-sdk/internal/pushclient"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/readsync"
 	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
@@ -42,6 +43,7 @@ type SDK struct {
 	tsp        *techspace.Service
 	spaces     *spaceimpl.Service
 	account    *accountImpl
+	push       *pushclient.Service
 	filesQueue *status.Queue
 	filesGC    *gc.Service
 	readSync   *readsync.Service
@@ -118,6 +120,18 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 
 	tsp := techspace.New(app, db)
 	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
+
+	// Push notifications (SYN-47): the push node is a direct out-of-band
+	// peer — register its dial addresses so the pool can reach it, then
+	// bind the client to spaceimpl's ACL-derived key provider. The
+	// service is ALWAYS constructed; unconfigured, its transport is nil
+	// and every method returns space.ErrPushNotConfigured at call time.
+	var pushTransport *pushclient.Client
+	if cfg.Push.PeerId != "" && len(cfg.Push.Addrs) > 0 {
+		app.SetPeerAddrs(cfg.Push.PeerId, cfg.Push.Addrs)
+		pushTransport = pushclient.NewClient(app.Pool(), cfg.Push.PeerId)
+	}
+	push := pushclient.NewService(pushTransport, spaces, app.AccountKeys())
 
 	// Files byte layer (SYN-25/27/28): CARv2s under <DataDir>/files (a
 	// sibling of anysync/ and sdk.db — cfg.Storage.DataDir was
@@ -202,6 +216,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 			tsp:        tsp,
 			spaces:     spaces,
 			account:    account,
+			push:       push,
 			filesQueue: filesQueue,
 			filesGC:    filesGC,
 		}, nil
@@ -344,6 +359,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		tsp:               tsp,
 		spaces:            spaces,
 		account:           account,
+		push:              push,
 		filesQueue:        filesQueue,
 		filesGC:           filesGC,
 		readSync:          readSync,
@@ -431,6 +447,13 @@ func (s *SDK) Identities() space.IdentitiesAPI { return spaceimpl.NewIdentitiesA
 
 // Account returns the account-level API.
 func (s *SDK) Account() AccountAPI { return s.account }
+
+// Push returns the push-notification API — device-token registration,
+// space registration, topic subscriptions and encrypted publishes
+// against the configured push node (config.Push). Always non-nil; when
+// no push node is configured every method returns
+// space.ErrPushNotConfigured.
+func (s *SDK) Push() space.PushAPI { return s.push }
 
 // PoolInternal exposes the any-sync peer pool (dial by peerId with this
 // account's identity in the handshake). Same-module internal surface —

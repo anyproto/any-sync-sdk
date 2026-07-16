@@ -52,6 +52,13 @@ type SpaceInfo struct {
 	Status      Status
 	OwnRole     Permission
 	CreatedAt   time.Time
+	// Settings is the account-private, client-owned per-space settings
+	// object: free-form keys with scalar values (string / float64 /
+	// bool — numbers decode as float64, JSON semantics). Written per
+	// key via Service.SetSettings; synced across the account's devices
+	// through the tech space, never visible to other space members.
+	// Nil when never written.
+	Settings map[string]any
 }
 
 // Status is the combined local+remote state of a space.

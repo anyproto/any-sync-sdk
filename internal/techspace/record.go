@@ -67,6 +67,12 @@ type SpaceIndexRecord struct {
 	// FieldCreatedAt). Zero on rows created before the field existed —
 	// treat 0 as "unknown".
 	CreatedAt int64
+
+	// Settings is the client-writable free-form settings object
+	// (FieldSettings, synced account-wide), decoded to Go natives —
+	// string / float64 / bool per JSON semantics. Nil when never
+	// written. Edited per key via Service.SetSettings.
+	Settings map[string]any
 }
 
 // DecodeSpaceIndexRecord pulls the fields off an anyenc value as
@@ -99,6 +105,13 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 			if s := e.GetStringBytes(); len(s) > 0 {
 				r.InviteNotifyPending = append(r.InviteNotifyPending, string(s))
 			}
+		}
+	}
+	if st := v.Get(FieldSettings); st != nil && st.Type() == anyenc.TypeObject {
+		// GoType converts recursively to JSON-shaped natives
+		// (map[string]any / []any / string / float64 / bool / nil).
+		if m, ok := st.GoType().(map[string]any); ok {
+			r.Settings = m
 		}
 	}
 	return r

@@ -35,6 +35,12 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
 		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
+		// KindObject with nil Properties = free-form shape: the schema
+		// validator accepts any nested keys (schema.validateValue stops at
+		// an untyped object) and the controller's field-class enforcement
+		// only looks at the top-level head, so arbitrary client keys under
+		// `settings` are permitted by declaration.
+		{Id: FieldSettings, Name: "Settings", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
 	}}
 }
 
@@ -115,6 +121,16 @@ const (
 	// storage, and on active rows so any of the account's devices can
 	// re-derive. Empty on non-1-1 rows.
 	FieldOneToOnePeer = "oneToOnePeer"
+	// FieldSettings is the client-writable, free-form per-space settings
+	// object (SYNCED): account-private via the tech-space's owner-only
+	// ACL, replicated across the account's devices, invisible to other
+	// space members. Keys are the client's own vocabulary — the SDK
+	// stores them verbatim under per-key paths (settings.<key>) via
+	// Service.SetSettings, so concurrent edits to DIFFERENT keys merge
+	// instead of last-writer-wins on the whole object. SDK-owned fields
+	// stay siblings of `settings`, never inside it, and the spaceIndex
+	// mirror (SetSpaceMetadata) never touches it.
+	FieldSettings = "settings"
 	// FieldCreatedAt is the added-to-account time: unix seconds, stamped
 	// by BeforeCreate from the creating change's timestamp when the row
 	// first lands locally (Create / Derive / OneToOne / Join all create

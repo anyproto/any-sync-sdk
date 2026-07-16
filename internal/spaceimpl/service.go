@@ -185,6 +185,10 @@ type Service struct {
 	// ACL waiter (the account is already a member).
 	pendingLoads map[string]struct{}
 
+	// pushKeys caches the per-space derived push-notification keys —
+	// see push.go (PushKeys).
+	pushKeys pushKeyCache
+
 	// One-to-one inbox (Layer-2 discovery, docs/13). inboxNotifier is the
 	// receive worker (coordinator push + poll → RegisterIncoming); the
 	// invite* fields drive the send-retry loop that (re)delivers
@@ -595,6 +599,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		Description: r.Description,
 		IconCID:     r.IconCID,
 		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		Settings:    r.Settings,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
@@ -610,6 +615,22 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		info.CreatedAt = time.Unix(r.CreatedAt, 0)
 	}
 	return info
+}
+
+// SetSettings patches the per-space client settings on spaceId's
+// tech-space row (see space.Service.SetSettings for the contract).
+// The row must exist: the techspace write is a strict (non-upsert)
+// modify — on an absent id it would silently no-op — so the unknown-id
+// case is turned into an error here. Deleted rows pass: the handler's
+// terminal-delete rule guards only status fields, and a tombstone's
+// settings staying editable is deliberate (the row remains the
+// account's record of the space).
+func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[string]any, unset []string) error {
+	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+		return fmt.Errorf("spaceimpl: unknown space %q", spaceId)
+	}
+	_, err := s.tsp.SetSettings(ctx, spaceId, set, unset)
+	return err
 }
 
 // Delete removes a space. It is offline-first and returns as soon as the

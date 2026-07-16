@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -112,7 +113,19 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	sdkDBPath := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "sdk.db")
-	db, err := anystore.Open(ctx, sdkDBPath, nil)
+	// Without the idle flush, checkpoints only happen when the WAL hits
+	// the commit-path threshold (10000 frames ≈ 40 MB) — a busy DB sits
+	// under a huge WAL that must be replayed on every open. Idle
+	// checkpointing keeps it bounded; the sentinel adds a quick-check
+	// after unclean shutdowns.
+	db, err := anystore.Open(ctx, sdkDBPath, &anystore.Config{
+		Durability: anystore.DurabilityConfig{
+			AutoFlush: true,
+			IdleAfter: 20 * time.Second,
+			FlushMode: anystore.FlushModeCheckpointPassive,
+			Sentinel:  true,
+		},
+	})
 	if err != nil {
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)

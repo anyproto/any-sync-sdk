@@ -47,7 +47,34 @@ func newStorageProvider(root string) *storageProvider {
 }
 
 func (s *storageProvider) Init(_ *app.App) error {
-	return os.MkdirAll(s.root, 0o755)
+	// Creates root too; sqlite rejects a temp_store_directory that
+	// doesn't exist.
+	return os.MkdirAll(s.tmpDir(), 0o755)
+}
+
+// tmpDir is where sqlite is told to put its temp files (statement
+// sub-journals, transient indices). sqlite's built-in candidates
+// ($TMPDIR, /var/tmp, /tmp, cwd) are all absent or unwritable inside
+// an Android app sandbox, and without a writable temp dir any write
+// tx that spills a savepoint sub-journal fails with SQLITE_IOERR
+// ("disk I/O error") — which permanently broke remote new-tree pulls
+// (SYN-82). Pointing temp_store_directory under our own root works on
+// every platform.
+func (s *storageProvider) tmpDir() string {
+	return filepath.Join(s.root, "tmp")
+}
+
+// anyStoreConfig builds a fresh per-open config: any-store mutates the
+// options map during Open, so it must not be shared across concurrent
+// opens.
+func (s *storageProvider) anyStoreConfig() *anystorev1.Config {
+	return &anystorev1.Config{
+		SQLiteConnectionOptions: map[string]string{
+			// The value is interpolated into "PRAGMA %s = %s" verbatim;
+			// paths must be single-quoted (embedded quotes doubled).
+			"temp_store_directory": "'" + strings.ReplaceAll(s.tmpDir(), "'", "''") + "'",
+		},
+	}
 }
 
 func (s *storageProvider) Name() string { return spacestorage.CName }
@@ -70,7 +97,7 @@ func (s *storageProvider) WaitSpaceStorage(ctx context.Context, id string) (spac
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil, spacestorage.ErrSpaceStorageMissing
 	}
-	db, err := anystorev1.Open(ctx, path, nil)
+	db, err := anystorev1.Open(ctx, path, s.anyStoreConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +118,7 @@ func (s *storageProvider) CreateSpaceStorage(ctx context.Context, payload spaces
 	if _, err := os.Stat(path); err == nil {
 		return nil, spacestorage.ErrSpaceStorageExists
 	}
-	db, err := anystorev1.Open(ctx, path, nil)
+	db, err := anystorev1.Open(ctx, path, s.anyStoreConfig())
 	if err != nil {
 		return nil, err
 	}

@@ -41,13 +41,22 @@ type ReadClassification struct {
 
 // ReadClassifier classifies one record change for read tracking. It
 // runs on the apply path for every change on an opted-in dataset —
-// keep it pure and cheap (no I/O, no locks). It receives the change
-// envelope only: classification runs after the record loop, so
+// keep it pure and cheap (no locks). It receives the change
+// envelope: classification runs after the record loop, so
 // ChangeCtx.Before is ALWAYS nil here (unlike the Before* hooks) —
 // classify from the ops and the envelope (Upsert, Creator, paths),
-// never from prior record state; when the verdict must depend on the
-// stored record (e.g. "count only for the record's author"), return
-// an Audience filter and the engine resolves it. Self-authored changes are born read
+// never from prior record state. When the verdict must depend on the
+// stored record, two tools exist: return an Audience filter and the
+// engine resolves it against the post-apply record (it gates the
+// WHOLE entry — every tag), or point-read the post-apply record
+// yourself via ChangeCtx.Get + ChangeCtx.RecordId (both populated on
+// this path) when only PART of the verdict depends on record state —
+// e.g. adding a "mention" tag next to an unconditional "message" tag
+// by inspecting a handler-derived field. Verdicts are device-local,
+// so combining SelfIdentity with post-apply state is sound;
+// incremental replays reapply from the persisted watermark, so
+// post-apply state at re-classification matches the original run
+// (first restore is seed-skipped). Self-authored changes are born read
 // regardless of the verdict; the classifier still runs for them so a
 // supersede Key can clear entries (own un-react clears the unread
 // reaction another device tracked).

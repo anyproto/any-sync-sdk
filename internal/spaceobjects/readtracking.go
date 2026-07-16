@@ -72,7 +72,7 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 	if len(s.readTracking) == 0 || s.readState == nil {
 		return nil
 	}
-	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, _ *crdt.ApplyResult) error {
+	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, res *crdt.ApplyResult) error {
 		rt := s.readTracking[ch.Dataset]
 		if rt == nil || rt.Classify == nil || ch.Local || ch.Injected || ch.ChangeId == "" {
 			return nil
@@ -85,6 +85,7 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			// covers this change instead.
 			return nil
 		}
+		rejected := rejectedOps(res)
 		var (
 			tags       []string
 			trackedIds []string
@@ -92,9 +93,25 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			key        string
 			tracked    bool
 		)
-		cctx := &crdt.ChangeCtx{Change: ch, SelfIdentity: s.selfIdentity}
+		cctx := &crdt.ChangeCtx{Change: ch, SelfIdentity: s.selfIdentity,
+			// Classifiers may point-read the POST-apply record (the
+			// hook runs after the record loop, same tx) — e.g. a
+			// derived field a handler just stamped. Same read
+			// recordMatchesAudience does; verdicts stay device-local,
+			// so self-relative use of post-apply state is sound.
+			Get: ctrl.RecordGetter(txCtx)}
 		for i := range ch.Records {
-			rec := &ch.Records[i]
+			// Classify only what actually LANDED: a handler-rejected op
+			// never mutated the record, so it must not create, clear, or
+			// supersede unread state — otherwise a rejected delete wipes
+			// the victim's unread entries and a rejected edit forges or
+			// clears mention entries. Whole-record rejections skip the
+			// record outright.
+			rec, ok := survivingRecord(&ch.Records[i], rejected[i])
+			if !ok {
+				continue
+			}
+			cctx.RecordId = recordIds[i]
 			for _, op := range rec.Ops {
 				if op.Type == crdt.OpDelete {
 					deletedIds = append(deletedIds, recordIds[i])
@@ -147,6 +164,54 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			SelfAuthored: ch.Creator != "" && ch.Creator == s.selfIdentity,
 		})
 	}
+}
+
+// rejectedOps indexes an ApplyResult's rejections by record index →
+// op-index set (OpIndex -1 = the whole record was dropped). nil map
+// (and nil inner sets) on the common everything-landed path.
+func rejectedOps(res *crdt.ApplyResult) map[int]map[int]struct{} {
+	if res == nil || len(res.Rejections) == 0 {
+		return nil
+	}
+	out := make(map[int]map[int]struct{}, len(res.Rejections))
+	for _, rj := range res.Rejections {
+		m := out[rj.RecordIndex]
+		if m == nil {
+			m = make(map[int]struct{}, 1)
+			out[rj.RecordIndex] = m
+		}
+		m[rj.OpIndex] = struct{}{}
+	}
+	return out
+}
+
+// survivingRecord narrows a RecordChange to the ops the apply step
+// actually landed. ok=false when the whole record was rejected
+// (OpIndex -1) or every op was. The common no-rejection path returns
+// the original pointer, copy-free. A partially-salvaged multi-field
+// op (some keys landed, some shed — same OpIndex) is dropped whole:
+// deliberately conservative, a rejection can only ever suppress
+// tracking, never forge or clear it.
+func survivingRecord(rec *crdt.RecordChange, rejected map[int]struct{}) (*crdt.RecordChange, bool) {
+	if len(rejected) == 0 {
+		return rec, true
+	}
+	if _, whole := rejected[-1]; whole {
+		return nil, false
+	}
+	ops := make([]crdt.Op, 0, len(rec.Ops))
+	for i := range rec.Ops {
+		if _, drop := rejected[i]; drop {
+			continue
+		}
+		ops = append(ops, rec.Ops[i])
+	}
+	if len(ops) == 0 {
+		return nil, false
+	}
+	out := *rec
+	out.Ops = ops
+	return &out, true
 }
 
 // recordMatchesAudience resolves an audience-restricted verdict: one

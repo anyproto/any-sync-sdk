@@ -310,8 +310,8 @@ const (
 // server checks that a datetime value parses).
 //
 // Value conventions per format:
-//   - FormatLinks:       array of "any://<objectId>" URI strings (see the
-//     anyuri package)
+//   - FormatLinks:       array of "any://<objectId>" URI strings (see
+//     github.com/anyproto/any/anyuri — the format's home)
 //   - FormatDate:        "2006-01-02" date string
 //   - FormatDatetime:    RFC 3339 datetime string
 //   - FormatTags:        array of tag record ids referencing the space's

@@ -21,6 +21,7 @@ type Config struct {
 	Sync    Sync
 	Files   Files
 	P2P     P2P
+	Push    Push
 
 	// Headless runs the SDK as an embedded backend service rather than
 	// a user-facing client. Open skips the account-facing boot work —
@@ -132,6 +133,22 @@ func (c Config) ResolveP2P() P2P {
 		p.Enabled = &off
 	}
 	return p
+}
+
+// Push configures the push-notification node. Unlike sync nodes it is
+// NOT part of the nodeconf — it is a direct out-of-band peer: the SDK
+// registers Addrs for PeerId on the peer service and dials it through
+// the regular secure-channel pool, so RPCs carry the account identity
+// the server authorizes by. Both fields empty (the default) disables
+// push entirely — SDK.Push() methods then return
+// space.ErrPushNotConfigured.
+type Push struct {
+	// PeerId is the push node's peer id (its device key identity).
+	PeerId string `yaml:"peerId"`
+
+	// Addrs are the node's dial addresses (same forms the nodeconf
+	// uses, e.g. "quic://host:port" or "host:port").
+	Addrs []string `yaml:"addrs"`
 }
 
 // Network is the any-sync network configuration. v1 is deliberately

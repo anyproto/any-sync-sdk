@@ -418,6 +418,21 @@ func (c *Controller) Collection(ctx context.Context, dataset string) anystore.Co
 	return c.collectionForRead(ctx, dataset)
 }
 
+// RecordGetter returns a ChangeCtx.Get implementation bound to ctx —
+// the one wrapper both the handler-hook and read-tracking classify
+// seams share. When ctx carries a WriteTx (the apply path), reads
+// reuse that tx (any-store's getReadTx), so calling it from inside a
+// Modify callback or an ApplyHook is safe. Empty ids resolve to nil
+// without a store round-trip.
+func (c *Controller) RecordGetter(ctx context.Context) func(dataset, id string) *anyenc.Value {
+	return func(dataset, id string) *anyenc.Value {
+		if id == "" {
+			return nil
+		}
+		return c.Get(ctx, dataset, id)
+	}
+}
+
 // Get returns the record by id from the dataset, or nil if absent.
 //
 // The returned *anyenc.Value is cloned off any-store's pooled doc
@@ -765,9 +780,12 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		}
 	}
 
+	// One getter for the whole change — backs ChangeCtx.Get in every
+	// record's handler hooks (in-tx reads; see RecordGetter).
+	getter := c.RecordGetter(txCtx)
 	for i := range ch.Records {
 		id := resolvedIds[i]
-		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i])
+		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i], getter)
 		if err != nil {
 			_ = tx.Rollback()
 			return res, err
@@ -962,10 +980,10 @@ func filterOpFields(arena *anyenc.Arena, ds schema.Dataset, route schema.Scope, 
 // modifier stamped beyond rc.Ops (handler-emitted derived ops,
 // _ver.id creation marker), which the dispatcher merges into the
 // EventRecord.
-func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange) ([]OpRejection, []Op, error) {
+func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange, getter func(dataset, id string) *anyenc.Value) ([]OpRejection, []Op, error) {
 	sink := c.sinkPool.Get().(*Sink)
 	mod := c.modifierPool.Get().(*recordModifier)
-	mod.set(handler, ch, id, rc, sink)
+	mod.set(handler, ch, id, rc, sink, getter)
 
 	defer func() {
 		mod.clear()
@@ -1108,6 +1126,10 @@ type recordModifier struct {
 	rec     *RecordChange
 	sink    *Sink
 
+	// getter backs ChangeCtx.Get for the handler hooks; nil in sibling
+	// mode (siblings run no hooks).
+	getter func(dataset, id string) *anyenc.Value
+
 	// sibling mode: when true, the modifier is applying a Sibling.Record
 	// without invoking handler hooks.
 	siblingMode bool
@@ -1134,12 +1156,13 @@ type recordModifier struct {
 	appliedDerivedArena *anyenc.Arena
 }
 
-func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange, sink *Sink) {
+func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange, sink *Sink, getter func(dataset, id string) *anyenc.Value) {
 	m.handler = h
 	m.ch = ch
 	m.id = id
 	m.rec = rc
 	m.sink = sink
+	m.getter = getter
 	m.siblingMode = false
 	m.siblingRec = nil
 	m.recordedErr = nil
@@ -1154,6 +1177,7 @@ func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
 	m.id = sib.Record.Id
 	m.rec = nil
 	m.sink = nil
+	m.getter = nil
 	m.siblingMode = true
 	m.siblingRec = &sib.Record
 	m.recordedErr = nil
@@ -1168,6 +1192,7 @@ func (m *recordModifier) clear() {
 	m.id = ""
 	m.rec = nil
 	m.sink = nil
+	m.getter = nil
 	m.siblingRec = nil
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
@@ -1243,7 +1268,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			}
 			return existing, false, nil
 		}
-		ctx := &ChangeCtx{Change: ch, Before: existing}
+		ctx := &ChangeCtx{Change: ch, Before: existing, Get: m.getter}
 		if err := m.handler.BeforeDelete(ctx, rc, m.sink); err != nil {
 			m.recordedErr = err
 			m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
@@ -1277,7 +1302,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		// Local and Injected materializations are handler-exclusive —
 		// their validation is writer-side (Properties.Set / the mirror).
 		if !ch.Local && !ch.Injected {
-			ctx := &ChangeCtx{Change: ch, Before: nil}
+			ctx := &ChangeCtx{Change: ch, Before: nil, Get: m.getter}
 			if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
 				m.recordedErr = err
 				m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
@@ -1299,7 +1324,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		if rc.Upsert {
 			lowerCreationMarker(a, existing, ch.VersionId)
 		}
-		ctx := &ChangeCtx{Change: ch, Before: existing}
+		ctx := &ChangeCtx{Change: ch, Before: existing, Get: m.getter}
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
 			// Local and Injected materializations are handler-exclusive

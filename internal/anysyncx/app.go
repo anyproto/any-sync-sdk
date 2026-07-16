@@ -438,6 +438,15 @@ func (a *App) FileNetworkId() string { return a.nodeConf.Configuration().FileNet
 // account's identity in the handshake.
 func (a *App) Pool() pool.Pool { return a.a.MustComponent(pool.CName).(pool.Pool) }
 
+// SetPeerAddrs registers dial addresses for a peer that is NOT in the
+// nodeconf — a direct out-of-band peer like the push-notification node
+// (config.Push). After registration Pool().Get(peerId) dials it over
+// the same secure transports as any node. Calling again replaces the
+// address list; there is no removal (the entry is process-lifetime).
+func (a *App) SetPeerAddrs(peerId string, addrs []string) {
+	a.a.MustComponent(peerservice.CName).(peerservice.PeerService).SetPeerAddrs(peerId, addrs)
+}
+
 // PeerStore exposes the p2p local-peer registry (which LAN peers share
 // which spaces). Used by the files p2p source for peer selection.
 func (a *App) PeerStore() *p2p.PeerStore { return a.peerStore }

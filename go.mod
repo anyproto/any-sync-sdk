@@ -8,6 +8,7 @@ require (
 	github.com/anyproto/any-sync v0.13.0-alpha.5
 	github.com/anyproto/anytype-push-server/pushclient v0.0.0-20250801122506-553f6c085a23
 	github.com/anyproto/go-slip10 v1.0.1
+	github.com/anyproto/go-sqlite v1.4.2-any
 	github.com/anyproto/lexid v0.0.6
 	github.com/brutella/dnssd v1.2.14
 	github.com/cheggaaa/mb/v3 v3.0.2
@@ -35,7 +36,6 @@ require (
 	github.com/anyproto/go-bip39 v1.0.0 // indirect
 	github.com/anyproto/go-chash v0.1.0 // indirect
 	github.com/anyproto/go-slip21 v1.0.0 // indirect
-	github.com/anyproto/go-sqlite v1.4.2-any // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/btcsuite/btcd v0.22.1 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1 // indirect

@@ -21,8 +21,20 @@
 package payloads
 
 import (
+	"errors"
+
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
+
+// ErrOwnerUnknown: the payloads id for this owner is not locally
+// resolvable yet. The id depends on the owner's class (signed vs
+// derived — see DerivedOwnerSeed), and nothing local discloses it:
+// no head entry for the owner, and no payloads tree of either shape.
+// A signed owner that hasn't synced and a derived owner that never
+// grew a payloads tree are locally indistinguishable, so resolving
+// here would be a guess whose answer flips once the owner arrives.
+// Resolvable after sync delivers the owner (or its payloads tree).
+var ErrOwnerUnknown = errors.New("payloads: owner class unknown; payloads id not resolvable yet")
 
 // Dataset is the CRDT dataset name; on disk the collection is
 // `<payloadsObjectId>_payloads`.

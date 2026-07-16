@@ -182,8 +182,24 @@ func TestE2E_Payloads(t *testing.T) {
 	require.NoError(t, err)
 	paB := payloadsSurface(t, spB)
 
+	// The payloads id depends on the owner's class (signed → parented
+	// shape), which B can't know before the owner tree syncs — ObjectId
+	// must refuse with the sentinel rather than guess an id that would
+	// flip, and must agree with A as soon as anything discloses the class.
 	objIdB, err := paB.ObjectId(ctx, ownerId)
-	require.NoError(t, err)
+	if err != nil {
+		require.ErrorIs(t, err, payloads.ErrOwnerUnknown,
+			"pre-sync ObjectId must fail with the sentinel, never return a wrong id")
+	} else {
+		assert.Equal(t, objId, objIdB, "derived payloads id must agree across devices")
+	}
+	if !waitFor(ctx, 90*time.Second, 250*time.Millisecond, func() bool {
+		_ = spB.SyncHeads(ctx)
+		objIdB, err = paB.ObjectId(ctx, ownerId)
+		return err == nil
+	}) {
+		t.Fatalf("device B never resolved the payloads id: %v", err)
+	}
 	assert.Equal(t, objId, objIdB, "derived payloads id must agree across devices")
 
 	var rowsB []payloads.Row

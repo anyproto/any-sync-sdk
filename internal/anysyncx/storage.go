@@ -81,6 +81,9 @@ func (s *storageProvider) tmpDir() string {
 func (s *storageProvider) anyStoreConfig() *anystorev1.Config {
 	return &anystorev1.Config{
 		ReadConnections: 4,
+		// Process-global pool shared by every sqlite connection,
+		// initialized once on the first open (later values are ignored).
+		SQLiteGlobalPageCachePreallocateSizeBytes: 1 << 26,
 		SQLiteConnectionOptions: map[string]string{
 			// The value is interpolated into "PRAGMA %s = %s" verbatim;
 			// paths must be single-quoted (embedded quotes doubled).

@@ -80,7 +80,7 @@ func (s *storageProvider) tmpDir() string {
 // stores never checkpoint and all data accumulates in the WAL.
 func (s *storageProvider) anyStoreConfig() *anystorev1.Config {
 	return &anystorev1.Config{
-		ReadConnections: 4,
+		ReadConnections: 8,
 		// Process-global pool shared by every sqlite connection,
 		// initialized once on the first open (later values are ignored).
 		SQLiteGlobalPageCachePreallocateSizeBytes: 1 << 26,

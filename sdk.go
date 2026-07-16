@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -113,17 +114,20 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	sdkDBPath := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "sdk.db")
-	// Without the idle flush, checkpoints only happen when the WAL hits
-	// the commit-path threshold (10000 frames ≈ 40 MB) — a busy DB sits
-	// under a huge WAL that must be replayed on every open. Idle
-	// checkpointing keeps it bounded; the sentinel adds a quick-check
-	// after unclean shutdowns.
 	// 64 MB process-global page-buffer pool (mirrors the sqlite-side
 	// preallocation for the v1 space stores). Idempotent; the page size
 	// must match the store's (v2 default, 4 KiB).
 	anystore.InitPageBuffer(4096, (1<<26)/4096)
 	db, err := anystore.Open(ctx, sdkDBPath, &anystore.Config{
 		UseGlobalPageBuffer: true,
+		// One shared DB serves every space's reads; keep the engine's
+		// CPU scaling but never drop below 8 concurrent readers.
+		ReadConcurrency: max(runtime.NumCPU(), 8),
+		// Without the idle flush, checkpoints only happen when the WAL
+		// hits the commit-path threshold (10000 frames ≈ 40 MB) — a busy
+		// DB sits under a huge WAL that must be replayed on every open.
+		// Idle checkpointing keeps it bounded; the sentinel adds a
+		// quick-check after unclean shutdowns.
 		Durability: anystore.DurabilityConfig{
 			AutoFlush: true,
 			IdleAfter: 20 * time.Second,

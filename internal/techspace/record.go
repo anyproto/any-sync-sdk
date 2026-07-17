@@ -2,6 +2,8 @@ package techspace
 
 import (
 	"github.com/anyproto/any-store/v2/anyenc"
+
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // SpaceIndexRecord is the typed view of one row in the space-index
@@ -73,6 +75,12 @@ type SpaceIndexRecord struct {
 	// string / float64 / bool per JSON semantics. Nil when never
 	// written. Edited per key via Service.SetSettings.
 	Settings map[string]any
+
+	// PushKeys is the device-local push-notification key material
+	// (FieldPushKeys, ScopeLocal), mirrored from ACL state by the
+	// per-space push-key watcher. Nil until the mirror first runs.
+	// Written via Service.SetPushKeys.
+	PushKeys *space.PushKeys
 }
 
 // DecodeSpaceIndexRecord pulls the fields off an anyenc value as
@@ -112,6 +120,18 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		// (map[string]any / []any / string / float64 / bool / nil).
 		if m, ok := st.GoType().(map[string]any); ok {
 			r.Settings = m
+		}
+	}
+	if pk := v.Get(FieldPushKeys); pk != nil && pk.Type() == anyenc.TypeObject {
+		keys := space.PushKeys{
+			SpaceKey: pk.GetString(PushKeySpaceKey),
+			EncKey:   pk.GetString(PushKeyEncKey),
+			EncKeyId: pk.GetString(PushKeyEncKeyId),
+		}
+		// Tolerate partial writes from older/newer mirrors: surface the
+		// object only when the decrypt-critical pair is present.
+		if keys.EncKey != "" && keys.EncKeyId != "" {
+			r.PushKeys = &keys
 		}
 	}
 	return r

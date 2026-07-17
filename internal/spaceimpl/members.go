@@ -421,8 +421,13 @@ func (m *membersAPI) ensureWatcher() *memberWatcher {
 	if existing := s.memberWatchers[m.s.id]; existing != nil {
 		// Race: another handle wired concurrently. Drop the loser so we
 		// don't leak its goroutines; its seed already ran and is harmless.
+		// It also subscribed itself to the ACL kick mux inside
+		// newMemberWatcher — detach it, or the stopped watcher (and its
+		// snapshot/collection state) is retained by the mux for the
+		// space's whole loaded lifetime.
 		s.mu.Unlock()
 		w.stop()
+		s.aclKickRemove(m.s.id, w)
 		w = existing
 	} else {
 		s.memberWatchers[m.s.id] = w
@@ -650,10 +655,16 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 		for id := range w.snapshot {
 			_ = w.api.s.tsp.AddIdentitySpace(ctx, id, w.api.s.id)
 		}
-		// Register as the syncacl AclUpdater so we tick immediately on
-		// every record add. The cast is safe — commonspace.Space.Acl()
+		// Register for ACL kicks so we tick immediately on every record
+		// add. syncacl has a SINGLE AclUpdater slot (last SetAclUpdater
+		// wins), shared with the push-key watcher — go through the
+		// Service's per-space fan-out when there is one; fall back to
+		// claiming the slot directly for parentless test harnesses. The
+		// cast inside aclKickFanout is safe — commonspace.Space.Acl()
 		// returns syncacl.SyncAcl, and our aclList() forwards that.
-		if su, ok := acl.(syncacl.SyncAcl); ok {
+		if svc := api.s.parent; svc != nil {
+			svc.aclKickFanout(api.s.id, acl).add(w)
+		} else if su, ok := acl.(syncacl.SyncAcl); ok {
 			su.SetAclUpdater(w)
 		}
 	}

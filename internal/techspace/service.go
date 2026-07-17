@@ -289,6 +289,44 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 	return obj.LocalSet(ctx, change)
 }
 
+// SetPushKeys mirrors the space's derived push-notification key
+// material onto its row via the local-set path (FieldPushKeys,
+// device-local; never enters the DAG — every device derives the same
+// values from the same converged ACL). The whole `push` object is
+// replaced in one op: encKey/encKeyId always rotate together and
+// spaceKey never changes, so per-subfield merging buys nothing.
+// Caller (the push-key watcher) is responsible for the row-exists
+// check and for skipping no-op writes.
+func (s *Service) SetPushKeys(ctx context.Context, spaceId string, keys space.PushKeys) (object.WriteResult, error) {
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	payload := arena.NewObject()
+	payload.Set(PushKeySpaceKey, arena.NewString(keys.SpaceKey))
+	payload.Set(PushKeyEncKey, arena.NewString(keys.EncKey))
+	payload.Set(PushKeyEncKeyId, arena.NewString(keys.EncKeyId))
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldPushKeys},
+					Payload: payload,
+				}},
+			},
+		},
+	}
+	return obj.LocalSet(ctx, change)
+}
+
 // SetAclHeadId records the ACL head id from RequestJoin on the joining
 // row via the local-set path (device-local; never enters the DAG). Read
 // back by the joiner-side post-acceptance waiter to detect a decline.

@@ -295,7 +295,7 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 // values from the same converged ACL). The whole `push` object is
 // replaced in one op: encKey/encKeyId always rotate together and
 // spaceKey never changes, so per-subfield merging buys nothing.
-// Caller (the push-key watcher) is responsible for the row-exists
+// Caller (the ACL mirror watcher) is responsible for the row-exists
 // check and for skipping no-op writes.
 func (s *Service) SetPushKeys(ctx context.Context, spaceId string, keys space.PushKeys) (object.WriteResult, error) {
 	if !s.open.Load() {
@@ -320,6 +320,38 @@ func (s *Service) SetPushKeys(ctx context.Context, spaceId string, keys space.Pu
 					Type:    crdt.OpSet,
 					Path:    []string{FieldPushKeys},
 					Payload: payload,
+				}},
+			},
+		},
+	}
+	return obj.LocalSet(ctx, change)
+}
+
+// SetOwnRole mirrors this account's own ACL permission onto the
+// space's row via the local-set path (FieldOwnRole, device-local;
+// never enters the DAG — every device derives the same role from the
+// same converged ACL). Stored as the canonical wire label
+// (space.Permission.String). Caller (the ACL mirror watcher) is
+// responsible for the row-exists check and for skipping no-op writes.
+func (s *Service) SetOwnRole(ctx context.Context, spaceId string, role space.Permission) (object.WriteResult, error) {
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldOwnRole},
+					Payload: arena.NewString(role.String()),
 				}},
 			},
 		},

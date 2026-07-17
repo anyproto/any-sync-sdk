@@ -111,7 +111,7 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	delete(s.spaceIndexWatchers, spaceId)
 	delete(s.accountMirrors, spaceId)
 	delete(s.memberWatchers, spaceId)
-	delete(s.pushKeyWatchers, spaceId)
+	delete(s.aclMirrorWatchers, spaceId)
 	// The mux only holds the stopped watchers above; drop it so a
 	// reload starts from an empty subscriber list (rewiring re-adds).
 	delete(s.aclMuxes, spaceId)

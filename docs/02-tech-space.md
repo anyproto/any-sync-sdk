@@ -31,8 +31,8 @@ Records with fields:
   identical across the account's devices. Absent on rows created before
   the field existed; readers treat 0 as "unknown".
 - `push` — device-local (`ScopeLocal`) push-notification key material,
-  mirrored from ACL state by spaceimpl's per-space push-key watcher
-  (`pushkeys_watcher.go`; one mirror pass at space load + a pass per
+  mirrored from ACL state by spaceimpl's per-space ACL mirror watcher
+  (`aclmirror_watcher.go`; one mirror pass at space load + a pass per
   applied ACL record via the `aclKickMux` fan-out). Local, not synced,
   because every device derives identical values from the same converged
   ACL. Subfields (encodings byte-compatible with anytype-heart's
@@ -50,6 +50,20 @@ Records with fields:
   OS keystore, and decrypt push payloads while the SDK process is down
   (mobile notification extensions). Absent until the mirror first runs —
   e.g. on a joiner whose access is still pending (no read key yet).
+- `ownRole` — device-local (`ScopeLocal`) string: this account's own ACL
+  permission in the space, in the canonical `space.Permission` wire
+  vocabulary (`owner` / `admin` / `writer` / `reader` / `guest` /
+  `none`). Mirrored by the same ACL mirror watcher as `push` (and local
+  for the same reason), but independently of it: a keyless reader or
+  pending joiner still gets a definite role mirrored while push-key
+  derivation errors. Surfaced as `SpaceInfo.OwnRole` on List/Subscribe so
+  clients read the caller's role off the space list without one
+  `Members().Me` call per space. Absent until the mirror first runs —
+  notably on rows whose space was never loaded by this device — which
+  readers must treat as "unknown yet", not as no-access; `Members().Me`
+  stays the authoritative per-space read. On a 1-1 space the ACL owner is
+  the synthetic shared key, so participants mirror the role the ACL
+  grants them (`writer`), never `owner`.
 - etc.
 
 ### Account Preferences (derived object, postponed)

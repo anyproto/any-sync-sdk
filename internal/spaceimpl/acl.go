@@ -420,6 +420,28 @@ func fromAclPermissions(p list.AclPermissions) space.Permission {
 	}
 }
 
+// ownRole resolves this account's current ACL permission in spaceId
+// from the loaded space's ACL state — the ACL mirror's source for the
+// row's ownRole field. Same access pattern as PushKeys (space via the
+// app cache, ACL read under RLock). An account absent from the ACL
+// (e.g. a still-pending joiner) resolves to PermissionNone without
+// error — that IS its current permission.
+func (s *Service) ownRole(ctx context.Context, spaceId string) (space.Permission, error) {
+	handle, err := s.app.GetSpace(ctx, spaceId)
+	if err != nil {
+		return space.PermissionNone, fmt.Errorf("ownRole: load space %q: %w", spaceId, err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return space.PermissionNone, fmt.Errorf("ownRole: space %q has no acl", spaceId)
+	}
+	acl.RLock()
+	state := acl.AclState()
+	perms := state.Permissions(state.Identity())
+	acl.RUnlock()
+	return fromAclPermissions(perms), nil
+}
+
 // encodeSelfSymKeyMetadata derives this account's metadata symkey and
 // returns its marshalled bytes for the ACL RequestMetadata / create
 // payload. The ACL carries ONLY the symkey, never inline name/icon —

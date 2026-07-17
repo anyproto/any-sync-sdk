@@ -12,6 +12,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 const (
@@ -434,4 +435,25 @@ func TestSpaceIndexRecord_DecodeInviteNotifyPending(t *testing.T) {
 	rec := techspace.DecodeSpaceIndexRecord(v)
 	assert.Equal(t, "s1", rec.Id)
 	assert.ElementsMatch(t, []string{"bob", "carol"}, rec.InviteNotifyPending)
+}
+
+func TestSpaceIndexRecord_DecodeOwnRole(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldType, arena.NewString("private"))
+	v.Set(techspace.FieldOwnRole, arena.NewString("owner"))
+
+	rec := techspace.DecodeSpaceIndexRecord(v)
+	assert.Equal(t, space.PermissionOwner, rec.OwnRole)
+
+	// Absent field — the never-mirrored row — decodes to None.
+	bare := arena.NewObject()
+	bare.Set("id", arena.NewString("s2"))
+	assert.Equal(t, space.PermissionNone, techspace.DecodeSpaceIndexRecord(bare).OwnRole)
+
+	// An unknown label (future vocabulary) degrades to None rather
+	// than failing the decode.
+	v.Set(techspace.FieldOwnRole, arena.NewString("superadmin"))
+	assert.Equal(t, space.PermissionNone, techspace.DecodeSpaceIndexRecord(v).OwnRole)
 }

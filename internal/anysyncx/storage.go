@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	anystorev1 "github.com/anyproto/any-store"
 	"github.com/anyproto/any-sync/app"
@@ -67,12 +68,34 @@ func (s *storageProvider) tmpDir() string {
 // anyStoreConfig builds a fresh per-open config: any-store mutates the
 // options map during Open, so it must not be shared across concurrent
 // opens.
+//
+// Tuning mirrors anytype-heart's production space-store profile. A
+// device runs many space DBs at once, so per-DB read connections are
+// capped instead of scaling with NumCPU. Commit-time fsync is relaxed
+// to checkpoint-time (synchronous=normal): losing the last local
+// commits on power loss is acceptable because space state re-syncs,
+// and the sentinel triggers a quick-check on unclean shutdown. The
+// commit-path autocheckpoint threshold is raised and the real
+// checkpoint work happens on idle — without the idle flush, busy
+// stores never checkpoint and all data accumulates in the WAL.
 func (s *storageProvider) anyStoreConfig() *anystorev1.Config {
 	return &anystorev1.Config{
+		ReadConnections: 8,
+		// Process-global pool shared by every sqlite connection,
+		// initialized once on the first open (later values are ignored).
+		SQLiteGlobalPageCachePreallocateSizeBytes: 1 << 26,
 		SQLiteConnectionOptions: map[string]string{
 			// The value is interpolated into "PRAGMA %s = %s" verbatim;
 			// paths must be single-quoted (embedded quotes doubled).
 			"temp_store_directory": "'" + strings.ReplaceAll(s.tmpDir(), "'", "''") + "'",
+			"synchronous":          "normal",
+			"wal_autocheckpoint":   "10000",
+		},
+		Durability: anystorev1.DurabilityConfig{
+			AutoFlush: true,
+			IdleAfter: 20 * time.Second,
+			FlushMode: anystorev1.FlushModeCheckpointPassive,
+			Sentinel:  true,
 		},
 	}
 }
@@ -186,6 +209,12 @@ func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string)
 	_ = s.CloseSpaceStorage(ctx, id)
 	if err := os.Remove(s.dbPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	// Companion files survive an unclean close: sqlite's -wal/-shm and
+	// the durability sentinel. A stale WAL next to a later re-created
+	// space DB would corrupt it, so sweep them with the main file.
+	for _, suffix := range []string{"-wal", "-shm", ".lock"} {
+		_ = os.Remove(s.dbPath(id) + suffix)
 	}
 	s.notifySetChange()
 	return nil

@@ -59,6 +59,40 @@ type SpaceInfo struct {
 	// through the tech space, never visible to other space members.
 	// Nil when never written.
 	Settings map[string]any
+	// PushKeys is the space's push-notification key material, mirrored
+	// from ACL state so clients can cache it and decrypt push payloads
+	// while the SDK process is down (see docs/02-tech-space.md
+	// § "Space Index"). Nil until the per-space mirror has run —
+	// notably on a joiner whose access is still pending (no read key
+	// yet) and on rows whose space was never loaded by this device.
+	PushKeys *PushKeys
+}
+
+// PushKeys is the per-space key material a push RECEIVER needs,
+// byte-compatible with anytype-heart's spacePushNotificationKey /
+// spacePushNotificationEncryptionKey space-view details.
+//
+// EncKey rotates with the ACL read key. Clients must treat their
+// cache as append-only per space ({EncKeyId → EncKey}): a payload
+// encrypted before a rotation still arrives carrying the old KeyId,
+// and a KeyId that was never cached (fresh install, rotation missed
+// while offline) means "render a generic notification".
+//
+// EncKey is a one-way SLIP-21 derivation from the read key — holding
+// it decrypts push payloads only, never space data.
+type PushKeys struct {
+	// SpaceKey is the base64 (std) of the protobuf-marshalled ed25519
+	// private key that identifies the space on the push server
+	// (pushapi Topic.SpaceKey is its public half). Derived from the
+	// ACL's first metadata key — fixed for the space's life.
+	SpaceKey string
+	// EncKey is the base64 (std) of the raw AES payload key derived
+	// from the CURRENT ACL read key.
+	EncKey string
+	// EncKeyId is hex(sha256(raw EncKey bytes)) — the value stamped
+	// into pushapi.Message.KeyId, i.e. the cache key a receiver looks
+	// up on an incoming push.
+	EncKeyId string
 }
 
 // Status is the combined local+remote state of a space.

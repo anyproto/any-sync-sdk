@@ -650,10 +650,16 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 		for id := range w.snapshot {
 			_ = w.api.s.tsp.AddIdentitySpace(ctx, id, w.api.s.id)
 		}
-		// Register as the syncacl AclUpdater so we tick immediately on
-		// every record add. The cast is safe — commonspace.Space.Acl()
+		// Register for ACL kicks so we tick immediately on every record
+		// add. syncacl has a SINGLE AclUpdater slot (last SetAclUpdater
+		// wins), shared with the push-key watcher — go through the
+		// Service's per-space fan-out when there is one; fall back to
+		// claiming the slot directly for parentless test harnesses. The
+		// cast inside aclKickFanout is safe — commonspace.Space.Acl()
 		// returns syncacl.SyncAcl, and our aclList() forwards that.
-		if su, ok := acl.(syncacl.SyncAcl); ok {
+		if svc := api.s.parent; svc != nil {
+			svc.aclKickFanout(api.s.id, acl).add(w)
+		} else if su, ok := acl.(syncacl.SyncAcl); ok {
 			su.SetAclUpdater(w)
 		}
 	}

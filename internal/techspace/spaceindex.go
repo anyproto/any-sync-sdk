@@ -41,6 +41,7 @@ func SpaceIndexSchema() schema.Dataset {
 		// only looks at the top-level head, so arbitrary client keys under
 		// `settings` are permitted by declaration.
 		{Id: FieldSettings, Name: "Settings", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
+		{Id: FieldPushKeys, Name: "Push keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeLocal},
 	}}
 }
 
@@ -147,6 +148,29 @@ const (
 	//     own change's timestamp — typically seconds apart.
 	// Callers treat 0 as "unknown".
 	FieldCreatedAt = "createdAt"
+	// FieldPushKeys is a DEVICE-LOCAL object (schema.ScopeLocal) holding
+	// the space's push-notification key material, mirrored from ACL
+	// state by spaceimpl's per-space push-key watcher so clients can
+	// read it off the row (and its subscribe stream), cache it, and
+	// decrypt push payloads while the SDK process is down. Subfields:
+	// PushKeySpaceKey / PushKeyEncKey / PushKeyEncKeyId. Local, not
+	// synced, because every device derives the same values from the
+	// same converged ACL — syncing would only add DAG writes. Written
+	// via Service.SetPushKeys → Object.LocalSet; absent until the
+	// mirror first runs (e.g. joiner without read access yet).
+	FieldPushKeys = "push"
+)
+
+// FieldPushKeys subfield names — the wire shape of the `push` object.
+// Values are encoded exactly like anytype-heart's space-view details
+// (spacePushNotificationKey / spacePushNotificationEncryptionKey) so
+// receiver-side client code is portable: spaceKey is base64(std) of
+// the protobuf-marshalled ed25519 private key, encKey base64(std) of
+// the raw AES key, encKeyId hex(sha256(raw)) = pushapi.Message.KeyId.
+const (
+	PushKeySpaceKey = "spaceKey"
+	PushKeyEncKey   = "encKey"
+	PushKeyEncKeyId = "encKeyId"
 )
 
 // Status lattice values. `Deleted` is terminal — once a record's

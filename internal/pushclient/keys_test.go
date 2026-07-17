@@ -3,6 +3,7 @@ package pushclient
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"testing"
 
@@ -131,5 +132,40 @@ func TestEncKeyId(t *testing.T) {
 	assert.NotEqual(t, id, otherId, "distinct keys must have distinct ids")
 
 	_, err = EncKeyId(nil)
+	assert.Error(t, err)
+}
+
+// EncodeSpaceKey / EncodeEncKey are the receiver-cache wire encodings
+// (heart's spacePushNotificationKey / ...EncryptionKey details): the
+// space key must round-trip through UnmarshalEd25519PrivateKeyProto,
+// the enc key through UnmarshallAESKey, and EncKeyId must be the
+// sha256 of the bytes EncodeEncKey carries — a client may recompute
+// the cache id from the encoded key alone.
+func TestEncodeKeys_RoundTrip(t *testing.T) {
+	spaceKey := testPrivKey(t, 0x21)
+	encKey := testSymKey(t, 0x42)
+
+	skB64, err := EncodeSpaceKey(spaceKey)
+	require.NoError(t, err)
+	skRaw, err := base64.StdEncoding.DecodeString(skB64)
+	require.NoError(t, err)
+	skBack, err := crypto.UnmarshalEd25519PrivateKeyProto(skRaw)
+	require.NoError(t, err)
+	assert.True(t, spaceKey.Equals(skBack), "space key must round-trip through proto-marshal + base64")
+
+	ekB64, err := EncodeEncKey(encKey)
+	require.NoError(t, err)
+	ekRaw, err := base64.StdEncoding.DecodeString(ekB64)
+	require.NoError(t, err)
+	assert.Equal(t, rawKey(t, encKey), ekRaw, "enc key encoding must be the raw AES bytes")
+
+	keyId, err := EncKeyId(encKey)
+	require.NoError(t, err)
+	sum := sha256.Sum256(ekRaw)
+	assert.Equal(t, hex.EncodeToString(sum[:]), keyId, "EncKeyId must be recomputable from the encoded key")
+
+	_, err = EncodeSpaceKey(nil)
+	assert.Error(t, err)
+	_, err = EncodeEncKey(nil)
 	assert.Error(t, err)
 }

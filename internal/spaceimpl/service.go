@@ -143,6 +143,16 @@ type Service struct {
 	// spaceId so all handles for one space share a single watcher.
 	memberWatchers map[string]*memberWatcher
 
+	// pushKeyWatchers holds one push-key mirror per loaded spaceId
+	// (see pushkeys_watcher.go) — ACL state → tech-space row `push`
+	// field. Same sticky Service-level-singleton lifecycle as the
+	// watchers above.
+	pushKeyWatchers map[string]*pushKeyWatcher
+
+	// aclMuxes fans each space's single syncacl AclUpdater slot out to
+	// its subscribers (member + push-key watchers) — see aclkick.go.
+	aclMuxes map[string]*aclKickMux
+
 	// watchers tracks every active members poller across all loaded
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
@@ -222,6 +232,8 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
 		accountMirrors:     make(map[string]*accountMirror),
 		memberWatchers:     make(map[string]*memberWatcher),
+		pushKeyWatchers:    make(map[string]*pushKeyWatcher),
+		aclMuxes:           make(map[string]*aclKickMux),
 		delKick:            make(chan struct{}, 1),
 		joinKick:           make(chan struct{}, 1),
 		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
@@ -418,6 +430,31 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 			}
 		}
 	}
+
+	// Push-key mirror: ACL state → this space's tech-space row `push`
+	// field (pushkeys_watcher.go). Same dedup dance; the initial mirror
+	// pass is primed inside newPushKeyWatcher. Registered on the
+	// space's ACL kick fan-out so read-key rotations land promptly.
+	if s.tsp != nil {
+		s.mu.Lock()
+		_, dup := s.pushKeyWatchers[spaceId]
+		s.mu.Unlock()
+		if !dup {
+			w := newPushKeyWatcher(s, spaceId)
+			s.mu.Lock()
+			if _, raced := s.pushKeyWatchers[spaceId]; raced {
+				s.mu.Unlock()
+				w.stop()
+			} else {
+				s.pushKeyWatchers[spaceId] = w
+				s.watchers.register(w)
+				s.mu.Unlock()
+				if acl := handle.Inner().Acl(); acl != nil {
+					s.aclKickFanout(spaceId, acl).add(w)
+				}
+			}
+		}
+	}
 	return objectId, nil
 }
 
@@ -600,6 +637,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		IconCID:     r.IconCID,
 		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
 		Settings:    r.Settings,
+		PushKeys:    r.PushKeys,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band

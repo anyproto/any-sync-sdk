@@ -22,6 +22,7 @@ package pushclient
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 
@@ -78,6 +79,37 @@ func DeriveEncKey(readKey crypto.SymKey) (crypto.SymKey, error) {
 		return nil, err
 	}
 	return crypto.DeriveSymmetricKey(raw, encKeyDerivationPath)
+}
+
+// EncodeSpaceKey packs the derived push signing key into its
+// receiver-cache wire form: base64 (std) of the protobuf-marshalled
+// private key — byte-compatible with anytype-heart's
+// spacePushNotificationKey space-view detail, so client-side decode
+// code is portable between the two stacks.
+func EncodeSpaceKey(k crypto.PrivKey) (string, error) {
+	if k == nil {
+		return "", errors.New("pushclient: nil space key")
+	}
+	raw, err := k.Marshall()
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+// EncodeEncKey packs the derived payload encryption key into its
+// receiver-cache wire form: base64 (std) of the raw AES key bytes —
+// byte-compatible with anytype-heart's
+// spacePushNotificationEncryptionKey space-view detail.
+func EncodeEncKey(k crypto.SymKey) (string, error) {
+	if k == nil {
+		return "", errors.New("pushclient: nil enc key")
+	}
+	raw, err := k.Raw()
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
 // EncKeyId is the wire identifier of a payload encryption key:

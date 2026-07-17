@@ -30,6 +30,26 @@ Records with fields:
   author, Join for a joiner — so it's per-account, immutable, and
   identical across the account's devices. Absent on rows created before
   the field existed; readers treat 0 as "unknown".
+- `push` — device-local (`ScopeLocal`) push-notification key material,
+  mirrored from ACL state by spaceimpl's per-space push-key watcher
+  (`pushkeys_watcher.go`; one mirror pass at space load + a pass per
+  applied ACL record via the `aclKickMux` fan-out). Local, not synced,
+  because every device derives identical values from the same converged
+  ACL. Subfields (encodings byte-compatible with anytype-heart's
+  `spacePushNotificationKey` / `spacePushNotificationEncryptionKey`
+  space-view details):
+  - `spaceKey` — base64(std) of the protobuf-marshalled ed25519 private
+    key identifying the space on the push server (SLIP-10 `m/99999'/1'`
+    off the ACL's first metadata key; fixed for the space's life).
+  - `encKey` — base64(std) of the raw AES payload key (SLIP-21
+    `m/SLIP-0021/anytype/space/key` off the CURRENT read key; rotates
+    with it).
+  - `encKeyId` — hex(sha256(raw encKey bytes)) = `pushapi.Message.KeyId`.
+  Purpose: clients read it off `SpaceInfo.PushKeys` (or the raw row /
+  its subscribe stream), cache `{encKeyId → encKey}` append-only in the
+  OS keystore, and decrypt push payloads while the SDK process is down
+  (mobile notification extensions). Absent until the mirror first runs —
+  e.g. on a joiner whose access is still pending (no read key yet).
 - etc.
 
 ### Account Preferences (derived object, postponed)

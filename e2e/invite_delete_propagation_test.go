@@ -188,6 +188,23 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 		t.Fatalf("bob never reached MemberStatusActive")
 	}
 
+	// The accept record that activated bob also kicks his ACL mirror:
+	// his tech-space row must surface the granted role as OwnRole.
+	if !waitFor(ctx, 30*time.Second, 1*time.Second, func() bool {
+		infos, lErr := bob.Spaces().List(ctx)
+		if lErr != nil {
+			return false
+		}
+		for _, info := range infos {
+			if info.Id == sp.Id() {
+				return info.OwnRole == space.PermissionWriter
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("bob's space row never mirrored OwnRole=writer")
+	}
+
 	// Bob waits for Alice's seed record to converge.
 	if !waitFor(ctx, 2*time.Minute, 1*time.Second, func() bool {
 		_ = bobSpace.SyncHeads(ctx)

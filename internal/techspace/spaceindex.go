@@ -42,6 +42,7 @@ func SpaceIndexSchema() schema.Dataset {
 		// `settings` are permitted by declaration.
 		{Id: FieldSettings, Name: "Settings", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
 		{Id: FieldPushKeys, Name: "Push keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeLocal},
+		{Id: FieldOwnRole, Name: "Own role", Schema: str(), Scope: schema.ScopeLocal},
 	}}
 }
 
@@ -150,7 +151,7 @@ const (
 	FieldCreatedAt = "createdAt"
 	// FieldPushKeys is a DEVICE-LOCAL object (schema.ScopeLocal) holding
 	// the space's push-notification key material, mirrored from ACL
-	// state by spaceimpl's per-space push-key watcher so clients can
+	// state by spaceimpl's per-space ACL mirror watcher so clients can
 	// read it off the row (and its subscribe stream), cache it, and
 	// decrypt push payloads while the SDK process is down. Subfields:
 	// PushKeySpaceKey / PushKeyEncKey / PushKeyEncKeyId. Local, not
@@ -159,6 +160,16 @@ const (
 	// via Service.SetPushKeys → Object.LocalSet; absent until the
 	// mirror first runs (e.g. joiner without read access yet).
 	FieldPushKeys = "push"
+	// FieldOwnRole is a DEVICE-LOCAL string (schema.ScopeLocal): this
+	// account's own ACL permission in the space, in the canonical
+	// space.Permission wire vocabulary ("owner" / "admin" / "writer" /
+	// "reader" / "guest" / "none"). Mirrored from ACL state by the same
+	// per-space ACL watcher that maintains FieldPushKeys — local, not
+	// synced, for the same reason (every device derives it from the
+	// same converged ACL). Written via Service.SetOwnRole →
+	// Object.LocalSet; absent until the mirror first runs, which
+	// readers must treat as "unknown yet", not as no-access.
+	FieldOwnRole = "ownRole"
 )
 
 // FieldPushKeys subfield names — the wire shape of the `push` object.

@@ -78,9 +78,16 @@ type SpaceIndexRecord struct {
 
 	// PushKeys is the device-local push-notification key material
 	// (FieldPushKeys, ScopeLocal), mirrored from ACL state by the
-	// per-space push-key watcher. Nil until the mirror first runs.
+	// per-space ACL mirror watcher. Nil until the mirror first runs.
 	// Written via Service.SetPushKeys.
 	PushKeys *space.PushKeys
+
+	// OwnRole is this account's own ACL permission in the space
+	// (FieldOwnRole, ScopeLocal), mirrored from ACL state by the same
+	// per-space watcher as PushKeys. PermissionNone until the mirror
+	// first runs — "unknown yet", not a verdict. Written via
+	// Service.SetOwnRole.
+	OwnRole space.Permission
 }
 
 // DecodeSpaceIndexRecord pulls the fields off an anyenc value as
@@ -103,6 +110,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		AclHeadId:           v.GetString(FieldAclHeadId),
 		OneToOnePeer:        v.GetString(FieldOneToOnePeer),
 		OneToOneInviteState: v.GetString(FieldOneToOneInviteState),
+		OwnRole:             space.ParsePermission(v.GetString(FieldOwnRole)),
 		// Float64 read — GetInt narrows through `int` and would truncate
 		// on 32-bit platforms; anyenc numbers are float64 on the wire.
 		CreatedAt: int64(v.GetFloat64(FieldCreatedAt)),

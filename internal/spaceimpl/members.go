@@ -657,7 +657,7 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 		}
 		// Register for ACL kicks so we tick immediately on every record
 		// add. syncacl has a SINGLE AclUpdater slot (last SetAclUpdater
-		// wins), shared with the push-key watcher — go through the
+		// wins), shared with the ACL mirror watcher — go through the
 		// Service's per-space fan-out when there is one; fall back to
 		// claiming the slot directly for parentless test harnesses. The
 		// cast inside aclKickFanout is safe — commonspace.Space.Acl()

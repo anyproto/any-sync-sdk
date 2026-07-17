@@ -50,8 +50,20 @@ type SpaceInfo struct {
 	Description string
 	IconCID     string
 	Status      Status
-	OwnRole     Permission
-	CreatedAt   time.Time
+	// OwnRole is this account's ACL permission in the space, mirrored
+	// from ACL state onto the tech-space row by the per-space ACL
+	// mirror (same trigger model as PushKeys: one pass at space load
+	// plus a kick per applied ACL record). PermissionNone until the
+	// mirror first runs — notably on rows whose space was never loaded
+	// by this device — so treat "none" on an active space as
+	// "unknown yet", not a verdict; Space.Members().Me stays the
+	// authoritative per-space read.
+	//
+	// For a 1-1 (SpaceTypeOneToOne) space the ACL owner is the
+	// synthetic shared key, so both participants mirror the role the
+	// ACL actually grants them — never PermissionOwner.
+	OwnRole   Permission
+	CreatedAt time.Time
 	// Settings is the account-private, client-owned per-space settings
 	// object: free-form keys with scalar values (string / float64 /
 	// bool — numbers decode as float64, JSON semantics). Written per
@@ -139,3 +151,43 @@ const (
 	PermissionAdmin
 	PermissionOwner
 )
+
+// String returns the canonical wire label for the permission —
+// "none" / "reader" / "guest" / "writer" / "admin" / "owner". The
+// inverse of ParsePermission; unknown values stringify as "none".
+func (p Permission) String() string {
+	switch p {
+	case PermissionReader:
+		return "reader"
+	case PermissionGuest:
+		return "guest"
+	case PermissionWriter:
+		return "writer"
+	case PermissionAdmin:
+		return "admin"
+	case PermissionOwner:
+		return "owner"
+	default:
+		return "none"
+	}
+}
+
+// ParsePermission maps a canonical wire label back onto the enum.
+// Unknown labels (including "") parse as PermissionNone — absent and
+// no-access are the same answer for every caller.
+func ParsePermission(s string) Permission {
+	switch s {
+	case "reader":
+		return PermissionReader
+	case "guest":
+		return PermissionGuest
+	case "writer":
+		return PermissionWriter
+	case "admin":
+		return PermissionAdmin
+	case "owner":
+		return PermissionOwner
+	default:
+		return PermissionNone
+	}
+}

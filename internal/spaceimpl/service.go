@@ -143,14 +143,14 @@ type Service struct {
 	// spaceId so all handles for one space share a single watcher.
 	memberWatchers map[string]*memberWatcher
 
-	// pushKeyWatchers holds one push-key mirror per loaded spaceId
-	// (see pushkeys_watcher.go) — ACL state → tech-space row `push`
-	// field. Same sticky Service-level-singleton lifecycle as the
-	// watchers above.
-	pushKeyWatchers map[string]*pushKeyWatcher
+	// aclMirrorWatchers holds one ACL mirror per loaded spaceId
+	// (see aclmirror_watcher.go) — ACL state → the tech-space row's
+	// `push` + `ownRole` fields. Same sticky Service-level-singleton
+	// lifecycle as the watchers above.
+	aclMirrorWatchers map[string]*aclMirrorWatcher
 
 	// aclMuxes fans each space's single syncacl AclUpdater slot out to
-	// its subscribers (member + push-key watchers) — see aclkick.go.
+	// its subscribers (member + ACL mirror watchers) — see aclkick.go.
 	aclMuxes map[string]*aclKickMux
 
 	// watchers tracks every active members poller across all loaded
@@ -232,7 +232,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
 		accountMirrors:     make(map[string]*accountMirror),
 		memberWatchers:     make(map[string]*memberWatcher),
-		pushKeyWatchers:    make(map[string]*pushKeyWatcher),
+		aclMirrorWatchers:  make(map[string]*aclMirrorWatcher),
 		aclMuxes:           make(map[string]*aclKickMux),
 		delKick:            make(chan struct{}, 1),
 		joinKick:           make(chan struct{}, 1),
@@ -431,22 +431,23 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 		}
 	}
 
-	// Push-key mirror: ACL state → this space's tech-space row `push`
-	// field (pushkeys_watcher.go). Same dedup dance; the initial mirror
-	// pass is primed inside newPushKeyWatcher. Registered on the
-	// space's ACL kick fan-out so read-key rotations land promptly.
+	// ACL mirror: ACL state → this space's tech-space row `push` +
+	// `ownRole` fields (aclmirror_watcher.go). Same dedup dance; the
+	// initial mirror pass is primed inside newAclMirrorWatcher.
+	// Registered on the space's ACL kick fan-out so read-key rotations
+	// and permission changes land promptly.
 	if s.tsp != nil {
 		s.mu.Lock()
-		_, dup := s.pushKeyWatchers[spaceId]
+		_, dup := s.aclMirrorWatchers[spaceId]
 		s.mu.Unlock()
 		if !dup {
-			w := newPushKeyWatcher(s, spaceId)
+			w := newAclMirrorWatcher(s, spaceId)
 			s.mu.Lock()
-			if _, raced := s.pushKeyWatchers[spaceId]; raced {
+			if _, raced := s.aclMirrorWatchers[spaceId]; raced {
 				s.mu.Unlock()
 				w.stop()
 			} else {
-				s.pushKeyWatchers[spaceId] = w
+				s.aclMirrorWatchers[spaceId] = w
 				s.watchers.register(w)
 				s.mu.Unlock()
 				var mux *aclKickMux
@@ -469,7 +470,7 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 				// watcher survives against a closed space.
 				s.mu.Lock()
 				if _, live := s.spaceIndexIds[spaceId]; !live {
-					delete(s.pushKeyWatchers, spaceId)
+					delete(s.aclMirrorWatchers, spaceId)
 					s.mu.Unlock()
 					if mux != nil {
 						mux.remove(w)
@@ -663,6 +664,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		Description: r.Description,
 		IconCID:     r.IconCID,
 		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		OwnRole:     r.OwnRole,
 		Settings:    r.Settings,
 		PushKeys:    r.PushKeys,
 	}

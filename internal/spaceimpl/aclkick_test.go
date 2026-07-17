@@ -14,7 +14,7 @@ type countingUpdater struct{ n atomic.Int64 }
 func (c *countingUpdater) UpdateAcl(list.AclList) { c.n.Add(1) }
 
 // The mux owns syncacl's single AclUpdater slot for two subscribers
-// (members + push-key watchers) — every kick must reach all of them,
+// (members + ACL mirror watchers) — every kick must reach all of them,
 // and a removed subscriber must stop receiving (the construction-race
 // loser path).
 func TestAclKickMux_FanoutAddRemove(t *testing.T) {

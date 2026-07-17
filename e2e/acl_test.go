@@ -320,6 +320,21 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, reqs, "no pending requests after Accept")
 
+	// Owner's own tech-space row mirrors the ACL role (async, via the
+	// ACL mirror watcher primed at space wiring).
+	require.Eventually(t, func() bool {
+		infos, lErr := owner.Spaces().List(ctx)
+		if lErr != nil {
+			return false
+		}
+		for _, info := range infos {
+			if info.Id == sp.Id() {
+				return info.OwnRole == space.PermissionOwner
+			}
+		}
+		return false
+	}, 15*time.Second, 250*time.Millisecond, "owner's space row should mirror OwnRole=owner")
+
 	// Subscribe firehose: the watcher's polling tick (~250 ms) lags
 	// the local AclList update, so allow up to 5 s for events to
 	// settle before asserting. We expect at minimum:
@@ -430,8 +445,9 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 }
 
 // TestSDK_Spaces_Derive verifies the deterministic-derive surface:
-// same (account, seed) lands on the same spaceId across calls, the
-// space appears in List with StatusActive, and the OwnRole is owner.
+// same (account, seed) lands on the same spaceId across calls, and the
+// space appears in List. (OwnRole mirroring is covered by
+// TestOwnRole_MirroredToSpaceRow.)
 func TestSDK_Spaces_Derive(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()

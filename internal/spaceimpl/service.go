@@ -449,8 +449,35 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 				s.pushKeyWatchers[spaceId] = w
 				s.watchers.register(w)
 				s.mu.Unlock()
+				var mux *aclKickMux
 				if acl := handle.Inner().Acl(); acl != nil {
-					s.aclKickFanout(spaceId, acl).add(w)
+					mux = s.aclKickFanout(spaceId, acl)
+					mux.add(w)
+					// Close the wiring gap: the primed mirror pass may
+					// already have read ACL state BEFORE the mux
+					// subscription above — an ACL record applied in that
+					// window produced no kick, and on a quiet space
+					// nothing else ever would. One post-subscribe kick
+					// re-mirrors from current state; coalescing makes it
+					// free when the primed pass hasn't run yet.
+					w.kick()
+				}
+				// Re-check against a concurrent offload: closeSpaceRuntime
+				// stops watchers and clears the maps under s.mu, but this
+				// wiring ran outside it — if the space was torn down
+				// meanwhile (spaceIndexIds entry gone), unwind so no live
+				// watcher survives against a closed space.
+				s.mu.Lock()
+				if _, live := s.spaceIndexIds[spaceId]; !live {
+					delete(s.pushKeyWatchers, spaceId)
+					s.mu.Unlock()
+					if mux != nil {
+						mux.remove(w)
+					}
+					s.watchers.unregister(w)
+					w.stop()
+				} else {
+					s.mu.Unlock()
 				}
 			}
 		}

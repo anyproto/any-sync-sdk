@@ -421,8 +421,13 @@ func (m *membersAPI) ensureWatcher() *memberWatcher {
 	if existing := s.memberWatchers[m.s.id]; existing != nil {
 		// Race: another handle wired concurrently. Drop the loser so we
 		// don't leak its goroutines; its seed already ran and is harmless.
+		// It also subscribed itself to the ACL kick mux inside
+		// newMemberWatcher — detach it, or the stopped watcher (and its
+		// snapshot/collection state) is retained by the mux for the
+		// space's whole loaded lifetime.
 		s.mu.Unlock()
 		w.stop()
+		s.aclKickRemove(m.s.id, w)
 		w = existing
 	} else {
 		s.memberWatchers[m.s.id] = w

@@ -39,6 +39,20 @@ func (m *aclKickMux) add(u headupdater.AclUpdater) {
 	m.subs = append(m.subs, u)
 }
 
+// remove detaches u. Required for watchers that lose a construction
+// race after subscribing — without it a stopped watcher stays a
+// subscriber (and is retained) for the space's whole loaded lifetime.
+func (m *aclKickMux) remove(u headupdater.AclUpdater) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, s := range m.subs {
+		if s == u {
+			m.subs = append(m.subs[:i], m.subs[i+1:]...)
+			return
+		}
+	}
+}
+
 // aclKickFanout returns spaceId's mux, creating it on first use, and
 // (re)installs it as acl's updater. Reinstalling on every call is the
 // point: a space offload evicts the loaded space, and the reload
@@ -58,4 +72,16 @@ func (s *Service) aclKickFanout(spaceId string, acl list.AclList) *aclKickMux {
 		su.SetAclUpdater(m)
 	}
 	return m
+}
+
+// aclKickRemove detaches u from spaceId's mux, if one exists. Used by
+// construction-race losers whose registration already happened inside
+// their constructor.
+func (s *Service) aclKickRemove(spaceId string, u headupdater.AclUpdater) {
+	s.mu.Lock()
+	m := s.aclMuxes[spaceId]
+	s.mu.Unlock()
+	if m != nil {
+		m.remove(u)
+	}
 }

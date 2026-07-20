@@ -281,22 +281,34 @@ func BenchmarkApply_SingleFieldUpdate(b *testing.B) {
 // BenchmarkCompact_SubtreeCollapse: nav-style nested subtree where
 // all children share a version.
 func BenchmarkCompact_SubtreeCollapse(b *testing.B) {
+	// Compaction mutates the record, so each op needs a fresh one. Rebuild
+	// in batches on a reset arena: per-op StopTimer/StartTimer would pay
+	// two ReadMemStats per iteration, and without the reset the arena's
+	// live heap grows with b.N — the bench diverges instead of converging.
+	const batch = 1024
 	arena := &anyenc.Arena{}
+	recs := make([]*anyenc.Value, batch)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; i < b.N; i += batch {
 		b.StopTimer()
-		rec := recordWith(arena, map[string]any{
-			IdField:   "v1",
-			"author":  "v1",
-			"spaceId": "v1",
-			"nav": map[string]any{
-				"type":     "v5",
-				"parentId": "v5",
-				"pos":      "v5",
-			},
-		})
+		arena.Reset()
+		k := min(batch, b.N-i)
+		for j := 0; j < k; j++ {
+			recs[j] = recordWith(arena, map[string]any{
+				IdField:   "v1",
+				"author":  "v1",
+				"spaceId": "v1",
+				"nav": map[string]any{
+					"type":     "v5",
+					"parentId": "v5",
+					"pos":      "v5",
+				},
+			})
+		}
 		b.StartTimer()
-		compactVersions(arena, rec)
+		for j := 0; j < k; j++ {
+			compactVersions(arena, recs[j])
+		}
 	}
 }

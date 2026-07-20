@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -264,20 +265,21 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	openSDK := func(name string) *anysyncsdk.SDK {
+	openSDK := func(name string) (*anysyncsdk.SDK, string) {
 		t.Helper()
+		dir := t.TempDir()
 		cfg := config.Config{
-			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Storage: config.Storage{DataDir: dir, Topology: config.StorageShared},
 			Network: config.Network{NodeConfYAML: yaml},
 		}
 		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
 		require.NoError(t, err, "%s: Open", name)
 		t.Cleanup(func() { _ = sdk.Close() })
-		return sdk
+		return sdk, dir
 	}
 
-	alice := openSDK("alice")
-	bob := openSDK("bob")
+	alice, _ := openSDK("alice")
+	bob, bobDir := openSDK("bob")
 	require.NotEqual(t, alice.Account().Id(), bob.Account().Id())
 
 	// Alice initiates — active immediately (implicit self-approval).
@@ -300,6 +302,17 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	si, ok = infoByID(t, ctx, bob, id)
 	require.True(t, ok, "bob must derive the same 1-1 id Alice initiated")
 	assert.Equal(t, space.StatusOneToOnePending, si.Status)
+
+	// While pending, a read path must not materialize the 1-1: Get is
+	// guarded, and no any-sync storage may exist. The stakes are higher
+	// than for a regular join — the two-writer ACL hands Bob a read key
+	// from derivation, so a stray Get would fully decrypt the space and
+	// reduce the accept gate to decoration.
+	_, err = bob.Spaces().Get(ctx, id)
+	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
+		"Get on a pending incoming 1-1 must refuse to materialize")
+	require.NoFileExists(t, filepath.Join(bobDir, id+".db"),
+		"a pending incoming 1-1 must not create any-sync space storage")
 
 	// Bob approves → active, materialized.
 	bobSp, err := bob.Spaces().AcceptOneToOne(ctx, id)

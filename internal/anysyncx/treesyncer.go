@@ -2,11 +2,13 @@ package anysyncx
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/treesyncer"
@@ -175,9 +177,20 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 				// diff again — park it or the controller replay is lost
 				// for the process lifetime.
 				t.markPending(id)
-				tsLog.Warn("tree sync failed; parked for retry",
-					zap.String("spaceId", t.spaceId), zap.String("treeId", id),
-					zap.String("peerId", p.Id()), zap.Error(regErr))
+				if errors.Is(regErr, list.ErrNoReadKey) {
+					// Expected long-lived state, not a failure: the tree's
+					// changes are stored but this account holds no read key
+					// yet (access pending or revoked). Park quietly — the
+					// retry sweep runs every round, and recovery logs
+					// "parked tree recovered" once the key arrives.
+					tsLog.Debug("tree parked: no read key",
+						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+						zap.String("peerId", p.Id()))
+				} else {
+					tsLog.Warn("tree sync failed; parked for retry",
+						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+						zap.String("peerId", p.Id()), zap.Error(regErr))
+				}
 				continue
 			}
 			if t.clearPending(id) {

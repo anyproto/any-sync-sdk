@@ -1,6 +1,20 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrSpaceNotAccepted is returned by Service.Get for a space this
+// account knows of but has not accepted yet: a pending join
+// (StatusJoining), an incoming or declined 1-1 (StatusOneToOnePending /
+// StatusOneToOneDeclined), or a pending/declined direct-add invite.
+// Nothing is downloaded for such spaces — a load with no local storage
+// triggers any-sync's SpacePull bootstrap, so materializing a pending
+// row would pull the whole space ciphertext before the user accepted
+// it. Acceptance (owner approval of a join, AcceptOneToOne,
+// AcceptInvite) is what authorizes materialization.
+var ErrSpaceNotAccepted = errors.New("space: not accepted; not materialized")
 
 // Service is the space-level entrypoint exposed by the top-level SDK.
 // It owns lifecycle (Create / Join / Derive / Delete) and the space
@@ -66,7 +80,9 @@ type Service interface {
 	DeclineInvite(ctx context.Context, spaceId string) error
 
 	// Get returns an already-joined space by id. Fails if the space is
-	// unknown locally.
+	// unknown locally, and with ErrSpaceNotAccepted for a known row
+	// whose acceptance is still pending (joining / incoming 1-1 /
+	// direct-add invite) — those must never be materialized by a read.
 	Get(ctx context.Context, spaceId string) (Space, error)
 
 	// Track registers a foreign spaceId in the local space index without

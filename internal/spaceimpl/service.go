@@ -599,14 +599,52 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
 	}
-	// A not-yet-accepted direct-add invite must not be materialized by a
-	// read path — "nothing is downloaded until accepted" is the whole
-	// materialization gate. AcceptInvite flips the row to active before
-	// it loads, so every legitimate load passes this guard.
-	if rec.RemoteStatus == techspace.InvitePendingRemoteStatus ||
-		rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus {
-		return nil, fmt.Errorf("spaceimpl: space %q is a pending direct-add invite; AcceptInvite it first", spaceId)
+	if err := MaterializeBlock(rec); err != nil {
+		return nil, err
 	}
+	return s.load(ctx, spaceId)
+}
+
+// MaterializeBlock reports why rec must not be materialized — loaded,
+// and, when local storage is absent, pulled from the responsible nodes
+// (any-sync's NewSpace falls back to a SpacePull bootstrap on missing
+// storage) — or nil when loading is allowed. "Nothing is downloaded
+// until accepted" is the whole materialization gate: it guards every
+// pending flavor, not just direct-add invites. Every accept path flips
+// its row (or calls the unguarded load) before materializing, so
+// legitimate loads pass:
+//   - join: the ACL waiter's loadJoinedSpace uses load directly (the
+//     row stays "joining" until the load succeeds);
+//   - incoming 1-1: activateOneToOne flips both statuses to active
+//     first;
+//   - direct-add invite: AcceptInvite flips the row to active before
+//     it loads.
+//
+// Shared with sdk.Open's boot eager-load, which must skip pending rows
+// even when storage exists (a pre-guard build may have materialized
+// one; eager-loading it would run headsync/treesyncer on a space this
+// account can't read yet).
+func MaterializeBlock(rec techspace.SpaceIndexRecord) error {
+	switch {
+	case rec.LocalStatus == joiningLocalStatus:
+		return fmt.Errorf("spaceimpl: space %q join is pending owner approval: %w", rec.Id, space.ErrSpaceNotAccepted)
+	case rec.LocalStatus == oneToOnePendingLocalStatus:
+		return fmt.Errorf("spaceimpl: space %q is an incoming 1-1; AcceptOneToOne it first: %w", rec.Id, space.ErrSpaceNotAccepted)
+	case rec.RemoteStatus == oneToOneDeclinedRemoteStatus:
+		return fmt.Errorf("spaceimpl: space %q is a declined 1-1; OneToOne the peer to un-decline: %w", rec.Id, space.ErrSpaceNotAccepted)
+	case rec.RemoteStatus == techspace.InvitePendingRemoteStatus,
+		rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus:
+		return fmt.Errorf("spaceimpl: space %q is a pending direct-add invite; AcceptInvite it first: %w", rec.Id, space.ErrSpaceNotAccepted)
+	}
+	return nil
+}
+
+// load materializes spaceId unconditionally — no pending guard. Used by
+// Get after MaterializeBlock, and by the join controller's
+// post-acceptance loaders (loadJoinedSpace / loadAcceptedInvite), which
+// run while the row still carries its pending localStatus: the flip to
+// active happens only after a successful load.
+func (s *Service) load(ctx context.Context, spaceId string) (space.Space, error) {
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
 	}

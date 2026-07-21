@@ -97,7 +97,8 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 }
 
 // Derive creates a deterministic object from a seed. Idempotent — a
-// second call with the same seed returns the same id.
+// second call with the same seed returns the same id and, when the
+// requested Types are already attached, writes no change at all.
 func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts) (string, error) {
 	obj, err := o.parent.store.Derive(ctx, spaceobjects.DeriveOpts{
 		ChangeType:    "object",
@@ -109,16 +110,83 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 	}
 	objectId := obj.Id()
 
-	// Type-binding is best-effort on Derive: if the index record
-	// doesn't exist yet we attempt to seed it. Subsequent calls (for
-	// the same id) skip — handler-level upsert semantics handle the
-	// idempotent case.
+	// Type-binding is idempotent in the DAG, not just in state: the
+	// requested types are compared against the object's current
+	// any.types and only the missing ones are attached, one $addToSet
+	// op each — never a whole-array $set, so a type attached
+	// concurrently (or by a later handler, e.g. a multitype object)
+	// is not clobbered. Derive runs on hot resolve paths ("the
+	// well-known chat/brain object of this space"), so a no-op call
+	// must not append a change.
 	if len(opts.Types) > 0 {
-		if _, err := o.bootstrap(ctx, objectId, space.CreateObjectOpts{Types: opts.Types}); err != nil {
+		missing, err := o.missingTypes(ctx, objectId, opts.Types)
+		if err != nil {
 			return "", err
+		}
+		if len(missing) > 0 {
+			if err := o.attachTypes(ctx, objectId, missing); err != nil {
+				return "", err
+			}
 		}
 	}
 	return objectId, nil
+}
+
+// missingTypes returns the entries of want absent from the object's
+// current any.types (deduplicated, input order preserved). A missing
+// row reads as "implements nothing", so every requested type is
+// reported missing on first derive.
+func (o *objectService) missingTypes(ctx context.Context, objectId string, want []string) ([]string, error) {
+	current, err := o.parent.store.ObjectTypes(ctx, objectId)
+	if err != nil {
+		return nil, err
+	}
+	have := make(map[string]struct{}, len(current)+len(want))
+	for _, t := range current {
+		have[t] = struct{}{}
+	}
+	out := make([]string, 0, len(want))
+	for _, t := range want {
+		if _, dup := have[t]; dup {
+			continue
+		}
+		have[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
+// attachTypes appends typeIds to the object's any.types in one change,
+// one $addToSet op per type — the same op AttachType uses, so
+// concurrent attaches merge instead of last-write-wins.
+func (o *objectService) attachTypes(ctx context.Context, objectId string, typeIds []string) error {
+	dataVersion, err := dataVersionForTypes(ctx, o.parent.store.Registry(), typeIds)
+	if err != nil {
+		return err
+	}
+	obj, err := o.parent.store.Get(ctx, objectId)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	ops := make([]crdt.Op, 0, len(typeIds))
+	for _, t := range typeIds {
+		ops = append(ops, crdt.Op{
+			Type:    crdt.OpAddToSet,
+			Path:    []string{"any", "types"},
+			Payload: arena.NewString(t),
+		})
+	}
+	_, err = obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: dataVersion,
+		Records: []crdt.RecordChange{{
+			Id:     objectId,
+			Upsert: true,
+			Ops:    ops,
+		}},
+	})
+	return err
 }
 
 // Delete records the deletion in the any-sync settings tree — the

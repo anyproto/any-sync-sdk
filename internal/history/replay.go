@@ -47,12 +47,12 @@ const DefaultMaxViewRecords = 500_000
 
 // recordCounter enforces the distinct-record bound with a hashed
 // bitset: one bit per seeded hash of the resolved (dataset, recordId)
-// pair, so repeated touches of the same record — the editor keystroke
-// profile — count once. Sized at 16 bits per expected entry (128KB
-// floor, 1MB at the default bound — flat, no per-entry allocation,
-// no retained id strings). The bound is deliberately approximate: a
-// hash collision undercounts one record, which at the sizing above
-// stays in the low percents at the bound and costs nothing —
+// pair, so a record touched by many changes counts once. Sized at 16
+// bits per expected entry (128KB floor, 1MB at the default bound —
+// flat, no per-entry allocation, no retained id strings). The bound
+// is deliberately approximate: a hash collision undercounts one
+// record, which at the sizing above stays in the low percents at the
+// bound and costs nothing —
 // ErrViewTooLarge is a soft memory guardrail, not an invariant. The
 // per-counter random seed keeps collisions non-craftable by a peer
 // choosing record ids.

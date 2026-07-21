@@ -12,9 +12,9 @@ import (
 
 // TestReplayGuardrailCountsDistinctRecords pins that ErrViewTooLarge
 // bounds MATERIALIZED state, not replay work: a single record edited
-// far past MaxRecords never trips (the editor keystroke profile — a
-// small document with a long history must stay viewable), while a cut
-// touching more DISTINCT records than the bound still does.
+// far past MaxRecords never trips (few records with a long edit
+// history must stay viewable), while a cut touching more DISTINCT
+// records than the bound still does.
 func TestReplayGuardrailCountsDistinctRecords(t *testing.T) {
 	ctx := context.Background()
 

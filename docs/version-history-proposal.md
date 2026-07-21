@@ -253,31 +253,43 @@ anchors, behind the same `ViewAt` signature when needed.
 
 ### 4.4 Engine B: persistent history index
 
-Normalized rows (not multikey arrays — "all changes touching record X
-in order" must be a range scan, not an array-unpack scan). Change and
-record rows live in PER-OBJECT collections mirroring the
+Change rows live in PER-OBJECT collections mirroring the
 `<objectId>_<dataset>` projection layout, with **OrderId as the
 primary key**: lexids are monotonic per tree, so inserts are
 append-ordered (no random-CID btree splits), descending listings are
-reverse PK scans with no secondary indexes at all, and an object's
-history is dropped by the same `<objectId>_*` purge sweep that drops
-its dataset collections. The double-underscore suffix keeps the
-namespace disjoint from datasets ("_"-prefixed dataset names are
-rejected at registration):
+reverse PK scans, and an object's history is dropped by the same
+`<objectId>_*` purge sweep that drops its dataset collections. The
+double-underscore suffix keeps the namespace disjoint from datasets
+("_"-prefixed dataset names are rejected at registration):
 
 - `<objectId>__history` — one row per change, PK `id = orderId`:
   `{id: o, c: changeId, ds, author, ts, n: recordCount, prev: [..],
-  traces: [..], recs: [{rec, k}]}`.
-- `<objectId>__history_recs` — one row per (change, record), PK
-  `id = recordId + NUL + orderId` — the record's history is a PK
-  prefix range scan, ordered by o: `{id, o, c: changeId}`.
+  traces: [..], recs: [{rec, k}], recIds: [..]}`. `recIds` is the
+  flat multikey-indexed mirror of `recs` (index gen 2, SYN-88 —
+  replaced the gen-1 `<objectId>__history_recs` collection): the
+  record filter is `{"recIds": R}` on the multikey index; matched
+  OrderIds sort in memory (a record's timeline is tens of changes
+  even in a million-change object, and multikey indexes never
+  satisfy sort order in the planner anyway), then only the page's
+  rows are re-read by PK. Halves the per-object collection count and
+  the per-change row writes; gen-1 collections are dropped by the
+  upgrade backfill.
 - `_history_traces` — space-level (the trace query is space-wide by
   requirement), one row per (change, trace), PK
-  `id = sp + NUL + traceId + NUL + o + NUL + objectId` (OrderIds are
+  `id = sp + SEP + traceId + SEP + o + SEP + objectId` (OrderIds are
   only unique per tree, hence the object tail — which also rides the
-  pagination cursor): `{id, o, obj, c: changeId}`.
+  pagination cursor): `{id, o, obj, c: changeId}`. SEP is a space
+  (0x20) — the only printable byte sorting below the whole lexid
+  alphabet (which starts at '!'), required because lexids of
+  different lengths can be prefix-related and a separator sorting
+  above any lexid char would invert bytewise key order vs OrderId
+  order. Gen-1 rows used NUL; leftovers are inert (new scans never
+  match their prefix).
 - `_history_meta` — space-level per-object index state:
-  `{id: objectId, sp, stale}`.
+  `{id: objectId, sp, stale, gen}`. `gen` versions the row shape: a
+  mismatch (or a rows-without-meta legacy object) fails the
+  freshness gate and re-backfills lazily — upserts rewrite rows in
+  the current shape.
 
 **Write paths:**
 

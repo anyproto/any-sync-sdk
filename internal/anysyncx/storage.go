@@ -117,7 +117,21 @@ func (s *storageProvider) WaitSpaceStorage(ctx context.Context, id string) (spac
 	s.mu.Unlock()
 
 	path := s.dbPath(id)
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+	fi, statErr := os.Stat(path)
+	if errors.Is(statErr, os.ErrNotExist) {
+		return nil, spacestorage.ErrSpaceStorageMissing
+	}
+	// A zero-byte db is an uninitialized husk, not a space: sqlite's
+	// open-with-create mints one when a reader (e.g. the p2p
+	// discovery-key derivation, which opens storage outside the space
+	// cache) races a concurrent offload — its stat sees the old file,
+	// the offload removes it, the open re-creates the path empty and
+	// then fails the any-store version check ("want 2 got 0"), leaving
+	// the husk to poison every later open. Report missing so the pull
+	// bootstrap recreates the space; CreateSpaceStorage sweeps the husk.
+	// No removal here — a legit creator's file is also briefly
+	// zero-byte and must not be unlinked under it.
+	if statErr == nil && fi.Size() == 0 {
 		return nil, spacestorage.ErrSpaceStorageMissing
 	}
 	db, err := anystorev1.Open(ctx, path, s.anyStoreConfig())
@@ -138,8 +152,19 @@ func (s *storageProvider) WaitSpaceStorage(ctx context.Context, id string) (spac
 func (s *storageProvider) CreateSpaceStorage(ctx context.Context, payload spacestorage.SpaceStorageCreatePayload) (spacestorage.SpaceStorage, error) {
 	id := payload.SpaceHeaderWithId.Id
 	path := s.dbPath(id)
-	if _, err := os.Stat(path); err == nil {
-		return nil, spacestorage.ErrSpaceStorageExists
+	if fi, err := os.Stat(path); err == nil {
+		if fi.Size() != 0 {
+			return nil, spacestorage.ErrSpaceStorageExists
+		}
+		// Zero-byte husk (see WaitSpaceStorage) — sweep it, with its
+		// companions, and create fresh. Safe here: creation is
+		// single-flight per space (only NewSpace calls this, under the
+		// space cache's per-id load), so no legit creator can be behind
+		// the empty file.
+		_ = os.Remove(path)
+		for _, suffix := range []string{"-wal", "-shm", ".lock"} {
+			_ = os.Remove(path + suffix)
+		}
 	}
 	db, err := anystorev1.Open(ctx, path, s.anyStoreConfig())
 	if err != nil {

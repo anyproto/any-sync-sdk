@@ -221,6 +221,15 @@ const (
 	// Surfaced to callers as space.StatusDeleted.
 	OneToOneDeletedStatus = "oneToOneDeleted"
 
+	// GuestDeletedRemoteStatus is the SYNCED remoteStatus written when a
+	// guest-mode (public-access) space is deleted. Like the 1-1 marker
+	// it is NOT terminal and never drives a coordinator SpaceDelete: a
+	// guest space is not owned on the network, only offloaded on every
+	// device, and it stays re-addable — a later JoinGuest with a valid
+	// token flips the row back to active. Surfaced as
+	// space.StatusDeleted.
+	GuestDeletedRemoteStatus = "guestDeleted"
+
 	// InvitePendingRemoteStatus is the SYNCED remoteStatus on a regular
 	// space another account added us to directly (ACL AddAccounts). We are
 	// already a full ACL member; approval is a local materialization gate.
@@ -242,7 +251,8 @@ const (
 // translator, and the deletion reconciler to treat both uniformly.
 func (r SpaceIndexRecord) IsDeleted() bool {
 	return r.RemoteStatus == StatusDeleted || r.LocalStatus == StatusDeleted ||
-		r.RemoteStatus == OneToOneDeletedStatus
+		r.RemoteStatus == OneToOneDeletedStatus ||
+		r.RemoteStatus == GuestDeletedRemoteStatus
 }
 
 // Sentinels — wrap crdt.ErrValidation in handler returns.

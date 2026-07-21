@@ -129,8 +129,10 @@ func TestE2E_GuestKeyLifecycle(t *testing.T) {
 		t.Fatalf("bob's guest space never flipped to active")
 	}
 	if bobSpace == nil {
-		bobSpace, err = bob.Spaces().Get(ctx, sp.Id())
-		require.NoError(t, err, "bob: Get after guest load")
+		require.True(t, waitFor(ctx, 60*time.Second, time.Second, func() bool {
+			bobSpace, err = bob.Spaces().Get(ctx, sp.Id())
+			return err == nil
+		}), "bob: Get after guest load: %v", err)
 	}
 
 	// Content convergence: type, object, property value.
@@ -196,8 +198,8 @@ func TestE2E_GuestKeyLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, keyBytes, key3Bytes, "re-created guest key must be a fresh identity")
 
-	// Bob drops the space locally. The row stays in List as a sticky
-	// tombstone — assert it is present AND deleted.
+	// Bob drops the space. The row stays in List with the (non-terminal)
+	// guest delete marker — assert it is present AND deleted.
 	require.NoError(t, bob.Spaces().Delete(ctx, sp.Id()), "bob: Delete guest space")
 	infos, err := bob.Spaces().List(ctx)
 	require.NoError(t, err)
@@ -208,5 +210,44 @@ func TestE2E_GuestKeyLifecycle(t *testing.T) {
 			assert.Equal(t, space.StatusDeleted, si.Status, "guest space must be locally deleted")
 		}
 	}
-	require.True(t, found, "deleted guest space must stay listed as a tombstone")
+	require.True(t, found, "deleted guest space must stay listed while deleted")
+
+	// Re-join after delete: the guest delete marker is non-terminal, and
+	// the fresh invite carries the ROTATED identity, so this also covers
+	// the key-refresh path (row still holds the revoked key). Content
+	// must re-converge from scratch — the delete offloaded local state.
+	token3, err := space.EncodeInvite(inv3)
+	require.NoError(t, err)
+	if _, err := bob.Spaces().JoinGuest(ctx, token3); err != nil {
+		require.True(t, errors.Is(err, space.ErrGuestJoinPending),
+			"bob: re-JoinGuest must return the space or ErrGuestJoinPending, got %v", err)
+	}
+	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = bob.Spaces().SyncSpaceList(ctx)
+		infos, listErr := bob.Spaces().List(ctx)
+		if listErr != nil {
+			return false
+		}
+		for _, si := range infos {
+			if si.Id == sp.Id() && si.Status == space.StatusActive {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("bob's re-joined guest space never flipped back to active")
+	}
+	var bobSpace2 space.Space
+	require.True(t, waitFor(ctx, 60*time.Second, time.Second, func() bool {
+		bobSpace2, err = bob.Spaces().Get(ctx, sp.Id())
+		return err == nil
+	}), "bob: Get after re-join: %v", err)
+	reconverged := waitFor(ctx, 3*time.Minute, 2*time.Second, func() bool {
+		_ = bobSpace2.SyncHeads(ctx)
+		rec, rErr := bobSpace2.Properties().Get(ctx, objId)
+		return rErr == nil && rec != nil && rec.GetString(typeId, propId) == "Casablanca"
+	})
+	require.True(t, reconverged, "bob: content never re-converged after rejoin")
+	_, err = bobSpace2.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	assert.ErrorIs(t, err, space.ErrReadOnlySpace, "re-joined guest space must stay read-only")
 }

@@ -182,7 +182,19 @@ func (s *Service) loadAcceptedInvite(ctx context.Context, spaceId string) {
 	const maxBackoff = 20 * time.Second
 	for {
 		rec, ok := s.tsp.Get(ctx, spaceId)
-		if !ok || rec.IsDeleted() {
+		if !ok {
+			return
+		}
+		if rec.GuestKey != "" && rec.LocalStatus == guestLoadingLocalStatus &&
+			rec.RemoteStatus == techspace.GuestDeletedRemoteStatus {
+			// Interrupted guest re-join: JoinGuest crashed between the
+			// loading marker and the synced un-delete — the marker proves
+			// the re-add intent, so finish the flip here.
+			if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+				joinLog.Warn("finish interrupted guest re-join",
+					zap.String("spaceId", spaceId), zap.Error(err))
+			}
+		} else if rec.IsDeleted() {
 			return
 		}
 		if rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus {

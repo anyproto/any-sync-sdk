@@ -784,6 +784,18 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		// offload via their own reconciler when the synced marker arrives.
 		return nil
 	}
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.GuestKey != "" {
+		// Guest-mode space: same shape as the 1-1 delete — synced,
+		// NON-terminal marker (a later JoinGuest re-adds), local offload,
+		// no coordinator SpaceDelete (the space isn't ours on the
+		// network). Other devices offload via their reconciler when the
+		// marker arrives.
+		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.GuestDeletedRemoteStatus); err != nil {
+			return fmt.Errorf("spaceimpl: mark guest space deleted: %w", err)
+		}
+		s.OffloadSpace(ctx, spaceId)
+		return nil
+	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
 	}
@@ -1358,15 +1370,18 @@ func (s *Service) JoinGuest(ctx context.Context, invite string) (space.Space, er
 		return nil, fmt.Errorf("spaceimpl: JoinGuest: encode guest key: %w", err)
 	}
 	if rec, ok := s.tsp.Get(ctx, inv.SpaceId); ok {
-		if rec.IsDeleted() {
+		rejoin := rec.GuestKey != "" && rec.RemoteStatus == techspace.GuestDeletedRemoteStatus &&
+			rec.LocalStatus != techspace.StatusDeleted
+		if rec.IsDeleted() && !rejoin {
 			return nil, fmt.Errorf("spaceimpl: JoinGuest: space %q was deleted on this account (tombstones are sticky)", inv.SpaceId)
 		}
 		if rec.GuestKey == "" {
 			return nil, fmt.Errorf("spaceimpl: JoinGuest: space %q is already tracked by this account — guest access would demote it", inv.SpaceId)
 		}
-		// Guest row already exists (another device joined, or a prior
-		// attempt) — refresh the key when the invite carries a rotated
-		// one (owner revoked + re-created), then (re)drive the load.
+		// Guest row already exists (another device joined, a prior
+		// attempt, or a guestDeleted row being re-added) — refresh the
+		// key when the invite carries a rotated one (owner revoked +
+		// re-created), then (re)drive the load.
 		if rec.GuestKey != encoded {
 			if _, err := s.tsp.SetGuestKey(ctx, inv.SpaceId, encoded); err != nil {
 				return nil, fmt.Errorf("spaceimpl: JoinGuest: refresh guest key: %w", err)
@@ -1376,6 +1391,19 @@ func (s *Service) JoinGuest(ctx context.Context, invite string) (space.Space, er
 			// identity; tear it all down so the next load rebuilds with
 			// the fresh key. Disk state stays.
 			s.closeSpaceRuntime(ctx, inv.SpaceId)
+		}
+		if rejoin {
+			// Un-delete AFTER the loading marker is durable, mirroring
+			// AcceptInvite: a crash between the two writes must leave a
+			// resumable marker, never an account-wide un-delete nobody
+			// finishes. loadAcceptedInvite completes the flip when it
+			// finds the marker with the row still guestDeleted.
+			if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, guestLoadingLocalStatus); err != nil {
+				return nil, fmt.Errorf("spaceimpl: JoinGuest: mark loading: %w", err)
+			}
+			if _, err := s.tsp.SetRemoteStatus(ctx, inv.SpaceId, techspace.StatusActive); err != nil {
+				return nil, fmt.Errorf("spaceimpl: JoinGuest: un-delete: %w", err)
+			}
 		}
 	} else {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
@@ -1672,6 +1700,10 @@ func mapStatus(typ, local, remote string) space.Status {
 		// 1-1 delete (synced, non-terminal): offloaded everywhere but
 		// re-creatable. Surfaced as Deleted; checked before the
 		// declined/pending 1-1 cases.
+		return space.StatusDeleted
+	case remote == techspace.GuestDeletedRemoteStatus:
+		// Guest-space delete (synced, non-terminal): offloaded
+		// everywhere, re-addable via JoinGuest. Surfaced as Deleted.
 		return space.StatusDeleted
 	case remote == oneToOneDeclinedRemoteStatus:
 		// Synced, sticky 1-1 decline — account-wide (could be declined on

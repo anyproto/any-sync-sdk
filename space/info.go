@@ -138,6 +138,13 @@ const (
 	// Synced, sticky, non-terminal: a later AcceptInvite overrides it. No
 	// ACL write happens on decline — the account remains an ACL member.
 	StatusInviteDeclined
+	// StatusGuestRevoked is a guest-key space whose shared guest identity
+	// was removed from the ACL (the owner revoked public access). The
+	// local copy stays readable; new content no longer arrives (the read
+	// key rotated away). Device-local and non-terminal: it self-heals
+	// back to Active if a fresh ACL shows the guest identity active
+	// again. Remove the space with Service.Delete when no longer wanted.
+	StatusGuestRevoked
 )
 
 // Permission mirrors any-sync's ACL permission ladder.

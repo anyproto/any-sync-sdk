@@ -95,6 +95,14 @@ type App struct {
 
 	keys *accountdata.AccountKeys
 
+	// guestKeyFn resolves the shared guest identity for a guest-mode
+	// space (nil for regular spaces). Set once by sdk.Open after the
+	// tech space is up; loadSpaceForCache consults it to open guest
+	// spaces signing as that identity. Atomic — space loads can race
+	// the wiring during boot, in which case they resolve nil (guest
+	// rows aren't eager-loaded before the fn is set).
+	guestKeyFn atomic.Pointer[func(spaceId string) crypto.PrivKey]
+
 	// selectiveTreeTypes is cfg.Sync.TreeTypes — the selective-sync
 	// tree-type allowlist. Empty = sync and materialize everything.
 	selectiveTreeTypes []string
@@ -485,6 +493,27 @@ func (a *App) SetKnownSpaceIdsFn(fn func() []string) {
 		}
 		return out
 	})
+}
+
+// SetGuestKeyFn wires the guest-identity resolver for guest-mode
+// (public-access) spaces: fn returns the shared guest identity's
+// private key for spaceId, or nil for regular spaces. Called once by
+// sdk.Open after the tech space is up (the resolver reads the
+// tech-space index). Guest spaces load with an account-service
+// override so the commonspace signs as the guest identity — see
+// loadSpaceForCache.
+func (a *App) SetGuestKeyFn(fn func(spaceId string) crypto.PrivKey) {
+	a.guestKeyFn.Store(&fn)
+}
+
+// guestKeyFor resolves spaceId's guest identity, nil when the resolver
+// isn't wired yet or the space isn't guest-mode.
+func (a *App) guestKeyFor(spaceId string) crypto.PrivKey {
+	fn := a.guestKeyFn.Load()
+	if fn == nil {
+		return nil
+	}
+	return (*fn)(spaceId)
 }
 
 // BroadcastP2P re-runs the LAN handshake with every known local peer —

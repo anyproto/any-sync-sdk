@@ -464,3 +464,48 @@ func newObjectID() string {
 	_, _ = rand.Read(b[4:])
 	return hex.EncodeToString(b[:])
 }
+
+// PurgeSpaceMeta removes every _meta row belonging to spaceId: the
+// space-scoped per-object watermark rows (matched on sp), any explicit
+// objectIds (pre-scoping rows without sp), and the `space:<id>` row —
+// dropping it rotates the generation on the next rebuild, the signal
+// change-index consumers full-reindex on. Offload calls this: a stale
+// MaxAddSeq watermark is NOT inert once a space can re-materialize
+// (guest rejoin) — the rebuilt controllers would trust it and skip the
+// entire cold-restore replay, leaving synced trees with zero rows.
+func PurgeSpaceMeta(ctx context.Context, coll anystore.Collection, spaceId string, objectIds []string) error {
+	filter, err := query.ParseCondition(map[string]any{metaSpaceIdKey: spaceId})
+	if err != nil {
+		return fmt.Errorf("crdt: build purge-meta filter: %w", err)
+	}
+	iter, err := coll.Find(filter).Iter(ctx)
+	if err != nil {
+		return fmt.Errorf("crdt: purge-meta iter: %w", err)
+	}
+	ids := make([]string, 0, 16)
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		if derr != nil {
+			continue
+		}
+		if id := doc.Value().GetString("id"); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	iterErr := iter.Err()
+	_ = iter.Close()
+	if iterErr != nil {
+		return fmt.Errorf("crdt: purge-meta scan: %w", iterErr)
+	}
+	ids = append(ids, objectIds...)
+	ids = append(ids, SpaceMetaKey(spaceId))
+	var firstErr error
+	for _, id := range ids {
+		if derr := coll.DeleteId(ctx, id); derr != nil && !errors.Is(derr, anystore.ErrDocNotFound) {
+			if firstErr == nil {
+				firstErr = derr
+			}
+		}
+	}
+	return firstErr
+}

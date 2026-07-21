@@ -260,6 +260,15 @@ type Store struct {
 	// historyPendingStale; without it a purge skipped once would leak
 	// the rows forever.
 	historyPendingPurge sync.Map
+
+	// writeGateErr, when non-nil, rejects every user-authored synced
+	// write (Store.Create and every Object's LocalWrite) with that
+	// error — read-only spaces (guest access, reader role). An atomic
+	// so the per-write check is a single load: the value is maintained
+	// event-driven, not computed per write — seeded at construction
+	// (guest rows) and updated by the per-space ACL mirror on role
+	// changes. Inbound apply / local-set paths are never gated.
+	writeGateErr atomic.Pointer[error]
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -330,6 +339,27 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes,
 		SelectiveTypes: selectiveTypes,
 	})
+}
+
+// SetWriteGateErr installs (non-nil) or clears (nil) the user-write
+// gate — see Store.writeGateErr. Safe at any time; cached Objects read
+// the live value on every write.
+func (s *Store) SetWriteGateErr(err error) {
+	if err == nil {
+		s.writeGateErr.Store(nil)
+		return
+	}
+	s.writeGateErr.Store(&err)
+}
+
+// CheckWrite applies the gate; nil = writable. Exposed for write entry
+// points that mutate outside the store's own DAG-write funnel (tree
+// deletion, file-node uploads).
+func (s *Store) CheckWrite() error {
+	if p := s.writeGateErr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // NewStoreWithConfig constructs a Store from cfg. The async drainer is
@@ -1135,6 +1165,9 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 // land on the root any-sync change; for the MVP they're informational
 // only.
 func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, error) {
+	if err := s.CheckWrite(); err != nil {
+		return nil, err
+	}
 	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
 		return nil, err
 	}
@@ -1335,6 +1368,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		Allocator:      s.alloc,
 		Gate:           gate,
 		AfterApply:     s.afterApplyFor(),
+		WriteGate:      s.CheckWrite,
 		PlaintextSpecs: plaintextSpecs,
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)

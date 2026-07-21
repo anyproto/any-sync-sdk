@@ -88,6 +88,17 @@ type SpaceIndexRecord struct {
 	// first runs — "unknown yet", not a verdict. Written via
 	// Service.SetOwnRole.
 	OwnRole space.Permission
+
+	// GuestKey is the shared read-only guest identity's private key
+	// (FieldGuestKey, synced) on a guest-mode row — the space was added
+	// via a guest invite and loads signing as this identity. Empty on
+	// all other rows; presence is the guest-mode discriminator.
+	GuestKey string
+
+	// IssuedGuestKey is the owner-side custody of the guest key issued
+	// for this space (FieldIssuedGuestKey, synced). Empty unless this
+	// account owns the space and has an active guest key.
+	IssuedGuestKey string
 }
 
 // DecodeSpaceIndexRecord pulls the fields off an anyenc value as
@@ -111,6 +122,8 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		OneToOnePeer:        v.GetString(FieldOneToOnePeer),
 		OneToOneInviteState: v.GetString(FieldOneToOneInviteState),
 		OwnRole:             space.ParsePermission(v.GetString(FieldOwnRole)),
+		GuestKey:            v.GetString(FieldGuestKey),
+		IssuedGuestKey:      v.GetString(FieldIssuedGuestKey),
 		// Float64 read — GetInt narrows through `int` and would truncate
 		// on 32-bit platforms; anyenc numbers are float64 on the wire.
 		CreatedAt: int64(v.GetFloat64(FieldCreatedAt)),
@@ -179,6 +192,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	}
 	if r.OneToOnePeer != "" {
 		obj.Set(FieldOneToOnePeer, a.NewString(r.OneToOnePeer))
+	}
+	if r.GuestKey != "" {
+		obj.Set(FieldGuestKey, a.NewString(r.GuestKey))
 	}
 	// CreatedAt is intentionally NOT written here — it's handler-derived
 	// (ScopeDerived; BeforeCreate stamps it from the change timestamp)

@@ -337,6 +337,151 @@ func (a *aclAPI) CancelJoinRequest(ctx context.Context) error {
 	return cl.CancelRequest(ctx)
 }
 
+// CreateGuestKey mints (or returns) the space's shared read-only guest
+// identity — see space.ACL.CreateGuestKey. Idempotent via owner-side
+// custody: the private key is persisted on the owner's tech-space row
+// (it is not recoverable from the ACL), so repeated calls return the
+// same invite while the guest account is still active.
+//
+// The custody field and the ACL are reconciled to hold exactly ONE
+// guest identity: any ACL guest account the custody doesn't know —
+// a concurrent mint on another device, a failed custody persist, a
+// stored key whose account was revoked elsewhere — is removed (with a
+// read-key rotation) before a fresh identity is minted. Without this,
+// an orphaned guest identity would survive every future revocation:
+// RemoveAccounts re-encrypts the rotated key for remaining members,
+// guests included.
+func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
+	if !a.s.localIdentityIsOwner(ctx) {
+		return space.Invite{}, errors.New("acl: CreateGuestKey: owner only")
+	}
+	var custodyPub crypto.PubKey
+	if rec, ok := a.s.tsp.Get(ctx, a.s.id); ok && rec.IssuedGuestKey != "" {
+		guestKey, err := crypto.DecodeKeyFromString(rec.IssuedGuestKey, crypto.UnmarshalEd25519PrivateKey, nil)
+		if err == nil {
+			custodyPub = guestKey.GetPublic()
+			guests, gErr := a.activeGuestIdentities(ctx)
+			if gErr != nil {
+				return space.Invite{}, gErr
+			}
+			// Custody active and no orphans — the idempotent fast path.
+			if len(guests) == 1 && guests[0].Equals(custodyPub) {
+				return space.Invite{SpaceId: a.s.id, InviteKey: guestKey, Kind: space.InviteKindGuest}, nil
+			}
+		}
+	}
+	// Same publish preconditions as AddAccounts: coordinator must know
+	// the space, consensus log must exist. No metadata and no inbox
+	// notification — the guest identity is synthetic, nobody's device
+	// listens for it.
+	if err := ensureShareable(ctx, a.s); err != nil {
+		return space.Invite{}, err
+	}
+	if err := a.removeAllGuestIdentities(ctx); err != nil {
+		return space.Invite{}, err
+	}
+	guestKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+	if err != nil {
+		return space.Invite{}, fmt.Errorf("acl: guest key: %w", err)
+	}
+	cl, err := a.client(ctx)
+	if err != nil {
+		return space.Invite{}, err
+	}
+	if err := callWaitingForLog(ctx, func() error {
+		return cl.AddAccounts(ctx, list.AccountsAddPayload{Additions: []list.AccountAdd{{
+			Identity:    guestKey.GetPublic(),
+			Permissions: list.AclPermissionsGuest,
+		}}})
+	}); err != nil {
+		return space.Invite{}, fmt.Errorf("acl: add guest account: %w", err)
+	}
+	encoded, err := crypto.EncodeKeyToString(guestKey)
+	if err != nil {
+		return space.Invite{}, fmt.Errorf("acl: encode guest key: %w", err)
+	}
+	if _, err := a.s.tsp.SetIssuedGuestKey(ctx, a.s.id, encoded); err != nil {
+		return space.Invite{}, fmt.Errorf("acl: persist guest key: %w", err)
+	}
+	return space.Invite{SpaceId: a.s.id, InviteKey: guestKey, Kind: space.InviteKindGuest}, nil
+}
+
+// RevokeGuestKey removes EVERY guest identity from the ACL (custodied
+// or orphaned — public access must end regardless of which device
+// minted what), rotating the read key, and clears the owner-side
+// custody — see space.ACL.RevokeGuestKey.
+func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
+	if !a.s.localIdentityIsOwner(ctx) {
+		return errors.New("acl: RevokeGuestKey: owner only")
+	}
+	rec, _ := a.s.tsp.Get(ctx, a.s.id)
+	guests, err := a.activeGuestIdentities(ctx)
+	if err != nil {
+		return err
+	}
+	if len(guests) == 0 && rec.IssuedGuestKey == "" {
+		return errors.New("acl: RevokeGuestKey: no active guest key")
+	}
+	if err := a.removeAllGuestIdentities(ctx); err != nil {
+		return err
+	}
+	if rec.IssuedGuestKey != "" {
+		if _, err := a.s.tsp.SetIssuedGuestKey(ctx, a.s.id, ""); err != nil {
+			return fmt.Errorf("acl: clear guest key: %w", err)
+		}
+	}
+	return nil
+}
+
+// activeGuestIdentities lists every ACL account currently holding
+// guest permission.
+func (a *aclAPI) activeGuestIdentities(ctx context.Context) ([]crypto.PubKey, error) {
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return nil, fmt.Errorf("acl: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return nil, errors.New("acl: space has no acl")
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	var out []crypto.PubKey
+	for _, acc := range acl.AclState().CurrentAccounts() {
+		if acc.Permissions.IsGuest() {
+			out = append(out, acc.PubKey)
+		}
+	}
+	return out, nil
+}
+
+// removeAllGuestIdentities drops every guest account from the ACL in
+// one RemoveAccounts (read-key rotation included). No-op when none.
+func (a *aclAPI) removeAllGuestIdentities(ctx context.Context) error {
+	guests, err := a.activeGuestIdentities(ctx)
+	if err != nil {
+		return err
+	}
+	if len(guests) == 0 {
+		return nil
+	}
+	change, err := newReadKeyChange()
+	if err != nil {
+		return err
+	}
+	cl, err := a.client(ctx)
+	if err != nil {
+		return err
+	}
+	if err := cl.RemoveAccounts(ctx, list.AccountRemovePayload{
+		Identities: guests,
+		Change:     change,
+	}); err != nil {
+		return fmt.Errorf("acl: remove guest accounts: %w", err)
+	}
+	return nil
+}
+
 func (a *aclAPI) StopSharing(ctx context.Context) error {
 	change, err := newReadKeyChange()
 	if err != nil {

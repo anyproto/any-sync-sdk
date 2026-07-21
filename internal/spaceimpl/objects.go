@@ -207,6 +207,9 @@ func (o *objectService) Delete(ctx context.Context, objectId string) error {
 	if objectId == "" {
 		return errors.New("spaceimpl: Objects.Delete requires objectId")
 	}
+	if err := o.parent.writeGate(ctx); err != nil {
+		return err
+	}
 	handle, err := o.parent.app.GetSpace(ctx, o.parent.id)
 	if err != nil {
 		return fmt.Errorf("spaceimpl: get space: %w", err)

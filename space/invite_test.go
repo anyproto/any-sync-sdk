@@ -73,3 +73,37 @@ func TestDecodeInvite_VersionMismatch(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, space.ErrInvalidInvite))
 }
+
+// TestEncodeDecodeInvite_GuestKind verifies guest invites round-trip
+// with their kind intact and stay distinct from member invites.
+func TestEncodeDecodeInvite_GuestKind(t *testing.T) {
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+
+	guest := space.Invite{SpaceId: "abc.xyz", InviteKey: priv, Kind: space.InviteKindGuest}
+	token, err := space.EncodeInvite(guest)
+	require.NoError(t, err)
+
+	got, err := space.DecodeInvite(token)
+	require.NoError(t, err)
+	assert.Equal(t, space.InviteKindGuest, got.Kind)
+	assert.Equal(t, guest.SpaceId, got.SpaceId)
+	wantBytes, err := guest.InviteKey.Marshall()
+	require.NoError(t, err)
+	gotBytes, err := got.InviteKey.Marshall()
+	require.NoError(t, err)
+	assert.Equal(t, wantBytes, gotBytes)
+
+	// Member encoding of the same payload produces a different token
+	// (version byte differs) that decodes back as member.
+	memberToken, err := space.EncodeInvite(space.Invite{SpaceId: "abc.xyz", InviteKey: priv})
+	require.NoError(t, err)
+	assert.NotEqual(t, token, memberToken)
+	gotMember, err := space.DecodeInvite(memberToken)
+	require.NoError(t, err)
+	assert.Equal(t, space.InviteKindMember, gotMember.Kind)
+
+	// Unknown kinds refuse to encode.
+	_, err = space.EncodeInvite(space.Invite{SpaceId: "x", InviteKey: priv, Kind: space.InviteKind(9)})
+	assert.Error(t, err)
+}

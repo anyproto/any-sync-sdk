@@ -39,6 +39,9 @@ func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opt
 	if objectId == "" {
 		return space.FileInfo{}, errors.New("files: objectId required")
 	}
+	if err := f.s.writeGate(ctx); err != nil {
+		return space.FileInfo{}, err
+	}
 	ok, err := f.s.store.HasTree(ctx, objectId)
 	if err != nil {
 		return space.FileInfo{}, err

@@ -10,6 +10,7 @@ import (
 	"github.com/anyproto/any-sync/app/ocache"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 )
 
@@ -135,8 +136,13 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 //     it is dropped) — this also catches type-owned `<typeId>_shortIds`
 //     / `<typeId>_properties`, since types are objects in the space.
 //
-// The global `_meta` watermark collection is shared across spaces and
-// intentionally left alone; stale rows for offloaded objects are inert.
+// The shared `_meta` collection is purged per-row (PurgeSpaceMeta), not
+// dropped: it holds other spaces' rows too. Purging is required, not
+// hygiene — a space CAN re-materialize (guest rejoin), and a stale
+// MaxAddSeq watermark would make the rebuilt controllers skip the whole
+// cold-restore replay: synced trees, zero rows. Dropping the space's
+// `space:<id>` row also rotates the change-feed generation, so
+// consumers full-reindex instead of trusting a renumbered applySeq axis.
 func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) error {
 	objectIds, err := s.spaceObjectIds(ctx, spaceId)
 	if err != nil {
@@ -153,6 +159,18 @@ func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) erro
 		if strings.HasPrefix(name, spacePrefix) || ownedByObject(name, objectIds) {
 			s.dropCollection(ctx, name)
 		}
+	}
+
+	if metaColl, mErr := s.db.OpenCollection(ctx, crdt.MetaCollectionName); mErr == nil {
+		ids := make([]string, 0, len(objectIds))
+		for id := range objectIds {
+			ids = append(ids, id)
+		}
+		if pErr := crdt.PurgeSpaceMeta(ctx, metaColl, spaceId, ids); pErr != nil {
+			offloadLog.Warn("purge space meta", zap.String("spaceId", spaceId), zap.Error(pErr))
+		}
+	} else if !errors.Is(mErr, anystore.ErrCollectionNotFound) {
+		offloadLog.Warn("open meta for purge", zap.String("spaceId", spaceId), zap.Error(mErr))
 	}
 	return nil
 }

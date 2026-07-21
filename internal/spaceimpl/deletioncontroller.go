@@ -108,21 +108,24 @@ func (s *Service) reconcileDeletions(ctx context.Context) {
 	}
 }
 
-// offloadDeletedOneToOnes offloads every 1-1 row carrying the synced
-// oneToOneDeleted marker that still has local storage. On the device that
-// issued the delete this is a no-op (already offloaded); on the account's
-// other devices it reclaims the local copy once the marker syncs in. Pure
-// local work — no coordinator round-trip.
+// offloadDeletedOneToOnes offloads every row carrying a synced,
+// non-terminal delete marker (1-1 oneToOneDeleted, guest guestDeleted)
+// that still has local storage. On the device that issued the delete
+// this is a no-op (already offloaded); on the account's other devices
+// it reclaims the local copy once the marker syncs in. Pure local work
+// — no coordinator round-trip.
 func (s *Service) offloadDeletedOneToOnes(ctx context.Context, rows []techspace.SpaceIndexRecord) {
 	for _, r := range rows {
 		if ctx.Err() != nil {
 			return
 		}
-		if r.Type != space.SpaceTypeOneToOne || r.RemoteStatus != techspace.OneToOneDeletedStatus {
+		oneToOne := r.Type == space.SpaceTypeOneToOne && r.RemoteStatus == techspace.OneToOneDeletedStatus
+		guest := r.GuestKey != "" && r.RemoteStatus == techspace.GuestDeletedRemoteStatus
+		if !oneToOne && !guest {
 			continue
 		}
 		if s.app.SpaceExists(r.Id) {
-			delLog.Info("offloading deleted 1-1", zap.String("spaceId", r.Id))
+			delLog.Info("offloading marker-deleted space", zap.String("spaceId", r.Id))
 			s.OffloadSpace(ctx, r.Id)
 		}
 	}

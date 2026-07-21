@@ -96,6 +96,11 @@ type Object struct {
 	spaceId    string
 	gate       ApplyGate
 	afterApply AfterApply
+	// writeGate, when set, is consulted at the top of LocalWrite — the
+	// sole entry for user-authored DAG changes. A non-nil error rejects
+	// the write (read-only guest spaces). Local-set and inbound apply
+	// paths are never gated.
+	writeGate func() error
 	// plaintextSpecs maps a tree-root ChangeType to its plaintext
 	// class declaration. The root's ChangeType is immutable, signed,
 	// and cleartext, so keyed and keyless readers resolve the same
@@ -121,6 +126,10 @@ type Config struct {
 	Allocator  *VersionAllocator
 	Gate       ApplyGate
 	AfterApply AfterApply
+	// WriteGate rejects user-authored DAG writes when it returns a
+	// non-nil error (read-only guest spaces). Optional — nil means
+	// writable.
+	WriteGate func() error
 	// PlaintextSpecs declares which tree-root ChangeTypes are plaintext
 	// object classes and which datasets they may carry. Optional — nil
 	// means every object writes encrypted changes.
@@ -162,6 +171,7 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 		spaceId:        cfg.SpaceId,
 		gate:           cfg.Gate,
 		afterApply:     cfg.AfterApply,
+		writeGate:      cfg.WriteGate,
 		plaintextSpecs: cfg.PlaintextSpecs,
 	}
 	tree, err := treeFunc(o)
@@ -430,6 +440,11 @@ type WriteResult struct {
 func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, error) {
 	if o.tree == nil {
 		return WriteResult{}, ErrTreeNotSet
+	}
+	if o.writeGate != nil {
+		if err := o.writeGate(); err != nil {
+			return WriteResult{}, err
+		}
 	}
 
 	// Pre-validate against the controller's structural rules

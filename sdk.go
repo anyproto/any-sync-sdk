@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/net/pool"
+	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
@@ -218,6 +219,23 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
+	// Guest-identity resolver for guest-mode (public-access) spaces:
+	// loadSpaceForCache opens a space whose row carries a guest key with
+	// an account-service override, signing as that shared identity. Must
+	// be wired before any space load — guest rows are only ever loaded
+	// after the tech space is open, so this spot qualifies for both the
+	// headless and regular paths.
+	app.SetGuestKeyFn(func(spaceId string) crypto.PrivKey {
+		rec, ok := tsp.Get(context.Background(), spaceId)
+		if !ok || rec.GuestKey == "" {
+			return nil
+		}
+		key, err := crypto.DecodeKeyFromString(rec.GuestKey, crypto.UnmarshalEd25519PrivateKey, nil)
+		if err != nil {
+			return nil
+		}
+		return key
+	})
 	// Start the background workers only after the last fallible Open
 	// step — a failed Open must not leak goroutines polling a closed DB.
 	filesQueue.Run()

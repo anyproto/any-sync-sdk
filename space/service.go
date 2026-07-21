@@ -16,6 +16,20 @@ import (
 // AcceptInvite) is what authorizes materialization.
 var ErrSpaceNotAccepted = errors.New("space: not accepted; not materialized")
 
+// ErrReadOnlySpace rejects synced writes into a space this account
+// cannot write to: any space opened via a guest key, and any space
+// where the ACL grants a role without write permission (reader /
+// guest). The nodes would drop the records anyway — the SDK fails the
+// write up front with a typed error instead of letting local state
+// silently diverge or surfacing a low-level ACL rejection.
+var ErrReadOnlySpace = errors.New("space: read-only")
+
+// ErrGuestJoinPending is returned by Service.JoinGuest when the guest
+// row was recorded durably but the space content isn't pullable yet.
+// Loading continues in the background and across restarts; callers
+// poll List/Get or Subscribe for the flip to StatusActive.
+var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pending")
+
 // Service is the space-level entrypoint exposed by the top-level SDK.
 // It owns lifecycle (Create / Join / Derive / Delete) and the space
 // list; individual space operations live on Space.
@@ -26,6 +40,18 @@ type Service interface {
 	// Join a space via an invite. Depending on the invite key mode the
 	// space is either immediately active or pending approval.
 	Join(ctx context.Context, req JoinRequest) (Space, error)
+
+	// JoinGuest adds a space via a guest invite (InviteKindGuest): the
+	// invite carries the shared read-only guest identity, so there is no
+	// join request and no owner approval — the space is pulled and opened
+	// signing as that identity. One bounded synchronous load attempt is
+	// made; if the content isn't pullable yet the row is recorded
+	// durably, (nil, ErrGuestJoinPending) is returned, and loading
+	// finishes in the background (resumed across restarts). The space is
+	// read-only for life: synced writes fail with ErrReadOnlySpace and
+	// Info reports OwnRole = PermissionGuest. Remove it with Delete
+	// (local drop — a guest cannot write to the ACL).
+	JoinGuest(ctx context.Context, invite string) (Space, error)
 
 	// Derive a deterministic space from the account keys. Used for
 	// the tech space (never returned here) and future derived spaces.

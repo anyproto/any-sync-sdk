@@ -8,6 +8,7 @@ import (
 
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace"
+	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
 )
 
@@ -97,11 +98,21 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 	// straight into it.
 	tracker := a.syncStatus.For(id)
 
-	cs, err := a.spaceService.NewSpace(ctx, id, commonspace.Deps{
+	deps := commonspace.Deps{
 		SyncStatus: tracker,
 		TreeSyncer: a.newTreeSyncerForSpace(id),
 		Indexer:    a.newKVDispatcher(id),
-	})
+	}
+	// Guest-mode space: override the space app's account service so the
+	// commonspace signs (and resolves ACL keys) as the shared guest
+	// identity instead of this account. The device peer key stays real —
+	// network auth is peer-level; space-level identity is what the ACL
+	// checks. commonspace registers Deps.AccountService into the
+	// per-space app when set.
+	if guestKey := a.guestKeyFor(id); guestKey != nil {
+		deps.AccountService = newAccount(accountdata.New(a.keys.PeerKey, guestKey))
+	}
+	cs, err := a.spaceService.NewSpace(ctx, id, deps)
 	if err != nil {
 		if errors.Is(err, spacestorage.ErrSpaceStorageMissing) {
 			return nil, fmt.Errorf("anysyncx: space %s not found locally: %w", id, err)

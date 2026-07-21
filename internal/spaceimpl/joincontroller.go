@@ -90,7 +90,20 @@ func (s *Service) reconcileJoins(ctx context.Context) {
 		if r.LocalStatus == joiningLocalStatus {
 			joining[r.Id] = r
 		}
-		if r.LocalStatus == inviteLoadingLocalStatus {
+		if r.LocalStatus == inviteLoadingLocalStatus || r.LocalStatus == guestLoadingLocalStatus {
+			// Same pull-until-available load for both: no ACL waiter —
+			// the account (or the shared guest identity) is already an
+			// ACL member; loadAcceptedInvite's invite-specific branches
+			// never trigger on a guest row.
+			s.startPendingLoad(ctx, r.Id)
+		} else if r.GuestKey != "" && !r.IsDeleted() &&
+			(r.LocalStatus == "" || r.LocalStatus == techspace.StatusActive) &&
+			!s.app.SpaceExists(r.Id) {
+			// Guest row without local storage and without a loading
+			// marker: a JoinGuest that crashed between the row write and
+			// the marker, or a row synced in from another device. The row
+			// itself is the durable intent — resume the pull regardless
+			// of the device-local marker. Revoked/deleted rows stay out.
 			s.startPendingLoad(ctx, r.Id)
 		}
 	}
@@ -169,7 +182,19 @@ func (s *Service) loadAcceptedInvite(ctx context.Context, spaceId string) {
 	const maxBackoff = 20 * time.Second
 	for {
 		rec, ok := s.tsp.Get(ctx, spaceId)
-		if !ok || rec.IsDeleted() {
+		if !ok {
+			return
+		}
+		if rec.GuestKey != "" && rec.LocalStatus == guestLoadingLocalStatus &&
+			rec.RemoteStatus == techspace.GuestDeletedRemoteStatus {
+			// Interrupted guest re-join: JoinGuest crashed between the
+			// loading marker and the synced un-delete — the marker proves
+			// the re-add intent, so finish the flip here.
+			if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+				joinLog.Warn("finish interrupted guest re-join",
+					zap.String("spaceId", spaceId), zap.Error(err))
+			}
+		} else if rec.IsDeleted() {
 			return
 		}
 		if rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus {

@@ -36,11 +36,49 @@ var (
 	ErrHistoryTruncated = errors.New("history: earlier changes not available on this device")
 )
 
-// DefaultMaxViewRecords bounds how many record-rows a single view may
-// materialize before the replay aborts with ErrViewTooLarge. Documents
-// stay far below this; million-record datasets are meant to go through
-// the record-scope fast path.
+// DefaultMaxViewRecords bounds how many DISTINCT record-rows a single
+// view may materialize before the replay aborts with ErrViewTooLarge —
+// a memory bound on the scratch projection, not a cap on replay work:
+// a small document with a million-change edit history stays under it,
+// while million-record datasets are meant to go through the
+// record-scope fast path.
 const DefaultMaxViewRecords = 500_000
+
+// recordCounter enforces the distinct-record bound. Keys are resolved
+// (dataset, recordId) pairs, so repeated touches of the same record —
+// the editor keystroke profile — count once. Its own memory is O(max)
+// worst case, the same order as the scratch rows it is guarding.
+type recordCounter struct {
+	seen map[recordKey]struct{}
+	max  int
+}
+
+type recordKey struct{ ds, id string }
+
+func newRecordCounter(max int) *recordCounter {
+	return &recordCounter{seen: make(map[recordKey]struct{}), max: max}
+}
+
+// add registers the change's resolved record ids; false once the
+// distinct-record bound is exceeded. Malformed changes (unresolvable
+// ids) contribute no rows — same stance as backfill, which skips them.
+func (rc *recordCounter) add(ch *crdt.Change) bool {
+	ids, err := crdt.ResolveRecordIds(*ch)
+	if err != nil {
+		return true
+	}
+	for _, id := range ids {
+		key := recordKey{ds: ch.Dataset, id: id}
+		if _, dup := rc.seen[key]; dup {
+			continue
+		}
+		rc.seen[key] = struct{}{}
+		if len(rc.seen) > rc.max {
+			return false
+		}
+	}
+	return true
+}
 
 // ViewParams describes one causal-cut materialization.
 type ViewParams struct {
@@ -203,7 +241,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 	}
 	txCtx := tx.Context()
 
-	records := 0
+	counter := newRecordCounter(maxRecords)
 	var fatalErr error
 
 	iter := func(ch *objecttree.Change) bool {
@@ -221,8 +259,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 		}
 		stampEnvelope(decoded, ch, p.ObjectId, objectAuthor, objectCreatedAt)
 
-		records += len(decoded.Records)
-		if records > maxRecords {
+		if !counter.add(decoded) {
 			fatalErr = ErrViewTooLarge
 			return false
 		}

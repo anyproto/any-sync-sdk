@@ -134,9 +134,9 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 		delta    []deltaEntry
 		deltaBuf []byte
 		arena    anyenc.Arena
-		records  int
 		fatalErr error
 	)
+	counter := newRecordCounter(maxRecords)
 
 	// Single walk: apply base changes while their payloads are fresh,
 	// buffer delta changes and collect which records they touch.
@@ -146,8 +146,7 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 			return true
 		}
 		stampEnvelope(decoded, ch, p.ObjectId, objectAuthor, objectCreatedAt)
-		records += len(decoded.Records)
-		if records > maxRecords {
+		if !counter.add(decoded) {
 			fatalErr = ErrViewTooLarge
 			return false
 		}

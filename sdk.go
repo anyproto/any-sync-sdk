@@ -304,9 +304,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	//
 	// Best-effort per space: a single failure (e.g. corrupted local
 	// storage for one space) is logged and skipped so SDK.Open still
-	// succeeds for the rest. Pending-join records (LocalStatus=joining)
-	// are skipped too — Service.Join wrote those before any-sync
-	// storage exists.
+	// succeeds for the rest.
 	for _, rec := range tsp.List(ctx) {
 		// Skip deletion tombstones. Both delete paths — local
 		// Service.Delete and inbound reconcile — record the delete via
@@ -323,6 +321,17 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 			if app.SpaceExists(rec.Id) {
 				spaces.OffloadSpace(ctx, rec.Id)
 			}
+			continue
+		}
+		// Skip not-yet-accepted rows (pending join / incoming 1-1 /
+		// direct-add invite) by STATUS, not by storage existence: those
+		// normally have no storage, but a build that predates the
+		// Service.Get pending guard may have materialized one. Eager-
+		// loading it would run headsync + treesyncer against a space
+		// this account holds no read key for — every tree parks on "no
+		// read key" and retries forever. The storage is left in place;
+		// acceptance loads it (and its already-pulled changes) as usual.
+		if spaceimpl.MaterializeBlock(rec) != nil {
 			continue
 		}
 		if !app.SpaceExists(rec.Id) {

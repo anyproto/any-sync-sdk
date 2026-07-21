@@ -185,7 +185,9 @@ func (s *Service) loadAcceptedInvite(ctx context.Context, spaceId string) {
 					zap.String("spaceId", spaceId), zap.Error(err))
 			}
 		}
-		if _, err := s.Get(ctx, spaceId); err == nil {
+		// load, not Get: the row keeps its loading localStatus until the
+		// load succeeds, and the pending guard must not see it.
+		if _, err := s.load(ctx, spaceId); err == nil {
 			if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err == nil {
 				s.kickJoinController()
 				return
@@ -253,7 +255,9 @@ func (s *Service) loadJoinedSpace(ctx context.Context, spaceId string) {
 	backoff := time.Second
 	const maxBackoff = 20 * time.Second
 	for {
-		if _, err := s.Get(ctx, spaceId); err == nil {
+		// load, not Get: the row stays "joining" until the load succeeds,
+		// and the pending guard must not see it.
+		if _, err := s.load(ctx, spaceId); err == nil {
 			if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err == nil {
 				s.kickJoinController()
 				return

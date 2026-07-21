@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -161,20 +162,21 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	mkSDK := func(name string) *anysyncsdk.SDK {
+	mkSDK := func(name string) (*anysyncsdk.SDK, string) {
 		t.Helper()
+		dir := t.TempDir()
 		cfg := config.Config{
-			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Storage: config.Storage{DataDir: dir, Topology: config.StorageShared},
 			Network: config.Network{NodeConfYAML: yaml},
 		}
 		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
 		require.NoError(t, err, "%s: Open", name)
 		t.Cleanup(func() { _ = sdk.Close() })
-		return sdk
+		return sdk, dir
 	}
 
-	owner := mkSDK("owner")
-	joiner := mkSDK("joiner")
+	owner, _ := mkSDK("owner")
+	joiner, joinerDir := mkSDK("joiner")
 	require.NotEqual(t, owner.Account().Id(), joiner.Account().Id(),
 		"owner and joiner must have distinct account ids")
 
@@ -242,6 +244,16 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.Len(t, joinerSpaces, 1)
 	assert.Equal(t, sp.Id(), joinerSpaces[0].Id)
 	assert.Equal(t, space.StatusJoining, joinerSpaces[0].Status)
+
+	// While the join is pending, a read path must not materialize the
+	// space: Get is guarded, and no any-sync storage may exist — a load
+	// with no local storage triggers a SpacePull bootstrap, which would
+	// download the whole space ciphertext before the owner accepted.
+	_, err = joiner.Spaces().Get(ctx, sp.Id())
+	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
+		"Get on a pending join must refuse to materialize")
+	require.NoFileExists(t, filepath.Join(joinerDir, sp.Id()+".db"),
+		"a pending join must not create any-sync space storage")
 
 	// 4. Owner polls JoinRequests until the joiner's request lands.
 	// The request arrives via the owner's per-space headsync pulling
@@ -442,6 +454,24 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 		}
 		return j.Name == "Joiner Live Name"
 	}, 5*time.Second, 100*time.Millisecond, "joiner profile override never applied on owner side")
+
+	// Joiner side: acceptance flips the row to active (ACL waiter →
+	// loadJoinedSpace, which loads while the row still says "joining")
+	// and from then on Get passes the pending guard.
+	require.Eventually(t, func() bool {
+		infos, lErr := joiner.Spaces().List(ctx)
+		if lErr != nil {
+			return false
+		}
+		for _, info := range infos {
+			if info.Id == sp.Id() {
+				return info.Status == space.StatusActive
+			}
+		}
+		return false
+	}, 90*time.Second, 2*time.Second, "joiner row never flipped to active after acceptance")
+	_, err = joiner.Spaces().Get(ctx, sp.Id())
+	require.NoError(t, err, "Get must succeed once the join is accepted")
 }
 
 // TestSDK_Spaces_Derive verifies the deterministic-derive surface:

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"sort"
 	"strings"
 
@@ -36,11 +37,69 @@ var (
 	ErrHistoryTruncated = errors.New("history: earlier changes not available on this device")
 )
 
-// DefaultMaxViewRecords bounds how many record-rows a single view may
-// materialize before the replay aborts with ErrViewTooLarge. Documents
-// stay far below this; million-record datasets are meant to go through
-// the record-scope fast path.
+// DefaultMaxViewRecords bounds how many DISTINCT record-rows a single
+// view may materialize before the replay aborts with ErrViewTooLarge —
+// a memory bound on the scratch projection, not a cap on replay work:
+// a small document with a million-change edit history stays under it,
+// while million-record datasets are meant to go through the
+// record-scope fast path.
 const DefaultMaxViewRecords = 500_000
+
+// recordCounter enforces the distinct-record bound with a hashed
+// bitset: one bit per seeded hash of the resolved (dataset, recordId)
+// pair, so a record touched by many changes counts once. Sized at 16
+// bits per expected entry, the bound is deliberately approximate — a
+// collision undercounts one record, fine for a soft memory guardrail.
+// The random seed keeps collisions non-craftable by a peer choosing
+// record ids.
+type recordCounter struct {
+	seed  maphash.Seed
+	bits  []uint64
+	mask  uint64
+	count int
+	max   int
+}
+
+func newRecordCounter(max int) *recordCounter {
+	size := uint64(1) << 20 // 128KB floor
+	for size < uint64(max)*16 {
+		size <<= 1
+	}
+	return &recordCounter{
+		seed: maphash.MakeSeed(),
+		bits: make([]uint64, size/64),
+		mask: size - 1,
+		max:  max,
+	}
+}
+
+// add registers the change's resolved record ids; false once the
+// distinct-record bound is exceeded. Malformed changes (unresolvable
+// ids) contribute no rows — same stance as backfill, which skips them.
+func (rc *recordCounter) add(ch *crdt.Change) bool {
+	ids, err := crdt.ResolveRecordIds(*ch)
+	if err != nil {
+		return true
+	}
+	for _, id := range ids {
+		var h maphash.Hash
+		h.SetSeed(rc.seed)
+		_, _ = h.WriteString(ch.Dataset)
+		_ = h.WriteByte(0)
+		_, _ = h.WriteString(id)
+		pos := h.Sum64() & rc.mask
+		word, bit := pos/64, uint64(1)<<(pos%64)
+		if rc.bits[word]&bit != 0 {
+			continue // seen (or collided — soft bound)
+		}
+		rc.bits[word] |= bit
+		rc.count++
+		if rc.count > rc.max {
+			return false
+		}
+	}
+	return true
+}
 
 // ViewParams describes one causal-cut materialization.
 type ViewParams struct {
@@ -203,7 +262,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 	}
 	txCtx := tx.Context()
 
-	records := 0
+	counter := newRecordCounter(maxRecords)
 	var fatalErr error
 
 	iter := func(ch *objecttree.Change) bool {
@@ -221,8 +280,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 		}
 		stampEnvelope(decoded, ch, p.ObjectId, objectAuthor, objectCreatedAt)
 
-		records += len(decoded.Records)
-		if records > maxRecords {
+		if !counter.add(decoded) {
 			fatalErr = ErrViewTooLarge
 			return false
 		}

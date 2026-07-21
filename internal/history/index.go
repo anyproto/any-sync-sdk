@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
+	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -35,12 +35,10 @@ import (
 // a "_" prefix are rejected at registration (ValidateExternalTypes).
 const (
 	// HistoryCollectionSuffix — `<objectId>__history`: one row per
-	// change, PK = OrderId.
+	// change, PK = OrderId. The row's `recIds` array (multikey-indexed)
+	// doubles as the record-filter index — "changes touching record R"
+	// is `{"recIds": R}`.
 	HistoryCollectionSuffix = "__history"
-	// HistoryRecsCollectionSuffix — `<objectId>__history_recs`: one row
-	// per (change, record), PK = recordId + sep + OrderId, so "changes
-	// touching record R in order" is a PK prefix range scan.
-	HistoryRecsCollectionSuffix = "__history_recs"
 	// HistoryTracesCollection — space-level: one row per (change,
 	// trace), PK = spaceId + sep + traceId + sep + OrderId + sep +
 	// objectId (OrderIds are only unique per tree, hence the object
@@ -51,13 +49,22 @@ const (
 	HistoryMetaCollection = "_history_meta"
 )
 
-// keySep separates composite primary-key parts; keySepEnd is its
-// exclusive upper bound for prefix range scans. Record and trace ids
-// must not contain NUL — enforced nowhere today, but a violating id
-// only mis-scopes its own history filter, nothing else.
+// keySep separates composite primary-key parts (traces only); keySepEnd
+// is its exclusive upper bound for prefix range scans. Space (0x20) is
+// the ONLY printable choice: the key tail is a lexid OrderId, lexids of
+// different lengths can be prefix-related, and the lexid alphabet
+// (CharsAllNoEscape) starts at '!' (0x21) — a separator sorting above
+// any lexid char would invert bytewise key order versus OrderId order,
+// breaking descending pagination (pinned by
+// TestListByTraceOrderWithPrefixRelatedOrderIds). Trace ids must not
+// contain a space — enforced nowhere today, but a violating id only
+// mis-scopes its own history filter, nothing else. RECORD ids never
+// enter composite keys: the record filter matches them as exact
+// `recIds` array values, so their alphabet is unconstrained (a
+// recordId may contain ':', spaces, anything).
 const (
-	keySep    = "\x00"
-	keySepEnd = "\x01"
+	keySep    = " "
+	keySepEnd = "!"
 )
 
 // DefaultBackfillBatch bounds changes per backfill transaction
@@ -78,6 +85,13 @@ type Index struct {
 	traces  anystore.Collection
 	meta    anystore.Collection
 	skip    map[string]struct{}
+
+	// touched tracks objects whose recIds index this process has
+	// already ensured — one EnsureIndex per object per process, not
+	// per change. Guarded by mu: apply hooks are single-writer, but
+	// Backfill runs from read paths concurrently with them.
+	mu      sync.Mutex
+	touched map[string]struct{}
 }
 
 // OpenIndex opens (creating if needed) the space-level history
@@ -88,6 +102,7 @@ func OpenIndex(ctx context.Context, db anystore.DB, spaceId string, skipDatasets
 		spaceId: spaceId,
 		db:      db,
 		skip:    make(map[string]struct{}, len(skipDatasets)),
+		touched: make(map[string]struct{}),
 	}
 	for _, ds := range skipDatasets {
 		ix.skip[ds] = struct{}{}
@@ -108,31 +123,35 @@ func (ix *Index) SkipsDataset(dataset string) bool {
 	return ok
 }
 
-// historyColl / recsColl resolve an object's collections. create=false
+// historyColl resolves an object's history collection. create=false
 // returns (nil, nil) when the collection doesn't exist — the object
-// simply has no indexed history yet.
+// simply has no indexed history yet. create=true opens (creating if
+// needed) and, once per object per process, ensures the recIds
+// multikey index.
 func (ix *Index) historyColl(ctx context.Context, objectId string, create bool) (anystore.Collection, error) {
-	return ix.objColl(ctx, objectId+HistoryCollectionSuffix, create)
-}
-
-func (ix *Index) recsColl(ctx context.Context, objectId string, create bool) (anystore.Collection, error) {
-	return ix.objColl(ctx, objectId+HistoryRecsCollectionSuffix, create)
-}
-
-func (ix *Index) objColl(ctx context.Context, name string, create bool) (anystore.Collection, error) {
-	if create {
-		coll, err := ix.db.Collection(ctx, name)
+	name := objectId + HistoryCollectionSuffix
+	if !create {
+		coll, err := ix.db.OpenCollection(ctx, name)
 		if err != nil {
+			if errors.Is(err, anystore.ErrCollectionNotFound) {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("history: open %s: %w", name, err)
 		}
 		return coll, nil
 	}
-	coll, err := ix.db.OpenCollection(ctx, name)
+	coll, err := ix.db.Collection(ctx, name)
 	if err != nil {
-		if errors.Is(err, anystore.ErrCollectionNotFound) {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("history: open %s: %w", name, err)
+	}
+	ix.mu.Lock()
+	_, seen := ix.touched[objectId]
+	ix.touched[objectId] = struct{}{}
+	ix.mu.Unlock()
+	if !seen {
+		if err := coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"recIds"}, Sparse: true}); err != nil {
+			return nil, fmt.Errorf("history: ensure recIds index on %s: %w", name, err)
+		}
 	}
 	return coll, nil
 }
@@ -151,10 +170,6 @@ func (ix *Index) IndexChange(txCtx context.Context, ch *crdt.Change, recordIds [
 		return nil
 	}
 	hist, err := ix.historyColl(txCtx, ch.ObjectId, true)
-	if err != nil {
-		return err
-	}
-	recs, err := ix.recsColl(txCtx, ch.ObjectId, true)
 	if err != nil {
 		return err
 	}
@@ -177,9 +192,6 @@ func (ix *Index) IndexChange(txCtx context.Context, ch *crdt.Change, recordIds [
 		row.Set("prev", stringArray(a, ch.PrevIds))
 	}
 	// Touched records inline: keeps ChangeMeta assembly one row wide.
-	// The `__history_recs` rows below are the record-filter index; this
-	// duplication trades a few bytes per change for a join-free list
-	// path.
 	recsArr := a.NewArray()
 	for i, rec := range recordIds {
 		item := a.NewObject()
@@ -190,18 +202,15 @@ func (ix *Index) IndexChange(txCtx context.Context, ch *crdt.Change, recordIds [
 		recsArr.SetArrayItem(i, item)
 	}
 	row.Set("recs", recsArr)
+	// recIds is the flat, multikey-indexed record-filter mirror of
+	// `recs` — anystore's index extraction doesn't descend array-of-
+	// object paths, so the scalar duplicate is what makes
+	// `{"recIds": R}` an index scan instead of a collection walk.
+	if len(recordIds) > 0 {
+		row.Set("recIds", stringArray(a, dedup(recordIds)))
+	}
 	if err := hist.UpsertOne(txCtx, row); err != nil {
 		return fmt.Errorf("history: index change %s: %w", ch.ChangeId, err)
-	}
-
-	for _, rec := range recordIds {
-		rrow := a.NewObject()
-		rrow.Set("id", a.NewString(rec+keySep+o)) // record-prefix range scan, ordered by o
-		rrow.Set("o", a.NewString(o))
-		rrow.Set("c", a.NewString(ch.ChangeId))
-		if err := recs.UpsertOne(txCtx, rrow); err != nil {
-			return fmt.Errorf("history: index change record %s/%s: %w", ch.ChangeId, rec, err)
-		}
 	}
 
 	for _, tr := range ch.TraceIds {
@@ -425,14 +434,10 @@ func (ix *Index) ListChanges(ctx context.Context, f Filter, limit int, cursor st
 		limit = MaxListLimit
 	}
 
-	switch {
-	case f.RecordId != "":
-		return ix.listByRecord(ctx, f, limit, cursor)
-	case f.TraceId != "":
+	if f.ObjectId == "" {
 		return ix.listByTrace(ctx, f, limit, cursor)
-	default:
-		return ix.listDirect(ctx, f, limit, cursor)
 	}
+	return ix.listDirect(ctx, f, limit, cursor)
 }
 
 // idRange builds the typed PK range condition lo < id < hi — the
@@ -447,8 +452,9 @@ func idRange(lo, hi string) query.Filter {
 var idPath = []string{"id"}
 
 // listDirect pages an object's `__history` collection: a reverse
-// primary-key scan (PK = OrderId), residual ds/author filters applied
-// by the query engine.
+// primary-key scan (PK = OrderId), with ds/author equality plus the
+// multikey recIds/traces array-membership filters applied by the
+// query engine.
 func (ix *Index) listDirect(ctx context.Context, f Filter, limit int, cursor string) ([]ChangeMeta, string, error) {
 	coll, err := ix.historyColl(ctx, f.ObjectId, false)
 	if err != nil || coll == nil {
@@ -460,6 +466,13 @@ func (ix *Index) listDirect(ctx context.Context, f Filter, limit int, cursor str
 	}
 	if f.Author != "" {
 		cond = append(cond, query.Key{Path: []string{"author"}, Filter: query.NewComp(query.CompOpEq, f.Author)})
+	}
+	if f.RecordId != "" {
+		// Multikey membership on the indexed recIds array.
+		cond = append(cond, query.Key{Path: []string{"recIds"}, Filter: query.NewComp(query.CompOpEq, f.RecordId)})
+	}
+	if f.TraceId != "" {
+		cond = append(cond, query.Key{Path: []string{"traces"}, Filter: query.NewComp(query.CompOpEq, f.TraceId)})
 	}
 	if cursor != "" {
 		cond = append(cond, query.Key{Path: idPath, Filter: query.NewComp(query.CompOpLt, cursor)})
@@ -491,52 +504,11 @@ func (ix *Index) listDirect(ctx context.Context, f Filter, limit int, cursor str
 	return out, out[len(out)-1].OrderId, nil
 }
 
-// listByRecord pages the object's `__history_recs` collection by the
-// record's PK prefix (rows are `rec\0o`, so the range is ordered by o)
-// and joins each hit to its `__history` row by o. Cursor = last
-// processed row's o. Dataset and TraceId apply as residual checks on
-// the joined row (the recs PK carries neither).
-func (ix *Index) listByRecord(ctx context.Context, f Filter, limit int, cursor string) ([]ChangeMeta, string, error) {
-	recs, err := ix.recsColl(ctx, f.ObjectId, false)
-	if err != nil || recs == nil {
-		return nil, "", err
-	}
-	hist, err := ix.historyColl(ctx, f.ObjectId, false)
-	if err != nil || hist == nil {
-		return nil, "", err
-	}
-
-	upper := f.RecordId + keySepEnd
-	if cursor != "" {
-		upper = f.RecordId + keySep + cursor
-	}
-	cond := idRange(f.RecordId+keySep, upper)
-
-	join := func(row *anyenc.Value) (ChangeMeta, bool, error) {
-		doc, ferr := hist.FindId(ctx, string(row.GetStringBytes("o")))
-		if ferr != nil {
-			if errors.Is(ferr, anystore.ErrDocNotFound) {
-				return ChangeMeta{}, false, nil // backfill in flight
-			}
-			return ChangeMeta{}, false, ferr
-		}
-		meta := changeMetaFromRow(doc.Value(), f.ObjectId)
-		if meta.Dataset != f.Dataset {
-			return ChangeMeta{}, false, nil // same record id in another dataset
-		}
-		if f.TraceId != "" && !slices.Contains(meta.TraceIds, f.TraceId) {
-			return ChangeMeta{}, false, nil
-		}
-		return meta, true, nil
-	}
-	return ix.pageJoin(ctx, recs, cond, f, limit, join, func(row *anyenc.Value) string {
-		return string(row.GetStringBytes("o"))
-	})
-}
+var recIdsPath = []string{"recIds"}
 
 // listByTrace pages the space-level traces collection by the trace's
 // PK prefix and joins each hit to its object's `__history` row.
-// OrderIds are only unique per tree, so the cursor is `o\0objectId` —
+// OrderIds are only unique per tree, so the cursor is `o<sep>objectId` —
 // the PK tail after the trace prefix. ObjectId, Dataset and Author
 // apply as residual checks on the joined row.
 func (ix *Index) listByTrace(ctx context.Context, f Filter, limit int, cursor string) ([]ChangeMeta, string, error) {
@@ -602,7 +574,7 @@ func (ix *Index) pageJoin(
 	cursorKey func(row *anyenc.Value) string,
 ) ([]ChangeMeta, string, error) {
 	fetch := limit
-	if f.Author != "" || f.ObjectId != "" || f.Dataset != "" || f.TraceId != "" {
+	if f.Author != "" || f.ObjectId != "" || f.Dataset != "" {
 		// Post-join filters may reject rows: over-fetch the window.
 		fetch = limit * 4
 	}
@@ -649,24 +621,28 @@ func (ix *Index) pageJoin(
 }
 
 // TouchedChangeIds returns every ChangeId known to touch recordId on
-// the object — the RecordAt fast-path pre-filter, straight off the
-// record's PK prefix range. The set may be a superset across datasets
-// (the recs PK carries no dataset); that is sound — the replay
-// re-checks dataset and record per change. What must NOT happen is a
-// non-empty set MISSING changes of the requested dataset, so datasets
-// opted out of history (SkipHistory — never indexed) return (nil, nil)
-// and take the decode-and-filter fallback. Bounded by
-// maxTouchedChangeIds; a record touched more often than that also
-// falls back.
+// the object — the RecordAt fast-path pre-filter, a `{"recIds": R}`
+// multikey-index scan over `__history`. The set is narrowed by
+// dataset (the row carries it) but may still be a superset; that is
+// sound — the replay re-checks dataset and record per change. What
+// must NOT happen is a non-empty set MISSING changes of the requested
+// dataset, so datasets opted out of history (SkipHistory — never
+// indexed) return (nil, nil) and take the decode-and-filter fallback.
+// Bounded by maxTouchedChangeIds; a record touched more often than
+// that also falls back.
 func (ix *Index) TouchedChangeIds(ctx context.Context, objectId, dataset, recordId string) ([]string, error) {
 	if ix.SkipsDataset(dataset) {
 		return nil, nil
 	}
-	recs, err := ix.recsColl(ctx, objectId, false)
-	if err != nil || recs == nil {
+	hist, err := ix.historyColl(ctx, objectId, false)
+	if err != nil || hist == nil {
 		return nil, err
 	}
-	iter, err := recs.Find(idRange(recordId+keySep, recordId+keySepEnd)).Iter(ctx)
+	cond := query.And{
+		query.Key{Path: recIdsPath, Filter: query.NewComp(query.CompOpEq, recordId)},
+		query.Key{Path: []string{"ds"}, Filter: query.NewComp(query.CompOpEq, dataset)},
+	}
+	iter, err := hist.Find(cond).Iter(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("history: touched change ids: %w", err)
 	}
@@ -742,6 +718,26 @@ func changeMetaFromRow(row *anyenc.Value, objectId string) ChangeMeta {
 		meta.Touched = append(meta.Touched, tr)
 	}
 	return meta
+}
+
+// dedup returns items with duplicates removed, order preserved.
+// Returns the input slice unchanged when already unique.
+func dedup(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := items[:0:0]
+	unique := true
+	for _, s := range items {
+		if _, dup := seen[s]; dup {
+			unique = false
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if unique {
+		return items
+	}
+	return out
 }
 
 func stringArray(a *anyenc.Arena, items []string) *anyenc.Value {

@@ -187,14 +187,42 @@ func (w *aclMirrorWatcher) mirror() bool {
 		return false
 	}
 
-	done := w.mirrorOwnRole(ctx, cur)
+	done := true
+	role, roleErr := w.s.ownRole(ctx, w.id)
+	if roleErr != nil {
+		aclMirrorLog.Debug("mirror own role failed", zap.String("spaceId", w.id), zap.Error(roleErr))
+		done = false
+	} else {
+		if !w.mirrorOwnRole(ctx, cur, role) {
+			done = false
+		}
+		w.mirrorWriteGate(cur, role)
+		if !w.mirrorGuestRevoked(ctx, cur, role) {
+			done = false
+		}
+	}
 	if !w.mirrorPushKeys(ctx, cur) {
 		done = false
 	}
-	if !w.mirrorGuestRevoked(ctx, cur) {
-		done = false
-	}
 	return done
+}
+
+// mirrorWriteGate maintains the Store's cached read-only gate from the
+// converged ACL role: reader/guest roles (and every guest-mode row)
+// reject user writes with ErrReadOnlySpace; writable roles clear it.
+// PermissionNone is "unknown / not a member" — the gate is left as-is
+// and any-sync's AddContent check stays the authority.
+func (w *aclMirrorWatcher) mirrorWriteGate(cur techspace.SpaceIndexRecord, role space.Permission) {
+	st := w.s.peekStore(w.id)
+	if st == nil {
+		return
+	}
+	switch {
+	case cur.GuestKey != "" || role == space.PermissionReader || role == space.PermissionGuest:
+		st.SetWriteGateErr(space.ErrReadOnlySpace)
+	case role != space.PermissionNone:
+		st.SetWriteGateErr(nil)
+	}
 }
 
 // mirrorGuestRevoked maintains the guestRevoked localStatus on a
@@ -204,14 +232,9 @@ func (w *aclMirrorWatcher) mirror() bool {
 // active again. Skipped while the initial load is still in flight
 // (guestLoading): an incomplete ACL must not read as a revocation.
 // Non-guest rows always report done.
-func (w *aclMirrorWatcher) mirrorGuestRevoked(ctx context.Context, cur techspace.SpaceIndexRecord) bool {
+func (w *aclMirrorWatcher) mirrorGuestRevoked(ctx context.Context, cur techspace.SpaceIndexRecord, role space.Permission) bool {
 	if cur.GuestKey == "" || cur.LocalStatus == guestLoadingLocalStatus || cur.IsDeleted() {
 		return true
-	}
-	role, err := w.s.ownRole(ctx, w.id)
-	if err != nil {
-		aclMirrorLog.Debug("mirror guest revoked failed", zap.String("spaceId", w.id), zap.Error(err))
-		return false
 	}
 	var want string
 	switch {
@@ -236,13 +259,9 @@ func (w *aclMirrorWatcher) mirrorGuestRevoked(ctx context.Context, cur techspace
 }
 
 // mirrorOwnRole writes this account's current ACL permission onto the
-// row when it differs (the SpaceInfo.OwnRole source).
-func (w *aclMirrorWatcher) mirrorOwnRole(ctx context.Context, cur techspace.SpaceIndexRecord) bool {
-	role, err := w.s.ownRole(ctx, w.id)
-	if err != nil {
-		aclMirrorLog.Debug("mirror own role failed", zap.String("spaceId", w.id), zap.Error(err))
-		return false
-	}
+// row when it differs (the SpaceInfo.OwnRole source). role is resolved
+// once by mirror() and shared with the gate/revocation mirrors.
+func (w *aclMirrorWatcher) mirrorOwnRole(ctx context.Context, cur techspace.SpaceIndexRecord, role space.Permission) bool {
 	if cur.OwnRole == role {
 		return true
 	}

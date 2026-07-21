@@ -286,8 +286,13 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	s.allocs[spaceId] = alloc
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
 	// Read-only gate on every user-authored synced write
-	// (Object.LocalWrite, Store.Create) — see spaceWriteGate.
-	st.SetWriteGate(func() error { return s.spaceWriteGate(spaceId) })
+	// (Object.LocalWrite, Store.Create). Guest-mode is fixed for the
+	// store's lifetime — a key refresh tears the runtime down — so it
+	// seeds once here; ACL role changes (reader) are maintained
+	// event-driven by the per-space ACL mirror (mirrorWriteGate).
+	if rec, ok := s.tsp.Get(context.Background(), spaceId); ok && rec.GuestKey != "" {
+		st.SetWriteGateErr(space.ErrReadOnlySpace)
+	}
 	// Resolve the read-sync service lazily: stores can be created
 	// before sdk.Open injects it, and untracked spaces never call it.
 	st.SetSeedHeadsProvider(func(ctx context.Context, objectId string) ([][]string, error) {
@@ -321,40 +326,12 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
 
-// spaceWriteGate rejects user-authored synced writes into spaceId with
-// ErrReadOnlySpace when the account affirmatively cannot write:
-//
-//   - guest-mode rows (space added via guest key) — always, even
-//     before the space is resident;
-//   - a resident space whose ACL grants a role without write
-//     permission (reader / guest).
-//
-// Deliberately permissive everywhere else: a not-yet-resident space,
-// an absent identity, or an unreadable ACL all pass — any-sync's
-// CanWrite check in tree.AddContent stays the authority, this gate
-// just fails fast with a typed error instead of letting the write
-// reach the DAG layer. Local-set and inbound applies are never gated.
-func (s *Service) spaceWriteGate(spaceId string) error {
-	ctx := context.Background()
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.GuestKey != "" {
-		return space.ErrReadOnlySpace
-	}
-	handle, ok := s.app.PickSpace(ctx, spaceId)
-	if !ok {
-		return nil
-	}
-	acl := handle.Inner().Acl()
-	if acl == nil {
-		return nil
-	}
-	acl.RLock()
-	state := acl.AclState()
-	perms := state.Permissions(state.Identity())
-	acl.RUnlock()
-	if !perms.NoPermissions() && !perms.CanWrite() {
-		return space.ErrReadOnlySpace
-	}
-	return nil
+// peekStore returns spaceId's Store only if already built — never
+// constructs. Used by watchers that must not create runtime state.
+func (s *Service) peekStore(spaceId string) *spaceobjects.Store {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stores[spaceId]
 }
 
 // SetReadSync injects the SDK-level read-state sync service. Called

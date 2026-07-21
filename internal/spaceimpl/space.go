@@ -120,11 +120,11 @@ func (s *spaceImpl) localIdentityActive(ctx context.Context) bool {
 
 // writeGate rejects user mutations on a read-only space (guest-mode
 // row, or an ACL role without write permission) with ErrReadOnlySpace.
-// Complements the store-level gate on LocalWrite/Create for entry
-// points that mutate outside the store's DAG-write path (tree
-// deletion, file-node uploads).
+// Reads the store's cached gate — seeded at store build, maintained by
+// the ACL mirror — for entry points that mutate outside the store's
+// DAG-write funnel (tree deletion, file-node uploads).
 func (s *spaceImpl) writeGate(_ context.Context) error {
-	return s.parent.spaceWriteGate(s.id)
+	return s.store.CheckWrite()
 }
 
 // canWrite reports whether this account currently has write permission

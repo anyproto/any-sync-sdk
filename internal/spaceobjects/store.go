@@ -261,12 +261,14 @@ type Store struct {
 	// the rows forever.
 	historyPendingPurge sync.Map
 
-	// writeGate rejects user-authored synced writes when non-nil and
-	// erroring (read-only guest spaces). Consulted by Store.Create and
-	// wired into every Object's LocalWrite. Set via SetWriteGate before
-	// the first object load; inbound apply / local-set paths are never
-	// gated.
-	writeGate func() error
+	// writeGateErr, when non-nil, rejects every user-authored synced
+	// write (Store.Create and every Object's LocalWrite) with that
+	// error — read-only spaces (guest access, reader role). An atomic
+	// so the per-write check is a single load: the value is maintained
+	// event-driven, not computed per write — seeded at construction
+	// (guest rows) and updated by the per-space ACL mirror on role
+	// changes. Inbound apply / local-set paths are never gated.
+	writeGateErr atomic.Pointer[error]
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -339,17 +341,25 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 	})
 }
 
-// SetWriteGate installs the user-write gate (see Store.writeGate).
-// Call right after construction, before the first object load —
-// cached Objects capture the gate at wiring time.
-func (s *Store) SetWriteGate(g func() error) { s.writeGate = g }
-
-// checkWriteGate applies the gate; nil gate = writable.
-func (s *Store) checkWriteGate() error {
-	if s.writeGate == nil {
-		return nil
+// SetWriteGateErr installs (non-nil) or clears (nil) the user-write
+// gate — see Store.writeGateErr. Safe at any time; cached Objects read
+// the live value on every write.
+func (s *Store) SetWriteGateErr(err error) {
+	if err == nil {
+		s.writeGateErr.Store(nil)
+		return
 	}
-	return s.writeGate()
+	s.writeGateErr.Store(&err)
+}
+
+// CheckWrite applies the gate; nil = writable. Exposed for write entry
+// points that mutate outside the store's own DAG-write funnel (tree
+// deletion, file-node uploads).
+func (s *Store) CheckWrite() error {
+	if p := s.writeGateErr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // NewStoreWithConfig constructs a Store from cfg. The async drainer is
@@ -1155,7 +1165,7 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 // land on the root any-sync change; for the MVP they're informational
 // only.
 func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, error) {
-	if err := s.checkWriteGate(); err != nil {
+	if err := s.CheckWrite(); err != nil {
 		return nil, err
 	}
 	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
@@ -1358,7 +1368,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		Allocator:      s.alloc,
 		Gate:           gate,
 		AfterApply:     s.afterApplyFor(),
-		WriteGate:      s.writeGate,
+		WriteGate:      s.CheckWrite,
 		PlaintextSpecs: plaintextSpecs,
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)

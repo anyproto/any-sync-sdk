@@ -265,15 +265,14 @@ double-underscore suffix keeps the namespace disjoint from datasets
 - `<objectId>__history` — one row per change, PK `id = orderId`:
   `{id: o, c: changeId, ds, author, ts, n: recordCount, prev: [..],
   traces: [..], recs: [{rec, k}], recIds: [..]}`. `recIds` is the
-  flat multikey-indexed mirror of `recs` (index gen 2, SYN-88 —
-  replaced the gen-1 `<objectId>__history_recs` collection): the
-  record filter is `{"recIds": R}` on the multikey index; matched
-  OrderIds sort in memory (a record's timeline is tens of changes
-  even in a million-change object, and multikey indexes never
-  satisfy sort order in the planner anyway), then only the page's
-  rows are re-read by PK. Halves the per-object collection count and
-  the per-change row writes; gen-1 collections are dropped by the
-  upgrade backfill.
+  flat multikey-indexed mirror of `recs` (SYN-88 — replaced the
+  earlier separate `<objectId>__history_recs` collection): the
+  record filter is plain query conditions on the change listing —
+  `{"recIds": R}` multikey membership plus the usual ds/author keys —
+  so one scan shape serves every object-scoped filter combination.
+  Halves the per-object collection count and the per-change row
+  writes. No migration (pre-release): DBs written under the old
+  layout should be recreated.
 - `_history_traces` — space-level (the trace query is space-wide by
   requirement), one row per (change, trace), PK
   `id = sp + SEP + traceId + SEP + o + SEP + objectId` (OrderIds are
@@ -283,13 +282,10 @@ double-underscore suffix keeps the namespace disjoint from datasets
   alphabet (which starts at '!'), required because lexids of
   different lengths can be prefix-related and a separator sorting
   above any lexid char would invert bytewise key order vs OrderId
-  order. Gen-1 rows used NUL; leftovers are inert (new scans never
-  match their prefix).
+  order (pinned by TestListByTraceOrderWithPrefixRelatedOrderIds;
+  earlier rows used NUL, which broke id-rendering tooling).
 - `_history_meta` — space-level per-object index state:
-  `{id: objectId, sp, stale, gen}`. `gen` versions the row shape: a
-  mismatch (or a rows-without-meta legacy object) fails the
-  freshness gate and re-backfills lazily — upserts rewrite rows in
-  the current shape.
+  `{id: objectId, sp, stale}`.
 
 **Write paths:**
 

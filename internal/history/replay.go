@@ -45,27 +45,36 @@ var (
 // record-scope fast path.
 const DefaultMaxViewRecords = 500_000
 
-// recordCounter enforces the distinct-record bound. Entries are
-// seeded 64-bit fingerprints of the resolved (dataset, recordId)
-// pair, so repeated touches of the same record — the editor
-// keystroke profile — count once. Fingerprints instead of string
-// keys keep the counter from becoming what it guards against: it
-// retains no decoded id strings and costs ~1/6 of a string-pair map
-// at the bound, while still growing with the actual distinct count
-// (a flat bitset would need a fixed multi-MB allocation per view, or
-// an id dictionary — a string map again). A collision undercounts
-// one record — harmless off-by-one on a soft bound — and the
-// per-counter random seed keeps collisions non-craftable by a
-// hostile peer choosing record ids (odds ~1e-8 at the default
-// bound).
+// recordCounter enforces the distinct-record bound with a hashed
+// bitset: one bit per seeded hash of the resolved (dataset, recordId)
+// pair, so repeated touches of the same record — the editor keystroke
+// profile — count once. Sized at 16 bits per expected entry (128KB
+// floor, 1MB at the default bound — flat, no per-entry allocation,
+// no retained id strings). The bound is deliberately approximate: a
+// hash collision undercounts one record, which at the sizing above
+// stays in the low percents at the bound and costs nothing —
+// ErrViewTooLarge is a soft memory guardrail, not an invariant. The
+// per-counter random seed keeps collisions non-craftable by a peer
+// choosing record ids.
 type recordCounter struct {
-	seed maphash.Seed
-	seen map[uint64]struct{}
-	max  int
+	seed  maphash.Seed
+	bits  []uint64
+	mask  uint64
+	count int
+	max   int
 }
 
 func newRecordCounter(max int) *recordCounter {
-	return &recordCounter{seed: maphash.MakeSeed(), seen: make(map[uint64]struct{}), max: max}
+	size := uint64(1) << 20 // 128KB floor
+	for size < uint64(max)*16 {
+		size <<= 1
+	}
+	return &recordCounter{
+		seed: maphash.MakeSeed(),
+		bits: make([]uint64, size/64),
+		mask: size - 1,
+		max:  max,
+	}
 }
 
 // add registers the change's resolved record ids; false once the
@@ -82,12 +91,14 @@ func (rc *recordCounter) add(ch *crdt.Change) bool {
 		_, _ = h.WriteString(ch.Dataset)
 		_ = h.WriteByte(0)
 		_, _ = h.WriteString(id)
-		key := h.Sum64()
-		if _, dup := rc.seen[key]; dup {
-			continue
+		pos := h.Sum64() & rc.mask
+		word, bit := pos/64, uint64(1)<<(pos%64)
+		if rc.bits[word]&bit != 0 {
+			continue // seen (or collided — soft bound)
 		}
-		rc.seen[key] = struct{}{}
-		if len(rc.seen) > rc.max {
+		rc.bits[word] |= bit
+		rc.count++
+		if rc.count > rc.max {
 			return false
 		}
 	}

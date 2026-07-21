@@ -30,13 +30,15 @@ func TestReplayGuardrailCountsDistinctRecords(t *testing.T) {
 	require.NoError(t, err, "a long edit history on one record must not trip the guardrail")
 	require.NotNil(t, v.Record(ctx, "notes", "n1"))
 
-	// 3 distinct records, bound 2: trips regardless of change count.
+	// Many distinct records over the bound: trips regardless of change
+	// count. Well past the bound (100 vs 8) so the counter's tolerated
+	// collision undercount can never flake the assertion.
 	b2 := newTreeBuilder(t)
-	b2.add("notes", upsert(t, "n1", `{"title":"a"}`))
-	b2.add("notes", upsert(t, "n2", `{"title":"b"}`))
-	last = b2.add("notes", upsert(t, "n3", `{"title":"c"}`))
+	for i := 0; i < 100; i++ {
+		last = b2.add("notes", upsert(t, fmt.Sprintf("n%d", i), `{"title":"x"}`))
+	}
 	_, err = buildScratch(t, b2.tree, ViewParams{
-		ObjectId: testObjectId, Heads: []string{last}, Regs: testRegs(), MaxRecords: 2,
+		ObjectId: testObjectId, Heads: []string{last}, Regs: testRegs(), MaxRecords: 8,
 	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrViewTooLarge))

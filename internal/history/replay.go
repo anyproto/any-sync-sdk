@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"sort"
 	"strings"
 
@@ -44,19 +45,27 @@ var (
 // record-scope fast path.
 const DefaultMaxViewRecords = 500_000
 
-// recordCounter enforces the distinct-record bound. Keys are resolved
-// (dataset, recordId) pairs, so repeated touches of the same record —
-// the editor keystroke profile — count once. Its own memory is O(max)
-// worst case, the same order as the scratch rows it is guarding.
+// recordCounter enforces the distinct-record bound. Entries are
+// seeded 64-bit fingerprints of the resolved (dataset, recordId)
+// pair, so repeated touches of the same record — the editor
+// keystroke profile — count once. Fingerprints instead of string
+// keys keep the counter from becoming what it guards against: it
+// retains no decoded id strings and costs ~1/6 of a string-pair map
+// at the bound, while still growing with the actual distinct count
+// (a flat bitset would need a fixed multi-MB allocation per view, or
+// an id dictionary — a string map again). A collision undercounts
+// one record — harmless off-by-one on a soft bound — and the
+// per-counter random seed keeps collisions non-craftable by a
+// hostile peer choosing record ids (odds ~1e-8 at the default
+// bound).
 type recordCounter struct {
-	seen map[recordKey]struct{}
+	seed maphash.Seed
+	seen map[uint64]struct{}
 	max  int
 }
 
-type recordKey struct{ ds, id string }
-
 func newRecordCounter(max int) *recordCounter {
-	return &recordCounter{seen: make(map[recordKey]struct{}), max: max}
+	return &recordCounter{seed: maphash.MakeSeed(), seen: make(map[uint64]struct{}), max: max}
 }
 
 // add registers the change's resolved record ids; false once the
@@ -68,7 +77,12 @@ func (rc *recordCounter) add(ch *crdt.Change) bool {
 		return true
 	}
 	for _, id := range ids {
-		key := recordKey{ds: ch.Dataset, id: id}
+		var h maphash.Hash
+		h.SetSeed(rc.seed)
+		_, _ = h.WriteString(ch.Dataset)
+		_ = h.WriteByte(0)
+		_, _ = h.WriteString(id)
+		key := h.Sum64()
 		if _, dup := rc.seen[key]; dup {
 			continue
 		}

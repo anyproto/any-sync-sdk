@@ -285,6 +285,9 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
+	// Read-only gate on every user-authored synced write
+	// (Object.LocalWrite, Store.Create) — see spaceWriteGate.
+	st.SetWriteGate(func() error { return s.spaceWriteGate(spaceId) })
 	// Resolve the read-sync service lazily: stores can be created
 	// before sdk.Open injects it, and untracked spaces never call it.
 	st.SetSeedHeadsProvider(func(ctx context.Context, objectId string) ([][]string, error) {
@@ -317,6 +320,42 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // spacesync catch-up driver invoked from SDK.Open) that need the
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
+
+// spaceWriteGate rejects user-authored synced writes into spaceId with
+// ErrReadOnlySpace when the account affirmatively cannot write:
+//
+//   - guest-mode rows (space added via guest key) — always, even
+//     before the space is resident;
+//   - a resident space whose ACL grants a role without write
+//     permission (reader / guest).
+//
+// Deliberately permissive everywhere else: a not-yet-resident space,
+// an absent identity, or an unreadable ACL all pass — any-sync's
+// CanWrite check in tree.AddContent stays the authority, this gate
+// just fails fast with a typed error instead of letting the write
+// reach the DAG layer. Local-set and inbound applies are never gated.
+func (s *Service) spaceWriteGate(spaceId string) error {
+	ctx := context.Background()
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.GuestKey != "" {
+		return space.ErrReadOnlySpace
+	}
+	handle, ok := s.app.PickSpace(ctx, spaceId)
+	if !ok {
+		return nil
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return nil
+	}
+	acl.RLock()
+	state := acl.AclState()
+	perms := state.Permissions(state.Identity())
+	acl.RUnlock()
+	if !perms.NoPermissions() && !perms.CanWrite() {
+		return space.ErrReadOnlySpace
+	}
+	return nil
+}
 
 // SetReadSync injects the SDK-level read-state sync service. Called
 // once from sdk.Open after the tech space is up.
@@ -1305,6 +1344,89 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 // approval. Maps to space.StatusJoining via mapStatus.
 const joiningLocalStatus = "joining"
 
+// guestLoadingLocalStatus is the DEVICE-LOCAL localStatus stamped by
+// JoinGuest while this device is still pulling the guest space's
+// content. Crash-recoverable exactly like inviteLoading: the join
+// controller's boot/tick pass resumes the load (no ACL waiter — the
+// shared guest identity is already an ACL member); the load-complete
+// flip clears it to active.
+const guestLoadingLocalStatus = "guestLoading"
+
+// guestRevokedLocalStatus is the DEVICE-LOCAL localStatus the ACL
+// mirror stamps on a guest-mode row when the shared guest identity has
+// been removed from the ACL (owner revoked public access). Maps to
+// space.StatusGuestRevoked. Non-terminal: the mirror flips it back to
+// active if a fresh ACL shows the identity active again.
+const guestRevokedLocalStatus = "guestRevoked"
+
+// JoinGuest adds a space via a guest invite — see space.Service.JoinGuest.
+// No ACL write and no approval: the invite key IS the shared read-only
+// guest identity, already an active ACL member. The row is recorded
+// durably (synced guest key + device-local loading marker) before the
+// single bounded load attempt, so a crash or offline start resumes in
+// the join controller.
+func (s *Service) JoinGuest(ctx context.Context, invite string) (space.Space, error) {
+	if invite == "" {
+		return nil, errors.New("spaceimpl: JoinGuest: invite required")
+	}
+	inv, err := space.DecodeInvite(invite)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: %w", err)
+	}
+	if inv.Kind != space.InviteKindGuest {
+		return nil, errors.New("spaceimpl: JoinGuest: not a guest invite — use Join")
+	}
+	encoded, err := crypto.EncodeKeyToString(inv.InviteKey)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: encode guest key: %w", err)
+	}
+	if rec, ok := s.tsp.Get(ctx, inv.SpaceId); ok {
+		if rec.IsDeleted() {
+			return nil, fmt.Errorf("spaceimpl: JoinGuest: space %q was deleted on this account (tombstones are sticky)", inv.SpaceId)
+		}
+		if rec.GuestKey == "" {
+			return nil, fmt.Errorf("spaceimpl: JoinGuest: space %q is already tracked by this account — guest access would demote it", inv.SpaceId)
+		}
+		// Guest row already exists (another device joined, or a prior
+		// attempt) — refresh the key when the invite carries a rotated
+		// one (owner revoked + re-created), then (re)drive the load.
+		if rec.GuestKey != encoded {
+			if _, err := s.tsp.SetGuestKey(ctx, inv.SpaceId, encoded); err != nil {
+				return nil, fmt.Errorf("spaceimpl: JoinGuest: refresh guest key: %w", err)
+			}
+			// The loaded runtime (commonspace AND the Store's cached
+			// objects/trees) still signs and decrypts as the old
+			// identity; tear it all down so the next load rebuilds with
+			// the fresh key. Disk state stays.
+			s.closeSpaceRuntime(ctx, inv.SpaceId)
+		}
+	} else {
+		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+			Id:           inv.SpaceId,
+			Type:         space.SpaceTypeRegular,
+			RemoteStatus: techspace.StatusActive,
+			GuestKey:     encoded,
+		}); err != nil {
+			return nil, fmt.Errorf("spaceimpl: JoinGuest: write index entry: %w", err)
+		}
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, guestLoadingLocalStatus); err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: mark loading: %w", err)
+	}
+	sp, err := s.load(ctx, inv.SpaceId)
+	if err != nil {
+		// Content not pullable yet (or offline). The join controller owns
+		// the retry; the guest row itself is already durable.
+		s.kickJoinController()
+		return nil, space.ErrGuestJoinPending
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, techspace.StatusActive); err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: flip active: %w", err)
+	}
+	s.kickJoinController() // reap any pending-load bookkeeping
+	return sp, nil
+}
+
 // inviteLoadingLocalStatus is the DEVICE-LOCAL localStatus stamped by
 // AcceptInvite while this device is still pulling the accepted space's
 // content. Crash-recoverable: the join controller's boot/tick pass
@@ -1600,6 +1722,11 @@ func mapStatus(typ, local, remote string) space.Status {
 		return space.StatusInvitePending
 	case local == joiningLocalStatus:
 		return space.StatusJoining
+	case local == guestRevokedLocalStatus:
+		// Guest-mode space whose shared identity was removed from the
+		// ACL. Device-local (each device's mirror detects it) and
+		// non-terminal — the mirror self-heals back to active.
+		return space.StatusGuestRevoked
 	case typ == space.SpaceTypeOneToOne && local != techspace.StatusActive && remote != techspace.StatusActive:
 		// A 1-1 row that exists but carries no active/declined signal and no
 		// device-local pending: the row synced from the device that

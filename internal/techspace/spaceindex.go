@@ -43,6 +43,8 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldSettings, Name: "Settings", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
 		{Id: FieldPushKeys, Name: "Push keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeLocal},
 		{Id: FieldOwnRole, Name: "Own role", Schema: str(), Scope: schema.ScopeLocal},
+		{Id: FieldGuestKey, Name: "Guest key", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldIssuedGuestKey, Name: "Issued guest key", Schema: str(), Scope: schema.ScopeSynced},
 	}}
 }
 
@@ -170,6 +172,22 @@ const (
 	// Object.LocalSet; absent until the mirror first runs, which
 	// readers must treat as "unknown yet", not as no-access.
 	FieldOwnRole = "ownRole"
+	// FieldGuestKey marks a guest-mode (public-access) space: the shared
+	// read-only guest identity's private key, string-encoded, written
+	// once by Service (JoinGuest path) when the account adds the space
+	// via a guest invite. SYNCED — any of the account's devices opens
+	// the space with the same identity. Presence is the guest-mode
+	// discriminator for space loading and the write gate; empty on all
+	// other rows. Account-private via the tech space's owner-only ACL.
+	FieldGuestKey = "guestKey"
+	// FieldIssuedGuestKey is the OWNER-side custody of the guest key
+	// this account issued for a space it owns: the guest identity's
+	// private key, string-encoded. SYNCED so every owner device can
+	// return / revoke the same invite (the private key is not
+	// recoverable from the ACL). Written by ACL.CreateGuestKey, cleared
+	// by RevokeGuestKey. Distinct from FieldGuestKey so an owner's own
+	// row never reads as guest-mode.
+	FieldIssuedGuestKey = "issuedGuestKey"
 )
 
 // FieldPushKeys subfield names — the wire shape of the `push` object.

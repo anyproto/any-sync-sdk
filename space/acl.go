@@ -75,6 +75,25 @@ type ACL interface {
 	// StopSharing drops every non-owner member, revokes every invite,
 	// and rotates the read key in one batch. Owner only.
 	StopSharing(ctx context.Context) error
+
+	// CreateGuestKey enables public read-only access: it mints a shared
+	// guest identity, adds it to the ACL with PermissionGuest, and
+	// returns it as an InviteKindGuest invite for Service.JoinGuest.
+	// One active guest key per space; the private key is persisted on
+	// the owner's tech-space row, so repeated calls return the same
+	// invite while the guest identity is still active in the ACL
+	// (idempotent — the key is not recoverable from the ACL itself).
+	// Owner only: custody lives in the owner's tech space, so admins
+	// can neither fetch nor reissue it.
+	CreateGuestKey(ctx context.Context) (Invite, error)
+
+	// RevokeGuestKey removes the guest identity from the ACL and
+	// rotates the read key, cutting every guest off from new content
+	// (already-synced local copies stay readable on their devices).
+	// Clears the stored key; a later CreateGuestKey mints a fresh
+	// identity, so old invites die permanently. No-op error when no
+	// guest key is active.
+	RevokeGuestKey(ctx context.Context) error
 }
 
 // PermissionChange is one entry in a batch ChangePermissions call.

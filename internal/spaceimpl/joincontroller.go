@@ -90,7 +90,20 @@ func (s *Service) reconcileJoins(ctx context.Context) {
 		if r.LocalStatus == joiningLocalStatus {
 			joining[r.Id] = r
 		}
-		if r.LocalStatus == inviteLoadingLocalStatus {
+		if r.LocalStatus == inviteLoadingLocalStatus || r.LocalStatus == guestLoadingLocalStatus {
+			// Same pull-until-available load for both: no ACL waiter —
+			// the account (or the shared guest identity) is already an
+			// ACL member; loadAcceptedInvite's invite-specific branches
+			// never trigger on a guest row.
+			s.startPendingLoad(ctx, r.Id)
+		} else if r.GuestKey != "" && !r.IsDeleted() &&
+			(r.LocalStatus == "" || r.LocalStatus == techspace.StatusActive) &&
+			!s.app.SpaceExists(r.Id) {
+			// Guest row without local storage and without a loading
+			// marker: a JoinGuest that crashed between the row write and
+			// the marker, or a row synced in from another device. The row
+			// itself is the durable intent — resume the pull regardless
+			// of the device-local marker. Revoked/deleted rows stay out.
 			s.startPendingLoad(ctx, r.Id)
 		}
 	}

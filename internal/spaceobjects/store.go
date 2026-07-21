@@ -260,6 +260,13 @@ type Store struct {
 	// historyPendingStale; without it a purge skipped once would leak
 	// the rows forever.
 	historyPendingPurge sync.Map
+
+	// writeGate rejects user-authored synced writes when non-nil and
+	// erroring (read-only guest spaces). Consulted by Store.Create and
+	// wired into every Object's LocalWrite. Set via SetWriteGate before
+	// the first object load; inbound apply / local-set paths are never
+	// gated.
+	writeGate func() error
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -330,6 +337,19 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes,
 		SelectiveTypes: selectiveTypes,
 	})
+}
+
+// SetWriteGate installs the user-write gate (see Store.writeGate).
+// Call right after construction, before the first object load —
+// cached Objects capture the gate at wiring time.
+func (s *Store) SetWriteGate(g func() error) { s.writeGate = g }
+
+// checkWriteGate applies the gate; nil gate = writable.
+func (s *Store) checkWriteGate() error {
+	if s.writeGate == nil {
+		return nil
+	}
+	return s.writeGate()
 }
 
 // NewStoreWithConfig constructs a Store from cfg. The async drainer is
@@ -1135,6 +1155,9 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 // land on the root any-sync change; for the MVP they're informational
 // only.
 func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, error) {
+	if err := s.checkWriteGate(); err != nil {
+		return nil, err
+	}
 	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
 		return nil, err
 	}
@@ -1335,6 +1358,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		Allocator:      s.alloc,
 		Gate:           gate,
 		AfterApply:     s.afterApplyFor(),
+		WriteGate:      s.writeGate,
 		PlaintextSpecs: plaintextSpecs,
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)

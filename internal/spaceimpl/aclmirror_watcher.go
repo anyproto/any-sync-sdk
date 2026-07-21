@@ -191,7 +191,48 @@ func (w *aclMirrorWatcher) mirror() bool {
 	if !w.mirrorPushKeys(ctx, cur) {
 		done = false
 	}
+	if !w.mirrorGuestRevoked(ctx, cur) {
+		done = false
+	}
 	return done
+}
+
+// mirrorGuestRevoked maintains the guestRevoked localStatus on a
+// guest-mode row: stamped when the shared guest identity (this space's
+// state.Identity()) has lost its ACL permission — the owner revoked
+// public access — and healed back to active if a fresh ACL shows it
+// active again. Skipped while the initial load is still in flight
+// (guestLoading): an incomplete ACL must not read as a revocation.
+// Non-guest rows always report done.
+func (w *aclMirrorWatcher) mirrorGuestRevoked(ctx context.Context, cur techspace.SpaceIndexRecord) bool {
+	if cur.GuestKey == "" || cur.LocalStatus == guestLoadingLocalStatus || cur.IsDeleted() {
+		return true
+	}
+	role, err := w.s.ownRole(ctx, w.id)
+	if err != nil {
+		aclMirrorLog.Debug("mirror guest revoked failed", zap.String("spaceId", w.id), zap.Error(err))
+		return false
+	}
+	var want string
+	switch {
+	case role == space.PermissionNone && cur.LocalStatus == techspace.StatusActive:
+		// Only a row this device has fully loaded (localStatus active)
+		// may flip to revoked: on a second device the row syncs in with
+		// no localStatus while the ACL may not be pulled yet, and an
+		// absent identity must not read as a revocation there — the
+		// guest loader flips the row active after a complete pull, and
+		// detection starts from that point.
+		want = guestRevokedLocalStatus
+	case role == space.PermissionGuest && cur.LocalStatus == guestRevokedLocalStatus:
+		want = techspace.StatusActive
+	default:
+		return true
+	}
+	if _, err := w.s.tsp.SetLocalStatus(ctx, w.id, want); err != nil {
+		aclMirrorLog.Warn("mirror guest revoked write failed", zap.String("spaceId", w.id), zap.Error(err))
+		return false
+	}
+	return true
 }
 
 // mirrorOwnRole writes this account's current ACL permission onto the

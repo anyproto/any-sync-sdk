@@ -494,6 +494,65 @@ func (s *Service) SetRemoteStatus(ctx context.Context, spaceId, status string) (
 	return obj.LocalWrite(ctx, change)
 }
 
+// SetIssuedGuestKey writes (or clears, with "") the SYNCED owner-side
+// custody of the guest key issued for spaceId — every owner device can
+// then return / revoke the same invite. Written by ACL.CreateGuestKey,
+// cleared by RevokeGuestKey.
+func (s *Service) SetIssuedGuestKey(ctx context.Context, spaceId, encodedKey string) (object.WriteResult, error) {
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldIssuedGuestKey},
+					Payload: arena.NewString(encodedKey),
+				}},
+			},
+		},
+	}
+	return obj.LocalWrite(ctx, change)
+}
+
+// SetGuestKey updates the SYNCED guest-mode key on an existing row —
+// the re-join path after the owner rotated the guest key (JoinGuest
+// with a fresh invite). Row creation writes the field via EncodeCreate.
+func (s *Service) SetGuestKey(ctx context.Context, spaceId, encodedKey string) (object.WriteResult, error) {
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id: spaceId,
+				Ops: []crdt.Op{{
+					Type:    crdt.OpSet,
+					Path:    []string{FieldGuestKey},
+					Payload: arena.NewString(encodedKey),
+				}},
+			},
+		},
+	}
+	return obj.LocalWrite(ctx, change)
+}
+
 // Get returns the current state of one space-index record. Reads off
 // the resident index object's controller; inbound changes are kept
 // current by the object's deferred-updater listener (no drain needed).

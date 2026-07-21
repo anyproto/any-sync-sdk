@@ -23,8 +23,13 @@ import (
 // config.Network.NodeConfYAML. Kept private so the public Config stays
 // any-sync-agnostic.
 type nodeConfYAML struct {
-	NetworkID string         `yaml:"networkId"`
-	Nodes     []nodeYAML     `yaml:"nodes"`
+	ID string `yaml:"id"`
+	// NetworkID identifies the tree/coordinator fleet; FileNetworkID is
+	// the fileV2 fleet's receipt-signing identity — without it durable
+	// receipts can't verify and files never leave the inflight state.
+	NetworkID     string     `yaml:"networkId"`
+	FileNetworkID string     `yaml:"fileNetworkId"`
+	Nodes         []nodeYAML `yaml:"nodes"`
 }
 
 type nodeYAML struct {
@@ -54,8 +59,10 @@ func parseNodeConf(raw []byte) (nodeconf.Configuration, error) {
 		}
 	}
 	return nodeconf.Configuration{
-		NetworkId: doc.NetworkID,
-		Nodes:     nodes,
+		Id:            doc.ID,
+		NetworkId:     doc.NetworkID,
+		FileNetworkId: doc.FileNetworkID,
+		Nodes:         nodes,
 	}, nil
 }
 

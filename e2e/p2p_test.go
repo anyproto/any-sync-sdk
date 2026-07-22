@@ -241,7 +241,12 @@ func TestE2E_P2POfflineSync(t *testing.T) {
 		return rErr == nil && rec != nil && rec.GetString(typeId, propId) == "from-B"
 	}), "device A never received B's edit over p2p")
 
+	// Kick the diff round instead of waiting for the periodic tick
+	// (SYN-90: the tick quantizes this wait, 0.6s → 90s). The kicked
+	// 0/0 round still proves the guard: a non-responsible peer's
+	// round would be ignored and the state would never flip.
 	require.True(t, waitFor(ctx, 30*time.Second, 250*time.Millisecond, func() bool {
+		_ = spB.SyncHeads(ctx)
 		return sdkB.Spaces().Status(spaceId).State == space.SyncStateSynced
 	}), "device B sync status never reached Synced over LAN; last=%+v", sdkB.Spaces().Status(spaceId))
 }

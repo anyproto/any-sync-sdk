@@ -119,6 +119,15 @@ type Service struct {
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
 
+	// oneToOneLocks serializes 1-1 materialization per space id.
+	// DeriveOneToOneSpace reaches CreateSpaceStorage outside the space
+	// cache's per-id single-flight, and that path deletes the db file
+	// on a duplicate-create error — two concurrent materializations
+	// (e.g. parallel Gets adopting a 1-1 accepted on another device)
+	// would race destructively. Entries are never freed: one per 1-1
+	// contact, bounded and tiny.
+	oneToOneLocks map[string]*sync.Mutex
+
 	// spaceIndexIds caches the deterministic spaceIndex object id per
 	// spaceId so SetMetadata / Info-side reads don't re-derive on every
 	// call. Populated by ensureSpaceIndexWiring.
@@ -239,6 +248,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
 		pendingLoads:       make(map[string]struct{}),
 		inviteKick:         make(chan struct{}, 1),
+		oneToOneLocks:      make(map[string]*sync.Mutex),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	s.startDeletionReconciler()
@@ -614,6 +624,15 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
+	}
+	// Deleted rows are refused outright, mirroring the boot eager-load:
+	// the storage is offloaded (or was never created), a load would
+	// SpacePull a space the account removed, and the node rejects
+	// deleted spaces anyway. mapStatus ranks deleted above pending, so
+	// without this a deleted-elsewhere pending row would fall through
+	// the guard into a pull.
+	if rec.IsDeleted() {
+		return nil, fmt.Errorf("spaceimpl: space %q is deleted", spaceId)
 	}
 	if err := MaterializeBlock(rec); err != nil {
 		return nil, err
@@ -1046,6 +1065,20 @@ const oneToOnePendingLocalStatus = "oneToOnePending"
 // space.StatusOneToOneDeclined.
 const oneToOneDeclinedRemoteStatus = "oneToOneDeclined"
 
+// lockOneToOne takes the per-space 1-1 materialization lock, returning
+// the unlock. See the oneToOneLocks field comment.
+func (s *Service) lockOneToOne(spaceId string) func() {
+	s.mu.Lock()
+	m, ok := s.oneToOneLocks[spaceId]
+	if !ok {
+		m = &sync.Mutex{}
+		s.oneToOneLocks[spaceId] = m
+	}
+	s.mu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
 // OneToOne reaches out to — or explicitly accepts / un-declines — the 1-1
 // space shared with otherIdentity. Derives the shared space, materializes
 // its storage, and activates it locally (implicit self-approval). Same id
@@ -1063,10 +1096,15 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
 	}
-	// DeriveOneToOneSpace creates the storage as a side effect (idempotent —
-	// ErrSpaceStorageExists is swallowed) and returns the derived id.
-	spaceId, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk)
+	spaceId, err := deriveOneToOneId(keys.SignKey, otherPk)
 	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: derive 1-1 id: %w", err)
+	}
+	unlock := s.lockOneToOne(spaceId)
+	defer unlock()
+	// DeriveOneToOneSpace creates the storage as a side effect (idempotent —
+	// ErrSpaceStorageExists is swallowed).
+	if _, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk); err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
 	}
 	sp, err := s.activateOneToOne(ctx, spaceId, otherIdentity)
@@ -1104,6 +1142,8 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w", err)
 	}
+	unlock := s.lockOneToOne(spaceId)
+	defer unlock()
 	// Pending rows carry no storage — materialize it now.
 	if _, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk); err != nil {
 		return nil, fmt.Errorf("spaceimpl: materialize 1-1: %w", err)

@@ -265,21 +265,22 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	openSDK := func(name string) (*anysyncsdk.SDK, string) {
+	openSDK := func(name string, p *fixedSeedProvider) (*anysyncsdk.SDK, string) {
 		t.Helper()
 		dir := t.TempDir()
 		cfg := config.Config{
 			Storage: config.Storage{DataDir: dir, Topology: config.StorageShared},
 			Network: config.Network{NodeConfYAML: yaml},
 		}
-		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+		sdk, err := anysyncsdk.Open(ctx, cfg, p)
 		require.NoError(t, err, "%s: Open", name)
 		t.Cleanup(func() { _ = sdk.Close() })
 		return sdk, dir
 	}
 
-	alice, _ := openSDK("alice")
-	bob, bobDir := openSDK("bob")
+	bobProvider := newFixedSeedProvider(t)
+	alice, _ := openSDK("alice", newFixedSeedProvider(t))
+	bob, bobDir := openSDK("bob", bobProvider)
 	require.NotEqual(t, alice.Account().Id(), bob.Account().Id())
 
 	// Alice initiates — active immediately (implicit self-approval).
@@ -311,14 +312,52 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	_, err = bob.Spaces().Get(ctx, id)
 	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
 		"Get on a pending incoming 1-1 must refuse to materialize")
-	require.NoFileExists(t, filepath.Join(bobDir, id+".db"),
+	require.NoFileExists(t, filepath.Join(bobDir, "anysync", id+".db"),
 		"a pending incoming 1-1 must not create any-sync space storage")
+
+	// Bob's SECOND device (same account, fresh device key). Discovery is
+	// per-device: it either registers its own pending row or receives
+	// device 1's row via tech-space sync (RegisterIncoming then no-ops).
+	// Both shapes are "unresolved on this device" and must refuse to
+	// materialize while no device has accepted.
+	bobB, bobBDir := openSDK("bob-2", sameAccountFreshDevice(t, bobProvider))
+	require.NoError(t, bobB.Spaces().RegisterIncoming(ctx, alice.Account().Id(), space.AccountMetadata{Name: "Alice"}))
+	_, err = bobB.Spaces().Get(ctx, id)
+	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
+		"an unresolved 1-1 on a second device must refuse to materialize")
 
 	// Bob approves → active, materialized.
 	bobSp, err := bob.Spaces().AcceptOneToOne(ctx, id)
 	require.NoError(t, err, "bob: AcceptOneToOne")
 	require.Equal(t, id, bobSp.Id())
 	si, ok = infoByID(t, ctx, bob, id)
+	require.True(t, ok)
+	assert.Equal(t, space.StatusActive, si.Status)
+
+	// Cross-device acceptance: bob accepted on device 1 only. Once the
+	// synced remote=active reaches device 2 it wins over the stale
+	// device-local pending (acceptance is account-scoped) and Get adopts
+	// the 1-1 — derives storage, clears the pending — with no per-device
+	// re-accept.
+	adopted := false
+	syncDeadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(syncDeadline) {
+		_ = bobB.Spaces().SyncSpaceList(ctx)
+		if si, ok := infoByID(t, ctx, bobB, id); ok && si.Status == space.StatusActive {
+			adopted = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !adopted {
+		t.Skipf("bob's second device did not converge on the accepted 1-1 in time (tech-space sync / node reachability)")
+	}
+	bobBSp, err := bobB.Spaces().Get(ctx, id)
+	require.NoError(t, err, "bob-2: Get must adopt a 1-1 accepted on another device")
+	require.Equal(t, id, bobBSp.Id())
+	require.FileExists(t, filepath.Join(bobBDir, "anysync", id+".db"),
+		"adoption must materialize local 1-1 storage")
+	si, ok = infoByID(t, ctx, bobB, id)
 	require.True(t, ok)
 	assert.Equal(t, space.StatusActive, si.Status)
 

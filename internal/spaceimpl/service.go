@@ -13,6 +13,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
@@ -20,6 +21,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -615,8 +617,31 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
 	}
+	// Deleted rows are refused outright, mirroring the boot eager-load:
+	// the storage is offloaded (or was never created), a load would
+	// SpacePull a space the account removed, and the node rejects
+	// deleted spaces anyway. mapStatus ranks deleted above pending, so
+	// without this a deleted-elsewhere pending row would fall through
+	// the guard into a pull.
+	if rec.IsDeleted() {
+		return nil, fmt.Errorf("spaceimpl: space %q: %w", spaceId, space.ErrSpaceDeleted)
+	}
 	if err := MaterializeBlock(rec); err != nil {
 		return nil, err
+	}
+	// A 1-1 accepted (or initiated) on another of this account's devices:
+	// the synced remote=active landed while this device never processed
+	// the 1-1 itself — its localStatus is a stale pending (own inbox
+	// discovery) or empty (row synced in first). Adopt via the accept
+	// path instead of a bare load — AcceptOneToOne derives the 1-1
+	// storage locally (load would SpacePull) and stamps local=active, so
+	// acceptance stays an account-level decision made once. A local
+	// delete (localStatus=deleted) is not adopted — this device removed
+	// the space on purpose.
+	if rec.Type == space.SpaceTypeOneToOne &&
+		rec.RemoteStatus == techspace.StatusActive &&
+		(rec.LocalStatus == "" || rec.LocalStatus == oneToOnePendingLocalStatus) {
+		return s.AcceptOneToOne(ctx, spaceId)
 	}
 	return s.load(ctx, spaceId)
 }
@@ -640,16 +665,24 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 // even when storage exists (a pre-guard build may have materialized
 // one; eager-loading it would run headsync/treesyncer on a space this
 // account can't read yet).
+//
+// The predicate is the mapStatus classification, not the raw fields, so
+// the guard and the surfaced Status can never disagree. In particular
+// acceptance is account-scoped: a 1-1 accepted or initiated on ANY of
+// the account's devices carries synced remote=active, which mapStatus
+// resolves as Active over a stale device-local pending — such a row
+// must load, not demand a per-device re-accept. Conversely a bare 1-1
+// row synced in before this device set any status classifies as
+// pending and blocks.
 func MaterializeBlock(rec techspace.SpaceIndexRecord) error {
-	switch {
-	case rec.LocalStatus == joiningLocalStatus:
+	switch mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) {
+	case space.StatusJoining:
 		return fmt.Errorf("spaceimpl: space %q join is pending owner approval: %w", rec.Id, space.ErrSpaceNotAccepted)
-	case rec.LocalStatus == oneToOnePendingLocalStatus:
+	case space.StatusOneToOnePending:
 		return fmt.Errorf("spaceimpl: space %q is an incoming 1-1; AcceptOneToOne it first: %w", rec.Id, space.ErrSpaceNotAccepted)
-	case rec.RemoteStatus == oneToOneDeclinedRemoteStatus:
+	case space.StatusOneToOneDeclined:
 		return fmt.Errorf("spaceimpl: space %q is a declined 1-1; OneToOne the peer to un-decline: %w", rec.Id, space.ErrSpaceNotAccepted)
-	case rec.RemoteStatus == techspace.InvitePendingRemoteStatus,
-		rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus:
+	case space.StatusInvitePending, space.StatusInviteDeclined:
 		return fmt.Errorf("spaceimpl: space %q is a pending direct-add invite; AcceptInvite it first: %w", rec.Id, space.ErrSpaceNotAccepted)
 	}
 	return nil
@@ -937,15 +970,21 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if keys == nil {
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
 	}
-	payload := s.derivePayload(keys, req)
-	spaceId, err := s.app.SpaceService().DeriveId(ctx, payload)
+	storageCreate, err := spacepayloads.StoragePayloadForSpaceDeriveV1(s.derivePayload(keys, req))
 	if err != nil {
-		return nil, fmt.Errorf("spaceimpl: derive id: %w", err)
+		return nil, fmt.Errorf("spaceimpl: derive: %w", err)
 	}
-	if !s.app.SpaceExists(spaceId) {
-		if _, err := s.app.SpaceService().DeriveSpace(ctx, payload); err != nil {
-			return nil, fmt.Errorf("spaceimpl: derive: %w", err)
-		}
+	spaceId := storageCreate.SpaceHeaderWithId.Id
+	// Storage creation rides the GetSpace cache load below (see
+	// ctxWithCreatePayload): derived ids are deterministic, so an
+	// out-of-band exists-check + create here would let two concurrent
+	// Derives of the same seed race the storage create.
+	ctx = ctxWithCreatePayload(ctx, storageCreate)
+	// Load (creating storage from the armed ctx on first derive) BEFORE
+	// writing the active row — an active row without storage is a state
+	// plain Get can't heal (see activateOneToOne).
+	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+		return nil, err
 	}
 	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
@@ -957,9 +996,6 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 		}
-	}
-	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
-		return nil, err
 	}
 	store := s.storeFor(spaceId)
 	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
@@ -1024,6 +1060,26 @@ const oneToOnePendingLocalStatus = "oneToOnePending"
 // space.StatusOneToOneDeclined.
 const oneToOneDeclinedRemoteStatus = "oneToOneDeclined"
 
+// ctxWithCreatePayload arms ctx so the space cache load can CREATE the
+// missing storage instead of pull-bootstrapping it: NewSpace, running
+// inside the ocache's per-id single-flight, builds the storage from the
+// AddSpaceCtxKey description — the same path inbound SpacePush uses.
+// This is the only sanctioned way to create storage for a
+// deterministic id: CreateSpaceStorage is concurrency-safe only under
+// that single-flight (its husk sweep and error cleanup delete the db
+// file), so calling SpaceService Derive*/Create* directly for an id
+// two callers can compute (1-1 derive, seed derive) races
+// destructively. Random-id Create doesn't need this.
+func ctxWithCreatePayload(ctx context.Context, p spacestorage.SpaceStorageCreatePayload) context.Context {
+	return context.WithValue(ctx, commonspace.AddSpaceCtxKey, commonspace.SpaceDescription{
+		SpaceHeader:          p.SpaceHeaderWithId,
+		AclId:                p.AclWithId.Id,
+		AclPayload:           p.AclWithId.Payload,
+		SpaceSettingsId:      p.SpaceSettingsWithId.Id,
+		SpaceSettingsPayload: p.SpaceSettingsWithId.RawChange,
+	})
+}
+
 // OneToOne reaches out to — or explicitly accepts / un-declines — the 1-1
 // space shared with otherIdentity. Derives the shared space, materializes
 // its storage, and activates it locally (implicit self-approval). Same id
@@ -1041,13 +1097,14 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
 	}
-	// DeriveOneToOneSpace creates the storage as a side effect (idempotent —
-	// ErrSpaceStorageExists is swallowed) and returns the derived id.
-	spaceId, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
 	}
-	sp, err := s.activateOneToOne(ctx, spaceId, otherIdentity)
+	spaceId := payload.SpaceHeaderWithId.Id
+	// Storage creation rides the activate's cache load (see
+	// ctxWithCreatePayload); no-op when storage already exists.
+	sp, err := s.activateOneToOne(ctxWithCreatePayload(ctx, payload), spaceId, otherIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -1082,11 +1139,13 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w", err)
 	}
-	// Pending rows carry no storage — materialize it now.
-	if _, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk); err != nil {
+	// Pending rows carry no storage — the activate's cache load creates
+	// it from the derived payload (see ctxWithCreatePayload).
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
+	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: materialize 1-1: %w", err)
 	}
-	return s.activateOneToOne(ctx, spaceId, rec.OneToOnePeer)
+	return s.activateOneToOne(ctxWithCreatePayload(ctx, payload), spaceId, rec.OneToOnePeer)
 }
 
 // DeclineOneToOne rejects an incoming 1-1. Writes the synced, sticky
@@ -1199,12 +1258,22 @@ func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity stri
 	_ = s.tsp.SetIdentityProfile(ctx, peerIdentity, prof.Name, prof.Description, prof.IconCID)
 }
 
-// activateOneToOne wires a 1-1 whose storage already exists and flips its
+// activateOneToOne loads (creating storage from the armed ctx when
+// missing — see ctxWithCreatePayload) and wires a 1-1, then flips its
 // index row to active, clearing any pending (device-local) or declined
 // (synced) state. Shared by OneToOne (initiate) and AcceptOneToOne.
+// The load runs BEFORE the flips — same rule as the join loaders: a
+// row must never say active while storage doesn't exist, or a crash in
+// between strands a state plain Get can't heal (its adopt branch keys
+// on pending, and an unarmed load can only SpacePull). A crash after
+// the load leaves storage + a pending row, which the accept paths and
+// Get's adoption both recover.
 // peerIdentity is recorded on a freshly-created row so any of the account's
 // devices can re-derive the space.
 func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity string) (space.Space, error) {
+	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+		return nil, err
+	}
 	if rec, ok := s.tsp.Get(ctx, spaceId); ok {
 		// SetRemoteStatus(active) overrides a synced decline
 		// (oneToOneDeclined is non-terminal); SetLocalStatus clears a
@@ -1227,9 +1296,6 @@ func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity st
 		OneToOnePeer: peerIdentity,
 	}); err != nil {
 		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
-	}
-	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
-		return nil, err
 	}
 	store := s.storeFor(spaceId)
 	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {

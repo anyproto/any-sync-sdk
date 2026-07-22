@@ -118,6 +118,12 @@ func (s *Service) Open(ctx context.Context) error {
 		s.app.MarkSpaceLocalOnly(spaceId)
 	}
 
+	// Boot-serial only (sdk.Open, before any API is exposed), so this
+	// exists-check + out-of-band create cannot race itself. Do NOT copy
+	// this shape into a concurrent context: CreateSpaceStorage is
+	// concurrency-safe only under the space cache's per-id load — a
+	// concurrent deterministic-id create must ride the cache load
+	// instead (see spaceimpl's ctxWithCreatePayload).
 	if !s.app.SpaceExists(spaceId) {
 		if _, err := s.app.SpaceService().DeriveSpace(ctx, spaceCfg); err != nil {
 			return fmt.Errorf("techspace: derive: %w", err)

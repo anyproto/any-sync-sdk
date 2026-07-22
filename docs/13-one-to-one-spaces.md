@@ -138,9 +138,13 @@ Rules:
   `displayHint`), so the UI can render "Alice wants to chat" without syncing
   anything.
 - **Accept** (`AcceptOneToOne(spaceId)`, or equivalently `OneToOne(peer)` again)
-  flips Pending→active and runs materialization. Idempotent. The space's
-  membership syncs through the normal tech-space list, so the account's other
-  devices materialize it on their own.
+  flips Pending→active and runs materialization. Idempotent. **Acceptance is
+  account-scoped**: it writes the synced `RemoteStatus=active`, and on the
+  account's other devices that wins over a stale device-local pending (or a
+  bare row that synced in before the device set any status) — the status maps
+  to Active, the materialization guard passes, and the next `Get` *adopts* the
+  1-1: derives storage locally and stamps the device active. No per-device
+  re-accept. A device-local delete is never adopted over.
 - **Decline** (`DeclineOneToOne(spaceId)`) writes the **synced** `oneToOneDeclined`
   marker, sticky against the automatic discovery path on **every** device:
   later inbox re-deliveries / peer writes never re-surface it as incoming. A

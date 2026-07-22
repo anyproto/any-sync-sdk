@@ -21,6 +21,12 @@ func TestMaterializeBlock(t *testing.T) {
 		{"empty statuses (tracked/legacy row)", techspace.SpaceIndexRecord{Id: "s"}, false},
 		{"joining", techspace.SpaceIndexRecord{Id: "s", LocalStatus: joiningLocalStatus, RemoteStatus: techspace.StatusActive}, true},
 		{"incoming 1-1 pending", techspace.SpaceIndexRecord{Id: "s", LocalStatus: oneToOnePendingLocalStatus}, true},
+		// Acceptance is account-scoped: synced remote=active (accepted or
+		// initiated on any device) wins over a stale device-local pending.
+		{"1-1 accepted on another device", techspace.SpaceIndexRecord{Id: "s", Type: space.SpaceTypeOneToOne, LocalStatus: oneToOnePendingLocalStatus, RemoteStatus: techspace.StatusActive}, false},
+		// A 1-1 row synced in before this device set any status is an
+		// unresolved incoming request — must not materialize.
+		{"bare 1-1 row (no statuses)", techspace.SpaceIndexRecord{Id: "s", Type: space.SpaceTypeOneToOne}, true},
 		{"1-1 declined", techspace.SpaceIndexRecord{Id: "s", RemoteStatus: oneToOneDeclinedRemoteStatus}, true},
 		{"direct-add invite pending", techspace.SpaceIndexRecord{Id: "s", RemoteStatus: techspace.InvitePendingRemoteStatus}, true},
 		{"direct-add invite declined", techspace.SpaceIndexRecord{Id: "s", RemoteStatus: techspace.InviteDeclinedRemoteStatus}, true},

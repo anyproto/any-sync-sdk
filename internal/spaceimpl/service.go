@@ -618,6 +618,20 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	if err := MaterializeBlock(rec); err != nil {
 		return nil, err
 	}
+	// A 1-1 accepted (or initiated) on another of this account's devices:
+	// the synced remote=active landed while this device never processed
+	// the 1-1 itself — its localStatus is a stale pending (own inbox
+	// discovery) or empty (row synced in first). Adopt via the accept
+	// path instead of a bare load — AcceptOneToOne derives the 1-1
+	// storage locally (load would SpacePull) and stamps local=active, so
+	// acceptance stays an account-level decision made once. A local
+	// delete (localStatus=deleted) is not adopted — this device removed
+	// the space on purpose.
+	if rec.Type == space.SpaceTypeOneToOne &&
+		rec.RemoteStatus == techspace.StatusActive &&
+		(rec.LocalStatus == "" || rec.LocalStatus == oneToOnePendingLocalStatus) {
+		return s.AcceptOneToOne(ctx, spaceId)
+	}
 	return s.load(ctx, spaceId)
 }
 
@@ -640,16 +654,24 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 // even when storage exists (a pre-guard build may have materialized
 // one; eager-loading it would run headsync/treesyncer on a space this
 // account can't read yet).
+//
+// The predicate is the mapStatus classification, not the raw fields, so
+// the guard and the surfaced Status can never disagree. In particular
+// acceptance is account-scoped: a 1-1 accepted or initiated on ANY of
+// the account's devices carries synced remote=active, which mapStatus
+// resolves as Active over a stale device-local pending — such a row
+// must load, not demand a per-device re-accept. Conversely a bare 1-1
+// row synced in before this device set any status classifies as
+// pending and blocks.
 func MaterializeBlock(rec techspace.SpaceIndexRecord) error {
-	switch {
-	case rec.LocalStatus == joiningLocalStatus:
+	switch mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) {
+	case space.StatusJoining:
 		return fmt.Errorf("spaceimpl: space %q join is pending owner approval: %w", rec.Id, space.ErrSpaceNotAccepted)
-	case rec.LocalStatus == oneToOnePendingLocalStatus:
+	case space.StatusOneToOnePending:
 		return fmt.Errorf("spaceimpl: space %q is an incoming 1-1; AcceptOneToOne it first: %w", rec.Id, space.ErrSpaceNotAccepted)
-	case rec.RemoteStatus == oneToOneDeclinedRemoteStatus:
+	case space.StatusOneToOneDeclined:
 		return fmt.Errorf("spaceimpl: space %q is a declined 1-1; OneToOne the peer to un-decline: %w", rec.Id, space.ErrSpaceNotAccepted)
-	case rec.RemoteStatus == techspace.InvitePendingRemoteStatus,
-		rec.RemoteStatus == techspace.InviteDeclinedRemoteStatus:
+	case space.StatusInvitePending, space.StatusInviteDeclined:
 		return fmt.Errorf("spaceimpl: space %q is a pending direct-add invite; AcceptInvite it first: %w", rec.Id, space.ErrSpaceNotAccepted)
 	}
 	return nil

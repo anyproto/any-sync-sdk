@@ -252,7 +252,7 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	_, err = joiner.Spaces().Get(ctx, sp.Id())
 	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
 		"Get on a pending join must refuse to materialize")
-	require.NoFileExists(t, filepath.Join(joinerDir, sp.Id()+".db"),
+	require.NoFileExists(t, filepath.Join(joinerDir, "anysync", sp.Id()+".db"),
 		"a pending join must not create any-sync space storage")
 
 	// 4. Owner polls JoinRequests until the joiner's request lands.

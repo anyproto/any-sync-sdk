@@ -144,9 +144,9 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 // `space:<id>` row also rotates the change-feed generation, so
 // consumers full-reindex instead of trusting a renumbered applySeq axis.
 func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) error {
-	objectIds, err := s.spaceObjectIds(ctx, spaceId)
-	if err != nil {
-		offloadLog.Debug("enumerate space objects", zap.String("spaceId", spaceId), zap.Error(err))
+	objectIds, enumErr := s.spaceObjectIds(ctx, spaceId)
+	if enumErr != nil {
+		offloadLog.Warn("enumerate space objects", zap.String("spaceId", spaceId), zap.Error(enumErr))
 	}
 
 	names, err := s.db.GetCollectionNames(ctx)
@@ -154,8 +154,18 @@ func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) erro
 		return err
 	}
 
+	// `<spaceId>_objects` is the enumeration source for the per-object
+	// sweep, so it goes LAST — after the per-object drops and the meta
+	// purge, and only when enumeration succeeded. A crash mid-sweep or
+	// a failed enumeration then leaves the next attempt (re-offload or
+	// the startup orphan GC) able to re-enumerate instead of leaking
+	// the per-object collections permanently.
+	objectsColl := spaceId + "_" + spaceobjects.SpaceObjectsCollection
 	spacePrefix := spaceId + "_"
 	for _, name := range names {
+		if name == objectsColl {
+			continue
+		}
 		if strings.HasPrefix(name, spacePrefix) || ownedByObject(name, objectIds) {
 			s.dropCollection(ctx, name)
 		}
@@ -171,6 +181,10 @@ func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) erro
 		}
 	} else if !errors.Is(mErr, anystore.ErrCollectionNotFound) {
 		offloadLog.Warn("open meta for purge", zap.String("spaceId", spaceId), zap.Error(mErr))
+	}
+
+	if enumErr == nil {
+		s.dropCollection(ctx, objectsColl)
 	}
 	return nil
 }

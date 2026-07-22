@@ -20,11 +20,12 @@ import (
 )
 
 // TestSDK_OrphanCollectionGC pins the boot-time sweep's integration
-// contract: leaked collections — a purge-leaked per-object collection
-// and an `_objects` shell for a space with no tech-space row — are
-// dropped on the next Open, while everything live (the tech space's own
-// collections, the created space's roster, its object's dataset rows)
-// survives the same sweep untouched.
+// contract: a purge-leaked per-object collection is dropped on the next
+// Open, while everything live (the tech space's own collections, the
+// created space's roster, its object's dataset rows) survives the same
+// sweep untouched — as does an `_objects` shell for a space with no
+// tech-space row (no positive tombstone, so the sweep must not touch
+// it).
 func TestSDK_OrphanCollectionGC(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -69,9 +70,10 @@ func TestSDK_OrphanCollectionGC(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, sdk.Close())
 
-	// Inject leaks straight into sdk.db while the SDK is down: a
-	// per-object collection for an object no space knows, and an
-	// `_objects` shell for a space with no tech-space row.
+	// Inject straight into sdk.db while the SDK is down: a per-object
+	// collection for an object no space knows (swept), and an
+	// `_objects` shell for a space with no tech-space row (kept —
+	// absence of a row is not a tombstone).
 	orphanObjHash, err := mh.Sum([]byte("gc-orphan-object"), mh.SHA2_256, -1)
 	require.NoError(t, err)
 	orphanObj := cid.NewCidV1(cid.Raw, orphanObjHash).String()
@@ -121,9 +123,10 @@ func TestSDK_OrphanCollectionGC(t *testing.T) {
 	for _, n := range names {
 		got[n] = true
 	}
-	for _, n := range []string{orphanObj + "_blocks", orphanObj + "__history", ghostSpace + "_objects"} {
+	for _, n := range []string{orphanObj + "_blocks", orphanObj + "__history"} {
 		assert.False(t, got[n], "expected leaked %s swept", n)
 	}
+	assert.True(t, got[ghostSpace+"_objects"], "unknown-space shell must be kept (no tombstone)")
 	assert.True(t, got[spaceId+"_objects"], "live space roster must survive")
 	assert.True(t, got[objId+"_"+blocksDataset], "live object dataset must survive")
 }

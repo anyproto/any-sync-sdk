@@ -43,7 +43,8 @@ func TestSweepOrphans(t *testing.T) {
 
 	liveSpace := testCid(t, "live-space") + ".1"
 	deadSpace := testCid(t, "dead-space") + ".2"
-	ghostSpace := testCid(t, "ghost-space") + ".3"    // collections but no tech row
+	ghostSpace := testCid(t, "ghost-space") + ".3"    // collections but no tech row: kept (no positive tombstone)
+	ghostObj := testCid(t, "ghost-obj")               // only the ghost's roster claims it: kept
 	emptyDeadSpace := testCid(t, "empty-dead") + ".4" // dead; meta-only leak, no collections
 	liveObj := testCid(t, "live-obj")                 // in liveSpace's objects
 	legacyObj := testCid(t, "legacy-obj")             // in liveSpace's objects; pre-scoping meta (no sp)
@@ -77,8 +78,10 @@ func TestSweepOrphans(t *testing.T) {
 	seedDoc(t, ctx, objsDead, deadSpaceObj)
 	seedDoc(t, ctx, mustColl(t, ctx, db, deadSpaceObj+"_editor_blocks"), "rec5")
 
-	// Ghost space: shell with no tech-space row at all.
-	seedDoc(t, ctx, mustColl(t, ctx, db, ghostSpace+"_objects"), "objZ")
+	// Ghost space: shell with no tech-space row at all — absence of
+	// evidence, kept; its roster shields its objects like a live one.
+	seedDoc(t, ctx, mustColl(t, ctx, db, ghostSpace+"_objects"), ghostObj)
+	seedDoc(t, ctx, mustColl(t, ctx, db, ghostObj+"_editor_blocks"), "rec6")
 
 	// Fixed collections the shape check must never touch.
 	metaColl := mustColl(t, ctx, db, crdt.MetaCollectionName)
@@ -113,6 +116,7 @@ func TestSweepOrphans(t *testing.T) {
 		liveObj + "_editor_blocks", legacyObj + "_editor_blocks",
 		prescopeObj + "_editor_blocks", crossObj + "_editor_blocks",
 		baseObj + "_chat_messages",
+		ghostSpace + "_objects", ghostObj + "_editor_blocks",
 		crdt.MetaCollectionName, "_history_traces", "_read_state", "files_local",
 	} {
 		assert.True(t, got[n], "expected %s preserved", n)
@@ -121,7 +125,6 @@ func TestSweepOrphans(t *testing.T) {
 		purgedObj + "_program_source", purgedObj + "__history",
 		orphanObj + "_agent_debug_log", orphanObj + "__history",
 		deadSpace + "_objects", deadSpaceObj + "_editor_blocks",
-		ghostSpace + "_objects",
 	} {
 		assert.False(t, got[n], "expected %s dropped", n)
 	}

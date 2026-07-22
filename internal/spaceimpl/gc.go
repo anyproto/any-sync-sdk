@@ -20,11 +20,17 @@ var gcLog = logger.NewNamed("sdk.collectiongc")
 
 // SweepOrphanCollections is the startup orphan-collection GC: it drops
 // every SDK CRDT collection whose owner — the `<spaceId>_` or
-// `<objectId>_` name prefix — no longer exists. Offload and object
-// purge are best-effort, so a crash mid-teardown (or a deletion from a
-// build that predated the per-object drop) can leak per-object
-// collections in the shared DB forever; this sweep turns every such
-// leak, past or future, into a self-healing condition.
+// `<objectId>_` name prefix — is positively dead: a tombstoned
+// (deleted/offloaded) space, or an object no kept space claims.
+// Offload and object purge are best-effort, so a crash mid-teardown
+// (or a deletion from a build that predated the per-object drop) can
+// leak per-object collections in the shared DB forever; this sweep
+// turns every such leak, past or future, into a self-healing
+// condition.
+//
+// A space's tech-space row is never physically removed (sticky
+// tombstone), so a deleted space is always enumerable — no positive
+// tombstone means keep, however orphaned a shell may look.
 //
 // Call once at SDK open, after the tech space is up and BEFORE any
 // other space loads — with no applies running, the liveness reads
@@ -40,9 +46,10 @@ func (s *Service) SweepOrphanCollections(ctx context.Context) {
 	rows := s.tsp.List(ctx)
 	if len(rows) == 0 {
 		// List returns nil for "no spaces" AND for every error (index
-		// not open, ocache failure). Mistaking an errored list for an
-		// empty account would classify every space dead and drop the
-		// lot — and a genuinely fresh account has nothing to sweep —
+		// not open, ocache failure). An errored list carries no
+		// tombstones — nothing could be positively swept anyway (and a
+		// meta row scoped to a then-unlisted live space would read as
+		// dead) — and a genuinely fresh account has nothing to sweep,
 		// so zero rows always means skip.
 		gcLog.Debug("skip sweep: empty space list")
 		return
@@ -67,14 +74,20 @@ func (s *Service) SweepOrphanCollections(ctx context.Context) {
 
 // sweepOrphans runs one sweep against the given space classification.
 //
+// Space collections drop only on the POSITIVE tombstone — a tech-space
+// row in a deleted/offloaded state. A space-shaped owner with no row
+// at all is absence of evidence, not evidence of deletion (a partially
+// replayed index, or state this build doesn't understand), so it is
+// kept, and its roster keeps protecting its objects like a live one.
+//
 // Sized for millions of objects: no live-object roster is ever
 // materialized. Candidates come from the collection catalog alone;
 // liveness is decided per unique owner with POINT reads — the `_meta`
-// row first (one FindId resolves every scoped object), the live
-// spaces' `objects` rosters as FindId fallback for legacy pre-scoping
-// rows. Names are sorted so an owner's collections are adjacent and
-// the decision runs once per owner, and every read errs toward "live"
-// — a collection is only ever dropped on positive evidence of a dead
+// row first (one FindId resolves every scoped object), the kept
+// spaces' `objects` rosters as FindId fallback for meta-less objects.
+// Names are sorted so an owner's collections are adjacent and the
+// decision runs once per owner, and every read errs toward "live" — a
+// collection is only ever dropped on positive evidence of a dead
 // owner.
 func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[string]struct{}) error {
 	names, err := s.db.GetCollectionNames(ctx)
@@ -83,13 +96,33 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 	}
 	sort.Strings(names)
 
+	// keptSpaces = live rows + space-shaped owners with no row: both
+	// shield their objects from the sweep; only tombstones don't.
+	keptSpaces := make(map[string]struct{}, len(liveSpaces))
+	for id := range liveSpaces {
+		keptSpaces[id] = struct{}{}
+	}
+	for _, name := range names {
+		owner, kind := collectionOwner(name)
+		if kind != ownerSpace {
+			continue
+		}
+		if _, dead := deadSpaces[owner]; dead {
+			continue
+		}
+		if _, live := liveSpaces[owner]; !live {
+			gcLog.Info("keeping collections of unknown space", zap.String("spaceId", owner))
+			keptSpaces[owner] = struct{}{}
+		}
+	}
+
 	var metaColl anystore.Collection
 	if coll, merr := s.db.OpenCollection(ctx, crdt.MetaCollectionName); merr == nil {
 		metaColl = coll
 	} else if !errors.Is(merr, anystore.ErrCollectionNotFound) {
 		return fmt.Errorf("open meta: %w", merr)
 	}
-	rosters := newRosterCache(s.db, liveSpaces)
+	rosters := newRosterCache(s.db, keptSpaces)
 
 	// Meta dies BEFORE collections, always: a stale watermark on a
 	// re-materializable owner makes the rebuilt controllers skip the
@@ -100,21 +133,12 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 	// when collections still exist: a crash between an offload's (or
 	// this sweep's) collection drops and its meta purge leaves
 	// meta-only leaks nothing else would ever revisit.
-	metaPurgedSpaces := map[string]struct{}{}
-	purgeSpaceMeta := func(spaceId string) {
-		if metaColl == nil {
-			return
+	if metaColl != nil {
+		for spaceId := range deadSpaces {
+			if perr := crdt.PurgeSpaceMeta(ctx, metaColl, spaceId, nil); perr != nil {
+				gcLog.Warn("purge space meta", zap.String("spaceId", spaceId), zap.Error(perr))
+			}
 		}
-		if _, done := metaPurgedSpaces[spaceId]; done {
-			return
-		}
-		metaPurgedSpaces[spaceId] = struct{}{}
-		if perr := crdt.PurgeSpaceMeta(ctx, metaColl, spaceId, nil); perr != nil {
-			gcLog.Warn("purge space meta", zap.String("spaceId", spaceId), zap.Error(perr))
-		}
-	}
-	for spaceId := range deadSpaces {
-		purgeSpaceMeta(spaceId)
 	}
 
 	var dropped int
@@ -125,12 +149,10 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 		owner, kind := collectionOwner(name)
 		switch kind {
 		case ownerSpace:
-			if _, live := liveSpaces[owner]; live {
+			if _, dead := deadSpaces[owner]; !dead {
 				continue
 			}
-			// Dead tombstone row (meta purged above) or a ghost with
-			// no row at all — both dead owners.
-			purgeSpaceMeta(owner)
+			// Positive tombstone; its meta was purged above.
 			s.dropCollection(ctx, name)
 			dropped++
 			sweptSpaces[owner] = struct{}{}
@@ -138,7 +160,7 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 			if owner != lastOwner {
 				lastOwner = owner
 				var keepMeta bool
-				lastDead, keepMeta = s.objectDead(ctx, metaColl, rosters, owner, liveSpaces)
+				lastDead, keepMeta = s.objectDead(ctx, metaColl, rosters, owner, keptSpaces)
 				if lastDead && !keepMeta {
 					// keepMeta exempts purged-object rows in live
 					// spaces: the sticky del marker is the
@@ -168,18 +190,19 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 	return nil
 }
 
-// objectDead decides one object owner's fate. dead: no live space
-// claims the object — its collections drop. keepMeta: the `_meta` row
-// carries the sticky purge marker for a live space (a pre-drop purge
-// leak) — the collections go but the row stays as the change-feed
-// deletion signal.
+// objectDead decides one object owner's fate. dead: no kept space —
+// live row or unknown space-shaped owner — claims the object, or its
+// meta positively marks it purged. keepMeta: the `_meta` row carries
+// the sticky purge marker for a kept space (a pre-drop purge leak) —
+// the collections go but the row stays as the change-feed deletion
+// signal.
 //
 // Read order matters for the (tiny, boot-time) concurrency window: the
 // candidate came from a catalog listing taken earlier, and both reads
 // here happen after it — an object materializing in between is seen
 // live. Any read error also resolves to live: never drop on
 // uncertainty.
-func (s *Service) objectDead(ctx context.Context, metaColl anystore.Collection, rosters *rosterCache, owner string, liveSpaces map[string]struct{}) (dead, keepMeta bool) {
+func (s *Service) objectDead(ctx context.Context, metaColl anystore.Collection, rosters *rosterCache, owner string, keptSpaces map[string]struct{}) (dead, keepMeta bool) {
 	if metaColl != nil {
 		doc, err := metaColl.FindId(ctx, owner)
 		switch {
@@ -192,22 +215,22 @@ func (s *Service) objectDead(ctx context.Context, metaColl anystore.Collection, 
 				// backfills `sp` on the object's next change.
 				return false, false
 			}
-			if _, live := liveSpaces[spaceId]; live {
+			if _, kept := keptSpaces[spaceId]; kept {
 				return deleted, deleted
 			}
-			// Scoped to a dead/unknown space — dead, unless a live
-			// roster still claims it (fall through to be safe).
+			// Scoped to a dead space — dead, unless a kept roster
+			// still claims it (fall through to be safe).
 		case !errors.Is(err, anystore.ErrDocNotFound):
 			gcLog.Warn("read object meta", zap.String("objectId", owner), zap.Error(err))
 			return false, false
 		}
 	}
 	// Meta-less objects (and dead-`sp` fall-through): point lookup in
-	// each live space's objects roster.
+	// each kept space's objects roster.
 	return !rosters.contains(ctx, owner), false
 }
 
-// rosterCache lazily opens the live spaces' `<spaceId>_objects`
+// rosterCache lazily opens the kept spaces' `<spaceId>_objects`
 // collections for point membership lookups. Handles are cached; a
 // space that never created its roster resolves to "not a member".
 type rosterCache struct {
@@ -216,16 +239,16 @@ type rosterCache struct {
 	colls  map[string]anystore.Collection
 }
 
-func newRosterCache(db anystore.DB, liveSpaces map[string]struct{}) *rosterCache {
-	spaces := make([]string, 0, len(liveSpaces))
-	for id := range liveSpaces {
+func newRosterCache(db anystore.DB, keptSpaces map[string]struct{}) *rosterCache {
+	spaces := make([]string, 0, len(keptSpaces))
+	for id := range keptSpaces {
 		spaces = append(spaces, id)
 	}
 	sort.Strings(spaces)
 	return &rosterCache{db: db, spaces: spaces, colls: map[string]anystore.Collection{}}
 }
 
-// contains reports whether any live space's roster has an objectId row.
+// contains reports whether any kept space's roster has an objectId row.
 // Open/read errors count as membership — never drop on uncertainty.
 func (r *rosterCache) contains(ctx context.Context, objectId string) bool {
 	for _, spaceId := range r.spaces {

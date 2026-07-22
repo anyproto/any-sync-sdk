@@ -16,6 +16,14 @@ import (
 // AcceptInvite) is what authorizes materialization.
 var ErrSpaceNotAccepted = errors.New("space: not accepted; not materialized")
 
+// ErrSpaceDeleted is returned by Service.Get for a space whose index
+// row carries a deletion marker (local or synced, including the 1-1
+// offload marker). The storage is offloaded — loading would SpacePull
+// a space the account removed, which the nodes reject anyway. A
+// deleted 1-1 is re-creatable via Service.OneToOne; a regular deleted
+// space is terminal.
+var ErrSpaceDeleted = errors.New("space: deleted")
+
 // ErrReadOnlySpace rejects synced writes into a space this account
 // cannot write to: any space opened via a guest key, and any space
 // where the ACL grants a role without write permission (reader /
@@ -106,9 +114,13 @@ type Service interface {
 	DeclineInvite(ctx context.Context, spaceId string) error
 
 	// Get returns an already-joined space by id. Fails if the space is
-	// unknown locally, and with ErrSpaceNotAccepted for a known row
-	// whose acceptance is still pending (joining / incoming 1-1 /
-	// direct-add invite) — those must never be materialized by a read.
+	// unknown locally, with ErrSpaceNotAccepted for a known row whose
+	// acceptance is still pending (joining / incoming 1-1 / direct-add
+	// invite) — those must never be materialized by a read — and with
+	// ErrSpaceDeleted for a deleted row. A 1-1 accepted or initiated on
+	// another of the account's devices (synced remote=active) is adopted
+	// transparently: Get materializes it locally, no per-device
+	// re-accept needed.
 	Get(ctx context.Context, spaceId string) (Space, error)
 
 	// Track registers a foreign spaceId in the local space index without

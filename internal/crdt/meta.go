@@ -136,6 +136,16 @@ func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string,
 	return err
 }
 
+// MetaOwnership reads the ownership fields off a per-object _meta row:
+// the scoping spaceId (empty on pre-scoping rows) and the sticky purge
+// marker. The orphan-collection GC uses it to decide whether a
+// per-object collection's owner is live — a row claiming a live space
+// without the purge marker proves liveness even when the object never
+// got a shared `objects` row (base-dataset-only objects).
+func MetaOwnership(v *anyenc.Value) (spaceId string, deleted bool) {
+	return v.GetString(metaSpaceIdKey), v.GetBool(metaDeletedKey)
+}
+
 // ObjectSeq pairs an object id with its persisted max applySeq.
 // Returned by QueryChangedObjects for the consumer-side change-index
 // feed. Deleted is true when the row is a purged-object marker (the

@@ -219,6 +219,11 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
+	// Orphan-collection GC: drop CRDT collections whose owner space /
+	// object no longer exists — heals interrupted offloads and
+	// historical purge leaks. Runs while only the tech space is open so
+	// the sweep never races live applies; best-effort, never fails Open.
+	spaces.SweepOrphanCollections(ctx)
 	// Guest-identity resolver for guest-mode (public-access) spaces:
 	// loadSpaceForCache opens a space whose row carries a guest key with
 	// an account-service override, signing as that shared identity. Must

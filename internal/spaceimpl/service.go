@@ -13,6 +13,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
@@ -20,6 +21,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -118,15 +120,6 @@ type Service struct {
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
-
-	// oneToOneLocks serializes 1-1 materialization per space id.
-	// DeriveOneToOneSpace reaches CreateSpaceStorage outside the space
-	// cache's per-id single-flight, and that path deletes the db file
-	// on a duplicate-create error — two concurrent materializations
-	// (e.g. parallel Gets adopting a 1-1 accepted on another device)
-	// would race destructively. Entries are never freed: one per 1-1
-	// contact, bounded and tiny.
-	oneToOneLocks map[string]*sync.Mutex
 
 	// spaceIndexIds caches the deterministic spaceIndex object id per
 	// spaceId so SetMetadata / Info-side reads don't re-derive on every
@@ -248,7 +241,6 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
 		pendingLoads:       make(map[string]struct{}),
 		inviteKick:         make(chan struct{}, 1),
-		oneToOneLocks:      make(map[string]*sync.Mutex),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	s.startDeletionReconciler()
@@ -978,16 +970,16 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if keys == nil {
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
 	}
-	payload := s.derivePayload(keys, req)
-	spaceId, err := s.app.SpaceService().DeriveId(ctx, payload)
+	storageCreate, err := spacepayloads.StoragePayloadForSpaceDeriveV1(s.derivePayload(keys, req))
 	if err != nil {
-		return nil, fmt.Errorf("spaceimpl: derive id: %w", err)
+		return nil, fmt.Errorf("spaceimpl: derive: %w", err)
 	}
-	if !s.app.SpaceExists(spaceId) {
-		if _, err := s.app.SpaceService().DeriveSpace(ctx, payload); err != nil {
-			return nil, fmt.Errorf("spaceimpl: derive: %w", err)
-		}
-	}
+	spaceId := storageCreate.SpaceHeaderWithId.Id
+	// Storage creation rides the GetSpace cache load below (see
+	// ctxWithCreatePayload): derived ids are deterministic, so an
+	// out-of-band exists-check + create here would let two concurrent
+	// Derives of the same seed race the storage create.
+	ctx = ctxWithCreatePayload(ctx, storageCreate)
 	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
@@ -1065,18 +1057,24 @@ const oneToOnePendingLocalStatus = "oneToOnePending"
 // space.StatusOneToOneDeclined.
 const oneToOneDeclinedRemoteStatus = "oneToOneDeclined"
 
-// lockOneToOne takes the per-space 1-1 materialization lock, returning
-// the unlock. See the oneToOneLocks field comment.
-func (s *Service) lockOneToOne(spaceId string) func() {
-	s.mu.Lock()
-	m, ok := s.oneToOneLocks[spaceId]
-	if !ok {
-		m = &sync.Mutex{}
-		s.oneToOneLocks[spaceId] = m
-	}
-	s.mu.Unlock()
-	m.Lock()
-	return m.Unlock
+// ctxWithCreatePayload arms ctx so the space cache load can CREATE the
+// missing storage instead of pull-bootstrapping it: NewSpace, running
+// inside the ocache's per-id single-flight, builds the storage from the
+// AddSpaceCtxKey description — the same path inbound SpacePush uses.
+// This is the only sanctioned way to create storage for a
+// deterministic id: CreateSpaceStorage is concurrency-safe only under
+// that single-flight (its husk sweep and error cleanup delete the db
+// file), so calling SpaceService Derive*/Create* directly for an id
+// two callers can compute (1-1 derive, seed derive) races
+// destructively. Random-id Create doesn't need this.
+func ctxWithCreatePayload(ctx context.Context, p spacestorage.SpaceStorageCreatePayload) context.Context {
+	return context.WithValue(ctx, commonspace.AddSpaceCtxKey, commonspace.SpaceDescription{
+		SpaceHeader:          p.SpaceHeaderWithId,
+		AclId:                p.AclWithId.Id,
+		AclPayload:           p.AclWithId.Payload,
+		SpaceSettingsId:      p.SpaceSettingsWithId.Id,
+		SpaceSettingsPayload: p.SpaceSettingsWithId.RawChange,
+	})
 }
 
 // OneToOne reaches out to — or explicitly accepts / un-declines — the 1-1
@@ -1096,18 +1094,14 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
 	}
-	spaceId, err := deriveOneToOneId(keys.SignKey, otherPk)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
 	if err != nil {
-		return nil, fmt.Errorf("spaceimpl: derive 1-1 id: %w", err)
-	}
-	unlock := s.lockOneToOne(spaceId)
-	defer unlock()
-	// DeriveOneToOneSpace creates the storage as a side effect (idempotent —
-	// ErrSpaceStorageExists is swallowed).
-	if _, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk); err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
 	}
-	sp, err := s.activateOneToOne(ctx, spaceId, otherIdentity)
+	spaceId := payload.SpaceHeaderWithId.Id
+	// Storage creation rides the activate's cache load (see
+	// ctxWithCreatePayload); no-op when storage already exists.
+	sp, err := s.activateOneToOne(ctxWithCreatePayload(ctx, payload), spaceId, otherIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -1142,13 +1136,13 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w", err)
 	}
-	unlock := s.lockOneToOne(spaceId)
-	defer unlock()
-	// Pending rows carry no storage — materialize it now.
-	if _, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk); err != nil {
+	// Pending rows carry no storage — the activate's cache load creates
+	// it from the derived payload (see ctxWithCreatePayload).
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
+	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: materialize 1-1: %w", err)
 	}
-	return s.activateOneToOne(ctx, spaceId, rec.OneToOnePeer)
+	return s.activateOneToOne(ctxWithCreatePayload(ctx, payload), spaceId, rec.OneToOnePeer)
 }
 
 // DeclineOneToOne rejects an incoming 1-1. Writes the synced, sticky

@@ -114,15 +114,24 @@ func EncryptProfile(meta AccountMetadata, key crypto.SymKey) ([]byte, error) {
 	return key.Encrypt(payload)
 }
 
+// minProfileCiphertext is the smallest well-formed AES-GCM profile blob:
+// 12-byte nonce + 16-byte auth tag. Anything shorter is not ciphertext —
+// notably legacy plaintext records pushed before profile encryption,
+// which live under the same identityRepo kind and can be arbitrarily
+// short (a 4-char name encodes to 6 bytes).
+const minProfileCiphertext = crypto.NonceBytes + 16
+
 // DecryptProfile decrypts an identityRepo profile blob with key and
-// decodes it. ok is false when key is nil or decryption fails — callers
-// must NOT fall back to parsing the raw bytes as plaintext (ciphertext
-// parsed as a NUL blob yields a garbage name). A reader without the
+// decodes it. ok is false when key is nil, data is too short to be
+// ciphertext, or decryption fails — callers must NOT fall back to
+// parsing the raw bytes as plaintext (ciphertext parsed as a NUL blob
+// yields a garbage name; a legacy plaintext record stays unresolved
+// until a re-push overwrites it with ciphertext). A reader without the
 // contact's symkey simply can't resolve the profile yet; it surfaces from
 // identity alone until the key arrives (see docs/13, the identityMetaKeys
 // cache).
 func DecryptProfile(data []byte, key crypto.SymKey) (AccountMetadata, bool) {
-	if key == nil || len(data) == 0 {
+	if key == nil || len(data) < minProfileCiphertext {
 		return AccountMetadata{}, false
 	}
 	plain, err := key.Decrypt(data)

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/logger"
@@ -76,8 +77,9 @@ type Exchange struct {
 	accountKeys func(ctx context.Context, spaceIds []string) map[string][]byte
 	// knownSpaceIds lists spaces this device knows OF (tech-space
 	// index) but may not store yet — the probe candidates. Nil
-	// disables probing.
-	knownSpaceIds func() []string
+	// disables probing. Atomic because it's wired after the discovery
+	// loop is already handshaking (see SetKnownSpaceIdsFn).
+	knownSpaceIds atomic.Pointer[func() []string]
 	// onPeerUpdated fires after a handshake recorded a peer's shared
 	// space set — the app layer uses it to kick an immediate head-sync
 	// of the shared spaces instead of waiting for the periodic diff.
@@ -124,9 +126,10 @@ func (e *Exchange) SetAccountKeysFn(fn func(ctx context.Context, spaceIds []stri
 }
 
 // SetKnownSpaceIdsFn wires the known-space-ids source (the tech-space
-// index) for probe tokens. Set after the SDK layers are up; handshakes
-// that run before simply don't probe.
-func (e *Exchange) SetKnownSpaceIdsFn(fn func() []string) { e.knownSpaceIds = fn }
+// index) for probe tokens. Set after the SDK layers are up — discovery
+// handshakes may already be running concurrently, hence the atomic;
+// handshakes that run before simply don't probe.
+func (e *Exchange) SetKnownSpaceIdsFn(fn func() []string) { e.knownSpaceIds.Store(&fn) }
 
 // PeerDiscovered is the discovery notifier: register the peer's
 // addresses, dial, and run the handshake. Errors are logged, not
@@ -362,12 +365,13 @@ func (e *Exchange) recordPeerAddrs(ctx context.Context, peerId string, localServ
 // ACL-derived key for, paired with their account-derived keys. Empty
 // when the probe sources aren't wired.
 func (e *Exchange) probeSet(ctx context.Context, storedIds []string, keyed map[string][]byte) ([]string, map[string][]byte) {
-	if e.knownSpaceIds == nil || e.accountKeys == nil {
+	knownFn := e.knownSpaceIds.Load()
+	if knownFn == nil || e.accountKeys == nil {
 		return nil, nil
 	}
 	seen := make(map[string]struct{}, len(storedIds))
 	var probeIds []string
-	for _, id := range append(e.knownSpaceIds(), storedIds...) {
+	for _, id := range append((*knownFn)(), storedIds...) {
 		if _, ok := seen[id]; ok {
 			continue
 		}

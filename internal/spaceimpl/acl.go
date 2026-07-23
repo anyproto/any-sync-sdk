@@ -522,6 +522,21 @@ func decodeIdentity(s string) (crypto.PubKey, error) {
 	return pk, nil
 }
 
+// selfAclActive reports whether state places the account's own
+// identity in StatusActive. Caller holds the ACL lock.
+func selfAclActive(state *list.AclState) bool {
+	me := state.Identity()
+	if me == nil {
+		return false
+	}
+	for _, acc := range state.CurrentAccounts() {
+		if acc.PubKey.Equals(me) {
+			return acc.Status == list.StatusActive
+		}
+	}
+	return false
+}
+
 // toAclPermissions maps the SDK Permission enum to any-sync's value.
 // Defined as a 1:1 lookup (rather than int conversion) so a future
 // reorder of either enum surfaces here as a compile error.

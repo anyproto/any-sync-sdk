@@ -10,6 +10,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -200,11 +201,7 @@ func (a *aggImpl) All(ctx context.Context) ([]*anyenc.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		cloned, err := cloneAnyenc(doc)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cloned)
+		out = append(out, anyencx.Clone(doc))
 	}
 	return out, it.Err()
 }

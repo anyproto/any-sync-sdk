@@ -2,8 +2,8 @@ package subscribe
 
 import (
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -201,7 +201,7 @@ func projectOp(op crdt.Op, post *anyenc.Value) (space.EventOp, bool) {
 		return space.EventOp{
 			Type:    op.Type,
 			Path:    clonePath(op.Path),
-			Payload: clonePayload(op.Payload),
+			Payload: anyencx.Clone(op.Payload),
 		}, true
 	default:
 		// $inc / $addToSet / $pull / $incGated — derive the post-apply
@@ -218,7 +218,7 @@ func projectOp(op crdt.Op, post *anyenc.Value) (space.EventOp, bool) {
 		return space.EventOp{
 			Type:    crdt.OpSet,
 			Path:    path,
-			Payload: clonePayload(val),
+			Payload: anyencx.Clone(val),
 		}, true
 	}
 }
@@ -245,16 +245,4 @@ func lookupPath(v *anyenc.Value, path []string) *anyenc.Value {
 		return v
 	}
 	return v.Get(path...)
-}
-
-// clonePayload deep-copies an anyenc value off its current arena onto
-// a fresh parser-owned arena. Mirrors crdt.cloneValue; we duplicate
-// here to keep this package free of crdt-internal helpers. nil-safe.
-func clonePayload(v *anyenc.Value) *anyenc.Value {
-	if v == nil {
-		return nil
-	}
-	var w anyencutil.Value
-	w.FillCopy(v)
-	return w.Value
 }

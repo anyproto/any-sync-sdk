@@ -735,16 +735,7 @@ func (w *memberWatcher) tick() {
 		return
 	}
 	current, symKeys := collectMembers(acl)
-	state := acl.AclState()
-	meActive := false
-	if me := state.Identity(); me != nil {
-		for _, acc := range state.CurrentAccounts() {
-			if acc.PubKey.Equals(me) {
-				meActive = acc.Status == list.StatusActive
-				break
-			}
-		}
-	}
+	meActive := selfAclActive(acl.AclState())
 	acl.RUnlock()
 
 	// Self-heal the tech-space LocalStatus when the owner has accepted

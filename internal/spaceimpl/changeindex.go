@@ -27,14 +27,14 @@ func (c *changeIndexAPI) ChangedSince(ctx context.Context, since uint64, limit i
 	}
 	out := make([]space.ObjectChange, len(rows))
 	for i, r := range rows {
-		out[i] = space.ObjectChange{ObjectId: r.ObjectId, ApplySeq: r.ApplySeq, Deleted: r.Deleted}
+		out[i] = space.ObjectChange(r)
 	}
 	return out, nil
 }
 
 func (c *changeIndexAPI) Subscribe(cb func(space.ObjectChange)) (cancel func()) {
 	return c.parent.store.SubscribeChanges(func(ev spaceobjects.ObjectChange) {
-		cb(space.ObjectChange{ObjectId: ev.ObjectId, ApplySeq: ev.ApplySeq, Deleted: ev.Deleted})
+		cb(space.ObjectChange(ev))
 	})
 }
 

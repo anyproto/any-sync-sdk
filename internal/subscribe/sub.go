@@ -6,11 +6,12 @@ import (
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/syncpool"
 	"github.com/cheggaaa/mb/v3"
 
 	"github.com/anyproto/any-sync-sdk/space"
+
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 )
 
 // querySub is the per-subscription state. Mutated only under
@@ -56,7 +57,7 @@ func (s *querySub) appendInitial(id string, doc *anyenc.Value) {
 		return
 	}
 	tuple := s.tupleFor(doc)
-	cloned := cloneValue(doc)
+	cloned := anyencx.Clone(doc)
 	s.insertEntry(id, tuple, cloned)
 }
 
@@ -204,7 +205,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 	// Apply transition to held set.
 	switch {
 	case wasHeld && matches:
-		s.updateEntry(oldEntry, postKey, cloneValue(postDoc))
+		s.updateEntry(oldEntry, postKey, anyencx.Clone(postDoc))
 	case wasHeld && !matches:
 		s.removeEntry(oldEntry)
 		s.lost++
@@ -216,7 +217,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 				// Not a "loss" — steady-state add.
 			}
 		}
-		s.insertEntry(rc.Id, postKey, cloneValue(postDoc))
+		s.insertEntry(rc.Id, postKey, anyencx.Clone(postDoc))
 	default:
 		return
 	}
@@ -284,15 +285,4 @@ func (s *querySub) checkDrift() {
 		_ = s.mb.Close()
 		s.closed = true
 	}
-}
-
-// cloneValue deep-copies v onto a fresh parser-owned arena via
-// anyencutil.Value.FillCopy. Mirrors event.go's clonePayload. nil-safe.
-func cloneValue(v *anyenc.Value) *anyenc.Value {
-	if v == nil {
-		return nil
-	}
-	var w anyencutil.Value
-	w.FillCopy(v)
-	return w.Value
 }

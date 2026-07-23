@@ -1,9 +1,10 @@
 package properties
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -145,13 +146,9 @@ func (e *ValidationError) knownList() string {
 	if len(e.Known) == 0 {
 		return "(none)"
 	}
-	ps := make([]types.PropInfo, len(e.Known))
-	copy(ps, e.Known)
-	sort.Slice(ps, func(i, j int) bool {
-		if ps[i].Name != ps[j].Name {
-			return ps[i].Name < ps[j].Name
-		}
-		return ps[i].Id < ps[j].Id
+	ps := slices.Clone(e.Known)
+	slices.SortFunc(ps, func(a, b types.PropInfo) int {
+		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Id, b.Id))
 	})
 	parts := make([]string, 0, len(ps))
 	for _, p := range ps {

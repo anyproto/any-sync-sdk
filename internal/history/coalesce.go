@@ -1,6 +1,7 @@
 package history
 
 import (
+	"slices"
 	"time"
 )
 
@@ -117,7 +118,7 @@ func unionTouched(group []ChangeMeta) []TouchedRecord {
 			out = append(out, TouchedRecord{
 				Dataset:  tr.Dataset,
 				RecordId: tr.RecordId,
-				Ops:      append([]string(nil), tr.Ops...),
+				Ops:      slices.Clone(tr.Ops),
 			})
 		}
 	}

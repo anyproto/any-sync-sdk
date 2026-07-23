@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
@@ -166,7 +167,7 @@ func (s *spaceImpl) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
 	if err = hs.IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
 		out = append(out, space.TreeHeads{
 			TreeId: e.Id,
-			Heads:  append([]string(nil), e.Heads...),
+			Heads:  slices.Clone(e.Heads),
 		})
 		return true, nil
 	}); err != nil {

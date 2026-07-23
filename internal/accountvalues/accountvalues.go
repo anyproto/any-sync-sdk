@@ -13,7 +13,8 @@
 package accountvalues
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -153,12 +154,12 @@ func Diff(arena *anyenc.Arena, carrier, target *anyenc.Value, resolve ScopeResol
 	out := make([]Batch, 0, len(byVersion))
 	for v, ops := range byVersion {
 		// Deterministic op order within a batch for testability.
-		sort.Slice(ops, func(i, j int) bool {
-			return pathKey(ops[i].Path) < pathKey(ops[j].Path)
+		slices.SortFunc(ops, func(a, b crdt.Op) int {
+			return cmp.Compare(pathKey(a.Path), pathKey(b.Path))
 		})
 		out = append(out, Batch{VersionId: v, Ops: ops})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].VersionId < out[j].VersionId })
+	slices.SortFunc(out, func(a, b Batch) int { return cmp.Compare(a.VersionId, b.VersionId) })
 	return out
 }
 

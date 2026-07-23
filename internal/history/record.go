@@ -235,33 +235,3 @@ func filteredReplayDisabled(regs []crdt.HandlerReg, dataset string) bool {
 	}
 	return false
 }
-
-// Ancestors returns the ChangeId set of the causal past of heads
-// (inclusive), via a metadata-only DAG walk — no payloads, no
-// decryption (proposal §4.2 "ancestor set amortization"). Callers
-// cache it against a pagination cursor and test membership per
-// candidate change.
-func Ancestors(storage objecttree.Storage, acl list.AclList, heads []string) (map[string]struct{}, error) {
-	tree, err := objecttree.BuildNonVerifiableHistoryTree(objecttree.HistoryTreeParams{
-		Storage:         storage,
-		AclList:         acl,
-		Heads:           heads,
-		IncludeBeforeId: true,
-		BuildEmptyData:  true,
-	})
-	if err != nil {
-		return nil, mapTreeErr(err)
-	}
-	out := make(map[string]struct{})
-	rootId := tree.Id()
-	err = tree.IterateRoot(nil, func(ch *objecttree.Change) bool {
-		if ch != nil && ch.Id != rootId {
-			out[ch.Id] = struct{}{}
-		}
-		return true
-	})
-	if err != nil {
-		return nil, mapTreeErr(err)
-	}
-	return out, nil
-}

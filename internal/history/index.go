@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -759,6 +759,6 @@ func opKinds(ops []crdt.Op) []string {
 			out = append(out, name)
 		}
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }

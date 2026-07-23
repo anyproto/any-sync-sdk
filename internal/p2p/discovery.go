@@ -3,7 +3,7 @@ package p2p
 import (
 	"context"
 	"net"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -378,7 +378,7 @@ func interfaceFingerprint() string {
 		}
 		parts = append(parts, p)
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return strings.Join(parts, ";")
 }
 

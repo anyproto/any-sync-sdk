@@ -3,6 +3,7 @@ package spaceimpl
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 
@@ -68,7 +69,7 @@ func (d *debugAPI) Object(ctx context.Context, objectId string) (space.ObjectDeb
 	// under one external lock. Blocks local writes for the duration
 	// of the walk — caller's price for joint consistency.
 	tree.Lock()
-	heads := append([]string(nil), tree.Heads()...)
+	heads := slices.Clone(tree.Heads())
 	treeLen := tree.Len()
 	snapshots, branches, walkErr := walkTreeStats(tree)
 	latest := latestVersionLocked(tree, heads)

@@ -1,10 +1,12 @@
 package history
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -246,11 +248,8 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 	for key := range touched {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].dataset != keys[j].dataset {
-			return keys[i].dataset < keys[j].dataset
-		}
-		return keys[i].record < keys[j].record
+	slices.SortFunc(keys, func(a, b recKey) int {
+		return cmp.Or(cmp.Compare(a.dataset, b.dataset), cmp.Compare(a.record, b.record))
 	})
 	for _, key := range keys {
 		after := ctrl.Get(ctx, key.dataset, key.record)
@@ -260,12 +259,7 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 	}
 
 	res := DiffResult{Base: joinHeads(baseHeads), Version: version}
-	names := make([]string, 0, len(byDataset))
-	for ds := range byDataset {
-		names = append(names, ds)
-	}
-	sort.Strings(names)
-	for _, ds := range names {
+	for _, ds := range slices.Sorted(maps.Keys(byDataset)) {
 		res.Datasets = append(res.Datasets, DatasetDiff{Dataset: ds, Records: byDataset[ds]})
 	}
 	return res, nil

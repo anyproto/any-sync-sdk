@@ -5,7 +5,7 @@
 package history
 
 import (
-	"sort"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
@@ -168,7 +168,7 @@ func DiffRecordSets(dataset string, base, version []*anyenc.Value) DatasetDiff {
 			ids = append(ids, id)
 		}
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 
 	d := DatasetDiff{Dataset: dataset}
 	for _, id := range ids {
@@ -192,7 +192,7 @@ func DiffObjects(base, version Version, baseSets, versionSets map[string][]*anye
 			names = append(names, ds)
 		}
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 
 	res := DiffResult{Base: base, Version: version}
 	for _, ds := range names {
@@ -235,7 +235,7 @@ func unionKeys(before, after *anyenc.Value) []string {
 	}
 	collect(before)
 	collect(after)
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 

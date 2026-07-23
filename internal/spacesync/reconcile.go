@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -109,7 +109,7 @@ func ReconcileDeletions(ctx context.Context, app *anysyncx.App, db anystore.DB, 
 // element after concurrent merges) then joins, so peers with identical CRDT
 // state compute the same checksum.
 func settingsHeadChecksum(heads []string) string {
-	s := append([]string(nil), heads...)
-	sort.Strings(s)
+	s := slices.Clone(heads)
+	slices.Sort(s)
 	return strings.Join(s, ",")
 }

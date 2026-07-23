@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -94,7 +95,7 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 	if err != nil {
 		return fmt.Errorf("list collections: %w", err)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 
 	// keptSpaces = live rows + space-shaped owners with no row: both
 	// shield their objects from the sweep; only tombstones don't.
@@ -240,11 +241,7 @@ type rosterCache struct {
 }
 
 func newRosterCache(db anystore.DB, keptSpaces map[string]struct{}) *rosterCache {
-	spaces := make([]string, 0, len(keptSpaces))
-	for id := range keptSpaces {
-		spaces = append(spaces, id)
-	}
-	sort.Strings(spaces)
+	spaces := slices.Sorted(maps.Keys(keptSpaces))
 	return &rosterCache{db: db, spaces: spaces, colls: map[string]anystore.Collection{}}
 }
 

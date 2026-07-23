@@ -2,7 +2,6 @@ package schema
 
 import (
 	"encoding/json"
-	"fmt"
 )
 
 // Scope is the single write/sync taxonomy shared by dataset fields AND
@@ -53,7 +52,7 @@ func (s Scope) String() string {
 }
 
 // ParseScope parses a scope label. Returns (0, false) on an unknown
-// label — the runtime counterpart of MustScope for wire-read paths.
+// label.
 func ParseScope(label string) (Scope, bool) {
 	switch label {
 	case "synced":
@@ -162,13 +161,3 @@ func schemaToJSON(s *Schema) map[string]any {
 // Leaf builds a scalar/leaf value Schema for a Kind (no items/properties).
 // Convenience for declaring simple dataset fields.
 func Leaf(k Kind) *Schema { return &Schema{Kind: k} }
-
-// MustScope parses a scope label, panicking on an unknown one. For static
-// declarations where the value is a compile-time constant.
-func MustScope(label string) Scope {
-	s, ok := ParseScope(label)
-	if !ok {
-		panic(fmt.Sprintf("schema: unknown scope %q", label))
-	}
-	return s
-}

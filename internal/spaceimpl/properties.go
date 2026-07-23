@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -129,10 +129,10 @@ func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (sche
 	}
 	parts := make([]string, 0, len(byScope))
 	for sc, keys := range byScope {
-		sort.Strings(keys)
+		slices.Sort(keys)
 		parts = append(parts, fmt.Sprintf("%s: [%s]", sc, strings.Join(keys, ", ")))
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return 0, nil, fmt.Errorf("propertiesAPI: patch spans multiple scopes — issue one Set per scope (%s)", strings.Join(parts, "; "))
 }
 

@@ -32,9 +32,10 @@
 package readstate
 
 import (
+	"cmp"
 	"context"
 	"errors"
-	"sort"
+	"slices"
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -699,7 +700,7 @@ func (e *Engine) compactFrontier(ctx context.Context, objectId string, st *objSt
 		}
 		members = append(members, member{id: id, v: v})
 	}
-	sort.Slice(members, func(i, j int) bool { return members[i].v < members[j].v })
+	slices.SortFunc(members, func(a, b member) int { return cmp.Compare(a.v, b.v) })
 	for _, m := range members[:len(members)-maxFrontierSize] {
 		delete(st.frontier, m.id)
 	}

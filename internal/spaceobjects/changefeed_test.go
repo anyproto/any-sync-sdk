@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 )
 
 // feedStore builds a minimal Store wired only with what the change feed
@@ -21,7 +22,7 @@ func feedStore(t *testing.T) (context.Context, *Store) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "feed.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	return ctx, &Store{db: db, spaceId: "spaceA", changeSubs: newChangeRegistry()}
+	return ctx, &Store{db: db, spaceId: "spaceA", changeSubs: fanout.New[ObjectChange]()}
 }
 
 func TestChangeRegistry_DispatchAndCancel(t *testing.T) {
@@ -29,15 +30,15 @@ func TestChangeRegistry_DispatchAndCancel(t *testing.T) {
 
 	var got []ObjectChange
 	cancel := s.SubscribeChanges(func(ev ObjectChange) { got = append(got, ev) })
-	assert.True(t, s.changeSubs.hasSubscribers())
+	assert.True(t, s.changeSubs.HasSubscribers())
 
-	s.changeSubs.dispatch(ObjectChange{ObjectId: "o1", ApplySeq: 7})
-	s.changeSubs.dispatch(ObjectChange{ObjectId: "o2", ApplySeq: 8})
+	s.changeSubs.Dispatch(ObjectChange{ObjectId: "o1", ApplySeq: 7})
+	s.changeSubs.Dispatch(ObjectChange{ObjectId: "o2", ApplySeq: 8})
 	require.Equal(t, []ObjectChange{{ObjectId: "o1", ApplySeq: 7}, {ObjectId: "o2", ApplySeq: 8}}, got)
 
 	cancel()
-	assert.False(t, s.changeSubs.hasSubscribers())
-	s.changeSubs.dispatch(ObjectChange{ObjectId: "o3", ApplySeq: 9})
+	assert.False(t, s.changeSubs.HasSubscribers())
+	s.changeSubs.Dispatch(ObjectChange{ObjectId: "o3", ApplySeq: 9})
 	assert.Len(t, got, 2, "no delivery after cancel")
 
 	cancel() // idempotent
@@ -46,7 +47,7 @@ func TestChangeRegistry_DispatchAndCancel(t *testing.T) {
 func TestChangeRegistry_NilCallbackNoOp(t *testing.T) {
 	_, s := feedStore(t)
 	cancel := s.SubscribeChanges(nil)
-	assert.False(t, s.changeSubs.hasSubscribers())
+	assert.False(t, s.changeSubs.HasSubscribers())
 	cancel() // safe
 }
 

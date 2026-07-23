@@ -10,6 +10,7 @@ import (
 
 	"github.com/ipfs/go-cid"
 
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
@@ -99,48 +100,43 @@ func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
 }
 
 // fileSubs is the SDK-wide registry of per-space file-status
-// subscribers, fed by queue transitions and local attach events.
+// subscribers, fed by queue transitions and local attach events. One
+// fanout registry per space, created lazily and kept for the process
+// lifetime (subscriber sets are tiny).
 type fileSubs struct {
-	mu   sync.Mutex
-	next uint64
-	m    map[string]map[uint64]func(space.FileStatus) // spaceId → subs
+	mu sync.Mutex
+	m  map[string]*fanout.Registry[space.FileStatus] // spaceId → registry
+}
+
+// reg returns spaceId's registry, creating it when create is set;
+// nil when absent and create is false.
+func (r *fileSubs) reg(spaceId string, create bool) *fanout.Registry[space.FileStatus] {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fr := r.m[spaceId]
+	if fr == nil && create {
+		if r.m == nil {
+			r.m = map[string]*fanout.Registry[space.FileStatus]{}
+		}
+		fr = fanout.New[space.FileStatus]()
+		r.m[spaceId] = fr
+	}
+	return fr
 }
 
 func (r *fileSubs) add(spaceId string, cb func(space.FileStatus)) (unsub func()) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.m == nil {
-		r.m = map[string]map[uint64]func(space.FileStatus){}
-	}
-	if r.m[spaceId] == nil {
-		r.m[spaceId] = map[uint64]func(space.FileStatus){}
-	}
-	r.next++
-	id := r.next
-	r.m[spaceId][id] = cb
-	return func() {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		delete(r.m[spaceId], id)
-	}
+	return r.reg(spaceId, true).Add(cb)
 }
 
 func (r *fileSubs) dispatch(spaceId string, st space.FileStatus) {
-	r.mu.Lock()
-	cbs := make([]func(space.FileStatus), 0, len(r.m[spaceId]))
-	for _, cb := range r.m[spaceId] {
-		cbs = append(cbs, cb)
-	}
-	r.mu.Unlock()
-	for _, cb := range cbs {
-		cb(st)
+	if fr := r.reg(spaceId, false); fr != nil {
+		fr.Dispatch(st)
 	}
 }
 
 func (r *fileSubs) hasSubs(spaceId string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.m[spaceId]) > 0
+	fr := r.reg(spaceId, false)
+	return fr != nil && fr.HasSubscribers()
 }
 
 // OnFileJobChange is the queue's OnChange hook: re-derive the file's

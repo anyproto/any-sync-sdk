@@ -108,8 +108,8 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// every dataset (base content, properties, type defs). Gated on
 		// hasSubscribers so the cold-restore / catch-up path stays free
 		// when no indexer is attached.
-		if s.changeSubs.hasSubscribers() {
-			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
+		if s.changeSubs.HasSubscribers() {
+			s.changeSubs.Dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
 		}
 
 		// Read-state ping: the apply hook already recorded any unread
@@ -125,15 +125,15 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// detected via the synthetic _ver.id derived op the apply path
 		// emits exactly once per record; deletion via a delete op in the
 		// change. Both key the account mirror's replay/GC.
-		if ch.Dataset == properties.Dataset && s.rowEvents.hasSubscribers() {
+		if ch.Dataset == properties.Dataset && s.rowEvents.HasSubscribers() {
 			for i, rc := range ch.Records {
 				rid := ch.ObjectId // shared collection: row id = objectId
 				if hasDeleteOp(rc.Ops) {
-					s.rowEvents.dispatch(RowEvent{ObjectId: rid, Deleted: true})
+					s.rowEvents.Dispatch(RowEvent{ObjectId: rid, Deleted: true})
 					continue
 				}
 				if res != nil && i < len(res.DerivedOps) && hasCreationMarker(res.DerivedOps[i]) {
-					s.rowEvents.dispatch(RowEvent{ObjectId: rid, Deleted: false})
+					s.rowEvents.Dispatch(RowEvent{ObjectId: rid, Deleted: false})
 				}
 			}
 		}

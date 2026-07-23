@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -68,7 +69,7 @@ type Service struct {
 
 	// spaceSubs is the account-wide subscriber registry for
 	// SpaceSyncStatus events. Fired by the rollup loop.
-	spaceSubs *registry[space.SpaceSyncStatus]
+	spaceSubs *fanout.Registry[space.SpaceSyncStatus]
 
 	// exclude is the set of tree ids the trackers should ignore.
 	// Names are space-relative: the spaceImpl injects its
@@ -98,7 +99,7 @@ type Service struct {
 func NewService() *Service {
 	return &Service{
 		trackers:  map[string]*Tracker{},
-		spaceSubs: newRegistry[space.SpaceSyncStatus](),
+		spaceSubs: fanout.New[space.SpaceSyncStatus](),
 		dirty:     map[string]struct{}{},
 		lastEvent: map[string]space.SpaceSyncStatus{},
 	}
@@ -136,7 +137,7 @@ func (s *Service) Tick() {
 	s.dirty = map[string]struct{}{}
 	s.dirtyMu.Unlock()
 
-	hasSubs := s.spaceSubs.hasSubscribers()
+	hasSubs := s.spaceSubs.HasSubscribers()
 	for spaceId := range dirty {
 		cur := s.Status(spaceId)
 		s.dirtyMu.Lock()
@@ -144,7 +145,7 @@ func (s *Service) Tick() {
 		s.lastEvent[spaceId] = cur
 		s.dirtyMu.Unlock()
 		if hasSubs && (!had || !rollupsEqual(prev, cur)) {
-			s.spaceSubs.dispatch(cur)
+			s.spaceSubs.Dispatch(cur)
 		}
 	}
 }
@@ -296,8 +297,7 @@ func (s *Service) SubscribeStatus(cb func(space.SpaceSyncStatus)) func() {
 	if cb == nil {
 		return func() {}
 	}
-	id := s.spaceSubs.add(cb)
-	return func() { s.spaceSubs.remove(id) }
+	return s.spaceSubs.Add(cb)
 }
 
 // Close drops every Tracker, stops the rollup loop, and rejects
@@ -322,7 +322,7 @@ func (s *Service) Close() {
 	for _, t := range trackers {
 		t.close()
 	}
-	s.spaceSubs.close()
+	s.spaceSubs.Close()
 }
 
 // refresh is called by Trackers on every state transition. Adds

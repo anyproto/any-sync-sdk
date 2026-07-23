@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 )
 
 // purgeStore builds a Store wired with exactly what the purge path needs: a
@@ -31,8 +32,8 @@ func purgeStore(t *testing.T) (context.Context, *Store) {
 	s := &Store{
 		db:         db,
 		spaceId:    "spaceA",
-		changeSubs: newChangeRegistry(),
-		rowEvents:  newRowEventRegistry(),
+		changeSubs: fanout.New[ObjectChange](),
+		rowEvents:  fanout.New[RowEvent](),
 	}
 	s.applySeqs = crdt.NewApplySeqAllocator(func(c context.Context) (uint64, error) {
 		coll, err := s.applySeqMeta(c)

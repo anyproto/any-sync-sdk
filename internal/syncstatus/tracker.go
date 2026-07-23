@@ -7,6 +7,7 @@ import (
 	"github.com/anyproto/any-sync/app"
 	anysyncstatus "github.com/anyproto/any-sync/commonspace/syncstatus"
 
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -47,7 +48,7 @@ type Tracker struct {
 	// per-tree hook fire yet but are demonstrably in sync at the
 	// space level.
 	lastAllSyncedAt time.Time
-	subs            *registry[space.ObjectSyncStatus]
+	subs            *fanout.Registry[space.ObjectSyncStatus]
 }
 
 // treeState is the per-tree row of the tracker. Pending heads are
@@ -75,7 +76,7 @@ func newTracker(spaceId string, parent *Service, excludedTrees []string) *Tracke
 		parent:   parent,
 		excluded: excl,
 		trees:    map[string]*treeState{},
-		subs:     newRegistry[space.ObjectSyncStatus](),
+		subs:     fanout.New[space.ObjectSyncStatus](),
 	}
 }
 
@@ -179,12 +180,11 @@ func (t *Tracker) SubscribeObject(objectId string, cb func(space.ObjectSyncStatu
 	// In v1 we share one registry per Tracker and let the dispatcher
 	// filter by objectId at delivery. Cheap enough — registries are
 	// per-space so the fan-out is bounded.
-	id := t.subs.add(func(ev space.ObjectSyncStatus) {
+	return t.subs.Add(func(ev space.ObjectSyncStatus) {
 		if ev.ObjectId == objectId {
 			cb(ev)
 		}
 	})
-	return func() { t.subs.remove(id) }
 }
 
 // PendingCount returns the number of trees currently in Syncing.
@@ -333,7 +333,7 @@ func (t *Tracker) BulkSyncedFromPeer(peerId string) {
 	}
 	t.mu.Unlock()
 	for _, ev := range events {
-		t.subs.dispatch(ev)
+		t.subs.Dispatch(ev)
 	}
 	if t.parent != nil {
 		t.parent.refresh(t.spaceId)
@@ -342,7 +342,7 @@ func (t *Tracker) BulkSyncedFromPeer(peerId string) {
 
 // close drops all subscribers. Called from Service.close.
 func (t *Tracker) close() {
-	t.subs.close()
+	t.subs.Close()
 }
 
 // ensureTreeLocked returns the treeState for treeId, creating an
@@ -360,7 +360,7 @@ func (t *Tracker) ensureTreeLocked(treeId string) *treeState {
 // account-level rollup. Both are safe under no-parent (test) — the
 // parent nudge is skipped.
 func (t *Tracker) dispatchAndRefresh(ev space.ObjectSyncStatus) {
-	t.subs.dispatch(ev)
+	t.subs.Dispatch(ev)
 	if t.parent != nil {
 		t.parent.refresh(t.spaceId)
 	}

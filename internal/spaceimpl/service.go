@@ -615,7 +615,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) {
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
-		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
+		return nil, fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	// Deleted rows are refused outright, mirroring the boot eager-load:
 	// the storage is offloaded (or was never created), a load would
@@ -781,7 +781,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 // account's record of the space).
 func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[string]any, unset []string) error {
 	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
-		return fmt.Errorf("spaceimpl: unknown space %q", spaceId)
+		return fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	_, err := s.tsp.SetSettings(ctx, spaceId, set, unset)
 	return err
@@ -1091,7 +1091,7 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
 	}
 	if otherIdentity == keys.SignKey.GetPublic().Account() {
-		return nil, errors.New("spaceimpl: OneToOne: cannot pair with self")
+		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", space.ErrSelfPair)
 	}
 	otherPk, err := decodeIdentity(otherIdentity)
 	if err != nil {
@@ -1127,7 +1127,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	}
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
-		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: unknown space %q", spaceId)
+		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	if rec.Type != space.SpaceTypeOneToOne {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %q is not a 1-1 space", spaceId)
@@ -1155,7 +1155,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 func (s *Service) DeclineOneToOne(ctx context.Context, spaceId string) error {
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
-		return fmt.Errorf("spaceimpl: DeclineOneToOne: unknown space %q", spaceId)
+		return fmt.Errorf("spaceimpl: DeclineOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	if rec.Type != space.SpaceTypeOneToOne {
 		return fmt.Errorf("spaceimpl: DeclineOneToOne: %q is not a 1-1 space", spaceId)
@@ -1177,7 +1177,7 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 		return errors.New("spaceimpl: anysyncx app has no account keys")
 	}
 	if peerIdentity == keys.SignKey.GetPublic().Account() {
-		return errors.New("spaceimpl: RegisterIncoming: cannot pair with self")
+		return fmt.Errorf("spaceimpl: RegisterIncoming: %w", space.ErrSelfPair)
 	}
 	otherPk, err := decodeIdentity(peerIdentity)
 	if err != nil {
@@ -1322,10 +1322,9 @@ func deriveOneToOneId(mySignKey crypto.PrivKey, peerPub crypto.PubKey) (string, 
 }
 
 // ErrJoinPending is returned by Join after a RequestToJoin invite was
-// successfully posted but the owner has not yet accepted. The space
-// is recorded in the tech-space index with LocalStatus=Joining;
-// callers can poll List for the status flip and then call Get.
-var ErrJoinPending = errors.New("spaceimpl: join pending owner approval")
+// successfully posted but the owner has not yet accepted. Wraps the
+// public space.ErrJoinPending for errors.Is.
+var ErrJoinPending = fmt.Errorf("spaceimpl: %w", space.ErrJoinPending)
 
 // Join sends a join request via the invite. v1 only supports
 // RequestToJoin invites — AnyoneCanJoin is deferred until any-sync
@@ -1519,10 +1518,10 @@ const inviteLoadingLocalStatus = "inviteLoading"
 func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space, error) {
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
-		return nil, fmt.Errorf("spaceimpl: AcceptInvite: unknown space %q", spaceId)
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	if rec.Type == space.SpaceTypeOneToOne {
-		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %q is a 1-1 space — use AcceptOneToOne", spaceId)
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %q %w — use AcceptOneToOne", spaceId, space.ErrIsOneToOne)
 	}
 	if rec.IsDeleted() {
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is deleted", spaceId)
@@ -1543,10 +1542,10 @@ func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space
 		switch rec.LocalStatus {
 		case "", techspace.StatusActive, inviteLoadingLocalStatus:
 		default:
-			return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is not invite-pending", spaceId)
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is %w", spaceId, space.ErrNotInvitePending)
 		}
 	default:
-		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is not invite-pending", spaceId)
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is %w", spaceId, space.ErrNotInvitePending)
 	}
 	// Persist the loading obligation BEFORE the synced accept flip: a
 	// crash between the two writes must leave a resumable marker, never a
@@ -1578,10 +1577,9 @@ func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space
 }
 
 // ErrInviteAcceptPending is returned by AcceptInvite when the accept was
-// recorded (synced account-wide) but the space content is not pullable
-// yet. Loading continues durably in the background and across restarts;
-// callers poll List/Get or Subscribe for the flip to StatusActive.
-var ErrInviteAcceptPending = errors.New("spaceimpl: invite accepted; space load pending")
+// recorded but the space content is not pullable yet. Wraps the public
+// space.ErrInviteAcceptPending for errors.Is.
+var ErrInviteAcceptPending = fmt.Errorf("spaceimpl: %w", space.ErrInviteAcceptPending)
 
 // DeclineInvite rejects a direct-add invite. Writes the synced, sticky
 // InviteDeclined marker so the request is suppressed on every device; a
@@ -1591,17 +1589,17 @@ var ErrInviteAcceptPending = errors.New("spaceimpl: invite accepted; space load 
 func (s *Service) DeclineInvite(ctx context.Context, spaceId string) error {
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
-		return fmt.Errorf("spaceimpl: DeclineInvite: unknown space %q", spaceId)
+		return fmt.Errorf("spaceimpl: DeclineInvite: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	if rec.Type == space.SpaceTypeOneToOne {
-		return fmt.Errorf("spaceimpl: DeclineInvite: %q is a 1-1 space — use DeclineOneToOne", spaceId)
+		return fmt.Errorf("spaceimpl: DeclineInvite: %q %w — use DeclineOneToOne", spaceId, space.ErrIsOneToOne)
 	}
 	switch rec.RemoteStatus {
 	case techspace.InviteDeclinedRemoteStatus:
 		return nil // idempotent
 	case techspace.InvitePendingRemoteStatus:
 	default:
-		return fmt.Errorf("spaceimpl: DeclineInvite: space %q is not invite-pending", spaceId)
+		return fmt.Errorf("spaceimpl: DeclineInvite: space %q is %w", spaceId, space.ErrNotInvitePending)
 	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.InviteDeclinedRemoteStatus); err != nil {
 		return fmt.Errorf("spaceimpl: DeclineInvite: %w", err)

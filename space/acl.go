@@ -1,6 +1,37 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
+
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+)
+
+// ErrNoActiveGuestKey is returned by RevokeGuestKey when the space has
+// no guest identity to revoke.
+var ErrNoActiveGuestKey = errors.New("no active guest key")
+
+// ErrBadIdentity is returned by identity-taking methods (ACL ops,
+// OneToOne, RegisterIncoming) when the identity string is empty or not
+// a decodable account address.
+var ErrBadIdentity = errors.New("bad identity")
+
+// Re-exported any-sync ACL sentinels, so consumers classify ACL
+// failures with errors.Is against this package instead of importing
+// any-sync internals.
+var (
+	// ErrDuplicateInvite is returned by CreateInvite when an active
+	// invite of the same type already exists.
+	ErrDuplicateInvite = list.ErrDuplicateInvites
+
+	// ErrInsufficientPermissions is returned by ACL ops the caller's
+	// permission does not allow.
+	ErrInsufficientPermissions = list.ErrInsufficientPermissions
+
+	// ErrAclRecordNotFound is returned by ACL ops addressing a record
+	// (or pending request) the ACL does not hold.
+	ErrAclRecordNotFound = list.ErrNoSuchRecord
+)
 
 // ACL is the owner/admin-side ACL surface: invite lifecycle, join
 // approvals, permission changes, ownership transfer, member removal.

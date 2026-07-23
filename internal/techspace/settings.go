@@ -17,15 +17,17 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // Settings-patch sentinels — wrapped by SettingsOps validation errors
-// so callers can classify with errors.Is.
+// so callers can classify with errors.Is. Canonical homes are in the
+// public space package; aliased here for internal callers.
 var (
-	ErrSettingsEmpty      = errors.New("techspace: settings patch is empty")
-	ErrSettingsBadKey     = errors.New("techspace: invalid settings key")
-	ErrSettingsBadValue   = errors.New("techspace: unsupported settings value")
-	ErrSettingsKeyOverlap = errors.New("techspace: key in both set and unset")
+	ErrSettingsEmpty      = space.ErrSettingsEmpty
+	ErrSettingsBadKey     = space.ErrSettingsBadKey
+	ErrSettingsBadValue   = space.ErrSettingsBadValue
+	ErrSettingsKeyOverlap = space.ErrSettingsKeyOverlap
 )
 
 // SettingsOps encodes a settings patch into per-path CRDT ops: one

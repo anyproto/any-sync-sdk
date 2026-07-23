@@ -264,11 +264,11 @@ func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, descripti
 	return obj.LocalWrite(ctx, change)
 }
 
-// SetLocalStatus updates the device-local localStatus field via the
-// local-set path: it does NOT enter the DAG and never syncs to other
-// devices (each device owns its own value). Use for per-device
-// lifecycle — active / joining / offloaded.
-func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
+// setRowField is the shared scaffold behind the per-field setters:
+// one OpSet at [field] on spaceId's row, payload built on a fresh
+// arena. local selects LocalSet (device-local, never enters the DAG)
+// vs LocalWrite (synced, account-wide).
+func (s *Service) setRowField(ctx context.Context, spaceId, field string, local bool, payload func(a *anyenc.Arena) *anyenc.Value) (object.WriteResult, error) {
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
@@ -276,23 +276,33 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 	if err != nil {
 		return object.WriteResult{}, err
 	}
-
 	arena := &anyenc.Arena{}
 	change := crdt.Change{
 		Dataset:     SpaceIndexDataset,
 		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldLocalStatus},
-					Payload: arena.NewString(status),
-				}},
-			},
-		},
+		Records: []crdt.RecordChange{{
+			Id: spaceId,
+			Ops: []crdt.Op{{
+				Type:    crdt.OpSet,
+				Path:    []string{field},
+				Payload: payload(arena),
+			}},
+		}},
 	}
-	return obj.LocalSet(ctx, change)
+	if local {
+		return obj.LocalSet(ctx, change)
+	}
+	return obj.LocalWrite(ctx, change)
+}
+
+// SetLocalStatus updates the device-local localStatus field via the
+// local-set path: it does NOT enter the DAG and never syncs to other
+// devices (each device owns its own value). Use for per-device
+// lifecycle — active / joining / offloaded.
+func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldLocalStatus, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(status)
+	})
 }
 
 // SetPushKeys mirrors the space's derived push-notification key
@@ -304,33 +314,13 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 // Caller (the ACL mirror watcher) is responsible for the row-exists
 // check and for skipping no-op writes.
 func (s *Service) SetPushKeys(ctx context.Context, spaceId string, keys space.PushKeys) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	payload := arena.NewObject()
-	payload.Set(PushKeySpaceKey, arena.NewString(keys.SpaceKey))
-	payload.Set(PushKeyEncKey, arena.NewString(keys.EncKey))
-	payload.Set(PushKeyEncKeyId, arena.NewString(keys.EncKeyId))
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldPushKeys},
-					Payload: payload,
-				}},
-			},
-		},
-	}
-	return obj.LocalSet(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldPushKeys, true, func(a *anyenc.Arena) *anyenc.Value {
+		payload := a.NewObject()
+		payload.Set(PushKeySpaceKey, a.NewString(keys.SpaceKey))
+		payload.Set(PushKeyEncKey, a.NewString(keys.EncKey))
+		payload.Set(PushKeyEncKeyId, a.NewString(keys.EncKeyId))
+		return payload
+	})
 }
 
 // SetOwnRole mirrors this account's own ACL permission onto the
@@ -340,58 +330,18 @@ func (s *Service) SetPushKeys(ctx context.Context, spaceId string, keys space.Pu
 // (space.Permission.String). Caller (the ACL mirror watcher) is
 // responsible for the row-exists check and for skipping no-op writes.
 func (s *Service) SetOwnRole(ctx context.Context, spaceId string, role space.Permission) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldOwnRole},
-					Payload: arena.NewString(role.String()),
-				}},
-			},
-		},
-	}
-	return obj.LocalSet(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldOwnRole, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(role.String())
+	})
 }
 
 // SetAclHeadId records the ACL head id from RequestJoin on the joining
 // row via the local-set path (device-local; never enters the DAG). Read
 // back by the joiner-side post-acceptance waiter to detect a decline.
 func (s *Service) SetAclHeadId(ctx context.Context, spaceId, aclHeadId string) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldAclHeadId},
-					Payload: arena.NewString(aclHeadId),
-				}},
-			},
-		},
-	}
-	return obj.LocalSet(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldAclHeadId, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(aclHeadId)
+	})
 }
 
 // SetOneToOneInviteState writes the device-local 1-1 invite-send marker
@@ -399,29 +349,9 @@ func (s *Service) SetAclHeadId(ctx context.Context, spaceId, aclHeadId string) (
 // DAG. Pass "toSend" to flag a pending notification, "" to clear it once
 // the coordinator confirms delivery.
 func (s *Service) SetOneToOneInviteState(ctx context.Context, spaceId, state string) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldOneToOneInviteState},
-					Payload: arena.NewString(state),
-				}},
-			},
-		},
-	}
-	return obj.LocalSet(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldOneToOneInviteState, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(state)
+	})
 }
 
 // AddInviteNotify queues identity into the device-local direct-add send
@@ -475,29 +405,9 @@ func (s *Service) inviteNotifyOp(ctx context.Context, spaceId, identity string, 
 // state that propagates to every device. Used for account-wide delete
 // (status=StatusDeleted); the handler keeps deleted terminal.
 func (s *Service) SetRemoteStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldRemoteStatus},
-					Payload: arena.NewString(status),
-				}},
-			},
-		},
-	}
-	return obj.LocalWrite(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldRemoteStatus, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(status)
+	})
 }
 
 // SetIssuedGuestKey writes (or clears, with "") the SYNCED owner-side
@@ -505,58 +415,18 @@ func (s *Service) SetRemoteStatus(ctx context.Context, spaceId, status string) (
 // then return / revoke the same invite. Written by ACL.CreateGuestKey,
 // cleared by RevokeGuestKey.
 func (s *Service) SetIssuedGuestKey(ctx context.Context, spaceId, encodedKey string) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldIssuedGuestKey},
-					Payload: arena.NewString(encodedKey),
-				}},
-			},
-		},
-	}
-	return obj.LocalWrite(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldIssuedGuestKey, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(encodedKey)
+	})
 }
 
 // SetGuestKey updates the SYNCED guest-mode key on an existing row —
 // the re-join path after the owner rotated the guest key (JoinGuest
 // with a fresh invite). Row creation writes the field via EncodeCreate.
 func (s *Service) SetGuestKey(ctx context.Context, spaceId, encodedKey string) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldGuestKey},
-					Payload: arena.NewString(encodedKey),
-				}},
-			},
-		},
-	}
-	return obj.LocalWrite(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldGuestKey, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(encodedKey)
+	})
 }
 
 // Get returns the current state of one space-index record. Reads off

@@ -660,6 +660,13 @@ type accountImpl struct {
 	app    *anysyncx.App
 	tsp    *techspace.Service
 	spaces *spaceimpl.Service
+	// pushMu serializes each local-profile-read/write → IdentityRepoPut
+	// sequence. Under DeferWarmup the boot republish runs concurrently
+	// with user calls; without the lock its in-flight put of the old
+	// profile can land AFTER a fresh UpdateMetadata and leave identityRepo
+	// stale until the next boot (the local copy stays fresh, so the
+	// divergence is invisible on this device).
+	pushMu sync.Mutex
 }
 
 func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl.Service) *accountImpl {
@@ -715,17 +722,23 @@ func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMeta
 	}
 	// Persist locally first so a future boot can republish without
 	// the user re-supplying the metadata. Tech-space writes are
-	// owner-only and cheap (single CRDT row).
+	// owner-only and cheap (single CRDT row). The local write and the
+	// repo push happen under pushMu as one unit so the repo converges
+	// to the LAST local write even when a boot republish is in flight.
+	a.pushMu.Lock()
 	if a.tsp != nil {
 		if err := a.tsp.SetProfile(ctx, techspace.ProfileRecord{
 			Name:        meta.Name,
 			Description: meta.Description,
 			IconCID:     meta.IconCID,
 		}); err != nil {
+			a.pushMu.Unlock()
 			return fmt.Errorf("anysyncsdk: persist profile: %w", err)
 		}
 	}
-	if err := a.pushToIdentityRepo(ctx, meta); err != nil {
+	err := a.pushToIdentityRepo(ctx, meta)
+	a.pushMu.Unlock()
+	if err != nil {
 		return err
 	}
 	// Kick every running members watcher so the just-published
@@ -745,6 +758,11 @@ func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
 	if a.tsp == nil {
 		return nil
 	}
+	// Read + push under pushMu: a concurrent UpdateMetadata either
+	// finishes first (we re-read and republish its fresh profile —
+	// harmless duplicate) or waits and pushes after us (its value wins).
+	a.pushMu.Lock()
+	defer a.pushMu.Unlock()
 	rec, ok := a.tsp.GetProfile(ctx)
 	if !ok || rec.IsEmpty() {
 		return nil

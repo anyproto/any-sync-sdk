@@ -64,6 +64,15 @@ func TestSDK_OpenCreateList(t *testing.T) {
 
 	require.NotEmpty(t, sdk.Account().Id(), "account id should resolve")
 
+	// Flag-off regression: a synchronous Open is never warming and
+	// WarmupDone is pre-closed.
+	assert.False(t, sdk.Warming())
+	select {
+	case <-sdk.WarmupDone():
+	default:
+		t.Fatal("WarmupDone must be pre-closed for a synchronous Open")
+	}
+
 	// Empty index initially.
 	list, err := sdk.Spaces().List(ctx)
 	require.NoError(t, err)

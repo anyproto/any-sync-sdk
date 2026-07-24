@@ -11,10 +11,12 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
@@ -38,6 +40,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+var log = logger.NewNamed("sdk")
+
 // SDK is the top-level handle held by middleware for the lifetime of
 // use. Constructed by Open; torn down by Close.
 type SDK struct {
@@ -54,6 +58,47 @@ type SDK struct {
 	// LAN re-handshakes when the known-space set grows; nil when p2p
 	// is disabled or in headless mode.
 	stopP2PIndexWatch func()
+	// warmupCancel / warmupDone track the deferred warmup goroutine
+	// when cfg.DeferWarmup is set. A non-nil warmupDone is THE deferred
+	// -mode sentinel — Warming, WarmupDone and Close all gate on it, and
+	// warmupCancel is only ever dereferenced behind that gate. Both nil
+	// when warmup ran synchronously (flag off) or was skipped
+	// (Headless). warmupDone is closed by the goroutine on exit; Close
+	// cancels and joins it before any teardown.
+	warmupCancel context.CancelFunc
+	warmupDone   chan struct{}
+}
+
+// warmupClosed is the pre-closed WarmupDone result for SDKs whose
+// warmup ran synchronously (DeferWarmup off) or was skipped (Headless).
+var warmupClosed = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// Warming reports whether the deferred background warmup started by
+// Open with cfg.DeferWarmup is still running. Always false when
+// DeferWarmup is off or Headless is set.
+func (s *SDK) Warming() bool {
+	select {
+	case <-s.WarmupDone():
+		return false
+	default:
+		return true
+	}
+}
+
+// WarmupDone returns a channel closed once the deferred warmup has
+// finished running (or immediately for a synchronous/headless Open).
+// "Done" means no longer running — it also closes when Close cancels
+// an in-flight warmup. Callers that need full cross-device catch-up
+// can select on it; local reads never need to.
+func (s *SDK) WarmupDone() <-chan struct{} {
+	if s.warmupDone == nil {
+		return warmupClosed
+	}
+	return s.warmupDone
 }
 
 // FileCacheSize returns the local bytes currently held by file content
@@ -267,25 +312,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		}, nil
 	}
 
-	// Resume any join left pending from a previous session now that the
-	// tech space is open (the join controller started in spaceimpl.New,
-	// before this point, so its initial scan saw an empty index).
-	spaces.ResumePendingJoins()
-
-	// Start the Layer-2 1-1 inbox subsystem now that the tech space is
-	// open: the receive notifier (coordinator push + poll → pending rows)
-	// and the send-retry loop. No-op when the inbox transport is
-	// unavailable; the out-of-band 1-1 path works without it.
-	spaces.StartOneToOneInbox(ctx)
-
-	// Cold-sync resolve: a fresh device syncs the identities directory's
-	// symkeys but no profiles (those are device-local). Batch-fetch the
-	// missing profiles from identityRepo in the background.
-	go spaces.ResolveIdentityProfiles(context.Background())
-
 	// Read-state sync: merge other devices' published read frontiers
 	// (tech-space KV) into the per-space readstate engines, and publish
-	// local marks. Live hook + idempotent per-space Reconcile below.
+	// local marks. Wired before any account-facing boot step —
+	// ResumePendingJoins can complete a join and load a space, and that
+	// space's first-load seed should already see the provider. Live
+	// hook here + idempotent per-space Reconcile in warmup.
 	readSync := readsync.New(
 		func(spaceId string) *readstate.Engine {
 			st := spaces.StoreFor(spaceId)
@@ -302,6 +334,84 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	app.OnKeyValues(tsp.SpaceId(), readSync.OnKeyValues)
 	spaces.SetReadSync(readSync)
 
+	sdk := &SDK{
+		app:        app,
+		db:         db,
+		tsp:        tsp,
+		spaces:     spaces,
+		account:    account,
+		push:       push,
+		filesQueue: filesQueue,
+		filesGC:    filesGC,
+		readSync:   readSync,
+	}
+
+	if cfg.DeferWarmup {
+		// Fast phase done — local reads are safe. The account-facing
+		// boot work runs in a background goroutine owned by the SDK.
+		// Its ctx derives from Background, not from Open's ctx: the
+		// latter is the caller's startup window and is routinely
+		// cancelled right after Open returns, while warmup must keep
+		// going until it finishes or Close cancels + joins it.
+		sdk.registerP2PIndexWatch()
+		warmupCtx, cancel := context.WithCancel(context.Background())
+		sdk.warmupCancel = cancel
+		sdk.warmupDone = make(chan struct{})
+		go func() {
+			defer close(sdk.warmupDone)
+			sdk.warmup(warmupCtx)
+		}()
+		return sdk, nil
+	}
+
+	sdk.warmup(ctx)
+	sdk.registerP2PIndexWatch()
+	return sdk, nil
+}
+
+// warmupTestHook, when non-nil, runs first inside warmup — a test-only
+// seam to hold a deferred warmup open and observe its cancellation.
+// Always nil in production.
+var warmupTestHook func(ctx context.Context)
+
+// warmup runs the account-facing boot work: pending-join resume, the
+// 1-1 inbox, identity-profile resolution, profile republish, the eager
+// space-loading loop, and the read-state reconcile. Synchronous inside
+// Open by default; with cfg.DeferWarmup it runs on a background
+// goroutine under the SDK-owned warmup ctx that Close cancels. Every
+// step is best-effort — errors are logged, never fatal (and not worth
+// warning about when the ctx was cancelled by Close).
+func (s *SDK) warmup(ctx context.Context) {
+	if h := warmupTestHook; h != nil {
+		h(ctx)
+	}
+	warn := func(msg string, err error, fields ...zap.Field) {
+		if err != nil && ctx.Err() == nil {
+			log.Warn("warmup: "+msg, append(fields, zap.Error(err))...)
+		}
+	}
+
+	// Resume any join left pending from a previous session now that the
+	// tech space is open (the join controller started in spaceimpl.New,
+	// before this point, so its initial scan saw an empty index).
+	s.spaces.ResumePendingJoins()
+
+	// Start the Layer-2 1-1 inbox subsystem now that the tech space is
+	// open: the receive notifier (coordinator push + poll → pending rows)
+	// and the send-retry loop. No-op when the inbox transport is
+	// unavailable; the out-of-band 1-1 path works without it. The
+	// notifier owns its own Background-derived ctx — warmup
+	// cancellation does not stop it; spaces.Close does.
+	s.spaces.StartOneToOneInbox(ctx)
+
+	// Cold-sync resolve: a fresh device syncs the identities directory's
+	// symkeys but no profiles (those are device-local). Batch-fetch the
+	// missing profiles from identityRepo, concurrently with the rest of
+	// warmup — one coordinator round-trip that must not delay the eager
+	// loop below. The goroutine is owned by spaceimpl (seedCtx/seedWG),
+	// so spaces.Close cancels and drains it on either boot path.
+	s.spaces.ResolveIdentityProfilesAsync()
+
 	// Republish the locally-stored profile to identityRepo on every
 	// boot. Heart's ownProfileSubscription does the equivalent (reads
 	// the local profile object, calls IdentityRepoPut). Without this,
@@ -311,11 +421,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	//
 	// Best-effort: a failed push doesn't prevent SDK use. The next
 	// successful push (next UpdateMetadata or next boot) heals it.
-	if err := account.republishStoredProfile(ctx); err != nil {
-		// Log via the any-sync log? We don't have one wired here.
-		// Swallow — Open succeeds; the rest of the SDK is functional.
-		_ = err
-	}
+	warn("republish profile", s.account.republishStoredProfile(ctx))
 
 	// Eager-load every non-deleted space from the tech-space index so
 	// per-space headsync / syncacl start running at boot rather than
@@ -326,9 +432,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// touching them first.
 	//
 	// Best-effort per space: a single failure (e.g. corrupted local
-	// storage for one space) is logged and skipped so SDK.Open still
-	// succeeds for the rest.
-	for _, rec := range tsp.List(ctx) {
+	// storage for one space) is logged and skipped so the rest of the
+	// spaces still load.
+	for _, rec := range s.tsp.List(ctx) {
+		if ctx.Err() != nil {
+			return // Close cancelled a deferred warmup
+		}
 		// Skip deletion tombstones. Both delete paths — local
 		// Service.Delete and inbound reconcile — record the delete via
 		// the SYNCED RemoteStatus field (LocalStatus is never set to
@@ -341,8 +450,8 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		// Includes the 1-1 synced offload marker (oneToOneDeleted) — a
 		// deleted 1-1 must be offloaded, not eager-loaded, on every device.
 		if rec.IsDeleted() {
-			if app.SpaceExists(rec.Id) {
-				spaces.OffloadSpace(ctx, rec.Id)
+			if s.app.SpaceExists(rec.Id) {
+				s.spaces.OffloadSpace(ctx, rec.Id)
 			}
 			continue
 		}
@@ -357,68 +466,57 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		if spaceimpl.MaterializeBlock(rec) != nil {
 			continue
 		}
-		if !app.SpaceExists(rec.Id) {
+		if !s.app.SpaceExists(rec.Id) {
 			continue
 		}
-		if _, err := app.GetSpace(ctx, rec.Id); err != nil {
-			_ = err
+		if _, err := s.app.GetSpace(ctx, rec.Id); err != nil {
+			warn("eager-load space", err, zap.String("spaceId", rec.Id))
 			continue
 		}
 		// Catch up any trees that advanced while we were offline (or
 		// that we have never opened). Best-effort: a failure here
-		// shouldn't block SDK.Open for the rest of the spaces — the
+		// shouldn't block boot for the rest of the spaces — the
 		// per-object lazy ColdRestore on first user touch still works.
-		if err := spacesync.Run(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
-			_ = err
-		}
+		warn("space catch-up", spacesync.Run(ctx, s.app, s.db, s.spaces.StoreFor(rec.Id), rec.Id),
+			zap.String("spaceId", rec.Id))
 		// Backstop the sdk.db-rebuild deletion gap: purge any local row for
 		// an object any-sync has flipped to Deleted (and stamp the consumer
 		// deletion feed). Best-effort; runs after Run so it also cleans
 		// anything the forward catch-up or a lazy Get re-materialized.
-		if err := spacesync.ReconcileDeletions(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
-			_ = err
-		}
+		warn("reconcile deletions", spacesync.ReconcileDeletions(ctx, s.app, s.db, s.spaces.StoreFor(rec.Id), rec.Id),
+			zap.String("spaceId", rec.Id))
 	}
 
 	// Replay published read frontiers through the idempotent merge —
 	// covers marks made by other devices while this one was offline and
-	// live-hook drops. One pass over the tech-space store for ALL
-	// spaces; cheap when nothing changed.
-	if err := readSync.ReconcileAll(ctx); err != nil {
-		_ = err
-	}
+	// live-hook drops. Must run after the eager loop: merges route
+	// through engineFor, which only resolves spaces the loop's
+	// Run/StoreFor established tracking for. One pass over the
+	// tech-space store for ALL spaces; cheap when nothing changed.
+	warn("reconcile read state", s.readSync.ReconcileAll(ctx))
+}
 
-	// LAN cold restore: let the p2p exchange probe for spaces this
-	// account knows of but hasn't pulled yet, and re-handshake known
-	// LAN peers whenever the tech-space index grows (a fresh device
-	// learns a space id and wants a pull source right away).
-	var stopP2PIndexWatch func()
-	if app.P2PEnabled() {
-		app.SetKnownSpaceIdsFn(func() []string {
-			recs := tsp.List(context.Background())
-			ids := make([]string, 0, len(recs))
-			for _, rec := range recs {
-				if !rec.IsDeleted() {
-					ids = append(ids, rec.Id)
-				}
+// registerP2PIndexWatch wires the LAN cold-restore hooks: the p2p
+// exchange probes for spaces this account knows of but hasn't pulled
+// yet, and known LAN peers are re-handshaken whenever the tech-space
+// index grows (a fresh device learns a space id and wants a pull
+// source right away). Cheap and local-only — one sub on the tech-space
+// engine, no network — so the deferred path runs it in the fast phase.
+func (s *SDK) registerP2PIndexWatch() {
+	if !s.app.P2PEnabled() {
+		return
+	}
+	s.app.SetKnownSpaceIdsFn(func() []string {
+		recs := s.tsp.List(context.Background())
+		ids := make([]string, 0, len(recs))
+		for _, rec := range recs {
+			if !rec.IsDeleted() {
+				ids = append(ids, rec.Id)
 			}
-			return ids
-		})
-		stopP2PIndexWatch = watchSpaceIndexForP2P(tsp, app)
-	}
-
-	return &SDK{
-		app:               app,
-		db:                db,
-		tsp:               tsp,
-		spaces:            spaces,
-		account:           account,
-		push:              push,
-		filesQueue:        filesQueue,
-		filesGC:           filesGC,
-		readSync:          readSync,
-		stopP2PIndexWatch: stopP2PIndexWatch,
-	}, nil
+		}
+		return ids
+	})
+	s.stopP2PIndexWatch = watchSpaceIndexForP2P(s.tsp, s.app)
 }
 
 // watchSpaceIndexForP2P subscribes to the tech-space `spaces` dataset
@@ -465,6 +563,15 @@ func watchSpaceIndexForP2P(tsp *techspace.Service, app *anysyncx.App) (stop func
 // spaces, the tech space, the SDK DB, and finally the any-sync app.
 func (s *SDK) Close() error {
 	ctx := context.Background()
+	// Cancel and JOIN the deferred warmup before any teardown: warmup
+	// touches readSync, spaces, tsp, db and app, all of which are
+	// closed below. Joining first also serializes StartOneToOneInbox
+	// against spaces.Close's stopOneToOneInbox — at that point the
+	// inbox is either fully started or never started.
+	if s.warmupDone != nil {
+		s.warmupCancel()
+		<-s.warmupDone
+	}
 	if s.stopP2PIndexWatch != nil {
 		s.stopP2PIndexWatch()
 	}

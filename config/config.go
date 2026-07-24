@@ -36,6 +36,25 @@ type Config struct {
 	// combined with Sync.TreeTypes. Regular app embedders leave it false.
 	Headless bool `yaml:"headless"`
 
+	// DeferWarmup makes Open return as soon as local state is usable
+	// and runs the network-facing boot work — pending-join resume, the
+	// 1-1 inbox subsystem, identity-profile resolution, profile
+	// republish, the eager space-loading loop, and the read-state
+	// reconcile — in a background goroutine owned by the SDK. Local
+	// reads (Spaces().List, per-space queries) are safe as soon as Open
+	// returns; cross-device sync catch-up completes in the background.
+	// Progress is observable via SDK.Warming / SDK.WarmupDone; Close
+	// cancels and joins the warmup before teardown.
+	//
+	// Intended for embedded/mobile hosts that must bind a listener
+	// quickly and cannot wait on sync-node round-trips at boot. False —
+	// the default — keeps Open fully synchronous, so boot failures
+	// surface before the first request is accepted.
+	//
+	// No-op when Headless is set: headless mode skips all of the warmup
+	// work permanently.
+	DeferWarmup bool `yaml:"deferWarmup"`
+
 	// Types is the optional list of caller-defined types extending
 	// the SDK's built-in catalog. Each Type binds a typeId to the
 	// dataset handlers it owns; every handler's Dataset() name must

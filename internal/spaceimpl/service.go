@@ -159,11 +159,13 @@ type Service struct {
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
 
-	// seedWG / seedCtx track the fire-and-forget spaceIndex lazy-seed
-	// goroutines (goSeed). Close cancels seedCtx and waits on seedWG so
-	// no background seed is still touching the store / tech space when
-	// the SDK tears them down. closing (under mu) stops new seeds from
-	// being spawned during shutdown.
+	// seedWG / seedCtx track the fire-and-forget background goroutines
+	// the service owns: the spaceIndex lazy-seeds (goSeed) and the boot
+	// identity-profile resolve (ResolveIdentityProfilesAsync). Close
+	// cancels seedCtx and waits on seedWG so no background work is
+	// still touching the store / tech space when the SDK tears them
+	// down. closing (under mu) stops new work from being spawned
+	// during shutdown.
 	seedWG     sync.WaitGroup
 	seedCtx    context.Context
 	seedCancel context.CancelFunc
@@ -1659,6 +1661,25 @@ func (s *Service) goSeed(sp *spaceImpl) {
 	go func() {
 		defer s.seedWG.Done()
 		sp.maybeLazySeedSpaceIndex(s.seedCtx)
+	}()
+}
+
+// ResolveIdentityProfilesAsync runs ResolveIdentityProfiles in the
+// background, tracked by seedWG and bound to seedCtx so Close cancels
+// and drains it — the goroutine can never race teardown of the tech
+// space or the coordinator client. No-op once closing. Called from
+// sdk.Open's warmup on every boot.
+func (s *Service) ResolveIdentityProfilesAsync() {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.seedWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.seedWG.Done()
+		s.ResolveIdentityProfiles(s.seedCtx)
 	}()
 }
 

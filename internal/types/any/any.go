@@ -56,6 +56,13 @@ var Properties = []BuiltInProperty{
 	{Id: "author", Name: "Author", Kind: schema.KindString, Scope: schema.ScopeDerived},
 	{Id: "spaceId", Name: "Space", Kind: schema.KindString, Scope: schema.ScopeDerived},
 	{Id: "createdAt", Name: "Created at", Kind: schema.KindNumber, Scope: schema.ScopeDerived},
+	// `modifiedAt` is the Unix-seconds timestamp of the latest synced
+	// change that touched the row — stamped by
+	// SystemPropertiesHandler on every create/modify from the change
+	// envelope, converging by LWW on the change's VersionId. Author's
+	// clock: display/sort quality, never a fencing token. Local- and
+	// account-scope writes bypass the DAG and do NOT bump it.
+	{Id: "modifiedAt", Name: "Modified at", Kind: schema.KindNumber, Scope: schema.ScopeDerived},
 	{Id: "name", Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	{Id: "description", Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	{Id: "icon", Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced},

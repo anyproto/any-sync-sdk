@@ -228,6 +228,8 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 		"create Doc missing createdAt — viewer can't sort/display creation time")
 	assert.NotNil(t, rec.Doc.Get("spaceId"),
 		"create Doc missing spaceId — viewer can't route across spaces")
+	assert.NotNil(t, rec.Doc.Get("modifiedAt"),
+		"create Doc missing modifiedAt — viewer can't sort by recency")
 
 	// VersionId on the wire carries the per-change DAG order; required
 	// for fence-and-replay consumers.
@@ -248,13 +250,20 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 	assertTitle(t, urec, typeId, titleProp, "Casablanca")
 
 	// Auto stamps must still be present on the Updated Doc (they're
-	// persisted on the row), but they should NOT appear in Ops (no
-	// re-stamp on update).
+	// persisted on the row), but the create-only ones should NOT appear
+	// in Ops (no re-stamp on update). modifiedAt is the exception: it
+	// re-stamps on every modify — and exactly once per record, not once
+	// per user op (Sink.DeriveOnce).
 	assert.NotNil(t, urec.Doc.Get("author"))
+	modifiedAtOps := 0
 	for _, op := range urec.Ops {
 		assert.NotEqual(t, []string{"author"}, op.Path, "update must not re-emit author op")
 		assert.NotEqual(t, []string{"createdAt"}, op.Path, "update must not re-emit createdAt op")
+		if len(op.Path) == 1 && op.Path[0] == "modifiedAt" {
+			modifiedAtOps++
+		}
 	}
+	assert.Equal(t, 1, modifiedAtOps, "update must re-emit exactly one modifiedAt op")
 }
 
 // TestSDK_QuerySubscribe_DeleteEmitsRemoved covers object deletion end

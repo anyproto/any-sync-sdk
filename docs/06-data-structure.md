@@ -17,7 +17,7 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 
 | Scope | write route | version domain | syncs to | overridable |
 |------|------|------|------|------|
-| **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`) | triggering change | (computed convergently) | no (read-only) |
+| **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`, `modifiedAt`) | triggering change | (computed convergently) | no (read-only) |
 | **synced** | the object's own CRDT change | object tree | everyone with access | n/a — no override stack |
 | **account** | carrier record in tech space + per-device mirror | tech tree | this account's devices | n/a |
 | **local** | `Object.LocalSet`, no DAG | local lexid | this device only | n/a |
@@ -97,7 +97,7 @@ Space
 ```
 
 A **type** is an object with `type = type`. Its own shape is hardcoded in the SDK. Every type object implements two built-ins:
-- `any` — universal properties (name, description, icon, id, author, createdAt)
+- `any` — universal properties (name, description, icon, id, author, createdAt, modifiedAt)
 - `type` — the meta-type; contributes the `properties` and (optionally) `datasets` datasets
 
 Built-ins are expected to exist as **derived objects** in every space (well-known ids, uniform with user types — no "built-in vs user" fork in query/UI code).

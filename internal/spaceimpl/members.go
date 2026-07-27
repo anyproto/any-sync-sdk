@@ -267,6 +267,8 @@ func applyJoinProfile(r *space.JoinRequestInfo, p space.AccountMetadata) {
 }
 
 func (m *membersAPI) Invites(ctx context.Context) ([]space.InviteInfo, error) {
+	// Custody read before the ACL lock — tsp.Get takes its own locks.
+	custody, hasCustody := m.s.loadIssuedKey(ctx, techspace.IssuedKeyMember)
 	acl, err := m.aclList(ctx)
 	if err != nil {
 		return nil, err
@@ -276,10 +278,14 @@ func (m *membersAPI) Invites(ctx context.Context) ([]space.InviteInfo, error) {
 	invites := acl.AclState().Invites()
 	out := make([]space.InviteInfo, 0, len(invites))
 	for _, inv := range invites {
-		out = append(out, space.InviteInfo{
+		info := space.InviteInfo{
 			RecordId:   inv.Id,
 			Permission: fromAclPermissions(inv.Permissions),
-		})
+		}
+		if hasCustody && inv.Key != nil && inv.Key.Equals(custody.GetPublic()) {
+			info.Key = custody
+		}
+		out = append(out, info)
 	}
 	return out, nil
 }

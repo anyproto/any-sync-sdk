@@ -32,7 +32,9 @@ func anySyncCryptoGenerate() (crypto.PrivKey, crypto.PubKey, error) {
 //     with PermissionOwner;
 //   - ACL.CreateInvite mints a valid share token (round-trips through
 //     EncodeInvite/DecodeInvite back to the same spaceId);
-//   - MembersAPI.Invites lists the active invite;
+//   - MembersAPI.Invites lists the active invite and recovers the
+//     minting account's key from custody (token re-encodes identically;
+//     a re-mint recovers the replacement, not the stale key);
 //   - ACL.RevokeAllInvites tears it down.
 //
 // The owner-on-empty-space surface needs no second peer, so it runs
@@ -99,17 +101,40 @@ func TestSDK_ACL_OwnerSurface(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, sp.Id(), decoded.SpaceId)
 
-	// Invites() lists exactly one active invite.
+	// Invites() lists exactly one active invite, and the minting
+	// account's custody makes the private key — and therefore the
+	// original share token — recoverable from the listing.
 	invs, err = sp.Members().Invites(ctx)
 	require.NoError(t, err)
 	require.Len(t, invs, 1)
 	require.NotEmpty(t, invs[0].RecordId)
+	require.NotNil(t, invs[0].Key, "minting account recovers the invite key from custody")
+	recovered, err := space.EncodeInvite(space.Invite{SpaceId: sp.Id(), InviteKey: invs[0].Key})
+	require.NoError(t, err)
+	assert.Equal(t, token, recovered, "recovered token re-encodes byte-identical")
 
-	// RevokeAllInvites tears it down.
+	// RevokeAllInvites tears it down and clears the custody.
 	require.NoError(t, sp.ACL().RevokeAllInvites(ctx))
 	invs, err = sp.Members().Invites(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, invs)
+
+	// Revoke-then-mint (the replacement flow — a second CreateInvite
+	// while one is active is ErrDuplicateInvite): custody follows the
+	// fresh invite, the old token is gone for good.
+	inv2, err := sp.ACL().CreateInvite(ctx)
+	require.NoError(t, err)
+	token2, err := space.EncodeInvite(inv2)
+	require.NoError(t, err)
+	assert.NotEqual(t, token, token2)
+	invs, err = sp.Members().Invites(ctx)
+	require.NoError(t, err)
+	require.Len(t, invs, 1)
+	require.NotNil(t, invs[0].Key)
+	recovered2, err := space.EncodeInvite(space.Invite{SpaceId: sp.Id(), InviteKey: invs[0].Key})
+	require.NoError(t, err)
+	assert.Equal(t, token2, recovered2)
+	require.NoError(t, sp.ACL().RevokeAllInvites(ctx))
 
 	// JoinRequests is empty on a fresh space.
 	reqs, err := sp.Members().JoinRequests(ctx)
@@ -470,8 +495,25 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 		}
 		return false
 	}, 90*time.Second, 2*time.Second, "joiner row never flipped to active after acceptance")
-	_, err = joiner.Spaces().Get(ctx, sp.Id())
+	joinerSp, err := joiner.Spaces().Get(ctx, sp.Id())
 	require.NoError(t, err, "Get must succeed once the join is accepted")
+
+	// Custody boundary: the invite key is recoverable only on the
+	// minting account's devices. The owner's listing carries it; the
+	// joiner sees the same record with Key nil — their account never
+	// held the private half.
+	ownerInvs, err := sp.Members().Invites(ctx)
+	require.NoError(t, err)
+	require.Len(t, ownerInvs, 1)
+	assert.NotNil(t, ownerInvs[0].Key, "minting account recovers the key")
+	var joinerInvs []space.InviteInfo
+	require.Eventually(t, func() bool {
+		var iErr error
+		joinerInvs, iErr = joinerSp.Members().Invites(ctx)
+		return iErr == nil && len(joinerInvs) == 1
+	}, 60*time.Second, 2*time.Second, "joiner never saw the invite record")
+	assert.Equal(t, ownerInvs[0].RecordId, joinerInvs[0].RecordId)
+	assert.Nil(t, joinerInvs[0].Key, "non-minting account must not recover the invite key")
 }
 
 // TestSDK_Spaces_Derive verifies the deterministic-derive surface:

@@ -13,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -45,6 +46,12 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 // transparently. The first call after Create may race with the
 // periodic headsync that pushes the space header to the coordinator;
 // we retry with a short backoff so callers don't have to.
+//
+// The invite private key is persisted as this account's issued-key
+// custody (synced tech-space row), so every device of the minting
+// account can re-encode the same token — Members.Invites returns it
+// on the matching row. Persist failure fails the call: the ACL invite
+// stands, but an unrecoverable token defeats the contract; re-mint.
 func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	if err := ensureShareable(ctx, a.s); err != nil {
 		return space.Invite{}, err
@@ -61,6 +68,9 @@ func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	}
 	if err := addRecordWaitingForLog(ctx, cl, res.InviteRec); err != nil {
 		return space.Invite{}, fmt.Errorf("acl: publish invite: %w", err)
+	}
+	if err := a.s.persistIssuedKey(ctx, techspace.IssuedKeyMember, res.InviteKey); err != nil {
+		return space.Invite{}, err
 	}
 	return space.Invite{SpaceId: a.s.id, InviteKey: res.InviteKey}, nil
 }
@@ -170,7 +180,11 @@ func (a *aclAPI) RevokeInvite(ctx context.Context, inviteRecordId string) error 
 	if err != nil {
 		return err
 	}
-	return cl.RevokeInvite(ctx, inviteRecordId)
+	if err := cl.RevokeInvite(ctx, inviteRecordId); err != nil {
+		return err
+	}
+	a.clearStaleMemberCustody(ctx)
+	return nil
 }
 
 func (a *aclAPI) RevokeAllInvites(ctx context.Context) error {
@@ -178,7 +192,38 @@ func (a *aclAPI) RevokeAllInvites(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return cl.RevokeAllInvites(ctx)
+	if err := cl.RevokeAllInvites(ctx); err != nil {
+		return err
+	}
+	a.clearStaleMemberCustody(ctx)
+	return nil
+}
+
+// clearStaleMemberCustody drops this account's member-invite custody
+// once it no longer matches an active invite record — called after a
+// successful revoke. Best-effort: the revoke already landed and the
+// read path hides stale custody, so failures are swallowed.
+func (a *aclAPI) clearStaleMemberCustody(ctx context.Context) {
+	key, ok := a.s.loadIssuedKey(ctx, techspace.IssuedKeyMember)
+	if !ok {
+		return
+	}
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return
+	}
+	acl.RLock()
+	_, matchErr := acl.AclState().GetInviteIdByPrivKey(key)
+	acl.RUnlock()
+	if matchErr == nil {
+		// Custody still matches an active invite — keep it.
+		return
+	}
+	_ = a.s.clearIssuedKey(ctx, techspace.IssuedKeyMember)
 }
 
 func (a *aclAPI) AcceptRequest(ctx context.Context, requestRecordId string, perm space.Permission) error {
@@ -355,19 +400,14 @@ func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
 	if !a.s.localIdentityIsOwner(ctx) {
 		return space.Invite{}, errors.New("acl: CreateGuestKey: owner only")
 	}
-	var custodyPub crypto.PubKey
-	if rec, ok := a.s.tsp.Get(ctx, a.s.id); ok && rec.IssuedGuestKey != "" {
-		guestKey, err := crypto.DecodeKeyFromString(rec.IssuedGuestKey, crypto.UnmarshalEd25519PrivateKey, nil)
-		if err == nil {
-			custodyPub = guestKey.GetPublic()
-			guests, gErr := a.activeGuestIdentities(ctx)
-			if gErr != nil {
-				return space.Invite{}, gErr
-			}
-			// Custody active and no orphans — the idempotent fast path.
-			if len(guests) == 1 && guests[0].Equals(custodyPub) {
-				return space.Invite{SpaceId: a.s.id, InviteKey: guestKey, Kind: space.InviteKindGuest}, nil
-			}
+	if guestKey, ok := a.s.loadIssuedKey(ctx, techspace.IssuedKeyGuest); ok {
+		guests, gErr := a.activeGuestIdentities(ctx)
+		if gErr != nil {
+			return space.Invite{}, gErr
+		}
+		// Custody active and no orphans — the idempotent fast path.
+		if len(guests) == 1 && guests[0].Equals(guestKey.GetPublic()) {
+			return space.Invite{SpaceId: a.s.id, InviteKey: guestKey, Kind: space.InviteKindGuest}, nil
 		}
 	}
 	// Same publish preconditions as AddAccounts: coordinator must know
@@ -396,12 +436,8 @@ func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
 	}); err != nil {
 		return space.Invite{}, fmt.Errorf("acl: add guest account: %w", err)
 	}
-	encoded, err := crypto.EncodeKeyToString(guestKey)
-	if err != nil {
-		return space.Invite{}, fmt.Errorf("acl: encode guest key: %w", err)
-	}
-	if _, err := a.s.tsp.SetIssuedGuestKey(ctx, a.s.id, encoded); err != nil {
-		return space.Invite{}, fmt.Errorf("acl: persist guest key: %w", err)
+	if err := a.s.persistIssuedKey(ctx, techspace.IssuedKeyGuest, guestKey); err != nil {
+		return space.Invite{}, err
 	}
 	return space.Invite{SpaceId: a.s.id, InviteKey: guestKey, Kind: space.InviteKindGuest}, nil
 }
@@ -415,22 +451,18 @@ func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
 		return errors.New("acl: RevokeGuestKey: owner only")
 	}
 	rec, _ := a.s.tsp.Get(ctx, a.s.id)
+	stored := rec.IssuedInviteKey(techspace.IssuedKeyGuest)
 	guests, err := a.activeGuestIdentities(ctx)
 	if err != nil {
 		return err
 	}
-	if len(guests) == 0 && rec.IssuedGuestKey == "" {
+	if len(guests) == 0 && stored == "" {
 		return fmt.Errorf("acl: RevokeGuestKey: %w", space.ErrNoActiveGuestKey)
 	}
 	if err := a.removeAllGuestIdentities(ctx); err != nil {
 		return err
 	}
-	if rec.IssuedGuestKey != "" {
-		if _, err := a.s.tsp.SetIssuedGuestKey(ctx, a.s.id, ""); err != nil {
-			return fmt.Errorf("acl: clear guest key: %w", err)
-		}
-	}
-	return nil
+	return a.s.clearIssuedKey(ctx, techspace.IssuedKeyGuest)
 }
 
 // activeGuestIdentities lists every ACL account currently holding
@@ -491,7 +523,12 @@ func (a *aclAPI) StopSharing(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return cl.StopSharing(ctx, change)
+	if err := cl.StopSharing(ctx, change); err != nil {
+		return err
+	}
+	// StopSharing revokes every invite as a side effect.
+	a.clearStaleMemberCustody(ctx)
+	return nil
 }
 
 // newReadKeyChange mints a fresh metadata privkey + read key. The

@@ -86,8 +86,8 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates every op in the creation payload, then
 // auto-stamps the `any`-scope auto fields (author, createdAt,
-// spaceId) via sink.Derive so every newly minted row in the per-
-// space `objects` collection carries them. The stamps are derived
+// spaceId, modifiedAt) via sink.Derive so every newly minted row in
+// the per-space `objects` collection carries them. The stamps are derived
 // from the change envelope (Creator from the signing identity,
 // Timestamp from the change wire, SpaceId from the apply context),
 // not from caller input — these fields are ScopeDerived in the `any`
@@ -121,7 +121,8 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 // — `author`, `createdAt`, `spaceId` — that live alongside `id` at
 // the top of the record (NOT under `any.*`). Stamped once at record
 // creation; BeforeCreate fires only on first-touch so they don't
-// re-apply.
+// re-apply. Also seeds the initial `modifiedAt` (per-change, keeps
+// moving on every modify — see stampModifiedAt).
 //
 // `author` and `createdAt` are taken from the tree's ROOT change
 // (immutable header), not from the per-change envelope — those are
@@ -162,6 +163,40 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 			Payload: a.NewString(spaceId),
 		})
 	}
+	stampModifiedAt(ctx, sink)
+}
+
+// stampModifiedAt queues the derived row-root `modifiedAt` stamp — the
+// Unix-seconds timestamp of the change being applied (the per-change
+// envelope Timestamp, NOT the root-header ObjectCreatedAt the createdAt
+// stamp uses). Fired from both BeforeCreate (so every row carries it
+// from birth, initially equal to the creating change's time) and
+// BeforeModify (so any synced write bumps it).
+//
+// Convergence: the stamp inherits the change's VersionId, so under
+// standard LWW every peer resolves modifiedAt to the timestamp of the
+// ordering-max change that touched the row — deterministic once all
+// changes are delivered. The value is the author's wall clock
+// (display/sort quality only, never a fencing token), same contract as
+// version-history timestamps.
+//
+// DeriveOnce, not Derive: BeforeModify runs per op, and a multi-op
+// RecordChange must stamp once, not once per op.
+func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+	if ctx == nil || ctx.Change == nil || sink == nil {
+		return
+	}
+	ts := ctx.Change.Timestamp
+	if ts <= 0 {
+		return
+	}
+	a := &anyenc.Arena{}
+	sink.DeriveOnce(crdt.Op{
+		Type: crdt.OpSet,
+		Path: []string{"modifiedAt"},
+		// Float64 for the same 32-bit-truncation reason as createdAt.
+		Payload: a.NewNumberFloat64(float64(ts)),
+	})
 }
 
 // BeforeModify validates one inbound op against the current schema.
@@ -175,13 +210,20 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // No any.types membership check here: an apply-time membership guard
 // would drop values written before the attach-type change arrives,
 // breaking out-of-order tolerance (docs/06-data-structure.md §397).
-func (h *SystemPropertiesHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
-	if h.Registry == nil {
-		return nil
+//
+// Every op that passes validation stamps the derived `modifiedAt`
+// (deduped via DeriveOnce — one stamp per RecordChange). Stamping after
+// the validation gate means a fully-rejected change never bumps
+// modifiedAt; an op that passes here but later loses its per-field LWW
+// race still bumps it, which is deterministic (every peer runs the same
+// gates in the same order) and reads as "latest valid write attempt".
+func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
+	if h.Registry != nil {
+		if verr := h.validateOp(op, nil); verr != nil {
+			return verr
+		}
 	}
-	if verr := h.validateOp(op, nil); verr != nil {
-		return verr
-	}
+	stampModifiedAt(ctx, sink)
 	return nil
 }
 

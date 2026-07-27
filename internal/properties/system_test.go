@@ -434,3 +434,141 @@ func TestPreValidate_ScopeMismatch(t *testing.T) {
 	assert.Equal(t, schema.ScopeAccount, ve.DeclaredScope)
 	assert.Equal(t, schema.ScopeSynced, ve.WriteRoute)
 }
+
+// ----------------------------------------------------------------------------
+// modifiedAt — derived per-change stamp (create seeds it, modify bumps it)
+// ----------------------------------------------------------------------------
+
+// makeChangeAt is makeChange plus the per-change envelope Timestamp the
+// modifiedAt stamp derives from.
+func makeChangeAt(versionId crdt.VersionId, ts int64, recId string, upsert bool, ops ...crdt.Op) crdt.Change {
+	ch := makeChange(versionId, recId, upsert, ops...)
+	ch.Timestamp = ts
+	return ch
+}
+
+func TestSystemPropertiesHandler_ModifiedAtSeededOnCreate(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "create seeds modifiedAt from the change Timestamp")
+}
+
+func TestSystemPropertiesHandler_ModifiedAtBumpsOnModify(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v2", 200, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(200), rec.GetFloat64("modifiedAt"), "valid modify bumps modifiedAt")
+}
+
+// Out-of-order delivery: an older change (lower VersionId) arriving after
+// a newer one must NOT regress modifiedAt — the stamp is LWW-gated on the
+// change's VersionId like any other field write.
+func TestSystemPropertiesHandler_ModifiedAtOutOfOrderConverges(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v3", 300, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v2", 200, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("later-but-older")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(300), rec.GetFloat64("modifiedAt"), "older change must not regress modifiedAt")
+}
+
+// A change whose every op fails validation stamps nothing: the stamp
+// runs after the per-op validation gate.
+func TestSystemPropertiesHandler_ModifiedAtNotBumpedWhenAllOpsRejected(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v2", 200, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "fully-rejected change must not bump modifiedAt")
+}
+
+// A multi-op RecordChange stamps modifiedAt exactly once (DeriveOnce),
+// so the wire projection carries one derived op, not one per user op.
+func TestSystemPropertiesHandler_ModifiedAtSingleStampPerRecord(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChangeAt(
+		"v2", 200, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("bye")},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	))
+	require.NoError(t, err)
+
+	stamps := 0
+	for _, recOps := range res.DerivedOps {
+		for _, op := range recOps {
+			if len(op.Path) == 1 && op.Path[0] == "modifiedAt" {
+				stamps++
+			}
+		}
+	}
+	assert.Equal(t, 1, stamps, "multi-op record must carry exactly one modifiedAt derived op")
+}
+
+// Client writes addressing any.modifiedAt are dropped by the scope gate,
+// same as the other derived built-ins.
+func TestSystemPropertiesHandler_ModifiedAtClientWriteDropped(t *testing.T) {
+	r := defaultRegistry()
+	r.SetScoped(typeAny, "modifiedAt", schema.KindNumber, schema.ScopeDerived)
+	ctrl := newPropsController(t, r)
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "modifiedAt"}, Payload: arena.NewNumberFloat64(9999)},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(typeAny, "modifiedAt"), "derived-scoped client op dropped")
+	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "handler stamp still lands at row root")
+}

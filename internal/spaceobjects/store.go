@@ -755,6 +755,16 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	}); err != nil {
 		return nil, fmt.Errorf("spaceobjects: ensure any.types index: %w", err)
 	}
+	// Dense ascending index on the derived `modifiedAt` stamp — the
+	// recency ordering (`sort: ["-modifiedAt"]`) is the default object-
+	// list sort for clients, which would otherwise scan the whole
+	// collection per query (SYN-98). Dense, not sparse: a sort index
+	// must cover every row.
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Fields: []string{"modifiedAt"},
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: ensure modifiedAt index: %w", err)
+	}
 	s.mu.Lock()
 	if s.sharedColl == nil {
 		s.sharedColl = coll

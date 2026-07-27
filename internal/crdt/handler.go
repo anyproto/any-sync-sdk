@@ -3,6 +3,7 @@ package crdt
 import (
 	"context"
 	"errors"
+	"slices"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -104,6 +105,20 @@ type Sink struct {
 // Derive queues an op to apply on the same record, in the same Modify
 // callback as the triggering op. Inherits the change's VersionId.
 func (s *Sink) Derive(op Op) { s.derived = append(s.derived, op) }
+
+// DeriveOnce queues op unless a derived op with the same Path is already
+// queued. For per-change stamps (e.g. modifiedAt) emitted from the per-op
+// BeforeModify hook, which may fire several times for one RecordChange —
+// without the guard each op would queue a duplicate stamp, and every
+// duplicate is projected onto the wire as a separate derived op.
+func (s *Sink) DeriveOnce(op Op) {
+	for i := range s.derived {
+		if slices.Equal(s.derived[i].Path, op.Path) {
+			return
+		}
+	}
+	s.derived = append(s.derived, op)
+}
 
 // Project queues a write to a different dataset on the same Controller.
 // Applied in the same WriteTx as the triggering change.

@@ -25,7 +25,6 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/gc"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
-	"github.com/anyproto/any-sync-sdk/p2p"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/pushclient"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
@@ -35,6 +34,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/spacesync"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/p2p"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -286,14 +286,23 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// Read-state sync: merge other devices' published read frontiers
 	// (tech-space KV) into the per-space readstate engines, and publish
 	// local marks. Live hook + idempotent per-space Reconcile below.
+	// EngineFor is gated on tech-space liveness (readSyncEngineFor) so
+	// merges for deleted / pending / storage-less spaces are dropped
+	// instead of building a Store for a dead space.
 	readSync := readsync.New(
-		func(spaceId string) *readstate.Engine {
-			st := spaces.StoreFor(spaceId)
-			if st == nil {
-				return nil
-			}
-			return st.ReadState()
-		},
+		readSyncEngineFor(
+			func(spaceId string) (techspace.SpaceIndexRecord, bool) {
+				return tsp.Get(context.Background(), spaceId)
+			},
+			app.SpaceExists,
+			func(spaceId string) *readstate.Engine {
+				st := spaces.StoreFor(spaceId)
+				if st == nil {
+					return nil
+				}
+				return st.ReadState()
+			},
+		),
 		func(ctx context.Context) (keyvaluestorage.Storage, error) {
 			return app.KeyValueStore(ctx, tsp.SpaceId())
 		},
@@ -419,6 +428,40 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		readSync:          readSync,
 		stopP2PIndexWatch: stopP2PIndexWatch,
 	}, nil
+}
+
+// readSyncEngineFor wraps the per-space engine lookup with the
+// tech-space liveness gate. Read-frontier keys (`read/<spaceId>/…`)
+// outlive their space in the tech-space KV store, and the underlying
+// StoreFor constructs a Store for ANY spaceId — so an ungated merge for
+// a dead space rebuilds runtime state the boot orphan GC just swept
+// (the `<spaceId>__detached` collection) and dials for storage that no
+// longer exists. Skip — return nil, readsync drops the value — when:
+//
+//   - the tech-space row is absent (space unknown to this account);
+//   - the row is deleted (row STATUS decides, not lingering storage:
+//     an interrupted offload's leftovers must not resurrect merges);
+//   - the row is blocked from materializing (pending join / incoming
+//     1-1 — the same statuses the boot eager-loader skips);
+//   - local space storage is missing (a merge must never trigger a
+//     remote space fetch).
+//
+// A live space that merely hasn't loaded yet passes all four checks —
+// engineOf (StoreFor) builds its Store lazily as before. Both merge
+// paths — boot ReconcileAll and the live OnKeyValues hook — route
+// through this one gate.
+func readSyncEngineFor(
+	rowFor func(spaceId string) (techspace.SpaceIndexRecord, bool),
+	storageExists func(spaceId string) bool,
+	engineOf readsync.EngineFor,
+) readsync.EngineFor {
+	return func(spaceId string) *readstate.Engine {
+		rec, ok := rowFor(spaceId)
+		if !ok || rec.IsDeleted() || spaceimpl.MaterializeBlock(rec) != nil || !storageExists(spaceId) {
+			return nil
+		}
+		return engineOf(spaceId)
+	}
 }
 
 // watchSpaceIndexForP2P subscribes to the tech-space `spaces` dataset

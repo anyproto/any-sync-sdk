@@ -10,9 +10,9 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/query"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
@@ -126,7 +126,7 @@ type Controller struct {
 	// such a dataset use the change's ObjectId as the row id (not
 	// RecordChange.Id), so all objects in the space project into one
 	// row each. Used for the per-space `objects` values collection.
-	shared    map[string]struct{}
+	shared map[string]struct{}
 	// scopeByKey marks datasets whose undeclared field heads carry
 	// per-key scopes (HandlerReg.DynamicScopeByKey).
 	scopeByKey map[string]bool
@@ -449,7 +449,7 @@ func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value 
 	if err != nil {
 		return nil
 	}
-	return cloneValue(doc.Value())
+	return anyencx.Clone(doc.Value())
 }
 
 // NextLocalVersion returns the VersionId to stamp on a device-local
@@ -515,29 +515,11 @@ func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Valu
 		if isTombstone(v) {
 			continue
 		}
-		if cloned := cloneValue(v); cloned != nil {
+		if cloned := anyencx.Clone(v); cloned != nil {
 			out = append(out, cloned)
 		}
 	}
 	return out
-}
-
-// cloneValue copies an anyenc value off whatever buffer it currently
-// lives on (any-store's pooled DocBuffer or an iterator's reused
-// parser) onto a fresh parser arena. Wraps anyencutil.Value.FillCopy
-// — the canonical helper.
-//
-// Each call allocates one fresh anyencutil.Value (i.e. one fresh
-// Parser + scratch buf). The returned *anyenc.Value points into
-// that parser's arena; Go's GC keeps the parser alive as long as
-// any caller retains the value.
-func cloneValue(v *anyenc.Value) *anyenc.Value {
-	if v == nil {
-		return nil
-	}
-	var w anyencutil.Value
-	w.FillCopy(v)
-	return w.Value
 }
 
 // ValidateChange runs the cheap up-front checks ApplyChange would

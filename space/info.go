@@ -147,6 +147,38 @@ const (
 	StatusGuestRevoked
 )
 
+// String returns the canonical wire label for the status — "unknown" /
+// "active" / "joining" / "leaving" / "deleted" / "remote_dead" /
+// "one_to_one_pending" / "one_to_one_declined" / "invite_pending" /
+// "invite_declined" / "guest_revoked". Unknown values stringify as
+// "unknown".
+func (s Status) String() string {
+	switch s {
+	case StatusActive:
+		return "active"
+	case StatusJoining:
+		return "joining"
+	case StatusLeaving:
+		return "leaving"
+	case StatusDeleted:
+		return "deleted"
+	case StatusRemoteDead:
+		return "remote_dead"
+	case StatusOneToOnePending:
+		return "one_to_one_pending"
+	case StatusOneToOneDeclined:
+		return "one_to_one_declined"
+	case StatusInvitePending:
+		return "invite_pending"
+	case StatusInviteDeclined:
+		return "invite_declined"
+	case StatusGuestRevoked:
+		return "guest_revoked"
+	default:
+		return "unknown"
+	}
+}
+
 // Permission mirrors any-sync's ACL permission ladder.
 type Permission uint8
 
@@ -183,18 +215,29 @@ func (p Permission) String() string {
 // Unknown labels (including "") parse as PermissionNone — absent and
 // no-access are the same answer for every caller.
 func ParsePermission(s string) Permission {
+	p, _ := ParsePermissionStrict(s)
+	return p
+}
+
+// ParsePermissionStrict is ParsePermission with an explicit ok: false
+// for any label that is not a canonical permission ("none" included as
+// valid). For callers validating external input, where an unknown
+// label must be an error rather than silently no-access.
+func ParsePermissionStrict(s string) (Permission, bool) {
 	switch s {
+	case "none":
+		return PermissionNone, true
 	case "reader":
-		return PermissionReader
+		return PermissionReader, true
 	case "guest":
-		return PermissionGuest
+		return PermissionGuest, true
 	case "writer":
-		return PermissionWriter
+		return PermissionWriter, true
 	case "admin":
-		return PermissionAdmin
+		return PermissionAdmin, true
 	case "owner":
-		return PermissionOwner
+		return PermissionOwner, true
 	default:
-		return PermissionNone
+		return PermissionNone, false
 	}
 }

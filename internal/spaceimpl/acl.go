@@ -420,7 +420,7 @@ func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
 		return err
 	}
 	if len(guests) == 0 && rec.IssuedGuestKey == "" {
-		return errors.New("acl: RevokeGuestKey: no active guest key")
+		return fmt.Errorf("acl: RevokeGuestKey: %w", space.ErrNoActiveGuestKey)
 	}
 	if err := a.removeAllGuestIdentities(ctx); err != nil {
 		return err
@@ -513,13 +513,28 @@ func newReadKeyChange() (list.ReadKeyChangePayload, error) {
 // address form, matching Account.Id()) into a crypto.PubKey.
 func decodeIdentity(s string) (crypto.PubKey, error) {
 	if s == "" {
-		return nil, errors.New("acl: identity empty")
+		return nil, fmt.Errorf("acl: identity empty: %w", space.ErrBadIdentity)
 	}
 	pk, err := crypto.DecodeAccountAddress(s)
 	if err != nil {
-		return nil, fmt.Errorf("acl: decode identity %q: %w", s, err)
+		return nil, fmt.Errorf("acl: decode identity %q: %w: %w", s, space.ErrBadIdentity, err)
 	}
 	return pk, nil
+}
+
+// selfAclActive reports whether state places the account's own
+// identity in StatusActive. Caller holds the ACL lock.
+func selfAclActive(state *list.AclState) bool {
+	me := state.Identity()
+	if me == nil {
+		return false
+	}
+	for _, acc := range state.CurrentAccounts() {
+		if acc.PubKey.Equals(me) {
+			return acc.Status == list.StatusActive
+		}
+	}
+	return false
 }
 
 // toAclPermissions maps the SDK Permission enum to any-sync's value.

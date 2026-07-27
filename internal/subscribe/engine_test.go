@@ -83,11 +83,11 @@ func subscribeSorted(t *testing.T, eng *Engine, scope Scope, filter query.Filter
 // from the given (id, postDoc, deleted, ops, sourceObjectId).
 func fireEvent(eng *Engine, objectId, dataset, id string, postDoc *anyenc.Value, deleted bool, ops []space.EventOp) {
 	ev := Event{
-		SpaceId:  "test",
-		ObjectId: objectId,
-		Dataset:  dataset,
+		SpaceId:   "test",
+		ObjectId:  objectId,
+		Dataset:   dataset,
 		VersionId: crdt.VersionId("v" + id),
-		Records: []EventRecord{{Id: id, Deleted: deleted, Ops: ops}},
+		Records:   []EventRecord{{Id: id, Deleted: deleted, Ops: ops}},
 	}
 	postValue := func(i int) *anyenc.Value {
 		if i == 0 {

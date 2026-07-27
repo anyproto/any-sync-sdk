@@ -5,7 +5,8 @@ package properties
 
 import (
 	"context"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -241,11 +242,7 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 			collectTypeAdditions(&ch.Records[ri].Ops[oi], members)
 		}
 	}
-	list := make([]string, 0, len(members))
-	for t := range members {
-		list = append(list, t)
-	}
-	sort.Strings(list)
+	list := slices.Sorted(maps.Keys(members))
 	return &preflight{members: members, list: list}
 }
 

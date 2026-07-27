@@ -8,11 +8,11 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-sync/app/logger"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -317,9 +317,7 @@ func (m *accountMirror) readTargetRow(ctx context.Context, objectId string) (*an
 	if v.Get(crdt.DeletedAtField) != nil {
 		return nil, targetTombstoned
 	}
-	var cloned anyencutil.Value
-	cloned.FillCopy(v)
-	return cloned.Value, mirrorDone
+	return anyencx.Clone(v), mirrorDone
 }
 
 // newResolver snapshots the registry into a memoizing ScopeResolver

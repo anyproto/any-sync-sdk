@@ -15,10 +15,11 @@ package carfile
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 
 	"github.com/ipfs/go-cid"
 	carv2 "github.com/ipld/go-car/v2"
@@ -108,7 +109,7 @@ func Open(r io.ReaderAt) (*File, error) {
 	if len(f.sections) == 0 {
 		return nil, errors.New("carfile: empty index")
 	}
-	sort.Slice(f.sections, func(i, j int) bool { return f.sections[i].Offset < f.sections[j].Offset })
+	slices.SortFunc(f.sections, func(a, b Section) int { return cmp.Compare(a.Offset, b.Offset) })
 	dataEnd := int64(cr.Header.DataOffset + cr.Header.DataSize)
 	for i := range f.sections {
 		end := dataEnd

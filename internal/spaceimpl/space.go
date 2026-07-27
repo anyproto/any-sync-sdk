@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
-	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -108,14 +108,7 @@ func (s *spaceImpl) localIdentityActive(ctx context.Context) bool {
 	}
 	acl.RLock()
 	defer acl.RUnlock()
-	state := acl.AclState()
-	me := state.Identity()
-	for _, acc := range state.CurrentAccounts() {
-		if acc.PubKey.Equals(me) {
-			return acc.Status == list.StatusActive
-		}
-	}
-	return false
+	return selfAclActive(acl.AclState())
 }
 
 // writeGate rejects user mutations on a read-only space (guest-mode
@@ -174,7 +167,7 @@ func (s *spaceImpl) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
 	if err = hs.IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
 		out = append(out, space.TreeHeads{
 			TreeId: e.Id,
-			Heads:  append([]string(nil), e.Heads...),
+			Heads:  slices.Clone(e.Heads),
 		})
 		return true, nil
 	}); err != nil {

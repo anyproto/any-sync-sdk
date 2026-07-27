@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
-	"sort"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -215,26 +215,8 @@ func scratchController(ctx context.Context, db anystore.DB, p ViewParams) (*crdt
 	for _, reg := range p.Regs {
 		datasets = append(datasets, reg.Name)
 	}
-	sort.Strings(datasets)
+	slices.Sort(datasets)
 	return ctrl, datasets, nil
-}
-
-// BuildEmptyView returns a view of the empty projection — the causal
-// past of a first change's (absent) parents. Heads are ignored.
-func BuildEmptyView(ctx context.Context, p ViewParams) (*View, error) {
-	db, err := anystore.Open(ctx, ":memory:", &anystore.Config{InMemory: true})
-	if err != nil {
-		return nil, fmt.Errorf("history: open scratch store: %w", err)
-	}
-	ctrl, datasets, err := scratchController(ctx, db, p)
-	if err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if p.Dataset != "" {
-		datasets = []string{p.Dataset}
-	}
-	return &View{ObjectId: p.ObjectId, Version: "", db: db, ctrl: ctrl, datasets: datasets}, nil
 }
 
 func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.HistoryTree, p ViewParams) (*View, error) {
@@ -322,7 +304,7 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 // Datasets lists the dataset names this view can serve (the registered
 // handler set, or the single replayed dataset for dataset-scoped views).
 func (v *View) Datasets() []string {
-	return append([]string(nil), v.datasets...)
+	return slices.Clone(v.datasets)
 }
 
 // Record returns one record (nil if absent), tombstones included —

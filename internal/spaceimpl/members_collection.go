@@ -26,59 +26,18 @@ const (
 	MemberFieldRequestId   = "requestId" // pending join records only
 )
 
-// permissionString maps the SDK Permission enum to the on-disk
-// string representation used in the members collection. Strings
-// (rather than numbers) so query filters read as cleanly as
-// `{"permission": "writer"}`.
-func permissionString(p space.Permission) string {
-	switch p {
-	case space.PermissionNone:
-		return "none"
-	case space.PermissionReader:
-		return "reader"
-	case space.PermissionGuest:
-		return "guest"
-	case space.PermissionWriter:
-		return "writer"
-	case space.PermissionAdmin:
-		return "admin"
-	case space.PermissionOwner:
-		return "owner"
-	default:
-		return "none"
-	}
-}
-
-// memberStatusString maps the SDK MemberStatus enum to the on-disk
-// string representation.
-func memberStatusString(s space.MemberStatus) string {
-	switch s {
-	case space.MemberStatusJoining:
-		return "joining"
-	case space.MemberStatusActive:
-		return "active"
-	case space.MemberStatusRemoved:
-		return "removed"
-	case space.MemberStatusDeclined:
-		return "declined"
-	case space.MemberStatusRemoving:
-		return "removing"
-	case space.MemberStatusCanceled:
-		return "canceled"
-	default:
-		return "unknown"
-	}
-}
-
 // encodeMember writes a Member into a fresh anyenc object on the
 // given arena. Only fields with content are emitted — empty strings
 // stay absent so an upsert leaves prior values untouched (same
-// convention as techspace.SpaceIndexRecord.EncodeCreate).
+// convention as techspace.SpaceIndexRecord.EncodeCreate). Permission
+// and status use the canonical wire labels (Permission.String /
+// MemberStatus.String) so query filters read as cleanly as
+// `{"permission": "writer"}`.
 func encodeMember(a *anyenc.Arena, m space.Member) *anyenc.Value {
 	obj := a.NewObject()
 	obj.Set(MemberFieldId, a.NewString(m.Identity))
-	obj.Set(MemberFieldPermission, a.NewString(permissionString(m.Permission)))
-	obj.Set(MemberFieldStatus, a.NewString(memberStatusString(m.Status)))
+	obj.Set(MemberFieldPermission, a.NewString(m.Permission.String()))
+	obj.Set(MemberFieldStatus, a.NewString(m.Status.String()))
 	if m.Name != "" {
 		obj.Set(MemberFieldName, a.NewString(m.Name))
 	}

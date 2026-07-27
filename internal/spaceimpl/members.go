@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -299,10 +300,7 @@ func (m *membersAPI) Subscribe(cb func(space.MemberEvent)) (cancel func()) {
 	if w == nil {
 		return func() {}
 	}
-	id := w.add(cb)
-	return func() {
-		w.remove(id)
-	}
+	return w.subs.Add(cb)
 }
 
 // Query returns a chainable query builder over the materialised
@@ -585,15 +583,14 @@ func fromAclStatus(s list.AclStatus) space.MemberStatus {
 //  3. The on-disk materialised members collection (drives Query).
 //
 // Started on the first Subscribe or Query (via membersAPI.ensureWatcher).
-// Runs until Service.Close. Subscribers are stored in a map keyed by
-// an int counter for O(1) remove.
+// Runs until Service.Close.
 type memberWatcher struct {
 	api  *membersAPI
 	coll anystore.Collection
 
+	subs fanout.Registry[space.MemberEvent]
+
 	mu       sync.Mutex
-	subs     map[int]func(space.MemberEvent)
-	nextID   int
 	headId   string
 	snapshot map[string]space.Member
 
@@ -625,7 +622,6 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 	w := &memberWatcher{
 		api:      api,
 		coll:     coll,
-		subs:     make(map[int]func(space.MemberEvent)),
 		snapshot: make(map[string]space.Member),
 		profiles: make(map[string]space.AccountMetadata),
 		kickCh:   make(chan struct{}, 1),
@@ -672,25 +668,6 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 	go w.loop()
 	go w.profileLoop()
 	return w, nil
-}
-
-// add registers cb and returns its slot id.
-func (w *memberWatcher) add(cb func(space.MemberEvent)) int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	id := w.nextID
-	w.nextID++
-	w.subs[id] = cb
-	return id
-}
-
-// remove detaches the subscriber. The watcher does NOT stop on the
-// last remove — it stays running until SDK shutdown so subsequent
-// Query calls keep seeing fresh data.
-func (w *memberWatcher) remove(id int) {
-	w.mu.Lock()
-	delete(w.subs, id)
-	w.mu.Unlock()
 }
 
 func (w *memberWatcher) spaceID() string { return w.api.s.id }
@@ -758,16 +735,7 @@ func (w *memberWatcher) tick() {
 		return
 	}
 	current, symKeys := collectMembers(acl)
-	state := acl.AclState()
-	meActive := false
-	if me := state.Identity(); me != nil {
-		for _, acc := range state.CurrentAccounts() {
-			if acc.PubKey.Equals(me) {
-				meActive = acc.Status == list.StatusActive
-				break
-			}
-		}
-	}
+	meActive := selfAclActive(acl.AclState())
 	acl.RUnlock()
 
 	// Self-heal the tech-space LocalStatus when the owner has accepted
@@ -807,10 +775,6 @@ func (w *memberWatcher) tick() {
 	w.headId = head
 	w.profilesDirty = false
 	w.snapshot = next
-	subs := make([]func(space.MemberEvent), 0, len(w.subs))
-	for _, cb := range w.subs {
-		subs = append(subs, cb)
-	}
 	w.mu.Unlock()
 
 	// Reconcile the on-disk collection first so any Query call that
@@ -828,7 +792,7 @@ func (w *memberWatcher) tick() {
 		old, existed := prev[id]
 		if !existed {
 			newcomers = append(newcomers, id)
-			fanout(subs, space.MemberEvent{
+			w.subs.Dispatch(space.MemberEvent{
 				Kind:   space.MemberEventAdded,
 				Member: m,
 			})
@@ -836,7 +800,7 @@ func (w *memberWatcher) tick() {
 		}
 		if old != m {
 			oldCopy := old
-			fanout(subs, space.MemberEvent{
+			w.subs.Dispatch(space.MemberEvent{
 				Kind:     space.MemberEventChanged,
 				Member:   m,
 				Previous: &oldCopy,
@@ -867,7 +831,7 @@ func (w *memberWatcher) tick() {
 		// Prune the sighting — this member left the space.
 		_ = w.api.s.tsp.RemoveIdentitySpace(ctx, id, w.spaceID())
 		oldCopy := old
-		fanout(subs, space.MemberEvent{
+		w.subs.Dispatch(space.MemberEvent{
 			Kind:     space.MemberEventRemoved,
 			Member:   old,
 			Previous: &oldCopy,
@@ -947,16 +911,6 @@ func (w *memberWatcher) reconcileCollection(
 		}
 	}
 	return firstErr
-}
-
-// fanout invokes each subscriber synchronously. A panic in one cb
-// would propagate; subscribers are expected to be well-behaved
-// (do small work or hand off). Wrapping in recover felt heavier
-// than the cost of a misbehaving caller learning fast.
-func fanout(subs []func(space.MemberEvent), ev space.MemberEvent) {
-	for _, cb := range subs {
-		cb(ev)
-	}
 }
 
 // applyProfile overrides the metadata fields on m with the

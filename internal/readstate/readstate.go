@@ -32,14 +32,17 @@
 package readstate
 
 import (
+	"cmp"
 	"context"
 	"errors"
-	"sort"
+	"slices"
 	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
+
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 )
 
 const (
@@ -138,9 +141,7 @@ type Engine struct {
 	// subs are the best-effort state pings (objectId, stateSeq).
 	// Callers fire NotifyState AFTER their tx commits — never from
 	// inside one — so a subscriber's ChangedSince pull sees the data.
-	subMu   sync.Mutex
-	subs    map[int]func(objectId string, stateSeq uint64)
-	nextSub int
+	subs fanout.Registry[statePing]
 
 	openOnce sync.Once
 	openErr  error
@@ -699,7 +700,7 @@ func (e *Engine) compactFrontier(ctx context.Context, objectId string, st *objSt
 		}
 		members = append(members, member{id: id, v: v})
 	}
-	sort.Slice(members, func(i, j int) bool { return members[i].v < members[j].v })
+	slices.SortFunc(members, func(a, b member) int { return cmp.Compare(a.v, b.v) })
 	for _, m := range members[:len(members)-maxFrontierSize] {
 		delete(st.frontier, m.id)
 	}
@@ -938,33 +939,22 @@ func (e *Engine) ChangedSince(ctx context.Context, since uint64, limit int) ([]O
 // dropped ping is recovered by pulling TransitionsSince from the
 // consumer's cursor.
 func (e *Engine) SubscribeState(cb func(objectId string, stateSeq uint64)) (cancel func()) {
-	e.subMu.Lock()
-	defer e.subMu.Unlock()
-	if e.subs == nil {
-		e.subs = map[int]func(string, uint64){}
+	if cb == nil {
+		return func() {}
 	}
-	id := e.nextSub
-	e.nextSub++
-	e.subs[id] = cb
-	return func() {
-		e.subMu.Lock()
-		defer e.subMu.Unlock()
-		delete(e.subs, id)
-	}
+	return e.subs.Add(func(p statePing) { cb(p.objectId, p.stateSeq) })
+}
+
+// statePing is the subs event payload.
+type statePing struct {
+	objectId string
+	stateSeq uint64
 }
 
 // NotifyState fires the subscribed pings. Call AFTER the tx that
 // produced stateSeq committed.
 func (e *Engine) NotifyState(objectId string, stateSeq uint64) {
-	e.subMu.Lock()
-	cbs := make([]func(string, uint64), 0, len(e.subs))
-	for _, cb := range e.subs {
-		cbs = append(cbs, cb)
-	}
-	e.subMu.Unlock()
-	for _, cb := range cbs {
-		cb(objectId, stateSeq)
-	}
+	e.subs.Dispatch(statePing{objectId: objectId, stateSeq: stateSeq})
 }
 
 // Seeded reports whether first-sight seeding already ran for the

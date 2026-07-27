@@ -2,6 +2,7 @@ package spaceobjects
 
 import (
 	"context"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/query"
 	"go.uber.org/zap"
@@ -136,7 +137,7 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			tracked = true
 			trackedIds = append(trackedIds, recordIds[i])
 			for _, tag := range cl.Tags {
-				if !containsString(tags, tag) {
+				if !slices.Contains(tags, tag) {
 					tags = append(tags, tag)
 				}
 			}
@@ -232,15 +233,6 @@ func recordMatchesAudience(ctx context.Context, ctrl *crdt.Controller, dataset, 
 	return f.Ok(doc, nil)
 }
 
-func containsString(ss []string, s string) bool {
-	for _, v := range ss {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
-
 // SeedHeadsProvider returns the account's published read frontiers
 // for an object (one set per device row, own rows included), nil when
 // none. Injected by the space layer from the read-sync service —
@@ -296,7 +288,7 @@ func (s *Store) seedReadState(ctx context.Context, obj *object.Object, objectId 
 		return
 	}
 	tree.Lock()
-	heads := append([]string(nil), tree.Heads()...)
+	heads := slices.Clone(tree.Heads())
 	tree.Unlock()
 	err := s.readState.WriteTx(ctx, func(txCtx context.Context) error {
 		_, seedErr := s.readState.SeedFrontier(txCtx, objectId, heads)

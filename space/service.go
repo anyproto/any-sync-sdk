@@ -38,6 +38,45 @@ var ErrReadOnlySpace = errors.New("space: read-only")
 // poll List/Get or Subscribe for the flip to StatusActive.
 var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pending")
 
+// ErrSpaceUnknown is returned by id-addressed Service methods (Get,
+// SetSettings, the accept/decline families) when the spaceId has no
+// row in the account's space index.
+var ErrSpaceUnknown = errors.New("unknown space")
+
+// ErrJoinPending is returned by Join after the RequestToJoin was
+// posted but the owner has not yet accepted. The space is recorded in
+// the index with StatusJoining; callers poll List for the status flip
+// and then call Get.
+var ErrJoinPending = errors.New("join pending owner approval")
+
+// ErrInviteAcceptPending is returned by AcceptInvite when the accept
+// was recorded (synced account-wide) but the space content is not
+// pullable yet. Loading continues durably in the background and across
+// restarts; callers poll List/Get or Subscribe for the flip to
+// StatusActive.
+var ErrInviteAcceptPending = errors.New("invite accepted; space load pending")
+
+// ErrNotInvitePending is returned by AcceptInvite / DeclineInvite when
+// the space is not awaiting direct-add invite approval.
+var ErrNotInvitePending = errors.New("not invite-pending")
+
+// ErrIsOneToOne is returned when a regular-space invite op targets a
+// 1-1 space — use the OneToOne accept/decline methods instead.
+var ErrIsOneToOne = errors.New("is a 1-1 space")
+
+// ErrSelfPair is returned by OneToOne / RegisterIncoming when the
+// given identity is the caller's own account.
+var ErrSelfPair = errors.New("cannot pair with self")
+
+// Settings-patch sentinels — wrapped by SetSettings validation errors
+// so callers can classify with errors.Is.
+var (
+	ErrSettingsEmpty      = errors.New("settings patch is empty")
+	ErrSettingsBadKey     = errors.New("invalid settings key")
+	ErrSettingsBadValue   = errors.New("unsupported settings value")
+	ErrSettingsKeyOverlap = errors.New("settings key in both set and unset")
+)
+
 // Service is the space-level entrypoint exposed by the top-level SDK.
 // It owns lifecycle (Create / Join / Derive / Delete) and the space
 // list; individual space operations live on Space.

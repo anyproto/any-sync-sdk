@@ -40,6 +40,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
 	"github.com/anyproto/any-sync-sdk/internal/history"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
@@ -186,7 +187,7 @@ type Store struct {
 	// changeSubs is the change-index live feed (consumer-side FTS /
 	// vector indexers). afterApply dispatches (objectId, applySeq)
 	// here, gated on hasSubscribers so an idle space pays nothing.
-	changeSubs *changeRegistry
+	changeSubs *fanout.Registry[ObjectChange]
 
 	// applySeqs mints the per-space apply sequence shared by every
 	// controller — the consumer-feed watermark covering DAG, mirror,
@@ -198,7 +199,7 @@ type Store struct {
 
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
-	rowEvents *rowEventRegistry
+	rowEvents *fanout.Registry[RowEvent]
 
 	// readTracking maps a tracked dataset to its registration;
 	// readState is the per-space read/unread engine. Both nil/empty
@@ -375,8 +376,8 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		alloc:          cfg.Alloc,
 		spaceId:        cfg.SpaceId,
 		engine:         subscribe.New(cfg.SpaceId),
-		changeSubs:     newChangeRegistry(),
-		rowEvents:      newRowEventRegistry(),
+		changeSubs:     fanout.New[ObjectChange](),
+		rowEvents:      fanout.New[RowEvent](),
 		customHandlers: cfg.Handlers,
 		disableGate:    cfg.DisableGate,
 	}
@@ -969,12 +970,12 @@ func (s *Store) fireDeletionEvents(objectId string, removed, stamped bool, seq u
 		if s.engine != nil {
 			s.engine.NotifyDeleted(s.spaceId, properties.Dataset, objectId)
 		}
-		if s.rowEvents != nil && s.rowEvents.hasSubscribers() {
-			s.rowEvents.dispatch(RowEvent{ObjectId: objectId, Deleted: true})
+		if s.rowEvents != nil && s.rowEvents.HasSubscribers() {
+			s.rowEvents.Dispatch(RowEvent{ObjectId: objectId, Deleted: true})
 		}
 	}
-	if stamped && s.changeSubs.hasSubscribers() {
-		s.changeSubs.dispatch(ObjectChange{ObjectId: objectId, ApplySeq: seq, Deleted: true})
+	if stamped && s.changeSubs.HasSubscribers() {
+		s.changeSubs.Dispatch(ObjectChange{ObjectId: objectId, ApplySeq: seq, Deleted: true})
 	}
 }
 

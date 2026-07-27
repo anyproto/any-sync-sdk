@@ -2,7 +2,7 @@ package spaceobjects
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -224,7 +224,7 @@ func flagFlipRecords(field string, desired, current map[string]struct{}) []crdt.
 			ids = append(ids, "-"+id)
 		}
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 	arena := &anyenc.Arena{}
 	out := make([]crdt.RecordChange, 0, len(ids))
 	for _, signed := range ids {

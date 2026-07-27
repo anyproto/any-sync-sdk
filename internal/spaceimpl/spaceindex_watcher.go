@@ -7,8 +7,8 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -150,9 +150,7 @@ func readSpaceIndexRow(ctx context.Context, store *spaceobjects.Store, spaceInde
 	}
 	// Clone off the doc buffer — FindId reuses it; the indexer call may
 	// outlive the iterator window.
-	var cloned anyencutil.Value
-	cloned.FillCopy(v)
-	row := cloned.Value
+	row := anyencx.Clone(v)
 	siNs := row.Get(spaceindex.TypeId)
 	if siNs == nil {
 		// Row exists (some other writer touched it) but no spaceIndex

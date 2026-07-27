@@ -4,14 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -54,9 +54,7 @@ func (p *propertiesAPI) Get(ctx context.Context, objectId string) (*anyenc.Value
 	// Doc's buffer is reused; clone before returning so callers can
 	// retain the value past this call (same contract as
 	// Controller.Get).
-	var cloned anyencutil.Value
-	cloned.FillCopy(v)
-	return cloned.Value, nil
+	return anyencx.Clone(v), nil
 }
 
 // Set merges the patch into the object's property record on the route
@@ -131,10 +129,10 @@ func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (sche
 	}
 	parts := make([]string, 0, len(byScope))
 	for sc, keys := range byScope {
-		sort.Strings(keys)
+		slices.Sort(keys)
 		parts = append(parts, fmt.Sprintf("%s: [%s]", sc, strings.Join(keys, ", ")))
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return 0, nil, fmt.Errorf("propertiesAPI: patch spans multiple scopes — issue one Set per scope (%s)", strings.Join(parts, "; "))
 }
 

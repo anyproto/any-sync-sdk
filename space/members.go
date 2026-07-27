@@ -109,6 +109,30 @@ const (
 	MemberStatusCanceled
 )
 
+// String returns the canonical wire label for the status — "unknown" /
+// "joining" / "active" / "removed" / "declined" / "removing" /
+// "canceled". Also the on-disk representation in the members
+// collection (see MembersAPI.Query). Unknown values stringify as
+// "unknown".
+func (s MemberStatus) String() string {
+	switch s {
+	case MemberStatusJoining:
+		return "joining"
+	case MemberStatusActive:
+		return "active"
+	case MemberStatusRemoved:
+		return "removed"
+	case MemberStatusDeclined:
+		return "declined"
+	case MemberStatusRemoving:
+		return "removing"
+	case MemberStatusCanceled:
+		return "canceled"
+	default:
+		return "unknown"
+	}
+}
+
 // MemberEvent is one delivery on a Subscribe firehose. Kind tells the
 // subscriber what changed; Member carries the post-event state;
 // Previous carries the pre-event state (nil for Added, set otherwise).

@@ -2,7 +2,6 @@ package spaceobjects
 
 import (
 	"context"
-	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
 
@@ -24,63 +23,6 @@ type ObjectChange struct {
 	Deleted  bool
 }
 
-// changeRegistry is the synchronous callback firehose backing the
-// change-index feed. It mirrors internal/syncstatus' registry: cb runs
-// under the registry lock, on the apply path, so callers must keep cb
-// cheap or hand work off to their own goroutine. A cb must not call
-// add / remove on the same registry (would deadlock).
-type changeRegistry struct {
-	mu   sync.Mutex
-	next uint64
-	subs map[uint64]func(ObjectChange)
-}
-
-func newChangeRegistry() *changeRegistry {
-	return &changeRegistry{subs: make(map[uint64]func(ObjectChange))}
-}
-
-// add registers cb and returns the id passed to remove. nil cb yields
-// id 0 (a no-op cancel).
-func (r *changeRegistry) add(cb func(ObjectChange)) uint64 {
-	if cb == nil {
-		return 0
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.next++
-	id := r.next
-	r.subs[id] = cb
-	return id
-}
-
-// remove drops a subscription. Idempotent; safe with id 0.
-func (r *changeRegistry) remove(id uint64) {
-	if id == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.subs, id)
-}
-
-// hasSubscribers is the non-blocking gate the apply hook checks before
-// building an event, so a space with no change-index consumer pays
-// nothing on the hot path.
-func (r *changeRegistry) hasSubscribers() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.subs) > 0
-}
-
-// dispatch fans ev out to every live cb, synchronously under the lock.
-func (r *changeRegistry) dispatch(ev ObjectChange) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, cb := range r.subs {
-		cb(ev)
-	}
-}
-
 // SubscribeChanges registers cb on the change-index feed; it fires once
 // per applied change in this space with (objectId, applySeq). cb runs
 // synchronously on the apply path — keep it small or hand off. The
@@ -90,8 +32,7 @@ func (r *changeRegistry) dispatch(ev ObjectChange) {
 // consumer that misses events (crash, slow cb, was offline) recovers by
 // re-running ChangedObjects from its last persisted cursor.
 func (s *Store) SubscribeChanges(cb func(ObjectChange)) (cancel func()) {
-	id := s.changeSubs.add(cb)
-	return func() { s.changeSubs.remove(id) }
+	return s.changeSubs.Add(cb)
 }
 
 // ChangedObjects returns objects in this space whose persisted max
@@ -199,56 +140,9 @@ type RowEvent struct {
 	Deleted  bool
 }
 
-// rowEventRegistry mirrors changeRegistry for RowEvent callbacks —
-// synchronous, on the apply path, keep callbacks cheap.
-type rowEventRegistry struct {
-	mu   sync.Mutex
-	next uint64
-	subs map[uint64]func(RowEvent)
-}
-
-func newRowEventRegistry() *rowEventRegistry {
-	return &rowEventRegistry{subs: make(map[uint64]func(RowEvent))}
-}
-
-func (r *rowEventRegistry) add(cb func(RowEvent)) uint64 {
-	if cb == nil {
-		return 0
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.next++
-	r.subs[r.next] = cb
-	return r.next
-}
-
-func (r *rowEventRegistry) remove(id uint64) {
-	if id == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.subs, id)
-}
-
-func (r *rowEventRegistry) hasSubscribers() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.subs) > 0
-}
-
-func (r *rowEventRegistry) dispatch(ev RowEvent) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, cb := range r.subs {
-		cb(ev)
-	}
-}
-
 // SubscribeRowEvents registers cb for objects-collection row
 // creations and deletions. cb runs synchronously on the apply path.
 // The returned cancel is idempotent.
 func (s *Store) SubscribeRowEvents(cb func(RowEvent)) (cancel func()) {
-	id := s.rowEvents.add(cb)
-	return func() { s.rowEvents.remove(id) }
+	return s.rowEvents.Add(cb)
 }

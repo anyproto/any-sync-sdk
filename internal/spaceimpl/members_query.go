@@ -6,10 +6,11 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/query"
 
 	"github.com/anyproto/any-sync-sdk/space"
+
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 )
 
 // membersQuery is a chainable query over the materialised members
@@ -92,11 +93,7 @@ func (q *membersQuery) All(ctx context.Context) ([]*anyenc.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		cloned, err := cloneAnyenc(doc)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cloned)
+		out = append(out, anyencx.Clone(doc))
 	}
 	return out, it.Err()
 }
@@ -118,7 +115,7 @@ func (q *membersQuery) One(ctx context.Context) (*anyenc.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cloneAnyenc(doc)
+	return anyencx.Clone(doc), nil
 }
 
 // Snapshot returns the snapshot of matching members with optional total.
@@ -228,8 +225,3 @@ func (i *membersIterator) Close() error {
 
 // Compile-time interface check.
 var _ space.Query = (*membersQuery)(nil)
-
-// (anyencutil import retained — used here for cloneAnyenc that lives
-// in query.go in the same package, but the types library reaches
-// across files within spaceimpl.)
-var _ = anyencutil.Value{}

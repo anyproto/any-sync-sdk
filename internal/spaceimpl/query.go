@@ -7,10 +7,10 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
@@ -142,11 +142,7 @@ func (q *queryImpl) All(ctx context.Context) ([]*anyenc.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		cloned, err := cloneAnyenc(doc)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cloned)
+		out = append(out, anyencx.Clone(doc))
 	}
 	return out, it.Err()
 }
@@ -170,19 +166,7 @@ func (q *queryImpl) One(ctx context.Context) (*anyenc.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cloneAnyenc(doc)
-}
-
-// cloneAnyenc copies a value off the iterator's reused buffer onto a
-// fresh parser arena via anyencutil.Value.FillCopy. Returns nil for
-// a nil input.
-func cloneAnyenc(v *anyenc.Value) (*anyenc.Value, error) {
-	if v == nil {
-		return nil, nil
-	}
-	var w anyencutil.Value
-	w.FillCopy(v)
-	return w.Value, nil
+	return anyencx.Clone(doc), nil
 }
 
 // Snapshot returns a point-in-time view plus, when opts.IncludeTotal is
@@ -261,11 +245,7 @@ func (q *queryImpl) page(ctx context.Context, coll anystore.Collection, combined
 		if err != nil {
 			return nil, err
 		}
-		cloned, err := cloneAnyenc(doc.Value())
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cloned)
+		out = append(out, anyencx.Clone(doc.Value()))
 	}
 	return out, it.Err()
 }
@@ -377,11 +357,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			}
 			// Capture for Initial — clone now so the slice survives past
 			// the iterator (which reuses its buffer).
-			cloned, cerr := cloneAnyenc(v)
-			if cerr != nil {
-				return cerr
-			}
-			snapshotRows = append(snapshotRows, cloned)
+			snapshotRows = append(snapshotRows, anyencx.Clone(v))
 			snapshotIds = append(snapshotIds, id)
 			yield(id, v)
 		}

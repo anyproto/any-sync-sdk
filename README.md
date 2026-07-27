@@ -114,7 +114,7 @@ Wired and tested:
 - Cold restore, watermarked replay (`MaxAddSeq`), parked-change drainer for missing schema dependencies
 - Tech space (per-account derived index of all spaces); spaces stay resident and are eager-loaded on boot
 - Space lifecycle: `Create` / `Get` / `List` / `Delete` / `Derive` / `OneToOne` / `Join`
-- Collaboration v1 — `ACL`: `CreateInvite` / `RevokeInvite` / `RevokeAllInvites` / `AcceptRequest` / `DeclineRequest` / `ChangePermissions` / `AddAccounts` / `RemoveAccounts` / `OwnershipChange` / `RequestSelfRemove` / `CancelJoinRequest` / `StopSharing`; `Members`: `List` / `Get` / `Me` / `JoinRequests` / `Invites` / `Subscribe` / `Query`
+- Collaboration v1 — `ACL`: `CreateInvite` / `RevokeInvite` / `RevokeAllInvites` / `AcceptRequest` / `DeclineRequest` / `ChangePermissions` / `AddAccounts` / `RemoveAccounts` / `OwnershipChange` / `RequestSelfRemove` / `CancelJoinRequest` / `StopSharing`; `Members`: `List` / `Get` / `Me` / `JoinRequests` / `Invites` (recovers the minting account's invite key from synced custody) / `Subscribe` / `Query`
 - Account identity: `Account.Metadata` and `Account.UpdateMetadata`, persisted in the tech space and republished to identityRepo on boot; per-member profile refetch
 
 Not wired yet:

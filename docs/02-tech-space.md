@@ -64,6 +64,22 @@ Records with fields:
   stays the authoritative per-space read. On a 1-1 space the ACL owner is
   the synthetic shared key, so participants mirror the role the ACL
   grants them (`writer`), never `owner`.
+- `guestKey` — synced (`ScopeSynced`) string on a guest-mode row: the shared
+  read-only guest identity's private key this account joined with (JoinGuest).
+  Presence is the guest-mode discriminator; empty everywhere else.
+- `issuedInviteKeys` — synced (`ScopeSynced`) object: this account's custody
+  of the invite private keys it ISSUED for the space, one subkey per kind —
+  `member` (RequestToJoin invite, written by `ACL.CreateInvite`) and `guest`
+  (shared guest identity, written by `ACL.CreateGuestKey`). ACL invite
+  records carry only the public key, so this custody is what lets every
+  device of the issuing account re-show or revoke the same invite token
+  (`Members.Invites` returns the key on the matching row; the idempotent
+  `CreateGuestKey` fast path reads it). Per-kind subkeys merge per-path, so
+  kinds minted on different devices never clobber each other. Cleared by the
+  revoke paths; custody that goes stale (invite replaced/revoked elsewhere
+  before the clear synced) is hidden by the read paths, which verify it
+  against live ACL state before returning it. Distinct from `guestKey` so an
+  issuer's own row never reads as guest-mode.
 - etc.
 
 ### Account Preferences (derived object, postponed)

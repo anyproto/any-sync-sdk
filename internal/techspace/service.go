@@ -410,14 +410,34 @@ func (s *Service) SetRemoteStatus(ctx context.Context, spaceId, status string) (
 	})
 }
 
-// SetIssuedGuestKey writes (or clears, with "") the SYNCED owner-side
-// custody of the guest key issued for spaceId — every owner device can
-// then return / revoke the same invite. Written by ACL.CreateGuestKey,
-// cleared by RevokeGuestKey.
-func (s *Service) SetIssuedGuestKey(ctx context.Context, spaceId, encodedKey string) (object.WriteResult, error) {
-	return s.setRowField(ctx, spaceId, FieldIssuedGuestKey, false, func(a *anyenc.Arena) *anyenc.Value {
-		return a.NewString(encodedKey)
-	})
+// SetIssuedInviteKey writes (or clears, with "") the SYNCED custody of
+// one issued invite key kind (IssuedKeyMember / IssuedKeyGuest) at
+// [issuedInviteKeys, kind] — every device of the issuing account can
+// then re-show or revoke the same invite. Per-path so kinds written on
+// different devices merge instead of clobbering. Written / cleared by
+// the ACL invite mint and revoke paths.
+func (s *Service) SetIssuedInviteKey(ctx context.Context, spaceId, kind, encodedKey string) (object.WriteResult, error) {
+	if kind != IssuedKeyMember && kind != IssuedKeyGuest {
+		return object.WriteResult{}, fmt.Errorf("techspace: unknown issued-key kind %q", kind)
+	}
+	if !s.open.Load() {
+		return object.WriteResult{}, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return object.WriteResult{}, err
+	}
+	arena := &anyenc.Arena{}
+	op := crdt.Op{Type: crdt.OpUnset, Path: []string{FieldIssuedInviteKeys, kind}}
+	if encodedKey != "" {
+		op = crdt.Op{Type: crdt.OpSet, Path: op.Path, Payload: arena.NewString(encodedKey)}
+	}
+	change := crdt.Change{
+		Dataset:     SpaceIndexDataset,
+		DataVersion: HandlerVersion,
+		Records:     []crdt.RecordChange{{Id: spaceId, Ops: []crdt.Op{op}}},
+	}
+	return obj.LocalWrite(ctx, change)
 }
 
 // SetGuestKey updates the SYNCED guest-mode key on an existing row —

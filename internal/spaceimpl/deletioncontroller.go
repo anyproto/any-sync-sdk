@@ -17,9 +17,11 @@ var delLog = logger.NewNamed("sdk.spacedeletion")
 // deletionReconcileInterval is how often the reconciler polls the
 // coordinator absent an explicit kick. Matches anytype-heart's deletion
 // controller cadence — space deletion is not latency-sensitive, and a
-// local Delete kicks the loop immediately anyway. A var (not const) so
-// tests can shorten it to exercise the inbound-detection tick.
-var deletionReconcileInterval = 180 * time.Second
+// local Delete kicks the loop immediately anyway. Atomic (nanoseconds)
+// so the test seam can override or restore it while another SDK
+// instance's loop starts concurrently (parallel tests share the
+// process).
+var deletionReconcileInterval = newAtomicInterval(180 * time.Second)
 
 // SetDeletionReconcileIntervalForTest overrides the reconcile poll
 // interval and returns a func that restores the previous value. Test
@@ -27,9 +29,8 @@ var deletionReconcileInterval = 180 * time.Second
 // waiting the full production interval. Call before opening the SDK
 // (the interval is read once when the loop starts).
 func SetDeletionReconcileIntervalForTest(d time.Duration) (restore func()) {
-	prev := deletionReconcileInterval
-	deletionReconcileInterval = d
-	return func() { deletionReconcileInterval = prev }
+	prev := deletionReconcileInterval.Swap(int64(d))
+	return func() { deletionReconcileInterval.Store(prev) }
 }
 
 // startDeletionReconciler launches the background reconcile loop. Bound
@@ -56,7 +57,7 @@ func (s *Service) kickDeletionReconciler() {
 // or kick.
 func (s *Service) deletionLoop(ctx context.Context) {
 	defer s.delWG.Done()
-	t := time.NewTicker(deletionReconcileInterval)
+	t := time.NewTicker(time.Duration(deletionReconcileInterval.Load()))
 	defer t.Stop()
 	// Initial pass so a space the user deleted while offline last
 	// session gets driven to the coordinator as soon as we're online.

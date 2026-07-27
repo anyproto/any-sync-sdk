@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
@@ -19,20 +20,31 @@ var inboxLog = logger.NewNamed("sdk.onetoone.inbox")
 
 // inboxPollInterval is the notifier's poll-fallback cadence (the push
 // stream drives latency). inviteRetryInterval is the send-retry loop's
-// cadence. Both var (not const) so tests can shorten them; read once when
-// the loops start, so set before StartOneToOneInbox.
+// cadence. Atomics (nanoseconds) so the test seam can override or
+// restore them while another SDK instance's loops start concurrently
+// (parallel tests share the process); each loop reads its value once
+// at start, so set before StartOneToOneInbox.
 var (
-	inboxPollInterval   = 60 * time.Second
-	inviteRetryInterval = 60 * time.Second
+	inboxPollInterval   = newAtomicInterval(60 * time.Second)
+	inviteRetryInterval = newAtomicInterval(60 * time.Second)
 )
+
+// newAtomicInterval seeds the race-free carrier for an interval seam.
+func newAtomicInterval(d time.Duration) *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(d))
+	return &v
+}
 
 // SetOneToOneInboxIntervalsForTest overrides the notifier poll and
 // invite-retry intervals, returning a restore func. Test seam only — call
 // before SDK.Open (the loops read the values once at start).
 func SetOneToOneInboxIntervalsForTest(poll, retry time.Duration) (restore func()) {
-	pp, rr := inboxPollInterval, inviteRetryInterval
-	inboxPollInterval, inviteRetryInterval = poll, retry
-	return func() { inboxPollInterval, inviteRetryInterval = pp, rr }
+	pp, rr := inboxPollInterval.Swap(int64(poll)), inviteRetryInterval.Swap(int64(retry))
+	return func() {
+		inboxPollInterval.Store(pp)
+		inviteRetryInterval.Store(rr)
+	}
 }
 
 // oneToOneInviteToSend is the device-local marker value meaning this
@@ -65,7 +77,7 @@ func (s *Service) StartOneToOneInbox(ctx context.Context) {
 		// Warmup: pull the tech space current before the first fetch so a
 		// fresh device seeds from the synced cursor, not offset 0.
 		Warmup:   func(ctx context.Context) error { return s.tsp.SyncHeads(ctx) },
-		Interval: inboxPollInterval,
+		Interval: time.Duration(inboxPollInterval.Load()),
 	})
 	// Coordinator push → kick the notifier. The event is body-less; the
 	// notifier reacts by fetching.
@@ -292,7 +304,7 @@ func (s *Service) kickInviteRetry() {
 // session (offline at initiate); thereafter it runs on tick or kick.
 func (s *Service) inviteRetryLoop(ctx context.Context) {
 	defer s.inviteWG.Done()
-	t := time.NewTicker(inviteRetryInterval)
+	t := time.NewTicker(time.Duration(inviteRetryInterval.Load()))
 	defer t.Stop()
 	s.reconcileInvites(ctx)
 	for {

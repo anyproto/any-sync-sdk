@@ -717,6 +717,15 @@ func (s *Store) RegularObjectCount(ctx context.Context) int {
 // Open-only: returns anystore.ErrCollectionNotFound if the writer
 // hasn't initialised the dataset yet. Callers should treat that as
 // "no records" — equivalent to an empty controller.
+//
+// Ownership note: handles opened through here bypass the controller's
+// eviction-time release (Controller.CloseOwnedCollections) — they stay
+// in any-store's registry until process exit. Today's callers are the
+// types registry reads (`<typeId>_propertyDefs` / `<typeId>_shortIds`
+// via spaceimpl/types.go) and the tech-space accountvalues dataset —
+// bounded O(types + tech-space objects), deliberately out of scope for
+// the per-object eviction fix. Don't route per-object DATA datasets
+// through here; those belong to the object's controller.
 func (s *Store) OpenObjectCollection(ctx context.Context, objectId, dataset string) (anystore.Collection, error) {
 	if objectId == "" {
 		return nil, errors.New("spaceobjects: OpenObjectCollection: objectId required")
@@ -1083,16 +1092,42 @@ func (s *Store) dropObjectCollectionsNamed(ctx context.Context, objectId string,
 		if i <= 0 || name[:i] != objectId {
 			continue
 		}
+		s.dropCollectionByName(ctx, name)
+	}
+}
+
+// dropCollectionByName opens and drops one collection, retrying once
+// when the handle turns out closed: an eviction (or the twin deletion
+// callback's own drop) can close the handle between our open and the
+// Drop, and without the retry the purge would report success while the
+// collection survives on disk. The retry's fresh open disambiguates
+// what the error alone cannot — ErrCollectionClosed WRAPS
+// ErrCollectionNotFound by definition, so "closed but still on disk"
+// and "concurrently reclaimed" look identical on the failed Drop. The
+// reopen resolves from the catalog: a live handle to drop, or a bare
+// ErrCollectionNotFound meaning the concurrent path already reclaimed
+// it (the goal state, not worth a warn).
+func (s *Store) dropCollectionByName(ctx context.Context, name string) {
+	for attempt := 0; ; attempt++ {
 		coll, err := s.db.OpenCollection(ctx, name)
 		if err != nil {
 			if !errors.Is(err, anystore.ErrCollectionNotFound) {
 				storeLog.Warn("purge: open collection", zap.String("coll", name), zap.Error(err))
 			}
-			continue
+			return
 		}
-		if err := coll.Drop(ctx); err != nil {
-			storeLog.Warn("purge: drop collection", zap.String("coll", name), zap.Error(err))
+		err = coll.Drop(ctx)
+		if err == nil {
+			return
 		}
+		if errors.Is(err, anystore.ErrCollectionClosed) && attempt == 0 {
+			continue // reopen resolves: still on disk → drop; gone → silent
+		}
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return // already reclaimed by the concurrent deletion path
+		}
+		storeLog.Warn("purge: drop collection", zap.String("coll", name), zap.Error(err))
+		return
 	}
 }
 
@@ -1381,6 +1416,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		AfterApply:     s.afterApplyFor(),
 		WriteGate:      s.CheckWrite,
 		PlaintextSpecs: plaintextSpecs,
+		OnClose:        func() { s.releaseHistoryHandle(objectId) },
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
 	})
@@ -1419,6 +1455,35 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		}
 	}
 	return obj, nil
+}
+
+// releaseHistoryHandle closes the registry handle of the object's
+// `<objectId>__history` collection on eviction — the history index
+// opens it by name per write/read (never caching), but any-store keeps
+// every opened handle in its registry, so without this the handle (and
+// its planner sketch + caches) outlives the object's residency, one
+// per object ever applied. Best-effort: a collection that was never
+// materialised (ErrCollectionNotFound) or a concurrent close are both
+// fine — the next history write/read re-opens by name.
+//
+// Serialization mirrors the controller handles: the only `__history`
+// writer inside an apply runs under this object's tree.Lock, which the
+// Object close path holds/held before firing OnClose. The lazy history
+// backfill iterates a separate history tree without that lock — it can
+// race this close, fail one flush with ErrCollectionClosed, and be
+// retried by the next history query (the stale flag only clears on a
+// completed backfill).
+func (s *Store) releaseHistoryHandle(objectId string) {
+	if s.customHandlers != nil {
+		return // raw-mode stores index no history
+	}
+	coll, err := s.db.OpenCollection(context.Background(), objectId+history.HistoryCollectionSuffix)
+	if err != nil {
+		return
+	}
+	if err := coll.Close(); err != nil {
+		storeLog.Warn("close history handle", zap.String("objectId", objectId), zap.Error(err))
+	}
 }
 
 // openTree picks PutTree vs BuildTree based on whether the caller has

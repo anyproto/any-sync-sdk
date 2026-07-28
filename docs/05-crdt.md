@@ -138,8 +138,8 @@ Every change carries optional `traceIds` — opaque caller-supplied correlation 
 
 ### Conflict Rules
 - **LWW by versionId** (v1) — acceptable for all ops except `$inc` (commutative counter) and the commutative set ops `$addToSet` / `$pull`
-- **Delete wins absolutely** — tombstones are sticky. Every modify on a tombstoned record is dropped at the protocol level regardless of version. Explicit resurrect is out of scope for v1; callers that need it must layer their own mechanism on top
-- **No conflict ever surfaces to the caller** — auto-merged
+- **Delete wins absolutely** — tombstones are sticky. Every modify on a tombstoned record is dropped at the protocol level regardless of version. Explicit resurrect is out of scope for v1; callers that need it must layer their own mechanism on top. The drop is REPORTED to the local writer as a whole-record rejection (`ErrRecordDeleted` in `ModifyResult.Rejections`) — without it, an upsert with a reused explicit id would be indistinguishable from a successful create while storing nothing (anyproto/any#141). Deleting an already-deleted record stays silent (idempotent)
+- **No conflict ever surfaces to the caller** — auto-merged (the tombstone rejection above is not a conflict resolution; it reports a write that was dropped whole)
 
 ### Storage
 - **`_ver` stored inline** in the same document — minimal query perf impact, and sorting by versionId is cheap

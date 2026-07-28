@@ -1354,6 +1354,11 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		}
 		m.drainDerivedTo(a, existing, ch)
 	} else if isTombstone(existing) {
+		// Delete-wins: none of the ops land — the tombstone is sticky.
+		// Report the absorption so a local caller can tell it from a
+		// successful create; remote replays discard rejections. The
+		// convergence bookkeeping below is unchanged.
+		m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: ErrRecordDeleted})
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 			stampAddSeq(a, existing, ch.AddSeq)
 			updateTraces(a, existing, *ch)

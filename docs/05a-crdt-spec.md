@@ -177,6 +177,8 @@ All other fields are wiped. `_ver` shrinks to two entries: `id` (the preserved c
 
 **Tombstones are sticky.** Every subsequent modify on a tombstoned record is dropped at the protocol level regardless of version — there is no way to resurrect a record at the CRDT layer in v1. This gives "delete wins absolutely" without depending on handlers to reject undeletes. Higher-level resurrect (e.g. user undelete UI) is out of scope for v1; callers that need it must layer their own mechanism on top.
 
+The drop is not silent to the local writer: applying a non-delete modify (upsert included) onto a tombstone emits a whole-record rejection (`OpIndex -1`, sentinel `ErrRecordDeleted`, re-exported as `space.ErrRecordDeleted`) into the apply result. State transitions are unchanged — the record stays a tombstone and the convergence bookkeeping (creation-marker min rule, `_addSeq`/trace stamps) still applies; only the reporting is new. Rationale: a caller writing with an explicit reused id (e.g. a seq-derived id after a range wipe) previously got a `ModifyResult` with recordIds and no rejections while nothing was stored — silent data loss (anyproto/any#141). Deleting an already-deleted record remains rejection-free (idempotent re-delete is a supported pattern in wipe flows).
+
 ---
 
 ## 4. Version IDs

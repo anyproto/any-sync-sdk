@@ -22,6 +22,16 @@ var ErrUnknownDataset = errors.New("crdt: no handler for dataset")
 // Change entirely.
 var ErrValidation = errors.New("crdt: validation rejected")
 
+// ErrRecordDeleted is the rejection sentinel for a modify (including
+// upsert) that landed on a tombstoned record. Delete-wins absorbs the
+// write — the tombstone is sticky and none of the ops land — which
+// used to look exactly like a successful create to a local caller
+// (ModifyResult with recordIds and no rejections, nothing stored).
+// The absorption itself is the convergence rule and stays; this
+// sentinel only makes it visible. Deleting an already-deleted record
+// stays silent (idempotent).
+var ErrRecordDeleted = errors.New("crdt: record is deleted; the id cannot be reused")
+
 // ChangeCtx is the per-callback context handed to a Handler. It carries the
 // originating Change (read-only metadata: VersionId, ChangeId, Timestamp,
 // Creator, ObjectAuthor, …) and the record's pre-op state.

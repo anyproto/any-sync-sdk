@@ -372,6 +372,10 @@ func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 		heads    []string
 	}
 	var repubs []repub
+	// Spaces with no engine (deleted / pending / untracked) are skipped
+	// silently per key; one debug line per space keeps boot logs quiet
+	// even when a dead space left hundreds of frontier keys behind.
+	skipped := map[string]struct{}{}
 	err = store.Iterate(ctx, func(decryptor keyvaluestorage.Decryptor, key string, values []innerstorage.KeyValue) (bool, error) {
 		spaceId, objectId, ok := parseKey(key)
 		if !ok || (onlySpaceId != "" && spaceId != onlySpaceId) {
@@ -379,6 +383,10 @@ func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 		}
 		eng := s.engineFor(spaceId)
 		if eng == nil {
+			if _, seen := skipped[spaceId]; !seen {
+				skipped[spaceId] = struct{}{}
+				log.Debug("reconcile: no engine for space, skipping its keys", zap.String("spaceId", spaceId))
+			}
 			return true, nil
 		}
 		var ownHeads []string
@@ -435,5 +443,8 @@ func sameSet(a, b []string) bool {
 	return true
 }
 
-// ErrUntracked is returned by marks on a space with no tracked datasets.
-var ErrUntracked = errors.New("readsync: space tracks no datasets")
+// ErrUntracked is returned by marks when EngineFor yields no engine:
+// the space tracks no datasets, or the liveness gate dropped it
+// (deleted / pending / unknown at mark time). spaceimpl maps it to
+// the public space.ErrSpaceNotTracked.
+var ErrUntracked = errors.New("readsync: space read state not tracked")

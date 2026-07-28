@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
+	"go.uber.org/zap"
 )
+
+var cacheLog = logger.NewNamed("anysyncx.spacecache")
 
 // Space cache TTL is disabled: once a commonspace.Space is loaded it
 // stays loaded for the SDK lifetime. Loaded spaces own only headsync
@@ -120,7 +124,27 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 		return nil, fmt.Errorf("anysyncx: NewSpace %s: %w", id, err)
 	}
 	if err := cs.Init(ctx); err != nil {
-		_ = cs.Close()
+		// Bounded cleanup: the space app's Close can wedge under
+		// unreachable nodes — its deletion loop joins an in-flight
+		// delete call that ignores ctx (any-sync bug; pre-existing at
+		// shutdown, but Close now routinely cancels in-flight loads,
+		// which lands exactly here). A synchronous Close would then
+		// wedge the loader's caller — the bootstrap goroutine, and
+		// through it SDK.Close — until any-sync's close watchdog
+		// panics the process. Wait a bound, then log and LEAK the
+		// close goroutine instead (the process is usually shutting
+		// down anyway) — the watchdog's philosophy, minus the panic.
+		closeErrored := make(chan struct{})
+		go func() {
+			defer close(closeErrored)
+			_ = cs.Close()
+		}()
+		select {
+		case <-closeErrored:
+		case <-time.After(10 * time.Second):
+			cacheLog.Warn("init-error cleanup: space close timed out; leaking close goroutine",
+				zap.String("spaceId", id))
+		}
 		return nil, fmt.Errorf("anysyncx: Init %s: %w", id, err)
 	}
 	a.sync.RegisterSpace(id, cs)

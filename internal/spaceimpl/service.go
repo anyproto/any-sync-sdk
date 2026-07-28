@@ -159,11 +159,13 @@ type Service struct {
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
 
-	// seedWG / seedCtx track the fire-and-forget spaceIndex lazy-seed
-	// goroutines (goSeed). Close cancels seedCtx and waits on seedWG so
-	// no background seed is still touching the store / tech space when
-	// the SDK tears them down. closing (under mu) stops new seeds from
-	// being spawned during shutdown.
+	// seedWG / seedCtx track the fire-and-forget background goroutines
+	// the service owns: the spaceIndex lazy-seeds (goSeed) and the boot
+	// identity-profile resolve (ResolveIdentityProfilesAsync). Close
+	// cancels seedCtx and waits on seedWG so no background work is
+	// still touching the store / tech space when the SDK tears them
+	// down. closing (under mu) stops new work from being spawned
+	// during shutdown.
 	seedWG     sync.WaitGroup
 	seedCtx    context.Context
 	seedCancel context.CancelFunc
@@ -200,6 +202,12 @@ type Service struct {
 	// pushKeys caches the per-space derived push-notification keys —
 	// see push.go (PushKeys).
 	pushKeys pushKeyCache
+
+	// onSpaceBorn, when set, is called with the space id after every
+	// successful Create/Derive. The SDK marks such spaces clean for the
+	// close-time watermark snapshot: the author device materializes its
+	// own writes by definition. Guarded by mu; set once from sdk.Open.
+	onSpaceBorn func(spaceId string)
 
 	// One-to-one inbox (Layer-2 discovery, docs/13). inboxNotifier is the
 	// receive worker (coordinator push + poll → RegisterIncoming); the
@@ -334,6 +342,24 @@ func (s *Service) peekStore(spaceId string) *spaceobjects.Store {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stores[spaceId]
+}
+
+// SetOnSpaceBorn registers the successful-Create/Derive hook (see the
+// onSpaceBorn field). Called once from sdk.Open.
+func (s *Service) SetOnSpaceBorn(fn func(spaceId string)) {
+	s.mu.Lock()
+	s.onSpaceBorn = fn
+	s.mu.Unlock()
+}
+
+// spaceBorn fires the onSpaceBorn hook, if any.
+func (s *Service) spaceBorn(spaceId string) {
+	s.mu.Lock()
+	fn := s.onSpaceBorn
+	s.mu.Unlock()
+	if fn != nil {
+		fn(spaceId)
+	}
 }
 
 // SetReadSync injects the SDK-level read-state sync service. Called
@@ -599,6 +625,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	if err := s.seedSpaceIndexOnCreate(ctx, store, spaceId, req, spaceType); err != nil {
 		return nil, fmt.Errorf("spaceimpl: seed spaceIndex: %w", err)
 	}
+	s.spaceBorn(spaceId)
 	return newSpace(spaceId, s.app, s.tsp, store, s), nil
 }
 
@@ -1003,6 +1030,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	}
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
 	s.goSeed(sp)
+	s.spaceBorn(spaceId)
 	return sp, nil
 }
 
@@ -1657,6 +1685,25 @@ func (s *Service) goSeed(sp *spaceImpl) {
 	go func() {
 		defer s.seedWG.Done()
 		sp.maybeLazySeedSpaceIndex(s.seedCtx)
+	}()
+}
+
+// ResolveIdentityProfilesAsync runs ResolveIdentityProfiles in the
+// background, tracked by seedWG and bound to seedCtx so Close cancels
+// and drains it — the goroutine can never race teardown of the tech
+// space or the coordinator client. No-op once closing. Called from
+// sdk.Open on every boot.
+func (s *Service) ResolveIdentityProfilesAsync() {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.seedWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.seedWG.Done()
+		s.ResolveIdentityProfiles(s.seedCtx)
 	}()
 }
 

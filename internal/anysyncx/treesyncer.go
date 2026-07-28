@@ -221,6 +221,17 @@ func (t *treeSyncerAdapter) pendingIds() []string {
 	return out
 }
 
+// pendingCount reports the parked-set size. Exposed via
+// App.ParkedTreeCount for the SDK's close-time watermark gate: a
+// nonzero count means storage holds trees the projection never
+// materialized, so the space watermark must NOT be snapshotted (the
+// boot replay is the only cross-restart recovery for them).
+func (t *treeSyncerAdapter) pendingCount() int {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	return len(t.pending)
+}
+
 func (t *treeSyncerAdapter) markPending(id string) {
 	t.pendingMu.Lock()
 	t.pending[id] = struct{}{}

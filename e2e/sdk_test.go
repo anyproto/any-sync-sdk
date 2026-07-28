@@ -64,10 +64,19 @@ func TestSDK_OpenCreateList(t *testing.T) {
 
 	require.NotEmpty(t, sdk.Account().Id(), "account id should resolve")
 
-	// Empty index initially.
+	// Empty index initially — local reads are safe right after Open,
+	// with the bootstrap pass still (possibly) running.
 	list, err := sdk.Spaces().List(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, list)
+
+	// The bootstrap pass completes on its own (fresh account — nothing
+	// to catch up, so this is near-immediate).
+	select {
+	case <-sdk.BootstrapDone():
+	case <-ctx.Done():
+		t.Fatal("bootstrap pass did not complete")
+	}
 
 	// Create a space — round-trips through any-sync (local create) and
 	// writes the space-index entry.

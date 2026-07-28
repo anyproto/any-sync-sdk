@@ -632,6 +632,22 @@ func (a *App) PeerSyncStats(spaceId string) []PeerSyncSnapshot {
 	return ts.Stats()
 }
 
+// ParkedTreeCount returns the number of trees parked for retry in
+// spaceId's treesyncer adapter — fetched to storage but never
+// materialized into the CRDT projection (see treeSyncerAdapter.pending).
+// 0 when the space was never loaded this session. Consumed by the
+// SDK's close-time watermark gate: a space with parked trees must keep
+// its boot replay, so its watermark is not snapshotted at Close.
+func (a *App) ParkedTreeCount(spaceId string) int {
+	a.syncersMu.Lock()
+	ts := a.syncers[spaceId]
+	a.syncersMu.Unlock()
+	if ts == nil {
+		return 0
+	}
+	return ts.pendingCount()
+}
+
 // p2pStateFor resolves a space's local-network state. Pure so it's
 // unit-testable without the app graph.
 func p2pStateFor(enabled bool, poss sdkp2p.Possibility, localPeerIds []string, pickable func(string) bool) space.P2PState {

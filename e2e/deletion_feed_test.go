@@ -132,6 +132,15 @@ func TestSDK_DeletionFeed_AndRebuild(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk2.Close() })
 
+	// The rebuild replay (spacesync.Run + ReconcileDeletions) runs on
+	// the background bootstrap pass now — wait for it, otherwise the
+	// absence assertions below pass vacuously against an empty sdk.db.
+	select {
+	case <-sdk2.BootstrapDone():
+	case <-ctx.Done():
+		t.Fatal("bootstrap pass did not complete after rebuild")
+	}
+
 	sp2, err := sdk2.Spaces().Get(ctx, spaceId)
 	require.NoError(t, err)
 

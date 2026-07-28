@@ -154,7 +154,7 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 				continue
 			}
 			// Positive tombstone; its meta was purged above.
-			s.dropCollection(ctx, name)
+			_ = s.dropCollection(ctx, name) // GC stays best-effort; error logged inside
 			dropped++
 			sweptSpaces[owner] = struct{}{}
 		case ownerObject:
@@ -177,7 +177,7 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 			if !lastDead {
 				continue
 			}
-			s.dropCollection(ctx, name)
+			_ = s.dropCollection(ctx, name) // GC stays best-effort; error logged inside
 			dropped++
 		}
 	}

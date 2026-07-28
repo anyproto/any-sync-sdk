@@ -203,6 +203,12 @@ type Service struct {
 	// see push.go (PushKeys).
 	pushKeys pushKeyCache
 
+	// onSpaceBorn, when set, is called with the space id after every
+	// successful Create/Derive. The SDK marks such spaces clean for the
+	// close-time watermark snapshot: the author device materializes its
+	// own writes by definition. Guarded by mu; set once from sdk.Open.
+	onSpaceBorn func(spaceId string)
+
 	// One-to-one inbox (Layer-2 discovery, docs/13). inboxNotifier is the
 	// receive worker (coordinator push + poll → RegisterIncoming); the
 	// invite* fields drive the send-retry loop that (re)delivers
@@ -336,6 +342,24 @@ func (s *Service) peekStore(spaceId string) *spaceobjects.Store {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stores[spaceId]
+}
+
+// SetOnSpaceBorn registers the successful-Create/Derive hook (see the
+// onSpaceBorn field). Called once from sdk.Open.
+func (s *Service) SetOnSpaceBorn(fn func(spaceId string)) {
+	s.mu.Lock()
+	s.onSpaceBorn = fn
+	s.mu.Unlock()
+}
+
+// spaceBorn fires the onSpaceBorn hook, if any.
+func (s *Service) spaceBorn(spaceId string) {
+	s.mu.Lock()
+	fn := s.onSpaceBorn
+	s.mu.Unlock()
+	if fn != nil {
+		fn(spaceId)
+	}
 }
 
 // SetReadSync injects the SDK-level read-state sync service. Called
@@ -601,6 +625,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	if err := s.seedSpaceIndexOnCreate(ctx, store, spaceId, req, spaceType); err != nil {
 		return nil, fmt.Errorf("spaceimpl: seed spaceIndex: %w", err)
 	}
+	s.spaceBorn(spaceId)
 	return newSpace(spaceId, s.app, s.tsp, store, s), nil
 }
 
@@ -1005,6 +1030,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	}
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
 	s.goSeed(sp)
+	s.spaceBorn(spaceId)
 	return sp, nil
 }
 

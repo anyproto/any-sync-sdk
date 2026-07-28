@@ -131,27 +131,20 @@ func Run(ctx context.Context, app *anysyncx.App, db anystore.DB, store *spaceobj
 
 // SnapshotWatermark persists spaceId's current head-store MaxLastAddSeq
 // as its catch-up watermark without force-loading anything. Called on
-// clean SDK Close for every open space whose offline catch-up completed
-// this session: everything the head store accepted DURING the session
-// was applied to the projection live as it arrived (or parked durably
-// in _detached, which the drainer resumes — the same tolerance Run
-// itself has), so the snapshot is valid and the next boot's Run
-// fast-path no-ops instead of force-loading every tree the session
-// touched. A crash skips this persist and the boot replay remains the
-// fallback. Same snapshot-before-teardown property as Run: anything
-// landing after the read stays above the persisted watermark and
-// replays next boot.
-//
-// The caller must NOT call this for a space that still needs its boot
-// replay — the SDK gates on two conditions:
-//   - the pre-session offline gap was replayed (catch-up Run completed
-//     this session); and
-//   - the treesyncer parked set is EMPTY (App.ParkedTreeCount == 0).
-//     Parked trees are storage-committed but never materialized (e.g.
-//     ErrNoReadKey during join key propagation, round deadlines); the
-//     retry sweep holding them is in-memory, so the boot replay is the
-//     only cross-restart recovery — a snapshot covering their seqs
-//     would make the records invisible forever.
+// clean SDK Close for allowlisted spaces only (SDK.caughtUp — caught
+// up by a boot Run or created/derived this session): everything the
+// head store accepted DURING the session was applied to the projection
+// live as it arrived (or parked durably in _detached, which the
+// drainer resumes — the same tolerance Run itself has), so the
+// snapshot is valid and the next boot's Run fast-path no-ops instead
+// of force-loading every tree the session touched. A crash skips this
+// persist and the boot replay remains the fallback. Same
+// snapshot-before-teardown property as Run: anything landing after the
+// read stays above the persisted watermark and replays next boot. The
+// caller must additionally skip spaces with a non-empty treesyncer
+// parked set (App.ParkedTreeCount) — parked trees are
+// storage-committed but never materialized, and the boot replay is
+// their only cross-restart recovery.
 func SnapshotWatermark(ctx context.Context, db anystore.DB, handle anysyncx.SpaceHandle, spaceId string) error {
 	metaColl, err := db.Collection(ctx, crdt.MetaCollectionName)
 	if err != nil {

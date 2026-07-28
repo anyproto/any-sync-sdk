@@ -85,19 +85,19 @@ func wmWrite(t *testing.T, ctx context.Context, sp space.Space, n int) {
 	}
 }
 
-// TestClose_WatermarkSkipsPendingCatchup pins exclusions one and two
-// of the close-time snapshot: a space whose catch-up Run never
-// completed this session (Close mid-bootstrap) keeps its old
-// watermark, so the next boot still replays; a normal session then
-// advances it.
-func TestClose_WatermarkSkipsPendingCatchup(t *testing.T) {
+// TestClose_WatermarkAllowlist pins the allowlist rule of the
+// close-time snapshot: a created-this-session space is born clean and
+// persisted; a space that never entered the allowlist (its catch-up
+// Run never ran — Close mid-bootstrap) keeps its old watermark so the
+// next boot still replays; a normal session then advances it.
+func TestClose_WatermarkAllowlist(t *testing.T) {
 	dataDir := t.TempDir()
 	provider := wmProvider(t, dataDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Session 1: create + write + clean Close. The created space was
-	// never in pendingCatchup (born mid-session), so Close snapshots
+	// Session 1: create + write + clean Close. The created space is
+	// born clean (allowlisted via the Create hook), so Close snapshots
 	// its watermark.
 	var spaceId string
 	{
@@ -110,25 +110,24 @@ func TestClose_WatermarkSkipsPendingCatchup(t *testing.T) {
 		require.NoError(t, sdk.Close())
 	}
 	w1 := wmRead(t, dataDir, spaceId)
-	require.Greater(t, w1, uint64(0), "clean Close must persist the created space's watermark")
+	require.Greater(t, w1, uint64(0), "a created-this-session space must be persisted (born clean)")
 
 	// Session 2: hold the bootstrap pass open so Run never executes —
-	// the space stays in pendingCatchup. Write more (advances the head
-	// store past w1), then Close mid-bootstrap. The watermark must NOT
-	// move: those writes must stay replayable.
+	// the space never enters the allowlist. Write more (advances the
+	// head store past w1), then Close mid-bootstrap. The watermark must
+	// NOT move: those writes must stay replayable.
 	bootstrapTestHook = func(hctx context.Context) { <-hctx.Done() }
 	t.Cleanup(func() { bootstrapTestHook = nil })
 	{
 		sdk, err := Open(ctx, wmConfig(t, dataDir), provider)
 		require.NoError(t, err)
-		require.True(t, sdk.Bootstrapping())
 		sp, err := sdk.Spaces().Get(ctx, spaceId)
 		require.NoError(t, err)
 		wmWrite(t, ctx, sp, 5)
 		require.NoError(t, sdk.Close())
 	}
 	assert.Equal(t, w1, wmRead(t, dataDir, spaceId),
-		"Close mid-bootstrap must not snapshot a pendingCatchup space")
+		"Close must not snapshot a space that never entered the allowlist")
 	bootstrapTestHook = nil
 
 	// Session 3 (control): a full bootstrap replays the session-2
@@ -171,9 +170,9 @@ func TestClose_WatermarkSkipsParkedTrees(t *testing.T) {
 	w1 := wmRead(t, dataDir, spaceId)
 	require.Greater(t, w1, uint64(0))
 
-	// Session 2: bootstrap completes (the space leaves pendingCatchup),
-	// new writes advance the head store, but the parked-tree gate must
-	// still block the snapshot.
+	// Session 2: bootstrap completes (the space is allowlisted via its
+	// Run), new writes advance the head store, but the parked-tree gate
+	// must still block the snapshot.
 	parkedCountHook = func(string) int { return 1 }
 	t.Cleanup(func() { parkedCountHook = nil })
 	{

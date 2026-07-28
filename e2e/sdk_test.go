@@ -77,7 +77,6 @@ func TestSDK_OpenCreateList(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("bootstrap pass did not complete")
 	}
-	assert.False(t, sdk.Bootstrapping())
 
 	// Create a space — round-trips through any-sync (local create) and
 	// writes the space-index entry.

@@ -137,6 +137,14 @@ func TestSDK_SpaceDelete_NotReloadedAfterRestart(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk2.Close() })
 
+	// The eager loop runs on the background bootstrap pass — wait for
+	// it so the no-reload assertion below actually covers it.
+	select {
+	case <-sdk2.BootstrapDone():
+	case <-ctx.Done():
+		t.Fatal("bootstrap pass did not complete after reboot")
+	}
+
 	// The eager-loader must NOT have reloaded the tombstone — no DB file.
 	_, statErr = os.Stat(dbPath)
 	assert.True(t, os.IsNotExist(statErr),

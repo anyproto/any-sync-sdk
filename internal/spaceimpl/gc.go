@@ -35,7 +35,11 @@ var gcLog = logger.NewNamed("sdk.collectiongc")
 //
 // Call once at SDK open, after the tech space is up and BEFORE any
 // other space loads — with no applies running, the liveness reads
-// below can't race an in-flight object materialization. Best-effort:
+// below can't race an in-flight object materialization. This is why
+// the sweep stays synchronous in Open while the eager space-loading
+// loop runs on the background bootstrap pass: only the pre-return,
+// pre-bootstrap spot guarantees "no space loads, no caller holds the
+// handle", and the sweep is cheap (1.6-40ms measured). Best-effort:
 // a failed sweep is logged and boot continues.
 //
 // The sweep is scoped to one DB: names, rosters and meta rows are all

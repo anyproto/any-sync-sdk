@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/auth"
 	"github.com/anyproto/any-sync-sdk/config"
@@ -38,6 +41,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+var log = logger.NewNamed("sdk")
+
 // SDK is the top-level handle held by middleware for the lifetime of
 // use. Constructed by Open; torn down by Close.
 type SDK struct {
@@ -54,6 +59,70 @@ type SDK struct {
 	// LAN re-handshakes when the known-space set grows; nil when p2p
 	// is disabled or in headless mode.
 	stopP2PIndexWatch func()
+
+	// bootstrapCancel / bootstrapDone track the SDK-owned background
+	// boot pass (see bootstrap): profile republish, the serial eager
+	// space-loading + offline catch-up loop, and the read-state
+	// reconcile. bootstrapDone is closed by the goroutine on exit;
+	// Close cancels and joins it before any teardown. Both nil in
+	// headless mode, which skips the pass entirely.
+	bootstrapCancel context.CancelFunc
+	bootstrapDone   chan struct{}
+	// bootRows is the ONE space-index snapshot both the pendingCatchup
+	// seed and the bootstrap eager loop work from — a single list keeps
+	// the seed and the loop's membership identical by construction (a
+	// space can't slip between two reads). bootListOK is false when the
+	// snapshot could not be read at all; the fail-conservative response
+	// is "run no eager loop and persist no watermarks this session".
+	bootRows   []techspace.SpaceIndexRecord
+	bootListOK bool
+	// pendingCatchup holds the spaces whose pre-session offline
+	// catch-up (spacesync.Run) has not completed yet this session —
+	// every non-deleted row of the boot snapshot, including pending
+	// (MaterializeBlock) and storage-less rows: a space leaves the set
+	// ONLY via a successful Run, so anything that loaded by another
+	// path mid-session (accepted join, cold Get) keeps its boot replay.
+	// Seeded by Open before the bootstrap goroutine starts, mutated
+	// only by that goroutine, read by Close only after joining it —
+	// the goroutine-start and channel-close edges order every access,
+	// so no lock is needed. Close must NOT snapshot the watermark of a
+	// space still in here (see snapshotWatermarks).
+	pendingCatchup map[string]struct{}
+}
+
+// bootstrapClosed is the pre-closed BootstrapDone result for SDK
+// handles without a background boot pass (headless mode, zero handle).
+var bootstrapClosed = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// Bootstrapping reports whether the background boot pass started by
+// Open is still running. Always false in headless mode.
+func (s *SDK) Bootstrapping() bool {
+	select {
+	case <-s.BootstrapDone():
+		return false
+	default:
+		return true
+	}
+}
+
+// BootstrapDone returns a channel closed once the background boot pass
+// has finished (or immediately for a headless Open). "Done" means no
+// longer running — it also closes when Close cancels an in-flight
+// pass. Local reads (Spaces().List, queries against loaded spaces)
+// never need to wait on it; select on it when you need full offline
+// catch-up — every space loaded and replayed up to what the sync nodes
+// hold. Until a space's turn comes, queries against it serve the
+// pre-offline state (the per-object lazy ColdRestore still covers
+// direct Gets).
+func (s *SDK) BootstrapDone() <-chan struct{} {
+	if s.bootstrapDone == nil {
+		return bootstrapClosed
+	}
+	return s.bootstrapDone
 }
 
 // FileCacheSize returns the local bytes currently held by file content
@@ -83,8 +152,17 @@ func (s *SDK) SweepFileCache(ctx context.Context) error {
 }
 
 // Open brings up the SDK: initializes auth, opens storage, boots any-sync,
-// derives the tech space, replays any unseen DAG changes, and returns a
-// ready handle.
+// derives the tech space, and returns a ready handle. Open is serial
+// local I/O with no synchronous network dependency.
+//
+// Contract: when Open returns, local reads are safe — Spaces().List,
+// queries against loaded spaces, Create/Get/Modify all work. The
+// account-facing boot work (eager space loading, offline catch-up
+// replay, profile republish, read-state reconcile) runs on ONE
+// SDK-owned background goroutine, strictly serial, started here and
+// cancelled+joined by Close; BootstrapDone exposes its completion.
+// Until a space's turn comes, queries against it serve the pre-offline
+// state (the per-object lazy ColdRestore still covers direct Gets).
 //
 // Storage layout:
 //
@@ -221,8 +299,11 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 	// Orphan-collection GC: drop CRDT collections whose owner space /
 	// object no longer exists — heals interrupted offloads and
-	// historical purge leaks. Runs while only the tech space is open so
-	// the sweep never races live applies; best-effort, never fails Open.
+	// historical purge leaks. Deliberately synchronous, unlike the
+	// eager loop (see bootstrap): its safety argument is "only the tech
+	// space is open, no applies are running, no caller holds the SDK
+	// handle yet", which only this spot provides — and at 1.6-40ms
+	// measured it costs Open nothing. Best-effort, never fails Open.
 	spaces.SweepOrphanCollections(ctx)
 	// Guest-identity resolver for guest-mode (public-access) spaces:
 	// loadSpaceForCache opens a space whose row carries a guest key with
@@ -267,25 +348,12 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		}, nil
 	}
 
-	// Resume any join left pending from a previous session now that the
-	// tech space is open (the join controller started in spaceimpl.New,
-	// before this point, so its initial scan saw an empty index).
-	spaces.ResumePendingJoins()
-
-	// Start the Layer-2 1-1 inbox subsystem now that the tech space is
-	// open: the receive notifier (coordinator push + poll → pending rows)
-	// and the send-retry loop. No-op when the inbox transport is
-	// unavailable; the out-of-band 1-1 path works without it.
-	spaces.StartOneToOneInbox(ctx)
-
-	// Cold-sync resolve: a fresh device syncs the identities directory's
-	// symkeys but no profiles (those are device-local). Batch-fetch the
-	// missing profiles from identityRepo in the background.
-	go spaces.ResolveIdentityProfiles(context.Background())
-
 	// Read-state sync: merge other devices' published read frontiers
 	// (tech-space KV) into the per-space readstate engines, and publish
-	// local marks. Live hook + idempotent per-space Reconcile below.
+	// local marks. Wired before any account-facing boot step —
+	// ResumePendingJoins can complete a join and load a space, and that
+	// space's first-load seed must already see the provider. Live hook
+	// here + idempotent per-space Reconcile in the bootstrap pass.
 	readSync := readsync.New(
 		func(spaceId string) *readstate.Engine {
 			st := spaces.StoreFor(spaceId)
@@ -302,6 +370,111 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	app.OnKeyValues(tsp.SpaceId(), readSync.OnKeyValues)
 	spaces.SetReadSync(readSync)
 
+	// Resume any join left pending from a previous session now that the
+	// tech space is open (the join controller started in spaceimpl.New,
+	// before this point, so its initial scan saw an empty index).
+	spaces.ResumePendingJoins()
+
+	// Start the Layer-2 1-1 inbox subsystem now that the tech space is
+	// open: the receive notifier (coordinator push + poll → pending rows)
+	// and the send-retry loop. No-op when the inbox transport is
+	// unavailable; the out-of-band 1-1 path works without it.
+	spaces.StartOneToOneInbox(ctx)
+
+	// Cold-sync resolve: a fresh device syncs the identities directory's
+	// symkeys but no profiles (those are device-local). Batch-fetch the
+	// missing profiles from identityRepo in the background. The
+	// goroutine is owned by spaceimpl (seedCtx/seedWG), so spaces.Close
+	// cancels and drains it instead of racing teardown.
+	spaces.ResolveIdentityProfilesAsync()
+
+	sdk := &SDK{
+		app:        app,
+		db:         db,
+		tsp:        tsp,
+		spaces:     spaces,
+		account:    account,
+		push:       push,
+		filesQueue: filesQueue,
+		filesGC:    filesGC,
+		readSync:   readSync,
+	}
+	sdk.registerP2PIndexWatch()
+
+	// Take the ONE boot space-index snapshot both the pendingCatchup
+	// seed and the bootstrap eager loop work from, BEFORE the goroutine
+	// starts: Close reads the set to decide which spaces may snapshot
+	// their watermark, and a Close racing an early cancel must still
+	// see every pre-existing space as not-yet-caught-up. Read with
+	// Background, not Open's caller ctx — the caller may cancel it the
+	// instant Open returns, and a ctx-error here must not masquerade as
+	// "no spaces". A failed read fails conservative: no eager loop, no
+	// watermark persist this session (next boot replays as before).
+	sdk.pendingCatchup = make(map[string]struct{})
+	if rows, lerr := tsp.ListStrict(context.Background()); lerr == nil {
+		sdk.bootRows = rows
+		sdk.bootListOK = true
+		for _, rec := range rows {
+			if rec.IsDeleted() {
+				continue
+			}
+			sdk.pendingCatchup[rec.Id] = struct{}{}
+		}
+	} else {
+		log.Warn("boot space list failed; eager catch-up and watermark persist disabled this session", zap.Error(lerr))
+	}
+
+	// Open is done — local reads are safe from here. The account-facing
+	// boot work (profile republish, eager space loading + offline
+	// catch-up, read-state reconcile) runs in ONE background goroutine
+	// owned by the SDK. Its ctx derives from Background, not from
+	// Open's ctx: the latter is the caller's startup window and is
+	// routinely cancelled right after Open returns, while the bootstrap
+	// pass must keep going until it finishes or Close cancels+joins it.
+	bootstrapCtx, cancel := context.WithCancel(context.Background())
+	sdk.bootstrapCancel = cancel
+	sdk.bootstrapDone = make(chan struct{})
+	go func() {
+		defer close(sdk.bootstrapDone)
+		// Every bootstrap step is best-effort by contract; a panic in
+		// one must not kill the process (pre-rework it would have
+		// surfaced inside Open where the embedder could recover). Log
+		// and finish — bootstrapDone still closes via the outer defer,
+		// and pendingCatchup keeps the untouched spaces replayable.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("bootstrap: panic recovered",
+					zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
+			}
+		}()
+		sdk.bootstrap(bootstrapCtx)
+	}()
+	return sdk, nil
+}
+
+// bootstrapTestHook, when non-nil, runs first inside bootstrap — a
+// test-only seam to hold the pass open and observe its cancellation.
+// Always nil in production.
+var bootstrapTestHook func(ctx context.Context)
+
+// bootstrap is the SDK-owned background boot pass, started by Open and
+// cancelled+joined by Close before any teardown. STRICTLY SERIAL on
+// purpose: concurrent commonspace builds spike RAM/CPU exactly on the
+// constrained devices this pass exists for (mobile foregrounding —
+// iOS jetsam kills over memory spikes); one space at a time keeps the
+// boot footprint flat. Every step is best-effort — errors are logged,
+// never fatal (and not worth warning about when the ctx was cancelled
+// by Close).
+func (s *SDK) bootstrap(ctx context.Context) {
+	if h := bootstrapTestHook; h != nil {
+		h(ctx)
+	}
+	warn := func(msg string, err error, fields ...zap.Field) {
+		if err != nil && ctx.Err() == nil {
+			log.Warn("bootstrap: "+msg, append(fields, zap.Error(err))...)
+		}
+	}
+
 	// Republish the locally-stored profile to identityRepo on every
 	// boot. Heart's ownProfileSubscription does the equivalent (reads
 	// the local profile object, calls IdentityRepoPut). Without this,
@@ -311,11 +484,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	//
 	// Best-effort: a failed push doesn't prevent SDK use. The next
 	// successful push (next UpdateMetadata or next boot) heals it.
-	if err := account.republishStoredProfile(ctx); err != nil {
-		// Log via the any-sync log? We don't have one wired here.
-		// Swallow — Open succeeds; the rest of the SDK is functional.
-		_ = err
-	}
+	warn("republish profile", s.account.republishStoredProfile(ctx))
 
 	// Eager-load every non-deleted space from the tech-space index so
 	// per-space headsync / syncacl start running at boot rather than
@@ -326,9 +495,34 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// touching them first.
 	//
 	// Best-effort per space: a single failure (e.g. corrupted local
-	// storage for one space) is logged and skipped so SDK.Open still
-	// succeeds for the rest.
-	for _, rec := range tsp.List(ctx) {
+	// storage for one space) is logged and skipped so the rest of the
+	// spaces still load.
+	//
+	// Iterates the boot snapshot (s.bootRows) — the same list that
+	// seeded pendingCatchup, so set membership and loop membership
+	// can't diverge — but re-reads each row fresh before acting on it:
+	// the pass runs concurrently with user calls now, and GetSpace
+	// below bypasses Service.Get's tombstone guard. Acting on a stale
+	// active row after a mid-session Delete would re-pull the space
+	// from the nodes (the coordinator delete is async, they still
+	// serve it) and resurrect it until the next boot. The fresh read
+	// shrinks that race to one iteration's processing time; the
+	// airtight fix is a tombstone guard on the load path itself
+	// (Service.Get-style, inside loadSpaceForCache) — follow-up
+	// material, not this change.
+	for _, boot := range s.bootRows {
+		if ctx.Err() != nil {
+			// Close cancelled the pass; the remaining spaces stay in
+			// pendingCatchup so their watermark is not snapshotted and
+			// the next boot replays them.
+			return
+		}
+		rec, ok := s.tsp.Get(ctx, boot.Id)
+		if !ok {
+			// Row unreadable — act on nothing rather than stale data;
+			// the space stays in pendingCatchup.
+			continue
+		}
 		// Skip deletion tombstones. Both delete paths — local
 		// Service.Delete and inbound reconcile — record the delete via
 		// the SYNCED RemoteStatus field (LocalStatus is never set to
@@ -341,8 +535,8 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		// Includes the 1-1 synced offload marker (oneToOneDeleted) — a
 		// deleted 1-1 must be offloaded, not eager-loaded, on every device.
 		if rec.IsDeleted() {
-			if app.SpaceExists(rec.Id) {
-				spaces.OffloadSpace(ctx, rec.Id)
+			if s.app.SpaceExists(rec.Id) {
+				s.spaces.OffloadSpace(ctx, rec.Id)
 			}
 			continue
 		}
@@ -357,68 +551,69 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		if spaceimpl.MaterializeBlock(rec) != nil {
 			continue
 		}
-		if !app.SpaceExists(rec.Id) {
+		if !s.app.SpaceExists(rec.Id) {
 			continue
 		}
-		if _, err := app.GetSpace(ctx, rec.Id); err != nil {
-			_ = err
+		if _, err := s.app.GetSpace(ctx, rec.Id); err != nil {
+			warn("eager-load space", err, zap.String("spaceId", rec.Id))
 			continue
 		}
 		// Catch up any trees that advanced while we were offline (or
 		// that we have never opened). Best-effort: a failure here
-		// shouldn't block SDK.Open for the rest of the spaces — the
+		// shouldn't block boot for the rest of the spaces — the
 		// per-object lazy ColdRestore on first user touch still works.
-		if err := spacesync.Run(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
-			_ = err
+		if err := spacesync.Run(ctx, s.app, s.db, s.spaces.StoreFor(rec.Id), rec.Id); err != nil {
+			warn("space catch-up", err, zap.String("spaceId", rec.Id))
+			// Belt-and-braces: a failed Run must leave the space in
+			// pendingCatchup. Membership already guarantees it (the
+			// loop and the seed share one snapshot), but the persist
+			// discipline is cheap to make locally evident and robust
+			// against future drift.
+			s.pendingCatchup[rec.Id] = struct{}{}
+		} else {
+			// Caught up: from here every head-store advance for this
+			// space is applied live, so Close may snapshot its
+			// watermark.
+			delete(s.pendingCatchup, rec.Id)
 		}
 		// Backstop the sdk.db-rebuild deletion gap: purge any local row for
 		// an object any-sync has flipped to Deleted (and stamp the consumer
 		// deletion feed). Best-effort; runs after Run so it also cleans
 		// anything the forward catch-up or a lazy Get re-materialized.
-		if err := spacesync.ReconcileDeletions(ctx, app, db, spaces.StoreFor(rec.Id), rec.Id); err != nil {
-			_ = err
-		}
+		warn("reconcile deletions", spacesync.ReconcileDeletions(ctx, s.app, s.db, s.spaces.StoreFor(rec.Id), rec.Id),
+			zap.String("spaceId", rec.Id))
 	}
 
 	// Replay published read frontiers through the idempotent merge —
 	// covers marks made by other devices while this one was offline and
-	// live-hook drops. One pass over the tech-space store for ALL
-	// spaces; cheap when nothing changed.
-	if err := readSync.ReconcileAll(ctx); err != nil {
-		_ = err
-	}
+	// live-hook drops. Must run after the eager loop: merges route
+	// through engineFor, which only resolves spaces the loop's
+	// Run/StoreFor established tracking for. One pass over the
+	// tech-space store for ALL spaces; cheap when nothing changed.
+	warn("reconcile read state", s.readSync.ReconcileAll(ctx))
+}
 
-	// LAN cold restore: let the p2p exchange probe for spaces this
-	// account knows of but hasn't pulled yet, and re-handshake known
-	// LAN peers whenever the tech-space index grows (a fresh device
-	// learns a space id and wants a pull source right away).
-	var stopP2PIndexWatch func()
-	if app.P2PEnabled() {
-		app.SetKnownSpaceIdsFn(func() []string {
-			recs := tsp.List(context.Background())
-			ids := make([]string, 0, len(recs))
-			for _, rec := range recs {
-				if !rec.IsDeleted() {
-					ids = append(ids, rec.Id)
-				}
+// registerP2PIndexWatch wires the LAN cold-restore hooks: the p2p
+// exchange probes for spaces this account knows of but hasn't pulled
+// yet, and known LAN peers are re-handshaken whenever the tech-space
+// index grows (a fresh device learns a space id and wants a pull
+// source right away). Cheap and local-only — one sub on the tech-space
+// engine, no network — so it runs on Open's fast path.
+func (s *SDK) registerP2PIndexWatch() {
+	if !s.app.P2PEnabled() {
+		return
+	}
+	s.app.SetKnownSpaceIdsFn(func() []string {
+		recs := s.tsp.List(context.Background())
+		ids := make([]string, 0, len(recs))
+		for _, rec := range recs {
+			if !rec.IsDeleted() {
+				ids = append(ids, rec.Id)
 			}
-			return ids
-		})
-		stopP2PIndexWatch = watchSpaceIndexForP2P(tsp, app)
-	}
-
-	return &SDK{
-		app:               app,
-		db:                db,
-		tsp:               tsp,
-		spaces:            spaces,
-		account:           account,
-		push:              push,
-		filesQueue:        filesQueue,
-		filesGC:           filesGC,
-		readSync:          readSync,
-		stopP2PIndexWatch: stopP2PIndexWatch,
-	}, nil
+		}
+		return ids
+	})
+	s.stopP2PIndexWatch = watchSpaceIndexForP2P(s.tsp, s.app)
 }
 
 // watchSpaceIndexForP2P subscribes to the tech-space `spaces` dataset
@@ -461,10 +656,22 @@ func watchSpaceIndexForP2P(tsp *techspace.Service, app *anysyncx.App) (stop func
 	}
 }
 
-// Close tears down the SDK: stops the files queue, closes loaded
+// Close tears down the SDK: joins the bootstrap pass, snapshots
+// per-space catch-up watermarks, stops the files queue, closes loaded
 // spaces, the tech space, the SDK DB, and finally the any-sync app.
 func (s *SDK) Close() error {
 	ctx := context.Background()
+	// Cancel and JOIN the bootstrap pass before any teardown: it
+	// touches readSync, spaces, tsp, db and app, all of which are
+	// closed below — including the case of a cold GetSpace hanging on
+	// an unreachable sync-node, which the cancel unblocks.
+	if s.bootstrapDone != nil {
+		s.bootstrapCancel()
+		<-s.bootstrapDone
+		// Everything is still up — snapshot the per-space watermarks
+		// now, while head stores and sdk.db are readable.
+		s.snapshotWatermarks(ctx)
+	}
 	if s.stopP2PIndexWatch != nil {
 		s.stopP2PIndexWatch()
 	}
@@ -490,6 +697,87 @@ func (s *SDK) Close() error {
 		return s.app.Close(ctx)
 	}
 	return nil
+}
+
+// snapshotWatermarks persists the per-space catch-up watermark for
+// every open space on clean Close. Everything the head store accepted
+// during the session was applied to sdk.db live as it arrived, so
+// snapshotting MaxLastAddSeq now is valid — without it, every tree
+// touched this session sits above the boot-persisted watermark and the
+// NEXT boot force-loads all of them even though their rows are current
+// (measured: ~0.8s for a session that wrote 2×3000 objects; mobile
+// hosts restart the SDK on every foregrounding, so each launch would
+// replay the previous session). A crash skips this and the boot replay
+// remains the fallback. There is deliberately no periodic persist: the
+// SDK owns no natural account-wide tick to ride, and a dedicated timer
+// isn't worth the crash-window it would shave.
+//
+// Three exclusions, all fail-conservative (a skipped snapshot only
+// costs the next boot a replay; a wrong snapshot loses records):
+//   - the whole pass is skipped when the boot space list could not be
+//     read (bootListOK false) — with no seed, pendingCatchup can't
+//     vouch for anything;
+//   - spaces still in pendingCatchup: their pre-session offline gap
+//     was never replayed (bootstrap cancelled mid-pass, per-space Run
+//     failed, or the space loaded via a non-Run path — accepted join,
+//     cold Get), and bumping their watermark would skip that replay
+//     permanently;
+//   - spaces with PARKED trees (treesyncer adapter pending set):
+//     any-sync commits fetched trees to storage BEFORE our GetTree
+//     materialization, which can fail transiently (ErrNoReadKey while
+//     join keys propagate, round deadlines). The park-and-retry set is
+//     in-memory, so across a restart the boot replay is the ONLY
+//     recovery — covering those seqs here would make the records
+//     invisible forever (headsync sees converged heads; query
+//     consumers never issue the healing per-object Get).
+//
+// PickSpace never loads, so only actually-open spaces are touched —
+// offloaded/deleted ones are naturally skipped. No quiescence barrier:
+// inbound sync keeps running until app.Close, but anything the head
+// store accepts after the per-space MaxLastAddSeq read lands above the
+// snapshot and replays next boot. The one theoretical residue is a
+// tree whose storage commit lands before the read while its
+// materialization failure has not yet reached the parked set — a
+// sub-millisecond window between two in-process steps; any-sync
+// exposes no cheap stop-intake hook to close it, so it is accepted
+// and documented rather than fenced.
+func (s *SDK) snapshotWatermarks(ctx context.Context) {
+	if !s.bootListOK {
+		log.Warn("close: skipping watermark snapshot — boot space list was unavailable")
+		return
+	}
+	for _, rec := range s.tsp.List(ctx) {
+		if rec.IsDeleted() {
+			continue
+		}
+		if _, pending := s.pendingCatchup[rec.Id]; pending {
+			continue
+		}
+		if n := s.parkedTreeCount(rec.Id); n > 0 {
+			log.Info("close: watermark snapshot skipped — parked trees keep the boot replay",
+				zap.String("spaceId", rec.Id), zap.Int("parked", n))
+			continue
+		}
+		handle, ok := s.app.PickSpace(ctx, rec.Id)
+		if !ok {
+			continue
+		}
+		if err := spacesync.SnapshotWatermark(ctx, s.db, handle, rec.Id); err != nil {
+			log.Warn("close: snapshot watermark", zap.String("spaceId", rec.Id), zap.Error(err))
+		}
+	}
+}
+
+// parkedCountHook overrides parkedTreeCount in tests — a seam for
+// simulating parked trees without a failing network. Always nil in
+// production.
+var parkedCountHook func(spaceId string) int
+
+func (s *SDK) parkedTreeCount(spaceId string) int {
+	if h := parkedCountHook; h != nil {
+		return h(spaceId)
+	}
+	return s.app.ParkedTreeCount(spaceId)
 }
 
 // Spaces returns the space-level entrypoint.
@@ -553,6 +841,13 @@ type accountImpl struct {
 	app    *anysyncx.App
 	tsp    *techspace.Service
 	spaces *spaceimpl.Service
+	// pushMu serializes each local-profile-read/write → IdentityRepoPut
+	// sequence. The boot republish runs on the bootstrap goroutine,
+	// concurrent with user calls; without the lock its in-flight put of
+	// the old profile can land AFTER a fresh UpdateMetadata and leave
+	// identityRepo stale until the next boot (the local copy stays
+	// fresh, so the divergence is invisible on this device).
+	pushMu sync.Mutex
 }
 
 func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl.Service) *accountImpl {
@@ -608,17 +903,23 @@ func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMeta
 	}
 	// Persist locally first so a future boot can republish without
 	// the user re-supplying the metadata. Tech-space writes are
-	// owner-only and cheap (single CRDT row).
+	// owner-only and cheap (single CRDT row). The local write and the
+	// repo push happen under pushMu as one unit so the repo converges
+	// to the LAST local write even when a boot republish is in flight.
+	a.pushMu.Lock()
 	if a.tsp != nil {
 		if err := a.tsp.SetProfile(ctx, techspace.ProfileRecord{
 			Name:        meta.Name,
 			Description: meta.Description,
 			IconCID:     meta.IconCID,
 		}); err != nil {
+			a.pushMu.Unlock()
 			return fmt.Errorf("anysyncsdk: persist profile: %w", err)
 		}
 	}
-	if err := a.pushToIdentityRepo(ctx, meta); err != nil {
+	err := a.pushToIdentityRepo(ctx, meta)
+	a.pushMu.Unlock()
+	if err != nil {
 		return err
 	}
 	// Kick every running members watcher so the just-published
@@ -638,6 +939,11 @@ func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
 	if a.tsp == nil {
 		return nil
 	}
+	// Read + push under pushMu: a concurrent UpdateMetadata either
+	// finishes first (we re-read and republish its fresh profile —
+	// harmless duplicate) or waits and pushes after us (its value wins).
+	a.pushMu.Lock()
+	defer a.pushMu.Unlock()
 	rec, ok := a.tsp.GetProfile(ctx)
 	if !ok || rec.IsEmpty() {
 		return nil

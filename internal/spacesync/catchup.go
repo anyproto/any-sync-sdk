@@ -13,6 +13,14 @@
 // per-object ColdRestore path then catches them up). Persist the
 // snapshot at the end so the fast path no-ops on the next boot.
 //
+// The watermark is also snapshotted WITHOUT a replay on clean SDK
+// Close (SnapshotWatermark): everything the head store accepted during
+// a session was applied live as it arrived, so at close time the
+// projection is current and only the persisted number lags. Without
+// that snapshot every tree touched during a session sits above the
+// boot-persisted watermark and the NEXT boot force-loads all of them
+// for nothing.
+//
 // Run covers only CREATES/UPDATES (force-load trees whose head advanced).
 // The deletion-reconcile backstop for the SDK-DB rebuild case lives in
 // ReconcileDeletions (reconcile.go): a settings-head-gated pass that purges
@@ -103,7 +111,13 @@ func Run(ctx context.Context, app *anysyncx.App, db anystore.DB, store *spaceobj
 		// Drop the cached Object as soon as the restore completes —
 		// the catch-up pass can touch thousands of trees, and we
 		// don't want to retain them all in RAM until the cache TTL
-		// expires. Subsequent live accesses re-load on demand.
+		// expires. Subsequent live accesses re-load on demand. NOTE:
+		// Drop hard-closes the object even if a concurrent caller
+		// still holds a handle — the same hazard class as TTL-GC
+		// eviction, amplified here because the pass touches every
+		// stale tree in one sweep and (post boot-rework) runs
+		// concurrently with user reads. Holders must tolerate a
+		// closed handle and re-Get, as they already must for GC.
 		if _, err := store.Get(ctx, id); err == nil {
 			store.Drop(id)
 		}
@@ -113,4 +127,58 @@ func Run(ctx context.Context, app *anysyncx.App, db anystore.DB, store *spaceobj
 		return fmt.Errorf("spacesync: persist watermark: %w", err)
 	}
 	return nil
+}
+
+// SnapshotWatermark persists spaceId's current head-store MaxLastAddSeq
+// as its catch-up watermark without force-loading anything. Called on
+// clean SDK Close for every open space whose offline catch-up completed
+// this session: everything the head store accepted DURING the session
+// was applied to the projection live as it arrived (or parked durably
+// in _detached, which the drainer resumes — the same tolerance Run
+// itself has), so the snapshot is valid and the next boot's Run
+// fast-path no-ops instead of force-loading every tree the session
+// touched. A crash skips this persist and the boot replay remains the
+// fallback. Same snapshot-before-teardown property as Run: anything
+// landing after the read stays above the persisted watermark and
+// replays next boot.
+//
+// The caller must NOT call this for a space that still needs its boot
+// replay — the SDK gates on two conditions:
+//   - the pre-session offline gap was replayed (catch-up Run completed
+//     this session); and
+//   - the treesyncer parked set is EMPTY (App.ParkedTreeCount == 0).
+//     Parked trees are storage-committed but never materialized (e.g.
+//     ErrNoReadKey during join key propagation, round deadlines); the
+//     retry sweep holding them is in-memory, so the boot replay is the
+//     only cross-restart recovery — a snapshot covering their seqs
+//     would make the records invisible forever.
+func SnapshotWatermark(ctx context.Context, db anystore.DB, handle anysyncx.SpaceHandle, spaceId string) error {
+	metaColl, err := db.Collection(ctx, crdt.MetaCollectionName)
+	if err != nil {
+		return fmt.Errorf("spacesync: open _meta: %w", err)
+	}
+	snapshot, err := handle.Inner().Storage().HeadStorage().MaxLastAddSeq(ctx)
+	if err != nil {
+		return fmt.Errorf("spacesync: MaxLastAddSeq: %w", err)
+	}
+	_, err = persistWatermarkIfAhead(ctx, metaColl, spaceId, snapshot)
+	return err
+}
+
+// persistWatermarkIfAhead advances the stored space watermark to
+// snapshot iff it is strictly ahead; the watermark never regresses.
+// Split out of SnapshotWatermark so the monotonic guard is testable
+// without a live commonspace handle.
+func persistWatermarkIfAhead(ctx context.Context, metaColl anystore.Collection, spaceId string, snapshot uint64) (advanced bool, err error) {
+	sdkSeq, err := crdt.LoadSpaceMaxAddSeq(ctx, metaColl, spaceId)
+	if err != nil {
+		return false, fmt.Errorf("spacesync: load watermark: %w", err)
+	}
+	if snapshot <= sdkSeq {
+		return false, nil
+	}
+	if err := crdt.PersistSpaceMaxAddSeq(ctx, metaColl, spaceId, snapshot); err != nil {
+		return false, fmt.Errorf("spacesync: persist watermark: %w", err)
+	}
+	return true, nil
 }

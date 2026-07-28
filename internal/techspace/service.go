@@ -450,21 +450,32 @@ func (s *Service) Get(ctx context.Context, spaceId string) (SpaceIndexRecord, bo
 // List returns every live space-index record. Inbound head-sync
 // changes are projected live by the resident index object's
 // deferred-updater listener, so a plain controller read is current —
-// the old read-time drain is gone.
+// the old read-time drain is gone. Errors collapse to nil — read
+// paths that can't act on the failure anyway; callers that must
+// distinguish "no spaces" from "index unavailable" use ListStrict.
 func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
+	rows, _ := s.ListStrict(ctx)
+	return rows
+}
+
+// ListStrict is List with the failure surfaced. The SDK's
+// watermark-persist discipline needs the distinction: an errored list
+// must mean "persist no watermarks this session" (fail conservative),
+// not "no spaces exist".
+func (s *Service) ListStrict(ctx context.Context) ([]SpaceIndexRecord, error) {
 	if !s.open.Load() {
-		return nil
+		return nil, errors.New("techspace: not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("techspace: index object: %w", err)
 	}
 	rows := obj.Controller().Records(ctx, SpaceIndexDataset)
 	out := make([]SpaceIndexRecord, 0, len(rows))
 	for _, v := range rows {
 		out = append(out, DecodeSpaceIndexRecord(v))
 	}
-	return out
+	return out, nil
 }
 
 // GetProfile returns the locally-stored profile (the source-of-truth

@@ -457,3 +457,59 @@ func TestSpaceIndexRecord_DecodeOwnRole(t *testing.T) {
 	v.Set(techspace.FieldOwnRole, arena.NewString("superadmin"))
 	assert.Equal(t, space.PermissionNone, techspace.DecodeSpaceIndexRecord(v).OwnRole)
 }
+
+// DecodeSpaceIndexRecord reads the issued-key custody object into the
+// per-kind map; non-string subvalues are skipped, absence decodes nil.
+func TestSpaceIndexRecord_DecodeIssuedInviteKeys(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldType, arena.NewString("private"))
+	keys := arena.NewObject()
+	keys.Set(techspace.IssuedKeyMember, arena.NewString("enc-member"))
+	keys.Set(techspace.IssuedKeyGuest, arena.NewString("enc-guest"))
+	v.Set(techspace.FieldIssuedInviteKeys, keys)
+
+	rec := techspace.DecodeSpaceIndexRecord(v)
+	assert.Equal(t, "enc-member", rec.IssuedInviteKey(techspace.IssuedKeyMember))
+	assert.Equal(t, "enc-guest", rec.IssuedInviteKey(techspace.IssuedKeyGuest))
+
+	// Absent field — nil map, lookups return "".
+	bare := arena.NewObject()
+	bare.Set("id", arena.NewString("s2"))
+	assert.Empty(t, techspace.DecodeSpaceIndexRecord(bare).IssuedInviteKey(techspace.IssuedKeyMember))
+}
+
+// Per-kind custody subkeys write and clear independently through the
+// controller: setting member never disturbs guest, unset removes just
+// its kind.
+func TestSpaceIndexHandler_IssuedInviteKeysPerKind(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-A"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldType: "private"}),
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldIssuedInviteKeys, techspace.IssuedKeyMember}, Payload: arena.NewString("enc-member")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldIssuedInviteKeys, techspace.IssuedKeyGuest}, Payload: arena.NewString("enc-guest")},
+	)))
+
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.Equal(t, "enc-member", rec.IssuedInviteKey(techspace.IssuedKeyMember))
+	assert.Equal(t, "enc-guest", rec.IssuedInviteKey(techspace.IssuedKeyGuest))
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", spaceId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{techspace.FieldIssuedInviteKeys, techspace.IssuedKeyMember}},
+	)))
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.Empty(t, rec.IssuedInviteKey(techspace.IssuedKeyMember))
+	assert.Equal(t, "enc-guest", rec.IssuedInviteKey(techspace.IssuedKeyGuest))
+}

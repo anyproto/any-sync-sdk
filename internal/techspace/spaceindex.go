@@ -44,7 +44,9 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldPushKeys, Name: "Push keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeLocal},
 		{Id: FieldOwnRole, Name: "Own role", Schema: str(), Scope: schema.ScopeLocal},
 		{Id: FieldGuestKey, Name: "Guest key", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldIssuedGuestKey, Name: "Issued guest key", Schema: str(), Scope: schema.ScopeSynced},
+		// Free-form object like `settings`: subkeys are the issued-key
+		// kinds, validated by the setter, not the schema.
+		{Id: FieldIssuedInviteKeys, Name: "Issued invite keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
 	}}
 }
 
@@ -180,14 +182,29 @@ const (
 	// discriminator for space loading and the write gate; empty on all
 	// other rows. Account-private via the tech space's owner-only ACL.
 	FieldGuestKey = "guestKey"
-	// FieldIssuedGuestKey is the OWNER-side custody of the guest key
-	// this account issued for a space it owns: the guest identity's
-	// private key, string-encoded. SYNCED so every owner device can
-	// return / revoke the same invite (the private key is not
-	// recoverable from the ACL). Written by ACL.CreateGuestKey, cleared
-	// by RevokeGuestKey. Distinct from FieldGuestKey so an owner's own
-	// row never reads as guest-mode.
-	FieldIssuedGuestKey = "issuedGuestKey"
+	// FieldIssuedInviteKeys is this account's custody of the invite
+	// private keys it has issued for the space, one subkey per kind
+	// (IssuedKeyMember / IssuedKeyGuest), each a string-encoded private
+	// key. SYNCED so every device of the issuing account can re-show or
+	// revoke the same invite (the private part is not recoverable from
+	// the ACL — records carry only the public key). Per-kind subkeys
+	// merge per-path: minting a member invite on one device and a guest
+	// key on another never clobber each other. Written / cleared via
+	// Service.SetIssuedInviteKey by ACL.CreateInvite / CreateGuestKey
+	// and the revoke paths. Distinct from FieldGuestKey so an issuer's
+	// own row never reads as guest-mode.
+	FieldIssuedInviteKeys = "issuedInviteKeys"
+)
+
+// FieldIssuedInviteKeys subkeys — the issued-key kinds. Slugs, not
+// space.InviteKind bytes, so the row stays readable.
+const (
+	// IssuedKeyMember is the RequestToJoin member-invite key custody —
+	// written by ACL.CreateInvite (any account permitted to mint).
+	IssuedKeyMember = "member"
+	// IssuedKeyGuest is the shared read-only guest identity custody —
+	// written by ACL.CreateGuestKey (owner only).
+	IssuedKeyGuest = "guest"
 )
 
 // FieldPushKeys subfield names — the wire shape of the `push` object.

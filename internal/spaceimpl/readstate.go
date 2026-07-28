@@ -2,9 +2,11 @@ package spaceimpl
 
 import (
 	"context"
+	"errors"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
+	"github.com/anyproto/any-sync-sdk/internal/readsync"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -86,7 +88,7 @@ func (r *readStateAPI) MarkRead(ctx context.Context, objectId string, changeIds 
 		return space.ErrReadTrackingDisabled
 	}
 	_, err := rs.MarkRead(ctx, r.parent.id, objectId, changeIds)
-	return err
+	return mapMarkErr(err)
 }
 
 func (r *readStateAPI) MarkReadUpTo(ctx context.Context, objectId string, upTo crdt.VersionId) error {
@@ -95,6 +97,16 @@ func (r *readStateAPI) MarkReadUpTo(ctx context.Context, objectId string, upTo c
 		return space.ErrReadTrackingDisabled
 	}
 	_, err := rs.MarkReadUpTo(ctx, r.parent.id, objectId, string(upTo))
+	return mapMarkErr(err)
+}
+
+// mapMarkErr translates readsync's internal untracked sentinel into the
+// public, errors.Is-matchable one: a mark racing a delete/leave passes
+// the engine check above but hits the readsync liveness gate.
+func mapMarkErr(err error) error {
+	if errors.Is(err, readsync.ErrUntracked) {
+		return space.ErrSpaceNotTracked
+	}
 	return err
 }
 

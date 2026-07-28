@@ -106,6 +106,11 @@ type Object struct {
 	// and cleartext, so keyed and keyless readers resolve the same
 	// class. Empty/nil map = every object is a regular encrypted one.
 	plaintextSpecs map[string]PlaintextSpec
+	// onClose is the store's per-object resource-release seam, fired
+	// exactly once from the close path (after the closed flag is set)
+	// — releases handles the controller doesn't own (the object's
+	// `__history` collection). Optional.
+	onClose func()
 
 	// tree's own lock (synctree.Lock) is the single mutex guarding
 	// all writes into the Controller: LocalWrite, replayLocked (via
@@ -134,6 +139,11 @@ type Config struct {
 	// object classes and which datasets they may carry. Optional — nil
 	// means every object writes encrypted changes.
 	PlaintextSpecs map[string]PlaintextSpec
+	// OnClose runs once when the Object is closed (eviction or cache
+	// shutdown), after the controller's own collection handles are
+	// released. The store hooks per-object resources the controller
+	// doesn't own (the `__history` collection handle). Optional.
+	OnClose func()
 }
 
 // TreeFunc constructs the any-sync ObjectTree for the new Object,
@@ -173,6 +183,7 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 		afterApply:     cfg.AfterApply,
 		writeGate:      cfg.WriteGate,
 		plaintextSpecs: cfg.PlaintextSpecs,
+		onClose:        cfg.OnClose,
 	}
 	tree, err := treeFunc(o)
 	if err != nil {
@@ -205,9 +216,21 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 // never reaches the synctree. tree.Close re-acquires tree.Lock
 // internally, so it must run after the Unlock; the closed flag set
 // under the lock guarantees exactly one caller reaches it.
+//
+// The close path also releases the controller's per-object collection
+// handles (and fires cfg.OnClose for store-owned extras) — each open
+// any-store handle pins planner sketches and caches, so a TTL-evicted
+// object must not keep its `<objectId>_<dataset>` handles pinned for
+// the process lifetime. Safe here: applies serialize on tree.Lock and
+// check o.closed, so once the flag is set under the lock no apply can
+// touch the controller's collections; unlocked readers re-open by
+// name (see Controller.CloseOwnedCollections).
 func (o *Object) Close() error {
 	if o.tree == nil {
-		o.closed = true
+		if !o.closed {
+			o.closed = true
+			o.releaseResources()
+		}
 		return nil
 	}
 	o.tree.Lock()
@@ -218,6 +241,7 @@ func (o *Object) Close() error {
 	o.setListenerNilLocked()
 	o.closed = true
 	o.tree.Unlock()
+	o.releaseResources()
 	return o.tree.Close()
 }
 
@@ -225,10 +249,14 @@ func (o *Object) Close() error {
 // (false, nil) when the tree is locked by an in-flight handler
 // (LocalWrite, inbound synchandler, drain). ocache retries on the
 // next tick. On success it closes the tree to reap the receive-queue
-// goroutine — see Close for why the tree close runs unlocked.
+// goroutine — see Close for why the tree close runs unlocked and why
+// collection handles are released here.
 func (o *Object) TryClose(_ time.Duration) (bool, error) {
 	if o.tree == nil {
-		o.closed = true
+		if !o.closed {
+			o.closed = true
+			o.releaseResources()
+		}
 		return true, nil
 	}
 	if !o.tree.TryLock() {
@@ -241,7 +269,23 @@ func (o *Object) TryClose(_ time.Duration) (bool, error) {
 	o.setListenerNilLocked()
 	o.closed = true
 	o.tree.Unlock()
+	o.releaseResources()
 	return true, o.tree.Close()
+}
+
+// releaseResources drops the per-object any-store state the Object's
+// residency pins: the controller's cached `<objectId>_<dataset>`
+// collection handles, then the store's OnClose extras. Runs exactly
+// once, from whichever close path flipped o.closed. Errors are logged,
+// not returned — a failed handle close must not abort the eviction
+// (the tree close and cache removal still have to happen).
+func (o *Object) releaseResources() {
+	if err := o.ctrl.CloseOwnedCollections(); err != nil {
+		log.Warn("close owned collections", zap.String("objectId", o.Id()), zap.Error(err))
+	}
+	if o.onClose != nil {
+		o.onClose()
+	}
 }
 
 // setListenerNilLocked sets the synctree listener to nil. Caller
@@ -259,9 +303,20 @@ func (o *Object) setListenerNilLocked() {
 // Takes tree.Lock (the apply-serializing mutex) and runs
 // applyDecodedLocked. Drain operations may wait briefly on inbound
 // sync — that's fine, drain is off the critical path.
+//
+// Rejects a closed Object like every other write entry point:
+// post-close the controller's handles are released and
+// collectionForWrite's open-by-name CREATES the collection if absent,
+// so a drain landing on a just-closed (worse: just-purged) object
+// would resurrect its `<objectId>_<dataset>` collection on disk. The
+// drainer resolves objects via a fresh Store.Get per pass, so the
+// retry lands on a live replacement.
 func (o *Object) ApplyDecoded(ctx context.Context, ch crdt.Change) error {
 	o.tree.Lock()
 	defer o.tree.Unlock()
+	if o.closed {
+		return errors.New("object: closed")
+	}
 	// Defense-in-depth for the drain path: replayLocked already skips
 	// non-allowlisted datasets on plaintext objects before parking, so
 	// a parked change violating the allowlist shouldn't exist — but a

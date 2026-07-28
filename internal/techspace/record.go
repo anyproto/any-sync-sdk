@@ -95,10 +95,18 @@ type SpaceIndexRecord struct {
 	// all other rows; presence is the guest-mode discriminator.
 	GuestKey string
 
-	// IssuedGuestKey is the owner-side custody of the guest key issued
-	// for this space (FieldIssuedGuestKey, synced). Empty unless this
-	// account owns the space and has an active guest key.
-	IssuedGuestKey string
+	// IssuedInviteKeys is this account's custody of the invite private
+	// keys it issued for the space, keyed by kind — IssuedKeyMember /
+	// IssuedKeyGuest (FieldIssuedInviteKeys, synced). Nil / missing kind
+	// means no custody: this account never minted that invite here, or
+	// revoked it.
+	IssuedInviteKeys map[string]string
+}
+
+// IssuedInviteKey returns the custody entry for one issued-key kind,
+// "" when absent.
+func (r SpaceIndexRecord) IssuedInviteKey(kind string) string {
+	return r.IssuedInviteKeys[kind]
 }
 
 // DecodeSpaceIndexRecord pulls the fields off an anyenc value as
@@ -123,7 +131,6 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		OneToOneInviteState: v.GetString(FieldOneToOneInviteState),
 		OwnRole:             space.ParsePermission(v.GetString(FieldOwnRole)),
 		GuestKey:            v.GetString(FieldGuestKey),
-		IssuedGuestKey:      v.GetString(FieldIssuedGuestKey),
 		// Float64 read — GetInt narrows through `int` and would truncate
 		// on 32-bit platforms; anyenc numbers are float64 on the wire.
 		CreatedAt: int64(v.GetFloat64(FieldCreatedAt)),
@@ -141,6 +148,19 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		// (map[string]any / []any / string / float64 / bool / nil).
 		if m, ok := st.GoType().(map[string]any); ok {
 			r.Settings = m
+		}
+	}
+	if ik := v.Get(FieldIssuedInviteKeys); ik != nil && ik.Type() == anyenc.TypeObject {
+		if obj, err := ik.Object(); err == nil {
+			keys := make(map[string]string, obj.Len())
+			obj.Visit(func(k []byte, val *anyenc.Value) {
+				if s := val.GetStringBytes(); len(s) > 0 {
+					keys[string(k)] = string(s)
+				}
+			})
+			if len(keys) > 0 {
+				r.IssuedInviteKeys = keys
+			}
 		}
 	}
 	if pk := v.Get(FieldPushKeys); pk != nil && pk.Type() == anyenc.TypeObject {

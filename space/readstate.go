@@ -93,3 +93,9 @@ type ReadStateAPI interface {
 // ErrReadTrackingDisabled is returned by ReadStateAPI methods when no
 // dataset in the space opted into read tracking.
 var ErrReadTrackingDisabled = errors.New("space: read tracking not enabled")
+
+// ErrSpaceNotTracked is returned by MarkRead / MarkReadUpTo when the
+// space's read state is not tracked on this device at mark time: the
+// space is unknown, deleted, or pending (join / incoming 1-1) in the
+// tech-space index — e.g. a mark racing a concurrent delete.
+var ErrSpaceNotTracked = errors.New("space: read state not tracked for space")

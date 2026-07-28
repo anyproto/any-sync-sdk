@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -121,6 +122,12 @@ type Controller struct {
 	// protects map access only.
 	collMu      sync.Mutex
 	collections map[string]anystore.Collection
+	// collsReleased flips once CloseOwnedCollections has run (object
+	// evicted from the space cache). After that the lazy open paths
+	// stop caching handles: a stale Controller held past eviction
+	// opens by name per call, so it can never retain a handle that a
+	// successor controller's eviction later closes under it.
+	collsReleased atomic.Bool
 	// shared maps a dataset to a "shared" (typically per-space)
 	// collection that supersedes the per-object collection. Writes to
 	// such a dataset use the change's ObjectId as the row id (not
@@ -362,7 +369,7 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
 		coll = existing
-	} else {
+	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
 	}
 	c.collMu.Unlock()
@@ -373,6 +380,13 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 // without creating it. Returns nil when no writer has materialised
 // the dataset yet — callers treat that as "no rows". Caches the
 // handle on first successful open.
+//
+// The nil also covers an eviction race: any-store's ErrCollectionClosed
+// WRAPS ErrCollectionNotFound, so a handle closed between resolution
+// and use reads as "absent" for one call — the next call re-opens by
+// name and sees the data again. Callers must treat the empty result as
+// a snapshot, never persist it as a negative fact (none do today; keep
+// it that way).
 func (c *Controller) collectionForRead(ctx context.Context, dataset string) anystore.Collection {
 	c.collMu.Lock()
 	if coll, ok := c.collections[dataset]; ok {
@@ -396,11 +410,55 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
 		coll = existing
-	} else {
+	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
 	}
 	c.collMu.Unlock()
 	return coll
+}
+
+// CloseOwnedCollections closes and forgets every cached PER-OBJECT
+// collection handle (`<objectId>_<dataset>`). Shared (per-space)
+// handles and the `_meta` collection stay untouched — the Store owns
+// those, and they are shared across every controller in the space.
+//
+// Called on ocache eviction (Object.Close / TryClose): each open
+// any-store handle pins its query-planner sketch and value caches for
+// the process lifetime, so with a collection-per-object schema an
+// account's heap grows linearly with objects ever touched unless idle
+// objects release their handles.
+//
+// Recovery is open-by-name: the lazy paths (collectionForWrite /
+// collectionForRead) re-open on the next touch, and after this call
+// they stop caching (collsReleased), so a stale Controller retained
+// past eviction can never hold a closed — or later-closed — handle.
+//
+// Serialization: the caller (Object close path) holds — or held —
+// tree.Lock with Object.closed set, so no apply is in flight on this
+// controller. Unlocked readers racing the close get a one-shot
+// ErrCollectionClosed and re-open by name on retry.
+func (c *Controller) CloseOwnedCollections() error {
+	if c == nil {
+		return nil
+	}
+	c.collMu.Lock()
+	c.collsReleased.Store(true)
+	var toClose []anystore.Collection
+	for name, coll := range c.collections {
+		if _, isShared := c.shared[name]; isShared {
+			continue
+		}
+		delete(c.collections, name)
+		toClose = append(toClose, coll)
+	}
+	c.collMu.Unlock()
+	var firstErr error
+	for _, coll := range toClose {
+		if err := coll.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Collection returns the any-store collection backing the named

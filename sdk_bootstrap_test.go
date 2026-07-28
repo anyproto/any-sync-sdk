@@ -16,11 +16,10 @@ import (
 
 // TestBootstrapState_ZeroSDK pins the state API on handles without a
 // bootstrap pass: a zero SDK (and by extension a headless Open, which
-// leaves bootstrapDone nil) reports not-bootstrapping, a pre-closed
-// BootstrapDone, and a nil-safe Close.
+// leaves bootstrapDone nil) reports a pre-closed BootstrapDone and a
+// nil-safe Close.
 func TestBootstrapState_ZeroSDK(t *testing.T) {
 	s := &SDK{}
-	assert.False(t, s.Bootstrapping())
 	select {
 	case <-s.BootstrapDone():
 	default:
@@ -29,15 +28,22 @@ func TestBootstrapState_ZeroSDK(t *testing.T) {
 	require.NoError(t, s.Close())
 }
 
-// TestBootstrapState_Channel pins Bootstrapping against the channel
-// lifecycle and Close's cancel+join prologue on an already-finished
-// pass.
+// TestBootstrapState_Channel pins BootstrapDone against the channel
+// lifecycle on a handle with a live pass.
 func TestBootstrapState_Channel(t *testing.T) {
 	done := make(chan struct{})
 	s := &SDK{bootstrapDone: done, bootstrapCancel: func() {}}
-	assert.True(t, s.Bootstrapping())
+	select {
+	case <-s.BootstrapDone():
+		t.Fatal("BootstrapDone must not be ready while the pass runs")
+	default:
+	}
 	close(done)
-	assert.False(t, s.Bootstrapping())
+	select {
+	case <-s.BootstrapDone():
+	default:
+		t.Fatal("BootstrapDone must be ready once the pass finished")
+	}
 	// Close's prologue receives from the closed channel and must not
 	// block; the watermark snapshot iterates an empty space list (nil
 	// tsp is not exercised here — a real handle always has one), so
@@ -46,8 +52,8 @@ func TestBootstrapState_Channel(t *testing.T) {
 }
 
 // TestOpen_CloseMidBootstrap holds the bootstrap pass open via the test
-// hook and proves the contract: Open returns while Bootstrapping() is
-// true, local reads work during the pass, and Close cancels and joins
+// hook and proves the contract: Open returns while the pass is held
+// open, local reads work during the pass, and Close cancels and joins
 // the goroutine within a bound. Uses e2e/local.yml only as a valid
 // nodeconf shape — no live network is required (Open never dials
 // synchronously).
@@ -83,7 +89,11 @@ func TestOpen_CloseMidBootstrap(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("bootstrap goroutine never started")
 	}
-	assert.True(t, sdk.Bootstrapping(), "bootstrap is held open by the hook")
+	select {
+	case <-sdk.BootstrapDone():
+		t.Fatal("bootstrap must still be held open by the hook")
+	default:
+	}
 
 	// Local reads are safe during the pass.
 	list, err := sdk.Spaces().List(ctx)
@@ -99,7 +109,11 @@ func TestOpen_CloseMidBootstrap(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Close did not cancel+join the bootstrap goroutine")
 	}
-	assert.False(t, sdk.Bootstrapping())
+	select {
+	case <-sdk.BootstrapDone():
+	default:
+		t.Fatal("BootstrapDone must be ready after Close")
+	}
 }
 
 // TestOpen_Headless_NoBootstrap pins headless behavior: no bootstrap
@@ -125,7 +139,6 @@ func TestOpen_Headless_NoBootstrap(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk.Close() })
 
-	assert.False(t, sdk.Bootstrapping())
 	select {
 	case <-sdk.BootstrapDone():
 	default:

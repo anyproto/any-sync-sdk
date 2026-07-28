@@ -68,26 +68,39 @@ type SDK struct {
 	// headless mode, which skips the pass entirely.
 	bootstrapCancel context.CancelFunc
 	bootstrapDone   chan struct{}
-	// bootRows is the ONE space-index snapshot both the pendingCatchup
-	// seed and the bootstrap eager loop work from — a single list keeps
-	// the seed and the loop's membership identical by construction (a
-	// space can't slip between two reads). bootListOK is false when the
-	// snapshot could not be read at all; the fail-conservative response
-	// is "run no eager loop and persist no watermarks this session".
-	bootRows   []techspace.SpaceIndexRecord
-	bootListOK bool
-	// pendingCatchup holds the spaces whose pre-session offline
-	// catch-up (spacesync.Run) has not completed yet this session —
-	// every non-deleted row of the boot snapshot, including pending
-	// (MaterializeBlock) and storage-less rows: a space leaves the set
-	// ONLY via a successful Run, so anything that loaded by another
-	// path mid-session (accepted join, cold Get) keeps its boot replay.
-	// Seeded by Open before the bootstrap goroutine starts, mutated
-	// only by that goroutine, read by Close only after joining it —
-	// the goroutine-start and channel-close edges order every access,
-	// so no lock is needed. Close must NOT snapshot the watermark of a
-	// space still in here (see snapshotWatermarks).
-	pendingCatchup map[string]struct{}
+	// caughtUp is the watermark-snapshot ALLOWLIST: spaces whose sdk.db
+	// projection is known current this session — caught up by a
+	// successful boot Run, or born here (Create/Derive: the author
+	// device materializes its own writes by definition). Absent means
+	// dirty, the safe default — Close persists nothing and the next
+	// boot replays. Joins/accepts are deliberately never marked: they
+	// stay dirty until their first boot Run, the conservative choice
+	// for the dangerous case (content pulled, not authored). Guarded by
+	// caughtUpMu — the bootstrap goroutine and user Create/Derive calls
+	// write concurrently.
+	caughtUpMu sync.Mutex
+	caughtUp   map[string]struct{}
+}
+
+// markCaughtUp adds spaceId to the watermark-snapshot allowlist.
+func (s *SDK) markCaughtUp(spaceId string) {
+	s.caughtUpMu.Lock()
+	if s.caughtUp == nil {
+		s.caughtUp = map[string]struct{}{}
+	}
+	s.caughtUp[spaceId] = struct{}{}
+	s.caughtUpMu.Unlock()
+}
+
+// caughtUpIds snapshots the allowlist for iteration.
+func (s *SDK) caughtUpIds() []string {
+	s.caughtUpMu.Lock()
+	defer s.caughtUpMu.Unlock()
+	ids := make([]string, 0, len(s.caughtUp))
+	for id := range s.caughtUp {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // bootstrapClosed is the pre-closed BootstrapDone result for SDK
@@ -97,17 +110,6 @@ var bootstrapClosed = func() chan struct{} {
 	close(c)
 	return c
 }()
-
-// Bootstrapping reports whether the background boot pass started by
-// Open is still running. Always false in headless mode.
-func (s *SDK) Bootstrapping() bool {
-	select {
-	case <-s.BootstrapDone():
-		return false
-	default:
-		return true
-	}
-}
 
 // BootstrapDone returns a channel closed once the background boot pass
 // has finished (or immediately for a headless Open). "Done" means no
@@ -400,29 +402,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		readSync:   readSync,
 	}
 	sdk.registerP2PIndexWatch()
-
-	// Take the ONE boot space-index snapshot both the pendingCatchup
-	// seed and the bootstrap eager loop work from, BEFORE the goroutine
-	// starts: Close reads the set to decide which spaces may snapshot
-	// their watermark, and a Close racing an early cancel must still
-	// see every pre-existing space as not-yet-caught-up. Read with
-	// Background, not Open's caller ctx — the caller may cancel it the
-	// instant Open returns, and a ctx-error here must not masquerade as
-	// "no spaces". A failed read fails conservative: no eager loop, no
-	// watermark persist this session (next boot replays as before).
-	sdk.pendingCatchup = make(map[string]struct{})
-	if rows, lerr := tsp.ListStrict(context.Background()); lerr == nil {
-		sdk.bootRows = rows
-		sdk.bootListOK = true
-		for _, rec := range rows {
-			if rec.IsDeleted() {
-				continue
-			}
-			sdk.pendingCatchup[rec.Id] = struct{}{}
-		}
-	} else {
-		log.Warn("boot space list failed; eager catch-up and watermark persist disabled this session", zap.Error(lerr))
-	}
+	// Born-clean: a space created or derived this session enters the
+	// watermark allowlist directly — see SDK.caughtUp.
+	spaces.SetOnSpaceBorn(sdk.markCaughtUp)
 
 	// Open is done — local reads are safe from here. The account-facing
 	// boot work (profile republish, eager space loading + offline
@@ -440,7 +422,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		// one must not kill the process (pre-rework it would have
 		// surfaced inside Open where the embedder could recover). Log
 		// and finish — bootstrapDone still closes via the outer defer,
-		// and pendingCatchup keeps the untouched spaces replayable.
+		// and untouched spaces simply stay off the caughtUp allowlist.
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("bootstrap: panic recovered",
@@ -498,29 +480,22 @@ func (s *SDK) bootstrap(ctx context.Context) {
 	// storage for one space) is logged and skipped so the rest of the
 	// spaces still load.
 	//
-	// Iterates the boot snapshot (s.bootRows) — the same list that
-	// seeded pendingCatchup, so set membership and loop membership
-	// can't diverge — but re-reads each row fresh before acting on it:
-	// the pass runs concurrently with user calls now, and GetSpace
-	// below bypasses Service.Get's tombstone guard. Acting on a stale
-	// active row after a mid-session Delete would re-pull the space
-	// from the nodes (the coordinator delete is async, they still
-	// serve it) and resurrect it until the next boot. The fresh read
-	// shrinks that race to one iteration's processing time; the
-	// airtight fix is a tombstone guard on the load path itself
-	// (Service.Get-style, inside loadSpaceForCache) — follow-up
-	// material, not this change.
-	for _, boot := range s.bootRows {
+	// Each row is re-read fresh before acting on it: the pass runs
+	// concurrently with user calls, and GetSpace below bypasses
+	// Service.Get's tombstone guard — acting on a stale active row
+	// after a mid-session Delete would re-pull the space from the nodes
+	// and resurrect it until the next boot. The fresh read shrinks that
+	// race to one iteration's processing time; the airtight fix is a
+	// tombstone guard on the load path itself — follow-up material.
+	for _, boot := range s.tsp.List(ctx) {
 		if ctx.Err() != nil {
-			// Close cancelled the pass; the remaining spaces stay in
-			// pendingCatchup so their watermark is not snapshotted and
-			// the next boot replays them.
+			// Close cancelled the pass; the remaining spaces never
+			// enter the caughtUp allowlist, so the next boot replays.
 			return
 		}
 		rec, ok := s.tsp.Get(ctx, boot.Id)
 		if !ok {
-			// Row unreadable — act on nothing rather than stale data;
-			// the space stays in pendingCatchup.
+			// Row unreadable — act on nothing rather than stale data.
 			continue
 		}
 		// Skip deletion tombstones. Both delete paths — local
@@ -564,17 +539,11 @@ func (s *SDK) bootstrap(ctx context.Context) {
 		// per-object lazy ColdRestore on first user touch still works.
 		if err := spacesync.Run(ctx, s.app, s.db, s.spaces.StoreFor(rec.Id), rec.Id); err != nil {
 			warn("space catch-up", err, zap.String("spaceId", rec.Id))
-			// Belt-and-braces: a failed Run must leave the space in
-			// pendingCatchup. Membership already guarantees it (the
-			// loop and the seed share one snapshot), but the persist
-			// discipline is cheap to make locally evident and robust
-			// against future drift.
-			s.pendingCatchup[rec.Id] = struct{}{}
 		} else {
 			// Caught up: from here every head-store advance for this
 			// space is applied live, so Close may snapshot its
 			// watermark.
-			delete(s.pendingCatchup, rec.Id)
+			s.markCaughtUp(rec.Id)
 		}
 		// Backstop the sdk.db-rebuild deletion gap: purge any local row for
 		// an object any-sync has flipped to Deleted (and stamp the consumer
@@ -699,71 +668,35 @@ func (s *SDK) Close() error {
 	return nil
 }
 
-// snapshotWatermarks persists the per-space catch-up watermark for
-// every open space on clean Close. Everything the head store accepted
-// during the session was applied to sdk.db live as it arrived, so
-// snapshotting MaxLastAddSeq now is valid — without it, every tree
-// touched this session sits above the boot-persisted watermark and the
-// NEXT boot force-loads all of them even though their rows are current
+// snapshotWatermarks persists the catch-up watermark for every space
+// on the caughtUp allowlist at clean Close, so the next boot's replay
+// no-ops instead of force-loading every tree the session touched
 // (measured: ~0.8s for a session that wrote 2×3000 objects; mobile
-// hosts restart the SDK on every foregrounding, so each launch would
-// replay the previous session). A crash skips this and the boot replay
-// remains the fallback. There is deliberately no periodic persist: the
-// SDK owns no natural account-wide tick to ride, and a dedicated timer
-// isn't worth the crash-window it would shave.
-//
-// Three exclusions, all fail-conservative (a skipped snapshot only
-// costs the next boot a replay; a wrong snapshot loses records):
-//   - the whole pass is skipped when the boot space list could not be
-//     read (bootListOK false) — with no seed, pendingCatchup can't
-//     vouch for anything;
-//   - spaces still in pendingCatchup: their pre-session offline gap
-//     was never replayed (bootstrap cancelled mid-pass, per-space Run
-//     failed, or the space loaded via a non-Run path — accepted join,
-//     cold Get), and bumping their watermark would skip that replay
-//     permanently;
-//   - spaces with PARKED trees (treesyncer adapter pending set):
-//     any-sync commits fetched trees to storage BEFORE our GetTree
-//     materialization, which can fail transiently (ErrNoReadKey while
-//     join keys propagate, round deadlines). The park-and-retry set is
-//     in-memory, so across a restart the boot replay is the ONLY
-//     recovery — covering those seqs here would make the records
-//     invisible forever (headsync sees converged heads; query
-//     consumers never issue the healing per-object Get).
-//
-// PickSpace never loads, so only actually-open spaces are touched —
-// offloaded/deleted ones are naturally skipped. No quiescence barrier:
-// inbound sync keeps running until app.Close, but anything the head
-// store accepts after the per-space MaxLastAddSeq read lands above the
-// snapshot and replays next boot. The one theoretical residue is a
-// tree whose storage commit lands before the read while its
-// materialization failure has not yet reached the parked set — a
-// sub-millisecond window between two in-process steps; any-sync
-// exposes no cheap stop-intake hook to close it, so it is accepted
-// and documented rather than fenced.
+// hosts restart the SDK on every foregrounding). A crash — or any
+// space absent from the allowlist — keeps the boot replay. Two guards
+// on top: a non-empty treesyncer parked set skips the space (parked
+// trees are storage-committed but never materialized; the in-memory
+// retry set doesn't survive a restart, so the boot replay is their
+// only recovery), and the write itself never regresses. PickSpace
+// never loads, so offloaded/deleted spaces are naturally skipped.
+// Anything the head store accepts after the per-space read lands above
+// the snapshot and replays next boot; there is deliberately no
+// periodic persist (no natural tick to ride) and no quiescence barrier
+// (the residue window between a tree's storage commit and its
+// park-mark is sub-millisecond and any-sync has no stop-intake hook).
 func (s *SDK) snapshotWatermarks(ctx context.Context) {
-	if !s.bootListOK {
-		log.Warn("close: skipping watermark snapshot — boot space list was unavailable")
-		return
-	}
-	for _, rec := range s.tsp.List(ctx) {
-		if rec.IsDeleted() {
-			continue
-		}
-		if _, pending := s.pendingCatchup[rec.Id]; pending {
-			continue
-		}
-		if n := s.parkedTreeCount(rec.Id); n > 0 {
+	for _, id := range s.caughtUpIds() {
+		if n := s.parkedTreeCount(id); n > 0 {
 			log.Info("close: watermark snapshot skipped — parked trees keep the boot replay",
-				zap.String("spaceId", rec.Id), zap.Int("parked", n))
+				zap.String("spaceId", id), zap.Int("parked", n))
 			continue
 		}
-		handle, ok := s.app.PickSpace(ctx, rec.Id)
+		handle, ok := s.app.PickSpace(ctx, id)
 		if !ok {
 			continue
 		}
-		if err := spacesync.SnapshotWatermark(ctx, s.db, handle, rec.Id); err != nil {
-			log.Warn("close: snapshot watermark", zap.String("spaceId", rec.Id), zap.Error(err))
+		if err := spacesync.SnapshotWatermark(ctx, s.db, handle, id); err != nil {
+			log.Warn("close: snapshot watermark", zap.String("spaceId", id), zap.Error(err))
 		}
 	}
 }

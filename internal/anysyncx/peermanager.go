@@ -73,11 +73,6 @@ func (m *localPeerManager) SendMessage(_ context.Context, _ string, _ drpc.Messa
 }
 func (m *localPeerManager) KeepAlive(_ context.Context) {}
 
-// spacePeerManager resolves nodes via nodeconf and ships messages
-// through the StreamPool for reactive push-based sync. Local-network
-// peers that share this space (from the p2p peer store) are folded
-// into the responsible/broadcast sets, so head-sync and pushes run
-// over the LAN too — including while every node is unreachable.
 // sendPool is the streamPool slice the manager uses — an interface so
 // tests can fake queue overflow without a real stream pool.
 type sendPool interface {
@@ -85,6 +80,11 @@ type sendPool interface {
 	Streams(tags ...string) []drpc.Stream
 }
 
+// spacePeerManager resolves nodes via nodeconf and ships messages
+// through the StreamPool for reactive push-based sync. Local-network
+// peers that share this space (from the p2p peer store) are folded
+// into the responsible/broadcast sets, so head-sync and pushes run
+// over the LAN too — including while every node is unreachable.
 type spacePeerManager struct {
 	spaceId         string
 	nodeConf        nodeconf.Service

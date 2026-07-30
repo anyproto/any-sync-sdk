@@ -1,5 +1,7 @@
 package space
 
+import "github.com/anyproto/any-sync-sdk/internal/crdt"
+
 // ModifyBatch is the caller-facing write batch: one or more record
 // changes in a single dataset of a single object. Applied atomically
 // and returns one VersionId for the whole batch.
@@ -142,3 +144,12 @@ type OpRejection struct {
 	Reason      string
 	ReasonErr   error
 }
+
+// ErrRecordDeleted is the ReasonErr (match with errors.Is) of the
+// whole-record rejection emitted when a modify or upsert lands on a
+// tombstoned record. Record deletion is sticky (CRDT delete-wins):
+// the write is absorbed, nothing is stored, and the id can never be
+// reused — without this rejection the absorbed write would be
+// indistinguishable from a successful create. Deleting an
+// already-deleted record stays silent (idempotent).
+var ErrRecordDeleted = crdt.ErrRecordDeleted

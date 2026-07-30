@@ -584,6 +584,53 @@ func TestDelete_BlocksLaterInsert(t *testing.T) {
 	assert.True(t, isTombstone(rec))
 }
 
+// TestDelete_ModifyOntoTombstoneRejects verifies the absorbed write is
+// REPORTED: delete-wins keeps eating the ops (state unchanged, sticky
+// tombstone), but the local caller now sees an ErrRecordDeleted
+// whole-record rejection instead of a result indistinguishable from a
+// successful create. Without it, an upsert with an explicit reused id
+// (e.g. a seq-derived id after a history wipe) returns recordIds and
+// no rejections while storing nothing — silent data loss.
+func TestDelete_ModifyOntoTombstoneRejects(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, st.ApplyChange(ctx, makeUpsert("v1", "r1", Op{
+		Type:    OpSet,
+		Payload: recordPayload(arena, map[string]any{"name": "hi"}),
+	})))
+	require.NoError(t, st.ApplyChange(ctx, makeChange("v3", "r1", Op{Type: OpDelete})))
+
+	// Upsert (create-intent) onto the tombstone: absorbed AND rejected.
+	res, err := st.ApplyChangeWithResult(ctx, makeUpsert("v9", "r1", Op{
+		Type:    OpSet,
+		Payload: recordPayload(arena, map[string]any{"name": "resurrect"}),
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.Equal(t, "r1", res.Rejections[0].RecordId)
+	assert.Equal(t, -1, res.Rejections[0].OpIndex)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrRecordDeleted)
+	rec := st.Get(ctx, testDS, "r1")
+	require.NotNil(t, rec)
+	assert.True(t, isTombstone(rec))
+	assert.Nil(t, rec.Get("name"))
+
+	// Plain modify (no upsert) onto the tombstone: same rejection.
+	res, err = st.ApplyChangeWithResult(ctx, makeChange("v10", "r1", Op{
+		Type: OpSet, Path: []string{"name"}, Payload: arena.NewString("Z"),
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrRecordDeleted)
+
+	// Deleting an already-deleted record stays silent — idempotent by
+	// contract (wipe flows re-delete ranges without tracking liveness).
+	res, err = st.ApplyChangeWithResult(ctx, makeChange("v11", "r1", Op{Type: OpDelete}))
+	require.NoError(t, err)
+	assert.Empty(t, res.Rejections)
+}
+
 func TestDelete_StickyTombstoneRejectsAllOps(t *testing.T) {
 	st := newTestController(t)
 	arena := &anyenc.Arena{}

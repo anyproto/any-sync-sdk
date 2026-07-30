@@ -153,8 +153,7 @@ func TestE2E_FilesV2_DerivedOwnerAttach(t *testing.T) {
 		t.Fatal("device B never saw the space in its tech-space")
 	}
 
-	spB, err := sdkB.Spaces().Get(ctx, sp.Id())
-	require.NoError(t, err)
+	spB := getSpaceEventually(ctx, t, sdkB, sp.Id())
 	paB := payloadsSurface(t, spB)
 
 	// Owner-keyed read on B resolves the unparented payloads object even

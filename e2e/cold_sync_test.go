@@ -277,6 +277,27 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 	}
 }
 
+// getSpaceEventually retries Spaces().Get until the load succeeds. A
+// Get racing a concurrent load of the same space can surface a
+// transient "context canceled" verdict from a coalesced network call
+// inside NewSpace — ocache retries only loads aborted by the load ctx
+// itself, not inner cancellations (the same transient the indexer's
+// spawnWorker retries with backoff).
+func getSpaceEventually(ctx context.Context, t *testing.T, sdk *anysyncsdk.SDK, spaceId string) space.Space {
+	t.Helper()
+	var (
+		sp   space.Space
+		last error
+	)
+	if !waitFor(ctx, 30*time.Second, 500*time.Millisecond, func() bool {
+		sp, last = sdk.Spaces().Get(ctx, spaceId)
+		return last == nil
+	}) {
+		t.Fatalf("space %s never loaded: %v", spaceId, last)
+	}
+	return sp
+}
+
 // waitFor polls fn at the given interval until it returns true or the
 // per-call deadline elapses (whichever is sooner than ctx). Returns
 // true on success.

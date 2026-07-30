@@ -110,8 +110,7 @@ func TestE2E_FilesV2_SDKDownload(t *testing.T) {
 		}
 		return false
 	}), "device B never saw the space")
-	spB, err := sdkB.Spaces().Get(ctx, spA.Id())
-	require.NoError(t, err)
+	spB := getSpaceEventually(ctx, t, sdkB, spA.Id())
 
 	var gotInfo space.FileInfo
 	require.True(t, waitFor(ctx, 120*time.Second, time.Second, func() bool {

@@ -26,22 +26,40 @@ const (
 	selfPeer  = "peer-self"
 )
 
-// fakeKV records Set calls and serves Iterate from its rows.
+// fakeKV records Set calls and serves Iterate from its rows. Faithful
+// to the real store in two ways that matter to reconcile: Set upserts
+// the own-peer row (so a republish is visible to the next pass), and
+// split mode delivers each row in its own Iterate callback — the real
+// storage.Iterate groups only consecutive rows of an unsorted scan, so
+// a key's rows can arrive split across callbacks.
 type fakeKV struct {
 	keyvaluestorage.Storage
-	mu   sync.Mutex
-	sets map[string][]byte
-	rows map[string][]innerstorage.KeyValue
+	mu       sync.Mutex
+	sets     map[string][]byte
+	setCount map[string]int
+	rows     map[string][]innerstorage.KeyValue
+	split    bool
 }
 
 func newFakeKV() *fakeKV {
-	return &fakeKV{sets: map[string][]byte{}, rows: map[string][]innerstorage.KeyValue{}}
+	return &fakeKV{sets: map[string][]byte{}, setCount: map[string]int{}, rows: map[string][]innerstorage.KeyValue{}}
 }
 
 func (f *fakeKV) Set(_ context.Context, key string, value []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sets[key] = append([]byte(nil), value...)
+	f.setCount[key]++
+	for i, kv := range f.rows[key] {
+		if kv.PeerId == selfPeer {
+			f.rows[key][i].Value.Value = append([]byte(nil), value...)
+			return nil
+		}
+	}
+	f.rows[key] = append(f.rows[key], innerstorage.KeyValue{
+		Key: key, PeerId: selfPeer,
+		Value: innerstorage.Value{Value: append([]byte(nil), value...)},
+	})
 	return nil
 }
 
@@ -49,6 +67,15 @@ func (f *fakeKV) Iterate(_ context.Context, fn func(decryptor keyvaluestorage.De
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for key, values := range f.rows {
+		if f.split {
+			for _, kv := range values {
+				cont, err := fn(plainDecryptor, key, []innerstorage.KeyValue{kv})
+				if err != nil || !cont {
+					return err
+				}
+			}
+			continue
+		}
 		cont, err := fn(plainDecryptor, key, values)
 		if err != nil || !cont {
 			return err
@@ -216,6 +243,80 @@ func TestReconcile_RepublishesDivergentFrontier(t *testing.T) {
 	var val frontierValue
 	require.NoError(t, json.Unmarshal(raw, &val))
 	assert.Equal(t, []string{"c2"}, val.Heads)
+}
+
+// The SYN-97 loop: real Iterate can split a key's rows across
+// callbacks; a group without the own row must not look divergent.
+func TestReconcile_SplitGroups_NoFalseRepublish(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	// Own row is CURRENT; a remote row arrives in a separate callback.
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+	}
+	f.kv.split = true
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	count := f.kv.setCount[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	assert.Zero(t, count, "up-to-date frontier must not republish, split groups or not")
+}
+
+func TestReconcile_SplitGroups_DivergentPublishesOnce(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	f.trackUnread(t, "c2", "v02", []string{"c1"})
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	// Stale own row plus two historical remote rows, one callback each.
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-old-1", []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), "peer-old-2", []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+	}
+	f.kv.split = true
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	count := f.kv.setCount[kvKey(testSpace, testObj)]
+	raw := f.kv.sets[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	assert.Equal(t, 1, count, "one republish per divergent key, not one per callback group")
+	var val frontierValue
+	require.NoError(t, json.Unmarshal(raw, &val))
+	assert.Equal(t, []string{"c2"}, val.Heads)
+}
+
+func TestReconcile_ConvergesAfterOnePass(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	// No own row at all (publish was lost before it hit disk).
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c1"}),
+	}
+	f.kv.split = true
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	count := f.kv.setCount[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	assert.Equal(t, 1, count, "pass 1 heals, pass 2 must publish nothing")
 }
 
 func TestMarkReadUpTo_ChunksLargeSets(t *testing.T) {

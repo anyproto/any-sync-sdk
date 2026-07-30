@@ -88,6 +88,10 @@ type mergeJob struct {
 }
 
 func New(engineFor EngineFor, kvStore KVStore, selfPeerId string) *Service {
+	// The peerId identifies this device's row in every published key;
+	// logging it once makes cross-boot row ownership checkable from
+	// device logs (a regenerated device key orphans all previous rows).
+	log.Info("readsync: starting", zap.String("selfPeerId", selfPeerId))
 	s := &Service{
 		engineFor:  engineFor,
 		kvStore:    kvStore,
@@ -364,14 +368,21 @@ func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 	if err != nil {
 		return err
 	}
-	// Republishing writes to the same store Iterate is reading — do it
-	// after the iteration, never from inside the callback.
-	type repub struct {
+	// keyState accumulates one key's rows across ALL Iterate callbacks.
+	// storage.Iterate groups only CONSECUTIVE rows of a key over an
+	// unsorted (insertion-order) scan, so one key's rows can arrive
+	// split into several callbacks. The republish decision must see the
+	// whole key: deciding per callback makes every group without the
+	// own row look divergent, republishing the same keys on every boot,
+	// once per own-row-less group.
+	type keyState struct {
 		spaceId  string
 		objectId string
-		heads    []string
+		ownHeads []string
 	}
-	var repubs []repub
+	states := map[string]*keyState{}
+	// Publish order follows first-seen order; map iteration is random.
+	var order []string
 	// Spaces with no engine (deleted / pending / untracked) are skipped
 	// silently per key; one debug line per space keeps boot logs quiet
 	// even when a dead space left hundreds of frontier keys behind.
@@ -381,15 +392,19 @@ func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 		if !ok || (onlySpaceId != "" && spaceId != onlySpaceId) {
 			return true, nil
 		}
-		eng := s.engineFor(spaceId)
-		if eng == nil {
+		if s.engineFor(spaceId) == nil {
 			if _, seen := skipped[spaceId]; !seen {
 				skipped[spaceId] = struct{}{}
 				log.Debug("reconcile: no engine for space, skipping its keys", zap.String("spaceId", spaceId))
 			}
 			return true, nil
 		}
-		var ownHeads []string
+		st := states[key]
+		if st == nil {
+			st = &keyState{spaceId: spaceId, objectId: objectId}
+			states[key] = st
+			order = append(order, key)
+		}
 		for _, kv := range values {
 			raw, decErr := decryptor(kv)
 			if decErr != nil {
@@ -402,27 +417,45 @@ func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 				continue
 			}
 			if kv.PeerId == s.selfPeerId {
-				ownHeads = val.Heads
+				st.ownHeads = val.Heads
 			}
 			if len(val.Heads) == 0 {
 				continue
 			}
 			s.merge(ctx, mergeJob{spaceId: spaceId, objectId: objectId, heads: val.Heads})
 		}
-		heads, _, ferr := eng.Frontier(ctx, objectId)
-		if ferr != nil {
-			return false, ferr
-		}
-		if len(heads) > 0 && !sameSet(heads, ownHeads) {
-			repubs = append(repubs, repub{spaceId: spaceId, objectId: objectId, heads: heads})
-		}
 		return true, nil
 	})
 	if err != nil {
 		return err
 	}
-	for _, r := range repubs {
-		s.publish(ctx, r.spaceId, r.objectId, r.heads)
+	// Frontier reads and republishes run after the full iteration: every
+	// row has merged by now, so the published row is the converged union
+	// — and republishing writes to the same store Iterate was reading.
+	republished := 0
+	for _, key := range order {
+		st := states[key]
+		eng := s.engineFor(st.spaceId)
+		if eng == nil {
+			continue
+		}
+		heads, _, ferr := eng.Frontier(ctx, st.objectId)
+		if ferr != nil {
+			return ferr
+		}
+		if len(heads) == 0 || sameSet(heads, st.ownHeads) {
+			continue
+		}
+		republished++
+		log.Debug("reconcile: republish divergent frontier",
+			zap.String("key", key),
+			zap.Int("frontier", len(heads)),
+			zap.Int("published", len(st.ownHeads)))
+		s.publish(ctx, st.spaceId, st.objectId, heads)
+	}
+	if republished > 0 {
+		log.Info("reconcile: republished divergent frontiers",
+			zap.Int("republished", republished), zap.Int("keys", len(order)))
 	}
 	return nil
 }

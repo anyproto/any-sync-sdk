@@ -56,15 +56,39 @@ func (p parkMsg) MsgSize() uint64 { return p.size }
 
 func msg(id string) parkMsg { return parkMsg{id: id} }
 
+// disableRetryWorker makes park() bookkeeping observable without the
+// retry worker concurrently popping the buffer: it consumes parkStart
+// and pre-closes parkDone so Close stays correct.
+func disableRetryWorker(m *spacePeerManager) {
+	m.parkStart.Do(func() {})
+	close(m.parkDone)
+}
+
+func TestBroadcastPark_OverflowParksAndReportsSuccess(t *testing.T) {
+	m := newTestManager(nil, nil, nil)
+	defer func() { require.NoError(t, m.Close(context.Background())) }()
+	disableRetryWorker(m)
+	m.streamPool = &fakeSendPool{err: mb.ErrOverflowed}
+
+	require.NoError(t, m.BroadcastMessage(context.Background(), msg("m0")),
+		"a parked broadcast reports success")
+
+	m.parkMu.Lock()
+	defer m.parkMu.Unlock()
+	require.Len(t, m.parked, 1)
+	assert.Equal(t, "m0", m.parked[0].(parkMsg).id)
+}
+
 func TestBroadcastPark_RetriesUntilDelivered(t *testing.T) {
 	m := newTestManager(nil, nil, nil)
 	defer func() { require.NoError(t, m.Close(context.Background())) }()
-	pool := &fakeSendPool{failN: 3}
+	pool := &fakeSendPool{}
 	m.streamPool = pool
 
+	// Park directly: overflow-then-succeed through BroadcastMessage
+	// would race the worker's own Send attempts for the failN budget.
 	for i := 0; i < 3; i++ {
-		require.NoError(t, m.BroadcastMessage(context.Background(), msg(fmt.Sprintf("m%d", i))),
-			"a parked broadcast reports success")
+		m.park(msg(fmt.Sprintf("m%d", i)))
 	}
 	require.Eventually(t, func() bool { return pool.sentCount() == 3 },
 		2*time.Second, 10*time.Millisecond, "parked broadcasts retried and delivered")
@@ -92,7 +116,8 @@ func TestBroadcastPark_ClosedPoolNotParked(t *testing.T) {
 func TestBroadcastPark_CountBoundDropsOldest(t *testing.T) {
 	m := newTestManager(nil, nil, nil)
 	defer func() { require.NoError(t, m.Close(context.Background())) }()
-	m.streamPool = &fakeSendPool{failN: parkedMaxCount + 100}
+	disableRetryWorker(m)
+	m.streamPool = &fakeSendPool{err: mb.ErrOverflowed}
 
 	for i := 0; i < parkedMaxCount+10; i++ {
 		require.NoError(t, m.BroadcastMessage(context.Background(), msg(fmt.Sprintf("m%03d", i))))
@@ -107,7 +132,8 @@ func TestBroadcastPark_CountBoundDropsOldest(t *testing.T) {
 func TestBroadcastPark_ByteBoundDropsOldest(t *testing.T) {
 	m := newTestManager(nil, nil, nil)
 	defer func() { require.NoError(t, m.Close(context.Background())) }()
-	m.streamPool = &fakeSendPool{failN: 100}
+	disableRetryWorker(m)
+	m.streamPool = &fakeSendPool{err: mb.ErrOverflowed}
 
 	big := func(id string) parkMsg { return parkMsg{id: id, size: 3 << 20} }
 	for _, id := range []string{"m0", "m1", "m2"} {

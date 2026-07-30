@@ -2,18 +2,24 @@ package anysyncx
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/anyproto/any-sync/app"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/peermanager"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/net/peer"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/anyproto/any-sync/nodeconf"
+	"github.com/cheggaaa/mb/v3"
+	"go.uber.org/zap"
 	"storj.io/drpc"
 )
+
+var pmLog = logger.NewNamed("anysyncx.peermanager")
 
 // peerManagerProvider creates per-space peer managers. any-sync calls
 // NewPeerManager once per space at NewSpace time. Local-only spaces
@@ -72,11 +78,18 @@ func (m *localPeerManager) KeepAlive(_ context.Context) {}
 // peers that share this space (from the p2p peer store) are folded
 // into the responsible/broadcast sets, so head-sync and pushes run
 // over the LAN too — including while every node is unreachable.
+// sendPool is the streamPool slice the manager uses — an interface so
+// tests can fake queue overflow without a real stream pool.
+type sendPool interface {
+	Send(ctx context.Context, msg drpc.Message, target streampool.PeerGetter) error
+	Streams(tags ...string) []drpc.Stream
+}
+
 type spacePeerManager struct {
 	spaceId         string
 	nodeConf        nodeconf.Service
 	pool            pool.Pool
-	streamPool      streampool.StreamPool
+	streamPool      sendPool
 	localPeers      localPeerSource
 	subscribeMsgRaw []byte
 
@@ -85,6 +98,18 @@ type spacePeerManager struct {
 
 	strikesMu   sync.Mutex
 	dialStrikes map[string]int
+
+	// Overflowed-broadcast park buffer (see BroadcastMessage). The
+	// retry worker is started lazily on first park: the space-pull path
+	// builds a short-lived throwaway peer manager, which must not spawn
+	// goroutines it never needs.
+	parkMu      sync.Mutex
+	parked      []drpc.Message
+	parkedBytes int
+	parkWake    chan struct{}
+	parkStart   sync.Once
+	parkDone    chan struct{}
+	parkStarted bool
 }
 
 func (m *spacePeerManager) Init(a *app.App) error {
@@ -101,6 +126,8 @@ func (m *spacePeerManager) Init(a *app.App) error {
 	}
 	m.subscribeMsgRaw = payload
 	m.runCtx, m.runCancel = context.WithCancel(context.Background())
+	m.parkWake = make(chan struct{}, 1)
+	m.parkDone = make(chan struct{})
 	return nil
 }
 
@@ -115,6 +142,14 @@ func (m *spacePeerManager) Run(_ context.Context) error {
 func (m *spacePeerManager) Close(_ context.Context) error {
 	if m.runCancel != nil {
 		m.runCancel()
+	}
+	// The retry worker never blocks outside runCtx selects (Send is a
+	// non-blocking TryAdd), so this wait is prompt.
+	m.parkMu.Lock()
+	started := m.parkStarted
+	m.parkMu.Unlock()
+	if started {
+		<-m.parkDone
 	}
 	return nil
 }
@@ -326,10 +361,22 @@ func (m *spacePeerManager) GetNodePeers(ctx context.Context) ([]peer.Peer, error
 // cancels in-flight broadcasts. This mirrors any-sync's own
 // synctest.TestPeerManager, which uses context.Background() for the
 // same reason.
+//
+// streamPool.Send is a non-blocking TryAdd into the shared dial queue;
+// when the queue is full it returns mb.ErrOverflowed and the message
+// would be silently lost — every producer (keyvaluestorage.Set,
+// synctree, syncacl) just logs the error, and nothing upstream ever
+// retries a broadcast (headsync pulls, it doesn't push). Overflowed
+// broadcasts are therefore parked in a bounded buffer and re-sent with
+// backoff — a full queue means delay, not loss. A parked message
+// reports success: from the caller's perspective it is queued.
 func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message) error {
-	return m.streamPool.Send(m.runCtx, msg, func(ctx context.Context) ([]peer.Peer, error) {
-		return m.getBroadcastPeers(ctx)
-	})
+	err := m.streamPool.Send(m.runCtx, msg, m.getBroadcastPeers)
+	if errors.Is(err, mb.ErrOverflowed) {
+		m.park(msg)
+		return nil
+	}
+	return err
 }
 
 // getBroadcastPeers is the push audience: every node peer plus every
@@ -344,6 +391,149 @@ func (m *spacePeerManager) getBroadcastPeers(ctx context.Context) ([]peer.Peer, 
 	return append(peers, m.getLocalPeers(ctx)...), nil
 }
 
+// Park-buffer bounds. Broadcast messages keep their payload (raw
+// changes / KV values) alive until sent, so the buffer is capped by
+// bytes as well as count; when full the OLDEST message drops — KV rows
+// are LWW per (key, peer) and head updates are idempotent, so a newer
+// parked message supersedes an older one for the same object.
+const (
+	parkedMaxCount = 256
+	parkedMaxBytes = 8 << 20
+
+	// outgoingQueueSize sizes both shared outgoing queues: the
+	// process-wide dial queue (GetStreamConfig) and each stream's write
+	// queue (streamHandler.OpenStream). Both drop on overflow, so they
+	// are sized to make overflow rare at real space counts; matches
+	// heart's DialQueueSize.
+	outgoingQueueSize = 300
+)
+
+// retryRamp is the flush schedule after an overflow: quick first
+// retries while the startup burst drains, then a slow steady tick.
+var retryRamp = []time.Duration{
+	100 * time.Millisecond,
+	500 * time.Millisecond,
+	2 * time.Second,
+}
+
+const retrySteady = 10 * time.Second
+
+// nextRetryDelay picks the wait before the next parked-broadcast flush
+// attempt. Pure, same shape as nextSubscribeDelay.
+func nextRetryDelay(attempt int) time.Duration {
+	if attempt < len(retryRamp) {
+		return retryRamp[attempt]
+	}
+	return retrySteady
+}
+
+// msgSize is the byte estimate for the park bound. Broadcast payloads
+// (objectmessages.HeadUpdate) expose MsgSize; anything else counts 0
+// and is bounded by parkedMaxCount alone.
+func msgSize(msg drpc.Message) int {
+	if s, ok := msg.(interface{ MsgSize() uint64 }); ok {
+		return int(s.MsgSize())
+	}
+	return 0
+}
+
+func (m *spacePeerManager) park(msg drpc.Message) {
+	size := msgSize(msg)
+	m.parkMu.Lock()
+	dropped := 0
+	for len(m.parked) > 0 &&
+		(len(m.parked) >= parkedMaxCount || m.parkedBytes+size > parkedMaxBytes) {
+		m.parkedBytes -= msgSize(m.parked[0])
+		m.parked = m.parked[1:]
+		dropped++
+	}
+	m.parked = append(m.parked, msg)
+	m.parkedBytes += size
+	count := len(m.parked)
+	if !m.parkStarted {
+		m.parkStarted = true
+		m.parkStart.Do(func() { go m.retryLoop() })
+	}
+	m.parkMu.Unlock()
+
+	if dropped > 0 {
+		pmLog.Warn("park buffer full; dropped oldest broadcasts",
+			zap.String("spaceId", m.spaceId), zap.Int("dropped", dropped))
+	}
+	pmLog.Warn("broadcast overflowed; parked for retry",
+		zap.String("spaceId", m.spaceId), zap.Int("parked", count))
+	select {
+	case m.parkWake <- struct{}{}:
+	default:
+	}
+}
+
+// retryLoop flushes the park buffer on a backoff ramp; once the buffer
+// drains it sleeps until the next park. Exits with runCtx.
+func (m *spacePeerManager) retryLoop() {
+	defer close(m.parkDone)
+	attempt := 0
+	for {
+		select {
+		case <-m.runCtx.Done():
+			return
+		case <-time.After(nextRetryDelay(attempt)):
+		}
+		if m.flushParked() {
+			attempt = 0
+			select {
+			case <-m.runCtx.Done():
+				return
+			case <-m.parkWake:
+			}
+		} else {
+			attempt++
+		}
+	}
+}
+
+// flushParked re-sends parked broadcasts FIFO until the first
+// re-overflow. Reports whether the buffer is empty afterwards.
+func (m *spacePeerManager) flushParked() bool {
+	delivered := 0
+	defer func() {
+		if delivered > 0 {
+			pmLog.Info("parked broadcasts delivered",
+				zap.String("spaceId", m.spaceId), zap.Int("count", delivered))
+		}
+	}()
+	for {
+		m.parkMu.Lock()
+		if len(m.parked) == 0 {
+			m.parkMu.Unlock()
+			return true
+		}
+		msg := m.parked[0]
+		m.parked = m.parked[1:]
+		m.parkedBytes -= msgSize(msg)
+		m.parkMu.Unlock()
+
+		err := m.streamPool.Send(m.runCtx, msg, m.getBroadcastPeers)
+		if errors.Is(err, mb.ErrOverflowed) {
+			// Back to the front; FIFO order is preserved for the next
+			// flush. May exceed the bound by one message — fine.
+			m.parkMu.Lock()
+			m.parked = append([]drpc.Message{msg}, m.parked...)
+			m.parkedBytes += msgSize(msg)
+			m.parkMu.Unlock()
+			return false
+		}
+		// Queued, or terminal (pool closed / shutdown): either way the
+		// message leaves the buffer.
+		if err == nil {
+			delivered++
+		}
+	}
+}
+
+// SendMessage is the unicast path (headsync diffsyncer's subscribe).
+// Deliberately no park-on-overflow: the diffsyncer re-subscribes on its
+// own cadence, so a lost send heals within a sync period.
 func (m *spacePeerManager) SendMessage(ctx context.Context, peerId string, msg drpc.Message) error {
 	return m.streamPool.Send(ctx, msg, func(ctx context.Context) ([]peer.Peer, error) {
 		p, err := m.pool.Get(ctx, peerId)

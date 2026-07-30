@@ -72,12 +72,16 @@ type fakeNodeConf struct {
 func (f *fakeNodeConf) NodeIds(string) []string { return f.nodeIds }
 
 func newTestManager(nodes []string, local *fakeLocalPeers, reachable map[string]peer.Peer) *spacePeerManager {
-	return &spacePeerManager{
+	m := &spacePeerManager{
 		spaceId:    "space1",
 		nodeConf:   &fakeNodeConf{nodeIds: nodes},
 		pool:       &fakePool{peers: reachable},
 		localPeers: local,
 	}
+	m.runCtx, m.runCancel = context.WithCancel(context.Background())
+	m.parkWake = make(chan struct{}, 1)
+	m.parkDone = make(chan struct{})
+	return m
 }
 
 func peerIds(peers []peer.Peer) []string {

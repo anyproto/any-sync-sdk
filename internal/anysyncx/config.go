@@ -117,11 +117,19 @@ func (c *configAdapter) GetWebTransport() webtransport.Config {
 
 func (c *configAdapter) GetSecureService() secureservice.Config { return secureservice.Config{} }
 
+// GetStreamConfig sizes the shared outgoing queues. The dial queue is
+// one per process and takes every broadcast + head-sync send across all
+// spaces at once; at boot the whole space list floods it while its 4
+// workers may be stuck in slow dials, and an overflowed TryAdd DROPS
+// the message (mitigated by the peer-manager park buffer, but the queue
+// should rarely overflow in the first place). 300 matches heart.
+// SendQueueSize is ignored for outgoing streams — the per-stream queue
+// size is set at streamHandler.OpenStream (spacesync.go).
 func (c *configAdapter) GetStreamConfig() streampool.StreamConfig {
 	return streampool.StreamConfig{
-		SendQueueSize:    100,
+		SendQueueSize:    outgoingQueueSize,
 		DialQueueWorkers: 4,
-		DialQueueSize:    100,
+		DialQueueSize:    outgoingQueueSize,
 	}
 }
 

@@ -401,7 +401,12 @@ func (h *streamHandler) OpenStream(ctx context.Context, p peer.Peer) (drpc.Strea
 	if len(h.nodeConf.NodeTypes(p.Id())) > 0 {
 		tag = nodeStreamTag
 	}
-	return objectStream, []string{tag}, 100, nil
+	// The queue size is the per-stream write buffer: after the dial
+	// queue accepts a send, stream.write TryAdds into this queue and an
+	// overflow is silently swallowed inside the worker — no error ever
+	// reaches the caller, so this is the one drop point the park buffer
+	// cannot cover. Sized with the dial queue.
+	return objectStream, []string{tag}, outgoingQueueSize, nil
 }
 
 // SyncSpaces kicks a detached head-sync for whichever of the given

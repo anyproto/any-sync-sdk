@@ -74,10 +74,12 @@ func (s *Service) StartOneToOneInbox(ctx context.Context) {
 		// device seeds from it instead of replaying the whole inbox.
 		LoadCursor: func(ctx context.Context) (string, error) { return s.tsp.GetInboxCursor(ctx), nil },
 		SaveCursor: s.tsp.SetInboxCursor,
-		// Warmup: pull the tech space current before the first fetch so a
-		// fresh device seeds from the synced cursor, not offset 0.
-		Warmup:   func(ctx context.Context) error { return s.tsp.SyncHeads(ctx) },
-		Interval: time.Duration(inboxPollInterval.Load()),
+		// ReplayGuard: an empty cursor may only be trusted once the tech
+		// space provably reflects the account's synced state — otherwise a
+		// cold-restored device replays the inbox and resurrects resolved
+		// invites (see inboxReplayGuard).
+		ReplayGuard: s.inboxReplayGuard,
+		Interval:    time.Duration(inboxPollInterval.Load()),
 	})
 	// Coordinator push → kick the notifier. The event is body-less; the
 	// notifier reacts by fetching.
@@ -91,6 +93,29 @@ func (s *Service) StartOneToOneInbox(ctx context.Context) {
 	// and handleRegularInvite reads inviteCtx.
 	s.startInviteRetry()
 	s.inboxNotifier.Run(ctx)
+}
+
+// inboxReplayGuard gates the notifier's empty-cursor (full-replay)
+// pass: nil only when the tech space provably holds the account's
+// synced state. One head-sync round runs first — its diff fetches and
+// applies missing trees synchronously (failures park in the
+// treesyncer) — then a zero parked-tree count confirms everything the
+// diff discovered is applied. Until both hold, an empty cursor just
+// means "not synced to this device yet", and replaying the inbox would
+// resurrect long-resolved 1-1 invites as pending rows: the cold-restore
+// stale-join-request bug. On a genuinely fresh account the round
+// converges trivially, the guard passes with the cursor still empty,
+// and replaying from the beginning is correct (nothing was ever
+// processed). Each deferred pass retries the round, which also drives
+// the treesyncer's parked-tree recovery.
+func (s *Service) inboxReplayGuard(ctx context.Context) error {
+	if err := s.tsp.SyncHeads(ctx); err != nil {
+		return fmt.Errorf("tech space head-sync: %w", err)
+	}
+	if n := s.app.ParkedTreeCount(s.tsp.SpaceId()); n > 0 {
+		return fmt.Errorf("tech space has %d parked trees", n)
+	}
+	return nil
 }
 
 // stopOneToOneInbox tears down the inbox subsystem. Called from Close

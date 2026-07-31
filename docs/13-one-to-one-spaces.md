@@ -370,8 +370,15 @@ design rule above:
    everything below it is already covered by synced 1-1 rows; and idempotent
    processing (#3) makes any cross-device regression a harmless, deduplicated
    re-fetch. A fresh device **seeds from this cursor instead of replaying the
-   whole inbox**. (The *decline* marker is separately synced because it is an
-   account-wide user decision — see groom decisions.)
+   whole inbox** — and because the cursor only reaches the device via sync, an
+   **empty cursor is gated by a replay guard**: the notifier defers any
+   from-the-beginning pass until the tech space has completed one clean
+   head-sync round (diff applied, nothing parked in the treesyncer). Without
+   the gate a cold-restored device races its own tech-space catch-up and
+   replays the inbox, resurrecting long-accepted 1-1s as pending join
+   requests for as long as the sync nodes stay unreachable. (The *decline*
+   marker is separately synced because it is an account-wide user decision —
+   see groom decisions.)
 
 ### Out-of-band / p2p fallback (no server)
 
@@ -433,7 +440,7 @@ discovery surface for the UI.
   `subscribeclient` (registered in `internal/anysyncx/app.go`): single
   serialized worker, push+poll funnel, verify/decrypt, per-batch cursor advance,
   idempotent dispatch (no processed-id ledger needed). Cursor load/save +
-  warmup are injected (the notifier is storage-agnostic). Started from
+  replay guard are injected (the notifier is storage-agnostic). Started from
   `sdk.Open` (guarded by coordinator presence), torn down in `Close`.
 - New `internal/techspace/inboxcursor.go` — the **synced, account-scoped** inbox
   cursor (`InboxCursor` dataset on the space-index tree; `GetInboxCursor` /

@@ -244,22 +244,19 @@ func TestNotifier_OfflineThenOnlineDelivers(t *testing.T) {
 	assert.Equal(t, "m1", cur.get())
 }
 
-// TestNotifier_WarmupRunsBeforeFirstFetch checks the warmup hook fires once
-// before the worker's first pass (used to pull the synced cursor current on
-// a fresh device before fetching).
-func TestNotifier_WarmupRunsBeforeFirstFetch(t *testing.T) {
+// TestNotifier_ReplayGuardDefersEmptyCursor checks that with an empty
+// cursor a failing guard defers the whole pass — no fetch happens — and
+// that once the guard clears, the next kick fetches from the beginning.
+func TestNotifier_ReplayGuardDefersEmptyCursor(t *testing.T) {
 	ctx := context.Background()
 	myPriv, _, _ := crypto.GenerateRandomEd25519KeyPair()
 	var mu sync.Mutex
-	warmups, fetches := 0, 0
-	warmedBeforeFetch := true
+	fetches, guardCalls := 0, 0
+	ready := false
 	cur := &memCursor{}
 	n := New(Deps{
 		Fetch: func(_ context.Context, _ string) ([]*coordinatorproto.InboxMessage, bool, error) {
 			mu.Lock()
-			if warmups == 0 {
-				warmedBeforeFetch = false
-			}
 			fetches++
 			mu.Unlock()
 			return nil, false, nil
@@ -268,11 +265,61 @@ func TestNotifier_WarmupRunsBeforeFirstFetch(t *testing.T) {
 		LoadCursor: cur.load,
 		SaveCursor: cur.save,
 		Handle:     func(_ context.Context, _ Message) error { return nil },
-		Warmup: func(context.Context) error {
+		ReplayGuard: func(context.Context) error {
 			mu.Lock()
-			warmups++
-			mu.Unlock()
+			defer mu.Unlock()
+			guardCalls++
+			if !ready {
+				return errors.New("not synced yet")
+			}
 			return nil
+		},
+		Interval: time.Hour,
+	})
+	n.Run(ctx)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return guardCalls >= 1
+	}, 2*time.Second, 10*time.Millisecond)
+	mu.Lock()
+	assert.Equal(t, 0, fetches, "a failing guard must defer the fetch")
+	ready = true
+	mu.Unlock()
+	n.Notify()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return fetches >= 1
+	}, 2*time.Second, 10*time.Millisecond)
+	n.Close()
+}
+
+// TestNotifier_ReplayGuardSkippedWithCursor checks the guard is not
+// consulted once a cursor exists — only the full-replay case is gated.
+func TestNotifier_ReplayGuardSkippedWithCursor(t *testing.T) {
+	ctx := context.Background()
+	myPriv, _, _ := crypto.GenerateRandomEd25519KeyPair()
+	var mu sync.Mutex
+	fetches, guardCalls := 0, 0
+	cur := &memCursor{off: "m7"}
+	n := New(Deps{
+		Fetch: func(_ context.Context, offset string) ([]*coordinatorproto.InboxMessage, bool, error) {
+			mu.Lock()
+			fetches++
+			mu.Unlock()
+			assert.Equal(t, "m7", offset)
+			return nil, false, nil
+		},
+		MyKey:      myPriv,
+		LoadCursor: cur.load,
+		SaveCursor: cur.save,
+		Handle:     func(_ context.Context, _ Message) error { return nil },
+		ReplayGuard: func(context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			guardCalls++
+			return errors.New("must not be asked")
 		},
 		Interval: time.Hour,
 	})
@@ -285,8 +332,7 @@ func TestNotifier_WarmupRunsBeforeFirstFetch(t *testing.T) {
 	n.Close()
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Equal(t, 1, warmups, "warmup runs exactly once")
-	assert.True(t, warmedBeforeFetch, "warmup must precede the first fetch")
+	assert.Equal(t, 0, guardCalls, "guard must be skipped when a cursor exists")
 }
 
 func TestNotifier_RunNotifyCloseLifecycle(t *testing.T) {

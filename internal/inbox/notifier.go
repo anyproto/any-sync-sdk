@@ -78,10 +78,18 @@ type Deps struct {
 	// fix" #3).
 	LoadCursor func(ctx context.Context) (string, error)
 	SaveCursor func(ctx context.Context, offset string) error
-	// Warmup, if set, runs once before the first fetch — used to pull the
-	// tech space (cursor + rows) current so a fresh device seeds from the
-	// synced cursor rather than offset 0. Best-effort; errors are ignored.
-	Warmup func(ctx context.Context) error
+	// ReplayGuard, if set, is consulted before any pass whose loaded
+	// cursor is EMPTY — the full-replay case. A non-nil error defers the
+	// whole pass; the next tick/kick retries. On an established account
+	// an empty cursor is indistinguishable from "the synced cursor
+	// hasn't reached this device yet": fetching would replay the entire
+	// inbox and resurrect long-resolved invites as pending rows (the
+	// row-level dedup can't help — the synced rows are equally missing).
+	// The guard returns nil only once local state provably reflects the
+	// account's synced truth; from then on an empty cursor really means
+	// "nothing processed ever" and a from-the-beginning fetch is
+	// correct. Not consulted when the cursor is non-empty.
+	ReplayGuard func(ctx context.Context) error
 	// Interval is the poll fallback cadence. The push stream drives
 	// latency; this is the safety net for missed/disconnected pushes.
 	Interval time.Duration
@@ -149,13 +157,6 @@ func (n *Notifier) Close() {
 
 func (n *Notifier) loop(ctx context.Context) {
 	defer n.wg.Done()
-	// Warmup once: pull the tech space current so a fresh device seeds from
-	// the synced cursor instead of replaying the whole inbox. Best-effort.
-	if n.deps.Warmup != nil {
-		if err := n.deps.Warmup(ctx); err != nil {
-			log.Debug("inbox warmup", zap.Error(err))
-		}
-	}
 	t := time.NewTicker(n.deps.Interval)
 	defer t.Stop()
 	// Initial pass: catch messages that arrived while offline, plus any
@@ -174,7 +175,9 @@ func (n *Notifier) loop(ctx context.Context) {
 }
 
 // processAll drains the inbox from the persisted (synced, account-scoped)
-// cursor. Fetch errors (offline / coordinator down / inbox unimplemented)
+// cursor. An empty cursor first has to clear ReplayGuard — a guard error
+// defers the pass entirely (retried next tick/kick). Fetch errors
+// (offline / coordinator down / inbox unimplemented)
 // end the pass without advancing — the next tick retries. A handler
 // ErrRetry halts the cursor at the offending message; content failures
 // skip past it. The cursor advances once PER BATCH (to the furthest
@@ -186,6 +189,12 @@ func (n *Notifier) processAll(ctx context.Context) {
 	if err != nil {
 		log.Warn("load cursor", zap.Error(err))
 		return
+	}
+	if offset == "" && n.deps.ReplayGuard != nil {
+		if err := n.deps.ReplayGuard(ctx); err != nil {
+			log.Debug("inbox pass deferred: replay guard", zap.Error(err))
+			return
+		}
 	}
 	for {
 		if ctx.Err() != nil {

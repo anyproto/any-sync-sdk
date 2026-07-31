@@ -245,8 +245,9 @@ func TestNotifier_OfflineThenOnlineDelivers(t *testing.T) {
 }
 
 // TestNotifier_ReplayGuardDefersEmptyCursor checks that with an empty
-// cursor a failing guard defers the whole pass — no fetch happens — and
-// that once the guard clears, the next kick fetches from the beginning.
+// cursor a failing guard defers the whole pass — no fetch happens — that
+// once the guard clears, the next kick fetches from the beginning, and
+// that the first success is latched (the guard is not consulted again).
 func TestNotifier_ReplayGuardDefersEmptyCursor(t *testing.T) {
 	ctx := context.Background()
 	myPriv, _, _ := crypto.GenerateRandomEd25519KeyPair()
@@ -292,7 +293,19 @@ func TestNotifier_ReplayGuardDefersEmptyCursor(t *testing.T) {
 		defer mu.Unlock()
 		return fetches >= 1
 	}, 2*time.Second, 10*time.Millisecond)
+	mu.Lock()
+	clearedCalls := guardCalls
+	mu.Unlock()
+	n.Notify()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return fetches >= 2
+	}, 2*time.Second, 10*time.Millisecond)
 	n.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, clearedCalls, guardCalls, "guard success must be latched — no re-consult after the first nil")
 }
 
 // TestNotifier_ReplayGuardSkippedWithCursor checks the guard is not

@@ -83,7 +83,6 @@ func startTCPProxies(t *testing.T, routes map[string]string) (stop func()) {
 	t.Helper()
 	var lns []net.Listener
 	var wg sync.WaitGroup
-	done := make(chan struct{})
 	for proxy, real := range routes {
 		ln, err := net.Listen("tcp", proxy)
 		require.NoError(t, err, "listen %s", proxy)
@@ -110,8 +109,6 @@ func startTCPProxies(t *testing.T, routes map[string]string) (stop func()) {
 		}(ln, real)
 	}
 	return func() {
-		close(done)
-		_ = done
 		for _, ln := range lns {
 			_ = ln.Close()
 		}

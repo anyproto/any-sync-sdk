@@ -109,6 +109,12 @@ func (s *Service) StartOneToOneInbox(ctx context.Context) {
 // processed). Each deferred pass retries the round, which also drives
 // the treesyncer's parked-tree recovery.
 func (s *Service) inboxReplayGuard(ctx context.Context) error {
+	// SyncHeads no-ops (nil) on a not-open tech space — that must read
+	// as "not ready", not as a clean round, or the guard silently
+	// vanishes if the boot ordering ever changes.
+	if s.tsp.SpaceId() == "" {
+		return errors.New("tech space not open")
+	}
 	if err := s.tsp.SyncHeads(ctx); err != nil {
 		return fmt.Errorf("tech space head-sync: %w", err)
 	}

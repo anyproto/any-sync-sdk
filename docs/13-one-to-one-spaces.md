@@ -373,7 +373,8 @@ design rule above:
    whole inbox** — and because the cursor only reaches the device via sync, an
    **empty cursor is gated by a replay guard**: the notifier defers any
    from-the-beginning pass until the tech space has completed one clean
-   head-sync round (diff applied, nothing parked in the treesyncer). Without
+   head-sync round (diff applied, nothing parked in the treesyncer; the
+   first success is latched per process — convergence can't regress). Without
    the gate a cold-restored device races its own tech-space catch-up and
    replays the inbox, resurrecting long-accepted 1-1s as pending join
    requests for as long as the sync nodes stay unreachable. (The *decline*

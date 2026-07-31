@@ -78,7 +78,7 @@ type Deps struct {
 	// fix" #3).
 	LoadCursor func(ctx context.Context) (string, error)
 	SaveCursor func(ctx context.Context, offset string) error
-	// ReplayGuard, if set, is consulted before any pass whose loaded
+	// ReplayGuard, if set, is consulted before a pass whose loaded
 	// cursor is EMPTY — the full-replay case. A non-nil error defers the
 	// whole pass; the next tick/kick retries. On an established account
 	// an empty cursor is indistinguishable from "the synced cursor
@@ -88,7 +88,10 @@ type Deps struct {
 	// The guard returns nil only once local state provably reflects the
 	// account's synced truth; from then on an empty cursor really means
 	// "nothing processed ever" and a from-the-beginning fetch is
-	// correct. Not consulted when the cursor is non-empty.
+	// correct. The first nil is latched for the notifier's lifetime —
+	// convergence can only advance within one process, so an account
+	// with no inbox history doesn't pay the guard on every pass. Not
+	// consulted when the cursor is non-empty.
 	ReplayGuard func(ctx context.Context) error
 	// Interval is the poll fallback cadence. The push stream drives
 	// latency; this is the safety net for missed/disconnected pushes.
@@ -100,6 +103,10 @@ type Deps struct {
 type Notifier struct {
 	deps Deps
 	kick chan struct{}
+
+	// guardCleared latches the first nil from ReplayGuard. Worker
+	// goroutine only — processAll runs solely on the loop goroutine.
+	guardCleared bool
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -190,11 +197,12 @@ func (n *Notifier) processAll(ctx context.Context) {
 		log.Warn("load cursor", zap.Error(err))
 		return
 	}
-	if offset == "" && n.deps.ReplayGuard != nil {
+	if offset == "" && !n.guardCleared && n.deps.ReplayGuard != nil {
 		if err := n.deps.ReplayGuard(ctx); err != nil {
 			log.Debug("inbox pass deferred: replay guard", zap.Error(err))
 			return
 		}
+		n.guardCleared = true
 	}
 	for {
 		if ctx.Err() != nil {

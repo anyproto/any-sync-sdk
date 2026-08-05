@@ -88,7 +88,7 @@ func TestSpaceExchangeV2RejectsBadAddresses(t *testing.T) {
 		LocalServer: &clientspaceproto.LocalServer{Ips: []string{"evil.example.com", "not-an-ip", "10.0.0.2"}, Port: 4242},
 	})
 	require.NoError(t, err)
-	require.Equal(t, []string{"quic://10.0.0.2:4242"}, ps.addrs["p"])
+	require.Equal(t, []string{"yamux://10.0.0.2:4242", "quic://10.0.0.2:4242"}, ps.addrs["p"])
 	require.ElementsMatch(t, []string{"p"}, store.LocalPeerIds("shared"))
 }
 
@@ -135,7 +135,7 @@ func TestSpaceExchangeV2Inbound(t *testing.T) {
 	require.ElementsMatch(t, []string{"remote-peer"}, store.LocalPeerIds("shared"))
 	require.Empty(t, store.LocalPeerIds("respOnly"))
 	require.Equal(t, []string{"shared"}, kicked)
-	require.Equal(t, []string{"quic://192.168.1.5:4242"}, ps.addrs["remote-peer"])
+	require.Equal(t, []string{"yamux://192.168.1.5:4242", "quic://192.168.1.5:4242"}, ps.addrs["remote-peer"])
 
 	// The response proves membership for exactly the intersection.
 	require.Len(t, resp.SpaceTokens, 1)

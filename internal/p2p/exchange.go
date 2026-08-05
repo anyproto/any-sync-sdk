@@ -445,13 +445,18 @@ func appendAddr(addrs []string, ip net.IP, port int) []string {
 	return append(addrs, a)
 }
 
-// addSchema pins the quic transport on each addr. Without an explicit
-// scheme the dialer falls back to yamux/TCP, but SDK peers listen on
-// UDP/QUIC only.
+// addSchema registers each addr under BOTH transports. SDK peers listen
+// on TCP (yamux) and UDP (QUIC) on the same port; yamux is what we want
+// dialed first on the LAN — a dead peer answers a TCP dial with an RST
+// in one RTT, while a QUIC dial waits out the whole handshake timeout
+// because quic-go gets no ICMP feedback on its unconnected dial
+// sockets. peerservice's per-address ordering puts yamux first for
+// local addrs on its own; the quic candidate stays as the fallback for
+// peers that still listen quic-only.
 func addSchema(addrs []string) []string {
-	out := make([]string, 0, len(addrs))
+	out := make([]string, 0, 2*len(addrs))
 	for _, addr := range addrs {
-		out = append(out, transport.Quic+"://"+addr)
+		out = append(out, transport.Yamux+"://"+addr, transport.Quic+"://"+addr)
 	}
 	return out
 }

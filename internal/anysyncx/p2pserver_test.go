@@ -45,13 +45,38 @@ func (f *fakeQuic) closeAll() {
 	f.conns = nil
 }
 
+// fakeYamux records the TCP listeners handed over by bindPair; the real
+// transport would start accept loops on them.
+type fakeYamux struct {
+	listeners []net.Listener
+}
+
+func (f *fakeYamux) AddListener(lis net.Listener) { f.listeners = append(f.listeners, lis) }
+
+func (f *fakeYamux) closeAll() {
+	for _, l := range f.listeners {
+		_ = l.Close()
+	}
+	f.listeners = nil
+}
+
 func newTestP2PServer(t *testing.T, dir string, cfg config.P2P) (*p2pServer, *fakeQuic) {
 	t.Helper()
 	fq := &fakeQuic{}
+	fy := &fakeYamux{}
 	t.Cleanup(fq.closeAll)
+	t.Cleanup(fy.closeAll)
 	s := newP2PServer(cfg, dir)
 	s.quic = fq
+	s.yamux = fy
 	return s, fq
+}
+
+// releaseAll frees both sides of a server's port pair so another
+// instance can claim it.
+func releaseAll(s *p2pServer, fq *fakeQuic) {
+	fq.closeAll()
+	s.yamux.(*fakeYamux).closeAll()
 }
 
 func TestP2PServerPersistsAndReusesPort(t *testing.T) {
@@ -67,9 +92,9 @@ func TestP2PServerPersistsAndReusesPort(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, strconv.Itoa(port), string(raw))
 
-	// Release the socket, then a second instance must come up on the
+	// Release the sockets, then a second instance must come up on the
 	// same persisted port.
-	fq.closeAll()
+	releaseAll(first, fq)
 	second, _ := newTestP2PServer(t, dir, config.P2P{})
 	require.NoError(t, second.Run(context.Background()))
 	require.True(t, second.Started())
@@ -102,7 +127,7 @@ func TestP2PServerForcedPort(t *testing.T) {
 	probe, fq := newTestP2PServer(t, dir, config.P2P{})
 	require.NoError(t, probe.Run(context.Background()))
 	forced := probe.Port()
-	fq.closeAll()
+	releaseAll(probe, fq)
 
 	s, _ := newTestP2PServer(t, dir, config.P2P{Port: forced})
 	require.NoError(t, s.Run(context.Background()))
@@ -120,6 +145,52 @@ func TestP2PServerForcedPort(t *testing.T) {
 	require.NoError(t, conflict.Run(context.Background()))
 	require.False(t, conflict.Started())
 	require.Zero(t, conflict.Port())
+}
+
+func TestP2PServerBindsBothTransportsOnOnePort(t *testing.T) {
+	s, fq := newTestP2PServer(t, t.TempDir(), config.P2P{})
+	require.NoError(t, s.Run(context.Background()))
+	require.True(t, s.Started())
+
+	fy := s.yamux.(*fakeYamux)
+	require.Len(t, fy.listeners, 1)
+	require.Len(t, fq.conns, 1)
+	tcpPort, err := parseAddrPort(fy.listeners[0].Addr().String())
+	require.NoError(t, err)
+	udpPort, err := parseAddrPort(fq.conns[0].LocalAddr().String())
+	require.NoError(t, err)
+	require.Equal(t, s.Port(), tcpPort)
+	require.Equal(t, s.Port(), udpPort)
+}
+
+func TestP2PServerRetriesWhenUDPTwinTaken(t *testing.T) {
+	dir := t.TempDir()
+
+	// Occupy only the UDP side of a port and persist that port as
+	// sticky: the TCP bind succeeds, the QUIC twin fails, and the server
+	// must release the TCP listener and move to a fresh pair.
+	hog, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	require.NoError(t, err)
+	defer hog.Close()
+	taken, err := parseAddrPort(hog.LocalAddr().String())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, portFileName), []byte(strconv.Itoa(taken)), 0o600))
+
+	s, fq := newTestP2PServer(t, dir, config.P2P{})
+	require.NoError(t, s.Run(context.Background()))
+	require.True(t, s.Started())
+	require.NotEqual(t, taken, s.Port())
+
+	// The abandoned TCP listener from the failed pair must be closed —
+	// only the winning pair's listener reaches the transport.
+	fy := s.yamux.(*fakeYamux)
+	require.Len(t, fy.listeners, 1)
+	require.Len(t, fq.conns, 1)
+
+	// The fresh port is persisted for the next boot.
+	raw, err := os.ReadFile(filepath.Join(dir, portFileName))
+	require.NoError(t, err)
+	require.Equal(t, strconv.Itoa(s.Port()), string(raw))
 }
 
 func TestP2PServerDisabled(t *testing.T) {

@@ -115,14 +115,6 @@ func (c *configAdapter) GetWebTransport() webtransport.Config {
 	return webtransport.Config{DialTimeoutSec: 30}
 }
 
-// GetParallelDial opts the SDK into any-sync's staggered parallel dial
-// (peerservice races addr candidates instead of serializing a full dial
-// timeout per dead addr — the cold-login stall on port-filtering
-// networks). Always on for SDK consumers; the opt-in exists for
-// anytype's gradual client rollout. No-op until the any-sync version
-// that consults it is pinned.
-func (c *configAdapter) GetParallelDial() bool { return true }
-
 func (c *configAdapter) GetSecureService() secureservice.Config { return secureservice.Config{} }
 
 // GetStreamConfig sizes the shared outgoing queues. The dial queue is

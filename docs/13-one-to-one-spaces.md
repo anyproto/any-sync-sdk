@@ -45,7 +45,7 @@ The whole space is built locally and offline by
     idempotent space id, both granted `AclPermissionsWriter` from the root.
 - Replication key = `fnv64(sharedPubKey)` — self-contained, independent of the
   account's replication key.
-- On-wire header `SpaceType = "any.onetoone"` (legacy anytype spaces carry `"anytype.onetoone"`; coordinator-gated allow-list,
+- On-wire header `SpaceType = "any.onetoone"` (coordinator-gated allow-list,
   see `docs/03-space.md`; irrelevant in a no-coordinator deployment).
 
 **Consequence that shapes everything below:** the ACL is **immutable** — just a

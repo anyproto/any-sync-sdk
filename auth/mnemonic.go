@@ -92,6 +92,3 @@ func (p *mnemonicProvider) AccountKey(_ context.Context) ([]byte, error) {
 func (p *mnemonicProvider) DeviceKey(_ context.Context) ([]byte, error) {
 	return p.deviceKey, nil
 }
-
-// AccountIndex returns the configured derivation index.
-func (p *mnemonicProvider) AccountIndex() uint32 { return p.index }

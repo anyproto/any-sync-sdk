@@ -363,7 +363,7 @@ func reconcileInviteOutbox(
 		if ctx.Err() != nil {
 			return
 		}
-		if space.IsOneToOne(r.Type) {
+		if r.Type == space.SpaceTypeOneToOne {
 			if r.OneToOneInviteState != oneToOneInviteToSend {
 				continue
 			}

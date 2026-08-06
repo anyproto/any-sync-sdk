@@ -221,15 +221,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)
 	}
 
-	// Tech-space header type is index-gated: index-0 accounts keep the
-	// anytype-compatible type (and their existing derived tech-space
-	// id); any other index — the `any` product's accounts — gets the
-	// any.* type. Providers that don't report an index count as 0.
-	techType := techspace.TechSpaceType
-	if ip, ok := provider.(auth.IndexProvider); ok && ip.AccountIndex() != 0 {
-		techType = techspace.AnyTechSpaceType
-	}
-	tsp := techspace.New(app, db, techType)
+	tsp := techspace.New(app, db)
 	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
 
 	// Push notifications (SYN-47): the push node is a direct out-of-band

@@ -44,36 +44,20 @@ import (
 
 // normalizeSpaceType applies the SpaceType allow-list before
 // stamping the value into an immutable space header. The
-// any-sync-coordinator rejects anything outside this set with
+// any-sync-coordinator rejects anything outside its allow-list with
 // "unknown space type: <value>", causing periodic headsync to fail
 // forever — and since the type is content-addressable into the
 // header, you can't fix the space after the fact. Catch it here.
 //
-// Empty defaults to SpaceTypeAny, the `any` product's own type; the
-// anytype.* values stay accepted for interop.
+// The SDK mints only any.space; empty means the same. 1-1 spaces are
+// derived, never created, so their type is not accepted here.
 func normalizeSpaceType(t string) (string, error) {
 	switch t {
-	case "":
+	case "", space.SpaceTypeAny:
 		return space.SpaceTypeAny, nil
-	case space.SpaceTypeAny, space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne:
-		return t, nil
 	default:
-		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s, %s, %s, %s)",
-			t, space.SpaceTypeAny, space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne)
-	}
-}
-
-// fileProtoVersionForType returns the header fileproto version for a
-// normalized space type. any.* headers must declare fileproto v2 (the
-// coordinator enforces it); anytype.* headers keep the unspecified
-// zero value — it feeds derived space ids, so it must never change
-// for existing types.
-func fileProtoVersionForType(t string) spacesyncproto.SpaceFileProtoVersion {
-	switch t {
-	case space.SpaceTypeAny, techspace.AnyTechSpaceType, space.SpaceTypeOneToOne:
-		return spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2
-	default:
-		return spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionUnspecified
+		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s or empty)",
+			t, space.SpaceTypeAny)
 	}
 }
 
@@ -594,13 +578,14 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		return nil, fmt.Errorf("spaceimpl: derive metadata key: %w", err)
 	}
 	payload := spacepayloads.SpaceCreatePayload{
-		SigningKey:       keys.SignKey,
-		MasterKey:        keys.SignKey,
-		ReadKey:          readKey,
-		MetadataKey:      metadataKey,
-		Metadata:         ownerMeta,
-		SpaceType:        spaceType,
-		FileProtoVersion: fileProtoVersionForType(spaceType),
+		SigningKey:  keys.SignKey,
+		MasterKey:   keys.SignKey,
+		ReadKey:     readKey,
+		MetadataKey: metadataKey,
+		Metadata:    ownerMeta,
+		SpaceType:   spaceType,
+		// any.* headers are files-v2 only (coordinator-enforced).
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
 		ReplicationKey:   replicationKeyFromSpaceId(s.tsp.SpaceId()),
 	}
 	spaceId, err := s.app.SpaceService().CreateSpace(ctx, payload)
@@ -681,7 +666,7 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	// acceptance stays an account-level decision made once. A local
 	// delete (localStatus=deleted) is not adopted — this device removed
 	// the space on purpose.
-	if space.IsOneToOne(rec.Type) &&
+	if rec.Type == space.SpaceTypeOneToOne &&
 		rec.RemoteStatus == techspace.StatusActive &&
 		(rec.LocalStatus == "" || rec.LocalStatus == oneToOnePendingLocalStatus) {
 		return s.AcceptOneToOne(ctx, spaceId)
@@ -808,7 +793,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	// who a 1-1 is with — and resolve their profile — straight from
 	// List/Subscribe, without loading or even materializing the space.
 	author := r.OneToOnePeer
-	if !space.IsOneToOne(r.Type) {
+	if r.Type != space.SpaceTypeOneToOne {
 		author = s.resolveAuthor(peekCtx, r.Id)
 	}
 	// An empty row type (joined/tracked space not yet loaded on any
@@ -834,7 +819,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
 	// displayHint fallback when nothing is resolved yet).
-	if space.IsOneToOne(r.Type) && r.OneToOnePeer != "" {
+	if r.Type == space.SpaceTypeOneToOne && r.OneToOnePeer != "" {
 		if id, ok := s.tsp.GetIdentity(ctx, r.OneToOnePeer); ok && id.Name != "" {
 			info.Name = id.Name
 			info.Description = id.Description
@@ -884,7 +869,7 @@ func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[strin
 // while the row stays re-creatable (a later OneToOne(peer) flips it back to
 // active). No coordinator SpaceDelete is ever sent.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && space.IsOneToOne(rec.Type) {
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Type == space.SpaceTypeOneToOne {
 		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.OneToOneDeletedStatus); err != nil {
 			return fmt.Errorf("spaceimpl: mark 1-1 deleted: %w", err)
 		}
@@ -1065,7 +1050,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
-			Type:         space.SpaceTypeRegular,
+			Type:         space.SpaceTypeAny,
 			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
@@ -1099,27 +1084,28 @@ func (s *Service) DeriveId(ctx context.Context, req space.DeriveRequest) (string
 }
 
 // derivePayload builds the any-sync derive payload shared by Derive and
-// DeriveId. The on-wire header SpaceType stays SpaceTypeRegular
-// (coordinator-gated). The app-level SpaceType tag and the seed are
-// encoded together into SpaceHeaderPayload, which is part of the header
-// (and thus the derived id) and is recoverable from the header alone on
-// cold restore. Both Derive and DeriveId build the identical payload, so
-// the derived id is stable for a given (seed, SpaceType) pair.
+// DeriveId. The on-wire header SpaceType is SpaceTypeAny
+// (coordinator-gated, files-v2 only). The app-level SpaceType tag and
+// the seed are encoded together into SpaceHeaderPayload, which is part
+// of the header (and thus the derived id) and is recoverable from the
+// header alone on cold restore. Both Derive and DeriveId build the
+// identical payload, so the derived id is stable for a given
+// (seed, SpaceType) pair.
 func (s *Service) derivePayload(keys *accountdata.AccountKeys, req space.DeriveRequest) spacepayloads.SpaceDerivePayload {
 	return spacepayloads.SpaceDerivePayload{
-		SigningKey:   keys.SignKey,
-		MasterKey:    keys.SignKey,
-		SpaceType:    space.SpaceTypeRegular,
-		SpacePayload: encodeDerivePayload(req.Seed, deriveSpaceTypeTag(req.SpaceType)),
+		SigningKey:       keys.SignKey,
+		MasterKey:        keys.SignKey,
+		SpaceType:        space.SpaceTypeAny,
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+		SpacePayload:     encodeDerivePayload(req.Seed, deriveSpaceTypeTag(req.SpaceType)),
 	}
 }
 
-// deriveSpaceTypeTag resolves the app-level SpaceType tag, defaulting an
-// empty request value to SpaceTypeRegular so existing Derive callers
-// keep today's behavior.
+// deriveSpaceTypeTag resolves the app-level SpaceType tag, defaulting
+// an empty request value to SpaceTypeAny.
 func deriveSpaceTypeTag(t string) string {
 	if t == "" {
-		return space.SpaceTypeRegular
+		return space.SpaceTypeAny
 	}
 	return t
 }
@@ -1206,7 +1192,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if !space.IsOneToOne(rec.Type) {
+	if rec.Type != space.SpaceTypeOneToOne {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %q is not a 1-1 space", spaceId)
 	}
 	if rec.OneToOnePeer == "" {
@@ -1234,7 +1220,7 @@ func (s *Service) DeclineOneToOne(ctx context.Context, spaceId string) error {
 	if !ok {
 		return fmt.Errorf("spaceimpl: DeclineOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if !space.IsOneToOne(rec.Type) {
+	if rec.Type != space.SpaceTypeOneToOne {
 		return fmt.Errorf("spaceimpl: DeclineOneToOne: %q is not a 1-1 space", spaceId)
 	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, oneToOneDeclinedRemoteStatus); err != nil {
@@ -1318,7 +1304,7 @@ func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity stri
 		return
 	}
 	rec, ok := s.tsp.Get(ctx, spaceId)
-	if !ok || !space.IsOneToOne(rec.Type) || rec.RemoteStatus == oneToOneDeclinedRemoteStatus {
+	if !ok || rec.Type != space.SpaceTypeOneToOne || rec.RemoteStatus == oneToOneDeclinedRemoteStatus {
 		return
 	}
 	// Record the sighting regardless of whether the profile resolves.
@@ -1598,7 +1584,7 @@ func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if space.IsOneToOne(rec.Type) {
+	if rec.Type == space.SpaceTypeOneToOne {
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %q %w — use AcceptOneToOne", spaceId, space.ErrIsOneToOne)
 	}
 	if rec.IsDeleted() {
@@ -1669,7 +1655,7 @@ func (s *Service) DeclineInvite(ctx context.Context, spaceId string) error {
 	if !ok {
 		return fmt.Errorf("spaceimpl: DeclineInvite: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if space.IsOneToOne(rec.Type) {
+	if rec.Type == space.SpaceTypeOneToOne {
 		return fmt.Errorf("spaceimpl: DeclineInvite: %q %w — use DeclineOneToOne", spaceId, space.ErrIsOneToOne)
 	}
 	switch rec.RemoteStatus {
@@ -1874,7 +1860,7 @@ func mapStatus(typ, local, remote string) space.Status {
 		// Synced, sticky direct-add decline — account-wide, non-terminal
 		// (AcceptInvite overrides).
 		return space.StatusInviteDeclined
-	case space.IsOneToOne(typ) && remote == techspace.StatusActive:
+	case typ == space.SpaceTypeOneToOne && remote == techspace.StatusActive:
 		// Account-scoped resolution wins over a device-local pending. A 1-1
 		// processed (accepted/initiated) on ANY device carries synced
 		// remote=active; a stale pending — e.g. an old inbox invite replayed
@@ -1897,7 +1883,7 @@ func mapStatus(typ, local, remote string) space.Status {
 		// ACL. Device-local (each device's mirror detects it) and
 		// non-terminal — the mirror self-heals back to active.
 		return space.StatusGuestRevoked
-	case space.IsOneToOne(typ) && local != techspace.StatusActive && remote != techspace.StatusActive:
+	case typ == space.SpaceTypeOneToOne && local != techspace.StatusActive && remote != techspace.StatusActive:
 		// A 1-1 row that exists but carries no active/declined signal and no
 		// device-local pending: the row synced from the device that
 		// registered the request before this device set its own status.

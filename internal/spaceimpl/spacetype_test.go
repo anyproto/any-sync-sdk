@@ -27,7 +27,7 @@ func TestEncodeDerivePayload_Deterministic(t *testing.T) {
 }
 
 func TestDecodeDerivePayload_RecoversType(t *testing.T) {
-	cases := []string{space.SpaceTypeRegular, "copilot.agent", "x"}
+	cases := []string{space.SpaceTypeAny, "copilot.agent", "x"}
 	for _, want := range cases {
 		got, ok := decodeDerivePayload(encodeDerivePayload([]byte("s"), want))
 		assert.True(t, ok, "encoded payload must decode")
@@ -45,8 +45,8 @@ func TestDecodeDerivePayload_RejectsForeign(t *testing.T) {
 	}
 }
 
-func TestDeriveSpaceTypeTag_DefaultsToRegular(t *testing.T) {
-	assert.Equal(t, space.SpaceTypeRegular, deriveSpaceTypeTag(""))
+func TestDeriveSpaceTypeTag_DefaultsToAny(t *testing.T) {
+	assert.Equal(t, space.SpaceTypeAny, deriveSpaceTypeTag(""))
 	assert.Equal(t, "copilot.agent", deriveSpaceTypeTag("copilot.agent"))
 }
 
@@ -55,22 +55,12 @@ func TestNormalizeSpaceType(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, space.SpaceTypeAny, got, "empty defaults to the any product type")
 
-	for _, allowed := range []string{space.SpaceTypeAny, space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne} {
-		got, err := normalizeSpaceType(allowed)
-		assert.NoError(t, err)
-		assert.Equal(t, allowed, got)
+	got, err = normalizeSpaceType(space.SpaceTypeAny)
+	assert.NoError(t, err)
+	assert.Equal(t, space.SpaceTypeAny, got)
+
+	for _, rejected := range []string{"anytype.space", "anytype.chatspace", space.SpaceTypeOneToOne, "other.space"} {
+		_, err := normalizeSpaceType(rejected)
+		assert.Error(t, err, rejected)
 	}
-
-	_, err = normalizeSpaceType("other.space")
-	assert.Error(t, err, "outside the coordinator allow-list")
-}
-
-func TestFileProtoVersionForType(t *testing.T) {
-	// any.* headers must declare fileproto v2 (coordinator-enforced);
-	// anytype.* headers keep the zero value — it feeds derived ids.
-	assert.EqualValues(t, 2, fileProtoVersionForType(space.SpaceTypeAny))
-	assert.EqualValues(t, 2, fileProtoVersionForType("any.techspace"))
-	assert.EqualValues(t, 2, fileProtoVersionForType(space.SpaceTypeOneToOne))
-	assert.EqualValues(t, 0, fileProtoVersionForType(space.SpaceTypeRegular))
-	assert.EqualValues(t, 0, fileProtoVersionForType(space.SpaceTypeOneToOneLegacy))
 }

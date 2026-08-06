@@ -44,10 +44,6 @@ type Service struct {
 	spaceId string
 	indexId string
 
-	// headerType is the on-the-wire SpaceType for the tech-space
-	// header, fixed at construction (see New).
-	headerType string
-
 	// avIds caches targetSpaceId → derived account-values carrier
 	// object id (see accountvalues.go). Guarded by avMu.
 	avMu  sync.Mutex
@@ -65,48 +61,30 @@ type Service struct {
 }
 
 // TechSpaceType is the on-the-wire SpaceType stamped into the
-// tech-space's space header for index-0 (anytype-compatible)
-// accounts. Mirrors anytype-heart's spacedomain.SpaceTypeTech and is
-// the value the any-sync-coordinator recognises for tech spaces (see
-// any-sync-coordinator spacestatus/changeverifier.go).
-const TechSpaceType = "anytype.techspace"
+// tech-space's space header. The `any` product's own value — distinct
+// from anytype-heart's "anytype.techspace", so an SDK account never
+// shares a tech space with a heart client, whatever its derivation
+// index. Headers carrying it declare fileproto v2 (coordinator-
+// enforced; see spacestatus/changeverifier.go there).
+const TechSpaceType = "any.techspace"
 
-// AnyTechSpaceType is the tech-space header type for `any` accounts
-// (derivation index != 0). The header type feeds the derived space id,
-// so the choice must be a pure function of the auth inputs: index-0
-// wallets keep TechSpaceType (and their existing tech-space id),
-// everything else gets the any.* type. Headers carrying it must
-// declare fileproto v2 — the coordinator enforces that.
-const AnyTechSpaceType = "any.techspace"
-
-// deriveCfg builds the tech-space derive payload. SpaceType matches
-// the any-sync-coordinator's allow-list (see
-// spacestatus/changeverifier.go there); the library default
-// spacepayloads.SpaceReserved ("any-sync.space") is rejected. The
-// type (and, for any.techspace, the fileproto version) feeds the
-// derived space id — the TechSpaceType payload must stay byte-
-// identical to the legacy one or every index-0 account's tech-space
-// id shifts (pinned by TestDeriveCfg_LegacyPayloadStable).
-func deriveCfg(signKey crypto.PrivKey, headerType string) spacepayloads.SpaceDerivePayload {
-	cfg := spacepayloads.SpaceDerivePayload{
-		SigningKey: signKey,
-		MasterKey:  signKey,
-		SpaceType:  headerType,
+// deriveCfg builds the tech-space derive payload. The type and
+// fileproto version feed the derived space id (pinned by
+// TestDeriveCfg_Stable). The library default
+// spacepayloads.SpaceReserved ("any-sync.space") is rejected by the
+// coordinator.
+func deriveCfg(signKey crypto.PrivKey) spacepayloads.SpaceDerivePayload {
+	return spacepayloads.SpaceDerivePayload{
+		SigningKey:       signKey,
+		MasterKey:        signKey,
+		SpaceType:        TechSpaceType,
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
 	}
-	if headerType == AnyTechSpaceType {
-		cfg.FileProtoVersion = spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2
-	}
-	return cfg
 }
 
-// New returns a Service ready for Open. headerType is the on-the-wire
-// SpaceType for the tech-space header (TechSpaceType or
-// AnyTechSpaceType); empty means TechSpaceType.
-func New(app *anysyncx.App, db anystore.DB, headerType string) *Service {
-	if headerType == "" {
-		headerType = TechSpaceType
-	}
-	return &Service{app: app, db: db, headerType: headerType}
+// New returns a Service ready for Open.
+func New(app *anysyncx.App, db anystore.DB) *Service {
+	return &Service{app: app, db: db}
 }
 
 // SyncHeads forces an immediate head-sync round on the tech space, so
@@ -133,7 +111,7 @@ func (s *Service) Open(ctx context.Context) error {
 		return errors.New("techspace: anysyncx app has no account keys")
 	}
 
-	spaceCfg := deriveCfg(keys.SignKey, s.headerType)
+	spaceCfg := deriveCfg(keys.SignKey)
 	spaceId, err := s.app.SpaceService().DeriveId(ctx, spaceCfg)
 	if err != nil {
 		return fmt.Errorf("techspace: derive id: %w", err)

@@ -120,7 +120,7 @@ func (s *Service) offloadDeletedOneToOnes(ctx context.Context, rows []techspace.
 		if ctx.Err() != nil {
 			return
 		}
-		oneToOne := space.IsOneToOne(r.Type) && r.RemoteStatus == techspace.OneToOneDeletedStatus
+		oneToOne := r.Type == space.SpaceTypeOneToOne && r.RemoteStatus == techspace.OneToOneDeletedStatus
 		guest := r.GuestKey != "" && r.RemoteStatus == techspace.GuestDeletedRemoteStatus
 		if !oneToOne && !guest {
 			continue

@@ -92,7 +92,7 @@ func noRegularClear(_ context.Context, spaceId, receiverId string) error {
 // is cleared so the loop can't spin on it.
 func TestReconcileOneToOneInvites_SelectsRowsAndClearsMalformed(t *testing.T) {
 	rows := []techspace.SpaceIndexRecord{
-		{Id: "regular", Type: space.SpaceTypeRegular, OneToOneInviteState: oneToOneInviteToSend, OneToOnePeer: "x"},
+		{Id: "regular", Type: space.SpaceTypeAny, OneToOneInviteState: oneToOneInviteToSend, OneToOnePeer: "x"},
 		{Id: "noMarker", Type: space.SpaceTypeOneToOne, OneToOnePeer: "x"},
 		{Id: "malformed", Type: space.SpaceTypeOneToOne, OneToOneInviteState: oneToOneInviteToSend},
 		{Id: "good", Type: space.SpaceTypeOneToOne, OneToOneInviteState: oneToOneInviteToSend, OneToOnePeer: "peerB"},
@@ -118,8 +118,8 @@ func TestReconcileOneToOneInvites_SelectsRowsAndClearsMalformed(t *testing.T) {
 // notifications).
 func TestReconcileInviteOutbox_RegularPerReceiver(t *testing.T) {
 	rows := []techspace.SpaceIndexRecord{
-		{Id: "s1", Type: space.SpaceTypeRegular, InviteNotifyPending: []string{"bob", "carol"}},
-		{Id: "noOutbox", Type: space.SpaceTypeRegular},
+		{Id: "s1", Type: space.SpaceTypeAny, InviteNotifyPending: []string{"bob", "carol"}},
+		{Id: "noOutbox", Type: space.SpaceTypeAny},
 	}
 	var sent []string
 	cleared := map[string]bool{}
@@ -147,7 +147,7 @@ func TestReconcileInviteOutbox_RegularPerReceiver(t *testing.T) {
 // retrying it forever.
 func TestReconcileInviteOutbox_UndeliverableClears(t *testing.T) {
 	rows := []techspace.SpaceIndexRecord{
-		{Id: "s1", Type: space.SpaceTypeRegular, InviteNotifyPending: []string{"junk-identity"}},
+		{Id: "s1", Type: space.SpaceTypeAny, InviteNotifyPending: []string{"junk-identity"}},
 	}
 	cleared := map[string]bool{}
 	send := func(_ context.Context, receiverId, spaceId string) error {
@@ -167,7 +167,7 @@ func TestReconcileInviteOutbox_UndeliverableClears(t *testing.T) {
 func TestReconcileInviteOutbox_Mixed(t *testing.T) {
 	rows := []techspace.SpaceIndexRecord{
 		{Id: "oto", Type: space.SpaceTypeOneToOne, OneToOneInviteState: oneToOneInviteToSend, OneToOnePeer: "peerA"},
-		{Id: "reg", Type: space.SpaceTypeRegular, InviteNotifyPending: []string{"bob"}},
+		{Id: "reg", Type: space.SpaceTypeAny, InviteNotifyPending: []string{"bob"}},
 	}
 	var otoSent, regSent []string
 	otoCleared, regCleared := map[string]bool{}, map[string]bool{}
@@ -206,7 +206,7 @@ func noOneToOneClear(_ context.Context, spaceId string) error {
 // Active, and a crash-window row (local=joining is impossible for
 // direct adds, but pending must win over unrelated local values).
 func TestMapStatus_InvitePendingDeclined(t *testing.T) {
-	reg := space.SpaceTypeRegular
+	reg := space.SpaceTypeAny
 
 	assert.Equal(t, space.StatusInvitePending,
 		mapStatus(reg, "", techspace.InvitePendingRemoteStatus), "synced pending row → InvitePending")

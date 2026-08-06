@@ -4,29 +4,21 @@ import "time"
 
 // On-the-wire SpaceType strings stamped into the space header at
 // derive/create time. The any-sync-coordinator gates inbound space
-// changes against this value (see any-sync-coordinator
-// spacestatus/changeverifier.go) — only the strings below plus an
-// empty value are accepted; anything else is rejected with
-// "unknown space type: <value>" and headsync fails. The type is
+// changes against an allow-list (see any-sync-coordinator
+// spacestatus/changeverifier.go); anything outside it is rejected
+// with "unknown space type: <value>" and headsync fails. The type is
 // content-addressed into the immutable header, so a rejected value
 // bricks the space permanently.
 //
-// The anytype.* strings mirror anytype-heart's spacedomain.SpaceType*
-// constants so a space created by the SDK is interoperable with
-// any-sync clients running anytype-heart. The any.* strings are the
-// `any` product's own; the coordinator requires fileproto v2 in
-// headers carrying them.
+// The SDK emits only the any.* family (the coordinator requires
+// fileproto v2 in headers carrying it). anytype.* spaces belong to
+// anytype-heart clients; the SDK can join/track them but never mints
+// them.
 const (
-	// SpaceTypeAny is the default for newly created spaces. Used when
-	// CreateRequest.SpaceType is empty.
+	// SpaceTypeAny is the type of every created or derived space.
+	// Used when CreateRequest.SpaceType is empty (the only accepted
+	// value).
 	SpaceTypeAny = "any.space"
-
-	// SpaceTypeRegular is anytype's regular-space type, accepted for
-	// interop when passed explicitly.
-	SpaceTypeRegular = "anytype.space"
-
-	// SpaceTypeChat is for chat spaces (one shared chat per space).
-	SpaceTypeChat = "anytype.chatspace"
 
 	// SpaceTypeOneToOne is for derived 1-1 spaces shared between two
 	// identities. The type is content-addressed into the symmetric
@@ -34,30 +26,18 @@ const (
 	// only within a product, and the any.* variant makes an
 	// any↔anytype 1-1 structurally impossible.
 	SpaceTypeOneToOne = "any.onetoone"
-
-	// SpaceTypeOneToOneLegacy is anytype's 1-1 type. Rows and spaces
-	// created before the any.* flip carry it; read paths match both
-	// via IsOneToOne.
-	SpaceTypeOneToOneLegacy = "anytype.onetoone"
 )
-
-// IsOneToOne reports whether t is a 1-1 space type (current or
-// legacy). Use it wherever a possibly-legacy row or header type is
-// classified; writes use SpaceTypeOneToOne.
-func IsOneToOne(t string) bool {
-	return t == SpaceTypeOneToOne || t == SpaceTypeOneToOneLegacy
-}
 
 // SpaceInfo is a point-in-time snapshot of space metadata. Returned by
 // Service.List and Space.Info; does not auto-update — subscribe via
 // Service.Subscribe for live changes.
 type SpaceInfo struct {
 	Id   string
-	Type string // on-wire header type (anytype.space, anytype.chatspace, anytype.onetoone — never the tech type)
+	Type string // on-wire header type (any.space, any.onetoone, … — never the tech type)
 	// SpaceType is the app-level tag set via DeriveRequest.SpaceType,
 	// read from the in-space spaceIndex. Independent of the header Type;
-	// use it for client-side classification/filtering. Empty/regular
-	// spaces carry SpaceTypeRegular.
+	// use it for client-side classification/filtering. Untagged spaces
+	// carry SpaceTypeAny.
 	SpaceType string
 	// Author is the space owner's account identity, resolved from the
 	// ACL. Best-effort: empty when the ACL is not loadable.

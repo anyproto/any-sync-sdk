@@ -10,14 +10,14 @@ import (
 	"github.com/ipfs/go-cid"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
-	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // Track registers a foreign spaceId in the tech-space index so a later
 // Get can open it. The row is the Create/Join registry shape minus the
-// membership semantics — Type regular, remote+local status active, no
-// metadata (nothing is known about a space we hold no keys to; the
-// name/icon mirror only runs for materialized spaceIndex trees).
+// membership semantics — Type unknown until the first load backfills
+// it from the header, remote+local status active, no metadata (nothing
+// is known about a space we hold no keys to; the name/icon mirror only
+// runs for materialized spaceIndex trees).
 //
 // No network round trip happens here: Get is what triggers any-sync's
 // storage bootstrap (SpacePull from the responsible nodes when local
@@ -35,7 +35,6 @@ func (s *Service) Track(ctx context.Context, spaceId string) error {
 	}
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 		Id:           spaceId,
-		Type:         space.SpaceTypeRegular,
 		RemoteStatus: techspace.StatusActive,
 	}); err != nil {
 		return fmt.Errorf("spaceimpl: Track: write index entry: %w", err)

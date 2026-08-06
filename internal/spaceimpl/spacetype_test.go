@@ -27,7 +27,7 @@ func TestEncodeDerivePayload_Deterministic(t *testing.T) {
 }
 
 func TestDecodeDerivePayload_RecoversType(t *testing.T) {
-	cases := []string{space.SpaceTypeRegular, "copilot.agent", "x"}
+	cases := []string{space.SpaceTypeAny, "copilot.agent", "x"}
 	for _, want := range cases {
 		got, ok := decodeDerivePayload(encodeDerivePayload([]byte("s"), want))
 		assert.True(t, ok, "encoded payload must decode")
@@ -45,7 +45,22 @@ func TestDecodeDerivePayload_RejectsForeign(t *testing.T) {
 	}
 }
 
-func TestDeriveSpaceTypeTag_DefaultsToRegular(t *testing.T) {
-	assert.Equal(t, space.SpaceTypeRegular, deriveSpaceTypeTag(""))
+func TestDeriveSpaceTypeTag_DefaultsToAny(t *testing.T) {
+	assert.Equal(t, space.SpaceTypeAny, deriveSpaceTypeTag(""))
 	assert.Equal(t, "copilot.agent", deriveSpaceTypeTag("copilot.agent"))
+}
+
+func TestNormalizeSpaceType(t *testing.T) {
+	got, err := normalizeSpaceType("")
+	assert.NoError(t, err)
+	assert.Equal(t, space.SpaceTypeAny, got, "empty defaults to the any product type")
+
+	got, err = normalizeSpaceType(space.SpaceTypeAny)
+	assert.NoError(t, err)
+	assert.Equal(t, space.SpaceTypeAny, got)
+
+	for _, rejected := range []string{"anytype.space", "anytype.chatspace", space.SpaceTypeOneToOne, "other.space"} {
+		_, err := normalizeSpaceType(rejected)
+		assert.Error(t, err, rejected)
+	}
 }

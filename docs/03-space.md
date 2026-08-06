@@ -148,10 +148,11 @@ type AclSpaceClient interface {
 - Space deletion → SDK updates tech space record to `status=deleted`, offloads local data, and the deletion reconciler sends the signed `coordinator.SpaceDelete` (see Space Lifecycle)
 - All writes go through SDK methods, never direct
 
-### Space type strings (interim)
-- The on-the-wire `header.SpaceType` value is gated by the any-sync-coordinator (`spacestatus/changeverifier.go`). Only the anytype-specific names are accepted today: `anytype.space` (regular), `anytype.techspace` (tech), `anytype.chatspace`, `anytype.onetoone`. Anything else fails periodic headsync with `unknown space type: <value>`.
-- The SDK therefore hardcodes `anytype.*` as defaults: regular spaces stamp `anytype.space`, the tech space stamps `anytype.techspace` (overriding `spacepayloads.SpaceReserved`, which is `any-sync.space` and rejected). Public constants `space.SpaceTypeRegular` / `SpaceTypeChat` / `SpaceTypeOneToOne` mirror anytype-heart's `spacedomain` package.
-- **Future**: drop the anytype-specific gate from any-sync-coordinator (or make the allow-list configurable per deployment) so the SDK can use deployment-neutral type strings. Tracked as a future any-sync change; the SDK will keep the public constants as the migration surface — bumping them is a one-line change here once the coordinator allows it.
+### Space type strings
+- The on-the-wire `header.SpaceType` value is gated by the any-sync-coordinator (`spacestatus/changeverifier.go`). Accepted: the `any` product's own `any.space` / `any.techspace` / `any.onetoone` (all require `fileprotoVersion=2` in the header) plus the anytype names `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. Anything else fails periodic headsync with `unknown space type: <value>` — and since the type is content-addressed into the immutable header, a rejected value bricks the space permanently.
+- The SDK mints only the `any.*` family, all with fileproto v2: created AND derived spaces stamp `any.space` (`space.SpaceTypeAny`; the only value `CreateRequest.SpaceType` accepts besides empty), the tech space `any.techspace`, 1-1s `any.onetoone` (`space.SpaceTypeOneToOne`). The anytype.* names belong to anytype-heart clients — the SDK can join/track such spaces but never creates them.
+- The 1-1 type feeds the symmetric derived 1-1 id, and 1-1s pair only within a product — the distinct type makes an any↔anytype 1-1 structurally impossible.
+- Rows registered before the space's header is readable (join/track/invite-pending) carry an unknown (empty) `type`, backfilled set-once from the header on the first successful load.
 
 ## Grooming Questions (open)
 

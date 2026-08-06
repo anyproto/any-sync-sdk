@@ -35,8 +35,11 @@ type FileProviderConfig struct {
 	// otherwise NewFileProvider returns ErrMnemonicMismatch.
 	Mnemonic string
 
-	// Index is the account derivation index used together with
-	// Mnemonic. Ignored when the wallet file already exists.
+	// Index is the account derivation index applied when the wallet is
+	// created — both for a supplied Mnemonic and for a freshly
+	// generated one. Ignored when the wallet file already exists (the
+	// stored index wins). Zero means index 0, the anytype-compatible
+	// account; `any` accounts use DefaultAccountIndex.
 	Index uint32
 }
 
@@ -45,7 +48,8 @@ type FileProviderConfig struct {
 var ErrInvalidMnemonic = errors.New("invalid mnemonic")
 
 // ErrMnemonicMismatch is returned when FileProviderConfig.Mnemonic is
-// set but an existing wallet file stores a different phrase.
+// set but an existing wallet file stores a different phrase — or the
+// same phrase at a different derivation index.
 var ErrMnemonicMismatch = errors.New("wallet exists with a different mnemonic")
 
 // ErrPasskeyRequired is returned when the wallet file is encrypted but
@@ -98,6 +102,11 @@ func NewFileProvider(cfg FileProviderConfig) (*FileProvider, error) {
 		return nil, err
 	} else if cfg.Mnemonic != "" && cfg.Mnemonic != w.Mnemonic {
 		return nil, ErrMnemonicMismatch
+	} else if cfg.Mnemonic != "" && cfg.Index != w.Index {
+		// A restore names the account it wants via (phrase, index);
+		// silently serving the wallet's other-index account would hand
+		// the caller the wrong identity.
+		return nil, fmt.Errorf("%w: wallet is index %d, requested %d", ErrMnemonicMismatch, w.Index, cfg.Index)
 	}
 
 	return &FileProvider{path: path, passkey: cfg.Passkey, w: w, created: created}, nil
@@ -129,6 +138,9 @@ func (p *FileProvider) AccountKey(_ context.Context) ([]byte, error) {
 func (p *FileProvider) DeviceKey(_ context.Context) ([]byte, error) {
 	return p.w.DeviceKey, nil
 }
+
+// AccountIndex returns the derivation index pinned in the wallet file.
+func (p *FileProvider) AccountIndex() uint32 { return p.w.Index }
 
 type wallet struct {
 	Mnemonic  string
@@ -175,7 +187,6 @@ func generateWallet(mnemonic string, index uint32) (*wallet, error) {
 			return nil, err
 		}
 		mnemonic = string(m)
-		index = 0
 	}
 	devPriv, _, err := crypto.GenerateRandomEd25519KeyPair()
 	if err != nil {

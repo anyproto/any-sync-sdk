@@ -89,6 +89,31 @@ func (s *Service) spaceTypeFromHeader(ctx context.Context, spaceId string) strin
 	return hdr.SpaceType
 }
 
+// headerTypeFromHeader reads a space's raw on-wire header SpaceType —
+// the coordinator-gated string (any.space / anytype.space / …), NOT
+// the app-level tag spaceTypeFromHeader prefers. Best-effort like the
+// other header readers: "" when the space is not resident or the
+// header does not parse.
+func (s *Service) headerTypeFromHeader(ctx context.Context, spaceId string) string {
+	handle, ok := s.app.PickSpace(ctx, spaceId)
+	if !ok {
+		return ""
+	}
+	desc, err := handle.Inner().Description(ctx)
+	if err != nil || desc.SpaceHeader == nil {
+		return ""
+	}
+	var raw spacesyncproto.RawSpaceHeader
+	if err := raw.UnmarshalVT(desc.SpaceHeader.RawHeader); err != nil {
+		return ""
+	}
+	var hdr spacesyncproto.SpaceHeader
+	if err := hdr.UnmarshalVT(raw.SpaceHeader); err != nil {
+		return ""
+	}
+	return hdr.SpaceType
+}
+
 // resolveSpaceType returns the cached tech-space SpaceType when present,
 // otherwise falls back to the authoritative header value. Keeps List/Info
 // cheap on the common path while guaranteeing correctness on cold restore

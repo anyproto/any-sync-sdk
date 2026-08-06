@@ -261,12 +261,10 @@ type CreateRequest struct {
 	Description string
 	IconCID     string
 	// SpaceType is stamped into the space header at create time and
-	// gated by the any-sync-coordinator. Must be one of the public
-	// constants (SpaceTypeRegular, SpaceTypeChat, SpaceTypeOneToOne)
-	// or empty — empty defaults to SpaceTypeRegular. Anything else
-	// is rejected by Create with a clear error; passing an invalid
-	// type would otherwise produce a space the coordinator refuses
-	// to sync.
+	// gated by the any-sync-coordinator. Must be SpaceTypeAny or empty
+	// (same meaning). Anything else is rejected by Create with a clear
+	// error; passing an invalid type would otherwise produce a space
+	// the coordinator refuses to sync.
 	SpaceType string
 }
 
@@ -289,8 +287,8 @@ type DeriveRequest struct {
 
 	// SpaceType is an app-level tag surfaced as SpaceInfo.SpaceType for
 	// client-side filtering. It is NOT the on-wire header type (that
-	// stays anytype.space and is coordinator-gated) and not stamped into
-	// the header. Empty defaults to SpaceTypeRegular.
+	// stays SpaceTypeAny and is coordinator-gated) and not stamped into
+	// the header as the type. Empty defaults to SpaceTypeAny.
 	SpaceType string
 }
 

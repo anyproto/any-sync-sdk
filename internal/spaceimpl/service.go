@@ -22,6 +22,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -43,22 +44,20 @@ import (
 
 // normalizeSpaceType applies the SpaceType allow-list before
 // stamping the value into an immutable space header. The
-// any-sync-coordinator rejects anything outside this set with
+// any-sync-coordinator rejects anything outside its allow-list with
 // "unknown space type: <value>", causing periodic headsync to fail
 // forever — and since the type is content-addressable into the
 // header, you can't fix the space after the fact. Catch it here.
 //
-// Empty defaults to SpaceTypeRegular, mirroring anytype-heart and
-// matching the coordinator's "" → SpaceTypeRegular treatment.
+// The SDK mints only any.space; empty means the same. 1-1 spaces are
+// derived, never created, so their type is not accepted here.
 func normalizeSpaceType(t string) (string, error) {
 	switch t {
-	case "":
-		return space.SpaceTypeRegular, nil
-	case space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne:
-		return t, nil
+	case "", space.SpaceTypeAny:
+		return space.SpaceTypeAny, nil
 	default:
-		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s, %s, %s)",
-			t, space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne)
+		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s or empty)",
+			t, space.SpaceTypeAny)
 	}
 }
 
@@ -579,13 +578,15 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		return nil, fmt.Errorf("spaceimpl: derive metadata key: %w", err)
 	}
 	payload := spacepayloads.SpaceCreatePayload{
-		SigningKey:     keys.SignKey,
-		MasterKey:      keys.SignKey,
-		ReadKey:        readKey,
-		MetadataKey:    metadataKey,
-		Metadata:       ownerMeta,
-		SpaceType:      spaceType,
-		ReplicationKey: replicationKeyFromSpaceId(s.tsp.SpaceId()),
+		SigningKey:  keys.SignKey,
+		MasterKey:   keys.SignKey,
+		ReadKey:     readKey,
+		MetadataKey: metadataKey,
+		Metadata:    ownerMeta,
+		SpaceType:   spaceType,
+		// any.* headers are files-v2 only (coordinator-enforced).
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+		ReplicationKey:   replicationKeyFromSpaceId(s.tsp.SpaceId()),
 	}
 	spaceId, err := s.app.SpaceService().CreateSpace(ctx, payload)
 	if err != nil {
@@ -733,7 +734,26 @@ func (s *Service) load(ctx context.Context, spaceId string) (space.Space, error)
 	// owner can write the initial spaceIndex properties, and non-
 	// owners skip silently (the owner's eventual write propagates).
 	s.goSeed(sp)
+	s.backfillHeaderType(ctx, spaceId)
 	return sp, nil
+}
+
+// backfillHeaderType fills the set-once tech-space row `type` from the
+// now-loaded space's on-wire header. Rows registered on join/track are
+// created before the header is readable and carry an empty type until
+// the first successful load lands here. Best-effort: a miss retries on
+// the next load, and the handler's set-once rule absorbs races.
+func (s *Service) backfillHeaderType(ctx context.Context, spaceId string) {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok || rec.Type != "" {
+		return
+	}
+	ht := s.headerTypeFromHeader(ctx, spaceId)
+	if ht == "" {
+		return
+	}
+	// Failure just leaves the row unknown; the next load retries.
+	_, _ = s.tsp.SetType(ctx, spaceId, ht)
 }
 
 // SyncSpaceList forces an immediate head-sync round on the tech space
@@ -759,6 +779,13 @@ func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 // Shared by List and the Subscribe translator so both surface the same
 // shape.
 func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord) space.SpaceInfo {
+	// The header/ACL peeks below never *trigger* a load (PickSpace),
+	// but ocache's Pick waits on a load already in flight — and rows
+	// with an empty type are exactly the mid-pull ones. Bound the
+	// peeks so a stuck pull can't stall List or the Subscribe
+	// translator; a timed-out peek just reports the row as-is.
+	peekCtx, cancelPeek := context.WithTimeout(ctx, time.Second)
+	defer cancelPeek()
 	// A 1-1 space's ACL "owner" is a synthetic shared key nobody holds
 	// (see docs/13), so resolveAuthor returns nothing meaningful. The
 	// useful value is the other participant's account identity, recorded
@@ -767,12 +794,19 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	// List/Subscribe, without loading or even materializing the space.
 	author := r.OneToOnePeer
 	if r.Type != space.SpaceTypeOneToOne {
-		author = s.resolveAuthor(ctx, r.Id)
+		author = s.resolveAuthor(peekCtx, r.Id)
+	}
+	// An empty row type (joined/tracked space not yet loaded on any
+	// device) falls back to the header when the space happens to be
+	// resident; the durable backfill happens in load.
+	typ := r.Type
+	if typ == "" {
+		typ = s.headerTypeFromHeader(peekCtx, r.Id)
 	}
 	info := space.SpaceInfo{
 		Id:          r.Id,
-		Type:        r.Type,
-		SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
+		Type:        typ,
+		SpaceType:   s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
 		Author:      author,
 		Name:        r.Name,
 		Description: r.Description,
@@ -1016,7 +1050,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
-			Type:         space.SpaceTypeRegular,
+			Type:         space.SpaceTypeAny,
 			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
@@ -1050,27 +1084,28 @@ func (s *Service) DeriveId(ctx context.Context, req space.DeriveRequest) (string
 }
 
 // derivePayload builds the any-sync derive payload shared by Derive and
-// DeriveId. The on-wire header SpaceType stays SpaceTypeRegular
-// (coordinator-gated). The app-level SpaceType tag and the seed are
-// encoded together into SpaceHeaderPayload, which is part of the header
-// (and thus the derived id) and is recoverable from the header alone on
-// cold restore. Both Derive and DeriveId build the identical payload, so
-// the derived id is stable for a given (seed, SpaceType) pair.
+// DeriveId. The on-wire header SpaceType is SpaceTypeAny
+// (coordinator-gated, files-v2 only). The app-level SpaceType tag and
+// the seed are encoded together into SpaceHeaderPayload, which is part
+// of the header (and thus the derived id) and is recoverable from the
+// header alone on cold restore. Both Derive and DeriveId build the
+// identical payload, so the derived id is stable for a given
+// (seed, SpaceType) pair.
 func (s *Service) derivePayload(keys *accountdata.AccountKeys, req space.DeriveRequest) spacepayloads.SpaceDerivePayload {
 	return spacepayloads.SpaceDerivePayload{
-		SigningKey:   keys.SignKey,
-		MasterKey:    keys.SignKey,
-		SpaceType:    space.SpaceTypeRegular,
-		SpacePayload: encodeDerivePayload(req.Seed, deriveSpaceTypeTag(req.SpaceType)),
+		SigningKey:       keys.SignKey,
+		MasterKey:        keys.SignKey,
+		SpaceType:        space.SpaceTypeAny,
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+		SpacePayload:     encodeDerivePayload(req.Seed, deriveSpaceTypeTag(req.SpaceType)),
 	}
 }
 
-// deriveSpaceTypeTag resolves the app-level SpaceType tag, defaulting an
-// empty request value to SpaceTypeRegular so existing Derive callers
-// keep today's behavior.
+// deriveSpaceTypeTag resolves the app-level SpaceType tag, defaulting
+// an empty request value to SpaceTypeAny.
 func deriveSpaceTypeTag(t string) string {
 	if t == "" {
-		return space.SpaceTypeRegular
+		return space.SpaceTypeAny
 	}
 	return t
 }
@@ -1125,7 +1160,7 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
 	}
-	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(keys.SignKey, otherPk, space.SpaceTypeOneToOne)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
 	}
@@ -1169,7 +1204,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	}
 	// Pending rows carry no storage — the activate's cache load creates
 	// it from the derived payload (see ctxWithCreatePayload).
-	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(keys.SignKey, otherPk, space.SpaceTypeOneToOne)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: materialize 1-1: %w", err)
 	}
@@ -1342,7 +1377,7 @@ func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity st
 // SpaceService.DeriveOneToOneSpace, which materializes it. Used by
 // RegisterIncoming to record a pending row before the user accepts.
 func deriveOneToOneId(mySignKey crypto.PrivKey, peerPub crypto.PubKey) (string, error) {
-	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(mySignKey, peerPub)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(mySignKey, peerPub, space.SpaceTypeOneToOne)
 	if err != nil {
 		return "", err
 	}
@@ -1400,9 +1435,10 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 	// the joining lifecycle is per-device (localStatus is a local field),
 	// so it's set separately via SetLocalStatus after the row exists.
 	if _, ok := s.tsp.Get(ctx, inv.SpaceId); !ok {
+		// Type is unknown at join time (the header isn't readable until
+		// the space loads) — left empty, backfilled set-once by load.
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           inv.SpaceId,
-			Type:         space.SpaceTypeRegular,
 			RemoteStatus: techspace.StatusActive,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
@@ -1499,9 +1535,9 @@ func (s *Service) JoinGuest(ctx context.Context, invite string) (space.Space, er
 			}
 		}
 	} else {
+		// Type unknown until the guest space loads; backfilled by load.
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           inv.SpaceId,
-			Type:         space.SpaceTypeRegular,
 			RemoteStatus: techspace.StatusActive,
 			GuestKey:     encoded,
 		}); err != nil {

@@ -12,7 +12,7 @@ A derived space (deterministic from account key) that stores account-level data.
 - **ocache pattern** — any-sync `CommonSpace` managed via ocache (like any-sync-node), init/close by activity. SDK doesn't depend on space being loaded in memory
 - **Sync priority** — tech space syncs first on startup, but sync is continuous (decentralized, never "done")
 - **Tech space loads before regular spaces** — space list comes from tech space
-- **SpaceType (interim)** — the tech space stamps `anytype.techspace` in its header (`techspace.TechSpaceType` constant). The any-sync-coordinator gates inbound spaces against an anytype-specific allow-list (`spacestatus/changeverifier.go`); the library default `spacepayloads.SpaceReserved` (`any-sync.space`) is rejected. See `03-space.md § Space type strings (interim)` for the migration plan.
+- **SpaceType** — always `any.techspace` (`techspace.TechSpaceType`) with `fileprotoVersion=2`, for every account regardless of derivation index. Distinct from anytype-heart's `anytype.techspace`, so an SDK account never shares a tech space with a heart client even at index 0. The header feeds the derived tech-space id (pinned by `TestDeriveCfg_Stable`) — changing it orphans every account's tech space. Accepted pre-production break: accounts created before this shipped derive a new (empty) tech-space id on upgrade. The coordinator gates the allow-list (`spacestatus/changeverifier.go`); the library default `spacepayloads.SpaceReserved` (`any-sync.space`) is rejected. See `03-space.md § Space type strings`.
 
 ## What Tech Space Stores
 

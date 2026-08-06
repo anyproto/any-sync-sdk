@@ -42,7 +42,6 @@ func TestOwnRole_MirroredToSpaceRow(t *testing.T) {
 
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{
 		Name:      "own-role",
-		SpaceType: space.SpaceTypeRegular,
 	})
 	require.NoError(t, err)
 

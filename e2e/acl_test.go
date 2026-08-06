@@ -639,12 +639,12 @@ func TestSDK_Spaces_DeriveType(t *testing.T) {
 
 	info := sp.Info()
 	assert.Equal(t, "copilot.agent", info.SpaceType, "app tag surfaced in SpaceInfo.SpaceType")
-	assert.Equal(t, space.SpaceTypeRegular, info.Type, "header Type stays the gated regular type")
+	assert.Equal(t, space.SpaceTypeAny, info.Type, "header Type stays the gated regular type")
 
 	// Empty SpaceType defaults to the regular tag.
 	spReg, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: []byte("plain")})
 	require.NoError(t, err)
-	assert.Equal(t, space.SpaceTypeRegular, spReg.Info().SpaceType)
+	assert.Equal(t, space.SpaceTypeAny, spReg.Info().SpaceType)
 
 	require.NoError(t, sdk.Close())
 
@@ -661,7 +661,7 @@ func TestSDK_Spaces_DeriveType(t *testing.T) {
 		if sinfo.Id == id {
 			found = true
 			assert.Equal(t, "copilot.agent", sinfo.SpaceType, "SpaceType survives cold restart")
-			assert.Equal(t, space.SpaceTypeRegular, sinfo.Type)
+			assert.Equal(t, space.SpaceTypeAny, sinfo.Type)
 		}
 	}
 	assert.True(t, found, "derived space present after restart")

@@ -114,9 +114,10 @@ func TestE2E_DirectAdd_InboxInvite(t *testing.T) {
 	carolPending := waitPending(carol, "carol")
 
 	// The pending rows carry the display hints from the invite body —
-	// no space content has been pulled yet.
+	// no space content has been pulled yet, so the header type is still
+	// unknown (backfilled after accept+load).
 	assert.Equal(t, "TeamSpace", bobPending.Name, "pending row shows the name hint")
-	assert.Equal(t, space.SpaceTypeRegular, bobPending.Type)
+	assert.Empty(t, bobPending.Type, "header type unknown until the space loads")
 	assert.Equal(t, "TeamSpace", carolPending.Name)
 
 	// The materialization gate: a pending invite cannot be loaded by a
@@ -137,6 +138,14 @@ func TestE2E_DirectAdd_InboxInvite(t *testing.T) {
 		return ok && si.Status == space.StatusActive
 	}) {
 		t.Fatalf("bob's accepted space never flipped to active")
+	}
+	// The accept-side load backfills the set-once row type from the
+	// header — the joiner converges on the creator's on-wire type.
+	if !waitFor(ctx, 30*time.Second, time.Second, func() bool {
+		si, ok := infoByID(t, ctx, bob, sp.Id())
+		return ok && si.Type == space.SpaceTypeAny
+	}) {
+		t.Fatalf("bob's row type never backfilled to %s", space.SpaceTypeAny)
 	}
 	if bobSp == nil {
 		bobSp, err = bob.Spaces().Get(ctx, sp.Id())

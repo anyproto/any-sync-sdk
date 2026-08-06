@@ -55,7 +55,6 @@ func TestPushKeys_MirroredToSpaceRow(t *testing.T) {
 
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{
 		Name:      "push-keys",
-		SpaceType: space.SpaceTypeRegular,
 	})
 	require.NoError(t, err)
 

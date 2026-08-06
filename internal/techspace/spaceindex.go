@@ -274,8 +274,7 @@ func (r SpaceIndexRecord) IsDeleted() bool {
 
 // Sentinels — wrap crdt.ErrValidation in handler returns.
 var (
-	ErrMissingType        = errors.New("techspace: space-index record requires `type`")
-	ErrTypeImmutable      = errors.New("techspace: `type` is pinned after first write")
+	ErrTypeImmutable      = errors.New("techspace: `type` is pinned after first non-empty write")
 	ErrStatusTerminal     = errors.New("techspace: status=deleted is terminal")
 	ErrDeleteOpNotAllowed = errors.New("techspace: deletion is via remoteStatus=deleted, not a delete op")
 )
@@ -292,8 +291,10 @@ var statusFields = map[string]struct{}{
 // dataset. Per docs/02-tech-space.md § "Space Index" and § "Key
 // Decisions (continued)":
 //
-//   - `type` is first-write-wins (a space's type is immutable once
-//     the index entry exists);
+//   - `type` is set-once: empty/absent means "unknown" (rows created
+//     on join/track before the space's header is readable) and may be
+//     filled exactly once — from the loaded space's on-wire header —
+//     after which it is immutable;
 //   - `localStatus` / `remoteStatus` cannot move OUT of "deleted"
 //     (terminal — deleted spaces stay in the index);
 //   - delete ops are rejected wholesale; deletion is a status edit,
@@ -305,20 +306,18 @@ type SpaceIndexHandler struct{}
 
 func (SpaceIndexHandler) Init(_ context.Context) error { return nil }
 
-// BeforeCreate requires the `type` field to be present and a non-empty
-// string. Strict allow-listing of type values is deferred until the
-// canonical space-type enum is consolidated; for now any non-empty
-// label passes.
+// BeforeCreate accepts any `type` value, including empty/absent —
+// rows registered on join/track are created before the space's header
+// is readable, so their type is unknown until the first load backfills
+// it (set-once, enforced by BeforeModify). Strict allow-listing of
+// type values is deferred until the canonical space-type enum is
+// consolidated.
 //
 // It also stamps `createdAt` (added-to-account time) from the change's
 // timestamp via sink.Derive — derived from the change envelope, so every
 // device replaying the same create lands on the same value. (Convergence
 // caveats in the FieldCreatedAt doc.)
 func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
-	t, ok := extractStringField(rec.Ops, FieldType)
-	if !ok || t == "" {
-		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrMissingType)
-	}
 	if ctx != nil && ctx.Change != nil && sink != nil && ctx.Change.Timestamp > 0 {
 		// Fresh arena per call — the derived Op holds it alive until
 		// the apply loop drains the sink (see drainDerivedTo).
@@ -335,14 +334,21 @@ func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChang
 }
 
 // BeforeModify enforces:
-//   - `type` is pinned (any op touching it drops);
+//   - `type` is set-once: writable while the current value is
+//     empty/absent (the header backfill), pinned afterwards;
 //   - status edits are rejected when the current status is "deleted".
+//
+// The set-once gate reads the LOCAL pre-op state, so two concurrent
+// fills with different values would pin divergently per device. That
+// is safe only because the sole writer (load's header backfill) writes
+// a pure function of the immutable space header — identical on every
+// device. Do not add a second `type` writer that isn't.
 func (SpaceIndexHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
 	if len(op.Path) == 0 {
 		return rejectMultiField(op.Payload, ctx.Before)
 	}
 	head := op.Path[0]
-	if head == FieldType {
+	if head == FieldType && currentType(ctx.Before) != "" {
 		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrTypeImmutable)
 	}
 	if _, isStatus := statusFields[head]; isStatus {
@@ -384,7 +390,7 @@ func rejectMultiField(payload, before *anyenc.Value) error {
 		if i := strings.IndexByte(head, '.'); i >= 0 {
 			head = head[:i]
 		}
-		if head == FieldType {
+		if head == FieldType && currentType(before) != "" {
 			hit = fmt.Errorf("%w: %w", crdt.ErrValidation, ErrTypeImmutable)
 			return
 		}
@@ -395,6 +401,20 @@ func rejectMultiField(payload, before *anyenc.Value) error {
 		}
 	})
 	return hit
+}
+
+// currentType reads `type` off the pre-op record. Empty string covers
+// absent record, missing field, and an explicit "" — all of which mean
+// "unknown, still fillable" for the set-once rule.
+func currentType(before *anyenc.Value) string {
+	if before == nil {
+		return ""
+	}
+	v := before.Get(FieldType)
+	if v == nil || v.Type() != anyenc.TypeString {
+		return ""
+	}
+	return string(v.GetStringBytes())
 }
 
 // currentStatus reads the named status field off the pre-op record.
@@ -412,34 +432,3 @@ func currentStatus(before *anyenc.Value, field string) string {
 	return string(v.GetStringBytes())
 }
 
-// extractStringField walks rec.Ops looking for a creation-shape op
-// that sets `field` to a string. Two valid shapes (mirrors the
-// PropertyHandler kind extractor):
-//
-//   - Multi-field $set with empty Path and `field` as a top-level
-//     key in the payload object.
-//   - Single-field $set with Path = [field] and a string payload.
-func extractStringField(ops []crdt.Op, field string) (string, bool) {
-	for i := range ops {
-		op := &ops[i]
-		if op.Type != crdt.OpSet {
-			continue
-		}
-		if len(op.Path) == 0 {
-			if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
-				continue
-			}
-			v := op.Payload.Get(field)
-			if v != nil && v.Type() == anyenc.TypeString {
-				return string(v.GetStringBytes()), true
-			}
-			continue
-		}
-		if len(op.Path) == 1 && op.Path[0] == field {
-			if op.Payload != nil && op.Payload.Type() == anyenc.TypeString {
-				return string(op.Payload.GetStringBytes()), true
-			}
-		}
-	}
-	return "", false
-}

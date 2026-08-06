@@ -12,6 +12,8 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -59,11 +61,26 @@ type Service struct {
 }
 
 // TechSpaceType is the on-the-wire SpaceType stamped into the
-// tech-space's space header. Mirrors anytype-heart's
-// spacedomain.SpaceTypeTech and is the value the any-sync-coordinator
-// recognises for tech spaces (see any-sync-coordinator
-// spacestatus/changeverifier.go).
-const TechSpaceType = "anytype.techspace"
+// tech-space's space header. The `any` product's own value — distinct
+// from anytype-heart's "anytype.techspace", so an SDK account never
+// shares a tech space with a heart client, whatever its derivation
+// index. Headers carrying it declare fileproto v2 (coordinator-
+// enforced; see spacestatus/changeverifier.go there).
+const TechSpaceType = "any.techspace"
+
+// deriveCfg builds the tech-space derive payload. The type and
+// fileproto version feed the derived space id (pinned by
+// TestDeriveCfg_Stable). The library default
+// spacepayloads.SpaceReserved ("any-sync.space") is rejected by the
+// coordinator.
+func deriveCfg(signKey crypto.PrivKey) spacepayloads.SpaceDerivePayload {
+	return spacepayloads.SpaceDerivePayload{
+		SigningKey:       signKey,
+		MasterKey:        signKey,
+		SpaceType:        TechSpaceType,
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+	}
+}
 
 // New returns a Service ready for Open.
 func New(app *anysyncx.App, db anystore.DB) *Service {
@@ -94,16 +111,7 @@ func (s *Service) Open(ctx context.Context) error {
 		return errors.New("techspace: anysyncx app has no account keys")
 	}
 
-	// SpaceType for the tech space matches the any-sync-coordinator's
-	// allow-list (see spacestatus/changeverifier.go in
-	// any-sync-coordinator). The library default
-	// spacepayloads.SpaceReserved ("any-sync.space") is rejected by
-	// the coordinator — it only knows the anytype.* family.
-	spaceCfg := spacepayloads.SpaceDerivePayload{
-		SigningKey: keys.SignKey,
-		MasterKey:  keys.SignKey,
-		SpaceType:  TechSpaceType,
-	}
+	spaceCfg := deriveCfg(keys.SignKey)
 	spaceId, err := s.app.SpaceService().DeriveId(ctx, spaceCfg)
 	if err != nil {
 		return fmt.Errorf("techspace: derive id: %w", err)
@@ -302,6 +310,16 @@ func (s *Service) setRowField(ctx context.Context, spaceId, field string, local 
 func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
 	return s.setRowField(ctx, spaceId, FieldLocalStatus, true, func(a *anyenc.Arena) *anyenc.Value {
 		return a.NewString(status)
+	})
+}
+
+// SetType backfills the on-wire header type onto a row created with an
+// unknown type (join/track register rows before the space's header is
+// readable). Synced write; the handler's set-once rule makes it a no-op
+// race loser everywhere the value is already non-empty.
+func (s *Service) SetType(ctx context.Context, spaceId, typ string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldType, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(typ)
 	})
 }
 

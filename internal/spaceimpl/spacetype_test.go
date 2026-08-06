@@ -70,6 +70,7 @@ func TestFileProtoVersionForType(t *testing.T) {
 	// anytype.* headers keep the zero value — it feeds derived ids.
 	assert.EqualValues(t, 2, fileProtoVersionForType(space.SpaceTypeAny))
 	assert.EqualValues(t, 2, fileProtoVersionForType("any.techspace"))
+	assert.EqualValues(t, 2, fileProtoVersionForType(space.SpaceTypeOneToOne))
 	assert.EqualValues(t, 0, fileProtoVersionForType(space.SpaceTypeRegular))
-	assert.EqualValues(t, 0, fileProtoVersionForType(space.SpaceTypeOneToOne))
+	assert.EqualValues(t, 0, fileProtoVersionForType(space.SpaceTypeOneToOneLegacy))
 }

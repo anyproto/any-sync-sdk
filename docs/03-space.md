@@ -149,10 +149,10 @@ type AclSpaceClient interface {
 - All writes go through SDK methods, never direct
 
 ### Space type strings
-- The on-the-wire `header.SpaceType` value is gated by the any-sync-coordinator (`spacestatus/changeverifier.go`). Accepted: the `any` product's own `any.space` / `any.techspace` (both require `fileprotoVersion=2` in the header) plus the anytype names `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. Anything else fails periodic headsync with `unknown space type: <value>` — and since the type is content-addressed into the immutable header, a rejected value bricks the space permanently.
+- The on-the-wire `header.SpaceType` value is gated by the any-sync-coordinator (`spacestatus/changeverifier.go`). Accepted: the `any` product's own `any.space` / `any.techspace` / `any.onetoone` (all require `fileprotoVersion=2` in the header) plus the anytype names `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. Anything else fails periodic headsync with `unknown space type: <value>` — and since the type is content-addressed into the immutable header, a rejected value bricks the space permanently.
 - Created spaces default to `any.space` (`space.SpaceTypeAny`; empty `CreateRequest.SpaceType`). The anytype constants `space.SpaceTypeRegular` / `SpaceTypeChat` / `SpaceTypeOneToOne` stay accepted for interop with anytype-heart clients.
 - The tech space stamps `any.techspace` for accounts derived at index != 0, `anytype.techspace` for index-0 accounts — the type feeds the derived tech-space id, so legacy index-0 accounts must keep their exact header (see 02-tech-space.md).
-- 1-1 spaces stay `anytype.onetoone` for all accounts: the value is hardcoded inside any-sync and both peers must derive the same 1-1 space id, so an `any.*` variant would break pairing across versions.
+- 1-1 spaces stamp `any.onetoone` (`space.SpaceTypeOneToOne`). The type feeds the symmetric derived 1-1 id, and 1-1s pair only within a product — the distinct type makes an any↔anytype 1-1 structurally impossible. Rows/spaces from before the flip carry `anytype.onetoone` (`SpaceTypeOneToOneLegacy`); read paths classify via `space.IsOneToOne`.
 - Rows registered before the space's header is readable (join/track/invite-pending) carry an unknown (empty) `type`, backfilled set-once from the header on the first successful load.
 
 ## Grooming Questions (open)

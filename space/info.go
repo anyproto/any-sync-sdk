@@ -29,11 +29,24 @@ const (
 	SpaceTypeChat = "anytype.chatspace"
 
 	// SpaceTypeOneToOne is for derived 1-1 spaces shared between two
-	// identities. Stays anytype.* even for `any` accounts: the value is
-	// hardcoded inside any-sync and both peers must derive the same
-	// 1-1 space id, so an any.* variant would break pairing.
-	SpaceTypeOneToOne = "anytype.onetoone"
+	// identities. The type is content-addressed into the symmetric
+	// derived id, so both peers must use the same value — 1-1s pair
+	// only within a product, and the any.* variant makes an
+	// any↔anytype 1-1 structurally impossible.
+	SpaceTypeOneToOne = "any.onetoone"
+
+	// SpaceTypeOneToOneLegacy is anytype's 1-1 type. Rows and spaces
+	// created before the any.* flip carry it; read paths match both
+	// via IsOneToOne.
+	SpaceTypeOneToOneLegacy = "anytype.onetoone"
 )
+
+// IsOneToOne reports whether t is a 1-1 space type (current or
+// legacy). Use it wherever a possibly-legacy row or header type is
+// classified; writes use SpaceTypeOneToOne.
+func IsOneToOne(t string) bool {
+	return t == SpaceTypeOneToOne || t == SpaceTypeOneToOneLegacy
+}
 
 // SpaceInfo is a point-in-time snapshot of space metadata. Returned by
 // Service.List and Space.Info; does not auto-update — subscribe via

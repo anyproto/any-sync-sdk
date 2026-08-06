@@ -141,5 +141,5 @@ See [`docs/`](docs/):
 
 ## Compatibility note
 
-The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's allow-list: the `any` product's `any.space` / `any.techspace` (fileproto v2 required) plus anytype's `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. Created spaces default to `any.space`; the SDK exposes the values as public constants in `space/info.go` and rejects others at `Service.Create` — see `docs/03-space.md § Space type strings`.
+The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's allow-list: the `any` product's `any.space` / `any.techspace` / `any.onetoone` (fileproto v2 required) plus anytype's `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. Created spaces default to `any.space`; the SDK exposes the values as public constants in `space/info.go` and rejects others at `Service.Create` — see `docs/03-space.md § Space type strings`.
 

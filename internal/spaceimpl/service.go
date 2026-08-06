@@ -70,7 +70,7 @@ func normalizeSpaceType(t string) (string, error) {
 // for existing types.
 func fileProtoVersionForType(t string) spacesyncproto.SpaceFileProtoVersion {
 	switch t {
-	case space.SpaceTypeAny, techspace.AnyTechSpaceType:
+	case space.SpaceTypeAny, techspace.AnyTechSpaceType, space.SpaceTypeOneToOne:
 		return spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2
 	default:
 		return spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionUnspecified
@@ -681,7 +681,7 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	// acceptance stays an account-level decision made once. A local
 	// delete (localStatus=deleted) is not adopted — this device removed
 	// the space on purpose.
-	if rec.Type == space.SpaceTypeOneToOne &&
+	if space.IsOneToOne(rec.Type) &&
 		rec.RemoteStatus == techspace.StatusActive &&
 		(rec.LocalStatus == "" || rec.LocalStatus == oneToOnePendingLocalStatus) {
 		return s.AcceptOneToOne(ctx, spaceId)
@@ -808,7 +808,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	// who a 1-1 is with — and resolve their profile — straight from
 	// List/Subscribe, without loading or even materializing the space.
 	author := r.OneToOnePeer
-	if r.Type != space.SpaceTypeOneToOne {
+	if !space.IsOneToOne(r.Type) {
 		author = s.resolveAuthor(peekCtx, r.Id)
 	}
 	// An empty row type (joined/tracked space not yet loaded on any
@@ -834,7 +834,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
 	// displayHint fallback when nothing is resolved yet).
-	if r.Type == space.SpaceTypeOneToOne && r.OneToOnePeer != "" {
+	if space.IsOneToOne(r.Type) && r.OneToOnePeer != "" {
 		if id, ok := s.tsp.GetIdentity(ctx, r.OneToOnePeer); ok && id.Name != "" {
 			info.Name = id.Name
 			info.Description = id.Description
@@ -884,7 +884,7 @@ func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[strin
 // while the row stays re-creatable (a later OneToOne(peer) flips it back to
 // active). No coordinator SpaceDelete is ever sent.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Type == space.SpaceTypeOneToOne {
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok && space.IsOneToOne(rec.Type) {
 		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.OneToOneDeletedStatus); err != nil {
 			return fmt.Errorf("spaceimpl: mark 1-1 deleted: %w", err)
 		}
@@ -1174,7 +1174,7 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
 	}
-	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(keys.SignKey, otherPk, space.SpaceTypeOneToOne)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
 	}
@@ -1206,7 +1206,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if rec.Type != space.SpaceTypeOneToOne {
+	if !space.IsOneToOne(rec.Type) {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %q is not a 1-1 space", spaceId)
 	}
 	if rec.OneToOnePeer == "" {
@@ -1218,7 +1218,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	}
 	// Pending rows carry no storage — the activate's cache load creates
 	// it from the derived payload (see ctxWithCreatePayload).
-	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(keys.SignKey, otherPk)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(keys.SignKey, otherPk, space.SpaceTypeOneToOne)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: materialize 1-1: %w", err)
 	}
@@ -1234,7 +1234,7 @@ func (s *Service) DeclineOneToOne(ctx context.Context, spaceId string) error {
 	if !ok {
 		return fmt.Errorf("spaceimpl: DeclineOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if rec.Type != space.SpaceTypeOneToOne {
+	if !space.IsOneToOne(rec.Type) {
 		return fmt.Errorf("spaceimpl: DeclineOneToOne: %q is not a 1-1 space", spaceId)
 	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, oneToOneDeclinedRemoteStatus); err != nil {
@@ -1318,7 +1318,7 @@ func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity stri
 		return
 	}
 	rec, ok := s.tsp.Get(ctx, spaceId)
-	if !ok || rec.Type != space.SpaceTypeOneToOne || rec.RemoteStatus == oneToOneDeclinedRemoteStatus {
+	if !ok || !space.IsOneToOne(rec.Type) || rec.RemoteStatus == oneToOneDeclinedRemoteStatus {
 		return
 	}
 	// Record the sighting regardless of whether the profile resolves.
@@ -1391,7 +1391,7 @@ func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity st
 // SpaceService.DeriveOneToOneSpace, which materializes it. Used by
 // RegisterIncoming to record a pending row before the user accepts.
 func deriveOneToOneId(mySignKey crypto.PrivKey, peerPub crypto.PubKey) (string, error) {
-	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(mySignKey, peerPub)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(mySignKey, peerPub, space.SpaceTypeOneToOne)
 	if err != nil {
 		return "", err
 	}
@@ -1598,7 +1598,7 @@ func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if rec.Type == space.SpaceTypeOneToOne {
+	if space.IsOneToOne(rec.Type) {
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %q %w — use AcceptOneToOne", spaceId, space.ErrIsOneToOne)
 	}
 	if rec.IsDeleted() {
@@ -1669,7 +1669,7 @@ func (s *Service) DeclineInvite(ctx context.Context, spaceId string) error {
 	if !ok {
 		return fmt.Errorf("spaceimpl: DeclineInvite: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
-	if rec.Type == space.SpaceTypeOneToOne {
+	if space.IsOneToOne(rec.Type) {
 		return fmt.Errorf("spaceimpl: DeclineInvite: %q %w — use DeclineOneToOne", spaceId, space.ErrIsOneToOne)
 	}
 	switch rec.RemoteStatus {
@@ -1874,7 +1874,7 @@ func mapStatus(typ, local, remote string) space.Status {
 		// Synced, sticky direct-add decline — account-wide, non-terminal
 		// (AcceptInvite overrides).
 		return space.StatusInviteDeclined
-	case typ == space.SpaceTypeOneToOne && remote == techspace.StatusActive:
+	case space.IsOneToOne(typ) && remote == techspace.StatusActive:
 		// Account-scoped resolution wins over a device-local pending. A 1-1
 		// processed (accepted/initiated) on ANY device carries synced
 		// remote=active; a stale pending — e.g. an old inbox invite replayed
@@ -1897,7 +1897,7 @@ func mapStatus(typ, local, remote string) space.Status {
 		// ACL. Device-local (each device's mirror detects it) and
 		// non-terminal — the mirror self-heals back to active.
 		return space.StatusGuestRevoked
-	case typ == space.SpaceTypeOneToOne && local != techspace.StatusActive && remote != techspace.StatusActive:
+	case space.IsOneToOne(typ) && local != techspace.StatusActive && remote != techspace.StatusActive:
 		// A 1-1 row that exists but carries no active/declined signal and no
 		// device-local pending: the row synced from the device that
 		// registered the request before this device set its own status.

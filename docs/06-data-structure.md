@@ -97,7 +97,7 @@ Space
 ```
 
 A **type** is an object with `type = type`. Its own shape is hardcoded in the SDK. Every type object implements two built-ins:
-- `any` — universal properties (name, description, icon, id, author, createdAt, modifiedAt)
+- `any` — universal properties (name, description, icon, tags, id, author, createdAt, modifiedAt)
 - `type` — the meta-type; contributes the `properties` and (optionally) `datasets` datasets
 
 Built-ins are expected to exist as **derived objects** in every space (well-known ids, uniform with user types — no "built-in vs user" fork in query/UI code).

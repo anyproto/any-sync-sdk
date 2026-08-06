@@ -68,4 +68,7 @@ var Properties = []BuiltInProperty{
 	// synced-only: type membership is structural and shared — never
 	// per-account or per-device.
 	{Id: "types", Name: "Types", Kind: schema.KindArray, Scope: schema.ScopeSynced},
+	// `tags` is a free-form list of user labels. Array of strings.
+	// Synced: tags are shared object metadata, like name/description.
+	{Id: "tags", Name: "Tags", Kind: schema.KindArray, Scope: schema.ScopeSynced},
 }

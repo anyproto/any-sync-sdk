@@ -110,7 +110,10 @@ func TestSpaceIndexHandler_LegacyCreateWithLocalStatusStillLands(t *testing.T) {
 	assert.Empty(t, rec.GetString(techspace.FieldLocalStatus), "the Local-class field never landed via the synced route")
 }
 
-func TestSpaceIndexHandler_CreateRejectedWithoutType(t *testing.T) {
+// Type-less creates land: join/track register rows before the space's
+// header is readable, so `type` is unknown until the first load
+// backfills it.
+func TestSpaceIndexHandler_CreateWithoutTypeLands(t *testing.T) {
 	ctrl := newSpaceIndexController(t)
 	arena := &anyenc.Arena{}
 
@@ -120,8 +123,43 @@ func TestSpaceIndexHandler_CreateRejectedWithoutType(t *testing.T) {
 		setMulti(arena, map[string]string{techspace.FieldName: "no type"}),
 	)))
 
-	assert.Nil(t, ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId),
-		"create without type should be dropped")
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec, "create without type lands as an unknown-type row")
+	assert.Empty(t, rec.GetString(techspace.FieldType))
+	assert.Equal(t, "no type", rec.GetString(techspace.FieldName))
+}
+
+// `type` is set-once: an unknown-type row accepts exactly one fill (the
+// header backfill) and pins from then on.
+func TestSpaceIndexHandler_TypeSetOnce(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-backfill"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldName: "joined"}),
+	)))
+	// Backfill fills the empty type.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldType}, Payload: arena.NewString("any.space")},
+	)))
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "any.space", rec.GetString(techspace.FieldType))
+
+	// A second write is an overwrite of a non-empty value — dropped.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldType}, Payload: arena.NewString("anytype.space")},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+	rec = ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "any.space", rec.GetString(techspace.FieldType), "type pinned after the fill")
 }
 
 // ----------------------------------------------------------------------------

@@ -49,3 +49,27 @@ func TestDeriveSpaceTypeTag_DefaultsToRegular(t *testing.T) {
 	assert.Equal(t, space.SpaceTypeRegular, deriveSpaceTypeTag(""))
 	assert.Equal(t, "copilot.agent", deriveSpaceTypeTag("copilot.agent"))
 }
+
+func TestNormalizeSpaceType(t *testing.T) {
+	got, err := normalizeSpaceType("")
+	assert.NoError(t, err)
+	assert.Equal(t, space.SpaceTypeAny, got, "empty defaults to the any product type")
+
+	for _, allowed := range []string{space.SpaceTypeAny, space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne} {
+		got, err := normalizeSpaceType(allowed)
+		assert.NoError(t, err)
+		assert.Equal(t, allowed, got)
+	}
+
+	_, err = normalizeSpaceType("other.space")
+	assert.Error(t, err, "outside the coordinator allow-list")
+}
+
+func TestFileProtoVersionForType(t *testing.T) {
+	// any.* headers must declare fileproto v2 (coordinator-enforced);
+	// anytype.* headers keep the zero value — it feeds derived ids.
+	assert.EqualValues(t, 2, fileProtoVersionForType(space.SpaceTypeAny))
+	assert.EqualValues(t, 2, fileProtoVersionForType("any.techspace"))
+	assert.EqualValues(t, 0, fileProtoVersionForType(space.SpaceTypeRegular))
+	assert.EqualValues(t, 0, fileProtoVersionForType(space.SpaceTypeOneToOne))
+}

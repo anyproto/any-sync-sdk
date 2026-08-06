@@ -17,3 +17,18 @@ type Provider interface {
 	AccountKey(ctx context.Context) ([]byte, error)
 	DeviceKey(ctx context.Context) ([]byte, error)
 }
+
+// DefaultAccountIndex is the account derivation index for `any`
+// accounts. Index 0 is anytype's, so one seed phrase yields a distinct
+// account per product. Callers restoring an anytype-derived (or
+// pre-index-1 `any`) account pass 0 explicitly.
+const DefaultAccountIndex uint32 = 1
+
+// IndexProvider is optionally implemented by Providers that know their
+// account derivation index. The SDK uses it to pick index-dependent
+// defaults (an index-0 account keeps anytype-compatible derived
+// spaces; any other index gets `any`-native ones). Providers that
+// cannot report an index are treated as index 0.
+type IndexProvider interface {
+	AccountIndex() uint32
+}

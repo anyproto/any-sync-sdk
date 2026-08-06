@@ -213,6 +213,7 @@ func makeAuth(_ context.Context) (auth.Provider, error) {
 	p, err := auth.NewFileProvider(auth.FileProviderConfig{
 		Path:    filepath.Join(home, ".any", "wallet.key"),
 		Passkey: os.Getenv("ANY_SYNC_PASSKEY"),
+		Index:   auth.DefaultAccountIndex,
 	})
 	if err != nil {
 		return nil, err

@@ -196,6 +196,59 @@ func TestAccountId(t *testing.T) {
 	}
 }
 
+// Fresh generation honors cfg.Index: the wallet pins it, reload derives
+// the same non-zero-index account, and AccountIndex reports it.
+func TestFileProvider_FreshGenerationHonorsIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wallet.key")
+	p, err := NewFileProvider(FileProviderConfig{Path: path, Index: DefaultAccountIndex})
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if got := p.AccountIndex(); got != DefaultAccountIndex {
+		t.Fatalf("AccountIndex = %d, want %d", got, DefaultAccountIndex)
+	}
+
+	wantId, err := AccountId(p.Mnemonic(), DefaultAccountIndex)
+	if err != nil {
+		t.Fatalf("AccountId: %v", err)
+	}
+	id0, err := AccountId(p.Mnemonic(), 0)
+	if err != nil {
+		t.Fatalf("AccountId index 0: %v", err)
+	}
+	if wantId == id0 {
+		t.Fatal("index 1 must derive a different identity than index 0")
+	}
+
+	providerId := func(p *FileProvider) string {
+		raw, err := p.AccountKey(context.Background())
+		if err != nil {
+			t.Fatalf("account key: %v", err)
+		}
+		priv, err := crypto.UnmarshalEd25519PrivateKey(raw)
+		if err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return priv.GetPublic().Account()
+	}
+	if got := providerId(p); got != wantId {
+		t.Fatalf("fresh wallet derives %q, want index-%d account %q", got, DefaultAccountIndex, wantId)
+	}
+
+	// Reload: the stored index wins; cfg.Index is ignored on existing files.
+	p2, err := NewFileProvider(FileProviderConfig{Path: path})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := p2.AccountIndex(); got != DefaultAccountIndex {
+		t.Fatalf("reloaded AccountIndex = %d, want %d", got, DefaultAccountIndex)
+	}
+	if got := providerId(p2); got != wantId {
+		t.Fatalf("reloaded wallet derives %q, want %q", got, wantId)
+	}
+}
+
 func TestFileProvider_RejectsPasskeyOnPlainFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wallet.key")

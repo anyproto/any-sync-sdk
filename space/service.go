@@ -262,11 +262,11 @@ type CreateRequest struct {
 	IconCID     string
 	// SpaceType is stamped into the space header at create time and
 	// gated by the any-sync-coordinator. Must be one of the public
-	// constants (SpaceTypeRegular, SpaceTypeChat, SpaceTypeOneToOne)
-	// or empty — empty defaults to SpaceTypeRegular. Anything else
-	// is rejected by Create with a clear error; passing an invalid
-	// type would otherwise produce a space the coordinator refuses
-	// to sync.
+	// constants (SpaceTypeAny, SpaceTypeRegular, SpaceTypeChat,
+	// SpaceTypeOneToOne) or empty — empty defaults to SpaceTypeAny.
+	// Anything else is rejected by Create with a clear error; passing
+	// an invalid type would otherwise produce a space the coordinator
+	// refuses to sync.
 	SpaceType string
 }
 

@@ -180,13 +180,12 @@ func (s *Service) handleRegularInvite(ctx context.Context, m inbox.Message) erro
 		return nil
 	}
 	// Name/SpaceType are unauthenticated display hints, replaced by the
-	// synced in-space values after accept. Type is hardcoded — direct add
-	// targets regular spaces only, and the field is pinned for life, so a
-	// sender-supplied value must not reach it. No storage is materialized
-	// and no localStatus is set: pending is synced-only.
+	// synced in-space values after accept. Type is left unknown — the
+	// field is set-once, so a sender-supplied value must not reach it;
+	// the post-accept load backfills it from the header. No storage is
+	// materialized and no localStatus is set: pending is synced-only.
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 		Id:           body.SpaceId,
-		Type:         space.SpaceTypeRegular,
 		SpaceType:    body.SpaceType,
 		Name:         body.Name,
 		RemoteStatus: techspace.InvitePendingRemoteStatus,

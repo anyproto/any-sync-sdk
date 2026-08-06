@@ -148,10 +148,12 @@ type AclSpaceClient interface {
 - Space deletion → SDK updates tech space record to `status=deleted`, offloads local data, and the deletion reconciler sends the signed `coordinator.SpaceDelete` (see Space Lifecycle)
 - All writes go through SDK methods, never direct
 
-### Space type strings (interim)
-- The on-the-wire `header.SpaceType` value is gated by the any-sync-coordinator (`spacestatus/changeverifier.go`). Only the anytype-specific names are accepted today: `anytype.space` (regular), `anytype.techspace` (tech), `anytype.chatspace`, `anytype.onetoone`. Anything else fails periodic headsync with `unknown space type: <value>`.
-- The SDK therefore hardcodes `anytype.*` as defaults: regular spaces stamp `anytype.space`, the tech space stamps `anytype.techspace` (overriding `spacepayloads.SpaceReserved`, which is `any-sync.space` and rejected). Public constants `space.SpaceTypeRegular` / `SpaceTypeChat` / `SpaceTypeOneToOne` mirror anytype-heart's `spacedomain` package.
-- **Future**: drop the anytype-specific gate from any-sync-coordinator (or make the allow-list configurable per deployment) so the SDK can use deployment-neutral type strings. Tracked as a future any-sync change; the SDK will keep the public constants as the migration surface — bumping them is a one-line change here once the coordinator allows it.
+### Space type strings
+- The on-the-wire `header.SpaceType` value is gated by the any-sync-coordinator (`spacestatus/changeverifier.go`). Accepted: the `any` product's own `any.space` / `any.techspace` (both require `fileprotoVersion=2` in the header) plus the anytype names `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. Anything else fails periodic headsync with `unknown space type: <value>` — and since the type is content-addressed into the immutable header, a rejected value bricks the space permanently.
+- Created spaces default to `any.space` (`space.SpaceTypeAny`; empty `CreateRequest.SpaceType`). The anytype constants `space.SpaceTypeRegular` / `SpaceTypeChat` / `SpaceTypeOneToOne` stay accepted for interop with anytype-heart clients.
+- The tech space stamps `any.techspace` for accounts derived at index != 0, `anytype.techspace` for index-0 accounts — the type feeds the derived tech-space id, so legacy index-0 accounts must keep their exact header (see 02-tech-space.md).
+- 1-1 spaces stay `anytype.onetoone` for all accounts: the value is hardcoded inside any-sync and both peers must derive the same 1-1 space id, so an `any.*` variant would break pairing across versions.
+- Rows registered before the space's header is readable (join/track/invite-pending) carry an unknown (empty) `type`, backfilled set-once from the header on the first successful load.
 
 ## Grooming Questions (open)
 

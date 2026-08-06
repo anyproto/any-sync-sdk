@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -42,6 +43,10 @@ type Service struct {
 	spaceId string
 	indexId string
 
+	// headerType is the on-the-wire SpaceType for the tech-space
+	// header, fixed at construction (see New).
+	headerType string
+
 	// avIds caches targetSpaceId → derived account-values carrier
 	// object id (see accountvalues.go). Guarded by avMu.
 	avMu  sync.Mutex
@@ -59,15 +64,28 @@ type Service struct {
 }
 
 // TechSpaceType is the on-the-wire SpaceType stamped into the
-// tech-space's space header. Mirrors anytype-heart's
-// spacedomain.SpaceTypeTech and is the value the any-sync-coordinator
-// recognises for tech spaces (see any-sync-coordinator
-// spacestatus/changeverifier.go).
+// tech-space's space header for index-0 (anytype-compatible)
+// accounts. Mirrors anytype-heart's spacedomain.SpaceTypeTech and is
+// the value the any-sync-coordinator recognises for tech spaces (see
+// any-sync-coordinator spacestatus/changeverifier.go).
 const TechSpaceType = "anytype.techspace"
 
-// New returns a Service ready for Open.
-func New(app *anysyncx.App, db anystore.DB) *Service {
-	return &Service{app: app, db: db}
+// AnyTechSpaceType is the tech-space header type for `any` accounts
+// (derivation index != 0). The header type feeds the derived space id,
+// so the choice must be a pure function of the auth inputs: index-0
+// wallets keep TechSpaceType (and their existing tech-space id),
+// everything else gets the any.* type. Headers carrying it must
+// declare fileproto v2 — the coordinator enforces that.
+const AnyTechSpaceType = "any.techspace"
+
+// New returns a Service ready for Open. headerType is the on-the-wire
+// SpaceType for the tech-space header (TechSpaceType or
+// AnyTechSpaceType); empty means TechSpaceType.
+func New(app *anysyncx.App, db anystore.DB, headerType string) *Service {
+	if headerType == "" {
+		headerType = TechSpaceType
+	}
+	return &Service{app: app, db: db, headerType: headerType}
 }
 
 // SyncHeads forces an immediate head-sync round on the tech space, so
@@ -98,11 +116,16 @@ func (s *Service) Open(ctx context.Context) error {
 	// allow-list (see spacestatus/changeverifier.go in
 	// any-sync-coordinator). The library default
 	// spacepayloads.SpaceReserved ("any-sync.space") is rejected by
-	// the coordinator — it only knows the anytype.* family.
+	// the coordinator. The type (and, for any.techspace, the fileproto
+	// version) feeds the derived space id — index-0 accounts must keep
+	// the legacy payload byte-identical or their tech-space id shifts.
 	spaceCfg := spacepayloads.SpaceDerivePayload{
 		SigningKey: keys.SignKey,
 		MasterKey:  keys.SignKey,
-		SpaceType:  TechSpaceType,
+		SpaceType:  s.headerType,
+	}
+	if s.headerType == AnyTechSpaceType {
+		spaceCfg.FileProtoVersion = spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2
 	}
 	spaceId, err := s.app.SpaceService().DeriveId(ctx, spaceCfg)
 	if err != nil {
@@ -302,6 +325,16 @@ func (s *Service) setRowField(ctx context.Context, spaceId, field string, local 
 func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
 	return s.setRowField(ctx, spaceId, FieldLocalStatus, true, func(a *anyenc.Arena) *anyenc.Value {
 		return a.NewString(status)
+	})
+}
+
+// SetType backfills the on-wire header type onto a row created with an
+// unknown type (join/track register rows before the space's header is
+// readable). Synced write; the handler's set-once rule makes it a no-op
+// race loser everywhere the value is already non-empty.
+func (s *Service) SetType(ctx context.Context, spaceId, typ string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldType, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(typ)
 	})
 }
 

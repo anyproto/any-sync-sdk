@@ -183,8 +183,9 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 // supplies the arena so the resulting *anyenc.Value can be embedded
 // in a larger Change payload without an extra copy.
 //
-// Empty-string fields are omitted from the payload — handler rules
-// only require Type to be present.
+// Empty-string fields are omitted from the payload; an omitted Type
+// means "unknown", backfilled set-once from the space header after the
+// first load.
 func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	obj := a.NewObject()
 	if r.Type != "" {

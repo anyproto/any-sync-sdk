@@ -23,6 +23,8 @@ Everything else (symmetric keys, space keys, read keys) is derived internally by
 3. Sub-path `…/0'` → `Identity` key (Ed25519) — this is the **account private key**
 4. Optional: **Ethereum** path `m/44'/60'/0'/0/[index]` → ECDSA key for Any Naming Service
 
+Account index semantics: **index 0 is anytype's**, `auth.DefaultAccountIndex` (1) is the `any` product's — one phrase yields a distinct account per product. `FileProviderConfig.Index` applies on wallet creation (fresh generation included) and is pinned in the wallet file thereafter; an existing wallet's stored index always wins. Providers expose the pinned value via the optional `auth.IndexProvider` interface — the SDK uses it to pick index-dependent defaults (e.g. the tech-space header type). Restoring an anytype-derived account means passing index 0 explicitly.
+
 ### Strategy 2: Server-side auth (future)
 Server returns account private key after authentication. Same downstream result.
 

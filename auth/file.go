@@ -35,8 +35,11 @@ type FileProviderConfig struct {
 	// otherwise NewFileProvider returns ErrMnemonicMismatch.
 	Mnemonic string
 
-	// Index is the account derivation index used together with
-	// Mnemonic. Ignored when the wallet file already exists.
+	// Index is the account derivation index applied when the wallet is
+	// created — both for a supplied Mnemonic and for a freshly
+	// generated one. Ignored when the wallet file already exists (the
+	// stored index wins). Zero means index 0, the anytype-compatible
+	// account; `any` accounts use DefaultAccountIndex.
 	Index uint32
 }
 
@@ -130,6 +133,9 @@ func (p *FileProvider) DeviceKey(_ context.Context) ([]byte, error) {
 	return p.w.DeviceKey, nil
 }
 
+// AccountIndex returns the derivation index pinned in the wallet file.
+func (p *FileProvider) AccountIndex() uint32 { return p.w.Index }
+
 type wallet struct {
 	Mnemonic  string
 	DeviceKey []byte
@@ -175,7 +181,6 @@ func generateWallet(mnemonic string, index uint32) (*wallet, error) {
 			return nil, err
 		}
 		mnemonic = string(m)
-		index = 0
 	}
 	devPriv, _, err := crypto.GenerateRandomEd25519KeyPair()
 	if err != nil {

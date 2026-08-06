@@ -7,21 +7,31 @@ import "time"
 // changes against this value (see any-sync-coordinator
 // spacestatus/changeverifier.go) — only the strings below plus an
 // empty value are accepted; anything else is rejected with
-// "unknown space type: <value>" and headsync fails.
+// "unknown space type: <value>" and headsync fails. The type is
+// content-addressed into the immutable header, so a rejected value
+// bricks the space permanently.
 //
-// These mirror anytype-heart's spacedomain.SpaceType* constants so a
-// space created by the SDK is interoperable with any-sync clients
-// running anytype-heart.
+// The anytype.* strings mirror anytype-heart's spacedomain.SpaceType*
+// constants so a space created by the SDK is interoperable with
+// any-sync clients running anytype-heart. The any.* strings are the
+// `any` product's own; the coordinator requires fileproto v2 in
+// headers carrying them.
 const (
-	// SpaceTypeRegular is the default for newly created spaces. Used
-	// when CreateRequest.SpaceType is empty.
+	// SpaceTypeAny is the default for newly created spaces. Used when
+	// CreateRequest.SpaceType is empty.
+	SpaceTypeAny = "any.space"
+
+	// SpaceTypeRegular is anytype's regular-space type, accepted for
+	// interop when passed explicitly.
 	SpaceTypeRegular = "anytype.space"
 
 	// SpaceTypeChat is for chat spaces (one shared chat per space).
 	SpaceTypeChat = "anytype.chatspace"
 
 	// SpaceTypeOneToOne is for derived 1-1 spaces shared between two
-	// identities.
+	// identities. Stays anytype.* even for `any` accounts: the value is
+	// hardcoded inside any-sync and both peers must derive the same
+	// 1-1 space id, so an any.* variant would break pairing.
 	SpaceTypeOneToOne = "anytype.onetoone"
 )
 

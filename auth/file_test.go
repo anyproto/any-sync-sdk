@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -193,6 +195,42 @@ func TestAccountId(t *testing.T) {
 
 	if _, err := AccountId("not a valid phrase", 0); !errors.Is(err, ErrInvalidMnemonic) {
 		t.Fatalf("expected ErrInvalidMnemonic, got %v", err)
+	}
+}
+
+// A legacy wallet file — index-0, written before the `index` key
+// existed (omitempty drops it) — must decode to index 0 and stay on
+// the index-0 account. Also pins the restore-with-wrong-index error.
+func TestFileProvider_LegacyWalletWithoutIndexKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wallet.key")
+	ref, err := NewFileProvider(FileProviderConfig{Path: filepath.Join(dir, "ref.key")})
+	if err != nil {
+		t.Fatalf("generate reference: %v", err)
+	}
+	// Hand-write the legacy shape: payload without an `index` key.
+	legacy := fmt.Sprintf(`{"version":1,"payload":{"mnemonic":%q,"deviceKey":%q}}`,
+		ref.Mnemonic(), base64.StdEncoding.EncodeToString(ref.w.DeviceKey))
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := NewFileProvider(FileProviderConfig{Path: path})
+	if err != nil {
+		t.Fatalf("load legacy wallet: %v", err)
+	}
+	if got := p.AccountIndex(); got != 0 {
+		t.Fatalf("legacy wallet AccountIndex = %d, want 0", got)
+	}
+
+	// Restoring over it with the same phrase at the new default index
+	// must refuse rather than silently serve the index-0 account.
+	if _, err := NewFileProvider(FileProviderConfig{Path: path, Mnemonic: ref.Mnemonic(), Index: DefaultAccountIndex}); !errors.Is(err, ErrMnemonicMismatch) {
+		t.Fatalf("expected ErrMnemonicMismatch on index mismatch, got %v", err)
+	}
+	// Matching index (explicit 0) loads fine.
+	if _, err := NewFileProvider(FileProviderConfig{Path: path, Mnemonic: ref.Mnemonic(), Index: 0}); err != nil {
+		t.Fatalf("matching index restore: %v", err)
 	}
 }
 

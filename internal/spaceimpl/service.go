@@ -794,6 +794,13 @@ func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 // Shared by List and the Subscribe translator so both surface the same
 // shape.
 func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord) space.SpaceInfo {
+	// The header/ACL peeks below never *trigger* a load (PickSpace),
+	// but ocache's Pick waits on a load already in flight — and rows
+	// with an empty type are exactly the mid-pull ones. Bound the
+	// peeks so a stuck pull can't stall List or the Subscribe
+	// translator; a timed-out peek just reports the row as-is.
+	peekCtx, cancelPeek := context.WithTimeout(ctx, time.Second)
+	defer cancelPeek()
 	// A 1-1 space's ACL "owner" is a synthetic shared key nobody holds
 	// (see docs/13), so resolveAuthor returns nothing meaningful. The
 	// useful value is the other participant's account identity, recorded
@@ -802,19 +809,19 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	// List/Subscribe, without loading or even materializing the space.
 	author := r.OneToOnePeer
 	if r.Type != space.SpaceTypeOneToOne {
-		author = s.resolveAuthor(ctx, r.Id)
+		author = s.resolveAuthor(peekCtx, r.Id)
 	}
 	// An empty row type (joined/tracked space not yet loaded on any
 	// device) falls back to the header when the space happens to be
 	// resident; the durable backfill happens in load.
 	typ := r.Type
 	if typ == "" {
-		typ = s.headerTypeFromHeader(ctx, r.Id)
+		typ = s.headerTypeFromHeader(peekCtx, r.Id)
 	}
 	info := space.SpaceInfo{
 		Id:          r.Id,
 		Type:        typ,
-		SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
+		SpaceType:   s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
 		Author:      author,
 		Name:        r.Name,
 		Description: r.Description,

@@ -337,6 +337,12 @@ func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChang
 //   - `type` is set-once: writable while the current value is
 //     empty/absent (the header backfill), pinned afterwards;
 //   - status edits are rejected when the current status is "deleted".
+//
+// The set-once gate reads the LOCAL pre-op state, so two concurrent
+// fills with different values would pin divergently per device. That
+// is safe only because the sole writer (load's header backfill) writes
+// a pure function of the immutable space header — identical on every
+// device. Do not add a second `type` writer that isn't.
 func (SpaceIndexHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
 	if len(op.Path) == 0 {
 		return rejectMultiField(op.Payload, ctx.Before)

@@ -13,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -78,6 +79,26 @@ const TechSpaceType = "anytype.techspace"
 // declare fileproto v2 — the coordinator enforces that.
 const AnyTechSpaceType = "any.techspace"
 
+// deriveCfg builds the tech-space derive payload. SpaceType matches
+// the any-sync-coordinator's allow-list (see
+// spacestatus/changeverifier.go there); the library default
+// spacepayloads.SpaceReserved ("any-sync.space") is rejected. The
+// type (and, for any.techspace, the fileproto version) feeds the
+// derived space id — the TechSpaceType payload must stay byte-
+// identical to the legacy one or every index-0 account's tech-space
+// id shifts (pinned by TestDeriveCfg_LegacyPayloadStable).
+func deriveCfg(signKey crypto.PrivKey, headerType string) spacepayloads.SpaceDerivePayload {
+	cfg := spacepayloads.SpaceDerivePayload{
+		SigningKey: signKey,
+		MasterKey:  signKey,
+		SpaceType:  headerType,
+	}
+	if headerType == AnyTechSpaceType {
+		cfg.FileProtoVersion = spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2
+	}
+	return cfg
+}
+
 // New returns a Service ready for Open. headerType is the on-the-wire
 // SpaceType for the tech-space header (TechSpaceType or
 // AnyTechSpaceType); empty means TechSpaceType.
@@ -112,21 +133,7 @@ func (s *Service) Open(ctx context.Context) error {
 		return errors.New("techspace: anysyncx app has no account keys")
 	}
 
-	// SpaceType for the tech space matches the any-sync-coordinator's
-	// allow-list (see spacestatus/changeverifier.go in
-	// any-sync-coordinator). The library default
-	// spacepayloads.SpaceReserved ("any-sync.space") is rejected by
-	// the coordinator. The type (and, for any.techspace, the fileproto
-	// version) feeds the derived space id — index-0 accounts must keep
-	// the legacy payload byte-identical or their tech-space id shifts.
-	spaceCfg := spacepayloads.SpaceDerivePayload{
-		SigningKey: keys.SignKey,
-		MasterKey:  keys.SignKey,
-		SpaceType:  s.headerType,
-	}
-	if s.headerType == AnyTechSpaceType {
-		spaceCfg.FileProtoVersion = spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2
-	}
+	spaceCfg := deriveCfg(keys.SignKey, s.headerType)
 	spaceId, err := s.app.SpaceService().DeriveId(ctx, spaceCfg)
 	if err != nil {
 		return fmt.Errorf("techspace: derive id: %w", err)

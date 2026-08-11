@@ -476,6 +476,35 @@ func sameSet(a, b []string) bool {
 	return true
 }
 
+// PruneSpace publishes a deletion watermark for the space's read/ keys
+// when any visible frontier row remains — the cleanup for removed
+// spaces (SYN-104). Joining re-seeds read state, so removed spaces'
+// frontiers have no restore value; the watermark physically drops them
+// on every replica. Idempotent and self-clearing: once applied the
+// prefix reads empty and further calls are no-ops, and a row published
+// later by a device that had not yet seen the removal makes the next
+// reconcile pass re-issue the watermark.
+func (s *Service) PruneSpace(ctx context.Context, spaceId string) error {
+	store, err := s.kvStore(ctx)
+	if err != nil {
+		return err
+	}
+	prefix := keyPrefix + spaceId + "/"
+	var found bool
+	err = store.GetAll(ctx, prefix, func(_ keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error {
+		found = len(values) > 0
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	log.Info("pruning read frontiers of removed space", zap.String("spaceId", spaceId))
+	return store.DeletePrefix(ctx, prefix)
+}
+
 // ErrUntracked is returned by marks when EngineFor yields no engine:
 // the space tracks no datasets, or the liveness gate dropped it
 // (deleted / pending / unknown at mark time). spaceimpl maps it to

@@ -89,6 +89,14 @@ func (s *Service) reconcileDeletions(ctx context.Context) {
 	// unreachable coordinator can't block it.
 	s.offloadDeletedOneToOnes(ctx, rows)
 
+	// Read-frontier prune is coordinator-independent too: removed spaces'
+	// read/ rows in the tech-space KV are dead weight on every device and
+	// node (SYN-104), and joining re-seeds read state, so EVERY removed
+	// row qualifies — deleted, 1-1 deleted, and whatever removal statuses
+	// come later. Local-first (the watermark row syncs when connectivity
+	// allows) and a no-op once the prefix is empty.
+	s.pruneRemovedSpacesReadState(ctx, rows)
+
 	ids := make([]string, len(rows))
 	for i, r := range rows {
 		ids[i] = r.Id
@@ -128,6 +136,27 @@ func (s *Service) offloadDeletedOneToOnes(ctx context.Context, rows []techspace.
 		if s.app.SpaceExists(r.Id) {
 			delLog.Info("offloading marker-deleted space", zap.String("spaceId", r.Id))
 			s.OffloadSpace(ctx, r.Id)
+		}
+	}
+}
+
+// pruneRemovedSpacesReadState issues the read-frontier watermark for
+// every removed space still holding visible read/ rows. Failures are
+// retried by the next pass.
+func (s *Service) pruneRemovedSpacesReadState(ctx context.Context, rows []techspace.SpaceIndexRecord) {
+	rs := s.readSync()
+	if rs == nil {
+		return
+	}
+	for _, r := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		if !r.IsDeleted() {
+			continue
+		}
+		if err := rs.PruneSpace(ctx, r.Id); err != nil {
+			delLog.Debug("read-state prune failed", zap.String("spaceId", r.Id), zap.Error(err))
 		}
 	}
 }

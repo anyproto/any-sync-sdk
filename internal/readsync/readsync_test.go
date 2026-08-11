@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,8 @@ type fakeKV struct {
 	setCount map[string]int
 	rows     map[string][]innerstorage.KeyValue
 	split    bool
+	// deletePrefixes records DeletePrefix calls in order.
+	deletePrefixes []string
 }
 
 func newFakeKV() *fakeKV {
@@ -380,11 +383,32 @@ func TestReconcileAll_SinglePassRoutesBySpace(t *testing.T) {
 	assert.Empty(t, entries)
 }
 
+// GetAll mirrors the real store's prefix semantics (IteratePrefix
+// under the hood): every row whose key starts with the argument.
 func (f *fakeKV) GetAll(_ context.Context, key string, get func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error) error {
 	f.mu.Lock()
-	values := f.rows[key]
+	var values []innerstorage.KeyValue
+	for k, rows := range f.rows {
+		if strings.HasPrefix(k, key) {
+			values = append(values, rows...)
+		}
+	}
 	f.mu.Unlock()
 	return get(plainDecryptor, values)
+}
+
+// DeletePrefix mirrors the real watermark apply: drops every row under
+// the prefix and records the call.
+func (f *fakeKV) DeletePrefix(_ context.Context, prefix string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k := range f.rows {
+		if strings.HasPrefix(k, prefix) {
+			delete(f.rows, k)
+		}
+	}
+	f.deletePrefixes = append(f.deletePrefixes, prefix)
+	return nil
 }
 
 func TestPublishedFrontiers_AllDeviceRows(t *testing.T) {
@@ -405,4 +429,44 @@ func mustFrontiers(t *testing.T, f *fixture, objectId string) [][]string {
 	sets, err := f.PublishedFrontiers(ctx, testSpace, objectId)
 	require.NoError(t, err)
 	return sets
+}
+
+// TestPruneSpace pins the prune contract: a watermark is issued only
+// while visible frontier rows remain, so the reconciler can call it on
+// every pass without spamming rewrites.
+func TestPruneSpace(t *testing.T) {
+	f := newFixture(t)
+
+	// Nothing published: no watermark.
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Empty(t, f.kv.deletePrefixes)
+
+	// Rows from two devices: one watermark, rows gone.
+	f.kv.rows[kvKey("sp-dead", "obj1")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj1"), selfPeer, []string{"c1"}),
+		frontierKV(kvKey("sp-dead", "obj1"), "peer-other", []string{"c2"}),
+	}
+	f.kv.rows[kvKey("sp-dead", "obj2")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj2"), "peer-other", []string{"c3"}),
+	}
+	// Another space's rows must not be touched.
+	f.kv.rows[kvKey("sp-live", "obj1")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-live", "obj1"), selfPeer, []string{"c9"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	require.Equal(t, []string{"read/sp-dead/"}, f.kv.deletePrefixes)
+	assert.NotContains(t, f.kv.rows, kvKey("sp-dead", "obj1"))
+	assert.NotContains(t, f.kv.rows, kvKey("sp-dead", "obj2"))
+	assert.Contains(t, f.kv.rows, kvKey("sp-live", "obj1"), "other spaces untouched")
+
+	// Prefix now empty: further calls are no-ops.
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Len(t, f.kv.deletePrefixes, 1, "self-clearing: no re-issue without rows")
+
+	// A late row from a lagging device re-arms the prune.
+	f.kv.rows[kvKey("sp-dead", "obj3")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj3"), "peer-lagging", []string{"c4"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Len(t, f.kv.deletePrefixes, 2, "re-issued after a late publish")
 }

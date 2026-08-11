@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,6 +71,10 @@ func (f *fakeKV) Iterate(_ context.Context, fn func(decryptor keyvaluestorage.De
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for key, values := range f.rows {
+		// The real store hides watermark rows from Iterate.
+		if len(values) > 0 && values[0].DeletePrefix != "" {
+			continue
+		}
 		if f.split {
 			for _, kv := range values {
 				cont, err := fn(plainDecryptor, key, []innerstorage.KeyValue{kv})
@@ -383,14 +388,21 @@ func TestReconcileAll_SinglePassRoutesBySpace(t *testing.T) {
 	assert.Empty(t, entries)
 }
 
-// GetAll mirrors the real store's prefix semantics (IteratePrefix
-// under the hood): every row whose key starts with the argument.
+// GetAll mirrors the real store's prefix semantics (IteratePrefix under
+// the hood, watermark rows filtered): every visible row whose key
+// starts with the argument.
 func (f *fakeKV) GetAll(_ context.Context, key string, get func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error) error {
 	f.mu.Lock()
 	var values []innerstorage.KeyValue
 	for k, rows := range f.rows {
-		if strings.HasPrefix(k, key) {
-			values = append(values, rows...)
+		if !strings.HasPrefix(k, key) {
+			continue
+		}
+		for _, kv := range rows {
+			if kv.DeletePrefix != "" {
+				continue
+			}
+			values = append(values, kv)
 		}
 	}
 	f.mu.Unlock()
@@ -398,7 +410,9 @@ func (f *fakeKV) GetAll(_ context.Context, key string, get func(decryptor keyval
 }
 
 // DeletePrefix mirrors the real watermark apply: drops every row under
-// the prefix and records the call.
+// the prefix, RETAINS the watermark row (hidden from GetAll/Iterate by
+// the DeletePrefix filter, exactly like the real store), and records
+// the call.
 func (f *fakeKV) DeletePrefix(_ context.Context, prefix string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -407,6 +421,9 @@ func (f *fakeKV) DeletePrefix(_ context.Context, prefix string) error {
 			delete(f.rows, k)
 		}
 	}
+	f.rows[prefix] = []innerstorage.KeyValue{{
+		Key: prefix, PeerId: selfPeer, DeletePrefix: prefix,
+	}}
 	f.deletePrefixes = append(f.deletePrefixes, prefix)
 	return nil
 }
@@ -469,4 +486,62 @@ func TestPruneSpace(t *testing.T) {
 	}
 	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
 	assert.Len(t, f.kv.deletePrefixes, 2, "re-issued after a late publish")
+}
+
+// TestPruneSpace_RetainedWatermarkNotVisible pins that the watermark
+// row the store keeps under the prefix never counts as a visible
+// frontier — otherwise every reconcile pass would re-issue a fresh
+// watermark forever.
+func TestPruneSpace_RetainedWatermarkNotVisible(t *testing.T) {
+	f := newFixture(t)
+	f.kv.rows[kvKey("sp-dead", "obj1")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj1"), selfPeer, []string{"c1"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	require.Len(t, f.kv.deletePrefixes, 1)
+	require.Contains(t, f.kv.rows, "read/sp-dead/", "fake retains the watermark row")
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	require.Len(t, f.kv.deletePrefixes, 1, "retained watermark row must not re-arm the prune")
+}
+
+// TestPruneSpace_FutureRowsSkipped: rows stamped ahead of the local
+// clock cannot be covered by a watermark we issue now — re-issuing for
+// them every pass is churn, so the prune skips until they fall due.
+func TestPruneSpace_FutureRowsSkipped(t *testing.T) {
+	f := newFixture(t)
+	future := frontierKV(kvKey("sp-dead", "obj1"), "peer-skewed", []string{"c1"})
+	future.TimestampMicro = time.Now().Add(time.Hour).UnixMicro()
+	f.kv.rows[kvKey("sp-dead", "obj1")] = []innerstorage.KeyValue{future}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Empty(t, f.kv.deletePrefixes, "future-stamped rows must not trigger a watermark")
+
+	// A coverable row alongside re-enables the prune.
+	f.kv.rows[kvKey("sp-dead", "obj2")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj2"), selfPeer, []string{"c2"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Len(t, f.kv.deletePrefixes, 1)
+}
+
+// TestPublishGate_DropsWhenUntracked: publish re-checks liveness so a
+// mark racing a space removal cannot resurrect just-pruned rows.
+func TestPublishGate_DropsWhenUntracked(t *testing.T) {
+	f := newFixture(t)
+	var live atomic.Bool
+	live.Store(true)
+	orig := f.Service.engineFor
+	f.Service.engineFor = func(spaceId string) *readstate.Engine {
+		if !live.Load() {
+			return nil
+		}
+		return orig(spaceId)
+	}
+
+	live.Store(false)
+	f.Service.publish(ctx, testSpace, testObj, []string{"c1"})
+	assert.Empty(t, f.kv.sets, "publish must drop when the space is no longer tracked")
+
+	live.Store(true)
+	f.Service.publish(ctx, testSpace, testObj, []string{"c1"})
+	assert.Len(t, f.kv.sets, 1, "publish resumes for a live space")
 }

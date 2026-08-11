@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 )
 
 func seedDoc(t *testing.T, ctx context.Context, coll anystore.Collection, id string) {
@@ -336,4 +338,26 @@ func TestOwnedByObject(t *testing.T) {
 	assert.False(t, ownedByObject("objY_blocks", ids))
 	assert.False(t, ownedByObject("noUnderscore", ids))
 	assert.False(t, ownedByObject("_meta", ids))
+}
+
+// TestShouldPruneReadState pins the prune gate on SYNCED removal
+// markers: a device-local declined-join tombstone (LocalStatus) must
+// never drive the account-wide destructive watermark.
+func TestShouldPruneReadState(t *testing.T) {
+	prune := []techspace.SpaceIndexRecord{
+		{Id: "deleted", RemoteStatus: techspace.StatusDeleted},
+		{Id: "one-to-one", RemoteStatus: techspace.OneToOneDeletedStatus},
+		{Id: "guest", RemoteStatus: techspace.GuestDeletedRemoteStatus},
+	}
+	keep := []techspace.SpaceIndexRecord{
+		{Id: "active"},
+		{Id: "declined-join", LocalStatus: techspace.StatusDeleted},
+		{Id: "pending", RemoteStatus: techspace.InvitePendingRemoteStatus},
+	}
+	for _, r := range prune {
+		require.True(t, shouldPruneReadState(r), r.Id)
+	}
+	for _, r := range keep {
+		require.False(t, shouldPruneReadState(r), r.Id)
+	}
 }

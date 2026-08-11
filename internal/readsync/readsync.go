@@ -25,6 +25,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
@@ -218,6 +219,13 @@ func (s *Service) mark(ctx context.Context, spaceId, objectId string, op func(*r
 // mark already committed, and an unpublished frontier is re-derivable
 // (the next mark republishes a superset).
 func (s *Service) publish(ctx context.Context, spaceId, objectId string, heads []string) {
+	// Liveness re-check at publish time: the mark resolved its engine
+	// before any concurrent removal flipped the space's row, and a row
+	// published after the removal's prune watermark would resurrect the
+	// prefix on every replica until a later reconcile pass re-prunes.
+	if s.engineFor(spaceId) == nil {
+		return
+	}
 	store, err := s.kvStore(ctx)
 	if err != nil {
 		log.Warn("publish: tech kv store", zap.Error(err))
@@ -490,19 +498,38 @@ func (s *Service) PruneSpace(ctx context.Context, spaceId string) error {
 		return err
 	}
 	prefix := keyPrefix + spaceId + "/"
-	var found bool
+	// A watermark drops only rows strictly older than itself, and ours is
+	// stamped with the local clock — so only rows older than now are
+	// coverable. Rows stamped ahead of our clock (a skewed writer) would
+	// survive any watermark we issue; re-issuing for them every pass is
+	// pure churn, and they fall due once wall time passes their stamp.
+	nowMicro := time.Now().UnixMicro()
+	var coverable bool
 	err = store.GetAll(ctx, prefix, func(_ keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error {
-		found = len(values) > 0
+		for _, kv := range values {
+			if kv.TimestampMicro < nowMicro {
+				coverable = true
+				break
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if !found {
+	if !coverable {
 		return nil
 	}
 	log.Info("pruning read frontiers of removed space", zap.String("spaceId", spaceId))
-	return store.DeletePrefix(ctx, prefix)
+	err = store.DeletePrefix(ctx, prefix)
+	if errors.Is(err, keyvaluestorage.ErrCoveredByWatermark) {
+		// An existing watermark is stamped ahead of our clock: any row it
+		// left visible is newer still, so a watermark of ours could not
+		// cover it either. Benign — a device with a further clock (or
+		// simply later wall time) completes the prune.
+		return nil
+	}
+	return err
 }
 
 // ErrUntracked is returned by marks when EngineFor yields no engine:

@@ -140,6 +140,21 @@ func (s *Service) offloadDeletedOneToOnes(ctx context.Context, rows []techspace.
 	}
 }
 
+// shouldPruneReadState gates the read-frontier prune on SYNCED removal
+// markers only. Deliberately narrower than IsDeleted(): that also fires
+// on LocalStatus==deleted, a DEVICE-LOCAL marker (a declined join
+// recorded before the account was later added for real) — one stale
+// device must never drive an account-wide destructive watermark for a
+// space the rest of the account actively uses. User-initiated Delete
+// stamps the synced RemoteStatus, so it qualifies immediately.
+func shouldPruneReadState(r techspace.SpaceIndexRecord) bool {
+	switch r.RemoteStatus {
+	case techspace.StatusDeleted, techspace.OneToOneDeletedStatus, techspace.GuestDeletedRemoteStatus:
+		return true
+	}
+	return false
+}
+
 // pruneRemovedSpacesReadState issues the read-frontier watermark for
 // every removed space still holding visible read/ rows. Failures are
 // retried by the next pass.
@@ -152,11 +167,11 @@ func (s *Service) pruneRemovedSpacesReadState(ctx context.Context, rows []techsp
 		if ctx.Err() != nil {
 			return
 		}
-		if !r.IsDeleted() {
+		if !shouldPruneReadState(r) {
 			continue
 		}
 		if err := rs.PruneSpace(ctx, r.Id); err != nil {
-			delLog.Debug("read-state prune failed", zap.String("spaceId", r.Id), zap.Error(err))
+			delLog.Warn("read-state prune failed", zap.String("spaceId", r.Id), zap.Error(err))
 		}
 	}
 }

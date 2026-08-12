@@ -234,6 +234,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 		XKey: "title",
 		Kind: space.PropertyKindString,
 		Meta: map[string]string{"index": "basic"},
+		Pos:  "a1",
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, titleProp)
@@ -256,6 +257,22 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	require.Contains(t, defById, plainProp)
 	assert.Equal(t, map[string]string{"index": "basic"}, defById[titleProp].Meta)
 	assert.Nil(t, defById[plainProp].Meta)
+
+	// Pos is the definition's lexid display-order key: set at create it
+	// round-trips; never set it reads back empty; a reorder is one
+	// mutable-leaf patch, like a rename.
+	assert.Equal(t, "a1", defById[titleProp].Pos)
+	assert.Empty(t, defById[plainProp].Pos)
+	require.NoError(t, sp.Types().PatchProperty(ctx, typeId, plainProp, space.PropertyPatch{
+		Set: map[string]any{"pos": "a0"},
+	}))
+	defs, err = sp.Types().Properties(ctx, typeId)
+	require.NoError(t, err)
+	for _, d := range defs {
+		if d.Id == plainProp {
+			assert.Equal(t, "a0", d.Pos)
+		}
+	}
 
 	// 4. Object — bind type at birth via InitialProperties.
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{

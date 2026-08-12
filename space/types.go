@@ -155,6 +155,13 @@ type PropertyDef struct {
 	// (meta.<k> paths).
 	Meta map[string]string
 
+	// Pos is a lexid ordering key for the property's display order
+	// within its type — the same role PropertyOption.Pos plays for
+	// options. CRDT-mutable; reorder is a single-leaf write. Empty when
+	// never set (definitions predating the field, or writers that don't
+	// order properties).
+	Pos string
+
 	Kind       PropertyKind  // first-write-wins; immutable
 	Items      *PropertyDef  // for arrays
 	Properties []PropertyDef // for objects
@@ -249,6 +256,7 @@ type PropertyDraft struct {
 	XKey        string
 	XKind       string
 	Meta        map[string]string // opaque consumer flags — see PropertyDef.Meta
+	Pos         string            // lexid display-order key — see PropertyDef.Pos
 	Kind        PropertyKind
 	Items       *PropertyDraft
 	Properties  []PropertyDraft

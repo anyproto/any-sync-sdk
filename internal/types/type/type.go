@@ -64,6 +64,7 @@ const (
 	FieldProperties  = "properties"  // recursive sub-shape for objects
 	FieldRequired    = "required"    // []string, mutable per docs/06
 	FieldMeta        = "meta"        // opaque consumer flag map (string→string), mutable
+	FieldPos         = "pos"         // lexid display-order key, mutable — the per-definition twin of OptionKeyPos
 	FieldFormat      = "format"      // value-format object — see the FormatKey* sub-keys
 )
 

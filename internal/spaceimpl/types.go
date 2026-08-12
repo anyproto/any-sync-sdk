@@ -167,6 +167,9 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 		}
 		payload.Set(typetype.FieldMeta, metaObj)
 	}
+	if draft.Pos != "" {
+		payload.Set(typetype.FieldPos, arena.NewString(draft.Pos))
+	}
 
 	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
 	if err != nil {
@@ -532,6 +535,7 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 	if meta := decodeStringMap(v.GetObject(typetype.FieldMeta)); meta != nil {
 		def.Meta = meta
 	}
+	def.Pos = v.GetString(typetype.FieldPos)
 	return def
 }
 

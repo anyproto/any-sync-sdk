@@ -65,7 +65,7 @@ func gateChange(dataVersion string) *crdt.Change {
 func TestGate_Decision(t *testing.T) {
 	t.Run("unknown shortId parks the change", func(t *testing.T) {
 		ctx, store := gateStore(t)
-		gate := store.gateFor("obj-X")
+		gate := store.gateFor("obj-X", nil)
 		ok, err := gate(ctx, gateChange("typeT:sMissing"), []byte("payload"))
 		require.NoError(t, err)
 		assert.False(t, ok, "gate must not pass an unknown-version change")
@@ -80,7 +80,7 @@ func TestGate_Decision(t *testing.T) {
 	t.Run("known shortId passes, no park", func(t *testing.T) {
 		ctx, store := gateStore(t)
 		landShortId(t, ctx, store, "typeT", "sA")
-		gate := store.gateFor("obj-X")
+		gate := store.gateFor("obj-X", nil)
 		ok, err := gate(ctx, gateChange("typeT:sA"), []byte("payload"))
 		require.NoError(t, err)
 		assert.True(t, ok)
@@ -89,7 +89,7 @@ func TestGate_Decision(t *testing.T) {
 
 	t.Run("legacy/unparseable DataVersion passes through", func(t *testing.T) {
 		ctx, store := gateStore(t)
-		gate := store.gateFor("obj-X")
+		gate := store.gateFor("obj-X", nil)
 		// Handler-version strings (no colon) parse-fail → fail-open.
 		ok, err := gate(ctx, gateChange("systemPropertyHandler-v1"), []byte("payload"))
 		require.NoError(t, err)
@@ -101,7 +101,7 @@ func TestGate_Decision(t *testing.T) {
 		// The empty-DataVersion reject lives in ApplyChange, not the gate;
 		// the gate sees zero pairs and lets it through.
 		ctx, store := gateStore(t)
-		gate := store.gateFor("obj-X")
+		gate := store.gateFor("obj-X", nil)
 		ok, err := gate(ctx, gateChange(""), []byte("payload"))
 		require.NoError(t, err)
 		assert.True(t, ok)
@@ -111,7 +111,7 @@ func TestGate_Decision(t *testing.T) {
 	t.Run("multi-pair parks with only the missing pair pending", func(t *testing.T) {
 		ctx, store := gateStore(t)
 		landShortId(t, ctx, store, "typeT", "sA") // known
-		gate := store.gateFor("obj-X")
+		gate := store.gateFor("obj-X", nil)
 		ok, err := gate(ctx, gateChange("typeT:sA;typeU:sMissing"), []byte("payload"))
 		require.NoError(t, err)
 		assert.False(t, ok)

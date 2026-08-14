@@ -138,6 +138,13 @@ type Space interface {
 	// Returned RecordIds mirror the input order.
 	Delete(ctx context.Context, batch DeleteBatch) (ModifyResult, error)
 
+	// Upsert is the generic schema-driven batch ingest: upsert by
+	// record id, diff only declared-mutable fields against stored
+	// values, skip identical records, one change per page. Requires an
+	// id:user dataset (the caller id is the idempotency key). See
+	// UpsertBatch for per-record semantics.
+	Upsert(ctx context.Context, batch UpsertBatch) (UpsertResult, error)
+
 	// SetMetadata mutates this space's display metadata (name,
 	// description, icon) by writing to the per-space `spaceIndex`
 	// derived object. The write is CRDT-replicated to every member;

@@ -103,6 +103,157 @@ type TypesAPI interface {
 	// — define a new property to change them. Format-leaf paths require
 	// a property that declared a format at creation.
 	PatchProperty(ctx context.Context, typeId, propId string, patch PropertyPatch) error
+
+	// Datasets returns the type's runtime dataset definitions (the
+	// compiled view — orphan/invalid records folded out).
+	Datasets(ctx context.Context, typeId string) ([]DatasetDef, error)
+
+	// AddDataset defines a new dataset on the type at runtime. The
+	// definition syncs like any space data; peers register the dataset
+	// (enforced by the SDK's generic schema handler) as it applies.
+	// Returns the definition's stable id. Behavioral parts of the
+	// declaration (name, id rule, delete gate, field kinds/flags) are
+	// pinned — remove and re-add to change them; display parts patch
+	// via PatchDataset.
+	AddDataset(ctx context.Context, typeId string, draft DatasetDraft) (datasetDefId string, err error)
+
+	// AddDatasetField appends a field to an existing dataset definition
+	// (additive evolution). Returns the field definition's id.
+	AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft DatasetFieldDraft) (fieldDefId string, err error)
+
+	// RemoveDataset drops a dataset definition. Existing record data is
+	// NOT cleaned up (the RemoveProperty stance); subsequent writes to
+	// the dataset drop once peers apply the removal.
+	RemoveDataset(ctx context.Context, typeId, datasetDefId string) error
+
+	// RemoveDatasetField drops one field definition. Existing values
+	// stay stored; subsequent writes to the field are rejected as
+	// undeclared (non-dynamic datasets).
+	RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error
+
+	// PatchDataset edits a definition's mutable leaves: displayName,
+	// description, name (field records' display label), search.title,
+	// search.text. Pinned paths are rejected up-front.
+	PatchDataset(ctx context.Context, typeId, defId string, patch DatasetDefPatch) error
+}
+
+// Behavioral dataset-schema vocabulary, aliased from the handler
+// package (one vocabulary for compiled-in and runtime declarations).
+type (
+	Mutability   = handler.Mutability
+	Stamp        = handler.Stamp
+	IdRule       = handler.IdRule
+	DeletePolicy = handler.DeletePolicy
+	SearchFields = handler.SearchFields
+)
+
+const (
+	MutableNever    = handler.MutableNever
+	MutableByAuthor = handler.MutableByAuthor
+	MutableByAnyone = handler.MutableByAnyone
+
+	StampNone       = handler.StampNone
+	StampCreator    = handler.StampCreator
+	StampCreateTime = handler.StampCreateTime
+	StampModifyTime = handler.StampModifyTime
+
+	IdAuto = handler.IdAuto
+	IdUser = handler.IdUser
+
+	DeleteByAnyone = handler.DeleteByAnyone
+	DeleteByAuthor = handler.DeleteByAuthor
+)
+
+// DatasetDraft is the input to TypesAPI.AddDataset.
+type DatasetDraft struct {
+	// Name is the dataset's collection name — pinned for the life of
+	// the definition. No "_" prefix, dots, slashes or colons; built-in
+	// names are reserved.
+	Name        string
+	DisplayName string
+	Description string
+
+	// Dynamic keeps a free-form keyspace next to the declared fields.
+	Dynamic bool
+
+	// IdRule / IdPattern / IdMaxLen: record-id production. Zero rule =
+	// auto-derived ids; IdUser accepts caller ids (also the upsert
+	// idempotency key) constrained by pattern/length.
+	IdRule    IdRule
+	IdPattern string
+	IdMaxLen  int
+
+	// DeleteBy gates record deletes. DeleteByAuthor requires a
+	// StampCreator field among Fields.
+	DeleteBy DeletePolicy
+
+	// SkipHistory keeps the dataset out of the version-history index.
+	SkipHistory bool
+
+	// Search is the optional search-extraction annotation (x-search).
+	Search *SearchFields
+
+	// Fields are the initial field definitions.
+	Fields []DatasetFieldDraft
+}
+
+// DatasetFieldDraft is one field definition — input to AddDataset /
+// AddDatasetField.
+type DatasetFieldDraft struct {
+	// Key is the on-record field name — pinned.
+	Key         string
+	Name        string
+	Description string
+
+	// Kind is the value kind. Required unless Stamp implies one
+	// (creator ⇒ string, createTime/modifyTime ⇒ number).
+	Kind PropertyKind
+	// Shape optionally refines array/object values (items/properties).
+	Shape *handler.FieldShape
+
+	// Scope: zero = synced. Derived is implied by Stamp and rejected
+	// otherwise.
+	Scope Scope
+	// Required: must be present on create. Incompatible with Stamp.
+	Required bool
+	// MutableBy: post-create write rule. Zero = write-once.
+	MutableBy Mutability
+	// Stamp: apply-time derived value (handler-written).
+	Stamp Stamp
+}
+
+// DatasetDef is the compiled view of one runtime dataset definition.
+type DatasetDef struct {
+	Id          string // head record id, immutable
+	Name        string
+	DisplayName string
+	Description string
+	Dynamic     bool
+	IdRule      IdRule
+	IdPattern   string
+	IdMaxLen    int
+	DeleteBy    DeletePolicy
+	SkipHistory bool
+	Search      *SearchFields
+	Fields      []DatasetFieldDef
+}
+
+// DatasetFieldDef is the compiled view of one dataset field.
+type DatasetFieldDef struct {
+	Key       string
+	Name      string
+	Kind      PropertyKind
+	Scope     Scope
+	Required  bool
+	MutableBy Mutability
+	Stamp     Stamp
+}
+
+// DatasetDefPatch is the input to PatchDataset — same per-path model
+// as PropertyPatch, over the dataset-def mutable leaves.
+type DatasetDefPatch struct {
+	Set   map[string]any
+	Unset []string
 }
 
 // TypeInfo is a point-in-time snapshot of a type object.

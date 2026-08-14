@@ -156,6 +156,10 @@ type Dataset struct {
 	DataVersion string
 
 	// Handler implements the dataset's lifecycle (Init / Before*).
+	// Optional when Schema declares fields: a nil Handler gets the SDK's
+	// generic schema handler, which enforces the declaration (required,
+	// mutability, stamps, id rules, delete gates) with no bespoke code.
+	// Bespoke handlers remain for cross-field rules.
 	Handler Handler
 
 	// Indexes are ensured on the dataset's collection the first time it
@@ -257,6 +261,41 @@ const (
 // (0, false) on an unknown label. Re-exported so HTTP layers share
 // the schema.Scope label vocabulary.
 func ParseScope(label string) (Scope, bool) { return schema.ParseScope(label) }
+
+// Behavioral schema vocabulary, re-exported from the SDK's schema layer.
+// A dataset whose declaration uses these and leaves Dataset.Handler nil
+// gets the SDK's generic schema handler: required-on-create, write-once /
+// author-gated mutability, apply-time stamps, id rules, and delete gates
+// enforced without bespoke handler code.
+type (
+	// Mutability is a field's post-create write rule (zero = write-once).
+	Mutability = schema.Mutability
+	// Stamp marks a field derived from the change at apply time.
+	Stamp = schema.Stamp
+	// IdRule declares how record ids are produced (zero = auto-derived).
+	IdRule = schema.IdRule
+	// DeletePolicy is the dataset-level record-delete gate.
+	DeletePolicy = schema.DeletePolicy
+	// SearchFields is the dataset's search-extraction annotation.
+	SearchFields = schema.SearchFields
+)
+
+const (
+	MutableNever    = schema.MutableNever
+	MutableByAuthor = schema.MutableByAuthor
+	MutableByAnyone = schema.MutableByAnyone
+
+	StampNone       = schema.StampNone
+	StampCreator    = schema.StampCreator
+	StampCreateTime = schema.StampCreateTime
+	StampModifyTime = schema.StampModifyTime
+
+	IdAuto = schema.IdAuto
+	IdUser = schema.IdUser
+
+	DeleteByAnyone = schema.DeleteByAnyone
+	DeleteByAuthor = schema.DeleteByAuthor
+)
 
 // Leaf builds an unconstrained scalar value shape for a PropertyKind —
 // convenience for declaring simple Field shapes.

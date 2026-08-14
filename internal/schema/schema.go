@@ -191,6 +191,13 @@ func compileSchema(v *anyenc.Value) (*Schema, error) {
 	return out, nil
 }
 
+// CompileShape compiles one record's `kind` / `items` / `properties`
+// fields into a value Schema — the same encoding property-definition
+// records use, reused by dataset-field definitions. Cold path.
+func CompileShape(v *anyenc.Value) (*Schema, error) {
+	return compileSchema(v)
+}
+
 // Kind returns the declared kind of a top-level property and whether
 // the property is declared at all.
 func (v *Validator) Kind(name string) (Kind, bool) {
@@ -243,6 +250,16 @@ func KindOf(v *anyenc.Value) Kind {
 		return KindObject
 	}
 	return KindUnknown
+}
+
+// ValidateValue checks `value` against the shape `s`. A nil schema is
+// unconstrained; a nil value (absent field) is always accepted. Zero
+// allocations on scalar success — safe for per-op apply paths.
+func ValidateValue(s *Schema, value *anyenc.Value) error {
+	if s == nil {
+		return nil
+	}
+	return validateValue(s, value)
 }
 
 // validateValue checks `value` against `s` recursively.

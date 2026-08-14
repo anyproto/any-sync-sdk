@@ -303,7 +303,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	default:
 		return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: scope %s is not writable via Modify (synced and local only)", batch.Scope)
 	}
-	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -311,6 +311,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 		return space.ModifyResult{}, err
 	}
 
+	s.store.EnsureDatasetRegistered(ctx, batch.ObjectId, batch.Dataset)
 	obj, err := s.store.Get(ctx, batch.ObjectId)
 	if err != nil {
 		return space.ModifyResult{}, err
@@ -365,7 +366,7 @@ func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (s
 			return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes cannot create records (Upsert unsupported)", i)
 		}
 	}
-	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -373,6 +374,7 @@ func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (s
 		return space.ModifyResult{}, err
 	}
 
+	s.store.EnsureDatasetRegistered(ctx, batch.ObjectId, batch.Dataset)
 	obj, err := s.store.Get(ctx, batch.ObjectId)
 	if err != nil {
 		return space.ModifyResult{}, err
@@ -418,6 +420,9 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		}
 	}
 
+	for i := range batches {
+		s.store.EnsureDatasetRegistered(ctx, objectId, batches[i].Dataset)
+	}
 	obj, err := s.store.Get(ctx, objectId)
 	if err != nil {
 		return nil, err
@@ -433,7 +438,7 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
 		}
-		dataVersion, err := s.store.DataVersion(b.Dataset)
+		dataVersion, err := s.store.DataVersionFor(ctx, b.Dataset)
 		if err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
@@ -479,10 +484,11 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 	if err := checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
-	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
+	s.store.EnsureDatasetRegistered(ctx, batch.ObjectId, batch.Dataset)
 	obj, err := s.store.Get(ctx, batch.ObjectId)
 	if err != nil {
 		return space.ModifyResult{}, err

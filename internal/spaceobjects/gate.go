@@ -20,27 +20,32 @@ import (
 // missing. The legacy hardcoded handler-version strings (e.g.
 // "systemPropertyHandler-v1") parse-fail and are treated as
 // unconstrained — the gate lets them through.
-func (s *Store) gateFor(objectId string) object.ApplyGate {
+//
+// The gate also parks a change whose DATASET this controller has no
+// handler for (spec §8.2 persist-but-skip): either the schema hasn't
+// arrived yet (dataset unknown everywhere) or it arrived after this
+// controller was built (stale reg set). Both drain the same way — the
+// defs apply refreshes the catalog and notifies the drainer, which
+// evicts the stale controller before replay. Without the park, one
+// unknown-dataset change would stall the object's replay at its
+// AddSeq. Cost on the accept path: one immutable-map lookup + one
+// atomic snapshot load.
+func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate {
 	return func(ctx context.Context, ch *crdt.Change, raw []byte) (bool, error) {
-		pairs, err := types.ParseDataVersion(ch.DataVersion)
-		if err != nil {
-			// Legacy / unknown DataVersion shape — pass through.
-			return true, nil
-		}
-		if len(pairs) == 0 {
-			return true, nil
-		}
 		var missing []types.DataVersionPair
-		for _, p := range pairs {
-			known, kerr := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId)
-			if kerr != nil {
-				return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
-			}
-			if !known {
-				missing = append(missing, p)
+		pairs, perr := types.ParseDataVersion(ch.DataVersion)
+		if perr == nil {
+			for _, p := range pairs {
+				known, kerr := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId)
+				if kerr != nil {
+					return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
+				}
+				if !known {
+					missing = append(missing, p)
+				}
 			}
 		}
-		if len(missing) == 0 {
+		if len(missing) == 0 && !s.controllerStaleFor(ctrl, ch.Dataset) {
 			return true, nil
 		}
 		row := DetachedRow{
@@ -138,8 +143,14 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			}
 		}
 
-		if ch.Dataset != typetype.DatasetPropertyDefs {
+		if ch.Dataset != typetype.DatasetPropertyDefs && ch.Dataset != typetype.DatasetDefs {
 			return
+		}
+		// Dataset-defs applies refresh the runtime catalog BEFORE the
+		// drainer wakes, so Drain sees the new snapshot when it decides
+		// which parked rows are replayable.
+		if ch.Dataset == typetype.DatasetDefs {
+			s.refreshType(ctx, ch.ObjectId)
 		}
 		if idsErr != nil {
 			s.drainer.Notify(types.DataVersionPair{TypeId: ch.ObjectId})
@@ -261,6 +272,20 @@ func (s *Store) replayParked(ctx context.Context, row DetachedRow) error {
 	obj, err := s.Get(ctx, row.ObjectId)
 	if err != nil {
 		return fmt.Errorf("drain: get %s: %w", row.ObjectId, err)
+	}
+	// A row parked for a then-unknown (or since-evolved) dataset may
+	// target a controller built before the schema arrived. Evict and
+	// reload so the rebuild picks the current catalog snapshot up
+	// through buildRegs. Runs on the drainer goroutine, off apply
+	// locks — eviction is safe here.
+	if s.controllerStaleFor(obj.Controller(), decoded.Dataset) {
+		if _, known := s.catalog.lookup(decoded.Dataset); !known && !obj.Controller().HasDataset(decoded.Dataset) {
+			return fmt.Errorf("drain: dataset %q still unknown for %s", decoded.Dataset, row.ChangeId)
+		}
+		s.Drop(row.ObjectId)
+		if obj, err = s.Get(ctx, row.ObjectId); err != nil {
+			return fmt.Errorf("drain: reload %s: %w", row.ObjectId, err)
+		}
 	}
 	return obj.ApplyDecoded(ctx, decoded)
 }

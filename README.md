@@ -138,6 +138,7 @@ See [`docs/`](docs/):
 - `06-data-structure.md` — record shape, datasets, variants
 - `07-files.md` — file/blob handling (deferred)
 - `08-versioning.md` — schema evolution, versioning hooks
+- `17-user-datasets.md` — runtime dataset schemas, generic schema handler, batch upsert
 
 ## Compatibility note
 

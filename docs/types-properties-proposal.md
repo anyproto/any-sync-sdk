@@ -122,6 +122,13 @@ Used only for the detached-changes gating decision ("do I have the schema state 
 
 For data datasets in Phase 1, the "known versions" are a hardcoded allowlist compiled into the SDK — same shape of lookup, different source of truth.
 
+Runtime dataset definitions (docs/17-user-datasets.md) ride this exact
+machinery: the type's `datasets` dataset projects rows into the SAME
+shortIds collection (a `src: "datasets"` discriminator, `defId` in
+place of `propId`), so one `typeId:latestShortId` stamp gates data
+changes against the type's whole schema state — property definitions
+and dataset definitions alike — with no gate changes.
+
 ### Decision rule in `ApplyChange`
 
 1. `DataVersion` empty → **reject** (whole change).

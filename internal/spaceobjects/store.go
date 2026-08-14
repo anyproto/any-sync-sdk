@@ -169,6 +169,13 @@ type Store struct {
 	// dataset-defs change applies. See catalog.go.
 	catalog *runtimeCatalog
 
+	// staticSchemaHandlers memoizes the generic schema handler for
+	// config-registered datasets that declare a schema and no bespoke
+	// Handler. Built once at store open — buildRegs runs on every
+	// object load and must not recompile declarations. SchemaHandler
+	// is read-only after construction, safe to share.
+	staticSchemaHandlers map[string]*crdt.SchemaHandler
+
 	// cache is the per-space *object.Object cache. LoadFunc holds
 	// the per-id lock during build+ColdRestore, so peers waiting on
 	// the same id never see partial state.
@@ -415,6 +422,17 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		s.extTypes = cfg.ExtTypes
 		s.dataVersions = dv
 		s.datasetOwners = owners
+		s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
+		for _, t := range cfg.ExtTypes {
+			for _, d := range t.Datasets {
+				if d.Handler != nil {
+					continue
+				}
+				if sh, err := crdt.NewSchemaHandler(datasetSchema(d)); err == nil {
+					s.staticSchemaHandlers[d.Name] = sh
+				}
+			}
+		}
 		s.catalog = newRuntimeCatalog()
 		s.initCatalog(context.Background())
 	}
@@ -915,6 +933,16 @@ func (s *Store) EnsureDatasetRegistered(ctx context.Context, objectId, dataset s
 		return
 	}
 	s.Drop(objectId)
+}
+
+// datasetRegistered reports whether the dataset is currently known to
+// any registration source (static catalog or runtime snapshot).
+func (s *Store) datasetRegistered(dataset string) bool {
+	if _, static := s.dataVersions[dataset]; static {
+		return true
+	}
+	_, known := s.catalog.lookup(dataset)
+	return known
 }
 
 // controllerStaleFor reports whether ctrl's registration for dataset is
@@ -1804,13 +1832,16 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 			if h == nil {
 				// Declared-schema dataset with no bespoke behavior: the
 				// generic schema handler enforces the declaration.
-				// Fresh per reg set — regs are also built for history
-				// scratch replays and must not share handler state.
-				sh, err := crdt.NewSchemaHandler(datasetSchema(d))
-				if err != nil {
-					return nil, nil, fmt.Errorf("spaceobjects: dataset %q: %w", d.Name, err)
+				// Memoized at store open (SchemaHandler is read-only
+				// after construction — sharing across controllers and
+				// history scratch replays is safe).
+				if h = s.staticSchemaHandlers[d.Name]; h == nil {
+					sh, err := crdt.NewSchemaHandler(datasetSchema(d))
+					if err != nil {
+						return nil, nil, fmt.Errorf("spaceobjects: dataset %q: %w", d.Name, err)
+					}
+					h = sh
 				}
-				h = sh
 			}
 			regs = append(regs, crdt.HandlerReg{
 				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),
@@ -1821,19 +1852,14 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		}
 	}
 	// Runtime datasets (SYN-147): one generic schema-handler reg per
-	// catalog entry. One atomic snapshot load — no storage reads on the
-	// controller-construction path. Handlers are fresh per reg set
-	// (history scratch replays must not share instances).
+	// catalog entry. One atomic snapshot load, handlers pre-built per
+	// snapshot — no storage reads or declaration compiles on the
+	// controller-construction path.
 	snap := s.catalog.snapshot()
 	for _, name := range sortedCatalogNames(snap) {
 		ds := snap.byName[name]
-		sh, err := crdt.NewSchemaHandler(ds.Schema)
-		if err != nil {
-			// A declaration that compiled is also constructible; failure
-			// here means catalog-layer drift — skip rather than wedge
-			// every object load.
-			storeLog.Warn("catalog: schema handler construction failed",
-				zap.String("dataset", ds.Name), zap.Error(err))
+		sh := snap.handlers[name]
+		if sh == nil {
 			continue
 		}
 		regs = append(regs, crdt.HandlerReg{

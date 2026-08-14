@@ -9,7 +9,6 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/query"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -24,13 +23,8 @@ import (
 
 // listTypesFilter selects rows from the per-space `objects` collection
 // whose `any.types` array carries the meta-type marker and that aren't
-// tombstoned. Compiled once — ParseCondition allocates and walks the
-// query tree on every call, which we don't want on a hot read path.
-// JSON literal (not map[string]any) because ParseCondition's map path
-// goes through json.Marshal under the hood, which we'd rather skip.
-var listTypesFilter = query.MustParseCondition(
-	`{"any.types":{"$in":["__type__"]},"_deletedAt":{"$exists":false}}`,
-)
+// tombstoned. One definition, shared with the store's catalog scan.
+var listTypesFilter = spaceobjects.LiveTypeRowsFilter
 
 // typesAPI implements space.TypesAPI. MVP scope: Create + AddProperty.
 // The other methods return "not implemented" so callers see a

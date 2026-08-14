@@ -46,6 +46,11 @@ type DetachedRow struct {
 	Timestamp int64
 	Payload   []byte
 	Pending   []types.DataVersionPair
+	// Dataset is the parked change's target dataset. Lets Drain skip
+	// rows whose dataset is still unregistered without paying the
+	// payload decode. Empty on rows parked by older SDKs (skipped
+	// check).
+	Dataset string
 }
 
 // Detached returns the per-space `_detached` collection, opening it
@@ -95,6 +100,9 @@ func (s *Store) Park(ctx context.Context, row DetachedRow) error {
 		pendingArr.SetArrayItem(i, a.NewString(p.TypeId+":"+p.ShortId))
 	}
 	doc.Set("pending", pendingArr)
+	if row.Dataset != "" {
+		doc.Set("dataset", a.NewString(row.Dataset))
+	}
 	return coll.UpsertOne(ctx, doc)
 }
 
@@ -160,6 +168,7 @@ func decodeDetachedRow(v *anyenc.Value) DetachedRow {
 		OrderId:   v.GetString("orderId"),
 		Timestamp: int64(v.GetInt("timestamp")),
 		Payload:   append([]byte(nil), v.GetBytes("payload")...),
+		Dataset:   v.GetString("dataset"),
 	}
 	if pending := v.GetArray("pending"); len(pending) > 0 {
 		row.Pending = make([]types.DataVersionPair, 0, len(pending))

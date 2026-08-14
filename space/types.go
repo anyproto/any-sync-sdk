@@ -236,6 +236,13 @@ type DatasetDef struct {
 	SkipHistory bool
 	Search      *SearchFields
 	Fields      []DatasetFieldDef
+
+	// Invalid marks a definition whose folded declaration fails
+	// validation (InvalidReason says why). Invalid definitions never
+	// register or accept data but stay listed so they can be repaired
+	// (AddDatasetField) or removed.
+	Invalid       bool
+	InvalidReason string
 }
 
 // DatasetFieldDef is the compiled view of one dataset field.

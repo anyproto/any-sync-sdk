@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
@@ -54,11 +55,19 @@ func (s *spaceImpl) Upsert(ctx context.Context, batch space.UpsertBatch) (space.
 		rules:    make(map[string]*schema.Field, len(decl.Fields)),
 		identity: s.store.SelfIdentity(),
 	}
+	re, maxLen, err := schema.CompileIdPattern(decl)
+	if err != nil {
+		return res, err
+	}
+	up.idRe, up.idMaxLen = re, maxLen
 	for i := range decl.Fields {
 		f := &decl.Fields[i]
 		up.rules[f.Id] = f
 		if f.Stamp == schema.StampCreator {
 			up.creatorField = f.Id
+		}
+		if f.Required {
+			up.requiredIds = append(up.requiredIds, f.Id)
 		}
 	}
 
@@ -77,6 +86,44 @@ type upserter struct {
 	rules        map[string]*schema.Field
 	creatorField string
 	identity     string
+	idRe         *regexp.Regexp
+	idMaxLen     int
+	requiredIds  []string
+}
+
+// screenCreate applies the same rules the schema handler enforces at
+// apply time (id constraints, required fields, declared kinds,
+// stamped/undeclared fields), so an invalid record becomes a
+// per-record rejection instead of failing the page's whole change at
+// the strict local pre-validation.
+func (u *upserter) screenCreate(id string, desired map[string]*anyenc.Value) error {
+	if len(id) > u.idMaxLen {
+		return fmt.Errorf("upsert: record id longer than %d", u.idMaxLen)
+	}
+	if !u.idRe.MatchString(id) {
+		return fmt.Errorf("upsert: record id %q does not match the dataset id pattern", id)
+	}
+	for _, req := range u.requiredIds {
+		if _, ok := desired[req]; !ok {
+			return fmt.Errorf("upsert: required field %q missing", req)
+		}
+	}
+	for k, v := range desired {
+		rule, declared := u.rules[k]
+		if !declared {
+			if !u.decl.Dynamic {
+				return fmt.Errorf("upsert: field %q is not declared on the dataset", k)
+			}
+			continue
+		}
+		if rule.Stamp != schema.StampNone {
+			return fmt.Errorf("upsert: field %q is derived (stamped) and not writable", k)
+		}
+		if err := schema.ValidateValue(rule.Schema, v); err != nil {
+			return fmt.Errorf("upsert: field %q: %w", k, err)
+		}
+	}
+	return nil
 }
 
 // upsertPage diffs records[start:end] against stored values and emits
@@ -90,6 +137,7 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 
 	arena := &anyenc.Arena{}
 	var recs []space.RecordModify
+	var created, updated int
 	seen := make(map[string]struct{}, len(page))
 	for i := range page {
 		rec := &page[i]
@@ -114,8 +162,12 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 		before := stored[rec.Id]
 		switch {
 		case before == nil:
+			if serr := up.screenCreate(rec.Id, desired); serr != nil {
+				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id, Err: serr})
+				continue
+			}
 			recs = append(recs, upsertCreate(arena, rec.Id, desired))
-			res.Created++
+			created++
 		default:
 			if before.Get(crdt.DeletedAtField) != nil {
 				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id, Err: space.ErrRecordDeleted})
@@ -131,7 +183,7 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 				continue
 			}
 			recs = append(recs, *mod)
-			res.Updated++
+			updated++
 		}
 	}
 	if len(recs) == 0 {
@@ -146,6 +198,10 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 	if err != nil {
 		return fmt.Errorf("spaceimpl: Upsert: page write: %w", err)
 	}
+	// Counters advance only after the page write commits, so a failed
+	// page never reports phantom successes.
+	res.Created += created
+	res.Updated += updated
 	res.Pages = append(res.Pages, mres)
 	return nil
 }

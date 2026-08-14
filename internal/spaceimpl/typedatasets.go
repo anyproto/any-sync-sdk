@@ -7,6 +7,8 @@ package spaceimpl
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -209,6 +211,20 @@ func (t *typesAPI) writeDatasetDefs(ctx context.Context, typeId string, recs ...
 	})
 }
 
+// newDatasetDefId mints the head record's id client-side. The head id
+// must be known before the write so the field records — which
+// reference it — can ride the SAME change: one atomic change means a
+// crash can never strand an orphan head with half its fields.
+// Uniqueness comes from randomness (concurrent same-name definitions
+// are distinct heads, resolved by the catalog's DefId tiebreak).
+func newDatasetDefId() (string, error) {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("typesAPI: mint dataset def id: %w", err)
+	}
+	return "dsd" + hex.EncodeToString(b[:]), nil
+}
+
 func (t *typesAPI) AddDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
 	if _, ok := t.findRegisteredType(typeId); ok {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
@@ -217,40 +233,36 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId string, draft space.Da
 	if err != nil {
 		return "", err
 	}
-	// Static catalog collision (built-in or config-registered dataset
-	// name): fail fast — the compile layer would exclude it anyway.
+	// Name collision preflight: static catalog (built-ins +
+	// config-registered) and already-active runtime datasets. The
+	// compile layer resolves races deterministically anyway — this
+	// just fails the obvious case fast with a readable error.
 	if _, err := t.parent.store.DataVersion(draft.Name); err == nil {
 		return "", fmt.Errorf("typesAPI: dataset name %q is already registered", draft.Name)
 	}
+	if existing, ok := t.parent.store.RuntimeDataset(draft.Name); ok {
+		return "", fmt.Errorf("typesAPI: dataset name %q is already defined on type %q", draft.Name, existing.TypeId)
+	}
 
-	// Head first: its record id (the datasetDefId) is derived from the
-	// change id, so field records — which reference it — must ride a
-	// second, causally-later change on the same tree.
-	arena := &anyenc.Arena{}
-	res, err := t.writeDatasetDefs(ctx, typeId, crdt.RecordChange{
-		Upsert: true, // empty Id → defId derived from ChangeId
-		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, &draft)}},
-	})
+	headId, err := newDatasetDefId()
 	if err != nil {
 		return "", err
 	}
-	if len(res.RecordIds) == 0 {
-		return "", errors.New("typesAPI: dataset head write returned no record id")
-	}
-	headId := res.RecordIds[0]
-	if len(draft.Fields) == 0 {
-		return headId, nil
-	}
-
-	recs := make([]crdt.RecordChange, 0, len(draft.Fields))
+	arena := &anyenc.Arena{}
+	recs := make([]crdt.RecordChange, 0, len(draft.Fields)+1)
+	recs = append(recs, crdt.RecordChange{
+		Id:     headId,
+		Upsert: true,
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, &draft)}},
+	})
 	for i := range draft.Fields {
 		recs = append(recs, crdt.RecordChange{
-			Upsert: true,
+			Upsert: true, // empty Id → fieldDefId derived from ChangeId
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetField(arena, headId, &draft.Fields[i], &decl.Fields[i])}},
 		})
 	}
 	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
-		return "", fmt.Errorf("typesAPI: dataset %q fields: %w", draft.Name, err)
+		return "", fmt.Errorf("typesAPI: dataset %q: %w", draft.Name, err)
 	}
 	return headId, nil
 }
@@ -271,6 +283,16 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 		if f.Key == decl.Id {
 			return "", fmt.Errorf("typesAPI: dataset %q already declares field %q", def.Name, decl.Id)
 		}
+	}
+	// Validate the COMBINED declaration, not the field in isolation: a
+	// field that invalidates the fold (author rule without a creator
+	// stamp, duplicate stamp kind) would otherwise sync everywhere and
+	// drop the whole dataset from every peer's catalog. Adding a field
+	// that REPAIRS an invalid definition passes by the same rule.
+	combined := defToDecl(&def)
+	combined.Fields = append(combined.Fields, decl)
+	if err := schema.ValidateDatasetDecl(combined); err != nil {
+		return "", fmt.Errorf("typesAPI: field %q would invalidate dataset %q: %w", decl.Id, def.Name, err)
 	}
 	arena := &anyenc.Arena{}
 	res, err := t.writeDatasetDefs(ctx, typeId, crdt.RecordChange{
@@ -396,19 +418,48 @@ func (t *typesAPI) findDatasetDef(ctx context.Context, typeId, defId string) (sp
 	return space.DatasetDef{}, fmt.Errorf("typesAPI: dataset definition %q not found on type %q", defId, typeId)
 }
 
+// defToDecl rebuilds the schema declaration a compiled DatasetDef
+// describes — for combined re-validation on additive evolution. Value
+// shapes reduce to leaf kinds (sufficient for the decl rules, which
+// never inspect nested shapes).
+func defToDecl(def *space.DatasetDef) schema.Dataset {
+	ds := schema.Dataset{
+		Dynamic:   def.Dynamic,
+		IdRule:    def.IdRule,
+		IdPattern: def.IdPattern,
+		IdMaxLen:  def.IdMaxLen,
+		DeleteBy:  def.DeleteBy,
+		Search:    def.Search,
+	}
+	for _, f := range def.Fields {
+		ds.Fields = append(ds.Fields, schema.Field{
+			Id:        f.Key,
+			Name:      f.Name,
+			Schema:    schema.Leaf(datasetPropertyKindToSchema(f.Kind)),
+			Scope:     f.Scope,
+			Required:  f.Required,
+			MutableBy: f.MutableBy,
+			Stamp:     f.Stamp,
+		})
+	}
+	return ds
+}
+
 func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 	def := space.DatasetDef{
-		Id:          c.DefId,
-		Name:        c.Name,
-		DisplayName: c.DisplayName,
-		Description: c.Description,
-		Dynamic:     c.Schema.Dynamic,
-		IdRule:      c.Schema.IdRule,
-		IdPattern:   c.Schema.IdPattern,
-		IdMaxLen:    c.Schema.IdMaxLen,
-		DeleteBy:    c.Schema.DeleteBy,
-		SkipHistory: c.SkipHistory,
-		Search:      c.Search,
+		Id:            c.DefId,
+		Name:          c.Name,
+		DisplayName:   c.DisplayName,
+		Description:   c.Description,
+		Dynamic:       c.Schema.Dynamic,
+		IdRule:        c.Schema.IdRule,
+		IdPattern:     c.Schema.IdPattern,
+		IdMaxLen:      c.Schema.IdMaxLen,
+		DeleteBy:      c.Schema.DeleteBy,
+		SkipHistory:   c.SkipHistory,
+		Search:        c.Search,
+		Invalid:       c.Invalid,
+		InvalidReason: c.InvalidReason,
 	}
 	for _, f := range c.Schema.Fields {
 		fd := space.DatasetFieldDef{

@@ -17,25 +17,38 @@ import (
 	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 )
 
-// catalogTypesFilter selects live `__type__` rows — same condition the
-// types API uses for List, compiled once.
-var catalogTypesFilter = query.MustParseCondition(
-	`{"any.types":{"$in":["__type__"]},"_deletedAt":{"$exists":false}}`,
-)
+// LiveTypeRowsFilter selects live `__type__` rows from the per-space
+// objects collection. Built once with the typed query package; shared
+// with the types API's List so the marker/tombstone condition has a
+// single definition.
+var LiveTypeRowsFilter query.Filter = func() query.Filter {
+	a := &anyenc.Arena{}
+	return query.And{
+		query.Key{Path: []string{"any", "types"}, Filter: query.NewInValue(a.NewString("__type__"))},
+		query.Key{Path: []string{"_deletedAt"}, Filter: query.Not{Filter: query.Exists{}}},
+	}
+}()
 
 // catalogSnapshot is the immutable resolved catalog. byName excludes
-// names shadowed by built-ins / config-registered datasets (the static
-// catalog always wins) and resolves cross-type name conflicts to the
-// head record with the smallest creation `_ver.id`.
+// invalid definitions and names shadowed by built-ins /
+// config-registered datasets (the static catalog always wins), and
+// resolves cross-type name conflicts to the smallest DefId. handlers
+// holds one SchemaHandler per registered dataset, built once per
+// snapshot and shared across controllers — SchemaHandler is read-only
+// after construction, so sharing is safe (unlike registry-holding
+// handlers).
 type catalogSnapshot struct {
-	byName map[string]types.CompiledDataset
-	byType map[string][]types.CompiledDataset
+	byName   map[string]types.CompiledDataset
+	byType   map[string][]types.CompiledDataset
+	handlers map[string]*crdt.SchemaHandler
 }
 
 var emptyCatalogSnapshot = &catalogSnapshot{}
@@ -126,13 +139,19 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 }
 
 // resolveCatalog folds per-type compiles into the name-resolved
-// snapshot: static catalog names (built-ins + config-registered
-// datasets) always win; cross-type conflicts resolve to the smallest
-// head-creation `_ver.id` — deterministic on converged defs.
+// snapshot: invalid definitions never register; static catalog names
+// (built-ins + config-registered datasets) always win; cross-type
+// conflicts resolve to the smallest DefId. DefId is content-addressed
+// and identical on every replica — creation `_ver.id`s are per-tree
+// and NOT comparable across type objects, so no first-writer order
+// exists to honor here.
 func (s *Store) resolveCatalog(byType map[string][]types.CompiledDataset) *catalogSnapshot {
 	byName := make(map[string]types.CompiledDataset)
 	for _, list := range byType {
 		for _, ds := range list {
+			if ds.Invalid {
+				continue
+			}
 			if _, static := s.dataVersions[ds.Name]; static {
 				storeLog.Warn("catalog: dataset name shadowed by static catalog",
 					zap.String("name", ds.Name), zap.String("typeId", ds.TypeId))
@@ -144,18 +163,31 @@ func (s *Store) resolveCatalog(byType map[string][]types.CompiledDataset) *catal
 			byName[ds.Name] = ds
 		}
 	}
-	return &catalogSnapshot{byName: byName, byType: byType}
+	handlers := make(map[string]*crdt.SchemaHandler, len(byName))
+	for name, ds := range byName {
+		sh, err := crdt.NewSchemaHandler(ds.Schema)
+		if err != nil {
+			// A compiled (valid) declaration is also constructible;
+			// failure means catalog-layer drift — drop the dataset
+			// rather than wedge every object load.
+			storeLog.Warn("catalog: schema handler construction failed",
+				zap.String("dataset", name), zap.Error(err))
+			delete(byName, name)
+			continue
+		}
+		handlers[name] = sh
+	}
+	return &catalogSnapshot{byName: byName, byType: byType, handlers: handlers}
 }
 
-// catalogWins reports whether candidate beats the current winner: the
-// smaller head-creation `_ver.id` (first writer in the converged
-// version order) wins; equal versions (impossible across trees,
-// defensive) tiebreak on DefId.
+// catalogWins resolves a cross-type name conflict: smallest DefId wins
+// — DefIds are unique and identical on every replica, so the pick is
+// replica-stable. TypeId breaks the (pathological) identical-DefId tie.
 func catalogWins(candidate, winner types.CompiledDataset) bool {
-	if candidate.CreatedVer != winner.CreatedVer {
-		return candidate.CreatedVer < winner.CreatedVer
+	if candidate.DefId != winner.DefId {
+		return candidate.DefId < winner.DefId
 	}
-	return candidate.DefId < winner.DefId
+	return candidate.TypeId < winner.TypeId
 }
 
 // catalogTypeIds scans the shared objects collection for live type
@@ -168,7 +200,7 @@ func (s *Store) catalogTypeIds(ctx context.Context) ([]string, error) {
 		}
 		return nil, err
 	}
-	iter, err := coll.Find(catalogTypesFilter).Iter(ctx)
+	iter, err := coll.Find(LiveTypeRowsFilter).Iter(ctx)
 	if err != nil {
 		return nil, err
 	}

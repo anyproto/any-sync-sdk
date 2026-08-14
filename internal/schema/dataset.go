@@ -68,12 +68,14 @@ func ParseScope(label string) (Scope, bool) {
 }
 
 // Mutability is a declared field's post-create write rule, enforced by
-// the generic schema handler. The zero value is write-once: the first
-// value to land is final (a late fill on an absent field is allowed).
+// the generic schema handler. The zero value is write-once: the field
+// is writable ONLY in the record's creating change — there is no late
+// fill (a presence-based rule would diverge under concurrent fills).
+// Declare MutableBy for fields that must stay settable later.
 type Mutability uint8
 
 const (
-	// MutableNever: write-once after the first value lands.
+	// MutableNever: writable only in the record's creating change.
 	MutableNever Mutability = iota
 	// MutableByAuthor: only the record's creator (the StampCreator
 	// field) may rewrite; accepted writes bump the modifyTime stamp.

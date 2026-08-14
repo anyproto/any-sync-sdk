@@ -54,12 +54,12 @@ func seedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, 
 	require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{
 		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-head-" + dsName,
 		VersionId: crdt.VersionId(verPrefix + "1"), DataVersion: typetype.DatasetDefsHandlerVersion,
-		Records: []crdt.RecordChange{{Id: "head-" + dsName, Upsert: true,
+		Records: []crdt.RecordChange{{Id: typeId + "-head-" + dsName, Upsert: true,
 			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: head}}}},
 	}))
 	field := a.NewObject()
 	field.Set(typetype.DefFieldDef, a.NewString(typetype.DefKindField))
-	field.Set(typetype.DefFieldDataset, a.NewString("head-"+dsName))
+	field.Set(typetype.DefFieldDataset, a.NewString(typeId+"-head-"+dsName))
 	field.Set(typetype.FieldKey, a.NewString("title"))
 	field.Set(typetype.FieldKind, a.NewString("string"))
 	require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{

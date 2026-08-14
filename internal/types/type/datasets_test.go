@@ -248,13 +248,15 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 	assert.Equal(t, schema.ScopeDerived, byId["creator"].Scope, "stamp normalizes to derived scope")
 }
 
-func TestCompileDatasetDefs_AuthorRuleWithoutCreatorStampSkipsDataset(t *testing.T) {
+func TestCompileDatasetDefs_AuthorRuleWithoutCreatorStampMarksInvalid(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
 
 	// deleteBy author but no creator-stamped field: the folded decl
-	// fails validation and the dataset is unusable until fixed.
+	// fails validation. The dataset stays VISIBLE (so it can be
+	// repaired or removed) but marked Invalid — the catalog layer
+	// never registers it.
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v1", "c1", "head-1", true,
 		headPayload(arena, "notes", map[string]any{typetype.DefFieldDeleteBy: "author"}))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "f-a", true,
@@ -262,14 +264,19 @@ func TestCompileDatasetDefs_AuthorRuleWithoutCreatorStampSkipsDataset(t *testing
 
 	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId)
 	require.NoError(t, err)
-	assert.Empty(t, compiled)
+	require.Len(t, compiled, 1)
+	assert.True(t, compiled[0].Invalid)
+	assert.NotEmpty(t, compiled[0].InvalidReason)
+	assert.Empty(t, compiled[0].SchemaRev)
 
-	// Adding the creator stamp completes the declaration.
+	// Adding the creator stamp repairs the declaration.
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v3", "c3", "f-creator", true,
 		fieldPayload(arena, "head-1", "creator", "string", map[string]any{typetype.DefFieldStamp: "creator"}))))
 	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId)
 	require.NoError(t, err)
 	require.Len(t, compiled, 1)
+	assert.False(t, compiled[0].Invalid)
+	assert.NotEmpty(t, compiled[0].SchemaRev)
 }
 
 func TestCompileDatasetDefs_DuplicateNameFirstWriterWins(t *testing.T) {

@@ -33,14 +33,19 @@ type CompiledDataset struct {
 	// DisplayName / Description are the head's mutable display fields.
 	DisplayName string
 	Description string
-	// CreatedVer is the head record's creation `_ver.id` — the stable
-	// order key catalog layers use to resolve cross-type name conflicts.
-	CreatedVer string
 	// SchemaRev fingerprints the compiled declaration. A controller
 	// registered with an older rev (a field added/removed since it was
 	// built) is stale and gets lazily evicted; identical declarations
 	// on every peer produce the identical rev.
 	SchemaRev string
+	// Invalid marks a definition whose folded declaration fails
+	// validation (e.g. author rules without a creator stamp — a
+	// cross-record fact no record-local handler check can see).
+	// Invalid definitions never register or accept data, but they stay
+	// VISIBLE so the management API can repair (add the missing field)
+	// or remove them — otherwise their name would wedge unreachably.
+	Invalid       bool
+	InvalidReason string
 }
 
 // schemaRev fingerprints a compiled declaration deterministically:
@@ -64,10 +69,10 @@ func schemaRev(ds schema.Dataset) string {
 //   - field records whose owning head is absent (orphans) are skipped;
 //   - duplicate field keys within a dataset and duplicate dataset names
 //     within the type resolve to the record with the smallest creation
-//     `_ver.id` (the first writer in the converged version order);
-//   - a dataset whose folded declaration fails ValidateDatasetDecl
-//     (e.g. author rules without a creator stamp — a cross-record fact
-//     no record-local handler check can see) is skipped entirely.
+//     `_ver.id` (sound within one tree — the converged version order);
+//   - a dataset whose folded declaration fails ValidateDatasetDecl is
+//     emitted with Invalid set: visible for repair/removal, never
+//     registered.
 //
 // Cross-TYPE name conflicts are the caller's (catalog layer's) concern.
 // Returns (nil, nil) when the type has no datasets collection.
@@ -236,22 +241,25 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 				ds.Fields = append(ds.Fields, f.field)
 			}
 		}
-		if err := schema.ValidateDatasetDecl(ds); err != nil {
-			continue // cross-record inconsistency: dataset unusable until fixed
-		}
-		norm := ds.Normalized()
-		out = append(out, CompiledDataset{
+		compiled := CompiledDataset{
 			Name:        h.name,
 			DefId:       h.id,
 			TypeId:      typeId,
-			Schema:      norm,
 			SkipHistory: h.skip,
 			Search:      h.search,
 			DisplayName: h.display,
 			Description: h.descr,
-			CreatedVer:  h.created,
-			SchemaRev:   schemaRev(norm),
-		})
+		}
+		if err := schema.ValidateDatasetDecl(ds); err != nil {
+			compiled.Invalid = true
+			compiled.InvalidReason = err.Error()
+			compiled.Schema = ds
+		} else {
+			norm := ds.Normalized()
+			compiled.Schema = norm
+			compiled.SchemaRev = schemaRev(norm)
+		}
+		out = append(out, compiled)
 	}
 	// Deterministic output order: by name.
 	for i := 1; i < len(out); i++ {

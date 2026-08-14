@@ -57,9 +57,18 @@ func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate
 			Timestamp: ch.Timestamp,
 			Payload:   append([]byte(nil), raw...),
 			Pending:   missing,
+			Dataset:   ch.Dataset,
 		}
 		if perr := s.Park(ctx, row); perr != nil {
 			return false, fmt.Errorf("gate: park: %w", perr)
+		}
+		if len(missing) == 0 {
+			// Parked only because this controller's registration is
+			// missing/stale — the schema may already be fully applied,
+			// so no future defs apply is guaranteed to wake the
+			// drainer. Nudge it now: Drain evicts the stale controller
+			// and replays the row.
+			s.drainer.Notify(types.DataVersionPair{})
 		}
 		return false, nil
 	}
@@ -217,12 +226,18 @@ func (s *Store) Drain(ctx context.Context) error {
 	var ready []DetachedRow
 	if err := s.IterDetached(ctx, func(row DetachedRow) bool {
 		all, err := s.allPendingKnown(ctx, row.Pending)
-		if err != nil {
+		if err != nil || !all {
 			return true
 		}
-		if all {
-			ready = append(ready, row)
+		// A row parked for a dataset that is STILL not registered
+		// anywhere (removed, or its schema never arrived) can't replay
+		// yet — skip before paying the payload decode. Retried when a
+		// later defs apply refreshes the catalog. Rows from older SDKs
+		// carry no dataset and take the decode path as before.
+		if row.Dataset != "" && !s.datasetRegistered(row.Dataset) {
+			return true
 		}
+		ready = append(ready, row)
 		return true
 	}); err != nil {
 		return err

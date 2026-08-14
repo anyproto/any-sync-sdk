@@ -171,6 +171,25 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.Len(t, res.Rejections, 1)
 	assert.ErrorIs(t, res.Rejections[0].Err, space.ErrRecordDeleted)
 
+	// Evolution guards: additive fields cannot be required (fresh
+	// devices would replay history against the stricter schema), and
+	// removing the creator stamp of an author-gated dataset is refused
+	// (it would invalidate the fold on every peer).
+	_, err = sp.Types().AddDatasetField(ctx, typeId, defId, space.DatasetFieldDraft{
+		Key: "mandatory", Kind: space.PropertyKindString, Required: true,
+	})
+	require.Error(t, err)
+	defs, err = sp.Types().Datasets(ctx, typeId)
+	require.NoError(t, err)
+	var creatorFieldId string
+	for _, f := range defs[0].Fields {
+		if f.Stamp == space.StampCreator {
+			creatorFieldId = f.Id
+		}
+	}
+	require.NotEmpty(t, creatorFieldId, "field def ids must surface")
+	require.Error(t, sp.Types().RemoveDatasetField(ctx, typeId, creatorFieldId))
+
 	// Additive evolution: a new field lands and accepts writes.
 	_, err = sp.Types().AddDatasetField(ctx, typeId, defId, space.DatasetFieldDraft{
 		Key: "tags", Kind: space.PropertyKindArray, MutableBy: space.MutableByAnyone,

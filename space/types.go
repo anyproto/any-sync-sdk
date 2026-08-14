@@ -118,7 +118,11 @@ type TypesAPI interface {
 	AddDataset(ctx context.Context, typeId string, draft DatasetDraft) (datasetDefId string, err error)
 
 	// AddDatasetField appends a field to an existing dataset definition
-	// (additive evolution). Returns the field definition's id.
+	// (additive evolution). Returns the field definition's id. Additive
+	// fields cannot be Required — validation always runs against the
+	// current schema, so a required field added later would reject the
+	// dataset's own history on fresh devices. Declare required fields
+	// at AddDataset.
 	AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft DatasetFieldDraft) (fieldDefId string, err error)
 
 	// RemoveDataset drops a dataset definition. Existing record data is
@@ -247,6 +251,9 @@ type DatasetDef struct {
 
 // DatasetFieldDef is the compiled view of one dataset field.
 type DatasetFieldDef struct {
+	// Id is the field definition record's id — the identity
+	// RemoveDatasetField targets.
+	Id        string
 	Key       string
 	Name      string
 	Kind      PropertyKind

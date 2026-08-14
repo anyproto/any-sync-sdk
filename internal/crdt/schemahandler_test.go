@@ -332,6 +332,45 @@ func TestSchemaHandler_PreValidateMultiStrict(t *testing.T) {
 	require.NoError(t, h.PreValidateMulti(&ok, func(string) *anyenc.Value { return nil }))
 }
 
+// Dotted keys must not satisfy required or slip past shape checks:
+// {title.x: 1} doesn't put a valid string at `title`, and writing
+// UNDER a declared scalar is invalid structure, not "unconstrained".
+func TestSchemaHandler_DottedKeysNoBypass(t *testing.T) {
+	st := newSchemaHandlerController(t, shDecl())
+	a := &anyenc.Arena{}
+
+	// Create whose only "title" write is a deep path: required fails,
+	// whole record dropped.
+	payload := a.NewObject()
+	payload.Set("title.x", a.NewNumberInt(1))
+	res, err := st.ApplyChangeWithResult(ctx, shChange("v1", shAuthorA, 100, RecordChange{
+		Id: "row-1", Upsert: true, Ops: []Op{{Type: OpSet, Payload: payload}},
+	}))
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Rejections)
+	assert.Nil(t, st.Get(ctx, shTestDS, "row-1"))
+
+	// Existing record: deep write under a declared scalar rejected on
+	// both the dotted-multi-field and the split-path forms.
+	shSeed(t, st)
+	res, err = st.ApplyChangeWithResult(ctx, shChange("v2", shAuthorB, 200, RecordChange{
+		Id: "row-1", Ops: []Op{{Type: OpSet, Path: []string{"note", "x"}, Payload: a.NewNumberInt(1)}},
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrValidation)
+
+	deep := a.NewObject()
+	deep.Set("note.x", a.NewNumberInt(1))
+	res, err = st.ApplyChangeWithResult(ctx, shChange("v3", shAuthorB, 300, RecordChange{
+		Id: "row-1", Ops: []Op{{Type: OpSet, Payload: deep}},
+	}))
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Rejections)
+	rec := st.Get(ctx, shTestDS, "row-1")
+	assert.Nil(t, rec.Get("note", "x"))
+}
+
 // Convergence: every SchemaHandler verdict must be arrival-order
 // independent. The adversarial delete-races-create case (a non-author
 // delete of a user-chosen id arriving before OR after the create) must

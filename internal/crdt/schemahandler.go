@@ -156,14 +156,16 @@ func (h *SchemaHandler) checkCreatePayload(rec *RecordChange) error {
 				}
 				continue
 			}
-			if present != nil {
+			// Only a WHOLE-field write satisfies required — a deep
+			// path (title.x) doesn't put a valid value at the field.
+			if len(op.Path) == 1 && present != nil {
 				present[op.Path[0]] = struct{}{}
 			}
 			if err := h.checkOpShape(op); err != nil {
 				return err
 			}
 		case OpAddToSet, OpInc, OpIncGated:
-			if len(op.Path) > 0 && present != nil {
+			if len(op.Path) == 1 && present != nil {
 				present[op.Path[0]] = struct{}{}
 			}
 			if err := h.checkOpShape(op); err != nil {
@@ -196,7 +198,9 @@ func (h *SchemaHandler) visitMultiField(op *Op, present map[string]struct{}) err
 		}
 		key := string(k)
 		head, rest, dotted := strings.Cut(key, ".")
-		if present != nil {
+		if !dotted && present != nil {
+			// Dotted keys never satisfy required: {title.x: 1} doesn't
+			// put a valid value at `title`.
 			present[head] = struct{}{}
 		}
 		rule, ok := h.rules[head]
@@ -205,10 +209,15 @@ func (h *SchemaHandler) visitMultiField(op *Op, present map[string]struct{}) err
 		}
 		shape := rule.shape
 		if dotted {
-			shape = subShape(shape, rest)
-			if shape == nil {
+			sub, valid := subShape(shape, rest)
+			if !valid {
+				firstErr = fmt.Errorf("%w: field %q: path descends below the declared shape", ErrValidation, key)
 				return
 			}
+			if sub == nil {
+				return
+			}
+			shape = sub
 		}
 		if err := schema.ValidateValue(shape, v); err != nil {
 			firstErr = fmt.Errorf("%w: field %q: %v", ErrValidation, key, err)
@@ -293,9 +302,15 @@ func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, op *Op, sink *Sink) er
 		}
 		shape := rule.shape
 		if dotted {
-			if shape = subShape(shape, rest); shape == nil {
+			sub, valid := subShape(shape, rest)
+			if !valid {
+				firstErr = fmt.Errorf("%w: field %q: path descends below the declared shape", ErrValidation, string(k))
 				return
 			}
+			if sub == nil {
+				return
+			}
+			shape = sub
 		}
 		if err := schema.ValidateValue(shape, v); err != nil {
 			firstErr = fmt.Errorf("%w: field %q: %v", ErrValidation, string(k), err)
@@ -349,9 +364,14 @@ func (h *SchemaHandler) checkOpShape(op *Op) error {
 	}
 	shape := rule.shape
 	if len(op.Path) > 1 {
-		if shape = subShapeSegs(shape, op.Path[1:]); shape == nil {
+		sub, valid := subShapeSegs(shape, op.Path[1:])
+		if !valid {
+			return fmt.Errorf("%w: field %q: path descends below the declared shape", ErrValidation, strings.Join(op.Path, "."))
+		}
+		if sub == nil {
 			return nil
 		}
+		shape = sub
 	}
 	switch op.Type {
 	case OpSet:
@@ -485,9 +505,15 @@ func (h *SchemaHandler) preValidateExistingOp(op *Op) error {
 			}
 			shape := rule.shape
 			if dotted {
-				if shape = subShape(shape, rest); shape == nil {
+				sub, valid := subShape(shape, rest)
+				if !valid {
+					firstErr = fmt.Errorf("%w: field %q: path descends below the declared shape", ErrValidation, string(k))
 					return
 				}
+				if sub == nil {
+					return
+				}
+				shape = sub
 			}
 			if err := schema.ValidateValue(shape, v); err != nil {
 				firstErr = fmt.Errorf("%w: field %q: %v", ErrValidation, string(k), err)
@@ -505,35 +531,55 @@ func (h *SchemaHandler) preValidateExistingOp(op *Op) error {
 	return h.checkOpShape(op)
 }
 
-// subShape descends a value shape along a dotted path remainder,
-// returning nil (unconstrained) when the shape doesn't reach that depth.
-func subShape(s *schema.Schema, rest string) *schema.Schema {
+// subShape descends a value shape along a dotted path remainder.
+// Returns (shape, true) when the path resolves ((nil, true) =
+// unconstrained: a free-shape object or an array interior), and
+// (nil, false) when the path is INVALID for the declared shape —
+// descending under a scalar, or into a property the shape's closed
+// object doesn't declare. Callers reject the false case; treating it
+// as unconstrained would let a dotted write smuggle arbitrary
+// structure into a declared scalar field.
+func subShape(s *schema.Schema, rest string) (*schema.Schema, bool) {
 	for rest != "" {
 		var seg string
 		seg, rest, _ = strings.Cut(rest, ".")
-		if s.Kind != schema.KindObject || s.Properties == nil {
-			return nil
+		switch s.Kind {
+		case schema.KindObject:
+			if s.Properties == nil {
+				return nil, true // free shape: any layout below
+			}
+			next, ok := s.Properties[seg]
+			if !ok {
+				return nil, false // closed object: undeclared sub-field
+			}
+			s = next
+		case schema.KindArray:
+			return nil, true // element paths unconstrained in v1
+		default:
+			return nil, false // scalar: nothing underneath
 		}
-		next, ok := s.Properties[seg]
-		if !ok {
-			return nil
-		}
-		s = next
 	}
-	return s
+	return s, true
 }
 
 // subShapeSegs is subShape over pre-split path segments.
-func subShapeSegs(s *schema.Schema, segs []string) *schema.Schema {
+func subShapeSegs(s *schema.Schema, segs []string) (*schema.Schema, bool) {
 	for _, seg := range segs {
-		if s.Kind != schema.KindObject || s.Properties == nil {
-			return nil
+		switch s.Kind {
+		case schema.KindObject:
+			if s.Properties == nil {
+				return nil, true
+			}
+			next, ok := s.Properties[seg]
+			if !ok {
+				return nil, false
+			}
+			s = next
+		case schema.KindArray:
+			return nil, true
+		default:
+			return nil, false
 		}
-		next, ok := s.Properties[seg]
-		if !ok {
-			return nil
-		}
-		s = next
 	}
-	return s
+	return s, true
 }

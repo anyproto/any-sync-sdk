@@ -162,7 +162,11 @@ const (
 	// explicit caller ids are rejected at create.
 	IdAuto IdRule = iota
 	// IdUser: the caller supplies the id, constrained by
-	// IdPattern/IdMaxLen. The id doubles as the upsert idempotency key.
+	// IdPattern/IdMaxLen. The id doubles as the upsert idempotency
+	// key. Contract: one writer per id — concurrent creates of the
+	// same id by different members take arrival-order-dependent
+	// creation verdicts (required checks, creator stamp) and are
+	// outside the convergence guarantee.
 	IdUser
 )
 

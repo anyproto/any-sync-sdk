@@ -12,6 +12,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -280,6 +281,36 @@ func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, datase
 	}
 }
 
+// localWriteRetry runs a LocalWrite, retrying once with a fresh
+// resolve when the object was evicted between Get and the write — the
+// lazy schema-refresh Drop (EnsureDatasetRegistered / drain) closes
+// resident handles, and an in-flight caller must not surface that
+// transient as a user error.
+func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
+	res, err := obj.LocalWrite(ctx, ch)
+	if !errors.Is(err, object.ErrClosed) {
+		return res, err
+	}
+	obj, gerr := s.store.Get(ctx, objectId)
+	if gerr != nil {
+		return object.WriteResult{}, gerr
+	}
+	return obj.LocalWrite(ctx, ch)
+}
+
+// localSetRetry is localWriteRetry for the LocalSet route.
+func (s *spaceImpl) localSetRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
+	res, err := obj.LocalSet(ctx, ch)
+	if !errors.Is(err, object.ErrClosed) {
+		return res, err
+	}
+	obj, gerr := s.store.Get(ctx, objectId)
+	if gerr != nil {
+		return object.WriteResult{}, gerr
+	}
+	return obj.LocalSet(ctx, ch)
+}
+
 // Modify resolves the target object via the per-space store, builds a
 // crdt.Change from the public batch, and submits it on the route the
 // batch's Scope selects: the Object's local-write (DAG) path for
@@ -322,7 +353,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 		return space.ModifyResult{}, err
 	}
 
-	res, err := obj.LocalWrite(ctx, change)
+	res, err := s.localWriteRetry(ctx, obj, batch.ObjectId, change)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -385,7 +416,7 @@ func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (s
 		return space.ModifyResult{}, err
 	}
 
-	res, err := obj.LocalSet(ctx, change)
+	res, err := s.localSetRetry(ctx, obj, batch.ObjectId, change)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -466,7 +497,7 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	// still surface in each ModifyResult.Rejections.
 	out := make([]space.ModifyResult, 0, len(changes))
 	for i := range changes {
-		res, err := obj.LocalWrite(ctx, changes[i])
+		res, err := s.localWriteRetry(ctx, obj, objectId, changes[i])
 		if err != nil {
 			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d write: %w", i, err)
 		}
@@ -507,7 +538,7 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 		TraceIds:    batch.TraceIds,
 		Records:     records,
 	}
-	res, err := obj.LocalWrite(ctx, change)
+	res, err := s.localWriteRetry(ctx, obj, batch.ObjectId, change)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}

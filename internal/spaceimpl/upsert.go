@@ -138,6 +138,11 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 	arena := &anyenc.Arena{}
 	var recs []space.RecordModify
 	var created, updated int
+	// isCreate / idxById map record ids back to batch positions so
+	// apply-time rejections fold into UpsertResult with correct
+	// counters.
+	isCreate := make(map[string]bool, len(page))
+	idxById := make(map[string]int, len(page))
 	seen := make(map[string]struct{}, len(page))
 	for i := range page {
 		rec := &page[i]
@@ -168,6 +173,8 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 			}
 			recs = append(recs, upsertCreate(arena, rec.Id, desired))
 			created++
+			isCreate[rec.Id] = true
+			idxById[rec.Id] = idx
 		default:
 			if before.Get(crdt.DeletedAtField) != nil {
 				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id, Err: space.ErrRecordDeleted})
@@ -184,6 +191,7 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 			}
 			recs = append(recs, *mod)
 			updated++
+			idxById[rec.Id] = idx
 		}
 	}
 	if len(recs) == 0 {
@@ -199,7 +207,33 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 		return fmt.Errorf("spaceimpl: Upsert: page write: %w", err)
 	}
 	// Counters advance only after the page write commits, so a failed
-	// page never reports phantom successes.
+	// page never reports phantom successes. Apply-time per-record
+	// rejections (author gates run at apply, races with concurrent
+	// deletes) fold back into the result: a whole-record drop
+	// (OpIndex -1) un-counts its record; per-op drops keep the record
+	// counted (partially applied) but stay visible.
+	dropped := make(map[string]struct{})
+	for _, rej := range mres.Rejections {
+		err := rej.ReasonErr
+		if err == nil {
+			err = fmt.Errorf("upsert: %s", rej.Reason)
+		}
+		res.Rejections = append(res.Rejections, space.UpsertRejection{
+			Index: idxById[rej.RecordId], Id: rej.RecordId, Err: err,
+		})
+		if rej.OpIndex != -1 {
+			continue
+		}
+		if _, dup := dropped[rej.RecordId]; dup {
+			continue
+		}
+		dropped[rej.RecordId] = struct{}{}
+		if isCreate[rej.RecordId] {
+			created--
+		} else if _, tracked := idxById[rej.RecordId]; tracked {
+			updated--
+		}
+	}
 	res.Created += created
 	res.Updated += updated
 	res.Pages = append(res.Pages, mres)
@@ -313,6 +347,12 @@ func (u *upserter) diffRecord(id string, desired map[string]*anyenc.Value, befor
 				string(before.GetStringBytes(u.creatorField)) != u.identity {
 				return nil, fmt.Errorf("%w: %q on record %q", space.ErrUpsertNotAuthor, k, id)
 			}
+		}
+		// Shape-check the changed value here so a wrong-kind update is
+		// a per-record rejection, not a strict-prevalidation abort of
+		// the whole page.
+		if err := schema.ValidateValue(rule.Schema, v); err != nil {
+			return nil, fmt.Errorf("upsert: field %q: %w", k, err)
 		}
 		ops = append(ops, space.Op{Type: space.OpSet, Path: k, Value: v})
 	}

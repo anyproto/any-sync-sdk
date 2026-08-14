@@ -946,7 +946,10 @@ func (s *Store) datasetRegistered(dataset string) bool {
 }
 
 // controllerStaleFor reports whether ctrl's registration for dataset is
-// missing or out of rev against the current catalog snapshot.
+// missing, out of rev against the current catalog snapshot, or carries
+// a runtime dataset the catalog no longer knows (removed definition —
+// residents must stop applying what fresh controllers park, or
+// replicas diverge).
 func (s *Store) controllerStaleFor(ctrl *crdt.Controller, dataset string) bool {
 	if ctrl == nil {
 		return false
@@ -954,10 +957,13 @@ func (s *Store) controllerStaleFor(ctrl *crdt.Controller, dataset string) bool {
 	if !ctrl.HasDataset(dataset) {
 		return true
 	}
-	if ds, ok := s.catalog.lookup(dataset); ok && ctrl.DatasetSchemaRev(dataset) != ds.SchemaRev {
-		return true
+	rev := ctrl.DatasetSchemaRev(dataset)
+	if ds, ok := s.catalog.lookup(dataset); ok {
+		return rev != ds.SchemaRev
 	}
-	return false
+	// Rev-tracked (runtime-registered) but absent from the catalog:
+	// the definition was removed since this controller was built.
+	return rev != ""
 }
 
 // Allocator returns the shared per-space VersionAllocator. Exposed so

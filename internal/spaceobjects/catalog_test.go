@@ -136,6 +136,35 @@ func TestCatalog_RefreshTypeAddsAndRemoves(t *testing.T) {
 	assert.Equal(t, catTypeId, ds.TypeId, "cross-type conflict resolves deterministically")
 }
 
+func TestControllerStaleFor_RemovedDataset(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "stale.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
+	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
+	store := NewStore(nil, db, nil, "spaceA", nil, nil)
+	t.Cleanup(func() { _ = store.Close() })
+
+	regs, _, err := store.buildRegs()
+	require.NoError(t, err)
+	ctrl, err := crdt.NewController(ctx, "obj-X", db, regs...)
+	require.NoError(t, err)
+
+	require.False(t, store.controllerStaleFor(ctrl, "notes"), "fresh reg matches catalog rev")
+
+	// Definition removed: the resident controller (still carrying the
+	// reg) must go stale so it stops applying what fresh peers park.
+	headColl, err := db.Collection(ctx, catTypeId+"_datasets")
+	require.NoError(t, err)
+	require.NoError(t, headColl.DeleteId(ctx, catTypeId+"-head-notes"))
+	store.refreshType(ctx, catTypeId)
+	_, known := store.RuntimeDataset("notes")
+	require.False(t, known)
+	assert.True(t, store.controllerStaleFor(ctrl, "notes"))
+}
+
 func TestGate_ParksUnknownDatasetChange(t *testing.T) {
 	ctx, store := gateStore(t)
 

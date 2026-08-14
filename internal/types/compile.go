@@ -46,6 +46,9 @@ type CompiledDataset struct {
 	// or remove them — otherwise their name would wedge unreachably.
 	Invalid       bool
 	InvalidReason string
+	// FieldDefIds are the field records' ids, aligned with
+	// Schema.Fields — the identities RemoveDatasetField targets.
+	FieldDefIds []string
 }
 
 // schemaRev fingerprints a compiled declaration deterministically:
@@ -69,7 +72,10 @@ func schemaRev(ds schema.Dataset) string {
 //   - field records whose owning head is absent (orphans) are skipped;
 //   - duplicate field keys within a dataset and duplicate dataset names
 //     within the type resolve to the record with the smallest creation
-//     `_ver.id` (sound within one tree — the converged version order);
+//     `_ver.id` — sound within one tree: orderId VALUES are peer-local
+//     but their relative order converges, so the comparison picks the
+//     same winner on every replica (cross-TREE comparison would not;
+//     the catalog layer uses DefId there);
 //   - a dataset whose folded declaration fails ValidateDatasetDecl is
 //     emitted with Invalid set: visible for repair/removal, never
 //     registered.
@@ -105,6 +111,7 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 		descr   string
 	}
 	type fieldRec struct {
+		id      string
 		headId  string
 		created string
 		field   schema.Field
@@ -187,7 +194,7 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 				f.MutableBy = mb
 			}
 			f.Required = v.GetBool("required")
-			fields = append(fields, &fieldRec{headId: headId, created: created, field: f})
+			fields = append(fields, &fieldRec{id: v.GetString("id"), headId: headId, created: created, field: f})
 		}
 	}
 	if iter.Err() != nil {
@@ -226,6 +233,7 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 	out := make([]CompiledDataset, 0, len(winnerByName))
 	for _, h := range winnerByName {
 		ds := h.ds
+		var fieldIds []string
 		if byKey := fieldWinners[h.id]; byKey != nil {
 			// Deterministic field order: by creation _ver.id.
 			ordered := make([]*fieldRec, 0, len(byKey))
@@ -240,6 +248,10 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 			for _, f := range ordered {
 				ds.Fields = append(ds.Fields, f.field)
 			}
+			fieldIds = make([]string, 0, len(ordered))
+			for _, f := range ordered {
+				fieldIds = append(fieldIds, f.id)
+			}
 		}
 		compiled := CompiledDataset{
 			Name:        h.name,
@@ -249,6 +261,7 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 			Search:      h.search,
 			DisplayName: h.display,
 			Description: h.descr,
+			FieldDefIds: fieldIds,
 		}
 		if err := schema.ValidateDatasetDecl(ds); err != nil {
 			compiled.Invalid = true

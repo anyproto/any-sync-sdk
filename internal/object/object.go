@@ -24,6 +24,11 @@ var log = logger.NewNamed("sdk.object")
 // is somehow zeroed out (defensive).
 var ErrTreeNotSet = errors.New("object: tree not set")
 
+// ErrClosed rejects writes on a closed (evicted) Object. Callers that
+// resolved the Object before an eviction (e.g. the lazy schema-refresh
+// Drop) retry with a fresh Store.Get.
+var ErrClosed = errors.New("object: closed")
+
 // Object binds one any-sync object tree to one crdt.Controller.
 //
 // Constructed via object.New, which builds the Object, runs the
@@ -315,7 +320,7 @@ func (o *Object) ApplyDecoded(ctx context.Context, ch crdt.Change) error {
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return errors.New("object: closed")
+		return ErrClosed
 	}
 	// Defense-in-depth for the drain path: replayLocked already skips
 	// non-allowlisted datasets on plaintext objects before parking, so
@@ -516,7 +521,7 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return WriteResult{}, errors.New("object: closed")
+		return WriteResult{}, ErrClosed
 	}
 
 	// Plaintext-class objects ship their changes UNencrypted, so only
@@ -629,7 +634,7 @@ func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, err
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return WriteResult{}, errors.New("object: closed")
+		return WriteResult{}, ErrClosed
 	}
 	ch.Local = true
 	ch.SpaceId = o.spaceId
@@ -673,7 +678,7 @@ func (o *Object) InjectedSet(ctx context.Context, ch crdt.Change) (WriteResult, 
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return WriteResult{}, errors.New("object: closed")
+		return WriteResult{}, ErrClosed
 	}
 	ch.Injected = true
 	ch.SpaceId = o.spaceId

@@ -271,6 +271,12 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 	if _, ok := t.findRegisteredType(typeId); ok {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if draft.Required {
+		// A required field added later would reject the dataset's own
+		// history: fresh devices replay old creates against the CURRENT
+		// schema. Required fields exist only from AddDataset.
+		return "", errors.New("typesAPI: additive fields cannot be required — declare required fields at AddDataset")
+	}
 	decl, err := draftFieldDecl(&draft)
 	if err != nil {
 		return "", err
@@ -313,7 +319,36 @@ func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId strin
 }
 
 func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error {
-	return t.removeDatasetDefRecord(ctx, typeId, fieldDefId)
+	if _, ok := t.findRegisteredType(typeId); ok {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	// Validate the declaration MINUS the field before writing the
+	// delete: removing e.g. the creator stamp of an author-gated
+	// dataset would invalidate the fold and drop the dataset from
+	// every peer's catalog (the AddDatasetField guard's mirror). A
+	// dataset that is ALREADY invalid stays removable — cleanup must
+	// never be blocked.
+	defs, err := t.Datasets(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	for i := range defs {
+		def := &defs[i]
+		for j := range def.Fields {
+			if def.Fields[j].Id != fieldDefId {
+				continue
+			}
+			if !def.Invalid {
+				remaining := defToDecl(def)
+				remaining.Fields = append(remaining.Fields[:j], remaining.Fields[j+1:]...)
+				if verr := schema.ValidateDatasetDecl(remaining); verr != nil {
+					return fmt.Errorf("typesAPI: removing field %q would invalidate dataset %q: %w", def.Fields[j].Key, def.Name, verr)
+				}
+			}
+			return t.removeDatasetDefRecord(ctx, typeId, fieldDefId)
+		}
+	}
+	return fmt.Errorf("typesAPI: field definition %q not found on type %q", fieldDefId, typeId)
 }
 
 func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId string) error {
@@ -461,7 +496,7 @@ func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 		Invalid:       c.Invalid,
 		InvalidReason: c.InvalidReason,
 	}
-	for _, f := range c.Schema.Fields {
+	for i, f := range c.Schema.Fields {
 		fd := space.DatasetFieldDef{
 			Key:       f.Id,
 			Name:      f.Name,
@@ -469,6 +504,9 @@ func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 			Required:  f.Required,
 			MutableBy: f.MutableBy,
 			Stamp:     f.Stamp,
+		}
+		if i < len(c.FieldDefIds) {
+			fd.Id = c.FieldDefIds[i]
 		}
 		if f.Schema != nil {
 			fd.Kind = schemaKindToPropertyKind(f.Schema.Kind)

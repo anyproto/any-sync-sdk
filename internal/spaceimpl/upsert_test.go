@@ -120,6 +120,14 @@ func TestUpsertDiff_UndeclaredField(t *testing.T) {
 	require.NotNil(t, mod)
 }
 
+func TestUpsertDiff_WrongKindValueRejectsRecord(t *testing.T) {
+	a := &anyenc.Arena{}
+	u := testUpserter("me")
+	before := storedRecord(a, map[string]string{"note": "old", "creator": "me"})
+	_, err := u.diffRecord("r1", map[string]*anyenc.Value{"note": a.NewNumberInt(1)}, before)
+	require.Error(t, err, "wrong-kind update must be a per-record rejection, not a page abort")
+}
+
 func TestUpsertFields_ReservedAndDottedRejected(t *testing.T) {
 	a := &anyenc.Arena{}
 	for _, bad := range []string{"id", "_ver", "a.b", ""} {

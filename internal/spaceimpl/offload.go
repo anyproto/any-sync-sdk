@@ -135,7 +135,6 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	// The mux only holds the stopped watchers above; drop it so a
 	// reload starts from an empty subscriber list (rewiring re-adds).
 	delete(s.aclMuxes, spaceId)
-	delete(s.pubsubAclWired, spaceId)
 	s.mu.Unlock()
 	if store != nil {
 		if err := store.Close(); err != nil {

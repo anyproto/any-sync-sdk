@@ -1,8 +1,8 @@
 package anysyncx
 
 import (
-	"context"
 	"encoding/hex"
+	"fmt"
 	"testing"
 
 	"github.com/anyproto/any-sync/util/crypto"
@@ -78,19 +78,14 @@ func TestPubSubCrypto_DecryptCacheHit(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestSpacePeerManager_OnSubscribedHook: broadcastSubscribe fires the
-// pubsub interest hook after each node-subscribe broadcast.
-func TestSpacePeerManager_OnSubscribedHook(t *testing.T) {
-	var got []string
-	m := &spacePeerManager{
-		spaceId:      "space1",
-		onSubscribed: func(id string) { got = append(got, id) },
+// TestPubSubCrypto_CacheBound: the derived-key cache resets at the
+// limit instead of growing without bound.
+func TestPubSubCrypto_CacheBound(t *testing.T) {
+	readKey := fixedReadKey(t)
+	c := &pubsubCrypto{}
+	for i := 0; i < pubsubKeyCacheLimit+10; i++ {
+		_, err := c.derived(fmt.Sprintf("kid-%d", i), readKey)
+		require.NoError(t, err)
 	}
-	m.runCtx, m.runCancel = context.WithCancel(context.Background())
-	defer m.runCancel()
-
-	// Empty subscribeMsgRaw short-circuits KeepAlive, isolating the hook.
-	m.broadcastSubscribe()
-	m.broadcastSubscribe()
-	assert.Equal(t, []string{"space1", "space1"}, got)
+	assert.LessOrEqual(t, len(c.cache), pubsubKeyCacheLimit)
 }

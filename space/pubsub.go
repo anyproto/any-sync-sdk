@@ -59,6 +59,10 @@ type PubSubMessage struct {
 // publisher, relay and receiver), which makes it spoof-proof for
 // presence-style topics.
 //
+// Guest-mode (public access) spaces are not supported: the transport
+// signs as the account identity, which a guest space's ACL does not
+// contain — Publish and Subscribe fail fast there.
+//
 // The handle is always non-nil; per-call state is checked at use time.
 type PubSubAPI interface {
 	// Publish sends payload on topic. Returns fast after local

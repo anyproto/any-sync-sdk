@@ -196,12 +196,6 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// announce itself over mDNS or accept LAN peers.
 	p2pCfg := cfg.ResolveP2P()
 	p2pSrv := newP2PServer(p2pCfg, cfg.Storage.DataDir)
-	// Piggyback pubsub interest resync on the per-space node-subscribe
-	// cadence: same reconnect-shaped events, same ramp.
-	pmProvider := newPeerManagerProvider(localOnly, peerStore)
-	pmProvider.onSubscribed = func(spaceId string) {
-		pubsubSyncInterest(psvc, spaceId)
-	}
 	discovery := p2p.NewDiscovery(p2pCfg, keys.PeerId, func() (int, bool) {
 		return p2pSrv.Port(), p2pSrv.Started()
 	}, exchange)
@@ -241,7 +235,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(sync).
 		Register(pool.New()).
 		Register(p2pSrv).
-		Register(pmProvider).
+		Register(newPeerManagerProvider(localOnly, peerStore)).
 		Register(coordinatorclient.New()).
 		Register(nodeclient.New()).
 		Register(storage).
@@ -319,20 +313,26 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		return nil, fmt.Errorf("anysyncx: set inbox receiver: %w", err)
 	}
 
+	// Fields the pubsub adapters and inbound handlers read (a, nodeConf,
+	// spaceService, spaceCache) are assigned BEFORE Start: listeners
+	// come up during Start, and an early inbound frame reading a field
+	// assigned after Start returns would be a data race. MustComponent
+	// only needs registration, which is complete here.
+	out.a = a
+	out.nodeConf = a.MustComponent(nodeconf.CName).(nodeconf.Service)
+	out.spaceService = a.MustComponent(commonspace.CName).(commonspace.SpaceService)
+	out.spaceCache = out.newSpaceCache()
+
 	if err := a.Start(ctx); err != nil {
 		return nil, fmt.Errorf("anysyncx: app start: %w", err)
 	}
 
-	out.a = a
-	out.spaceService = a.MustComponent(commonspace.CName).(commonspace.SpaceService)
 	out.coord = a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
 	out.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
 	out.joining = a.MustComponent(aclclient.CName).(aclclient.AclJoiningClient)
 	// Wire the responsible-node resolver so per-space trackers can
-	// filter inbound HeadsApply senders. nodeconf is registered above;
-	// fetch the component once here so the closure stays cheap.
-	nc := a.MustComponent(nodeconf.CName).(nodeconf.Service)
-	out.nodeConf = nc
+	// filter inbound HeadsApply senders.
+	nc := out.nodeConf
 	out.syncStatus.SetNodeIdsFn(nc.NodeIds)
 	// Connected LAN peers are responsible senders too, so a space
 	// synced purely over the LAN still advances to Synced.
@@ -379,7 +379,6 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// the dirty set, and dispatches SpaceSyncStatus events to
 	// account-wide subscribers. Close() cancels via syncStatus.Close.
 	out.syncStatus.Run(context.Background())
-	out.spaceCache = out.newSpaceCache()
 	// Wire the head cache into the sync handler so HeadSync's fast
 	// path sees the same map updated by space loads, and the app
 	// back-reference the peer-facing SpacePush handler loads through.

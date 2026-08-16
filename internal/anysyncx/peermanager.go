@@ -28,13 +28,6 @@ var pmLog = logger.NewNamed("anysyncx.peermanager")
 type peerManagerProvider struct {
 	localOnly  *localOnlySpaces
 	localPeers localPeerSource
-
-	// onSubscribed, when set, fires after every node-subscribe
-	// broadcast of a space's manager — the reconnect-shaped hook the
-	// pubsub interest resync rides (same eager send, ramp and
-	// churn/refresh cadence as the subscribe itself). Set before the
-	// provider is registered; never called for local-only spaces.
-	onSubscribed func(spaceId string)
 }
 
 // localPeerSource is the slice of p2p.PeerStore the peer manager needs;
@@ -55,7 +48,7 @@ func (p *peerManagerProvider) NewPeerManager(_ context.Context, spaceId string) 
 	if p.localOnly.has(spaceId) {
 		return &localPeerManager{}, nil
 	}
-	return &spacePeerManager{spaceId: spaceId, localPeers: p.localPeers, onSubscribed: p.onSubscribed}, nil
+	return &spacePeerManager{spaceId: spaceId, localPeers: p.localPeers}, nil
 }
 
 // localPeerManager is the peer manager of a local-only space: it
@@ -99,7 +92,6 @@ type spacePeerManager struct {
 	streamPool      sendPool
 	localPeers      localPeerSource
 	subscribeMsgRaw []byte
-	onSubscribed    func(spaceId string)
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
@@ -256,9 +248,6 @@ func (m *spacePeerManager) broadcastSubscribe() {
 	ctx, cancel := context.WithTimeout(m.runCtx, 10*time.Second)
 	defer cancel()
 	m.KeepAlive(ctx)
-	if m.onSubscribed != nil {
-		m.onSubscribed(m.spaceId)
-	}
 }
 
 func (m *spacePeerManager) Name() string { return peermanager.CName }

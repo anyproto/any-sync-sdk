@@ -40,10 +40,22 @@ const pubsubEncKeyPath = "m/SLIP-0021/anysync-sdk/pubsub/enc"
 // space.
 var ErrPubSubNoKey = errors.New("anysyncx: no pubsub key")
 
-// aclOpTimeout bounds the space-handle acquisition inside adapter
-// methods the engine calls without a context (Encrypt/Decrypt): a
-// wedged space load must not stall the engine's dispatch loop forever.
+// ErrPubSubGuestSpace rejects pubsub on guest-mode (public access)
+// spaces: the engine signs and handshakes as the real account, which a
+// guest space's ACL does not contain, so peers would silently reject
+// every publish and subscribe as non-member. Fail fast instead.
+var ErrPubSubGuestSpace = errors.New("anysyncx: pubsub unavailable in guest-mode spaces")
+
+// aclOpTimeout bounds the space-handle acquisition on the encrypt
+// path, which the engine calls without a context: a wedged space load
+// must not stall a Publish forever.
 const aclOpTimeout = 10 * time.Second
+
+// pubsubKeyCacheLimit bounds the derived-key cache. Kids accumulate
+// across every space's key rotations for the process lifetime; on
+// overflow the cache resets wholesale — derivation is a cheap re-do on
+// miss.
+const pubsubKeyCacheLimit = 1024
 
 // pubsubPeers is the engine's PeerProvider: the responsible sync node
 // plus every connectable LAN peer sharing the space — the same
@@ -88,7 +100,7 @@ type pubsubCrypto struct {
 }
 
 func (c *pubsubCrypto) Encrypt(spaceId string, payload []byte) (keyId string, encrypted []byte, err error) {
-	acl, err := c.aclFor(spaceId)
+	acl, err := c.aclFor(spaceId, true)
 	if err != nil {
 		return "", nil, err
 	}
@@ -116,7 +128,11 @@ func (c *pubsubCrypto) Decrypt(spaceId, keyId string, encrypted []byte) ([]byte,
 	key := c.cache[keyId]
 	c.mu.Unlock()
 	if key == nil {
-		acl, err := c.aclFor(spaceId)
+		// Resident-only (no load): Decrypt runs inline on the engine's
+		// stream read path, where a blocking space load would stall
+		// every pubsub frame from that peer — and membership already
+		// proved residency for anything that reaches here.
+		acl, err := c.aclFor(spaceId, false)
 		if err != nil {
 			return nil, err
 		}
@@ -133,16 +149,28 @@ func (c *pubsubCrypto) Decrypt(spaceId, keyId string, encrypted []byte) ([]byte,
 	return key.Decrypt(encrypted)
 }
 
-func (c *pubsubCrypto) aclFor(spaceId string) (list.AclList, error) {
+// aclFor resolves the space's ACL. load=true (publish path) may load
+// the space, bounded by aclOpTimeout; load=false (receive path) is
+// PickSpace-only — non-resident spaces error and the engine drops the
+// message.
+func (c *pubsubCrypto) aclFor(spaceId string, load bool) (list.AclList, error) {
 	a := c.app
 	if a == nil {
 		return nil, errors.New("anysyncx: pubsub crypto not wired")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), aclOpTimeout)
 	defer cancel()
-	handle, err := a.GetSpace(ctx, spaceId)
-	if err != nil {
-		return nil, fmt.Errorf("anysyncx: pubsub load space: %w", err)
+	var handle SpaceHandle
+	if load {
+		var err error
+		if handle, err = a.GetSpace(ctx, spaceId); err != nil {
+			return nil, fmt.Errorf("anysyncx: pubsub load space: %w", err)
+		}
+	} else {
+		var ok bool
+		if handle, ok = a.PickSpace(ctx, spaceId); !ok {
+			return nil, fmt.Errorf("anysyncx: pubsub: space %s not resident", spaceId)
+		}
 	}
 	acl := handle.Inner().Acl()
 	if acl == nil {
@@ -165,7 +193,7 @@ func (c *pubsubCrypto) derived(kid string, readKey crypto.SymKey) (crypto.SymKey
 	if err != nil {
 		return nil, err
 	}
-	if c.cache == nil {
+	if c.cache == nil || len(c.cache) >= pubsubKeyCacheLimit {
 		c.cache = make(map[string]crypto.SymKey)
 	}
 	c.cache[kid] = key
@@ -236,27 +264,36 @@ func logPubSubStatus(peerId string, status *pubsubproto.Status) {
 }
 
 // pubsubSyncInterest pushes the space's local subscription patterns to
-// its current peers, off a background context — callers hook it into
-// reconnect-shaped events (node subscribe cadence, LAN peer set
-// change). No-op inside the engine when the space has no local
-// patterns; the engine's own resync loop is the fallback.
+// its current peers — hooked into the LAN exchange's peer-updated
+// event. Background context with NO per-call cancel: the pool only
+// ENQUEUES a send closure capturing this ctx, so cancelling on return
+// would kill the send before the dial worker runs it. No-op inside the
+// engine when the space has no local patterns; the engine's own resync
+// loop is the fallback.
 func pubsubSyncInterest(svc pubsub.Service, spaceId string) {
-	ctx, cancel := context.WithTimeout(context.Background(), aclOpTimeout)
-	defer cancel()
-	_ = svc.SyncInterest(ctx, spaceId)
+	_ = svc.SyncInterest(context.Background(), spaceId)
 }
 
 // PubSubPublish signs, encrypts and fans payload out on spaceId/topic.
 // Fire-and-forget past local validation; own publishes deliver to
-// local subscribers synchronously.
+// local subscribers synchronously. The network send is detached from
+// the caller's cancelation (WithoutCancel): the pool runs the send
+// closure after Publish returns, and the public contract promises
+// delivery survives the caller's ctx.
 func (a *App) PubSubPublish(ctx context.Context, spaceId, topic string, payload []byte) error {
-	return a.pubsub.Publish(ctx, spaceId, topic, payload)
+	if a.guestKeyFor(spaceId) != nil {
+		return ErrPubSubGuestSpace
+	}
+	return a.pubsub.Publish(context.WithoutCancel(ctx), spaceId, topic, payload)
 }
 
 // PubSubSubscribe registers h for topics matching pattern in spaceId
 // and pushes the interest to the space's peers. The returned cancel is
 // idempotent.
 func (a *App) PubSubSubscribe(spaceId, pattern string, h pubsub.Handler) (cancel func(), err error) {
+	if a.guestKeyFor(spaceId) != nil {
+		return nil, ErrPubSubGuestSpace
+	}
 	return a.pubsub.Subscribe(spaceId, pattern, h)
 }
 

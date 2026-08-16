@@ -73,9 +73,11 @@ func mapPubSubErr(err error) error {
 
 // pubsubAclWatcher forwards ACL kicks into the pubsub engine's
 // membership revalidation, so a removed member's serving-side interest
-// is dropped promptly instead of on stream close. UpdateAcl runs
-// synchronously on the syncacl write path — hand off to a goroutine
-// (ACL records are rare; PubSubRevalidate is a cheap snapshot).
+// is dropped promptly instead of on stream close. Registered once per
+// aclKickMux at mux creation (aclkick.go), so it rides every load path
+// and dies with the mux on offload. UpdateAcl runs synchronously on
+// the syncacl write path — hand off to a goroutine (ACL records are
+// rare; PubSubRevalidate is a cheap snapshot).
 type pubsubAclWatcher struct {
 	spaceId string
 	app     *anysyncx.App
@@ -83,20 +85,4 @@ type pubsubAclWatcher struct {
 
 func (w *pubsubAclWatcher) UpdateAcl(_ list.AclList) {
 	go w.app.PubSubRevalidate(w.spaceId)
-}
-
-// wirePubSubRevalidate subscribes the space's ACL kick fan-out to
-// pubsub membership revalidation, once per loaded lifetime (the guard
-// entry and the mux both die in closeSpaceRuntime; a reload rewires).
-func (s *Service) wirePubSubRevalidate(spaceId string, handle anysyncx.SpaceHandle) {
-	s.mu.Lock()
-	if s.pubsubAclWired[spaceId] {
-		s.mu.Unlock()
-		return
-	}
-	s.pubsubAclWired[spaceId] = true
-	s.mu.Unlock()
-	if acl := handle.Inner().Acl(); acl != nil {
-		s.aclKickFanout(spaceId, acl).add(&pubsubAclWatcher{spaceId: spaceId, app: s.app})
-	}
 }

@@ -211,6 +211,13 @@ func (s *spaceImpl) ReadState() space.ReadStateAPI {
 	return newReadStateAPI(s)
 }
 
+// PubSub returns the ephemeral pub/sub surface for this space.
+// Constructed on every call; the subscriptions live on the app-level
+// engine. See space.PubSubAPI.
+func (s *spaceImpl) PubSub() space.PubSubAPI {
+	return NewPubSubAPI(s.app, s.id)
+}
+
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {

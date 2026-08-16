@@ -154,6 +154,11 @@ type Service struct {
 	// its subscribers (member + ACL mirror watchers) — see aclkick.go.
 	aclMuxes map[string]*aclKickMux
 
+	// pubsubAclWired guards one pubsub-revalidation ACL subscriber per
+	// loaded spaceId — see wirePubSubRevalidate (pubsub.go). Entry
+	// removed in closeSpaceRuntime alongside the mux.
+	pubsubAclWired map[string]bool
+
 	// watchers tracks every active members poller across all loaded
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
@@ -243,6 +248,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		memberWatchers:     make(map[string]*memberWatcher),
 		aclMirrorWatchers:  make(map[string]*aclMirrorWatcher),
 		aclMuxes:           make(map[string]*aclKickMux),
+		pubsubAclWired:     make(map[string]bool),
 		delKick:            make(chan struct{}, 1),
 		joinKick:           make(chan struct{}, 1),
 		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
@@ -722,9 +728,11 @@ func MaterializeBlock(rec techspace.SpaceIndexRecord) error {
 // run while the row still carries its pending localStatus: the flip to
 // active happens only after a successful load.
 func (s *Service) load(ctx context.Context, spaceId string) (space.Space, error) {
-	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+	handle, err := s.app.GetSpace(ctx, spaceId)
+	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
 	}
+	s.wirePubSubRevalidate(spaceId, handle)
 	store := s.storeFor(spaceId)
 	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
 		return nil, err

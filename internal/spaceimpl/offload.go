@@ -117,6 +117,12 @@ func (s *Service) Evict(ctx context.Context, spaceId string) error {
 func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	s.watchers.stopForSpace(spaceId)
 
+	// Drop pubsub subscriptions + remote interest before the space
+	// evicts. Deliberately here — the deliberate teardown funnel — and
+	// not in the cache eviction path, so a background eviction can
+	// never kill live subscriptions.
+	s.app.PubSubCloseSpace(spaceId)
+
 	s.mu.Lock()
 	store := s.stores[spaceId]
 	delete(s.stores, spaceId)
@@ -129,6 +135,7 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	// The mux only holds the stopped watchers above; drop it so a
 	// reload starts from an empty subscriber list (rewiring re-adds).
 	delete(s.aclMuxes, spaceId)
+	delete(s.pubsubAclWired, spaceId)
 	s.mu.Unlock()
 	if store != nil {
 		if err := store.Close(); err != nil {

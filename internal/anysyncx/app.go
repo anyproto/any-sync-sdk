@@ -19,6 +19,7 @@ import (
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/coordinator/inboxclient"
+	"github.com/anyproto/any-sync/commonspace/pubsub"
 	"github.com/anyproto/any-sync/coordinator/nodeconfsource"
 	"github.com/anyproto/any-sync/coordinator/subscribeclient"
 	"github.com/anyproto/any-sync/net/peerservice"
@@ -115,6 +116,11 @@ type App struct {
 	// localOnly pins spaces to this device — no node subscribe, no
 	// push, no coordinator receipt. See localOnlySpaces.
 	localOnly *localOnlySpaces
+
+	// pubsub is the commonspace/pubsub engine (ephemeral, ACL-gated
+	// pub/sub). Registered as an app component; reached through the
+	// PubSub* pass-throughs.
+	pubsub pubsub.Service
 }
 
 // New brings up the any-sync app. Order matters: keys first (provider
@@ -162,11 +168,27 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// space's first ACL read key, cached in memory. Spaces whose ACL
 	// isn't readable yet are skipped until it syncs in.
 	discoveryKeys := newDiscoveryKeySource(storage, keys)
+	// pubsub engine + its Deps adapters. The adapters are late-bound to
+	// the App below (their methods only run post-Start); the engine is
+	// registered as a component so the app drives its lifecycle.
+	psPeers := &pubsubPeers{}
+	psCrypto := &pubsubCrypto{}
+	psMembership := &pubsubMembership{}
+	psvc := pubsub.New(pubsub.Deps{
+		Membership: psMembership,
+		Crypto:     psCrypto,
+		Peers:      psPeers,
+		OnStatus:   logPubSubStatus,
+	})
 	// A handshaked local peer's shared space set changed — head-sync
 	// whatever we share with it right away rather than on the next
-	// diff tick.
+	// diff tick, and re-push pubsub interest so the fresh LAN peer
+	// starts relaying to us before the engine's next resync tick.
 	exchange := p2p.NewExchange(keys.PeerId, peerStore, advertisedSpaceIds, discoveryKeys.DiscoveryKeys, func(_ string, spaceIds []string) {
 		sync.SyncSpaces(spaceIds)
+		for _, id := range spaceIds {
+			pubsubSyncInterest(psvc, id)
+		}
 	})
 	exchange.SetAccountKeysFn(discoveryKeys.AccountDiscoveryKeys)
 	// Resolve the effective p2p config. Headless mode defaults p2p off
@@ -174,6 +196,12 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// announce itself over mDNS or accept LAN peers.
 	p2pCfg := cfg.ResolveP2P()
 	p2pSrv := newP2PServer(p2pCfg, cfg.Storage.DataDir)
+	// Piggyback pubsub interest resync on the per-space node-subscribe
+	// cadence: same reconnect-shaped events, same ramp.
+	pmProvider := newPeerManagerProvider(localOnly, peerStore)
+	pmProvider.onSubscribed = func(spaceId string) {
+		pubsubSyncInterest(psvc, spaceId)
+	}
 	discovery := p2p.NewDiscovery(p2pCfg, keys.PeerId, func() (int, bool) {
 		return p2pSrv.Port(), p2pSrv.Started()
 	}, exchange)
@@ -213,7 +241,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(sync).
 		Register(pool.New()).
 		Register(p2pSrv).
-		Register(newPeerManagerProvider(localOnly, peerStore)).
+		Register(pmProvider).
 		Register(coordinatorclient.New()).
 		Register(nodeclient.New()).
 		Register(storage).
@@ -224,6 +252,12 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(subscribeclient.New()).
 		Register(inbox).
 		Register(peerStore).
+		// The pubsub engine owns a private streampool; pubsubRpc puts
+		// its stream handler on the DRPC mux during Init (before the
+		// accept loop), so both must be components. Registered after
+		// server (mux) and accountAdapter (engine Init resolves it).
+		Register(psvc).
+		Register(pubsubRpc{}).
 		Register(exchange).
 		// Discovery is registered last: by the time it announces and
 		// starts handshaking, every component it can trigger (server,
@@ -266,7 +300,11 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		selectiveTreeTypes: cfg.Sync.TreeTypes,
 		headless:           cfg.Headless,
 		localOnly:          localOnly,
+		pubsub:             psvc,
 	}
+	psPeers.app = out
+	psCrypto.app = out
+	psMembership.app = out
 
 	// Install the push forwarder BEFORE Start: inboxClient.Run rejects a
 	// nil receiver. The forwarder delegates to the notifier's handler

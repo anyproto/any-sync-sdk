@@ -848,6 +848,34 @@ func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[strin
 	return err
 }
 
+// SetDevice upserts this device's row in the devices registry (see
+// space.Service.SetDevice for the contract). Thin wrapper — the
+// techspace method owns the peer-id resolution and op encoding.
+func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) error {
+	_, err := s.tsp.SetDevice(ctx, up)
+	return err
+}
+
+// ClaimActive claims the active role for app on this device (see
+// space.Service.ClaimActive for the contract).
+func (s *Service) ClaimActive(ctx context.Context, app string) error {
+	_, err := s.tsp.ClaimActive(ctx, app)
+	return err
+}
+
+// DeleteDevice prunes a device row (see space.Service.DeleteDevice
+// for the contract; the techspace method owns the exists-check that
+// keeps a typo from minting a permanent tombstone).
+func (s *Service) DeleteDevice(ctx context.Context, peerId string) error {
+	_, err := s.tsp.DeleteDevice(ctx, peerId)
+	return err
+}
+
+// ListDevices returns the devices-registry snapshot.
+func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
+	return s.tsp.ListDevices(ctx), nil
+}
+
 // Delete removes a space. It is offline-first and returns as soon as the
 // local work is done — no network round trip on the call path:
 //  1. write the SYNCED remoteStatus=deleted tombstone (propagates the
@@ -976,7 +1004,7 @@ func (s *Service) toSpaceListEvent(ctx context.Context, ev space.SubscriptionEve
 
 // SpaceIndexObjectId returns the well-known id of the tech-space index
 // object. Pass it to Query/Subscribe to read the system datasets
-// (spaces, profile) generically. Future system objects expose their
+// (spaces, profile, devices) generically. Future system objects expose their
 // own ids the same way.
 func (s *Service) SpaceIndexObjectId() string { return s.tsp.IndexObjectId() }
 
@@ -989,7 +1017,7 @@ func (s *Service) Query(objectId, dataset string) space.Query {
 }
 
 // Datasets returns the JSON-Schema description of the tech-space system
-// datasets (spaces, profile) for discovery.
+// datasets (spaces, profile, devices) for discovery.
 func (s *Service) Datasets() []space.DatasetSchema {
 	return toDatasetSchemas(s.tsp.Store().Schemas())
 }

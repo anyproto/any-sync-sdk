@@ -68,6 +68,13 @@ var ErrIsOneToOne = errors.New("is a 1-1 space")
 // given identity is the caller's own account.
 var ErrSelfPair = errors.New("cannot pair with self")
 
+// ErrBadSpaceType is returned by Create when CreateRequest.SpaceType
+// is outside the allow-list (SpaceTypeAny or empty). The type is
+// content-addressed into the immutable space header and coordinator-
+// gated, so a bad value is rejected up front — classify with
+// errors.Is to turn it into a caller-facing 4xx.
+var ErrBadSpaceType = errors.New("unsupported space type")
+
 // Settings-patch sentinels — wrapped by SetSettings validation errors
 // so callers can classify with errors.Is.
 var (

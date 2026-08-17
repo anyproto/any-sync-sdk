@@ -2,7 +2,6 @@ package spaceimpl
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"github.com/ipfs/go-cid"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // Track registers a foreign spaceId in the tech-space index so a later
@@ -28,7 +28,7 @@ func (s *Service) Track(ctx context.Context, spaceId string) error {
 		return err
 	}
 	if spaceId == s.tsp.SpaceId() {
-		return errors.New("spaceimpl: Track: cannot track the tech space")
+		return fmt.Errorf("spaceimpl: Track: %w", space.ErrIsTechSpace)
 	}
 	if _, ok := s.tsp.Get(ctx, spaceId); ok {
 		return nil
@@ -55,13 +55,13 @@ func (s *Service) Track(ctx context.Context, spaceId string) error {
 func validateSpaceId(spaceId string) error {
 	dot := strings.LastIndexByte(spaceId, '.')
 	if dot <= 0 || dot == len(spaceId)-1 {
-		return fmt.Errorf("spaceimpl: invalid spaceId %q: want <cid>.<replication key>", spaceId)
+		return fmt.Errorf("spaceimpl: %w: %q: want <cid>.<replication key>", space.ErrBadSpaceId, spaceId)
 	}
 	if _, err := cid.Decode(spaceId[:dot]); err != nil {
-		return fmt.Errorf("spaceimpl: invalid spaceId %q: bad cid: %w", spaceId, err)
+		return fmt.Errorf("spaceimpl: %w: %q: bad cid: %w", space.ErrBadSpaceId, spaceId, err)
 	}
 	if _, err := strconv.ParseUint(spaceId[dot+1:], 36, 64); err != nil {
-		return fmt.Errorf("spaceimpl: invalid spaceId %q: bad replication key: %w", spaceId, err)
+		return fmt.Errorf("spaceimpl: %w: %q: bad replication key: %w", space.ErrBadSpaceId, spaceId, err)
 	}
 	return nil
 }

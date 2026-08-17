@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 func TestValidateSpaceId(t *testing.T) {
@@ -20,6 +22,6 @@ func TestValidateSpaceId(t *testing.T) {
 		"bad rep key":      "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.!!!",
 		"rep key overflow": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.zzzzzzzzzzzzzzzzzz",
 	} {
-		assert.Error(t, validateSpaceId(id), "case %q must be rejected", name)
+		assert.ErrorIs(t, validateSpaceId(id), space.ErrBadSpaceId, "case %q must be rejected", name)
 	}
 }

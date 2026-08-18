@@ -117,6 +117,12 @@ func (s *Service) Evict(ctx context.Context, spaceId string) error {
 func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	s.watchers.stopForSpace(spaceId)
 
+	// Drop pubsub subscriptions + remote interest before the space
+	// evicts. Deliberately here — the deliberate teardown funnel — and
+	// not in the cache eviction path, so a background eviction can
+	// never kill live subscriptions.
+	s.app.PubSubCloseSpace(spaceId)
+
 	s.mu.Lock()
 	store := s.stores[spaceId]
 	delete(s.stores, spaceId)

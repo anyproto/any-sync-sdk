@@ -773,6 +773,14 @@ func (s *SDK) Account() AccountAPI { return s.account }
 // space.ErrPushNotConfigured.
 func (s *SDK) Push() space.PushAPI { return s.push }
 
+// PubSub returns the account-wide ephemeral pub/sub surface: the same
+// API as Space.PubSub(), bound to the tech space. The tech space's ACL
+// is owner-only, so its peers are exactly this account's own devices —
+// publishes here fan out account-wide with no separate transport. In
+// headless mode the tech space is local-only, so delivery degrades to
+// in-process loopback (no error).
+func (s *SDK) PubSub() space.PubSubAPI { return spaceimpl.NewPubSubAPI(s.app, s.tsp.SpaceId()) }
+
 // PoolInternal exposes the any-sync peer pool (dial by peerId with this
 // account's identity in the handshake). Same-module internal surface —
 // mirrors the PayloadsInternal pattern — used by the e2e suite to speak

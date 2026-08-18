@@ -66,6 +66,11 @@ type Space interface {
 	// See Files.
 	Files() Files
 
+	// PubSub is ephemeral space-scoped pub/sub — fire-and-forget,
+	// at-most-once messages between the space's online members, never
+	// persisted. See PubSubAPI.
+	PubSub() PubSubAPI
+
 	// ReadState tracks read/unread changes for datasets registered
 	// with handler.Dataset.ReadTracking. Methods return
 	// ErrReadTrackingDisabled when nothing in the space opted in.

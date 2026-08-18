@@ -61,6 +61,23 @@ func TestActiveDevice_IgnoresDanglingClaims(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// A malformed synced claim decodes to the zero DeviceClaim; key
+// presence alone must not win the election — real claims carry
+// Seq >= 1 (ClaimActive mints from 1).
+func TestActiveDevice_IgnoresInvalidClaims(t *testing.T) {
+	bad := Device{
+		PeerId:       "a",
+		Apps:         map[string]map[string]any{"bao": {}},
+		ActiveClaims: map[string]DeviceClaim{"bao": {}},
+	}
+	_, ok := ActiveDevice([]Device{bad, dev("b", "bao", 0, 0)}, "bao")
+	assert.False(t, ok, "a zero claim never wins, even as sole claimant")
+
+	winner, ok := ActiveDevice([]Device{bad, dev("c", "bao", 1, 1)}, "bao")
+	require.True(t, ok)
+	assert.Equal(t, "c", winner)
+}
+
 // Per-app independence: claims for one slug never leak into another's
 // election.
 func TestActiveDevice_PerApp(t *testing.T) {

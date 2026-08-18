@@ -12,8 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -118,7 +118,19 @@ func (DevicesHandler) BeforeModify(_ *crdt.ChangeCtx, rec *crdt.RecordChange, _ 
 	return nil
 }
 
-func (DevicesHandler) BeforeDelete(_ *crdt.ChangeCtx, _ *crdt.RecordChange, _ *crdt.Sink) error {
+// BeforeDelete rejects tombstoning a row that was never created:
+// deletes are otherwise allowed (pruning is the "device doesn't
+// exist" signal), but the tombstone is sticky, and a delete on an
+// absent id would permanently ban a possibly-mistyped peer id. A
+// never-created id carries no creation marker (_ver) in ctx.Before —
+// the same test the apply path's own create detection uses. The gate
+// is deterministic (every replica evaluates it on the same causal
+// prefix) and so covers every writer, not just the exists-check in
+// Service.DeleteDevice.
+func (DevicesHandler) BeforeDelete(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, _ *crdt.Sink) error {
+	if ctx.Before == nil || ctx.Before.Get(crdt.VersionsKey) == nil {
+		return fmt.Errorf("%w: delete of a never-created device row", crdt.ErrValidation)
+	}
 	return nil
 }
 
@@ -131,7 +143,7 @@ func DecodeDeviceRecord(v *anyenc.Value) space.Device {
 		return space.Device{}
 	}
 	d := space.Device{
-		PeerId:  v.GetString("id"),
+		PeerId:  v.GetString(crdt.IdField),
 		Name:    v.GetString(FieldDeviceName),
 		OS:      v.GetString(FieldDeviceOS),
 		Version: v.GetString(FieldDeviceVersion),
@@ -154,16 +166,76 @@ func DecodeDeviceRecord(v *anyenc.Value) space.Device {
 		if obj, err := claims.Object(); err == nil {
 			d.ActiveClaims = make(map[string]space.DeviceClaim, obj.Len())
 			obj.Visit(func(k []byte, val *anyenc.Value) {
-				// Float64 reads — anyenc numbers are float64 on the
-				// wire; GetInt would truncate on 32-bit platforms.
-				d.ActiveClaims[string(k)] = space.DeviceClaim{
-					Seq: int64(val.GetFloat64(DeviceClaimSeq)),
-					At:  int64(val.GetFloat64(DeviceClaimAt)),
+				// Strict shape gate — unlike the tolerant Apps decode
+				// above, a claim feeds the election: a malformed bag
+				// (unknown future writer, corrupt data) decoding to
+				// zeros would beat genuinely-unclaimed rows, and an
+				// out-of-range seq would convert differently per
+				// architecture (see claimNum). Seq must be a valid
+				// number >= 1 (ClaimActive mints from 1); a bad claim
+				// reads as absent.
+				seq, okSeq := claimNum(val, DeviceClaimSeq)
+				if !okSeq || seq < 1 {
+					return
 				}
+				at, _ := claimNum(val, DeviceClaimAt) // advisory tiebreak; bad reads as 0
+				d.ActiveClaims[string(k)] = space.DeviceClaim{Seq: seq, At: at}
 			})
 		}
 	}
 	return d
+}
+
+// maxClaimNum bounds claim numbers at 2^53 — the float64
+// exactly-representable integer limit. Beyond it seq+1 could stop
+// advancing (float64 rounding), long before int64 overflow matters.
+const maxClaimNum = 1 << 53
+
+// claimNum reads one numeric claim subfield. anyenc numbers are
+// float64 on the wire, and Go's float-to-int conversion for
+// out-of-range values is implementation-defined (amd64 saturates to
+// MinInt64, arm64 to MaxInt64) — different architectures would elect
+// different winners from the same synced claim. So anything missing,
+// non-numeric, non-finite, fractional, negative, or above maxClaimNum
+// is rejected here instead of converted.
+func claimNum(v *anyenc.Value, key string) (int64, bool) {
+	nv := v.Get(key)
+	if nv == nil {
+		return 0, false
+	}
+	f, err := nv.Float64()
+	if err != nil {
+		return 0, false
+	}
+	if math.IsNaN(f) || f < 0 || f > maxClaimNum || f != math.Trunc(f) {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// liveDeviceRow reports whether v is a live devices row — present and
+// not a sticky tombstone. The single definition of row liveness for
+// this dataset.
+func liveDeviceRow(v *anyenc.Value) bool {
+	return v != nil && v.Get(crdt.DeletedAtField) == nil
+}
+
+// surfaceDeviceRejections lifts per-op handler rejections on an
+// own-row devices write into a caller-visible error. The writes here
+// are single-record and valid by construction, so any rejection means
+// nothing landed; the critical case is delete-wins absorption
+// (crdt.ErrRecordDeleted) — this device was pruned and the sticky
+// tombstone absorbs every later write, which without this check would
+// read as success forever.
+func surfaceDeviceRejections(res object.WriteResult, peerId string) error {
+	if len(res.Rejections) == 0 {
+		return nil
+	}
+	rej := res.Rejections[0]
+	if errors.Is(rej.Err, crdt.ErrRecordDeleted) {
+		return fmt.Errorf("techspace: %w: %q", space.ErrDevicePruned, peerId)
+	}
+	return fmt.Errorf("techspace: devices write rejected: %w", rej.Err)
 }
 
 // PeerId returns this device's libp2p peer id — the devices-dataset
@@ -176,17 +248,12 @@ func (s *Service) PeerId() string {
 	return keys.PeerKey.GetPublic().PeerId()
 }
 
-// validDeviceApp gates app slugs the same way settings keys are gated:
-// non-empty, dot-free (a dotted slug would silently become a deeper
-// path under apps./activeClaims.).
+// validDeviceApp gates app slugs the same way settings keys are gated
+// (a dotted slug would silently become a deeper path under apps. /
+// activeClaims.): the shared single-level-key grammar, wrapping the
+// devices sentinel.
 func validDeviceApp(slug string) error {
-	if slug == "" {
-		return fmt.Errorf("%w: empty", space.ErrDeviceBadApp)
-	}
-	if strings.ContainsRune(slug, '.') {
-		return fmt.Errorf("%w: %q contains '.' (single-level slugs only)", space.ErrDeviceBadApp, slug)
-	}
-	return nil
+	return validSingleLevelKey(slug, space.ErrDeviceBadApp)
 }
 
 // DeviceUpsertOps encodes a space.DeviceUpsert into per-path CRDT ops
@@ -260,7 +327,11 @@ func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) (object.
 			{Id: peerId, Upsert: true, Ops: ops},
 		},
 	}
-	return obj.LocalWrite(ctx, change)
+	res, err := obj.LocalWrite(ctx, change)
+	if err != nil {
+		return res, err
+	}
+	return res, surfaceDeviceRejections(res, peerId)
 }
 
 // ClaimActive marks THIS device as the active instance of app: it
@@ -270,6 +341,13 @@ func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) (object.
 // claiming concurrently can mint the same seq — but the reader-side
 // rule (space.ActiveDevice: highest seq, then at, then peer id) makes
 // that survivable by design; see SYN-165.
+//
+// Known limit (v1): seq is minted from THIS replica's view — on a
+// device that hasn't synced the latest claims yet, a fresh claim can
+// mint a lower seq than an unseen earlier one and lose the election
+// once heads converge, inverting the user's newest intent (the same
+// caveat space.ActiveDevice documents). Claims are cheap: re-claim
+// after sync.
 //
 // The same change also marks the app installed (apps.<app> = {}) when
 // the own row doesn't carry it yet, so a claim can never dangle on a
@@ -318,7 +396,11 @@ func (s *Service) ClaimActive(ctx context.Context, app string) (object.WriteResu
 			{Id: peerId, Upsert: true, Ops: ops},
 		},
 	}
-	return obj.LocalWrite(ctx, change)
+	res, err := obj.LocalWrite(ctx, change)
+	if err != nil {
+		return res, err
+	}
+	return res, surfaceDeviceRejections(res, peerId)
 }
 
 // DeleteDevice prunes peerId's row — the "device doesn't exist"
@@ -327,7 +409,11 @@ func (s *Service) ClaimActive(ctx context.Context, app string) (object.WriteResu
 // device that comes back online stays unlisted until it re-derives
 // its peer keys). The row must exist — a delete on an absent id would
 // still mint a tombstone, permanently banning a possibly-mistyped id,
-// so the unknown case errors instead.
+// so the unknown case errors instead (double-guarded by the handler's
+// BeforeDelete, which covers non-service writers too). The local
+// device's OWN row is refused (ErrDeviceSelfDelete): the sticky
+// tombstone would permanently lock this installation out of the
+// registry — prune it from another device.
 func (s *Service) DeleteDevice(ctx context.Context, peerId string) (object.WriteResult, error) {
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
@@ -335,11 +421,14 @@ func (s *Service) DeleteDevice(ctx context.Context, peerId string) (object.Write
 	if peerId == "" {
 		return object.WriteResult{}, fmt.Errorf("%w: empty peer id", space.ErrDeviceUnknown)
 	}
+	if peerId == s.PeerId() {
+		return object.WriteResult{}, fmt.Errorf("techspace: %w: %q", space.ErrDeviceSelfDelete, peerId)
+	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
 		return object.WriteResult{}, err
 	}
-	if v := obj.Controller().Get(ctx, DevicesDataset, peerId); v == nil || v.Get(crdt.DeletedAtField) != nil {
+	if !liveDeviceRow(obj.Controller().Get(ctx, DevicesDataset, peerId)) {
 		return object.WriteResult{}, fmt.Errorf("%w: %q", space.ErrDeviceUnknown, peerId)
 	}
 	change := crdt.Change{
@@ -349,41 +438,32 @@ func (s *Service) DeleteDevice(ctx context.Context, peerId string) (object.Write
 			{Id: peerId, Ops: []crdt.Op{{Type: crdt.OpDelete}}},
 		},
 	}
-	return obj.LocalWrite(ctx, change)
-}
-
-// GetDevice returns one devices row. Tombstoned (pruned) rows read as
-// absent.
-func (s *Service) GetDevice(ctx context.Context, peerId string) (space.Device, bool) {
-	if !s.open.Load() || peerId == "" {
-		return space.Device{}, false
-	}
-	obj, err := s.indexObj(ctx)
+	res, err := obj.LocalWrite(ctx, change)
 	if err != nil {
-		return space.Device{}, false
+		return res, err
 	}
-	v := obj.Controller().Get(ctx, DevicesDataset, peerId)
-	if v == nil || v.Get(crdt.DeletedAtField) != nil {
-		return space.Device{}, false
-	}
-	return DecodeDeviceRecord(v), true
+	return res, surfaceDeviceRejections(res, peerId)
 }
 
 // ListDevices returns every live devices row (tombstones excluded by
 // Controller.Records). Inbound head-sync changes are projected live by
 // the resident index object's listener, so a plain read is current.
-func (s *Service) ListDevices(ctx context.Context) []space.Device {
+// Unavailability (service not open, index object not loadable) is an
+// error, never an empty slice — an empty registry and a closed
+// service must stay distinguishable, or an election consumer reading
+// during boot would wrongly self-claim against an "empty" registry.
+func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
 	if !s.open.Load() {
-		return nil
+		return nil, errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	rows := obj.Controller().Records(ctx, DevicesDataset)
 	out := make([]space.Device, 0, len(rows))
 	for _, v := range rows {
 		out = append(out, DecodeDeviceRecord(v))
 	}
-	return out
+	return out, nil
 }

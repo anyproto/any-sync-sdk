@@ -226,7 +226,9 @@ type Service interface {
 	// id (SDK.PeerId()), never caller-supplied. Only non-empty fields are
 	// written; each Apps entry lands per-slug (nil value removes the
 	// slug), so writes touching different fields merge. At least one
-	// field must be non-empty (ErrDeviceEmptyUpsert).
+	// field must be non-empty (ErrDeviceEmptyUpsert). ErrDevicePruned
+	// when this device's row was deleted — the sticky tombstone
+	// absorbs the write and the id can never re-register.
 	//
 	// Read back via ListDevices, or generically via
 	// Query(SpaceIndexObjectId(), "devices").
@@ -238,18 +240,26 @@ type Service interface {
 	// the reader — resolve the winner with ActiveDevice, never by
 	// comparing claims ad hoc. There is no un-claim: only a higher
 	// claim from another device or a row deletion moves the winner.
+	// ErrDevicePruned when this device's row was deleted (see
+	// SetDevice).
 	ClaimActive(ctx context.Context, app string) error
 
 	// DeleteDevice prunes peerId's row — the "device doesn't exist"
 	// signal that moves the active election away from it. The tombstone
 	// is sticky: the peer id can never re-register (a pruned device
 	// that comes back stays unlisted until it re-derives its peer
-	// keys). ErrDeviceUnknown when the row doesn't exist.
+	// keys). ErrDeviceUnknown when the row doesn't exist;
+	// ErrDeviceSelfDelete for the local device's own row (self-pruning
+	// would permanently lock this installation out of the registry —
+	// prune it from another device).
 	DeleteDevice(ctx context.Context, peerId string) error
 
 	// ListDevices returns a point-in-time snapshot of the devices
 	// registry (pruned rows excluded). Feed it to ActiveDevice to
-	// resolve the active instance of an app.
+	// resolve the active instance of an app. Unavailability (tech
+	// space not open yet) is an error, never an empty snapshot — an
+	// election consumer must not mistake a closed service for an
+	// empty registry.
 	ListDevices(ctx context.Context) ([]Device, error)
 
 	// Subscribe delivers space-list changes (added / updated / removed).

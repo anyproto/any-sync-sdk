@@ -26,6 +26,16 @@ var (
 	// ErrDeviceUnknown is returned by DeleteDevice when peerId has no
 	// live row.
 	ErrDeviceUnknown = errors.New("unknown device")
+	// ErrDevicePruned reports a write absorbed by the own row's sticky
+	// tombstone: this device was pruned (DeleteDevice) and its peer id
+	// can never re-register. Without this error the absorbed write
+	// would be indistinguishable from success.
+	ErrDevicePruned = errors.New("device row is pruned")
+	// ErrDeviceSelfDelete rejects DeleteDevice on the local device's
+	// own row — the tombstone is sticky, so self-pruning would
+	// permanently lock this installation out of the registry. Prune a
+	// device from one of the account's other devices instead.
+	ErrDeviceSelfDelete = errors.New("cannot delete own device row")
 )
 
 // Device is one row of the account's devices registry. All fields are
@@ -92,6 +102,17 @@ type DeviceUpsert struct {
 // has no row at all), the claim with the highest Seq wins, ties
 // broken by highest At, then by lexicographically largest peer id.
 // ok=false when no device qualifies.
+//
+// A claim with Seq <= 0 is treated as absent: ClaimActive mints seqs
+// from 1, so a zero can only come from a malformed bag (unknown
+// future writer, corrupt data) that decoded to the zero value — it
+// must never beat genuinely-unclaimed rows.
+//
+// Known limit (v1): Seq is minted from the claiming replica's view,
+// so a claim made on a not-yet-synced device can mint a lower Seq
+// than an unseen earlier claim and lose once heads converge — the
+// user's newest intent losing to an older one. Claims are cheap:
+// re-claim after sync.
 func ActiveDevice(devices []Device, app string) (peerId string, ok bool) {
 	var win DeviceClaim
 	for _, d := range devices {
@@ -99,7 +120,7 @@ func ActiveDevice(devices []Device, app string) (peerId string, ok bool) {
 			continue
 		}
 		c, claimed := d.ActiveClaims[app]
-		if !claimed {
+		if !claimed || c.Seq <= 0 {
 			continue
 		}
 		better := c.Seq > win.Seq ||

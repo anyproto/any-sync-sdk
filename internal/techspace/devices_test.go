@@ -155,6 +155,64 @@ func TestDevices_DeleteIsSticky(t *testing.T) {
 	assert.Empty(t, ctrl.Records(ctx, techspace.DevicesDataset))
 }
 
+// A delete on a never-created id is rejected by BeforeDelete instead
+// of minting a sticky tombstone — a mistyped peer id must stay free
+// to register, and the gate holds for every writer, not just the
+// exists-check in Service.DeleteDevice.
+func TestDevices_DeleteAbsentRejected(t *testing.T) {
+	ctrl := newDevicesController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+
+	const peer = "12D3KooWDevA"
+	res, err := ctrl.ApplyChangeWithResult(ctx, devicesChange("v1", peer, false,
+		crdt.Op{Type: crdt.OpDelete},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+
+	require.NoError(t, ctrl.ApplyChange(ctx, devicesChange("v2", peer, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceName}, Payload: arena.NewString("laptop")},
+	)))
+	d := techspace.DecodeDeviceRecord(ctrl.Get(ctx, techspace.DevicesDataset, peer))
+	assert.Equal(t, "laptop", d.Name, "no tombstone minted — the id registers normally")
+	assert.Len(t, ctrl.Records(ctx, techspace.DevicesDataset), 1)
+}
+
+// Claims feed the election, so the decode is strict: a claim whose
+// seq is missing, non-numeric, zero, fractional, or outside the
+// float64-exact integer range reads as absent. Out-of-range floats
+// would otherwise convert implementation-dependently (amd64 MinInt64
+// vs arm64 MaxInt64) and different architectures would elect
+// different winners from the same synced data.
+func TestDevices_DecodeSkipsMalformedClaims(t *testing.T) {
+	ctrl := newDevicesController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+
+	const peer = "12D3KooWDevA"
+	claim := func(seq float64) *anyenc.Value {
+		c := arena.NewObject()
+		c.Set(techspace.DeviceClaimSeq, arena.NewNumberFloat64(seq))
+		return c
+	}
+	good := claim(2)
+	good.Set(techspace.DeviceClaimAt, arena.NewNumberFloat64(1770000000))
+	require.NoError(t, ctrl.ApplyChange(ctx, devicesChange("v1", peer, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceApps, "good"}, Payload: arena.NewObject()},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "good"}, Payload: good},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "notObj"}, Payload: arena.NewString("junk")},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "noSeq"}, Payload: arena.NewObject()},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "huge"}, Payload: claim(1e300)},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "zero"}, Payload: claim(0)},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "frac"}, Payload: claim(1.5)},
+	)))
+
+	d := techspace.DecodeDeviceRecord(ctrl.Get(ctx, techspace.DevicesDataset, peer))
+	assert.Equal(t, map[string]space.DeviceClaim{"good": {Seq: 2, At: 1770000000}}, d.ActiveClaims)
+}
+
 // The claim payload ClaimActive writes, applied via the synced route
 // and decoded back — the {seq, at} wire shape is the cross-repo
 // contract the `any` server and the runtime read.

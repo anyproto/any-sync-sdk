@@ -871,9 +871,11 @@ func (s *Service) DeleteDevice(ctx context.Context, peerId string) error {
 	return err
 }
 
-// ListDevices returns the devices-registry snapshot.
+// ListDevices returns the devices-registry snapshot. Unavailability
+// (techspace not open, index object not loadable) surfaces as an
+// error — it must never read as an empty registry.
 func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
-	return s.tsp.ListDevices(ctx), nil
+	return s.tsp.ListDevices(ctx)
 }
 
 // Delete removes a space. It is offline-first and returns as soon as the

@@ -51,15 +51,7 @@ func SettingsOps(a *anyenc.Arena, set map[string]any, unset []string) ([]crdt.Op
 	if len(set) == 0 && len(unset) == 0 {
 		return nil, ErrSettingsEmpty
 	}
-	validKey := func(k string) error {
-		if k == "" {
-			return fmt.Errorf("%w: empty", ErrSettingsBadKey)
-		}
-		if strings.ContainsRune(k, '.') {
-			return fmt.Errorf("%w: %q contains '.' (single-level keys only)", ErrSettingsBadKey, k)
-		}
-		return nil
-	}
+	validKey := func(k string) error { return validSingleLevelKey(k, ErrSettingsBadKey) }
 	ops := make([]crdt.Op, 0, len(set)+len(unset))
 	for _, k := range slices.Sorted(maps.Keys(set)) {
 		if err := validKey(k); err != nil {
@@ -81,6 +73,21 @@ func SettingsOps(a *anyenc.Arena, set map[string]any, unset []string) ([]crdt.Op
 		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Path: []string{FieldSettings, k}})
 	}
 	return ops, nil
+}
+
+// validSingleLevelKey gates a single-level path key: non-empty and
+// dot-free (a dotted key would silently become a deeper path under
+// the parent object). One grammar shared by settings keys and device
+// app slugs, wrapping the caller's sentinel — tighten it here and
+// every consumer tightens together.
+func validSingleLevelKey(k string, sentinel error) error {
+	if k == "" {
+		return fmt.Errorf("%w: empty", sentinel)
+	}
+	if strings.ContainsRune(k, '.') {
+		return fmt.Errorf("%w: %q contains '.' (single-level keys only)", sentinel, k)
+	}
+	return nil
 }
 
 // encodeSettingsValue maps a Go scalar onto its anyenc value. Numbers

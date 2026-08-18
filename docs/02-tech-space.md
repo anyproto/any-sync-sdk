@@ -120,7 +120,15 @@ Every consumer resolves the winner with the single rule implementation,
 `space.ActiveDevice`: among live rows with the app installed, highest `seq`
 wins, ties broken by highest `at`, then largest peer id. There is no un-claim;
 only a higher claim or a row deletion moves the winner. `DeleteDevice`
-tombstones are sticky — a pruned peer id can never re-register.
+tombstones are sticky — a pruned peer id can never re-register — so the local
+device's own row is refused (`ErrDeviceSelfDelete`: prune from another device),
+and a pruned device's later `SetDevice`/`ClaimActive` writes surface
+`ErrDevicePruned` instead of silently no-oping into the tombstone. Claims are
+decoded strictly (numeric integer `seq >= 1`, at most 2^53) so a malformed or
+out-of-range claim reads as absent on every architecture instead of electing
+different winners. Known v1 limit: `seq` is minted from the claiming replica's
+view, so a claim made on a stale (not-yet-synced) device can lose to an older
+unseen claim once heads converge — claims are cheap, re-claim after sync.
 
 ## Current any-sync Implementation
 

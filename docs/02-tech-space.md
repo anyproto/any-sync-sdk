@@ -100,6 +100,36 @@ The tech space also hosts two account-scoped helper datasets: `profile` (the
 account's own profile, republished to identityRepo on boot) and `inboxCursor`
 (the synced 1-1 inbox read position — see `docs/13-one-to-one-spaces.md`).
 
+### Devices registry (`devices` dataset, SYN-165)
+One row per device of the account, keyed by the device's libp2p **peer id**
+(`SDK.PeerId()`). All fields **synced**: `name`, `os`, `version`, `apps`
+(free-form object keyed by app slug — presence = installed; slugs are an open
+set, nothing app-specific is hardcoded) and `activeClaims` (per-slug
+`{seq, at}` claims). Online status deliberately does not live here (KV /
+event-bus territory).
+
+System-owned like the space list: reads go through the generic dataset surface
+(`Spaces().Query(SpaceIndexObjectId(), "devices")` / `ListDevices`), writes
+only through the typed methods — `SetDevice` (self-row-only by construction:
+the row id is always the local peer id), `ClaimActive`, `DeleteDevice`.
+
+**Active-app election** — semantics live in the reader, not the write. A claim
+is writer-supplied `{seq: max+1, at: now}` data, NOT a CRDT version id
+(version ids are peer-locally allocated and not comparable across devices).
+Every consumer resolves the winner with the single rule implementation,
+`space.ActiveDevice`: among live rows with the app installed, highest `seq`
+wins, ties broken by highest `at`, then largest peer id. There is no un-claim;
+only a higher claim or a row deletion moves the winner. `DeleteDevice`
+tombstones are sticky — a pruned peer id can never re-register — so the local
+device's own row is refused (`ErrDeviceSelfDelete`: prune from another device),
+and a pruned device's later `SetDevice`/`ClaimActive` writes surface
+`ErrDevicePruned` instead of silently no-oping into the tombstone. Claims are
+decoded strictly (numeric integer `seq >= 1`, at most 2^53) so a malformed or
+out-of-range claim reads as absent on every architecture instead of electing
+different winners. Known v1 limit: `seq` is minted from the claiming replica's
+view, so a claim made on a stale (not-yet-synced) device can lose to an older
+unseen claim once heads converge — claims are cheap, re-claim after sync.
+
 ## Current any-sync Implementation
 
 ### Derivation

@@ -787,6 +787,13 @@ func (s *SDK) PubSub() space.PubSubAPI { return spaceimpl.NewPubSubAPI(s.app, s.
 // node-side protocols (e.g. fileprotov2 against a fileV2 broker).
 func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
 
+// PeerId returns this device's libp2p peer id — stable per device
+// installation, distinct from the account identity (Account().Id()).
+// It is the row id of this device's entry in the devices registry
+// (Spaces().SetDevice / ListDevices) and the value election consumers
+// compare against space.ActiveDevice's winner.
+func (s *SDK) PeerId() string { return s.tsp.PeerId() }
+
 // P2PStatus reports the local-network layer: listener state, discovery
 // possibility, and every known LAN peer with its shared spaces and
 // live-connection flag. Per-space p2p state lives in SpaceSyncStatus

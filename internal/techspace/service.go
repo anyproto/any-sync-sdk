@@ -149,6 +149,7 @@ func (s *Service) Open(ctx context.Context) error {
 			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
 			{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()},
 			{Name: IdentitiesDataset, Handler: IdentitiesHandler{}, Schema: IdentitiesSchema(), Indexes: IdentitiesIndexes()},
+			{Name: DevicesDataset, Handler: DevicesHandler{}, Schema: DevicesSchema()},
 			// Account-values carrier (one derived object per target
 			// space) — see accountvalues.go. Dynamic: carrier records
 			// carry free-form typeId heads at the target rows' paths.
@@ -160,6 +161,7 @@ func (s *Service) Open(ctx context.Context) error {
 			ProfileDataset:        ProfileHandlerVersion,
 			InboxCursorDataset:    InboxCursorHandlerVersion,
 			IdentitiesDataset:     IdentitiesHandlerVersion,
+			DevicesDataset:        DevicesHandlerVersion,
 			accountvalues.Dataset: accountvalues.HandlerVersion,
 		},
 	})

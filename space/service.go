@@ -238,13 +238,55 @@ type Service interface {
 	// where the subtree appears under the row's `settings` field.
 	SetSettings(ctx context.Context, spaceId string, set map[string]any, unset []string) error
 
+	// SetDevice upserts THIS device's row in the account's devices
+	// registry — a system dataset in the tech space, one row per device,
+	// synced account-wide (SYN-165). The row id is always the local peer
+	// id (SDK.PeerId()), never caller-supplied. Only non-empty fields are
+	// written; each Apps entry lands per-slug (nil value removes the
+	// slug), so writes touching different fields merge. At least one
+	// field must be non-empty (ErrDeviceEmptyUpsert). ErrDevicePruned
+	// when this device's row was deleted — the sticky tombstone
+	// absorbs the write and the id can never re-register.
+	//
+	// Read back via ListDevices, or generically via
+	// Query(SpaceIndexObjectId(), "devices").
+	SetDevice(ctx context.Context, up DeviceUpsert) error
+
+	// ClaimActive marks THIS device as the active instance of app: it
+	// writes an activeClaims.<app> = {seq, at} claim on the own row
+	// (seq = max existing + 1). Conflict-resolution semantics live in
+	// the reader — resolve the winner with ActiveDevice, never by
+	// comparing claims ad hoc. There is no un-claim: only a higher
+	// claim from another device or a row deletion moves the winner.
+	// ErrDevicePruned when this device's row was deleted (see
+	// SetDevice).
+	ClaimActive(ctx context.Context, app string) error
+
+	// DeleteDevice prunes peerId's row — the "device doesn't exist"
+	// signal that moves the active election away from it. The tombstone
+	// is sticky: the peer id can never re-register (a pruned device
+	// that comes back stays unlisted until it re-derives its peer
+	// keys). ErrDeviceUnknown when the row doesn't exist;
+	// ErrDeviceSelfDelete for the local device's own row (self-pruning
+	// would permanently lock this installation out of the registry —
+	// prune it from another device).
+	DeleteDevice(ctx context.Context, peerId string) error
+
+	// ListDevices returns a point-in-time snapshot of the devices
+	// registry (pruned rows excluded). Feed it to ActiveDevice to
+	// resolve the active instance of an app. Unavailability (tech
+	// space not open yet) is an error, never an empty snapshot — an
+	// election consumer must not mistake a closed service for an
+	// empty registry.
+	ListDevices(ctx context.Context) ([]Device, error)
+
 	// Subscribe delivers space-list changes (added / updated / removed).
 	// Returns a cancel function.
 	Subscribe(cb func(SpaceListEvent)) (cancel func())
 
 	// SpaceIndexObjectId returns the id of the tech-space index object —
 	// the handle for generic Query/Subscribe over the system datasets
-	// (spaces, profile). Future system objects expose their own ids.
+	// (spaces, profile, devices). Future system objects expose their own ids.
 	SpaceIndexObjectId() string
 
 	// Query builds a generic read query over a system object's dataset
@@ -255,7 +297,7 @@ type Service interface {
 	Query(objectId, dataset string) Query
 
 	// Datasets returns the JSON-Schema description of the tech-space
-	// system datasets (spaces, profile) — field names, value shapes, and
+	// system datasets (spaces, profile, devices) — field names, value shapes, and
 	// per-field class (synced / derived / local) via `x-scope`. For
 	// discovery, mirroring Space.Datasets.
 	Datasets() []DatasetSchema

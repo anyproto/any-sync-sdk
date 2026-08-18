@@ -28,11 +28,22 @@ const ShortIdsDataset = "shortIds"
 
 // ShortId row field names.
 const (
-	ShortIdFieldChangeId   = "changeId"   // the changeId the shortId was derived from
-	ShortIdFieldPropId     = "propId"     // the property record this shortId stamps (added or removed)
-	ShortIdFieldKind       = "kind"       // on-wire kind label, present on add rows
-	ShortIdFieldRemoved    = "removed"    // bool, true on removal rows
+	ShortIdFieldChangeId = "changeId" // the changeId the shortId was derived from
+	ShortIdFieldPropId   = "propId"   // the property record this shortId stamps (added or removed)
+	ShortIdFieldKind     = "kind"     // on-wire kind label, present on add rows
+	ShortIdFieldRemoved  = "removed"  // bool, true on removal rows
+	ShortIdFieldDefId    = "defId"    // the dataset-def record this shortId stamps
+	ShortIdFieldSrc      = "src"      // discriminator: absent = properties, "datasets" = dataset defs
 )
+
+// ShortIdSrcDatasets marks rows projected by DatasetDefsHandler.
+// Property rows carry no `src` — the absent value is the legacy
+// discriminant, so old readers keep working. The gate never inspects
+// fields (KnownShortId is a FindId), so mixing both streams in one
+// collection is free; LatestShortId then gates data changes against the
+// type's WHOLE schema state (properties + dataset defs), which is
+// strictly safer.
+const ShortIdSrcDatasets = "datasets"
 
 // shortIdRow returns the RecordChange that records an "added" shortId
 // (a property creation). Caller hands it to sink.Project against
@@ -48,6 +59,44 @@ func shortIdRow(changeId, propId, kindLabel string) crdt.RecordChange {
 	payload.Set(ShortIdFieldChangeId, a.NewString(changeId))
 	payload.Set(ShortIdFieldPropId, a.NewString(propId))
 	payload.Set(ShortIdFieldKind, a.NewString(kindLabel))
+	return crdt.RecordChange{
+		Id:     crdt.DeriveRecordId(changeId),
+		Upsert: true,
+		Ops: []crdt.Op{{
+			Type:    crdt.OpSet,
+			Payload: payload,
+		}},
+	}
+}
+
+// datasetShortIdRow returns the RecordChange recording an "added"
+// dataset-def shortId (a head or field record creation). Same mechanics
+// as shortIdRow with `defId` in place of `propId` and the `src`
+// discriminator.
+func datasetShortIdRow(changeId, defId string) crdt.RecordChange {
+	a := &anyenc.Arena{}
+	payload := a.NewObject()
+	payload.Set(ShortIdFieldChangeId, a.NewString(changeId))
+	payload.Set(ShortIdFieldDefId, a.NewString(defId))
+	payload.Set(ShortIdFieldSrc, a.NewString(ShortIdSrcDatasets))
+	return crdt.RecordChange{
+		Id:     crdt.DeriveRecordId(changeId),
+		Upsert: true,
+		Ops: []crdt.Op{{
+			Type:    crdt.OpSet,
+			Payload: payload,
+		}},
+	}
+}
+
+// datasetRemovalShortIdRow records a "removed" dataset-def shortId.
+func datasetRemovalShortIdRow(changeId, defId string) crdt.RecordChange {
+	a := &anyenc.Arena{}
+	payload := a.NewObject()
+	payload.Set(ShortIdFieldChangeId, a.NewString(changeId))
+	payload.Set(ShortIdFieldDefId, a.NewString(defId))
+	payload.Set(ShortIdFieldSrc, a.NewString(ShortIdSrcDatasets))
+	payload.Set(ShortIdFieldRemoved, a.NewTrue())
 	return crdt.RecordChange{
 		Id:     crdt.DeriveRecordId(changeId),
 		Upsert: true,

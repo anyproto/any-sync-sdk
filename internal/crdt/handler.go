@@ -192,6 +192,13 @@ type HandlerReg struct {
 	// the per-type `objects` namespace) set Schema.Dynamic.
 	Schema schema.Dataset
 
+	// SchemaRev is an opaque fingerprint of the registered schema for
+	// runtime-defined datasets. The store compares a resident
+	// controller's rev against the current catalog rev to detect stale
+	// registrations (a field added/removed after construction) and
+	// evict lazily. Empty for static registrations.
+	SchemaRev string
+
 	// DynamicScopeByKey marks a Dynamic dataset whose UNDECLARED field
 	// heads carry per-key scopes owned by the dataset's own layer (the
 	// per-space `objects` dataset: scope lives on the property

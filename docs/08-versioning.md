@@ -13,6 +13,27 @@ Versioning is the mechanism that detects staleness and triggers re-indexing.
 - **New system datasets** — SDK adds a new built-in dataset (e.g., for search indexing); existing objects need to be re-indexed
 - **Bug fixes in handlers** — silently corrupted state needs a rebuild
 
+## Implemented today
+
+Runtime dataset schemas (docs/17-user-datasets.md) ship a working
+subset of this vision, scoped to runtime-defined datasets:
+
+- **SchemaRev** — a fingerprint of the compiled declaration, stamped on
+  each registration; a resident controller whose rev differs from the
+  catalog's is stale and gets lazily evicted + rebuilt on first touch.
+  This is "handler version detects staleness" for the generic schema
+  handler, without a replay: additive-only evolution means rebuilt
+  registrations only need to APPLY future changes differently, never
+  recompute stored ones.
+- **Unknown-dataset parking** — changes for unregistered datasets park
+  in `_detached` and drain once a registration exists (spec §8.2), so
+  "new handler added" needs no wipe-and-rebuild for datasets whose
+  changes arrived early.
+
+Still open here: version-driven re-index for COMPILED-IN handler logic
+changes (wipe and replay), which additive runtime evolution
+deliberately avoids needing.
+
 ## Version Scopes
 
 Multiple version counters live in different parts of the system. Each scope answers a different question: "does this piece of state need to be rebuilt?"

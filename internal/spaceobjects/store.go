@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,7 @@ var builtinDataVersions = map[string]string{
 	properties.Dataset:           properties.HandlerVersion,
 	typetype.DatasetPropertyDefs: typetype.HandlerVersion,
 	typetype.ShortIdsDataset:     "shortIds-v1",
+	typetype.DatasetDefs:         typetype.DatasetDefsHandlerVersion,
 	payloads.Dataset:             payloads.HandlerVersion,
 }
 
@@ -160,6 +162,19 @@ type Store struct {
 	// one of its datasets. Built-in datasets (objects/properties/shortIds)
 	// are absent.
 	datasetOwners map[string]string
+
+	// catalog is the runtime dataset snapshot compiled from type
+	// objects' `datasets` records (SYN-147). Nil in raw mode. Readers
+	// take the copy-on-write snapshot lock-free; refreshed only when a
+	// dataset-defs change applies. See catalog.go.
+	catalog *runtimeCatalog
+
+	// staticSchemaHandlers memoizes the generic schema handler for
+	// config-registered datasets that declare a schema and no bespoke
+	// Handler. Built once at store open — buildRegs runs on every
+	// object load and must not recompile declarations. SchemaHandler
+	// is read-only after construction, safe to share.
+	staticSchemaHandlers map[string]*crdt.SchemaHandler
 
 	// cache is the per-space *object.Object cache. LoadFunc holds
 	// the per-id lock during build+ColdRestore, so peers waiting on
@@ -407,6 +422,19 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		s.extTypes = cfg.ExtTypes
 		s.dataVersions = dv
 		s.datasetOwners = owners
+		s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
+		for _, t := range cfg.ExtTypes {
+			for _, d := range t.Datasets {
+				if d.Handler != nil {
+					continue
+				}
+				if sh, err := crdt.NewSchemaHandler(datasetSchema(d)); err == nil {
+					s.staticSchemaHandlers[d.Name] = sh
+				}
+			}
+		}
+		s.catalog = newRuntimeCatalog()
+		s.initCatalog(context.Background())
 	}
 	s.applySeqs = crdt.NewApplySeqAllocator(func(ctx context.Context) (uint64, error) {
 		coll, err := s.applySeqMeta(ctx)
@@ -516,7 +544,15 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 		// declaration / tag). Only a non-empty Id is required.
 		for j, d := range t.Datasets {
 			if d.Handler == nil {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: nil Handler", i, t.Id, j)
+				// No bespoke handler: the dataset gets the generic
+				// schema handler, which requires a declared schema and a
+				// well-formed behavioral declaration.
+				if len(d.Schema.Fields) == 0 && !d.Schema.Dynamic {
+					return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: nil Handler requires a declared Schema", i, t.Id, j)
+				}
+				if err := schema.ValidateDatasetDecl(d.Schema); err != nil {
+					return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d] (%q): %w", i, t.Id, j, d.Name, err)
+				}
 			}
 			if d.Name == "" {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: empty Name", i, t.Id, j)
@@ -592,6 +628,10 @@ func (s *Store) SubEngine() *subscribe.Engine { return s.engine }
 type NamedSchema struct {
 	Name   string
 	Schema schema.Dataset
+	// TypeId is the owning type for type-owned datasets (registered or
+	// runtime); empty for space-level built-ins. External indexers key
+	// their type gating on it.
+	TypeId string
 }
 
 // Schemas returns the declared schema of every dataset this store hosts —
@@ -609,11 +649,17 @@ func (s *Store) Schemas() []NamedSchema {
 		{Name: properties.Dataset, Schema: objectsDatasetSchema()},
 		{Name: typetype.DatasetPropertyDefs, Schema: schema.Dataset{Dynamic: true}},
 		{Name: typetype.ShortIdsDataset, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.DatasetDefs, Schema: schema.Dataset{Dynamic: true}},
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d)})
+			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d), TypeId: t.Id})
 		}
+	}
+	snap := s.catalog.snapshot()
+	for _, name := range sortedCatalogNames(snap) {
+		ds := snap.byName[name]
+		out = append(out, NamedSchema{Name: ds.Name, Schema: ds.Schema, TypeId: ds.TypeId})
 	}
 	return out
 }
@@ -626,7 +672,13 @@ func datasetSchema(d handler.Dataset) schema.Dataset {
 	if len(d.Schema.Fields) == 0 && !d.Schema.Dynamic {
 		return schema.Dataset{Dynamic: true}
 	}
-	return d.Schema
+	return d.Schema.Normalized()
+}
+
+// DatasetDefs returns the compiled runtime dataset definitions of one
+// type object (deterministic fold of its `datasets` records).
+func (s *Store) DatasetDefs(ctx context.Context, typeId string) ([]types.CompiledDataset, error) {
+	return types.CompileDatasetDefs(ctx, s.db, typeId)
 }
 
 // NotifyDrainer is the public hook used by callers (e.g. the
@@ -657,8 +709,13 @@ func (s *Store) SpaceId() string { return s.spaceId }
 // write path to enforce that an object implements a type before writing
 // into one of its datasets.
 func (s *Store) DatasetOwner(dataset string) (string, bool) {
-	owner, ok := s.datasetOwners[dataset]
-	return owner, ok
+	if owner, ok := s.datasetOwners[dataset]; ok {
+		return owner, ok
+	}
+	if ds, ok := s.catalog.lookup(dataset); ok {
+		return ds.TypeId, true
+	}
+	return "", false
 }
 
 // ObjectTypes returns the typeIds an object implements (its any.types),
@@ -794,6 +851,119 @@ func (s *Store) DataVersion(dataset string) (string, error) {
 		return "", fmt.Errorf("%w: %q", ErrUnknownDataset, dataset)
 	}
 	return v, nil
+}
+
+// DataVersionFor resolves the DataVersion stamp for any known dataset:
+// the static map for built-ins / config-registered datasets, and for
+// runtime datasets the owning type's latest shortId encoded as a
+// `typeId:shortId` pair — so peers gate the data change against the
+// writer's schema state (dataVersionForTypes model). Falls back to the
+// defs handler version when the type has no shortId rows yet (fresh
+// hand-built state; the string parse-fails and passes the gate).
+func (s *Store) DataVersionFor(ctx context.Context, dataset string) (string, error) {
+	if v, ok := s.dataVersions[dataset]; ok {
+		return v, nil
+	}
+	ds, ok := s.catalog.lookup(dataset)
+	if !ok {
+		return "", fmt.Errorf("%w: %q", ErrUnknownDataset, dataset)
+	}
+	latest, err := s.reg.LatestShortId(ctx, ds.TypeId)
+	if err != nil {
+		return "", err
+	}
+	if latest == "" {
+		return typetype.DatasetDefsHandlerVersion, nil
+	}
+	return types.EncodeDataVersion([]types.DataVersionPair{{TypeId: ds.TypeId, ShortId: latest}}), nil
+}
+
+// RuntimeDataset resolves a runtime dataset's compiled declaration by
+// collection name — one atomic snapshot load.
+func (s *Store) RuntimeDataset(dataset string) (types.CompiledDataset, bool) {
+	return s.catalog.lookup(dataset)
+}
+
+// DatasetDecl resolves any known dataset's schema declaration:
+// config-registered datasets first, then the runtime catalog. Built-ins
+// are absent on purpose (their declarations are SDK-internal).
+func (s *Store) DatasetDecl(dataset string) (schema.Dataset, bool) {
+	for _, t := range s.extTypes {
+		for _, d := range t.Datasets {
+			if d.Name == dataset {
+				return datasetSchema(d), true
+			}
+		}
+	}
+	if ds, ok := s.catalog.lookup(dataset); ok {
+		return ds.Schema, true
+	}
+	return schema.Dataset{}, false
+}
+
+// SelfIdentity returns this replica's account identity (empty when the
+// store has no signing key — raw/test mode).
+func (s *Store) SelfIdentity() string { return s.selfIdentity }
+
+// EnsureDatasetRegistered makes sure the RESIDENT controller for
+// objectId (if any) carries the dataset's CURRENT registration. A
+// controller built before a runtime dataset was defined lacks its
+// handler; one built before a field was added/removed carries a stale
+// SchemaRev. Both fix by eviction — the next Get rebuilds through
+// buildRegs, which reads the current catalog snapshot. Lazy and
+// demand-driven: cost lands only on the first touch per object, never
+// as a fleet-wide sweep on schema apply.
+func (s *Store) EnsureDatasetRegistered(ctx context.Context, objectId, dataset string) {
+	if _, static := s.dataVersions[dataset]; static {
+		return
+	}
+	ds, known := s.catalog.lookup(dataset)
+	if !known {
+		return
+	}
+	v, err := s.cache.Pick(ctx, objectId)
+	if err != nil {
+		return // not resident: the next load registers it naturally
+	}
+	obj, ok := v.(*object.Object)
+	if !ok || obj.Controller() == nil {
+		return
+	}
+	if ctrl := obj.Controller(); ctrl.HasDataset(dataset) && ctrl.DatasetSchemaRev(dataset) == ds.SchemaRev {
+		return
+	}
+	s.Drop(objectId)
+}
+
+// datasetRegistered reports whether the dataset is currently known to
+// any registration source (static catalog or runtime snapshot).
+func (s *Store) datasetRegistered(dataset string) bool {
+	if _, static := s.dataVersions[dataset]; static {
+		return true
+	}
+	_, known := s.catalog.lookup(dataset)
+	return known
+}
+
+// controllerStaleFor reports whether ctrl's registration for dataset is
+// missing, out of rev against the current catalog snapshot, or carries
+// a runtime dataset the catalog no longer knows (removed definition —
+// residents must stop applying what fresh controllers park, or
+// replicas diverge).
+func (s *Store) controllerStaleFor(ctrl *crdt.Controller, dataset string) bool {
+	if ctrl == nil {
+		return false
+	}
+	if !ctrl.HasDataset(dataset) {
+		return true
+	}
+	rev := ctrl.DatasetSchemaRev(dataset)
+	if ds, ok := s.catalog.lookup(dataset); ok {
+		return rev != ds.SchemaRev
+	}
+	// Rev-tracked (runtime-registered) but absent from the catalog:
+	// the definition was removed since this controller was built.
+	return rev != ""
 }
 
 // Allocator returns the shared per-space VersionAllocator. Exposed so
@@ -1405,7 +1575,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	}
 	var gate object.ApplyGate
 	if !s.disableGate {
-		gate = s.gateFor(objectId)
+		gate = s.gateFor(objectId, ctrl)
 	}
 	obj, err := object.New(object.Config{
 		SpaceId:        s.spaceId,
@@ -1649,6 +1819,11 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// dense (never sparse) — a reverse-scan to the last key replaces a
 		// full-collection scan+sort as the shortIds dataset grows.
 		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}, Indexes: []anystore.IndexInfo{{Name: "idx__ver_id", Fields: []string{"_ver.id"}}}},
+		// `datasets` — runtime dataset definitions on type objects
+		// (docs: SYN-147). Dynamic keyspace; the handler pins the
+		// schema-bearing fields and projects shortId rows so the
+		// DataVersion gate covers dataset-def state too.
+		{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}},
 		// `payloads` — the node-readable per-file index. Registered on
 		// every controller (uniform handler set), but only payloads
 		// objects (plaintext class, see plaintextSpecs) ever write it:
@@ -1659,15 +1834,63 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
+			h := d.Handler
+			if h == nil {
+				// Declared-schema dataset with no bespoke behavior: the
+				// generic schema handler enforces the declaration.
+				// Memoized at store open (SchemaHandler is read-only
+				// after construction — sharing across controllers and
+				// history scratch replays is safe).
+				if h = s.staticSchemaHandlers[d.Name]; h == nil {
+					sh, err := crdt.NewSchemaHandler(datasetSchema(d))
+					if err != nil {
+						return nil, nil, fmt.Errorf("spaceobjects: dataset %q: %w", d.Name, err)
+					}
+					h = sh
+				}
+			}
 			regs = append(regs, crdt.HandlerReg{
-				Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d),
+				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),
 				ReadTracking:          d.ReadTracking,
 				SkipHistory:           d.SkipHistory,
 				DisableFilteredReplay: d.DisableFilteredReplay,
 			})
 		}
 	}
+	// Runtime datasets (SYN-147): one generic schema-handler reg per
+	// catalog entry. One atomic snapshot load, handlers pre-built per
+	// snapshot — no storage reads or declaration compiles on the
+	// controller-construction path.
+	snap := s.catalog.snapshot()
+	for _, name := range sortedCatalogNames(snap) {
+		ds := snap.byName[name]
+		sh := snap.handlers[name]
+		if sh == nil {
+			continue
+		}
+		regs = append(regs, crdt.HandlerReg{
+			Name:        ds.Name,
+			Handler:     sh,
+			Schema:      ds.Schema,
+			SchemaRev:   ds.SchemaRev,
+			SkipHistory: ds.SkipHistory,
+		})
+	}
 	return regs, []string{properties.Dataset}, nil
+}
+
+// sortedCatalogNames returns the snapshot's dataset names in stable
+// order so controller reg sets are deterministic across loads.
+func sortedCatalogNames(snap *catalogSnapshot) []string {
+	if len(snap.byName) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(snap.byName))
+	for name := range snap.byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // HistoryReplayRegs returns a fresh handler-reg set plus the shared

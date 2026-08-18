@@ -113,6 +113,10 @@ type Controller struct {
 	// schemas is the per-dataset field declaration (field classes +
 	// Dynamic). Source of truth for synced/derived/local enforcement.
 	schemas map[string]schema.Dataset
+	// schemaRevs holds each runtime dataset's registered SchemaRev
+	// fingerprint (nil/absent for static regs). Immutable after
+	// construction, read lock-free by the store's staleness checks.
+	schemaRevs map[string]string
 
 	// collMu guards collections. Per-object collections are opened
 	// lazily — on first write via db.Collection (creates), on read via
@@ -294,7 +298,15 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 	}
 	c.versions[name] = version
 	c.indexes[name] = reg.Indexes
-	c.schemas[name] = reg.Schema
+	// Zero-value scopes are resolved once here (stamps → derived, rest →
+	// synced) so field-class enforcement never sees an unset scope.
+	c.schemas[name] = reg.Schema.Normalized()
+	if reg.SchemaRev != "" {
+		if c.schemaRevs == nil {
+			c.schemaRevs = make(map[string]string)
+		}
+		c.schemaRevs[name] = reg.SchemaRev
+	}
 	if reg.DynamicScopeByKey {
 		if c.scopeByKey == nil {
 			c.scopeByKey = make(map[string]bool)
@@ -318,6 +330,22 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 		}
 	}
 	return nil
+}
+
+// HasDataset reports whether a handler is registered for the dataset.
+// The handler map is immutable after construction, so this is safe to
+// call concurrently (same contract as ValidateChange). Used by the
+// store to detect controllers built before a runtime dataset appeared.
+func (c *Controller) HasDataset(dataset string) bool {
+	_, ok := c.handlers[dataset]
+	return ok
+}
+
+// DatasetSchemaRev returns the SchemaRev the dataset registered with
+// ("" for static regs / unknown datasets). Immutable after
+// construction; concurrency-safe like HasDataset.
+func (c *Controller) DatasetSchemaRev(dataset string) string {
+	return c.schemaRevs[dataset]
 }
 
 // ensureHandlerIndexes calls EnsureIndex for every IndexInfo a dataset

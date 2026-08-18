@@ -494,6 +494,10 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	if dataset == sharedObjectsDataset {
 		return store.SharedObjects(ctx)
 	}
+	// A resident controller built before a runtime dataset was defined
+	// doesn't know its collection; reload it so a just-defined dataset
+	// reads back real rows instead of silently empty results.
+	store.EnsureDatasetRegistered(ctx, objectId, dataset)
 	obj, err := store.Get(ctx, objectId)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)

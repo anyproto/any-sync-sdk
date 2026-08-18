@@ -56,8 +56,8 @@ func normalizeSpaceType(t string) (string, error) {
 	case "", space.SpaceTypeAny:
 		return space.SpaceTypeAny, nil
 	default:
-		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s or empty)",
-			t, space.SpaceTypeAny)
+		return "", fmt.Errorf("spaceimpl: %w: %q (allowed: %s or empty)",
+			space.ErrBadSpaceType, t, space.SpaceTypeAny)
 	}
 }
 

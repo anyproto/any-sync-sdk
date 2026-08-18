@@ -68,6 +68,24 @@ var ErrIsOneToOne = errors.New("is a 1-1 space")
 // given identity is the caller's own account.
 var ErrSelfPair = errors.New("cannot pair with self")
 
+// ErrBadSpaceId is returned by Track when the given id does not have
+// the any-sync spaceId shape (`<cid>.<replication key base36>`). A
+// malformed id would otherwise sit in the index and fail every Get
+// with an opaque remote error — Track rejects it up front instead.
+var ErrBadSpaceId = errors.New("invalid space id")
+
+// ErrIsTechSpace is returned by Track when the given id is the
+// account's own tech space — the tech space is system-owned and never
+// appears in the space list.
+var ErrIsTechSpace = errors.New("cannot track the tech space")
+
+// ErrBadSpaceType is returned by Create when CreateRequest.SpaceType
+// is outside the allow-list (SpaceTypeAny or empty). The type is
+// content-addressed into the immutable space header and coordinator-
+// gated, so a bad value is rejected up front — classify with
+// errors.Is to turn it into a caller-facing 4xx.
+var ErrBadSpaceType = errors.New("unsupported space type")
+
 // Settings-patch sentinels — wrapped by SetSettings validation errors
 // so callers can classify with errors.Is.
 var (

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -247,6 +248,50 @@ func (s *spaceImpl) SpaceIndexObjectId() string {
 		return ""
 	}
 	return id
+}
+
+// WaitIndexSynced blocks until the spaceIndex object's seeded state is
+// projected locally — the marker that the index tree's content has
+// arrived and the bundles registry is readable. Offline-first: when the
+// seed row is already local it returns without touching the network.
+// Otherwise it forces head-sync rounds until the row lands or ctx
+// expires. The Derive each round materializes the tree (idempotent —
+// same deterministic id everywhere) and runs ColdRestore, so state that
+// head-synced before this device booted is projected too, not just
+// live-listener arrivals.
+func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
+	objectId, err := s.parent.spaceIndexObjectIdFor(ctx, s.id)
+	if err != nil {
+		return err
+	}
+	projected := func(ctx context.Context) bool {
+		if _, derr := s.store.Derive(ctx, spaceobjects.DeriveOpts{
+			ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
+		}); derr != nil {
+			return false
+		}
+		return spaceIndexHasNamespace(ctx, s.store, objectId)
+	}
+	if projected(ctx) {
+		return nil
+	}
+	backoff := time.Second
+	for {
+		// Best-effort: an offline round errors and we keep waiting —
+		// the caller's ctx is the only deadline.
+		_ = s.app.SyncHeads(ctx, s.id)
+		if projected(ctx) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 // spaceIndexHasNamespace returns true when the per-space `objects`

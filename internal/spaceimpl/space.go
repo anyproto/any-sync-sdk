@@ -38,6 +38,7 @@ type spaceImpl struct {
 	properties *propertiesAPI
 	acl        *aclAPI
 	members    *membersAPI
+	bundles    *bundlesAPI
 }
 
 func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *spaceobjects.Store, parent *Service) *spaceImpl {
@@ -47,6 +48,7 @@ func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *space
 	s.properties = newPropertiesAPI(s)
 	s.acl = newACLAPI(s)
 	s.members = newMembersAPI(s)
+	s.bundles = newBundlesAPI(s)
 	return s
 }
 
@@ -146,6 +148,7 @@ func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
 
 func (s *spaceImpl) ACL() space.ACL            { return s.acl }
 func (s *spaceImpl) Members() space.MembersAPI { return s.members }
+func (s *spaceImpl) Bundles() space.BundlesAPI { return s.bundles }
 
 // SyncHeads forces an immediate head-sync (diff) round on this space
 // instead of waiting for the periodic timer. Blocks until the round

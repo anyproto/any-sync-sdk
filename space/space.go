@@ -175,6 +175,21 @@ type Space interface {
 	// spaceIndex's `objects` dataset for live UI updates.
 	SpaceIndexObjectId() string
 
+	// Bundles is the typed surface over the per-space installed-bundles
+	// registry on the spaceIndex object. See BundlesAPI.
+	Bundles() BundlesAPI
+
+	// WaitIndexSynced blocks until the in-space spaceIndex object is
+	// present locally with its seeded state projected — the gate the
+	// restore path takes before reading the bundles registry ("wait for
+	// the space index, then see what is set up"). While waiting it
+	// forces head-sync rounds; when the index is already local it
+	// returns immediately without touching the network (offline-first).
+	// Bounded only by ctx — on a space whose index was never seeded
+	// (owner crashed pre-seed on a legacy space) it waits until ctx
+	// expires.
+	WaitIndexSynced(ctx context.Context) error
+
 	// SyncHeads forces an immediate head-sync (diff) round on this
 	// space against its responsible nodes, instead of waiting for the
 	// periodic timer. Blocks until the round completes. Use it to

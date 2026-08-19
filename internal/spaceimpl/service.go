@@ -764,6 +764,30 @@ func (s *Service) SyncSpaceList(ctx context.Context) error {
 	return s.tsp.SyncHeads(ctx)
 }
 
+// WaitListSynced blocks until the tech space completes a clean
+// head-sync round with no parked trees (same convergence test as
+// inboxReplayGuard), retrying rounds until ctx expires. SyncHeads
+// no-ops (nil) on a not-open tech space — that must read as "not
+// ready", not as a clean round.
+func (s *Service) WaitListSynced(ctx context.Context) error {
+	backoff := time.Second
+	for {
+		if s.tsp.SpaceId() != "" &&
+			s.tsp.SyncHeads(ctx) == nil &&
+			s.app.ParkedTreeCount(s.tsp.SpaceId()) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 // List returns the space-index snapshot.
 func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 	rows := s.tsp.List(ctx)

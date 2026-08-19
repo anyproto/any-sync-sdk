@@ -75,6 +75,7 @@ var reservedDatasetNames = map[string]struct{}{
 	"shortIds":   {},
 	"datasets":   {},
 	"payloads":   {},
+	"bundles":    {},
 }
 
 // datasetDefMutableTop are the head-level fields freely mutable on an

@@ -325,6 +325,16 @@ func (s *Service) SetType(ctx context.Context, spaceId, typ string) (object.Writ
 	})
 }
 
+// SetDerived flags a row as seed-derived (FieldDerived, synced) — the
+// heal path for rows that predate the flag (Derive stamps it at row
+// create otherwise). Set-once: the handler pins it after the first
+// true write.
+func (s *Service) SetDerived(ctx context.Context, spaceId string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldDerived, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewTrue()
+	})
+}
+
 // SetPushKeys mirrors the space's derived push-notification key
 // material onto its row via the local-set path (FieldPushKeys,
 // device-local; never enters the DAG — every device derives the same

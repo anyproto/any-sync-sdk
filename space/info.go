@@ -81,6 +81,10 @@ type SpaceInfo struct {
 	// notably on a joiner whose access is still pending (no read key
 	// yet) and on rows whose space was never loaded by this device.
 	PushKeys *PushKeys
+	// Derived marks a space created by the account's own
+	// Service.Derive — Delete refuses it (see ErrIsDerivedSpace).
+	// Always false on created / joined / tracked / 1-1 spaces.
+	Derived bool
 }
 
 // PushKeys is the per-space key material a push RECEIVER needs,

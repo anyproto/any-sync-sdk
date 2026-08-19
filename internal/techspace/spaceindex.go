@@ -34,6 +34,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldOneToOneInviteState, Name: "One-to-one invite state", Schema: str(), Scope: schema.ScopeLocal},
 		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
 		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
 		// KindObject with nil Properties = free-form shape: the schema
 		// validator accepts any nested keys (schema.validateValue stops at
@@ -194,6 +195,14 @@ const (
 	// and the revoke paths. Distinct from FieldGuestKey so an issuer's
 	// own row never reads as guest-mode.
 	FieldIssuedInviteKeys = "issuedInviteKeys"
+	// FieldDerived marks a row written by the account's own
+	// Spaces().Derive (SYNCED bool, stamped at row create or healed by
+	// SetDerived; set-once — the handler pins it like `type`). Gates
+	// every delete refusal for derived spaces, including the handler's
+	// own remoteStatus=deleted rejection; why they are permanent is on
+	// space.ErrIsDerivedSpace. Absent on created / joined / tracked /
+	// 1-1 rows.
+	FieldDerived = "derived"
 )
 
 // FieldIssuedInviteKeys subkeys — the issued-key kinds. Slugs, not
@@ -277,6 +286,8 @@ var (
 	ErrTypeImmutable      = errors.New("techspace: `type` is pinned after first non-empty write")
 	ErrStatusTerminal     = errors.New("techspace: status=deleted is terminal")
 	ErrDeleteOpNotAllowed = errors.New("techspace: deletion is via remoteStatus=deleted, not a delete op")
+	ErrDerivedImmutable   = errors.New("techspace: `derived` is pinned after first true write")
+	ErrDerivedUndeletable = errors.New("techspace: derived rows refuse status=deleted")
 )
 
 // statusFields are the SYNCED fields whose terminal-Deleted rule is
@@ -297,6 +308,8 @@ var statusFields = map[string]struct{}{
 //     after which it is immutable;
 //   - `localStatus` / `remoteStatus` cannot move OUT of "deleted"
 //     (terminal — deleted spaces stay in the index);
+//   - `derived` is set-once like `type`, and derived rows refuse
+//     remoteStatus=deleted from any writer (see FieldDerived);
 //   - delete ops are rejected wholesale; deletion is a status edit,
 //     not a CRDT delete.
 //
@@ -333,10 +346,7 @@ func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChang
 	return nil
 }
 
-// BeforeModify enforces:
-//   - `type` is set-once: writable while the current value is
-//     empty/absent (the header backfill), pinned afterwards;
-//   - status edits are rejected when the current status is "deleted".
+// BeforeModify enforces the headRuleErr rule table on single-path ops.
 //
 // The set-once gate reads the LOCAL pre-op state, so two concurrent
 // fills with different values would pin divergently per device. That
@@ -347,16 +357,42 @@ func (SpaceIndexHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange,
 	if len(op.Path) == 0 {
 		return rejectMultiField(op.Payload, ctx.Before)
 	}
-	head := op.Path[0]
-	if head == FieldType && currentType(ctx.Before) != "" {
+	return headRuleErr(op.Path[0], op.Payload, ctx.Before)
+}
+
+// headRuleErr is the per-field write rule shared by BeforeModify's
+// single-path branch and rejectMultiField's walk — one rule table, so
+// a pin added to one path can't be bypassed through the other:
+//   - `type` / `derived` are set-once (see the Field docs);
+//   - status fields never move out of "deleted" (terminal);
+//   - a derived row refuses remoteStatus=deleted from any writer —
+//     derived spaces are permanent (space.ErrIsDerivedSpace), and the
+//     synced flag is only as strong as this apply-side gate.
+func headRuleErr(head string, payload, before *anyenc.Value) error {
+	if head == FieldType && currentType(before) != "" {
 		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrTypeImmutable)
 	}
+	if head == FieldDerived && currentDerived(before) {
+		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrDerivedImmutable)
+	}
 	if _, isStatus := statusFields[head]; isStatus {
-		if currentStatus(ctx.Before, head) == StatusDeleted {
+		if currentStatus(before, head) == StatusDeleted {
 			return fmt.Errorf("%w: %w (field %q)", crdt.ErrValidation, ErrStatusTerminal, head)
+		}
+		if payloadString(payload) == StatusDeleted && currentDerived(before) {
+			return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrDerivedUndeletable)
 		}
 	}
 	return nil
+}
+
+// payloadString reads a string payload; "" for nil / non-string
+// (unset ops, object bundles).
+func payloadString(payload *anyenc.Value) string {
+	if payload == nil || payload.Type() != anyenc.TypeString {
+		return ""
+	}
+	return string(payload.GetStringBytes())
 }
 
 // BeforeDelete rejects every delete attempt — there is no physical
@@ -381,26 +417,24 @@ func rejectMultiField(payload, before *anyenc.Value) error {
 	}
 	obj, _ := payload.Object()
 	var hit error
-	obj.Visit(func(k []byte, _ *anyenc.Value) {
+	obj.Visit(func(k []byte, v *anyenc.Value) {
 		if hit != nil {
 			return
 		}
-		key := string(k)
-		head := key
+		head := string(k)
 		if i := strings.IndexByte(head, '.'); i >= 0 {
 			head = head[:i]
 		}
-		if head == FieldType && currentType(before) != "" {
-			hit = fmt.Errorf("%w: %w", crdt.ErrValidation, ErrTypeImmutable)
-			return
-		}
-		if _, isStatus := statusFields[head]; isStatus {
-			if currentStatus(before, head) == StatusDeleted {
-				hit = fmt.Errorf("%w: %w (field %q)", crdt.ErrValidation, ErrStatusTerminal, head)
-			}
-		}
+		hit = headRuleErr(head, v, before)
 	})
 	return hit
+}
+
+// currentDerived reads `derived` off the pre-op record. False covers
+// absent record, missing field, and an explicit false — all "not yet
+// pinned" for the set-once rule.
+func currentDerived(before *anyenc.Value) bool {
+	return before != nil && before.GetBool(FieldDerived)
 }
 
 // currentType reads `type` off the pre-op record. Empty string covers

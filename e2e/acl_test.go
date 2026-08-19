@@ -539,13 +539,15 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 	t.Cleanup(func() { _ = sdk.Close() })
 
 	seed := []byte("project:demo:2026-05")
-	sp1, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed})
+	sp1, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed, Name: "Demo"})
 	require.NoError(t, err)
 	require.NotEmpty(t, sp1.Id())
+	assert.Equal(t, "Demo", sp1.Info().Name, "first materialization writes the name")
 
 	sp2, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed})
 	require.NoError(t, err)
-	assert.Equal(t, sp1.Id(), sp2.Id(), "Derive must be idempotent for the same seed")
+	assert.Equal(t, sp1.Id(), sp2.Id(), "Derive must be idempotent for the same seed — the name is not part of the id")
+	assert.Equal(t, "Demo", sp2.Info().Name, "re-derive keeps existing metadata")
 
 	// Different seed → different space.
 	sp3, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: []byte("different")})
@@ -556,6 +558,38 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 	list, err := sdk.Spaces().List(ctx)
 	require.NoError(t, err)
 	require.Len(t, list, 2)
+
+	// Derived spaces are permanent: Delete refuses, the row stays
+	// active and carries the flag.
+	err = sdk.Spaces().Delete(ctx, sp1.Id())
+	require.ErrorIs(t, err, space.ErrIsDerivedSpace)
+	list, err = sdk.Spaces().List(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2, "refused delete must not tombstone the row")
+	for _, info := range list {
+		assert.True(t, info.Derived, "derived rows carry the flag")
+		assert.Equal(t, space.StatusActive, info.Status)
+	}
+
+	// A regular created space stays unflagged and deletable — the flag
+	// must not leak onto non-derived rows.
+	created, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "NotDerived"})
+	require.NoError(t, err)
+	assert.False(t, created.Info().Derived, "created spaces must not carry the flag")
+	require.NoError(t, sdk.Spaces().Delete(ctx, created.Id()))
+
+	// A row that predates the flag (here: written by Track of the
+	// derived id) is healed by Derive, after which Delete refuses.
+	healReq := space.DeriveRequest{Seed: []byte("heal-me")}
+	healId, err := sdk.Spaces().DeriveId(ctx, healReq)
+	require.NoError(t, err)
+	require.NoError(t, sdk.Spaces().Track(ctx, healId))
+	healed, err := sdk.Spaces().Derive(ctx, healReq)
+	require.NoError(t, err)
+	require.Equal(t, healId, healed.Id())
+	assert.True(t, healed.Info().Derived, "Derive must flag a pre-existing unflagged row")
+	err = sdk.Spaces().Delete(ctx, healId)
+	require.ErrorIs(t, err, space.ErrIsDerivedSpace)
 }
 
 // TestSDK_Spaces_DeriveId confirms DeriveId is a pure, side-effect-free

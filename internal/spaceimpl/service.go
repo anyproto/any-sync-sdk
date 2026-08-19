@@ -815,6 +815,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		OwnRole:     r.OwnRole,
 		Settings:    r.Settings,
 		PushKeys:    r.PushKeys,
+		Derived:     r.Derived,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
@@ -898,8 +899,17 @@ func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
 // delete to the account's other devices — each offloads its local copy —
 // while the row stays re-creatable (a later OneToOne(peer) flips it back to
 // active). No coordinator SpaceDelete is ever sent.
+//
+// The tech space (system-owned, never in the list) and seed-derived
+// spaces (rows flagged FieldDerived — see space.ErrIsDerivedSpace) are
+// refused outright.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Type == space.SpaceTypeOneToOne {
+	if spaceId == s.tsp.SpaceId() {
+		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrIsTechSpace)
+	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	switch {
+	case ok && rec.Type == space.SpaceTypeOneToOne:
 		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.OneToOneDeletedStatus); err != nil {
 			return fmt.Errorf("spaceimpl: mark 1-1 deleted: %w", err)
 		}
@@ -907,8 +917,7 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		// No coordinator kick: a 1-1 is never node-deleted. Other devices
 		// offload via their own reconciler when the synced marker arrives.
 		return nil
-	}
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.GuestKey != "" {
+	case ok && rec.GuestKey != "":
 		// Guest-mode space: same shape as the 1-1 delete — synced,
 		// NON-terminal marker (a later JoinGuest re-adds), local offload,
 		// no coordinator SpaceDelete (the space isn't ours on the
@@ -919,6 +928,12 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		}
 		s.OffloadSpace(ctx, spaceId)
 		return nil
+	case ok && rec.Derived:
+		return space.ErrIsDerivedSpace
+	case !ok:
+		// No row = the account doesn't know this space; deleting would
+		// silently succeed while writing nothing (strict-skip modify).
+		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrSpaceUnknown)
 	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
@@ -1077,15 +1092,25 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err
 	}
-	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+	if rec, ok := s.tsp.Get(ctx, spaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
 			Type:         space.SpaceTypeAny,
 			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
+			Name:         req.Name,
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
+			// Synced: every device of the account refuses Delete, not
+			// just the device that ran Derive.
+			Derived: true,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+		}
+	} else if !rec.Derived {
+		// Heal rows that predate the flag (older SDK, or a Track of the
+		// derived id): the set-once gate permits the first true write.
+		if _, err := s.tsp.SetDerived(ctx, spaceId); err != nil {
+			return nil, fmt.Errorf("spaceimpl: flag derived row: %w", err)
 		}
 	}
 	store := s.storeFor(spaceId)

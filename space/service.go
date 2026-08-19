@@ -39,8 +39,8 @@ var ErrReadOnlySpace = errors.New("space: read-only")
 var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pending")
 
 // ErrSpaceUnknown is returned by id-addressed Service methods (Get,
-// SetSettings, the accept/decline families) when the spaceId has no
-// row in the account's space index.
+// Delete, SetSettings, the accept/decline families) when the spaceId
+// has no row in the account's space index.
 var ErrSpaceUnknown = errors.New("unknown space")
 
 // ErrJoinPending is returned by Join after the RequestToJoin was
@@ -78,6 +78,19 @@ var ErrBadSpaceId = errors.New("invalid space id")
 // account's own tech space — the tech space is system-owned and never
 // appears in the space list.
 var ErrIsTechSpace = errors.New("cannot track the tech space")
+
+// ErrIsDerivedSpace is returned by Delete when the target is a
+// seed-derived space (created via Derive). Derived spaces are
+// permanent: the deterministic id means a delete followed by a
+// re-derive would recreate the space with fresh history under the
+// same id — history replacement — and the sticky deleted tombstone
+// would otherwise wedge the account's well-known derived id forever.
+// The deriving account's row carries a synced set-once `derived` flag
+// (surfaced as SpaceInfo.Derived) that every enforcement point keys
+// on; a joiner of someone else's derived space never gets the flag —
+// they cannot re-derive it, so their removal stays allowed. 1-1
+// spaces keep their own re-derivable delete path.
+var ErrIsDerivedSpace = errors.New("derived spaces cannot be deleted")
 
 // ErrBadSpaceType is returned by Create when CreateRequest.SpaceType
 // is outside the allow-list (SpaceTypeAny or empty). The type is
@@ -120,6 +133,8 @@ type Service interface {
 
 	// Derive a deterministic space from the account keys. Used for
 	// the tech space (never returned here) and future derived spaces.
+	// Derived spaces are permanent — Delete refuses them with
+	// ErrIsDerivedSpace (see the sentinel for why).
 	Derive(ctx context.Context, req DeriveRequest) (Space, error)
 
 	// DeriveId returns the deterministic spaceId for a DeriveRequest
@@ -215,7 +230,9 @@ type Service interface {
 	// Delete tears down a space locally. For regular spaces this also
 	// flags the space as deleted on the network; for 1-1 spaces it is
 	// local-only (the space is always re-derivable). The record stays
-	// in List with Status = StatusDeleted.
+	// in List with Status = StatusDeleted. Seed-derived spaces are
+	// refused with ErrIsDerivedSpace (permanent), the tech space with
+	// ErrIsTechSpace, and an id with no index row with ErrSpaceUnknown.
 	Delete(ctx context.Context, spaceId string) error
 
 	// SetSettings patches the account-private per-space client settings
@@ -350,6 +367,13 @@ type DeriveRequest struct {
 	// stays SpaceTypeAny and is coordinator-gated) and not stamped into
 	// the header as the type. Empty defaults to SpaceTypeAny.
 	SpaceType string
+
+	// Name is the initial display name, written on FIRST
+	// materialization only (a pre-existing row keeps its metadata) and
+	// NOT hashed into the derivation — the id is stable regardless.
+	// Propagates into the in-space spaceIndex via the owner-side lazy
+	// seed; rename later with Space.SetMetadata.
+	Name string
 }
 
 // SpaceListEvent is delivered to Service.Subscribe callbacks.

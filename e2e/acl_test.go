@@ -568,6 +568,26 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 		assert.True(t, info.Derived, "derived rows carry the flag")
 		assert.Equal(t, space.StatusActive, info.Status)
 	}
+
+	// A regular created space stays unflagged and deletable — the flag
+	// must not leak onto non-derived rows.
+	created, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "NotDerived"})
+	require.NoError(t, err)
+	assert.False(t, created.Info().Derived, "created spaces must not carry the flag")
+	require.NoError(t, sdk.Spaces().Delete(ctx, created.Id()))
+
+	// A row that predates the flag (here: written by Track of the
+	// derived id) is healed by Derive, after which Delete refuses.
+	healReq := space.DeriveRequest{Seed: []byte("heal-me")}
+	healId, err := sdk.Spaces().DeriveId(ctx, healReq)
+	require.NoError(t, err)
+	require.NoError(t, sdk.Spaces().Track(ctx, healId))
+	healed, err := sdk.Spaces().Derive(ctx, healReq)
+	require.NoError(t, err)
+	require.Equal(t, healId, healed.Id())
+	assert.True(t, healed.Info().Derived, "Derive must flag a pre-existing unflagged row")
+	err = sdk.Spaces().Delete(ctx, healId)
+	require.ErrorIs(t, err, space.ErrIsDerivedSpace)
 }
 
 // TestSDK_Spaces_DeriveId confirms DeriveId is a pure, side-effect-free

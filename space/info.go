@@ -82,9 +82,8 @@ type SpaceInfo struct {
 	// yet) and on rows whose space was never loaded by this device.
 	PushKeys *PushKeys
 	// Derived marks a space created by the account's own
-	// Service.Derive (synced row flag). Derived spaces are permanent —
-	// Delete refuses them with ErrIsDerivedSpace. Always false on
-	// created / joined / tracked / 1-1 spaces.
+	// Service.Derive — Delete refuses it (see ErrIsDerivedSpace).
+	// Always false on created / joined / tracked / 1-1 spaces.
 	Derived bool
 }
 

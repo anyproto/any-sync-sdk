@@ -639,3 +639,52 @@ func TestSpaceIndexHandler_DerivedBundleSalvagesSiblings(t *testing.T) {
 	assert.True(t, rec.Derived)
 	assert.Equal(t, "from-peer", rec.Name, "siblings of the pinned key must survive: %v", res.Rejections)
 }
+
+// Derived rows refuse remoteStatus=deleted from any writer — the
+// apply-side gate the synced flag exists for. Single-path and
+// multi-field forms; non-derived rows keep the normal delete edit
+// (TestSpaceIndexHandler_StatusActiveToDeletedPasses).
+func TestSpaceIndexHandler_DerivedRefusesDeletedStatus(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-derived-tomb"
+	create := arena.NewObject()
+	create.Set(techspace.FieldType, arena.NewString("any.space"))
+	create.Set(techspace.FieldDerived, arena.NewTrue())
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		crdt.Op{Type: crdt.OpSet, Payload: create},
+	)))
+
+	// Single-path tombstone write dropped.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusDeleted)},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+
+	// Multi-field bundle: tombstone shed, sibling applies.
+	bundle := arena.NewObject()
+	bundle.Set(techspace.FieldRemoteStatus, arena.NewString(techspace.StatusDeleted))
+	bundle.Set(techspace.FieldName, arena.NewString("still-here"))
+	_, err = ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: bundle},
+	))
+	require.NoError(t, err)
+
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.NotEqual(t, techspace.StatusDeleted, rec.RemoteStatus, "derived row must not be tombstoned")
+	assert.Equal(t, "still-here", rec.Name)
+
+	// Other status values still writable (e.g. archived).
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusArchived)},
+	)))
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.Equal(t, techspace.StatusArchived, rec.RemoteStatus)
+}

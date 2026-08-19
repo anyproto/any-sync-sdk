@@ -98,9 +98,14 @@ type AclSpaceClient interface {
   recreate the space with fresh history under the same id (history replacement),
   and the sticky deleted tombstone would wedge the account's well-known derived
   id forever. The deriving account's row carries a synced set-once `derived`
-  flag (surfaced as `SpaceInfo.Derived`); a joiner of someone else's derived
-  space never gets the flag — they cannot re-derive it, so removal stays
-  allowed. 1-1 spaces keep their own re-derivable local-delete path.
+  flag (surfaced as `SpaceInfo.Derived`; healed onto pre-flag rows by
+  re-running Derive); a joiner of someone else's derived space never gets the
+  flag — they cannot re-derive it, so removal stays allowed. 1-1 spaces keep
+  their own re-derivable local-delete path. Enforcement is layered: `Delete`
+  refuses flagged rows (and the tech-space id — `ErrIsTechSpace`), the
+  space-index handler rejects `remoteStatus=deleted` on flagged rows from any
+  writer, and the deletion reconciler exempts them (a coordinator `NotExists`
+  for a space derived offline must not tombstone it).
 
 ### Source files
 - `any-sync/commonspace/space.go` — Space interface

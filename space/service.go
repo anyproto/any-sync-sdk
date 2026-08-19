@@ -39,8 +39,8 @@ var ErrReadOnlySpace = errors.New("space: read-only")
 var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pending")
 
 // ErrSpaceUnknown is returned by id-addressed Service methods (Get,
-// SetSettings, the accept/decline families) when the spaceId has no
-// row in the account's space index.
+// Delete, SetSettings, the accept/decline families) when the spaceId
+// has no row in the account's space index.
 var ErrSpaceUnknown = errors.New("unknown space")
 
 // ErrJoinPending is returned by Join after the RequestToJoin was
@@ -85,6 +85,11 @@ var ErrIsTechSpace = errors.New("cannot track the tech space")
 // re-derive would recreate the space with fresh history under the
 // same id — history replacement — and the sticky deleted tombstone
 // would otherwise wedge the account's well-known derived id forever.
+// The deriving account's row carries a synced set-once `derived` flag
+// (surfaced as SpaceInfo.Derived) that every enforcement point keys
+// on; a joiner of someone else's derived space never gets the flag —
+// they cannot re-derive it, so their removal stays allowed. 1-1
+// spaces keep their own re-derivable delete path.
 var ErrIsDerivedSpace = errors.New("derived spaces cannot be deleted")
 
 // ErrBadSpaceType is returned by Create when CreateRequest.SpaceType
@@ -226,7 +231,8 @@ type Service interface {
 	// flags the space as deleted on the network; for 1-1 spaces it is
 	// local-only (the space is always re-derivable). The record stays
 	// in List with Status = StatusDeleted. Seed-derived spaces are
-	// refused with ErrIsDerivedSpace — they are permanent.
+	// refused with ErrIsDerivedSpace (permanent), the tech space with
+	// ErrIsTechSpace, and an id with no index row with ErrSpaceUnknown.
 	Delete(ctx context.Context, spaceId string) error
 
 	// SetSettings patches the account-private per-space client settings

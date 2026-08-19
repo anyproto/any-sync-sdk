@@ -81,12 +81,17 @@ Records with fields:
   against live ACL state before returning it. Distinct from `guestKey` so an
   issuer's own row never reads as guest-mode.
 - `derived` — synced (`ScopeSynced`) set-once bool: marks a row written by the
-  account's own `Spaces().Derive`. Gates the `Delete` refusal
-  (`space.ErrIsDerivedSpace`) — derived spaces are permanent, since their
-  deterministic id makes delete + re-derive a history replacement and the
-  sticky tombstone would wedge the well-known id forever. Pinned once true
-  (the handler drops later edits, like `type`). Absent on created / joined /
-  tracked / 1-1 rows; surfaced as `SpaceInfo.Derived`.
+  account's own `Spaces().Derive` (stamped at row create; healed onto a
+  pre-existing unflagged row by re-running Derive — `SetDerived`). Gates every
+  delete refusal for derived spaces (why they are permanent:
+  `space.ErrIsDerivedSpace`): `Service.Delete` refuses flagged rows, the
+  handler additionally rejects `remoteStatus=deleted` on them from ANY writer
+  (so a pre-flag peer's synced tombstone is dropped on apply), and the
+  deletion reconciler skips them entirely — a coordinator `NotExists` is
+  expected for a space derived offline before its first push and must not
+  tombstone the row. Pinned once true (the handler drops later edits, like
+  `type`). Absent on created / joined / tracked / 1-1 rows; surfaced as
+  `SpaceInfo.Derived`.
 - etc.
 
 ### Account Preferences (derived object, postponed)

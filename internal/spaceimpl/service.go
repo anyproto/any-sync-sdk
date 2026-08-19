@@ -768,13 +768,20 @@ func (s *Service) SyncSpaceList(ctx context.Context) error {
 // head-sync round with no parked trees (same convergence test as
 // inboxReplayGuard), retrying rounds until ctx expires. SyncHeads
 // no-ops (nil) on a not-open tech space — that must read as "not
-// ready", not as a clean round.
+// ready", not as a clean round. A nil round alone is NOT proof of
+// convergence — any-sync's diffsyncer swallows per-peer sync failures
+// and returns nil — so the gate also requires the tracker rollup to
+// report Synced: that flips only on HeadsApply from a responsible
+// peer, stays Syncing on a swallowed failure, and reads Offline with
+// no peers, which is exactly the "empty list because nothing was
+// fetched" case this gate must not bless.
 func (s *Service) WaitListSynced(ctx context.Context) error {
 	backoff := time.Second
 	for {
 		if s.tsp.SpaceId() != "" &&
 			s.tsp.SyncHeads(ctx) == nil &&
-			s.app.ParkedTreeCount(s.tsp.SpaceId()) == 0 {
+			s.app.ParkedTreeCount(s.tsp.SpaceId()) == 0 &&
+			s.app.SyncStatus().Status(s.tsp.SpaceId()).State == space.SyncStateSynced {
 			return nil
 		}
 		select {

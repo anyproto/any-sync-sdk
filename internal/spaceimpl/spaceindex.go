@@ -255,19 +255,19 @@ func (s *spaceImpl) SpaceIndexObjectId() string {
 // arrived and the bundles registry is readable. Offline-first: when the
 // seed row is already local it returns without touching the network.
 // Otherwise it forces head-sync rounds until the row lands or ctx
-// expires. The Derive each round materializes the tree (idempotent —
-// same deterministic id everywhere) and runs ColdRestore, so state that
-// head-synced before this device booted is projected too, not just
-// live-listener arrivals.
+// expires. Read-only: the tree is loaded (Store.Get runs ColdRestore,
+// so pre-boot head-synced state projects too), never derived — a wait
+// primitive must not create trees, least of all on read-only/guest
+// spaces where the write gate would refuse the same effect.
 func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
 	objectId, err := s.parent.spaceIndexObjectIdFor(ctx, s.id)
 	if err != nil {
 		return err
 	}
+	var lastErr error
 	projected := func(ctx context.Context) bool {
-		if _, derr := s.store.Derive(ctx, spaceobjects.DeriveOpts{
-			ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
-		}); derr != nil {
+		if _, gerr := s.store.Get(ctx, objectId); gerr != nil {
+			lastErr = gerr // tree not arrived yet, or a real failure — keep waiting, report on timeout
 			return false
 		}
 		return spaceIndexHasNamespace(ctx, s.store, objectId)
@@ -277,14 +277,17 @@ func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
 	}
 	backoff := time.Second
 	for {
-		// Best-effort: an offline round errors and we keep waiting —
-		// the caller's ctx is the only deadline.
-		_ = s.app.SyncHeads(ctx, s.id)
+		if serr := s.app.SyncHeads(ctx, s.id); serr != nil {
+			lastErr = serr // offline round — keep waiting; the caller's ctx is the only deadline
+		}
 		if projected(ctx) {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
+			}
 			return ctx.Err()
 		case <-time.After(backoff):
 		}

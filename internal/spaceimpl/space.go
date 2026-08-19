@@ -17,6 +17,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -264,7 +265,12 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 // written only by the SDK's files layer (its change shapes are fixed
 // and its object class ships changes unencrypted).
 func checkPublicDataset(dataset string) error {
-	if dataset == payloads.Dataset {
+	// bundles: registry writes go through the typed BundlesAPI only — a
+	// raw Modify could assert an arbitrary winner (passing the handler's
+	// claim invariant) and turn the genuine root into a deletable
+	// "loser", and a raw Delete would be signed into the DAG before the
+	// apply-time rejection.
+	if dataset == payloads.Dataset || dataset == spaceindex.BundlesDataset {
 		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
 	}
 	return nil

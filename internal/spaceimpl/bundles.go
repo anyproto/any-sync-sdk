@@ -11,9 +11,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -25,14 +27,30 @@ import (
 
 type bundlesAPI struct {
 	parent *spaceImpl
-	// mu serializes local Ensure calls (read-then-write). Cross-device
-	// races are the CRDT's job; this only stops one process from
-	// installing the same bundle twice in parallel.
-	mu sync.Mutex
+	// locks serialize local Ensure calls per bundle id (read-then-
+	// write). Cross-device races are the CRDT's job; this only stops
+	// one process from installing the same bundle twice in parallel.
+	// Per-id — NewRoot runs under its own bundle's lock only, so a
+	// composite install may Ensure OTHER bundles from inside NewRoot
+	// and a slow NewRoot doesn't stall unrelated installs. Same-id
+	// reentry from NewRoot still self-deadlocks: don't.
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
 }
 
 func newBundlesAPI(parent *spaceImpl) *bundlesAPI {
-	return &bundlesAPI{parent: parent}
+	return &bundlesAPI{parent: parent, locks: map[string]*sync.Mutex{}}
+}
+
+func (b *bundlesAPI) lockFor(bundleId string) *sync.Mutex {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	l := b.locks[bundleId]
+	if l == nil {
+		l = &sync.Mutex{}
+		b.locks[bundleId] = l
+	}
+	return l
 }
 
 // indexObj returns the resident spaceIndex object, materializing the
@@ -54,21 +72,26 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	if err := b.parent.writeGate(ctx); err != nil {
 		return space.Bundle{}, err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	l := b.lockFor(req.Id)
+	l.Lock()
+	defer l.Unlock()
 
 	obj, err := b.indexObj(ctx)
 	if err != nil {
 		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
 	}
 
-	// Adopt path: a live record with a winner means the bundle is
-	// installed — locally-known state; the winner may still flip when
-	// a concurrent remote install syncs in (callers re-read after
-	// sync, see the public contract).
+	// Adopt path: a live record whose winner's tree is not deleted
+	// means the bundle is installed — locally-known state; the winner
+	// may still flip when a concurrent remote install syncs in
+	// (callers re-read after sync, see the public contract). A DELETED
+	// winner reads as uninstalled — otherwise the bundle id would be
+	// permanently wedged (record deletes are rejected, rootId has no
+	// unset, ResolveLoser refuses the winner) — and falls through to a
+	// fresh install.
 	if row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id); liveBundleRow(row) {
 		bd := decodeBundleRecord(row)
-		if bd.RootId != "" {
+		if bd.RootId != "" && !b.winnerDeleted(ctx, &bd) {
 			b.fillLosers(ctx, &bd)
 			return bd, nil
 		}
@@ -82,17 +105,30 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: NewRoot returned an empty id", space.ErrBundleBadRequest)
 	}
 	// A derived root would make a losing install unresolvable —
-	// derived trees cannot be deleted. Best-effort check: status
-	// unknown (tree not present locally) passes.
-	if derived, present, derr := b.parent.store.TreeIsDerived(ctx, rootId); derr == nil && present && derived {
+	// derived trees cannot be deleted. Fail closed: the honest path
+	// (Objects().Create in this space) materializes storage
+	// synchronously, so an absent entry or a read error means the input
+	// is wrong, and letting it through would plant a permanently
+	// unresolvable Losers entry on every device if it loses a race.
+	derived, present, derr := b.parent.store.TreeIsDerived(ctx, rootId)
+	if derr != nil {
+		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: verify root %q: %w", rootId, derr)
+	}
+	if !present {
+		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: root %q has no local tree — create it with Objects().Create in this space", space.ErrBundleBadRequest, rootId)
+	}
+	if derived {
 		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: root %q is a derived object — bundle roots must be created, not derived", space.ErrBundleBadRequest, rootId)
 	}
 	// Stamp the root with the bundle name so its tree always carries a
 	// non-root change: any-sync's head-sync diff skips root-only trees,
 	// and an unsyncable loser root could never be resolved from another
-	// device. Best-effort — an app that already wrote into the root is
-	// covered either way.
-	b.stampRootName(ctx, rootId, req)
+	// device. Must succeed BEFORE the registering write — registering
+	// an unstamped (possibly forever-unsyncable) root would plant a
+	// loser no other device can ever resolve.
+	if err := b.stampRootName(ctx, rootId, req); err != nil {
+		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
+	}
 
 	arena := &anyenc.Arena{}
 	var ops []crdt.Op
@@ -145,6 +181,12 @@ func (b *bundlesAPI) Get(ctx context.Context, bundleId string) (space.Bundle, er
 		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
 	}
 	bd := decodeBundleRecord(row)
+	// A deleted winner = uninstalled (matches Ensure's adopt gate) —
+	// reporting the dead RootId as live would send callers deriving
+	// children from a tombstoned parent.
+	if bd.RootId == "" || b.winnerDeleted(ctx, &bd) {
+		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: %q (no live install)", space.ErrBundleUnknown, bundleId)
+	}
 	b.fillLosers(ctx, &bd)
 	return bd, nil
 }
@@ -161,10 +203,22 @@ func (b *bundlesAPI) List(ctx context.Context) ([]space.Bundle, error) {
 	out := make([]space.Bundle, 0, len(rows))
 	for _, v := range rows {
 		bd := decodeBundleRecord(v)
+		if bd.RootId == "" || b.winnerDeleted(ctx, &bd) {
+			continue // uninstalled — same gate as Get
+		}
 		b.fillLosers(ctx, &bd)
 		out = append(out, bd)
 	}
 	return out, nil
+}
+
+// winnerDeleted reports whether the record's winning root tree is
+// deleted. Unknown status (read error) counts as live — a spurious
+// "uninstalled" would trigger a duplicate install, which is worse than
+// briefly adopting a dead winner.
+func (b *bundlesAPI) winnerDeleted(ctx context.Context, bd *space.Bundle) bool {
+	deleted, err := b.parent.store.TreeDeleted(ctx, bd.RootId)
+	return err == nil && deleted
 }
 
 func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {
@@ -180,7 +234,7 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
 	}
 	bd := decodeBundleRecord(row)
-	if bd.RootId == "" || loserRootId == bd.RootId || !containsString(bd.Roots, loserRootId) {
+	if bd.RootId == "" || loserRootId == bd.RootId || !slices.Contains(bd.Roots, loserRootId) {
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleNotLoser, loserRootId)
 	}
 	if deleted, derr := b.parent.store.TreeDeleted(ctx, loserRootId); derr == nil && deleted {
@@ -203,13 +257,11 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 
 // stampRootName writes `any.name` on a freshly created bundle root.
 // Load-bearing despite looking cosmetic: it guarantees the root tree
-// carries a non-root change (see the Ensure call site). Best-effort —
-// on failure the install proceeds; an app write into the root covers
-// the same need.
-func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space.EnsureBundleRequest) {
+// carries a non-root change (see the Ensure call site).
+func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space.EnsureBundleRequest) error {
 	obj, err := b.parent.store.Get(ctx, rootId)
 	if err != nil {
-		return
+		return err
 	}
 	name := req.Name
 	if name == "" {
@@ -220,9 +272,9 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 	payload.Set("any.name", arena.NewString(name))
 	dataVersion, err := b.parent.store.DataVersion(properties.Dataset)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = obj.LocalWrite(ctx, crdt.Change{
+	res, err := obj.LocalWrite(ctx, crdt.Change{
 		Dataset:     properties.Dataset,
 		DataVersion: dataVersion,
 		Records: []crdt.RecordChange{{
@@ -231,12 +283,22 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
 		}},
 	})
+	if err != nil {
+		return err
+	}
+	if len(res.Rejections) > 0 {
+		return fmt.Errorf("write rejected: %w", res.Rejections[0].Err)
+	}
+	return nil
 }
 
 // readIndexObj is the read-path loader: no derive, no tree creation.
-// A missing spaceIndex tree (legacy space never seeded, joiner before
-// first sync) reads as "no registry" — mapped to ErrBundleUnknown so
-// callers distinguish it from infrastructure errors.
+// ONLY a genuinely missing spaceIndex tree (legacy space never seeded,
+// joiner before first sync) reads as "no registry" / ErrBundleUnknown;
+// every other failure (ctx cancellation, closed DB, poisoned ocache
+// load) propagates as an infrastructure error — flattening those to
+// "unknown" would make List report an empty registry and callers
+// re-run setup, minting a duplicate root.
 func (b *bundlesAPI) readIndexObj(ctx context.Context) (*object.Object, error) {
 	objectId, err := b.parent.parent.spaceIndexObjectIdFor(ctx, b.parent.id)
 	if err != nil {
@@ -244,7 +306,10 @@ func (b *bundlesAPI) readIndexObj(ctx context.Context) (*object.Object, error) {
 	}
 	obj, err := b.parent.store.Get(ctx, objectId)
 	if err != nil {
-		return nil, fmt.Errorf("spaceimpl: bundles: %w: spaceIndex object not available: %v", space.ErrBundleUnknown, err)
+		if errors.Is(err, treestorage.ErrUnknownTreeId) {
+			return nil, fmt.Errorf("spaceimpl: bundles: %w: spaceIndex tree not present locally: %v", space.ErrBundleUnknown, err)
+		}
+		return nil, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
 	}
 	return obj, nil
 }
@@ -296,13 +361,4 @@ func decodeBundleRecord(v *anyenc.Value) space.Bundle {
 		}
 	}
 	return bd
-}
-
-func containsString(list []string, want string) bool {
-	for _, s := range list {
-		if s == want {
-			return true
-		}
-	}
-	return false
 }

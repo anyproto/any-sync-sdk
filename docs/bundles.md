@@ -92,6 +92,17 @@ everything else in the setup is derived from it with
 
 ## Known edges
 
+- A deleted winning root reads as **uninstalled** on every surface
+  (Get/List report absent, Ensure reinstalls fresh) — without this the
+  bundle id would be permanently wedged, since record deletes are
+  rejected and `rootId` has no unset.
+- The `bundles` dataset is fenced off the public Modify/Delete surface
+  (like `payloads`); writes go through the typed API only.
+- The dataset name `bundles` is reserved retroactively: a pre-existing
+  runtime dataset with that name (legal before this shipped) is
+  shadowed by the built-in. Accepted without migration — pre-release
+  decision.
+
 - Crash between `NewRoot` and the registering write leaves one
   unreferenced object; the retried Ensure installs a fresh root. The
   orphan is unlisted junk, not a conflict.

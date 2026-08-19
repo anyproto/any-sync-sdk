@@ -186,6 +186,43 @@ func TestBundlesHandler_Validation(t *testing.T) {
 	})
 }
 
+// The create branch runs only BeforeCreate, so the per-op rules must
+// hold there too: a FIRST change carrying a `$set roots` (which would
+// stamp _ver[roots] and version-gate out later legitimate claims) must
+// drop the whole record.
+func TestBundlesApply_InvalidCreateDropped(t *testing.T) {
+	lx := lexid.Must(lexid.CharsAllNoEscape, 4, 100)
+	v1 := lx.Next("")
+	v2 := lx.Next(v1)
+
+	ctrl := newBundlesController(t)
+	arena := &anyenc.Arena{}
+	attack := crdt.Change{
+		ObjectId:    "spaceIndexObj",
+		Dataset:     spaceindex.BundlesDataset,
+		VersionId:   crdt.VersionId(v1),
+		DataVersion: spaceindex.BundlesHandlerVersion,
+		Records: []crdt.RecordChange{{
+			Id:     "bao/v1",
+			Upsert: true,
+			Ops: []crdt.Op{
+				{Type: crdt.OpSet, Path: []string{spaceindex.FieldBundleRoots}, Payload: arena.NewArray()},
+				{Type: crdt.OpSet, Path: []string{spaceindex.FieldBundleRootId}, Payload: arena.NewString("unclaimed")},
+			},
+		}},
+	}
+	require.NoError(t, ctrl.ApplyChange(ctx, attack))
+	require.Nil(t, ctrl.Get(ctx, spaceindex.BundlesDataset, "bao/v1"),
+		"invalid create must drop the whole record")
+
+	// A later legitimate install must land untainted.
+	require.NoError(t, ctrl.ApplyChange(ctx, installChange(crdt.VersionId(v2), "bao/v1", "Bao", "rootA")))
+	rec := ctrl.Get(ctx, spaceindex.BundlesDataset, "bao/v1")
+	require.NotNil(t, rec)
+	assert.Equal(t, "rootA", rec.GetString(spaceindex.FieldBundleRootId))
+	assert.Equal(t, []string{"rootA"}, rootsOf(t, rec))
+}
+
 // Invalid ops are dropped per-op at apply time — a hostile or buggy
 // writer cannot shrink the claim set through the DAG route.
 func TestBundlesApply_InvalidOpsDropped(t *testing.T) {

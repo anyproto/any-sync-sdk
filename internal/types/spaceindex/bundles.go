@@ -63,9 +63,21 @@ type BundlesHandler struct{}
 
 func (BundlesHandler) Init(_ context.Context) error { return nil }
 
+// BeforeCreate runs the full per-op rules over the whole change: the
+// apply pipeline runs ONLY BeforeCreate on a record's first change (no
+// per-op BeforeModify), so every invariant must hold here too or it is
+// unenforced exactly once per bundle id — and a first-change `$set
+// roots` would stamp _ver[roots] and gate out legitimate claims
+// forever. An invalid op drops the whole RecordChange (per-record
+// hook), which is the right granularity for a malformed create.
 func (BundlesHandler) BeforeCreate(_ *crdt.ChangeCtx, rec *crdt.RecordChange, _ *crdt.Sink) error {
 	if rec.Id == "" {
 		return fmt.Errorf("%w: empty bundle id", crdt.ErrValidation)
+	}
+	for i := range rec.Ops {
+		if err := validateBundleOp(rec, &rec.Ops[i]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -74,6 +86,12 @@ func (BundlesHandler) BeforeModify(_ *crdt.ChangeCtx, rec *crdt.RecordChange, op
 	if rec.Id == "" {
 		return fmt.Errorf("%w: empty bundle id", crdt.ErrValidation)
 	}
+	return validateBundleOp(rec, op)
+}
+
+// validateBundleOp is the single per-op rule set, shared by the create
+// and modify hooks.
+func validateBundleOp(rec *crdt.RecordChange, op *crdt.Op) error {
 	// Explicit single-field paths only. A root-level multi-field $set
 	// (empty path) decomposes per-key at apply time and could smuggle a
 	// `roots` replace past the per-field rules below.

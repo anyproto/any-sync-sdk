@@ -85,7 +85,10 @@ type BundlesAPI interface {
 	Ensure(ctx context.Context, req EnsureBundleRequest) (Bundle, error)
 
 	// Get returns the bundle row. ErrBundleUnknown when no live record
-	// exists (as of local state — sync first for a network answer).
+	// exists OR the winning root's tree is deleted — a dead winner
+	// reads as uninstalled everywhere (Get, List, Ensure's adopt gate),
+	// and the next Ensure reinstalls with a fresh root. As of local
+	// state — sync first for a network answer.
 	Get(ctx context.Context, bundleId string) (Bundle, error)
 
 	// List returns every live bundle row.

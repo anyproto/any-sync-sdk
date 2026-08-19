@@ -22,7 +22,7 @@ func articleDatasetDraft() space.DatasetDraft {
 		DisplayName: "Articles",
 		IdRule:      space.IdUser,
 		DeleteBy:    space.DeleteByAuthor,
-		Search:      &space.SearchFields{Title: "title", Text: "body"},
+		Search:      &space.SearchFields{Title: "title", Text: "body", Scope: "articles"},
 		Fields: []space.DatasetFieldDraft{
 			{Key: "title", Kind: space.PropertyKindString, Required: true},
 			{Key: "body", Kind: space.PropertyKindString, MutableBy: space.MutableByAuthor},
@@ -79,6 +79,8 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.Equal(t, "articles", def.Name)
 	assert.Equal(t, space.IdUser, def.IdRule)
 	assert.Equal(t, space.DeleteByAuthor, def.DeleteBy)
+	require.NotNil(t, def.Search)
+	assert.Equal(t, "articles", def.Search.Scope)
 	require.Len(t, def.Fields, 6)
 
 	// Discovery includes the runtime dataset with its owning type.
@@ -88,6 +90,7 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 			discovered = true
 			assert.Equal(t, typeId, ds.TypeId)
 			assert.Contains(t, string(ds.JSONSchema), `"x-search"`)
+			assert.Contains(t, string(ds.JSONSchema), `"scope":"articles"`)
 		}
 	}
 	assert.True(t, discovered, "Datasets() must list the runtime dataset")

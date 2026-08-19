@@ -48,7 +48,7 @@ const (
 	DefFieldIdMaxLen    = "idMaxLen"    // number (head), pinned
 	DefFieldDeleteBy    = "deleteBy"    // "anyone"/"author" (head), pinned
 	DefFieldSkipHistory = "skipHistory" // bool (head), pinned
-	DefFieldSearch      = "search"      // {title,text} (head); leaves mutable
+	DefFieldSearch      = "search"      // {title,text,scope} (head); leaves mutable
 	DefFieldDisplayName = "displayName" // human label (head), mutable
 	DefFieldDataset     = "dataset"     // owning head record id (field), pinned
 	DefFieldStamp       = "stamp"       // "creator"/"createTime"/"modifyTime" (field), pinned
@@ -62,6 +62,7 @@ const (
 const (
 	SearchKeyTitle = "title"
 	SearchKeyText  = "text"
+	SearchKeyScope = "scope"
 )
 
 // reservedDatasetNames are collection names a user dataset-def may not
@@ -104,7 +105,7 @@ func isDatasetDefPinnedPath(path []string) bool {
 		if len(path) != 2 {
 			return true // broad `search` replace or a deeper path
 		}
-		return path[1] != SearchKeyTitle && path[1] != SearchKeyText
+		return path[1] != SearchKeyTitle && path[1] != SearchKeyText && path[1] != SearchKeyScope
 	}
 	return true
 }

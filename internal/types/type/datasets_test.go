@@ -157,6 +157,7 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		{Type: crdt.OpSet, Path: []string{typetype.FieldDescription}, Payload: arena.NewString("descr")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyTitle}, Payload: arena.NewString("title")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: arena.NewString("body")},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyScope}, Payload: arena.NewString("notes")},
 		{Type: crdt.OpUnset, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}},
 	}
 	for i, op := range mutable {

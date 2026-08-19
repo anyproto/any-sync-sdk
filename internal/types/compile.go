@@ -162,6 +162,7 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 				sf := &schema.SearchFields{
 					Title: s.GetString("title"),
 					Text:  s.GetString("text"),
+					Scope: s.GetString("scope"),
 				}
 				if sf.Title != "" || sf.Text != "" {
 					h.search = sf

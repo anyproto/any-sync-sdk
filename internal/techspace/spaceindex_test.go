@@ -551,3 +551,91 @@ func TestSpaceIndexHandler_IssuedInviteKeysPerKind(t *testing.T) {
 	assert.Empty(t, rec.IssuedInviteKey(techspace.IssuedKeyMember))
 	assert.Equal(t, "enc-guest", rec.IssuedInviteKey(techspace.IssuedKeyGuest))
 }
+
+// ----------------------------------------------------------------------------
+// `derived` — stamped at create, pinned once true
+// ----------------------------------------------------------------------------
+
+func TestSpaceIndexHandler_DerivedSetOnce(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-derived"
+	create := arena.NewObject()
+	create.Set(techspace.FieldType, arena.NewString("any.space"))
+	create.Set(techspace.FieldDerived, arena.NewTrue())
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		crdt.Op{Type: crdt.OpSet, Payload: create},
+	)))
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	require.True(t, rec.Derived, "create must land the flag")
+
+	// Clearing the flag is dropped — pinned once true.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDerived}, Payload: arena.NewFalse()},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.True(t, rec.Derived, "flag pinned after create")
+
+	// Unset is dropped too.
+	res, err = ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{techspace.FieldDerived}},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.True(t, rec.Derived, "flag survives unset attempt")
+}
+
+func TestSpaceIndexRecord_DerivedEncodeDecode(t *testing.T) {
+	arena := &anyenc.Arena{}
+	// EncodeCreate includes the flag only when set.
+	withFlag := techspace.SpaceIndexRecord{Id: "s1", Type: "any.space", Derived: true}.EncodeCreate(arena)
+	assert.True(t, withFlag.GetBool(techspace.FieldDerived))
+	withoutFlag := techspace.SpaceIndexRecord{Id: "s2", Type: "any.space"}.EncodeCreate(arena)
+	assert.Nil(t, withoutFlag.Get(techspace.FieldDerived), "unset flag must be omitted, not false")
+
+	// A non-derived row decodes false.
+	ctrl := newSpaceIndexController(t)
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "space-plain", true,
+		setMulti(arena, map[string]string{techspace.FieldType: "any.space"}),
+	)))
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, "space-plain"))
+	assert.False(t, rec.Derived)
+}
+
+// A replayed derive-create bundle (concurrent Derive on two devices:
+// the second device's create replays as an upsert-modify) sheds only
+// the pinned `derived` key; siblings still apply.
+func TestSpaceIndexHandler_DerivedBundleSalvagesSiblings(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-derived-replay"
+	create := arena.NewObject()
+	create.Set(techspace.FieldType, arena.NewString("any.space"))
+	create.Set(techspace.FieldDerived, arena.NewTrue())
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		crdt.Op{Type: crdt.OpSet, Payload: create},
+	)))
+
+	replay := arena.NewObject()
+	replay.Set(techspace.FieldDerived, arena.NewTrue())
+	replay.Set(techspace.FieldName, arena.NewString("from-peer"))
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: replay},
+	))
+	require.NoError(t, err)
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.True(t, rec.Derived)
+	assert.Equal(t, "from-peer", rec.Name, "siblings of the pinned key must survive: %v", res.Rejections)
+}

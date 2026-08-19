@@ -93,6 +93,14 @@ type AclSpaceClient interface {
 ### Derived Spaces
 - `DeriveSpace()` — deterministic from keys (used for tech space)
 - `DeriveOneToOneSpace()` — shared space between two users, same ID regardless of key order
+- **Seed-derived spaces are permanent** — `Spaces().Delete` refuses them with
+  `space.ErrIsDerivedSpace`. The deterministic id means delete + re-derive would
+  recreate the space with fresh history under the same id (history replacement),
+  and the sticky deleted tombstone would wedge the account's well-known derived
+  id forever. The deriving account's row carries a synced set-once `derived`
+  flag (surfaced as `SpaceInfo.Derived`); a joiner of someone else's derived
+  space never gets the flag — they cannot re-derive it, so removal stays
+  allowed. 1-1 spaces keep their own re-derivable local-delete path.
 
 ### Source files
 - `any-sync/commonspace/space.go` — Space interface

@@ -556,6 +556,18 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 	list, err := sdk.Spaces().List(ctx)
 	require.NoError(t, err)
 	require.Len(t, list, 2)
+
+	// Derived spaces are permanent: Delete refuses, the row stays
+	// active and carries the flag.
+	err = sdk.Spaces().Delete(ctx, sp1.Id())
+	require.ErrorIs(t, err, space.ErrIsDerivedSpace)
+	list, err = sdk.Spaces().List(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2, "refused delete must not tombstone the row")
+	for _, info := range list {
+		assert.True(t, info.Derived, "derived rows carry the flag")
+		assert.Equal(t, space.StatusActive, info.Status)
+	}
 }
 
 // TestSDK_Spaces_DeriveId confirms DeriveId is a pure, side-effect-free

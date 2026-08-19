@@ -815,6 +815,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		OwnRole:     r.OwnRole,
 		Settings:    r.Settings,
 		PushKeys:    r.PushKeys,
+		Derived:     r.Derived,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
@@ -898,7 +899,18 @@ func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
 // delete to the account's other devices — each offloads its local copy —
 // while the row stays re-creatable (a later OneToOne(peer) flips it back to
 // active). No coordinator SpaceDelete is ever sent.
+//
+// Seed-derived spaces (rows flagged FieldDerived) are refused outright
+// with space.ErrIsDerivedSpace — they are permanent.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Derived {
+		// Seed-derived spaces are permanent: the deterministic id means
+		// delete + re-derive would replace history, and the sticky
+		// tombstone would wedge the well-known id for the account's
+		// lifetime. (1-1 rows never carry the flag — they keep their
+		// re-derivable delete path below.)
+		return space.ErrIsDerivedSpace
+	}
 	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Type == space.SpaceTypeOneToOne {
 		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.OneToOneDeletedStatus); err != nil {
 			return fmt.Errorf("spaceimpl: mark 1-1 deleted: %w", err)
@@ -1084,6 +1096,9 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
+			// Synced, so every device of the account sees the flag and
+			// refuses Delete — not just the device that ran Derive.
+			Derived: true,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 		}

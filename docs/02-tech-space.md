@@ -80,6 +80,13 @@ Records with fields:
   before the clear synced) is hidden by the read paths, which verify it
   against live ACL state before returning it. Distinct from `guestKey` so an
   issuer's own row never reads as guest-mode.
+- `derived` — synced (`ScopeSynced`) set-once bool: marks a row written by the
+  account's own `Spaces().Derive`. Gates the `Delete` refusal
+  (`space.ErrIsDerivedSpace`) — derived spaces are permanent, since their
+  deterministic id makes delete + re-derive a history replacement and the
+  sticky tombstone would wedge the well-known id forever. Pinned once true
+  (the handler drops later edits, like `type`). Absent on created / joined /
+  tracked / 1-1 rows; surfaced as `SpaceInfo.Derived`.
 - etc.
 
 ### Account Preferences (derived object, postponed)

@@ -539,13 +539,15 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 	t.Cleanup(func() { _ = sdk.Close() })
 
 	seed := []byte("project:demo:2026-05")
-	sp1, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed})
+	sp1, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed, Name: "Demo"})
 	require.NoError(t, err)
 	require.NotEmpty(t, sp1.Id())
+	assert.Equal(t, "Demo", sp1.Info().Name, "first materialization writes the name")
 
 	sp2, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed})
 	require.NoError(t, err)
-	assert.Equal(t, sp1.Id(), sp2.Id(), "Derive must be idempotent for the same seed")
+	assert.Equal(t, sp1.Id(), sp2.Id(), "Derive must be idempotent for the same seed — the name is not part of the id")
+	assert.Equal(t, "Demo", sp2.Info().Name, "re-derive keeps existing metadata")
 
 	// Different seed → different space.
 	sp3, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: []byte("different")})

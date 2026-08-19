@@ -367,6 +367,13 @@ type DeriveRequest struct {
 	// stays SpaceTypeAny and is coordinator-gated) and not stamped into
 	// the header as the type. Empty defaults to SpaceTypeAny.
 	SpaceType string
+
+	// Name is the initial display name, written on FIRST
+	// materialization only (a pre-existing row keeps its metadata) and
+	// NOT hashed into the derivation — the id is stable regardless.
+	// Propagates into the in-space spaceIndex via the owner-side lazy
+	// seed; rename later with Space.SetMetadata.
+	Name string
 }
 
 // SpaceListEvent is delivered to Service.Subscribe callbacks.

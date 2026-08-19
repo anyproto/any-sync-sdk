@@ -1097,6 +1097,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 			Id:           spaceId,
 			Type:         space.SpaceTypeAny,
 			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
+			Name:         req.Name,
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
 			// Synced: every device of the account refuses Delete, not

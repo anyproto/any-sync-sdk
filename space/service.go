@@ -227,6 +227,16 @@ type Service interface {
 	// the round completes.
 	SyncSpaceList(ctx context.Context) error
 
+	// WaitListSynced blocks until the tech space (the account's space
+	// list) has completed a clean head-sync round with no trees parked
+	// for retry — the restore-path gate before deciding "does space X
+	// exist on this account" (creation-vs-restore split): after it
+	// returns, List reflects the responsible node's converged view.
+	// Retries rounds until ctx expires; unlike SyncSpaceList (one round,
+	// error verbatim) a transiently offline node keeps it waiting rather
+	// than failing.
+	WaitListSynced(ctx context.Context) error
+
 	// Delete tears down a space locally. For regular spaces this also
 	// flags the space as deleted on the network; for 1-1 spaces it is
 	// local-only (the space is always re-derivable). The record stays

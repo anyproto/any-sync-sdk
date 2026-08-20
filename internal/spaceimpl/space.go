@@ -17,6 +17,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -38,6 +39,7 @@ type spaceImpl struct {
 	properties *propertiesAPI
 	acl        *aclAPI
 	members    *membersAPI
+	bundles    *bundlesAPI
 }
 
 func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *spaceobjects.Store, parent *Service) *spaceImpl {
@@ -47,6 +49,7 @@ func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *space
 	s.properties = newPropertiesAPI(s)
 	s.acl = newACLAPI(s)
 	s.members = newMembersAPI(s)
+	s.bundles = newBundlesAPI(s)
 	return s
 }
 
@@ -146,6 +149,7 @@ func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
 
 func (s *spaceImpl) ACL() space.ACL            { return s.acl }
 func (s *spaceImpl) Members() space.MembersAPI { return s.members }
+func (s *spaceImpl) Bundles() space.BundlesAPI { return s.bundles }
 
 // SyncHeads forces an immediate head-sync (diff) round on this space
 // instead of waiting for the periodic timer. Blocks until the round
@@ -261,7 +265,12 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 // written only by the SDK's files layer (its change shapes are fixed
 // and its object class ships changes unencrypted).
 func checkPublicDataset(dataset string) error {
-	if dataset == payloads.Dataset {
+	// bundles: registry writes go through the typed BundlesAPI only — a
+	// raw Modify could assert an arbitrary winner (passing the handler's
+	// claim invariant) and turn the genuine root into a deletable
+	// "loser", and a raw Delete would be signed into the DAG before the
+	// apply-time rejection.
+	if dataset == payloads.Dataset || dataset == spaceindex.BundlesDataset {
 		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
 	}
 	return nil

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
@@ -247,6 +249,73 @@ func (s *spaceImpl) SpaceIndexObjectId() string {
 		return ""
 	}
 	return id
+}
+
+// WaitIndexSynced blocks until the local view of the spaceIndex is
+// trustworthy, via either exit:
+//
+//   - Fast path (offline-capable): the seeded metadata row is already
+//     projected locally — regular spaces get it at Create.
+//   - Converged path: a clean head-sync round with the sync-status
+//     rollup at Synced. Covers spaces that never seed metadata (1-1 /
+//     nameless derived spaces): after a converged round the network's
+//     current index state is local — including "the index tree exists
+//     nowhere yet", a valid converged answer (callers then read an
+//     empty registry), NOT a wait-forever.
+//
+// Read-only: the tree is loaded (Store.Get runs ColdRestore, so
+// pre-boot head-synced state projects too), never derived — a wait
+// primitive must not create trees, least of all on read-only/guest
+// spaces where the write gate would refuse the same effect.
+func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
+	objectId, err := s.parent.spaceIndexObjectIdFor(ctx, s.id)
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	seeded := func(ctx context.Context) bool {
+		if _, gerr := s.store.Get(ctx, objectId); gerr != nil {
+			lastErr = gerr // tree not arrived yet, or a real failure — keep waiting, report on timeout
+			return false
+		}
+		return spaceIndexHasNamespace(ctx, s.store, objectId)
+	}
+	if seeded(ctx) {
+		return nil
+	}
+	backoff := time.Second
+	for {
+		serr := s.app.SyncHeads(ctx, s.id)
+		if serr != nil {
+			lastErr = serr // offline round — keep waiting; the caller's ctx is the only deadline
+		}
+		if seeded(ctx) {
+			return nil
+		}
+		// Converged exit: a clean round + Synced rollup means the local
+		// index state IS the network's (a nil round alone is not proof —
+		// any-sync swallows per-peer failures; the rollup flips Synced
+		// only on HeadsApply from a responsible peer). Absent tree after
+		// convergence = index exists nowhere = done.
+		if serr == nil && s.app.SyncStatus().Status(s.id).State == space.SyncStateSynced {
+			_, gerr := s.store.Get(ctx, objectId)
+			if gerr == nil || errors.Is(gerr, treestorage.ErrUnknownTreeId) {
+				return nil
+			}
+			lastErr = gerr
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
+			}
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 // spaceIndexHasNamespace returns true when the per-space `objects`

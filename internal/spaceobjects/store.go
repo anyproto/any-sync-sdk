@@ -71,6 +71,7 @@ var builtinDataVersions = map[string]string{
 	typetype.ShortIdsDataset:     "shortIds-v1",
 	typetype.DatasetDefs:         typetype.DatasetDefsHandlerVersion,
 	payloads.Dataset:             payloads.HandlerVersion,
+	spaceindex.BundlesDataset:    spaceindex.BundlesHandlerVersion,
 }
 
 // plaintextSpecs declares the plaintext (node-readable) object
@@ -1831,6 +1832,11 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// which is harmless (encrypted change, empty collection) and
 		// fenced off at the public Modify API anyway.
 		{Name: payloads.Dataset, Handler: payloads.Handler{}, Schema: payloads.Schema()},
+		// `bundles` — the per-space installed-bundles registry.
+		// Registered on every controller (uniform handler set); only the
+		// spaceIndex object carries rows by convention — the typed
+		// Bundles API always targets it.
+		{Name: spaceindex.BundlesDataset, Handler: spaceindex.BundlesHandler{}, Schema: spaceindex.BundlesSchema()},
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {

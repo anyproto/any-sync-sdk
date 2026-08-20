@@ -240,6 +240,12 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	if deleted, derr := b.parent.store.TreeDeleted(ctx, loserRootId); derr == nil && deleted {
 		return nil // already resolved
 	}
+	// Deletion needs the loser's local head entry (any-sync settings
+	// delete has no delete-by-id) — absent means "not synced here yet",
+	// a retryable state with its own sentinel, not a storage error.
+	if _, present, perr := b.parent.store.TreeIsDerived(ctx, loserRootId); perr == nil && !present {
+		return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, loserRootId)
+	}
 	err = b.parent.objects.Delete(ctx, loserRootId)
 	if err == nil {
 		return nil
@@ -248,11 +254,12 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	if deleted, derr := b.parent.store.TreeDeleted(ctx, loserRootId); derr == nil && deleted {
 		return nil
 	}
-	// The common cause is the loser's tree not having synced to this
-	// device yet (deletion needs the local head entry). The Ensure-time
-	// name stamp keeps every root tree syncable, so a retry after sync
-	// succeeds.
-	return fmt.Errorf("spaceimpl: bundles: delete loser %q (retry after its tree syncs): %w", loserRootId, err)
+	// Entry raced away between the probe above and the delete — same
+	// retryable state.
+	if _, present, perr := b.parent.store.TreeIsDerived(ctx, loserRootId); perr == nil && !present {
+		return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, loserRootId)
+	}
+	return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
 }
 
 // stampRootName writes `any.name` on a freshly created bundle root.

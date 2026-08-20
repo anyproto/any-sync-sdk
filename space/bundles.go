@@ -27,6 +27,10 @@ var (
 	// ErrBundleNotLoser — ResolveLoser target is not a loser of the
 	// bundle: it is the current winner, or was never claimed in roots.
 	ErrBundleNotLoser = errors.New("bundle root is not a loser")
+	// ErrLoserNotSynced — ResolveLoser target's tree has not synced to
+	// this device yet (deletion needs the local head entry). Retry
+	// after sync, or resolve from a device that holds the tree.
+	ErrLoserNotSynced = errors.New("bundle loser tree not synced locally")
 )
 
 // Bundle is one row of the bundles registry.
@@ -99,9 +103,9 @@ type BundlesAPI interface {
 	// mattered out of it. The target must be a claimed root and must
 	// not be the current winner (ErrBundleNotLoser). Idempotent: a
 	// root already deleted returns nil. Deletion needs the loser's
-	// tree synced to this device — until then the call errors and is
-	// retried after sync (or run from the device that created the
-	// loser). Never auto-invoked — loser cleanup is always an explicit
-	// caller decision.
+	// tree synced to this device — until then the call fails with
+	// ErrLoserNotSynced (retry after sync, or run from the device that
+	// created the loser). Never auto-invoked — loser cleanup is always
+	// an explicit caller decision.
 	ResolveLoser(ctx context.Context, bundleId, loserRootId string) error
 }

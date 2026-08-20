@@ -55,7 +55,7 @@ func TestDataset_MarshalBehavioralAnnotations(t *testing.T) {
 		IdRule:    IdUser,
 		IdPattern: `[a-z]+`,
 		IdMaxLen:  32,
-		Search:    &SearchFields{Title: "title", Text: "body"},
+		Search:    &SearchFields{Title: "title", Text: "body", Scope: "articles"},
 	}
 	raw, err := json.Marshal(ds)
 	require.NoError(t, err)
@@ -70,6 +70,15 @@ func TestDataset_MarshalBehavioralAnnotations(t *testing.T) {
 	search := doc["x-search"].(map[string]any)
 	assert.Equal(t, "title", search["title"])
 	assert.Equal(t, "body", search["text"])
+	assert.Equal(t, "articles", search["scope"])
+
+	// An empty scope is omitted, like every other default.
+	rawNoScope, err := json.Marshal(Dataset{Search: &SearchFields{Title: "title"}})
+	require.NoError(t, err)
+	var docNoScope map[string]any
+	require.NoError(t, json.Unmarshal(rawNoScope, &docNoScope))
+	_, hasScope := docNoScope["x-search"].(map[string]any)["scope"]
+	assert.False(t, hasScope)
 
 	props := doc["properties"].(map[string]any)
 	assert.Equal(t, "author", props["body"].(map[string]any)["x-mutable-by"])

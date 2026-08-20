@@ -218,11 +218,15 @@ func ParseDeletePolicy(label string) (DeletePolicy, bool) {
 }
 
 // SearchFields is the dataset's search-extraction annotation: which
-// field feeds the document title and which the body text. Opaque to the
-// SDK — surfaced through discovery (`x-search`) for external indexers.
+// field feeds the document title and which the body text, plus the
+// index scope the entries land under. Opaque to the SDK — surfaced
+// through discovery (`x-search`) for external indexers; Scope is a
+// free-form slug the indexer interprets (empty = the indexer's
+// default).
 type SearchFields struct {
 	Title string
 	Text  string
+	Scope string
 }
 
 // Field is one declared dataset field: a JSON-Schema value shape plus its
@@ -373,6 +377,9 @@ func (d Dataset) MarshalJSON() ([]byte, error) {
 		}
 		if d.Search.Text != "" {
 			s["text"] = d.Search.Text
+		}
+		if d.Search.Scope != "" {
+			s["scope"] = d.Search.Scope
 		}
 		doc["x-search"] = s
 	}

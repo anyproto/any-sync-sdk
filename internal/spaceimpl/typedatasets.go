@@ -155,6 +155,9 @@ func encodeDatasetHead(arena *anyenc.Arena, draft *space.DatasetDraft) *anyenc.V
 		if draft.Search.Text != "" {
 			search.Set(typetype.SearchKeyText, arena.NewString(draft.Search.Text))
 		}
+		if draft.Search.Scope != "" {
+			search.Set(typetype.SearchKeyScope, arena.NewString(draft.Search.Scope))
+		}
 		payload.Set(typetype.DefFieldSearch, search)
 	}
 	if draft.DisplayName != "" {

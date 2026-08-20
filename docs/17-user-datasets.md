@@ -38,7 +38,7 @@ Per dataset:
 | `IdRule` | `auto` (zero: ids derived from the change, the empty-id sugar) / `user` (caller ids, pattern + max length constrained) |
 | `DeleteBy` | record-delete gate: `anyone` (zero) / `author` |
 | `SkipHistory` | keep out of the version-history index (existing) |
-| `Search` | `{title, text}` field mapping, surfaced as `x-search` for external indexers; SDK-opaque |
+| `Search` | `{title, text}` field mapping plus an optional `scope` slug (which index scope the entries land under), surfaced as `x-search` for external indexers; SDK-opaque |
 
 Declaration well-formedness (`schema.ValidateDatasetDecl`, shared by
 every entry path so a bad declaration can neither register nor sync):
@@ -114,8 +114,8 @@ other. A definition is CRDT records:
   `def:"dataset"`, `collection` (the dataset name), `dynamic`,
   `idRule`/`idPattern`/`idMaxLen`, `deleteBy`, `skipHistory` — all
   pinned first-write; `displayName`, `description`, and the
-  `search.title`/`search.text` string leaves stay mutable (the
-  `format.ui`/`format.filter` model).
+  `search.title`/`search.text`/`search.scope` string leaves stay
+  mutable (the `format.ui`/`format.filter` model).
 - **Field record** (one per field; id derived from the change):
   `def:"field"`, `dataset` (owning head id), `key`, `kind`, `scope`,
   `stamp`, `required`, `mutableBy`, `items`/`properties` — pinned;
@@ -241,7 +241,7 @@ carries the owning `TypeId` (consumer indexers gate on it) and the
 JSON Schema document grows the behavioral keywords: standard
 `required`, per-field `x-mutable-by` / `x-stamp`, dataset-level
 `x-delete-by`, `x-id` / `x-id-pattern` / `x-id-max-length`, and
-`x-search {title, text}` — defaults omitted. `Types().Datasets(typeId)`
+`x-search {title, text, scope}` — defaults omitted. `Types().Datasets(typeId)`
 returns the management view (definition ids, invalid state, display
 fields).
 

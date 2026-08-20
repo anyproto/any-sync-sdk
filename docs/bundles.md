@@ -75,11 +75,12 @@ everything else in the setup is derived from it with
   split: after it returns, `List` reflects the responsible node's
   converged view (clean head-sync round, no parked trees). Retries until
   ctx expires.
-- `Space.WaitIndexSynced` — blocks until the spaceIndex object's seeded
-  state is projected locally. Returns immediately (no network) when the
-  index is already local; otherwise forces head-sync rounds. The wait
-  covers projection, not just heads (materialize + ColdRestore each
-  attempt).
+- `Space.WaitIndexSynced` — blocks until the local index view is
+  trustworthy: seeded metadata row projected locally (immediate,
+  offline-capable), or a clean head-sync round with the Synced rollup —
+  the latter covers 1-1 / nameless derived spaces that never seed
+  metadata (an absent index after convergence reads as "nothing set
+  up", not wait-forever). Covers projection, not just heads.
 
 ## Restore flow (app side)
 
@@ -106,9 +107,9 @@ everything else in the setup is derived from it with
 - Crash between `NewRoot` and the registering write leaves one
   unreferenced object; the retried Ensure installs a fresh root. The
   orphan is unlisted junk, not a conflict.
-- A space whose index was never seeded (legacy space, owner crashed
-  pre-seed) keeps `WaitIndexSynced` waiting until ctx expires; a hard
-  re-setup mechanism is future work.
+- A never-seeded index blocks `WaitIndexSynced` only while offline: a
+  converged round returns "nothing set up" and the caller reads an
+  empty registry; a hard re-setup mechanism is future work.
 - `Losers` counts a root with unknown deletion status (tree not present
   locally) as live; `ResolveLoser` re-validates and deletion is
   idempotent, so over-reporting is safe.

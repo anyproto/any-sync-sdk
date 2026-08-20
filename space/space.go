@@ -179,15 +179,17 @@ type Space interface {
 	// registry on the spaceIndex object. See BundlesAPI.
 	Bundles() BundlesAPI
 
-	// WaitIndexSynced blocks until the in-space spaceIndex object is
-	// present locally with its seeded state projected — the gate the
-	// restore path takes before reading the bundles registry ("wait for
-	// the space index, then see what is set up"). While waiting it
-	// forces head-sync rounds; when the index is already local it
-	// returns immediately without touching the network (offline-first).
-	// Bounded only by ctx — on a space whose index was never seeded
-	// (owner crashed pre-seed on a legacy space) it waits until ctx
-	// expires.
+	// WaitIndexSynced blocks until the local view of the space's index
+	// is trustworthy — the gate the restore path takes before reading
+	// the bundles registry ("wait for the space index, then see what is
+	// set up"). Two exits: the seeded metadata row is already projected
+	// locally (immediate, no network — offline-first), or a clean
+	// head-sync round completes with the sync-status rollup at Synced,
+	// which also covers spaces that never seed metadata (1-1 / nameless
+	// derived spaces) — there an absent index after convergence is the
+	// valid answer "nothing set up yet", not a wait-forever. While
+	// waiting it forces head-sync rounds; bounded only by ctx (an
+	// offline device with no local index keeps waiting).
 	WaitIndexSynced(ctx context.Context) error
 
 	// SyncHeads forces an immediate head-sync (diff) round on this

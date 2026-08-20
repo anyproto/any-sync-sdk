@@ -26,11 +26,60 @@ import (
 // peer.
 const WellKnownDeriveSeed = "builtin:type"
 
+// MetaTypeMarker is the reserved label every type object carries in
+// its `any.types` list — what distinguishes a type object from a
+// regular one (see spaceobjects.LiveTypeRowsFilter).
+//
+// TypeId is the meta-type's id: the namespace its type-only property
+// values live under (`record.type.xkey`) and the id surfaced through
+// Space.Types(). The two differ because a `_`-prefixed top-level field
+// is protocol-owned (crdt.validatePath), so the marker cannot double
+// as a storage namespace.
+//
+// Both are reserved — user-derived type ids are content-addressable
+// and never produce either string.
+const (
+	MetaTypeMarker = "__type__"
+	TypeId         = "type"
+)
+
 // Display metadata for the `type` meta-type object.
 const (
 	Name        = "Type"
 	Description = "A type — defines properties (and optionally datasets) for the objects that implement it"
 )
+
+// FieldXKeyProp is the property id of the meta-type's `xkey` — the
+// caller-side programmatic handle for the type itself, stored at
+// `record.type.xkey`. Distinct from FieldXKey (`x-key`), which is the
+// same idea one level down, on a property DEFINITION record.
+const FieldXKeyProp = "xkey"
+
+// BuiltInProperty is one hardcoded property definition. Same shape as
+// anytype.BuiltInProperty so the types registry surfaces built-ins
+// uniformly with user-defined types.
+type BuiltInProperty struct {
+	Id    string
+	Name  string
+	Kind  schema.Kind
+	Scope schema.Scope
+}
+
+// Properties lists the meta-type's hardcoded property definitions —
+// the values that are meaningful only on a type object. They live in
+// the `type` namespace rather than `any` so the membership check in
+// properties.SystemPropertiesHandler fences them off: a row that
+// doesn't carry the marker cannot hold them at all.
+//
+// The `objects` DataVersion is deliberately NOT bumped for the move
+// off `any.xkey`: a peer that doesn't know a version parks every
+// change for that dataset, so bumping would halt all property sync
+// with older peers to protect one field. Mixed versions instead drop
+// the unknown-namespace op per-op — the type's other metadata still
+// applies, and its xkey resolves on upgraded peers only.
+var Properties = []BuiltInProperty{
+	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced},
+}
 
 // DatasetPropertyDefs is the dataset on a type object that holds its
 // property-*definition* records (id, name, kind, ...). On disk the

@@ -38,8 +38,14 @@ func newTypesAPI(parent *spaceImpl) *typesAPI { return &typesAPI{parent: parent}
 
 // Create mints a new type object: a fresh any-sync tree whose
 // `properties` dataset record carries the type's display metadata
-// (any.name / any.description / any.icon / any.xkey) and `any.types =
-// ["__type__"]` to mark it as a meta-type instance.
+// (any.name / any.description / any.icon), its programmatic handle
+// (type.xkey) and `any.types = ["__type__"]` to mark it as a meta-type
+// instance.
+//
+// The universal fields stay under `any`; `xkey` is meaningful only on
+// a type object, so it lives in the meta-type's own namespace — which
+// also makes it unwritable on a row that doesn't carry the marker
+// (properties.SystemPropertiesHandler membership check).
 //
 // The returned typeId is the new tree's id (= root change id) — used
 // as the namespace prefix in property paths on instance objects.
@@ -64,13 +70,14 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 		multi.Set("any.icon", arena.NewString(params.IconCID))
 	}
 	if params.XKey != "" {
-		multi.Set("any.xkey", arena.NewString(params.XKey))
+		multi.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(params.XKey))
 	}
 	// Mark the object as a meta-type instance — the convention we use
 	// in MVP to distinguish types from regular objects without a
-	// dedicated catalog.
+	// dedicated catalog. Set in the same change as the xkey write, so
+	// the local pre-flight sees the namespace as implemented.
 	types := arena.NewArray()
-	types.SetArrayItem(0, arena.NewString("__type__"))
+	types.SetArrayItem(0, arena.NewString(typetype.MetaTypeMarker))
 	multi.Set("any.types", types)
 
 	dataVersion, err := t.parent.store.DataVersion(properties.Dataset)
@@ -101,7 +108,7 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 // an error. Use a custom dataset/handler for that type's mutable
 // state.
 func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.PropertyDraft) (string, error) {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	filterJSON, err := validateFormatDraft(&draft)
@@ -212,6 +219,19 @@ func builtInSpaceIndexTypeInfo() space.TypeInfo {
 	}
 }
 
+// builtInMetaTypeInfo describes the synthetic `type` meta-type —
+// the shape of type objects themselves. Every type object implements
+// it (that's what the marker in `any.types` says), so it belongs in
+// the catalog next to `any` and `spaceIndex`.
+func builtInMetaTypeInfo() space.TypeInfo {
+	return space.TypeInfo{
+		Id:          typetype.TypeId,
+		Name:        typetype.Name,
+		Description: typetype.Description,
+		BuiltIn:     true,
+	}
+}
+
 // registeredTypeInfo maps a caller-registered handler.Type into the
 // public TypeInfo shape. Registered types are statically declared at
 // SDK init (via config.Config.Types), so they're surfaced with
@@ -231,6 +251,21 @@ func registeredTypeInfo(t handler.Type) space.TypeInfo {
 		IconCID:     t.IconCID,
 		BuiltIn:     true,
 	}
+}
+
+// staticType reports whether typeId is a type whose declarations are
+// hardcoded — a caller-registered type from config.Config.Types, or
+// one of the synthetic built-ins (`any`, `spaceIndex`, `type`). Every
+// runtime mutator rejects them with ErrTypeRegistered; without the
+// built-in half a mutator called with an enumerable id like `type`
+// (Types().List surfaces it) falls through to a tree build on that
+// literal id and surfaces an opaque CID error instead.
+func (t *typesAPI) staticType(typeId string) bool {
+	if _, reserved := spaceobjects.ReservedTypeIds[typeId]; reserved {
+		return true
+	}
+	_, ok := t.findRegisteredType(typeId)
+	return ok
 }
 
 // findRegisteredType returns the catalog entry for typeId, or
@@ -262,9 +297,10 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 	defer iter.Close()
 
 	registered := t.parent.store.ExternalTypes()
-	out := make([]space.TypeInfo, 0, 2+len(registered))
+	out := make([]space.TypeInfo, 0, 3+len(registered))
 	out = append(out, builtInAnyTypeInfo())
 	out = append(out, builtInSpaceIndexTypeInfo())
+	out = append(out, builtInMetaTypeInfo())
 	for _, rt := range registered {
 		out = append(out, registeredTypeInfo(rt))
 	}
@@ -300,6 +336,9 @@ func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, erro
 	if typeId == spaceindex.TypeId {
 		return builtInSpaceIndexTypeInfo(), nil
 	}
+	if typeId == typetype.TypeId {
+		return builtInMetaTypeInfo(), nil
+	}
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeInfo(rt), nil
 	}
@@ -330,7 +369,7 @@ func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 		Name:        rec.GetString("any", "name"),
 		Description: rec.GetString("any", "description"),
 		IconCID:     rec.GetString("any", "icon"),
-		XKey:        rec.GetString("any", "xkey"),
+		XKey:        rec.GetString(typetype.TypeId, typetype.FieldXKeyProp),
 		BuiltIn:     false,
 	}
 }
@@ -341,7 +380,7 @@ func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 func hasTypeMarker(rec *anyenc.Value) bool {
 	arr := rec.GetArray("any", "types")
 	for _, v := range arr {
-		if string(v.GetStringBytes()) == "__type__" {
+		if string(v.GetStringBytes()) == typetype.MetaTypeMarker {
 			return true
 		}
 	}
@@ -353,7 +392,8 @@ func (t *typesAPI) Delete(_ context.Context, _ string) error {
 }
 
 // Properties returns the property definitions of a type. For the
-// built-in `any` type, the list is hardcoded (one entry per
+// built-in `any`, `spaceIndex` and `type` types, the list is
+// hardcoded (one entry per package-level Properties table, e.g.
 // anytype.Properties). Caller-registered types own datasets, not
 // property definitions, so an empty slice is returned (those types
 // expose state via custom datasets reached through Space.Modify /
@@ -369,6 +409,9 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 	}
 	if typeId == spaceindex.TypeId {
 		return builtInSpaceIndexProperties(), nil
+	}
+	if typeId == typetype.TypeId {
+		return builtInMetaTypeProperties(), nil
 	}
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeProperties(rt), nil
@@ -425,6 +468,23 @@ func builtInAnyProperties() []space.PropertyDef {
 func builtInSpaceIndexProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(spaceindex.Properties))
 	for _, p := range spaceindex.Properties {
+		out = append(out, space.PropertyDef{
+			Id:    p.Id,
+			Name:  p.Name,
+			Kind:  schemaKindToPropertyKind(p.Kind),
+			Scope: p.Scope,
+		})
+	}
+	return out
+}
+
+// builtInMetaTypeProperties translates typetype.Properties into the
+// public PropertyDef shape — the values a type object carries in its
+// own namespace (`xkey`), as opposed to the universal ones it carries
+// under `any`.
+func builtInMetaTypeProperties() []space.PropertyDef {
+	out := make([]space.PropertyDef, 0, len(typetype.Properties))
+	for _, p := range typetype.Properties {
 		out = append(out, space.PropertyDef{
 			Id:    p.Id,
 			Name:  p.Name,
@@ -632,7 +692,7 @@ func schemaKindToPropertyKind(k schema.Kind) space.PropertyKind {
 // an unknown or already-removed propId (a pre-flight, so a stray delete
 // can't mint a tombstone for a record that never existed).
 func (t *typesAPI) RemoveProperty(ctx context.Context, typeId, propId string) error {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if _, err := t.findPropertyDef(ctx, typeId, propId); err != nil {
@@ -673,7 +733,7 @@ func (t *typesAPI) RemoveProperty(ctx context.Context, typeId, propId string) er
 // semantics (ui vocabulary, filter syntax, option membership) stay a
 // consumer concern.
 func (t *typesAPI) PatchProperty(ctx context.Context, typeId, propId string, patch space.PropertyPatch) error {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if len(patch.Set) == 0 && len(patch.Unset) == 0 {

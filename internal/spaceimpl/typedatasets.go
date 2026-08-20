@@ -229,7 +229,7 @@ func newDatasetDefId() (string, error) {
 }
 
 func (t *typesAPI) AddDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	decl, err := draftToDecl(&draft)
@@ -271,7 +271,7 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId string, draft space.Da
 }
 
 func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft space.DatasetFieldDraft) (string, error) {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if draft.Required {
@@ -322,7 +322,7 @@ func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId strin
 }
 
 func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	// Validate the declaration MINUS the field before writing the
@@ -355,7 +355,7 @@ func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 }
 
 func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId string) error {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if defId == "" {
@@ -371,7 +371,7 @@ func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId str
 }
 
 func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch space.DatasetDefPatch) error {
-	if _, ok := t.findRegisteredType(typeId); ok {
+	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if len(patch.Set) == 0 && len(patch.Unset) == 0 {

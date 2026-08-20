@@ -277,10 +277,12 @@ type TypeInfo struct {
 	Description string
 	IconCID     string
 	// XKey is the optional caller-side "programmatic" name set at
-	// Create. Empty if unset.
+	// Create, stored at `type.xkey` on the type object. Empty if
+	// unset.
 	XKey string
-	// BuiltIn marks `any` / `type` (immutable, always-present). User
-	// types return false.
+	// BuiltIn marks the synthetic types — `any`, `spaceIndex`,
+	// `type` and every caller-registered type (immutable,
+	// always-present). User types return false.
 	BuiltIn bool
 }
 
@@ -291,9 +293,10 @@ type TypeCreateParams struct {
 	IconCID     string
 
 	// XKey is an optional stable, caller-side "programmatic" name for
-	// the type (e.g. for generated client code mapping). Like Name and
-	// Description it's client-set display metadata — not unique, not
-	// enforced by the SDK.
+	// the type (e.g. for generated client code mapping). Client-set,
+	// not unique, not enforced by the SDK. Unlike Name/Description it
+	// is stored in the meta-type's own namespace (`type.xkey`), so
+	// only rows carrying the type marker can hold one.
 	XKey string
 }
 

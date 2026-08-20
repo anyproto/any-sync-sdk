@@ -466,13 +466,14 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 
 // buildStaticSchema assembles the registry's static overlay: the
 // schema for types whose definitions don't live in a per-type-object
-// `properties` collection — the built-in `any` / `spaceIndex` tables
-// and every registered external type's declared Properties. User
-// types are absent (resolved from their defs collection at lookup).
+// `properties` collection — the built-in `any` / `spaceIndex` /
+// `type` tables and every registered external type's declared
+// Properties. User types are absent (resolved from their defs
+// collection at lookup).
 //
 // Returns typeId → propId → PropInfo. Safe with nil/empty extTypes.
 func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.PropInfo {
-	static := make(map[string]map[string]types.PropInfo, 2+len(extTypes))
+	static := make(map[string]map[string]types.PropInfo, 3+len(extTypes))
 
 	anyProps := make(map[string]types.PropInfo, len(anytype.Properties))
 	for _, p := range anytype.Properties {
@@ -485,6 +486,15 @@ func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.Prop
 		siProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
 	}
 	static[spaceindex.TypeId] = siProps
+
+	// The meta-type's namespace. Without this entry every type Create
+	// fails: the `type.xkey` write resolves no type in the registry
+	// and PreValidate rejects the whole change.
+	mtProps := make(map[string]types.PropInfo, len(typetype.Properties))
+	for _, p := range typetype.Properties {
+		mtProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
+	}
+	static[typetype.TypeId] = mtProps
 
 	for _, t := range extTypes {
 		if len(t.Properties) == 0 {
@@ -526,6 +536,15 @@ func propertyKindToSchema(k handler.PropertyKind) schema.Kind {
 	return schema.KindUnknown
 }
 
+// ReservedTypeIds are the synthetic built-ins: they own a namespace in
+// the static schema and a row in Types().List, so a caller-registered
+// type may not claim one.
+var ReservedTypeIds = map[string]struct{}{
+	anytype.TypeId:    {},
+	spaceindex.TypeId: {},
+	typetype.TypeId:   {},
+}
+
 // ValidateExternalTypes checks the caller-supplied catalog against
 // the built-in dataset names, against each other, and for internal
 // well-formedness. Returns the first error encountered. Called once
@@ -539,6 +558,14 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 		}
 		if _, dup := seenTypeIds[t.Id]; dup {
 			return fmt.Errorf("spaceobjects: type[%d]: duplicate type Id %q", i, t.Id)
+		}
+		if _, reserved := ReservedTypeIds[t.Id]; reserved {
+			// buildStaticSchema writes the built-in tables first and the
+			// ext-type loop REPLACES by id, so a registration under a
+			// built-in id silently takes over its namespace — for `type`
+			// that breaks every Types().Create carrying an XKey. Fail at
+			// boot instead.
+			return fmt.Errorf("spaceobjects: type[%d]: Id %q is reserved for a built-in type", i, t.Id)
 		}
 		seenTypeIds[t.Id] = struct{}{}
 		// A type may own datasets, properties, both, or neither (a pure

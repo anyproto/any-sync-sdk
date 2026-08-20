@@ -23,6 +23,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
 // LiveTypeRowsFilter selects live `__type__` rows from the per-space
@@ -32,7 +33,7 @@ import (
 var LiveTypeRowsFilter query.Filter = func() query.Filter {
 	a := &anyenc.Arena{}
 	return query.And{
-		query.Key{Path: []string{"any", "types"}, Filter: query.NewInValue(a.NewString("__type__"))},
+		query.Key{Path: []string{"any", "types"}, Filter: query.NewInValue(a.NewString(typetype.MetaTypeMarker))},
 		query.Key{Path: []string{"_deletedAt"}, Filter: query.Not{Filter: query.Exists{}}},
 	}
 }()

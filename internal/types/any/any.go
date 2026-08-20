@@ -60,9 +60,6 @@ var Properties = []BuiltInProperty{
 	{Id: "name", Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	{Id: "description", Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	{Id: "icon", Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced},
-	// `xkey` is the optional caller-side programmatic key. Set on type objects
-	// at Create (TypeCreateParams.XKey → any.xkey); harmless/unset on others.
-	{Id: "xkey", Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	// `types` is the list of type ids this object implements (docs 06
 	// §"Property ids" / §"types list"). Array of strings. Deliberately
 	// synced-only: type membership is structural and shared — never

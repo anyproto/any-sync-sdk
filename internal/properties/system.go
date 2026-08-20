@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
 // Dataset is the name every regular object uses for its base-scope
@@ -272,6 +273,12 @@ type preflight struct {
 // buildPreflight computes the set of typeIds the object implements
 // after this change: the universal `any` type, the types already in
 // the record's any.types, plus any types this change attaches.
+//
+// The meta-type is the one entry whose marker and namespace differ —
+// a type object carries `__type__` in any.types but stores its
+// type-only values under `type` (an underscore-prefixed top-level
+// field is protocol-owned). Grant the namespace off the marker so
+// only rows that declare themselves types can write there.
 func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc.Value) *preflight {
 	members := map[string]struct{}{anytype.TypeId: {}}
 	if before != nil {
@@ -283,6 +290,14 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 		for oi := range ch.Records[ri].Ops {
 			collectTypeAdditions(&ch.Records[ri].Ops[oi], members)
 		}
+	}
+	if _, isType := members[typetype.MetaTypeMarker]; isType {
+		members[typetype.TypeId] = struct{}{}
+	} else {
+		// The marker is the ONLY grant: an object that merely lists the
+		// meta-type id in any.types (nothing stops a client attaching
+		// it) must not reach the namespace.
+		delete(members, typetype.TypeId)
 	}
 	list := slices.Sorted(maps.Keys(members))
 	return &preflight{members: members, list: list}

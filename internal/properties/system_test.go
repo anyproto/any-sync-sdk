@@ -479,6 +479,42 @@ func TestSystemPropertiesHandler_ModifiedAtBumpsOnModify(t *testing.T) {
 	assert.Equal(t, float64(200), rec.GetFloat64("modifiedAt"), "valid modify bumps modifiedAt")
 }
 
+// ----------------------------------------------------------------------------
+// createdAt — root header when present, first-touch fallback for derived trees
+// ----------------------------------------------------------------------------
+
+func TestSystemPropertiesHandler_CreatedAtFromRootHeader(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	ch := makeChangeAt("v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)
+	ch.ObjectCreatedAt = 50
+	require.NoError(t, ctrl.ApplyChange(context.Background(), ch))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(50), rec.GetFloat64("createdAt"), "root header wins over the change envelope")
+}
+
+// A derived tree's root is deterministic and timestamp-less, so
+// ObjectCreatedAt is 0 for every change — createdAt falls back to the
+// first-touch change's envelope Timestamp instead of staying unstamped.
+func TestSystemPropertiesHandler_CreatedAtDerivedFallback(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "derived root: createdAt = first-touch change time")
+}
+
 // Out-of-order delivery: an older change (lower VersionId) arriving after
 // a newer one must NOT regress modifiedAt — the stamp is LWW-gated on the
 // change's VersionId like any other field write.

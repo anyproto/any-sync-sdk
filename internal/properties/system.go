@@ -146,7 +146,16 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 			Payload: a.NewString(author),
 		})
 	}
-	if ts := ctx.Change.ObjectCreatedAt; ts > 0 {
+	// Derived trees carry a deterministic, timestamp-less root (every
+	// device must derive byte-identical bytes), so ObjectCreatedAt is 0
+	// there — fall back to the first-touch change's envelope time. LWW
+	// on the stamp's VersionId keeps concurrent first-touches
+	// convergent, same as every other auto field.
+	ts := ctx.Change.ObjectCreatedAt
+	if ts <= 0 {
+		ts = ctx.Change.Timestamp
+	}
+	if ts > 0 {
 		sink.Derive(crdt.Op{
 			Type: crdt.OpSet,
 			Path: []string{"createdAt"},

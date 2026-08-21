@@ -230,6 +230,27 @@ type HandlerReg struct {
 	SkipHistory bool
 }
 
+// CreateStamper is an optional interface a Handler may implement to
+// derive creation stamps — $setCreate offers (creator/author,
+// createdAt) that must track the `_ver.id` creation marker. The
+// modifier invokes it at exactly the sites that touch the marker: the
+// creating branch, and every upsert modify on a live record —
+// INDEPENDENT of per-op validation verdicts. Emitting from the per-op
+// accept path instead diverges: a change can be accepted as a create
+// on one peer and all-rejected as a modify on another (write-once and
+// author-gated fields validate asymmetrically), so the marker would
+// move without an offer and the stamps would split while `_ver.id`
+// agrees. Tied to the marker, the stamps are exactly as convergent as
+// the marker itself.
+//
+// Not consulted on Local/Injected materializations (handler-exclusive
+// routes; their rows pick stamps up from the next synced upsert), on
+// tombstones (delete-wins wipes fields), or on sibling writes (no
+// handler runs there at all).
+type CreateStamper interface {
+	DeriveCreateStamps(ctx *ChangeCtx, sink *Sink)
+}
+
 // LocalPreValidator is an optional interface a Handler may implement
 // to validate a LOCAL change before it enters the DAG. The Controller
 // calls PreValidate from the local-write path (not on inbound apply);

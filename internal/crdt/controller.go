@@ -1376,6 +1376,10 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 				m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
 				return existing, false, nil
 			}
+			// Creation stamps ride the marker, not op verdicts: the
+			// record now exists with _ver.id = ch.VersionId, so the
+			// stamps are derived even when every op was dropped above.
+			m.deriveCreateStamps(ctx)
 		}
 		for i := range rc.Ops {
 			applyOp(a, existing, *ch, rc.Ops[i])
@@ -1398,6 +1402,19 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			lowerCreationMarker(a, existing, ch.VersionId)
 		}
 		ctx := &ChangeCtx{Change: ch, Before: existing, Get: m.getter}
+		// Creation-stamp offers are emitted at the same sites that touch
+		// the _ver.id marker — every upsert on a live record — never from
+		// the per-op accept path. Gating them on op acceptance diverges:
+		// create-path and modify-path validation are asymmetric
+		// (write-once / author-gated fields), so the causally-earliest
+		// upsert can be all-rejected here while it stamped on the peer
+		// where it created the record; the marker would move without an
+		// offer and the stamps would split while _ver.id agrees. The
+		// $setCreate min gate makes losing offers no-ops, so emitting
+		// unconditionally is convergent (see CreateStamper).
+		if rc.Upsert && !ch.Local && !ch.Injected {
+			m.deriveCreateStamps(ctx)
+		}
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
 			// Local and Injected materializations are handler-exclusive
@@ -1438,10 +1455,10 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 //
 // Safe to call BeforeModify more than once: a handler's BeforeModify
 // writes the sink only through per-record-deduped stamps (DeriveOnce /
-// pre-checked queues — modifiedAt, the $setCreate creation offers), so
-// the combined-then-per-key probing queues nothing twice, and each
-// handler's single-path branch is the per-key equivalent of its
-// multi-field branch.
+// pre-checked queues — the modifiedAt bump; creation stamps are the
+// modifier's job, see CreateStamper), so the combined-then-per-key
+// probing queues nothing twice, and each handler's single-path branch
+// is the per-key equivalent of its multi-field branch.
 func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Value, ctx *ChangeCtx, op *Op, opIndex int) {
 	isMultiField := (op.Type == OpSet || op.Type == OpUnset) && len(op.Path) == 0 &&
 		op.Payload != nil && op.Payload.Type() == anyenc.TypeObject
@@ -1475,6 +1492,19 @@ func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Val
 		return
 	}
 	applyOp(a, existing, *m.ch, Op{Type: op.Type, Payload: kept})
+}
+
+// deriveCreateStamps asks a CreateStamper handler for its $setCreate
+// creation-stamp offers. Called from Modify at exactly the sites that
+// touch the _ver.id marker (see CreateStamper); a handler that doesn't
+// stamp, or a sibling-mode modifier with no handler, is a no-op.
+func (m *recordModifier) deriveCreateStamps(ctx *ChangeCtx) {
+	if m.handler == nil || m.sink == nil {
+		return
+	}
+	if cs, ok := m.handler.(CreateStamper); ok {
+		cs.DeriveCreateStamps(ctx, m.sink)
+	}
 }
 
 // applySibling is the modifier path for a Sibling write — no handler, no

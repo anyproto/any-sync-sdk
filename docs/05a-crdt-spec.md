@@ -332,15 +332,23 @@ delivery order — the per-field twin of the `_ver.id` marker's min-update
 rule (§3.5).
 
 Used exclusively for handler-derived creation stamps (`author`/`creator`,
-`createdAt`): the stamping handler re-offers them from **every accepted
-upsert** (create and modify alike), each offer carrying that change's own
+`createdAt`): the apply loop requests an offer from the stamping handler
+at **exactly the sites that touch the `_ver.id` marker** — record
+creation and every upsert modify on a live record — independent of
+per-op validation verdicts, each offer carrying that change's own
 envelope. Re-offering is what makes the stamp convergent — a create-only
-stamp is a different one-shot on every peer (each peer's local first-touch
-differs), so LWW never gets two values to compare — and what backfills
-records minted before the stamp existed. For objects whose tree root
-carries the value (a real root header's timestamp/signer), every offer is
-identical and the min-rule is trivially stable; the envelope fallback only
-matters for derived trees, whose deterministic roots carry neither.
+stamp is a different one-shot on every peer (each peer's local
+first-touch differs), so LWW never gets two values to compare — and what
+backfills records minted before the stamp existed. Riding the per-op
+*accept* path instead would still diverge: create-path and modify-path
+validation are asymmetric (required/shape vs write-once/author gates), so
+the causally-earliest upsert can be all-rejected as a modify on one peer
+while it stamped as a create on another — the marker would move without
+an offer. Tied to the marker sites, the stamps are exactly as convergent
+as `_ver.id` itself. For objects whose tree root carries the value (a
+real root header's timestamp/signer), every offer is identical and the
+min-rule is trivially stable; the envelope fallback only matters for
+derived trees, whose deterministic roots carry neither.
 
 `$setCreate` never travels in a caller or wire `RecordChange` — pre-apply
 path validation rejects it (it could pin a synced field against every
@@ -569,9 +577,10 @@ replica-independent by construction.
 op folded into the same store write, inheriting the change's VersionId.
 Max-flavored stamps (`modifiedAt`) land as plain `$set` under the
 standard LWW gate; creation stamps (`creator`/`author`, `createdAt`)
-land as `$setCreate` offers re-emitted by every accepted upsert,
-converging under the min-rule (§5.9) to the causally-earliest upsert's
-envelope — the same change the `_ver.id` marker elects.
+land as `$setCreate` offers the apply loop requests (via the optional
+`CreateStamper` interface) at the sites that touch the `_ver.id`
+marker, converging under the min-rule (§5.9) to the causally-earliest
+upsert's envelope — the same change the marker elects.
 `Project(dataset, rec)` queues a sibling write to another dataset on
 the same object, applied in the same transaction.
 

@@ -732,10 +732,46 @@ func TestSystemPropertiesHandler_CreatedAtBackfilledOnUpsertModify(t *testing.T)
 	assert.Equal(t, float64(200), rec.GetFloat64("createdAt"), "older upsert's offer wins under the min-rule")
 }
 
-// A creating change whose every op fails validation mints no auto
-// fields — the stamps run behind the same validation gate BeforeModify
-// uses (a change with no surviving content must not stamp).
-func TestSystemPropertiesHandler_CreateStampsSkippedWhenAllOpsRejected(t *testing.T) {
+// Offers ride the marker path, not the per-op accept path: a change
+// whose every op is rejected still moves the `_ver.id` marker on the
+// peer where the record pre-exists, so it must offer its stamps there
+// too — in both orders the stamps settle on the earliest upsert's
+// envelope, aligned with the marker.
+func TestSystemPropertiesHandler_CreatedAtConvergesWhenEarliestChangeAllRejected(t *testing.T) {
+	arena := &anyenc.Arena{}
+	bad := func() crdt.Change { // every op fails kind validation
+		return makeChangeAt("v1", 100, testObjectId, true,
+			crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")})
+	}
+	good := func() crdt.Change {
+		return makeChangeAt("v2", 200, testObjectId, true,
+			crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")})
+	}
+
+	peerA := newPropsController(t, defaultRegistry())
+	require.NoError(t, peerA.ApplyChange(context.Background(), bad()))
+	require.NoError(t, peerA.ApplyChange(context.Background(), good()))
+
+	peerB := newPropsController(t, defaultRegistry())
+	require.NoError(t, peerB.ApplyChange(context.Background(), good()))
+	require.NoError(t, peerB.ApplyChange(context.Background(), bad()))
+
+	for name, ctrl := range map[string]*crdt.Controller{"in-order": peerA, "reversed": peerB} {
+		rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+		require.NotNil(t, rec)
+		assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "%s: earliest upsert's time, ops rejected or not", name)
+		assert.Equal(t, "v1", rec.GetString("_ver", "id"), "%s", name)
+	}
+}
+
+// A creating change whose every op fails validation still mints the
+// row (with its `_ver.id` marker), so the creation stamps land — they
+// track the marker, not op verdicts (a peer where the row pre-exists
+// would derive them for this change via the modifier's upsert-site
+// offer, so gating them on acceptance here would split the peers).
+// modifiedAt stays behind the validation gate, mirroring BeforeModify:
+// no surviving content, no write-attempt stamp.
+func TestSystemPropertiesHandler_AllOpsRejectedCreateStampsMarkerOnly(t *testing.T) {
 	ctrl := newPropsController(t, defaultRegistry())
 	arena := &anyenc.Arena{}
 
@@ -746,6 +782,6 @@ func TestSystemPropertiesHandler_CreateStampsSkippedWhenAllOpsRejected(t *testin
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Nil(t, rec.Get("createdAt"), "fully-rejected create stamps no createdAt")
+	assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "creation stamp tracks the minted marker")
 	assert.Nil(t, rec.Get("modifiedAt"), "fully-rejected create stamps no modifiedAt")
 }

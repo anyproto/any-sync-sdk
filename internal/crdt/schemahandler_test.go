@@ -468,6 +468,41 @@ func TestSchemaHandler_ConvergenceCreateStampsUpsertRace(t *testing.T) {
 	}
 }
 
+// The offers must ride the marker path, not the per-op accept path:
+// create-path and modify-path validation are asymmetric, so a change
+// can be accepted as a create on one peer and ALL-rejected as a modify
+// on the other. Here `title` is write-once — v1's payload is valid at
+// create but rejected wholesale on the modify path — yet the marker
+// still lowers to v1 on the reversed peer, so the stamps must follow.
+// (Acceptance-gated offers reproduced creator=authorA/createdAt=100 on
+// one peer and authorB/200 on the other with _ver.id=v1 on both.)
+func TestSchemaHandler_ConvergenceCreateStampsAllOpsRejectedModify(t *testing.T) {
+	a := &anyenc.Arena{}
+	early := shChange("v1", shAuthorA, 100,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t"}))
+	late := shChange("v2", shAuthorB, 200,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t"}))
+
+	apply := func(t *testing.T, order []Change) *anyenc.Value {
+		st := newSchemaHandlerController(t, shDecl())
+		for i := range order {
+			_, err := st.ApplyChangeWithResult(ctx, order[i])
+			require.NoError(t, err)
+		}
+		return st.Get(ctx, shTestDS, "row-1")
+	}
+
+	recAB := apply(t, []Change{early, late})
+	recBA := apply(t, []Change{late, early})
+	require.NotNil(t, recAB)
+	require.NotNil(t, recBA)
+	for name, rec := range map[string]*anyenc.Value{"in-order": recAB, "reversed": recBA} {
+		assert.Equal(t, shAuthorA, string(rec.GetStringBytes("creator")), "%s", name)
+		assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "%s", name)
+		assert.Equal(t, "v1", string(rec.GetStringBytes(VersionsKey, IdField)), "%s", name)
+	}
+}
+
 // Strict (non-upsert) modifies leave the creation stamps alone — the
 // offer rule mirrors the `_ver.id` marker's upsert-only update rule.
 func TestSchemaHandler_CreateStampsIgnoreStrictModify(t *testing.T) {

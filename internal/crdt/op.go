@@ -24,14 +24,16 @@ const (
 
 	// OpSetCreate is the creation-stamp register: the value offered by the
 	// LOWEST-VersionId change wins (min-rule, the per-field twin of the
-	// `_ver.id` creation marker — see lowerCreationMarker). Handlers emit it
-	// via Sink.Derive for stamps that must reflect the record's creating
+	// `_ver.id` creation marker — see lowerCreationMarker). CreateStamper
+	// handlers emit it for stamps that must reflect the record's creating
 	// change (creator/author, createdAt) no matter which change happens to
-	// first-touch the record locally: every touching upsert re-offers the
-	// stamp, an offer from an older change overwrites one from a newer, and
-	// all peers converge on the causally-earliest offer regardless of
-	// delivery order. Derivation-only — validateOpPaths rejects it in
-	// caller/wire RecordChanges.
+	// first-touch the record locally: the modifier requests an offer at
+	// every site that touches the marker (record creation, every upsert
+	// modify) independent of per-op validation verdicts, an offer from an
+	// older change overwrites one from a newer, and all peers converge on
+	// the causally-earliest offer regardless of delivery order.
+	// Derivation-only — validateOpPaths rejects it in caller/wire
+	// RecordChanges.
 	OpSetCreate OpType = "$setCreate"
 )
 

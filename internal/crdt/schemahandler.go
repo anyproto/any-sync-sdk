@@ -108,8 +108,10 @@ func NewSchemaHandler(ds schema.Dataset) (*SchemaHandler, error) {
 func (h *SchemaHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates the creating change (id rule, required fields,
-// declared value shapes) and derives the declared stamps from the
-// change's metadata — no DB reads. An error drops the whole RecordChange.
+// declared value shapes) and seeds the modifyTime stamp — no DB reads.
+// The creator/createTime creation stamps are derived by the modifier via
+// CreateStamper at the `_ver.id` marker sites (see DeriveCreateStamps),
+// not here. An error drops the whole RecordChange.
 func (h *SchemaHandler) BeforeCreate(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error {
 	if err := h.checkRecordId(rec); err != nil {
 		return err
@@ -120,7 +122,6 @@ func (h *SchemaHandler) BeforeCreate(ctx *ChangeCtx, rec *RecordChange, sink *Si
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return nil
 	}
-	h.deriveCreateStamps(ctx, sink)
 	h.bumpModifyTime(ctx, sink)
 	return nil
 }
@@ -232,19 +233,25 @@ func (h *SchemaHandler) visitMultiField(op *Op, present map[string]struct{}) err
 	return firstErr
 }
 
-// deriveCreateStamps queues the creator / createTime stamps as
+// DeriveCreateStamps queues the creator / createTime stamps as
 // $setCreate offers — the min-version-wins register mirroring the
 // `_ver.id` creation marker (see OpSetCreate). Each offer carries the
 // offering change's own envelope (Creator / Timestamp); the min-rule
 // resolves concurrent upsert races to the causally-earliest change's
-// envelope on every peer, in any delivery order. Fired from
-// BeforeCreate and re-offered by every accepted upsert modify
-// (stampOnAccept) — the re-offers are what make the stamp convergent
-// (each peer's create-path stamp alone is a different one-shot per
-// peer) and what backfill records minted before a stamp field was
-// declared. The queue pre-check keeps repeated per-op calls from
-// allocating an arena just for DeriveOnce to drop the duplicate.
-func (h *SchemaHandler) deriveCreateStamps(ctx *ChangeCtx, sink *Sink) {
+// envelope on every peer, in any delivery order.
+//
+// Implements CreateStamper: the MODIFIER invokes this at the sites
+// that touch the marker (record creation, every upsert modify on a
+// live record), never the per-op accept path — create-path and
+// modify-path validation are asymmetric (write-once / author gates),
+// so acceptance-gated offers would let the marker move without an
+// offer and split the stamps while _ver.id agrees. The marker-site
+// re-offers are also what make the stamp convergent at all (each
+// peer's create-path stamp alone is a different one-shot per peer)
+// and what backfill records minted before a stamp field was declared.
+// The queue pre-check keeps a double invocation from allocating an
+// arena just for duplicate offers.
+func (h *SchemaHandler) DeriveCreateStamps(ctx *ChangeCtx, sink *Sink) {
 	if h.creatorField == "" && h.createTimeField == "" {
 		return
 	}
@@ -265,26 +272,19 @@ func (h *SchemaHandler) deriveCreateStamps(ctx *ChangeCtx, sink *Sink) {
 	}
 }
 
-// stampOnAccept is the accepted-modify stamp bundle: re-offer the
-// creation stamps when the RecordChange is an upsert (non-upsert
-// modifies leave them alone, exactly mirroring the `_ver.id` marker's
-// update rule), then bump modifyTime.
-func (h *SchemaHandler) stampOnAccept(ctx *ChangeCtx, rec *RecordChange, sink *Sink) {
-	if rec != nil && rec.Upsert {
-		h.deriveCreateStamps(ctx, sink)
-	}
-	h.bumpModifyTime(ctx, sink)
-}
+// Compile-time check: the modifier discovers the stamps via the
+// optional interface.
+var _ CreateStamper = (*SchemaHandler)(nil)
 
 // BeforeModify is the per-op gate on existing records. An error drops
 // just this op (the controller salvages multi-field ops per key by
 // re-probing, so combined rejections keep their innocent keys).
-func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, rec *RecordChange, op *Op, sink *Sink) error {
+func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, _ *RecordChange, op *Op, sink *Sink) error {
 	if op.Type == OpDelete {
 		return nil
 	}
 	if len(op.Path) == 0 {
-		return h.beforeModifyMulti(ctx, rec, op, sink)
+		return h.beforeModifyMulti(ctx, op, sink)
 	}
 	rule, ok := h.rules[op.Path[0]]
 	if !ok {
@@ -297,20 +297,20 @@ func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, rec *RecordChange, op *Op, 
 		return err
 	}
 	if op.Type == OpUnset {
-		h.stampOnAccept(ctx, rec, sink)
+		h.bumpModifyTime(ctx, sink)
 		return nil
 	}
 	if err := h.checkOpShape(op); err != nil {
 		return err
 	}
-	h.stampOnAccept(ctx, rec, sink)
+	h.bumpModifyTime(ctx, sink)
 	return nil
 }
 
 // beforeModifyMulti validates every key of a combined $set/$unset; the
 // first violation rejects the combined op and the controller re-probes
 // per key. On full acceptance the modifyTime bump is derived once.
-func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, rec *RecordChange, op *Op, sink *Sink) error {
+func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, op *Op, sink *Sink) error {
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return fmt.Errorf("%w: multi-field %s payload must be an object", ErrValidation, op.Type)
 	}
@@ -354,7 +354,7 @@ func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, rec *RecordChange, op 
 		return firstErr
 	}
 	if touched {
-		h.stampOnAccept(ctx, rec, sink)
+		h.bumpModifyTime(ctx, sink)
 	}
 	return nil
 }

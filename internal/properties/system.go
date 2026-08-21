@@ -82,17 +82,21 @@ func New(reg types.Registry) *SystemPropertiesHandler {
 	return &SystemPropertiesHandler{Registry: reg}
 }
 
+// Compile-time check: the modifier derives the author/createdAt
+// creation stamps through the optional CreateStamper interface.
+var _ crdt.CreateStamper = (*SystemPropertiesHandler)(nil)
+
 func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates every op in the creation payload, then
-// auto-stamps the `any`-scope auto fields (author, createdAt,
-// spaceId, modifiedAt) via sink.Derive so every newly minted row in
-// the per-space `objects` collection carries them. The stamps are derived
-// from the change envelope (Creator from the signing identity,
-// Timestamp from the change wire, SpaceId from the apply context),
-// not from caller input — these fields are ScopeDerived in the `any`
-// type, read-only by contract (validateField rejects input ops on
-// them via the scope check).
+// auto-stamps `spaceId` and seeds `modifiedAt` via sink.Derive
+// (stampAutoFields). The other two auto fields — `author` and
+// `createdAt`, the creation stamps — are derived by the MODIFIER
+// through the CreateStamper interface at the `_ver.id` marker sites
+// (see DeriveCreateStamps), not here. All four are derived from the
+// change envelope / apply context, never from caller input — they are
+// ScopeDerived in the `any` type, read-only by contract (validateField
+// rejects input ops on them via the scope check).
 //
 // Validation is per-op drop, same as BeforeModify: ops that fail the
 // current schema are filtered out and the rest of the record still
@@ -103,6 +107,7 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 // means a removed-property replay or cross-peer bug, not a sync gap.
 // No any.types membership check (out-of-order tolerance).
 func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
+	allDropped := false
 	if h.Registry != nil && len(rec.Ops) > 0 {
 		kept := rec.Ops[:0]
 		for i := range rec.Ops {
@@ -112,34 +117,35 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 			kept = append(kept, rec.Ops[i])
 		}
 		rec.Ops = kept
-		if len(rec.Ops) == 0 {
-			// Every op dropped: stamp nothing, mirroring BeforeModify's
-			// stamp-behind-validation gate — a change with no surviving
-			// content must not mint auto fields. Deterministic (validation
-			// is convergent), and the creation stamps are re-offered by the
-			// next valid upsert anyway.
-			return nil
-		}
+		allDropped = len(rec.Ops) == 0
 	}
-	stampAutoFields(ctx, sink)
+	stampAutoFields(ctx, sink, allDropped)
 	return nil
 }
 
-// stampAutoFields queues derived ops for the row-root auto fields —
-// `author`, `createdAt`, `spaceId` — that live alongside `id` at the
-// top of the record (NOT under `any.*`), and seeds the initial
-// `modifiedAt` (per-change, keeps moving on every modify — see
-// stampModifiedAt). Fired from BeforeCreate; the creation stamps are
-// additionally re-offered by every accepted upsert modify (see
-// stampCreateStamps for why).
+// stampAutoFields queues the create-path derived ops for the row-root
+// auto fields that live alongside `id` at the top of the record (NOT
+// under `any.*`): `spaceId`, plus the initial `modifiedAt` seed
+// (per-change, keeps moving on every modify — see stampModifiedAt).
+// The creation stamps (`author` / `createdAt`) are NOT stamped here —
+// the modifier derives them via CreateStamper at the `_ver.id` marker
+// sites (see DeriveCreateStamps).
 //
 // `spaceId` comes from the apply context, is constant per space, and
-// inherits the change's VersionId under standard LWW.
-func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+// inherits the change's VersionId under standard LWW. It stamps even
+// on an all-dropped create — the record row exists either way, and a
+// peer where the same row was minted by a valid change carries the
+// stamp, so skipping it here would make its presence delivery-order
+// dependent (the value is identical from every change, so the stamp
+// itself is always convergent). modifiedAt stays behind the
+// validation gate, mirroring BeforeModify: a change with no surviving
+// content is not a "write attempt" worth reflecting, and the verdict
+// is deterministic (validation is convergent and identical on the
+// create and modify paths of this handler).
+func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink, allDropped bool) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
-	stampCreateStamps(ctx, sink)
 	if spaceId := ctx.Change.SpaceId; spaceId != "" {
 		a := &anyenc.Arena{}
 		sink.Derive(crdt.Op{
@@ -148,12 +154,26 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 			Payload: a.NewString(spaceId),
 		})
 	}
-	stampModifiedAt(ctx, sink)
+	if !allDropped {
+		stampModifiedAt(ctx, sink)
+	}
 }
 
-// stampCreateStamps queues the `author` / `createdAt` creation stamps as
-// $setCreate offers — the min-version-wins register that mirrors the
-// `_ver.id` creation marker (see crdt.OpSetCreate).
+// DeriveCreateStamps queues the `author` / `createdAt` creation stamps
+// as $setCreate offers — the min-version-wins register that mirrors
+// the `_ver.id` creation marker (see crdt.OpSetCreate).
+//
+// Implements crdt.CreateStamper: the MODIFIER invokes this at exactly
+// the sites that touch the marker — record creation and every upsert
+// modify on a live record — independent of per-op validation
+// verdicts. Riding the accept path instead would diverge: the
+// causally-earliest upsert can be all-rejected on the modify path of
+// one peer while it stamped on the peer where it created the record,
+// moving the marker without an offer. Tied to the marker, the stamps
+// are exactly as convergent as `_ver.id` itself. The marker-site
+// re-offers are also what make the fallback convergent at all (each
+// peer's create-path stamp alone is a different one-shot per peer)
+// and what backfill rows minted before these stamps existed.
 //
 // Sources: `author` and `createdAt` are taken from the tree's ROOT
 // change (immutable header) when it carries them — constants per
@@ -166,17 +186,10 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // resolves: every peer converges on the causally-earliest upsert's
 // envelope, no matter which change first-touched the record locally.
 //
-// Emitted from BeforeCreate AND from every accepted upsert modify: the
-// modify-path re-offers are what make the fallback convergent (each
-// peer's create-path stamp alone is a different one-shot per peer) and
-// what backfills rows minted before these stamps existed. DeriveOnce,
-// not Derive — BeforeModify runs per op and must stamp once per
-// RecordChange.
-//
 // The fallback value is the author's unvalidated wall clock / signing
 // identity, skew included — display/sort quality only, never a fencing
 // token, same contract as modifiedAt and version-history timestamps.
-func stampCreateStamps(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+func (h *SystemPropertiesHandler) DeriveCreateStamps(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
@@ -262,19 +275,14 @@ func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // race still bumps it, which is deterministic (every peer runs the same
 // gates in the same order) and reads as "latest valid write attempt".
 //
-// Accepted upsert ops also re-offer the creation stamps
-// (stampCreateStamps): the min-rule needs an offer from every touching
-// upsert to converge — and to backfill rows minted before the stamps
-// existed. Non-upsert modifies leave them alone, exactly mirroring the
-// `_ver.id` marker's update rule.
-func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
+// The creation stamps (`author` / `createdAt`) are NOT re-offered here:
+// they must track the `_ver.id` marker independent of op verdicts, so
+// the modifier derives them via CreateStamper (see DeriveCreateStamps).
+func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
 	if h.Registry != nil {
 		if verr := h.validateOp(op, nil); verr != nil {
 			return verr
 		}
-	}
-	if rec != nil && rec.Upsert {
-		stampCreateStamps(ctx, sink)
 	}
 	stampModifiedAt(ctx, sink)
 	return nil

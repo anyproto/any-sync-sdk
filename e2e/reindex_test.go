@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	reindexTypeId     = "reindex-notes-type"
-	reindexDataset    = "reindex_notes"
-	reindexDataVer    = "reindex-notes-v1"
-	reindexRecA       = "rec-a"
-	reindexRecB       = "rec-b"
+	reindexTypeId  = "reindex-notes-type"
+	reindexDataset = "reindex_notes"
+	reindexDataVer = "reindex-notes-v1"
+	reindexRecA    = "rec-a"
+	reindexRecB    = "rec-b"
 )
 
 // stampHandler derives a per-record `stamp` carrying the handler's tag,

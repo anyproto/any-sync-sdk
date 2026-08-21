@@ -231,3 +231,82 @@ func swapSweepPacing(start, pace time.Duration) func() {
 	reindexSweepStartDelay, reindexSweepPace = start, pace
 	return func() { reindexSweepStartDelay, reindexSweepPace = oldStart, oldPace }
 }
+
+// A wipe that cannot even enumerate the object's collections must fail
+// the rebuild, not press on: the replay would land on top of rows the
+// old handler wrote, and stamping the current versions over that would
+// disarm the trigger for good.
+func TestReindex_WipeFailureAbortsRebuild(t *testing.T) {
+	ctx, s, ctrl := reindexStore(t)
+	require.NoError(t, s.db.Close())
+
+	err := s.wipeMaterialized(ctx, "obj1", ctrl)
+	require.Error(t, err, "a failed wipe must surface")
+
+	_, err = s.reindexPrepare(ctx, "obj1", ctrl, []string{reindexNotes})
+	require.Error(t, err, "prepare propagates it, so loadObject never stamps versions")
+}
+
+// Close must not return while a rebuild is still writing: an offload
+// drops the space's collections immediately after, and a sweep that
+// outlived Close would re-create them behind it.
+func TestReindex_CloseWaitsForSweep(t *testing.T) {
+	ctx, s, _ := reindexStore(t)
+
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "stale-1", 1, 1, map[string]int{reindexNotes: 1}, "spaceA"))
+	s.customHandlers = []crdt.HandlerReg{{
+		Name: reindexNotes, Version: 2, Handler: crdt.DefaultHandler{},
+		Schema: schema.Dataset{Dynamic: true},
+	}}
+
+	inLoad := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	s.cache.Close()
+	s.cache = ocache.New(func(_ context.Context, id string) (ocache.Object, error) {
+		once.Do(func() { close(inLoad) })
+		<-release
+		return nil, fmt.Errorf("load stub %s", id)
+	})
+	t.Cleanup(func() { _ = s.cache.Close() })
+
+	defer swapSweepPacing(time.Millisecond, time.Millisecond)()
+	s.StartReindexSweep()
+
+	select {
+	case <-inLoad:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep never reached a load")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		s.stopSweep()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("stopSweep returned while a rebuild was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopSweep did not return after the rebuild finished")
+	}
+
+	// Documented "safe to call multiple times" — and two shutdown paths
+	// (offload, SDK teardown) can reach the same store.
+	s.stopSweep()
+}
+
+// A store whose sweep never started still closes cleanly.
+func TestReindex_StopSweepWithoutStart(t *testing.T) {
+	_, s, _ := reindexStore(t)
+	s.stopSweep()
+	s.stopSweep()
+}

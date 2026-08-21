@@ -226,10 +226,14 @@ type Store struct {
 	selfIdentity string
 	readMat      *readMaterializer
 
-	// sweepOnce/sweepStop drive the background re-index sweep — one per
-	// store, stopped with the store (see reindex.go).
-	sweepOnce sync.Once
-	sweepStop chan struct{}
+	// The background re-index sweep: one per store, started once, stopped
+	// with the store and waited for (Close must not return while a
+	// rebuild is still writing — an offload drops collections right
+	// after). See reindex.go.
+	sweepOnce  sync.Once
+	sweepStop  chan struct{}
+	sweepClose sync.Once
+	sweepDone  chan struct{}
 	// readSeedPending marks objects mid-first-restore: the apply hook
 	// skips tracking for them (the seed covers everything present).
 	readSeedPending sync.Map
@@ -640,13 +644,7 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
-	if s.sweepStop != nil {
-		select {
-		case <-s.sweepStop:
-		default:
-			close(s.sweepStop)
-		}
-	}
+	s.stopSweep()
 	if s.readMat != nil {
 		s.readMat.close()
 	}
@@ -1597,16 +1595,9 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		return nil, err
 	}
 	// A handler-version bump recorded on the object's _meta row rebuilds
-	// the object before anything reads it: wipe the materialized rows and
-	// rewind, so the cold restore below replays the whole tree through the
-	// current handlers (see reindex.go).
-	var reindexLeaves []localLeaf
-	reindexing := len(ctrl.StaleDatasets()) > 0
-	if reindexing {
-		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, ctrl.StaleDatasets()); err != nil {
-			return nil, err
-		}
-	}
+	// the object before anything reads it (see reindex.go). The verdict is
+	// read here; the wipe itself waits until the tree is open, below.
+	stale := ctrl.StaleDatasets()
 	payload := loadPayloadFromCtx(ctx)
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
@@ -1625,7 +1616,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 			}
 		}
 	}
-	if reindexing {
+	if len(stale) > 0 {
 		// The replay re-applies every change in the tree, which would mark
 		// the whole object unread. Read state itself survives the wipe (it
 		// lives outside the object's collections) and the materializer
@@ -1653,6 +1644,17 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err != nil {
 		return nil, err
 	}
+	// Tree is open, so the replay can actually run: capture device-local
+	// values, rewind and wipe. Doing this before object.New would leave a
+	// failed open (offline, tree removed, selective-mode reject) with the
+	// rows gone, nothing to replay them back, and the captured local
+	// values dropped on the error path.
+	var reindexLeaves []localLeaf
+	if len(stale) > 0 {
+		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale); err != nil {
+			return nil, err
+		}
+	}
 	// First materialization (fresh controller, no watermark): the cold
 	// restore may drain the whole tree — skip per-change history-index
 	// rows (protected perf path, proposal §4.4) and mark the object
@@ -1677,7 +1679,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 			s.historyPendingStale.Store(objectId, struct{}{})
 		}
 	}
-	if reindexing {
+	if len(stale) > 0 {
 		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
 	}
 	if seedPending {

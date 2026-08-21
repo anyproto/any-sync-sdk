@@ -47,6 +47,15 @@ func staleDatasets(stored, registered map[string]int) []string {
 	return out
 }
 
+// NormalizedVersion resolves a HandlerReg.Version to the value that is
+// actually persisted and compared: an unset version means 1.
+func NormalizedVersion(v int) int {
+	if v == 0 {
+		return 1
+	}
+	return v
+}
+
 // StaleDatasets returns the datasets whose materialized rows were built
 // by a different version of their handler. Empty for a fresh object (no
 // stored versions) and for the common case where nothing changed.

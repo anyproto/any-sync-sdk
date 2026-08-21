@@ -86,7 +86,9 @@ func (s *Store) reindexPrepare(ctx context.Context, objectId string, ctrl *crdt.
 	if err := ctrl.ResetForReindex(ctx); err != nil {
 		return nil, fmt.Errorf("spaceobjects: reindex rewind %s: %w", objectId, err)
 	}
-	s.wipeMaterialized(ctx, objectId, ctrl)
+	if err := s.wipeMaterialized(ctx, objectId, ctrl); err != nil {
+		return nil, err
+	}
 	return leaves, nil
 }
 
@@ -126,16 +128,15 @@ func (s *Store) captureLocalLeaves(ctx context.Context, objectId string, ctrl *c
 			// Deliberately NOT ctrl.Collection: that caches the handle on
 			// the controller, and the wipe drops the collection out from
 			// under it — the replay would then write through a dead
-			// handle. This one is opened, read and closed right here.
+			// handle. Not closed either: any-store hands back the
+			// process-wide registry handle, shared with every other
+			// reader of the same name, and the collection is dropped
+			// moments later anyway.
 			coll, oerr := s.OpenObjectCollection(ctx, objectId, dataset)
 			if oerr != nil {
 				continue // never materialized
 			}
 			out, err = captureRecordFields(ctx, coll, dataset, fields, out)
-			if cerr := coll.Close(); cerr != nil {
-				storeLog.Warn("reindex: close capture handle",
-					zap.String("objectId", objectId), zap.String("dataset", dataset), zap.Error(cerr))
-			}
 		}
 		if err != nil {
 			storeLog.Warn("reindex: capture local values",
@@ -228,7 +229,8 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 				value:    leaf.MarshalTo(nil),
 			})
 			if len(out) >= reindexLocalLeafCap {
-				break
+				_ = iter.Close()
+				return out, nil // hard cap: no further field starts a scan
 			}
 		}
 		err = iter.Err()
@@ -248,7 +250,19 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 // Deliberately not the deletion path: no `del` stamp, no Removed events.
 // The object is being rebuilt, not deleted, and a del stamp is sticky —
 // it would evict the object from every consumer index permanently.
-func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crdt.Controller) {
+//
+// Errors abort the rebuild. A half-wiped object replayed on top of rows
+// the old handler wrote is exactly the corrupt state this mechanism
+// exists to repair, and its versions must NOT be stamped as current —
+// the watermark is already rewound, so the next load tries again.
+//
+// NOTE for a type object (objectId == typeId): the sweep drops its
+// `properties` / `shortIds` / `datasets` collections, so the space's
+// type registry reads empty until the replay finishes. Same window a
+// fresh joiner's first materialization has always had, now reachable
+// mid-session; concurrent writes in that window validate against an
+// empty definition set.
+func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crdt.Controller) error {
 	for _, dataset := range ctrl.RegisteredDatasets() {
 		if !ctrl.IsShared(dataset) {
 			continue
@@ -258,22 +272,43 @@ func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crd
 			continue
 		}
 		if err := coll.DeleteId(ctx, objectId); err != nil && !errors.Is(err, anystore.ErrDocNotFound) {
-			storeLog.Warn("reindex: clear shared row",
-				zap.String("objectId", objectId), zap.String("dataset", dataset), zap.Error(err))
+			return fmt.Errorf("spaceobjects: reindex clear %s row %s: %w", dataset, objectId, err)
 		}
 	}
-	s.dropObjectCollections(ctx, objectId)
+	if err := s.dropObjectCollectionsChecked(ctx, objectId); err != nil {
+		return err
+	}
 	s.purgeHistoryForReindex(ctx, objectId)
+	return nil
+}
+
+// dropObjectCollectionsChecked drops the object's per-object collections
+// and reports whether the sweep could even be enumerated. The drops
+// themselves stay best-effort (dropCollectionByName resolves the
+// closed-handle races and logs what it cannot); a failed LISTING is the
+// case that must not pass for a rebuild, since it silently drops nothing.
+func (s *Store) dropObjectCollectionsChecked(ctx context.Context, objectId string) error {
+	names, err := s.db.GetCollectionNames(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: reindex list collections %s: %w", objectId, err)
+	}
+	s.dropObjectCollectionsNamed(ctx, objectId, names)
+	return nil
 }
 
 // purgeHistoryForReindex clears the object's space-level history rows
-// (trace rows, the stale-flag row) when the index is open. Deliberately
-// NOT purgeHistoryRows: that one queues a deferred purge when the index
-// is unavailable, and a deferred purge firing later would wipe the rows
-// the post-replay backfill has just rebuilt. The per-object history
-// collection went with the `<objectId>_*` sweep either way, and the load
-// path marks the object stale after the replay, so the backfill rewrites
-// whatever is left.
+// (trace rows, the stale-flag row) when the index is open.
+//
+// Deliberately NOT purgeHistoryRows: that one queues a deferred purge
+// when the index is unavailable, and a deferred purge firing later would
+// wipe the rows the post-replay backfill has just rebuilt, leaving the
+// object unmarked and its history empty. Skipping is the safer failure:
+// the per-object history collection went with the `<objectId>_*` sweep
+// either way, and the load path marks the object stale after the replay,
+// so the backfill rewrites everything the DAG still produces. What can
+// survive is a space-level trace row for a record the new handler no
+// longer writes — the backfill upserts by changeId and never deletes —
+// so /history can list a stale trace until the next full purge.
 func (s *Store) purgeHistoryForReindex(ctx context.Context, objectId string) {
 	ix := s.historyIx.Load()
 	if ix == nil {
@@ -329,13 +364,24 @@ func (s *Store) restoreLocalLeaves(ctx context.Context, obj *object.Object, leav
 				zap.String("objectId", obj.Id()), zap.String("dataset", dataset), zap.Error(err))
 			continue
 		}
-		if _, err := obj.LocalSet(ctx, crdt.Change{
+		res, err := obj.LocalSet(ctx, crdt.Change{
 			Dataset:     dataset,
 			DataVersion: dataVersion,
 			Records:     records,
-		}); err != nil {
+		})
+		if err != nil {
 			storeLog.Warn("reindex: restore local values",
 				zap.String("objectId", obj.Id()), zap.String("dataset", dataset), zap.Error(err))
+			continue
+		}
+		// Per-op refusals don't surface as an error — a path whose scope
+		// no longer resolves local, a record the replay didn't recreate.
+		// They are device-local values no peer can hand back, so they get
+		// a line rather than silence.
+		for _, rej := range res.Rejections {
+			storeLog.Warn("reindex: local value rejected",
+				zap.String("objectId", obj.Id()), zap.String("dataset", dataset),
+				zap.String("recordId", rej.RecordId), zap.Error(rej.Err))
 		}
 	}
 }
@@ -356,7 +402,31 @@ func (s *Store) StartReindexSweep() {
 	if s == nil {
 		return
 	}
-	s.sweepOnce.Do(func() { go s.reindexSweep() })
+	s.sweepOnce.Do(func() {
+		if s.sweepStop == nil {
+			s.sweepStop = make(chan struct{})
+		}
+		s.sweepDone = make(chan struct{})
+		go func() {
+			defer close(s.sweepDone)
+			s.reindexSweep()
+		}()
+	})
+}
+
+// stopSweep signals the sweep and waits for it to leave the store alone.
+// Close must not return early: an offload drops the space's collections
+// right after, and a rebuild still in flight would re-create them behind
+// it. Safe to call more than once, and on a store whose sweep never
+// started — the Once here also fences a later StartReindexSweep out.
+func (s *Store) stopSweep() {
+	if s.sweepStop != nil {
+		s.sweepClose.Do(func() { close(s.sweepStop) })
+	}
+	s.sweepOnce.Do(func() {})
+	if s.sweepDone != nil {
+		<-s.sweepDone
+	}
 }
 
 func (s *Store) reindexSweep() {
@@ -365,19 +435,24 @@ func (s *Store) reindexSweep() {
 		return
 	case <-time.After(reindexSweepStartDelay):
 	}
-	ctx := context.Background()
-	regs, _, err := s.buildRegs()
+	// Loads inherit the sweep's cancellation: a rebuild is a full tree
+	// replay, and at shutdown it has to stop mid-object rather than hold
+	// the DB open past Close.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-s.sweepStop:
+			cancel()
+		case <-stopped:
+		}
+	}()
+	registered, err := s.handlerVersions()
 	if err != nil {
 		storeLog.Warn("reindex sweep: build regs", zap.String("spaceId", s.spaceId), zap.Error(err))
 		return
-	}
-	registered := make(map[string]int, len(regs))
-	for _, reg := range regs {
-		v := reg.Version
-		if v == 0 {
-			v = 1
-		}
-		registered[reg.Name] = v
 	}
 	metaColl, err := s.metaCollection(ctx)
 	if err != nil {
@@ -414,4 +489,20 @@ func (s *Store) reindexSweep() {
 	}
 	storeLog.Info("reindex sweep: done",
 		zap.String("spaceId", s.spaceId), zap.Int("rebuilt", done), zap.Int("total", len(ids)))
+}
+
+// handlerVersions is the dataset→handler version map the stale check
+// compares against, normalized the same way registerHandler normalizes
+// it — one owner for the "zero means 1" rule, so the sweep and the lazy
+// path can never disagree about which objects are stale.
+func (s *Store) handlerVersions() (map[string]int, error) {
+	regs, _, err := s.buildRegs()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int, len(regs))
+	for _, reg := range regs {
+		out[reg.Name] = crdt.NormalizedVersion(reg.Version)
+	}
+	return out, nil
 }

@@ -300,11 +300,7 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 		return fmt.Errorf("crdt: init handler %q: %w", name, err)
 	}
 	c.handlers[name] = reg.Handler
-	version := reg.Version
-	if version == 0 {
-		version = 1
-	}
-	c.versions[name] = version
+	c.versions[name] = NormalizedVersion(reg.Version)
 	c.indexes[name] = reg.Indexes
 	// Zero-value scopes are resolved once here (stamps → derived, rest →
 	// synced) so field-class enforcement never sees an unset scope.

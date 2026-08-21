@@ -271,6 +271,28 @@ func SearchTextFromAnyenc(v *anyenc.Value) []string {
 	return nil
 }
 
+// SearchTextToAnyenc encodes a text mapping in the canonical wire
+// form: nil for no keys, the bare string for a single key, an array
+// otherwise — SearchTextFromAnyenc's inverse. Every anyenc writer of a
+// `search.text` leaf (the head-record encoder, the PatchDataset leaf
+// rewrite) goes through this one canonicalization so locally-authored
+// records and the x-search marshal (which applies the same rule in
+// JSON) can never disagree.
+func SearchTextToAnyenc(arena *anyenc.Arena, keys []string) *anyenc.Value {
+	switch len(keys) {
+	case 0:
+		return nil
+	case 1:
+		return arena.NewString(keys[0])
+	default:
+		arr := arena.NewArray()
+		for i, k := range keys {
+			arr.SetArrayItem(i, arena.NewString(k))
+		}
+		return arr
+	}
+}
+
 // Field is one declared dataset field: a JSON-Schema value shape plus its
 // class. Modeled like a type property (Id/Name + recursive Schema) so the
 // two share one representation.

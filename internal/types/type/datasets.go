@@ -27,6 +27,16 @@ const DatasetDefs = "datasets"
 // DatasetDefsHandlerVersion is the DataVersion stamped on changes to
 // the DatasetDefs dataset itself (hardcoded, like HandlerVersion —
 // definition writes are never gated on their own schema state).
+//
+// Known mixed-fleet limitation (SYN-179): this string is deliberately
+// NOT parseable by the spaceobjects DataVersion gate (legacy
+// handler-version strings pass through unconstrained — see gateFor),
+// so bumping it CANNOT park new wire forms on old replicas. A
+// pre-SYN-179 peer receiving an array-form `search.text` $set sheds
+// that op (its handler admits only scalar strings) and never replays
+// it, diverging the head record until re-written. Accepted
+// pre-release; a real fix needs a version pair the gate parses (and
+// old drainers can satisfy), which is a protocol change.
 const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 
 // Discriminator values of the pinned `def` field.
@@ -269,12 +279,8 @@ func (DatasetDefsHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, 
 // checkSearchLeafOp validates a mutation of a search.* leaf: $unset
 // always passes, $set must carry a valid leaf value
 // (CheckSearchLeafValue), other ops are rejected — the
-// checkFormatLeafOp contract extended with the string-or-array `text`
-// form.
+// checkFormatLeafOp contract with the string-or-array `text` form.
 func checkSearchLeafOp(opType crdt.OpType, path []string, payload *anyenc.Value) error {
-	if len(path) == 0 || path[len(path)-1] != SearchKeyText {
-		return checkFormatLeafOp(opType, path, payload)
-	}
 	switch opType {
 	case crdt.OpUnset:
 		return nil
@@ -293,6 +299,15 @@ func checkSearchLeafOp(opType crdt.OpType, path []string, payload *anyenc.Value)
 // non-empty array of unique non-empty string keys (both SYN-179 wire
 // forms). Shared with the client-side PatchDataset preflight; returns
 // a plain error — callers wrap with their own sentinel.
+//
+// The array branch deliberately re-checks entry types instead of
+// decoding through schema.SearchTextFromAnyenc: the parser is
+// tolerance-biased (a non-string entry becomes "" for the compile fold
+// to flag), while a write gate owes the author the precise "entries
+// must be strings". A bare "" stays admissible here — pre-SYN-179
+// handlers accepted it, so rejecting it at apply time would diverge
+// on old-authored changes; the PatchDataset preflight is where the
+// empty spellings get refused.
 func CheckSearchLeafValue(path []string, payload *anyenc.Value) error {
 	if len(path) > 0 && path[len(path)-1] == SearchKeyText {
 		if payload != nil && payload.Type() == anyenc.TypeString {

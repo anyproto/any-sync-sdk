@@ -19,6 +19,13 @@ var ErrPinnedField = errors.New("space: property field is pinned or immutable")
 // creation (format.type is pinned-absent). A client error → 400.
 var ErrPropertyNoFormat = errors.New("space: property has no format")
 
+// ErrInvalidFieldValue is returned by PatchDataset when a MUTABLE
+// leaf's value is malformed (e.g. a `search.text` mapping with empty
+// or duplicate keys, or an empty spelling where Unset is the clear
+// path) — distinct from ErrPinnedField, which reports an immutable
+// PATH. Consumers map it to a validation-class client error.
+var ErrInvalidFieldValue = errors.New("space: invalid dataset field value")
+
 // ErrTypeRegistered is returned by AddProperty / RemoveProperty /
 // PatchProperty when the target type is a registered built-in whose
 // properties are statically declared and cannot be mutated at runtime.
@@ -138,7 +145,10 @@ type TypesAPI interface {
 	// PatchDataset edits a definition's mutable leaves: displayName,
 	// description, name (field records' display label), search.title,
 	// search.text (a field key string or a non-empty array of unique
-	// keys), search.scope. Pinned paths are rejected up-front.
+	// keys; single-element arrays canonicalize to the bare string on
+	// the wire, and clearing the mapping is Unset's job), search.scope.
+	// Pinned paths are rejected up-front (ErrPinnedField); malformed
+	// values on mutable search leaves return ErrInvalidFieldValue.
 	PatchDataset(ctx context.Context, typeId, defId string, patch DatasetDefPatch) error
 }
 

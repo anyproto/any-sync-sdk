@@ -152,17 +152,9 @@ func encodeDatasetHead(arena *anyenc.Arena, draft *space.DatasetDraft) *anyenc.V
 		if draft.Search.Title != "" {
 			search.Set(typetype.SearchKeyTitle, arena.NewString(draft.Search.Title))
 		}
-		switch len(draft.Search.Text) {
-		case 0:
-		case 1:
-			// Canonical wire form: a single key rides as the bare string
-			// (records written before SYN-179 stay byte-identical).
-			search.Set(typetype.SearchKeyText, arena.NewString(draft.Search.Text[0]))
-		default:
-			text := arena.NewArray()
-			for i, key := range draft.Search.Text {
-				text.SetArrayItem(i, arena.NewString(key))
-			}
+		// Canonical wire form (records written before SYN-179 stay
+		// byte-identical: a single key rides as the bare string).
+		if text := schema.SearchTextToAnyenc(arena, draft.Search.Text); text != nil {
 			search.Set(typetype.SearchKeyText, text)
 		}
 		if draft.Search.Scope != "" {
@@ -416,8 +408,20 @@ func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch
 			return fmt.Errorf("typesAPI: patch dataset: convert %q: %w", path, err)
 		}
 		if strings.HasPrefix(path, typetype.DefFieldSearch+".") {
-			if lerr := typetype.CheckSearchLeafValue(strings.Split(path, "."), v); lerr != nil {
-				return fmt.Errorf("%w: search path %q: %v", space.ErrPinnedField, path, lerr)
+			segs := strings.Split(path, ".")
+			if lerr := typetype.CheckSearchLeafValue(segs, v); lerr != nil {
+				return fmt.Errorf("%w: search path %q: %w", space.ErrInvalidFieldValue, path, lerr)
+			}
+			if segs[len(segs)-1] == typetype.SearchKeyText {
+				// Re-encode canonically (a single-element array becomes
+				// the bare string, matching encodeDatasetHead and the
+				// x-search marshal) and refuse the empty spellings —
+				// clearing the mapping is Unset's job.
+				text := schema.SearchTextToAnyenc(arena, schema.SearchTextFromAnyenc(v))
+				if text == nil {
+					return fmt.Errorf("%w: search path %q: empty text mapping — use Unset to clear", space.ErrInvalidFieldValue, path)
+				}
+				v = text
 			}
 		}
 		setObj.Set(path, v)

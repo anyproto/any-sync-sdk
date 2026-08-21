@@ -100,13 +100,18 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.True(t, discovered, "Datasets() must list the runtime dataset")
 
 	// SYN-179: the text mapping patches to a key array (the ensure-drift
-	// path); malformed arrays are rejected up-front.
-	require.Error(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
+	// path); malformed values are rejected up-front with
+	// ErrInvalidFieldValue (not the pinned-path sentinel).
+	err = sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
 		Set: map[string]any{"search.text": []string{"body", "body"}},
-	}), "duplicate keys must be rejected")
-	require.Error(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
+	})
+	require.ErrorIs(t, err, space.ErrInvalidFieldValue, "duplicate keys must be rejected")
+	require.ErrorIs(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
 		Set: map[string]any{"search.text": []string{}},
-	}), "an empty array must be rejected")
+	}), space.ErrInvalidFieldValue, "an empty array must be rejected")
+	require.ErrorIs(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
+		Set: map[string]any{"search.text": ""},
+	}), space.ErrInvalidFieldValue, "the empty string must be rejected — Unset clears")
 	require.NoError(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
 		Set: map[string]any{"search.text": []string{"body", "summary"}},
 	}))
@@ -114,6 +119,16 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, defs[0].Search)
 	assert.Equal(t, []string{"body", "summary"}, defs[0].Search.Text)
+
+	// A single-element array patch canonicalizes to the bare-string
+	// wire form and reads back as the one-key mapping.
+	require.NoError(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
+		Set: map[string]any{"search.text": []string{"body"}},
+	}))
+	defs, err = sp.Types().Datasets(ctx, typeId)
+	require.NoError(t, err)
+	require.NotNil(t, defs[0].Search)
+	assert.Equal(t, []string{"body"}, defs[0].Search.Text)
 
 	// An instance object implementing the type hosts the records.
 	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})

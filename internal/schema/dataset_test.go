@@ -132,6 +132,28 @@ func TestSearchTextFromAnyenc(t *testing.T) {
 	assert.Equal(t, []string{""}, SearchTextFromAnyenc(bad))
 }
 
+func TestSearchTextToAnyenc_Canonicalizes(t *testing.T) {
+	arena := &anyenc.Arena{}
+	assert.Nil(t, SearchTextToAnyenc(arena, nil))
+
+	single := SearchTextToAnyenc(arena, []string{"body"})
+	require.NotNil(t, single)
+	assert.Equal(t, anyenc.TypeString, single.Type(), "a single key encodes as the bare string")
+	assert.Equal(t, "body", string(single.GetStringBytes()))
+
+	multi := SearchTextToAnyenc(arena, []string{"body", "notes"})
+	require.NotNil(t, multi)
+	assert.Equal(t, anyenc.TypeArray, multi.Type())
+
+	// Round-trip through the parser is identity for canonical forms.
+	assert.Equal(t, []string{"body"}, SearchTextFromAnyenc(single))
+	assert.Equal(t, []string{"body", "notes"}, SearchTextFromAnyenc(multi))
+	// And the encoder collapses the non-canonical one-element array.
+	oneElem := arena.NewArray()
+	oneElem.SetArrayItem(0, arena.NewString("body"))
+	assert.Equal(t, anyenc.TypeString, SearchTextToAnyenc(arena, SearchTextFromAnyenc(oneElem)).Type())
+}
+
 func TestDataset_MarshalOmitsDefaultBehavior(t *testing.T) {
 	raw, err := json.Marshal(Dataset{Fields: []Field{{Id: "a", Schema: Leaf(KindString)}}})
 	require.NoError(t, err)

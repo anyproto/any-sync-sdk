@@ -147,13 +147,16 @@ func encodeDatasetHead(arena *anyenc.Arena, draft *space.DatasetDraft) *anyenc.V
 	if draft.SkipHistory {
 		payload.Set(typetype.DefFieldSkipHistory, arena.NewTrue())
 	}
-	if draft.Search != nil && (draft.Search.Title != "" || draft.Search.Text != "") {
+	if draft.Search != nil && (draft.Search.Title != "" || len(draft.Search.Text) > 0) {
 		search := arena.NewObject()
 		if draft.Search.Title != "" {
 			search.Set(typetype.SearchKeyTitle, arena.NewString(draft.Search.Title))
 		}
-		if draft.Search.Text != "" {
-			search.Set(typetype.SearchKeyText, arena.NewString(draft.Search.Text))
+		// Canonical wire form: a single key rides as the bare string,
+		// so single-field records are byte-identical to those written
+		// before the array form existed.
+		if text := schema.SearchTextToAnyenc(arena, draft.Search.Text); text != nil {
+			search.Set(typetype.SearchKeyText, text)
 		}
 		if draft.Search.Scope != "" {
 			search.Set(typetype.SearchKeyScope, arena.NewString(draft.Search.Scope))
@@ -405,8 +408,22 @@ func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch
 		if err != nil {
 			return fmt.Errorf("typesAPI: patch dataset: convert %q: %w", path, err)
 		}
-		if strings.HasPrefix(path, typetype.DefFieldSearch+".") && v.Type() != anyenc.TypeString {
-			return fmt.Errorf("%w: search path %q must be a string", space.ErrPinnedField, path)
+		if strings.HasPrefix(path, typetype.DefFieldSearch+".") {
+			segs := strings.Split(path, ".")
+			if lerr := typetype.CheckSearchLeafValue(segs, v); lerr != nil {
+				return fmt.Errorf("%w: search path %q: %w", space.ErrInvalidFieldValue, path, lerr)
+			}
+			if segs[len(segs)-1] == typetype.SearchKeyText {
+				// Re-encode canonically (a single-element array becomes
+				// the bare string, matching encodeDatasetHead and the
+				// x-search marshal) and refuse the empty spellings —
+				// clearing the mapping is Unset's job.
+				text := schema.SearchTextToAnyenc(arena, schema.SearchTextFromAnyenc(v))
+				if text == nil {
+					return fmt.Errorf("%w: search path %q: empty text mapping — use Unset to clear", space.ErrInvalidFieldValue, path)
+				}
+				v = text
+			}
 		}
 		setObj.Set(path, v)
 	}

@@ -161,10 +161,10 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 			if s := v.Get("search"); s != nil && s.Type() == anyenc.TypeObject {
 				sf := &schema.SearchFields{
 					Title: s.GetString("title"),
-					Text:  s.GetString("text"),
+					Text:  schema.SearchTextFromAnyenc(s.Get("text")),
 					Scope: s.GetString("scope"),
 				}
-				if sf.Title != "" || sf.Text != "" {
+				if sf.Title != "" || len(sf.Text) > 0 {
 					h.search = sf
 					h.ds.Search = sf
 				}

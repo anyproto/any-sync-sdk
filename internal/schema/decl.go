@@ -27,7 +27,10 @@ var ErrDecl = errors.New("schema: invalid dataset declaration")
 //     StampCreator field — the authorship fact must live on the record
 //     so apply-time checks read only ctx.Before;
 //   - IdPattern must compile (RE2) when set; id constraints only make
-//     sense under IdUser.
+//     sense under IdUser;
+//   - a search text mapping, when present, names at least one field
+//     key, with no empty or duplicate keys (mapped keys are NOT
+//     required to be declared fields — the annotation stays opaque).
 func ValidateDatasetDecl(ds Dataset) error {
 	seen := make(map[string]struct{}, len(ds.Fields))
 	stamps := make(map[Stamp]string, 3)
@@ -84,6 +87,32 @@ func ValidateDatasetDecl(ds Dataset) error {
 	}
 	if ds.IdMaxLen < 0 {
 		return fmt.Errorf("%w: negative id max length", ErrDecl)
+	}
+	if ds.Search != nil && ds.Search.Text != nil {
+		if err := ValidateSearchText(ds.Search.Text); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateSearchText checks a search text mapping's field keys: at
+// least one, none empty, no duplicates. Shared by the declaration
+// validator and the wire-leaf checks (the dataset-def handler and the
+// PatchDataset preflight), so every entry path rejects the same forms.
+func ValidateSearchText(keys []string) error {
+	if len(keys) == 0 {
+		return fmt.Errorf("%w: search.text must name at least one field key", ErrDecl)
+	}
+	seen := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		if k == "" {
+			return fmt.Errorf("%w: search.text has an empty field key", ErrDecl)
+		}
+		if _, dup := seen[k]; dup {
+			return fmt.Errorf("%w: search.text names %q twice", ErrDecl, k)
+		}
+		seen[k] = struct{}{}
 	}
 	return nil
 }

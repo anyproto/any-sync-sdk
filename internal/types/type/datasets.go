@@ -27,6 +27,16 @@ const DatasetDefs = "datasets"
 // DatasetDefsHandlerVersion is the DataVersion stamped on changes to
 // the DatasetDefs dataset itself (hardcoded, like HandlerVersion —
 // definition writes are never gated on their own schema state).
+//
+// Known mixed-fleet limitation: this string is deliberately
+// NOT parseable by the spaceobjects DataVersion gate (legacy
+// handler-version strings pass through unconstrained — see gateFor),
+// so bumping it CANNOT park new wire forms on old replicas. A peer
+// that predates the array text form sheds an array-form `search.text`
+// $set (its handler admits only scalar strings) and never replays
+// it, diverging the head record until re-written. Accepted
+// pre-release; a real fix needs a version pair the gate parses (and
+// old drainers can satisfy), which is a protocol change.
 const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 
 // Discriminator values of the pinned `def` field.
@@ -48,7 +58,7 @@ const (
 	DefFieldIdMaxLen    = "idMaxLen"    // number (head), pinned
 	DefFieldDeleteBy    = "deleteBy"    // "anyone"/"author" (head), pinned
 	DefFieldSkipHistory = "skipHistory" // bool (head), pinned
-	DefFieldSearch      = "search"      // {title,text,scope} (head); leaves mutable
+	DefFieldSearch      = "search"      // {title,text,scope} (head); leaves mutable, text string-or-array
 	DefFieldDisplayName = "displayName" // human label (head), mutable
 	DefFieldDataset     = "dataset"     // owning head record id (field), pinned
 	DefFieldStamp       = "stamp"       // "creator"/"createTime"/"modifyTime" (field), pinned
@@ -56,9 +66,10 @@ const (
 	DefFieldMutableBy   = "mutableBy"   // "never"/"author"/"any" (field), pinned
 )
 
-// Sub-keys of the head `search` object — mutable string leaves (the
+// Sub-keys of the head `search` object — mutable leaves (the
 // format.ui/filter model: broad `search` replaces are pinned, the
-// leaves mutate freely as scalar strings).
+// leaves mutate freely). `title` and `scope` are scalar strings; `text`
+// is a bare field key or a non-empty array of field keys.
 const (
 	SearchKeyTitle = "title"
 	SearchKeyText  = "text"
@@ -250,8 +261,8 @@ func validateFieldCreate(ops []crdt.Op) error {
 }
 
 // BeforeModify rejects edits to pinned dataset-def state; the mutable
-// display fields pass through and the search leaves must stay scalar
-// strings.
+// display fields pass through and the search leaves must keep their
+// wire shapes (scalar strings; `text` also accepts a key array).
 func (DatasetDefsHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
 	if len(op.Path) == 0 {
 		return rejectIfMultiFieldTouchesDefPinned(op)
@@ -260,7 +271,63 @@ func (DatasetDefsHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, 
 		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, strings.Join(op.Path, "."))
 	}
 	if op.Path[0] == DefFieldSearch {
-		return checkFormatLeafOp(op.Type, op.Path, op.Payload)
+		return checkSearchLeafOp(op.Type, op.Path, op.Payload)
+	}
+	return nil
+}
+
+// checkSearchLeafOp validates a mutation of a search.* leaf: $unset
+// always passes, $set must carry a valid leaf value
+// (CheckSearchLeafValue), other ops are rejected — the
+// checkFormatLeafOp contract with the string-or-array `text` form.
+func checkSearchLeafOp(opType crdt.OpType, path []string, payload *anyenc.Value) error {
+	switch opType {
+	case crdt.OpUnset:
+		return nil
+	case crdt.OpSet:
+		if err := CheckSearchLeafValue(path, payload); err != nil {
+			return fmt.Errorf("%w: %w: %v", crdt.ErrValidation, ErrBadDatasetDef, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %w: op %s not allowed on %q", crdt.ErrValidation, ErrBadDatasetDef, opType, strings.Join(path, "."))
+	}
+}
+
+// CheckSearchLeafValue validates a search.* leaf's $set payload:
+// `title`/`scope` must be scalar strings, `text` a bare string or a
+// non-empty array of unique non-empty string keys (both wire forms).
+// Shared with the client-side PatchDataset preflight; returns
+// a plain error — callers wrap with their own sentinel.
+//
+// The array branch deliberately re-checks entry types instead of
+// decoding through schema.SearchTextFromAnyenc: the parser is
+// tolerance-biased (a non-string entry becomes "" for the compile fold
+// to flag), while a write gate owes the author the precise "entries
+// must be strings". A bare "" stays admissible here — older
+// handlers accepted it, so rejecting it at apply time would diverge
+// on old-authored changes; the PatchDataset preflight is where the
+// empty spellings get refused.
+func CheckSearchLeafValue(path []string, payload *anyenc.Value) error {
+	if len(path) > 0 && path[len(path)-1] == SearchKeyText {
+		if payload != nil && payload.Type() == anyenc.TypeString {
+			return nil
+		}
+		if payload != nil && payload.Type() == anyenc.TypeArray {
+			arr, _ := payload.Array()
+			keys := make([]string, 0, len(arr))
+			for _, e := range arr {
+				if e == nil || e.Type() != anyenc.TypeString {
+					return fmt.Errorf("%q entries must be strings", strings.Join(path, "."))
+				}
+				keys = append(keys, string(e.GetStringBytes()))
+			}
+			return schema.ValidateSearchText(keys)
+		}
+		return fmt.Errorf("%q must be a string or an array of field keys", strings.Join(path, "."))
+	}
+	if payload == nil || payload.Type() != anyenc.TypeString {
+		return fmt.Errorf("%q must be a string", strings.Join(path, "."))
 	}
 	return nil
 }
@@ -283,7 +350,7 @@ func rejectIfMultiFieldTouchesDefPinned(op *crdt.Op) error {
 			return
 		}
 		if path[0] == DefFieldSearch {
-			hit = checkFormatLeafOp(op.Type, path, v)
+			hit = checkSearchLeafOp(op.Type, path, v)
 		}
 	})
 	return hit

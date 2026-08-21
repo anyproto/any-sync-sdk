@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -55,7 +56,7 @@ func TestDataset_MarshalBehavioralAnnotations(t *testing.T) {
 		IdRule:    IdUser,
 		IdPattern: `[a-z]+`,
 		IdMaxLen:  32,
-		Search:    &SearchFields{Title: "title", Text: "body", Scope: "articles"},
+		Search:    &SearchFields{Title: "title", Text: []string{"body"}, Scope: "articles"},
 	}
 	raw, err := json.Marshal(ds)
 	require.NoError(t, err)
@@ -69,7 +70,7 @@ func TestDataset_MarshalBehavioralAnnotations(t *testing.T) {
 	assert.Equal(t, float64(32), doc["x-id-max-length"])
 	search := doc["x-search"].(map[string]any)
 	assert.Equal(t, "title", search["title"])
-	assert.Equal(t, "body", search["text"])
+	assert.Equal(t, "body", search["text"], "a single text key canonicalizes to the bare string")
 	assert.Equal(t, "articles", search["scope"])
 
 	// An empty scope is omitted, like every other default.
@@ -92,6 +93,65 @@ func TestDataset_MarshalBehavioralAnnotations(t *testing.T) {
 	assert.False(t, has)
 	_, has = title["x-stamp"]
 	assert.False(t, has)
+}
+
+func TestDataset_MarshalMultiFieldSearchText(t *testing.T) {
+	raw, err := json.Marshal(Dataset{Search: &SearchFields{Title: "subject", Text: []string{"body", "notes"}}})
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(raw, &doc))
+	search := doc["x-search"].(map[string]any)
+	assert.Equal(t, []any{"body", "notes"}, search["text"])
+
+	// No text mapping — the key is omitted like every other default.
+	raw, err = json.Marshal(Dataset{Search: &SearchFields{Title: "subject"}})
+	require.NoError(t, err)
+	doc = nil
+	require.NoError(t, json.Unmarshal(raw, &doc))
+	_, hasText := doc["x-search"].(map[string]any)["text"]
+	assert.False(t, hasText)
+}
+
+func TestSearchTextFromAnyenc(t *testing.T) {
+	arena := &anyenc.Arena{}
+	assert.Nil(t, SearchTextFromAnyenc(nil))
+	assert.Nil(t, SearchTextFromAnyenc(arena.NewString("")), "empty string means no mapping")
+	assert.Equal(t, []string{"body"}, SearchTextFromAnyenc(arena.NewString("body")))
+
+	arr := arena.NewArray()
+	arr.SetArrayItem(0, arena.NewString("body"))
+	arr.SetArrayItem(1, arena.NewString("notes"))
+	assert.Equal(t, []string{"body", "notes"}, SearchTextFromAnyenc(arr))
+
+	assert.Nil(t, SearchTextFromAnyenc(arena.NewArray()), "empty array means no mapping")
+	assert.Nil(t, SearchTextFromAnyenc(arena.NewNumberInt(1)), "non-string/array shapes are ignored")
+
+	// Non-string entries ride as "" so ValidateSearchText flags them.
+	bad := arena.NewArray()
+	bad.SetArrayItem(0, arena.NewNumberInt(1))
+	assert.Equal(t, []string{""}, SearchTextFromAnyenc(bad))
+}
+
+func TestSearchTextToAnyenc_Canonicalizes(t *testing.T) {
+	arena := &anyenc.Arena{}
+	assert.Nil(t, SearchTextToAnyenc(arena, nil))
+
+	single := SearchTextToAnyenc(arena, []string{"body"})
+	require.NotNil(t, single)
+	assert.Equal(t, anyenc.TypeString, single.Type(), "a single key encodes as the bare string")
+	assert.Equal(t, "body", string(single.GetStringBytes()))
+
+	multi := SearchTextToAnyenc(arena, []string{"body", "notes"})
+	require.NotNil(t, multi)
+	assert.Equal(t, anyenc.TypeArray, multi.Type())
+
+	// Round-trip through the parser is identity for canonical forms.
+	assert.Equal(t, []string{"body"}, SearchTextFromAnyenc(single))
+	assert.Equal(t, []string{"body", "notes"}, SearchTextFromAnyenc(multi))
+	// And the encoder collapses the non-canonical one-element array.
+	oneElem := arena.NewArray()
+	oneElem.SetArrayItem(0, arena.NewString("body"))
+	assert.Equal(t, anyenc.TypeString, SearchTextToAnyenc(arena, SearchTextFromAnyenc(oneElem)).Type())
 }
 
 func TestDataset_MarshalOmitsDefaultBehavior(t *testing.T) {

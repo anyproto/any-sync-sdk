@@ -2,6 +2,8 @@ package schema
 
 import (
 	"encoding/json"
+
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // Scope is the single write/sync taxonomy shared by dataset fields AND
@@ -218,15 +220,77 @@ func ParseDeletePolicy(label string) (DeletePolicy, bool) {
 }
 
 // SearchFields is the dataset's search-extraction annotation: which
-// field feeds the document title and which the body text, plus the
-// index scope the entries land under. Opaque to the SDK — surfaced
+// field feeds the document title and which fields the body text, plus
+// the index scope the entries land under. Opaque to the SDK — surfaced
 // through discovery (`x-search`) for external indexers; Scope is a
 // free-form slug the indexer interprets (empty = the indexer's
 // default).
+//
+// Text holds one or more field keys; the indexer joins the
+// mapped values into one body. On the wire (`x-search` and the head
+// record's `search.text` leaf) a single key rides as a bare string and
+// multiple keys as an array — MarshalJSON canonicalizes, so
+// single-field declarations look exactly as they did before.
 type SearchFields struct {
 	Title string
-	Text  string
+	Text  []string
 	Scope string
+}
+
+// SearchTextFromAnyenc parses the wire form of a search `text` leaf: a
+// bare string or an array of field keys. Empty/absent forms (nil, "",
+// []) return nil — "no text mapping", matching the empty-string
+// tolerance of the single-field era. Array elements ride verbatim
+// (non-strings become "") so ValidateSearchText can flag bad entries.
+func SearchTextFromAnyenc(v *anyenc.Value) []string {
+	if v == nil {
+		return nil
+	}
+	switch v.Type() {
+	case anyenc.TypeString:
+		s := string(v.GetStringBytes())
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	case anyenc.TypeArray:
+		arr, _ := v.Array()
+		if len(arr) == 0 {
+			return nil
+		}
+		keys := make([]string, 0, len(arr))
+		for _, e := range arr {
+			if e != nil && e.Type() == anyenc.TypeString {
+				keys = append(keys, string(e.GetStringBytes()))
+			} else {
+				keys = append(keys, "")
+			}
+		}
+		return keys
+	}
+	return nil
+}
+
+// SearchTextToAnyenc encodes a text mapping in the canonical wire
+// form: nil for no keys, the bare string for a single key, an array
+// otherwise — SearchTextFromAnyenc's inverse. Every anyenc writer of a
+// `search.text` leaf (the head-record encoder, the PatchDataset leaf
+// rewrite) goes through this one canonicalization so locally-authored
+// records and the x-search marshal (which applies the same rule in
+// JSON) can never disagree.
+func SearchTextToAnyenc(arena *anyenc.Arena, keys []string) *anyenc.Value {
+	switch len(keys) {
+	case 0:
+		return nil
+	case 1:
+		return arena.NewString(keys[0])
+	default:
+		arr := arena.NewArray()
+		for i, k := range keys {
+			arr.SetArrayItem(i, arena.NewString(k))
+		}
+		return arr
+	}
 }
 
 // Field is one declared dataset field: a JSON-Schema value shape plus its
@@ -375,7 +439,11 @@ func (d Dataset) MarshalJSON() ([]byte, error) {
 		if d.Search.Title != "" {
 			s["title"] = d.Search.Title
 		}
-		if d.Search.Text != "" {
+		switch len(d.Search.Text) {
+		case 0:
+		case 1:
+			s["text"] = d.Search.Text[0] // canonical bare string
+		default:
 			s["text"] = d.Search.Text
 		}
 		if d.Search.Scope != "" {

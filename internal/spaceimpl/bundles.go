@@ -11,11 +11,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -24,6 +27,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+var bundleLog = logger.NewNamed("sdk.bundles")
 
 type bundlesAPI struct {
 	parent *spaceImpl
@@ -36,6 +41,9 @@ type bundlesAPI struct {
 	// reentry from NewRoot still self-deadlocks: don't.
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
+	// derivedIds memoizes canonicalRootId per bundle id. The answer is
+	// a pure function of (space, bundle id) and never changes.
+	derivedIds sync.Map
 }
 
 func newBundlesAPI(parent *spaceImpl) *bundlesAPI {
@@ -62,15 +70,24 @@ func (b *bundlesAPI) indexObj(ctx context.Context) (*object.Object, error) {
 	})
 }
 
-func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, error) {
+func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, bool, error) {
 	if req.Id == "" {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
 	}
-	if req.NewRoot == nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: NewRoot required", space.ErrBundleBadRequest)
+	if req.DerivedRoot {
+		if req.NewRoot != nil {
+			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
+		}
+	} else {
+		if req.NewRoot == nil {
+			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: NewRoot required", space.ErrBundleBadRequest)
+		}
+		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
+			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
+		}
 	}
 	if err := b.parent.writeGate(ctx); err != nil {
-		return space.Bundle{}, err
+		return space.Bundle{}, false, err
 	}
 	l := b.lockFor(req.Id)
 	l.Lock()
@@ -78,7 +95,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 
 	obj, err := b.indexObj(ctx)
 	if err != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
 	}
 
 	// Adopt path: a live record whose winner's tree is not deleted
@@ -89,45 +106,45 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	// permanently wedged (record deletes are rejected, rootId has no
 	// unset, ResolveLoser refuses the winner) — and falls through to a
 	// fresh install.
-	if row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id); liveBundleRow(row) {
-		bd := decodeBundleRecord(row)
-		if bd.RootId != "" && !b.winnerDeleted(ctx, &bd) {
-			b.fillLosers(ctx, &bd)
-			return bd, nil
+	// Adoption wins over derivation: an install already on a created
+	// root stays there even when this call asks for a derived one.
+	// Migration is content movement, which only the app can decide.
+	if bd, live := b.view(ctx, obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id)); live {
+		// The registry row can arrive before the root tree does (they
+		// are different trees). When the winner is the canonical
+		// derived root, this device can materialize it itself instead
+		// of handing back an id whose tree is still in flight —
+		// idempotent, and it converges with whatever syncs in. The
+		// stamp is part of that: a tree still sitting on its root
+		// change is left out of this device's head-sync diff, so its
+		// local copy only rejoins sync once something writes to it.
+		// RootProperties are NOT re-seeded — seeding belongs to the
+		// install, and the installer's values sync in.
+		if req.DerivedRoot && bd.Derived {
+			rootId, err := b.deriveRoot(ctx, req)
+			if err != nil {
+				return space.Bundle{}, false, err
+			}
+			if err := b.stampRootName(ctx, rootId, req); err != nil {
+				return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
+			}
 		}
+		return bd, false, nil
 	}
 
-	rootId, err := req.NewRoot(ctx)
+	rootId, err := b.mintRoot(ctx, req)
 	if err != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: NewRoot: %w", err)
-	}
-	if rootId == "" {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: NewRoot returned an empty id", space.ErrBundleBadRequest)
-	}
-	// A derived root would make a losing install unresolvable —
-	// derived trees cannot be deleted. Fail closed: the honest path
-	// (Objects().Create in this space) materializes storage
-	// synchronously, so an absent entry or a read error means the input
-	// is wrong, and letting it through would plant a permanently
-	// unresolvable Losers entry on every device if it loses a race.
-	derived, present, derr := b.parent.store.TreeIsDerived(ctx, rootId)
-	if derr != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: verify root %q: %w", rootId, derr)
-	}
-	if !present {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: root %q has no local tree — create it with Objects().Create in this space", space.ErrBundleBadRequest, rootId)
-	}
-	if derived {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: root %q is a derived object — bundle roots must be created, not derived", space.ErrBundleBadRequest, rootId)
+		return space.Bundle{}, false, err
 	}
 	// Stamp the root with the bundle name so its tree always carries a
-	// non-root change: any-sync's head-sync diff skips root-only trees,
-	// and an unsyncable loser root could never be resolved from another
-	// device. Must succeed BEFORE the registering write — registering
-	// an unstamped (possibly forever-unsyncable) root would plant a
-	// loser no other device can ever resolve.
+	// non-root change: any-sync's head-sync diff skips a tree still
+	// sitting on its root change, so an unstamped root is invisible to
+	// sync. A created loser root would then be unresolvable from
+	// another device; a DERIVED root — which every device materializes
+	// for itself — would sit outside that device's diff and never pull
+	// the peer's content. Must succeed BEFORE the registering write.
 	if err := b.stampRootName(ctx, rootId, req); err != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 	}
 
 	arena := &anyenc.Arena{}
@@ -141,7 +158,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	)
 	dataVersion, err := b.parent.store.DataVersion(spaceindex.BundlesDataset)
 	if err != nil {
-		return space.Bundle{}, err
+		return space.Bundle{}, false, err
 	}
 	res, err := obj.LocalWrite(ctx, crdt.Change{
 		Dataset:     spaceindex.BundlesDataset,
@@ -151,21 +168,220 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		},
 	})
 	if err != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: write: %w", err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: write: %w", err)
 	}
 	if len(res.Rejections) > 0 {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: write rejected: %w", res.Rejections[0].Err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: write rejected: %w", res.Rejections[0].Err)
 	}
 
 	// Return the applied state, not the input — an inbound install may
 	// have landed between the read above and this write's apply.
 	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id)
 	if !liveBundleRow(row) {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: record %q absent after write", req.Id)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: record %q absent after write", req.Id)
 	}
+	return b.materialize(ctx, row), true, nil
+}
+
+// mintRoot produces the root object of a fresh install.
+//
+// The created path takes whatever NewRoot made and fails closed on
+// anything it cannot verify: the honest path (Objects().Create in this
+// space) materializes storage synchronously, so an absent entry or a
+// read error means the input is wrong, and a derived root would plant
+// a Losers entry that nothing can ever delete.
+//
+// The derived path mints the canonical root itself — idempotent, so a
+// device that already derived it (offline, or on a previous attempt)
+// re-registers the same id rather than forking — and seeds
+// RootProperties BEFORE the caller registers anything, so a failed
+// seed leaves no install: the retry mints and seeds again instead of
+// adopting a root whose values never landed.
+func (b *bundlesAPI) mintRoot(ctx context.Context, req space.EnsureBundleRequest) (string, error) {
+	if req.DerivedRoot {
+		rootId, err := b.deriveRoot(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		if err := b.seedRootProperties(ctx, rootId, req.RootProperties); err != nil {
+			return "", err
+		}
+		return rootId, nil
+	}
+
+	rootId, err := req.NewRoot(ctx)
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: bundles: NewRoot: %w", err)
+	}
+	if rootId == "" {
+		return "", fmt.Errorf("spaceimpl: %w: NewRoot returned an empty id", space.ErrBundleBadRequest)
+	}
+	derived, present, derr := b.parent.store.TreeIsDerived(ctx, rootId)
+	if derr != nil {
+		return "", fmt.Errorf("spaceimpl: bundles: verify root %q: %w", rootId, derr)
+	}
+	if !present {
+		return "", fmt.Errorf("spaceimpl: %w: root %q has no local tree — create it with Objects().Create in this space", space.ErrBundleBadRequest, rootId)
+	}
+	if derived {
+		return "", fmt.Errorf("spaceimpl: %w: root %q is a derived object — a created root is required, or ask for DerivedRoot", space.ErrBundleBadRequest, rootId)
+	}
+	return rootId, nil
+}
+
+// deriveRoot materializes the bundle's canonical derived root and
+// attaches RootTypes. Idempotent: a device that already derived it —
+// offline, on a previous attempt, or from a peer's synced tree —
+// re-uses the same tree instead of forking.
+func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleRequest) (string, error) {
+	canonical, err := b.canonicalRootId(ctx, req.Id)
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: bundles: canonical root of %q: %w", req.Id, err)
+	}
+	rootId, err := b.parent.objects.Derive(ctx, space.DeriveObjectOpts{
+		Seed:  spaceindex.BundleRootSeed(req.Id),
+		Types: derivedRootTypes(req),
+	})
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: bundles: derive root of %q: %w", req.Id, err)
+	}
+	if rootId != canonical {
+		// Unreachable unless derivation itself changed shape.
+		// Registering a root other devices would not recognize as
+		// canonical is worse than refusing to install.
+		return "", fmt.Errorf("spaceimpl: bundles: derived root %q is not the canonical %q", rootId, canonical)
+	}
+	return rootId, nil
+}
+
+// derivedRootTypes is what a derived root implements: the requested
+// types plus every type RootProperties writes into. A property write
+// to a type the object does not implement is rejected, and the created
+// path attaches the same union through Objects().Create.
+func derivedRootTypes(req space.EnsureBundleRequest) []string {
+	if len(req.RootProperties) == 0 {
+		return req.RootTypes
+	}
+	seen := make(map[string]struct{}, len(req.RootTypes)+len(req.RootProperties))
+	out := make([]string, 0, len(req.RootTypes)+len(req.RootProperties))
+	for _, t := range req.RootTypes {
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	// Sorted: map order would make the attach change differ per call
+	// for no reason.
+	for _, t := range slices.Sorted(maps.Keys(req.RootProperties)) {
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+// seedRootProperties writes a derived root's initial property values,
+// one call per type. A created root gets the same state atomically
+// from Objects().Create; a derived object has no create-time hook, so
+// they land as ordinary writes — identical on every installer, so
+// concurrent seeds converge.
+func (b *bundlesAPI) seedRootProperties(ctx context.Context, rootId string, props map[string]map[string]any) error {
+	for _, typeId := range slices.Sorted(maps.Keys(props)) {
+		kv := props[typeId]
+		if len(kv) == 0 {
+			continue
+		}
+		if _, err := b.parent.properties.Set(ctx, rootId, typeId, kv); err != nil {
+			return fmt.Errorf("spaceimpl: bundles: seed root properties of type %q: %w", typeId, err)
+		}
+	}
+	return nil
+}
+
+// canonicalRootId is the id the bundle's derived root has in this
+// space: a pure function of (space, bundle id), computed without
+// materializing anything, identical on every device and for every
+// member.
+func (b *bundlesAPI) canonicalRootId(ctx context.Context, bundleId string) (string, error) {
+	if v, ok := b.derivedIds.Load(bundleId); ok {
+		return v.(string), nil
+	}
+	id, err := b.parent.store.DeriveId(ctx, spaceobjects.DeriveOpts{
+		ChangeType:    objectChangeType,
+		ChangePayload: spaceindex.BundleRootSeed(bundleId),
+	})
+	if err != nil {
+		return "", err
+	}
+	b.derivedIds.Store(bundleId, id)
+	return id, nil
+}
+
+func (b *bundlesAPI) DerivedRootId(ctx context.Context, bundleId string) (string, error) {
+	if bundleId == "" {
+		return "", fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
+	}
+	return b.canonicalRootId(ctx, bundleId)
+}
+
+// view lifts a stored row into the public Bundle and reports whether
+// it is a LIVE install. A row whose winner's tree is deleted reads as
+// uninstalled everywhere (Get, List, Ensure's adopt gate) — otherwise
+// the bundle id would be permanently wedged, since record deletes are
+// rejected and rootId has no unset.
+func (b *bundlesAPI) view(ctx context.Context, row *anyenc.Value) (space.Bundle, bool) {
+	if !liveBundleRow(row) {
+		return space.Bundle{}, false
+	}
+	bd := b.materialize(ctx, row)
+	if bd.RootId == "" || b.winnerDeleted(ctx, &bd) {
+		return bd, false
+	}
+	return bd, true
+}
+
+// materialize decodes a row and applies the two read-side rules: the
+// derived-root verdict and the live conflict set.
+func (b *bundlesAPI) materialize(ctx context.Context, row *anyenc.Value) space.Bundle {
 	bd := decodeBundleRecord(row)
+	b.preferDerivedRoot(ctx, &bd)
 	b.fillLosers(ctx, &bd)
-	return bd, nil
+	return bd
+}
+
+// preferDerivedRoot applies the derived-root verdict: once the
+// canonical derived root has been claimed, it IS the winner, whatever
+// the rootId register converged to.
+//
+// The claim set is add-only, so every replica reaches this verdict
+// from any causal prefix that contains the claim — no ordering, no
+// race, no window where two devices disagree about a root they can
+// both compute. Without it a concurrent created install could win the
+// LWW register and strand the derived root as a loser, and a derived
+// tree cannot be deleted — the one conflict the registry could never
+// resolve.
+func (b *bundlesAPI) preferDerivedRoot(ctx context.Context, bd *space.Bundle) {
+	if bd.Id == "" || len(bd.Roots) == 0 {
+		return
+	}
+	canonical, err := b.canonicalRootId(ctx, bd.Id)
+	if err != nil {
+		// Falling back to the register means this reader can disagree
+		// with every other replica about the winner — and about
+		// Derived, which drives how callers bind child objects. Rare
+		// (a cancelled ctx, a closing store), but never silent.
+		bundleLog.Warn("bundle winner falls back to the rootId register",
+			zap.String("bundle", bd.Id), zap.String("spaceId", b.parent.id), zap.Error(err))
+		return
+	}
+	if canonical == "" || !slices.Contains(bd.Roots, canonical) {
+		return
+	}
+	bd.RootId = canonical
+	bd.Derived = true
 }
 
 func (b *bundlesAPI) Get(ctx context.Context, bundleId string) (space.Bundle, error) {
@@ -176,18 +392,13 @@ func (b *bundlesAPI) Get(ctx context.Context, bundleId string) (space.Bundle, er
 	if err != nil {
 		return space.Bundle{}, err
 	}
-	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, bundleId)
-	if !liveBundleRow(row) {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
-	}
-	bd := decodeBundleRecord(row)
 	// A deleted winner = uninstalled (matches Ensure's adopt gate) —
 	// reporting the dead RootId as live would send callers deriving
 	// children from a tombstoned parent.
-	if bd.RootId == "" || b.winnerDeleted(ctx, &bd) {
+	bd, live := b.view(ctx, obj.Controller().Get(ctx, spaceindex.BundlesDataset, bundleId))
+	if !live {
 		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: %q (no live install)", space.ErrBundleUnknown, bundleId)
 	}
-	b.fillLosers(ctx, &bd)
 	return bd, nil
 }
 
@@ -202,11 +413,10 @@ func (b *bundlesAPI) List(ctx context.Context) ([]space.Bundle, error) {
 	rows := obj.Controller().Records(ctx, spaceindex.BundlesDataset)
 	out := make([]space.Bundle, 0, len(rows))
 	for _, v := range rows {
-		bd := decodeBundleRecord(v)
-		if bd.RootId == "" || b.winnerDeleted(ctx, &bd) {
+		bd, live := b.view(ctx, v)
+		if !live {
 			continue // uninstalled — same gate as Get
 		}
-		b.fillLosers(ctx, &bd)
 		out = append(out, bd)
 	}
 	return out, nil
@@ -233,7 +443,11 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	if !liveBundleRow(row) {
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
 	}
+	// Same winner the readers see: with a canonical derived root
+	// claimed, the created root the register may still name is a
+	// LOSER, and deleting it is exactly what the caller is here for.
 	bd := decodeBundleRecord(row)
+	b.preferDerivedRoot(ctx, &bd)
 	if bd.RootId == "" || loserRootId == bd.RootId || !slices.Contains(bd.Roots, loserRootId) {
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleNotLoser, loserRootId)
 	}
@@ -273,6 +487,16 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 	name := req.Name
 	if name == "" {
 		name = req.Id
+	}
+	// Already stamped: a derived root is materialized by every device
+	// that installs it, and re-writing the same name on each would add
+	// a change per device for nothing. The record's existence is the
+	// property that matters — the tree already carries a non-root
+	// change.
+	if row := obj.Controller().Get(ctx, properties.Dataset, rootId); row != nil {
+		if cur := row.Get("any", "name"); cur != nil && string(cur.GetStringBytes()) == name {
+			return nil
+		}
 	}
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()

@@ -45,7 +45,20 @@ const (
 	// Never shrunk: losers stay listed as the audit trail; their death
 	// is recorded by tree deletion, not by mutating this array.
 	FieldBundleRoots = "roots"
+
+	// BundleRootSeedPrefix namespaces the derivation payload of a
+	// bundle's canonical derived root, keeping it clear of the seeds
+	// applications choose for their own derived objects.
+	BundleRootSeedPrefix = "builtin:bundleRoot:"
 )
+
+// BundleRootSeed is the derivation payload of the bundle's canonical
+// derived root: the bundle id alone, so the root id is a pure function
+// of (space, bundle id) and every device computes it with zero
+// communication. See docs/bundles.md § Derived roots.
+func BundleRootSeed(bundleId string) []byte {
+	return []byte(BundleRootSeedPrefix + bundleId)
+}
 
 // BundlesSchema declares the bundles dataset.
 func BundlesSchema() schema.Dataset {

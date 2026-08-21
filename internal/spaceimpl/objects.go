@@ -68,6 +68,11 @@ func dataVersionForTypes(ctx context.Context, reg *types.LiveRegistry, typeIds [
 	return encoded, nil
 }
 
+// objectChangeType is the tree change-type every user-space object is
+// created and derived with. It is part of a derived object's id, so
+// every deriver of the same object must pass the same value.
+const objectChangeType = "object"
+
 // objectService implements space.ObjectService backed by the
 // per-space spaceobjects.Store.
 type objectService struct {
@@ -81,7 +86,7 @@ func newObjectService(parent *spaceImpl) *objectService { return &objectService{
 // change, and returns the new objectId.
 func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts) (string, error) {
 	obj, err := o.parent.store.Create(ctx, spaceobjects.CreateOpts{
-		ChangeType: "object",
+		ChangeType: objectChangeType,
 	})
 	if err != nil {
 		return "", err
@@ -101,7 +106,7 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 // requested Types are already attached, writes no change at all.
 func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts) (string, error) {
 	obj, err := o.parent.store.Derive(ctx, spaceobjects.DeriveOpts{
-		ChangeType:    "object",
+		ChangeType:    objectChangeType,
 		ChangePayload: opts.Seed,
 		ParentId:      opts.ParentId,
 	})

@@ -319,7 +319,34 @@ Payload is unused (the record id comes from `RecordChange.id`).
 | `$pull` | yes | no | yes (set merge) |
 | `$inc` | yes (against `$set`) | no | yes (counter) |
 | `$incGated` | yes | yes | no (LWW; non-convergent under arbitrary delivery — see §15) |
+| `$setCreate` | yes (min: older offer wins) | yes | yes (min merge) |
 | `delete` | sticky tombstone | collapses `_ver` to `{ "*": v }` | N/A — wins absolutely |
+
+### 5.9 `$setCreate` (derivation-only creation stamp)
+
+The min-rule mirror of `$set`: the offer lands when the position is
+unclaimed or its `_ver` entry is **newer** than the offering change, and
+is dropped against an older-or-equal one. Min is commutative and
+associative, so every peer settles on the causally-earliest offer in any
+delivery order — the per-field twin of the `_ver.id` marker's min-update
+rule (§3.5).
+
+Used exclusively for handler-derived creation stamps (`author`/`creator`,
+`createdAt`): the stamping handler re-offers them from **every accepted
+upsert** (create and modify alike), each offer carrying that change's own
+envelope. Re-offering is what makes the stamp convergent — a create-only
+stamp is a different one-shot on every peer (each peer's local first-touch
+differs), so LWW never gets two values to compare — and what backfills
+records minted before the stamp existed. For objects whose tree root
+carries the value (a real root header's timestamp/signer), every offer is
+identical and the min-rule is trivially stable; the envelope fallback only
+matters for derived trees, whose deterministic roots carry neither.
+
+`$setCreate` never travels in a caller or wire `RecordChange` — pre-apply
+path validation rejects it (it could pin a synced field against every
+later write). It exists only as a Sink-derived op, re-derived locally on
+every peer, and projects onto subscriber events as a plain `$set` of the
+post-apply value like every other non-`$set` op.
 
 **Auto-create** (no explicit row): controlled by `RecordChange.upsert`. When `upsert: true`, any modify op targeting a non-existent id auto-creates an empty record `{id, _ver: {}}` first, then applies. When `upsert: false` (the default, strict), modifies on absent records are no-ops. `delete` ignores the flag. There is no `insert` op.
 
@@ -539,9 +566,12 @@ read-tracking-proposal.md) — handler validation stays
 replica-independent by construction.
 
 **Sink** is how hooks write: `Derive(op)` queues a same-record derived
-op folded into the same store write (inheriting the change's
-VersionId — server-stamped fields like `creator`/`createdAt` land this
-way, converging under the standard LWW gate), and
+op folded into the same store write, inheriting the change's VersionId.
+Max-flavored stamps (`modifiedAt`) land as plain `$set` under the
+standard LWW gate; creation stamps (`creator`/`author`, `createdAt`)
+land as `$setCreate` offers re-emitted by every accepted upsert,
+converging under the min-rule (§5.9) to the causally-earliest upsert's
+envelope — the same change the `_ver.id` marker elects.
 `Project(dataset, rec)` queues a sibling write to another dataset on
 the same object, applied in the same transaction.
 

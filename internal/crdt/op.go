@@ -21,6 +21,18 @@ const (
 	OpInc      OpType = "$inc"
 	OpIncGated OpType = "$incGated"
 	OpDelete   OpType = "delete"
+
+	// OpSetCreate is the creation-stamp register: the value offered by the
+	// LOWEST-VersionId change wins (min-rule, the per-field twin of the
+	// `_ver.id` creation marker — see lowerCreationMarker). Handlers emit it
+	// via Sink.Derive for stamps that must reflect the record's creating
+	// change (creator/author, createdAt) no matter which change happens to
+	// first-touch the record locally: every touching upsert re-offers the
+	// stamp, an offer from an older change overwrites one from a newer, and
+	// all peers converge on the causally-earliest offer regardless of
+	// delivery order. Derivation-only — validateOpPaths rejects it in
+	// caller/wire RecordChanges.
+	OpSetCreate OpType = "$setCreate"
 )
 
 // Op is one operation inside a RecordChange.
@@ -124,15 +136,21 @@ type Change struct {
 	DataVersion string
 	// Timestamp carried alongside the change for tombstones (delete writes a
 	// `deletedAt` field). The CRDT layer treats it as advisory metadata; it is
-	// not used for conflict resolution.
+	// not used for conflict resolution. Handlers do copy it into queryable
+	// stamp fields (modifiedAt; the createdAt fallback on derived trees) —
+	// but WHICH change's clock sticks is always resolved by VersionId
+	// (LWW / $setCreate min-rule), never by comparing timestamps, and the
+	// value is the author's unvalidated wall clock: display/sort quality
+	// only, never a fencing token.
 	Timestamp int64
 	// ObjectAuthor is the StrKey-encoded identity (PubKey.Account()) of
 	// the peer that created the OBJECT — i.e. the signer of the tree's
 	// root change. Constant across every change in a tree; the apply
 	// pipeline stamps it before calling Controller.ApplyChange. Used by
-	// SystemPropertiesHandler to auto-stamp `author` at row root on
-	// first record creation. Empty on hand-built changes (tests) where
-	// no tree is wired.
+	// SystemPropertiesHandler to auto-stamp `author` at row root (a
+	// $setCreate creation stamp; Creator is the fallback for derived
+	// trees, whose deterministic root carries no identity). Empty on
+	// hand-built changes (tests) where no tree is wired.
 	//
 	// Distinct from Creator below: ObjectAuthor is the constant root
 	// signer (object creator); Creator is the per-change signer (who
@@ -148,7 +166,9 @@ type Change struct {
 	// ObjectCreatedAt is the Unix-seconds timestamp of the tree's root
 	// change — the moment the object was created. Constant across every
 	// change in a tree. Used by SystemPropertiesHandler to auto-stamp
-	// `createdAt` at row root on first record creation.
+	// `createdAt` at row root (a $setCreate creation stamp; Timestamp
+	// is the fallback for derived trees, whose deterministic root is
+	// timestamp-less — zero here).
 	ObjectCreatedAt int64
 	// TraceIds are opaque correlation tokens attached by the originating
 	// caller (e.g. a UI session id, an AI operation id). They travel with the

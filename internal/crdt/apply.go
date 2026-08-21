@@ -45,6 +45,8 @@ func applyOp(arena *anyenc.Arena, rec *anyenc.Value, ch Change, op Op) {
 		applyInc(arena, rec, ch, op)
 	case OpIncGated:
 		applyIncGated(arena, rec, ch, op)
+	case OpSetCreate:
+		applySetCreate(arena, rec, ch, op)
 	case OpDelete:
 		// delete is handled at a higher level (buildModifier / applyDelete)
 		// because it replaces the whole record rather than mutating it.
@@ -249,6 +251,36 @@ func mergeReplace(arena *anyenc.Arena, oldVal, verNode, newVal *anyenc.Value, v 
 	// Survivors keep the position an object; a non-object incoming value
 	// is superseded per-leaf and does not land.
 	return outVal, outVer, true
+}
+
+// ----------------------------------------------------------------------------
+// $setCreate (creation stamps, min-version-wins)
+// ----------------------------------------------------------------------------
+
+// applySetCreate applies a creation-stamp offer under the min-rule: the
+// offer lands when the position is unclaimed OR its current `_ver` entry
+// is NEWER than the offering change — i.e. the current value came from a
+// later change, and this offer is closer to the record's true creation.
+// Min is commutative and associative, so every peer converges to the
+// causally-earliest offer in any delivery order — the same argument as
+// lowerCreationMarker's `_ver.id` min-rule, applied per field.
+//
+// Stamps are scalar row-root fields, so a position with finer-grained
+// `_ver` entries below it (subtree) never occurs for a well-behaved
+// handler; if one exists the offer is skipped rather than merged.
+func applySetCreate(arena *anyenc.Arena, rec *anyenc.Value, ch Change, op Op) {
+	if len(op.Path) == 0 || op.Payload == nil {
+		return
+	}
+	gate, subtree := gateVersion(rec, op.Path)
+	if subtree != nil {
+		return
+	}
+	if gate != "" && gate <= ch.VersionId {
+		return
+	}
+	setNested(arena, rec, op.Path, cloneInto(arena, op.Payload))
+	SetRecordVersion(arena, rec, ch.VersionId, op.Path...)
 }
 
 // ----------------------------------------------------------------------------

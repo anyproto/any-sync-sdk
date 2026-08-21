@@ -116,10 +116,13 @@ type Stamp uint8
 
 const (
 	StampNone Stamp = iota
-	// StampCreator: the creating change's signer identity, set once at
-	// create. The authorship fact author-gated rules check against.
+	// StampCreator: the creating change's signer identity — the
+	// causally-earliest upsert's, min-rule convergent across concurrent
+	// creates (crdt.OpSetCreate). The authorship fact author-gated
+	// rules check against.
 	StampCreator
-	// StampCreateTime: the creating change's timestamp, set once.
+	// StampCreateTime: the creating change's timestamp — min-rule
+	// convergent like StampCreator.
 	StampCreateTime
 	// StampModifyTime: the change timestamp, set at create and bumped
 	// on every accepted mutable write.

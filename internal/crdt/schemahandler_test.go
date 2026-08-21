@@ -405,9 +405,10 @@ func TestSchemaHandler_ConvergenceDeleteRacesCreate(t *testing.T) {
 	assert.Equal(t, "t", string(recBA.GetStringBytes("title")))
 }
 
-// Author-gated modify verdicts converge too: the creator stamp is a
-// derived-at-create immutable fact, so the verdict never depends on
-// which of two independent edits applied first.
+// Author-gated modify verdicts converge too: the creator stamp is
+// min-convergent (every peer settles on the causally-earliest upsert's
+// signer), so once delivery quiesces the verdict never depends on which
+// of two independent edits applied first.
 func TestSchemaHandler_ConvergenceAuthorEditOrders(t *testing.T) {
 	a := &anyenc.Arena{}
 	create := shChange("v1", shAuthorA, 100,
@@ -432,6 +433,62 @@ func TestSchemaHandler_ConvergenceAuthorEditOrders(t *testing.T) {
 	// the non-author op is rejected regardless of position.
 	assert.Equal(t, "by-author", apply(t, []Change{create, editByAuthor, editByOther}))
 	assert.Equal(t, "by-author", apply(t, []Change{create, editByOther, editByAuthor}))
+}
+
+// Concurrent upserts to the same id race on the creation stamps. The
+// $setCreate min-rule (offers re-emitted by every accepted upsert)
+// makes creator/createdAt settle on the causally-earliest upsert's
+// envelope in either delivery order — the same change `_ver.id`
+// elects. Before this rule each peer kept its local first-touch's
+// stamp and diverged permanently.
+func TestSchemaHandler_ConvergenceCreateStampsUpsertRace(t *testing.T) {
+	a := &anyenc.Arena{}
+	early := shChange("v1", shAuthorA, 100,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t", "note": "from-early"}))
+	late := shChange("v2", shAuthorB, 200,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t", "note": "from-late"}))
+
+	apply := func(t *testing.T, order []Change) *anyenc.Value {
+		st := newSchemaHandlerController(t, shDecl())
+		for i := range order {
+			_, err := st.ApplyChangeWithResult(ctx, order[i])
+			require.NoError(t, err)
+		}
+		return st.Get(ctx, shTestDS, "row-1")
+	}
+
+	recAB := apply(t, []Change{early, late})
+	recBA := apply(t, []Change{late, early})
+	require.NotNil(t, recAB)
+	require.NotNil(t, recBA)
+	for name, rec := range map[string]*anyenc.Value{"in-order": recAB, "reversed": recBA} {
+		assert.Equal(t, shAuthorA, string(rec.GetStringBytes("creator")), "%s: earliest upsert's signer", name)
+		assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "%s: earliest upsert's time", name)
+		assert.Equal(t, "v1", string(rec.GetStringBytes(VersionsKey, IdField)), "%s: stamps match the creation marker", name)
+	}
+}
+
+// Strict (non-upsert) modifies leave the creation stamps alone — the
+// offer rule mirrors the `_ver.id` marker's upsert-only update rule.
+func TestSchemaHandler_CreateStampsIgnoreStrictModify(t *testing.T) {
+	st := newSchemaHandlerController(t, shDecl())
+	a := &anyenc.Arena{}
+	_, err := st.ApplyChangeWithResult(ctx, shChange("v2", shAuthorB, 200,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t"})))
+	require.NoError(t, err)
+
+	// Contrived lower-versioned strict modify: accepted, but it must not
+	// re-elect the creation stamps (nor lower _ver.id).
+	_, err = st.ApplyChangeWithResult(ctx, shChange("v1", shAuthorA, 100, RecordChange{
+		Id: "row-1", Ops: []Op{{Type: OpSet, Path: []string{"note"}, Payload: a.NewString("n")}},
+	}))
+	require.NoError(t, err)
+
+	rec := st.Get(ctx, shTestDS, "row-1")
+	require.NotNil(t, rec)
+	assert.Equal(t, shAuthorB, string(rec.GetStringBytes("creator")))
+	assert.Equal(t, float64(200), rec.GetFloat64("createdAt"))
+	assert.Equal(t, "v2", string(rec.GetStringBytes(VersionsKey, IdField)))
 }
 
 // The accept path of BeforeModify must not allocate: cold restore replays

@@ -1406,9 +1406,9 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 		// Timestamp is the creation moment baked into the immutable
 		// root change. SystemPropertiesHandler reads it back via
 		// tree.Root().Timestamp to auto-stamp `createdAt` on the
-		// object's row at first property write — without setting it
-		// here, the root carries 0 and the auto-stamp is silently
-		// skipped (see properties.stampAutoFields).
+		// object's row — without setting it here, the root carries 0
+		// and the stamp falls back to the min-rule envelope offers
+		// meant for derived trees (see properties.stampCreateStamps).
 		Timestamp: time.Now().Unix(),
 	})
 	if err != nil {

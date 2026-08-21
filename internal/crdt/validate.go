@@ -52,6 +52,11 @@ func validateOpPaths(op Op) error {
 		return validatePath(op.Path)
 	case OpAddToSet, OpPull, OpInc, OpIncGated:
 		return validatePath(op.Path)
+	case OpSetCreate:
+		// Derivation-only: creation stamps are emitted by handlers via the
+		// Sink (which bypasses this pass); a caller- or wire-supplied
+		// $setCreate could pin a synced field's value against later writes.
+		return fmt.Errorf("%w: %s is derivation-only", ErrInvalidPath, op.Type)
 	}
 	return nil
 }

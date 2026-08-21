@@ -479,42 +479,6 @@ func TestSystemPropertiesHandler_ModifiedAtBumpsOnModify(t *testing.T) {
 	assert.Equal(t, float64(200), rec.GetFloat64("modifiedAt"), "valid modify bumps modifiedAt")
 }
 
-// ----------------------------------------------------------------------------
-// createdAt — root header when present, first-touch fallback for derived trees
-// ----------------------------------------------------------------------------
-
-func TestSystemPropertiesHandler_CreatedAtFromRootHeader(t *testing.T) {
-	ctrl := newPropsController(t, defaultRegistry())
-	arena := &anyenc.Arena{}
-
-	ch := makeChangeAt("v1", 100, testObjectId, true,
-		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
-	)
-	ch.ObjectCreatedAt = 50
-	require.NoError(t, ctrl.ApplyChange(context.Background(), ch))
-
-	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
-	require.NotNil(t, rec)
-	assert.Equal(t, float64(50), rec.GetFloat64("createdAt"), "root header wins over the change envelope")
-}
-
-// A derived tree's root is deterministic and timestamp-less, so
-// ObjectCreatedAt is 0 for every change — createdAt falls back to the
-// first-touch change's envelope Timestamp instead of staying unstamped.
-func TestSystemPropertiesHandler_CreatedAtDerivedFallback(t *testing.T) {
-	ctrl := newPropsController(t, defaultRegistry())
-	arena := &anyenc.Arena{}
-
-	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
-		"v1", 100, testObjectId, true,
-		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
-	)))
-
-	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
-	require.NotNil(t, rec)
-	assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "derived root: createdAt = first-touch change time")
-}
-
 // Out-of-order delivery: an older change (lower VersionId) arriving after
 // a newer one must NOT regress modifiedAt — the stamp is LWW-gated on the
 // change's VersionId like any other field write.
@@ -607,4 +571,181 @@ func TestSystemPropertiesHandler_ModifiedAtClientWriteDropped(t *testing.T) {
 	require.NotNil(t, rec)
 	assert.Nil(t, rec.Get(typeAny, "modifiedAt"), "derived-scoped client op dropped")
 	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "handler stamp still lands at row root")
+}
+
+// ----------------------------------------------------------------------------
+// author / createdAt — creation stamps: root header when present, min-rule
+// envelope fallback for derived trees ($setCreate offers, see OpSetCreate)
+// ----------------------------------------------------------------------------
+
+func TestSystemPropertiesHandler_CreatedAtFromRootHeader(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	ch := makeChangeAt("v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)
+	ch.ObjectCreatedAt = 50
+	require.NoError(t, ctrl.ApplyChange(context.Background(), ch))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(50), rec.GetFloat64("createdAt"), "root header wins over the change envelope")
+}
+
+// A derived tree's root is deterministic and timestamp-less, so
+// ObjectCreatedAt is 0 for every change — createdAt falls back to the
+// creating change's envelope Timestamp instead of staying unstamped.
+func TestSystemPropertiesHandler_CreatedAtDerivedFallback(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "derived root: createdAt = creating change's time")
+}
+
+// The convergence case that motivates the $setCreate min-rule: two peers
+// receive the same concurrent upserts in opposite orders. Whichever
+// change first-touches the record locally, both peers must settle on the
+// causally-earliest (lowest-VersionId) upsert's envelope for createdAt.
+func TestSystemPropertiesHandler_CreatedAtDerivedFallbackConverges(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v1 := func() crdt.Change {
+		return makeChangeAt("v1", 100, testObjectId, true,
+			crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")})
+	}
+	v2 := func() crdt.Change {
+		return makeChangeAt("v2", 200, testObjectId, true,
+			crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)})
+	}
+
+	peerA := newPropsController(t, defaultRegistry())
+	require.NoError(t, peerA.ApplyChange(context.Background(), v1()))
+	require.NoError(t, peerA.ApplyChange(context.Background(), v2()))
+
+	peerB := newPropsController(t, defaultRegistry())
+	require.NoError(t, peerB.ApplyChange(context.Background(), v2()))
+	require.NoError(t, peerB.ApplyChange(context.Background(), v1()))
+
+	recA := peerA.Get(context.Background(), properties.Dataset, testObjectId)
+	recB := peerB.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, recA)
+	require.NotNil(t, recB)
+	assert.Equal(t, float64(100), recA.GetFloat64("createdAt"), "peer A: earliest upsert's time")
+	assert.Equal(t, float64(100), recB.GetFloat64("createdAt"), "peer B: reversed order, same verdict")
+	assert.Equal(t, "v1", recA.GetString("_ver", "id"))
+	assert.Equal(t, "v1", recB.GetString("_ver", "id"), "createdAt's authority matches the creation marker")
+}
+
+// `author` has the identical derived-root hole and the identical fix:
+// BuildDerivedRoot carries no Identity, so ObjectAuthor is empty — fall
+// back to the change's own signer (Creator), min-rule convergent.
+func TestSystemPropertiesHandler_AuthorDerivedFallbackConverges(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v1 := func() crdt.Change {
+		ch := makeChangeAt("v1", 100, testObjectId, true,
+			crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")})
+		ch.Creator = "signer-early"
+		return ch
+	}
+	v2 := func() crdt.Change {
+		ch := makeChangeAt("v2", 200, testObjectId, true,
+			crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)})
+		ch.Creator = "signer-late"
+		return ch
+	}
+
+	peerA := newPropsController(t, defaultRegistry())
+	require.NoError(t, peerA.ApplyChange(context.Background(), v1()))
+	require.NoError(t, peerA.ApplyChange(context.Background(), v2()))
+
+	peerB := newPropsController(t, defaultRegistry())
+	require.NoError(t, peerB.ApplyChange(context.Background(), v2()))
+	require.NoError(t, peerB.ApplyChange(context.Background(), v1()))
+
+	recA := peerA.Get(context.Background(), properties.Dataset, testObjectId)
+	recB := peerB.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, recA)
+	require.NotNil(t, recB)
+	assert.Equal(t, "signer-early", recA.GetString("author"))
+	assert.Equal(t, "signer-early", recB.GetString("author"), "author converges to the earliest upsert's signer")
+}
+
+// Root-header objects are untouched by the fallback: every change offers
+// the same header value, so delivery order trivially cannot matter.
+func TestSystemPropertiesHandler_CreatedAtRootHeaderWinsOverLaterEnvelope(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	ch1 := makeChangeAt("v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")})
+	ch1.ObjectCreatedAt = 50
+	ch2 := makeChangeAt("v2", 200, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)})
+	ch2.ObjectCreatedAt = 50
+	require.NoError(t, ctrl.ApplyChange(context.Background(), ch1))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), ch2))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(50), rec.GetFloat64("createdAt"), "header value stays put across modifies")
+}
+
+// Backfill: a row minted by a change that carried no stampable time
+// (legacy rows predating the fallback look exactly like this — createdAt
+// null, _ver set) picks the stamp up from the NEXT accepted upsert; the
+// min-rule then lets any later-arriving older change refine it, so
+// every peer still converges.
+func TestSystemPropertiesHandler_CreatedAtBackfilledOnUpsertModify(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 0, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	require.Nil(t, rec.Get("createdAt"), "no stampable time on the creating change")
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v3", 300, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	)))
+	rec = ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(300), rec.GetFloat64("createdAt"), "next upsert backfills the stamp")
+
+	// An older change surfacing later refines the stamp downward.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v2", 200, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("later-but-older")},
+	)))
+	rec = ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(200), rec.GetFloat64("createdAt"), "older upsert's offer wins under the min-rule")
+}
+
+// A creating change whose every op fails validation mints no auto
+// fields — the stamps run behind the same validation gate BeforeModify
+// uses (a change with no surviving content must not stamp).
+func TestSystemPropertiesHandler_CreateStampsSkippedWhenAllOpsRejected(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get("createdAt"), "fully-rejected create stamps no createdAt")
+	assert.Nil(t, rec.Get("modifiedAt"), "fully-rejected create stamps no modifiedAt")
 }

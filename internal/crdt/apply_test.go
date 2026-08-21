@@ -538,6 +538,59 @@ func TestIncGated_NewerWins(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// $setCreate (creation stamps, min-version-wins)
+// ----------------------------------------------------------------------------
+
+// The min gate, leaf by leaf: an offer lands on an unclaimed position or
+// over a NEWER claim, and is dropped against an older-or-equal one.
+// Idempotent replay of the same change is the equal case.
+func TestSetCreate_MinGate(t *testing.T) {
+	arena := &anyenc.Arena{}
+	rec := arena.NewObject()
+	offer := func(version VersionId, ts float64) {
+		applySetCreate(arena, rec, Change{VersionId: version}, Op{
+			Type: OpSetCreate, Path: []string{"createdAt"}, Payload: arena.NewNumberFloat64(ts),
+		})
+	}
+
+	offer("v5", 500) // unclaimed: lands
+	assert.Equal(t, float64(500), rec.GetFloat64("createdAt"))
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "createdAt"))
+
+	offer("v7", 700) // newer offer: dropped
+	assert.Equal(t, float64(500), rec.GetFloat64("createdAt"))
+
+	offer("v3", 300) // older offer: refines downward
+	assert.Equal(t, float64(300), rec.GetFloat64("createdAt"))
+	assert.Equal(t, VersionId("v3"), GetRecordVersion(rec, "createdAt"))
+
+	offer("v3", 999) // equal (replay): dropped
+	assert.Equal(t, float64(300), rec.GetFloat64("createdAt"))
+}
+
+// $setCreate is derivation-only: a caller- or wire-supplied RecordChange
+// carrying one is dropped at pre-apply path validation with a recorded
+// rejection (it could otherwise pin a synced field's value against every
+// later write).
+func TestSetCreate_RejectedInCallerChanges(t *testing.T) {
+	st := newTestController(t)
+	arena := &anyenc.Arena{}
+
+	res, err := st.ApplyChangeWithResult(ctx, makeUpsert("v1", "r1", Op{
+		Type:    OpSetCreate,
+		Path:    []string{"name"},
+		Payload: arena.NewString("pinned"),
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, ErrInvalidPath)
+	rec := st.Get(ctx, testDS, "r1")
+	if rec != nil {
+		assert.Nil(t, rec.Get("name"), "the pinned value must not land")
+	}
+}
+
+// ----------------------------------------------------------------------------
 // delete
 // ----------------------------------------------------------------------------
 

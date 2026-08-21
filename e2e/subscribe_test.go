@@ -250,20 +250,36 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 	assertTitle(t, urec, typeId, titleProp, "Casablanca")
 
 	// Auto stamps must still be present on the Updated Doc (they're
-	// persisted on the row), but the create-only ones should NOT appear
-	// in Ops (no re-stamp on update). modifiedAt is the exception: it
-	// re-stamps on every modify — and exactly once per record, not once
-	// per user op (Sink.DeriveOnce).
+	// persisted on the row). Every stamp re-emits on an accepted upsert
+	// modify — exactly once per record, not once per user op
+	// (Sink.DeriveOnce): modifiedAt as an LWW bump, and the creation
+	// stamps (author / createdAt) as $setCreate min-rule offers, which
+	// is what keeps them convergent across concurrent first-touches and
+	// backfills pre-stamp rows. On the wire every op projects to a $set
+	// of the post-apply value, so the re-offered createdAt must carry
+	// the CREATING change's time — this change is newer, so its offer
+	// loses the min race and the applied value doesn't move.
 	assert.NotNil(t, urec.Doc.Get("author"))
-	modifiedAtOps := 0
+	createdAt := rec.Doc.GetFloat64("createdAt")
+	assert.Equal(t, createdAt, urec.Doc.GetFloat64("createdAt"),
+		"a later write's createdAt offer must lose the min race — value pinned to the creating change")
+	stampOps := map[string]int{}
 	for _, op := range urec.Ops {
-		assert.NotEqual(t, []string{"author"}, op.Path, "update must not re-emit author op")
-		assert.NotEqual(t, []string{"createdAt"}, op.Path, "update must not re-emit createdAt op")
-		if len(op.Path) == 1 && op.Path[0] == "modifiedAt" {
-			modifiedAtOps++
+		if len(op.Path) != 1 {
+			continue
+		}
+		switch op.Path[0] {
+		case "modifiedAt", "author", "createdAt":
+			assert.Equal(t, crdt.OpSet, op.Type, "stamps project as plain $set on the wire")
+			stampOps[op.Path[0]]++
+			if op.Path[0] == "createdAt" {
+				assert.Equal(t, createdAt, op.Payload.GetFloat64(),
+					"projected createdAt op carries the post-apply (min-gated) value, not this change's clock")
+			}
 		}
 	}
-	assert.Equal(t, 1, modifiedAtOps, "update must re-emit exactly one modifiedAt op")
+	assert.Equal(t, map[string]int{"modifiedAt": 1, "author": 1, "createdAt": 1}, stampOps,
+		"update must re-emit each stamp exactly once")
 }
 
 // TestSDK_QuerySubscribe_DeleteEmitsRemoved covers object deletion end

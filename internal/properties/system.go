@@ -112,60 +112,36 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 			kept = append(kept, rec.Ops[i])
 		}
 		rec.Ops = kept
+		if len(rec.Ops) == 0 {
+			// Every op dropped: stamp nothing, mirroring BeforeModify's
+			// stamp-behind-validation gate — a change with no surviving
+			// content must not mint auto fields. Deterministic (validation
+			// is convergent), and the creation stamps are re-offered by the
+			// next valid upsert anyway.
+			return nil
+		}
 	}
 	stampAutoFields(ctx, sink)
 	return nil
 }
 
-// stampAutoFields queues derived ops for the row-root auto fields
-// — `author`, `createdAt`, `spaceId` — that live alongside `id` at
-// the top of the record (NOT under `any.*`). Stamped once at record
-// creation; BeforeCreate fires only on first-touch so they don't
-// re-apply. Also seeds the initial `modifiedAt` (per-change, keeps
-// moving on every modify — see stampModifiedAt).
+// stampAutoFields queues derived ops for the row-root auto fields —
+// `author`, `createdAt`, `spaceId` — that live alongside `id` at the
+// top of the record (NOT under `any.*`), and seeds the initial
+// `modifiedAt` (per-change, keeps moving on every modify — see
+// stampModifiedAt). Fired from BeforeCreate; the creation stamps are
+// additionally re-offered by every accepted upsert modify (see
+// stampCreateStamps for why).
 //
-// `author` and `createdAt` are taken from the tree's ROOT change
-// (immutable header), not from the per-change envelope — those are
-// constants per object, regardless of which change happens to land
-// first locally. `spaceId` comes from the apply context. Derived
-// ops route to row root (see recordModifier.Modify) so these land
-// at `record.author` / `record.createdAt` / `record.spaceId`,
-// alongside `id`.
-//
-// All three stamps inherit the change's VersionId, so concurrent
-// peer-side BeforeCreate stamps converge under standard LWW.
+// `spaceId` comes from the apply context, is constant per space, and
+// inherits the change's VersionId under standard LWW.
 func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
-	a := &anyenc.Arena{}
-	if author := ctx.Change.ObjectAuthor; author != "" {
-		sink.Derive(crdt.Op{
-			Type:    crdt.OpSet,
-			Path:    []string{"author"},
-			Payload: a.NewString(author),
-		})
-	}
-	// Derived trees carry a deterministic, timestamp-less root (every
-	// device must derive byte-identical bytes), so ObjectCreatedAt is 0
-	// there — fall back to the first-touch change's envelope time. LWW
-	// on the stamp's VersionId keeps concurrent first-touches
-	// convergent, same as every other auto field.
-	ts := ctx.Change.ObjectCreatedAt
-	if ts <= 0 {
-		ts = ctx.Change.Timestamp
-	}
-	if ts > 0 {
-		sink.Derive(crdt.Op{
-			Type: crdt.OpSet,
-			Path: []string{"createdAt"},
-			// Float64, not NewNumberInt(int(ts)) — same wire encoding
-			// (anyenc numbers are float64), but int() would truncate the
-			// int64 timestamp on 32-bit platforms.
-			Payload: a.NewNumberFloat64(float64(ts)),
-		})
-	}
+	stampCreateStamps(ctx, sink)
 	if spaceId := ctx.Change.SpaceId; spaceId != "" {
+		a := &anyenc.Arena{}
 		sink.Derive(crdt.Op{
 			Type:    crdt.OpSet,
 			Path:    []string{"spaceId"},
@@ -175,12 +151,71 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	stampModifiedAt(ctx, sink)
 }
 
+// stampCreateStamps queues the `author` / `createdAt` creation stamps as
+// $setCreate offers — the min-version-wins register that mirrors the
+// `_ver.id` creation marker (see crdt.OpSetCreate).
+//
+// Sources: `author` and `createdAt` are taken from the tree's ROOT
+// change (immutable header) when it carries them — constants per
+// object, so every offer is identical and the first simply sticks.
+// Derived trees carry a deterministic, timestamp-less, identity-less
+// root (every device must derive byte-identical bytes), so
+// ObjectCreatedAt is 0 and ObjectAuthor is "" there — fall back to the
+// offering change's own envelope (Timestamp / Creator). Fallback
+// offers differ per change, which is exactly what the min-rule
+// resolves: every peer converges on the causally-earliest upsert's
+// envelope, no matter which change first-touched the record locally.
+//
+// Emitted from BeforeCreate AND from every accepted upsert modify: the
+// modify-path re-offers are what make the fallback convergent (each
+// peer's create-path stamp alone is a different one-shot per peer) and
+// what backfills rows minted before these stamps existed. DeriveOnce,
+// not Derive — BeforeModify runs per op and must stamp once per
+// RecordChange.
+//
+// The fallback value is the author's unvalidated wall clock / signing
+// identity, skew included — display/sort quality only, never a fencing
+// token, same contract as modifiedAt and version-history timestamps.
+func stampCreateStamps(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+	if ctx == nil || ctx.Change == nil || sink == nil {
+		return
+	}
+	a := &anyenc.Arena{}
+	author := ctx.Change.ObjectAuthor
+	if author == "" {
+		author = ctx.Change.Creator
+	}
+	if author != "" {
+		sink.DeriveOnce(crdt.Op{
+			Type:    crdt.OpSetCreate,
+			Path:    []string{"author"},
+			Payload: a.NewString(author),
+		})
+	}
+	ts := ctx.Change.ObjectCreatedAt
+	if ts <= 0 {
+		ts = ctx.Change.Timestamp
+	}
+	if ts > 0 {
+		sink.DeriveOnce(crdt.Op{
+			Type: crdt.OpSetCreate,
+			Path: []string{"createdAt"},
+			// Float64, not NewNumberInt(int(ts)) — same wire encoding
+			// (anyenc numbers are float64), but int() would truncate the
+			// int64 timestamp on 32-bit platforms.
+			Payload: a.NewNumberFloat64(float64(ts)),
+		})
+	}
+}
+
 // stampModifiedAt queues the derived row-root `modifiedAt` stamp — the
 // Unix-seconds timestamp of the change being applied (the per-change
-// envelope Timestamp, NOT the root-header ObjectCreatedAt the createdAt
-// stamp uses). Fired from both BeforeCreate (so every row carries it
-// from birth, initially equal to the creating change's time) and
-// BeforeModify (so any synced write bumps it).
+// envelope Timestamp). The max-flavored counterpart of the createdAt
+// creation stamp: modifiedAt tracks the ordering-MAX change under
+// standard LWW, createdAt the ordering-MIN under $setCreate. Fired from
+// both BeforeCreate (so every row carries it from birth, initially equal
+// to the creating change's time) and BeforeModify (so any synced write
+// bumps it).
 //
 // Convergence: the stamp inherits the change's VersionId, so under
 // standard LWW every peer resolves modifiedAt to the timestamp of the
@@ -226,11 +261,20 @@ func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // modifiedAt; an op that passes here but later loses its per-field LWW
 // race still bumps it, which is deterministic (every peer runs the same
 // gates in the same order) and reads as "latest valid write attempt".
-func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
+//
+// Accepted upsert ops also re-offer the creation stamps
+// (stampCreateStamps): the min-rule needs an offer from every touching
+// upsert to converge — and to backfill rows minted before the stamps
+// existed. Non-upsert modifies leave them alone, exactly mirroring the
+// `_ver.id` marker's update rule.
+func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
 	if h.Registry != nil {
 		if verr := h.validateOp(op, nil); verr != nil {
 			return verr
 		}
+	}
+	if rec != nil && rec.Upsert {
+		stampCreateStamps(ctx, sink)
 	}
 	stampModifiedAt(ctx, sink)
 	return nil

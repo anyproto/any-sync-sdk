@@ -137,7 +137,8 @@ type TypesAPI interface {
 
 	// PatchDataset edits a definition's mutable leaves: displayName,
 	// description, name (field records' display label), search.title,
-	// search.text, search.scope. Pinned paths are rejected up-front.
+	// search.text (a field key string or a non-empty array of unique
+	// keys), search.scope. Pinned paths are rejected up-front.
 	PatchDataset(ctx context.Context, typeId, defId string, patch DatasetDefPatch) error
 }
 

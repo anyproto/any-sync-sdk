@@ -147,13 +147,23 @@ func encodeDatasetHead(arena *anyenc.Arena, draft *space.DatasetDraft) *anyenc.V
 	if draft.SkipHistory {
 		payload.Set(typetype.DefFieldSkipHistory, arena.NewTrue())
 	}
-	if draft.Search != nil && (draft.Search.Title != "" || draft.Search.Text != "") {
+	if draft.Search != nil && (draft.Search.Title != "" || len(draft.Search.Text) > 0) {
 		search := arena.NewObject()
 		if draft.Search.Title != "" {
 			search.Set(typetype.SearchKeyTitle, arena.NewString(draft.Search.Title))
 		}
-		if draft.Search.Text != "" {
-			search.Set(typetype.SearchKeyText, arena.NewString(draft.Search.Text))
+		switch len(draft.Search.Text) {
+		case 0:
+		case 1:
+			// Canonical wire form: a single key rides as the bare string
+			// (records written before SYN-179 stay byte-identical).
+			search.Set(typetype.SearchKeyText, arena.NewString(draft.Search.Text[0]))
+		default:
+			text := arena.NewArray()
+			for i, key := range draft.Search.Text {
+				text.SetArrayItem(i, arena.NewString(key))
+			}
+			search.Set(typetype.SearchKeyText, text)
 		}
 		if draft.Search.Scope != "" {
 			search.Set(typetype.SearchKeyScope, arena.NewString(draft.Search.Scope))
@@ -405,8 +415,10 @@ func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch
 		if err != nil {
 			return fmt.Errorf("typesAPI: patch dataset: convert %q: %w", path, err)
 		}
-		if strings.HasPrefix(path, typetype.DefFieldSearch+".") && v.Type() != anyenc.TypeString {
-			return fmt.Errorf("%w: search path %q must be a string", space.ErrPinnedField, path)
+		if strings.HasPrefix(path, typetype.DefFieldSearch+".") {
+			if lerr := typetype.CheckSearchLeafValue(strings.Split(path, "."), v); lerr != nil {
+				return fmt.Errorf("%w: search path %q: %v", space.ErrPinnedField, path, lerr)
+			}
 		}
 		setObj.Set(path, v)
 	}

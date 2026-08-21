@@ -22,7 +22,7 @@ func articleDatasetDraft() space.DatasetDraft {
 		DisplayName: "Articles",
 		IdRule:      space.IdUser,
 		DeleteBy:    space.DeleteByAuthor,
-		Search:      &space.SearchFields{Title: "title", Text: "body", Scope: "articles"},
+		Search:      &space.SearchFields{Title: "title", Text: []string{"body"}, Scope: "articles"},
 		Fields: []space.DatasetFieldDraft{
 			{Key: "title", Kind: space.PropertyKindString, Required: true},
 			{Key: "body", Kind: space.PropertyKindString, MutableBy: space.MutableByAuthor},
@@ -81,9 +81,12 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.Equal(t, space.DeleteByAuthor, def.DeleteBy)
 	require.NotNil(t, def.Search)
 	assert.Equal(t, "articles", def.Search.Scope)
+	assert.Equal(t, []string{"body"}, def.Search.Text)
 	require.Len(t, def.Fields, 6)
 
-	// Discovery includes the runtime dataset with its owning type.
+	// Discovery includes the runtime dataset with its owning type. A
+	// single-key text mapping surfaces as the bare string — discovery
+	// output is unchanged for pre-SYN-179 consumers.
 	var discovered bool
 	for _, ds := range sp.Datasets() {
 		if ds.Name == "articles" {
@@ -91,9 +94,26 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 			assert.Equal(t, typeId, ds.TypeId)
 			assert.Contains(t, string(ds.JSONSchema), `"x-search"`)
 			assert.Contains(t, string(ds.JSONSchema), `"scope":"articles"`)
+			assert.Contains(t, string(ds.JSONSchema), `"text":"body"`)
 		}
 	}
 	assert.True(t, discovered, "Datasets() must list the runtime dataset")
+
+	// SYN-179: the text mapping patches to a key array (the ensure-drift
+	// path); malformed arrays are rejected up-front.
+	require.Error(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
+		Set: map[string]any{"search.text": []string{"body", "body"}},
+	}), "duplicate keys must be rejected")
+	require.Error(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
+		Set: map[string]any{"search.text": []string{}},
+	}), "an empty array must be rejected")
+	require.NoError(t, sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
+		Set: map[string]any{"search.text": []string{"body", "summary"}},
+	}))
+	defs, err = sp.Types().Datasets(ctx, typeId)
+	require.NoError(t, err)
+	require.NotNil(t, defs[0].Search)
+	assert.Equal(t, []string{"body", "summary"}, defs[0].Search.Text)
 
 	// An instance object implementing the type hosts the records.
 	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})

@@ -38,7 +38,7 @@ Per dataset:
 | `IdRule` | `auto` (zero: ids derived from the change, the empty-id sugar) / `user` (caller ids, pattern + max length constrained) |
 | `DeleteBy` | record-delete gate: `anyone` (zero) / `author` |
 | `SkipHistory` | keep out of the version-history index (existing) |
-| `Search` | `{title, text}` field mapping plus an optional `scope` slug (which index scope the entries land under), surfaced as `x-search` for external indexers; SDK-opaque |
+| `Search` | `{title, text}` field mapping plus an optional `scope` slug (which index scope the entries land under), surfaced as `x-search` for external indexers; SDK-opaque. `text` names one or more field keys (SYN-179) — the indexer joins the mapped values into one body; on the wire a single key rides as a bare string, multiple as an array (single-element arrays canonicalize to the string on marshal) |
 
 Declaration well-formedness (`schema.ValidateDatasetDecl`, shared by
 every entry path so a bad declaration can neither register nor sync):
@@ -47,7 +47,9 @@ stamps force derived scope; at most one field per stamp kind;
 `MutableBy: author` field or `DeleteBy: author` requires a
 `Stamp: creator` field (the authorship fact must live ON the record so
 apply-time checks read only `ctx.Before` — zero extra reads); id
-constraints only under `IdRule: user`.
+constraints only under `IdRule: user`; a `search.text` mapping names at
+least one field key with no empty or duplicate keys (mapped keys are
+not required to be declared fields — the annotation stays opaque).
 
 ## The generic schema handler
 
@@ -114,8 +116,10 @@ other. A definition is CRDT records:
   `def:"dataset"`, `collection` (the dataset name), `dynamic`,
   `idRule`/`idPattern`/`idMaxLen`, `deleteBy`, `skipHistory` — all
   pinned first-write; `displayName`, `description`, and the
-  `search.title`/`search.text`/`search.scope` string leaves stay
-  mutable (the `format.ui`/`format.filter` model).
+  `search.title`/`search.text`/`search.scope` leaves stay mutable (the
+  `format.ui`/`format.filter` model). `title`/`scope` are scalar
+  strings; `text` is a bare field key or a non-empty array of unique
+  keys (SYN-179).
 - **Field record** (one per field; id derived from the change):
   `def:"field"`, `dataset` (owning head id), `key`, `kind`, `scope`,
   `stamp`, `required`, `mutableBy`, `items`/`properties` — pinned;
@@ -241,7 +245,9 @@ carries the owning `TypeId` (consumer indexers gate on it) and the
 JSON Schema document grows the behavioral keywords: standard
 `required`, per-field `x-mutable-by` / `x-stamp`, dataset-level
 `x-delete-by`, `x-id` / `x-id-pattern` / `x-id-max-length`, and
-`x-search {title, text, scope}` — defaults omitted. `Types().Datasets(typeId)`
+`x-search {title, text, scope}` (`text`: a field key or an array of
+keys; a single key marshals as the bare string) — defaults omitted.
+`Types().Datasets(typeId)`
 returns the management view (definition ids, invalid state, display
 fields).
 

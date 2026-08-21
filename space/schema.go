@@ -23,7 +23,9 @@ import "encoding/json"
 // Behavioral declarations ride further x-keywords: per-field
 // `x-mutable-by` / `x-stamp`, dataset-level `required`, `x-delete-by`,
 // `x-id` (+ `x-id-pattern` / `x-id-max-length`), and `x-search`
-// ({title,text} field mapping for external indexers).
+// ({title,text} field mapping for external indexers; `text` is a bare
+// field key or an array of keys — a single key marshals as the bare
+// string).
 type DatasetSchema struct {
 	Name       string
 	JSONSchema json.RawMessage

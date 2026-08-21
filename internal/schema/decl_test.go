@@ -24,8 +24,13 @@ func TestValidateDatasetDecl_OK(t *testing.T) {
 		IdRule:    IdUser,
 		IdPattern: `[a-z0-9-]+`,
 		IdMaxLen:  64,
+		Search:    &SearchFields{Title: "title", Text: []string{"body", "summary"}},
 	}
 	require.NoError(t, ValidateDatasetDecl(ds))
+
+	// A single-key mapping and a title-only mapping (nil Text) pass too.
+	require.NoError(t, ValidateDatasetDecl(Dataset{Search: &SearchFields{Text: []string{"body"}}}))
+	require.NoError(t, ValidateDatasetDecl(Dataset{Search: &SearchFields{Title: "title"}}))
 }
 
 func TestValidateDatasetDecl_Rejections(t *testing.T) {
@@ -46,6 +51,9 @@ func TestValidateDatasetDecl_Rejections(t *testing.T) {
 		{"id constraints under auto rule", Dataset{IdPattern: "x+"}},
 		{"bad id pattern", Dataset{IdRule: IdUser, IdPattern: "("}},
 		{"negative id max length", Dataset{IdRule: IdUser, IdMaxLen: -1}},
+		{"empty search text array", Dataset{Search: &SearchFields{Title: "t", Text: []string{}}}},
+		{"empty search text key", Dataset{Search: &SearchFields{Text: []string{"body", ""}}}},
+		{"duplicate search text key", Dataset{Search: &SearchFields{Text: []string{"body", "body"}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

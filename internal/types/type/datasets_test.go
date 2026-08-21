@@ -152,11 +152,15 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
 	}
 
+	multiText := arena.NewArray()
+	multiText.SetArrayItem(0, arena.NewString("body"))
+	multiText.SetArrayItem(1, arena.NewString("summary"))
 	mutable := []crdt.Op{
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldDisplayName}, Payload: arena.NewString("Notes")},
 		{Type: crdt.OpSet, Path: []string{typetype.FieldDescription}, Payload: arena.NewString("descr")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyTitle}, Payload: arena.NewString("title")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: arena.NewString("body")},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: multiText},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyScope}, Payload: arena.NewString("notes")},
 		{Type: crdt.OpUnset, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}},
 	}
@@ -167,15 +171,44 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		require.Empty(t, res.Rejections, "op %d must be mutable", i)
 	}
 
-	// Search leaves must stay scalar strings.
-	res, err := ctrl.ApplyChangeWithResult(ctx, defsChange("vz", "cz", "head-1", false,
-		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyTitle}, Payload: arena.NewNumberInt(1)}))
+	// title/scope leaves must stay scalar strings; text must be a
+	// string or a well-formed key array.
+	emptyArr := arena.NewArray()
+	dupArr := arena.NewArray()
+	dupArr.SetArrayItem(0, arena.NewString("body"))
+	dupArr.SetArrayItem(1, arena.NewString("body"))
+	blankArr := arena.NewArray()
+	blankArr.SetArrayItem(0, arena.NewString(""))
+	numArr := arena.NewArray()
+	numArr.SetArrayItem(0, arena.NewNumberInt(1))
+	badLeaves := []crdt.Op{
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyTitle}, Payload: arena.NewNumberInt(1)},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: arena.NewNumberInt(1)},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: emptyArr},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: dupArr},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: blankArr},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyText}, Payload: numArr},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, typetype.SearchKeyScope}, Payload: multiText},
+	}
+	for i, op := range badLeaves {
+		res, err := ctrl.ApplyChangeWithResult(ctx,
+			defsChange(crdt.VersionId("z"+string(rune('a'+i))), "cz"+string(rune('a'+i)), "head-1", false, op))
+		require.NoError(t, err)
+		require.Len(t, res.Rejections, 1, "bad search leaf %d must reject", i)
+		assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+	}
+
+	// Multi-field $set may carry the array text leaf as a dotted key.
+	payload := arena.NewObject()
+	payload.Set(typetype.DefFieldSearch+"."+typetype.SearchKeyText, multiText)
+	res, err := ctrl.ApplyChangeWithResult(ctx, defsChange("vx", "cx", "head-1", false,
+		crdt.Op{Type: crdt.OpSet, Payload: payload}))
 	require.NoError(t, err)
-	require.Len(t, res.Rejections, 1)
+	require.Empty(t, res.Rejections)
 
 	// Multi-field $set touching pinned state rejects (probed per key: the
 	// mutable key survives).
-	payload := arena.NewObject()
+	payload = arena.NewObject()
 	payload.Set(typetype.DefFieldName, arena.NewString("hax"))
 	payload.Set(typetype.DefFieldDisplayName, arena.NewString("kept"))
 	res, err = ctrl.ApplyChangeWithResult(ctx, defsChange("vy", "cy", "head-1", false,
@@ -247,6 +280,56 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 	assert.Equal(t, schema.MutableByAuthor, byId["body"].MutableBy)
 	assert.Equal(t, schema.StampCreator, byId["creator"].Stamp)
 	assert.Equal(t, schema.ScopeDerived, byId["creator"].Scope, "stamp normalizes to derived scope")
+}
+
+func TestCompileDatasetDefs_SearchTextForms(t *testing.T) {
+	ctrl, db := newDefsController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+
+	// String wire form parses to a one-key mapping.
+	single := arena.NewObject()
+	single.Set(typetype.SearchKeyTitle, arena.NewString("title"))
+	single.Set(typetype.SearchKeyText, arena.NewString("body"))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v1", "c1", "head-single", true,
+		headPayload(arena, "articles", map[string]any{typetype.DefFieldSearch: single}))))
+
+	// Array wire form keeps declaration order.
+	multiArr := arena.NewArray()
+	multiArr.SetArrayItem(0, arena.NewString("body"))
+	multiArr.SetArrayItem(1, arena.NewString("notes"))
+	multi := arena.NewObject()
+	multi.Set(typetype.SearchKeyText, multiArr)
+	multi.Set(typetype.SearchKeyScope, arena.NewString("email"))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "head-multi", true,
+		headPayload(arena, "emails", map[string]any{typetype.DefFieldSearch: multi}))))
+
+	// A duplicate-key array (a raw peer write — the create hook doesn't
+	// inspect search) folds Invalid via ValidateDatasetDecl: visible for
+	// repair, never registered.
+	dupArr := arena.NewArray()
+	dupArr.SetArrayItem(0, arena.NewString("body"))
+	dupArr.SetArrayItem(1, arena.NewString("body"))
+	dup := arena.NewObject()
+	dup.Set(typetype.SearchKeyText, dupArr)
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v3", "c3", "head-dup", true,
+		headPayload(arena, "dups", map[string]any{typetype.DefFieldSearch: dup}))))
+
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId)
+	require.NoError(t, err)
+	require.Len(t, compiled, 3)
+	byName := map[string]types.CompiledDataset{}
+	for _, c := range compiled {
+		byName[c.Name] = c
+	}
+
+	require.NotNil(t, byName["articles"].Search)
+	assert.Equal(t, []string{"body"}, byName["articles"].Search.Text)
+	require.NotNil(t, byName["emails"].Search)
+	assert.Equal(t, []string{"body", "notes"}, byName["emails"].Search.Text)
+	assert.Equal(t, "email", byName["emails"].Search.Scope)
+	assert.True(t, byName["dups"].Invalid)
+	assert.NotEmpty(t, byName["dups"].InvalidReason)
 }
 
 func TestCompileDatasetDefs_AuthorRuleWithoutCreatorStampMarksInvalid(t *testing.T) {

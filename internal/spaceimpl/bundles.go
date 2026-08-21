@@ -11,11 +11,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -24,6 +27,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+var bundleLog = logger.NewNamed("sdk.bundles")
 
 type bundlesAPI struct {
 	parent *spaceImpl
@@ -65,24 +70,24 @@ func (b *bundlesAPI) indexObj(ctx context.Context) (*object.Object, error) {
 	})
 }
 
-func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, error) {
+func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, bool, error) {
 	if req.Id == "" {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
 	}
 	if req.DerivedRoot {
 		if req.NewRoot != nil {
-			return space.Bundle{}, fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
+			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
 		}
 	} else {
 		if req.NewRoot == nil {
-			return space.Bundle{}, fmt.Errorf("spaceimpl: %w: NewRoot required", space.ErrBundleBadRequest)
+			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: NewRoot required", space.ErrBundleBadRequest)
 		}
-		if len(req.RootTypes) > 0 {
-			return space.Bundle{}, fmt.Errorf("spaceimpl: %w: RootTypes applies to DerivedRoot only — a created root gets its types from NewRoot", space.ErrBundleBadRequest)
+		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
+			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
 		}
 	}
 	if err := b.parent.writeGate(ctx); err != nil {
-		return space.Bundle{}, err
+		return space.Bundle{}, false, err
 	}
 	l := b.lockFor(req.Id)
 	l.Lock()
@@ -90,7 +95,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 
 	obj, err := b.indexObj(ctx)
 	if err != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
 	}
 
 	// Adopt path: a live record whose winner's tree is not deleted
@@ -109,18 +114,27 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		// are different trees). When the winner is the canonical
 		// derived root, this device can materialize it itself instead
 		// of handing back an id whose tree is still in flight —
-		// idempotent, and it converges with whatever syncs in.
+		// idempotent, and it converges with whatever syncs in. The
+		// stamp is part of that: a tree still sitting on its root
+		// change is left out of this device's head-sync diff, so its
+		// local copy only rejoins sync once something writes to it.
+		// RootProperties are NOT re-seeded — seeding belongs to the
+		// install, and the installer's values sync in.
 		if req.DerivedRoot && bd.Derived {
-			if _, err := b.deriveRoot(ctx, req); err != nil {
-				return space.Bundle{}, err
+			rootId, err := b.deriveRoot(ctx, req)
+			if err != nil {
+				return space.Bundle{}, false, err
+			}
+			if err := b.stampRootName(ctx, rootId, req); err != nil {
+				return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 			}
 		}
-		return bd, nil
+		return bd, false, nil
 	}
 
 	rootId, err := b.mintRoot(ctx, req)
 	if err != nil {
-		return space.Bundle{}, err
+		return space.Bundle{}, false, err
 	}
 	// Stamp the root with the bundle name so its tree always carries a
 	// non-root change: any-sync's head-sync diff skips a tree still
@@ -130,7 +144,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	// for itself — would sit outside that device's diff and never pull
 	// the peer's content. Must succeed BEFORE the registering write.
 	if err := b.stampRootName(ctx, rootId, req); err != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 	}
 
 	arena := &anyenc.Arena{}
@@ -144,7 +158,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	)
 	dataVersion, err := b.parent.store.DataVersion(spaceindex.BundlesDataset)
 	if err != nil {
-		return space.Bundle{}, err
+		return space.Bundle{}, false, err
 	}
 	res, err := obj.LocalWrite(ctx, crdt.Change{
 		Dataset:     spaceindex.BundlesDataset,
@@ -154,19 +168,19 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		},
 	})
 	if err != nil {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: write: %w", err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: write: %w", err)
 	}
 	if len(res.Rejections) > 0 {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: write rejected: %w", res.Rejections[0].Err)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: write rejected: %w", res.Rejections[0].Err)
 	}
 
 	// Return the applied state, not the input — an inbound install may
 	// have landed between the read above and this write's apply.
 	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id)
 	if !liveBundleRow(row) {
-		return space.Bundle{}, fmt.Errorf("spaceimpl: bundles: record %q absent after write", req.Id)
+		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: record %q absent after write", req.Id)
 	}
-	return b.materialize(ctx, row), nil
+	return b.materialize(ctx, row), true, nil
 }
 
 // mintRoot produces the root object of a fresh install.
@@ -179,10 +193,20 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 //
 // The derived path mints the canonical root itself — idempotent, so a
 // device that already derived it (offline, or on a previous attempt)
-// re-registers the same id rather than forking.
+// re-registers the same id rather than forking — and seeds
+// RootProperties BEFORE the caller registers anything, so a failed
+// seed leaves no install: the retry mints and seeds again instead of
+// adopting a root whose values never landed.
 func (b *bundlesAPI) mintRoot(ctx context.Context, req space.EnsureBundleRequest) (string, error) {
 	if req.DerivedRoot {
-		return b.deriveRoot(ctx, req)
+		rootId, err := b.deriveRoot(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		if err := b.seedRootProperties(ctx, rootId, req.RootProperties); err != nil {
+			return "", err
+		}
+		return rootId, nil
 	}
 
 	rootId, err := req.NewRoot(ctx)
@@ -216,7 +240,7 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 	}
 	rootId, err := b.parent.objects.Derive(ctx, space.DeriveObjectOpts{
 		Seed:  spaceindex.BundleRootSeed(req.Id),
-		Types: req.RootTypes,
+		Types: derivedRootTypes(req),
 	})
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: bundles: derive root of %q: %w", req.Id, err)
@@ -228,6 +252,53 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 		return "", fmt.Errorf("spaceimpl: bundles: derived root %q is not the canonical %q", rootId, canonical)
 	}
 	return rootId, nil
+}
+
+// derivedRootTypes is what a derived root implements: the requested
+// types plus every type RootProperties writes into. A property write
+// to a type the object does not implement is rejected, and the created
+// path attaches the same union through Objects().Create.
+func derivedRootTypes(req space.EnsureBundleRequest) []string {
+	if len(req.RootProperties) == 0 {
+		return req.RootTypes
+	}
+	seen := make(map[string]struct{}, len(req.RootTypes)+len(req.RootProperties))
+	out := make([]string, 0, len(req.RootTypes)+len(req.RootProperties))
+	for _, t := range req.RootTypes {
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	// Sorted: map order would make the attach change differ per call
+	// for no reason.
+	for _, t := range slices.Sorted(maps.Keys(req.RootProperties)) {
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+// seedRootProperties writes a derived root's initial property values,
+// one call per type. A created root gets the same state atomically
+// from Objects().Create; a derived object has no create-time hook, so
+// they land as ordinary writes — identical on every installer, so
+// concurrent seeds converge.
+func (b *bundlesAPI) seedRootProperties(ctx context.Context, rootId string, props map[string]map[string]any) error {
+	for _, typeId := range slices.Sorted(maps.Keys(props)) {
+		kv := props[typeId]
+		if len(kv) == 0 {
+			continue
+		}
+		if _, err := b.parent.properties.Set(ctx, rootId, typeId, kv); err != nil {
+			return fmt.Errorf("spaceimpl: bundles: seed root properties of type %q: %w", typeId, err)
+		}
+	}
+	return nil
 }
 
 // canonicalRootId is the id the bundle's derived root has in this
@@ -297,7 +368,16 @@ func (b *bundlesAPI) preferDerivedRoot(ctx context.Context, bd *space.Bundle) {
 		return
 	}
 	canonical, err := b.canonicalRootId(ctx, bd.Id)
-	if err != nil || canonical == "" || !slices.Contains(bd.Roots, canonical) {
+	if err != nil {
+		// Falling back to the register means this reader can disagree
+		// with every other replica about the winner — and about
+		// Derived, which drives how callers bind child objects. Rare
+		// (a cancelled ctx, a closing store), but never silent.
+		bundleLog.Warn("bundle winner falls back to the rootId register",
+			zap.String("bundle", bd.Id), zap.String("spaceId", b.parent.id), zap.Error(err))
+		return
+	}
+	if canonical == "" || !slices.Contains(bd.Roots, canonical) {
 		return
 	}
 	bd.RootId = canonical

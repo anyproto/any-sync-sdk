@@ -78,10 +78,23 @@ installing anything, or touching the network.
 a derived root are ever claimed for one bundle id, every replica reports
 the derived one as `rootId` regardless of what the LWW register
 converged to, and the created root becomes an ordinary resolvable loser.
-The verdict reads only the add-only claim set, so it is
-order-independent and cannot be raced. Without it the LWW register could
-strand the derived root as a loser — and a derived tree cannot be
+The verdict reads only the add-only claim set, so every replica reaches
+it from any prefix containing the claim. Without it the LWW register
+could strand the derived root as a loser — and a derived tree cannot be
 deleted, which is the one conflict the registry could never resolve.
+
+**The verdict is not a race; the claim can be.** A device that installs
+derived without a converged registry cannot fork *among derived
+installs* — but if the space already carried a **created** install it has
+not seen, its claim demotes that install to a loser on every replica,
+irreversibly. The demoted root keeps its content and stays deletable, so
+nothing is destroyed; what is lost is the app's pointer to it, and for
+content that cannot be merged across objects (chat) that is the same
+thing. This is the one protection the convergence wait still buys a
+derived install, and the deliberate trade of installing anyway: converge
+before installing derived into a space that may already carry a created
+install of the same id, and treat expiring the wait as accepting that
+demotion.
 
 **The costs, both permanent:**
 
@@ -102,11 +115,19 @@ canonical, so the children are just as deterministic. Nothing is lost —
 the ParentId binding buys cascade deletion, and a derived root is never
 deleted.
 
-Ensure derives the root itself and attaches `RootTypes` idempotently;
-`NewRoot` must be nil. On the adopt path it also materializes the
-canonical tree when the row arrived before the tree did — the same
-device can mint it, so there is no reason to hand back an id that is not
-yet writable. The `any.name` stamp applies here too and is
+Ensure derives the root itself, attaches `RootTypes` idempotently and
+seeds `RootProperties` before registering anything (a failed seed
+therefore leaves no install to adopt); `NewRoot` must be nil. Every type
+`RootProperties` writes into is attached along with `RootTypes` — a
+property write to a type the object does not implement is rejected, and
+the created path attaches the same union through `Objects().Create`.
+
+On the adopt path Ensure materializes the canonical tree — and stamps it
+— when the row arrived before the tree did: the same device can mint it,
+so there is no reason to hand back an id that is not yet writable, and
+the stamp is what puts the fresh local copy back in that device's
+head-sync diff. `RootProperties` are not re-seeded there; seeding
+belongs to the install, and the installer's values sync in. The `any.name` stamp applies here too and is
 load-bearing for a different reason: head-sync skips a tree still
 sitting on its root change, so a derived root that a device never
 stamped would sit outside that device's diff and never pull the peer's
@@ -114,8 +135,9 @@ content.
 
 ## API (`space/bundles.go`)
 
-- `Space.Bundles().Ensure` — adopt-or-install. Fully local, no network
-  wait (offline-first): a winner exists → return it, no root minted;
+- `Space.Bundles().Ensure` — adopt-or-install, returning the row and
+  whether THIS call registered it. Fully local, no network wait
+  (offline-first): a winner exists → return it, no root minted;
   otherwise the root is minted (`NewRoot`, or the canonical derivation
   for `DerivedRoot`) and one change registers it. The returned winner is
   provisional until the space syncs — unless it is derived, which is the

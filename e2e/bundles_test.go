@@ -77,18 +77,20 @@ func TestE2E_BundlesConvergeAndRestore(t *testing.T) {
 		t.Fatalf("device A: Spaces().Create: %v", err)
 	}
 
-	installed, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	installed, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "bao/v1", Name: "Bao", NewRoot: newRootVia(spA),
 	})
 	require.NoError(t, err, "device A: Ensure(bao/v1)")
+	require.True(t, didInstall, "first Ensure must register the install")
 	require.NotEmpty(t, installed.RootId)
 	require.Equal(t, []string{installed.RootId}, installed.Roots)
 	require.Empty(t, installed.Losers)
 
-	adopted, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	adopted, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "bao/v1", NewRoot: mustAdopt("device A"),
 	})
 	require.NoError(t, err, "device A: re-Ensure must adopt")
+	require.False(t, didInstall, "adopting must not report an install")
 	require.Equal(t, installed.RootId, adopted.RootId)
 
 	// Push before B pulls (see cold_sync_test for why).
@@ -118,7 +120,7 @@ func TestE2E_BundlesConvergeAndRestore(t *testing.T) {
 	require.NoError(t, err, "device B: Bundles().Get after WaitIndexSynced")
 	require.Equal(t, installed.RootId, got.RootId)
 
-	gotEnsure, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	gotEnsure, _, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "bao/v1", NewRoot: mustAdopt("device B"),
 	})
 	require.NoError(t, err, "device B: Ensure must adopt")
@@ -129,10 +131,10 @@ func TestE2E_BundlesConvergeAndRestore(t *testing.T) {
 	// realtime sync interleaves, one device may adopt the other's
 	// record (no conflict) or both create roots (conflict). Both
 	// outcomes are valid; the invariant is deterministic convergence.
-	resA, errA := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	resA, _, errA := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "race/v1", Name: "Race", NewRoot: newRootVia(spA),
 	})
-	resB, errB := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	resB, _, errB := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "race/v1", Name: "Race", NewRoot: newRootVia(spB),
 	})
 	require.NoError(t, errA, "device A: Ensure(race/v1)")
@@ -241,23 +243,34 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	_, err = spA.Bundles().Get(ctx, bundleId)
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "computing the id must not install anything")
 
-	inst, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	inst, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, Name: "Chat", DerivedRoot: true,
+		RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
 	})
 	require.NoError(t, err, "device A: Ensure(derived)")
+	require.True(t, didInstall, "first derived Ensure must register the install")
 	require.Equal(t, wantRoot, inst.RootId, "installed root must be the canonical derived id")
 	require.True(t, inst.Derived)
 	require.Equal(t, []string{wantRoot}, inst.Roots)
 	require.Empty(t, inst.Losers)
 
+	// Initial property values land on the derived root — a created
+	// root gets them from Objects().Create, a derived one from the
+	// seeding write Ensure runs before it registers anything.
+	props, err := spA.Properties().Get(ctx, wantRoot)
+	require.NoError(t, err)
+	require.NotNil(t, props)
+	require.Equal(t, "seeded", string(props.Get("any", "description").GetStringBytes()))
+
 	// A created-root request cannot fork a live install.
-	adopted, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	adopted, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId,
 		NewRoot: func(context.Context) (string, error) {
 			return "", errors.New("device A: NewRoot called on adopt path")
 		},
 	})
 	require.NoError(t, err, "device A: re-Ensure must adopt")
+	require.False(t, didInstall, "adopting must not report an install")
 	require.Equal(t, wantRoot, adopted.RootId)
 	require.True(t, adopted.Derived)
 
@@ -285,7 +298,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 
 	// The offline-1-1 shape: install with no WaitIndexSynced. Whether
 	// B's registry has converged or not, it lands on the same root.
-	resB, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	resB, _, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, Name: "Chat", DerivedRoot: true,
 	})
 	require.NoError(t, err, "device B: Ensure(derived) without a convergence gate")

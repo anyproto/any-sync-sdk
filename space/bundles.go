@@ -99,6 +99,13 @@ type EnsureBundleRequest struct {
 	// idempotently. DerivedRoot only — a created root gets its types
 	// from NewRoot.
 	RootTypes []string
+	// RootProperties seeds the derived root's property values, keyed
+	// typeId → propId → value, written before the install is
+	// registered so a failed seed leaves no install to adopt. Every
+	// keyed type is attached along with RootTypes — a property write
+	// to a type the object does not implement is rejected.
+	// DerivedRoot only.
+	RootProperties map[string]map[string]any
 }
 
 // BundlesAPI is the typed surface over the per-space bundles registry.
@@ -122,10 +129,22 @@ type BundlesAPI interface {
 	//
 	// A CLAIMED CANONICAL DERIVED ROOT ALWAYS WINS the registry, on
 	// every replica, whatever the rootId register says. The claim set
-	// is add-only, so this verdict is order-independent and cannot be
-	// raced — which is what keeps a derived root (undeletable, and
+	// is add-only, so the verdict itself is order-independent: every
+	// replica reads the same winner from any prefix containing the
+	// claim, which is what keeps a derived root (undeletable, and
 	// therefore unresolvable as a loser) from ever becoming one.
-	Ensure(ctx context.Context, req EnsureBundleRequest) (Bundle, error)
+	//
+	// The verdict is not a race, but the CLAIM can be: a device that
+	// installs a derived root without a converged registry demotes an
+	// existing created install to a loser, irreversibly, on every
+	// replica. Converge before installing derived into a space that
+	// may already carry a created install of the same id — see
+	// docs/bundles.md § Derived roots.
+	//
+	// The bool reports whether THIS call registered the install.
+	// False means an existing one was adopted — which for a derived
+	// root may still materialize its tree locally.
+	Ensure(ctx context.Context, req EnsureBundleRequest) (Bundle, bool, error)
 
 	// Get returns the bundle row. ErrBundleUnknown when no live record
 	// exists OR the winning root's tree is deleted — a dead winner

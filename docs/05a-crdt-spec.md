@@ -354,7 +354,29 @@ derived trees, whose deterministic roots carry neither.
 path validation rejects it (it could pin a synced field against every
 later write). It exists only as a Sink-derived op, re-derived locally on
 every peer, and projects onto subscriber events as a plain `$set` of the
-post-apply value like every other non-`$set` op.
+post-apply value; when the post-apply snapshot is unavailable the offer
+is dropped from the projection rather than degraded to `$unset` (a
+creation stamp is never unset).
+
+**Offers are local derivations, so the min ranges over the changes a
+device applied while running offer-emitting code** — by itself that is a
+function of the device's upgrade history, not of the DAG. Any handler
+change that alters what a stamp offers therefore bumps the dataset's
+`HandlerReg.Version`, and the version-driven re-index
+(docs/08-versioning.md) replays the object's full tree through the
+current handlers: after the replay every device has offered every
+change, and the converged value is a pure function of the DAG again.
+
+The max-flavored counterpart is the **touch stamp** (`modifiedAt` /
+`modifyTime`): a plain `$set` under the standard LWW gate, derived by
+the apply loop for EVERY record-change of the synced route — create and
+modify, upsert or strict, independent of per-op verdicts and of whether
+any op survives the pre-apply field-class filter. Unconditionality is
+load-bearing: dense sort indexes (the default `-modifiedAt` ordering)
+require the stamp on every minted row, and an acceptance-gated bump
+splits peers that see the same change as a create on one side and an
+all-rejected modify on the other. It reads as "newest change that
+touched the row", valid or not.
 
 **Auto-create** (no explicit row): controlled by `RecordChange.upsert`. When `upsert: true`, any modify op targeting a non-existent id auto-creates an empty record `{id, _ver: {}}` first, then applies. When `upsert: false` (the default, strict), modifies on absent records are no-ops. `delete` ignores the flag. There is no `insert` op.
 

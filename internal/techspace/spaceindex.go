@@ -138,21 +138,18 @@ const (
 	// stay siblings of `settings`, never inside it, and the spaceIndex
 	// mirror (SetSpaceMetadata) never touches it.
 	FieldSettings = "settings"
-	// FieldCreatedAt is the added-to-account time: unix seconds, stamped
-	// by BeforeCreate from the creating change's timestamp when the row
-	// first lands locally (Create / Derive / OneToOne / Join all create
-	// the row once). ScopeDerived — handler-only, no input op may write
-	// it, so it's immutable for life.
-	//
-	// Caveats (accepted — the value is advisory ordering metadata):
-	//   - stamping is per-device first-touch: a device whose store
-	//     materialized the row under an older handler reads 0 forever
-	//     (no backfill), while a device replaying the same DAG with this
-	//     handler stamps the real value;
-	//   - two devices independently creating the same row (e.g. both
-	//     Derive/Join before tech-space sync converges) each keep their
-	//     own change's timestamp — typically seconds apart.
-	// Callers treat 0 as "unknown".
+	// FieldCreatedAt is the added-to-account time: unix seconds, a
+	// $setCreate creation stamp the modifier derives via
+	// crdt.CreateStamper (see SpaceIndexHandler.DeriveCreateStamps) at
+	// the `_ver.id` marker sites, min-rule convergent — two devices
+	// independently creating the same row (e.g. both Derive/Join before
+	// tech-space sync converges) settle on the causally-earliest
+	// change's timestamp once their upserts cross-deliver, and rows
+	// materialized before the stamp existed backfill from the next
+	// upsert that touches them. ScopeDerived — handler-only, no input
+	// op may write it. The value is advisory ordering metadata (the
+	// writer's wall clock); callers treat an absent/0 value as
+	// "unknown".
 	FieldCreatedAt = "createdAt"
 	// FieldPushKeys is a DEVICE-LOCAL object (schema.ScopeLocal) holding
 	// the space's push-notification key material, mirrored from ACL
@@ -324,27 +321,41 @@ func (SpaceIndexHandler) Init(_ context.Context) error { return nil }
 // is readable, so their type is unknown until the first load backfills
 // it (set-once, enforced by BeforeModify). Strict allow-listing of
 // type values is deferred until the canonical space-type enum is
-// consolidated.
-//
-// It also stamps `createdAt` (added-to-account time) from the change's
-// timestamp via sink.Derive — derived from the change envelope, so every
-// device replaying the same create lands on the same value. (Convergence
-// caveats in the FieldCreatedAt doc.)
-func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
-	if ctx != nil && ctx.Change != nil && sink != nil && ctx.Change.Timestamp > 0 {
-		// Fresh arena per call — the derived Op holds it alive until
-		// the apply loop drains the sink (see drainDerivedTo).
-		// Float64 constructor: anyenc numbers are float64 on the wire,
-		// and NewNumberInt would truncate int64 on 32-bit platforms.
-		a := &anyenc.Arena{}
-		sink.Derive(crdt.Op{
-			Type:    crdt.OpSet,
-			Path:    []string{FieldCreatedAt},
-			Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp)),
-		})
-	}
+// consolidated. The `createdAt` stamp is NOT emitted here — the
+// modifier derives it via crdt.CreateStamper (DeriveCreateStamps).
+func (SpaceIndexHandler) BeforeCreate(_ *crdt.ChangeCtx, _ *crdt.RecordChange, _ *crdt.Sink) error {
 	return nil
 }
+
+// DeriveCreateStamps offers `createdAt` (added-to-account time) as a
+// $setCreate min-rule offer from the change's envelope timestamp.
+//
+// Implements crdt.CreateStamper: the modifier invokes this at the
+// `_ver.id` marker sites, so two devices that independently create the
+// same row converge on the causally-earliest change's timestamp once
+// their upserts cross-deliver, and rows materialized before this stamp
+// existed backfill from the next upsert — the two first-touch caveats
+// the create-only `$set` version of this stamp had to accept. A
+// timestamp-less change (hand-built tests) offers nothing rather than
+// pinning 0 under a low version the min gate would then defend.
+//
+// Float64 constructor: anyenc numbers are float64 on the wire, and
+// NewNumberInt would truncate int64 on 32-bit platforms.
+func (SpaceIndexHandler) DeriveCreateStamps(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+	if ctx == nil || ctx.Change == nil || sink == nil || ctx.Change.Timestamp <= 0 {
+		return
+	}
+	a := &anyenc.Arena{}
+	sink.DeriveOnce(crdt.Op{
+		Type:    crdt.OpSetCreate,
+		Path:    []string{FieldCreatedAt},
+		Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp)),
+	})
+}
+
+// Compile-time check: the modifier discovers the createdAt stamp via
+// the optional interface.
+var _ crdt.CreateStamper = SpaceIndexHandler{}
 
 // BeforeModify enforces the headRuleErr rule table on single-path ops.
 //

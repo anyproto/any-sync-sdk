@@ -82,21 +82,25 @@ func New(reg types.Registry) *SystemPropertiesHandler {
 	return &SystemPropertiesHandler{Registry: reg}
 }
 
-// Compile-time check: the modifier derives the author/createdAt
-// creation stamps through the optional CreateStamper interface.
-var _ crdt.CreateStamper = (*SystemPropertiesHandler)(nil)
+// Compile-time checks: the modifier derives the author/createdAt
+// creation stamps through CreateStamper and the modifiedAt touch stamp
+// through TouchStamper.
+var (
+	_ crdt.CreateStamper = (*SystemPropertiesHandler)(nil)
+	_ crdt.TouchStamper  = (*SystemPropertiesHandler)(nil)
+)
 
 func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates every op in the creation payload, then
-// auto-stamps `spaceId` and seeds `modifiedAt` via sink.Derive
-// (stampAutoFields). The other two auto fields — `author` and
-// `createdAt`, the creation stamps — are derived by the MODIFIER
-// through the CreateStamper interface at the `_ver.id` marker sites
-// (see DeriveCreateStamps), not here. All four are derived from the
-// change envelope / apply context, never from caller input — they are
-// ScopeDerived in the `any` type, read-only by contract (validateField
-// rejects input ops on them via the scope check).
+// auto-stamps `spaceId` via sink.Derive (stampAutoFields). The other
+// auto fields are derived by the MODIFIER through optional interfaces:
+// `author` / `createdAt` via CreateStamper at the `_ver.id` marker
+// sites (DeriveCreateStamps) and `modifiedAt` via TouchStamper on
+// every synced record-change (DeriveTouchStamps). All four are derived
+// from the change envelope / apply context, never from caller input —
+// they are ScopeDerived in the `any` type, read-only by contract
+// (validateField rejects input ops on them via the scope check).
 //
 // Validation is per-op drop, same as BeforeModify: ops that fail the
 // current schema are filtered out and the rest of the record still
@@ -107,7 +111,6 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 // means a removed-property replay or cross-peer bug, not a sync gap.
 // No any.types membership check (out-of-order tolerance).
 func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
-	allDropped := false
 	if h.Registry != nil && len(rec.Ops) > 0 {
 		kept := rec.Ops[:0]
 		for i := range rec.Ops {
@@ -117,32 +120,21 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 			kept = append(kept, rec.Ops[i])
 		}
 		rec.Ops = kept
-		allDropped = len(rec.Ops) == 0
 	}
-	stampAutoFields(ctx, sink, allDropped)
+	stampAutoFields(ctx, sink)
 	return nil
 }
 
-// stampAutoFields queues the create-path derived ops for the row-root
-// auto fields that live alongside `id` at the top of the record (NOT
-// under `any.*`): `spaceId`, plus the initial `modifiedAt` seed
-// (per-change, keeps moving on every modify — see stampModifiedAt).
-// The creation stamps (`author` / `createdAt`) are NOT stamped here —
-// the modifier derives them via CreateStamper at the `_ver.id` marker
-// sites (see DeriveCreateStamps).
-//
-// `spaceId` comes from the apply context, is constant per space, and
-// inherits the change's VersionId under standard LWW. It stamps even
-// on an all-dropped create — the record row exists either way, and a
-// peer where the same row was minted by a valid change carries the
-// stamp, so skipping it here would make its presence delivery-order
-// dependent (the value is identical from every change, so the stamp
-// itself is always convergent). modifiedAt stays behind the
-// validation gate, mirroring BeforeModify: a change with no surviving
-// content is not a "write attempt" worth reflecting, and the verdict
-// is deterministic (validation is convergent and identical on the
-// create and modify paths of this handler).
-func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink, allDropped bool) {
+// stampAutoFields queues the create-path derived op for `spaceId`, the
+// one row-root auto field still stamped from BeforeCreate. It is
+// UNCONDITIONAL — emitted even when every op in the creating change was
+// dropped by validation: the record row is minted either way, its value
+// is the same constant from every change, and every peer mints the row
+// through SOME create path, so presence converges. The other auto
+// fields moved to modifier-invoked interfaces: `author` / `createdAt`
+// to CreateStamper (marker sites, DeriveCreateStamps) and `modifiedAt`
+// to TouchStamper (every synced record-change, DeriveTouchStamps).
+func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
@@ -153,9 +145,6 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink, allDropped bool) {
 			Path:    []string{"spaceId"},
 			Payload: a.NewString(spaceId),
 		})
-	}
-	if !allDropped {
-		stampModifiedAt(ctx, sink)
 	}
 }
 
@@ -221,25 +210,27 @@ func (h *SystemPropertiesHandler) DeriveCreateStamps(ctx *crdt.ChangeCtx, sink *
 	}
 }
 
-// stampModifiedAt queues the derived row-root `modifiedAt` stamp — the
-// Unix-seconds timestamp of the change being applied (the per-change
-// envelope Timestamp). The max-flavored counterpart of the createdAt
-// creation stamp: modifiedAt tracks the ordering-MAX change under
-// standard LWW, createdAt the ordering-MIN under $setCreate. Fired from
-// both BeforeCreate (so every row carries it from birth, initially equal
-// to the creating change's time) and BeforeModify (so any synced write
-// bumps it).
+// DeriveTouchStamps queues the derived row-root `modifiedAt` stamp —
+// the Unix-seconds timestamp of the change being applied (the
+// per-change envelope Timestamp). The max-flavored counterpart of the
+// createdAt creation stamp: modifiedAt tracks the ordering-MAX change
+// under standard LWW, createdAt the ordering-MIN under $setCreate.
 //
-// Convergence: the stamp inherits the change's VersionId, so under
-// standard LWW every peer resolves modifiedAt to the timestamp of the
-// ordering-max change that touched the row — deterministic once all
-// changes are delivered. The value is the author's wall clock
-// (display/sort quality only, never a fencing token), same contract as
-// version-history timestamps.
+// Implements crdt.TouchStamper: the MODIFIER invokes this for EVERY
+// record-change of the synced route — create and modify, upsert or
+// strict, whether or not any op survives validation or even reaches a
+// handler hook. modifiedAt reads as "newest change that touched the
+// row", valid or not, and that unconditionality is load-bearing twice
+// over: the default `-modifiedAt` object sort rides a DENSE index (see
+// the ensure-index comment in spaceobjects), so every minted row must
+// carry the stamp; and the bump must be a function of the change
+// alone, or peers that see the same change as a create on one side and
+// an all-rejected (or fully filtered) modify on the other split on the
+// stamp while agreeing on everything else.
 //
-// DeriveOnce, not Derive: BeforeModify runs per op, and a multi-op
-// RecordChange must stamp once, not once per op.
-func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+// The value is the author's wall clock (display/sort quality only,
+// never a fencing token), same contract as version-history timestamps.
+func (h *SystemPropertiesHandler) DeriveTouchStamps(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
@@ -268,23 +259,18 @@ func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // would drop values written before the attach-type change arrives,
 // breaking out-of-order tolerance (docs/06-data-structure.md §397).
 //
-// Every op that passes validation stamps the derived `modifiedAt`
-// (deduped via DeriveOnce — one stamp per RecordChange). Stamping after
-// the validation gate means a fully-rejected change never bumps
-// modifiedAt; an op that passes here but later loses its per-field LWW
-// race still bumps it, which is deterministic (every peer runs the same
-// gates in the same order) and reads as "latest valid write attempt".
-//
-// The creation stamps (`author` / `createdAt`) are NOT re-offered here:
-// they must track the `_ver.id` marker independent of op verdicts, so
-// the modifier derives them via CreateStamper (see DeriveCreateStamps).
-func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
+// No stamps are emitted here at all any more: `modifiedAt` is derived
+// by the MODIFIER via TouchStamper on every record-change of the
+// synced route (see DeriveTouchStamps — the bump must be a function of
+// the change alone, not of per-op verdicts or of whether any op even
+// reached this hook), and the creation stamps (`author` / `createdAt`)
+// via CreateStamper at the `_ver.id` marker sites (DeriveCreateStamps).
+func (h *SystemPropertiesHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
 	if h.Registry != nil {
 		if verr := h.validateOp(op, nil); verr != nil {
 			return verr
 		}
 	}
-	stampModifiedAt(ctx, sink)
 	return nil
 }
 

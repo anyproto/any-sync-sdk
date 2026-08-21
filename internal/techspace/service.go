@@ -145,7 +145,9 @@ func (s *Service) Open(ctx context.Context) error {
 		SpaceId: s.spaceId,
 		Alloc:   object.NewVersionAllocator(""),
 		Handlers: []crdt.HandlerReg{
-			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
+			// Version 2: `createdAt` became a $setCreate min-rule offer
+			// derived at the _ver.id marker sites (see FieldCreatedAt).
+			{Name: SpaceIndexDataset, Version: 2, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
 			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
 			{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()},
 			{Name: IdentitiesDataset, Handler: IdentitiesHandler{}, Schema: IdentitiesSchema(), Indexes: IdentitiesIndexes()},

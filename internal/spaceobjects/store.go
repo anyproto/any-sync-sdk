@@ -1810,7 +1810,15 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// handler enforces them on the DAG route, Properties.Set on
 		// the local/account routes. Declared derived heads (author /
 		// createdAt / spaceId) stay controller-enforced.
-		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true},
+		// Version 2: creation stamps (author/createdAt) became $setCreate
+		// min-rule offers derived at the _ver.id marker sites, and
+		// modifiedAt an unconditional per-change touch stamp. Offers are
+		// local derivations (never on the wire), so the min only ranges
+		// over changes applied under stamping code — the bump has the
+		// version-driven re-index replay each object's full tree, making
+		// the converged value a function of the DAG rather than of when
+		// the device upgraded.
+		{Name: properties.Dataset, Version: 2, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true},
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
 		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
@@ -1831,7 +1839,9 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// LocalWrite on a regular object could technically carry it,
 		// which is harmless (encrypted change, empty collection) and
 		// fenced off at the public Modify API anyway.
-		{Name: payloads.Dataset, Handler: payloads.Handler{}, Schema: payloads.Schema()},
+		// Version 2: the derived `author` became a $setCreate min-rule
+		// offer (same re-index rationale as the objects dataset above).
+		{Name: payloads.Dataset, Version: 2, Handler: payloads.Handler{}, Schema: payloads.Schema()},
 		// `bundles` — the per-space installed-bundles registry.
 		// Registered on every controller (uniform handler set); only the
 		// spaceIndex object carries rows by convention — the typed

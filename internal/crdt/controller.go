@@ -1379,7 +1379,10 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			// Creation stamps ride the marker, not op verdicts: the
 			// record now exists with _ver.id = ch.VersionId, so the
 			// stamps are derived even when every op was dropped above.
+			// Touch stamps ride the record-change itself (dense-index
+			// contract — see TouchStamper).
 			m.deriveCreateStamps(ctx)
+			m.deriveTouchStamps(ctx)
 		}
 		for i := range rc.Ops {
 			applyOp(a, existing, *ch, rc.Ops[i])
@@ -1412,8 +1415,13 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		// offer and the stamps would split while _ver.id agrees. The
 		// $setCreate min gate makes losing offers no-ops, so emitting
 		// unconditionally is convergent (see CreateStamper).
-		if rc.Upsert && !ch.Local && !ch.Injected {
-			m.deriveCreateStamps(ctx)
+		if !ch.Local && !ch.Injected {
+			if rc.Upsert {
+				m.deriveCreateStamps(ctx)
+			}
+			// Touch stamps bump for EVERY synced record-change — upsert
+			// or strict, ops surviving or not (see TouchStamper).
+			m.deriveTouchStamps(ctx)
 		}
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
@@ -1504,6 +1512,18 @@ func (m *recordModifier) deriveCreateStamps(ctx *ChangeCtx) {
 	}
 	if cs, ok := m.handler.(CreateStamper); ok {
 		cs.DeriveCreateStamps(ctx, m.sink)
+	}
+}
+
+// deriveTouchStamps asks a TouchStamper handler for its per-change
+// touch stamps (modifiedAt-class fields). Called from Modify once per
+// synced record-change, create and modify alike (see TouchStamper).
+func (m *recordModifier) deriveTouchStamps(ctx *ChangeCtx) {
+	if m.handler == nil || m.sink == nil {
+		return
+	}
+	if ts, ok := m.handler.(TouchStamper); ok {
+		ts.DeriveTouchStamps(ctx, m.sink)
 	}
 }
 

@@ -34,9 +34,10 @@ import (
 //
 // The declaration is compiled once at construction into a flat rule
 // table; the accept path of BeforeModify is one map lookup with zero
-// allocations. BeforeModify writes to the sink only on acceptance (the
-// modifyTime bump via DeriveOnce), so the controller's multi-field
-// per-key salvage may safely re-probe it.
+// allocations. BeforeModify is pure validation — it never writes the
+// sink (all declared stamps are modifier-derived via CreateStamper /
+// TouchStamper) — so the controller's multi-field per-key salvage may
+// safely re-probe it.
 type SchemaHandler struct {
 	rules       map[string]*fieldRule
 	requiredIds []string
@@ -108,22 +109,17 @@ func NewSchemaHandler(ds schema.Dataset) (*SchemaHandler, error) {
 func (h *SchemaHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates the creating change (id rule, required fields,
-// declared value shapes) and seeds the modifyTime stamp — no DB reads.
-// The creator/createTime creation stamps are derived by the modifier via
-// CreateStamper at the `_ver.id` marker sites (see DeriveCreateStamps),
-// not here. An error drops the whole RecordChange.
-func (h *SchemaHandler) BeforeCreate(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error {
+// declared value shapes) — no DB reads, no stamps. All declared stamps
+// are derived by the modifier via the optional interfaces:
+// creator/createTime through CreateStamper at the `_ver.id` marker
+// sites (DeriveCreateStamps), modifyTime through TouchStamper on every
+// synced record-change (DeriveTouchStamps). An error drops the whole
+// RecordChange.
+func (h *SchemaHandler) BeforeCreate(_ *ChangeCtx, rec *RecordChange, _ *Sink) error {
 	if err := h.checkRecordId(rec); err != nil {
 		return err
 	}
-	if err := h.checkCreatePayload(rec); err != nil {
-		return err
-	}
-	if ctx == nil || ctx.Change == nil || sink == nil {
-		return nil
-	}
-	h.bumpModifyTime(ctx, sink)
-	return nil
+	return h.checkCreatePayload(rec)
 }
 
 func (h *SchemaHandler) checkRecordId(rec *RecordChange) error {
@@ -249,8 +245,13 @@ func (h *SchemaHandler) visitMultiField(op *Op, present map[string]struct{}) err
 // re-offers are also what make the stamp convergent at all (each
 // peer's create-path stamp alone is a different one-shot per peer)
 // and what backfill records minted before a stamp field was declared.
-// The queue pre-check keeps a double invocation from allocating an
-// arena just for duplicate offers.
+//
+// Empty envelope values are skipped rather than offered: a Creator-less
+// or Timestamp-less change (hand-built tests, pre-bind drains) must not
+// pin ""/0 under a low version the min gate would then defend
+// irrecoverably — the next upsert that carries the value offers it.
+// DeriveOnce keys on the op PATH, so a double invocation dedups per
+// field, never suppressing one stamp because a different one is queued.
 func (h *SchemaHandler) DeriveCreateStamps(ctx *ChangeCtx, sink *Sink) {
 	if h.creatorField == "" && h.createTimeField == "" {
 		return
@@ -258,33 +259,40 @@ func (h *SchemaHandler) DeriveCreateStamps(ctx *ChangeCtx, sink *Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
-	for i := range sink.derived {
-		if sink.derived[i].Type == OpSetCreate {
-			return
-		}
-	}
 	a := &anyenc.Arena{}
 	if h.creatorField != "" && ctx.Change.Creator != "" {
-		sink.Derive(Op{Type: OpSetCreate, Path: []string{h.creatorField}, Payload: a.NewString(ctx.Change.Creator)})
+		sink.DeriveOnce(Op{Type: OpSetCreate, Path: []string{h.creatorField}, Payload: a.NewString(ctx.Change.Creator)})
 	}
-	if h.createTimeField != "" {
-		sink.Derive(Op{Type: OpSetCreate, Path: []string{h.createTimeField}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+	if h.createTimeField != "" && ctx.Change.Timestamp > 0 {
+		sink.DeriveOnce(Op{Type: OpSetCreate, Path: []string{h.createTimeField}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
 	}
 }
 
-// Compile-time check: the modifier discovers the stamps via the
-// optional interface.
-var _ CreateStamper = (*SchemaHandler)(nil)
+// DeriveTouchStamps implements TouchStamper: the modifier invokes it
+// once per synced record-change, so modifyTime bumps for every change
+// that touches the record — upsert or strict, ops surviving validation
+// or not. See TouchStamper for why the bump must not ride op verdicts
+// (dense sort index + create/modify validation asymmetry).
+func (h *SchemaHandler) DeriveTouchStamps(ctx *ChangeCtx, sink *Sink) {
+	h.bumpModifyTime(ctx, sink)
+}
+
+// Compile-time checks: the modifier discovers the stamps via the
+// optional interfaces.
+var (
+	_ CreateStamper = (*SchemaHandler)(nil)
+	_ TouchStamper  = (*SchemaHandler)(nil)
+)
 
 // BeforeModify is the per-op gate on existing records. An error drops
 // just this op (the controller salvages multi-field ops per key by
 // re-probing, so combined rejections keep their innocent keys).
-func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, _ *RecordChange, op *Op, sink *Sink) error {
+func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, _ *RecordChange, op *Op, _ *Sink) error {
 	if op.Type == OpDelete {
 		return nil
 	}
 	if len(op.Path) == 0 {
-		return h.beforeModifyMulti(ctx, op, sink)
+		return h.beforeModifyMulti(ctx, op)
 	}
 	rule, ok := h.rules[op.Path[0]]
 	if !ok {
@@ -297,26 +305,21 @@ func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, _ *RecordChange, op *Op, si
 		return err
 	}
 	if op.Type == OpUnset {
-		h.bumpModifyTime(ctx, sink)
 		return nil
 	}
-	if err := h.checkOpShape(op); err != nil {
-		return err
-	}
-	h.bumpModifyTime(ctx, sink)
-	return nil
+	return h.checkOpShape(op)
 }
 
 // beforeModifyMulti validates every key of a combined $set/$unset; the
 // first violation rejects the combined op and the controller re-probes
-// per key. On full acceptance the modifyTime bump is derived once.
-func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, op *Op, sink *Sink) error {
+// per key. Pure validation — the modifyTime bump is the modifier's job
+// (TouchStamper), independent of these verdicts.
+func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, op *Op) error {
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return fmt.Errorf("%w: multi-field %s payload must be an object", ErrValidation, op.Type)
 	}
 	obj, _ := op.Payload.Object()
 	var firstErr error
-	touched := false
 	obj.Visit(func(k []byte, v *anyenc.Value) {
 		if firstErr != nil {
 			return
@@ -326,7 +329,6 @@ func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, op *Op, sink *Sink) er
 		if !ok {
 			return
 		}
-		touched = true
 		if err := h.checkMutable(ctx, head, rule); err != nil {
 			firstErr = err
 			return
@@ -350,13 +352,7 @@ func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, op *Op, sink *Sink) er
 			firstErr = fmt.Errorf("%w: field %q: %v", ErrValidation, string(k), err)
 		}
 	})
-	if firstErr != nil {
-		return firstErr
-	}
-	if touched {
-		h.bumpModifyTime(ctx, sink)
-	}
-	return nil
+	return firstErr
 }
 
 // checkMutable enforces the field's post-create write rule. Write-once
@@ -429,20 +425,15 @@ func (h *SchemaHandler) checkOpShape(op *Op) error {
 	return nil
 }
 
+// bumpModifyTime queues the modifyTime stamp. Called once per
+// record-change via DeriveTouchStamps; DeriveOnce keeps an accidental
+// double invocation from queuing twice.
 func (h *SchemaHandler) bumpModifyTime(ctx *ChangeCtx, sink *Sink) {
 	if h.modifyTimeField == "" || sink == nil || ctx == nil || ctx.Change == nil {
 		return
 	}
-	// Pre-check the queue so repeated accepted ops in one RecordChange
-	// (and salvage re-probes) don't each allocate an arena just for
-	// DeriveOnce to drop the duplicate.
-	for i := range sink.derived {
-		if len(sink.derived[i].Path) == 1 && sink.derived[i].Path[0] == h.modifyTimeField {
-			return
-		}
-	}
 	a := &anyenc.Arena{}
-	sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+	sink.DeriveOnce(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
 }
 
 // BeforeDelete enforces the dataset's delete gate. Author-gated deletes

@@ -185,15 +185,32 @@ func isCreationMarker(op crdt.Op) bool {
 }
 
 // projectOp converts a single input op against a post-apply record
-// snapshot into a $set / $unset op the wire ships. ok=false means
-// the op should be dropped from the projection (currently only used
-// for crdt.OpDelete, which is signalled by EventRecord.Deleted at
-// the record level).
+// snapshot into a $set / $unset op the wire ships. ok=false means the
+// op should be dropped from the projection: crdt.OpDelete (signalled
+// by EventRecord.Deleted at the record level), and a creation-stamp
+// offer whose post-apply value is unreadable.
 func projectOp(op crdt.Op, post *anyenc.Value) (space.EventOp, bool) {
 	switch op.Type {
 	case crdt.OpDelete:
 		// Record-level — handled out-of-band via EventRecord.Deleted.
 		return space.EventOp{}, false
+	case crdt.OpSetCreate:
+		// Creation-stamp offer: ship the post-apply (min-gated) value as
+		// a plain $set. When the snapshot is unavailable or lacks the
+		// field, DROP the op rather than falling through to the generic
+		// $unset — a creation stamp is never unset, and shipping one
+		// would tell viewers to erase a field that is merely unreadable
+		// at this instant.
+		path := clonePath(op.Path)
+		val := lookupPath(post, path)
+		if val == nil {
+			return space.EventOp{}, false
+		}
+		return space.EventOp{
+			Type:    crdt.OpSet,
+			Path:    path,
+			Payload: anyencx.Clone(val),
+		}, true
 	case crdt.OpSet, crdt.OpUnset:
 		// Already in the wire-friendly form. Clone the payload off
 		// any caller-owned arena so the event can outlive the build

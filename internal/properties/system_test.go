@@ -504,9 +504,13 @@ func TestSystemPropertiesHandler_ModifiedAtOutOfOrderConverges(t *testing.T) {
 	assert.Equal(t, float64(300), rec.GetFloat64("modifiedAt"), "older change must not regress modifiedAt")
 }
 
-// A change whose every op fails validation stamps nothing: the stamp
-// runs after the per-op validation gate.
-func TestSystemPropertiesHandler_ModifiedAtNotBumpedWhenAllOpsRejected(t *testing.T) {
+// A change whose every op fails validation still bumps modifiedAt —
+// the touch stamp is a function of the change alone (TouchStamper),
+// never of per-op verdicts: the default -modifiedAt sort rides a dense
+// index, and an acceptance-gated bump splits peers that see the same
+// change as a create on one side and an all-rejected modify on the
+// other.
+func TestSystemPropertiesHandler_ModifiedAtBumpsEvenWhenAllOpsRejected(t *testing.T) {
 	ctrl := newPropsController(t, defaultRegistry())
 	arena := &anyenc.Arena{}
 
@@ -521,7 +525,7 @@ func TestSystemPropertiesHandler_ModifiedAtNotBumpedWhenAllOpsRejected(t *testin
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "fully-rejected change must not bump modifiedAt")
+	assert.Equal(t, float64(200), rec.GetFloat64("modifiedAt"), "touch stamp bumps for every change, verdicts notwithstanding")
 }
 
 // A multi-op RecordChange stamps modifiedAt exactly once (DeriveOnce),
@@ -765,13 +769,13 @@ func TestSystemPropertiesHandler_CreatedAtConvergesWhenEarliestChangeAllRejected
 }
 
 // A creating change whose every op fails validation still mints the
-// row (with its `_ver.id` marker), so the creation stamps land — they
-// track the marker, not op verdicts (a peer where the row pre-exists
-// would derive them for this change via the modifier's upsert-site
-// offer, so gating them on acceptance here would split the peers).
-// modifiedAt stays behind the validation gate, mirroring BeforeModify:
-// no surviving content, no write-attempt stamp.
-func TestSystemPropertiesHandler_AllOpsRejectedCreateStampsMarkerOnly(t *testing.T) {
+// row (with its `_ver.id` marker), and ALL the auto stamps land with
+// it: the creation stamps track the marker (CreateStamper), and
+// modifiedAt tracks the record-change itself (TouchStamper) — the
+// dense -modifiedAt sort index requires it on every minted row, or the
+// row silently vanishes from client listings until a later accepted
+// write.
+func TestSystemPropertiesHandler_AllOpsRejectedCreateStillMintsAutoFields(t *testing.T) {
 	ctrl := newPropsController(t, defaultRegistry())
 	arena := &anyenc.Arena{}
 
@@ -783,5 +787,5 @@ func TestSystemPropertiesHandler_AllOpsRejectedCreateStampsMarkerOnly(t *testing
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
 	assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "creation stamp tracks the minted marker")
-	assert.Nil(t, rec.Get("modifiedAt"), "fully-rejected create stamps no modifiedAt")
+	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "touch stamp present from birth (dense sort index)")
 }

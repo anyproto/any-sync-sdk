@@ -20,35 +20,48 @@ import (
 //     file, record a networkSign, delete a row — and anything else
 //     rejects the whole write.
 //   - BeforeCreate / BeforeModify (inbound + replay): tolerant per-op
-//     drop. BeforeCreate stamps the derived `author`; BeforeModify
-//     enforces immutability (rootCid / size / enc are create-time
-//     facts) and the networkSign-requires-rootCid rule, dropping only
-//     the offending op.
+//     drop. BeforeModify enforces immutability (rootCid / size / enc
+//     are create-time facts) and the networkSign-requires-rootCid
+//     rule, dropping only the offending op. The derived `author` is a
+//     creation stamp the modifier derives via crdt.CreateStamper (see
+//     DeriveCreateStamps), not a hook-emitted `$set`.
 type Handler struct {
 	crdt.DefaultHandler
 }
 
 func (Handler) Init(_ context.Context) error { return nil }
 
-// BeforeCreate stamps the derived `author` from the creating change's
-// signer (the per-change Creator, not the tree-root author — for
-// collective durability another member may register rows in the same
-// payloads object). Tolerates an empty Creator (hand-built changes in
-// tests, pre-bind drains) by simply not stamping.
-func (Handler) BeforeCreate(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, sink *crdt.Sink) error {
+// DeriveCreateStamps offers the derived `author` — the row's creating
+// change's signer (the per-change Creator, not the tree-root author:
+// for collective durability another member may register rows in the
+// same payloads object) — as a $setCreate min-rule offer, so
+// concurrent same-row upserts converge on the causally-earliest
+// registrant on every peer, in any delivery order.
+//
+// Implements crdt.CreateStamper: the modifier invokes this at the
+// `_ver.id` marker sites, never the per-op accept path — a
+// per-change-envelope `$set` at create only diverged the same way the
+// objects dataset's stamps did (each peer kept its local first-touch's
+// signer). An empty Creator (hand-built changes in tests, pre-bind
+// drains) offers nothing rather than pinning "" under a low version
+// the min gate would then defend; the next signed upsert fills it.
+func (Handler) DeriveCreateStamps(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
-		return nil
+		return
 	}
 	if creator := ctx.Change.Creator; creator != "" {
 		a := &anyenc.Arena{}
-		sink.Derive(crdt.Op{
-			Type:    crdt.OpSet,
+		sink.DeriveOnce(crdt.Op{
+			Type:    crdt.OpSetCreate,
 			Path:    []string{FieldAuthor},
 			Payload: a.NewString(creator),
 		})
 	}
-	return nil
 }
+
+// Compile-time check: the modifier discovers the author stamp via the
+// optional interface.
+var _ crdt.CreateStamper = Handler{}
 
 // BeforeModify is the inbound-tolerant guard on existing rows: a
 // returned error drops just this op, the rest of the record still

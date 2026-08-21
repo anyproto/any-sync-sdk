@@ -688,3 +688,62 @@ func TestSpaceIndexHandler_DerivedRefusesDeletedStatus(t *testing.T) {
 	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
 	assert.Equal(t, techspace.StatusArchived, rec.RemoteStatus)
 }
+
+// createdAt is a $setCreate min-rule offer derived at the _ver.id
+// marker sites: two devices independently creating the same row settle
+// on the causally-earliest change's timestamp in either delivery order
+// — even though the losing order sees the earliest change as an
+// all-rejected modify (its type fill hits the set-once gate).
+func TestSpaceIndexHandler_CreatedAtConvergesAcrossDeliveryOrders(t *testing.T) {
+	arena := &anyenc.Arena{}
+	const spaceId = "space-race"
+	mk := func(version crdt.VersionId, ts int64) crdt.Change {
+		ch := makeChange(version, spaceId, true,
+			setMulti(arena, map[string]string{techspace.FieldType: "private"}))
+		ch.Timestamp = ts
+		return ch
+	}
+
+	apply := func(order []crdt.Change) *anyenc.Value {
+		ctrl := newSpaceIndexController(t)
+		for i := range order {
+			require.NoError(t, ctrl.ApplyChange(context.Background(), order[i]))
+		}
+		return ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	}
+
+	recAB := apply([]crdt.Change{mk("v1", 100), mk("v2", 200)})
+	recBA := apply([]crdt.Change{mk("v2", 200), mk("v1", 100)})
+	require.NotNil(t, recAB)
+	require.NotNil(t, recBA)
+	assert.Equal(t, int64(100), techspace.DecodeSpaceIndexRecord(recAB).CreatedAt)
+	assert.Equal(t, int64(100), techspace.DecodeSpaceIndexRecord(recBA).CreatedAt,
+		"reversed delivery must settle on the earliest change's time")
+}
+
+// Rows materialized before the stamp existed (timestamp-less create —
+// same shape legacy rows have) backfill from the NEXT upsert that
+// touches them, even one whose every op is rejected.
+func TestSpaceIndexHandler_CreatedAtBackfillsLegacyRows(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-backfill"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldType: "private"}),
+	)))
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	require.Nil(t, rec.Get(techspace.FieldCreatedAt), "no stampable time on the creating change")
+
+	late := makeChange("v2", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldType: "private"})) // set-once: rejected
+	late.Timestamp = 1718000000
+	require.NoError(t, ctrl.ApplyChange(context.Background(), late))
+
+	rec = ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, int64(1718000000), techspace.DecodeSpaceIndexRecord(rec).CreatedAt,
+		"next upsert backfills the stamp regardless of op verdicts")
+}

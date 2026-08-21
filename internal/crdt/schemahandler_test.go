@@ -503,6 +503,109 @@ func TestSchemaHandler_ConvergenceCreateStampsAllOpsRejectedModify(t *testing.T)
 	}
 }
 
+// modifyTime is a TouchStamper stamp — it bumps for EVERY change that
+// touches the record, verdicts notwithstanding. The asymmetry probe:
+// the MAX-version change is accepted as a create on one peer and
+// all-rejected (write-once title) as a modify on the other; an
+// acceptance-gated bump would leave the two on different values.
+func TestSchemaHandler_ModifyTimeConvergesWhenMaxChangeAllRejected(t *testing.T) {
+	a := &anyenc.Arena{}
+	early := shChange("v1", shAuthorA, 100,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t"}))
+	late := shChange("v2", shAuthorB, 200,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t"}))
+
+	apply := func(t *testing.T, order []Change) *anyenc.Value {
+		st := newSchemaHandlerController(t, shDecl())
+		for i := range order {
+			_, err := st.ApplyChangeWithResult(ctx, order[i])
+			require.NoError(t, err)
+		}
+		return st.Get(ctx, shTestDS, "row-1")
+	}
+
+	recAB := apply(t, []Change{early, late})
+	recBA := apply(t, []Change{late, early})
+	require.NotNil(t, recAB)
+	require.NotNil(t, recBA)
+	assert.Equal(t, float64(200), recAB.GetFloat64("modifiedAt"), "max change bumps even when all-rejected")
+	assert.Equal(t, float64(200), recBA.GetFloat64("modifiedAt"), "reversed order agrees")
+}
+
+// A timestamp-less change offers no createTime — pinning 0 under a low
+// version would be irrecoverable (the min gate defends it against
+// every later, higher-versioned real value). The next upsert that
+// carries a timestamp backfills instead.
+func TestSchemaHandler_CreateTimeZeroTimestampNotPinned(t *testing.T) {
+	st := newSchemaHandlerController(t, shDecl())
+	a := &anyenc.Arena{}
+	_, err := st.ApplyChangeWithResult(ctx, shChange("v1", shAuthorA, 0,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t"})))
+	require.NoError(t, err)
+	rec := st.Get(ctx, shTestDS, "row-1")
+	require.NotNil(t, rec)
+	require.Nil(t, rec.Get("createdAt"), "no offer from a timestamp-less change")
+
+	_, err = st.ApplyChangeWithResult(ctx, shChange("v2", shAuthorA, 200,
+		shCreateRecord(a, "row-1", map[string]string{"title": "t"}))) // write-once: all-rejected
+	require.NoError(t, err)
+	rec = st.Get(ctx, shTestDS, "row-1")
+	require.NotNil(t, rec)
+	assert.Equal(t, float64(200), rec.GetFloat64("createdAt"), "next stamped upsert backfills")
+}
+
+// The stamps survive even a change whose every op is shed by the
+// CONTROLLER's field-class filter — no handler hook ever sees such a
+// change, so hook-emitted stamps would mint the row bare on the peer
+// where it arrives first and split from peers where it arrives as a
+// modify. The modifier-site derivation covers it: both orders agree on
+// all three stamps and the marker.
+func TestSchemaHandler_StampsSurviveFullyFilteredChange(t *testing.T) {
+	// No Required fields: a zero-op create must mint the row (a required
+	// check would drop the whole record and re-open the pre-existing
+	// marker-divergence hole this test is not about).
+	ds := schema.Dataset{
+		Fields: []schema.Field{
+			{Id: "note", Schema: schema.Leaf(schema.KindString), MutableBy: schema.MutableByAnyone},
+			{Id: "creator", Stamp: schema.StampCreator, Scope: schema.ScopeDerived},
+			{Id: "createdAt", Stamp: schema.StampCreateTime, Scope: schema.ScopeDerived},
+			{Id: "modifiedAt", Stamp: schema.StampModifyTime, Scope: schema.ScopeDerived},
+		},
+		IdRule: schema.IdUser,
+	}
+	a := &anyenc.Arena{}
+	// Undeclared head on a non-Dynamic dataset: dropped by the field-
+	// class filter before any handler hook fires — a zero-op upsert.
+	filtered := shChange("v1", shAuthorA, 100, RecordChange{
+		Id: "row-1", Upsert: true,
+		Ops: []Op{{Type: OpSet, Path: []string{"junk"}, Payload: a.NewString("x")}},
+	})
+	valid := shChange("v2", shAuthorB, 200, RecordChange{
+		Id: "row-1", Upsert: true,
+		Ops: []Op{{Type: OpSet, Path: []string{"note"}, Payload: a.NewString("n")}},
+	})
+
+	apply := func(t *testing.T, order []Change) *anyenc.Value {
+		st := newSchemaHandlerController(t, ds)
+		for i := range order {
+			_, err := st.ApplyChangeWithResult(ctx, order[i])
+			require.NoError(t, err)
+		}
+		return st.Get(ctx, shTestDS, "row-1")
+	}
+
+	recAB := apply(t, []Change{filtered, valid})
+	recBA := apply(t, []Change{valid, filtered})
+	require.NotNil(t, recAB)
+	require.NotNil(t, recBA)
+	for name, rec := range map[string]*anyenc.Value{"in-order": recAB, "reversed": recBA} {
+		assert.Equal(t, shAuthorA, string(rec.GetStringBytes("creator")), "%s", name)
+		assert.Equal(t, float64(100), rec.GetFloat64("createdAt"), "%s", name)
+		assert.Equal(t, float64(200), rec.GetFloat64("modifiedAt"), "%s", name)
+		assert.Equal(t, "v1", string(rec.GetStringBytes(VersionsKey, IdField)), "%s", name)
+	}
+}
+
 // Strict (non-upsert) modifies leave the creation stamps alone — the
 // offer rule mirrors the `_ver.id` marker's upsert-only update rule.
 func TestSchemaHandler_CreateStampsIgnoreStrictModify(t *testing.T) {

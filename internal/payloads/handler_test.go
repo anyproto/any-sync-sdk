@@ -325,3 +325,37 @@ func TestPreValidate_Shapes(t *testing.T) {
 }
 
 func ptr(ch crdt.Change) *crdt.Change { return &ch }
+
+// The derived author is a $setCreate min-rule offer derived at the
+// _ver.id marker sites: two members concurrently registering the same
+// row converge on the causally-earliest registrant's signer in either
+// delivery order — even though the losing order sees the earliest
+// change as an all-rejected modify (multi-field $set on an existing
+// row), which is exactly why the offer must not ride op acceptance.
+func TestApply_AuthorConvergesAcrossDeliveryOrders(t *testing.T) {
+	ctx := context.Background()
+	a := &anyenc.Arena{}
+	mk := func(changeId, version, creator string) crdt.Change {
+		ch := createChange(a, changeId, version, creator,
+			createRowPayload(a, "bafyroot", 1, "", "kid-1", []byte{1}))
+		ch.Records[0].Id = "row-shared"
+		return ch
+	}
+	early := func() crdt.Change { return mk("chE", "v1", "acc-early") }
+	late := func() crdt.Change { return mk("chL", "v2", "acc-late") }
+
+	inOrder := newPayloadsController(t)
+	require.NoError(t, inOrder.ApplyChange(ctx, early()))
+	require.NoError(t, inOrder.ApplyChange(ctx, late()))
+
+	reversed := newPayloadsController(t)
+	require.NoError(t, reversed.ApplyChange(ctx, late()))
+	require.NoError(t, reversed.ApplyChange(ctx, early()))
+
+	for name, ctrl := range map[string]*crdt.Controller{"in-order": inOrder, "reversed": reversed} {
+		rec := ctrl.Get(ctx, Dataset, "row-shared")
+		require.NotNil(t, rec, name)
+		assert.Equal(t, "acc-early", rec.GetString(FieldAuthor), "%s: earliest registrant's signer", name)
+		assert.Equal(t, "v1", rec.GetString("_ver", "id"), "%s: author matches the creation marker", name)
+	}
+}

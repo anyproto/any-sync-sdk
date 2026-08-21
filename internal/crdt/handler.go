@@ -251,6 +251,26 @@ type CreateStamper interface {
 	DeriveCreateStamps(ctx *ChangeCtx, sink *Sink)
 }
 
+// TouchStamper is an optional interface a Handler may implement to
+// derive touch stamps — max-LWW per-change fields (modifiedAt /
+// modifyTime) that must be present on EVERY row and bump for EVERY
+// change of the synced route. The modifier invokes it once per
+// record-change — create and modify, upsert or strict — independent of
+// per-op verdicts and of whether any op even reaches a handler hook
+// (the controller's field-class filter can shed a whole record's ops
+// before BeforeModify fires). Unconditionality is load-bearing twice:
+// dense sort indexes (the default `-modifiedAt` object ordering)
+// require the stamp on every minted row, and an acceptance-gated bump
+// diverges — the same change can be a create on one peer and an
+// all-rejected modify on another, splitting the stamp by delivery
+// order while everything else agrees.
+//
+// Not consulted on Local/Injected materializations, tombstones, or
+// sibling writes — same exclusions as CreateStamper.
+type TouchStamper interface {
+	DeriveTouchStamps(ctx *ChangeCtx, sink *Sink)
+}
+
 // LocalPreValidator is an optional interface a Handler may implement
 // to validate a LOCAL change before it enters the DAG. The Controller
 // calls PreValidate from the local-write path (not on inbound apply);

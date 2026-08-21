@@ -148,3 +148,20 @@ func TestReindex_LocalFields(t *testing.T) {
 	assert.Nil(t, ctrl.LocalFields("unknown"))
 	assert.Equal(t, []string{"notes"}, ctrl.RegisteredDatasets())
 }
+
+func TestReindex_StaleObjectsScan(t *testing.T) {
+	db, coll := openMetaColl(t)
+	_ = db
+
+	require.NoError(t, PersistMeta(ctx, coll, "fresh", 1, 1, map[string]int{"blocks": 2}, "spaceA"))
+	require.NoError(t, PersistMeta(ctx, coll, "stale", 1, 1, map[string]int{"blocks": 1}, "spaceA"))
+	require.NoError(t, PersistMeta(ctx, coll, "otherSpace", 1, 1, map[string]int{"blocks": 1}, "spaceB"))
+	require.NoError(t, PersistMeta(ctx, coll, "unwritten", 1, 1, nil, "spaceA"))
+	require.NoError(t, PersistMeta(ctx, coll, "purged", 1, 1, map[string]int{"blocks": 1}, "spaceA"))
+	require.NoError(t, PersistDeletionMark(ctx, coll, "purged", "spaceA", 9))
+
+	ids, err := StaleObjects(ctx, coll, "spaceA", map[string]int{"blocks": 2})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"stale"}, ids,
+		"only this space's live objects with a version mismatch")
+}

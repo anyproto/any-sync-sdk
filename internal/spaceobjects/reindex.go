@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -46,6 +47,19 @@ const (
 	// rebuild proceeds and the excess leaves are lost — a bounded,
 	// logged loss beats an unbounded read on a boot path.
 	reindexLocalLeafCap = 20000
+)
+
+// Sweep pacing. Vars, not consts, so tests don't wait on them.
+var (
+	// reindexSweepStartDelay keeps the sweep off the boot path's back:
+	// the first seconds after a space store appears belong to catch-up
+	// and the caller's own first reads.
+	reindexSweepStartDelay = 2 * time.Second
+	// reindexSweepPace spaces out the loads. A rebuild is a full tree
+	// replay, so the sweep is deliberately unhurried — nothing waits on
+	// it, and the lazy path still rebuilds on demand whatever it has not
+	// reached yet.
+	reindexSweepPace = 50 * time.Millisecond
 )
 
 // localLeaf is one captured local-scope value. The document it came from
@@ -314,4 +328,80 @@ func (s *Store) restoreLocalLeaves(ctx context.Context, obj *object.Object, leav
 				zap.String("objectId", obj.Id()), zap.String("dataset", dataset), zap.Error(err))
 		}
 	}
+}
+
+// StartReindexSweep rebuilds, in the background, every object this store
+// materialized with a stale handler version, instead of waiting for each
+// one to be opened.
+//
+// The lazy path alone would leave the per-space `objects` collection
+// mixing rows built by the old handler with rows built by the new one for
+// as long as some object stays unopened — and a sort or filter over a
+// rebuilt field reads both shapes. The sweep closes that window.
+//
+// Idempotent, one sweep per store. A store with nothing stale pays one
+// _meta scan and stops. Errors are logged, never fatal: whatever the
+// sweep misses, the lazy path still rebuilds on first touch.
+func (s *Store) StartReindexSweep() {
+	if s == nil {
+		return
+	}
+	s.sweepOnce.Do(func() { go s.reindexSweep() })
+}
+
+func (s *Store) reindexSweep() {
+	select {
+	case <-s.sweepStop:
+		return
+	case <-time.After(reindexSweepStartDelay):
+	}
+	ctx := context.Background()
+	regs, _, err := s.buildRegs()
+	if err != nil {
+		storeLog.Warn("reindex sweep: build regs", zap.String("spaceId", s.spaceId), zap.Error(err))
+		return
+	}
+	registered := make(map[string]int, len(regs))
+	for _, reg := range regs {
+		v := reg.Version
+		if v == 0 {
+			v = 1
+		}
+		registered[reg.Name] = v
+	}
+	metaColl, err := s.metaCollection(ctx)
+	if err != nil {
+		storeLog.Warn("reindex sweep: open _meta", zap.String("spaceId", s.spaceId), zap.Error(err))
+		return
+	}
+	ids, err := crdt.StaleObjects(ctx, metaColl, s.spaceId, registered)
+	if err != nil {
+		storeLog.Warn("reindex sweep: scan", zap.String("spaceId", s.spaceId), zap.Error(err))
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	storeLog.Info("reindex sweep: rebuilding objects",
+		zap.String("spaceId", s.spaceId), zap.Int("objects", len(ids)))
+	done := 0
+	for _, id := range ids {
+		select {
+		case <-s.sweepStop:
+			storeLog.Info("reindex sweep: stopped early",
+				zap.String("spaceId", s.spaceId), zap.Int("done", done), zap.Int("total", len(ids)))
+			return
+		case <-time.After(reindexSweepPace):
+		}
+		// Loading is the rebuild: loadObject wipes and replays whatever
+		// the version compare found stale.
+		if _, err := s.Get(ctx, id); err != nil {
+			storeLog.Warn("reindex sweep: load object",
+				zap.String("objectId", id), zap.Error(err))
+			continue
+		}
+		done++
+	}
+	storeLog.Info("reindex sweep: done",
+		zap.String("spaceId", s.spaceId), zap.Int("rebuilt", done), zap.Int("total", len(ids)))
 }

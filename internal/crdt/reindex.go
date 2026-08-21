@@ -2,7 +2,12 @@ package crdt
 
 import (
 	"context"
+	"fmt"
 	"sort"
+
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
@@ -109,4 +114,48 @@ func (c *Controller) RegisteredDatasets() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// StaleObjects returns the ids of objects in spaceId whose persisted
+// handler versions differ from `registered` — the sweep's work list.
+// Purged objects are skipped: their rows are already gone and a rebuild
+// must never resurrect them.
+//
+// One scan of the space's _meta rows, bounded by its object count. The
+// hv map is small (one entry per dataset the object wrote), so the
+// per-row compare is cheap.
+func StaleObjects(ctx context.Context, coll anystore.Collection, spaceId string, registered map[string]int) ([]string, error) {
+	filter := query.Key{Path: []string{metaSpaceIdKey}, Filter: query.NewComp(query.CompOpEq, spaceId)}
+	iter, err := coll.Find(filter).Iter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("crdt: stale-objects iter: %w", err)
+	}
+	defer iter.Close()
+	var out []string
+	stored := make(map[string]int, 8)
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		if derr != nil {
+			return nil, derr
+		}
+		v := doc.Value()
+		if v.GetBool(metaDeletedKey) {
+			continue
+		}
+		hv := v.Get(metaHandlerVersionsKey)
+		if hv == nil || hv.Type() != anyenc.TypeObject {
+			continue
+		}
+		clear(stored)
+		obj, _ := hv.Object()
+		obj.Visit(func(k []byte, vv *anyenc.Value) {
+			if vv.Type() == anyenc.TypeNumber {
+				stored[string(k)] = vv.GetInt()
+			}
+		})
+		if len(staleDatasets(stored, registered)) > 0 {
+			out = append(out, v.GetString(IdField))
+		}
+	}
+	return out, iter.Err()
 }

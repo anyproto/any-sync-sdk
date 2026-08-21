@@ -33,9 +33,16 @@ running older code. `HandlerVersion` never leaves the device.
 
 Properties of the mechanism:
 
-- **Lazy, per object.** The rebuild runs on load, not as a boot-time
-  sweep — the cost is the cold-restore cost, paid on first touch, on a
-  path that opens the tree anyway.
+- **Lazy, per object.** The rebuild runs on load — the cost is the
+  cold-restore cost, paid on first touch, on a path that opens the tree
+  anyway.
+- **Converged by a background sweep.** Lazy alone would leave the
+  per-space `objects` collection mixing rows built by the old handler
+  with rows built by the new one for as long as some object stays
+  unopened, and a sort or filter over a rebuilt field would read both
+  shapes. When a space store appears, a paced background sweep loads
+  whatever the `_meta` scan reports stale. Nothing waits on it, and a
+  store with nothing stale pays one scan.
 - **Crash-safe.** The rewound watermark is persisted BEFORE the wipe and
   the stored versions are left stale until a replay re-applies something,
   so a crash anywhere in the middle simply rebuilds again on the next
@@ -99,6 +106,10 @@ Controller construction (crdt/reindex.go):
   1. LoadAndSeedMeta reads the stored dataset→version map
   2. staleDatasets() diffs it against the registered HandlerReg.Versions
   3. Stale names hang off the Controller as its re-index verdict
+
+Space store start (spaceimpl/service.go::storeFor):
+  0. StartReindexSweep — scan _meta for this space's stale objects and
+     load them in the background, paced; loading is the rebuild
 
 Object load (spaceobjects/reindex.go, spaceobjects/store.go::loadObject):
   4. Capture local-scope leaves (per-object datasets by declared field,

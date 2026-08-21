@@ -225,6 +225,11 @@ type Store struct {
 	readState    *readstate.Engine
 	selfIdentity string
 	readMat      *readMaterializer
+
+	// sweepOnce/sweepStop drive the background re-index sweep — one per
+	// store, stopped with the store (see reindex.go).
+	sweepOnce sync.Once
+	sweepStop chan struct{}
 	// readSeedPending marks objects mid-first-restore: the apply hook
 	// skips tracking for them (the seed covers everything present).
 	readSeedPending sync.Map
@@ -459,6 +464,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		ocache.WithTTL(objectCacheTTL),
 		ocache.WithGCPeriod(objectCacheGC),
 	)
+	s.sweepStop = make(chan struct{})
 	s.drainer = newDrainer(s)
 	s.drainer.Run()
 	return s
@@ -634,6 +640,13 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
+	if s.sweepStop != nil {
+		select {
+		case <-s.sweepStop:
+		default:
+			close(s.sweepStop)
+		}
+	}
 	if s.readMat != nil {
 		s.readMat.close()
 	}

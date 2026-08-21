@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -171,4 +173,61 @@ func TestReindex_WipeIsIdempotent(t *testing.T) {
 	ctx, s, ctrl := reindexStore(t)
 	s.wipeMaterialized(ctx, "obj1", ctrl)
 	s.wipeMaterialized(ctx, "obj1", ctrl)
+}
+
+// TestReindex_SweepLoadsStaleObjectsOnly: the sweep picks its work list
+// from the _meta rows and drives each stale object through the normal
+// load path (loading IS the rebuild). Objects already on the current
+// version, purged objects and other spaces' rows stay untouched.
+func TestReindex_SweepLoadsStaleObjectsOnly(t *testing.T) {
+	ctx, s, _ := reindexStore(t)
+
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "stale-1", 1, 1, map[string]int{reindexNotes: 1}, "spaceA"))
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "stale-2", 1, 1, map[string]int{reindexNotes: 1}, "spaceA"))
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "current", 1, 1, map[string]int{reindexNotes: 2}, "spaceA"))
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "elsewhere", 1, 1, map[string]int{reindexNotes: 1}, "spaceB"))
+
+	// The store's registered version for the dataset — buildRegs is
+	// raw-mode here, so the sweep compares against exactly this.
+	s.customHandlers = []crdt.HandlerReg{{
+		Name: reindexNotes, Version: 2, Handler: crdt.DefaultHandler{},
+		Schema: schema.Dataset{Dynamic: true},
+	}}
+
+	var mu sync.Mutex
+	var loaded []string
+	s.cache.Close()
+	s.cache = ocache.New(func(_ context.Context, id string) (ocache.Object, error) {
+		mu.Lock()
+		loaded = append(loaded, id)
+		mu.Unlock()
+		return nil, fmt.Errorf("load stub %s", id)
+	})
+	t.Cleanup(func() { _ = s.cache.Close() })
+
+	defer swapSweepPacing(time.Millisecond, time.Millisecond)()
+	s.StartReindexSweep()
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(loaded) >= 2
+	}, 5*time.Second, 10*time.Millisecond, "the sweep must load both stale objects")
+
+	mu.Lock()
+	got := slices.Clone(loaded)
+	mu.Unlock()
+	slices.Sort(got)
+	assert.Equal(t, []string{"stale-1", "stale-2"}, got,
+		"only this space's live objects whose handler version moved")
+}
+
+// swapSweepPacing shortens the sweep's timers for the duration of a test
+// and returns the restore func.
+func swapSweepPacing(start, pace time.Duration) func() {
+	oldStart, oldPace := reindexSweepStartDelay, reindexSweepPace
+	reindexSweepStartDelay, reindexSweepPace = start, pace
+	return func() { reindexSweepStartDelay, reindexSweepPace = oldStart, oldPace }
 }

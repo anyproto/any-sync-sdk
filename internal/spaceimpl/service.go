@@ -323,6 +323,10 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	_ = st.EnsureApplySeq(context.Background())
 	s.stores[spaceId] = st
 	s.mu.Unlock()
+	// Converge any pending re-index in the background instead of waiting
+	// for every object to be opened (spaceobjects/reindex.go). No-op when
+	// no handler version changed.
+	st.StartReindexSweep()
 	// Kick the drainer once so prior-session parked rows whose
 	// dependencies have since landed get picked up on first touch.
 	st.NotifyDrainer(types.DataVersionPair{})

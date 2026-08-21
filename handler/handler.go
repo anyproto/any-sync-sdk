@@ -380,6 +380,11 @@ const (
 	PropertyKindNull
 	PropertyKindArray
 	PropertyKindObject
+	// PropertyKindDatetime is an instant, stored as any-store's native
+	// TypeDateTime (unix millis, orderable, index-keyable, `{"$date": …}`
+	// in JSON) rather than as a string or an epoch number — the shape
+	// any-store's date operators compute on.
+	PropertyKindDatetime
 )
 
 // PropertyDecl is one property definition declared by an external

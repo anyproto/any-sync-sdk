@@ -39,6 +39,13 @@ const Dataset = "objects"
 // identifier in Phase 1).
 const HandlerVersion = "systemPropertyHandler-v1"
 
+// LocalVersion is the handler's LOCAL logic version (HandlerReg.Version)
+// — bumped when already-materialized rows would come out different, so
+// the SDK rebuilds them from the DAG (docs/08-versioning.md). v2: the
+// derived createdAt / modifiedAt stamps are TypeDateTime instants, not
+// epoch numbers.
+const LocalVersion = 2
+
 // SystemPropertiesHandler validates property writes on every user
 // object. Corresponds to the `baseProperty` handler named in
 // docs/06-data-structure.md § "Handlers" — renamed to emphasize its
@@ -151,10 +158,10 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 		sink.Derive(crdt.Op{
 			Type: crdt.OpSet,
 			Path: []string{"createdAt"},
-			// Float64, not NewNumberInt(int(ts)) — same wire encoding
-			// (anyenc numbers are float64), but int() would truncate the
-			// int64 timestamp on 32-bit platforms.
-			Payload: a.NewNumberFloat64(float64(ts)),
+			// A TypeDateTime instant, not an epoch number: the shape
+			// any-store orders, indexes and computes dates on. The
+			// envelope carries unix SECONDS; TypeDateTime is millis.
+			Payload: a.NewDateTimeMillis(ts * 1000),
 		})
 	}
 	if spaceId := ctx.Change.SpaceId; spaceId != "" {
@@ -195,8 +202,8 @@ func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	sink.DeriveOnce(crdt.Op{
 		Type: crdt.OpSet,
 		Path: []string{"modifiedAt"},
-		// Float64 for the same 32-bit-truncation reason as createdAt.
-		Payload: a.NewNumberFloat64(float64(ts)),
+		// TypeDateTime millis, as createdAt (envelope is seconds).
+		Payload: a.NewDateTimeMillis(ts * 1000),
 	})
 }
 

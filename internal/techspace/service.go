@@ -145,7 +145,7 @@ func (s *Service) Open(ctx context.Context) error {
 		SpaceId: s.spaceId,
 		Alloc:   object.NewVersionAllocator(""),
 		Handlers: []crdt.HandlerReg{
-			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
+			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema(), Version: SpaceIndexLocalVersion},
 			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
 			{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()},
 			{Name: IdentitiesDataset, Handler: IdentitiesHandler{}, Schema: IdentitiesSchema(), Indexes: IdentitiesIndexes()},

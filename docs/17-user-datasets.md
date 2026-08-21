@@ -28,7 +28,7 @@ Per field:
 | `Schema` | value shape (recursive JSON-Schema subset); nil = unconstrained |
 | `Required` | must be present in the create payload; create-only check |
 | `MutableBy` | post-create write rule: `never` (zero) / `author` / `any` |
-| `Stamp` | apply-time derived value: `creator` / `createTime` / `modifyTime`; forces derived scope |
+| `Stamp` | apply-time derived value: `creator` / `createTime` / `modifyTime`; forces derived scope, and the time stamps force kind `datetime` (the value is handler-produced, so a declared kind would only be a way to get it wrong) |
 
 Per dataset:
 

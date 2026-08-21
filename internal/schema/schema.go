@@ -41,6 +41,12 @@ const (
 	KindNull
 	KindArray
 	KindObject
+	// KindDatetime is an instant, stored as any-store's native
+	// TypeDateTime (unix millis, memcmp-orderable, index-keyable,
+	// `{"$date": …}` in JSON). Appended last: the numeric values are
+	// mirrored by the public handler.PropertyKind enum, so the existing
+	// ones must not move.
+	KindDatetime
 )
 
 func (k Kind) String() string {
@@ -57,6 +63,8 @@ func (k Kind) String() string {
 		return "array"
 	case KindObject:
 		return "object"
+	case KindDatetime:
+		return "datetime"
 	}
 	return "unknown"
 }
@@ -77,6 +85,8 @@ func ParseKind(s string) (Kind, bool) {
 		return KindArray, true
 	case "object":
 		return KindObject, true
+	case "datetime":
+		return KindDatetime, true
 	}
 	return KindUnknown, false
 }
@@ -248,6 +258,8 @@ func KindOf(v *anyenc.Value) Kind {
 		return KindArray
 	case anyenc.TypeObject:
 		return KindObject
+	case anyenc.TypeDateTime:
+		return KindDatetime
 	}
 	return KindUnknown
 }

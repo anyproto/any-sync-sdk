@@ -17,7 +17,7 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 
 | Scope | write route | version domain | syncs to | overridable |
 |------|------|------|------|------|
-| **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`, `modifiedAt`) | triggering change | (computed convergently) | no (read-only) |
+| **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`, `modifiedAt` — the times are `datetime` instants) | triggering change | (computed convergently) | no (read-only) |
 | **synced** | the object's own CRDT change | object tree | everyone with access | n/a — no override stack |
 | **account** | carrier record in tech space + per-device mirror | tech tree | this account's devices | n/a |
 | **local** | `Object.LocalSet`, no DAG | local lexid | this device only | n/a |

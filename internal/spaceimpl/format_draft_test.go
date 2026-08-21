@@ -23,13 +23,30 @@ func TestValidateFormatDraft_KindDefaulting(t *testing.T) {
 		want   space.PropertyKind
 	}{
 		{space.FormatLinks, space.PropertyKindArray},
-		{space.FormatDate, space.PropertyKindString},
-		{space.FormatDatetime, space.PropertyKindString},
+		{space.FormatDate, space.PropertyKindDatetime},
+		{space.FormatDatetime, space.PropertyKindDatetime},
+		{space.FormatSelect, space.PropertyKindString},
 	} {
 		draft := space.PropertyDraft{Format: &space.PropertyFormatDraft{Type: tc.format}}
 		_, err := validateFormatDraft(&draft)
 		require.NoError(t, err, tc.format)
 		assert.Equal(t, tc.want, draft.Kind, "kind defaulted from format %s", tc.format)
+	}
+}
+
+// A date property declared `string` keeps the ISO-8601 convention these
+// formats carried before datetime values existed. Kind is pinned on
+// first write, so properties created under the old default can never
+// move to the new one.
+func TestValidateFormatDraft_DateAcceptsLegacyStringKind(t *testing.T) {
+	for _, format := range []space.FormatType{space.FormatDate, space.FormatDatetime} {
+		draft := space.PropertyDraft{
+			Kind:   space.PropertyKindString,
+			Format: &space.PropertyFormatDraft{Type: format},
+		}
+		_, err := validateFormatDraft(&draft)
+		require.NoError(t, err, format)
+		assert.Equal(t, space.PropertyKindString, draft.Kind, "an explicit string kind is kept")
 	}
 }
 
@@ -41,6 +58,7 @@ func TestValidateFormatDraft_KindMismatch(t *testing.T) {
 		{space.FormatLinks, space.PropertyKindString},
 		{space.FormatDate, space.PropertyKindArray},
 		{space.FormatDatetime, space.PropertyKindNumber},
+		{space.FormatSelect, space.PropertyKindDatetime},
 	} {
 		draft := space.PropertyDraft{Kind: tc.kind, Format: &space.PropertyFormatDraft{Type: tc.format}}
 		_, err := validateFormatDraft(&draft)

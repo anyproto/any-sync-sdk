@@ -350,7 +350,7 @@ func (d Dataset) Normalized() Dataset {
 	needs := false
 	for i := range d.Fields {
 		f := &d.Fields[i]
-		if f.Scope == 0 || (f.Stamp != StampNone && f.Scope != ScopeDerived) {
+		if f.Scope == 0 || (f.Stamp != StampNone && f.Scope != ScopeDerived) || timeStampNeedsKind(f) {
 			needs = true
 			break
 		}
@@ -368,8 +368,24 @@ func (d Dataset) Normalized() Dataset {
 		} else if f.Scope == 0 {
 			f.Scope = ScopeSynced
 		}
+		if timeStampNeedsKind(f) {
+			f.Schema = Leaf(KindDatetime)
+		}
 	}
 	return out
+}
+
+// timeStampNeedsKind reports whether a time-stamped field still carries
+// a shape other than datetime. The value is handler-produced — a
+// TypeDateTime instant — so the declared kind is not the caller's to
+// choose, and a declaration written before the type existed (or one that
+// simply guessed `number`) would otherwise reject every stamp.
+func timeStampNeedsKind(f *Field) bool {
+	switch f.Stamp {
+	case StampCreateTime, StampModifyTime:
+		return f.Schema == nil || f.Schema.Kind != KindDatetime
+	}
+	return false
 }
 
 // ScopeOf returns the declared class of field id and whether it's

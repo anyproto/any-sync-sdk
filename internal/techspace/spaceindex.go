@@ -35,7 +35,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
 		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced},
-		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
+		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindDatetime), Scope: schema.ScopeDerived},
 		// KindObject with nil Properties = free-form shape: the schema
 		// validator accepts any nested keys (schema.validateValue stops at
 		// an untyped object) and the controller's field-class enforcement
@@ -154,6 +154,16 @@ const (
 	//     own change's timestamp — typically seconds apart.
 	// Callers treat 0 as "unknown".
 	FieldCreatedAt = "createdAt"
+)
+
+// SpaceIndexLocalVersion is the spaces handler's LOCAL logic version
+// (HandlerReg.Version) — bumped when already-materialized rows would
+// come out different, so the SDK rebuilds them from the DAG
+// (docs/08-versioning.md). v2: the derived createdAt stamp is a
+// TypeDateTime instant, not an epoch number.
+const SpaceIndexLocalVersion = 2
+
+const (
 	// FieldPushKeys is a DEVICE-LOCAL object (schema.ScopeLocal) holding
 	// the space's push-notification key material, mirrored from ACL
 	// state by spaceimpl's per-space ACL mirror watcher so clients can
@@ -340,7 +350,7 @@ func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChang
 		sink.Derive(crdt.Op{
 			Type:    crdt.OpSet,
 			Path:    []string{FieldCreatedAt},
-			Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp)),
+			Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000),
 		})
 	}
 	return nil

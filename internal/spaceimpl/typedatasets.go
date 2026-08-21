@@ -39,12 +39,14 @@ func datasetPropertyKindToSchema(k space.PropertyKind) schema.Kind {
 		return schema.KindArray
 	case space.PropertyKindObject:
 		return schema.KindObject
+	case space.PropertyKindDatetime:
+		return schema.KindDatetime
 	}
 	return schema.KindUnknown
 }
 
 // draftFieldDecl resolves one field draft into its schema.Field form,
-// defaulting stamped kinds (creator ⇒ string, times ⇒ number).
+// defaulting stamped kinds (creator ⇒ string, times ⇒ datetime).
 func draftFieldDecl(draft *space.DatasetFieldDraft) (schema.Field, error) {
 	f := schema.Field{
 		Id:        draft.Key,
@@ -67,7 +69,7 @@ func draftFieldDecl(draft *space.DatasetFieldDraft) (schema.Field, error) {
 		case space.StampCreator:
 			kind = schema.KindString
 		case space.StampCreateTime, space.StampModifyTime:
-			kind = schema.KindNumber
+			kind = schema.KindDatetime
 		default:
 			return f, fmt.Errorf("typesAPI: field %q: Kind required", draft.Key)
 		}

@@ -542,6 +542,8 @@ func propertyKindToSchema(k handler.PropertyKind) schema.Kind {
 		return schema.KindArray
 	case handler.PropertyKindObject:
 		return schema.KindObject
+	case handler.PropertyKindDatetime:
+		return schema.KindDatetime
 	}
 	return schema.KindUnknown
 }
@@ -1884,10 +1886,10 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// handler enforces them on the DAG route, Properties.Set on
 		// the local/account routes. Declared derived heads (author /
 		// createdAt / spaceId) stay controller-enforced.
-		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true},
+		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
-		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.PropertyHandlerLocalVersion},
 		// `_ver.id` index backs LiveRegistry.LatestShortId, which reads the
 		// greatest `_ver.id` (Sort("-_ver.id").Limit(1)) to derive a type's
 		// DataVersion. `_ver.id` is stamped on every row, so the index is
@@ -1929,9 +1931,15 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 					h = sh
 				}
 			}
+			version := d.HandlerVersion
+			if d.Handler == nil {
+				// Declared-schema dataset: the SDK owns the apply logic,
+				// so its own version participates in the rebuild trigger.
+				version += crdt.SchemaHandlerVersion
+			}
 			regs = append(regs, crdt.HandlerReg{
 				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),
-				Version:               d.HandlerVersion,
+				Version:               version,
 				ReadTracking:          d.ReadTracking,
 				SkipHistory:           d.SkipHistory,
 				DisableFilteredReplay: d.DisableFilteredReplay,
@@ -1955,6 +1963,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 			Schema:      ds.Schema,
 			SchemaRev:   ds.SchemaRev,
 			SkipHistory: ds.SkipHistory,
+			Version:     crdt.SchemaHandlerVersion,
 		})
 	}
 	return regs, []string{properties.Dataset}, nil

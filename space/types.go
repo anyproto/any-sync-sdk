@@ -480,6 +480,10 @@ const (
 	PropertyKindNull
 	PropertyKindArray
 	PropertyKindObject
+	// PropertyKindDatetime is an instant, stored as any-store's native
+	// TypeDateTime (unix millis, orderable, index-keyable, `{"$date": …}`
+	// in JSON). The kind the `date` / `datetime` formats imply.
+	PropertyKindDatetime
 )
 
 // FormatType declares a property's value convention beyond its
@@ -491,8 +495,11 @@ const (
 // Value conventions per format:
 //   - FormatLinks:       array of "any://<objectId>" URI strings (see
 //     github.com/anyproto/any/anyuri — the format's home)
-//   - FormatDate:        "2006-01-02" date string
-//   - FormatDatetime:    RFC 3339 datetime string
+//   - FormatDate:        a datetime value at midnight UTC (Kind
+//     datetime); "2006-01-02" strings when the property was declared
+//     with Kind string
+//   - FormatDatetime:    a datetime value (Kind datetime); RFC 3339
+//     strings when the property was declared with Kind string
 //   - FormatTags:        array of tag record ids referencing the space's
 //     tag table — reserved, not accepted by AddProperty yet
 //   - FormatSelect:      a single option key (string) chosen from the

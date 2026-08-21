@@ -202,3 +202,15 @@ func TestReindex_StaleObjectsScan(t *testing.T) {
 	assert.Equal(t, []string{"stale"}, ids,
 		"only this space's live objects with a version mismatch")
 }
+
+// stampSecs reads a derived timestamp leaf as unix seconds, asserting it
+// really is a datetime instant — a stamp that regressed to a plain
+// number would otherwise read as a silent zero.
+func stampSecs(t *testing.T, rec *anyenc.Value, field string) int64 {
+	t.Helper()
+	leaf := rec.Get(field)
+	require.NotNil(t, leaf, "stamp %q present", field)
+	ms, err := leaf.DateTimeMillis()
+	require.NoError(t, err, "stamp %q is a datetime", field)
+	return ms / 1000
+}

@@ -118,7 +118,7 @@ const PropertyHandlerLocalVersion = 2
 // docs/types-properties-proposal.md § "Schema format — decision").
 const (
 	FieldKey         = "key"         // user-facing stable identifier (e.g. "actors")
-	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"
+	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"/"datetime"
 	FieldScope       = "scope"       // "synced"/"account"/"local" — write/sync class, pinned
 	FieldName        = "name"        // human label, mutable
 	FieldDescription = "description" // mutable

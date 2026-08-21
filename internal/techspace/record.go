@@ -142,7 +142,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		// The stamp is a TypeDateTime instant; rows written before that
 		// carried epoch seconds and read the old way until the re-index
 		// reaches them (anyencx.StampSeconds handles both).
-		CreatedAt: stampSeconds(v, FieldCreatedAt),
+		CreatedAt: anyencx.StampSeconds(v.Get(FieldCreatedAt)),
 	}
 	if arr := v.GetArray(FieldInviteNotifyPending); len(arr) > 0 {
 		r.InviteNotifyPending = make([]string, 0, len(arr))
@@ -233,11 +233,4 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	// (ScopeDerived; BeforeCreate stamps it from the change timestamp)
 	// and an input op writing it would be rejected by the controller.
 	return obj
-}
-
-// stampSeconds reads a derived timestamp leaf as unix seconds, or 0 when
-// it is absent — the "unknown" value callers already expect.
-func stampSeconds(v *anyenc.Value, field string) int64 {
-	secs, _ := anyencx.StampSeconds(v.Get(field))
-	return secs
 }

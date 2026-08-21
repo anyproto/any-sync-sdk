@@ -221,7 +221,7 @@ type DatasetFieldDraft struct {
 	Description string
 
 	// Kind is the value kind. Required unless Stamp implies one
-	// (creator ⇒ string, createTime/modifyTime ⇒ number).
+	// (creator ⇒ string, createTime/modifyTime ⇒ datetime).
 	Kind PropertyKind
 	// Shape optionally refines array/object values (items/properties).
 	Shape *handler.FieldShape

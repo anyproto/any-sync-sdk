@@ -61,8 +61,7 @@ func draftFieldDecl(draft *space.DatasetFieldDraft) (schema.Field, error) {
 		if kind != schema.KindUnknown && kind != draft.Shape.Kind {
 			return f, fmt.Errorf("typesAPI: field %q: Kind and Shape.Kind disagree", draft.Key)
 		}
-		f.Schema = draft.Shape
-		return f, nil
+		kind = draft.Shape.Kind
 	}
 	if kind == schema.KindUnknown {
 		switch draft.Stamp {
@@ -73,6 +72,23 @@ func draftFieldDecl(draft *space.DatasetFieldDraft) (schema.Field, error) {
 		default:
 			return f, fmt.Errorf("typesAPI: field %q: Kind required", draft.Key)
 		}
+	}
+	// A time stamp's value is handler-produced, so a declared kind is
+	// only a way to get it wrong. Rejected rather than normalized: the
+	// declaration is signed into the type object and read back by
+	// discovery, so accepting one the apply path then overrides would
+	// publish a lie. (Declarations already stored under the old default
+	// are normalized on the read side — schema.Dataset.Normalized.)
+	switch draft.Stamp {
+	case space.StampCreateTime, space.StampModifyTime:
+		if kind != schema.KindDatetime {
+			return f, fmt.Errorf("typesAPI: field %q: stamp %s requires kind datetime; got %s",
+				draft.Key, draft.Stamp, kind)
+		}
+	}
+	if draft.Shape != nil {
+		f.Schema = draft.Shape
+		return f, nil
 	}
 	f.Schema = schema.Leaf(kind)
 	return f, nil

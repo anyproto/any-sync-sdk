@@ -383,7 +383,10 @@ func newTombstone(arena *anyenc.Arena, id string, ch Change, existing *anyenc.Va
 	}
 	tomb := arena.NewObject()
 	tomb.Set(IdField, arena.NewString(id))
-	tomb.Set(DeletedAtField, arena.NewNumberInt(int(ch.Timestamp)))
+	// An instant, like every other change-timestamp stamp — and int()
+	// would truncate the int64 envelope on 32-bit builds (the mobile
+	// ABIs), recording a pre-1970 delete time past 2038.
+	tomb.Set(DeletedAtField, arena.NewDateTimeMillis(ch.Timestamp*1000))
 	o := arena.NewObject()
 	o.Set(IdField, arena.NewString(string(preservedIdVersion)))
 	o.Set(defaultKey, arena.NewString(string(ch.VersionId)))

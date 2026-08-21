@@ -214,3 +214,22 @@ func stampSecs(t *testing.T, rec *anyenc.Value, field string) int64 {
 	require.NoError(t, err, "stamp %q is a datetime", field)
 	return ms / 1000
 }
+
+// The composed version has to be injective in both halves: a sum lets a
+// consumer's bump cancel an SDK bump, so neither logic change rebuilds.
+func TestComposeVersion(t *testing.T) {
+	seen := map[int][2]int{}
+	for sdk := 1; sdk <= 4; sdk++ {
+		for consumer := 0; consumer <= 4; consumer++ {
+			got := ComposeVersion(sdk, consumer)
+			if prev, dup := seen[got]; dup {
+				t.Fatalf("ComposeVersion(%d,%d) collides with (%d,%d) at %d",
+					sdk, consumer, prev[0], prev[1], got)
+			}
+			seen[got] = [2]int{sdk, consumer}
+		}
+	}
+	// A plain unversioned handler must not land on the value a composed
+	// pair produces.
+	assert.NotEqual(t, NormalizedVersion(0), ComposeVersion(1, 0))
+}

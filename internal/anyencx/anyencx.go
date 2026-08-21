@@ -23,26 +23,27 @@ func Clone(v *anyenc.Value) *anyenc.Value {
 	return w.Value
 }
 
-// StampSeconds reads a derived timestamp leaf as unix seconds.
+// StampSeconds reads a derived timestamp leaf as unix seconds, or 0 when
+// it is absent or not a timestamp — the "unknown" value every caller of
+// these stamps already expects.
 //
-// Stamps are TypeDateTime instants (unix millis). Rows materialized
-// before that carried a plain epoch-seconds number and are read the old
-// way until the re-index reaches them (docs/08-versioning.md), so both
-// shapes resolve here. Returns false for an absent leaf or any other
-// type — callers treat that as "unknown", never as zero time.
-func StampSeconds(v *anyenc.Value) (int64, bool) {
+// Stamps are datetime instants (unix millis). Rows materialized before
+// that carried a plain epoch-seconds number and are read the old way
+// until the re-index reaches them (docs/08-versioning.md), so both
+// shapes resolve here.
+func StampSeconds(v *anyenc.Value) int64 {
 	if v == nil {
-		return 0, false
+		return 0
 	}
 	switch v.Type() {
 	case anyenc.TypeDateTime:
 		ms, err := v.DateTimeMillis()
 		if err != nil {
-			return 0, false
+			return 0
 		}
-		return ms / 1000, true
+		return ms / 1000
 	case anyenc.TypeNumber:
-		return int64(v.GetFloat64()), true
+		return int64(v.GetFloat64())
 	}
-	return 0, false
+	return 0
 }

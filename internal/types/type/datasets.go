@@ -39,6 +39,16 @@ const DatasetDefs = "datasets"
 // old drainers can satisfy), which is a protocol change.
 const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 
+// DatasetDefsLocalVersion is this handler's LOCAL logic version
+// (HandlerReg.Version): bumped when a validation change means an
+// already-materialized set of dataset definitions would come out
+// different, so the SDK replays the type object's tree. Like the
+// property handler's, it is also the recovery path for definitions an
+// older build dropped because it could not validate them.
+//
+// v2: `datetime` is a kind, so a stamped time field validates.
+const DatasetDefsLocalVersion = 2
+
 // Discriminator values of the pinned `def` field.
 const (
 	DefKindDataset = "dataset" // head record: one per defined dataset

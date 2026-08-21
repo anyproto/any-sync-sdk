@@ -1900,7 +1900,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// (docs: SYN-147). Dynamic keyspace; the handler pins the
 		// schema-bearing fields and projects shortId rows so the
 		// DataVersion gate covers dataset-def state too.
-		{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.DatasetDefsLocalVersion},
 		// `payloads` — the node-readable per-file index. Registered on
 		// every controller (uniform handler set), but only payloads
 		// objects (plaintext class, see plaintextSpecs) ever write it:
@@ -1931,11 +1931,13 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 					h = sh
 				}
 			}
-			version := d.HandlerVersion
+			version := crdt.NormalizedVersion(d.HandlerVersion)
 			if d.Handler == nil {
 				// Declared-schema dataset: the SDK owns the apply logic,
-				// so its own version participates in the rebuild trigger.
-				version += crdt.SchemaHandlerVersion
+				// so its version participates too. Encoded as a pair
+				// rather than summed — a sum lets a consumer bump cancel
+				// an SDK bump and suppress the rebuild both asked for.
+				version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, version)
 			}
 			regs = append(regs, crdt.HandlerReg{
 				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),

@@ -1583,6 +1583,17 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err != nil {
 		return nil, err
 	}
+	// A handler-version bump recorded on the object's _meta row rebuilds
+	// the object before anything reads it: wipe the materialized rows and
+	// rewind, so the cold restore below replays the whole tree through the
+	// current handlers (see reindex.go).
+	var reindexLeaves []localLeaf
+	reindexing := len(ctrl.StaleDatasets()) > 0
+	if reindexing {
+		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, ctrl.StaleDatasets()); err != nil {
+			return nil, err
+		}
+	}
 	payload := loadPayloadFromCtx(ctx)
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
@@ -1600,6 +1611,14 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 				defer s.readSeedPending.Delete(objectId)
 			}
 		}
+	}
+	if reindexing {
+		// The replay re-applies every change in the tree, which would mark
+		// the whole object unread. Read state itself survives the wipe (it
+		// lives outside the object's collections) and the materializer
+		// re-projects the flags once the rows are back.
+		s.readSeedPending.Store(objectId, struct{}{})
+		defer s.readSeedPending.Delete(objectId)
 	}
 	var gate object.ApplyGate
 	if !s.disableGate {
@@ -1644,6 +1663,9 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 			// successful open repairs it.
 			s.historyPendingStale.Store(objectId, struct{}{})
 		}
+	}
+	if reindexing {
+		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
 	}
 	if seedPending {
 		if len(publishedSets) > 0 {
@@ -1884,6 +1906,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 			}
 			regs = append(regs, crdt.HandlerReg{
 				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),
+				Version:               d.HandlerVersion,
 				ReadTracking:          d.ReadTracking,
 				SkipHistory:           d.SkipHistory,
 				DisableFilteredReplay: d.DisableFilteredReplay,

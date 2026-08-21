@@ -28,12 +28,12 @@ const DatasetDefs = "datasets"
 // the DatasetDefs dataset itself (hardcoded, like HandlerVersion —
 // definition writes are never gated on their own schema state).
 //
-// Known mixed-fleet limitation (SYN-179): this string is deliberately
+// Known mixed-fleet limitation: this string is deliberately
 // NOT parseable by the spaceobjects DataVersion gate (legacy
 // handler-version strings pass through unconstrained — see gateFor),
-// so bumping it CANNOT park new wire forms on old replicas. A
-// pre-SYN-179 peer receiving an array-form `search.text` $set sheds
-// that op (its handler admits only scalar strings) and never replays
+// so bumping it CANNOT park new wire forms on old replicas. A peer
+// that predates the array text form sheds an array-form `search.text`
+// $set (its handler admits only scalar strings) and never replays
 // it, diverging the head record until re-written. Accepted
 // pre-release; a real fix needs a version pair the gate parses (and
 // old drainers can satisfy), which is a protocol change.
@@ -69,7 +69,7 @@ const (
 // Sub-keys of the head `search` object — mutable leaves (the
 // format.ui/filter model: broad `search` replaces are pinned, the
 // leaves mutate freely). `title` and `scope` are scalar strings; `text`
-// is a bare field key or a non-empty array of field keys (SYN-179).
+// is a bare field key or a non-empty array of field keys.
 const (
 	SearchKeyTitle = "title"
 	SearchKeyText  = "text"
@@ -296,15 +296,15 @@ func checkSearchLeafOp(opType crdt.OpType, path []string, payload *anyenc.Value)
 
 // CheckSearchLeafValue validates a search.* leaf's $set payload:
 // `title`/`scope` must be scalar strings, `text` a bare string or a
-// non-empty array of unique non-empty string keys (both SYN-179 wire
-// forms). Shared with the client-side PatchDataset preflight; returns
+// non-empty array of unique non-empty string keys (both wire forms).
+// Shared with the client-side PatchDataset preflight; returns
 // a plain error — callers wrap with their own sentinel.
 //
 // The array branch deliberately re-checks entry types instead of
 // decoding through schema.SearchTextFromAnyenc: the parser is
 // tolerance-biased (a non-string entry becomes "" for the compile fold
 // to flag), while a write gate owes the author the precise "entries
-// must be strings". A bare "" stays admissible here — pre-SYN-179
+// must be strings". A bare "" stays admissible here — older
 // handlers accepted it, so rejecting it at apply time would diverge
 // on old-authored changes; the PatchDataset preflight is where the
 // empty spellings get refused.

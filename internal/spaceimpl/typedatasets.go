@@ -152,8 +152,9 @@ func encodeDatasetHead(arena *anyenc.Arena, draft *space.DatasetDraft) *anyenc.V
 		if draft.Search.Title != "" {
 			search.Set(typetype.SearchKeyTitle, arena.NewString(draft.Search.Title))
 		}
-		// Canonical wire form (records written before SYN-179 stay
-		// byte-identical: a single key rides as the bare string).
+		// Canonical wire form: a single key rides as the bare string,
+		// so single-field records are byte-identical to those written
+		// before the array form existed.
 		if text := schema.SearchTextToAnyenc(arena, draft.Search.Text); text != nil {
 			search.Set(typetype.SearchKeyText, text)
 		}

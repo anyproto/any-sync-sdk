@@ -86,7 +86,7 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 
 	// Discovery includes the runtime dataset with its owning type. A
 	// single-key text mapping surfaces as the bare string — discovery
-	// output is unchanged for pre-SYN-179 consumers.
+	// output is unchanged for consumers of the single-field form.
 	var discovered bool
 	for _, ds := range sp.Datasets() {
 		if ds.Name == "articles" {
@@ -99,9 +99,9 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	}
 	assert.True(t, discovered, "Datasets() must list the runtime dataset")
 
-	// SYN-179: the text mapping patches to a key array (the ensure-drift
-	// path); malformed values are rejected up-front with
-	// ErrInvalidFieldValue (not the pinned-path sentinel).
+	// The text mapping patches to a key array (the ensure-drift path);
+	// malformed values are rejected up-front with ErrInvalidFieldValue
+	// (not the pinned-path sentinel).
 	err = sp.Types().PatchDataset(ctx, typeId, defId, space.DatasetDefPatch{
 		Set: map[string]any{"search.text": []string{"body", "body"}},
 	})

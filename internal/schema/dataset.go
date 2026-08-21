@@ -226,7 +226,7 @@ func ParseDeletePolicy(label string) (DeletePolicy, bool) {
 // free-form slug the indexer interprets (empty = the indexer's
 // default).
 //
-// Text holds one or more field keys (SYN-179); the indexer joins the
+// Text holds one or more field keys; the indexer joins the
 // mapped values into one body. On the wire (`x-search` and the head
 // record's `search.text` leaf) a single key rides as a bare string and
 // multiple keys as an array — MarshalJSON canonicalizes, so

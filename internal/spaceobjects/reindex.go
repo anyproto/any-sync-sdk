@@ -319,9 +319,19 @@ func (s *Store) restoreLocalLeaves(ctx context.Context, obj *object.Object, leav
 		})
 	}
 	for dataset, records := range byDataset {
+		// DataVersionFor, not the static map: runtime datasets (whose
+		// declarations live in the space, not in config) resolve theirs
+		// from the owning type's latest shortId, and a local write with
+		// an empty DataVersion is refused outright.
+		dataVersion, err := s.DataVersionFor(ctx, dataset)
+		if err != nil {
+			storeLog.Warn("reindex: resolve data version",
+				zap.String("objectId", obj.Id()), zap.String("dataset", dataset), zap.Error(err))
+			continue
+		}
 		if _, err := obj.LocalSet(ctx, crdt.Change{
 			Dataset:     dataset,
-			DataVersion: s.dataVersions[dataset],
+			DataVersion: dataVersion,
 			Records:     records,
 		}); err != nil {
 			storeLog.Warn("reindex: restore local values",

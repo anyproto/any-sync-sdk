@@ -241,21 +241,17 @@ func (h *SchemaHandler) deriveCreateStamps(ctx *ChangeCtx, sink *Sink) {
 	if h.creatorField != "" && ctx.Change.Creator != "" {
 		sink.Derive(Op{Type: OpSet, Path: []string{h.creatorField}, Payload: a.NewString(ctx.Change.Creator)})
 	}
-	if h.createTimeField != "" {
-		if ctx.Change.Timestamp > 0 {
-			sink.Derive(Op{Type: OpSet, Path: []string{h.createTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
-		}
-	}
-	if h.modifyTimeField != "" {
-		if ctx.Change.Timestamp > 0 {
-			if ctx.Change.Timestamp <= 0 {
-		// No envelope clock, no stamp: an instant at the epoch would be
-		// indistinguishable from a real one, where an absent field still
-		// reads as "unknown".
+	if ctx.Change.Timestamp <= 0 {
+		// No envelope clock, no time stamps: an instant at the epoch would
+		// be indistinguishable from a real one, where an absent field
+		// still reads as "unknown".
 		return
 	}
-	sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
-		}
+	if h.createTimeField != "" {
+		sink.Derive(Op{Type: OpSet, Path: []string{h.createTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
+	}
+	if h.modifyTimeField != "" {
+		sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
 	}
 }
 

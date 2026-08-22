@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
@@ -635,8 +636,10 @@ func splitPath(p string) []string {
 // goToAnyenc converts a Go value into an anyenc.Value on the given
 // arena. Accepts:
 //
-//   - Native Go types (string, bool, ints, float64, []byte, []any,
-//     []string, map[string]any) for in-process callers.
+//   - Native Go types (string, bool, ints, float64, time.Time, []byte,
+//     []any, []string, map[string]any) for in-process callers. A
+//     time.Time becomes a dateTime value (millisecond precision) — the
+//     shape date properties and derived stamps carry.
 //   - *fastjson.Value for HTTP / JSON callers — they parse the
 //     request body once with a pooled fastjson.Parser, then hand the
 //     parsed values straight through. anyenc.Arena.NewFromFastJson
@@ -668,6 +671,8 @@ func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 		return a.NewNumberInt(int(x)), nil
 	case float64:
 		return a.NewNumberFloat64(x), nil
+	case time.Time:
+		return a.NewDateTime(x), nil
 	case []byte:
 		return a.NewBinary(x), nil
 	case []any:

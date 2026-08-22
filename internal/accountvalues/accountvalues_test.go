@@ -204,3 +204,28 @@ func TestDiff_NilTarget(t *testing.T) {
 	require.Len(t, batches, 1)
 	assert.Equal(t, crdt.OpSet, batches[0].Ops[0].Type)
 }
+
+// An account-scoped datetime value has to survive the carrier→target
+// clone. A hand-rolled type switch used to return nil for anything it
+// didn't list, and a nil payload is dropped silently by the apply path
+// — the value would vanish on every device with no error.
+func TestDiff_CarriesDatetimeValues(t *testing.T) {
+	a := &anyenc.Arena{}
+	const millis int64 = 1786014230123
+
+	carrier := rec(a, nil, map[string]string{"movie.read": "t5"})
+	ns := a.NewObject()
+	ns.Set("read", a.NewDateTimeMillis(millis))
+	carrier.Set("movie", ns)
+	crdt.SetRecordVersion(a, carrier, crdt.VersionId("t5"), "movie", "read")
+
+	batches := Diff(a, carrier, rec(a, nil, nil), testResolver)
+	require.Len(t, batches, 1)
+	require.Len(t, batches[0].Ops, 1)
+	op := batches[0].Ops[0]
+	require.NotNil(t, op.Payload, "a nil payload is dropped by the apply path")
+	require.Equal(t, anyenc.TypeDateTime, op.Payload.Type())
+	got, err := op.Payload.DateTimeMillis()
+	require.NoError(t, err)
+	assert.Equal(t, millis, got)
+}

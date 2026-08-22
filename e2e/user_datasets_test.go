@@ -154,8 +154,13 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.NotNil(t, row)
 	assert.Equal(t, "One", string(row.GetStringBytes("title")))
 	assert.Equal(t, sdk.Account().Id(), string(row.GetStringBytes("creator")))
-	assert.NotZero(t, row.GetFloat64("createdAt"))
-	assert.NotZero(t, row.GetFloat64("modifiedAt"))
+	for _, stamp := range []string{"createdAt", "modifiedAt"} {
+		leaf := row.Get(stamp)
+		require.NotNil(t, leaf, "%s stamped", stamp)
+		ms, mserr := leaf.DateTimeMillis()
+		require.NoError(t, mserr, "%s is a datetime instant, not an epoch number", stamp)
+		assert.NotZero(t, ms)
+	}
 
 	// Idempotent re-run: nothing to write.
 	res, err = sp.Upsert(ctx, batch)

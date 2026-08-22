@@ -56,6 +56,23 @@ func NormalizedVersion(v int) int {
 	return v
 }
 
+// versionSpan bounds the consumer half of a composed version. Well past
+// any hand-maintained counter, and small enough that the pair stays
+// readable in a _meta row.
+const versionSpan = 1_000_000
+
+// ComposeVersion packs an SDK-side and a consumer-side handler version
+// into the single integer persisted per dataset. Only equality matters
+// downstream, so any injective encoding works — this one keeps both
+// halves legible (2_000_003 = SDK 2, consumer 3) and, unlike a sum,
+// cannot let one side's bump cancel the other's.
+func ComposeVersion(sdkVersion, consumerVersion int) int {
+	if consumerVersion < 0 || consumerVersion >= versionSpan {
+		consumerVersion = consumerVersion % versionSpan
+	}
+	return sdkVersion*versionSpan + consumerVersion
+}
+
 // StaleDatasets returns the datasets whose materialized rows were built
 // by a different version of their handler. Empty for a fresh object (no
 // stored versions) and for the common case where nothing changed.

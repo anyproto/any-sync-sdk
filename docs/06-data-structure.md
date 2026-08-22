@@ -17,7 +17,20 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 
 | Scope | write route | version domain | syncs to | overridable |
 |------|------|------|------|------|
-| **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`, `modifiedAt`) | triggering change | (computed convergently) | no (read-only) |
+| **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`, `modifiedAt` — the times are `datetime` instants) | triggering change | (computed convergently) | no (read-only) |
+
+> **Reading the time stamps.** They are `datetime` instants, not epoch
+> numbers: a filter literal has to be one too (`{"createdAt": {"$gte":
+> {"$date": "2026-01-01T00:00:00Z"}}}`). A bare number does not error —
+> any-store decides cross-type comparisons by type rank and instants
+> rank above numbers and strings, so `$gte` matches every row whatever
+> the date, and `$lt` / `$eq` match none. A filter that forgets the
+> wrapper returns a wrong answer, not an empty one.
+>
+> Sorting (`-modifiedAt`) is unaffected in a converged store. While a
+> re-index is in flight the collection can hold both shapes at once, so
+> that window sorts as two type-grouped blocks — it closes when the
+> space's sweep finishes (docs/08-versioning.md).
 | **synced** | the object's own CRDT change | object tree | everyone with access | n/a — no override stack |
 | **account** | carrier record in tech space + per-device mirror | tech tree | this account's devices | n/a |
 | **local** | `Object.LocalSet`, no DAG | local lexid | this device only | n/a |

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -98,12 +99,26 @@ const DatasetPropertyDefs = "properties"
 // rules ever change in a way that must reject stale writers.
 const HandlerVersion = "typePropertyHandler-v1"
 
+// PropertyHandlerLocalVersion is this handler's LOCAL logic version
+// (HandlerReg.Version) — bumped when a validation change means an
+// already-materialized set of definitions would come out different, so
+// the SDK replays the type object's tree (docs/08-versioning.md).
+//
+// It is also how a peer recovers definitions its previous build dropped:
+// the wire DataVersion deliberately stays put (bumping it would park
+// every property change on peers that don't know the new version — see
+// the Properties note above), so an older build rejects a definition it
+// cannot validate, and the replay after the upgrade applies it.
+//
+// v2: `datetime` is a kind, and the date formats accept it.
+const PropertyHandlerLocalVersion = 2
+
 // Property-record field names. The shape is hardcoded in Go (no JSON
 // Schema applies on this dataset — see
 // docs/types-properties-proposal.md § "Schema format — decision").
 const (
 	FieldKey         = "key"         // user-facing stable identifier (e.g. "actors")
-	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"
+	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"/"datetime"
 	FieldScope       = "scope"       // "synced"/"account"/"local" — write/sync class, pinned
 	FieldName        = "name"        // human label, mutable
 	FieldDescription = "description" // mutable
@@ -142,17 +157,22 @@ const (
 	OptionKeyMeta  = "meta"  // per-option opaque bag (string→string), mutable
 )
 
-// formatTypeKindLabel maps each known format-type label to the `kind`
-// label it requires. The SDK checks only this structural coupling —
-// format semantics (ui vocabulary, filter syntax, value shapes) are a
-// consumer concern.
-var formatTypeKindLabel = map[string]string{
-	"links":       "array",
-	"date":        "string",
-	"datetime":    "string",
-	"tags":        "array",
-	"select":      "string",
-	"multiselect": "array",
+// formatTypeKinds maps each known format-type label to the `kind`
+// labels it accepts, first one canonical. The SDK checks only this
+// structural coupling — format semantics (ui vocabulary, filter syntax,
+// value shapes) are a consumer concern.
+//
+// The date formats accept two: `datetime` for the native instant, and
+// `string` for the ISO-8601 convention they carried before instants
+// existed. Kind is pinned for the life of a property, so properties
+// created under the old rule keep working exactly as they did.
+var formatTypeKinds = map[string][]string{
+	"links":       {"array"},
+	"date":        {"datetime", "string"},
+	"datetime":    {"datetime", "string"},
+	"tags":        {"array"},
+	"select":      {"string"},
+	"multiselect": {"array"},
 }
 
 // schemaBearingFields are pinned for the life of the property record.
@@ -289,13 +309,14 @@ func validateFormatCreate(ops []crdt.Op, kindLabel string) error {
 		return fmt.Errorf("%w: %w: missing or non-string `format.type`", crdt.ErrValidation, ErrBadFormatShape)
 	}
 	typeLabel := string(typeVal.GetStringBytes())
-	requiredKind, known := formatTypeKindLabel[typeLabel]
+	acceptedKinds, known := formatTypeKinds[typeLabel]
 	if !known {
 		return fmt.Errorf("%w: %w (got %q)", crdt.ErrValidation, ErrBadFormatType, typeLabel)
 	}
-	if kindLabel != requiredKind {
-		return fmt.Errorf("%w: %w: format %q requires kind %q, got %q",
-			crdt.ErrValidation, ErrFormatKindMismatch, typeLabel, requiredKind, kindLabel)
+	if !slices.Contains(acceptedKinds, kindLabel) {
+		return fmt.Errorf("%w: %w: format %q requires kind %s, got %q",
+			crdt.ErrValidation, ErrFormatKindMismatch, typeLabel,
+			strings.Join(acceptedKinds, " or "), kindLabel)
 	}
 	for _, key := range []string{FormatKeyUi, FormatKeyFilter} {
 		if v := format.Get(key); v != nil && v.Type() != anyenc.TypeString {

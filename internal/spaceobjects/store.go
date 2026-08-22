@@ -542,6 +542,8 @@ func propertyKindToSchema(k handler.PropertyKind) schema.Kind {
 		return schema.KindArray
 	case handler.PropertyKindObject:
 		return schema.KindObject
+	case handler.PropertyKindDatetime:
+		return schema.KindDatetime
 	}
 	return schema.KindUnknown
 }
@@ -1884,10 +1886,10 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// handler enforces them on the DAG route, Properties.Set on
 		// the local/account routes. Declared derived heads (author /
 		// createdAt / spaceId) stay controller-enforced.
-		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true},
+		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
-		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.PropertyHandlerLocalVersion},
 		// `_ver.id` index backs LiveRegistry.LatestShortId, which reads the
 		// greatest `_ver.id` (Sort("-_ver.id").Limit(1)) to derive a type's
 		// DataVersion. `_ver.id` is stamped on every row, so the index is
@@ -1898,7 +1900,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// (docs: SYN-147). Dynamic keyspace; the handler pins the
 		// schema-bearing fields and projects shortId rows so the
 		// DataVersion gate covers dataset-def state too.
-		{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.DatasetDefsLocalVersion},
 		// `payloads` — the node-readable per-file index. Registered on
 		// every controller (uniform handler set), but only payloads
 		// objects (plaintext class, see plaintextSpecs) ever write it:
@@ -1929,9 +1931,17 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 					h = sh
 				}
 			}
+			version := crdt.NormalizedVersion(d.HandlerVersion)
+			if d.Handler == nil {
+				// Declared-schema dataset: the SDK owns the apply logic,
+				// so its version participates too. Encoded as a pair
+				// rather than summed — a sum lets a consumer bump cancel
+				// an SDK bump and suppress the rebuild both asked for.
+				version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, version)
+			}
 			regs = append(regs, crdt.HandlerReg{
 				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),
-				Version:               d.HandlerVersion,
+				Version:               version,
 				ReadTracking:          d.ReadTracking,
 				SkipHistory:           d.SkipHistory,
 				DisableFilteredReplay: d.DisableFilteredReplay,
@@ -1955,6 +1965,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 			Schema:      ds.Schema,
 			SchemaRev:   ds.SchemaRev,
 			SkipHistory: ds.SkipHistory,
+			Version:     crdt.SchemaHandlerVersion,
 		})
 	}
 	return regs, []string{properties.Dataset}, nil

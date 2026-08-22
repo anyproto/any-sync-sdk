@@ -24,7 +24,7 @@ Records with fields:
 - `icon` — space icon
 - `localStatus` — local state
 - `remoteStatus` — remote state
-- `createdAt` — added-to-account time (unix seconds). Handler-derived
+- `createdAt` — added-to-account time, a `datetime` instant. Handler-derived
   (`ScopeDerived`): `SpaceIndexHandler.BeforeCreate` stamps it from the
   creating change's timestamp when the row first lands — Create for the
   author, Join for a joiner — so it's per-account, immutable, and

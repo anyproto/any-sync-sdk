@@ -91,8 +91,8 @@ func TestSchemaHandler_CreateStampsAndFields(t *testing.T) {
 	require.NotNil(t, rec)
 	assert.Equal(t, "t", string(rec.GetStringBytes("title")))
 	assert.Equal(t, shAuthorA, string(rec.GetStringBytes("creator")))
-	assert.Equal(t, float64(100), rec.GetFloat64("createdAt"))
-	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"))
+	assert.EqualValues(t, 100, stampSecs(t, rec, "createdAt"))
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"))
 }
 
 func TestSchemaHandler_CreateMissingRequiredDropsRecord(t *testing.T) {
@@ -190,7 +190,7 @@ func TestSchemaHandler_AuthorMutable(t *testing.T) {
 	require.Empty(t, res.Rejections)
 	rec := st.Get(ctx, shTestDS, "row-1")
 	assert.Equal(t, "edited", string(rec.GetStringBytes("body")))
-	assert.Equal(t, float64(300), rec.GetFloat64("modifiedAt"))
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
 
 	// A change with no creator cannot pass an author gate.
 	res, err = st.ApplyChangeWithResult(ctx, shChange("v4", "", 400, RecordChange{
@@ -268,7 +268,7 @@ func TestSchemaHandler_MultiFieldSalvage(t *testing.T) {
 	rec := st.Get(ctx, shTestDS, "row-1")
 	assert.Equal(t, "t", string(rec.GetStringBytes("title")))
 	assert.Equal(t, "kept", string(rec.GetStringBytes("note")))
-	assert.Equal(t, float64(200), rec.GetFloat64("modifiedAt"))
+	assert.EqualValues(t, 200, stampSecs(t, rec, "modifiedAt"))
 }
 
 func TestSchemaHandler_DeleteByAuthor(t *testing.T) {

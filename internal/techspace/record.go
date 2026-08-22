@@ -3,6 +3,7 @@ package techspace
 import (
 	"github.com/anyproto/any-store/v2/anyenc"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -138,9 +139,10 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		OwnRole:             space.ParsePermission(v.GetString(FieldOwnRole)),
 		GuestKey:            v.GetString(FieldGuestKey),
 		Derived:             v.GetBool(FieldDerived),
-		// Float64 read — GetInt narrows through `int` and would truncate
-		// on 32-bit platforms; anyenc numbers are float64 on the wire.
-		CreatedAt: int64(v.GetFloat64(FieldCreatedAt)),
+		// The stamp is a TypeDateTime instant; rows written before that
+		// carried epoch seconds and read the old way until the re-index
+		// reaches them (anyencx.StampSeconds handles both).
+		CreatedAt: anyencx.StampSeconds(v.Get(FieldCreatedAt)),
 	}
 	if arr := v.GetArray(FieldInviteNotifyPending); len(arr) > 0 {
 		r.InviteNotifyPending = make([]string, 0, len(arr))

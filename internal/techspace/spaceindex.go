@@ -35,7 +35,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
 		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced},
-		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeDerived},
+		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindDatetime), Scope: schema.ScopeDerived},
 		// KindObject with nil Properties = free-form shape: the schema
 		// validator accepts any nested keys (schema.validateValue stops at
 		// an untyped object) and the controller's field-class enforcement
@@ -138,22 +138,34 @@ const (
 	// stay siblings of `settings`, never inside it, and the spaceIndex
 	// mirror (SetSpaceMetadata) never touches it.
 	FieldSettings = "settings"
-	// FieldCreatedAt is the added-to-account time: unix seconds, stamped
-	// by BeforeCreate from the creating change's timestamp when the row
-	// first lands locally (Create / Derive / OneToOne / Join all create
-	// the row once). ScopeDerived — handler-only, no input op may write
-	// it, so it's immutable for life.
+	// FieldCreatedAt is the added-to-account time: a datetime instant,
+	// stamped by BeforeCreate from the creating change's timestamp when
+	// the row first lands locally (Create / Derive / OneToOne / Join all
+	// create the row once). ScopeDerived — handler-only, no input op may
+	// write it, so it's immutable for life.
 	//
 	// Caveats (accepted — the value is advisory ordering metadata):
 	//   - stamping is per-device first-touch: a device whose store
-	//     materialized the row under an older handler reads 0 forever
-	//     (no backfill), while a device replaying the same DAG with this
-	//     handler stamps the real value;
+	//     materialized the row under an older handler reads nothing until
+	//     a re-index replays the row's create change (SpaceIndexLocalVersion
+	//     drives exactly that), while a device replaying the same DAG with
+	//     this handler stamps the real value;
 	//   - two devices independently creating the same row (e.g. both
 	//     Derive/Join before tech-space sync converges) each keep their
 	//     own change's timestamp — typically seconds apart.
-	// Callers treat 0 as "unknown".
+	// Callers treat an absent stamp as "unknown" (SpaceIndexRecord
+	// reports it as 0).
 	FieldCreatedAt = "createdAt"
+)
+
+// SpaceIndexLocalVersion is the spaces handler's LOCAL logic version
+// (HandlerReg.Version) — bumped when already-materialized rows would
+// come out different, so the SDK rebuilds them from the DAG
+// (docs/08-versioning.md). v2: the derived createdAt stamp is a
+// TypeDateTime instant, not an epoch number.
+const SpaceIndexLocalVersion = 2
+
+const (
 	// FieldPushKeys is a DEVICE-LOCAL object (schema.ScopeLocal) holding
 	// the space's push-notification key material, mirrored from ACL
 	// state by spaceimpl's per-space ACL mirror watcher so clients can
@@ -333,14 +345,13 @@ func (SpaceIndexHandler) Init(_ context.Context) error { return nil }
 func (SpaceIndexHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
 	if ctx != nil && ctx.Change != nil && sink != nil && ctx.Change.Timestamp > 0 {
 		// Fresh arena per call — the derived Op holds it alive until
-		// the apply loop drains the sink (see drainDerivedTo).
-		// Float64 constructor: anyenc numbers are float64 on the wire,
-		// and NewNumberInt would truncate int64 on 32-bit platforms.
+		// the apply loop drains the sink (see drainDerivedTo). The
+		// envelope carries unix SECONDS; an instant is millis.
 		a := &anyenc.Arena{}
 		sink.Derive(crdt.Op{
 			Type:    crdt.OpSet,
 			Path:    []string{FieldCreatedAt},
-			Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp)),
+			Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000),
 		})
 	}
 	return nil

@@ -11,6 +11,13 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
+// SchemaHandlerVersion is the generic schema handler's LOCAL logic
+// version (HandlerReg.Version). Every dataset the SDK applies through
+// this handler carries it, so a change here rebuilds their rows from the
+// DAG (docs/08-versioning.md). v2: the createTime / modifyTime stamps
+// are TypeDateTime instants, not epoch numbers.
+const SchemaHandlerVersion = 2
+
 // SchemaHandler is the generic dataset handler: it enforces a
 // schema.Dataset's behavioral declaration (required fields, write-once /
 // author-gated mutability, apply-time stamps, id rules, delete gates,
@@ -234,11 +241,17 @@ func (h *SchemaHandler) deriveCreateStamps(ctx *ChangeCtx, sink *Sink) {
 	if h.creatorField != "" && ctx.Change.Creator != "" {
 		sink.Derive(Op{Type: OpSet, Path: []string{h.creatorField}, Payload: a.NewString(ctx.Change.Creator)})
 	}
+	if ctx.Change.Timestamp <= 0 {
+		// No envelope clock, no time stamps: an instant at the epoch would
+		// be indistinguishable from a real one, where an absent field
+		// still reads as "unknown".
+		return
+	}
 	if h.createTimeField != "" {
-		sink.Derive(Op{Type: OpSet, Path: []string{h.createTimeField}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+		sink.Derive(Op{Type: OpSet, Path: []string{h.createTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
 	}
 	if h.modifyTimeField != "" {
-		sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+		sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
 	}
 }
 
@@ -408,7 +421,7 @@ func (h *SchemaHandler) bumpModifyTime(ctx *ChangeCtx, sink *Sink) {
 		}
 	}
 	a := &anyenc.Arena{}
-	sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+	sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
 }
 
 // BeforeDelete enforces the dataset's delete gate. Author-gated deletes

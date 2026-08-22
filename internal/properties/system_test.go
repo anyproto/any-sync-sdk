@@ -458,7 +458,7 @@ func TestSystemPropertiesHandler_ModifiedAtSeededOnCreate(t *testing.T) {
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "create seeds modifiedAt from the change Timestamp")
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"), "create seeds modifiedAt from the change Timestamp")
 }
 
 func TestSystemPropertiesHandler_ModifiedAtBumpsOnModify(t *testing.T) {
@@ -476,7 +476,7 @@ func TestSystemPropertiesHandler_ModifiedAtBumpsOnModify(t *testing.T) {
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, float64(200), rec.GetFloat64("modifiedAt"), "valid modify bumps modifiedAt")
+	assert.EqualValues(t, 200, stampSecs(t, rec, "modifiedAt"), "valid modify bumps modifiedAt")
 }
 
 // Out-of-order delivery: an older change (lower VersionId) arriving after
@@ -501,7 +501,7 @@ func TestSystemPropertiesHandler_ModifiedAtOutOfOrderConverges(t *testing.T) {
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, float64(300), rec.GetFloat64("modifiedAt"), "older change must not regress modifiedAt")
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"), "older change must not regress modifiedAt")
 }
 
 // A change whose every op fails validation stamps nothing: the stamp
@@ -521,7 +521,7 @@ func TestSystemPropertiesHandler_ModifiedAtNotBumpedWhenAllOpsRejected(t *testin
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
-	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "fully-rejected change must not bump modifiedAt")
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"), "fully-rejected change must not bump modifiedAt")
 }
 
 // A multi-op RecordChange stamps modifiedAt exactly once (DeriveOnce),
@@ -570,5 +570,17 @@ func TestSystemPropertiesHandler_ModifiedAtClientWriteDropped(t *testing.T) {
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)
 	assert.Nil(t, rec.Get(typeAny, "modifiedAt"), "derived-scoped client op dropped")
-	assert.Equal(t, float64(100), rec.GetFloat64("modifiedAt"), "handler stamp still lands at row root")
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"), "handler stamp still lands at row root")
+}
+
+// stampSecs reads a derived timestamp leaf as unix seconds, asserting it
+// really is a datetime instant — a stamp that regressed to a plain
+// number would otherwise read as a silent zero.
+func stampSecs(t *testing.T, rec *anyenc.Value, field string) int64 {
+	t.Helper()
+	leaf := rec.Get(field)
+	require.NotNil(t, leaf, "stamp %q present", field)
+	ms, err := leaf.DateTimeMillis()
+	require.NoError(t, err, "stamp %q is a datetime", field)
+	return ms / 1000
 }

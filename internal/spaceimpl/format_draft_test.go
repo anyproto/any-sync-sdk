@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -23,13 +24,30 @@ func TestValidateFormatDraft_KindDefaulting(t *testing.T) {
 		want   space.PropertyKind
 	}{
 		{space.FormatLinks, space.PropertyKindArray},
-		{space.FormatDate, space.PropertyKindString},
-		{space.FormatDatetime, space.PropertyKindString},
+		{space.FormatDate, space.PropertyKindDatetime},
+		{space.FormatDatetime, space.PropertyKindDatetime},
+		{space.FormatSelect, space.PropertyKindString},
 	} {
 		draft := space.PropertyDraft{Format: &space.PropertyFormatDraft{Type: tc.format}}
 		_, err := validateFormatDraft(&draft)
 		require.NoError(t, err, tc.format)
 		assert.Equal(t, tc.want, draft.Kind, "kind defaulted from format %s", tc.format)
+	}
+}
+
+// A date property declared `string` keeps the ISO-8601 convention these
+// formats carried before datetime values existed. Kind is pinned on
+// first write, so properties created under the old default can never
+// move to the new one.
+func TestValidateFormatDraft_DateAcceptsLegacyStringKind(t *testing.T) {
+	for _, format := range []space.FormatType{space.FormatDate, space.FormatDatetime} {
+		draft := space.PropertyDraft{
+			Kind:   space.PropertyKindString,
+			Format: &space.PropertyFormatDraft{Type: format},
+		}
+		_, err := validateFormatDraft(&draft)
+		require.NoError(t, err, format)
+		assert.Equal(t, space.PropertyKindString, draft.Kind, "an explicit string kind is kept")
 	}
 }
 
@@ -41,6 +59,7 @@ func TestValidateFormatDraft_KindMismatch(t *testing.T) {
 		{space.FormatLinks, space.PropertyKindString},
 		{space.FormatDate, space.PropertyKindArray},
 		{space.FormatDatetime, space.PropertyKindNumber},
+		{space.FormatSelect, space.PropertyKindDatetime},
 	} {
 		draft := space.PropertyDraft{Kind: tc.kind, Format: &space.PropertyFormatDraft{Type: tc.format}}
 		_, err := validateFormatDraft(&draft)
@@ -102,4 +121,27 @@ func TestValidateFormatDraft_FilterSerialization(t *testing.T) {
 	}}
 	_, err = validateFormatDraft(&draft)
 	assert.Error(t, err)
+}
+
+// A time stamp's value is handler-produced. A declaration naming another
+// kind is rejected rather than normalized: the draft is signed into the
+// type object and read back by discovery, so accepting one the apply
+// path then overrides would publish a lie.
+func TestDraftFieldDecl_TimeStampRequiresDatetime(t *testing.T) {
+	for _, stamp := range []space.Stamp{space.StampCreateTime, space.StampModifyTime} {
+		_, err := draftFieldDecl(&space.DatasetFieldDraft{
+			Key: "createdAt", Stamp: stamp, Kind: space.PropertyKindNumber,
+		})
+		assert.Error(t, err, "stamp %v with kind number", stamp)
+
+		f, err := draftFieldDecl(&space.DatasetFieldDraft{Key: "createdAt", Stamp: stamp})
+		require.NoError(t, err, "stamp %v with kind omitted", stamp)
+		require.NotNil(t, f.Schema)
+		assert.Equal(t, schema.KindDatetime, f.Schema.Kind)
+	}
+	// A Shape saying the same thing another way is refused too.
+	_, err := draftFieldDecl(&space.DatasetFieldDraft{
+		Key: "createdAt", Stamp: space.StampCreateTime, Shape: schema.Leaf(schema.KindNumber),
+	})
+	assert.Error(t, err, "stamped field declared through Shape")
 }

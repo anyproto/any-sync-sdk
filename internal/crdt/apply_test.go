@@ -563,7 +563,8 @@ func TestDelete_CreatesTombstone(t *testing.T) {
 	rec := st.Get(ctx, testDS, "r1")
 	require.NotNil(t, rec)
 	assert.Nil(t, rec.Get("name"))
-	assert.Equal(t, 1715000000, rec.GetInt(DeletedAtField))
+	assert.EqualValues(t, 1715000000, stampSecs(t, rec, DeletedAtField),
+		"the tombstone stamp is an instant, like every other change-time stamp")
 	// Tombstone is excluded from Records().
 	assert.Empty(t, st.Records(ctx, testDS))
 }

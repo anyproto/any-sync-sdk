@@ -545,6 +545,8 @@ func handlerKindToPropertyKind(k handler.PropertyKind) space.PropertyKind {
 		return space.PropertyKindArray
 	case handler.PropertyKindObject:
 		return space.PropertyKindObject
+	case handler.PropertyKindDatetime:
+		return space.PropertyKindDatetime
 	}
 	return 0
 }
@@ -680,6 +682,8 @@ func schemaKindToPropertyKind(k schema.Kind) space.PropertyKind {
 		return space.PropertyKindArray
 	case schema.KindObject:
 		return space.PropertyKindObject
+	case schema.KindDatetime:
+		return space.PropertyKindDatetime
 	}
 	return 0
 }
@@ -864,12 +868,21 @@ func validateFormatDraft(draft *space.PropertyDraft) (filterJSON string, err err
 	if f == nil {
 		return "", nil
 	}
-	var requiredKind space.PropertyKind
+	// altKind is a second kind the format tolerates (zero = none).
+	var requiredKind, altKind space.PropertyKind
 	switch f.Type {
 	case space.FormatLinks, space.FormatMultiselect:
 		requiredKind = space.PropertyKindArray
-	case space.FormatDate, space.FormatDatetime, space.FormatSelect:
+	case space.FormatSelect:
 		requiredKind = space.PropertyKindString
+	case space.FormatDate, space.FormatDatetime:
+		// The instant itself, as a TypeDateTime value — the shape
+		// any-store's date operators compute on. `string` stays
+		// accepted for the ISO-8601 convention these formats carried
+		// before: kind is pinned on first write, so properties created
+		// under the old default can never move, and a caller keeping a
+		// string column has to be able to say so.
+		requiredKind, altKind = space.PropertyKindDatetime, space.PropertyKindString
 	case space.FormatTags:
 		return "", errors.New("typesAPI: format `tags` is not supported yet (space-level tag table pending)")
 	default:
@@ -877,7 +890,11 @@ func validateFormatDraft(draft *space.PropertyDraft) (filterJSON string, err err
 	}
 	if draft.Kind == 0 {
 		draft.Kind = requiredKind
-	} else if draft.Kind != requiredKind {
+	} else if draft.Kind != requiredKind && (altKind == 0 || draft.Kind != altKind) {
+		if altKind != 0 {
+			return "", fmt.Errorf("typesAPI: format %q requires Kind %s or %s; got %s",
+				f.Type, propertyKindLabel(requiredKind), propertyKindLabel(altKind), propertyKindLabel(draft.Kind))
+		}
 		return "", fmt.Errorf("typesAPI: format %q requires Kind %s; got %s",
 			f.Type, propertyKindLabel(requiredKind), propertyKindLabel(draft.Kind))
 	}
@@ -915,6 +932,8 @@ func propertyKindLabel(k space.PropertyKind) string {
 		return "array"
 	case space.PropertyKindObject:
 		return "object"
+	case space.PropertyKindDatetime:
+		return "datetime"
 	default:
 		return ""
 	}

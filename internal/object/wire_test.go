@@ -83,3 +83,36 @@ func TestCodec_DecodeEmpty(t *testing.T) {
 	_, err := c.Decode(nil)
 	assert.ErrorIs(t, err, ErrEmptyPayload)
 }
+
+// TestCodec_RoundtripDatetime: a datetime value survives the wire.
+// Date properties are stored as anyenc's native TypeDateTime, so the
+// change payload has to carry the type — a codec that fell back to a
+// number or a string would land 1970 (or a lexicographic sort) on every
+// other peer.
+func TestCodec_RoundtripDatetime(t *testing.T) {
+	a := &anyenc.Arena{}
+	const millis int64 = 1786014230123
+
+	c := NewCodec()
+	raw, err := c.Encode(&crdt.Change{
+		Dataset: "notes",
+		Records: []crdt.RecordChange{{
+			Id: "rec-1",
+			Ops: []crdt.Op{
+				{Type: crdt.OpSet, Path: []string{"due"}, Payload: a.NewDateTimeMillis(millis)},
+			},
+		}},
+	})
+	require.NoError(t, err)
+
+	out, err := c.Decode(raw)
+	require.NoError(t, err)
+	require.Len(t, out.Records, 1)
+	require.Len(t, out.Records[0].Ops, 1)
+
+	payload := out.Records[0].Ops[0].Payload
+	require.Equal(t, anyenc.TypeDateTime, payload.Type())
+	got, err := payload.DateTimeMillis()
+	require.NoError(t, err)
+	assert.Equal(t, millis, got)
+}

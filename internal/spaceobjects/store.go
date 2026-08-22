@@ -225,6 +225,15 @@ type Store struct {
 	readState    *readstate.Engine
 	selfIdentity string
 	readMat      *readMaterializer
+
+	// The background re-index sweep: one per store, started once, stopped
+	// with the store and waited for (Close must not return while a
+	// rebuild is still writing — an offload drops collections right
+	// after). See reindex.go.
+	sweepOnce  sync.Once
+	sweepStop  chan struct{}
+	sweepClose sync.Once
+	sweepDone  chan struct{}
 	// readSeedPending marks objects mid-first-restore: the apply hook
 	// skips tracking for them (the seed covers everything present).
 	readSeedPending sync.Map
@@ -459,6 +468,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		ocache.WithTTL(objectCacheTTL),
 		ocache.WithGCPeriod(objectCacheGC),
 	)
+	s.sweepStop = make(chan struct{})
 	s.drainer = newDrainer(s)
 	s.drainer.Run()
 	return s
@@ -634,6 +644,7 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
+	s.stopSweep()
 	if s.readMat != nil {
 		s.readMat.close()
 	}
@@ -1583,6 +1594,15 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err != nil {
 		return nil, err
 	}
+	// A handler-version bump recorded on the object's _meta row rebuilds
+	// the object before anything reads it (see reindex.go). The verdict is
+	// read here; the wipe itself waits until the tree is open, below. A
+	// rebuild an earlier load started and never finished (its captured
+	// local leaves are still on the row) resumes: the replay continues
+	// from the persisted watermark and the leaves are restored after it.
+	stale := ctrl.StaleDatasets()
+	resume := len(stale) == 0 && ctrl.ReindexPending()
+	rebuilding := len(stale) > 0 || resume
 	payload := loadPayloadFromCtx(ctx)
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
@@ -1600,6 +1620,14 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 				defer s.readSeedPending.Delete(objectId)
 			}
 		}
+	}
+	if rebuilding {
+		// The replay re-applies every change in the tree, which would mark
+		// the whole object unread. Read state itself survives the wipe (it
+		// lives outside the object's collections) and the materializer
+		// re-projects the flags once the rows are back.
+		s.readSeedPending.Store(objectId, struct{}{})
+		defer s.readSeedPending.Delete(objectId)
 	}
 	var gate object.ApplyGate
 	if !s.disableGate {
@@ -1621,11 +1649,27 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err != nil {
 		return nil, err
 	}
+	// Tree is open, so the replay can actually run: capture device-local
+	// values, rewind and wipe. Doing this before object.New would leave a
+	// failed open (offline, tree removed, selective-mode reject) with the
+	// rows gone, nothing to replay them back, and the captured local
+	// values dropped on the error path.
+	var reindexLeaves []localLeaf
+	if len(stale) > 0 {
+		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale); err != nil {
+			return nil, err
+		}
+	} else if resume {
+		storeLog.Info("reindex: resuming interrupted rebuild", zap.String("objectId", objectId))
+		reindexLeaves = ctrl.ReindexLocalLeaves()
+	}
 	// First materialization (fresh controller, no watermark): the cold
 	// restore may drain the whole tree — skip per-change history-index
 	// rows (protected perf path, proposal §4.4) and mark the object
-	// stale for lazy backfill if anything was actually restored.
-	firstRestore := ctrl.MaxAddSeq() == 0
+	// stale for lazy backfill if anything was actually restored. A
+	// resumed rebuild is the same case mid-way: its first attempt skipped
+	// the rows and never reached the mark.
+	firstRestore := ctrl.MaxAddSeq() == 0 || resume
 	if firstRestore {
 		s.historySkipIndex.Store(objectId, struct{}{})
 		defer s.historySkipIndex.Delete(objectId)
@@ -1644,6 +1688,9 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 			// successful open repairs it.
 			s.historyPendingStale.Store(objectId, struct{}{})
 		}
+	}
+	if rebuilding {
+		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
 	}
 	if seedPending {
 		if len(publishedSets) > 0 {
@@ -1884,6 +1931,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 			}
 			regs = append(regs, crdt.HandlerReg{
 				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),
+				Version:               d.HandlerVersion,
 				ReadTracking:          d.ReadTracking,
 				SkipHistory:           d.SkipHistory,
 				DisableFilteredReplay: d.DisableFilteredReplay,

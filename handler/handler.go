@@ -155,6 +155,19 @@ type Dataset struct {
 	// way that must reject older writers.
 	DataVersion string
 
+	// HandlerVersion is the LOCAL version of this dataset's handler
+	// logic. Bump it when a change to that logic makes rows already
+	// materialized on disk wrong — a derived field that now holds a
+	// different shape, a stamp computed differently. The next load of
+	// each object wipes its materialized rows and replays its tree
+	// through the current handlers. Zero means 1.
+	//
+	// This is not DataVersion. DataVersion gates PEERS: bumping it parks
+	// this dataset's changes on every peer still running older code.
+	// HandlerVersion never leaves the device and gates nothing — it only
+	// decides whether local state has to be rebuilt.
+	HandlerVersion int
+
 	// Handler implements the dataset's lifecycle (Init / Before*).
 	// Optional when Schema declares fields: a nil Handler gets the SDK's
 	// generic schema handler, which enforces the declaration (required,

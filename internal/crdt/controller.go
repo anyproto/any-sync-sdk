@@ -118,6 +118,19 @@ type Controller struct {
 	// construction, read lock-free by the store's staleness checks.
 	schemaRevs map[string]string
 
+	// staleDatasets are the datasets whose persisted handler version
+	// differs from the registered one — the re-index trigger. Computed
+	// once at construction from the stored _meta row, cleared by
+	// ResetForReindex. See reindex.go.
+	staleDatasets []string
+
+	// reindexPending is set while a rebuild is in flight: the captured
+	// local-scope leaves sit on the _meta row (reindexLocal, encoded)
+	// until the replay finishes and PersistVersions clears them. A load
+	// that finds it set resumes the rebuild. See reindex.go.
+	reindexPending bool
+	reindexLocal   []byte
+
 	// collMu guards collections. Per-object collections are opened
 	// lazily — on first write via db.Collection (creates), on read via
 	// db.OpenCollection (no-create). Shared (per-space) handles are
@@ -215,9 +228,11 @@ func NewControllerWithShared(ctx context.Context, objectId string, db anystore.D
 	if err := ensureMetaIndexes(ctx, metaColl); err != nil {
 		return nil, fmt.Errorf("crdt: ensure meta indexes: %w", err)
 	}
-	if _, err := c.LoadAndSeedMeta(ctx, metaColl); err != nil {
+	stored, err := c.LoadAndSeedMeta(ctx, metaColl)
+	if err != nil {
 		return nil, fmt.Errorf("crdt: load meta: %w", err)
 	}
+	c.staleDatasets = staleDatasets(stored, c.versions)
 	return c, nil
 }
 
@@ -292,11 +307,7 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 		return fmt.Errorf("crdt: init handler %q: %w", name, err)
 	}
 	c.handlers[name] = reg.Handler
-	version := reg.Version
-	if version == 0 {
-		version = 1
-	}
-	c.versions[name] = version
+	c.versions[name] = NormalizedVersion(reg.Version)
 	c.indexes[name] = reg.Indexes
 	// Zero-value scopes are resolved once here (stamps → derived, rest →
 	// synced) so field-class enforcement never sees an unset scope.

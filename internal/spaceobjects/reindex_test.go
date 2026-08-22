@@ -123,18 +123,81 @@ func TestReindex_CaptureLocalLeaves(t *testing.T) {
 	leaves := s.captureLocalLeaves(ctx, "obj1", ctrl)
 	require.Len(t, leaves, 2, "one per-property local value, one record flag")
 
-	i := slices.IndexFunc(leaves, func(l localLeaf) bool { return l.dataset == properties.Dataset })
+	i := slices.IndexFunc(leaves, func(l localLeaf) bool { return l.Dataset == properties.Dataset })
 	require.GreaterOrEqual(t, i, 0, "the objects row's local property must be captured")
-	assert.Equal(t, "obj1", leaves[i].recordId)
-	assert.Equal(t, []string{"typeA", "pLocal"}, leaves[i].path)
-	got, err := anyenc.Parse(leaves[i].value)
+	assert.Equal(t, "obj1", leaves[i].RecordId)
+	assert.Equal(t, []string{"typeA", "pLocal"}, leaves[i].Path)
+	got, err := anyenc.Parse(leaves[i].Value)
 	require.NoError(t, err)
 	assert.Equal(t, 7, got.GetInt())
 
-	j := slices.IndexFunc(leaves, func(l localLeaf) bool { return l.dataset == reindexNotes })
+	j := slices.IndexFunc(leaves, func(l localLeaf) bool { return l.Dataset == reindexNotes })
 	require.GreaterOrEqual(t, j, 0)
-	assert.Equal(t, "rec1", leaves[j].recordId, "only the record carrying the flag")
-	assert.Equal(t, []string{"unread"}, leaves[j].path)
+	assert.Equal(t, "rec1", leaves[j].RecordId, "only the record carrying the flag")
+	assert.Equal(t, []string{"unread"}, leaves[j].Path)
+}
+
+// The captured leaves must outlive the wipe on disk: a replay cut short
+// (a crash, or the sweep cancelled at shutdown) has nothing else to
+// restore them from, and the next load must both see the rebuild as
+// in flight and get the same leaves back — without re-capturing from
+// rows that are gone.
+func TestReindex_PrepareKeepsLeavesOnDisk(t *testing.T) {
+	ctx, s, ctrl := reindexStore(t)
+
+	notes, err := s.db.Collection(ctx, "obj1_"+reindexNotes)
+	require.NoError(t, err)
+	upsert(t, ctx, notes, "rec1", func(a *anyenc.Arena, v *anyenc.Value) {
+		v.Set("text", a.NewString("hello"))
+		v.Set("unread", a.NewTrue())
+	})
+
+	leaves, err := s.reindexPrepare(ctx, "obj1", ctrl, []string{reindexNotes})
+	require.NoError(t, err)
+	require.Len(t, leaves, 1)
+	_, err = s.db.OpenCollection(ctx, "obj1_"+reindexNotes)
+	require.ErrorIs(t, err, anystore.ErrCollectionNotFound, "the wipe ran")
+
+	// A fresh controller — the next load after an interruption — reads
+	// the mark and the leaves off the _meta row.
+	shared, err := s.SharedObjects(ctx)
+	require.NoError(t, err)
+	again, err := crdt.NewControllerWithShared(ctx, "obj1", s.db,
+		crdt.SharedCollections{properties.Dataset: shared},
+		crdt.HandlerReg{Name: reindexNotes, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Fields: []schema.Field{
+			{Id: "unread", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeLocal},
+		}}})
+	require.NoError(t, err)
+	again.SetSpaceId("spaceA")
+	require.True(t, again.ReindexPending())
+	require.Equal(t, leaves, again.ReindexLocalLeaves())
+
+	// Preparing again (the stale verdict still armed, rows gone) keeps
+	// the persisted leaves instead of capturing an empty set.
+	leaves2, err := s.reindexPrepare(ctx, "obj1", again, []string{reindexNotes})
+	require.NoError(t, err)
+	assert.Equal(t, leaves, leaves2)
+
+	// The sweep's work list includes the in-flight object even once its
+	// versions read current.
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	require.NoError(t, again.PersistMeta(ctx, metaColl))
+	ids, err := crdt.StaleObjects(ctx, metaColl, "spaceA", again.HandlerVersions())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1"}, ids)
+
+	// Finishing clears both.
+	require.NoError(t, again.PersistVersions(ctx))
+	ids, err = crdt.StaleObjects(ctx, metaColl, "spaceA", again.HandlerVersions())
+	require.NoError(t, err)
+	assert.Empty(t, ids)
+	done, err := crdt.NewControllerWithShared(ctx, "obj1", s.db,
+		crdt.SharedCollections{properties.Dataset: shared},
+		crdt.HandlerReg{Name: reindexNotes, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}})
+	require.NoError(t, err)
+	assert.False(t, done.ReindexPending())
+	assert.Nil(t, done.ReindexLocalLeaves())
 }
 
 func TestReindex_WipeClearsOnlyThisObject(t *testing.T) {

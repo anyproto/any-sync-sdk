@@ -1596,8 +1596,13 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	}
 	// A handler-version bump recorded on the object's _meta row rebuilds
 	// the object before anything reads it (see reindex.go). The verdict is
-	// read here; the wipe itself waits until the tree is open, below.
+	// read here; the wipe itself waits until the tree is open, below. A
+	// rebuild an earlier load started and never finished (its captured
+	// local leaves are still on the row) resumes: the replay continues
+	// from the persisted watermark and the leaves are restored after it.
 	stale := ctrl.StaleDatasets()
+	resume := len(stale) == 0 && ctrl.ReindexPending()
+	rebuilding := len(stale) > 0 || resume
 	payload := loadPayloadFromCtx(ctx)
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
@@ -1616,7 +1621,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 			}
 		}
 	}
-	if len(stale) > 0 {
+	if rebuilding {
 		// The replay re-applies every change in the tree, which would mark
 		// the whole object unread. Read state itself survives the wipe (it
 		// lives outside the object's collections) and the materializer
@@ -1654,12 +1659,17 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale); err != nil {
 			return nil, err
 		}
+	} else if resume {
+		storeLog.Info("reindex: resuming interrupted rebuild", zap.String("objectId", objectId))
+		reindexLeaves = ctrl.ReindexLocalLeaves()
 	}
 	// First materialization (fresh controller, no watermark): the cold
 	// restore may drain the whole tree — skip per-change history-index
 	// rows (protected perf path, proposal §4.4) and mark the object
-	// stale for lazy backfill if anything was actually restored.
-	firstRestore := ctrl.MaxAddSeq() == 0
+	// stale for lazy backfill if anything was actually restored. A
+	// resumed rebuild is the same case mid-way: its first attempt skipped
+	// the rows and never reached the mark.
+	firstRestore := ctrl.MaxAddSeq() == 0 || resume
 	if firstRestore {
 		s.historySkipIndex.Store(objectId, struct{}{})
 		defer s.historySkipIndex.Delete(objectId)
@@ -1679,7 +1689,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 			s.historyPendingStale.Store(objectId, struct{}{})
 		}
 	}
-	if len(stale) > 0 {
+	if rebuilding {
 		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
 	}
 	if seedPending {

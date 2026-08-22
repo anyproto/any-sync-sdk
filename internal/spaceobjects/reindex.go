@@ -37,11 +37,16 @@ import (
 // axis at zero, does.
 //
 // What a replay cannot reproduce is local-scope state: it never entered
-// the DAG. Those leaves are captured before the wipe and re-applied after
-// the replay. Account-scope values need no capture — the mirror replays
-// its carrier records when the row re-materializes. Read-tracking flags
-// need none either: the materializer recomputes them from unread entries
-// and self-heals.
+// the DAG. Those leaves are captured before the wipe, persisted on the
+// object's _meta row in the same upsert as the watermark rewind, and
+// re-applied after the replay. A rebuild interrupted anywhere in between
+// — a crash, or the sweep cancelled at shutdown mid-replay — resumes on
+// the next load: the replay continues from the persisted watermark and
+// the leaves come back from the row (crdt.Controller.ReindexPending).
+// Account-scope values need no capture — the mirror replays its carrier
+// records when the row re-materializes. Read-tracking flags need none
+// either: the materializer recomputes them from unread entries and
+// self-heals.
 const (
 	// reindexLocalLeafCap bounds the local-scope capture. Past it the
 	// rebuild proceeds and the excess leaves are lost — a bounded,
@@ -62,28 +67,34 @@ var (
 	reindexSweepPace = 50 * time.Millisecond
 )
 
-// localLeaf is one captured local-scope value. The document it came from
-// is only valid during iteration, so the value travels as its own bytes.
-type localLeaf struct {
-	dataset  string
-	recordId string
-	path     []string
-	value    []byte
-}
+// localLeaf is one captured local-scope value; the persisted form lives
+// with the controller, which owns the _meta row it rides on.
+type localLeaf = crdt.LocalLeaf
 
 // reindexPrepare captures local-scope state, rewinds the controller and
 // wipes the object's materialized rows. The caller then cold-restores,
 // which replays the whole tree, and finally calls reindexFinish.
 //
-// The rewind is persisted before the wipe: a crash in between must leave
-// a watermark of zero over missing rows, so the next load rebuilds again.
-// The reverse order would strand rows that no watermark asks for.
+// The rewind and the captured leaves are persisted together before the
+// wipe: a crash in between must leave a watermark of zero over missing
+// rows, so the next load rebuilds again, and the leaves must outlive the
+// rows they came from. The reverse order would strand rows that no
+// watermark asks for.
+//
+// A rebuild that was already in flight (the previous attempt persisted
+// its leaves and did not finish) re-uses them instead of capturing: the
+// rows are gone or half-rebuilt, so a fresh capture would read nothing.
 func (s *Store) reindexPrepare(ctx context.Context, objectId string, ctrl *crdt.Controller, stale []string) ([]localLeaf, error) {
 	storeLog.Info("reindex: rebuilding object",
 		zap.String("objectId", objectId),
 		zap.Strings("datasets", stale))
-	leaves := s.captureLocalLeaves(ctx, objectId, ctrl)
-	if err := ctrl.ResetForReindex(ctx); err != nil {
+	var leaves []localLeaf
+	if ctrl.ReindexPending() {
+		leaves = ctrl.ReindexLocalLeaves()
+	} else {
+		leaves = s.captureLocalLeaves(ctx, objectId, ctrl)
+	}
+	if err := ctrl.ResetForReindex(ctx, leaves); err != nil {
 		return nil, fmt.Errorf("spaceobjects: reindex rewind %s: %w", objectId, err)
 	}
 	if err := s.wipeMaterialized(ctx, objectId, ctrl); err != nil {
@@ -92,10 +103,12 @@ func (s *Store) reindexPrepare(ctx context.Context, objectId string, ctrl *crdt.
 	return leaves, nil
 }
 
-// reindexFinish re-applies the captured local leaves and stamps the
-// current handler versions. The stamp matters for an object whose replay
-// re-applied nothing — without it the object would be found stale on
-// every load, rebuilding forever.
+// reindexFinish re-applies the captured local leaves, then stamps the
+// current handler versions and clears the in-flight mark. The stamp
+// matters for an object whose replay re-applied nothing — without it the
+// object would be found stale on every load, rebuilding forever. The
+// mark is cleared last: a crash before it costs one redundant restore on
+// the next load, never the leaves.
 func (s *Store) reindexFinish(ctx context.Context, obj *object.Object, ctrl *crdt.Controller, leaves []localLeaf) {
 	s.restoreLocalLeaves(ctx, obj, leaves)
 	if err := ctrl.PersistVersions(ctx); err != nil {
@@ -165,8 +178,8 @@ func (s *Store) captureSharedRow(ctx context.Context, coll anystore.Collection, 
 	v := doc.Value()
 	for _, field := range ctrl.LocalFields(dataset) {
 		if leaf := v.Get(field); leaf != nil {
-			out = append(out, localLeaf{dataset: dataset, recordId: objectId,
-				path: []string{field}, value: leaf.MarshalTo(nil)})
+			out = append(out, localLeaf{Dataset: dataset, RecordId: objectId,
+				Path: []string{field}, Value: leaf.MarshalTo(nil)})
 		}
 	}
 	if s.reg == nil {
@@ -195,8 +208,8 @@ func (s *Store) captureSharedRow(ctx context.Context, coll anystore.Collection, 
 			if leaf == nil {
 				continue
 			}
-			out = append(out, localLeaf{dataset: dataset, recordId: objectId,
-				path: []string{typeId, p.Id}, value: leaf.MarshalTo(nil)})
+			out = append(out, localLeaf{Dataset: dataset, RecordId: objectId,
+				Path: []string{typeId, p.Id}, Value: leaf.MarshalTo(nil)})
 		}
 	}
 	return out, nil
@@ -223,10 +236,10 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 				continue
 			}
 			out = append(out, localLeaf{
-				dataset:  dataset,
-				recordId: string(v.GetStringBytes("id")),
-				path:     []string{field},
-				value:    leaf.MarshalTo(nil),
+				Dataset:  dataset,
+				RecordId: string(v.GetStringBytes("id")),
+				Path:     []string{field},
+				Value:    leaf.MarshalTo(nil),
 			})
 			if len(out) >= reindexLocalLeafCap {
 				_ = iter.Close()
@@ -260,8 +273,14 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 // `properties` / `shortIds` / `datasets` collections, so the space's
 // type registry reads empty until the replay finishes. Same window a
 // fresh joiner's first materialization has always had, now reachable
-// mid-session; concurrent writes in that window validate against an
-// empty definition set.
+// mid-session. Remote changes for the type in that window fail the
+// gate's KnownShortId lookup (the collection is gone) and park, draining
+// once the replay lands the defs; only local writes see a transient
+// type_unknown rejection.
+//
+// Live subscriptions are not notified of the wipe (nothing here reaches
+// the subscribe engine): a window keeps its rows and sees the replay as
+// one update per change in the tree, converging when it ends.
 func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crdt.Controller) error {
 	for _, dataset := range ctrl.RegisteredDatasets() {
 		if !ctrl.IsShared(dataset) {
@@ -332,25 +351,25 @@ func (s *Store) restoreLocalLeaves(ctx context.Context, obj *object.Object, leav
 	byDataset := map[string][]crdt.RecordChange{}
 	index := map[string]map[string]int{}
 	for _, leaf := range leaves {
-		val, err := anyenc.Parse(leaf.value)
+		val, err := anyenc.Parse(leaf.Value)
 		if err != nil {
 			storeLog.Warn("reindex: decode captured local value",
-				zap.String("dataset", leaf.dataset), zap.String("recordId", leaf.recordId), zap.Error(err))
+				zap.String("dataset", leaf.Dataset), zap.String("recordId", leaf.RecordId), zap.Error(err))
 			continue
 		}
-		op := crdt.Op{Type: crdt.OpSet, Path: leaf.path, Payload: val}
-		recs := index[leaf.dataset]
+		op := crdt.Op{Type: crdt.OpSet, Path: leaf.Path, Payload: val}
+		recs := index[leaf.Dataset]
 		if recs == nil {
 			recs = map[string]int{}
-			index[leaf.dataset] = recs
+			index[leaf.Dataset] = recs
 		}
-		if i, ok := recs[leaf.recordId]; ok {
-			byDataset[leaf.dataset][i].Ops = append(byDataset[leaf.dataset][i].Ops, op)
+		if i, ok := recs[leaf.RecordId]; ok {
+			byDataset[leaf.Dataset][i].Ops = append(byDataset[leaf.Dataset][i].Ops, op)
 			continue
 		}
-		recs[leaf.recordId] = len(byDataset[leaf.dataset])
-		byDataset[leaf.dataset] = append(byDataset[leaf.dataset], crdt.RecordChange{
-			Id: leaf.recordId, Ops: []crdt.Op{op},
+		recs[leaf.RecordId] = len(byDataset[leaf.Dataset])
+		byDataset[leaf.Dataset] = append(byDataset[leaf.Dataset], crdt.RecordChange{
+			Id: leaf.RecordId, Ops: []crdt.Op{op},
 		})
 	}
 	for dataset, records := range byDataset {
@@ -479,7 +498,8 @@ func (s *Store) reindexSweep() {
 		case <-time.After(reindexSweepPace):
 		}
 		// Loading is the rebuild: loadObject wipes and replays whatever
-		// the version compare found stale.
+		// the version compare found stale, and finishes whatever an
+		// earlier attempt left in flight.
 		if _, err := s.Get(ctx, id); err != nil {
 			storeLog.Warn("reindex sweep: load object",
 				zap.String("objectId", id), zap.Error(err))

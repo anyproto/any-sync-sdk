@@ -46,20 +46,37 @@ Properties of the mechanism:
 - **Crash-safe.** The rewound watermark is persisted BEFORE the wipe and
   the stored versions are left stale until a replay re-applies something,
   so a crash anywhere in the middle simply rebuilds again on the next
-  load.
+  load. Once the replay has stamped versions, an interruption (a crash,
+  or the sweep cancelled at shutdown mid-object) leaves the rebuild
+  marked in flight on the `_meta` row; the next load resumes the replay
+  from the persisted watermark and finishes the restore.
 - **Not a deletion.** No `del` stamp, no Removed events: a `del` stamp is
   sticky and would evict the object from every consumer index for good.
+  Live query subscriptions are not told about the wipe either — it never
+  touches the subscribe engine — so a window keeps its rows and then
+  sees the replay as one `updated` delta per change in the tree, with
+  intermediate partial docs, converging when the replay ends.
 - **Consumer cursors stay valid.** applySeq keeps climbing across a
   rebuild (the allocator seeds past the space's high-water mark), so a
   re-applied row simply surfaces as changed again. Only a wiped sdk.db,
   which restarts the axis at zero, mints a new space `Generation`.
 - **Local-scope state survives.** Local values never entered the DAG, so
-  no replay can reproduce them: they are captured before the wipe and
-  re-applied after (bounded — past 20k leaves the excess is dropped with
-  a warning). Account-scope values need no capture (the mirror replays
-  its carrier records when the row re-materializes) and neither do
-  read-tracking flags (the materializer recomputes them from unread
+  no replay can reproduce them: they are captured before the wipe,
+  persisted on the object's `_meta` row in the same upsert as the
+  watermark rewind, and re-applied after the replay (bounded — past 20k
+  leaves the excess is dropped with a warning). The persisted copy is
+  what an interrupted rebuild restores from; it is cleared only when the
+  restore has run. Account-scope values need no capture (the mirror
+  replays its carrier records when the row re-materializes) and neither
+  do read-tracking flags (the materializer recomputes them from unread
   entries).
+- **Type objects rebuild without losing remote changes.** Wiping a type
+  object drops its `shortIds` / `properties` / `datasets` collections, so
+  the registry reads empty until the replay lands them. A remote change
+  for that type arriving in the window fails the DataVersion gate's
+  `KnownShortId` lookup and is parked, then drained once the defs are
+  back — not dropped. Only local writes in the window see a transient
+  `type_unknown` rejection.
 - **Read state is not disturbed.** The replay re-applies every change in
   the tree, which would otherwise mark the whole object unread; read
   classification is suppressed for the duration, exactly as it is during
@@ -114,13 +131,19 @@ Space store start (spaceimpl/service.go::storeFor):
 Object load (spaceobjects/reindex.go, spaceobjects/store.go::loadObject):
   4. Capture local-scope leaves (per-object datasets by declared field,
      the shared objects row also by per-property scope from the registry)
-  5. ResetForReindex — watermark to 0, persisted before anything is wiped
+     — or, for a rebuild already in flight, take the leaves persisted by
+     the earlier attempt
+  5. ResetForReindex — watermark to 0 and the leaves onto the `_meta`
+     row, one upsert, persisted before anything is wiped
   6. Wipe — the object's row in each shared collection, every
      `<objectId>_*` collection, the space-level history rows
   7. ColdRestore replays the tree through the current handlers
      (read classification suppressed for the duration)
   8. Restore the captured local values via LocalSet; stamp the current
-     handler versions
+     handler versions and clear the in-flight mark (PersistVersions)
+
+A load that finds the in-flight mark with versions already current skips
+4–6 and runs 7–8 from the persisted watermark.
 ```
 
 A dataset the object never wrote has no stored version and never
@@ -159,7 +182,9 @@ are per object, since one tree carries all its datasets.
 7. ~~Failure handling~~ — **answered: no rollback, resume instead.**
    The rewound watermark is durable before the wipe and the stored
    versions stay stale until a replay re-applies something, so a crash
-   mid-rebuild replays from the start of the tree on the next load.
+   mid-rebuild replays from the start of the tree on the next load; a
+   crash after that resumes from the watermark, with the captured local
+   leaves still on the `_meta` row.
 
 ### Handler Versioning
 8. ~~How does a handler declare its version?~~ — **answered: a single

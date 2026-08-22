@@ -66,33 +66,136 @@ func (c *Controller) StaleDatasets() []string {
 	return c.staleDatasets
 }
 
+// LocalLeaf is one local-scope value captured before a rebuild's wipe.
+// Local values never entered the DAG, so no replay reproduces them; the
+// re-index path re-applies these after the replay. Value is the leaf's
+// anyenc encoding — the document it came from dies with its read.
+type LocalLeaf struct {
+	Dataset  string
+	RecordId string
+	Path     []string
+	Value    []byte
+}
+
+// Leaf keys inside the persisted array: short, the blob rides a row
+// that every load of the object reads.
+const (
+	leafDatasetKey  = "d"
+	leafRecordIdKey = "r"
+	leafPathKey     = "p"
+	leafValueKey    = "v"
+)
+
+func encodeLocalLeaves(a *anyenc.Arena, leaves []LocalLeaf) *anyenc.Value {
+	arr := a.NewArray()
+	n := 0
+	for _, leaf := range leaves {
+		val, err := anyenc.Parse(leaf.Value)
+		if err != nil {
+			continue // unreadable capture: nothing to restore anyway
+		}
+		item := a.NewObject()
+		item.Set(leafDatasetKey, a.NewString(leaf.Dataset))
+		item.Set(leafRecordIdKey, a.NewString(leaf.RecordId))
+		path := a.NewArray()
+		for i, seg := range leaf.Path {
+			path.SetArrayItem(i, a.NewString(seg))
+		}
+		item.Set(leafPathKey, path)
+		item.Set(leafValueKey, val)
+		arr.SetArrayItem(n, item)
+		n++
+	}
+	return arr
+}
+
+func decodeLocalLeaves(v *anyenc.Value) []LocalLeaf {
+	if v == nil || v.Type() != anyenc.TypeArray {
+		return nil
+	}
+	items := v.GetArray()
+	out := make([]LocalLeaf, 0, len(items))
+	for _, item := range items {
+		val := item.Get(leafValueKey)
+		if val == nil {
+			continue
+		}
+		leaf := LocalLeaf{
+			Dataset:  item.GetString(leafDatasetKey),
+			RecordId: item.GetString(leafRecordIdKey),
+			Value:    val.MarshalTo(nil),
+		}
+		for _, seg := range item.GetArray(leafPathKey) {
+			leaf.Path = append(leaf.Path, seg.GetString())
+		}
+		out = append(out, leaf)
+	}
+	return out
+}
+
+// ReindexPending reports whether a rebuild of this object was started
+// and never finished restoring its local-scope leaves — a crash, or the
+// sweep cancelled at shutdown, between ResetForReindex and
+// PersistVersions. The next load resumes: the replay continues from the
+// persisted watermark and the leaves come back from the _meta row.
+func (c *Controller) ReindexPending() bool {
+	return c != nil && c.reindexPending
+}
+
+// ReindexLocalLeaves returns the leaves an in-flight rebuild persisted.
+// Empty unless ReindexPending.
+func (c *Controller) ReindexLocalLeaves() []LocalLeaf {
+	if c == nil || len(c.reindexLocal) == 0 {
+		return nil
+	}
+	v, err := anyenc.Parse(c.reindexLocal)
+	if err != nil {
+		return nil
+	}
+	return decodeLocalLeaves(v)
+}
+
 // ResetForReindex rewinds the controller to "never applied" so the next
 // ColdRestore replays the whole tree, and persists the rewound watermark
-// BEFORE the caller wipes the materialized rows.
+// together with the captured local-scope leaves BEFORE the caller wipes
+// the materialized rows.
 //
 // Order matters: a crash between the wipe and the first re-applied change
 // must leave a watermark of 0 over the missing rows, so the next boot
 // replays them. Persisting after the wipe would leave a window where the
-// stored watermark claims changes are applied whose rows are gone.
+// stored watermark claims changes are applied whose rows are gone. The
+// leaves ride the same upsert for the same reason — once the rows are
+// gone they exist nowhere else, and a replay interrupted at any point
+// (including the sweep's own shutdown cancel) must still find them.
 //
 // The stored handler versions are deliberately left alone — they keep the
 // stale verdict (and therefore the wipe) armed until a replay actually
 // re-applies a change, at which point its PersistMeta stamps the current
-// versions.
-func (c *Controller) ResetForReindex(ctx context.Context) error {
+// versions. The leaves outlive that stamp: only PersistVersions clears
+// them.
+func (c *Controller) ResetForReindex(ctx context.Context, leaves []LocalLeaf) error {
 	c.maxAddSeq = 0
 	c.maxApplySeq = 0
 	c.staleDatasets = nil
-	return PersistMeta(ctx, c.metaColl, c.objectId, 0, 0, nil, c.spaceId)
+	c.reindexPending = true
+	c.reindexLocal = nil
+	return persistMeta(ctx, c.metaColl, c.objectId, 0, 0, nil, c.spaceId, func(a *anyenc.Arena, v *anyenc.Value) {
+		v.Set(metaReindexLocalKey, encodeLocalLeaves(a, leaves))
+	})
 }
 
-// PersistVersions stamps the current watermarks and handler versions.
-// The replay path normally does this from inside each apply; this covers
-// the object whose replay re-applied nothing (an empty tree, or one whose
-// every change belongs to a dataset that is no longer registered), which
-// would otherwise be found stale again on every load.
+// PersistVersions stamps the current watermarks and handler versions and
+// clears the in-flight mark (the persisted local leaves), ending the
+// rebuild. The replay path stamps versions from inside each apply; this
+// also covers the object whose replay re-applied nothing (an empty tree,
+// or one whose every change belongs to a dataset that is no longer
+// registered), which would otherwise be found stale again on every load.
 func (c *Controller) PersistVersions(ctx context.Context) error {
-	return PersistMeta(ctx, c.metaColl, c.objectId, c.maxAddSeq, c.maxApplySeq, c.HandlerVersions(), c.spaceId)
+	c.reindexPending = false
+	c.reindexLocal = nil
+	return persistMeta(ctx, c.metaColl, c.objectId, c.maxAddSeq, c.maxApplySeq, c.HandlerVersions(), c.spaceId, func(_ *anyenc.Arena, v *anyenc.Value) {
+		v.Del(metaReindexLocalKey)
+	})
 }
 
 // LocalFields returns the dataset's declared local-scope top-level field
@@ -126,9 +229,10 @@ func (c *Controller) RegisteredDatasets() []string {
 }
 
 // StaleObjects returns the ids of objects in spaceId whose persisted
-// handler versions differ from `registered` — the sweep's work list.
-// Purged objects are skipped: their rows are already gone and a rebuild
-// must never resurrect them.
+// handler versions differ from `registered`, plus those whose rebuild
+// was interrupted (captured leaves still on the row) — the sweep's work
+// list. Purged objects are skipped: their rows are already gone and a
+// rebuild must never resurrect them.
 //
 // One scan of the space's _meta rows, bounded by its object count. The
 // hv map is small (one entry per dataset the object wrote), so the
@@ -149,6 +253,10 @@ func StaleObjects(ctx context.Context, coll anystore.Collection, spaceId string,
 		}
 		v := doc.Value()
 		if v.GetBool(metaDeletedKey) {
+			continue
+		}
+		if v.Get(metaReindexLocalKey) != nil {
+			out = append(out, v.GetString(IdField))
 			continue
 		}
 		hv := v.Get(metaHandlerVersionsKey)

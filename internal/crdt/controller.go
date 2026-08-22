@@ -124,6 +124,13 @@ type Controller struct {
 	// ResetForReindex. See reindex.go.
 	staleDatasets []string
 
+	// reindexPending is set while a rebuild is in flight: the captured
+	// local-scope leaves sit on the _meta row (reindexLocal, encoded)
+	// until the replay finishes and PersistVersions clears them. A load
+	// that finds it set resumes the rebuild. See reindex.go.
+	reindexPending bool
+	reindexLocal   []byte
+
 	// collMu guards collections. Per-object collections are opened
 	// lazily — on first write via db.Collection (creates), on read via
 	// db.OpenCollection (no-create). Shared (per-space) handles are

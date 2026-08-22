@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -100,7 +101,7 @@ func TestReindex_ResetRewindsAndKeepsTriggerArmed(t *testing.T) {
 	ctrl := reindexCtrl(t, db, 2)
 	require.Equal(t, uint64(55), ctrl.MaxAddSeq())
 
-	require.NoError(t, ctrl.ResetForReindex(ctx))
+	require.NoError(t, ctrl.ResetForReindex(ctx, nil))
 	assert.Zero(t, ctrl.MaxAddSeq(), "the replay must start from the beginning of the tree")
 	assert.Empty(t, ctrl.StaleDatasets(), "the verdict is consumed once acted on")
 
@@ -118,10 +119,46 @@ func TestReindex_ResetRewindsAndKeepsTriggerArmed(t *testing.T) {
 	assert.Equal(t, []string{"blocks"}, reindexCtrl(t, db, 2).StaleDatasets())
 }
 
+func TestReindex_LeavesRideTheMetaRow(t *testing.T) {
+	db := reindexDB(t, 1)
+	ctrl := reindexCtrl(t, db, 2)
+	a := &anyenc.Arena{}
+	leaves := []LocalLeaf{
+		{Dataset: "blocks", RecordId: "r1", Path: []string{"pinned"}, Value: a.NewTrue().MarshalTo(nil)},
+		{Dataset: "objects", RecordId: "obj1", Path: []string{"typeA", "pLocal"}, Value: a.NewNumberInt(7).MarshalTo(nil)},
+		{Dataset: "blocks", RecordId: "bad", Path: []string{"x"}, Value: []byte{0xff}},
+	}
+	require.NoError(t, ctrl.ResetForReindex(ctx, leaves))
+	assert.True(t, ctrl.ReindexPending())
+
+	// The crash-restart case: a fresh controller finds the rebuild in
+	// flight and the readable leaves intact; the unreadable one is gone.
+	next := reindexCtrl(t, db, 2)
+	require.True(t, next.ReindexPending())
+	assert.Equal(t, leaves[:2], next.ReindexLocalLeaves())
+	assert.Equal(t, []string{"blocks"}, next.StaleDatasets(), "versions stay stale until a replay stamps them")
+
+	// The replay's own stamp does not end the rebuild — only the finish does.
+	coll, err := db.Collection(ctx, MetaCollectionName)
+	require.NoError(t, err)
+	require.NoError(t, next.PersistMeta(ctx, coll))
+	assert.True(t, reindexCtrl(t, db, 2).ReindexPending())
+	ids, err := StaleObjects(ctx, coll, "spaceA", map[string]int{"blocks": 2})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1"}, ids, "the sweep still visits an in-flight rebuild")
+
+	require.NoError(t, next.PersistVersions(ctx))
+	assert.False(t, next.ReindexPending())
+	last := reindexCtrl(t, db, 2)
+	assert.False(t, last.ReindexPending())
+	assert.Nil(t, last.ReindexLocalLeaves())
+	assert.Empty(t, last.StaleDatasets())
+}
+
 func TestReindex_PersistVersionsDisarmsTrigger(t *testing.T) {
 	db := reindexDB(t, 1)
 	ctrl := reindexCtrl(t, db, 2)
-	require.NoError(t, ctrl.ResetForReindex(ctx))
+	require.NoError(t, ctrl.ResetForReindex(ctx, nil))
 	require.NoError(t, ctrl.PersistVersions(ctx))
 
 	assert.Empty(t, reindexCtrl(t, db, 2).StaleDatasets(),

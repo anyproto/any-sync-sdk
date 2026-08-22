@@ -195,3 +195,122 @@ func TestE2E_ReindexOnHandlerVersionBump(t *testing.T) {
 	assert.Zero(t, h3.applies.Load(), "nothing replays on a load with no version mismatch")
 	require.NoError(t, sdk3.Close())
 }
+
+// stampKindHandler stamps `when` as a number at v1 and as an instant at
+// v2 — the shape of the real datetime migration, where a handler that
+// used to write epoch seconds starts writing an anyenc instant.
+type stampKindHandler struct{ instant bool }
+
+func (stampKindHandler) Init(context.Context) error { return nil }
+
+func (h stampKindHandler) BeforeCreate(ctx *handler.ChangeCtx, _ *handler.RecordChange, sink *handler.Sink) error {
+	a := &anyenc.Arena{}
+	ts := ctx.Change.Timestamp
+	if h.instant {
+		sink.Derive(handler.Op{Type: handler.OpSet, Path: []string{"when"}, Payload: a.NewDateTimeMillis(ts * 1000)})
+		return nil
+	}
+	sink.Derive(handler.Op{Type: handler.OpSet, Path: []string{"when"}, Payload: a.NewNumberFloat64(float64(ts))})
+	return nil
+}
+
+func (stampKindHandler) BeforeModify(*handler.ChangeCtx, *handler.RecordChange, *handler.Op, *handler.Sink) error {
+	return nil
+}
+func (stampKindHandler) BeforeDelete(*handler.ChangeCtx, *handler.RecordChange, *handler.Sink) error {
+	return nil
+}
+
+func stampKindType(instant bool, version int) handler.Type {
+	kind := handler.PropertyKindNumber
+	if instant {
+		kind = handler.PropertyKindDatetime
+	}
+	return handler.Type{
+		Id:   "stamp-kind-type",
+		Name: "Stamp kind",
+		Datasets: []handler.Dataset{{
+			Name:           "stamp_kind",
+			DataVersion:    "stamp-kind-v1",
+			Handler:        stampKindHandler{instant: instant},
+			HandlerVersion: version,
+			Schema: handler.Schema{Fields: []handler.Field{
+				{Id: "text", Name: "Text", Schema: handler.Leaf(handler.PropertyKindString), Scope: handler.ScopeSynced},
+				{Id: "when", Name: "When", Schema: handler.Leaf(kind), Scope: handler.ScopeDerived},
+			}},
+		}},
+	}
+}
+
+// TestE2E_ReindexConvertsNumberStampsToInstants: the upgrade this
+// mechanism exists for. Rows written by a build that stamped epoch
+// numbers come back as instants after the version bump, carrying the
+// same moment — no migration code, no rewrite of the DAG.
+func TestE2E_ReindexConvertsNumberStampsToInstants(t *testing.T) {
+	t.Parallel()
+	yaml, _, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	provider := newFixedSeedProvider(t)
+	open := func(instant bool, version int) *anysyncsdk.SDK {
+		t.Helper()
+		sdk, oerr := anysyncsdk.Open(ctx, config.Config{
+			Storage: config.Storage{DataDir: dir, Topology: config.StorageShared},
+			Network: config.Network{NodeConfYAML: yaml},
+			Types:   []handler.Type{stampKindType(instant, version)},
+		}, provider)
+		require.NoError(t, oerr, "Open")
+		return sdk
+	}
+
+	// ---- The old build: a numeric stamp ----
+	sdk1 := open(false, 1)
+	sp1, err := sdk1.Spaces().Create(ctx, space.CreateRequest{Name: "StampKind"})
+	if err != nil {
+		if isNoNetworkErr(err) {
+			_ = sdk1.Close()
+			t.Skipf("network unreachable on space create: %v", err)
+		}
+		t.Fatalf("Spaces().Create: %v", err)
+	}
+	spaceId := sp1.Id()
+	objId, err := sp1.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"stamp-kind-type"}})
+	require.NoError(t, err)
+	_, err = sp1.Modify(ctx, space.ModifyBatch{
+		ObjectId: objId,
+		Dataset:  "stamp_kind",
+		Records: []space.RecordModify{{
+			Id: "rec-1", Upsert: true,
+			Ops: []space.Op{{Type: space.OpSet, Path: "text", Value: "written by the old build"}},
+		}},
+	})
+	require.NoError(t, err)
+
+	before, err := sp1.Query(objId, "stamp_kind").One(ctx)
+	require.NoError(t, err)
+	require.Equal(t, anyenc.TypeNumber, before.Get("when").Type(), "the old build stamps a number")
+	wasSeconds := int64(before.GetFloat64("when"))
+	require.NotZero(t, wasSeconds)
+	require.NoError(t, sdk1.Close())
+
+	// ---- The new build: same data dir, instants ----
+	sdk2 := open(true, 2)
+	t.Cleanup(func() { _ = sdk2.Close() })
+	sp2, err := sdk2.Spaces().Get(ctx, spaceId)
+	require.NoError(t, err)
+
+	after, err := sp2.Query(objId, "stamp_kind").One(ctx)
+	require.NoError(t, err)
+	require.Equal(t, anyenc.TypeDateTime, after.Get("when").Type(),
+		"the rebuild re-derives the stamp through the current handler")
+	ms, err := after.Get("when").DateTimeMillis()
+	require.NoError(t, err)
+	assert.Equal(t, wasSeconds, ms/1000, "the same moment, a different representation")
+	assert.Equal(t, "written by the old build", after.GetString("text"), "synced content is untouched")
+}

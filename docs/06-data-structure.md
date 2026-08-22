@@ -21,8 +21,12 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 
 > **Reading the time stamps.** They are `datetime` instants, not epoch
 > numbers: a filter literal has to be one too (`{"createdAt": {"$gte":
-> {"$date": "2026-01-01T00:00:00Z"}}}`), since any-store orders across
-> types by type rank and a bare number therefore matches all-or-nothing.
+> {"$date": "2026-01-01T00:00:00Z"}}}`). A bare number does not error —
+> any-store decides cross-type comparisons by type rank and instants
+> rank above numbers and strings, so `$gte` matches every row whatever
+> the date, and `$lt` / `$eq` match none. A filter that forgets the
+> wrapper returns a wrong answer, not an empty one.
+>
 > Sorting (`-modifiedAt`) is unaffected in a converged store. While a
 > re-index is in flight the collection can hold both shapes at once, so
 > that window sorts as two type-grouped blocks — it closes when the

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -99,6 +101,46 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 		}
 	}
 	return objectId, nil
+}
+
+// Get reads the object's row from the shared objects collection. An
+// absent or tombstoned row alone is ambiguous (deletion hard-removes
+// the row), so the tree's deleted status decides between ErrNotFound
+// and ErrObjectDeleted.
+func (o *objectService) Get(ctx context.Context, objectId string) (*anyenc.Value, error) {
+	if objectId == "" {
+		return nil, errors.New("spaceimpl: Objects().Get: empty object id")
+	}
+	coll, err := o.parent.store.SharedObjects(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: shared objects: %w", err)
+	}
+	var row *anyenc.Value
+	doc, err := coll.FindId(ctx, objectId)
+	switch {
+	case err == nil:
+		row = doc.Value()
+	case errors.Is(err, anystore.ErrDocNotFound):
+	default:
+		return nil, fmt.Errorf("spaceimpl: find object %s: %w", objectId, err)
+	}
+	if live := liveObjectRow(row); live {
+		// Doc's buffer is reused; clone before returning.
+		return anyencx.Clone(row), nil
+	}
+	deleted, err := o.parent.store.TreeDeleted(ctx, objectId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: object %s: deleted status: %w", objectId, err)
+	}
+	if deleted {
+		return nil, fmt.Errorf("spaceimpl: object %s: %w", objectId, space.ErrObjectDeleted)
+	}
+	return nil, fmt.Errorf("spaceimpl: object %s: %w", objectId, space.ErrNotFound)
+}
+
+// liveObjectRow reports whether v is a present, non-tombstoned row.
+func liveObjectRow(v *anyenc.Value) bool {
+	return v != nil && v.Get(crdt.DeletedAtField) == nil
 }
 
 // Derive creates a deterministic object from a seed. Idempotent — a

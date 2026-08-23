@@ -27,6 +27,7 @@ func TestSentinelMessages(t *testing.T) {
 		{ErrInsufficientPermissions, "insufficient permissions"},
 		{ErrAclRecordNotFound, "no such record"},
 		{ErrUnsupported, "unsupported on this space"},
+		{ErrObjectDeleted, "object deleted"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(c.err.Error(), c.phrase) {

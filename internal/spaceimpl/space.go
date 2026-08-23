@@ -361,15 +361,19 @@ func (s *spaceImpl) checkPublicDataset(dataset string) error {
 	return nil
 }
 
-// isTechSystemDataset reports whether name is one of the tech space's
-// system datasets.
-func isTechSystemDataset(name string) bool {
+// techSystemDatasetNames is the set of tech-space system datasets,
+// fenced from the tech handle's public write surface.
+var techSystemDatasetNames = func() map[string]struct{} {
+	out := map[string]struct{}{}
 	for _, sd := range techspace.SystemDatasets() {
-		if sd.Reg.Name == name {
-			return true
-		}
+		out[sd.Reg.Name] = struct{}{}
 	}
-	return false
+	return out
+}()
+
+func isTechSystemDataset(name string) bool {
+	_, ok := techSystemDatasetNames[name]
+	return ok
 }
 
 // checkDatasetMembership enforces the unified ownership invariant for

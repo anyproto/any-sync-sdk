@@ -253,6 +253,14 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId string, draft space.Da
 	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	return t.declareDataset(ctx, typeId, draft)
+}
+
+// declareDataset validates the draft, preflights its name against the
+// static catalog and the runtime catalog, and writes head + field
+// records in one change on typeId's `datasets` dataset. Returns the
+// head (definition) id. Shared by AddDataset and bundle installs.
+func (t *typesAPI) declareDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
 	decl, err := draftToDecl(&draft)
 	if err != nil {
 		return "", err

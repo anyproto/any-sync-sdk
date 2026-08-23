@@ -25,6 +25,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
+	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -74,17 +75,8 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	if req.Id == "" {
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
 	}
-	if req.DerivedRoot {
-		if req.NewRoot != nil {
-			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
-		}
-	} else {
-		if req.NewRoot == nil {
-			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: NewRoot required", space.ErrBundleBadRequest)
-		}
-		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
-			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
-		}
+	if err := validateEnsureRequest(req, b.parent.tech); err != nil {
+		return space.Bundle{}, false, err
 	}
 	if err := b.parent.writeGate(ctx); err != nil {
 		return space.Bundle{}, false, err
@@ -120,9 +112,16 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		// local copy only rejoins sync once something writes to it.
 		// RootProperties are NOT re-seeded — seeding belongs to the
 		// install, and the installer's values sync in.
+		// Datasets ARE reconciled: a declaration missing on the root
+		// (crash between declaring and registering, a dataset added to
+		// the request later, a row adopted before the root tree
+		// synced) is declared here; present names are left alone.
 		if req.DerivedRoot && bd.Derived {
 			rootId, err := b.deriveRoot(ctx, req)
 			if err != nil {
+				return space.Bundle{}, false, err
+			}
+			if err := b.declareDatasets(ctx, rootId, req.Datasets); err != nil {
 				return space.Bundle{}, false, err
 			}
 			if err := b.stampRootName(ctx, rootId, req); err != nil {
@@ -135,6 +134,14 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	rootId, err := b.mintRoot(ctx, req)
 	if err != nil {
 		return space.Bundle{}, false, err
+	}
+	// Declarations land before the registering write for the same
+	// reason RootProperties do: a failed declaration leaves no install
+	// to adopt, and the retry declares only what is still missing.
+	if req.DerivedRoot {
+		if err := b.declareDatasets(ctx, rootId, req.Datasets); err != nil {
+			return space.Bundle{}, false, err
+		}
 	}
 	// Stamp the root with the bundle name so its tree always carries a
 	// non-root change: any-sync's head-sync diff skips a tree still
@@ -181,6 +188,80 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: record %q absent after write", req.Id)
 	}
 	return b.materialize(ctx, row), true, nil
+}
+
+// validateEnsureRequest is the structural gate on Ensure input, run
+// before any lock or write so a bad request mints nothing.
+func validateEnsureRequest(req space.EnsureBundleRequest, tech bool) error {
+	if req.DerivedRoot {
+		if req.NewRoot != nil {
+			return fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
+		}
+	} else {
+		if req.NewRoot == nil {
+			return fmt.Errorf("spaceimpl: %w: NewRoot required", space.ErrBundleBadRequest)
+		}
+		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 || len(req.Datasets) > 0 {
+			return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties/Datasets apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
+		}
+	}
+	if tech {
+		if !req.DerivedRoot {
+			return fmt.Errorf("spaceimpl: %w: tech-space bundles are derived-only", space.ErrBundleBadRequest)
+		}
+		if len(req.Datasets) == 0 {
+			return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Datasets", space.ErrBundleBadRequest)
+		}
+	}
+	return validateBundleDatasets(req.Datasets)
+}
+
+// validateBundleDatasets rejects an invalid draft or a duplicate name
+// up front — the same validation declareDataset applies, so nothing
+// half-registers.
+func validateBundleDatasets(drafts []space.DatasetDraft) error {
+	seen := make(map[string]struct{}, len(drafts))
+	for i := range drafts {
+		d := &drafts[i]
+		if _, err := draftToDecl(d); err != nil {
+			return fmt.Errorf("spaceimpl: %w: dataset %q: %w", space.ErrBundleBadRequest, d.Name, err)
+		}
+		if _, dup := seen[d.Name]; dup {
+			return fmt.Errorf("spaceimpl: %w: dataset %q declared twice", space.ErrBundleBadRequest, d.Name)
+		}
+		seen[d.Name] = struct{}{}
+	}
+	return nil
+}
+
+// declareDatasets writes the drafts missing on the root as runtime
+// dataset definitions with typeId = rootId. Names already declared
+// (valid or not — an invalid definition still owns its name, repair
+// goes through Types()) are skipped, so re-runs and concurrent
+// installs add nothing twice. The apply is synchronous: the catalog
+// knows the datasets when this returns.
+func (b *bundlesAPI) declareDatasets(ctx context.Context, rootId string, drafts []space.DatasetDraft) error {
+	if len(drafts) == 0 {
+		return nil
+	}
+	existing, err := b.parent.store.DatasetDefs(ctx, rootId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: bundles: read declarations of root %q: %w", rootId, err)
+	}
+	present := make(map[string]struct{}, len(existing))
+	for _, ds := range existing {
+		present[ds.Name] = struct{}{}
+	}
+	for i := range drafts {
+		d := &drafts[i]
+		if _, ok := present[d.Name]; ok {
+			continue
+		}
+		if _, err := b.parent.types.declareDataset(ctx, rootId, *d); err != nil {
+			return fmt.Errorf("spaceimpl: bundles: declare dataset %q on root %q: %w", d.Name, rootId, err)
+		}
+	}
+	return nil
 }
 
 // mintRoot produces the root object of a fresh install.
@@ -238,9 +319,13 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: bundles: canonical root of %q: %w", req.Id, err)
 	}
+	selfType := ""
+	if len(req.Datasets) > 0 {
+		selfType = canonical
+	}
 	rootId, err := b.parent.objects.Derive(ctx, space.DeriveObjectOpts{
 		Seed:  spaceindex.BundleRootSeed(req.Id),
-		Types: derivedRootTypes(req),
+		Types: derivedRootTypes(req, selfType),
 	})
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: bundles: derive root of %q: %w", req.Id, err)
@@ -257,13 +342,20 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 // derivedRootTypes is what a derived root implements: the requested
 // types plus every type RootProperties writes into. A property write
 // to a type the object does not implement is rejected, and the created
-// path attaches the same union through Objects().Create.
-func derivedRootTypes(req space.EnsureBundleRequest) []string {
-	if len(req.RootProperties) == 0 {
+// path attaches the same union through Objects().Create. With a
+// selfType (the root declares Datasets) the root is also a type object
+// implementing itself: the type marker plus its own id come first.
+func derivedRootTypes(req space.EnsureBundleRequest, selfType string) []string {
+	if len(req.RootProperties) == 0 && selfType == "" {
 		return req.RootTypes
 	}
-	seen := make(map[string]struct{}, len(req.RootTypes)+len(req.RootProperties))
-	out := make([]string, 0, len(req.RootTypes)+len(req.RootProperties))
+	seen := make(map[string]struct{}, len(req.RootTypes)+len(req.RootProperties)+2)
+	out := make([]string, 0, len(req.RootTypes)+len(req.RootProperties)+2)
+	if selfType != "" {
+		seen[typetype.MetaTypeMarker] = struct{}{}
+		seen[selfType] = struct{}{}
+		out = append(out, typetype.MetaTypeMarker, selfType)
+	}
 	for _, t := range req.RootTypes {
 		if _, dup := seen[t]; dup {
 			continue
@@ -531,7 +623,7 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 // "unknown" would make List report an empty registry and callers
 // re-run setup, minting a duplicate root.
 func (b *bundlesAPI) readIndexObj(ctx context.Context) (*object.Object, error) {
-	objectId, err := b.parent.parent.spaceIndexObjectIdFor(ctx, b.parent.id)
+	objectId, err := b.parent.indexObjectId(ctx)
 	if err != nil {
 		return nil, err
 	}

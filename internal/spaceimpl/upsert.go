@@ -31,7 +31,7 @@ func (s *spaceImpl) Upsert(ctx context.Context, batch space.UpsertBatch) (space.
 	if batch.Dataset == "" {
 		return res, errors.New("spaceimpl: Upsert: Dataset required")
 	}
-	if err := checkPublicDataset(batch.Dataset); err != nil {
+	if err := s.checkPublicDataset(batch.Dataset); err != nil {
 		return res, err
 	}
 	decl, ok := s.store.DatasetDecl(batch.Dataset)

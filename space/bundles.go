@@ -21,8 +21,10 @@ import (
 var (
 	// ErrBundleUnknown — no live record for the bundle id.
 	ErrBundleUnknown = errors.New("bundle unknown")
-	// ErrBundleBadRequest — structurally invalid input (empty bundle
-	// id, nil NewRoot, empty root id).
+	// ErrBundleBadRequest — structurally invalid input: empty bundle
+	// id, nil NewRoot, empty root id, DerivedRoot-only fields on a
+	// created root, an invalid or duplicate dataset declaration, or a
+	// tech-space request that is not derived-only with Datasets.
 	ErrBundleBadRequest = errors.New("bundle bad request")
 	// ErrBundleNotLoser — ResolveLoser target is not a loser of the
 	// bundle: it is the current winner, or was never claimed in roots.
@@ -103,9 +105,23 @@ type EnsureBundleRequest struct {
 	// typeId → propId → value, written before the install is
 	// registered so a failed seed leaves no install to adopt. Every
 	// keyed type is attached along with RootTypes — a property write
-	// to a type the object does not implement is rejected.
-	// DerivedRoot only.
+	// to a type the object does not implement is rejected. The root's
+	// own id is not a usable key: a self-typed root (Datasets) grants a
+	// dataset namespace, not property definitions. DerivedRoot only.
 	RootProperties map[string]map[string]any
+
+	// Datasets declares runtime datasets on the derived root, which
+	// then implements itself as a type: any.types = ["__type__",
+	// rootId], typeId = rootId. Records live on the root under the
+	// declared names, discoverable through Types().Datasets(rootId)
+	// and Space.Datasets(), writable through Modify/Upsert on the
+	// root. Declared on install and reconciled on every adopt: a name
+	// already declared on the root is skipped, never patched — later
+	// evolution goes through Types().AddDataset / AddDatasetField /
+	// PatchDataset with typeId = rootId. Each draft is validated up
+	// front; an invalid or duplicate one fails the whole request before
+	// any root is minted. DerivedRoot only. Required on the tech space.
+	Datasets []DatasetDraft
 }
 
 // BundlesAPI is the typed surface over the per-space bundles registry.
@@ -140,6 +156,17 @@ type BundlesAPI interface {
 	// replica. Converge before installing derived into a space that
 	// may already carry a created install of the same id — see
 	// docs/bundles.md § Derived roots.
+	//
+	// With Datasets the derived root is stamped as a type implementing
+	// itself and the declarations are written on it before the
+	// registry row, so a crash mid-install leaves no install to adopt
+	// and the retry re-runs idempotently. Two devices declaring the
+	// same name concurrently converge on one definition after sync;
+	// a DefId read before convergence may change — look definitions
+	// up by name when evolving them.
+	//
+	// On the tech space (Service.Get(SDK.TechSpaceId())) bundles are
+	// derived-only and must declare Datasets; NewRoot is refused.
 	//
 	// The bool reports whether THIS call registered the install.
 	// False means an existing one was adopted — which for a derived

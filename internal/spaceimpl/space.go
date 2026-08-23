@@ -34,6 +34,10 @@ type spaceImpl struct {
 	tsp    *techspace.Service
 	store  *spaceobjects.Store
 	parent *Service
+	// tech marks the restricted tech-space handle: backed by the tech
+	// Store, bundles derived-only, system datasets read-only, every
+	// other lifecycle surface refused with space.ErrUnsupported.
+	tech bool
 
 	objects    *objectService
 	types      *typesAPI
@@ -54,7 +58,27 @@ func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *space
 	return s
 }
 
+// newTechSpace builds the restricted handle over the tech Store. The
+// sub-APIs are real (bundles derive roots through objects, declare
+// datasets through types); only the public getters swap to stubs.
+func newTechSpace(app *anysyncx.App, tsp *techspace.Service, parent *Service) *spaceImpl {
+	s := newSpace(tsp.SpaceId(), app, tsp, tsp.Store(), parent)
+	s.tech = true
+	return s
+}
+
 func (s *spaceImpl) Id() string { return s.id }
+
+// indexObjectId resolves this space's spaceIndex object: the tech
+// index for the tech handle, otherwise the per-space derived object
+// (which also wires the index watcher and mirrors — never for the
+// tech id).
+func (s *spaceImpl) indexObjectId(ctx context.Context) (string, error) {
+	if s.tech {
+		return s.tsp.IndexObjectId(), nil
+	}
+	return s.parent.spaceIndexObjectIdFor(ctx, s.id)
+}
 
 // Info reads the space-index snapshot.
 //
@@ -255,17 +279,13 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 	return toDatasetSchemas(s.store.Schemas())
 }
 
-// checkDatasetMembership enforces the unified ownership invariant for
-// type-owned datasets: an object may only hold a type's dataset if it
-// implements that type (any.types ∋ owner). No-op for built-in / unknown
-// datasets (DatasetOwner returns false) — property-namespace membership
-// is enforced separately by SystemPropertiesHandler.PreValidate. Local
-// write-time only; inbound apply stays read-tolerant.
 // checkPublicDataset rejects writes to SDK-internal datasets through
-// the public Modify/ModifyMany/Delete surface. The payloads dataset is
-// written only by the SDK's files layer (its change shapes are fixed
-// and its object class ships changes unencrypted).
-func checkPublicDataset(dataset string) error {
+// the public Modify/ModifyMany/Delete/Upsert surface. The payloads
+// dataset is written only by the SDK's files layer (its change shapes
+// are fixed and its object class ships changes unencrypted). On the
+// tech handle the system datasets (spaces, profile, devices, …) are
+// typed-API-only as well; reads stay open.
+func (s *spaceImpl) checkPublicDataset(dataset string) error {
 	// bundles: registry writes go through the typed BundlesAPI only — a
 	// raw Modify could assert an arbitrary winner (passing the handler's
 	// claim invariant) and turn the genuine root into a deletable
@@ -274,9 +294,29 @@ func checkPublicDataset(dataset string) error {
 	if dataset == payloads.Dataset || dataset == spaceindex.BundlesDataset {
 		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
 	}
+	if s.tech && isTechSystemDataset(dataset) {
+		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
+	}
 	return nil
 }
 
+// isTechSystemDataset reports whether name is one of the tech space's
+// system datasets.
+func isTechSystemDataset(name string) bool {
+	for _, sd := range techspace.SystemDatasets() {
+		if sd.Reg.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// checkDatasetMembership enforces the unified ownership invariant for
+// type-owned datasets: an object may only hold a type's dataset if it
+// implements that type (any.types ∋ owner). No-op for built-in / unknown
+// datasets (DatasetOwner returns false) — property-namespace membership
+// is enforced separately by SystemPropertiesHandler.PreValidate. Local
+// write-time only; inbound apply stays read-tolerant.
 func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
 	owner, ok := s.store.DatasetOwner(dataset)
 	if !ok {
@@ -340,7 +380,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	if batch.Dataset == "" {
 		return space.ModifyResult{}, errors.New("spaceimpl: Dataset required")
 	}
-	if err := checkPublicDataset(batch.Dataset); err != nil {
+	if err := s.checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
 	switch batch.Scope {
@@ -482,7 +522,7 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	changes := make([]crdt.Change, len(batches))
 	var validationErrs []error
 	for i, b := range batches {
-		if err := checkPublicDataset(b.Dataset); err != nil {
+		if err := s.checkPublicDataset(b.Dataset); err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
 		}
@@ -529,7 +569,7 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 	if len(batch.RecordIds) == 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: DeleteBatch.RecordIds empty")
 	}
-	if err := checkPublicDataset(batch.Dataset); err != nil {
+	if err := s.checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
 	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)

@@ -201,7 +201,7 @@ func (s *spaceImpl) SetMetadata(ctx context.Context, req space.SetMetadataReques
 	if req.Name == nil && req.Description == nil && req.IconCID == nil {
 		return errors.New("spaceimpl: SetMetadata: at least one field required")
 	}
-	objectId, err := s.parent.spaceIndexObjectIdFor(ctx, s.id)
+	objectId, err := s.indexObjectId(ctx)
 	if err != nil {
 		return err
 	}
@@ -244,7 +244,7 @@ func (s *spaceImpl) SetMetadata(ctx context.Context, req space.SetMetadataReques
 // to compute (rare — usually a programming error if hit).
 func (s *spaceImpl) SpaceIndexObjectId() string {
 	// Prefer the cached value; fall back to an on-demand derive.
-	id, err := s.parent.spaceIndexObjectIdFor(context.Background(), s.id)
+	id, err := s.indexObjectId(context.Background())
 	if err != nil {
 		return ""
 	}
@@ -268,7 +268,7 @@ func (s *spaceImpl) SpaceIndexObjectId() string {
 // primitive must not create trees, least of all on read-only/guest
 // spaces where the write gate would refuse the same effect.
 func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
-	objectId, err := s.parent.spaceIndexObjectIdFor(ctx, s.id)
+	objectId, err := s.indexObjectId(ctx)
 	if err != nil {
 		return err
 	}

@@ -173,7 +173,7 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, sdkA.Account().Id(), string(one.GetStringBytes("creator")))
 
-	// Re-Ensure adopts and declares nothing twice.
+	// Re-Ensure adopts, declares nothing twice and keeps the name.
 	adopted, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft()},
 	})
@@ -183,6 +183,30 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	defs, err = techA.Types().Datasets(ctx, wantRoot)
 	require.NoError(t, err)
 	require.Len(t, defs, 1, "adopt must not redeclare an existing name")
+	ti, err = techA.Types().Get(ctx, wantRoot)
+	require.NoError(t, err)
+	assert.Equal(t, "Favorites", ti.Name, "adopt must not rename the root")
+
+	// Dataset names are unique per space: another bundle claiming
+	// `entries` is refused before its root exists.
+	otherRoot, err := techA.Bundles().DerivedRootId(ctx, "other/v1")
+	require.NoError(t, err)
+	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "other/v1", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft()},
+	})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "owned dataset name")
+	_, err = techA.Objects().Get(ctx, otherRoot)
+	require.ErrorIs(t, err, space.ErrNotFound, "a refused install must mint no root")
+	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "other/v1", DerivedRoot: true, Datasets: []space.DatasetDraft{{Name: "spaces", IdRule: space.IdUser}},
+	})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "reserved dataset name")
+
+	// Dataset mutators reach bundle roots only.
+	_, err = techA.Types().AddDataset(ctx, techA.SpaceIndexObjectId(), entriesDatasetDraft())
+	require.ErrorIs(t, err, space.ErrUnsupported)
+	_, err = techA.Modify(ctx, space.ModifyBatch{ObjectId: wantRoot, Dataset: "objects"})
+	require.ErrorIs(t, err, space.ErrUnsupported, "type-system built-ins are not writable generically")
 
 	_ = sdkA.Spaces().SyncSpaceList(ctx)
 	_ = techA.SyncHeads(ctx)
@@ -305,6 +329,27 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	defsA, err = techA.Types().Datasets(ctx, root)
 	require.NoError(t, err)
 	require.Len(t, defsA, 2)
+
+	// A removed dataset stays removed through later Ensures.
+	require.NoError(t, techA.Types().RemoveDataset(ctx, root, names(defsA)["tags"]))
+	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft(), tags},
+	})
+	require.NoError(t, err)
+	defsA, err = techA.Types().Datasets(ctx, root)
+	require.NoError(t, err)
+	require.Len(t, defsA, 1, "Ensure must not resurrect a removed dataset")
+	require.NoError(t, techA.Types().RemoveDataset(ctx, root, names(defsA)["entries"]))
+	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft(), tags},
+	})
+	require.NoError(t, err)
+	defsA, err = techA.Types().Datasets(ctx, root)
+	require.NoError(t, err)
+	require.Empty(t, defsA)
+	// Explicit re-add is the way back.
+	_, err = techA.Types().AddDataset(ctx, root, tags)
+	require.NoError(t, err)
 
 	// Both datasets are writable on both devices.
 	res, err := techA.Upsert(ctx, space.UpsertBatch{

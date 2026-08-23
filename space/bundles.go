@@ -115,12 +115,18 @@ type EnsureBundleRequest struct {
 	// rootId], typeId = rootId. Records live on the root under the
 	// declared names, discoverable through Types().Datasets(rootId)
 	// and Space.Datasets(), writable through Modify/Upsert on the
-	// root. Declared on install and reconciled on every adopt: a name
-	// already declared on the root is skipped, never patched — later
-	// evolution goes through Types().AddDataset / AddDatasetField /
-	// PatchDataset with typeId = rootId. Each draft is validated up
-	// front; an invalid or duplicate one fails the whole request before
-	// any root is minted. DerivedRoot only. Required on the tech space.
+	// root. Declared in one change on install, and on adopt only when
+	// the root carries no declaration yet (crash before the registry
+	// row, a row adopted before the root tree synced); a root with any
+	// declaration — live, or removed through Types().RemoveDataset — is
+	// left alone: nothing is patched, added or resurrected by Ensure.
+	// Later evolution goes through Types().AddDataset / AddDatasetField
+	// / PatchDataset with typeId = rootId. Dataset names are unique per
+	// space: a name another type or bundle owns, or one the store
+	// reserves, fails the request with ErrBundleBadRequest before any
+	// root is minted, as does an invalid or duplicate draft. Adopting
+	// an install that lives on a created root with Datasets set fails
+	// the same way. DerivedRoot only. Required on the tech space.
 	Datasets []DatasetDraft
 }
 

@@ -34,10 +34,10 @@ type spaceImpl struct {
 	tsp    *techspace.Service
 	store  *spaceobjects.Store
 	parent *Service
-	// tech marks the restricted tech-space handle: backed by the tech
-	// Store, bundles derived-only, system datasets read-only, every
-	// other lifecycle surface refused with space.ErrUnsupported.
-	tech bool
+	// techIndexId is set on the inner impl of the tech-space handle:
+	// the resident tech index object stands in for the per-space
+	// spaceIndex object (no derive, no index watcher wiring).
+	techIndexId string
 
 	objects    *objectService
 	types      *typesAPI
@@ -58,24 +58,15 @@ func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *space
 	return s
 }
 
-// newTechSpace builds the restricted handle over the tech Store. The
-// sub-APIs are real (bundles derive roots through objects, declare
-// datasets through types); only the public getters swap to stubs.
-func newTechSpace(app *anysyncx.App, tsp *techspace.Service, parent *Service) *spaceImpl {
-	s := newSpace(tsp.SpaceId(), app, tsp, tsp.Store(), parent)
-	s.tech = true
-	return s
-}
-
 func (s *spaceImpl) Id() string { return s.id }
 
 // indexObjectId resolves this space's spaceIndex object: the tech
-// index for the tech handle, otherwise the per-space derived object
-// (which also wires the index watcher and mirrors — never for the
-// tech id).
+// index on the tech handle's inner impl, otherwise the per-space
+// derived object (which also wires the index watcher and mirrors —
+// never for the tech id).
 func (s *spaceImpl) indexObjectId(ctx context.Context) (string, error) {
-	if s.tech {
-		return s.tsp.IndexObjectId(), nil
+	if s.techIndexId != "" {
+		return s.techIndexId, nil
 	}
 	return s.parent.spaceIndexObjectIdFor(ctx, s.id)
 }
@@ -92,9 +83,6 @@ func (s *spaceImpl) indexObjectId(ctx context.Context) (string, error) {
 // any Members().Subscribe / Query).
 func (s *spaceImpl) Info() space.SpaceInfo {
 	ctx := context.Background()
-	if s.tech {
-		return s.techInfo()
-	}
 	rec, ok := s.tsp.Get(ctx, s.id)
 	if !ok {
 		return space.SpaceInfo{Id: s.id}
@@ -171,59 +159,13 @@ func (s *spaceImpl) canWrite(ctx context.Context) bool {
 	return state.Permissions(state.Identity()).CanWrite()
 }
 
-func (s *spaceImpl) Objects() space.ObjectService {
-	if s.tech {
-		return techObjects{s.objects}
-	}
-	return s.objects
-}
+func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
+func (s *spaceImpl) Types() space.TypesAPI           { return s.types }
+func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
 
-func (s *spaceImpl) Types() space.TypesAPI {
-	if s.tech {
-		return techTypes{s.types}
-	}
-	return s.types
-}
-
-func (s *spaceImpl) Properties() space.PropertiesAPI {
-	if s.tech {
-		return unsupportedProperties{}
-	}
-	return s.properties
-}
-
-func (s *spaceImpl) ACL() space.ACL {
-	if s.tech {
-		return unsupportedACL{}
-	}
-	return s.acl
-}
-
-func (s *spaceImpl) Members() space.MembersAPI {
-	if s.tech {
-		return unsupportedMembers{}
-	}
-	return s.members
-}
-
+func (s *spaceImpl) ACL() space.ACL            { return s.acl }
+func (s *spaceImpl) Members() space.MembersAPI { return s.members }
 func (s *spaceImpl) Bundles() space.BundlesAPI { return s.bundles }
-
-// techInfo is the synthetic descriptor of the tech space: it has no
-// registry row (it IS the registry), is owner-only and derived.
-func (s *spaceImpl) techInfo() space.SpaceInfo {
-	info := space.SpaceInfo{
-		Id:        s.id,
-		Type:      techspace.TechSpaceType,
-		SpaceType: techspace.TechSpaceType,
-		Status:    space.StatusActive,
-		OwnRole:   space.PermissionOwner,
-		Derived:   true,
-	}
-	if keys := s.app.AccountKeys(); keys != nil {
-		info.Author = keys.SignKey.GetPublic().Account()
-	}
-	return info
-}
 
 // SyncHeads forces an immediate head-sync (diff) round on this space
 // instead of waiting for the periodic timer. Blocks until the round
@@ -275,27 +217,18 @@ func (s *spaceImpl) Debug() space.DebugAPI {
 // every call; the state lives on the spaceobjects.Store. See
 // space.ChangeIndexAPI.
 func (s *spaceImpl) Changes() space.ChangeIndexAPI {
-	if s.tech {
-		return unsupportedChanges{}
-	}
 	return newChangeIndexAPI(s)
 }
 
 // History returns the version-history surface for this space. See
 // space.HistoryAPI and docs/version-history-proposal.md.
 func (s *spaceImpl) History() space.HistoryAPI {
-	if s.tech {
-		return unsupportedHistory{}
-	}
 	return newHistoryAPI(s)
 }
 
 // ReadState exposes the read/unread tracking surface —
 // space.ReadStateAPI.
 func (s *spaceImpl) ReadState() space.ReadStateAPI {
-	if s.tech {
-		return unsupportedReadState{}
-	}
 	return newReadStateAPI(s)
 }
 
@@ -303,9 +236,6 @@ func (s *spaceImpl) ReadState() space.ReadStateAPI {
 // Constructed on every call; the subscriptions live on the app-level
 // engine. See space.PubSubAPI.
 func (s *spaceImpl) PubSub() space.PubSubAPI {
-	if s.tech {
-		return unsupportedPubSub{}
-	}
 	return NewPubSubAPI(s.app, s.id)
 }
 
@@ -343,10 +273,8 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 // checkPublicDataset rejects writes to SDK-internal datasets through
 // the public Modify/ModifyMany/Delete/Upsert surface. The payloads
 // dataset is written only by the SDK's files layer (its change shapes
-// are fixed and its object class ships changes unencrypted). On the
-// tech handle the system datasets (spaces, profile, devices, …) are
-// typed-API-only as well; reads stay open.
-func (s *spaceImpl) checkPublicDataset(dataset string) error {
+// are fixed and its object class ships changes unencrypted).
+func checkPublicDataset(dataset string) error {
 	// bundles: registry writes go through the typed BundlesAPI only — a
 	// raw Modify could assert an arbitrary winner (passing the handler's
 	// claim invariant) and turn the genuine root into a deletable
@@ -355,25 +283,7 @@ func (s *spaceImpl) checkPublicDataset(dataset string) error {
 	if dataset == payloads.Dataset || dataset == spaceindex.BundlesDataset {
 		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
 	}
-	if s.tech && isTechSystemDataset(dataset) {
-		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
-	}
 	return nil
-}
-
-// techSystemDatasetNames is the set of tech-space system datasets,
-// fenced from the tech handle's public write surface.
-var techSystemDatasetNames = func() map[string]struct{} {
-	out := map[string]struct{}{}
-	for _, sd := range techspace.SystemDatasets() {
-		out[sd.Reg.Name] = struct{}{}
-	}
-	return out
-}()
-
-func isTechSystemDataset(name string) bool {
-	_, ok := techSystemDatasetNames[name]
-	return ok
 }
 
 // checkDatasetMembership enforces the unified ownership invariant for
@@ -445,7 +355,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	if batch.Dataset == "" {
 		return space.ModifyResult{}, errors.New("spaceimpl: Dataset required")
 	}
-	if err := s.checkPublicDataset(batch.Dataset); err != nil {
+	if err := checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
 	switch batch.Scope {
@@ -587,7 +497,7 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	changes := make([]crdt.Change, len(batches))
 	var validationErrs []error
 	for i, b := range batches {
-		if err := s.checkPublicDataset(b.Dataset); err != nil {
+		if err := checkPublicDataset(b.Dataset); err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
 		}
@@ -634,7 +544,7 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 	if len(batch.RecordIds) == 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: DeleteBatch.RecordIds empty")
 	}
-	if err := s.checkPublicDataset(batch.Dataset); err != nil {
+	if err := checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
 	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)

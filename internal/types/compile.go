@@ -64,6 +64,67 @@ func schemaRev(ds schema.Dataset) string {
 	return strconv.FormatUint(h.Sum64(), 36)
 }
 
+// DatasetHeadIds lists the live head record ids declaring name on the
+// type object — the winner and every concurrent duplicate the compile
+// layer hides. Nil when the type has no datasets collection.
+func DatasetHeadIds(ctx context.Context, db anystore.DB, typeId, name string) ([]string, error) {
+	if db == nil {
+		return nil, nil
+	}
+	coll, err := db.OpenCollection(ctx, typeId+"_datasets")
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	iter, err := coll.Find(nil).Iter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("types: dataset defs iter: %w", err)
+	}
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		if derr != nil {
+			return nil, derr
+		}
+		v := doc.Value()
+		if v == nil || v.Type() != anyenc.TypeObject || v.Get("_deletedAt") != nil {
+			continue
+		}
+		if v.GetString("def") == "dataset" && v.GetString("collection") == name {
+			out = append(out, v.GetString("id"))
+		}
+	}
+	if iter.Err() != nil {
+		return nil, iter.Err()
+	}
+	return out, nil
+}
+
+// HasDatasetDefs reports whether anything was ever declared on the
+// type object — live or tombstoned records alike (a tombstone keeps
+// no fields, so a removed dataset is known only by its presence).
+// False when the type has no datasets collection.
+func HasDatasetDefs(ctx context.Context, db anystore.DB, typeId string) (bool, error) {
+	if db == nil {
+		return false, nil
+	}
+	coll, err := db.OpenCollection(ctx, typeId+"_datasets")
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	n, err := coll.Find(nil).Limit(1).Count(ctx)
+	if err != nil {
+		return false, fmt.Errorf("types: dataset defs count: %w", err)
+	}
+	return n > 0, nil
+}
+
 // CompileDatasetDefs folds a type object's `datasets` records into
 // CompiledDataset declarations — one storage pass, deterministic on
 // converged records:

@@ -149,11 +149,26 @@ lives in records, not in child objects.
 - Declarations are written after the root's types and before the
   registry row, so a failed declaration leaves no install to adopt;
   the retry declares only what is still missing.
-- Every adopt reconciles: a name missing on the root (crash before the
-  row, a dataset added to the request, a row adopted before the root
-  tree synced) is declared; present names are left alone — never
-  patched. Evolution goes through `Types().AddDataset` /
-  `AddDatasetField` / `PatchDataset` with `typeId = rootId`.
+- Declarations are one change. An adopt declares them only on a root
+  that carries no declaration yet (crash before the row, a row
+  adopted before the root tree synced); a root with any declaration —
+  live, or removed through `Types().RemoveDataset` (a tombstone keeps
+  no name) — is left alone: `Ensure` never patches, adds or
+  resurrects a dataset. Evolution goes through `Types().AddDataset` /
+  `AddDatasetField` / `PatchDataset` with `typeId = rootId`. Adopting
+  never renames the root either: the name stamp is written only when
+  the root carries none.
+- Dataset names are unique per space (the runtime catalog resolves
+  by name across types). A name another type or bundle already owns,
+  or one the store reserves (built-ins, the tech space's system
+  datasets), fails `Ensure` with `ErrBundleBadRequest` before the
+  permanent root is derived. Two bundles that must coexist in one
+  space prefix their dataset names (`favorites_entries`); a bundle
+  vocabulary version bump that keeps a name is a new root claiming an
+  owned name and is refused — rename the dataset with the version.
+- Adopting an install that lives on a created root with `Datasets`
+  set fails with `ErrBundleBadRequest` instead of dropping the
+  declarations.
 - Two devices declaring the same name concurrently write two heads;
   `CompileDatasetDefs` resolves them to one per name (first creation
   `_ver.id`), so every replica converges on one definition. A `DefId`

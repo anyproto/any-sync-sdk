@@ -20,37 +20,6 @@ func errUnsupported(op string) error {
 	return fmt.Errorf("spaceimpl: %s on the tech space: %w", op, space.ErrUnsupported)
 }
 
-// techObjects keeps Get (a local row read) and refuses lifecycle:
-// tech-space objects exist only as bundle roots.
-type techObjects struct{ *objectService }
-
-func (techObjects) Create(context.Context, space.CreateObjectOpts) (string, error) {
-	return "", errUnsupported("Objects().Create")
-}
-func (techObjects) Derive(context.Context, space.DeriveObjectOpts) (string, error) {
-	return "", errUnsupported("Objects().Derive")
-}
-func (techObjects) Delete(context.Context, string) error { return errUnsupported("Objects().Delete") }
-
-// techTypes keeps reads and the dataset-declaration methods (a bundle
-// root is a type; its datasets evolve through them) and refuses type
-// lifecycle and property definitions.
-type techTypes struct{ *typesAPI }
-
-func (techTypes) Create(context.Context, space.TypeCreateParams) (string, error) {
-	return "", errUnsupported("Types().Create")
-}
-func (techTypes) Delete(context.Context, string) error { return errUnsupported("Types().Delete") }
-func (techTypes) AddProperty(context.Context, string, space.PropertyDraft) (string, error) {
-	return "", errUnsupported("Types().AddProperty")
-}
-func (techTypes) RemoveProperty(context.Context, string, string) error {
-	return errUnsupported("Types().RemoveProperty")
-}
-func (techTypes) PatchProperty(context.Context, string, string, space.PropertyPatch) error {
-	return errUnsupported("Types().PatchProperty")
-}
-
 type unsupportedProperties struct{}
 
 func (unsupportedProperties) Get(context.Context, string) (*anyenc.Value, error) {
@@ -255,8 +224,6 @@ func (unsupportedChanges) Generation(context.Context) (string, error) {
 }
 
 var (
-	_ space.ObjectService  = techObjects{}
-	_ space.TypesAPI       = techTypes{}
 	_ space.PropertiesAPI  = unsupportedProperties{}
 	_ space.ACL            = unsupportedACL{}
 	_ space.MembersAPI     = unsupportedMembers{}

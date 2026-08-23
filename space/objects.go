@@ -18,8 +18,9 @@ var ErrObjectDeleted = errors.New("space: object deleted")
 type ObjectService interface {
 	// Get returns the object's row from the per-space objects
 	// collection (any.types and property values). ErrNotFound when no
-	// live row exists, ErrObjectDeleted when the object's tree is
-	// deleted. Pure local read.
+	// live row exists (an object that never wrote a row reads as not
+	// found), ErrObjectDeleted when the object's tree is deleted — the
+	// deleted status is read from the space's any-sync storage.
 	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
 
 	// Create a fresh object. Returns the any-sync-assigned objectId.

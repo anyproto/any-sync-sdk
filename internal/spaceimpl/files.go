@@ -27,9 +27,6 @@ type filesAPI struct {
 }
 
 func (s *spaceImpl) Files() space.Files {
-	if s.tech {
-		return unsupportedFiles{}
-	}
 	return &filesAPI{s: s}
 }
 

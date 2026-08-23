@@ -704,6 +704,16 @@ func (s *Store) Schemas() []NamedSchema {
 	return out
 }
 
+// SystemSchemas returns the declared schema of this store's system
+// datasets only (the tech space's spaces/profile/devices/…).
+func (s *Store) SystemSchemas() []NamedSchema {
+	out := make([]NamedSchema, 0, len(s.systemRegs))
+	for _, h := range s.systemRegs {
+		out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
+	}
+	return out
+}
+
 // datasetSchema resolves an external dataset's declared schema, applying
 // the backward-compatible default: a zero Schema (no Fields, not Dynamic)
 // is treated as a Dynamic synced keyspace — the pre-schema behavior — so
@@ -719,6 +729,18 @@ func datasetSchema(d handler.Dataset) schema.Dataset {
 // type object (deterministic fold of its `datasets` records).
 func (s *Store) DatasetDefs(ctx context.Context, typeId string) ([]types.CompiledDataset, error) {
 	return types.CompileDatasetDefs(ctx, s.db, typeId)
+}
+
+// DatasetHeadIds lists the live head ids declaring name on the type
+// object, duplicates included. See types.DatasetHeadIds.
+func (s *Store) DatasetHeadIds(ctx context.Context, typeId, name string) ([]string, error) {
+	return types.DatasetHeadIds(ctx, s.db, typeId, name)
+}
+
+// HasDatasetDefs reports whether anything was ever declared on the
+// type object, removed definitions included. See types.HasDatasetDefs.
+func (s *Store) HasDatasetDefs(ctx context.Context, typeId string) (bool, error) {
+	return types.HasDatasetDefs(ctx, s.db, typeId)
 }
 
 // NotifyDrainer is the public hook used by callers (e.g. the

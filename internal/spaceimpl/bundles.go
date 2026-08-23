@@ -64,8 +64,12 @@ func (b *bundlesAPI) lockFor(bundleId string) *sync.Mutex {
 
 // indexObj returns the resident spaceIndex object, materializing the
 // derived tree when absent (idempotent — every deriver mints the same
-// tree; the owner's changes merge in when sync delivers them).
+// tree; the owner's changes merge in when sync delivers them). On the
+// tech handle the index object is the tech index, already resident.
 func (b *bundlesAPI) indexObj(ctx context.Context) (*object.Object, error) {
+	if id := b.parent.techIndexId; id != "" {
+		return b.parent.store.Get(ctx, id)
+	}
 	return b.parent.store.Derive(ctx, spaceobjects.DeriveOpts{
 		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
 	})
@@ -75,10 +79,13 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	if req.Id == "" {
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
 	}
-	if err := validateEnsureRequest(req, b.parent.tech); err != nil {
+	if err := validateEnsureRequest(req); err != nil {
 		return space.Bundle{}, false, err
 	}
 	if err := b.parent.writeGate(ctx); err != nil {
+		return space.Bundle{}, false, err
+	}
+	if err := b.preflightDatasets(ctx, req); err != nil {
 		return space.Bundle{}, false, err
 	}
 	l := b.lockFor(req.Id)
@@ -112,10 +119,11 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		// local copy only rejoins sync once something writes to it.
 		// RootProperties are NOT re-seeded — seeding belongs to the
 		// install, and the installer's values sync in.
-		// Datasets ARE reconciled: a declaration missing on the root
-		// (crash between declaring and registering, a dataset added to
-		// the request later, a row adopted before the root tree
-		// synced) is declared here; present names are left alone.
+		// Datasets ARE declared when the root carries none yet (crash
+		// between declaring and registering, a row adopted before the
+		// root tree synced); a root with any declaration — live or
+		// removed — is left alone. The name stamp is written only
+		// when the root carries none: adopting never renames.
 		if req.DerivedRoot && bd.Derived {
 			rootId, err := b.deriveRoot(ctx, req)
 			if err != nil {
@@ -124,9 +132,14 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 			if err := b.declareDatasets(ctx, rootId, req.Datasets); err != nil {
 				return space.Bundle{}, false, err
 			}
-			if err := b.stampRootName(ctx, rootId, req); err != nil {
+			if err := b.stampRootName(ctx, rootId, req, true); err != nil {
 				return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 			}
+		} else if len(req.Datasets) > 0 {
+			// A created-root install cannot carry declarations (its
+			// losers would each carry their own); say so instead of
+			// returning an install the caller's datasets never reach.
+			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: bundle %q is installed on a created root; Datasets apply to derived roots only", space.ErrBundleBadRequest, req.Id)
 		}
 		return bd, false, nil
 	}
@@ -150,7 +163,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	// another device; a DERIVED root — which every device materializes
 	// for itself — would sit outside that device's diff and never pull
 	// the peer's content. Must succeed BEFORE the registering write.
-	if err := b.stampRootName(ctx, rootId, req); err != nil {
+	if err := b.stampRootName(ctx, rootId, req, false); err != nil {
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 	}
 
@@ -167,7 +180,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	if err != nil {
 		return space.Bundle{}, false, err
 	}
-	res, err := obj.LocalWrite(ctx, crdt.Change{
+	res, err := b.parent.localWriteRetry(ctx, obj, obj.Id(), crdt.Change{
 		Dataset:     spaceindex.BundlesDataset,
 		DataVersion: dataVersion,
 		Records: []crdt.RecordChange{
@@ -192,7 +205,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 
 // validateEnsureRequest is the structural gate on Ensure input, run
 // before any lock or write so a bad request mints nothing.
-func validateEnsureRequest(req space.EnsureBundleRequest, tech bool) error {
+func validateEnsureRequest(req space.EnsureBundleRequest) error {
 	if req.DerivedRoot {
 		if req.NewRoot != nil {
 			return fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
@@ -205,15 +218,36 @@ func validateEnsureRequest(req space.EnsureBundleRequest, tech bool) error {
 			return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties/Datasets apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
 		}
 	}
-	if tech {
-		if !req.DerivedRoot {
-			return fmt.Errorf("spaceimpl: %w: tech-space bundles are derived-only", space.ErrBundleBadRequest)
+	return validateBundleDatasets(req.Datasets)
+}
+
+// preflightDatasets fails a Datasets request before the permanent root
+// is derived: a name the store already serves (a built-in, a system
+// dataset, a dataset of another type — names are space-wide) and a
+// RootProperties key equal to the root's own id (the self-type grants
+// a dataset namespace, not property definitions). A name already owned
+// by this root is fine — that is the adopt path.
+func (b *bundlesAPI) preflightDatasets(ctx context.Context, req space.EnsureBundleRequest) error {
+	if len(req.Datasets) == 0 {
+		return nil
+	}
+	canonical, err := b.canonicalRootId(ctx, req.Id)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: bundles: canonical root of %q: %w", req.Id, err)
+	}
+	if _, self := req.RootProperties[canonical]; self {
+		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — a self-typed root has no property definitions", space.ErrBundleBadRequest)
+	}
+	for i := range req.Datasets {
+		name := req.Datasets[i].Name
+		if _, err := b.parent.store.DataVersion(name); err == nil {
+			return fmt.Errorf("spaceimpl: %w: dataset name %q is reserved by the store", space.ErrBundleBadRequest, name)
 		}
-		if len(req.Datasets) == 0 {
-			return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Datasets", space.ErrBundleBadRequest)
+		if existing, ok := b.parent.store.RuntimeDataset(name); ok && existing.TypeId != canonical {
+			return fmt.Errorf("spaceimpl: %w: dataset name %q is already defined on type %q — names are unique per space", space.ErrBundleBadRequest, name, existing.TypeId)
 		}
 	}
-	return validateBundleDatasets(req.Datasets)
+	return nil
 }
 
 // validateBundleDatasets rejects an invalid draft or a duplicate name
@@ -234,32 +268,36 @@ func validateBundleDatasets(drafts []space.DatasetDraft) error {
 	return nil
 }
 
-// declareDatasets writes the drafts missing on the root as runtime
-// dataset definitions with typeId = rootId. Names already declared
-// (valid or not — an invalid definition still owns its name, repair
-// goes through Types()) are skipped, so re-runs and concurrent
-// installs add nothing twice. The apply is synchronous: the catalog
-// knows the datasets when this returns.
+// declareDatasets writes the drafts as runtime dataset definitions
+// with typeId = rootId, all in one change, on a root that carries no
+// declaration yet. A root with any declaration — live, invalid
+// (repair goes through Types()) or removed (a tombstone keeps no
+// name; a removal is never undone here) — is left alone: the install
+// declared atomically, later evolution is Types().AddDataset. The
+// apply is synchronous: the catalog knows the datasets when this
+// returns.
 func (b *bundlesAPI) declareDatasets(ctx context.Context, rootId string, drafts []space.DatasetDraft) error {
 	if len(drafts) == 0 {
 		return nil
 	}
-	existing, err := b.parent.store.DatasetDefs(ctx, rootId)
+	declared, err := b.parent.store.HasDatasetDefs(ctx, rootId)
 	if err != nil {
 		return fmt.Errorf("spaceimpl: bundles: read declarations of root %q: %w", rootId, err)
 	}
-	present := make(map[string]struct{}, len(existing))
-	for _, ds := range existing {
-		present[ds.Name] = struct{}{}
+	if declared {
+		return nil
 	}
+	arena := &anyenc.Arena{}
+	recs := make([]crdt.RecordChange, 0, len(drafts))
 	for i := range drafts {
-		d := &drafts[i]
-		if _, ok := present[d.Name]; ok {
-			continue
+		_, r, err := datasetDefRecords(arena, &drafts[i])
+		if err != nil {
+			return fmt.Errorf("spaceimpl: bundles: declare dataset %q on root %q: %w", drafts[i].Name, rootId, err)
 		}
-		if _, err := b.parent.types.declareDataset(ctx, rootId, *d); err != nil {
-			return fmt.Errorf("spaceimpl: bundles: declare dataset %q on root %q: %w", d.Name, rootId, err)
-		}
+		recs = append(recs, r...)
+	}
+	if _, err := b.parent.types.writeDatasetDefs(ctx, rootId, recs...); err != nil {
+		return fmt.Errorf("spaceimpl: bundles: declare datasets on root %q: %w", rootId, err)
 	}
 	return nil
 }
@@ -524,9 +562,6 @@ func (b *bundlesAPI) winnerDeleted(ctx context.Context, bd *space.Bundle) bool {
 }
 
 func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {
-	if b.parent.tech {
-		return errUnsupported("Bundles().ResolveLoser")
-	}
 	if bundleId == "" || loserRootId == "" {
 		return fmt.Errorf("spaceimpl: %w: bundle id and loser root id required", space.ErrBundleBadRequest)
 	}
@@ -574,7 +609,7 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 // stampRootName writes `any.name` on a freshly created bundle root.
 // Load-bearing despite looking cosmetic: it guarantees the root tree
 // carries a non-root change (see the Ensure call site).
-func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space.EnsureBundleRequest) error {
+func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space.EnsureBundleRequest, adopt bool) error {
 	obj, err := b.parent.store.Get(ctx, rootId)
 	if err != nil {
 		return err
@@ -587,9 +622,10 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 	// that installs it, and re-writing the same name on each would add
 	// a change per device for nothing. The record's existence is the
 	// property that matters — the tree already carries a non-root
-	// change.
+	// change. On adopt any existing name is kept: a later Ensure with
+	// a different (or no) Name must not rename the root.
 	if row := obj.Controller().Get(ctx, properties.Dataset, rootId); row != nil {
-		if cur := row.Get("any", "name"); cur != nil && string(cur.GetStringBytes()) == name {
+		if cur := row.Get("any", "name"); cur != nil && (adopt || string(cur.GetStringBytes()) == name) {
 			return nil
 		}
 	}
@@ -600,7 +636,7 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 	if err != nil {
 		return err
 	}
-	res, err := obj.LocalWrite(ctx, crdt.Change{
+	res, err := b.parent.localWriteRetry(ctx, obj, rootId, crdt.Change{
 		Dataset:     properties.Dataset,
 		DataVersion: dataVersion,
 		Records: []crdt.RecordChange{{

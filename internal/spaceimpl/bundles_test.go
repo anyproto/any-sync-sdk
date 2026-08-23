@@ -45,10 +45,15 @@ func TestValidateEnsureRequest(t *testing.T) {
 		{name: "tech derived with datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}}, tech: true},
 		{name: "tech created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot}, tech: true, bad: true},
 		{name: "tech without datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}, tech: true, bad: true},
+		{name: "tech with root types", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}, RootTypes: []string{"t"}}, tech: true, bad: true},
+		{name: "tech with root properties", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}, RootProperties: map[string]map[string]any{"t": {"a": 1}}}, tech: true, bad: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateEnsureRequest(tc.req, tc.tech)
+			err := validateEnsureRequest(tc.req)
+			if err == nil && tc.tech {
+				err = validateTechEnsureRequest(tc.req)
+			}
 			if tc.bad {
 				require.ErrorIs(t, err, space.ErrBundleBadRequest)
 				return
@@ -61,9 +66,13 @@ func TestValidateEnsureRequest(t *testing.T) {
 // Ensure refuses a bad request before touching the store: a zero
 // spaceImpl would panic on any store access.
 func TestEnsure_BadRequestBeforeStore(t *testing.T) {
-	b := newBundlesAPI(&spaceImpl{tech: true})
-	_, _, err := b.Ensure(context.Background(), space.EnsureBundleRequest{Id: "b", DerivedRoot: true})
+	b := newBundlesAPI(&spaceImpl{})
+	_, _, err := b.Ensure(context.Background(), space.EnsureBundleRequest{Id: "b"})
 	require.ErrorIs(t, err, space.ErrBundleBadRequest)
+	tb := techBundles{b}
+	_, _, err = tb.Ensure(context.Background(), space.EnsureBundleRequest{Id: "b", DerivedRoot: true})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest)
+	require.ErrorIs(t, tb.ResolveLoser(context.Background(), "b", "r"), space.ErrUnsupported)
 }
 
 func TestDerivedRootTypes(t *testing.T) {

@@ -3,12 +3,15 @@ package spaceimpl
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -91,17 +94,33 @@ func TestTechWrappers_RefuseLifecycle(t *testing.T) {
 	assert.ErrorIs(t, errUnsupported("x"), space.ErrUnsupported)
 }
 
-// Tech-handle methods that refuse before touching the store.
-func TestTechHandle_RefusesBeforeStore(t *testing.T) {
+// The tech handle's generic write surface reaches catalog-owned
+// (bundle) datasets only: built-ins, system datasets and unknown
+// names refuse before any store write.
+func TestTechHandle_WriteFence(t *testing.T) {
 	ctx := context.Background()
-	s := &spaceImpl{tech: true}
-	assert.ErrorIs(t, s.SetMetadata(ctx, space.SetMetadataRequest{}), space.ErrUnsupported)
-	b := newBundlesAPI(s)
-	assert.ErrorIs(t, b.ResolveLoser(ctx, "b", "r"), space.ErrUnsupported)
-	for _, ds := range []string{"spaces", "profile", "inboxCursor", "identities", "devices", "account_values", "bundles", "payloads"} {
-		assert.Error(t, s.checkPublicDataset(ds), ds)
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "tech.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	store := spaceobjects.NewStore(nil, db, nil, "tech", nil, nil)
+	t.Cleanup(func() { _ = store.Close() })
+	ts := &techSpace{inner: &spaceImpl{id: "tech", store: store}}
+
+	assert.ErrorIs(t, ts.SetMetadata(ctx, space.SetMetadataRequest{}), space.ErrUnsupported)
+	for _, ds := range []string{"spaces", "profile", "devices", "objects", "datasets", "shortIds", "bundles", "payloads", "nope"} {
+		_, err := ts.Modify(ctx, space.ModifyBatch{ObjectId: "o", Dataset: ds})
+		assert.ErrorIs(t, err, space.ErrUnsupported, ds)
+		_, err = ts.Upsert(ctx, space.UpsertBatch{ObjectId: "o", Dataset: ds})
+		assert.ErrorIs(t, err, space.ErrUnsupported, ds)
+		_, err = ts.Delete(ctx, space.DeleteBatch{ObjectId: "o", Dataset: ds})
+		assert.ErrorIs(t, err, space.ErrUnsupported, ds)
+		_, err = ts.ModifyMany(ctx, []space.ModifyBatch{{ObjectId: "o", Dataset: ds}})
+		assert.ErrorIs(t, err, space.ErrUnsupported, ds)
 	}
-	assert.NoError(t, s.checkPublicDataset("entries"))
-	regular := &spaceImpl{}
-	assert.NoError(t, regular.checkPublicDataset("spaces"), "system names are fenced on the tech handle only")
+	// Dataset mutators need a bundle root; an object without a row is
+	// not one.
+	tt := techTypes{inner: newTypesAPI(ts.inner), t: ts}
+	_, err = tt.AddDataset(ctx, "not-a-root", space.DatasetDraft{Name: "x"})
+	assert.ErrorIs(t, err, space.ErrUnsupported)
+	assert.ErrorIs(t, tt.RemoveDataset(ctx, "not-a-root", "d"), space.ErrUnsupported)
 }

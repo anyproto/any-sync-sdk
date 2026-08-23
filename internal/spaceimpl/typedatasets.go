@@ -228,7 +228,7 @@ func (t *typesAPI) writeDatasetDefs(ctx context.Context, typeId string, recs ...
 	if err != nil {
 		return object.WriteResult{}, err
 	}
-	return obj.LocalWrite(ctx, crdt.Change{
+	return t.parent.localWriteRetry(ctx, obj, typeId, crdt.Change{
 		Dataset:     typetype.DatasetDefs,
 		DataVersion: dataVersion,
 		Records:     recs,
@@ -256,36 +256,54 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId string, draft space.Da
 	return t.declareDataset(ctx, typeId, draft)
 }
 
-// declareDataset validates the draft, preflights its name against the
-// static catalog and the runtime catalog, and writes head + field
-// records in one change on typeId's `datasets` dataset. Returns the
-// head (definition) id. Shared by AddDataset and bundle installs.
+// declareDataset validates the draft, preflights its name, and writes
+// head + field records in one change on typeId's `datasets` dataset.
+// Returns the head (definition) id.
 func (t *typesAPI) declareDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
-	decl, err := draftToDecl(&draft)
+	if err := t.preflightDatasetName(draft.Name); err != nil {
+		return "", err
+	}
+	headId, recs, err := datasetDefRecords(&anyenc.Arena{}, &draft)
 	if err != nil {
 		return "", err
 	}
-	// Name collision preflight: static catalog (built-ins +
-	// config-registered) and already-active runtime datasets. The
-	// compile layer resolves races deterministically anyway — this
-	// just fails the obvious case fast with a readable error.
-	if _, err := t.parent.store.DataVersion(draft.Name); err == nil {
-		return "", fmt.Errorf("typesAPI: dataset name %q is already registered", draft.Name)
+	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
+		return "", fmt.Errorf("typesAPI: dataset %q: %w", draft.Name, err)
 	}
-	if existing, ok := t.parent.store.RuntimeDataset(draft.Name); ok {
-		return "", fmt.Errorf("typesAPI: dataset name %q is already defined on type %q", draft.Name, existing.TypeId)
-	}
+	return headId, nil
+}
 
+// preflightDatasetName fails fast on a name collision with the static
+// catalog (built-ins + config-registered) or an already-active runtime
+// dataset. The compile layer resolves races deterministically anyway —
+// this just gives the obvious case a readable error.
+func (t *typesAPI) preflightDatasetName(name string) error {
+	if _, err := t.parent.store.DataVersion(name); err == nil {
+		return fmt.Errorf("typesAPI: dataset name %q is already registered", name)
+	}
+	if existing, ok := t.parent.store.RuntimeDataset(name); ok {
+		return fmt.Errorf("typesAPI: dataset name %q is already defined on type %q", name, existing.TypeId)
+	}
+	return nil
+}
+
+// datasetDefRecords validates the draft and builds its head + field
+// records (one head, fields referencing it). Returns the minted head
+// id with the records.
+func datasetDefRecords(arena *anyenc.Arena, draft *space.DatasetDraft) (string, []crdt.RecordChange, error) {
+	decl, err := draftToDecl(draft)
+	if err != nil {
+		return "", nil, err
+	}
 	headId, err := newDatasetDefId()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	arena := &anyenc.Arena{}
 	recs := make([]crdt.RecordChange, 0, len(draft.Fields)+1)
 	recs = append(recs, crdt.RecordChange{
 		Id:     headId,
 		Upsert: true,
-		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, &draft)}},
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, draft)}},
 	})
 	for i := range draft.Fields {
 		recs = append(recs, crdt.RecordChange{
@@ -293,10 +311,7 @@ func (t *typesAPI) declareDataset(ctx context.Context, typeId string, draft spac
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetField(arena, headId, &draft.Fields[i], &decl.Fields[i])}},
 		})
 	}
-	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
-		return "", fmt.Errorf("typesAPI: dataset %q: %w", draft.Name, err)
-	}
-	return headId, nil
+	return headId, recs, nil
 }
 
 func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft space.DatasetFieldDraft) (string, error) {
@@ -346,8 +361,44 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 	return res.RecordIds[0], nil
 }
 
+// RemoveDataset tombstones the definition and every live duplicate
+// head declaring the same name (concurrent declarations converge to
+// one visible definition; the hidden duplicates would otherwise
+// resurface as the dataset the moment the winner is removed).
 func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId string) error {
-	return t.removeDatasetDefRecord(ctx, typeId, datasetDefId)
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if datasetDefId == "" {
+		return errors.New("typesAPI: definition id required")
+	}
+	ids := []string{datasetDefId}
+	defs, err := t.Datasets(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	for i := range defs {
+		if defs[i].Id != datasetDefId {
+			continue
+		}
+		heads, err := t.parent.store.DatasetHeadIds(ctx, typeId, defs[i].Name)
+		if err != nil {
+			return fmt.Errorf("typesAPI: remove dataset definition: %w", err)
+		}
+		for _, h := range heads {
+			if h != datasetDefId {
+				ids = append(ids, h)
+			}
+		}
+	}
+	recs := make([]crdt.RecordChange, 0, len(ids))
+	for _, id := range ids {
+		recs = append(recs, crdt.RecordChange{Id: id, Ops: []crdt.Op{{Type: crdt.OpDelete}}})
+	}
+	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
+		return fmt.Errorf("typesAPI: remove dataset definition: %w", err)
+	}
+	return nil
 }
 
 func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error {

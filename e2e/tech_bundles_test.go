@@ -255,8 +255,11 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 }
 
 // TestE2E_TechBundle_AdoptReconcilesDatasets: two devices install the
-// same tech bundle with different dataset lists, B before A's root
-// tree reached it. Both end with exactly one definition per name.
+// same tech bundle with different dataset lists. Whether B's Ensure
+// ran before A's root tree reached it (both declare `entries`, the
+// duplicate heads converge to one) or after (B adopts A's
+// declarations and adds `tags` through Types().AddDataset), both end
+// with exactly one definition per name, the same on both devices.
 func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -297,9 +300,6 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	require.Equal(t, instA.RootId, instB.RootId, "derived root is device-independent")
 	root := instA.RootId
 
-	_ = sdkA.Spaces().SyncSpaceList(ctx)
-	_ = sdkB.Spaces().SyncSpaceList(ctx)
-
 	names := func(defs []space.DatasetDef) map[string]string {
 		out := map[string]string{}
 		for _, d := range defs {
@@ -307,7 +307,17 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 		}
 		return out
 	}
-	var defsA, defsB []space.DatasetDef
+	// Adopted A's declarations (tree arrived first): evolve explicitly.
+	defsB, err := techB.Types().Datasets(ctx, root)
+	require.NoError(t, err)
+	if _, ok := names(defsB)["tags"]; !ok {
+		_, err = techB.Types().AddDataset(ctx, root, tags)
+		require.NoError(t, err, "device B: AddDataset(tags) after adopting")
+	}
+
+	_ = sdkA.Spaces().SyncSpaceList(ctx)
+	_ = sdkB.Spaces().SyncSpaceList(ctx)
+	var defsA []space.DatasetDef
 	require.True(t, waitFor(ctx, 120*time.Second, 500*time.Millisecond, func() bool {
 		_ = techA.SyncHeads(ctx)
 		_ = techB.SyncHeads(ctx)

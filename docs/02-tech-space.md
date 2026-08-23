@@ -7,7 +7,7 @@ A derived space (deterministic from account key) that stores account-level data.
 - **Derived** — created on first login if not on device; deterministic ID from account key, always re-derivable
 - **Derived ACL** — owner-only, network denies any new ACL changes. No shared accounts possible
 - **Hidden** — not exposed as a `Space` in SDK API, only through purpose-specific methods
-- **Same CRDT** — uses the same version-gated record store CRDT as regular spaces
+- **Same CRDT, same Store** — the tech space runs the regular `spaceobjects.Store` path (type registry, `<techSpaceId>_objects` collection, built-in handlers, runtime dataset catalog, schema gate). Its own datasets (`spaces`, `profile`, `inboxCursor`, `identities`, `devices`, `account_values`) are registered as type-less system built-ins (`StoreConfig.SystemDatasets`, `techspace.SystemDatasets()`), ungated like `payloads`/`bundles`. The index object and the account-values carriers carry no `objects` row. History indexing is off (`DisableHistory`): there is no tech-space history surface
 - **any-store first** — all data lives in any-store, SDK reads DB + listens to event flow, not in-memory state
 - **ocache pattern** — any-sync `CommonSpace` managed via ocache (like any-sync-node), init/close by activity. SDK doesn't depend on space being loaded in memory
 - **Sync priority** — tech space syncs first on startup, but sync is continuous (decentralized, never "done")

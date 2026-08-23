@@ -252,9 +252,9 @@ func TestReindex_SweepLoadsStaleObjectsOnly(t *testing.T) {
 	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "current", 1, 1, map[string]int{reindexNotes: 2}, "spaceA"))
 	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "elsewhere", 1, 1, map[string]int{reindexNotes: 1}, "spaceB"))
 
-	// The store's registered version for the dataset — buildRegs is
-	// raw-mode here, so the sweep compares against exactly this.
-	s.customHandlers = []crdt.HandlerReg{{
+	// The store's registered version for the dataset; the sweep
+	// compares the stored version against this system reg.
+	s.systemRegs = []crdt.HandlerReg{{
 		Name: reindexNotes, Version: 2, Handler: crdt.DefaultHandler{},
 		Schema: schema.Dataset{Dynamic: true},
 	}}
@@ -319,7 +319,7 @@ func TestReindex_CloseWaitsForSweep(t *testing.T) {
 	metaColl, err := s.metaCollection(ctx)
 	require.NoError(t, err)
 	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "stale-1", 1, 1, map[string]int{reindexNotes: 1}, "spaceA"))
-	s.customHandlers = []crdt.HandlerReg{{
+	s.systemRegs = []crdt.HandlerReg{{
 		Name: reindexNotes, Version: 2, Handler: crdt.DefaultHandler{},
 		Schema: schema.Dataset{Dynamic: true},
 	}}

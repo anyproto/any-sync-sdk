@@ -132,7 +132,7 @@ func decodeMetaRow(v *anyenc.Value) (maxAddSeq, maxApplySeq uint64, handlerVersi
 // inside the same WriteTx as the record mutations for atomicity.
 //
 // spaceId scopes the row for the change-index query; pass "" to leave it
-// unset (unit tests, raw mode without a space). An unset row is
+// unset (unit tests without a space). An unset row is
 // invisible to QueryChangedObjects, which is the accepted lazy-backfill
 // behaviour.
 func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string, maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int, spaceId string) error {

@@ -14,9 +14,9 @@ import (
 )
 
 // buildReadTracking collects the read-tracking registrations by
-// dataset from the type catalog (regular mode) or the raw handler
-// regs (tech space). Empty map = nothing tracked in this space.
-func buildReadTracking(extTypes []handler.Type, raw []crdt.HandlerReg) map[string]*crdt.ReadTracking {
+// dataset from the type catalog and the store's system regs. Empty
+// map = nothing tracked in this space.
+func buildReadTracking(extTypes []handler.Type, system []crdt.HandlerReg) map[string]*crdt.ReadTracking {
 	out := map[string]*crdt.ReadTracking{}
 	for _, t := range extTypes {
 		for _, d := range t.Datasets {
@@ -25,7 +25,7 @@ func buildReadTracking(extTypes []handler.Type, raw []crdt.HandlerReg) map[strin
 			}
 		}
 	}
-	for _, reg := range raw {
+	for _, reg := range system {
 		if reg.ReadTracking != nil {
 			out[reg.Name] = reg.ReadTracking
 		}

@@ -21,6 +21,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
+	"github.com/anyproto/any-sync-sdk/internal/types"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -49,14 +50,12 @@ type Service struct {
 	avMu  sync.Mutex
 	avIds map[string]string
 
-	// store backs the single index object. It is a "raw" spaceobjects
-	// Store (custom handlers, gate disabled) so the index inherits the
-	// regular-space sync + subscription machinery — ocache-resident
-	// object, SetDeferredUpdater(true), ColdRestore-on-load, and the
-	// subscribe.Engine — without the type/properties model. The index
-	// object's spaces/profile datasets live at <indexId>_spaces /
-	// <indexId>_profile, exactly as the previous bespoke controller
-	// wrote them.
+	// store is a regular spaceobjects Store (type/properties model,
+	// runtime dataset catalog, schema gate) with the tech datasets
+	// registered as system built-ins — see SystemDatasets. The index
+	// object and the account-values carriers carry no `objects` row;
+	// their datasets live at <indexId>_spaces, <indexId>_profile, …
+	// History indexing is off: the tech space has no history surface.
 	store *spaceobjects.Store
 }
 
@@ -139,32 +138,17 @@ func (s *Service) Open(ctx context.Context) error {
 	}
 
 	s.store = spaceobjects.NewStoreWithConfig(spaceobjects.StoreConfig{
-		App:     s.app,
-		DB:      s.db,
-		SignKey: keys.SignKey,
-		SpaceId: s.spaceId,
-		Alloc:   object.NewVersionAllocator(""),
-		Handlers: []crdt.HandlerReg{
-			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema(), Version: SpaceIndexLocalVersion},
-			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
-			{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()},
-			{Name: IdentitiesDataset, Handler: IdentitiesHandler{}, Schema: IdentitiesSchema(), Indexes: IdentitiesIndexes()},
-			{Name: DevicesDataset, Handler: DevicesHandler{}, Schema: DevicesSchema()},
-			// Account-values carrier (one derived object per target
-			// space) — see accountvalues.go. Dynamic: carrier records
-			// carry free-form typeId heads at the target rows' paths.
-			{Name: accountvalues.Dataset, Handler: crdt.DefaultHandler{}, Schema: accountvalues.Schema()},
-		},
-		DisableGate: true,
-		DataVersions: map[string]string{
-			SpaceIndexDataset:     HandlerVersion,
-			ProfileDataset:        ProfileHandlerVersion,
-			InboxCursorDataset:    InboxCursorHandlerVersion,
-			IdentitiesDataset:     IdentitiesHandlerVersion,
-			DevicesDataset:        DevicesHandlerVersion,
-			accountvalues.Dataset: accountvalues.HandlerVersion,
-		},
+		App:            s.app,
+		DB:             s.db,
+		SignKey:        keys.SignKey,
+		SpaceId:        s.spaceId,
+		Alloc:          object.NewVersionAllocator(""),
+		SystemDatasets: SystemDatasets(),
+		DisableHistory: true,
 	})
+	// Gate is on: rows parked for a dataset that registers later (a
+	// bundle root's declarations) drain on first touch after restart.
+	s.store.NotifyDrainer(types.DataVersionPair{})
 
 	// Derive the single index object through the Store. Store.Derive
 	// computes the deterministic id, then runs PutTree (first boot) /
@@ -180,6 +164,24 @@ func (s *Service) Open(ctx context.Context) error {
 
 	s.open.Store(true)
 	return nil
+}
+
+// SystemDatasets lists the tech-space datasets registered on every
+// controller of the tech Store as ungated built-ins, with the
+// DataVersion stamp their typed writers use. Also the set the public
+// write surface of the tech-space handle refuses.
+func SystemDatasets() []spaceobjects.SystemDataset {
+	return []spaceobjects.SystemDataset{
+		{Reg: crdt.HandlerReg{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema(), Version: SpaceIndexLocalVersion}, DataVersion: HandlerVersion},
+		{Reg: crdt.HandlerReg{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()}, DataVersion: ProfileHandlerVersion},
+		{Reg: crdt.HandlerReg{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()}, DataVersion: InboxCursorHandlerVersion},
+		{Reg: crdt.HandlerReg{Name: IdentitiesDataset, Handler: IdentitiesHandler{}, Schema: IdentitiesSchema(), Indexes: IdentitiesIndexes()}, DataVersion: IdentitiesHandlerVersion},
+		{Reg: crdt.HandlerReg{Name: DevicesDataset, Handler: DevicesHandler{}, Schema: DevicesSchema()}, DataVersion: DevicesHandlerVersion},
+		// Account-values carrier (one derived object per target
+		// space) — see accountvalues.go. Dynamic: carrier records
+		// carry free-form typeId heads at the target rows' paths.
+		{Reg: crdt.HandlerReg{Name: accountvalues.Dataset, Handler: crdt.DefaultHandler{}, Schema: accountvalues.Schema()}, DataVersion: accountvalues.HandlerVersion},
+	}
 }
 
 // indexObj returns the resident index *object.Object via the Store's
@@ -874,8 +876,8 @@ func (s *Service) Close(_ context.Context) error {
 }
 
 // SpaceRegistry adapter — the tech-space hosts the index object plus
-// one account-values carrier object per target space, all served by
-// the same raw Store. Every tech-space tree routes through it so the
+// one account-values carrier object per target space, plus bundle
+// roots, all served by the same Store. Every tech-space tree routes through it so the
 // listener-bound, deferred-updater, cold-restored object is what the
 // tree syncer touches.
 
@@ -892,9 +894,9 @@ var ErrSpaceRegistryUnknown = errors.New("techspace: unknown (spaceId, treeId)")
 // values never crossed devices.
 //
 // Accepting arbitrary tree ids is safe: the tech space is owner-only —
-// every tree in it is this account's, and the raw Store registers the
-// full tech handler set (spaces/profile/account_values) on every
-// controller. An id any-sync can't resolve fails inside Store.Get and
+// every tree in it is this account's, and the Store registers the
+// full handler set (built-ins + system datasets) on every controller.
+// An id any-sync can't resolve fails inside Store.Get and
 // the syncer skips it.
 func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
 	if spaceId != s.spaceId {

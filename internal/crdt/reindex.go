@@ -31,7 +31,7 @@ import (
 // A dataset the object never wrote has no stored version and is never
 // stale — there is nothing materialized to rebuild. A stored version for
 // a dataset this controller doesn't register is ignored: the handler that
-// owns it isn't loaded here (raw mode, a type detached from the space),
+// owns it isn't loaded here (a type detached from the space),
 // so a replay would not reproduce those rows anyway.
 func staleDatasets(stored, registered map[string]int) []string {
 	if len(stored) == 0 {

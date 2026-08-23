@@ -246,6 +246,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	inst, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, Name: "Chat", DerivedRoot: true,
 		RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
+		Datasets:       []space.DatasetDraft{articleDatasetDraft()},
 	})
 	require.NoError(t, err, "device A: Ensure(derived)")
 	require.True(t, didInstall, "first derived Ensure must register the install")
@@ -253,6 +254,21 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.True(t, inst.Derived)
 	require.Equal(t, []string{wantRoot}, inst.Roots)
 	require.Empty(t, inst.Losers)
+
+	// A root declaring datasets is a type implementing itself: the
+	// declaration is discoverable under typeId = rootId and records
+	// land on the root through the generic upsert path.
+	defs, err := spA.Types().Datasets(ctx, wantRoot)
+	require.NoError(t, err, "device A: Types().Datasets(root)")
+	require.Len(t, defs, 1)
+	require.Equal(t, "articles", defs[0].Name)
+	upRes, err := spA.Upsert(ctx, space.UpsertBatch{
+		ObjectId: wantRoot, Dataset: "articles",
+		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{"title": "One"}}},
+	})
+	require.NoError(t, err, "device A: Upsert on the bundle root")
+	require.Equal(t, 1, upRes.Created)
+	require.Empty(t, upRes.Rejections)
 
 	// Initial property values land on the derived root — a created
 	// root gets them from Objects().Create, a derived one from the
@@ -300,6 +316,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	// B's registry has converged or not, it lands on the same root.
 	resB, _, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, Name: "Chat", DerivedRoot: true,
+		Datasets: []space.DatasetDraft{articleDatasetDraft()},
 	})
 	require.NoError(t, err, "device B: Ensure(derived) without a convergence gate")
 	require.Equal(t, wantRoot, resB.RootId)
@@ -321,6 +338,21 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	assert.True(t, a.Derived && b.Derived)
 	assert.Empty(t, a.Losers)
 	assert.Empty(t, b.Losers)
+
+	// Both devices declared `articles`; the definitions converge to one
+	// per name and A's record reaches B.
+	var defsB []space.DatasetDef
+	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
+		_ = spA.SyncHeads(ctx)
+		_ = spB.SyncHeads(ctx)
+		defsA, aerr := spA.Types().Datasets(ctx, wantRoot)
+		defsB, berr = spB.Types().Datasets(ctx, wantRoot)
+		if aerr != nil || berr != nil || len(defsA) != 1 || len(defsB) != 1 || defsA[0].Id != defsB[0].Id {
+			return false
+		}
+		n, qerr := spB.Query(wantRoot, "articles").Count(ctx)
+		return qerr == nil && n == 1
+	}), "bundle datasets never converged: B defs=%+v", defsB)
 
 	// The derived root is permanent: the tree cannot be deleted, which
 	// is the price of never forking.

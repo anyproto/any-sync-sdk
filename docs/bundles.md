@@ -133,6 +133,56 @@ sitting on its root change, so a derived root that a device never
 stamped would sit outside that device's diff and never pull the peer's
 content.
 
+## Bundle datasets: self-typed roots
+
+`EnsureBundleRequest.Datasets` declares runtime datasets (the
+`DatasetDraft` vocabulary of `17-user-datasets.md`) on a derived root.
+The root then carries `any.types = ["__type__", rootId]`: it is a type
+object implementing itself, `typeId = rootId`. Nothing else is
+special-cased — the catalog's `__type__` scan finds it, the membership
+check (`any.types ∋ owner`) passes, the gate stamp is the ordinary
+`<rootId>:<shortId>`, `Types().Datasets(rootId)` and `Space.Datasets()`
+list the declarations with `TypeId = rootId`, and records go through
+`Upsert` / `Modify` / `Query` on the root. The bundle's setup state
+lives in records, not in child objects.
+
+- Declarations are written after the root's types and before the
+  registry row, so a failed declaration leaves no install to adopt;
+  the retry declares only what is still missing.
+- Every adopt reconciles: a name missing on the root (crash before the
+  row, a dataset added to the request, a row adopted before the root
+  tree synced) is declared; present names are left alone — never
+  patched. Evolution goes through `Types().AddDataset` /
+  `AddDatasetField` / `PatchDataset` with `typeId = rootId`.
+- Two devices declaring the same name concurrently write two heads;
+  `CompileDatasetDefs` resolves them to one per name (first creation
+  `_ver.id`), so every replica converges on one definition. A `DefId`
+  read on the losing device before sync changes after it: look
+  definitions up by name when evolving them.
+- `DerivedRoot` only (a created root's losers would each carry their
+  own declarations). Accepted in every space; required on the tech
+  space.
+- `RootProperties` keyed by the root's own id are rejected: the
+  self-type grants a dataset namespace, not property definitions.
+
+## Tech-space bundles
+
+Account-level product data (favourites, pinned items, personal
+settings objects) lives in bundles on the tech space, reached through
+`Spaces().Get(SDK.TechSpaceId())` — the restricted handle described in
+`02-tech-space.md`. Same registry (`bundles` on the tech index object),
+same `Ensure` / `Get` / `List` / `DerivedRootId`, with two rules:
+derived-only (`NewRoot` is refused, `ResolveLoser` is unsupported) and
+`Datasets` required. Bundle ids are a versioned vocabulary
+(`favorites/v1`), never a scratch namespace: derived trees cannot be
+deleted.
+
+Restore on a second device: `WaitListSynced` → `Spaces().Get(TechSpaceId())`
+→ `WaitIndexSynced` (delegates to the list gate) → `Bundles().Get` /
+`Ensure`; records on the root sync in like any tree. The tech space is
+owner-only, so everything in it is synced scope shared by the
+account's devices and nobody else.
+
 ## API (`space/bundles.go`)
 
 - `Space.Bundles().Ensure` — adopt-or-install, returning the row and
@@ -141,7 +191,8 @@ content.
   otherwise the root is minted (`NewRoot`, or the canonical derivation
   for `DerivedRoot`) and one change registers it. The returned winner is
   provisional until the space syncs — unless it is derived, which is the
-  same on every device by construction.
+  same on every device by construction. `Datasets` declares runtime
+  datasets on a derived root (see § Bundle datasets).
 - `DerivedRootId` — the canonical derived root id for a bundle id. Pure
   computation: no registry read, no materialization, no network.
 - `Get` / `List` — read the registry with `Losers` computed.

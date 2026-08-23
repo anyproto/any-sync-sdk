@@ -1,12 +1,12 @@
 # Tech Space
 
 ## Vision
-A derived space (deterministic from account key) that stores account-level data. One tech space per account. Hidden from the public SDK API — callers interact through dedicated methods, never with the space directly.
+A derived space (deterministic from account key) that stores account-level data. One tech space per account. Never listed; reachable as a restricted `Space` handle through `Spaces().Get(SDK.TechSpaceId())` for account-level bundles, otherwise used through dedicated methods.
 
 ## Key Decisions
 - **Derived** — created on first login if not on device; deterministic ID from account key, always re-derivable
 - **Derived ACL** — owner-only, network denies any new ACL changes. No shared accounts possible
-- **Hidden** — not exposed as a `Space` in SDK API, only through purpose-specific methods
+- **Restricted handle** — `Spaces().Get(SDK.TechSpaceId())` returns a `Space` that supports reads (`Query`, `QueryObjects`, `Aggregate`, `Datasets`, `Objects().Get`, `Types()` reads), dataset declarations on bundle roots (`Types().AddDataset` / `AddDatasetField` / `RemoveDataset*` / `PatchDataset`), `Bundles()` (derived-only, `Datasets` required, no `ResolveLoser`), generic record writes (`Modify` / `ModifyMany` / `Delete` / `Upsert`) on bundle roots, `Info()` (synthetic: owner-only, derived, `any.techspace`), `SyncStatus`, `Debug`, `SyncHeads`, `TreeHeads`, `WaitIndexSynced` (= `WaitListSynced`). The system datasets (`spaces`, `profile`, `inboxCursor`, `identities`, `devices`, `account_values`) are readable through it and writable only through the typed methods. Everything else — `Objects().Create/Derive/Delete`, `Types().Create/Delete` and property definitions, `Properties()`, `Members()`, `ACL()`, `Files()`, `History()`, `ReadState()`, `PubSub()`, `Changes()`, `SetMetadata` — returns `space.ErrUnsupported`. The handle never appears in `List` / `Subscribe`; `Delete` / `Track` refuse it (`ErrIsTechSpace`). See `bundles.md § Tech-space bundles`
 - **Same CRDT, same Store** — the tech space runs the regular `spaceobjects.Store` path (type registry, `<techSpaceId>_objects` collection, built-in handlers, runtime dataset catalog, schema gate). Its own datasets (`spaces`, `profile`, `inboxCursor`, `identities`, `devices`, `account_values`) are registered as type-less system built-ins (`StoreConfig.SystemDatasets`, `techspace.SystemDatasets()`), ungated like `payloads`/`bundles`. The index object and the account-values carriers carry no `objects` row. History indexing is off (`DisableHistory`): there is no tech-space history surface
 - **any-store first** — all data lives in any-store, SDK reads DB + listens to event flow, not in-memory state
 - **ocache pattern** — any-sync `CommonSpace` managed via ocache (like any-sync-node), init/close by activity. SDK doesn't depend on space being loaded in memory

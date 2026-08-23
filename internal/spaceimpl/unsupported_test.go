@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -102,12 +103,15 @@ func TestTechHandle_WriteFence(t *testing.T) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "tech.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	store := spaceobjects.NewStore(nil, db, nil, "tech", nil, nil)
+	store := spaceobjects.NewStoreWithConfig(spaceobjects.StoreConfig{
+		DB: db, SpaceId: "tech",
+		SystemDatasets: techspace.SystemDatasets(), DisableHistory: true,
+	})
 	t.Cleanup(func() { _ = store.Close() })
 	ts := &techSpace{inner: &spaceImpl{id: "tech", store: store}}
 
 	assert.ErrorIs(t, ts.SetMetadata(ctx, space.SetMetadataRequest{}), space.ErrUnsupported)
-	for _, ds := range []string{"spaces", "profile", "devices", "objects", "datasets", "shortIds", "bundles", "payloads", "nope"} {
+	for _, ds := range []string{"spaces", "profile", "devices", "objects", "datasets", "shortIds", "bundles", "payloads"} {
 		_, err := ts.Modify(ctx, space.ModifyBatch{ObjectId: "o", Dataset: ds})
 		assert.ErrorIs(t, err, space.ErrUnsupported, ds)
 		_, err = ts.Upsert(ctx, space.UpsertBatch{ObjectId: "o", Dataset: ds})
@@ -117,6 +121,16 @@ func TestTechHandle_WriteFence(t *testing.T) {
 		_, err = ts.ModifyMany(ctx, []space.ModifyBatch{{ObjectId: "o", Dataset: ds}})
 		assert.ErrorIs(t, err, space.ErrUnsupported, ds)
 	}
+	// The tech index object accepts no generic writes, whatever the
+	// dataset name.
+	ts.inner.techIndexId = "idx"
+	_, err = ts.Delete(ctx, space.DeleteBatch{ObjectId: "idx", Dataset: "entries"})
+	assert.ErrorIs(t, err, space.ErrUnsupported)
+	_, err = ts.Modify(ctx, space.ModifyBatch{ObjectId: "idx", Dataset: "entries"})
+	assert.ErrorIs(t, err, space.ErrUnsupported)
+	// A dataset the store never heard of passes through and fails as
+	// unknown, not as unsupported.
+	assert.NoError(t, ts.checkWrite("o", "nope"))
 	// Dataset mutators need a bundle root; an object without a row is
 	// not one.
 	tt := techTypes{inner: newTypesAPI(ts.inner), t: ts}

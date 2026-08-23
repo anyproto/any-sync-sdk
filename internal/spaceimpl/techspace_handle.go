@@ -85,18 +85,28 @@ func (t *techSpace) AggregateObjects(pipeline any) space.Agg {
 func (t *techSpace) Datasets() []space.DatasetSchema { return t.inner.Datasets() }
 
 // Generic writes reach bundle datasets only — the datasets a bundle
-// root declared (catalog-owned). The type-system built-ins (objects,
-// properties, shortIds, datasets) and the system datasets (spaces,
-// profile, devices, …) stay typed-API-only on this handle.
-func (t *techSpace) checkWriteDataset(dataset string) error {
-	if _, owned := t.inner.store.DatasetOwner(dataset); !owned {
+// root declared (catalog-owned) — and never the tech index object:
+// its tree is the account's space list, and a write fence keyed on the
+// dataset name alone would let a bundle dataset name target it. The
+// type-system built-ins (objects, properties, shortIds, datasets) and
+// the system datasets (spaces, profile, devices, …) stay
+// typed-API-only on this handle; a dataset the store has never heard
+// of passes through so the regular unknown-dataset error surfaces.
+func (t *techSpace) checkWrite(objectId, dataset string) error {
+	if objectId == t.inner.techIndexId {
+		return fmt.Errorf("spaceimpl: the tech index object accepts no generic writes: %w", space.ErrUnsupported)
+	}
+	if _, owned := t.inner.store.DatasetOwner(dataset); owned {
+		return nil
+	}
+	if _, err := t.inner.store.DataVersion(dataset); err == nil {
 		return fmt.Errorf("spaceimpl: dataset %q is not a bundle dataset: %w", dataset, space.ErrUnsupported)
 	}
-	return nil
+	return nil // unknown everywhere: the write path reports it as such
 }
 
 func (t *techSpace) Modify(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
-	if err := t.checkWriteDataset(batch.Dataset); err != nil {
+	if err := t.checkWrite(batch.ObjectId, batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
 	return t.inner.Modify(ctx, batch)
@@ -104,7 +114,7 @@ func (t *techSpace) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 
 func (t *techSpace) ModifyMany(ctx context.Context, batches []space.ModifyBatch) ([]space.ModifyResult, error) {
 	for i := range batches {
-		if err := t.checkWriteDataset(batches[i].Dataset); err != nil {
+		if err := t.checkWrite(batches[i].ObjectId, batches[i].Dataset); err != nil {
 			return nil, err
 		}
 	}
@@ -112,14 +122,14 @@ func (t *techSpace) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 }
 
 func (t *techSpace) Delete(ctx context.Context, batch space.DeleteBatch) (space.ModifyResult, error) {
-	if err := t.checkWriteDataset(batch.Dataset); err != nil {
+	if err := t.checkWrite(batch.ObjectId, batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
 	return t.inner.Delete(ctx, batch)
 }
 
 func (t *techSpace) Upsert(ctx context.Context, batch space.UpsertBatch) (space.UpsertResult, error) {
-	if err := t.checkWriteDataset(batch.Dataset); err != nil {
+	if err := t.checkWrite(batch.ObjectId, batch.Dataset); err != nil {
 		return space.UpsertResult{}, err
 	}
 	return t.inner.Upsert(ctx, batch)

@@ -105,8 +105,9 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 
 // Get reads the object's row from the shared objects collection. An
 // absent or tombstoned row alone is ambiguous (deletion hard-removes
-// the row), so the tree's deleted status decides between ErrNotFound
-// and ErrObjectDeleted.
+// the row, and a live object that never wrote a property has none),
+// so the tree decides: deleted → ErrObjectDeleted, present without a
+// row → a synthetic {id} row, unknown → ErrNotFound.
 func (o *objectService) Get(ctx context.Context, objectId string) (*anyenc.Value, error) {
 	if objectId == "" {
 		return nil, errors.New("spaceimpl: Objects().Get: empty object id")
@@ -134,6 +135,16 @@ func (o *objectService) Get(ctx context.Context, objectId string) (*anyenc.Value
 	}
 	if deleted {
 		return nil, fmt.Errorf("spaceimpl: object %s: %w", objectId, space.ErrObjectDeleted)
+	}
+	present, err := o.parent.store.HasTree(ctx, objectId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: object %s: tree presence: %w", objectId, err)
+	}
+	if present {
+		a := &anyenc.Arena{}
+		row := a.NewObject()
+		row.Set("id", a.NewString(objectId))
+		return row, nil
 	}
 	return nil, fmt.Errorf("spaceimpl: object %s: %w", objectId, space.ErrNotFound)
 }

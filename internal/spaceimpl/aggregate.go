@@ -131,7 +131,9 @@ func (a *aggImpl) MemoryLimit(bytes int) space.Agg { a.memLimit = &bytes; return
 // applied. coll.Aggregate parses (and detaches from) the combined
 // pipeline; parse errors surface from the terminal call.
 func (a *aggImpl) buildAgg(coll anystore.Collection) anystore.AggQuery {
-	aq := coll.Aggregate(a.combined())
+	// The public aggregate surface is a read: $merge/$out sinks would
+	// write store collections past the CRDT and every write fence.
+	aq := coll.Aggregate(a.combined()).ReadOnly()
 	if a.groupLimit != nil {
 		aq = aq.GroupLimit(*a.groupLimit)
 	}
@@ -152,6 +154,9 @@ func (a *aggImpl) buildAgg(coll anystore.Collection) anystore.AggQuery {
 // pipeline — acceptable; the alternative (parse errors reading as
 // internal failures) is worse.
 func classifyAggErr(err error) error {
+	if errors.Is(err, anystore.ErrAggregateReadOnly) {
+		return fmt.Errorf("%w: %v", space.ErrBadPipeline, err)
+	}
 	if err == nil ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, space.ErrBadPipeline) ||

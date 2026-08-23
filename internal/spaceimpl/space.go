@@ -92,6 +92,9 @@ func (s *spaceImpl) indexObjectId(ctx context.Context) (string, error) {
 // any Members().Subscribe / Query).
 func (s *spaceImpl) Info() space.SpaceInfo {
 	ctx := context.Background()
+	if s.tech {
+		return s.techInfo()
+	}
 	rec, ok := s.tsp.Get(ctx, s.id)
 	if !ok {
 		return space.SpaceInfo{Id: s.id}
@@ -168,13 +171,59 @@ func (s *spaceImpl) canWrite(ctx context.Context) bool {
 	return state.Permissions(state.Identity()).CanWrite()
 }
 
-func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
-func (s *spaceImpl) Types() space.TypesAPI           { return s.types }
-func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
+func (s *spaceImpl) Objects() space.ObjectService {
+	if s.tech {
+		return techObjects{s.objects}
+	}
+	return s.objects
+}
 
-func (s *spaceImpl) ACL() space.ACL            { return s.acl }
-func (s *spaceImpl) Members() space.MembersAPI { return s.members }
+func (s *spaceImpl) Types() space.TypesAPI {
+	if s.tech {
+		return techTypes{s.types}
+	}
+	return s.types
+}
+
+func (s *spaceImpl) Properties() space.PropertiesAPI {
+	if s.tech {
+		return unsupportedProperties{}
+	}
+	return s.properties
+}
+
+func (s *spaceImpl) ACL() space.ACL {
+	if s.tech {
+		return unsupportedACL{}
+	}
+	return s.acl
+}
+
+func (s *spaceImpl) Members() space.MembersAPI {
+	if s.tech {
+		return unsupportedMembers{}
+	}
+	return s.members
+}
+
 func (s *spaceImpl) Bundles() space.BundlesAPI { return s.bundles }
+
+// techInfo is the synthetic descriptor of the tech space: it has no
+// registry row (it IS the registry), is owner-only and derived.
+func (s *spaceImpl) techInfo() space.SpaceInfo {
+	info := space.SpaceInfo{
+		Id:        s.id,
+		Type:      techspace.TechSpaceType,
+		SpaceType: techspace.TechSpaceType,
+		Status:    space.StatusActive,
+		OwnRole:   space.PermissionOwner,
+		Derived:   true,
+	}
+	if keys := s.app.AccountKeys(); keys != nil {
+		info.Author = keys.SignKey.GetPublic().Account()
+	}
+	return info
+}
 
 // SyncHeads forces an immediate head-sync (diff) round on this space
 // instead of waiting for the periodic timer. Blocks until the round
@@ -226,18 +275,27 @@ func (s *spaceImpl) Debug() space.DebugAPI {
 // every call; the state lives on the spaceobjects.Store. See
 // space.ChangeIndexAPI.
 func (s *spaceImpl) Changes() space.ChangeIndexAPI {
+	if s.tech {
+		return unsupportedChanges{}
+	}
 	return newChangeIndexAPI(s)
 }
 
 // History returns the version-history surface for this space. See
 // space.HistoryAPI and docs/version-history-proposal.md.
 func (s *spaceImpl) History() space.HistoryAPI {
+	if s.tech {
+		return unsupportedHistory{}
+	}
 	return newHistoryAPI(s)
 }
 
 // ReadState exposes the read/unread tracking surface —
 // space.ReadStateAPI.
 func (s *spaceImpl) ReadState() space.ReadStateAPI {
+	if s.tech {
+		return unsupportedReadState{}
+	}
 	return newReadStateAPI(s)
 }
 
@@ -245,6 +303,9 @@ func (s *spaceImpl) ReadState() space.ReadStateAPI {
 // Constructed on every call; the subscriptions live on the app-level
 // engine. See space.PubSubAPI.
 func (s *spaceImpl) PubSub() space.PubSubAPI {
+	if s.tech {
+		return unsupportedPubSub{}
+	}
 	return NewPubSubAPI(s.app, s.id)
 }
 

@@ -524,6 +524,9 @@ func (b *bundlesAPI) winnerDeleted(ctx context.Context, bd *space.Bundle) bool {
 }
 
 func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {
+	if b.parent.tech {
+		return errUnsupported("Bundles().ResolveLoser")
+	}
 	if bundleId == "" || loserRootId == "" {
 		return fmt.Errorf("spaceimpl: %w: bundle id and loser root id required", space.ErrBundleBadRequest)
 	}

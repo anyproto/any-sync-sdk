@@ -198,6 +198,9 @@ func lazySpaceTypeTag(rec techspace.SpaceIndexRecord) string {
 // No permission gate in v1 — non-writers are rejected by any-sync
 // ACL on the apply path at peers. See PROMPT.md § "Open questions".
 func (s *spaceImpl) SetMetadata(ctx context.Context, req space.SetMetadataRequest) error {
+	if s.tech {
+		return errUnsupported("SetMetadata")
+	}
 	if req.Name == nil && req.Description == nil && req.IconCID == nil {
 		return errors.New("spaceimpl: SetMetadata: at least one field required")
 	}
@@ -268,6 +271,10 @@ func (s *spaceImpl) SpaceIndexObjectId() string {
 // primitive must not create trees, least of all on read-only/guest
 // spaces where the write gate would refuse the same effect.
 func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
+	if s.tech {
+		// The tech index object is the space list itself.
+		return s.parent.WaitListSynced(ctx)
+	}
 	objectId, err := s.indexObjectId(ctx)
 	if err != nil {
 		return err

@@ -119,6 +119,10 @@ type Service struct {
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
+	// techSpace is the restricted handle over the tech space, built on
+	// first Get(techSpaceId). One instance per process: its bundles
+	// API holds per-id install locks.
+	techSpace *spaceImpl
 
 	// spaceIndexIds caches the deterministic spaceIndex object id per
 	// spaceId so SetMetadata / Info-side reads don't re-derive on every
@@ -644,7 +648,13 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 // to receive pushed changes for an arbitrarily long stretch.
 //
 // Mirrors the eager-load that Create / Derive / OneToOne already do.
+//
+// The tech space id returns the restricted tech handle (no registry
+// row, no load, no index wiring) — see space.ErrUnsupported.
 func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) {
+	if id := s.tsp.SpaceId(); id != "" && spaceId == id {
+		return s.techHandle(), nil
+	}
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
@@ -676,6 +686,16 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 		return s.AcceptOneToOne(ctx, spaceId)
 	}
 	return s.load(ctx, spaceId)
+}
+
+// techHandle returns the process-wide tech-space handle.
+func (s *Service) techHandle() *spaceImpl {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.techSpace == nil {
+		s.techSpace = newTechSpace(s.app, s.tsp, s)
+	}
+	return s.techSpace
 }
 
 // MaterializeBlock reports why rec must not be materialized — loaded,

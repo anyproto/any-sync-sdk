@@ -33,7 +33,7 @@ const (
 // Service.Subscribe for live changes.
 type SpaceInfo struct {
 	Id   string
-	Type string // on-wire header type (any.space, any.onetoone, … — never the tech type)
+	Type string // on-wire header type (any.space, any.onetoone, …; the tech type only on the tech handle)
 	// SpaceType is the app-level tag set via DeriveRequest.SpaceType,
 	// read from the in-space spaceIndex. Independent of the header Type;
 	// use it for client-side classification/filtering. Untagged spaces

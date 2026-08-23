@@ -26,6 +26,7 @@ func TestSentinelMessages(t *testing.T) {
 		{ErrDuplicateInvite, "duplicate invites"},
 		{ErrInsufficientPermissions, "insufficient permissions"},
 		{ErrAclRecordNotFound, "no such record"},
+		{ErrUnsupported, "unsupported on this space"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(c.err.Error(), c.phrase) {

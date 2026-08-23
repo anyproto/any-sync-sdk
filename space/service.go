@@ -193,6 +193,13 @@ type Service interface {
 	// another of the account's devices (synced remote=active) is adopted
 	// transparently: Get materializes it locally, no per-device
 	// re-accept needed.
+	//
+	// The account's own tech space id (SDK.TechSpaceId) returns a
+	// restricted handle: reads, dataset declarations on bundle roots,
+	// derived-only Bundles() and generic record writes work; the
+	// system datasets are read-only through it and every lifecycle
+	// surface (objects, types, members, ACL, files, history, …)
+	// returns ErrUnsupported. It never appears in List / Subscribe.
 	Get(ctx context.Context, spaceId string) (Space, error)
 
 	// Track registers a foreign spaceId in the local space index without

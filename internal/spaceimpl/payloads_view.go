@@ -20,6 +20,9 @@ type payloadsView struct {
 
 // Payloads returns the read-only payloads view. See space.PayloadsView.
 func (s *spaceImpl) Payloads() space.PayloadsView {
+	if s.tech {
+		return unsupportedPayloads{}
+	}
 	return &payloadsView{s: s, keys: &aclKeyProvider{s: s}}
 }
 

@@ -1,6 +1,15 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrUnsupported is returned by every surface the tech-space handle
+// (Service.Get(techSpaceId)) does not offer: object and type
+// lifecycle, members and ACL, files, history, read state, pub/sub,
+// change feed, metadata. Classify with errors.Is.
+var ErrUnsupported = errors.New("space: unsupported on this space")
 
 // SetMetadataRequest is the input to Space.SetMetadata. Pointer
 // semantics: nil = leave-unchanged; non-nil empty string = set-empty.

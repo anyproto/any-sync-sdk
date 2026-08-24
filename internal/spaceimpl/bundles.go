@@ -135,12 +135,11 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 			if err := b.stampRootName(ctx, rootId, req, true); err != nil {
 				return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 			}
-		} else if len(req.Datasets) > 0 {
-			// A created-root install cannot carry declarations (its
-			// losers would each carry their own); say so instead of
-			// returning an install the caller's datasets never reach.
-			return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: bundle %q is installed on a created root; Datasets apply to derived roots only", space.ErrBundleBadRequest, req.Id)
 		}
+		// A created winner needs no heal: its install wrote types,
+		// declarations and stamp before registering, and they arrive
+		// with its tree. The datasets in this request are the caller's
+		// canonical declaration; the winner's copy governs.
 		return bd, false, nil
 	}
 
@@ -151,10 +150,8 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	// Declarations land before the registering write for the same
 	// reason RootProperties do: a failed declaration leaves no install
 	// to adopt, and the retry declares only what is still missing.
-	if req.DerivedRoot {
-		if err := b.declareDatasets(ctx, rootId, req.Datasets); err != nil {
-			return space.Bundle{}, false, err
-		}
+	if err := b.declareDatasets(ctx, rootId, req.Datasets); err != nil {
+		return space.Bundle{}, false, err
 	}
 	// Stamp the root with the bundle name so its tree always carries a
 	// non-root change: any-sync's head-sync diff skips a tree still
@@ -211,11 +208,15 @@ func validateEnsureRequest(req space.EnsureBundleRequest) error {
 			return fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
 		}
 	} else {
-		if req.NewRoot == nil {
-			return fmt.Errorf("spaceimpl: %w: NewRoot required", space.ErrBundleBadRequest)
+		// NewRoot == nil is the SDK-minted created root: Ensure creates
+		// a bare object and stamps it as its own type — the only shape
+		// a space whose free object create is fenced (the tech space)
+		// can use. Datasets give that root its purpose.
+		if req.NewRoot == nil && len(req.Datasets) == 0 {
+			return fmt.Errorf("spaceimpl: %w: NewRoot or Datasets required", space.ErrBundleBadRequest)
 		}
-		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 || len(req.Datasets) > 0 {
-			return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties/Datasets apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
+		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
+			return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
 		}
 	}
 	return validateBundleDatasets(req.Datasets)
@@ -238,12 +239,22 @@ func (b *bundlesAPI) preflightDatasets(ctx context.Context, req space.EnsureBund
 	if _, self := req.RootProperties[canonical]; self {
 		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — a self-typed root has no property definitions", space.ErrBundleBadRequest)
 	}
+	// A name owned by this bundle's OWN root is not a conflict: the
+	// canonical derived id covers derived installs, the registry's
+	// live winner covers created ones (its id is minted at install, so
+	// only the row can name it).
+	own := map[string]bool{canonical: true}
+	if obj, err := b.indexObj(ctx); err == nil {
+		if bd, live := b.view(ctx, obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id)); live && bd.RootId != "" {
+			own[bd.RootId] = true
+		}
+	}
 	for i := range req.Datasets {
 		name := req.Datasets[i].Name
 		if _, err := b.parent.store.DataVersion(name); err == nil {
 			return fmt.Errorf("spaceimpl: %w: dataset name %q is reserved by the store", space.ErrBundleBadRequest, name)
 		}
-		if existing, ok := b.parent.store.RuntimeDataset(name); ok && existing.TypeId != canonical {
+		if existing, ok := b.parent.store.RuntimeDataset(name); ok && !own[existing.TypeId] {
 			return fmt.Errorf("spaceimpl: %w: dataset name %q is already defined on type %q — names are unique per space", space.ErrBundleBadRequest, name, existing.TypeId)
 		}
 	}
@@ -328,22 +339,43 @@ func (b *bundlesAPI) mintRoot(ctx context.Context, req space.EnsureBundleRequest
 		return rootId, nil
 	}
 
-	rootId, err := req.NewRoot(ctx)
-	if err != nil {
-		return "", fmt.Errorf("spaceimpl: bundles: NewRoot: %w", err)
+	var rootId string
+	if req.NewRoot == nil {
+		// SDK-minted created root (validate guaranteed Datasets).
+		id, err := b.parent.objects.Create(ctx, space.CreateObjectOpts{})
+		if err != nil {
+			return "", fmt.Errorf("spaceimpl: bundles: create root: %w", err)
+		}
+		rootId = id
+	} else {
+		id, err := req.NewRoot(ctx)
+		if err != nil {
+			return "", fmt.Errorf("spaceimpl: bundles: NewRoot: %w", err)
+		}
+		if id == "" {
+			return "", fmt.Errorf("spaceimpl: %w: NewRoot returned an empty id", space.ErrBundleBadRequest)
+		}
+		derived, present, derr := b.parent.store.TreeIsDerived(ctx, id)
+		if derr != nil {
+			return "", fmt.Errorf("spaceimpl: bundles: verify root %q: %w", id, derr)
+		}
+		if !present {
+			return "", fmt.Errorf("spaceimpl: %w: root %q has no local tree — create it with Objects().Create in this space", space.ErrBundleBadRequest, id)
+		}
+		if derived {
+			return "", fmt.Errorf("spaceimpl: %w: root %q is a derived object — a created root is required, or ask for DerivedRoot", space.ErrBundleBadRequest, id)
+		}
+		rootId = id
 	}
-	if rootId == "" {
-		return "", fmt.Errorf("spaceimpl: %w: NewRoot returned an empty id", space.ErrBundleBadRequest)
-	}
-	derived, present, derr := b.parent.store.TreeIsDerived(ctx, rootId)
-	if derr != nil {
-		return "", fmt.Errorf("spaceimpl: bundles: verify root %q: %w", rootId, derr)
-	}
-	if !present {
-		return "", fmt.Errorf("spaceimpl: %w: root %q has no local tree — create it with Objects().Create in this space", space.ErrBundleBadRequest, rootId)
-	}
-	if derived {
-		return "", fmt.Errorf("spaceimpl: %w: root %q is a derived object — a created root is required, or ask for DerivedRoot", space.ErrBundleBadRequest, rootId)
+	// A datasets-carrying created root is its own type, like the
+	// derived path: the marker plus its own id. $addToSet, so a NewRoot
+	// that already attached them is untouched.
+	if len(req.Datasets) > 0 {
+		for _, t := range []string{typetype.MetaTypeMarker, rootId} {
+			if _, err := b.parent.properties.AttachType(ctx, rootId, t); err != nil {
+				return "", fmt.Errorf("spaceimpl: bundles: self-type root %q: %w", rootId, err)
+			}
+		}
 	}
 	return rootId, nil
 }

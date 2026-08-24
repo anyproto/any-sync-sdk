@@ -31,7 +31,7 @@ func newTechSpace(app *anysyncx.App, tsp *techspace.Service, parent *Service) *t
 	inner := newSpace(tsp.SpaceId(), app, tsp, tsp.Store(), parent)
 	inner.techIndexId = tsp.IndexObjectId()
 	t := &techSpace{inner: inner, tsp: tsp, parent: parent}
-	t.objects = techObjects{inner.objects}
+	t.objects = techObjects{objectService: inner.objects, t: t}
 	t.types = techTypes{inner: inner.types, t: t}
 	t.bundles = techBundles{inner.bundles}
 	return t
@@ -164,9 +164,26 @@ func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, er
 	return marker && self, nil
 }
 
-// techObjects keeps Get (a local row read) and refuses lifecycle:
-// tech-space objects exist only as bundle roots.
-type techObjects struct{ *objectService }
+// techObjects keeps Get (a local row read) and refuses free lifecycle:
+// tech-space objects exist only as bundle roots. Delete is allowed for
+// exactly those — a deleted created winner reads as uninstalled, which
+// is how a bundle uninstalls; a derived root stays undeletable (the
+// object layer refuses derived deletion).
+type techObjects struct {
+	*objectService
+	t *techSpace
+}
+
+func (x techObjects) Delete(ctx context.Context, objectId string) error {
+	ok, err := x.t.isBundleRoot(ctx, objectId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: tech Objects().Delete: %w", err)
+	}
+	if !ok {
+		return errUnsupported("Objects().Delete (non-bundle-root)")
+	}
+	return x.objectService.Delete(ctx, objectId)
+}
 
 func (techObjects) Create(context.Context, space.CreateObjectOpts) (string, error) {
 	return "", errUnsupported("Objects().Create")
@@ -174,7 +191,6 @@ func (techObjects) Create(context.Context, space.CreateObjectOpts) (string, erro
 func (techObjects) Derive(context.Context, space.DeriveObjectOpts) (string, error) {
 	return "", errUnsupported("Objects().Derive")
 }
-func (techObjects) Delete(context.Context, string) error { return errUnsupported("Objects().Delete") }
 
 // techTypes keeps reads, and the dataset-declaration methods for
 // bundle roots only (a bundle root is a type; its datasets evolve
@@ -260,17 +276,27 @@ func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	return x.bundlesAPI.Ensure(ctx, req)
 }
 
-func (techBundles) ResolveLoser(context.Context, string, string) error {
-	return errUnsupported("Bundles().ResolveLoser")
+func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {
+	// Load-bearing with created roots: two devices installing while
+	// apart fork, and the losing root must be resolvable here like in
+	// any space. The delete runs on the inner object service — the
+	// public techObjects fence is about free lifecycle, not this.
+	return x.bundlesAPI.ResolveLoser(ctx, bundleId, loserRootId)
 }
 
 // validateTechEnsureRequest adds the tech-space rules on top of the
-// structural gate: derived-only, Datasets required, no foreign types
-// (a type from another space would stamp a DataVersion the tech space
-// can never satisfy on a device that lacks that space).
+// structural gate: Datasets required (the root is its own type — that
+// declaration is the install), roots minted by Ensure only (free
+// object create is fenced, so NewRoot has nothing legal to call), and
+// no foreign types (a type from another space would stamp a
+// DataVersion the tech space can never satisfy on a device that lacks
+// that space). Both root strategies are allowed: DerivedRoot for
+// bundles that must never fork or uninstall, the SDK-minted created
+// root for ordinary app installs (deletable; concurrent offline
+// installs fork and resolve like in any space).
 func validateTechEnsureRequest(req space.EnsureBundleRequest) error {
-	if !req.DerivedRoot || req.NewRoot != nil {
-		return fmt.Errorf("spaceimpl: %w: tech-space bundles are derived-only", space.ErrBundleBadRequest)
+	if req.NewRoot != nil {
+		return fmt.Errorf("spaceimpl: %w: NewRoot is not available on the tech space — Ensure mints the root", space.ErrBundleBadRequest)
 	}
 	if len(req.Datasets) == 0 {
 		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Datasets", space.ErrBundleBadRequest)

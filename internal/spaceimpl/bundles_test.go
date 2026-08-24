@@ -39,11 +39,14 @@ func TestValidateEnsureRequest(t *testing.T) {
 		{name: "derived with datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}}},
 		{name: "both strategies", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, NewRoot: newRoot}, bad: true},
 		{name: "no strategy", req: space.EnsureBundleRequest{Id: "b"}, bad: true},
-		{name: "datasets on created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Datasets: []space.DatasetDraft{entriesDraft()}}, bad: true},
+		{name: "created root with datasets", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Datasets: []space.DatasetDraft{entriesDraft()}}},
+		{name: "sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Datasets: []space.DatasetDraft{entriesDraft()}}},
+		{name: "created root with root types", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, RootTypes: []string{"t"}}, bad: true},
 		{name: "invalid draft", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{{Name: "_private"}}}, bad: true},
 		{name: "duplicate name", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft(), entriesDraft()}}, bad: true},
 		{name: "tech derived with datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}}, tech: true},
-		{name: "tech created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot}, tech: true, bad: true},
+		{name: "tech caller-created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Datasets: []space.DatasetDraft{entriesDraft()}}, tech: true, bad: true},
+		{name: "tech sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Datasets: []space.DatasetDraft{entriesDraft()}}, tech: true},
 		{name: "tech without datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}, tech: true, bad: true},
 		{name: "tech with root types", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}, RootTypes: []string{"t"}}, tech: true, bad: true},
 		{name: "tech with root properties", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}, RootProperties: map[string]map[string]any{"t": {"a": 1}}}, tech: true, bad: true},
@@ -72,7 +75,11 @@ func TestEnsure_BadRequestBeforeStore(t *testing.T) {
 	tb := techBundles{b}
 	_, _, err = tb.Ensure(context.Background(), space.EnsureBundleRequest{Id: "b", DerivedRoot: true})
 	require.ErrorIs(t, err, space.ErrBundleBadRequest)
-	require.ErrorIs(t, tb.ResolveLoser(context.Background(), "b", "r"), space.ErrUnsupported)
+	_, _, err = tb.Ensure(context.Background(), space.EnsureBundleRequest{
+		Id: "b", NewRoot: func(context.Context) (string, error) { return "r", nil },
+		Datasets: []space.DatasetDraft{entriesDraft()},
+	})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "NewRoot is refused on the tech space")
 }
 
 func TestDerivedRootTypes(t *testing.T) {

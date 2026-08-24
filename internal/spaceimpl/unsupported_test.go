@@ -81,7 +81,9 @@ func TestTechWrappers_RefuseLifecycle(t *testing.T) {
 	assert.ErrorIs(t, err, space.ErrUnsupported)
 	_, err = o.Derive(ctx, space.DeriveObjectOpts{})
 	assert.ErrorIs(t, err, space.ErrUnsupported)
-	assert.ErrorIs(t, o.Delete(ctx, "x"), space.ErrUnsupported)
+	// Delete is conditional now — refused for non-bundle-roots, allowed
+	// for created bundle roots (uninstall). Needs a store to decide;
+	// covered by the tech bundles e2e.
 
 	ty := techTypes{}
 	_, err = ty.Create(ctx, space.TypeCreateParams{})

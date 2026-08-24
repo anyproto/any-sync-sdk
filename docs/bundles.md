@@ -174,9 +174,13 @@ lives in records, not in child objects.
   `_ver.id`), so every replica converges on one definition. A `DefId`
   read on the losing device before sync changes after it: look
   definitions up by name when evolving them.
-- `DerivedRoot` only (a created root's losers would each carry their
-  own declarations). Accepted in every space; required on the tech
-  space.
+- Both root strategies carry declarations. A derived root declares at
+  every device's own materialization (idempotent, converges); a created
+  root declares once at install and the declaration travels with its
+  tree. Concurrent created installs fork into roots that each carry
+  their own copy — clients merging a loser's records write them through
+  the winner's declaration, then `ResolveLoser` deletes the loser,
+  declarations included.
 - `RootProperties` keyed by the root's own id are rejected: the
   self-type grants a dataset namespace, not property definitions.
 
@@ -186,11 +190,19 @@ Account-level product data (favourites, pinned items, personal
 settings objects) lives in bundles on the tech space, reached through
 `Spaces().Get(SDK.TechSpaceId())` — the restricted handle described in
 `02-tech-space.md`. Same registry (`bundles` on the tech index object),
-same `Ensure` / `Get` / `List` / `DerivedRootId`, with two rules:
-derived-only (`NewRoot` is refused, `ResolveLoser` is unsupported) and
-`Datasets` required. Bundle ids are a versioned vocabulary
-(`favorites/v1`), never a scratch namespace: derived trees cannot be
-deleted.
+same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`, with
+two rules: roots are minted by `Ensure` only (`NewRoot` is refused —
+free object create is fenced on the tech handle; omit both strategies
+and `Ensure` creates the root itself), and `Datasets` required. Both
+strategies are available: `DerivedRoot` for bundles that must never
+fork or uninstall; the SDK-minted created root for ordinary app
+installs — deletable (`Objects().Delete` is allowed on bundle roots:
+deleting the created winner reads as uninstalled; a derived root stays
+undeletable at the object layer), forking on concurrent offline
+installs and resolving like in any space (the account is always owner,
+so the convergence wait's owner escape always applies on expiry).
+Bundle ids are a versioned vocabulary (`favorites/v1`), never a
+scratch namespace.
 
 Restore on a second device: `WaitListSynced` → `Spaces().Get(TechSpaceId())`
 → `WaitIndexSynced` (delegates to the list gate) → `Bundles().Get` /
@@ -207,7 +219,9 @@ account's devices and nobody else.
   for `DerivedRoot`) and one change registers it. The returned winner is
   provisional until the space syncs — unless it is derived, which is the
   same on every device by construction. `Datasets` declares runtime
-  datasets on a derived root (see § Bundle datasets).
+  datasets on the root — derived or created (see § Bundle datasets);
+  with neither `NewRoot` nor `DerivedRoot`, `Ensure` mints a created
+  root itself and stamps it as its own type.
 - `DerivedRootId` — the canonical derived root id for a bundle id. Pure
   computation: no registry read, no materialization, no network.
 - `Get` / `List` — read the registry with `Losers` computed.

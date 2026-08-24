@@ -113,13 +113,14 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	})
 	require.Error(t, err, "device A: system datasets are typed-API-only")
 
-	// Bundles are derived-only and must declare datasets.
+	// Bundles must declare datasets; roots are minted by Ensure only.
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: bundleId, DerivedRoot: true})
 	require.ErrorIs(t, err, space.ErrBundleBadRequest, "tech bundle without Datasets")
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, NewRoot: func(context.Context) (string, error) { return "r", nil },
+		Datasets: []space.DatasetDraft{entriesDatasetDraft()},
 	})
-	require.ErrorIs(t, err, space.ErrBundleBadRequest, "tech bundle with a created root")
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "tech bundle with a caller-created root")
 
 	wantRoot, err := techA.Bundles().DerivedRootId(ctx, bundleId)
 	require.NoError(t, err)
@@ -201,6 +202,50 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 		Id: "other/v1", DerivedRoot: true, Datasets: []space.DatasetDraft{{Name: "spaces", IdRule: space.IdUser}},
 	})
 	require.ErrorIs(t, err, space.ErrBundleBadRequest, "reserved dataset name")
+
+	// Created-root install: no DerivedRoot, no NewRoot — Ensure mints
+	// the root, stamps it as its own type, declares. Deletable, so it
+	// is the ordinary shape for app installs.
+	pinsDraft := entriesDatasetDraft()
+	pinsDraft.Name = "pins"
+	pins, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "pins/v1", Name: "Pins",
+		Datasets: []space.DatasetDraft{pinsDraft},
+	})
+	require.NoError(t, err, "device A: Ensure(pins/v1) created root")
+	require.True(t, didInstall)
+	require.False(t, pins.Derived)
+	require.NotEmpty(t, pins.RootId)
+	prow, err := techA.Objects().Get(ctx, pins.RootId)
+	require.NoError(t, err)
+	var ptypes []string
+	for _, v := range prow.GetArray("any", "types") {
+		ptypes = append(ptypes, string(v.GetStringBytes()))
+	}
+	assert.Contains(t, ptypes, "__type__")
+	assert.Contains(t, ptypes, pins.RootId, "created root implements itself")
+	_, err = techA.Upsert(ctx, space.UpsertBatch{
+		ObjectId: pins.RootId, Dataset: "pins",
+		Records: []space.UpsertRecord{{Id: "any://o/two", Fields: map[string]any{"title": "Two"}}},
+	})
+	require.NoError(t, err, "device A: records on the created root")
+	padopt, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "pins/v1", Datasets: []space.DatasetDraft{pinsDraft},
+	})
+	require.NoError(t, err)
+	require.False(t, didInstall, "re-ensure adopts")
+	require.Equal(t, pins.RootId, padopt.RootId)
+	// ResolveLoser is wired (the winner is refused as a loser, not
+	// ErrUnsupported); uninstall = delete the created winner, after
+	// which the id reads as uninstalled and a fresh install works.
+	err = techA.Bundles().ResolveLoser(ctx, "pins/v1", pins.RootId)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, space.ErrUnsupported, "ResolveLoser must be wired on the tech handle")
+	require.NoError(t, techA.Objects().Delete(ctx, pins.RootId), "uninstall: delete the created winner")
+	_, err = techA.Bundles().Get(ctx, "pins/v1")
+	require.ErrorIs(t, err, space.ErrBundleUnknown, "deleted winner reads as uninstalled")
+	require.Error(t, techA.Objects().Delete(ctx, wantRoot),
+		"a DERIVED bundle root stays undeletable (any-sync refuses derived deletion)")
 
 	// Dataset mutators reach bundle roots only.
 	_, err = techA.Types().AddDataset(ctx, techA.SpaceIndexObjectId(), entriesDatasetDraft())

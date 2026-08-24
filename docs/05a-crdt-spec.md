@@ -562,7 +562,7 @@ handler.Dataset{
 }
 ```
 
-Internally (and for the tech space's raw mode) the same bundle is a
+Internally (and for the tech space's system datasets) the same bundle is a
 `crdt.HandlerReg`, which additionally carries the handler `Version`
 persisted per collection for re-index decisions. A registration with a
 declared `Schema` and a nil `Handler` gets the SDK's generic schema

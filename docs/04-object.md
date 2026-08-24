@@ -114,6 +114,7 @@ Changes are signed by the creator's key and optionally encrypted with the space 
 space.Objects().Create(opts)
 space.Objects().Derive(opts)
 space.Objects().Delete(objectId)
+space.Objects().Get(objectId)   // the objects row; ErrNotFound / ErrObjectDeleted
 
 // Reads + live updates: chained query builder on the Space.
 space.Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe
@@ -126,6 +127,7 @@ space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|
 - **Deletion**:
   - Remote delete → SDK listens to the settings tree, deletes local data accordingly
   - Local delete → SDK adds entry to settings tree (any-sync side) + deletes local data
+  - The objects row is hard-removed, so an absent row alone does not say whether the id ever existed. `Objects().Get` consults the tree's deleted status and returns `ErrObjectDeleted` for a deleted object, `ErrNotFound` otherwise
 - **No restore / time window** — a separate "bin" mechanism will be built later, based on system object properties. Not part of the Object layer
 
 ### Snapshots

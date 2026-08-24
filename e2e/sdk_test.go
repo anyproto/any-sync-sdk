@@ -506,8 +506,17 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	})
 	require.Error(t, err)
 
+	// Objects.Get reads the row; an unknown id is not found.
+	row, err := sp.Objects().Get(ctx, objectId)
+	require.NoError(t, err)
+	require.Equal(t, objectId, row.GetString("id"))
+	_, err = sp.Objects().Get(ctx, "bafy-no-such-object")
+	require.ErrorIs(t, err, space.ErrNotFound)
+
 	// Objects.Delete: marks the tree deleted via settings tree, drops
-	// our cached state. After this, Get on the deleted id returns an
-	// any-sync deletion error.
+	// our cached state. After this, Get on the deleted id reports the
+	// deletion, distinct from an unknown id.
 	require.NoError(t, sp.Objects().Delete(ctx, objectId))
+	_, err = sp.Objects().Get(ctx, objectId)
+	require.ErrorIs(t, err, space.ErrObjectDeleted)
 }

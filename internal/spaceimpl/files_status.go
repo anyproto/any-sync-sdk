@@ -43,7 +43,10 @@ func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
 	if err != nil {
 		return err
 	}
-	impl := sp.(*spaceImpl)
+	impl, ok := sp.(*spaceImpl)
+	if !ok {
+		return fmt.Errorf("spaceimpl: RunFileJob: %s has no file surface", job.SpaceId)
+	}
 	pa := impl.PayloadsInternal()
 	row, err := pa.FindRow(ctx, job.FileId)
 	if errors.Is(err, space.ErrNotFound) {
@@ -151,7 +154,11 @@ func (s *Service) OnFileJobChange(job status.Job, _ bool) {
 	if err != nil {
 		return
 	}
-	st, err := sp.(*spaceImpl).fileStatus(ctx, job.FileId)
+	impl, ok := sp.(*spaceImpl)
+	if !ok {
+		return
+	}
+	st, err := impl.fileStatus(ctx, job.FileId)
 	if err != nil {
 		return
 	}
@@ -166,7 +173,10 @@ func (s *Service) SpaceFiles(ctx context.Context, spaceId string) (map[string]bo
 	if err != nil {
 		return nil, err
 	}
-	impl := sp.(*spaceImpl)
+	impl, ok := sp.(*spaceImpl)
+	if !ok {
+		return nil, fmt.Errorf("spaceimpl: SpaceFiles: %s has no file surface", spaceId)
+	}
 	pa := impl.PayloadsInternal()
 	objIds, err := impl.store.TreeIdsByChangeType(ctx, payloads.ChangeType)
 	if err != nil {
@@ -193,7 +203,11 @@ func (s *Service) ResolveIntent(ctx context.Context, spaceId, ownerId string, ro
 	if err != nil {
 		return "", false, err
 	}
-	rows, err := sp.(*spaceImpl).PayloadsInternal().ListRows(ctx, ownerId)
+	impl, ok := sp.(*spaceImpl)
+	if !ok {
+		return "", false, fmt.Errorf("spaceimpl: ResolveIntent: %s has no file surface", spaceId)
+	}
+	rows, err := impl.PayloadsInternal().ListRows(ctx, ownerId)
 	if err != nil {
 		return "", false, err
 	}

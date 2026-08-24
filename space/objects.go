@@ -1,11 +1,29 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
 
-// ObjectService is the object lifecycle surface on a space.
-// Create/Derive/Delete only — reads, writes, and subscriptions happen
-// at the space level keyed by objectId.
+	"github.com/anyproto/any-store/v2/anyenc"
+)
+
+// ErrObjectDeleted is returned by ObjectService.Get for an object
+// whose tree any-sync records as deleted — here or on a peer. Distinct
+// from ErrNotFound: the id existed and is gone for good.
+var ErrObjectDeleted = errors.New("space: object deleted")
+
+// ObjectService is the object lifecycle surface on a space, plus the
+// single-object row read. Record reads, writes and subscriptions
+// happen at the space level keyed by objectId.
 type ObjectService interface {
+	// Get returns the object's row from the per-space objects
+	// collection (any.types and property values). An object whose tree
+	// is present locally but that never wrote a row returns {id} only;
+	// ErrNotFound when the id is unknown here, ErrObjectDeleted when
+	// the object's tree is deleted — both read from the space's
+	// any-sync storage.
+	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
+
 	// Create a fresh object. Returns the any-sync-assigned objectId.
 	// Types attached here seed the object's any.types list at birth;
 	// InitialProperties seeds the per-space properties record.

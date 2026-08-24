@@ -160,15 +160,15 @@ func TestReadSyncGate_ReconcileAllDeadSpace(t *testing.T) {
 		st := spaceobjects.NewStoreWithConfig(spaceobjects.StoreConfig{
 			DB:      db,
 			SpaceId: spaceId,
-			// Raw mode with one read-tracked dataset so ReadState() is live.
-			Handlers: []crdt.HandlerReg{{
+			// One read-tracked system dataset so ReadState() is live.
+			SystemDatasets: []spaceobjects.SystemDataset{{Reg: crdt.HandlerReg{
 				Name: "msgs",
 				ReadTracking: &crdt.ReadTracking{
 					Classify: func(*crdt.ChangeCtx, *crdt.RecordChange) crdt.ReadClassification {
 						return crdt.ReadClassification{}
 					},
 				},
-			}},
+			}}},
 		})
 		// First-touch drain kick, same as spaceimpl.storeFor — the side
 		// effect that open-or-creates `<spaceId>__detached`.

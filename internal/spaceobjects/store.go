@@ -165,7 +165,7 @@ type Store struct {
 	datasetOwners map[string]string
 
 	// catalog is the runtime dataset snapshot compiled from type
-	// objects' `datasets` records (SYN-147). Nil in raw mode. Readers
+	// objects' `datasets` records. Readers
 	// take the copy-on-write snapshot lock-free; refreshed only when a
 	// dataset-defs change applies. See catalog.go.
 	catalog *runtimeCatalog
@@ -241,17 +241,16 @@ type Store struct {
 	// first-sight seeding — see SetSeedHeadsProvider.
 	seedHeads SeedHeadsProvider
 
-	// customHandlers, when non-nil, makes this a "raw" store: every
-	// controller registers EXACTLY these handlers (no shared `objects`
-	// collection, no built-in properties/typetype/shortIds regs, no
-	// extTypes). Used by the tech space, whose index object holds its
-	// own datasets (spaces/profile) with bespoke handlers rather than
-	// the regular type/properties model. reg is nil in this mode.
-	customHandlers []crdt.HandlerReg
-	// disableGate skips the schema-gate on every object. Set together
-	// with customHandlers — the gate is a registry/type-system concept
-	// the tech space doesn't participate in.
-	disableGate bool
+	// systemRegs are per-store type-less built-ins registered on every
+	// controller after the shared built-in set — the tech space's
+	// spaces/profile/devices/… datasets. Ungated like payloads/bundles:
+	// no owner, a hardcoded DataVersion stamp, rows only on the objects
+	// that write them by convention.
+	systemRegs []crdt.HandlerReg
+	// disableHistory keeps the history index closed for this store:
+	// no eager open, no apply hook, no purge bookkeeping. Set for the
+	// tech space, which has no history surface.
+	disableHistory bool
 
 	// selective is the selective-sync tree-type allowlist (root
 	// changeType → allowed). Nil/empty = sync everything. See
@@ -320,11 +319,19 @@ func loadPayloadFromCtx(ctx context.Context) *treestorage.TreeStorageCreatePaylo
 	return p
 }
 
-// StoreConfig is the input to NewStoreWithConfig. It carries both the
-// regular type/properties path (ExtTypes) and the "raw" tech-space path
-// (Handlers + DisableGate + DataVersions). Exactly one path is active:
-// when Handlers is non-nil the store skips the LiveRegistry, the shared
-// `objects` collection, the built-in handler set, and the schema gate.
+// SystemDataset is a per-store type-less built-in: a handler
+// registered on every controller of that store plus the hardcoded
+// DataVersion its writers stamp. The tech space registers its
+// spaces/profile/devices/… datasets this way.
+type SystemDataset struct {
+	Reg         crdt.HandlerReg
+	DataVersion string
+}
+
+// StoreConfig is the input to NewStoreWithConfig. Every store runs the
+// same path: LiveRegistry, shared `objects` collection, built-in
+// handler set, runtime dataset catalog, schema gate. ExtTypes and
+// SystemDatasets extend the handler set.
 type StoreConfig struct {
 	App     *anysyncx.App
 	DB      anystore.DB
@@ -332,15 +339,15 @@ type StoreConfig struct {
 	SpaceId string
 	Alloc   *object.VersionAllocator
 
-	// ExtTypes is the caller-supplied type catalog (regular path).
+	// ExtTypes is the caller-supplied type catalog.
 	ExtTypes []handler.Type
 
-	// Handlers, when non-nil, switches the store to raw mode: every
-	// controller registers EXACTLY these handlers. DataVersions then
-	// supplies the dataset → DataVersion stamp (no built-ins).
-	Handlers     []crdt.HandlerReg
-	DisableGate  bool
-	DataVersions map[string]string
+	// SystemDatasets are extra ungated built-ins for this store.
+	SystemDatasets []SystemDataset
+
+	// DisableHistory keeps the history index closed — for stores with
+	// no history surface (the tech space).
+	DisableHistory bool
 
 	// SelectiveTypes is the selective-sync tree-type allowlist. Only
 	// the regular-space path (NewStore) sets it — the tech space is
@@ -389,10 +396,7 @@ func (s *Store) CheckWrite() error {
 }
 
 // NewStoreWithConfig constructs a Store from cfg. The async drainer is
-// built and started here — it lives until Close. The subscribe engine
-// is always built (both paths support Query.Subscribe). In raw mode
-// (cfg.Handlers != nil) the LiveRegistry is nil and the schema gate is
-// disabled — see newController / loadObject.
+// built and started here — it lives until Close.
 func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s := &Store{
 		app:            cfg.App,
@@ -403,8 +407,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		engine:         subscribe.New(cfg.SpaceId),
 		changeSubs:     fanout.New[ObjectChange](),
 		rowEvents:      fanout.New[RowEvent](),
-		customHandlers: cfg.Handlers,
-		disableGate:    cfg.DisableGate,
+		disableHistory: cfg.DisableHistory,
 	}
 	if len(cfg.SelectiveTypes) > 0 {
 		s.selective = make(map[string]struct{}, len(cfg.SelectiveTypes))
@@ -412,40 +415,40 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 			s.selective[t] = struct{}{}
 		}
 	}
-	if cfg.Handlers != nil {
-		// Raw mode: no registry, no built-in dataset versions; the
-		// caller's DataVersions are authoritative.
-		s.dataVersions = cfg.DataVersions
-	} else {
-		dv := make(map[string]string, len(builtinDataVersions))
-		for k, v := range builtinDataVersions {
-			dv[k] = v
-		}
-		owners := make(map[string]string)
-		for _, t := range cfg.ExtTypes {
-			for _, d := range t.Datasets {
-				dv[d.Name] = d.DataVersion
-				owners[d.Name] = t.Id
-			}
-		}
-		s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes))
-		s.extTypes = cfg.ExtTypes
-		s.dataVersions = dv
-		s.datasetOwners = owners
-		s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
-		for _, t := range cfg.ExtTypes {
-			for _, d := range t.Datasets {
-				if d.Handler != nil {
-					continue
-				}
-				if sh, err := crdt.NewSchemaHandler(datasetSchema(d)); err == nil {
-					s.staticSchemaHandlers[d.Name] = sh
-				}
-			}
-		}
-		s.catalog = newRuntimeCatalog()
-		s.initCatalog(context.Background())
+	dv := make(map[string]string, len(builtinDataVersions))
+	for k, v := range builtinDataVersions {
+		dv[k] = v
 	}
+	owners := make(map[string]string)
+	for _, t := range cfg.ExtTypes {
+		for _, d := range t.Datasets {
+			dv[d.Name] = d.DataVersion
+			owners[d.Name] = t.Id
+		}
+	}
+	// System datasets get a stamp but no owner: DatasetOwner stays
+	// false, so the type-membership check is a no-op for them.
+	for _, sd := range cfg.SystemDatasets {
+		dv[sd.Reg.Name] = sd.DataVersion
+		s.systemRegs = append(s.systemRegs, sd.Reg)
+	}
+	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes))
+	s.extTypes = cfg.ExtTypes
+	s.dataVersions = dv
+	s.datasetOwners = owners
+	s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
+	for _, t := range cfg.ExtTypes {
+		for _, d := range t.Datasets {
+			if d.Handler != nil {
+				continue
+			}
+			if sh, err := crdt.NewSchemaHandler(datasetSchema(d)); err == nil {
+				s.staticSchemaHandlers[d.Name] = sh
+			}
+		}
+	}
+	s.catalog = newRuntimeCatalog()
+	s.initCatalog(context.Background())
 	s.applySeqs = crdt.NewApplySeqAllocator(func(ctx context.Context) (uint64, error) {
 		coll, err := s.applySeqMeta(ctx)
 		if err != nil {
@@ -456,7 +459,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	if s.signKey != nil {
 		s.selfIdentity = s.signKey.GetPublic().Account()
 	}
-	s.readTracking = buildReadTracking(s.extTypes, s.customHandlers)
+	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs)
 	if len(s.readTracking) > 0 {
 		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
 		if needsReadMaterializer(s.readTracking) {
@@ -679,18 +682,14 @@ type NamedSchema struct {
 // the same schemas its controllers enforce. Used by the space layer to
 // expose dataset discovery to consumers.
 func (s *Store) Schemas() []NamedSchema {
-	if s.customHandlers != nil {
-		out := make([]NamedSchema, 0, len(s.customHandlers))
-		for _, h := range s.customHandlers {
-			out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
-		}
-		return out
-	}
 	out := []NamedSchema{
 		{Name: properties.Dataset, Schema: objectsDatasetSchema()},
 		{Name: typetype.DatasetPropertyDefs, Schema: schema.Dataset{Dynamic: true}},
 		{Name: typetype.ShortIdsDataset, Schema: schema.Dataset{Dynamic: true}},
 		{Name: typetype.DatasetDefs, Schema: schema.Dataset{Dynamic: true}},
+	}
+	for _, h := range s.systemRegs {
+		out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
@@ -701,6 +700,16 @@ func (s *Store) Schemas() []NamedSchema {
 	for _, name := range sortedCatalogNames(snap) {
 		ds := snap.byName[name]
 		out = append(out, NamedSchema{Name: ds.Name, Schema: ds.Schema, TypeId: ds.TypeId})
+	}
+	return out
+}
+
+// SystemSchemas returns the declared schema of this store's system
+// datasets only (the tech space's spaces/profile/devices/…).
+func (s *Store) SystemSchemas() []NamedSchema {
+	out := make([]NamedSchema, 0, len(s.systemRegs))
+	for _, h := range s.systemRegs {
+		out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
 	}
 	return out
 }
@@ -720,6 +729,24 @@ func datasetSchema(d handler.Dataset) schema.Dataset {
 // type object (deterministic fold of its `datasets` records).
 func (s *Store) DatasetDefs(ctx context.Context, typeId string) ([]types.CompiledDataset, error) {
 	return types.CompileDatasetDefs(ctx, s.db, typeId)
+}
+
+// DatasetHeadIds lists the live head ids declaring name on the type
+// object, duplicates included. See types.DatasetHeadIds.
+func (s *Store) DatasetHeadIds(ctx context.Context, typeId, name string) ([]string, error) {
+	return types.DatasetHeadIds(ctx, s.db, typeId, name)
+}
+
+// DatasetHeadName resolves a live head's dataset name by record id.
+// See types.DatasetHeadName.
+func (s *Store) DatasetHeadName(ctx context.Context, typeId, defId string) (string, error) {
+	return types.DatasetHeadName(ctx, s.db, typeId, defId)
+}
+
+// HasDatasetDefs reports whether anything was ever declared on the
+// type object, removed definitions included. See types.HasDatasetDefs.
+func (s *Store) HasDatasetDefs(ctx context.Context, typeId string) (bool, error) {
+	return types.HasDatasetDefs(ctx, s.db, typeId)
 }
 
 // NotifyDrainer is the public hook used by callers (e.g. the
@@ -1150,6 +1177,15 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	s.dropObjectCollections(ctx, objectId)
 	s.purgeHistoryRows(ctx, objectId)
 	_ = s.unmarkSkipped(ctx, objectId)
+	// A deleted TYPE object must leave the runtime catalog, or its
+	// dataset names stay occupied forever (blocking e.g. a bundle
+	// reinstall after uninstall). refreshType compiles from the now-
+	// dropped defs collection — empty — and removes the entry. Gated
+	// on catalog membership so a bulk purge of ordinary objects never
+	// pays a rebuild per row.
+	if s.catalogHasType(objectId) {
+		s.refreshType(ctx, objectId)
+	}
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil
 }
@@ -1265,8 +1301,18 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		if nerr == nil {
 			s.dropObjectCollectionsNamed(ctx, p.id, names)
 		}
+		if nerr != nil {
+			// The batch listing failed — drop per object so the defs
+			// collection is gone before the catalog recompile, or the
+			// refresh below would re-add the deleted type's names.
+			s.dropObjectCollections(ctx, p.id)
+		}
 		s.purgeHistoryRows(ctx, p.id)
 		s.Drop(p.id)
+		// See purgeObject: a deleted type object leaves the catalog.
+		if s.catalogHasType(p.id) {
+			s.refreshType(ctx, p.id)
+		}
 		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
 	}
 	if s.SelectiveMode() {
@@ -1631,10 +1677,7 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		s.readSeedPending.Store(objectId, struct{}{})
 		defer s.readSeedPending.Delete(objectId)
 	}
-	var gate object.ApplyGate
-	if !s.disableGate {
-		gate = s.gateFor(objectId, ctrl)
-	}
+	gate := s.gateFor(objectId, ctrl)
 	obj, err := object.New(object.Config{
 		SpaceId:        s.spaceId,
 		SignKey:        s.signKey,
@@ -1721,8 +1764,8 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 // retried by the next history query (the stale flag only clears on a
 // completed backfill).
 func (s *Store) releaseHistoryHandle(objectId string) {
-	if s.customHandlers != nil {
-		return // raw-mode stores index no history
+	if s.disableHistory {
+		return
 	}
 	coll, err := s.db.OpenCollection(context.Background(), objectId+history.HistoryCollectionSuffix)
 	if err != nil {
@@ -1845,7 +1888,7 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	// for why opening in-tx is unsafe). A failure here is tolerated —
 	// the hook defers to the stale/backfill path and the next open
 	// retries.
-	if s.customHandlers == nil {
+	if !s.disableHistory {
 		if _, ixErr := s.HistoryIndex(ctx); ixErr != nil {
 			storeLog.Warn("history index open failed; deferring to backfill", zap.Error(ixErr))
 		}
@@ -1874,12 +1917,6 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 // opened here — the live path opens the space one (SharedObjects), the
 // history replay path opens scratch ones (proposal §4.1).
 func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
-	if s.customHandlers != nil {
-		// Raw mode: exactly the caller's handlers, each on its own
-		// per-object collection (<objectId>_<dataset>). No shared
-		// `objects` collection, no built-in regs.
-		return s.customHandlers, nil, nil
-	}
 	regs := []crdt.HandlerReg{
 		// DynamicScopeByKey: undeclared heads (`any`, typeIds) carry
 		// per-PROPERTY scopes resolved from the type registry — the
@@ -1914,6 +1951,8 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// Bundles API always targets it.
 		{Name: spaceindex.BundlesDataset, Handler: spaceindex.BundlesHandler{}, Schema: spaceindex.BundlesSchema()},
 	}
+	// Per-store system datasets: same footing as payloads/bundles.
+	regs = append(regs, s.systemRegs...)
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
 			h := d.Handler
@@ -1993,9 +2032,9 @@ func (s *Store) HistoryReplayRegs() ([]crdt.HandlerReg, []string, error) {
 	return s.buildRegs()
 }
 
-// ErrHistoryUnavailable — this store has no history index (raw-mode /
-// tech-space stores carry internal bookkeeping only, no history
-// surface).
+// ErrHistoryUnavailable — this store has no history index
+// (DisableHistory: the tech space carries internal bookkeeping only,
+// no history surface).
 var ErrHistoryUnavailable = errors.New("spaceobjects: history index unavailable for this store")
 
 // HistoryIndex returns the per-space version-history index, opening it
@@ -2011,7 +2050,7 @@ var ErrHistoryUnavailable = errors.New("spaceobjects: history index unavailable 
 // instead and defers indexing via historyPendingStale until an
 // out-of-tx caller (newController, a history query) has opened it.
 func (s *Store) HistoryIndex(ctx context.Context) (*history.Index, error) {
-	if s.customHandlers != nil {
+	if s.disableHistory {
 		return nil, ErrHistoryUnavailable
 	}
 	ix := s.historyIx.Load()
@@ -2064,6 +2103,9 @@ func (s *Store) flushPendingStale(ctx context.Context, ix *history.Index) {
 // unavailable or the purge fails. A queued purge supersedes any queued
 // stale mark — a deleted object must not be re-marked for backfill.
 func (s *Store) purgeHistoryRows(ctx context.Context, objectId string) {
+	if s.disableHistory {
+		return
+	}
 	s.historyPendingStale.Delete(objectId)
 	ix := s.historyIx.Load()
 	if ix == nil {
@@ -2118,7 +2160,7 @@ func (s *Store) composedApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 }
 
 // historyApplyHook writes warm-path history-index rows in the apply tx
-// (proposal §4.4). Nil for raw-mode stores (tech space): their objects
+// (proposal §4.4). Nil under DisableHistory (tech space): its objects
 // are internal bookkeeping with no history surface, and indexing them
 // would grow a permanent index nobody can query. Objects mid-cold-
 // restore are skipped — they're marked stale and lazily backfilled
@@ -2127,7 +2169,7 @@ func (s *Store) composedApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 // itself) but they DO mark the object stale so the lazy backfill
 // closes the gap instead of it becoming permanent.
 func (s *Store) historyApplyHook() crdt.ApplyHook {
-	if s.customHandlers != nil {
+	if s.disableHistory {
 		return nil
 	}
 	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, _ *crdt.ApplyResult) error {

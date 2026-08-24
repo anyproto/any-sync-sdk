@@ -112,6 +112,12 @@ The `type` meta-type owns a third built-in dataset, **`datasets`**
 (next to `properties` and `shortIds`), registered compiled-in like any
 other. A definition is CRDT records:
 
+A bundle root that declares `Datasets` is a type object implementing
+itself (`any.types = ["__type__", rootId]`, `typeId == objectId`): its
+definitions live on the root exactly like this, and evolve through
+`Types().AddDataset` / `AddDatasetField` / `PatchDataset` with
+`typeId = rootId`. See `bundles.md § Bundle datasets`.
+
 - **Head record** (one per dataset; id minted client-side, unique):
   `def:"dataset"`, `collection` (the dataset name), `dynamic`,
   `idRule`/`idPattern`/`idMaxLen`, `deleteBy`, `skipHistory` — all

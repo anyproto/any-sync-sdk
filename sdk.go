@@ -794,6 +794,11 @@ func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
 // compare against space.ActiveDevice's winner.
 func (s *SDK) PeerId() string { return s.tsp.PeerId() }
 
+// TechSpaceId returns the account's tech space id. Spaces().Get with
+// it yields the restricted tech-space handle — the home of
+// account-level bundles (see space.Service.Get, space.ErrUnsupported).
+func (s *SDK) TechSpaceId() string { return s.tsp.SpaceId() }
+
 // P2PStatus reports the local-network layer: listener state, discovery
 // possibility, and every known LAN peer with its shared spaces and
 // live-connection flag. Per-space p2p state lives in SpaceSyncStatus

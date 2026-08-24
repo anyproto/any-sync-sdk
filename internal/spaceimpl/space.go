@@ -34,6 +34,10 @@ type spaceImpl struct {
 	tsp    *techspace.Service
 	store  *spaceobjects.Store
 	parent *Service
+	// techIndexId is set on the inner impl of the tech-space handle:
+	// the resident tech index object stands in for the per-space
+	// spaceIndex object (no derive, no index watcher wiring).
+	techIndexId string
 
 	objects    *objectService
 	types      *typesAPI
@@ -55,6 +59,17 @@ func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *space
 }
 
 func (s *spaceImpl) Id() string { return s.id }
+
+// indexObjectId resolves this space's spaceIndex object: the tech
+// index on the tech handle's inner impl, otherwise the per-space
+// derived object (which also wires the index watcher and mirrors —
+// never for the tech id).
+func (s *spaceImpl) indexObjectId(ctx context.Context) (string, error) {
+	if s.techIndexId != "" {
+		return s.techIndexId, nil
+	}
+	return s.parent.spaceIndexObjectIdFor(ctx, s.id)
+}
 
 // Info reads the space-index snapshot.
 //
@@ -255,16 +270,10 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 	return toDatasetSchemas(s.store.Schemas())
 }
 
-// checkDatasetMembership enforces the unified ownership invariant for
-// type-owned datasets: an object may only hold a type's dataset if it
-// implements that type (any.types ∋ owner). No-op for built-in / unknown
-// datasets (DatasetOwner returns false) — property-namespace membership
-// is enforced separately by SystemPropertiesHandler.PreValidate. Local
-// write-time only; inbound apply stays read-tolerant.
 // checkPublicDataset rejects writes to SDK-internal datasets through
-// the public Modify/ModifyMany/Delete surface. The payloads dataset is
-// written only by the SDK's files layer (its change shapes are fixed
-// and its object class ships changes unencrypted).
+// the public Modify/ModifyMany/Delete/Upsert surface. The payloads
+// dataset is written only by the SDK's files layer (its change shapes
+// are fixed and its object class ships changes unencrypted).
 func checkPublicDataset(dataset string) error {
 	// bundles: registry writes go through the typed BundlesAPI only — a
 	// raw Modify could assert an arbitrary winner (passing the handler's
@@ -277,6 +286,12 @@ func checkPublicDataset(dataset string) error {
 	return nil
 }
 
+// checkDatasetMembership enforces the unified ownership invariant for
+// type-owned datasets: an object may only hold a type's dataset if it
+// implements that type (any.types ∋ owner). No-op for built-in / unknown
+// datasets (DatasetOwner returns false) — property-namespace membership
+// is enforced separately by SystemPropertiesHandler.PreValidate. Local
+// write-time only; inbound apply stays read-tolerant.
 func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
 	owner, ok := s.store.DatasetOwner(dataset)
 	if !ok {

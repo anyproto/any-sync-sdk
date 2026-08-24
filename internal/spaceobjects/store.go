@@ -737,6 +737,12 @@ func (s *Store) DatasetHeadIds(ctx context.Context, typeId, name string) ([]stri
 	return types.DatasetHeadIds(ctx, s.db, typeId, name)
 }
 
+// DatasetHeadName resolves a live head's dataset name by record id.
+// See types.DatasetHeadName.
+func (s *Store) DatasetHeadName(ctx context.Context, typeId, defId string) (string, error) {
+	return types.DatasetHeadName(ctx, s.db, typeId, defId)
+}
+
 // HasDatasetDefs reports whether anything was ever declared on the
 // type object, removed definitions included. See types.HasDatasetDefs.
 func (s *Store) HasDatasetDefs(ctx context.Context, typeId string) (bool, error) {
@@ -1174,9 +1180,12 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	// A deleted TYPE object must leave the runtime catalog, or its
 	// dataset names stay occupied forever (blocking e.g. a bundle
 	// reinstall after uninstall). refreshType compiles from the now-
-	// dropped defs collection — empty — and removes the entry; no-op
-	// for ordinary objects.
-	s.refreshType(ctx, objectId)
+	// dropped defs collection — empty — and removes the entry. Gated
+	// on catalog membership so a bulk purge of ordinary objects never
+	// pays a rebuild per row.
+	if s.catalogHasType(objectId) {
+		s.refreshType(ctx, objectId)
+	}
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil
 }
@@ -1292,10 +1301,18 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		if nerr == nil {
 			s.dropObjectCollectionsNamed(ctx, p.id, names)
 		}
+		if nerr != nil {
+			// The batch listing failed — drop per object so the defs
+			// collection is gone before the catalog recompile, or the
+			// refresh below would re-add the deleted type's names.
+			s.dropObjectCollections(ctx, p.id)
+		}
 		s.purgeHistoryRows(ctx, p.id)
 		s.Drop(p.id)
 		// See purgeObject: a deleted type object leaves the catalog.
-		s.refreshType(ctx, p.id)
+		if s.catalogHasType(p.id) {
+			s.refreshType(ctx, p.id)
+		}
 		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
 	}
 	if s.SelectiveMode() {

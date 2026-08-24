@@ -174,13 +174,18 @@ lives in records, not in child objects.
   `_ver.id`), so every replica converges on one definition. A `DefId`
   read on the losing device before sync changes after it: look
   definitions up by name when evolving them.
-- Both root strategies carry declarations. A derived root declares at
-  every device's own materialization (idempotent, converges); a created
-  root declares once at install and the declaration travels with its
-  tree. Concurrent created installs fork into roots that each carry
-  their own copy — clients merging a loser's records write them through
-  the winner's declaration, then `ResolveLoser` deletes the loser,
-  declarations included.
+- Both root strategies carry declarations, written AFTER the
+  registering change: a failure between the two leaves a registered
+  row whose root carries no declaration — the state the adopt path
+  heals on the next Ensure (derived roots at every device's own
+  materialization; a created winner when its tree is local). The
+  inverse order would strand an orphan root owning the dataset names
+  with no registry reference — unhealable, wedging the bundle id.
+  Concurrent created installs fork into roots that each carry their
+  own copy — clients merging a loser's records write them through the
+  winner's declaration, then `ResolveLoser` deletes the loser,
+  declarations included. A name held by a root no registry row
+  references answers `ErrDatasetNameUnsettled` — retry after sync.
 - `RootProperties` keyed by the root's own id are rejected: the
   self-type grants a dataset namespace, not property definitions.
 

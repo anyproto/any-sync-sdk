@@ -372,16 +372,17 @@ func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId strin
 	if datasetDefId == "" {
 		return errors.New("typesAPI: definition id required")
 	}
+	// Resolve the id's dataset name from the raw heads — the caller may
+	// hold a LOSING duplicate's id (a DefId read before convergence),
+	// and removing by it must remove the DATASET: the winner and every
+	// duplicate, not just the hidden head.
 	ids := []string{datasetDefId}
-	defs, err := t.Datasets(ctx, typeId)
+	name, err := t.parent.store.DatasetHeadName(ctx, typeId, datasetDefId)
 	if err != nil {
-		return err
+		return fmt.Errorf("typesAPI: remove dataset definition: %w", err)
 	}
-	for i := range defs {
-		if defs[i].Id != datasetDefId {
-			continue
-		}
-		heads, err := t.parent.store.DatasetHeadIds(ctx, typeId, defs[i].Name)
+	if name != "" {
+		heads, err := t.parent.store.DatasetHeadIds(ctx, typeId, name)
 		if err != nil {
 			return fmt.Errorf("typesAPI: remove dataset definition: %w", err)
 		}

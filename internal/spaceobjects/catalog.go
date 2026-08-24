@@ -110,6 +110,21 @@ func (s *Store) initCatalog(ctx context.Context) {
 	s.catalog.snap.Store(s.resolveCatalog(byType))
 }
 
+// catalogHasType reports whether the runtime catalog currently carries
+// datasets for typeId — one lock-free snapshot load. The purge paths
+// use it to skip per-object catalog rebuilds for ordinary objects.
+func (s *Store) catalogHasType(typeId string) bool {
+	if s.catalog == nil || typeId == "" {
+		return false
+	}
+	snap := s.catalog.snap.Load()
+	if snap == nil {
+		return false
+	}
+	_, ok := snap.byType[typeId]
+	return ok
+}
+
 // refreshType recompiles one type object's defs and swaps the snapshot.
 // Called from afterApplyFor when a `datasets` change applies, and from
 // the drain path. Reads committed collections via the DB directly —

@@ -42,6 +42,13 @@ type bundlesAPI struct {
 	// reentry from NewRoot still self-deadlocks: don't.
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
+	// namesMu serializes dataset-name claims across BUNDLES: the name
+	// preflight is advisory (per-id locks only), so declareDatasets
+	// re-checks and writes under this one mutex — the catalog registers
+	// synchronously on defs apply, closing the two-installs-one-name
+	// race in-process. Never held across NewRoot or any reentrant
+	// Ensure.
+	namesMu sync.Mutex
 	// derivedIds memoizes canonicalRootId per bundle id. The answer is
 	// a pure function of (space, bundle id) and never changes.
 	derivedIds sync.Map
@@ -85,9 +92,6 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	if err := b.parent.writeGate(ctx); err != nil {
 		return space.Bundle{}, false, err
 	}
-	if err := b.preflightDatasets(ctx, req); err != nil {
-		return space.Bundle{}, false, err
-	}
 	l := b.lockFor(req.Id)
 	l.Lock()
 	defer l.Unlock()
@@ -95,6 +99,9 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	obj, err := b.indexObj(ctx)
 	if err != nil {
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
+	}
+	if err := b.preflightDatasets(ctx, obj, req); err != nil {
+		return space.Bundle{}, false, err
 	}
 
 	// Adopt path: a live record whose winner's tree is not deleted
@@ -135,22 +142,23 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 			if err := b.stampRootName(ctx, rootId, req, true); err != nil {
 				return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 			}
+		} else if len(req.Datasets) > 0 {
+			// Created winner: heal the declaration when the root's
+			// tree is local and carries none (crash between the
+			// registering write and declaring). A winner whose tree
+			// has not arrived is left alone — the installer's
+			// declaration syncs with it.
+			if _, present, perr := b.parent.store.TreeIsDerived(ctx, bd.RootId); perr == nil && present {
+				if err := b.declareDatasets(ctx, bd.RootId, req.Datasets); err != nil {
+					return space.Bundle{}, false, err
+				}
+			}
 		}
-		// A created winner needs no heal: its install wrote types,
-		// declarations and stamp before registering, and they arrive
-		// with its tree. The datasets in this request are the caller's
-		// canonical declaration; the winner's copy governs.
 		return bd, false, nil
 	}
 
 	rootId, err := b.mintRoot(ctx, req)
 	if err != nil {
-		return space.Bundle{}, false, err
-	}
-	// Declarations land before the registering write for the same
-	// reason RootProperties do: a failed declaration leaves no install
-	// to adopt, and the retry declares only what is still missing.
-	if err := b.declareDatasets(ctx, rootId, req.Datasets); err != nil {
 		return space.Bundle{}, false, err
 	}
 	// Stamp the root with the bundle name so its tree always carries a
@@ -191,6 +199,16 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: write rejected: %w", res.Rejections[0].Err)
 	}
 
+	// Declarations land AFTER the registering write: a failure between
+	// the two leaves a registered row whose root carries no declaration
+	// — exactly the state the adopt path heals on the next Ensure.
+	// The inverse order would strand an ORPHAN root that owns the
+	// dataset names with no registry reference: nothing could ever
+	// adopt or heal it, and the bundle id would be wedged for good.
+	if err := b.declareDatasets(ctx, rootId, req.Datasets); err != nil {
+		return space.Bundle{}, false, err
+	}
+
 	// Return the applied state, not the input — an inbound install may
 	// have landed between the read above and this write's apply.
 	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id)
@@ -228,7 +246,7 @@ func validateEnsureRequest(req space.EnsureBundleRequest) error {
 // RootProperties key equal to the root's own id (the self-type grants
 // a dataset namespace, not property definitions). A name already owned
 // by this root is fine — that is the adopt path.
-func (b *bundlesAPI) preflightDatasets(ctx context.Context, req space.EnsureBundleRequest) error {
+func (b *bundlesAPI) preflightDatasets(ctx context.Context, obj *object.Object, req space.EnsureBundleRequest) error {
 	if len(req.Datasets) == 0 {
 		return nil
 	}
@@ -239,14 +257,25 @@ func (b *bundlesAPI) preflightDatasets(ctx context.Context, req space.EnsureBund
 	if _, self := req.RootProperties[canonical]; self {
 		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — a self-typed root has no property definitions", space.ErrBundleBadRequest)
 	}
-	// A name owned by this bundle's OWN root is not a conflict: the
-	// canonical derived id covers derived installs, the registry's
-	// live winner covers created ones (its id is minted at install, so
-	// only the row can name it).
+	// Ownership of a name is decided by the registry, not the catalog
+	// alone: this bundle's own roots (canonical derived id + every root
+	// any of ITS rows claims) are fine; a root another bundle's row
+	// claims is a hard conflict; a root NO row references is unsettled
+	// — an install mid-sync (declaration tree before registry row) or a
+	// crashed install's orphan — and the caller retries after sync.
 	own := map[string]bool{canonical: true}
-	if obj, err := b.indexObj(ctx); err == nil {
-		if bd, live := b.view(ctx, obj.Controller().Get(ctx, spaceindex.BundlesDataset, req.Id)); live && bd.RootId != "" {
-			own[bd.RootId] = true
+	foreign := map[string]string{}
+	for _, row := range obj.Controller().Records(ctx, spaceindex.BundlesDataset) {
+		bd, live := b.view(ctx, row)
+		if !live && bd.Id == "" {
+			continue
+		}
+		for _, r := range bd.Roots {
+			if bd.Id == req.Id {
+				own[r] = true
+			} else {
+				foreign[r] = bd.Id
+			}
 		}
 	}
 	for i := range req.Datasets {
@@ -254,11 +283,35 @@ func (b *bundlesAPI) preflightDatasets(ctx context.Context, req space.EnsureBund
 		if _, err := b.parent.store.DataVersion(name); err == nil {
 			return fmt.Errorf("spaceimpl: %w: dataset name %q is reserved by the store", space.ErrBundleBadRequest, name)
 		}
-		if existing, ok := b.parent.store.RuntimeDataset(name); ok && !own[existing.TypeId] {
+		existing, ok := b.parent.store.RuntimeDataset(name)
+		if !ok || own[existing.TypeId] {
+			continue
+		}
+		if owner, taken := foreign[existing.TypeId]; taken {
+			return fmt.Errorf("spaceimpl: %w: dataset name %q is already defined by bundle %q — names are unique per space", space.ErrBundleBadRequest, name, owner)
+		}
+		if hasMarker, merr := b.selfTyped(ctx, existing.TypeId); merr == nil && !hasMarker {
+			// An ordinary user type owns the name.
 			return fmt.Errorf("spaceimpl: %w: dataset name %q is already defined on type %q — names are unique per space", space.ErrBundleBadRequest, name, existing.TypeId)
 		}
+		return fmt.Errorf("spaceimpl: %w: dataset name %q is held by root %q", space.ErrDatasetNameUnsettled, name, existing.TypeId)
 	}
 	return nil
+}
+
+// selfTyped reports whether objectId carries the type marker plus its
+// own id — the bundle-root shape.
+func (b *bundlesAPI) selfTyped(ctx context.Context, objectId string) (bool, error) {
+	types, err := b.parent.store.ObjectTypes(ctx, objectId)
+	if err != nil {
+		return false, err
+	}
+	var marker, self bool
+	for _, t := range types {
+		marker = marker || t == typetype.MetaTypeMarker
+		self = self || t == objectId
+	}
+	return marker && self, nil
 }
 
 // validateBundleDatasets rejects an invalid draft or a duplicate name
@@ -297,6 +350,18 @@ func (b *bundlesAPI) declareDatasets(ctx context.Context, rootId string, drafts 
 	}
 	if declared {
 		return nil
+	}
+	// The name preflight runs under per-BUNDLE locks only, so two
+	// concurrent installs of different bundles can both pass it with
+	// the same fresh name. The write is the authority: re-check under
+	// the one names mutex — the catalog registers synchronously on
+	// defs apply, so the second claimant sees the first here.
+	b.namesMu.Lock()
+	defer b.namesMu.Unlock()
+	for i := range drafts {
+		if existing, ok := b.parent.store.RuntimeDataset(drafts[i].Name); ok && existing.TypeId != rootId {
+			return fmt.Errorf("spaceimpl: %w: dataset name %q was claimed concurrently by type %q", space.ErrBundleBadRequest, drafts[i].Name, existing.TypeId)
+		}
 	}
 	arena := &anyenc.Arena{}
 	recs := make([]crdt.RecordChange, 0, len(drafts))

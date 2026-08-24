@@ -33,6 +33,18 @@ var (
 	// this device yet (deletion needs the local head entry). Retry
 	// after sync, or resolve from a device that holds the tree.
 	ErrLoserNotSynced = errors.New("bundle loser tree not synced locally")
+
+	// ErrBundleRootNotSynced: the registry references a root whose tree
+	// (or objects row) has not arrived on this device yet. Transient —
+	// retry after sync.
+	ErrBundleRootNotSynced = errors.New("bundle root not yet synced locally")
+
+	// ErrDatasetNameUnsettled: a requested dataset name is owned by a
+	// root no registry row references — an install mid-sync (the
+	// declaration's tree arrived before its registry row) or an orphan
+	// from a crashed install. Transient in the first case: retry after
+	// sync.
+	ErrDatasetNameUnsettled = errors.New("bundle dataset name owned by an unregistered root")
 )
 
 // Bundle is one row of the bundles registry.
@@ -110,23 +122,28 @@ type EnsureBundleRequest struct {
 	// dataset namespace, not property definitions. DerivedRoot only.
 	RootProperties map[string]map[string]any
 
-	// Datasets declares runtime datasets on the derived root, which
-	// then implements itself as a type: any.types = ["__type__",
-	// rootId], typeId = rootId. Records live on the root under the
-	// declared names, discoverable through Types().Datasets(rootId)
-	// and Space.Datasets(), writable through Modify/Upsert on the
-	// root. Declared in one change on install, and on adopt only when
-	// the root carries no declaration yet (crash before the registry
-	// row, a row adopted before the root tree synced); a root with any
-	// declaration — live, or removed through Types().RemoveDataset — is
-	// left alone: nothing is patched, added or resurrected by Ensure.
-	// Later evolution goes through Types().AddDataset / AddDatasetField
-	// / PatchDataset with typeId = rootId. Dataset names are unique per
-	// space: a name another type or bundle owns, or one the store
-	// reserves, fails the request with ErrBundleBadRequest before any
-	// root is minted, as does an invalid or duplicate draft. Adopting
-	// an install that lives on a created root with Datasets set fails
-	// the same way. DerivedRoot only. Required on the tech space.
+	// Datasets declares runtime datasets on the root — derived or
+	// created — which then implements itself as a type: any.types =
+	// ["__type__", rootId], typeId = rootId. Records live on the root
+	// under the declared names, discoverable through
+	// Types().Datasets(rootId) and Space.Datasets(), writable through
+	// Modify/Upsert on the root. Declared in one change after the
+	// registering write, and on adopt only when the root's tree is
+	// local and carries no declaration yet (crash between registering
+	// and declaring, a row adopted before the root tree synced); a
+	// root with any declaration — live, or removed through
+	// Types().RemoveDataset — is left alone: nothing is patched, added
+	// or resurrected by Ensure. Later evolution goes through
+	// Types().AddDataset / AddDatasetField / PatchDataset with typeId
+	// = rootId. Dataset names are unique per space: a name another
+	// type or bundle owns, or one the store reserves, fails the
+	// request with ErrBundleBadRequest before any root is minted, as
+	// does an invalid or duplicate draft; a name held by a root no
+	// registry row references is ErrDatasetNameUnsettled (retry after
+	// sync). With a created strategy, omit NewRoot and Ensure mints
+	// and self-types the root itself — the only create a space with a
+	// fenced object lifecycle (the tech space) allows. Required on the
+	// tech space.
 	Datasets []DatasetDraft
 }
 

@@ -64,6 +64,39 @@ func schemaRev(ds schema.Dataset) string {
 	return strconv.FormatUint(h.Sum64(), 36)
 }
 
+// DatasetHeadName resolves a live head record's dataset name by its
+// record id — the winner OR a hidden concurrent duplicate. Empty when
+// the id names no live head. Removal by a stale DefId (read before
+// convergence) resolves its name here so the whole dataset goes, not
+// just the hidden duplicate.
+func DatasetHeadName(ctx context.Context, db anystore.DB, typeId, defId string) (string, error) {
+	if db == nil || defId == "" {
+		return "", nil
+	}
+	coll, err := db.OpenCollection(ctx, typeId+"_datasets")
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	doc, err := coll.FindId(ctx, defId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	v := doc.Value()
+	if v == nil || v.Type() != anyenc.TypeObject || v.Get("_deletedAt") != nil {
+		return "", nil
+	}
+	if string(v.GetStringBytes("def")) != "dataset" {
+		return "", nil
+	}
+	return string(v.GetStringBytes("collection")), nil
+}
+
 // DatasetHeadIds lists the live head record ids declaring name on the
 // type object — the winner and every concurrent duplicate the compile
 // layer hides. Nil when the type has no datasets collection.

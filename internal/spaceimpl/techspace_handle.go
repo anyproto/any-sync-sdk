@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/anyproto/any-store/v2/anyenc"
+
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -31,9 +34,9 @@ func newTechSpace(app *anysyncx.App, tsp *techspace.Service, parent *Service) *t
 	inner := newSpace(tsp.SpaceId(), app, tsp, tsp.Store(), parent)
 	inner.techIndexId = tsp.IndexObjectId()
 	t := &techSpace{inner: inner, tsp: tsp, parent: parent}
-	t.objects = techObjects{objectService: inner.objects, t: t}
+	t.objects = techObjects{inner: inner.objects, t: t}
 	t.types = techTypes{inner: inner.types, t: t}
-	t.bundles = techBundles{inner.bundles}
+	t.bundles = techBundles{inner: inner.bundles}
 	return t
 }
 
@@ -73,7 +76,34 @@ func (t *techSpace) SyncStatus() space.SyncStatusAPI { return t.inner.SyncStatus
 func (t *techSpace) Debug() space.DebugAPI           { return t.inner.Debug() }
 
 func (t *techSpace) Query(objectId, dataset string) space.Query {
+	// The identities rows carry the synced symKey — the profile-
+	// decryption secret the public Identities() surface deliberately
+	// withholds. The generic read path must not hand it out raw.
+	if objectId == t.tsp.IndexObjectId() && dataset == techspace.IdentitiesDataset {
+		return failQuery{err: fmt.Errorf("spaceimpl: %w: identities carry a decryption secret — read them via SDK.Identities()", space.ErrUnsupported)}
+	}
 	return t.inner.Query(objectId, dataset)
+}
+
+// failQuery is a Query whose terminal calls fail with a fixed error:
+// the builder shape lets the fence live at Query() without changing
+// the interface.
+type failQuery struct{ err error }
+
+func (q failQuery) Filter(any) space.Query                       { return q }
+func (q failQuery) Sort(...any) space.Query                      { return q }
+func (q failQuery) Limit(int) space.Query                        { return q }
+func (q failQuery) Offset(int) space.Query                       { return q }
+func (q failQuery) Projection(space.ProjectionOpts) space.Query  { return q }
+func (q failQuery) Iter(context.Context) (space.Iterator, error) { return nil, q.err }
+func (q failQuery) All(context.Context) ([]*anyenc.Value, error) { return nil, q.err }
+func (q failQuery) One(context.Context) (*anyenc.Value, error)   { return nil, q.err }
+func (q failQuery) Count(context.Context) (int, error)           { return 0, q.err }
+func (q failQuery) Snapshot(context.Context, space.QueryOpts) (*space.QueryResult, error) {
+	return nil, q.err
+}
+func (q failQuery) Subscribe(context.Context, space.QueryOpts) (*space.QueryResult, error) {
+	return nil, q.err
 }
 func (t *techSpace) QueryObjects() space.Query { return t.inner.QueryObjects() }
 func (t *techSpace) Aggregate(objectId, dataset string, pipeline any) space.Agg {
@@ -161,7 +191,41 @@ func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, er
 		marker = marker || ty == typetype.MetaTypeMarker
 		self = self || ty == objectId
 	}
-	return marker && self, nil
+	if marker && self {
+		return true, nil
+	}
+	// No self-typed row. When the registry references the id as a
+	// bundle root, that is a root whose tree/row has not applied here
+	// yet — a retryable state, not the hard fence: without this, a
+	// device that received the registry row before the root tree would
+	// read a genuine bundle root as permanently unsupported. The probe
+	// reads the committed registry collection directly — no tree load.
+	if t.inner.techIndexId != "" {
+		coll, cerr := t.inner.store.OpenObjectCollection(ctx, t.inner.techIndexId, spaceindex.BundlesDataset)
+		if cerr == nil {
+			iter, ierr := coll.Find(nil).Iter(ctx)
+			if ierr != nil {
+				return false, ierr
+			}
+			defer iter.Close()
+			for iter.Next() {
+				doc, derr := iter.Doc()
+				if derr != nil {
+					return false, derr
+				}
+				v := doc.Value()
+				if v == nil {
+					continue
+				}
+				for _, r := range v.GetArray(spaceindex.FieldBundleRoots) {
+					if string(r.GetStringBytes()) == objectId {
+						return false, fmt.Errorf("spaceimpl: %w: root %q of bundle %q", space.ErrBundleRootNotSynced, objectId, string(v.GetStringBytes("id")))
+					}
+				}
+			}
+		}
+	}
+	return false, nil
 }
 
 // techObjects keeps Get (a local row read) and refuses free lifecycle:
@@ -170,8 +234,12 @@ func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, er
 // is how a bundle uninstalls; a derived root stays undeletable (the
 // object layer refuses derived deletion).
 type techObjects struct {
-	*objectService
-	t *techSpace
+	inner *objectService
+	t     *techSpace
+}
+
+func (x techObjects) Get(ctx context.Context, objectId string) (*anyenc.Value, error) {
+	return x.inner.Get(ctx, objectId)
 }
 
 func (x techObjects) Delete(ctx context.Context, objectId string) error {
@@ -182,7 +250,7 @@ func (x techObjects) Delete(ctx context.Context, objectId string) error {
 	if !ok {
 		return errUnsupported("Objects().Delete (non-bundle-root)")
 	}
-	return x.objectService.Delete(ctx, objectId)
+	return x.inner.Delete(ctx, objectId)
 }
 
 func (techObjects) Create(context.Context, space.CreateObjectOpts) (string, error) {
@@ -267,13 +335,25 @@ func (techTypes) PatchProperty(context.Context, string, string, space.PropertyPa
 
 // techBundles: derived-only installs that declare datasets; no loser
 // resolution (derived roots have none).
-type techBundles struct{ *bundlesAPI }
+type techBundles struct{ inner *bundlesAPI }
+
+func (x techBundles) Get(ctx context.Context, bundleId string) (space.Bundle, error) {
+	return x.inner.Get(ctx, bundleId)
+}
+
+func (x techBundles) List(ctx context.Context) ([]space.Bundle, error) {
+	return x.inner.List(ctx)
+}
+
+func (x techBundles) DerivedRootId(ctx context.Context, bundleId string) (string, error) {
+	return x.inner.DerivedRootId(ctx, bundleId)
+}
 
 func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, bool, error) {
 	if err := validateTechEnsureRequest(req); err != nil {
 		return space.Bundle{}, false, err
 	}
-	return x.bundlesAPI.Ensure(ctx, req)
+	return x.inner.Ensure(ctx, req)
 }
 
 func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {
@@ -281,7 +361,7 @@ func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	// apart fork, and the losing root must be resolvable here like in
 	// any space. The delete runs on the inner object service — the
 	// public techObjects fence is about free lifecycle, not this.
-	return x.bundlesAPI.ResolveLoser(ctx, bundleId, loserRootId)
+	return x.inner.ResolveLoser(ctx, bundleId, loserRootId)
 }
 
 // validateTechEnsureRequest adds the tech-space rules on top of the

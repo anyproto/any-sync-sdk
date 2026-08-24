@@ -105,9 +105,12 @@ type EnsureBundleRequest struct {
 	// Two consequences, both permanent: the install can never be
 	// uninstalled (derived trees are not deletable, so a dead-winner
 	// reinstall is impossible), and a claimed canonical root always
-	// wins the registry — see BundlesAPI.Ensure. Choose it for setups
-	// that must exist on both sides of a partition (a space's chat),
-	// not for anything a user may remove.
+	// wins the registry — see BundlesAPI.Ensure. The EXCEPTION, not
+	// the default: bundles exist so a converged install does not need
+	// a derived object, and the registry resolves created-root forks.
+	// Derive only when a fork would be unmergeable — chat-like content,
+	// above all the 1-1 general chat, where the convergence gate cannot
+	// work — never for anything a user may remove or for id convenience.
 	DerivedRoot bool
 	// RootTypes are attached to the derived root at materialization,
 	// idempotently. DerivedRoot only — a created root gets its types

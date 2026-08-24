@@ -1171,6 +1171,12 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	s.dropObjectCollections(ctx, objectId)
 	s.purgeHistoryRows(ctx, objectId)
 	_ = s.unmarkSkipped(ctx, objectId)
+	// A deleted TYPE object must leave the runtime catalog, or its
+	// dataset names stay occupied forever (blocking e.g. a bundle
+	// reinstall after uninstall). refreshType compiles from the now-
+	// dropped defs collection — empty — and removes the entry; no-op
+	// for ordinary objects.
+	s.refreshType(ctx, objectId)
 	s.fireDeletionEvents(objectId, removed, stamped, seq)
 	return nil
 }
@@ -1288,6 +1294,8 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		}
 		s.purgeHistoryRows(ctx, p.id)
 		s.Drop(p.id)
+		// See purgeObject: a deleted type object leaves the catalog.
+		s.refreshType(ctx, p.id)
 		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
 	}
 	if s.SelectiveMode() {

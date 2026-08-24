@@ -244,6 +244,13 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	require.NoError(t, techA.Objects().Delete(ctx, pins.RootId), "uninstall: delete the created winner")
 	_, err = techA.Bundles().Get(ctx, "pins/v1")
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "deleted winner reads as uninstalled")
+	pins2, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "pins/v1", Name: "Pins",
+		Datasets: []space.DatasetDraft{pinsDraft},
+	})
+	require.NoError(t, err, "reinstall after uninstall — the deleted root's dataset name is released")
+	require.True(t, didInstall)
+	require.NotEqual(t, pins.RootId, pins2.RootId, "reinstall mints a fresh root")
 	require.Error(t, techA.Objects().Delete(ctx, wantRoot),
 		"a DERIVED bundle root stays undeletable (any-sync refuses derived deletion)")
 

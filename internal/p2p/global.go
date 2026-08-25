@@ -152,6 +152,8 @@ type Global struct {
 	// in. The inbound gate and the connector read it — never the pool.
 	liveMu sync.Mutex
 	live   map[string]peer.Peer
+	// onLive is told about every newly live global peer.
+	onLive func(peerId string)
 
 	tasks chan task
 	conn  *connector
@@ -202,6 +204,10 @@ func (g *Global) Name() string { return globalCName }
 // SetKVSubscriber wires the per-space key-value dispatcher. Set during
 // app assembly, before any space loads.
 func (g *Global) SetKVSubscriber(fn KVSubscriber) { g.subscribe = fn }
+
+// SetOnLive registers a callback for every global peer that becomes
+// live (dialed or accepted). Set during app assembly.
+func (g *Global) SetOnLive(fn func(peerId string)) { g.onLive = fn }
 
 func (g *Global) Run(_ context.Context) error {
 	if err := g.status.Load(); err != nil {
@@ -732,6 +738,9 @@ func (g *Global) addLive(p peer.Peer) {
 	}
 	g.live[id] = p
 	g.liveMu.Unlock()
+	if g.onLive != nil {
+		g.onLive(id)
+	}
 	done := g.runCtx
 	if done == nil {
 		done = context.Background()

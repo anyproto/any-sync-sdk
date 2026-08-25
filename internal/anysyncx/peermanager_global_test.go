@@ -47,14 +47,12 @@ type fakeGlobalPeers struct{ ids []string }
 func (f *fakeGlobalPeers) GlobalPeerIds(string) []string { return f.ids }
 
 // recordingSendPool resolves the PeerGetter of every Send and records
-// the audience; streams toggles the node-stream signal.
+// the audience; nodeUp toggles the node-stream signal.
 type recordingSendPool struct {
 	mu        sync.Mutex
 	audiences [][]string
 	messages  []drpc.Message
 	nodeUp    bool
-	// tagged holds inbound streams by tag (global subscriptions).
-	tagged map[string][]drpc.Stream
 }
 
 func (r *recordingSendPool) Send(ctx context.Context, msg drpc.Message, getter streampool.PeerGetter) error {
@@ -74,28 +72,23 @@ func (r *recordingSendPool) Streams(tags ...string) []drpc.Stream {
 	defer r.mu.Unlock()
 	var out []drpc.Stream
 	for _, tag := range tags {
-		if tag == nodeStreamTag {
-			if r.nodeUp {
-				out = append(out, nil)
-			}
-			continue
+		if tag == nodeStreamTag && r.nodeUp {
+			out = append(out, nil)
 		}
-		out = append(out, r.tagged[tag]...)
 	}
 	return out
 }
 
-// subscribe registers an inbound stream from peerId tagged with the
-// global subscription of spaceId.
-func (r *recordingSendPool) subscribe(spaceId, peerId string) {
+func (r *recordingSendPool) setNodeUp(up bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.tagged == nil {
-		r.tagged = map[string][]drpc.Stream{}
-	}
-	tag := globalSubTag(spaceId)
-	r.tagged[tag] = append(r.tagged[tag], fakeStream{ctx: peer.CtxWithPeerId(context.Background(), peerId)})
+	r.nodeUp = up
+	r.mu.Unlock()
 }
+
+// fakeSubs is a global subscription registry with fixed contents.
+type fakeSubs struct{ ids map[string][]string }
+
+func (f *fakeSubs) Subscribers(spaceId string) []string { return f.ids[spaceId] }
 
 // sentPayloads lists the ObjectSyncMessage payloads sent so far, one
 // per Send, nil for other message kinds.
@@ -110,13 +103,6 @@ func (r *recordingSendPool) sentPayloads() [][]byte {
 	}
 	return out
 }
-
-type fakeStream struct {
-	drpc.Stream
-	ctx context.Context
-}
-
-func (f fakeStream) Context() context.Context { return f.ctx }
 
 func (r *recordingSendPool) sent() [][]string {
 	r.mu.Lock()
@@ -167,6 +153,7 @@ func newGlobalTestManager(pool netpool.Pool, nodes []string, global []string, se
 	m.runCtx, m.runCancel = context.WithCancel(context.Background())
 	m.parkWake = make(chan struct{}, 1)
 	m.parkDone = make(chan struct{})
+	m.globalAskWake = make(chan struct{}, 1)
 	return m
 }
 

@@ -52,7 +52,8 @@ type Service struct {
 	// tests; then every sender is treated as responsible.
 	nodeIds NodeIdsFn
 
-	// localPeerIds resolves the connected LAN-peer list per space.
+	// localPeerIds resolves the connected direct peers (LAN and global)
+	// per space.
 	// Local peers are responsible senders too (a space synced purely
 	// over the LAN must still drain pending heads and advance to
 	// Synced). nil ⇒ no local peers considered.
@@ -172,8 +173,8 @@ func (s *Service) SetNodeIdsFn(fn NodeIdsFn) {
 	s.nodeIds = fn
 }
 
-// SetLocalPeerIdsFn wires the connected-LAN-peer resolver so local
-// peers count as responsible senders. Pass the p2p peer store's
+// SetLocalPeerIdsFn wires the connected direct-peer (LAN and global)
+// resolver so those peers count as responsible senders. Pass the p2p peer store's
 // LocalPeerIds method.
 func (s *Service) SetLocalPeerIdsFn(fn NodeIdsFn) {
 	s.mu.Lock()
@@ -391,8 +392,8 @@ func (s *Service) isResponsibleSender(spaceId, senderId string) bool {
 			return true
 		}
 	}
-	// A connected LAN peer sharing this space is also a responsible
-	// sender — otherwise a space synced only over the LAN never drains
+	// A connected direct peer (LAN or global) sharing this space is also
+	// a responsible sender — otherwise a space synced only over the LAN never drains
 	// pending heads and sync status is stuck "syncing" forever.
 	if localFn != nil {
 		for _, id := range localFn(spaceId) {

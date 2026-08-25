@@ -213,9 +213,20 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	}
 	statusBook := p2p.NewStatusBook(filepath.Join(cfg.Storage.DataDir, p2pPeersFileName), p2p.ThresholdsFrom(globalCfg))
 	peerStore.SetStatus(statusBook)
-	var global *p2p.Global
+	var (
+		global *p2p.Global
+		subs   *globalSubs
+	)
+	peerManagers := newPeerManagerProvider(localOnly, peerStore, globalPeersOrNil(peerStore, globalEnabled), globalCfg.MaxConnections, nil)
 	if globalEnabled {
 		global = p2p.NewGlobal(globalCfg, keys.PeerId, keys.SignKey.GetPublic().Account(), peerStore, statusBook, addrBook)
+		// asks from global peers are recorded here and read by the
+		// peer managers at send time; a newly connected global peer is
+		// asked right away by every node-less space
+		subs = newGlobalSubs(globalSubExpiry)
+		stream.subs = subs
+		peerManagers.subs = subs
+		global.SetOnLive(func(string) { peerManagers.wakeGlobalAsks() })
 	}
 	// A LAN entry that goes away hands the peer's addresses over to its
 	// iroh ticket, if any (addr book: LAN xor ticket).
@@ -263,7 +274,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(sync).
 		Register(pool.New()).
 		Register(p2pSrv).
-		Register(newPeerManagerProvider(localOnly, peerStore, globalPeersOrNil(peerStore, globalEnabled), globalCfg.MaxConnections)).
+		Register(peerManagers).
 		Register(coordinatorclient.New()).
 		Register(nodeclient.New()).
 		Register(storage).

@@ -96,7 +96,9 @@ type treeSyncerAdapter struct {
 	// re-create the silent divergence, and the per-round Warn keeps a
 	// stuck id visible.
 	pendingMu sync.Mutex
-	pending   map[string]struct{}
+	// pending maps a parked id to whether it was missing locally when
+	// parked, so a recovered fetch still reports through onFetched.
+	pending map[string]bool
 }
 
 // Compile-time check: the adapter implements any-sync's optional
@@ -109,7 +111,7 @@ func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCall
 		registry: registry,
 		stats:    map[string]PeerSyncSnapshot{},
 		onRound:  onRound,
-		pending:  map[string]struct{}{},
+		pending:  map[string]bool{},
 	}
 }
 
@@ -175,11 +177,12 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 				continue
 			}
 			seen[id] = struct{}{}
+			_, wasMissing := fetched[id]
 			if ctx.Err() != nil {
 				// Round budget exhausted: park everything unresolved for
 				// the next round instead of burning through the rest
 				// with guaranteed failures.
-				t.markPending(id)
+				t.markPending(id, wasMissing)
 				continue
 			}
 			tree, regErr := t.registry.GetTree(peerCtx, t.spaceId, id)
@@ -188,7 +191,7 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 				// landed in storage, so this id may never show up in a
 				// diff again — park it or the controller replay is lost
 				// for the process lifetime.
-				t.markPending(id)
+				t.markPending(id, wasMissing)
 				if errors.Is(regErr, list.ErrNoReadKey) {
 					// Expected long-lived state, not a failure: the tree's
 					// changes are stored but this account holds no read key
@@ -205,12 +208,13 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 				}
 				continue
 			}
-			if t.clearPending(id) {
+			recovered, parkedMissing := t.clearPending(id)
+			if recovered {
 				tsLog.Info("parked tree recovered",
 					zap.String("spaceId", t.spaceId), zap.String("treeId", id),
 					zap.String("peerId", p.Id()))
 			}
-			if _, wasMissing := fetched[id]; wasMissing && t.onFetched != nil && tree != nil {
+			if (wasMissing || parkedMissing) && t.onFetched != nil && tree != nil {
 				tree.Lock()
 				heads := slices.Clone(tree.Heads())
 				tree.Unlock()
@@ -250,22 +254,24 @@ func (t *treeSyncerAdapter) pendingCount() int {
 	return len(t.pending)
 }
 
-func (t *treeSyncerAdapter) markPending(id string) {
+// markPending parks id; a parked id already marked missing stays so.
+func (t *treeSyncerAdapter) markPending(id string, missing bool) {
 	t.pendingMu.Lock()
-	t.pending[id] = struct{}{}
+	t.pending[id] = t.pending[id] || missing
 	t.pendingMu.Unlock()
 }
 
 // clearPending removes id from the parked set, reporting whether it
-// was there (a recovery, worth logging) or not (the common case).
-func (t *treeSyncerAdapter) clearPending(id string) bool {
+// was there (a recovery, worth logging) and whether it was missing
+// locally when parked.
+func (t *treeSyncerAdapter) clearPending(id string) (recovered, missing bool) {
 	t.pendingMu.Lock()
 	defer t.pendingMu.Unlock()
-	if _, ok := t.pending[id]; !ok {
-		return false
+	missing, recovered = t.pending[id]
+	if recovered {
+		delete(t.pending, id)
 	}
-	delete(t.pending, id)
-	return true
+	return recovered, missing
 }
 
 // record stores the latest per-peer snapshot and fires the

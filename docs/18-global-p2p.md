@@ -97,6 +97,10 @@ Device-wide, in `config.P2P.Global` (type `config.GlobalP2P`):
   hold the dial slot; a dial that finds nobody home still costs about
   13 KB of uplink in retransmitted handshake packets, which is what the
   rate limit and the backoff are there to bound.
+- A relay connection held for reachability alone is kept by the pool
+  for the transport's peer TTL (30 min from its creation) and then
+  recycled with a fresh handshake by design: an always-open idle
+  connection would never be re-evaluated against the budget.
 - `KeepAlive` (60 s); the QUIC idle timeout is three periods. Measured
   over the relay, an idle connection costs ~170 B/min at 60 s and
   ~480 B/min at 25 s. The relay session is the floor cost of being
@@ -109,15 +113,21 @@ Device-wide, in `config.P2P.Global` (type `config.GlobalP2P`):
 ## Head updates and head-sync
 
 Pushes to global peers follow subscriptions. A device with no node
-stream asks every connected global peer for pushes (a
-`SpaceSubscription` on the same cadence as its node subscriptions, so a
-peer that connects later is asked too) and withdraws the ask once a node
-stream is back; it also pushes to all of its connected global peers,
-since they are its only path. A device with a node stream pushes only
-to the global peers that asked — everyone else receives through the
-nodes — and the ask is honoured only from a peer the space's records
-name (a LAN-reachable peer is served by the LAN path instead). The
-subscription lives on the inbound stream and dies with it.
+stream asks every connected global peer for pushes with a
+`SpaceSubscription`: right away when the node stream drops or a global
+peer connects, then every 30 s; it withdraws the ask once a node stream
+is back, and pushes to all of its connected global peers itself, since
+they are its only path. A device with a node stream pushes only to the
+global peers that asked — everyone else receives through the nodes.
+
+The receiver keeps the asks in a registry of its own, not on the
+stream: an ask is honoured only from a peer the space's records name
+and that is not reachable over the LAN (the LAN path pushes to it
+already), at most 64 well-formed space ids per message, and it expires
+three cadences (90 s) after the last refresh. A lost withdrawal, a peer
+removed from the records, or a stream that died therefore stop pushes
+on their own, and a stranger can neither obtain an ask nor keep a space
+pushing with an empty audience.
 
 Pushed head updates are coalesced per object over a 1 s window (a tree
 receiver fetches whatever it misses; key-value and ACL updates are
@@ -125,9 +135,10 @@ queued in order, their payloads are not cumulative) and sent to at most
 `MaxConnections` peers. The periodic diff adds one connected global peer
 per tick, rotating, only while no node stream is up. A space with no
 known global peer queues nothing. A tree fetched whole from a peer
-during a diff round counts as synced with that peer, so a space that
-converges through pulls alone reports `synced` without waiting for an
-empty round.
+during a diff round counts as synced with that peer (as with the
+nodes: a peer that itself lags is not detected until its own diff), so
+a space that converges through pulls alone reports `synced` without
+waiting for an empty round.
 
 Measured over the relay, fifty edits of one object cost nothing at all
 towards a global peer while a node stream is up, ~3.1 KB per edit when

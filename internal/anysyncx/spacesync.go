@@ -328,11 +328,6 @@ const nodeStreamTag = "anysyncx/node-stream"
 // "healthy" by a LAN stream while every node is unreachable.
 const p2pStreamTag = "anysyncx/p2p-stream"
 
-// globalSubTag marks an inbound stream on which a global peer sharing
-// spaceId asked for pushes: a device with no node stream subscribes to
-// its global peers, and a device with a node pushes only to those.
-func globalSubTag(spaceId string) string { return "anysyncx/global-sub/" + spaceId }
-
 // peerKinds is the slice of the p2p peer store the stream handler
 // needs to tell a global-only peer from a node or LAN peer.
 type peerKinds interface {
@@ -352,6 +347,10 @@ type streamHandler struct {
 	// peers classifies remote peers for the global-subscription rules;
 	// nil keeps every stream on the node/LAN behaviour.
 	peers peerKinds
+	// subs records the global peers that asked for pushes; shared with
+	// the peer managers, which read it at send time. nil when the
+	// global layer is off.
+	subs *globalSubs
 	// resyncing coalesces concurrent recovery head-syncs: every node
 	// stream (re)open triggers kickResync, but only one pass runs at a
 	// time. See kickResync.
@@ -482,6 +481,32 @@ func (h *streamHandler) kickResync() {
 	}()
 }
 
+// isGlobalOnly reports a peer known through space records only: not a
+// node, not on the LAN.
+func (h *streamHandler) isGlobalOnly(peerId string) bool {
+	if h.peers == nil || !h.peers.HasGlobalPeer(peerId) || h.peers.HasLocalPeer(peerId) {
+		return false
+	}
+	return len(h.nodeConf.NodeTypes(peerId)) == 0
+}
+
+// globalSubSpaces returns the spaces out of spaceIds a global peer's
+// ask is honoured for: the peer must be known through records for
+// that space and not reachable over the LAN (the LAN path pushes to it
+// already). Anyone else earns nothing.
+func (h *streamHandler) globalSubSpaces(peerId string, spaceIds []string) []string {
+	if h.subs == nil || h.peers == nil || !h.peers.HasGlobalPeer(peerId) || h.peers.HasLocalPeer(peerId) {
+		return nil
+	}
+	var out []string
+	for _, spaceId := range spaceIds {
+		if slices.Contains(h.peers.GlobalPeerIds(spaceId), peerId) {
+			out = append(out, spaceId)
+		}
+	}
+	return out
+}
+
 // HandleMessage processes one inbound stream message. It NEVER returns a
 // non-nil error: any-sync's streampool readLoop tears the whole shared
 // node stream down the moment a handler errors (net/streampool/stream.go:
@@ -494,31 +519,6 @@ func (h *streamHandler) kickResync() {
 // frame) are therefore logged and swallowed; the change is reconciled by
 // head-sync. The errors are logged at debug because they are expected
 // during normal churn (offload, lazy load).
-// isGlobalOnly reports a peer known through space records only: not a
-// node, not on the LAN.
-func (h *streamHandler) isGlobalOnly(peerId string) bool {
-	if h.peers == nil || !h.peers.HasGlobalPeer(peerId) || h.peers.HasLocalPeer(peerId) {
-		return false
-	}
-	return len(h.nodeConf.NodeTypes(peerId)) == 0
-}
-
-// globalSubTags returns the subscription tags a global peer earns for
-// the spaces it shares with us out of spaceIds; a peer the records do
-// not name for a space gets no tag for it.
-func (h *streamHandler) globalSubTags(peerId string, spaceIds []string) []string {
-	if h.peers == nil || !h.peers.HasGlobalPeer(peerId) {
-		return nil
-	}
-	var tags []string
-	for _, spaceId := range spaceIds {
-		if slices.Contains(h.peers.GlobalPeerIds(spaceId), peerId) {
-			tags = append(tags, globalSubTag(spaceId))
-		}
-	}
-	return tags
-}
-
 func (h *streamHandler) HandleMessage(ctx context.Context, _ string, msg drpc.Message) error {
 	headUpdate, ok := msg.(*objectmessages.HeadUpdate)
 	if !ok {
@@ -532,24 +532,27 @@ func (h *streamHandler) HandleMessage(ctx context.Context, _ string, msg drpc.Me
 			streamLog.Debug("decode subscription control", zap.Error(err))
 			return nil
 		}
+		// the ids are remote input: only well-formed space ids reach the
+		// tag index or the subscription registry
+		spaceIds := validSpaceIds(sub.SpaceIds)
+		if len(spaceIds) == 0 {
+			return nil
+		}
 		peerId, _ := peer.CtxPeerId(ctx)
 		if sub.Action == spacesyncproto.SpaceSubscriptionAction_Subscribe {
-			if err := h.streamPool.AddTagsCtx(ctx, sub.SpaceIds...); err != nil {
+			if err := h.streamPool.AddTagsCtx(ctx, spaceIds...); err != nil {
 				streamLog.Debug("add stream tags", zap.Error(err))
 			}
-			if tags := h.globalSubTags(peerId, sub.SpaceIds); len(tags) > 0 {
-				if err := h.streamPool.AddTagsCtx(ctx, tags...); err != nil {
-					streamLog.Debug("add global subscription tags", zap.Error(err))
-				}
+			if honoured := h.globalSubSpaces(peerId, spaceIds); len(honoured) > 0 {
+				h.subs.Add(peerId, honoured...)
 			}
 			return nil
 		}
-		tags := append([]string(nil), sub.SpaceIds...)
-		for _, spaceId := range sub.SpaceIds {
-			tags = append(tags, globalSubTag(spaceId))
-		}
-		if err := h.streamPool.RemoveTagsCtx(ctx, tags...); err != nil {
+		if err := h.streamPool.RemoveTagsCtx(ctx, spaceIds...); err != nil {
 			streamLog.Debug("remove stream tags", zap.Error(err))
+		}
+		if h.subs != nil {
+			h.subs.Remove(peerId, spaceIds...)
 		}
 		return nil
 	}

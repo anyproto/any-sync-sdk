@@ -62,6 +62,17 @@ func TestGoToAnyencExtJSONWrappers(t *testing.T) {
 	v, err = goToAnyenc(a, map[string]any{"$gte": at})
 	require.NoError(t, err)
 	require.Equal(t, anyenc.TypeDateTime, v.Get("$gte").Type(), "operator objects are walked, not marshaled")
+
+	// a wrapper key over an object or parsed payload is malformed and
+	// walked natively, so nested types and pass-through values survive
+	own := a.NewString("own")
+	v, err = goToAnyenc(a, map[string]any{"$date": map[string]any{"t": at, "o": own}})
+	require.NoError(t, err)
+	require.Equal(t, anyenc.TypeDateTime, v.Get("$date", "t").Type())
+	require.Same(t, own, v.Get("$date", "o"))
+	v, err = goToAnyenc(a, map[string]any{"$binary": own})
+	require.NoError(t, err)
+	require.Same(t, own, v.Get("$binary"))
 }
 
 // The Go route and the fastjson route yield byte-identical documents.
@@ -177,6 +188,24 @@ func TestGoToAnyencGoValues(t *testing.T) {
 	}
 	_, err = goToAnyenc(a, map[string]any{"bad": []any{math.Inf(1)}})
 	require.ErrorContains(t, err, `"bad": [0]:`)
+
+	// cycles and over-deep nesting error instead of overflowing
+	cyc := map[string]any{}
+	cyc["self"] = cyc
+	_, err = goToAnyenc(a, cyc)
+	require.ErrorContains(t, err, "nesting deeper than")
+	loop := []any{nil}
+	loop[0] = loop
+	_, err = goToAnyenc(a, loop)
+	require.ErrorContains(t, err, "nesting deeper than")
+	deep := any("leaf")
+	for i := 0; i < 300; i++ {
+		deep = map[string]any{"d": deep}
+	}
+	_, err = goToAnyenc(a, deep)
+	require.NoError(t, err)
+	_, err = goToAnyenc(a, map[string]any{"d": deep})
+	require.Error(t, err)
 }
 
 // A Go filter literal types a time.Time the way the record holds it,
@@ -201,11 +230,11 @@ func TestParseConditionTypesGoLiterals(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, f.Ok(doc, nil))
 
-	// prebuilt filters and nil pass straight through
-	f, err = parseCondition(query.All{})
-	require.NoError(t, err)
-	require.Equal(t, query.All{}, f)
-	f, err = parseCondition(nil)
-	require.NoError(t, err)
-	require.Equal(t, query.All{}, f)
+	// prebuilt filters pass straight through; every empty spelling
+	// is a non-nil match-all, so a later Filter can AND with it
+	for _, cond := range []any{query.All{}, nil, map[string]any(nil), map[string]any{}, "{}"} {
+		f, err = parseCondition(cond)
+		require.NoError(t, err, "%#v", cond)
+		require.Equal(t, query.All{}, f, "%#v", cond)
+	}
 }

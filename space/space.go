@@ -108,8 +108,10 @@ type Space interface {
 	// (objectId, dataset) — the aggregation sibling of Query. The
 	// pipeline is accepted in the same forms Query.Filter takes a
 	// condition: a JSON string, *fastjson.Value, *anyenc.Value,
-	// marshaled-anyenc []byte, or any JSON-marshalable Go value.
-	// Snapshot-only. See Agg.
+	// marshaled-anyenc []byte, or a Go value converted like a record
+	// value (see Op.Value). A Go map has no key order, so a stage whose
+	// key order matters ($sort over several keys) is given as JSON
+	// text or *fastjson.Value. Snapshot-only. See Agg.
 	Aggregate(objectId, dataset string, pipeline any) Agg
 
 	// AggregateObjects builds an aggregation pipeline against the

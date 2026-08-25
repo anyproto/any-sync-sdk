@@ -2,12 +2,15 @@ package spaceimpl
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/valyala/fastjson"
 
@@ -648,21 +651,49 @@ func splitPath(p string) []string {
 	return out
 }
 
+// jsonParsers backs goToAnyencJSON. A parser is held only for the
+// duration of one conversion; NewFromFastJson copies every byte onto
+// the arena, so nothing aliases its buffer afterwards.
+var jsonParsers fastjson.ParserPool
+
 // goToAnyenc converts a Go value into an anyenc.Value on the given
-// arena. Accepts:
+// arena. One rule on every write path: a value means what its JSON
+// form means, and the Extended-JSON wrappers ({"$date": …},
+// {"$binary": …}, {"$oid": …}, {"$vector": …}) are typed values — a
+// record holds the same instant whether it was written from a Go map,
+// a parsed HTTP body, or named in a query filter literal.
 //
-//   - Native Go types (string, bool, ints, float64, time.Time, []byte,
-//     []any, []string, map[string]any) for in-process callers. A
-//     time.Time becomes a dateTime value (millisecond precision) — the
-//     shape date properties and derived stamps carry.
-//   - *fastjson.Value for HTTP / JSON callers — they parse the
-//     request body once with a pooled fastjson.Parser, then hand the
-//     parsed values straight through. anyenc.Arena.NewFromFastJson
-//     does the conversion in one walk on our arena, no Go-native
-//     intermediate.
-//   - *anyenc.Value passes through unchanged (already on the right
-//     arena, or cross-arena — caller's responsibility).
+//   - *fastjson.Value (HTTP / JSON callers parse the body once with a
+//     pooled parser) is decoded by anyenc.Arena.NewFromFastJson, which
+//     owns the wrapper rule. *anyenc.Value is taken verbatim, wrapper-
+//     shaped or not. Both are accepted at any depth of map[string]any
+//     / []any.
+//   - Go-native typed values: time.Time is a datetime (millisecond
+//     precision), []byte is binary — the anyenc types the $date and
+//     $binary wrappers decode to.
+//   - nil, bool, string, int, int64, float64, json.Number, []string,
+//     []any, []map[string]any and map[string]any are built directly:
+//     numbers keep their bits and keys go in sorted order, so the
+//     encoding is deterministic and matches the fastjson route byte
+//     for byte (fastjson itself rounds a few exponent-form floats). A
+//     nil slice or map of these kinds is an empty container. Nesting
+//     deeper than fastjson.MaxDepth levels — a cycle included — is an
+//     error, as on the fastjson route.
+//   - A wrapper-shaped map (single key $date / $binary / $oid /
+//     $vector with a payload that is not an object or a parsed value)
+//     and every other Go value (structs, other slices and maps, other
+//     numeric kinds) go through json.Marshal and NewFromFastJson;
+//     inside those a time.Time or []byte takes the string form
+//     encoding/json gives it and a nil is null. Values encoding/json
+//     rejects (NaN, ±Inf, channels) return its error.
 func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
+	return goToAnyencDepth(a, v, 0)
+}
+
+func goToAnyencDepth(a *anyenc.Arena, v any, depth int) (*anyenc.Value, error) {
+	if depth > fastjson.MaxDepth {
+		return nil, fmt.Errorf("nesting deeper than %d levels", fastjson.MaxDepth)
+	}
 	switch x := v.(type) {
 	case nil:
 		return a.NewNull(), nil
@@ -672,44 +703,57 @@ func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 		}
 		return a.NewFromFastJson(x), nil
 	case *anyenc.Value:
+		if x == nil {
+			return a.NewNull(), nil
+		}
 		return x, nil
 	case bool:
-		if x {
-			return a.NewTrue(), nil
-		}
-		return a.NewFalse(), nil
+		return a.NewBool(x), nil
 	case string:
 		return a.NewString(x), nil
 	case int:
 		return a.NewNumberInt(x), nil
 	case int64:
-		return a.NewNumberInt(int(x)), nil
+		return a.NewNumberFloat64(float64(x)), nil
 	case float64:
-		return a.NewNumberFloat64(x), nil
+		return newFiniteNumber(a, x)
+	case json.Number:
+		f, err := x.Float64()
+		if err != nil {
+			return nil, err
+		}
+		return newFiniteNumber(a, f)
 	case time.Time:
 		return a.NewDateTime(x), nil
 	case []byte:
 		return a.NewBinary(x), nil
-	case []any:
-		arr := a.NewArray()
-		for i, e := range x {
-			ev, err := goToAnyenc(a, e)
-			if err != nil {
-				return nil, fmt.Errorf("[%d]: %w", i, err)
-			}
-			arr.SetArrayItem(i, ev)
-		}
-		return arr, nil
 	case []string:
 		arr := a.NewArray()
-		for i, e := range x {
-			arr.SetArrayItem(i, a.NewString(e))
+		for i, s := range x {
+			arr.SetArrayItem(i, a.NewString(s))
 		}
 		return arr, nil
+	case []any:
+		return goSliceToAnyenc(a, x, depth+1)
+	case []map[string]any:
+		return goSliceToAnyenc(a, x, depth+1)
 	case map[string]any:
+		if len(x) == 1 {
+			for k, payload := range x {
+				if isExtJSONWrapper(k, payload) {
+					return goToAnyencJSON(a, x)
+				}
+			}
+		}
+		var keyBuf [16]string // stack-resident for the common small object
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
 		obj := a.NewObject()
-		for k, vv := range x {
-			ev, err := goToAnyenc(a, vv)
+		for _, k := range keys {
+			ev, err := goToAnyencDepth(a, x[k], depth+1)
 			if err != nil {
 				return nil, fmt.Errorf("%q: %w", k, err)
 			}
@@ -717,6 +761,85 @@ func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 		}
 		return obj, nil
 	default:
-		return nil, fmt.Errorf("unsupported value type %T", v)
+		return goToAnyencJSON(a, v)
 	}
+}
+
+func goSliceToAnyenc[E any](a *anyenc.Arena, x []E, depth int) (*anyenc.Value, error) {
+	arr := a.NewArray()
+	for i, e := range x {
+		ev, err := goToAnyencDepth(a, e, depth)
+		if err != nil {
+			return nil, fmt.Errorf("[%d]: %w", i, err)
+		}
+		arr.SetArrayItem(i, ev)
+	}
+	return arr, nil
+}
+
+// isExtJSONWrapper reports whether a single-key map is one of the
+// wrapper shapes anyenc decodes. A payload that is itself an object or
+// a parsed value can never be well-formed, so that map is walked
+// natively and keeps nested Go types and pass-through values.
+func isExtJSONWrapper(key string, payload any) bool {
+	switch key {
+	case "$date", "$binary", "$oid", "$vector":
+	default:
+		return false
+	}
+	switch payload.(type) {
+	case map[string]any, []map[string]any, *anyenc.Value, *fastjson.Value:
+		return false
+	}
+	return true
+}
+
+func newFiniteNumber(a *anyenc.Arena, f float64) (*anyenc.Value, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, fmt.Errorf("json: unsupported value: %v", f)
+	}
+	return a.NewNumberFloat64(f), nil
+}
+
+// goToAnyencJSON is the JSON route: json.Marshal, then the decoder the
+// *fastjson.Value path uses.
+func goToAnyencJSON(a *anyenc.Arena, v any) (*anyenc.Value, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	p := jsonParsers.Get()
+	defer jsonParsers.Put(p)
+	jv, err := p.ParseBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	return a.NewFromFastJson(jv), nil
+}
+
+// parseCondition is query.ParseCondition over a caller-supplied
+// filter, with a Go map literal converted by goToAnyenc first: a
+// time.Time or []byte in it is typed the way the record holds it and
+// a {"$date": …} literal is an instant. JSON text, marshaled anyenc
+// bytes, parsed values and prebuilt filters reach the parser
+// untouched. An empty condition ({}, a nil map) matches everything.
+func parseCondition(filter any) (query.Filter, error) {
+	cond := filter
+	switch filter.(type) {
+	case nil, string, []byte, *fastjson.Value, *anyenc.Value, query.Filter:
+	default:
+		v, err := goToAnyenc(&anyenc.Arena{}, filter)
+		if err != nil {
+			return nil, err
+		}
+		cond = v
+	}
+	parsed, err := query.ParseCondition(cond)
+	if err != nil {
+		return nil, err
+	}
+	if parsed == nil {
+		return query.All{}, nil
+	}
+	return parsed, nil
 }

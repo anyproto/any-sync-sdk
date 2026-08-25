@@ -33,7 +33,7 @@ func (q *membersQuery) Filter(filter any) space.Query {
 	if q.parseErr != nil {
 		return q
 	}
-	parsed, err := query.ParseCondition(filter)
+	parsed, err := parseCondition(filter)
 	if err != nil {
 		q.parseErr = fmt.Errorf("members.query: filter: %w", err)
 		return q

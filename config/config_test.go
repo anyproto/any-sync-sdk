@@ -66,7 +66,7 @@ func TestGlobalDefaultsAndEnable(t *testing.T) {
 	}
 	// ResolveP2P: headless turns the LAN default off but leaves an
 	// explicit global opt-in alone, defaults filled.
-	c := Config{Headless: true, P2P: P2P{Global: Global{Enabled: &on}}}
+	c := Config{Headless: true, P2P: P2P{Global: GlobalP2P{Enabled: &on}}}
 	r := c.ResolveP2P()
 	if r.IsEnabled() || !r.Global.IsEnabled() || r.Global.MaxConnections != DefaultGlobalP2PMaxConnections {
 		t.Fatalf("unexpected resolve: %+v", r)

@@ -578,7 +578,7 @@ func TestBackoffFor(t *testing.T) {
 	require.Equal(t, 30*time.Second, backoffFor(TierActive, 1))
 	require.Equal(t, time.Minute, backoffFor(TierActive, 2))
 	require.Equal(t, 4*time.Minute, backoffFor(TierActive, 4))
-	require.Equal(t, 10*time.Minute, backoffFor(TierActive, 40))
+	require.Equal(t, activeBackoffMax, backoffFor(TierActive, 40))
 	require.Equal(t, staleProbe, backoffFor(TierStale, 3))
 	require.Equal(t, dormantProbe, backoffFor(TierDormant, 1))
 }

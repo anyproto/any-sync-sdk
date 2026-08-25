@@ -18,10 +18,10 @@ const (
 	// activeBackoffMin / activeBackoffMax bound the exponential backoff
 	// of an active peer that fails to answer.
 	activeBackoffMin = 30 * time.Second
-	activeBackoffMax = 10 * time.Minute
+	activeBackoffMax = 30 * time.Minute
 	// staleProbe / dormantProbe are the fixed cadences of the slower
 	// tiers.
-	staleProbe   = 30 * time.Minute
+	staleProbe   = 2 * time.Hour
 	dormantProbe = 6 * time.Hour
 	// idleCheck bounds how long the loop sleeps without a wake-up.
 	idleCheck  = time.Minute

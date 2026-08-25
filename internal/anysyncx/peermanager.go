@@ -479,7 +479,7 @@ func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message)
 // globalCoalesceWindow is how long head updates are held before one
 // batch goes to the global peers: the latest update per object wins,
 // so a burst of edits costs one relay send per peer.
-const globalCoalesceWindow = 500 * time.Millisecond
+const globalCoalesceWindow = time.Second
 
 // coalesce queues msg for the global peers. A tree head update
 // replaces the older queued one for the same object (a tree receiver

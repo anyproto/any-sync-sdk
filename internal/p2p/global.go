@@ -37,7 +37,7 @@ const (
 	reconcileInterval = 5 * time.Minute
 	// sweepInterval bumps LastSeen of every global peer that is still
 	// connected — cheap, no network.
-	sweepInterval = time.Minute
+	sweepInterval = 10 * time.Second
 	// publishDebounce coalesces ticket changes before republishing.
 	publishDebounce = 3 * time.Second
 	// opTimeout bounds one publish or reconcile of one space on the

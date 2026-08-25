@@ -164,6 +164,9 @@ type GlobalP2P struct {
 	MaxDialsPerMinute int `yaml:"maxDialsPerMinute"`
 
 	// DialTimeout bounds one global dial (relay round trip included).
+	// A relay dial either completes in about a round trip or dies at
+	// QUIC's own handshake timeout of 5 s, so this only decides how long
+	// the connector's single dial slot stays busy on a dead peer.
 	DialTimeout time.Duration `yaml:"dialTimeout"`
 
 	// KeepAlive is the QUIC keep-alive period of global connections.
@@ -178,17 +181,12 @@ type GlobalP2P struct {
 	DisableAfter time.Duration `yaml:"disableAfter"`
 }
 
-// Global is the former name of GlobalP2P.
-//
-// Deprecated: use GlobalP2P.
-type Global = GlobalP2P
-
 // Defaults for the zero-valued GlobalP2P budget fields.
 const (
 	DefaultGlobalP2PMaxConnections    = 4
 	DefaultGlobalP2PMaxInbound        = 8
 	DefaultGlobalP2PMaxDialsPerMinute = 6
-	DefaultGlobalP2PDialTimeout       = 15 * time.Second
+	DefaultGlobalP2PDialTimeout       = 6 * time.Second
 	DefaultGlobalP2PKeepAlive         = 60 * time.Second
 	DefaultGlobalP2PStaleAfter        = time.Hour
 	DefaultGlobalP2PDormantAfter      = 7 * 24 * time.Hour

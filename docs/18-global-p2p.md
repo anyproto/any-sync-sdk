@@ -52,7 +52,7 @@ each space's key-value store.
   the disabled tier, and only while fewer than
   `MaxConnections + MaxInbound` distinct global peers hold a live
   connection (the layer's own count: connector dials plus inbound
-  connections folded in by the minute sweep). The records are the
+  connections folded in by the 10 s sweep). The records are the
   allowlist.
 
 ## Liveness tiers
@@ -60,13 +60,13 @@ each space's key-value store.
 Every peer carries a persisted record (`p2p_peers.json` under DataDir):
 `lastSeen`, `lastAttempt`, `failures`. `lastSeen` is the newest of the
 key-value row timestamps (publisher clock, clamped to now), a
-successful dial, an accepted connection, or the one-minute sweep over
+successful dial, an accepted connection, or the 10 s sweep over
 peers still connected. Age selects the tier:
 
 | tier     | age (defaults) | dialing                              | in peer sets    |
 |----------|----------------|--------------------------------------|-----------------|
-| active   | < 1 h          | kept connected, 30 s → 10 min backoff | yes            |
-| stale    | 1 h – 7 d      | probed every 30 min, after active     | while connected |
+| active   | < 1 h          | kept connected, 30 s → 30 min backoff | yes            |
+| stale    | 1 h – 7 d      | probed every 2 h, after active     | while connected |
 | dormant  | 7 d – 30 d     | probed at startup and every 6 h       | while connected |
 | disabled | > 30 d         | never; no address, refused inbound    | no              |
 
@@ -90,25 +90,39 @@ Device-wide, in `config.P2P.Global` (type `config.GlobalP2P`):
 - `MaxInbound` (8): headroom above `MaxConnections` for connections
   the other side opened, counted as distinct peers with a live
   connection.
-- `MaxDialsPerMinute` (6), one dial in flight, `DialTimeout` (15 s),
+- `MaxDialsPerMinute` (6), one dial in flight, `DialTimeout` (6 s),
   per-peer backoff by tier. Nothing loaded or everything covered means
-  zero dials.
-- `KeepAlive` (60 s); the QUIC idle timeout is three periods. The relay
-  session is the floor cost of being reachable.
+  zero dials. A relay dial completes in about a round trip or dies at
+  QUIC's own 5 s handshake timeout, so a longer `DialTimeout` would only
+  hold the dial slot; a dial that finds nobody home still costs about
+  13 KB of uplink in retransmitted handshake packets, which is what the
+  rate limit and the backoff are there to bound.
+- `KeepAlive` (60 s); the QUIC idle timeout is three periods. Measured
+  over the relay, an idle connection costs ~170 B/min at 60 s and
+  ~480 B/min at 25 s. The relay session is the floor cost of being
+  reachable and is larger than either: ~315 B/min per endpoint, four
+  relay pings a minute, whether or not anything is connected.
 - `p2p.SetPowerHint(p2p.PowerLow)` (platform bridges) stops probing;
-  `PowerNormal` resumes it.
+  `PowerNormal` resumes it. It does not unbind the endpoint, so a
+  backgrounded device keeps paying the relay session's floor above.
 
 ## Head updates and head-sync
 
 With a node stream up, global peers receive nothing directly: the nodes
 propagate, and the connections serve pubsub, files p2p, inbound sync
 and failover. Without a node, global peers take over: tree head updates are
-coalesced per object over a 500 ms window (a tree receiver fetches
+coalesced per object over a 1 s window (a tree receiver fetches
 whatever it misses; key-value and ACL updates are queued in order, their
 payloads are not cumulative) and sent to at most `MaxConnections`
 connected peers; the periodic diff runs against one connected global
 peer per tick, rotating. A space with no known global peer queues
 nothing.
+
+Measured over the relay, fifty edits of one object cost nothing at all
+towards a global peer while a node stream is up, ~3.1 KB per edit when
+they land in one coalescing window, and ~9.2 KB per edit when each falls
+in its own — the window is worth about a factor of three, and most of
+what remains is the changes themselves travelling.
 
 ## Configuration
 

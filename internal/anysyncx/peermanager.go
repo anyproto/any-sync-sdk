@@ -100,31 +100,37 @@ type sendPool interface {
 // into the responsible/broadcast sets, so head-sync and pushes run
 // over the LAN too — including while every node is unreachable.
 //
-// Global peers (internet-wide, from key-value records) join only while
-// no node stream is up: with a node reachable they receive everything
-// through it, so broadcasting to them would multiply upload for
-// nothing. Without a node they take over — head updates coalesced per
-// object over a short window and fanned out to at most globalFanout
-// already-connected peers, the periodic diff against one connected
-// peer per tick, rotating. They are never dialed from here.
+// Global peers (internet-wide, from key-value records) get pushes by
+// subscription: a device with no node stream asks its connected global
+// peers for pushes (KeepAlive) and pushes to all of them itself — they
+// are its only path; a device with a node reachable pushes only to the
+// global peers that asked, since everyone else receives through the
+// nodes. Pushes are coalesced per object over a short window and fanned
+// out to at most globalFanout already-connected peers; the periodic
+// diff adds one connected global peer per tick, rotating, only while no
+// node stream is up. Global peers are never dialed from here.
 type spacePeerManager struct {
-	spaceId         string
-	nodeConf        nodeconf.Service
-	pool            pool.Pool
-	streamPool      sendPool
-	localPeers      localPeerSource
-	globalPeers     globalPeerSource
-	globalFanout    int
-	subscribeMsgRaw []byte
+	spaceId           string
+	nodeConf          nodeconf.Service
+	pool              pool.Pool
+	streamPool        sendPool
+	localPeers        localPeerSource
+	globalPeers       globalPeerSource
+	globalFanout      int
+	subscribeMsgRaw   []byte
+	unsubscribeMsgRaw []byte
 
 	// globalRotation picks the next connected global peer for the
-	// periodic diff.
-	globalMu       sync.Mutex
-	globalRotation int
-	coalesced      map[string]drpc.Message
-	coalesceOrder  []string
-	coalesceSeq    int
-	coalesceTimer  *time.Timer
+	// periodic diff; globalSubscribed remembers that the global peers
+	// were asked for pushes, so the ask is withdrawn once a node is
+	// back.
+	globalMu         sync.Mutex
+	globalRotation   int
+	globalSubscribed bool
+	coalesced        map[string]drpc.Message
+	coalesceOrder    []string
+	coalesceSeq      int
+	coalesceTimer    *time.Timer
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
@@ -158,6 +164,10 @@ func (m *spacePeerManager) Init(a *app.App) error {
 		return err
 	}
 	m.subscribeMsgRaw = payload
+	sub.Action = spacesyncproto.SpaceSubscriptionAction_Unsubscribe
+	if m.unsubscribeMsgRaw, err = sub.MarshalVT(); err != nil {
+		return err
+	}
 	m.runCtx, m.runCancel = context.WithCancel(context.Background())
 	m.parkWake = make(chan struct{}, 1)
 	m.parkDone = make(chan struct{})
@@ -173,6 +183,17 @@ func (m *spacePeerManager) Run(_ context.Context) error {
 }
 
 func (m *spacePeerManager) Close(_ context.Context) error {
+	m.globalMu.Lock()
+	subscribed := m.globalSubscribed
+	m.globalSubscribed = false
+	m.globalMu.Unlock()
+	if subscribed {
+		// best effort: the send is queued, the peers drop the tags with
+		// the stream anyway
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		m.sendGlobal(ctx, m.unsubscribeMsgRaw)
+		cancel()
+	}
 	if m.runCancel != nil {
 		m.runCancel()
 	}
@@ -470,10 +491,20 @@ func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message)
 		m.park(msg)
 		err = nil
 	}
-	if m.globalFallback() {
+	if m.globalPushActive() {
 		m.coalesce(msg)
 	}
 	return err
+}
+
+// globalPushActive reports whether this space pushes to global peers
+// right now: always while no node stream is up, otherwise only while
+// some global peer holds a subscription.
+func (m *spacePeerManager) globalPushActive() bool {
+	if m.globalPeers == nil {
+		return false
+	}
+	return !m.hasNodeStream() || len(m.streamPool.Streams(globalSubTag(m.spaceId))) > 0
 }
 
 // globalCoalesceWindow is how long head updates are held before one
@@ -546,9 +577,55 @@ func (m *spacePeerManager) flushCoalesced() {
 	}
 }
 
-// getGlobalPeers is the fan-out audience of one coalesced batch.
+// getGlobalPeers is the fan-out audience of one coalesced batch: every
+// connected global peer while no node stream is up, the subscribed ones
+// otherwise.
 func (m *spacePeerManager) getGlobalPeers(ctx context.Context) ([]peer.Peer, error) {
-	return m.connectedGlobalPeers(ctx, m.globalFanout), nil
+	if !m.hasNodeStream() {
+		return m.connectedGlobalPeers(ctx, m.globalFanout), nil
+	}
+	return m.subscribedGlobalPeers(ctx, m.globalFanout), nil
+}
+
+// subscribedGlobalPeers lists the connected global peers that asked
+// for pushes of this space (an inbound stream tagged globalSubTag), at
+// most limit (0 = all). A peer the records do not name for the space,
+// or one reachable over the LAN (pushed to by the LAN path), is skipped.
+func (m *spacePeerManager) subscribedGlobalPeers(ctx context.Context, limit int) []peer.Peer {
+	if m.globalPeers == nil {
+		return nil
+	}
+	streams := m.streamPool.Streams(globalSubTag(m.spaceId))
+	if len(streams) == 0 {
+		return nil
+	}
+	global := m.globalPeers.GlobalPeerIds(m.spaceId)
+	var local []string
+	if m.localPeers != nil {
+		local = m.localPeers.LocalPeerIds(m.spaceId)
+	}
+	seen := map[string]struct{}{}
+	var out []peer.Peer
+	for _, s := range streams {
+		if s == nil {
+			continue
+		}
+		id, err := peer.CtxPeerId(s.Context())
+		if err != nil {
+			continue
+		}
+		if _, dup := seen[id]; dup || !slices.Contains(global, id) || slices.Contains(local, id) {
+			continue
+		}
+		seen[id] = struct{}{}
+		if p, err := p2p.PickLive(ctx, m.pool, id); err == nil {
+			out = append(out, p)
+		}
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 // getBroadcastPeers is the push audience: every node peer plus every
@@ -746,5 +823,36 @@ func (m *spacePeerManager) KeepAlive(ctx context.Context) {
 	msg := &spacesyncproto.ObjectSyncMessage{Payload: m.subscribeMsgRaw}
 	_ = m.streamPool.Send(m.runCtx, msg, func(ctx context.Context) ([]peer.Peer, error) {
 		return m.GetNodePeers(ctx)
+	})
+	m.keepAliveGlobal()
+}
+
+// keepAliveGlobal asks every connected global peer for pushes while no
+// node stream is up (re-sent on the KeepAlive cadence, so a peer that
+// connected later is asked too) and withdraws the ask once a node is
+// back, so a device with a node stops pushing to us.
+func (m *spacePeerManager) keepAliveGlobal() {
+	if m.globalPeers == nil {
+		return
+	}
+	nodeUp := m.hasNodeStream()
+	m.globalMu.Lock()
+	was := m.globalSubscribed
+	m.globalSubscribed = !nodeUp
+	m.globalMu.Unlock()
+	switch {
+	case !nodeUp:
+		m.sendGlobal(m.runCtx, m.subscribeMsgRaw)
+	case was:
+		m.sendGlobal(m.runCtx, m.unsubscribeMsgRaw)
+	}
+}
+
+// sendGlobal sends one control message to every connected global peer
+// sharing this space; nothing is dialed.
+func (m *spacePeerManager) sendGlobal(ctx context.Context, payload []byte) {
+	msg := &spacesyncproto.ObjectSyncMessage{Payload: payload}
+	_ = m.streamPool.Send(ctx, msg, func(ctx context.Context) ([]peer.Peer, error) {
+		return m.connectedGlobalPeers(ctx, 0), nil
 	})
 }

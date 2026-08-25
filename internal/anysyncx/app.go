@@ -156,6 +156,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	tree := newTreeManager()
 	localOnly := newLocalOnlySpaces()
 	peerStore := p2p.NewPeerStore()
+	stream.peers = peerStore
 	addrBook := p2p.NewAddrBook()
 	// advertisedSpaceIds is the set the p2p exchange discloses and
 	// serves: every locally-stored space EXCEPT local-only ones, which
@@ -702,6 +703,12 @@ func (a *App) newTreeSyncerForSpace(spaceId string) *treeSyncerAdapter {
 		a.syncStatus.For(spaceId).BulkSyncedFromPeer(peerId)
 	}
 	ts := newTreeSyncer(spaceId, a.tree.registry, onRound)
+	// A tree fetched whole from a responsible peer (node, LAN or global)
+	// is in sync with it: without this a space that converges through
+	// peer pulls alone would sit in Syncing until a fully empty round.
+	ts.onFetched = func(peerId, treeId string, heads []string) {
+		a.syncStatus.For(spaceId).HeadsApply(peerId, treeId, heads, true)
+	}
 	a.syncersMu.Lock()
 	a.syncers[spaceId] = ts
 	a.syncersMu.Unlock()

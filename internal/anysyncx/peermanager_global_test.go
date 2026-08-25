@@ -51,28 +51,72 @@ func (f *fakeGlobalPeers) GlobalPeerIds(string) []string { return f.ids }
 type recordingSendPool struct {
 	mu        sync.Mutex
 	audiences [][]string
+	messages  []drpc.Message
 	nodeUp    bool
+	// tagged holds inbound streams by tag (global subscriptions).
+	tagged map[string][]drpc.Stream
 }
 
-func (r *recordingSendPool) Send(ctx context.Context, _ drpc.Message, getter streampool.PeerGetter) error {
+func (r *recordingSendPool) Send(ctx context.Context, msg drpc.Message, getter streampool.PeerGetter) error {
 	peers, err := getter(ctx)
 	if err != nil {
 		return err
 	}
 	r.mu.Lock()
 	r.audiences = append(r.audiences, peerIds(peers))
+	r.messages = append(r.messages, msg)
 	r.mu.Unlock()
 	return nil
 }
 
-func (r *recordingSendPool) Streams(...string) []drpc.Stream {
+func (r *recordingSendPool) Streams(tags ...string) []drpc.Stream {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.nodeUp {
-		return []drpc.Stream{nil}
+	var out []drpc.Stream
+	for _, tag := range tags {
+		if tag == nodeStreamTag {
+			if r.nodeUp {
+				out = append(out, nil)
+			}
+			continue
+		}
+		out = append(out, r.tagged[tag]...)
 	}
-	return nil
+	return out
 }
+
+// subscribe registers an inbound stream from peerId tagged with the
+// global subscription of spaceId.
+func (r *recordingSendPool) subscribe(spaceId, peerId string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.tagged == nil {
+		r.tagged = map[string][]drpc.Stream{}
+	}
+	tag := globalSubTag(spaceId)
+	r.tagged[tag] = append(r.tagged[tag], fakeStream{ctx: peer.CtxWithPeerId(context.Background(), peerId)})
+}
+
+// sentPayloads lists the ObjectSyncMessage payloads sent so far, one
+// per Send, nil for other message kinds.
+func (r *recordingSendPool) sentPayloads() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([][]byte, len(r.messages))
+	for i, m := range r.messages {
+		if osm, ok := m.(*spacesyncproto.ObjectSyncMessage); ok {
+			out[i] = osm.Payload
+		}
+	}
+	return out
+}
+
+type fakeStream struct {
+	drpc.Stream
+	ctx context.Context
+}
+
+func (f fakeStream) Context() context.Context { return f.ctx }
 
 func (r *recordingSendPool) sent() [][]string {
 	r.mu.Lock()

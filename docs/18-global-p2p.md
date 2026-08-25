@@ -108,15 +108,26 @@ Device-wide, in `config.P2P.Global` (type `config.GlobalP2P`):
 
 ## Head updates and head-sync
 
-With a node stream up, global peers receive nothing directly: the nodes
-propagate, and the connections serve pubsub, files p2p, inbound sync
-and failover. Without a node, global peers take over: tree head updates are
-coalesced per object over a 1 s window (a tree receiver fetches
-whatever it misses; key-value and ACL updates are queued in order, their
-payloads are not cumulative) and sent to at most `MaxConnections`
-connected peers; the periodic diff runs against one connected global
-peer per tick, rotating. A space with no known global peer queues
-nothing.
+Pushes to global peers follow subscriptions. A device with no node
+stream asks every connected global peer for pushes (a
+`SpaceSubscription` on the same cadence as its node subscriptions, so a
+peer that connects later is asked too) and withdraws the ask once a node
+stream is back; it also pushes to all of its connected global peers,
+since they are its only path. A device with a node stream pushes only
+to the global peers that asked — everyone else receives through the
+nodes — and the ask is honoured only from a peer the space's records
+name (a LAN-reachable peer is served by the LAN path instead). The
+subscription lives on the inbound stream and dies with it.
+
+Pushed head updates are coalesced per object over a 1 s window (a tree
+receiver fetches whatever it misses; key-value and ACL updates are
+queued in order, their payloads are not cumulative) and sent to at most
+`MaxConnections` peers. The periodic diff adds one connected global peer
+per tick, rotating, only while no node stream is up. A space with no
+known global peer queues nothing. A tree fetched whole from a peer
+during a diff round counts as synced with that peer, so a space that
+converges through pulls alone reports `synced` without waiting for an
+empty round.
 
 Measured over the relay, fifty edits of one object cost nothing at all
 towards a global peer while a node stream is up, ~3.1 KB per edit when

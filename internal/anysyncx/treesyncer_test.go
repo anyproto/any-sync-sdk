@@ -3,6 +3,7 @@ package anysyncx
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
@@ -15,6 +16,7 @@ import (
 // recorded so tests can assert retry behavior.
 type scriptedRegistry struct {
 	fail  map[string]error
+	trees map[string]objecttree.ObjectTree
 	calls []string
 }
 
@@ -22,6 +24,9 @@ func (r *scriptedRegistry) GetTree(_ context.Context, _, treeId string) (objectt
 	r.calls = append(r.calls, treeId)
 	if err, ok := r.fail[treeId]; ok {
 		return nil, err
+	}
+	if tr, ok := r.trees[treeId]; ok {
+		return tr, nil
 	}
 	// nil tree is fine for SyncAll: the synctree.SyncTree assertion
 	// just comes back false and the ping is skipped.
@@ -102,4 +107,30 @@ func TestTreeSyncerDedupsPendingAgainstDiff(t *testing.T) {
 	require.NoError(t, ts.SyncAll(context.Background(), p, nil, []string{"t1"}))
 	require.Equal(t, []string{"t1"}, reg.calls)
 	require.Equal(t, 0, ts.Stats()[0].Pending)
+}
+
+// headsTree is the slice of an object tree SyncAll reads after a fetch.
+type headsTree struct {
+	objecttree.ObjectTree
+	heads []string
+}
+
+func (h headsTree) Lock()           {}
+func (h headsTree) Unlock()         {}
+func (h headsTree) Heads() []string { return h.heads }
+
+// A tree fetched whole from the peer is reported with its heads; a
+// tree that already existed is not.
+func TestTreeSyncerReportsFetchedTrees(t *testing.T) {
+	reg := &scriptedRegistry{trees: map[string]objecttree.ObjectTree{
+		"missing":  headsTree{heads: []string{"h1", "h2"}},
+		"existing": headsTree{heads: []string{"h3"}},
+	}}
+	ts := newTreeSyncer("space1", reg, nil)
+	var got []string
+	ts.onFetched = func(peerId, treeId string, heads []string) {
+		got = append(got, peerId+"/"+treeId+"/"+strings.Join(heads, ","))
+	}
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "n1"}, []string{"existing"}, []string{"missing"}))
+	require.Equal(t, []string{"n1/missing/h1,h2"}, got)
 }

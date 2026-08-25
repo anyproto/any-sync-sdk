@@ -3,6 +3,7 @@ package anysyncx
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -57,6 +58,11 @@ type PeerSyncSnapshot struct {
 // is the SyncAll error, nil on success.
 type PeerRoundCallback func(peerId string, newCount, changedCount int, err error)
 
+// TreeFetchedCallback fires after a tree missing locally was fetched
+// from a peer during SyncAll, with the heads it now holds: the tree is
+// in sync with that peer by construction.
+type TreeFetchedCallback func(peerId, treeId string, heads []string)
+
 type treeSyncerAdapter struct {
 	spaceId     string
 	treeBuilder objecttreebuilder.TreeBuilder
@@ -74,6 +80,8 @@ type treeSyncerAdapter struct {
 	// onRound is the optional space-level "round done" callback —
 	// fires on every SyncAll. nil-safe.
 	onRound PeerRoundCallback
+	// onFetched reports a tree fetched whole from a peer. nil-safe.
+	onFetched TreeFetchedCallback
 
 	// pendingMu guards pending: tree ids whose GetTree failed during a
 	// SyncAll round. The any-sync fetch may write a tree's changes to
@@ -156,6 +164,10 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 		return ErrSpaceRegistryUnset
 	}
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
+	fetched := make(map[string]struct{}, len(missing))
+	for _, id := range missing {
+		fetched[id] = struct{}{}
+	}
 	seen := make(map[string]struct{}, len(missing)+len(existing))
 	for _, ids := range [][]string{missing, existing, t.pendingIds()} {
 		for _, id := range ids {
@@ -197,6 +209,12 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 				tsLog.Info("parked tree recovered",
 					zap.String("spaceId", t.spaceId), zap.String("treeId", id),
 					zap.String("peerId", p.Id()))
+			}
+			if _, wasMissing := fetched[id]; wasMissing && t.onFetched != nil && tree != nil {
+				tree.Lock()
+				heads := slices.Clone(tree.Heads())
+				tree.Unlock()
+				t.onFetched(p.Id(), id, heads)
 			}
 			if st, ok := tree.(synctree.SyncTree); ok {
 				_ = st.SyncWithPeer(ctx, p)

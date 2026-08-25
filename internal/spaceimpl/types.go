@@ -857,7 +857,8 @@ func (t *typesAPI) findPropertyDef(ctx context.Context, typeId, propId string) (
 // rejected until the space-level tag table lands), the declared Kind —
 // defaulted from the format type when zero — must satisfy the
 // format→kind coupling (links ⇒ array of string; date/datetime ⇒
-// string), and Filter is serialized to its JSON text. Returns the
+// datetime, string accepted), and Filter is serialized to its JSON
+// text. Returns the
 // filter JSON to store ("" = none).
 //
 // Structure only: UI and the filter contents are stored opaquely — the

@@ -441,8 +441,9 @@ type PropertyDraft struct {
 
 	// Format optionally declares the value convention. Format.Type
 	// constrains Kind (links/tags/multiselect ⇒ array of string;
-	// date/datetime/select ⇒ string) and, when Kind is zero, defaults
-	// it. Format.Type is pinned by the first write; UI, Filter, Options
+	// select ⇒ string; date/datetime ⇒ datetime, with string still
+	// accepted for the ISO-8601 text convention) and, when Kind is
+	// zero, defaults it. Format.Type is pinned by the first write; UI, Filter, Options
 	// and Meta stay mutable via PatchProperty. FormatTags is reserved
 	// until the space-level tags table lands and is rejected.
 	Format *PropertyFormatDraft
@@ -451,9 +452,9 @@ type PropertyDraft struct {
 // PropertyPatch is a generic per-path patch to a property definition,
 // the input to PatchProperty.
 //
-// Set maps a dotted field path to its new value (values are stored
-// verbatim; format.* leaves must be strings — the CRDT handler enforces
-// this). Unset lists dotted field paths to remove (subtree removals are
+// Set maps a dotted field path to its new value (values convert as
+// Op.Value describes and are not otherwise validated; format.* leaves
+// must be strings — the CRDT handler enforces this). Unset lists dotted field paths to remove (subtree removals are
 // allowed, e.g. "format.options.<key>" to delete a whole option). A path
 // present in neither is left unchanged. At least one entry across Set /
 // Unset is required.

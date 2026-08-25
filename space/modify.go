@@ -71,14 +71,19 @@ type Op struct {
 	Type OpType
 	Path string
 	// Value is the operand — scalar, slice, or map[string]any
-	// depending on Type — converted as its JSON form. Extended-JSON
-	// wrappers ({"$date": "<RFC 3339>"}, {"$binary": "<base64>"}) are
-	// typed values, the same shape a Query.Filter literal uses; a
-	// *fastjson.Value or *anyenc.Value passes through as-is. A
-	// time.Time or []byte becomes the string encoding/json gives it.
-	// The same rule governs every Go value that enters a record:
-	// UpsertRecord.Fields, Properties.Set, CreateObjectOpts
-	// .InitialProperties, PropertyPatch.Set, DatasetDefPatch.Set.
+	// depending on Type. A value means what its JSON form means:
+	// Extended-JSON wrappers are typed values, the same spelling a
+	// Query.Filter literal uses, and {"$date": "<RFC 3339>"} is the
+	// one with a property kind (datetime); $binary, $oid and $vector
+	// decode too but fit only undeclared fields. A Go time.Time is a
+	// datetime and []byte is binary, at any depth of map[string]any /
+	// []any. A *fastjson.Value is decoded under the same rule; a
+	// *anyenc.Value is taken verbatim. Every value written into a
+	// dataset record follows this rule: UpsertRecord.Fields,
+	// PropertiesAPI.Set, CreateObjectOpts.InitialProperties,
+	// PropertyPatch.Set, DatasetDefPatch.Set. Tech-space settings and
+	// device app bags are scalar-only (Service.SetSettings,
+	// DeviceUpsert.Apps).
 	Value any
 }
 

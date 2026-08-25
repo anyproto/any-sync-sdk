@@ -2,7 +2,6 @@ package spaceimpl
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -86,10 +85,7 @@ func (a *aggImpl) normalizePipeline(pipeline any) (*anyenc.Value, error) {
 	case []byte:
 		v, err = anyenc.Parse(p)
 	default:
-		var raw []byte
-		if raw, err = json.Marshal(p); err == nil {
-			v, err = anyenc.ParseJson(string(raw))
-		}
+		v, err = goToAnyenc(a.arena, p)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", space.ErrBadPipeline, err)

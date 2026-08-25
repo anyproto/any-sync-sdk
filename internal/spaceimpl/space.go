@@ -2,9 +2,11 @@ package spaceimpl
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -707,6 +709,26 @@ func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 		}
 		return arr, nil
 	case map[string]any:
+		// An Extended-JSON wrapper ({"$date": …}, {"$binary": …}, …) is
+		// one typed value, not an object: hand it to the same lenient
+		// decoder the fastjson path uses (anyenc extjson), so a record
+		// written through Upsert carries the same instant it would
+		// through Modify. Only a single-key `$`-map takes the detour.
+		if len(x) == 1 {
+			for k := range x {
+				if strings.HasPrefix(k, "$") {
+					raw, err := json.Marshal(x)
+					if err != nil {
+						return nil, err
+					}
+					jv, err := fastjson.ParseBytes(raw)
+					if err != nil {
+						return nil, err
+					}
+					return a.NewFromFastJson(jv), nil
+				}
+			}
+		}
 		obj := a.NewObject()
 		for k, vv := range x {
 			ev, err := goToAnyenc(a, vv)

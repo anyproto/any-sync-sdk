@@ -745,7 +745,8 @@ func goToAnyencDepth(a *anyenc.Arena, v any, depth int) (*anyenc.Value, error) {
 				}
 			}
 		}
-		keys := make([]string, 0, len(x))
+		var keyBuf [16]string // stack-resident for the common small object
+		keys := keyBuf[:0]
 		for k := range x {
 			keys = append(keys, k)
 		}

@@ -68,9 +68,18 @@ type RecordModify struct {
 // an object whose keys are paths applied in parallel under one
 // VersionId.
 type Op struct {
-	Type  OpType
-	Path  string
-	Value any // scalar, slice, or map[string]any depending on Type
+	Type OpType
+	Path string
+	// Value is the operand — scalar, slice, or map[string]any
+	// depending on Type — converted as its JSON form. Extended-JSON
+	// wrappers ({"$date": "<RFC 3339>"}, {"$binary": "<base64>"}) are
+	// typed values, the same shape a Query.Filter literal uses; a
+	// *fastjson.Value or *anyenc.Value passes through as-is. A
+	// time.Time or []byte becomes the string encoding/json gives it.
+	// The same rule governs every Go value that enters a record:
+	// UpsertRecord.Fields, Properties.Set, CreateObjectOpts
+	// .InitialProperties, PropertyPatch.Set, DatasetDefPatch.Set.
+	Value any
 }
 
 // OpType is the set of supported modifiers for v1. No insert op —

@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
-	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
@@ -650,20 +648,29 @@ func splitPath(p string) []string {
 	return out
 }
 
+// jsonParsers backs goToAnyenc's Go-value route. A parser is held
+// only for the duration of one conversion; NewFromFastJson copies
+// every byte onto the arena, so nothing aliases its buffer afterwards.
+var jsonParsers fastjson.ParserPool
+
 // goToAnyenc converts a Go value into an anyenc.Value on the given
-// arena. Accepts:
+// arena. Every route ends in anyenc.Arena.NewFromFastJson, so the
+// Extended-JSON wrappers ({"$date": …}, {"$binary": …}, {"$oid": …},
+// {"$vector": …}) are typed values on each of them: a record holds the
+// same instant whether it was written from a Go map, a parsed HTTP
+// body, or named in a query filter literal.
 //
-//   - Native Go types (string, bool, ints, float64, time.Time, []byte,
-//     []any, []string, map[string]any) for in-process callers. A
-//     time.Time becomes a dateTime value (millisecond precision) — the
-//     shape date properties and derived stamps carry.
-//   - *fastjson.Value for HTTP / JSON callers — they parse the
-//     request body once with a pooled fastjson.Parser, then hand the
-//     parsed values straight through. anyenc.Arena.NewFromFastJson
-//     does the conversion in one walk on our arena, no Go-native
-//     intermediate.
+//   - *fastjson.Value: HTTP / JSON callers parse the request body once
+//     with a pooled parser and hand the parsed values straight
+//     through — one walk onto our arena, no Go-native intermediate.
 //   - *anyenc.Value passes through unchanged (already on the right
 //     arena, or cross-arena — caller's responsibility).
+//   - Any other Go value is converted as its JSON form: json.Marshal,
+//     then the fastjson route. Maps, slices, structs and every numeric
+//     kind work. A time.Time or []byte becomes the string encoding/json
+//     gives it; typed values are expressed as wrappers or handed in as
+//     a *anyenc.Value. Values encoding/json rejects (NaN, cycles,
+//     channels) return its error.
 func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 	switch x := v.(type) {
 	case nil:
@@ -674,71 +681,21 @@ func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 		}
 		return a.NewFromFastJson(x), nil
 	case *anyenc.Value:
+		if x == nil {
+			return a.NewNull(), nil
+		}
 		return x, nil
-	case bool:
-		if x {
-			return a.NewTrue(), nil
-		}
-		return a.NewFalse(), nil
-	case string:
-		return a.NewString(x), nil
-	case int:
-		return a.NewNumberInt(x), nil
-	case int64:
-		return a.NewNumberInt(int(x)), nil
-	case float64:
-		return a.NewNumberFloat64(x), nil
-	case time.Time:
-		return a.NewDateTime(x), nil
-	case []byte:
-		return a.NewBinary(x), nil
-	case []any:
-		arr := a.NewArray()
-		for i, e := range x {
-			ev, err := goToAnyenc(a, e)
-			if err != nil {
-				return nil, fmt.Errorf("[%d]: %w", i, err)
-			}
-			arr.SetArrayItem(i, ev)
-		}
-		return arr, nil
-	case []string:
-		arr := a.NewArray()
-		for i, e := range x {
-			arr.SetArrayItem(i, a.NewString(e))
-		}
-		return arr, nil
-	case map[string]any:
-		// An Extended-JSON wrapper ({"$date": …}, {"$binary": …}, …) is
-		// one typed value, not an object: hand it to the same lenient
-		// decoder the fastjson path uses (anyenc extjson), so a record
-		// written through Upsert carries the same instant it would
-		// through Modify. Only a single-key `$`-map takes the detour.
-		if len(x) == 1 {
-			for k := range x {
-				if strings.HasPrefix(k, "$") {
-					raw, err := json.Marshal(x)
-					if err != nil {
-						return nil, err
-					}
-					jv, err := fastjson.ParseBytes(raw)
-					if err != nil {
-						return nil, err
-					}
-					return a.NewFromFastJson(jv), nil
-				}
-			}
-		}
-		obj := a.NewObject()
-		for k, vv := range x {
-			ev, err := goToAnyenc(a, vv)
-			if err != nil {
-				return nil, fmt.Errorf("%q: %w", k, err)
-			}
-			obj.Set(k, ev)
-		}
-		return obj, nil
 	default:
-		return nil, fmt.Errorf("unsupported value type %T", v)
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		p := jsonParsers.Get()
+		defer jsonParsers.Put(p)
+		jv, err := p.ParseBytes(raw)
+		if err != nil {
+			return nil, err
+		}
+		return a.NewFromFastJson(jv), nil
 	}
 }

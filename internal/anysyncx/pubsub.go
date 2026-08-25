@@ -57,13 +57,13 @@ const aclOpTimeout = 10 * time.Second
 // miss.
 const pubsubKeyCacheLimit = 1024
 
-// pubsubPeers is the engine's PeerProvider: the responsible sync node
-// plus every connectable LAN peer sharing the space — the same
-// audience spacePeerManager.getBroadcastPeers resolves. Local-only
-// spaces resolve nobody (mirrors localPeerManager), so publishes on
-// them deliver loopback-only. Dial errors drop the peer silently: the
-// engine only logs peer-resolution failures and its resync loop
-// retries.
+// pubsubPeers is the engine's PeerProvider: the responsible sync node,
+// every connectable LAN peer sharing the space, and every global peer
+// sharing it that is ALREADY connected (pool.Pick — never a dial; the
+// global connector owns those). Local-only spaces resolve nobody
+// (mirrors localPeerManager), so publishes on them deliver
+// loopback-only. Dial errors drop the peer silently: the engine only
+// logs peer-resolution failures and its resync loop retries.
 type pubsubPeers struct {
 	app *App
 }
@@ -82,6 +82,13 @@ func (p *pubsubPeers) SpacePeers(ctx context.Context, spaceId string) ([]peer.Pe
 	for _, id := range a.peerStore.LocalPeerIds(spaceId) {
 		if lp, err := a.Pool().Get(ctx, id); err == nil {
 			peers = append(peers, lp)
+		}
+	}
+	if a.globalEnabled {
+		for _, id := range a.peerStore.GlobalPeerIds(spaceId) {
+			if gp, err := a.Pool().Pick(ctx, id); err == nil {
+				peers = append(peers, gp)
+			}
 		}
 	}
 	return peers, nil

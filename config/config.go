@@ -116,22 +116,124 @@ type P2P struct {
 	// e.g. e2e tests use a unique per-run name so developer machines on
 	// the same LAN don't discover each other.
 	ServiceName string `yaml:"serviceName"`
+
+	// Global is the internet-wide device-to-device layer (iroh: QUIC
+	// with relay fallback and hole punching, peers discovered through
+	// each space's key-value store). Independent of the LAN layer:
+	// Enabled=false above with Global.Enabled=true is a valid setup.
+	Global Global `yaml:"global"`
 }
 
 // IsEnabled resolves the opt-out tristate: nil = enabled.
 func (p P2P) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+
+// Global configures the internet-wide p2p layer. Opt-in: nil Enabled
+// means off until a relay is deployed for the network. Zero-valued
+// budget fields take the Default* values; see docs/18-global-p2p.md.
+type Global struct {
+	// Enabled turns the layer on. nil and false both mean off.
+	Enabled *bool `yaml:"enabled"`
+
+	// RelayURLs are the home-relay candidates ("https://relay.example").
+	// Empty means no relay: only direct paths work and the published
+	// ticket carries this device's IP addresses.
+	RelayURLs []string `yaml:"relayUrls"`
+
+	// InsecureRelay admits http:// relay URLs (plaintext transport to
+	// the relay). Development and tests only.
+	InsecureRelay bool `yaml:"insecureRelay"`
+
+	// Port fixes the UDP port of the iroh endpoint. Zero binds an
+	// ephemeral port.
+	Port int `yaml:"port"`
+
+	// MaxConnections caps the global connections this device maintains
+	// (outbound, chosen to cover the loaded spaces).
+	MaxConnections int `yaml:"maxConnections"`
+
+	// MaxInbound is the headroom above MaxConnections for connections
+	// initiated by other devices; past MaxConnections+MaxInbound live
+	// global connections, inbound ones are refused before the handshake.
+	MaxInbound int `yaml:"maxInbound"`
+
+	// MaxDialsPerMinute rate-limits the connector; dials are sequential
+	// (one in flight) regardless.
+	MaxDialsPerMinute int `yaml:"maxDialsPerMinute"`
+
+	// DialTimeout bounds one global dial (relay round trip included).
+	DialTimeout time.Duration `yaml:"dialTimeout"`
+
+	// KeepAlive is the QUIC keep-alive period of global connections.
+	KeepAlive time.Duration `yaml:"keepAlive"`
+
+	// StaleAfter / DormantAfter / DisableAfter are the liveness tiers:
+	// a peer not seen for StaleAfter is probed on a slow cadence, past
+	// DormantAfter only at startup and every few hours, past
+	// DisableAfter never (its record is ignored until it moves).
+	StaleAfter   time.Duration `yaml:"staleAfter"`
+	DormantAfter time.Duration `yaml:"dormantAfter"`
+	DisableAfter time.Duration `yaml:"disableAfter"`
+}
+
+// Defaults for the zero-valued Global budget fields.
+const (
+	DefaultGlobalMaxConnections    = 4
+	DefaultGlobalMaxInbound        = 8
+	DefaultGlobalMaxDialsPerMinute = 6
+	DefaultGlobalDialTimeout       = 15 * time.Second
+	DefaultGlobalKeepAlive         = 60 * time.Second
+	DefaultGlobalStaleAfter        = time.Hour
+	DefaultGlobalDormantAfter      = 7 * 24 * time.Hour
+	DefaultGlobalDisableAfter      = 30 * 24 * time.Hour
+)
+
+// IsEnabled reports whether the global layer is on (explicit opt-in).
+func (g Global) IsEnabled() bool { return g.Enabled != nil && *g.Enabled }
+
+// WithDefaults returns g with every zero budget field replaced by its
+// default.
+func (g Global) WithDefaults() Global {
+	if g.MaxConnections <= 0 {
+		g.MaxConnections = DefaultGlobalMaxConnections
+	}
+	if g.MaxInbound <= 0 {
+		g.MaxInbound = DefaultGlobalMaxInbound
+	}
+	if g.MaxDialsPerMinute <= 0 {
+		g.MaxDialsPerMinute = DefaultGlobalMaxDialsPerMinute
+	}
+	if g.DialTimeout <= 0 {
+		g.DialTimeout = DefaultGlobalDialTimeout
+	}
+	if g.KeepAlive <= 0 {
+		g.KeepAlive = DefaultGlobalKeepAlive
+	}
+	if g.StaleAfter <= 0 {
+		g.StaleAfter = DefaultGlobalStaleAfter
+	}
+	if g.DormantAfter <= 0 {
+		g.DormantAfter = DefaultGlobalDormantAfter
+	}
+	if g.DisableAfter <= 0 {
+		g.DisableAfter = DefaultGlobalDisableAfter
+	}
+	return g
+}
 
 // ResolveP2P returns the effective P2P config for this Config, applying
 // the headless default: in headless mode a nil (unset) Enabled resolves
 // to disabled, because an embedded backend has no reason to announce
 // over mDNS or accept LAN peers. An explicit Enabled — &true or &false —
 // is always honored, so a headless broker can opt back into local sync.
+// Global is opt-in in every mode, so it passes through with its budget
+// defaults filled in.
 func (c Config) ResolveP2P() P2P {
 	p := c.P2P
 	if c.Headless && p.Enabled == nil {
 		off := false
 		p.Enabled = &off
 	}
+	p.Global = p.Global.WithDefaults()
 	return p
 }
 

@@ -32,14 +32,18 @@ const (
 	banTTL = 5 * time.Minute
 )
 
-// LocalPeers is the slice of the p2p peer store this source needs.
+// LocalPeers is the slice of the p2p peer store this source needs: LAN
+// peers are dialed (bounded), global peers only used while connected.
 type LocalPeers interface {
 	LocalPeerIds(spaceId string) []string
+	GlobalPeerIds(spaceId string) []string
 }
 
-// DialPool is the slice of the any-sync pool this source needs.
+// DialPool is the slice of the any-sync pool this source needs. Get
+// dials LAN peers; Pick is the only call ever made for a global peer.
 type DialPool interface {
 	Get(ctx context.Context, id string) (peer.Peer, error)
+	Pick(ctx context.Context, id string) (peer.Peer, error)
 }
 
 // Source is the fetch.PeerSource: it finds a LAN peer that holds a file
@@ -66,34 +70,48 @@ var _ fetch.PeerSource = (*Source)(nil)
 // ok=false when no peer holds the file. Each candidate gets its own
 // bounded budget, so a slow first peer never poisons the rest.
 func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (fetch.CarSource, func(), bool) {
-	ids := s.filterBanned(s.peers.LocalPeerIds(spaceId))
-	if len(ids) == 0 {
+	type candidate struct {
+		id     string
+		global bool
+	}
+	var cands []candidate
+	for _, id := range s.filterBanned(s.peers.LocalPeerIds(spaceId)) {
+		cands = append(cands, candidate{id: id})
+	}
+	for _, id := range s.filterBanned(s.peers.GlobalPeerIds(spaceId)) {
+		cands = append(cands, candidate{id: id, global: true})
+	}
+	if len(cands) == 0 {
 		return nil, nil, false
 	}
 	tried := 0
-	for _, id := range ids {
+	for _, c := range cands {
 		if tried >= maxCandidates {
 			break
 		}
 		tried++
-		if s.holdsFull(ctx, id, spaceId, root) {
-			peerId := id
-			car := &peerCar{pool: s.pool, peerId: peerId, spaceId: spaceId, root: root}
+		if s.holdsFull(ctx, c.id, c.global, spaceId, root) {
+			peerId := c.id
+			car := &peerCar{pool: s.pool, peerId: peerId, global: c.global, spaceId: spaceId, root: root}
 			return car, func() { s.ban(peerId) }, true
 		}
 	}
 	return nil, nil, false
 }
 
-// holdsFull dials one peer (under its own timeout) and asks whether it
-// holds the file in full. A dial/RPC failure bans the peer — it is
+// holdsFull reaches one peer (under its own timeout) and asks whether
+// it holds the file in full. LAN peers are dialed; a global peer is
+// only picked from the pool and skipped, not banned, when it has no
+// live connection. A dial/RPC failure bans the peer — it is
 // unreachable — but a plain "not full" answer does not.
-func (s *Source) holdsFull(ctx context.Context, peerId, spaceId string, root cid.Cid) bool {
+func (s *Source) holdsFull(ctx context.Context, peerId string, global bool, spaceId string, root cid.Cid) bool {
 	pctx, cancel := context.WithTimeout(ctx, perPeerTimeout)
 	defer cancel()
-	p, err := s.pool.Get(pctx, peerId)
+	p, err := s.peer(pctx, peerId, global)
 	if err != nil {
-		s.ban(peerId)
+		if !global {
+			s.ban(peerId)
+		}
 		return false
 	}
 	var full bool
@@ -117,6 +135,15 @@ func (s *Source) holdsFull(ctx context.Context, peerId, spaceId string, root cid
 		return false
 	}
 	return full
+}
+
+// peer resolves a candidate: dial for LAN, live connection only for
+// global.
+func (s *Source) peer(ctx context.Context, peerId string, global bool) (peer.Peer, error) {
+	if global {
+		return s.pool.Pick(ctx, peerId)
+	}
+	return s.pool.Get(ctx, peerId)
 }
 
 func (s *Source) ban(peerId string) {
@@ -148,14 +175,21 @@ func (s *Source) filterBanned(ids []string) []string {
 // (via the ban hook SourceFor returned) whether a failure was invalid
 // content — ban — or merely transient — demote for this fetch only.
 type peerCar struct {
-	pool    DialPool
-	peerId  string
+	pool   DialPool
+	peerId string
+	// global peers are picked, never dialed.
+	global  bool
 	spaceId string
 	root    cid.Cid
 }
 
 func (c *peerCar) read(ctx context.Context, off, length int64) (data []byte, total int64, err error) {
-	p, err := c.pool.Get(ctx, c.peerId)
+	var p peer.Peer
+	if c.global {
+		p, err = c.pool.Pick(ctx, c.peerId)
+	} else {
+		p, err = c.pool.Get(ctx, c.peerId)
+	}
 	if err != nil {
 		return nil, 0, err
 	}

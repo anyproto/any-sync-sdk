@@ -9,11 +9,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type fakePeerService struct {
+type fakeLANAddrs struct {
 	addrs map[string][]string
 }
 
-func (f *fakePeerService) SetPeerAddrs(peerId string, addrs []string) {
+func (f *fakeLANAddrs) SetLAN(peerId string, addrs []string) {
 	if f.addrs == nil {
 		f.addrs = map[string][]string{}
 	}
@@ -44,7 +44,7 @@ func testKey(seed byte) []byte {
 func TestSpaceExchangeV1AlwaysRefused(t *testing.T) {
 	store := NewPeerStore()
 	ex := NewExchange("self-peer", store, func() []string { return []string{"mine"} }, nil, nil)
-	ex.peerService = &fakePeerService{}
+	ex.addrs = &fakeLANAddrs{}
 
 	// The legacy plaintext exchange must never be served — regardless
 	// of who asks — and must record nothing.
@@ -63,8 +63,8 @@ func TestSpaceExchangeV2RejectsBadAddresses(t *testing.T) {
 	store := NewPeerStore()
 	ex := NewExchange("self-peer", store, func() []string { return []string{"shared"} },
 		fakeDiscoveryKeys(keys), nil)
-	ps := &fakePeerService{}
-	ex.peerService = ps
+	ps := &fakeLANAddrs{}
+	ex.addrs = ps
 	ctx := peer.CtxWithPeerId(context.Background(), "p")
 
 	// Out-of-range port: no addresses and no space set recorded, but
@@ -116,8 +116,8 @@ func TestSpaceExchangeV2Inbound(t *testing.T) {
 		func() []string { return []string{"shared", "respOnly", "keyless"} },
 		fakeDiscoveryKeys(map[string][]byte{"shared": sharedKey, "respOnly": responderOnlyKey}),
 		func(_ string, spaceIds []string) { kicked = spaceIds })
-	ps := &fakePeerService{}
-	ex.peerService = ps
+	ps := &fakeLANAddrs{}
+	ex.addrs = ps
 
 	nonce, tokens := buildV2Request(t, map[string][]byte{"shared": sharedKey, "callerOnly": callerOnlyKey}, "remote-peer", "self-peer")
 
@@ -148,7 +148,7 @@ func TestSpaceExchangeV2ProbeWithoutLocalServer(t *testing.T) {
 	ex := NewExchange("self-peer", store,
 		func() []string { return []string{"shared"} },
 		fakeDiscoveryKeys(map[string][]byte{"shared": sharedKey}), nil)
-	ex.peerService = &fakePeerService{}
+	ex.addrs = &fakeLANAddrs{}
 
 	nonce, tokens := buildV2Request(t, map[string][]byte{"shared": sharedKey}, "remote-peer", "self-peer")
 	ctx := peer.CtxWithPeerId(context.Background(), "remote-peer")
@@ -164,7 +164,7 @@ func TestSpaceExchangeV2RejectsBadRequests(t *testing.T) {
 	store := NewPeerStore()
 	ex := NewExchange("self-peer", store, func() []string { return nil },
 		fakeDiscoveryKeys(nil), nil)
-	ex.peerService = &fakePeerService{}
+	ex.addrs = &fakeLANAddrs{}
 	ctx := peer.CtxWithPeerId(context.Background(), "remote-peer")
 
 	_, err := ex.SpaceExchangeV2(ctx, &clientspaceproto.SpaceExchangeV2Request{Nonce: []byte("short")})
@@ -197,7 +197,7 @@ func TestSpaceExchangeV2ProbeColdRestore(t *testing.T) {
 	ex := NewExchange("self-peer", store,
 		func() []string { return []string{"mine"} },
 		fakeDiscoveryKeys(map[string][]byte{"mine": testKey(1)}), nil)
-	ex.peerService = &fakePeerService{}
+	ex.addrs = &fakeLANAddrs{}
 	ex.SetAccountKeysFn(fakeDiscoveryKeys(map[string][]byte{"mine": accountKey}))
 
 	nonce, err := clientspaceproto.NewNonceV2()
@@ -231,7 +231,7 @@ func TestSpaceExchangeV2ProbeWrongAccountKey(t *testing.T) {
 	ex := NewExchange("self-peer", store,
 		func() []string { return []string{"mine"} },
 		fakeDiscoveryKeys(map[string][]byte{"mine": testKey(1)}), nil)
-	ex.peerService = &fakePeerService{}
+	ex.addrs = &fakeLANAddrs{}
 	ex.SetAccountKeysFn(fakeDiscoveryKeys(map[string][]byte{"mine": testKey(4)}))
 
 	nonce, err := clientspaceproto.NewNonceV2()
@@ -275,7 +275,7 @@ func TestSpaceExchangeV2StrangerLearnsNothing(t *testing.T) {
 	ex := NewExchange("self-peer", store,
 		func() []string { return []string{"shared"} },
 		fakeDiscoveryKeys(map[string][]byte{"shared": sharedKey}), nil)
-	ex.peerService = &fakePeerService{}
+	ex.addrs = &fakeLANAddrs{}
 
 	// A stranger who knows the space id but not the read key derives a
 	// different discovery key: no intersection, empty response, nothing

@@ -17,7 +17,6 @@ import (
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/clientspaceproto"
 	"github.com/anyproto/any-sync/net/peer"
-	"github.com/anyproto/any-sync/net/peerservice"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/transport"
@@ -61,7 +60,7 @@ var log = logger.NewNamed("sdk.p2p")
 // must never leave this device, and there is no fallback an attacker
 // could downgrade to. Pre-v2 peers simply don't pair over LAN.
 type Exchange struct {
-	peerService peerService
+	addrs       lanAddrs
 	pool        dialPool
 	store       *PeerStore
 	selfPeerId  string
@@ -89,10 +88,12 @@ type Exchange struct {
 	ownAddrs func() sdkp2p.OwnAddresses
 }
 
-// peerService / dialPool are the slices of any-sync this component
-// touches, held as narrow interfaces so tests can fake them.
-type peerService interface {
-	SetPeerAddrs(peerId string, addrs []string)
+// lanAddrs / dialPool are the slices of the addr book and any-sync
+// this component touches, held as narrow interfaces so tests can fake
+// them. LAN addresses go through the AddrBook, which keeps them apart
+// from a peer's iroh ticket.
+type lanAddrs interface {
+	SetLAN(peerId string, addrs []string)
 }
 
 type dialPool interface {
@@ -104,8 +105,8 @@ func NewExchange(selfPeerId string, store *PeerStore, allSpaceIds func() []strin
 }
 
 func (e *Exchange) Init(a *app.App) error {
-	if e.peerService == nil {
-		e.peerService = a.MustComponent(peerservice.CName).(peerservice.PeerService)
+	if e.addrs == nil {
+		e.addrs = a.MustComponent(addrBookCName).(*AddrBook)
 	}
 	if e.pool == nil {
 		e.pool = a.MustComponent(pool.CName).(pool.Pool)
@@ -136,7 +137,7 @@ func (e *Exchange) SetKnownSpaceIdsFn(fn func() []string) { e.knownSpaceIds.Stor
 // returned — discovery re-announces periodically, so a failed attempt
 // retries on the next sighting.
 func (e *Exchange) PeerDiscovered(ctx context.Context, discovered sdkp2p.DiscoveredPeer, own sdkp2p.OwnAddresses) {
-	e.peerService.SetPeerAddrs(discovered.PeerId, addSchema(discovered.Addrs))
+	e.addrs.SetLAN(discovered.PeerId, addSchema(discovered.Addrs))
 	e.handshake(ctx, discovered.PeerId, own)
 }
 
@@ -356,7 +357,7 @@ func (e *Exchange) recordPeerAddrs(ctx context.Context, peerId string, localServ
 		log.Info("space exchange with no usable addresses", zap.String("peerId", peerId))
 		return false
 	}
-	e.peerService.SetPeerAddrs(peerId, addSchema(addrs))
+	e.addrs.SetLAN(peerId, addSchema(addrs))
 	return true
 }
 

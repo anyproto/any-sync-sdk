@@ -273,7 +273,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// P2P files (SYN-48): serve our stored CAR objects to LAN peers and
 	// prefer a LAN peer over the public GET when fetching. Rides the
 	// existing p2p toggle; the peer store + DRPC server come from the app.
-	if app.P2PEnabled() {
+	if app.P2PEnabled() || app.GlobalP2PEnabled() {
 		filesFetch.SetPeer(filep2p.NewSource(app.Pool(), app.PeerStore()))
 		// The server was registered on the DRPC mux during app start
 		// (as a component, to avoid a serving race); hand it the store now.

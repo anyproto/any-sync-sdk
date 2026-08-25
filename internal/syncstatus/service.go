@@ -27,9 +27,9 @@ type NodeIdsFn func(spaceId string) []string
 type TotalFn func(spaceId string) int
 
 // PeerCountsFn reports live-connection counts for spaceId: responsible
-// sync nodes and local-network peers sharing the space. Wired from
-// anysyncx (non-dialing pool.Pick reads). nil ⇒ both report 0.
-type PeerCountsFn func(spaceId string) (networkPeers, localPeers int)
+// sync nodes, local-network peers and global peers sharing the space.
+// Wired from anysyncx (non-dialing pool.Pick reads). nil ⇒ all report 0.
+type PeerCountsFn func(spaceId string) (networkPeers, localPeers, globalPeers int)
 
 // P2PStateFn resolves the per-space local-network state. Wired from
 // anysyncx over discovery possibility + the p2p peer store. nil ⇒
@@ -246,7 +246,7 @@ func (s *Service) For(spaceId string) *Tracker {
 func (s *Service) Status(spaceId string) space.SpaceSyncStatus {
 	t := s.trackerNoCreate(spaceId)
 	out := space.SpaceSyncStatus{SpaceId: spaceId}
-	out.NetworkPeers, out.LocalPeers = s.peerCountsFor(spaceId)
+	out.NetworkPeers, out.LocalPeers, out.GlobalPeers = s.peerCountsFor(spaceId)
 	out.P2P = s.p2pStateFor(spaceId)
 	if t == nil {
 		// Unknown space — return the presence fields with the id
@@ -270,12 +270,12 @@ func (s *Service) Status(spaceId string) space.SpaceSyncStatus {
 }
 
 // peerCountsFor reads the configured PeerCountsFn. Zeros when unwired.
-func (s *Service) peerCountsFor(spaceId string) (networkPeers, localPeers int) {
+func (s *Service) peerCountsFor(spaceId string) (networkPeers, localPeers, globalPeers int) {
 	s.mu.Lock()
 	fn := s.peerCountsFn
 	s.mu.Unlock()
 	if fn == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	return fn(spaceId)
 }
@@ -370,6 +370,7 @@ func rollupsEqual(a, b space.SpaceSyncStatus) bool {
 		a.Total == b.Total &&
 		a.NetworkPeers == b.NetworkPeers &&
 		a.LocalPeers == b.LocalPeers &&
+		a.GlobalPeers == b.GlobalPeers &&
 		a.P2P == b.P2P
 }
 

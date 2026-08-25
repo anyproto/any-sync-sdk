@@ -3,6 +3,7 @@ package anysyncx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -26,8 +27,10 @@ var pmLog = logger.NewNamed("anysyncx.peermanager")
 // (see localOnlySpaces) get an inert manager instead of the node-backed
 // one, so nothing about them ever reaches the network.
 type peerManagerProvider struct {
-	localOnly  *localOnlySpaces
-	localPeers localPeerSource
+	localOnly    *localOnlySpaces
+	localPeers   localPeerSource
+	globalPeers  globalPeerSource
+	globalFanout int
 }
 
 // localPeerSource is the slice of p2p.PeerStore the peer manager needs;
@@ -37,8 +40,15 @@ type localPeerSource interface {
 	RemoveLocalPeer(peerId string)
 }
 
-func newPeerManagerProvider(localOnly *localOnlySpaces, localPeers localPeerSource) *peerManagerProvider {
-	return &peerManagerProvider{localOnly: localOnly, localPeers: localPeers}
+// globalPeerSource lists the global peers sharing a space, best first.
+// nil when the global layer is off. Global peers are never dialed
+// here — only picked from the pool while already connected.
+type globalPeerSource interface {
+	GlobalPeerIds(spaceId string) []string
+}
+
+func newPeerManagerProvider(localOnly *localOnlySpaces, localPeers localPeerSource, globalPeers globalPeerSource, globalFanout int) *peerManagerProvider {
+	return &peerManagerProvider{localOnly: localOnly, localPeers: localPeers, globalPeers: globalPeers, globalFanout: globalFanout}
 }
 
 func (p *peerManagerProvider) Init(_ *app.App) error { return nil }
@@ -48,7 +58,7 @@ func (p *peerManagerProvider) NewPeerManager(_ context.Context, spaceId string) 
 	if p.localOnly.has(spaceId) {
 		return &localPeerManager{}, nil
 	}
-	return &spacePeerManager{spaceId: spaceId, localPeers: p.localPeers}, nil
+	return &spacePeerManager{spaceId: spaceId, localPeers: p.localPeers, globalPeers: p.globalPeers, globalFanout: p.globalFanout}, nil
 }
 
 // localPeerManager is the peer manager of a local-only space: it
@@ -85,13 +95,31 @@ type sendPool interface {
 // peers that share this space (from the p2p peer store) are folded
 // into the responsible/broadcast sets, so head-sync and pushes run
 // over the LAN too — including while every node is unreachable.
+//
+// Global peers (internet-wide, from key-value records) join only while
+// no node stream is up: with a node reachable they receive everything
+// through it, so broadcasting to them would multiply upload for
+// nothing. Without a node they take over — head updates coalesced per
+// object over a short window and fanned out to at most globalFanout
+// already-connected peers, the periodic diff against one connected
+// peer per tick, rotating. They are never dialed from here.
 type spacePeerManager struct {
 	spaceId         string
 	nodeConf        nodeconf.Service
 	pool            pool.Pool
 	streamPool      sendPool
 	localPeers      localPeerSource
+	globalPeers     globalPeerSource
+	globalFanout    int
 	subscribeMsgRaw []byte
+
+	// globalRotation picks the next connected global peer for the
+	// periodic diff.
+	globalMu       sync.Mutex
+	globalRotation int
+	coalesced      map[string]drpc.Message
+	coalesceOrder  []string
+	coalesceTimer  *time.Timer
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
@@ -143,6 +171,12 @@ func (m *spacePeerManager) Close(_ context.Context) error {
 	if m.runCancel != nil {
 		m.runCancel()
 	}
+	m.globalMu.Lock()
+	if m.coalesceTimer != nil {
+		m.coalesceTimer.Stop()
+		m.coalesceTimer = nil
+	}
+	m.globalMu.Unlock()
 	// The retry worker never blocks outside runCtx selects (Send is a
 	// non-blocking TryAdd), so this wait is prompt.
 	m.parkMu.Lock()
@@ -257,8 +291,10 @@ func (m *spacePeerManager) Name() string { return peermanager.CName }
 // live connection when possible) plus every connectable local-network
 // peer that shares this space. When all nodes are unreachable but a
 // local peer is up, the local peers alone are returned — that is what
-// keeps a space syncing over the LAN while offline. The node error
-// only surfaces when there is nobody at all to sync with.
+// keeps a space syncing over the LAN while offline. With no node
+// stream open one connected global peer joins too (rotating across
+// ticks). The node error only surfaces when there is nobody at all to
+// sync with.
 func (m *spacePeerManager) GetResponsiblePeers(ctx context.Context) ([]peer.Peer, error) {
 	var (
 		peers   []peer.Peer
@@ -273,10 +309,54 @@ func (m *spacePeerManager) GetResponsiblePeers(ctx context.Context) ([]peer.Peer
 		}
 	}
 	peers = append(peers, m.getLocalPeers(ctx)...)
+	if m.globalFallback() {
+		if gp := m.nextGlobalPeer(ctx); gp != nil {
+			peers = append(peers, gp)
+		}
+	}
 	if len(peers) == 0 && nodeErr != nil {
 		return nil, nodeErr
 	}
 	return peers, nil
+}
+
+// globalFallback reports whether global peers take part in this
+// space's sync right now: the layer is on and no node stream is up.
+func (m *spacePeerManager) globalFallback() bool {
+	return m.globalPeers != nil && !m.hasNodeStream()
+}
+
+// connectedGlobalPeers picks the global peers sharing this space that
+// are connected right now, best first, at most limit (0 = all).
+// pool.Pick never dials.
+func (m *spacePeerManager) connectedGlobalPeers(ctx context.Context, limit int) []peer.Peer {
+	if m.globalPeers == nil {
+		return nil
+	}
+	var out []peer.Peer
+	for _, id := range m.globalPeers.GlobalPeerIds(m.spaceId) {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		if p, err := m.pool.Pick(ctx, id); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// nextGlobalPeer rotates over the connected global peers so successive
+// diff ticks spread across them instead of always hitting the first.
+func (m *spacePeerManager) nextGlobalPeer(ctx context.Context) peer.Peer {
+	peers := m.connectedGlobalPeers(ctx, 0)
+	if len(peers) == 0 {
+		return nil
+	}
+	m.globalMu.Lock()
+	i := m.globalRotation % len(peers)
+	m.globalRotation++
+	m.globalMu.Unlock()
+	return peers[i]
 }
 
 // localDialStrikes is how many CONSECUTIVE dial failures a LAN peer
@@ -374,9 +454,68 @@ func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message)
 	err := m.streamPool.Send(m.runCtx, msg, m.getBroadcastPeers)
 	if errors.Is(err, mb.ErrOverflowed) {
 		m.park(msg)
-		return nil
+		err = nil
+	}
+	if m.globalFallback() {
+		m.coalesce(msg)
 	}
 	return err
+}
+
+// globalCoalesceWindow is how long head updates are held before one
+// batch goes to the global peers: the latest update per object wins,
+// so a burst of edits costs one relay send per peer.
+const globalCoalesceWindow = 500 * time.Millisecond
+
+// coalesce queues msg for the global peers. Messages that name an
+// object (head updates) replace the older queued one for the same
+// object; anything else is kept as is.
+func (m *spacePeerManager) coalesce(msg drpc.Message) {
+	key := fmt.Sprintf("%p", msg)
+	if o, ok := msg.(interface{ ObjectId() string }); ok && o.ObjectId() != "" {
+		key = "object:" + o.ObjectId()
+	}
+	m.globalMu.Lock()
+	if m.coalesced == nil {
+		m.coalesced = map[string]drpc.Message{}
+	}
+	if _, ok := m.coalesced[key]; !ok {
+		m.coalesceOrder = append(m.coalesceOrder, key)
+	}
+	m.coalesced[key] = msg
+	if m.coalesceTimer == nil {
+		m.coalesceTimer = time.AfterFunc(globalCoalesceWindow, m.flushCoalesced)
+	}
+	m.globalMu.Unlock()
+}
+
+// flushCoalesced sends the held batch to at most globalFanout connected
+// global peers. Overflow is not parked: the node / LAN copy of every
+// message already has the park buffer, and the next diff tick against
+// a global peer converges anyway.
+func (m *spacePeerManager) flushCoalesced() {
+	m.globalMu.Lock()
+	batch := make([]drpc.Message, 0, len(m.coalesceOrder))
+	for _, key := range m.coalesceOrder {
+		batch = append(batch, m.coalesced[key])
+	}
+	m.coalesced = nil
+	m.coalesceOrder = nil
+	m.coalesceTimer = nil
+	m.globalMu.Unlock()
+	if m.runCtx.Err() != nil {
+		return
+	}
+	for _, msg := range batch {
+		if err := m.streamPool.Send(m.runCtx, msg, m.getGlobalPeers); err != nil {
+			pmLog.Debug("global broadcast", zap.String("spaceId", m.spaceId), zap.Error(err))
+		}
+	}
+}
+
+// getGlobalPeers is the fan-out audience of one coalesced batch.
+func (m *spacePeerManager) getGlobalPeers(ctx context.Context) ([]peer.Peer, error) {
+	return m.connectedGlobalPeers(ctx, m.globalFanout), nil
 }
 
 // getBroadcastPeers is the push audience: every node peer plus every

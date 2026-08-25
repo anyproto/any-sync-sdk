@@ -12,21 +12,45 @@ import (
 func TestP2PStateFor(t *testing.T) {
 	connected := func(string) bool { return true }
 	nobody := func(string) bool { return false }
-	peers := []string{"lp1"}
+	only := func(want string) func(string) bool {
+		return func(id string) bool { return id == want }
+	}
+	lan := []string{"lp1"}
+	global := []string{"gp1"}
 
+	// LAN only — the pre-global verdicts.
 	require.Equal(t, space.P2PStateNotPossible,
-		p2pStateFor(false, sdkp2p.PossibilityPossible, peers, connected))
+		p2pStateFor(false, false, sdkp2p.PossibilityPossible, lan, nil, connected))
 	require.Equal(t, space.P2PStateNotPossible,
-		p2pStateFor(true, sdkp2p.PossibilityNoInterfaces, peers, connected))
+		p2pStateFor(true, false, sdkp2p.PossibilityNoInterfaces, lan, nil, connected))
 	require.Equal(t, space.P2PStateRestricted,
-		p2pStateFor(true, sdkp2p.PossibilityRestricted, peers, connected))
+		p2pStateFor(true, false, sdkp2p.PossibilityRestricted, lan, nil, connected))
 	require.Equal(t, space.P2PStateConnected,
-		p2pStateFor(true, sdkp2p.PossibilityPossible, peers, connected))
+		p2pStateFor(true, false, sdkp2p.PossibilityPossible, lan, nil, connected))
 	require.Equal(t, space.P2PStateNotConnected,
-		p2pStateFor(true, sdkp2p.PossibilityPossible, peers, nobody))
+		p2pStateFor(true, false, sdkp2p.PossibilityPossible, lan, nil, nobody))
 	require.Equal(t, space.P2PStateNotConnected,
-		p2pStateFor(true, sdkp2p.PossibilityPossible, nil, connected))
+		p2pStateFor(true, false, sdkp2p.PossibilityPossible, nil, nil, connected))
 	// Unknown possibility (probe hasn't run yet) is not a blocker.
 	require.Equal(t, space.P2PStateConnected,
-		p2pStateFor(true, sdkp2p.PossibilityUnknown, peers, connected))
+		p2pStateFor(true, false, sdkp2p.PossibilityUnknown, lan, nil, connected))
+
+	// Global only: LAN verdicts don't apply, a connected global peer is
+	// Connected, none is NotConnected.
+	require.Equal(t, space.P2PStateConnected,
+		p2pStateFor(false, true, sdkp2p.PossibilityNoInterfaces, lan, global, only("gp1")))
+	require.Equal(t, space.P2PStateNotConnected,
+		p2pStateFor(false, true, sdkp2p.PossibilityRestricted, lan, global, nobody))
+	// A LAN peer does not count while the LAN layer is off.
+	require.Equal(t, space.P2PStateNotConnected,
+		p2pStateFor(false, true, sdkp2p.PossibilityPossible, lan, nil, only("lp1")))
+
+	// Both on: either kind of live peer is Connected; a restricted LAN
+	// with the global layer up is NotConnected, not Restricted.
+	require.Equal(t, space.P2PStateConnected,
+		p2pStateFor(true, true, sdkp2p.PossibilityPossible, lan, global, only("lp1")))
+	require.Equal(t, space.P2PStateConnected,
+		p2pStateFor(true, true, sdkp2p.PossibilityPossible, lan, global, only("gp1")))
+	require.Equal(t, space.P2PStateNotConnected,
+		p2pStateFor(true, true, sdkp2p.PossibilityRestricted, lan, global, nobody))
 }

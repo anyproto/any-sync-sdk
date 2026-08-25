@@ -16,7 +16,9 @@ const addrBookCName = "sdk.p2p.addrbook"
 // both: a LAN dial that fails must answer in one RTT, not fall through
 // into a relay dial that can take the whole dial timeout. LAN wins
 // while present; the ticket takes over once the LAN entry is cleared
-// (mDNS lost, dial strikes).
+// (mDNS lost, dial strikes). The one address the book does not own is
+// the push node's (config.Push), registered by the SDK directly: it is
+// neither a LAN nor a global peer and never enters the peer store.
 type AddrBook struct {
 	ps peerService
 

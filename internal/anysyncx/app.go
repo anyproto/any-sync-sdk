@@ -73,7 +73,6 @@ type App struct {
 	exchange      *p2p.Exchange
 	fileP2PServer *filep2p.Server
 	addrBook      *p2p.AddrBook
-	statusBook    *p2p.StatusBook
 	// global is the internet-wide p2p layer; nil when cfg.P2P.Global is
 	// off.
 	global *p2p.Global
@@ -208,6 +207,9 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// itself (records, connector, inbound gate) exists only when on.
 	globalCfg := p2pCfg.Global
 	globalEnabled := globalCfg.IsEnabled()
+	if err := globalCfg.Validate(); err != nil {
+		return nil, fmt.Errorf("anysyncx: %w", err)
+	}
 	statusBook := p2p.NewStatusBook(filepath.Join(cfg.Storage.DataDir, p2pPeersFileName), p2p.ThresholdsFrom(globalCfg))
 	peerStore.SetStatus(statusBook)
 	var global *p2p.Global
@@ -320,7 +322,6 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		discovery:          discovery,
 		exchange:           exchange,
 		addrBook:           addrBook,
-		statusBook:         statusBook,
 		global:             global,
 		p2pEnabled:         p2pCfg.IsEnabled(),
 		globalEnabled:      globalEnabled,
@@ -388,10 +389,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// discovery possibility changes. (The "Phase 3 peer-presence
 	// reader" slot from docs/09-sync-status-proposal.md.)
 	poolComp := a.MustComponent(pool.CName).(pool.Pool)
-	pickable := func(id string) bool {
-		_, err := poolComp.Pick(context.Background(), id)
-		return err == nil
-	}
+	pickable := func(id string) bool { return pickLive(poolComp, id) }
 	out.syncStatus.SetPeerCountsFn(func(spaceId string) (networkPeers, localPeers, globalPeers int) {
 		for _, id := range nc.NodeIds(spaceId) {
 			if pickable(id) {
@@ -740,11 +738,20 @@ func (a *App) ParkedTreeCount(spaceId string) int {
 	return ts.pendingCount()
 }
 
+// pickLive reports a live pool connection to the peer within
+// p2p.PickTimeout; it never dials and never waits out somebody else's
+// dial.
+func pickLive(pl pool.Pool, id string) bool {
+	_, err := p2p.PickLive(context.Background(), pl, id)
+	return err == nil
+}
+
 // p2pStateFor resolves a space's direct-peer state over both layers.
-// A live LAN or global peer is Connected; the LAN-only verdicts
-// (NotPossible on missing interfaces, Restricted) apply only while the
-// global layer is off — with it on, the device can still reach peers
-// through the relay. Pure so it's unit-testable without the app graph.
+// A live LAN or global peer is Connected. With nobody live, the LAN
+// verdicts (NotPossible on missing interfaces, Restricted on a denied
+// local-network permission) still surface while the LAN layer is on —
+// the global layer does not hide why the LAN path is down. Pure so
+// it's unit-testable without the app graph.
 func p2pStateFor(lanEnabled, globalEnabled bool, poss sdkp2p.Possibility, localPeerIds, globalPeerIds []string, pickable func(string) bool) space.P2PState {
 	if !lanEnabled && !globalEnabled {
 		return space.P2PStateNotPossible
@@ -763,13 +770,14 @@ func p2pStateFor(lanEnabled, globalEnabled bool, poss sdkp2p.Possibility, localP
 				return space.P2PStateConnected
 			}
 		}
-		return space.P2PStateNotConnected
 	}
-	if poss == sdkp2p.PossibilityNoInterfaces {
-		return space.P2PStateNotPossible
-	}
-	if poss == sdkp2p.PossibilityRestricted {
-		return space.P2PStateRestricted
+	if lanEnabled {
+		switch poss {
+		case sdkp2p.PossibilityNoInterfaces:
+			return space.P2PStateNotPossible
+		case sdkp2p.PossibilityRestricted:
+			return space.P2PStateRestricted
+		}
 	}
 	return space.P2PStateNotConnected
 }
@@ -787,10 +795,8 @@ func globalPeersOrNil(store *p2p.PeerStore, enabled bool) globalPeerSource {
 // LAN listener state, discovery possibility, every LAN peer with its
 // live-connection flag, and the global layer.
 func (a *App) P2PStatus() sdkp2p.Status {
-	pickable := func(id string) bool {
-		_, err := a.Pool().Pick(context.Background(), id)
-		return err == nil
-	}
+	pl := a.Pool()
+	pickable := func(id string) bool { return pickLive(pl, id) }
 	allPeers := a.peerStore.AllLocalPeers()
 	st := sdkp2p.Status{
 		PeerId:          a.keys.PeerId,
@@ -807,8 +813,13 @@ func (a *App) P2PStatus() sdkp2p.Status {
 			SpaceIds:  a.peerStore.SpaceIds(peerId),
 			Connected: pickable(peerId),
 		}
-		if a.global != nil {
-			ps = a.global.PeerStatus(peerId)
+		for _, src := range a.peerStore.Sources(peerId) {
+			ps.Sources = append(ps.Sources, src.String())
+		}
+		// liveness fields exist only for peers known through records
+		if a.global != nil && a.peerStore.HasGlobalPeer(peerId) {
+			gs := a.global.PeerStatus(peerId)
+			ps.LastSeen, ps.Tier, ps.Failures = gs.LastSeen, gs.Tier, gs.Failures
 		}
 		st.Peers = append(st.Peers, ps)
 	}

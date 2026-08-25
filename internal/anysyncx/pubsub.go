@@ -19,6 +19,9 @@ import (
 	"github.com/anyproto/any-sync/commonspace/pubsub"
 	"github.com/anyproto/any-sync/commonspace/pubsub/pubsubproto"
 	"github.com/anyproto/any-sync/net/peer"
+	"github.com/anyproto/any-sync/net/pool"
+
+	"github.com/anyproto/any-sync-sdk/internal/p2p"
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/util/crypto"
 	"go.uber.org/zap"
@@ -66,6 +69,15 @@ const pubsubKeyCacheLimit = 1024
 // logs peer-resolution failures and its resync loop retries.
 type pubsubPeers struct {
 	app *App
+	// pool overrides the app's pool (tests).
+	pool pool.Pool
+}
+
+func (p *pubsubPeers) poolOf() pool.Pool {
+	if p.pool != nil {
+		return p.pool
+	}
+	return p.app.Pool()
 }
 
 func (p *pubsubPeers) SpacePeers(ctx context.Context, spaceId string) ([]peer.Peer, error) {
@@ -73,20 +85,21 @@ func (p *pubsubPeers) SpacePeers(ctx context.Context, spaceId string) ([]peer.Pe
 	if a == nil || a.localOnly.has(spaceId) {
 		return nil, nil
 	}
+	pl := p.poolOf()
 	var peers []peer.Peer
 	if nodeIds := a.nodeConf.NodeIds(spaceId); len(nodeIds) > 0 {
-		if np, err := a.Pool().GetOneOf(ctx, nodeIds); err == nil {
+		if np, err := pl.GetOneOf(ctx, nodeIds); err == nil {
 			peers = append(peers, np)
 		}
 	}
 	for _, id := range a.peerStore.LocalPeerIds(spaceId) {
-		if lp, err := a.Pool().Get(ctx, id); err == nil {
+		if lp, err := pl.Get(ctx, id); err == nil {
 			peers = append(peers, lp)
 		}
 	}
 	if a.globalEnabled {
 		for _, id := range a.peerStore.GlobalPeerIds(spaceId) {
-			if gp, err := a.Pool().Pick(ctx, id); err == nil {
+			if gp, err := p2p.PickLive(ctx, pl, id); err == nil {
 				peers = append(peers, gp)
 			}
 		}

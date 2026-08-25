@@ -13,6 +13,7 @@ import (
 	"storj.io/drpc"
 
 	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/p2p"
 )
 
 const (
@@ -141,7 +142,7 @@ func (s *Source) holdsFull(ctx context.Context, peerId string, global bool, spac
 // global.
 func (s *Source) peer(ctx context.Context, peerId string, global bool) (peer.Peer, error) {
 	if global {
-		return s.pool.Pick(ctx, peerId)
+		return p2p.PickLive(ctx, s.pool, peerId)
 	}
 	return s.pool.Get(ctx, peerId)
 }
@@ -186,7 +187,7 @@ type peerCar struct {
 func (c *peerCar) read(ctx context.Context, off, length int64) (data []byte, total int64, err error) {
 	var p peer.Peer
 	if c.global {
-		p, err = c.pool.Pick(ctx, c.peerId)
+		p, err = p2p.PickLive(ctx, c.pool, c.peerId)
 	} else {
 		p, err = c.pool.Get(ctx, c.peerId)
 	}

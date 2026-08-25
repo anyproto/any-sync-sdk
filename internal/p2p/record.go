@@ -15,39 +15,56 @@ import (
 // exactly one row: its endpoint ticket, re-set as a heartbeat.
 const RecordKey = "p2p/iroh"
 
+// maxTicketLen bounds a record value before it is decoded: a relay-only
+// ticket is ~120 bytes, and the value is remote input.
+const maxTicketLen = 512
+
 var (
-	errRecordSelf     = errors.New("own record")
+	errRecordTooLong  = errors.New("record value too long")
 	errRecordIdentity = errors.New("ticket endpoint id does not belong to the row's peer")
+	errRecordDirect   = errors.New("ticket carries direct addresses")
+	errRecordNoRelay  = errors.New("ticket carries no relay")
 )
 
 // record is one validated row: the peer's ticket, the identity that
-// signed it and the row timestamp (clamped by the status book).
+// signed it and the row timestamp (clamped to now at ingestion).
 type record struct {
 	ticket   string
 	identity string
 	seen     time.Time
 }
 
-// parseTicket decodes a record value and checks that the ticket names
-// the endpoint of the peer that signed the row — a member can publish
-// only its own address, never point others at a third party.
-func parseTicket(peerId, selfPeerId string, value []byte) (string, netaddr.EndpointAddr, error) {
-	if peerId == selfPeerId {
-		return "", netaddr.EndpointAddr{}, errRecordSelf
+// parseTicket validates a record value: bounded size, decodes once,
+// names the endpoint of the peer that signed the row (a member can
+// publish only its own address, never point others at a third party),
+// and — with relays configured locally — carries a relay and no direct
+// IP, so a row can never make this device send packets to an
+// attacker-chosen host.
+func parseTicket(peerId string, value []byte, requireRelay bool) (string, error) {
+	if len(value) > maxTicketLen {
+		return "", errRecordTooLong
 	}
 	ticket := string(value)
 	addr, err := endpointticket.Decode(ticket)
 	if err != nil {
-		return "", netaddr.EndpointAddr{}, fmt.Errorf("decode ticket: %w", err)
+		return "", fmt.Errorf("decode ticket: %w", err)
 	}
-	owner, err := iroh.PeerIdFromTicket(ticket)
+	owner, err := iroh.PeerIdFromEndpointId(addr.ID)
 	if err != nil {
-		return "", netaddr.EndpointAddr{}, err
+		return "", err
 	}
 	if owner != peerId {
-		return "", netaddr.EndpointAddr{}, errRecordIdentity
+		return "", errRecordIdentity
 	}
-	return ticket, addr, nil
+	if requireRelay {
+		if len(addr.IPAddrs()) > 0 {
+			return "", errRecordDirect
+		}
+		if len(addr.RelayURLs()) == 0 {
+			return "", errRecordNoRelay
+		}
+	}
+	return ticket, nil
 }
 
 // homeRelay returns the first relay URL of a ticket, empty when the
@@ -62,3 +79,5 @@ func homeRelay(ticket string) string {
 	}
 	return ""
 }
+
+var _ = netaddr.EndpointAddr{}

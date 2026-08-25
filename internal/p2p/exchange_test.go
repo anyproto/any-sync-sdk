@@ -7,6 +7,8 @@ import (
 	"github.com/anyproto/any-sync/commonspace/clientspaceproto"
 	"github.com/anyproto/any-sync/net/peer"
 	"github.com/stretchr/testify/require"
+
+	sdkp2p "github.com/anyproto/any-sync-sdk/p2p"
 )
 
 type fakeLANAddrs struct {
@@ -19,6 +21,33 @@ func (f *fakeLANAddrs) SetLAN(peerId string, addrs []string) {
 	}
 	f.addrs[peerId] = addrs
 }
+
+func (f *fakeLANAddrs) ClearLAN(peerId string) { delete(f.addrs, peerId) }
+
+// A lost LAN peer releases its addresses and presence so its ticket, if
+// any, can take over; a first handshake that fails never leaves addrs
+// behind.
+func TestExchangePeerLostAndFailedFirstHandshake(t *testing.T) {
+	store := NewPeerStore()
+	addrs := &fakeLANAddrs{}
+	ex := NewExchange("self-peer", store, func() []string { return nil }, fakeDiscoveryKeys(nil), nil)
+	ex.addrs = addrs
+	ex.pool = &fakeDialPool{err: context.DeadlineExceeded}
+
+	ex.PeerDiscovered(context.Background(), sdkp2p.DiscoveredPeer{PeerId: "p", Addrs: []string{"10.0.0.2:4242"}}, sdkp2p.OwnAddresses{})
+	require.Empty(t, addrs.addrs["p"], "failed first handshake leaves no LAN addrs")
+
+	store.UpdateLocalPeer("q", []string{"s1"})
+	addrs.SetLAN("q", []string{"yamux://10.0.0.3:1"})
+	ex.PeerLost("q")
+	require.False(t, store.HasLocalPeer("q"))
+	require.Empty(t, addrs.addrs["q"])
+}
+
+// fakeDialPool fails every dial with err.
+type fakeDialPool struct{ err error }
+
+func (f *fakeDialPool) Get(context.Context, string) (peer.Peer, error) { return nil, f.err }
 
 // fakeDiscoveryKeys returns a static spaceId→key resolver for tests.
 func fakeDiscoveryKeys(keys map[string][]byte) func(context.Context, []string) map[string][]byte {

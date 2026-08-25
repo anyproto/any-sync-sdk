@@ -65,6 +65,13 @@ type recordingNotifier struct {
 	mu    sync.Mutex
 	peers []sdkp2p.DiscoveredPeer
 	own   []sdkp2p.OwnAddresses
+	lost  []string
+}
+
+func (r *recordingNotifier) PeerLost(peerId string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lost = append(r.lost, peerId)
 }
 
 func (r *recordingNotifier) PeerDiscovered(_ context.Context, p sdkp2p.DiscoveredPeer, own sdkp2p.OwnAddresses) {

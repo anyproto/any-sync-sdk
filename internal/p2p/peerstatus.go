@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -50,7 +51,7 @@ type Thresholds struct {
 
 // ThresholdsFrom reads the tier boundaries from the global config
 // (defaults already applied by WithDefaults).
-func ThresholdsFrom(g config.Global) Thresholds {
+func ThresholdsFrom(g config.GlobalP2P) Thresholds {
 	return Thresholds{Stale: g.StaleAfter, Dormant: g.DormantAfter, Disable: g.DisableAfter}
 }
 
@@ -83,8 +84,12 @@ type PeerRecord struct {
 
 // statusFile is the on-disk shape of the status book.
 type statusFile struct {
-	Peers map[string]PeerRecord `json:"peers"`
+	Version int                   `json:"v"`
+	Peers   map[string]PeerRecord `json:"peers"`
 }
+
+// statusFileVersion is the current on-disk format.
+const statusFileVersion = 1
 
 const statusSaveDelay = 2 * time.Second
 
@@ -127,6 +132,8 @@ func (b *StatusBook) SetOnAdvance(fn func(peerId string)) {
 }
 
 // Load reads the persisted records; a missing file is an empty book.
+// Records past the disable threshold are dropped: the peer is disabled
+// anyway and a fresh row re-creates its record.
 func (b *StatusBook) Load() error {
 	if b.path == "" {
 		return nil
@@ -142,10 +149,22 @@ func (b *StatusBook) Load() error {
 	if err = json.Unmarshal(raw, &f); err != nil {
 		return err
 	}
+	if f.Version > statusFileVersion {
+		return fmt.Errorf("peer status file version %d is newer than %d", f.Version, statusFileVersion)
+	}
+	now := b.now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	pruned := false
 	for id, rec := range f.Peers {
+		if b.th.Disable > 0 && !rec.LastSeen.IsZero() && now.Sub(rec.LastSeen) >= b.th.Disable {
+			pruned = true
+			continue
+		}
 		b.peers[id] = rec
+	}
+	if pruned {
+		b.markDirtyLocked()
 	}
 	return nil
 }
@@ -246,7 +265,9 @@ func (b *StatusBook) markDirtyLocked() {
 	})
 }
 
-// Flush writes the book now (atomic replace). No-op when clean.
+// Flush writes the book now (fsync, atomic replace). No-op when clean.
+// The book stays dirty until the replace succeeded, so a failed write
+// is retried by the next change.
 func (b *StatusBook) Flush() error {
 	b.mu.Lock()
 	if b.saveTimer != nil {
@@ -257,28 +278,58 @@ func (b *StatusBook) Flush() error {
 		b.mu.Unlock()
 		return nil
 	}
-	snapshot := statusFile{Peers: make(map[string]PeerRecord, len(b.peers))}
+	snapshot := statusFile{Version: statusFileVersion, Peers: make(map[string]PeerRecord, len(b.peers))}
 	for id, rec := range b.peers {
 		snapshot.Peers[id] = rec
 	}
-	b.dirty = false
 	b.mu.Unlock()
 
-	raw, err := json.Marshal(snapshot)
+	err := writeFileSync(b.path, snapshot)
+	b.mu.Lock()
+	if err == nil {
+		b.dirty = false
+	} else if !b.closed {
+		b.markDirtyLocked()
+	}
+	b.mu.Unlock()
+	return err
+}
+
+// writeFileSync writes v as JSON to a temp file, fsyncs it and renames
+// it over path.
+func writeFileSync(path string, v any) error {
+	raw, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	tmp := b.path + ".tmp"
-	if err = os.WriteFile(tmp, raw, 0o600); err != nil {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, b.path)
+	if _, err = f.Write(raw); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
-// Close flushes pending changes and stops the debounce timer.
+// Close flushes pending changes, then refuses further saves.
 func (b *StatusBook) Close() error {
+	err := b.Flush()
 	b.mu.Lock()
 	b.closed = true
+	if b.saveTimer != nil {
+		b.saveTimer.Stop()
+		b.saveTimer = nil
+	}
 	b.mu.Unlock()
-	return b.Flush()
+	return err
 }

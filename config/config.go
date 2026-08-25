@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"time"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -121,22 +122,23 @@ type P2P struct {
 	// with relay fallback and hole punching, peers discovered through
 	// each space's key-value store). Independent of the LAN layer:
 	// Enabled=false above with Global.Enabled=true is a valid setup.
-	Global Global `yaml:"global"`
+	Global GlobalP2P `yaml:"global"`
 }
 
 // IsEnabled resolves the opt-out tristate: nil = enabled.
 func (p P2P) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
 
-// Global configures the internet-wide p2p layer. Opt-in: nil Enabled
+// GlobalP2P configures the internet-wide p2p layer. Opt-in: nil Enabled
 // means off until a relay is deployed for the network. Zero-valued
-// budget fields take the Default* values; see docs/18-global-p2p.md.
-type Global struct {
+// budget fields take the DefaultGlobalP2P* values; see
+// docs/18-global-p2p.md.
+type GlobalP2P struct {
 	// Enabled turns the layer on. nil and false both mean off.
 	Enabled *bool `yaml:"enabled"`
 
 	// RelayURLs are the home-relay candidates ("https://relay.example").
-	// Empty means no relay: only direct paths work and the published
-	// ticket carries this device's IP addresses.
+	// Required when enabled: without a relay the published ticket would
+	// carry this device's IP addresses into every space's records.
 	RelayURLs []string `yaml:"relayUrls"`
 
 	// InsecureRelay admits http:// relay URLs (plaintext transport to
@@ -152,8 +154,9 @@ type Global struct {
 	MaxConnections int `yaml:"maxConnections"`
 
 	// MaxInbound is the headroom above MaxConnections for connections
-	// initiated by other devices; past MaxConnections+MaxInbound live
-	// global connections, inbound ones are refused before the handshake.
+	// initiated by other devices: once MaxConnections+MaxInbound distinct
+	// global peers hold a live connection, inbound ones are refused
+	// before the handshake.
 	MaxInbound int `yaml:"maxInbound"`
 
 	// MaxDialsPerMinute rate-limits the connector; dials are sequential
@@ -175,47 +178,62 @@ type Global struct {
 	DisableAfter time.Duration `yaml:"disableAfter"`
 }
 
-// Defaults for the zero-valued Global budget fields.
+// Global is the former name of GlobalP2P.
+//
+// Deprecated: use GlobalP2P.
+type Global = GlobalP2P
+
+// Defaults for the zero-valued GlobalP2P budget fields.
 const (
-	DefaultGlobalMaxConnections    = 4
-	DefaultGlobalMaxInbound        = 8
-	DefaultGlobalMaxDialsPerMinute = 6
-	DefaultGlobalDialTimeout       = 15 * time.Second
-	DefaultGlobalKeepAlive         = 60 * time.Second
-	DefaultGlobalStaleAfter        = time.Hour
-	DefaultGlobalDormantAfter      = 7 * 24 * time.Hour
-	DefaultGlobalDisableAfter      = 30 * 24 * time.Hour
+	DefaultGlobalP2PMaxConnections    = 4
+	DefaultGlobalP2PMaxInbound        = 8
+	DefaultGlobalP2PMaxDialsPerMinute = 6
+	DefaultGlobalP2PDialTimeout       = 15 * time.Second
+	DefaultGlobalP2PKeepAlive         = 60 * time.Second
+	DefaultGlobalP2PStaleAfter        = time.Hour
+	DefaultGlobalP2PDormantAfter      = 7 * 24 * time.Hour
+	DefaultGlobalP2PDisableAfter      = 30 * 24 * time.Hour
 )
 
 // IsEnabled reports whether the global layer is on (explicit opt-in).
-func (g Global) IsEnabled() bool { return g.Enabled != nil && *g.Enabled }
+func (g GlobalP2P) IsEnabled() bool { return g.Enabled != nil && *g.Enabled }
+
+// Validate reports a configuration the layer cannot run with: enabled
+// without a relay would publish this device's IP addresses into every
+// space's records.
+func (g GlobalP2P) Validate() error {
+	if g.IsEnabled() && len(g.RelayURLs) == 0 {
+		return errors.New("p2p.global: relayUrls is required when enabled")
+	}
+	return nil
+}
 
 // WithDefaults returns g with every zero budget field replaced by its
 // default.
-func (g Global) WithDefaults() Global {
+func (g GlobalP2P) WithDefaults() GlobalP2P {
 	if g.MaxConnections <= 0 {
-		g.MaxConnections = DefaultGlobalMaxConnections
+		g.MaxConnections = DefaultGlobalP2PMaxConnections
 	}
 	if g.MaxInbound <= 0 {
-		g.MaxInbound = DefaultGlobalMaxInbound
+		g.MaxInbound = DefaultGlobalP2PMaxInbound
 	}
 	if g.MaxDialsPerMinute <= 0 {
-		g.MaxDialsPerMinute = DefaultGlobalMaxDialsPerMinute
+		g.MaxDialsPerMinute = DefaultGlobalP2PMaxDialsPerMinute
 	}
 	if g.DialTimeout <= 0 {
-		g.DialTimeout = DefaultGlobalDialTimeout
+		g.DialTimeout = DefaultGlobalP2PDialTimeout
 	}
 	if g.KeepAlive <= 0 {
-		g.KeepAlive = DefaultGlobalKeepAlive
+		g.KeepAlive = DefaultGlobalP2PKeepAlive
 	}
 	if g.StaleAfter <= 0 {
-		g.StaleAfter = DefaultGlobalStaleAfter
+		g.StaleAfter = DefaultGlobalP2PStaleAfter
 	}
 	if g.DormantAfter <= 0 {
-		g.DormantAfter = DefaultGlobalDormantAfter
+		g.DormantAfter = DefaultGlobalP2PDormantAfter
 	}
 	if g.DisableAfter <= 0 {
-		g.DisableAfter = DefaultGlobalDisableAfter
+		g.DisableAfter = DefaultGlobalP2PDisableAfter
 	}
 	return g
 }

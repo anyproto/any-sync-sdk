@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
 	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage/innerstorage"
 	"github.com/anyproto/any-sync/net/peer"
+	"github.com/anyproto/any-sync/net/peerservice"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/transport"
 	"github.com/anyproto/any-sync/net/transport/iroh"
@@ -29,16 +31,30 @@ const (
 	heartbeatInterval   = 24 * time.Hour
 	heartbeatStaleAfter = 12 * time.Hour
 	// reconcileInterval re-reads every loaded space's records, catching
-	// ACL removals and tier changes that no row write announces.
-	reconcileInterval = 30 * time.Minute
+	// ACL removals and tier changes that no row write announces. It is
+	// the only signal for removals: syncacl's single AclUpdater slot is
+	// owned by the space layer above.
+	reconcileInterval = 5 * time.Minute
 	// sweepInterval bumps LastSeen of every global peer that is still
 	// connected — cheap, no network.
 	sweepInterval = time.Minute
 	// publishDebounce coalesces ticket changes before republishing.
 	publishDebounce = 3 * time.Second
+	// opTimeout bounds one publish or reconcile of one space on the
+	// single worker.
+	opTimeout = 30 * time.Second
 	// closeTimeout bounds Close's wait for the workers.
 	globalCloseTimeout = 2 * time.Second
 	taskQueueSize      = 1024
+	// maxRowsPerIdentity caps the devices one identity may announce in
+	// one space (newest win); maxGlobalPeers caps the peers one space
+	// contributes. Both bound what a member can make us track.
+	maxRowsPerIdentity = 8
+	maxGlobalPeers     = 256
+	// globalPeerTTL keeps a connected global peer in the pool through
+	// idle periods; the pool's default minute would churn relay
+	// connections.
+	globalPeerTTL = 30 * time.Minute
 )
 
 // SpaceKV is the slice of a loaded space the global layer reads and
@@ -68,11 +84,18 @@ type endpoint interface {
 	SetIncomingFilter(f func(peerId string) bool)
 }
 
-// globalPool is the slice of the any-sync pool the layer uses: Get for
-// the connector only, Pick everywhere else.
+// globalPool is the slice of the any-sync pool the layer uses. The
+// connector never calls Get: it dials through globalDialer and hands
+// the peer to AddPeer, so no in-flight pool load ever exists for a
+// global peer and Pick answers at once.
 type globalPool interface {
-	Get(ctx context.Context, id string) (peer.Peer, error)
 	Pick(ctx context.Context, id string) (peer.Peer, error)
+	AddPeer(ctx context.Context, p peer.Peer) error
+}
+
+// globalDialer is the peer service: the only dial path of the layer.
+type globalDialer interface {
+	Dial(ctx context.Context, peerId string) (peer.Peer, error)
 }
 
 type taskKind uint8
@@ -107,7 +130,7 @@ type globalSpace struct {
 // set of global connections. Everything network-facing happens on the
 // connector; the key-value side never dials.
 type Global struct {
-	cfg          config.Global
+	cfg          config.GlobalP2P
 	selfPeerId   string
 	selfIdentity string
 	store        *PeerStore
@@ -115,11 +138,20 @@ type Global struct {
 	book         *AddrBook
 	ep           endpoint
 	pool         globalPool
+	dialer       globalDialer
 	subscribe    KVSubscriber
 	now          func() time.Time
+	// publishDebounce coalesces ticket changes before republishing.
+	publishDebounce time.Duration
 
 	mu     sync.Mutex
 	spaces map[string]*globalSpace
+
+	// live holds the global peers with a connection this layer knows
+	// about: connector dials, plus inbound connections the sweep folds
+	// in. The inbound gate and the connector read it — never the pool.
+	liveMu sync.Mutex
+	live   map[string]peer.Peer
 
 	tasks chan task
 	conn  *connector
@@ -130,18 +162,20 @@ type Global struct {
 	closeOnce sync.Once
 }
 
-// NewGlobal builds the layer. cfg must have its defaults applied.
-func NewGlobal(cfg config.Global, selfPeerId, selfIdentity string, store *PeerStore, status *StatusBook, book *AddrBook) *Global {
+// NewGlobal builds the layer; zero budget fields take their defaults.
+func NewGlobal(cfg config.GlobalP2P, selfPeerId, selfIdentity string, store *PeerStore, status *StatusBook, book *AddrBook) *Global {
 	g := &Global{
-		cfg:          cfg,
-		selfPeerId:   selfPeerId,
-		selfIdentity: selfIdentity,
-		store:        store,
-		status:       status,
-		book:         book,
-		now:          time.Now,
-		spaces:       map[string]*globalSpace{},
-		tasks:        make(chan task, taskQueueSize),
+		cfg:             cfg.WithDefaults(),
+		selfPeerId:      selfPeerId,
+		selfIdentity:    selfIdentity,
+		store:           store,
+		status:          status,
+		book:            book,
+		now:             time.Now,
+		publishDebounce: publishDebounce,
+		spaces:          map[string]*globalSpace{},
+		live:            map[string]peer.Peer{},
+		tasks:           make(chan task, taskQueueSize),
 	}
 	g.conn = newConnector(g)
 	return g
@@ -153,6 +187,9 @@ func (g *Global) Init(a *app.App) error {
 	}
 	if g.pool == nil {
 		g.pool = a.MustComponent(pool.CName).(pool.Pool)
+	}
+	if g.dialer == nil {
+		g.dialer = a.MustComponent(peerservice.CName).(peerservice.PeerService)
 	}
 	// The transport refuses to start without a filter: nobody is let in
 	// before the allowlist exists.
@@ -180,7 +217,8 @@ func (g *Global) Run(_ context.Context) error {
 	return nil
 }
 
-// Close stops the workers (bounded wait) and flushes the status book.
+// Close stops the workers (bounded wait), then flushes and closes the
+// status book.
 func (g *Global) Close(_ context.Context) error {
 	g.closeOnce.Do(func() {
 		if g.runCancel != nil {
@@ -222,6 +260,12 @@ func (g *Global) SpaceLoaded(spaceId string, kv SpaceKV) {
 	if g.subscribe != nil {
 		cancel := g.subscribe(spaceId, g.handlerFor(spaceId))
 		g.mu.Lock()
+		// an unload that raced the subscription finds no cancel to call
+		if g.spaces[spaceId] != sp {
+			g.mu.Unlock()
+			cancel()
+			return
+		}
 		sp.cancel = cancel
 		g.mu.Unlock()
 	}
@@ -239,13 +283,14 @@ func (g *Global) SpaceUnloaded(spaceId string) {
 		return
 	}
 	delete(g.spaces, spaceId)
+	cancel := sp.cancel
 	peers := make([]string, 0, len(sp.records))
 	for id := range sp.records {
 		peers = append(peers, id)
 	}
 	g.mu.Unlock()
-	if sp.cancel != nil {
-		sp.cancel()
+	if cancel != nil {
+		cancel()
 	}
 	g.recompute(peers...)
 }
@@ -265,6 +310,19 @@ func (g *Global) space(spaceId string) *globalSpace {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.spaces[spaceId]
+}
+
+// requireRelay reports whether consumed tickets must be relay-only: with
+// relays configured, a direct address in a row is a member pointing our
+// dials at a host of its choosing.
+func (g *Global) requireRelay() bool { return len(g.cfg.RelayURLs) > 0 }
+
+// clamp bounds a publisher timestamp to now.
+func (g *Global) clamp(at time.Time) time.Time {
+	if now := g.now(); at.After(now) {
+		return now
+	}
+	return at
 }
 
 // enqueue hands a task to the worker; a full queue drops it — the
@@ -291,15 +349,15 @@ func (g *Global) handlerFor(spaceId string) KVHandler {
 				log.Debug("global p2p record decrypt", zap.String("peerId", kv.PeerId), zap.Error(err))
 				continue
 			}
-			ticket, _, err := parseTicket(kv.PeerId, g.selfPeerId, raw)
+			ticket, err := parseTicket(kv.PeerId, raw, g.requireRelay())
 			if err != nil {
-				log.Info("global p2p record rejected", zap.String("spaceId", spaceId), zap.String("peerId", kv.PeerId), zap.Error(err))
+				log.Debug("global p2p record rejected", zap.String("spaceId", spaceId), zap.String("peerId", kv.PeerId), zap.Error(err))
 				continue
 			}
 			g.enqueue(task{kind: taskApply, spaceId: spaceId, peerId: kv.PeerId, rec: record{
 				ticket:   ticket,
 				identity: kv.Identity,
-				seen:     time.UnixMicro(kv.TimestampMicro).UTC(),
+				seen:     g.clamp(time.UnixMicro(kv.TimestampMicro).UTC()),
 			}})
 		}
 	}
@@ -354,11 +412,13 @@ func (g *Global) publish(spaceId string) {
 	if ticket == "" || sp == nil || !sp.kv.CanWrite() {
 		return
 	}
+	ctx, cancel := context.WithTimeout(g.runCtx, opTimeout)
+	defer cancel()
 	var (
 		cur     string
 		curSeen time.Time
 	)
-	err := sp.kv.Store().GetAll(g.runCtx, RecordKey, func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error {
+	err := sp.kv.Store().GetAll(ctx, RecordKey, func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error {
 		for _, kv := range values {
 			if kv.Key != RecordKey || kv.PeerId != g.selfPeerId {
 				continue
@@ -379,7 +439,7 @@ func (g *Global) publish(spaceId string) {
 	if cur == ticket && g.now().Sub(curSeen) < heartbeatStaleAfter {
 		return
 	}
-	if err = sp.kv.Store().Set(g.runCtx, RecordKey, []byte(ticket)); err != nil {
+	if err = sp.kv.Store().Set(ctx, RecordKey, []byte(ticket)); err != nil {
 		log.Info("global p2p publish", zap.String("spaceId", spaceId), zap.Error(err))
 		return
 	}
@@ -394,8 +454,10 @@ func (g *Global) reconcile(spaceId string) {
 	if sp == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(g.runCtx, opTimeout)
+	defer cancel()
 	fresh := map[string]record{}
-	err := sp.kv.Store().GetAll(g.runCtx, RecordKey, func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error {
+	err := sp.kv.Store().GetAll(ctx, RecordKey, func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error {
 		for _, kv := range values {
 			if kv.Key != RecordKey || kv.PeerId == g.selfPeerId {
 				continue
@@ -404,12 +466,12 @@ func (g *Global) reconcile(spaceId string) {
 			if decErr != nil {
 				continue
 			}
-			ticket, _, pErr := parseTicket(kv.PeerId, g.selfPeerId, raw)
+			ticket, pErr := parseTicket(kv.PeerId, raw, g.requireRelay())
 			if pErr != nil {
-				log.Info("global p2p record rejected", zap.String("spaceId", spaceId), zap.String("peerId", kv.PeerId), zap.Error(pErr))
+				log.Debug("global p2p record rejected", zap.String("spaceId", spaceId), zap.String("peerId", kv.PeerId), zap.Error(pErr))
 				continue
 			}
-			fresh[kv.PeerId] = record{ticket: ticket, identity: kv.Identity, seen: time.UnixMicro(kv.TimestampMicro).UTC()}
+			fresh[kv.PeerId] = record{ticket: ticket, identity: kv.Identity, seen: g.clamp(time.UnixMicro(kv.TimestampMicro).UTC())}
 		}
 		return nil
 	})
@@ -422,6 +484,7 @@ func (g *Global) reconcile(spaceId string) {
 			delete(fresh, id)
 		}
 	}
+	capRecords(fresh)
 	g.mu.Lock()
 	touched := make([]string, 0, len(sp.records)+len(fresh))
 	for id := range sp.records {
@@ -435,7 +498,42 @@ func (g *Global) reconcile(spaceId string) {
 	g.recompute(touched...)
 }
 
-// apply upserts one live row.
+// capRecords trims a space's record set to the caps: at most
+// maxRowsPerIdentity newest rows per identity, at most maxGlobalPeers
+// newest rows overall.
+func capRecords(records map[string]record) {
+	type row struct {
+		id  string
+		rec record
+	}
+	byIdentity := map[string][]row{}
+	for id, rec := range records {
+		byIdentity[rec.identity] = append(byIdentity[rec.identity], row{id: id, rec: rec})
+	}
+	newestFirst := func(a, b row) int { return b.rec.seen.Compare(a.rec.seen) }
+	var all []row
+	for _, rows := range byIdentity {
+		slices.SortFunc(rows, newestFirst)
+		for i, r := range rows {
+			if i >= maxRowsPerIdentity {
+				delete(records, r.id)
+				continue
+			}
+			all = append(all, r)
+		}
+	}
+	if len(all) <= maxGlobalPeers {
+		return
+	}
+	slices.SortFunc(all, newestFirst)
+	for _, r := range all[maxGlobalPeers:] {
+		delete(records, r.id)
+	}
+}
+
+// apply upserts one live row, holding the per-identity and per-space
+// caps: a new device of an identity at its cap evicts that identity's
+// oldest row; a new peer past the space cap is ignored.
 func (g *Global) apply(spaceId, peerId string, rec record) {
 	sp := g.space(spaceId)
 	if sp == nil {
@@ -449,19 +547,45 @@ func (g *Global) apply(spaceId, peerId string, rec record) {
 		return
 	}
 	g.mu.Lock()
-	if cur, ok := sp.records[peerId]; ok && cur.ticket == rec.ticket && !rec.seen.After(cur.seen) {
+	cur, known := sp.records[peerId]
+	if known && cur.ticket == rec.ticket && !rec.seen.After(cur.seen) {
 		g.mu.Unlock()
 		return
 	}
+	var evicted []string
+	if !known {
+		if len(sp.records) >= maxGlobalPeers {
+			g.mu.Unlock()
+			log.Debug("global p2p record ignored: space at peer cap", zap.String("spaceId", spaceId), zap.String("peerId", peerId))
+			return
+		}
+		var oldestId string
+		var oldest record
+		n := 0
+		for id, r := range sp.records {
+			if r.identity != rec.identity {
+				continue
+			}
+			n++
+			if oldestId == "" || r.seen.Before(oldest.seen) {
+				oldestId, oldest = id, r
+			}
+		}
+		if n >= maxRowsPerIdentity {
+			delete(sp.records, oldestId)
+			evicted = append(evicted, oldestId)
+		}
+	}
 	sp.records[peerId] = rec
 	g.mu.Unlock()
-	g.recompute(peerId)
+	g.recompute(append(evicted, peerId)...)
 }
 
 // recompute folds a peer's records across loaded spaces into the peer
 // store, addr book and status book: the newest row wins the ticket,
 // its timestamp is liveness evidence, disabled peers lose their
-// ticket. Wakes the connector.
+// ticket. A peer gone from every space and every source is forgotten
+// once its record is past the disable threshold. Wakes the connector.
 func (g *Global) recompute(peerIds ...string) {
 	for _, peerId := range peerIds {
 		var (
@@ -483,6 +607,10 @@ func (g *Global) recompute(peerIds ...string) {
 		if len(spaceIds) == 0 {
 			g.store.RemoveGlobalPeer(peerId)
 			g.book.ClearTicket(peerId)
+			g.conn.forget(peerId)
+			if len(g.store.Sources(peerId)) == 0 && g.status.Tier(peerId) == TierDisabled {
+				g.status.Forget(peerId)
+			}
 			continue
 		}
 		g.status.Seen(peerId, latest.seen)
@@ -528,7 +656,7 @@ func (g *Global) watchTicket() {
 			return
 		case <-g.ep.TicketUpdates():
 			pending = true
-			due = time.Now().Add(publishDebounce)
+			due = time.Now().Add(g.publishDebounce)
 		case <-wait:
 			pending = false
 			g.enqueue(task{kind: taskPublish})
@@ -559,48 +687,100 @@ func (g *Global) tickers() {
 	}
 }
 
-// sweep bumps LastSeen of every global peer that still has a live
-// connection. pool.Pick never dials.
+// sweep folds inbound-accepted global peers into the live set and bumps
+// LastSeen of every global peer with a live connection. Pool lookups are
+// bounded by PickTimeout and never dial.
 func (g *Global) sweep() {
 	now := g.now()
 	for _, id := range g.store.AllGlobalPeers() {
-		if g.connected(id) {
-			g.status.Seen(id, now)
+		if g.runCtx != nil && g.runCtx.Err() != nil {
+			return
 		}
+		if !g.connected(id) {
+			p := g.pickIroh(id)
+			if p == nil {
+				continue
+			}
+			g.addLive(p)
+		}
+		g.status.Seen(id, now)
 	}
 }
 
-// connected reports a live connection to the peer, without dialing.
-// Pick never blocks, so no lifetime ctx is needed (the inbound filter
-// calls this before Run).
+// pickIroh returns the pool's live iroh connection to a peer, nil when
+// there is none within PickTimeout.
+func (g *Global) pickIroh(peerId string) peer.Peer {
+	ctx := g.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p, err := PickLive(ctx, g.pool, peerId)
+	if err != nil || !strings.HasPrefix(peer.CtxPeerAddr(p.Context()), transport.Iroh+"://") {
+		return nil
+	}
+	return p
+}
+
+// addLive records a live global connection and drops it when the
+// connection closes.
+func (g *Global) addLive(p peer.Peer) {
+	id := p.Id()
+	g.liveMu.Lock()
+	if cur, ok := g.live[id]; ok && cur == p {
+		g.liveMu.Unlock()
+		return
+	}
+	g.live[id] = p
+	g.liveMu.Unlock()
+	done := g.runCtx
+	if done == nil {
+		done = context.Background()
+	}
+	go func() {
+		select {
+		case <-p.CloseChan():
+		case <-done.Done():
+		}
+		g.liveMu.Lock()
+		if g.live[id] == p {
+			delete(g.live, id)
+		}
+		g.liveMu.Unlock()
+	}()
+}
+
+// connected reports a live global connection to the peer. Reads the
+// layer's own set — never the pool, never blocks.
 func (g *Global) connected(peerId string) bool {
-	_, err := g.pool.Pick(context.Background(), peerId)
-	return err == nil
+	g.liveMu.Lock()
+	p, ok := g.live[peerId]
+	g.liveMu.Unlock()
+	return ok && !p.IsClosed()
 }
 
-// allowInbound is the iroh incoming filter: only members known through
-// key-value records and not disabled, and only while the live global
-// connection count is under MaxConnections+MaxInbound.
-func (g *Global) allowInbound(peerId string) bool {
-	if !g.store.HasGlobalPeer(peerId) || g.status.Tier(peerId) == TierDisabled {
-		return false
-	}
-	return g.liveGlobalConns() < g.cfg.MaxConnections+g.cfg.MaxInbound
-}
-
-// liveGlobalConns counts known global peers connected over iroh.
-func (g *Global) liveGlobalConns() int {
+// liveCount is the number of distinct global peers with a live
+// connection.
+func (g *Global) liveCount() int {
+	g.liveMu.Lock()
+	defer g.liveMu.Unlock()
 	n := 0
-	for _, id := range g.store.AllGlobalPeers() {
-		p, err := g.pool.Pick(context.Background(), id)
-		if err != nil {
-			continue
-		}
-		if strings.HasPrefix(peer.CtxPeerAddr(p.Context()), transport.Iroh+"://") {
+	for _, p := range g.live {
+		if !p.IsClosed() {
 			n++
 		}
 	}
 	return n
+}
+
+// allowInbound is the iroh incoming filter: only members known through
+// key-value records and not disabled, and only while fewer than
+// MaxConnections+MaxInbound distinct global peers are connected. O(1):
+// it runs on the accept path before any handshake.
+func (g *Global) allowInbound(peerId string) bool {
+	if !g.store.HasGlobalPeer(peerId) || g.status.Tier(peerId) == TierDisabled {
+		return false
+	}
+	return g.liveCount() < g.cfg.MaxConnections+g.cfg.MaxInbound
 }
 
 // Status is the debug snapshot of the layer.

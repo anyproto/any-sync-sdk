@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -97,4 +98,31 @@ func TestStatusBookPersistRoundTrip(t *testing.T) {
 	b3 := NewStatusBook(filepath.Join(t.TempDir(), "none.json"), testThresholds)
 	require.NoError(t, b3.Load())
 	require.Equal(t, TierDisabled, b3.Tier("p1"))
+}
+
+// The file carries a version; records past the disable threshold are
+// pruned on load; a newer version is refused, not misread.
+func TestStatusBookLoadPrunesAndVersions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p2p_peers.json")
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	b := NewStatusBook(path, testThresholds)
+	b.now = func() time.Time { return now }
+	b.Seen("fresh", now)
+	b.Seen("old", now.Add(-2*testThresholds.Disable))
+	require.NoError(t, b.Close())
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"v":1`)
+
+	b2 := NewStatusBook(path, testThresholds)
+	b2.now = func() time.Time { return now }
+	require.NoError(t, b2.Load())
+	_, ok := b2.Get("fresh")
+	require.True(t, ok)
+	_, ok = b2.Get("old")
+	require.False(t, ok)
+
+	require.NoError(t, os.WriteFile(path, []byte(`{"v":99,"peers":{}}`), 0o600))
+	b3 := NewStatusBook(path, testThresholds)
+	require.Error(t, b3.Load())
 }

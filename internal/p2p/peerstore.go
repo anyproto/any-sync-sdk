@@ -94,9 +94,18 @@ func (p *PeerStore) AddSourceObserver(o SourceObserver) {
 	p.srcObs = append(p.srcObs, o)
 }
 
-// UpdateLocalPeer records the full LAN space set for a peer.
+// UpdateLocalPeer records the full LAN space set for a peer; an empty
+// set keeps the peer known (it stays in AllLocalPeers).
 func (p *PeerStore) UpdateLocalPeer(peerId string, spaceIds []string) {
 	p.update(SourceLAN, peerId, spaceIds)
+}
+
+// HasLocalPeer reports whether the peer is known on the LAN.
+func (p *PeerStore) HasLocalPeer(peerId string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.sources[SourceLAN].byPeer[peerId]
+	return ok
 }
 
 // RemoveLocalPeer forgets a peer's LAN presence (dial failure,
@@ -112,15 +121,14 @@ func (p *PeerStore) UpdateGlobalPeer(peerId string, spaceIds []string) {
 func (p *PeerStore) RemoveGlobalPeer(peerId string) { p.remove(SourceGlobal, peerId) }
 
 // update records the full space set of a peer in one source, diffing
-// against the previous set. A no-change update fires no observers.
+// against the previous set. A no-change update fires no observers. An
+// empty set keeps the peer known to the source with no spaces (a LAN
+// peer that shares nothing yet stays reachable for re-handshakes);
+// only remove forgets it.
 func (p *PeerStore) update(src Source, peerId string, spaceIds []string) {
 	after := slices.Clone(spaceIds)
 	slices.Sort(after)
 	after = slices.Compact(after)
-	if len(after) == 0 {
-		p.remove(src, peerId)
-		return
-	}
 
 	p.mu.Lock()
 	idx := p.sources[src]

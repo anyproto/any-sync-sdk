@@ -125,8 +125,16 @@ func TestPeerStoreSourcesAreSeparate(t *testing.T) {
 	require.True(t, last.removed)
 	require.Nil(t, last.after)
 
-	// An empty global set is a removal.
+	// An empty set keeps the peer known with no spaces; only remove
+	// forgets it (a LAN peer sharing nothing yet stays reachable for
+	// re-handshakes).
 	s.UpdateGlobalPeer("g", nil)
+	require.True(t, s.HasGlobalPeer("g"))
+	require.Empty(t, s.GlobalSpaceIds("g"))
+	s.UpdateLocalPeer("l", nil)
+	require.True(t, s.HasLocalPeer("l"))
+	require.Contains(t, s.AllLocalPeers(), "l")
+	s.RemoveGlobalPeer("g")
 	require.False(t, s.HasGlobalPeer("g"))
 	require.Empty(t, s.AllGlobalPeers())
 }

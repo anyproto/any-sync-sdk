@@ -3,7 +3,8 @@ package anysyncx
 import (
 	"context"
 	"errors"
-	"fmt"
+	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/peermanager"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/commonspace/sync/objectsync/objectmessages"
 	"github.com/anyproto/any-sync/net/peer"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/streampool"
@@ -18,6 +20,8 @@ import (
 	"github.com/cheggaaa/mb/v3"
 	"go.uber.org/zap"
 	"storj.io/drpc"
+
+	"github.com/anyproto/any-sync-sdk/internal/p2p"
 )
 
 var pmLog = logger.NewNamed("anysyncx.peermanager")
@@ -119,6 +123,7 @@ type spacePeerManager struct {
 	globalRotation int
 	coalesced      map[string]drpc.Message
 	coalesceOrder  []string
+	coalesceSeq    int
 	coalesceTimer  *time.Timer
 
 	runCtx    context.Context
@@ -327,8 +332,8 @@ func (m *spacePeerManager) globalFallback() bool {
 }
 
 // connectedGlobalPeers picks the global peers sharing this space that
-// are connected right now, best first, at most limit (0 = all).
-// pool.Pick never dials.
+// are connected right now, best first, at most limit (0 = all). Each
+// lookup is bounded by p2p.PickTimeout and never dials.
 func (m *spacePeerManager) connectedGlobalPeers(ctx context.Context, limit int) []peer.Peer {
 	if m.globalPeers == nil {
 		return nil
@@ -338,11 +343,20 @@ func (m *spacePeerManager) connectedGlobalPeers(ctx context.Context, limit int) 
 		if limit > 0 && len(out) >= limit {
 			break
 		}
-		if p, err := m.pool.Pick(ctx, id); err == nil {
+		if p, err := p2p.PickLive(ctx, m.pool, id); err == nil {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// isGlobalOnly reports a peer known to this space through records only:
+// such a peer is never dialed from a sync path.
+func (m *spacePeerManager) isGlobalOnly(peerId string) bool {
+	if m.globalPeers == nil || !slices.Contains(m.globalPeers.GlobalPeerIds(m.spaceId), peerId) {
+		return false
+	}
+	return m.localPeers == nil || !slices.Contains(m.localPeers.LocalPeerIds(m.spaceId), peerId)
 }
 
 // nextGlobalPeer rotates over the connected global peers so successive
@@ -467,15 +481,24 @@ func (m *spacePeerManager) BroadcastMessage(_ context.Context, msg drpc.Message)
 // so a burst of edits costs one relay send per peer.
 const globalCoalesceWindow = 500 * time.Millisecond
 
-// coalesce queues msg for the global peers. Messages that name an
-// object (head updates) replace the older queued one for the same
-// object; anything else is kept as is.
+// coalesce queues msg for the global peers. A tree head update
+// replaces the older queued one for the same object (a tree receiver
+// fetches whatever it misses); every other message — key-value rows,
+// ACL records, whose payloads are not cumulative — is queued in order
+// under its own key. Nothing is queued while no global peer shares the
+// space.
 func (m *spacePeerManager) coalesce(msg drpc.Message) {
-	key := fmt.Sprintf("%p", msg)
-	if o, ok := msg.(interface{ ObjectId() string }); ok && o.ObjectId() != "" {
-		key = "object:" + o.ObjectId()
+	if len(m.globalPeers.GlobalPeerIds(m.spaceId)) == 0 {
+		return
 	}
 	m.globalMu.Lock()
+	var key string
+	if hu, ok := msg.(*objectmessages.HeadUpdate); ok && isTreeUpdate(hu) && hu.Meta.ObjectId != "" {
+		key = "object:" + hu.Meta.ObjectId
+	} else {
+		m.coalesceSeq++
+		key = "seq:" + strconv.Itoa(m.coalesceSeq)
+	}
 	if m.coalesced == nil {
 		m.coalesced = map[string]drpc.Message{}
 	}
@@ -487,6 +510,16 @@ func (m *spacePeerManager) coalesce(msg drpc.Message) {
 		m.coalesceTimer = time.AfterFunc(globalCoalesceWindow, m.flushCoalesced)
 	}
 	m.globalMu.Unlock()
+}
+
+// isTreeUpdate reports a head update of an object tree. An outbound
+// update carries its type on the inner update; a decoded one on the
+// message itself.
+func isTreeUpdate(hu *objectmessages.HeadUpdate) bool {
+	if hu.Update != nil {
+		return hu.Update.ObjectType() == spacesyncproto.ObjectType_Tree
+	}
+	return hu.ObjectType() == spacesyncproto.ObjectType_Tree
 }
 
 // flushCoalesced sends the held batch to at most globalFanout connected
@@ -672,10 +705,20 @@ func (m *spacePeerManager) flushParked() bool {
 
 // SendMessage is the unicast path (headsync diffsyncer's subscribe).
 // Deliberately no park-on-overflow: the diffsyncer re-subscribes on its
-// own cadence, so a lost send heals within a sync period.
+// own cadence, so a lost send heals within a sync period. A global-only
+// peer is picked, never dialed; nodes and LAN peers are dialed as
+// before.
 func (m *spacePeerManager) SendMessage(ctx context.Context, peerId string, msg drpc.Message) error {
 	return m.streamPool.Send(ctx, msg, func(ctx context.Context) ([]peer.Peer, error) {
-		p, err := m.pool.Get(ctx, peerId)
+		var (
+			p   peer.Peer
+			err error
+		)
+		if m.isGlobalOnly(peerId) {
+			p, err = p2p.PickLive(ctx, m.pool, peerId)
+		} else {
+			p, err = m.pool.Get(ctx, peerId)
+		}
 		if err != nil {
 			return nil, err
 		}

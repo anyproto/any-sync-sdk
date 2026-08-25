@@ -2,6 +2,7 @@ package anysyncx
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -129,7 +130,8 @@ func (c *configAdapter) GetIroh() iroh.Config {
 		MaxIdleTimeoutSec:  int(3 * g.KeepAlive / time.Second),
 	}
 	if g.Port != 0 {
-		conf.BindAddr = "0.0.0.0:" + strconv.Itoa(g.Port)
+		// dual-stack, like go-iroh's own default bind
+		conf.BindAddr = net.JoinHostPort("::", strconv.Itoa(g.Port))
 	}
 	return conf
 }

@@ -172,11 +172,11 @@ func (c *connector) candidates() map[string][]string {
 	return out
 }
 
-// selectTargets is the greedy space cover: repeatedly take the peer
-// covering the most still-uncovered spaces — ties to already connected
-// peers, then own devices, then the most recently seen, then by id —
-// until every space is covered or max peers are chosen. Spaces already
-// covered by a connected target need no extra dial.
+// selectTargets is the greedy space cover. Connected candidates are
+// taken first and the spaces they cover need no dial; then the peer
+// covering the most still-uncovered spaces is taken repeatedly — ties to
+// own devices, then the most recently seen, then by id — until every
+// space is covered or max peers are chosen.
 func selectTargets(candidates map[string][]string, infos map[string]peerInfo, max int) []string {
 	uncovered := map[string]struct{}{}
 	spacesOf := map[string][]string{}
@@ -188,6 +188,20 @@ func selectTargets(candidates map[string][]string, infos map[string]peerInfo, ma
 	}
 	var targets []string
 	chosen := map[string]struct{}{}
+	connectedIds := make([]string, 0, len(spacesOf))
+	for id := range spacesOf {
+		if infos[id].connected {
+			connectedIds = append(connectedIds, id)
+		}
+	}
+	slices.Sort(connectedIds)
+	for _, id := range connectedIds {
+		targets = append(targets, id)
+		chosen[id] = struct{}{}
+		for _, s := range spacesOf[id] {
+			delete(uncovered, s)
+		}
+	}
 	for len(targets) < max && len(uncovered) > 0 {
 		best, bestCov := "", 0
 		for id, spaces := range spacesOf {
@@ -221,9 +235,6 @@ func selectTargets(candidates map[string][]string, infos map[string]peerInfo, ma
 
 // betterPeer orders two equally covering peers.
 func betterPeer(a peerInfo, aId string, b peerInfo, bId string) bool {
-	if a.connected != b.connected {
-		return a.connected
-	}
 	if a.own != b.own {
 		return a.own
 	}
@@ -240,14 +251,24 @@ func (c *connector) rateLimitWait(now time.Time) time.Duration {
 	defer c.mu.Unlock()
 	cut := now.Add(-rateWindow)
 	c.attempts = slices.DeleteFunc(c.attempts, func(t time.Time) bool { return t.Before(cut) })
-	if len(c.attempts) < c.g.cfg.MaxDialsPerMinute {
+	if limit := c.g.cfg.MaxDialsPerMinute; limit <= 0 || len(c.attempts) < limit {
 		return 0
 	}
 	return c.attempts[0].Add(rateWindow).Sub(now)
 }
 
-// dial is the single global dial path: the only pool.Get on a global
-// peer, the only ctx carrying CtxWithGlobalDial, bounded by DialTimeout.
+// forget drops a peer's backoff entry once it left every space.
+func (c *connector) forget(peerId string) {
+	c.mu.Lock()
+	delete(c.next, peerId)
+	c.mu.Unlock()
+}
+
+// dial is the single global dial path: the peer service is called
+// directly (the only ctx carrying CtxWithGlobalDial, bounded by
+// DialTimeout) and the connection is handed to the pool as an
+// incoming-style peer. Going around pool.Get means no in-flight pool
+// load ever exists for a global peer, so every Pick answers at once.
 func (c *connector) dial(ctx context.Context, peerId string) {
 	g := c.g
 	now := g.now()
@@ -256,16 +277,24 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 	c.mu.Unlock()
 
 	dctx, cancel := context.WithTimeout(peerservice.CtxWithGlobalDial(ctx), g.cfg.DialTimeout)
-	_, err := g.pool.Get(dctx, peerId)
+	p, err := g.dialer.Dial(dctx, peerId)
 	cancel()
 	if errors.Is(err, peerservice.ErrAddrsNotFound) {
-		// The pool shares one in-flight load per peer: a plain Get racing
-		// this dial answers for both with its own verdict. Not evidence
-		// about the peer — retry shortly.
+		// The addr book handed the peer to the LAN or dropped its ticket
+		// between planning and dialing. Not evidence about the peer —
+		// retry shortly.
 		c.mu.Lock()
 		c.next[peerId] = now.Add(addrsNotFoundRetry)
 		c.mu.Unlock()
 		return
+	}
+	if err == nil {
+		p.SetTTL(globalPeerTTL)
+		if err = g.pool.AddPeer(ctx, p); err != nil {
+			_ = p.Close()
+		} else {
+			g.addLive(p)
+		}
 	}
 	ok := err == nil
 	g.status.Attempt(peerId, ok)

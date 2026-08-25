@@ -1,8 +1,10 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -159,38 +161,66 @@ func (s *fakeSpace) IsMember(identity string) bool  { return s.members[identity]
 // fakePeer is a connected peer whose context carries an iroh address.
 type fakePeer struct {
 	peer.Peer
-	id  string
-	ctx context.Context
+	id     string
+	ctx    context.Context
+	closed chan struct{}
+	once   sync.Once
 }
 
-func (p fakePeer) Id() string               { return p.id }
-func (p fakePeer) Context() context.Context { return p.ctx }
-
-func irohPeer(id string) fakePeer {
-	return fakePeer{id: id, ctx: peer.CtxWithPeerAddr(context.Background(), transport.Iroh+"://x")}
+func (p *fakePeer) Id() string               { return p.id }
+func (p *fakePeer) Context() context.Context { return p.ctx }
+func (p *fakePeer) CloseChan() <-chan struct{} {
+	return p.closed
+}
+func (p *fakePeer) IsClosed() bool {
+	select {
+	case <-p.closed:
+		return true
+	default:
+		return false
+	}
+}
+func (p *fakePeer) SetTTL(time.Duration) {}
+func (p *fakePeer) Close() error {
+	p.once.Do(func() { close(p.closed) })
+	return nil
 }
 
-// fakeGlobalPool: Pick serves the connected map; Get is scripted.
+func irohPeer(id string) *fakePeer {
+	return &fakePeer{id: id, ctx: peer.CtxWithPeerAddr(context.Background(), transport.Iroh+"://x"), closed: make(chan struct{})}
+}
+
+// fakeGlobalPool stands in for the pool and the peer service: Pick
+// serves the connected map, Dial is scripted, AddPeer connects.
 type fakeGlobalPool struct {
 	mu        sync.Mutex
 	connected map[string]peer.Peer
-	getFn     func(ctx context.Context, id string) (peer.Peer, error)
-	gets      []string
+	dialFn    func(ctx context.Context, id string) (peer.Peer, error)
+	dials     []string
+	// pickBlocks makes Pick wait for ctx: the pool's Pick waits on an
+	// in-flight load for the same id.
+	pickBlocks bool
 }
 
-func (f *fakeGlobalPool) Pick(_ context.Context, id string) (peer.Peer, error) {
+func (f *fakeGlobalPool) Pick(ctx context.Context, id string) (peer.Peer, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if p, ok := f.connected[id]; ok {
+	blocks := f.pickBlocks
+	p, ok := f.connected[id]
+	f.mu.Unlock()
+	if blocks {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if ok {
 		return p, nil
 	}
 	return nil, errors.New("not connected")
 }
 
-func (f *fakeGlobalPool) Get(ctx context.Context, id string) (peer.Peer, error) {
+func (f *fakeGlobalPool) Dial(ctx context.Context, id string) (peer.Peer, error) {
 	f.mu.Lock()
-	f.gets = append(f.gets, id)
-	fn := f.getFn
+	f.dials = append(f.dials, id)
+	fn := f.dialFn
 	f.mu.Unlock()
 	if fn == nil {
 		return nil, errors.New("no dial")
@@ -198,19 +228,31 @@ func (f *fakeGlobalPool) Get(ctx context.Context, id string) (peer.Peer, error) 
 	return fn(ctx, id)
 }
 
-func (f *fakeGlobalPool) getCount() int {
+func (f *fakeGlobalPool) AddPeer(_ context.Context, p peer.Peer) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.gets)
+	if f.connected == nil {
+		f.connected = map[string]peer.Peer{}
+	}
+	f.connected[p.Id()] = p
+	return nil
 }
 
-func (f *fakeGlobalPool) connect(id string) {
+func (f *fakeGlobalPool) dialCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.dials)
+}
+
+func (f *fakeGlobalPool) connect(id string) *fakePeer {
+	p := irohPeer(id)
 	f.mu.Lock()
 	if f.connected == nil {
 		f.connected = map[string]peer.Peer{}
 	}
-	f.connected[id] = irohPeer(id)
+	f.connected[id] = p
 	f.mu.Unlock()
+	return p
 }
 
 // globalFixture wires a Global with fakes; the subscriber captures
@@ -229,7 +271,7 @@ type globalFixture struct {
 	handlers map[string]KVHandler
 }
 
-func newGlobalFixture(t *testing.T, cfg config.Global) *globalFixture {
+func newGlobalFixture(t *testing.T, cfg config.GlobalP2P) *globalFixture {
 	t.Helper()
 	cfg = cfg.WithDefaults()
 	fx := &globalFixture{
@@ -250,6 +292,8 @@ func newGlobalFixture(t *testing.T, cfg config.Global) *globalFixture {
 	g.now = fx.clock
 	g.ep = fx.ep
 	g.pool = fx.pool
+	g.dialer = fx.pool
+	g.publishDebounce = 50 * time.Millisecond
 	g.subscribe = func(spaceId string, h KVHandler) func() {
 		fx.mu.Lock()
 		fx.handlers[spaceId] = h
@@ -263,6 +307,14 @@ func newGlobalFixture(t *testing.T, cfg config.Global) *globalFixture {
 	require.NoError(t, g.Init(nil))
 	fx.g = g
 	return fx
+}
+
+// connect puts a live iroh connection to the peer into the pool and the
+// layer's live set, as a connector dial or a sweep would.
+func (fx *globalFixture) connect(id string) *fakePeer {
+	p := fx.pool.connect(id)
+	fx.g.addLive(p)
+	return p
 }
 
 func (fx *globalFixture) clock() time.Time {
@@ -309,19 +361,32 @@ func TestParseTicket(t *testing.T) {
 	a := newTestPeer(t, "a")
 	b := newTestPeer(t, "b")
 
-	ticket, addr, err := parseTicket(a.peerId, "self", []byte(a.ticket))
+	ticket, err := parseTicket(a.peerId, []byte(a.ticket), true)
 	require.NoError(t, err)
 	require.Equal(t, a.ticket, ticket)
-	require.Len(t, addr.RelayURLs(), 1)
 
-	_, _, err = parseTicket(a.peerId, "self", []byte(b.ticket))
+	_, err = parseTicket(a.peerId, []byte(b.ticket), true)
 	require.ErrorIs(t, err, errRecordIdentity, "a row may only carry its signer's own endpoint")
-	_, _, err = parseTicket(a.peerId, a.peerId, []byte(a.ticket))
-	require.ErrorIs(t, err, errRecordSelf)
-	_, _, err = parseTicket(a.peerId, "self", []byte("garbage"))
+	_, err = parseTicket(a.peerId, []byte("garbage"), true)
 	require.Error(t, err)
-	_, _, err = parseTicket("not-a-peer-id", "self", []byte(a.ticket))
+	_, err = parseTicket("not-a-peer-id", []byte(a.ticket), true)
 	require.Error(t, err)
+	_, err = parseTicket(a.peerId, bytes.Repeat([]byte("x"), maxTicketLen+1), true)
+	require.ErrorIs(t, err, errRecordTooLong)
+
+	// With relays configured a row must be relay-only: a direct address
+	// would point our dials at a host of the writer's choosing.
+	id, err := iroh.EndpointIdFromPeerId(a.peerId)
+	require.NoError(t, err)
+	relay, _ := netaddr.ParseRelayURL("https://relay.test")
+	direct := endpointticket.Encode(netaddr.NewEndpointAddr(id).WithRelayURL(relay).WithIP(netip.MustParseAddrPort("10.0.0.1:4000")))
+	_, err = parseTicket(a.peerId, []byte(direct), true)
+	require.ErrorIs(t, err, errRecordDirect)
+	noRelay := mintTicket(t, a.peerId, "")
+	_, err = parseTicket(a.peerId, []byte(noRelay), true)
+	require.ErrorIs(t, err, errRecordNoRelay)
+	_, err = parseTicket(a.peerId, []byte(direct), false)
+	require.NoError(t, err, "direct mode (no local relays) accepts direct addresses")
 
 	require.Equal(t, "https://relay.test/", homeRelay(a.ticket))
 	require.Equal(t, "", homeRelay(mintTicket(t, a.peerId, "")))
@@ -329,7 +394,7 @@ func TestParseTicket(t *testing.T) {
 }
 
 func TestGlobalConsumeRecords(t *testing.T) {
-	fx := newGlobalFixture(t, config.Global{})
+	fx := newGlobalFixture(t, config.GlobalP2P{})
 	a := newTestPeer(t, "me")     // own device on another machine
 	b := newTestPeer(t, "bob")    // member
 	c := newTestPeer(t, "carol")  // signed rows, but removed from the ACL
@@ -396,7 +461,7 @@ func TestGlobalConsumeRecords(t *testing.T) {
 }
 
 func TestGlobalPublishHeartbeat(t *testing.T) {
-	fx := newGlobalFixture(t, config.Global{})
+	fx := newGlobalFixture(t, config.GlobalP2P{})
 	fx.run(t)
 
 	// No own row yet → publish.
@@ -433,13 +498,13 @@ func TestGlobalPublishHeartbeat(t *testing.T) {
 	fx.drain(t)
 	require.Equal(t, 0, ro.kv.setCount())
 	fx.ep.setTicket("")
-	time.Sleep(publishDebounce + 100*time.Millisecond)
+	time.Sleep(fx.g.publishDebounce + 100*time.Millisecond)
 	fx.drain(t)
 	require.Equal(t, 3, sp.kv.setCount())
 }
 
 func TestGlobalInboundFilter(t *testing.T) {
-	fx := newGlobalFixture(t, config.Global{MaxConnections: 1, MaxInbound: 1})
+	fx := newGlobalFixture(t, config.GlobalP2P{MaxConnections: 1, MaxInbound: 1})
 	require.NotNil(t, fx.ep.filter, "filter installed at Init, before the transport starts")
 	a := newTestPeer(t, "a")
 	b := newTestPeer(t, "b")
@@ -458,11 +523,17 @@ func TestGlobalInboundFilter(t *testing.T) {
 	require.False(t, fx.ep.filter(old.peerId), "disabled tier")
 	require.True(t, fx.ep.filter(a.peerId))
 
-	// MaxConnections+MaxInbound live iroh connections → refuse.
+	// MaxConnections+MaxInbound distinct live peers → refuse. Inbound
+	// connections live only in the pool until the sweep folds them in.
 	fx.pool.connect(a.peerId)
 	require.True(t, fx.ep.filter(b.peerId))
-	fx.pool.connect(b.peerId)
+	fx.g.sweep()
+	require.True(t, fx.ep.filter(b.peerId))
+	pb := fx.connect(b.peerId)
 	require.False(t, fx.ep.filter(c.peerId))
+	// A closed connection frees its slot.
+	require.NoError(t, pb.Close())
+	require.Eventually(t, func() bool { return fx.ep.filter(c.peerId) }, time.Second, 5*time.Millisecond)
 }
 
 func TestSelectTargets(t *testing.T) {
@@ -513,7 +584,7 @@ func TestBackoffFor(t *testing.T) {
 }
 
 func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
-	fx := newGlobalFixture(t, config.Global{MaxConnections: 2, MaxDialsPerMinute: 2, DialTimeout: 50 * time.Millisecond})
+	fx := newGlobalFixture(t, config.GlobalP2P{MaxConnections: 2, MaxDialsPerMinute: 2, DialTimeout: 50 * time.Millisecond})
 	a := newTestPeer(t, "a")
 	b := newTestPeer(t, "b")
 	c := newTestPeer(t, "c")
@@ -529,7 +600,7 @@ func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 	// per-minute budget. Dials run one at a time.
 	var inflight, maxInflight int
 	var mu sync.Mutex
-	fx.pool.getFn = func(ctx context.Context, id string) (peer.Peer, error) {
+	fx.pool.dialFn = func(ctx context.Context, id string) (peer.Peer, error) {
 		dl, ok := ctx.Deadline()
 		require.True(t, ok, "dial ctx carries DialTimeout")
 		require.WithinDuration(t, time.Now().Add(50*time.Millisecond), dl, 30*time.Millisecond)
@@ -550,10 +621,10 @@ func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 	fx.g.SpaceLoaded("s2", sp2)
 
 	// The cover is a (s1) + c (s2); b is never worth a dial.
-	require.Eventually(t, func() bool { return fx.pool.getCount() == 2 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return fx.pool.dialCount() == 2 }, 5*time.Second, 5*time.Millisecond)
 	time.Sleep(200 * time.Millisecond)
 	fx.pool.mu.Lock()
-	require.ElementsMatch(t, []string{a.peerId, c.peerId}, fx.pool.gets)
+	require.ElementsMatch(t, []string{a.peerId, c.peerId}, fx.pool.dials)
 	fx.pool.mu.Unlock()
 	mu.Lock()
 	require.Equal(t, 1, maxInflight, "one dial in flight")
@@ -565,50 +636,50 @@ func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 	fx.advance(31 * time.Second)
 	fx.g.conn.wakeUp()
 	time.Sleep(200 * time.Millisecond)
-	require.Equal(t, 2, fx.pool.getCount(), "rate limit: 2 dials per minute")
+	require.Equal(t, 2, fx.pool.dialCount(), "rate limit: 2 dials per minute")
 
 	// Budget back → the freshest due target is retried.
 	fx.advance(30 * time.Second)
 	fx.g.conn.wakeUp()
-	require.Eventually(t, func() bool { return fx.pool.getCount() == 3 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return fx.pool.dialCount() == 3 }, 5*time.Second, 5*time.Millisecond)
 	fx.pool.mu.Lock()
-	require.Equal(t, a.peerId, fx.pool.gets[2])
+	require.Equal(t, a.peerId, fx.pool.dials[2])
 	fx.pool.mu.Unlock()
 
 	// A connected peer is never dialed; a LAN-reachable one neither.
-	fx.pool.connect(a.peerId)
+	fx.connect(a.peerId)
 	fx.book.SetLAN(c.peerId, []string{"yamux://10.0.0.1:1"})
 	fx.advance(2 * time.Minute)
 	fx.g.conn.reactivate(a.peerId)
 	fx.g.conn.reactivate(c.peerId)
 	time.Sleep(200 * time.Millisecond)
-	require.Equal(t, 3, fx.pool.getCount())
+	require.Equal(t, 3, fx.pool.dialCount())
 }
 
 func TestConnectorPowerHintAndAddrsNotFound(t *testing.T) {
 	sdkp2p.SetPowerHint(sdkp2p.PowerLow)
 	t.Cleanup(func() { sdkp2p.SetPowerHint(sdkp2p.PowerNormal) })
 
-	fx := newGlobalFixture(t, config.Global{})
+	fx := newGlobalFixture(t, config.GlobalP2P{})
 	a := newTestPeer(t, "a")
 	sp := fx.space(a)
 	sp.kv.put(a, a.ticket, fx.now)
-	fx.pool.getFn = func(context.Context, string) (peer.Peer, error) { return nil, peerservice.ErrAddrsNotFound }
+	fx.pool.dialFn = func(context.Context, string) (peer.Peer, error) { return nil, peerservice.ErrAddrsNotFound }
 	fx.run(t)
 	fx.g.SpaceLoaded("s1", sp)
 	fx.drain(t)
 	time.Sleep(100 * time.Millisecond)
-	require.Equal(t, 0, fx.pool.getCount(), "no dials while low power")
+	require.Equal(t, 0, fx.pool.dialCount(), "no dials while low power")
 
 	sdkp2p.SetPowerHint(sdkp2p.PowerNormal)
-	require.Eventually(t, func() bool { return fx.pool.getCount() == 1 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return fx.pool.dialCount() == 1 }, 5*time.Second, 5*time.Millisecond)
 	rec, _ := fx.status.Get(a.peerId)
 	require.Equal(t, 0, rec.Failures, "a lost pool load is not a failure")
 	require.True(t, rec.LastAttempt.IsZero())
 }
 
 func TestGlobalSweepBumpsConnectedPeers(t *testing.T) {
-	fx := newGlobalFixture(t, config.Global{})
+	fx := newGlobalFixture(t, config.GlobalP2P{})
 	a := newTestPeer(t, "a")
 	b := newTestPeer(t, "b")
 	sp := fx.space(a, b)
@@ -619,8 +690,11 @@ func TestGlobalSweepBumpsConnectedPeers(t *testing.T) {
 	fx.drain(t)
 	require.Equal(t, TierStale, fx.status.Tier(a.peerId))
 
+	// an inbound connection lives only in the pool until the sweep
 	fx.pool.connect(a.peerId)
+	require.False(t, fx.g.connected(a.peerId))
 	fx.g.sweep()
+	require.True(t, fx.g.connected(a.peerId))
 	require.Equal(t, TierActive, fx.status.Tier(a.peerId))
 	require.Equal(t, TierStale, fx.status.Tier(b.peerId))
 
@@ -635,4 +709,103 @@ func TestGlobalSweepBumpsConnectedPeers(t *testing.T) {
 	require.True(t, st.Peers[0].Connected)
 	require.Equal(t, "active", st.Peers[0].Tier)
 	require.Equal(t, []string{"global"}, st.Peers[0].Sources)
+}
+
+// The layer never waits on the pool: with a Pick that blocks until its
+// ctx ends (an in-flight load for the same id), the inbound gate,
+// connectivity checks and the sweep still answer promptly.
+func TestGlobalNeverWaitsOnPool(t *testing.T) {
+	fx := newGlobalFixture(t, config.GlobalP2P{})
+	a := newTestPeer(t, "a")
+	b := newTestPeer(t, "b")
+	sp := fx.space(a, b)
+	sp.kv.put(a, a.ticket, fx.now)
+	sp.kv.put(b, b.ticket, fx.now)
+	fx.run(t)
+	fx.g.SpaceLoaded("s1", sp)
+	fx.drain(t)
+	fx.pool.mu.Lock()
+	fx.pool.pickBlocks = true
+	fx.pool.mu.Unlock()
+
+	start := time.Now()
+	require.True(t, fx.ep.filter(a.peerId))
+	require.False(t, fx.g.connected(a.peerId))
+	require.Less(t, time.Since(start), 20*time.Millisecond, "filter and connected read the live set, not the pool")
+
+	start = time.Now()
+	fx.g.sweep()
+	require.Less(t, time.Since(start), 2*PickTimeout+50*time.Millisecond, "sweep bounds each pool lookup")
+	require.Equal(t, TierActive, fx.status.Tier(a.peerId), "unchanged: nobody was seen")
+
+	// A connector dial hands the peer to the layer directly.
+	fx.connect(a.peerId)
+	require.True(t, fx.g.connected(a.peerId))
+	require.Equal(t, 1, fx.g.liveCount())
+}
+
+func TestCapRecords(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	records := map[string]record{}
+	for i := 0; i < maxRowsPerIdentity+3; i++ {
+		records["same"+string(rune('a'+i))] = record{identity: "one", seen: now.Add(time.Duration(i) * time.Minute)}
+	}
+	records["other"] = record{identity: "two", seen: now.Add(-time.Hour)}
+	capRecords(records)
+	require.Len(t, records, maxRowsPerIdentity+1)
+	_, oldestKept := records["samea"]
+	require.False(t, oldestKept, "the identity's oldest rows go first")
+	_, ok := records["other"]
+	require.True(t, ok)
+
+	records = map[string]record{}
+	for i := 0; i < maxGlobalPeers+10; i++ {
+		records["p"+string(rune(i))] = record{identity: "id" + string(rune(i)), seen: now.Add(time.Duration(i) * time.Second)}
+	}
+	capRecords(records)
+	require.Len(t, records, maxGlobalPeers)
+}
+
+// A live row for a new device of an identity at its cap evicts that
+// identity's oldest device; a new peer past the space cap is ignored.
+func TestGlobalApplyHoldsCaps(t *testing.T) {
+	fx := newGlobalFixture(t, config.GlobalP2P{})
+	devices := make([]testPeer, 0, maxRowsPerIdentity+1)
+	for i := 0; i <= maxRowsPerIdentity; i++ {
+		devices = append(devices, newTestPeer(t, "multi"))
+	}
+	sp := fx.space(devices...)
+	fx.run(t)
+	fx.g.SpaceLoaded("s1", sp)
+	fx.drain(t)
+	// oldest row first: device 0 is the identity's oldest device
+	for i, d := range devices {
+		at := fx.now.Add(-time.Duration(maxRowsPerIdentity+1-i) * time.Minute)
+		fx.handler("s1")(decrypt, []innerstorage.KeyValue{{Key: RecordKey, PeerId: d.peerId, Identity: d.identity, TimestampMicro: at.UnixMicro(), Value: innerstorage.Value{Value: []byte(d.ticket)}}})
+	}
+	fx.drain(t)
+	require.False(t, fx.store.HasGlobalPeer(devices[0].peerId), "oldest device of the identity evicted")
+	require.True(t, fx.store.HasGlobalPeer(devices[maxRowsPerIdentity].peerId))
+	require.Empty(t, fx.ps.addrs[devices[0].peerId])
+}
+
+// A peer that left every space is forgotten once past the disable
+// threshold; one still fresh keeps its record.
+func TestGlobalForgetsDisabledOrphans(t *testing.T) {
+	fx := newGlobalFixture(t, config.GlobalP2P{})
+	a := newTestPeer(t, "a")
+	old := newTestPeer(t, "old")
+	sp := fx.space(a, old)
+	sp.kv.put(a, a.ticket, fx.now)
+	sp.kv.put(old, old.ticket, fx.now.Add(-40*24*time.Hour))
+	fx.run(t)
+	fx.g.SpaceLoaded("s1", sp)
+	fx.drain(t)
+	_, ok := fx.status.Get(old.peerId)
+	require.True(t, ok)
+	fx.g.SpaceUnloaded("s1")
+	_, ok = fx.status.Get(old.peerId)
+	require.False(t, ok, "disabled orphan forgotten")
+	_, ok = fx.status.Get(a.peerId)
+	require.True(t, ok, "fresh orphan kept for its next row")
 }

@@ -71,3 +71,24 @@ func TestSourceGlobalPeersPickOnly(t *testing.T) {
 	src.banMu.Unlock()
 	require.False(t, banned)
 }
+
+// blockingPickPool: Pick waits on its ctx (an in-flight pool load).
+type blockingPickPool struct{ hangingDialPool }
+
+func (b *blockingPickPool) Pick(ctx context.Context, _ string) (peer.Peer, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestSourceGlobalPeersBoundedPick(t *testing.T) {
+	pool := &blockingPickPool{}
+	src := NewSource(pool, globalOnlyPeers{global: []string{"g1", "g2"}})
+	root, err := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+	require.NoError(t, err)
+
+	start := time.Now()
+	_, _, ok := src.SourceFor(context.Background(), "s", root)
+	require.False(t, ok)
+	require.Less(t, time.Since(start), 2*perPeerTimeout, "each global lookup is bounded well below the per-peer budget")
+	require.Equal(t, 0, pool.gets)
+}

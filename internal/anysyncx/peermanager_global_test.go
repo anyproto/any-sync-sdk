@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/commonspace/sync/objectsync/objectmessages"
 	"github.com/anyproto/any-sync/net/peer"
+	netpool "github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/streampool"
 	"github.com/stretchr/testify/require"
 	"storj.io/drpc"
@@ -84,7 +87,30 @@ type objMsg struct {
 
 func (m objMsg) ObjectId() string { return m.objectId }
 
-func newGlobalTestManager(pool *hangingPool, nodes []string, global []string, sendPool *recordingSendPool) *spacePeerManager {
+// fakeInner is an outbound inner head update of a given object type.
+type fakeInner struct {
+	objectmessages.InnerHeadUpdate
+	typ spacesyncproto.ObjectType
+}
+
+func (f fakeInner) ObjectType() spacesyncproto.ObjectType { return f.typ }
+
+func headUpdate(objectId string, typ spacesyncproto.ObjectType) *objectmessages.HeadUpdate {
+	return &objectmessages.HeadUpdate{Meta: objectmessages.ObjectMeta{ObjectId: objectId, SpaceId: "space1"}, Update: fakeInner{typ: typ}}
+}
+
+// blockingPickPool: Pick waits for ctx (an in-flight pool load for the
+// same id) and Get hangs like hangingPool.
+type blockingPickPool struct {
+	hangingPool
+}
+
+func (b *blockingPickPool) Pick(ctx context.Context, _ string) (peer.Peer, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func newGlobalTestManager(pool netpool.Pool, nodes []string, global []string, sendPool *recordingSendPool) *spacePeerManager {
 	m := &spacePeerManager{
 		spaceId:      "space1",
 		nodeConf:     &fakeNodeConf{nodeIds: nodes},
@@ -152,19 +178,61 @@ func TestGlobalBroadcastCoalescesWithoutNode(t *testing.T) {
 	defer func() { require.NoError(t, m.Close(context.Background())) }()
 
 	ctx := context.Background()
-	// Three updates of one object and one of another within the window
-	// → two messages to the global peers, latest per object, fan-out
-	// capped at globalFanout (2 of 3 connected).
-	require.NoError(t, m.BroadcastMessage(ctx, objMsg{objectId: "o1"}))
-	require.NoError(t, m.BroadcastMessage(ctx, objMsg{objectId: "o1"}))
-	require.NoError(t, m.BroadcastMessage(ctx, objMsg{objectId: "o2"}))
-	require.NoError(t, m.BroadcastMessage(ctx, objMsg{objectId: "o1"}))
+	// Three tree updates of one object and one of another within the
+	// window → two messages to the global peers, latest per object,
+	// fan-out capped at globalFanout (2 of 3 connected).
+	require.NoError(t, m.BroadcastMessage(ctx, headUpdate("o1", spacesyncproto.ObjectType_Tree)))
+	require.NoError(t, m.BroadcastMessage(ctx, headUpdate("o1", spacesyncproto.ObjectType_Tree)))
+	require.NoError(t, m.BroadcastMessage(ctx, headUpdate("o2", spacesyncproto.ObjectType_Tree)))
+	require.NoError(t, m.BroadcastMessage(ctx, headUpdate("o1", spacesyncproto.ObjectType_Tree)))
 	require.Eventually(t, func() bool { return len(send.sent()) == 6 }, 3*time.Second, 10*time.Millisecond)
 	sent := send.sent()
 	// First four sends are the immediate node/LAN broadcasts (empty
 	// audiences here); the last two are the coalesced global batch.
 	require.Equal(t, []string{"g1", "g2"}, sent[4])
 	require.Equal(t, []string{"g1", "g2"}, sent[5])
+	require.Equal(t, 0, pool.getCount())
+
+	// Key-value and ACL updates carry non-cumulative payloads: two rows
+	// of the same store object both reach the global peers.
+	require.NoError(t, m.BroadcastMessage(ctx, headUpdate("kv", spacesyncproto.ObjectType_KeyValue)))
+	require.NoError(t, m.BroadcastMessage(ctx, headUpdate("kv", spacesyncproto.ObjectType_KeyValue)))
+	require.Eventually(t, func() bool { return len(send.sent()) == 10 }, 3*time.Second, 10*time.Millisecond)
+}
+
+// A space with no global peer queues nothing for the global fan-out.
+func TestGlobalBroadcastSkipsWithoutGlobalPeers(t *testing.T) {
+	pool := &hangingPool{fakePool: fakePool{peers: map[string]peer.Peer{}}}
+	send := &recordingSendPool{}
+	m := newGlobalTestManager(pool, nil, nil, send)
+	defer func() { require.NoError(t, m.Close(context.Background())) }()
+
+	require.NoError(t, m.BroadcastMessage(context.Background(), headUpdate("o1", spacesyncproto.ObjectType_Tree)))
+	time.Sleep(globalCoalesceWindow + 100*time.Millisecond)
+	require.Len(t, send.sent(), 1, "node/LAN send only")
+	m.globalMu.Lock()
+	require.Nil(t, m.coalesceTimer)
+	m.globalMu.Unlock()
+}
+
+// A pool whose Pick waits on an in-flight load must not stall the sync
+// path: global lookups are bounded by p2p.PickTimeout.
+func TestGlobalPeersNeverWaitOnPick(t *testing.T) {
+	pool := &blockingPickPool{hangingPool{fakePool: fakePool{peers: map[string]peer.Peer{}}}}
+	send := &recordingSendPool{}
+	m := newGlobalTestManager(pool, nil, []string{"g1", "g2"}, send)
+	defer func() { require.NoError(t, m.Close(context.Background())) }()
+
+	start := time.Now()
+	peers, err := m.GetResponsiblePeers(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, peers)
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+
+	start = time.Now()
+	err = m.SendMessage(context.Background(), "g1", msg("x"))
+	require.Error(t, err, "a global-only peer is picked, never dialed")
+	require.Less(t, time.Since(start), 500*time.Millisecond)
 	require.Equal(t, 0, pool.getCount())
 }
 
@@ -177,5 +245,7 @@ func TestGlobalBroadcastKeepsNonObjectMessages(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, m.BroadcastMessage(ctx, msg("kv1")))
 	require.NoError(t, m.BroadcastMessage(ctx, msg("kv2")))
-	require.Eventually(t, func() bool { return len(send.sent()) == 4 }, 3*time.Second, 10*time.Millisecond)
+	require.NoError(t, m.BroadcastMessage(ctx, msg("same")))
+	require.NoError(t, m.BroadcastMessage(ctx, msg("same")))
+	require.Eventually(t, func() bool { return len(send.sent()) == 8 }, 3*time.Second, 10*time.Millisecond, "identical messages are not collapsed")
 }

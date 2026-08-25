@@ -918,6 +918,14 @@ func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttr
 // derived yet. (The index object is always derived locally at Open, so
 // it never arrives this way, but accepting it is harmless: Derive and
 // PutTree converge on the same deterministic tree.)
+// HasTree reports whether the tech space already stores treeId.
+func (s *Service) HasTree(ctx context.Context, spaceId, treeId string) (bool, error) {
+	if spaceId != s.spaceId {
+		return false, ErrSpaceRegistryUnknown
+	}
+	return s.store.HasTree(ctx, treeId)
+}
+
 func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {
 	if spaceId != s.spaceId {
 		return ErrSpaceRegistryUnknown

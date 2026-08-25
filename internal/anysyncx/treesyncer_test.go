@@ -33,6 +33,11 @@ func (r *scriptedRegistry) GetTree(_ context.Context, _, treeId string) (objectt
 	return nil, nil
 }
 
+func (r *scriptedRegistry) HasTree(_ context.Context, _, treeId string) (bool, error) {
+	_, ok := r.trees[treeId]
+	return ok, nil
+}
+
 func (r *scriptedRegistry) PutTree(context.Context, string, treestorage.TreeStorageCreatePayload) error {
 	return nil
 }

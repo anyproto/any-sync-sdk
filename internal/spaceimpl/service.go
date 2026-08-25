@@ -1887,6 +1887,14 @@ func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttr
 	return tree, nil
 }
 
+// HasTree reports whether (spaceId, treeId) is already in local storage.
+func (s *Service) HasTree(ctx context.Context, spaceId, treeId string) (bool, error) {
+	if spaceId == s.tsp.SpaceId() {
+		return s.tsp.HasTree(ctx, spaceId, treeId)
+	}
+	return s.storeFor(spaceId).HasTree(ctx, treeId)
+}
+
 // PutTree binds a remote-delivered tree payload. Tech-space's
 // index tree is locally created, never put from the network — the
 // tech-space's adapter rejects this, which is the correct behavior.

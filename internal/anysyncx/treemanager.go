@@ -3,12 +3,14 @@ package anysyncx
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/object/treemanager"
+	"github.com/anyproto/any-sync/net/peer"
 )
 
 // ErrSpaceRegistryUnset is returned when GetTree fires before the
@@ -25,6 +27,9 @@ type SpaceRegistry interface {
 	// the space and the object via ocache as needed. Errors propagate
 	// from any-sync directly.
 	GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error)
+
+	// HasTree reports whether the tree already exists in local storage.
+	HasTree(ctx context.Context, spaceId, treeId string) (bool, error)
 
 	// PutTree stores a remote-built tree payload — used by sync when a
 	// node delivers a tree we don't have yet.
@@ -53,6 +58,11 @@ type SpaceRegistry interface {
 // space-package implementation owns ocache wiring and lifecycle.
 type treeManagerAdapter struct {
 	registry SpaceRegistry
+	// onFetched reports a tree that did not exist locally and was built
+	// from the peer named by the request context: a head update for an
+	// unknown tree makes any-sync pull it whole from the sender through
+	// GetTree, and that pull is the tree's sync with the sender. nil-safe.
+	onFetched func(spaceId, peerId, treeId string, heads []string)
 }
 
 func newTreeManager() *treeManagerAdapter { return &treeManagerAdapter{} }
@@ -70,7 +80,21 @@ func (t *treeManagerAdapter) GetTree(ctx context.Context, spaceId, treeId string
 	if t.registry == nil {
 		return nil, ErrSpaceRegistryUnset
 	}
-	return t.registry.GetTree(ctx, spaceId, treeId)
+	peerId, _ := peer.CtxPeerId(ctx)
+	report := peerId != "" && t.onFetched != nil
+	if report {
+		existed, err := t.registry.HasTree(ctx, spaceId, treeId)
+		report = err == nil && !existed
+	}
+	tree, err := t.registry.GetTree(ctx, spaceId, treeId)
+	if err != nil || !report || tree == nil {
+		return tree, err
+	}
+	tree.Lock()
+	heads := slices.Clone(tree.Heads())
+	tree.Unlock()
+	t.onFetched(spaceId, peerId, treeId, heads)
+	return tree, nil
 }
 
 func (t *treeManagerAdapter) ValidateAndPutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {

@@ -396,6 +396,13 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	out.syncStatus.SetLocalPeerIdsFn(func(spaceId string) []string {
 		return append(peerStore.LocalPeerIds(spaceId), peerStore.GlobalPeerIds(spaceId)...)
 	})
+	// A tree pulled whole because a peer's head update named it is in
+	// sync with that peer, like one fetched during a diff round (see
+	// treeSyncerAdapter.onFetched); without this a tree that only ever
+	// arrives by push never reaches the tracker.
+	out.tree.onFetched = func(spaceId, peerId, treeId string, heads []string) {
+		out.syncStatus.For(spaceId).HeadsApply(peerId, treeId, heads, true)
+	}
 	// Peer presence for sync status: live-connection counts via the
 	// non-dialing pool.Pick, refreshed when the p2p peer store or the
 	// discovery possibility changes. (The "Phase 3 peer-presence

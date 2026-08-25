@@ -429,8 +429,9 @@ func TestGlobalConsumeRecords(t *testing.T) {
 	// Own record: unchanged and fresh → no rewrite.
 	require.Equal(t, 0, sp.kv.setCount())
 
-	// A live row with a newer timestamp reactivates a disabled peer;
-	// an older one changes nothing.
+	// A live row reactivates a disabled peer; a live row with an older
+	// timestamp inside the skew window still proves the device is alive
+	// now.
 	fx.handler("s1")(decrypt, []innerstorage.KeyValue{
 		{Key: RecordKey, PeerId: old.peerId, Identity: old.identity, TimestampMicro: fx.now.UnixMicro(), Value: innerstorage.Value{Value: []byte(old.ticket)}},
 		{Key: RecordKey, PeerId: b.peerId, Identity: b.identity, TimestampMicro: fx.now.Add(-3 * time.Hour).UnixMicro(), Value: innerstorage.Value{Value: []byte(b.ticket)}},
@@ -439,7 +440,7 @@ func TestGlobalConsumeRecords(t *testing.T) {
 	fx.drain(t)
 	require.Equal(t, TierActive, fx.status.Tier(old.peerId))
 	require.Equal(t, []string{"iroh://" + old.ticket}, fx.ps.addrs[old.peerId])
-	require.Equal(t, fx.now.Add(-2*time.Hour), fx.status.LastSeen(b.peerId))
+	require.Equal(t, fx.now, fx.status.LastSeen(b.peerId), "a live row inside the skew window reads as now")
 
 	// A second space adds coverage; unloading it drops the peers known
 	// only through it.
@@ -778,9 +779,10 @@ func TestGlobalApplyHoldsCaps(t *testing.T) {
 	fx.run(t)
 	fx.g.SpaceLoaded("s1", sp)
 	fx.drain(t)
-	// oldest row first: device 0 is the identity's oldest device
+	// oldest row first: device 0 is the identity's oldest device. Rows
+	// sit beyond the live skew window so each keeps its own timestamp.
 	for i, d := range devices {
-		at := fx.now.Add(-time.Duration(maxRowsPerIdentity+1-i) * time.Minute)
+		at := fx.now.Add(-time.Duration(maxRowsPerIdentity+1-i) * 25 * time.Hour)
 		fx.handler("s1")(decrypt, []innerstorage.KeyValue{{Key: RecordKey, PeerId: d.peerId, Identity: d.identity, TimestampMicro: at.UnixMicro(), Value: innerstorage.Value{Value: []byte(d.ticket)}}})
 	}
 	fx.drain(t)
@@ -808,4 +810,38 @@ func TestGlobalForgetsDisabledOrphans(t *testing.T) {
 	require.False(t, ok, "disabled orphan forgotten")
 	_, ok = fx.status.Get(a.peerId)
 	require.True(t, ok, "fresh orphan kept for its next row")
+}
+
+// A row arriving through the apply path is a sign of life regardless of
+// the writer's clock, as long as its timestamp is within a day of ours;
+// older rows keep their own timestamp and far-future ones clamp to now.
+// Reconcile keeps row timestamps.
+func TestGlobalLiveRowClockSkew(t *testing.T) {
+	fx := newGlobalFixture(t, config.GlobalP2P{})
+	behind := newTestPeer(t, "behind") // clock 2 h behind, row arrives live
+	stale := newTestPeer(t, "stale")   // row 3 days old, arrives live
+	ahead := newTestPeer(t, "ahead")   // clock far ahead, arrives live
+	stored := newTestPeer(t, "stored") // same 2 h skew, but read by reconcile
+	sp := fx.space(behind, stale, ahead, stored)
+	sp.kv.put(stored, stored.ticket, fx.now.Add(-2*time.Hour))
+	fx.run(t)
+	fx.g.SpaceLoaded("s1", sp)
+	fx.drain(t)
+	require.Equal(t, fx.now.Add(-2*time.Hour), fx.status.LastSeen(stored.peerId), "reconcile keeps the row timestamp")
+	require.Equal(t, TierStale, fx.status.Tier(stored.peerId))
+
+	row := func(p testPeer, at time.Time) innerstorage.KeyValue {
+		return innerstorage.KeyValue{Key: RecordKey, PeerId: p.peerId, Identity: p.identity, TimestampMicro: at.UnixMicro(), Value: innerstorage.Value{Value: []byte(p.ticket)}}
+	}
+	fx.handler("s1")(decrypt, []innerstorage.KeyValue{
+		row(behind, fx.now.Add(-2*time.Hour)),
+		row(stale, fx.now.Add(-3*24*time.Hour)),
+		row(ahead, fx.now.Add(30*24*time.Hour)),
+	})
+	fx.drain(t)
+	require.Equal(t, fx.now, fx.status.LastSeen(behind.peerId))
+	require.Equal(t, TierActive, fx.status.Tier(behind.peerId))
+	require.Equal(t, fx.now.Add(-3*24*time.Hour), fx.status.LastSeen(stale.peerId))
+	require.Equal(t, TierStale, fx.status.Tier(stale.peerId))
+	require.Equal(t, fx.now, fx.status.LastSeen(ahead.peerId), "far-future rows clamp to now")
 }

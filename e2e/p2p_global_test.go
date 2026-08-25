@@ -282,6 +282,13 @@ func TestE2E_GlobalP2PSync(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, fr.Close())
 	assert.True(t, bytes.Equal(content, got), "cross-device byte equality over iroh")
+
+	// Everything B holds now arrived by push or pull from A alone; once
+	// the writes stop, the status must account for all of it.
+	require.True(t, waitFor(ctx, 60*time.Second, 500*time.Millisecond, func() bool {
+		st := sdkB2.Spaces().Status(spaceId)
+		return st.Total > 0 && st.Synced == st.Total
+	}), "status never caught up with pushed trees: %+v", sdkB2.Spaces().Status(spaceId))
 }
 
 // TestE2E_GlobalP2PRefusesStranger proves the inbound gate: the

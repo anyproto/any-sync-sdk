@@ -27,7 +27,9 @@ var (
 )
 
 // record is one validated row: the peer's ticket, the identity that
-// signed it and the row timestamp (clamped to now at ingestion).
+// signed it and when the peer was last known alive — the row timestamp
+// clamped to now, or now itself for a row that just arrived live within
+// the clock-skew window (see Global.liveSeen).
 type record struct {
 	ticket   string
 	identity string

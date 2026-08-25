@@ -38,6 +38,9 @@ const (
 	// sweepInterval bumps LastSeen of every global peer that is still
 	// connected — cheap, no network.
 	sweepInterval = 10 * time.Second
+	// liveSkewWindow is how far a live row's timestamp may sit from the
+	// local clock and still count as "seen now" (see liveSeen).
+	liveSkewWindow = 24 * time.Hour
 	// publishDebounce coalesces ticket changes before republishing.
 	publishDebounce = 3 * time.Second
 	// opTimeout bounds one publish or reconcile of one space on the
@@ -324,6 +327,21 @@ func (g *Global) space(spaceId string) *globalSpace {
 func (g *Global) requireRelay() bool { return len(g.cfg.RelayURLs) > 0 }
 
 // clamp bounds a publisher timestamp to now.
+// liveSeen dates a row that just arrived through the apply path. The
+// arrival itself proves the device is alive now, so a row timestamp
+// within liveSkewWindow of the local clock reads as now: a device whose
+// clock runs hours off is not demoted to a slower tier for it. A row
+// further off keeps its own clamped timestamp — it is a replay of old
+// state (a device catching up on rows), not a sign of life. Reconcile
+// reads stored rows and keeps their timestamps.
+func (g *Global) liveSeen(at time.Time) time.Time {
+	now := g.now()
+	if d := now.Sub(at); d < liveSkewWindow && d > -liveSkewWindow {
+		return now
+	}
+	return g.clamp(at)
+}
+
 func (g *Global) clamp(at time.Time) time.Time {
 	if now := g.now(); at.After(now) {
 		return now
@@ -363,7 +381,7 @@ func (g *Global) handlerFor(spaceId string) KVHandler {
 			g.enqueue(task{kind: taskApply, spaceId: spaceId, peerId: kv.PeerId, rec: record{
 				ticket:   ticket,
 				identity: kv.Identity,
-				seen:     g.clamp(time.UnixMicro(kv.TimestampMicro).UTC()),
+				seen:     g.liveSeen(time.UnixMicro(kv.TimestampMicro).UTC()),
 			}})
 		}
 	}

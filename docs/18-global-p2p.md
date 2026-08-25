@@ -61,7 +61,12 @@ Every peer carries a persisted record (`p2p_peers.json` under DataDir):
 `lastSeen`, `lastAttempt`, `failures`. `lastSeen` is the newest of the
 key-value row timestamps (publisher clock, clamped to now), a
 successful dial, an accepted connection, or the 10 s sweep over
-peers still connected. Age selects the tier:
+peers still connected. A row that arrives live through the store's
+apply path is itself a sign of life: when its timestamp is within a
+day of the local clock it reads as "seen now", so a device whose clock
+runs hours off is not demoted for it; a row further off keeps its own
+timestamp (it is a replay of old state), and the periodic reconcile
+always keeps row timestamps. Age selects the tier:
 
 | tier     | age (defaults) | dialing                              | in peer sets    |
 |----------|----------------|--------------------------------------|-----------------|
@@ -134,11 +139,12 @@ receiver fetches whatever it misses; key-value and ACL updates are
 queued in order, their payloads are not cumulative) and sent to at most
 `MaxConnections` peers. The periodic diff adds one connected global peer
 per tick, rotating, only while no node stream is up. A space with no
-known global peer queues nothing. A tree fetched whole from a peer
-during a diff round counts as synced with that peer (as with the
+known global peer queues nothing. A tree fetched whole from a peer —
+during a diff round, or because that peer's head update named a tree
+this device did not have — counts as synced with that peer (as with the
 nodes: a peer that itself lags is not detected until its own diff), so
-a space that converges through pulls alone reports `synced` without
-waiting for an empty round.
+a space that converges through pulls or pushes alone reports `synced`
+without waiting for an empty round.
 
 Measured over the relay, fifty edits of one object cost nothing at all
 towards a global peer while a node stream is up, ~3.1 KB per edit when
@@ -175,3 +181,17 @@ is `Connected` when any direct peer — LAN or global — is live; with
 nobody live the LAN verdicts (`Restricted`, `NotPossible`) still
 surface while the LAN layer is on, so a denied local-network permission
 is never hidden by the global layer.
+
+## Operational notes
+
+- Global p2p is not a cold-restore path: a device with an empty data
+  dir has no records to dial from and nobody's allowlist knows it yet,
+  so a first restore needs the nodes or the LAN. Once a device holds
+  its spaces it reconnects to its global peers from the persisted
+  records without any node.
+- One device key means one endpoint: the relay keeps a single session
+  per endpoint id, so two processes sharing a device key evict each
+  other and neither stays reachable. Every process needs its own key.
+- An idle relay connection is recycled every peer TTL (30 min): the
+  pool closes it, the connector dials again on its next pass. That is
+  a bounded, intentional cost (one handshake per half hour), not churn.

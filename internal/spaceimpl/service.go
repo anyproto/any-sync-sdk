@@ -871,6 +871,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		Settings:    r.Settings,
 		PushKeys:    r.PushKeys,
 		Derived:     r.Derived,
+		Advertise:   r.Advertise,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band

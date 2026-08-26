@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/transport"
 	"github.com/anyproto/any-sync/net/transport/iroh"
+	"github.com/anyproto/any-sync/util/crypto"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/config"
@@ -85,6 +86,7 @@ type endpoint interface {
 	TicketUpdates() <-chan struct{}
 	RelayConnected() bool
 	SetIncomingFilter(f func(peerId string) bool)
+	SetHandshakeFilter(f func(peerId string, identity crypto.PubKey) bool)
 }
 
 // globalPool is the slice of the any-sync pool the layer uses. The
@@ -157,6 +159,11 @@ type Global struct {
 	live   map[string]peer.Peer
 	// onLive is told about every newly live global peer.
 	onLive func(peerId string)
+	// advertise decides whether a space gets this device's row; nil
+	// advertises everywhere.
+	advertise func(spaceId string) bool
+	// acct is the account-level discovery; nil when off.
+	acct *accountLayer
 
 	tasks chan task
 	conn  *connector
@@ -199,7 +206,29 @@ func (g *Global) Init(a *app.App) error {
 	// The transport refuses to start without a filter: nobody is let in
 	// before the allowlist exists.
 	g.ep.SetIncomingFilter(g.allowInbound)
+	g.ep.SetHandshakeFilter(g.allowHandshake)
 	return nil
+}
+
+// SetAdvertiseFn gates the per-space row: spaces the fn declines get no
+// row and no heartbeat. Loaded spaces are re-evaluated at once.
+func (g *Global) SetAdvertiseFn(fn func(spaceId string) bool) {
+	g.mu.Lock()
+	g.advertise = fn
+	g.mu.Unlock()
+	g.enqueue(task{kind: taskPublish})
+}
+
+// Republish re-sets the own row of a space (advertising switched on).
+func (g *Global) Republish(spaceId string) {
+	g.enqueue(task{kind: taskPublish, spaceId: spaceId})
+}
+
+func (g *Global) advertised(spaceId string) bool {
+	g.mu.Lock()
+	fn := g.advertise
+	g.mu.Unlock()
+	return fn == nil || fn(spaceId)
 }
 
 func (g *Global) Name() string { return globalCName }
@@ -223,6 +252,10 @@ func (g *Global) Run(_ context.Context) error {
 	go g.watchTicket()
 	go g.tickers()
 	go g.conn.loop(g.runCtx, &g.wg)
+	if g.acct != nil {
+		g.wg.Add(1)
+		go g.accountLoop()
+	}
 	return nil
 }
 
@@ -433,7 +466,7 @@ func (g *Global) forSpaces(spaceId string, fn func(spaceId string)) {
 func (g *Global) publish(spaceId string) {
 	ticket := g.ep.Ticket()
 	sp := g.space(spaceId)
-	if ticket == "" || sp == nil || !sp.kv.CanWrite() {
+	if ticket == "" || sp == nil || !g.advertised(spaceId) || !sp.kv.CanWrite() {
 		return
 	}
 	ctx, cancel := context.WithTimeout(g.runCtx, opTimeout)
@@ -628,8 +661,17 @@ func (g *Global) recompute(peerIds ...string) {
 			}
 		}
 		g.mu.Unlock()
-		if len(spaceIds) == 0 {
+		// a sibling's account entry is one more record: the newest of
+		// the two decides the ticket, its timestamp counts as seen
+		sibling, isSibling := g.accountEntryFor(peerId)
+		if isSibling && sibling.seen.After(latest.seen) {
+			latest = record{ticket: g.accountTicket(peerId, sibling), seen: sibling.seen}
+		} else if isSibling && latest.ticket == "" {
+			latest.ticket = g.accountTicket(peerId, sibling)
+		}
+		if len(spaceIds) == 0 && !isSibling {
 			g.store.RemoveGlobalPeer(peerId)
+			g.store.RemoveAccountPeer(peerId)
 			g.book.ClearTicket(peerId)
 			g.conn.forget(peerId)
 			if len(g.store.Sources(peerId)) == 0 && g.status.Tier(peerId) == TierDisabled {
@@ -638,12 +680,21 @@ func (g *Global) recompute(peerIds ...string) {
 			continue
 		}
 		g.status.Seen(peerId, latest.seen)
-		if g.status.Tier(peerId) == TierDisabled {
+		if g.status.Tier(peerId) == TierDisabled || latest.ticket == "" {
 			g.book.ClearTicket(peerId)
 		} else {
 			g.book.SetTicket(peerId, latest.ticket)
 		}
-		g.store.UpdateGlobalPeer(peerId, spaceIds)
+		if len(spaceIds) > 0 {
+			g.store.UpdateGlobalPeer(peerId, spaceIds)
+		} else {
+			g.store.RemoveGlobalPeer(peerId)
+		}
+		if isSibling {
+			g.store.UpdateAccountPeer(peerId)
+		} else {
+			g.store.RemoveAccountPeer(peerId)
+		}
 	}
 	g.conn.wakeUp()
 }
@@ -651,6 +702,9 @@ func (g *Global) recompute(peerIds ...string) {
 // peerIdentity returns the identity behind a global peer's newest
 // record; empty when unknown.
 func (g *Global) peerIdentity(peerId string) string {
+	if _, ok := g.accountEntryFor(peerId); ok {
+		return g.selfIdentity
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	var latest record
@@ -684,6 +738,7 @@ func (g *Global) watchTicket() {
 		case <-wait:
 			pending = false
 			g.enqueue(task{kind: taskPublish})
+			g.RepublishAccount()
 		}
 	}
 }
@@ -799,15 +854,21 @@ func (g *Global) liveCount() int {
 	return n
 }
 
-// allowInbound is the iroh incoming filter: only members known through
-// key-value records and not disabled, and only while fewer than
-// MaxConnections+MaxInbound distinct global peers are connected. O(1):
-// it runs on the accept path before any handshake.
+// allowInbound is the iroh incoming filter: peers known through records
+// (space rows or the account record) and not disabled, while fewer than
+// MaxConnections+MaxInbound distinct global peers are connected. With
+// the account layer on, an unknown peer passes under a small budget —
+// the handshake-stage filter then admits it only if it proves this
+// account's identity. O(1): it runs on the accept path before any
+// handshake.
 func (g *Global) allowInbound(peerId string) bool {
-	if !g.store.HasGlobalPeer(peerId) || g.status.Tier(peerId) == TierDisabled {
+	if g.liveCount() >= g.cfg.MaxConnections+g.cfg.MaxInbound {
 		return false
 	}
-	return g.liveCount() < g.cfg.MaxConnections+g.cfg.MaxInbound
+	if g.store.HasGlobalPeer(peerId) {
+		return g.status.Tier(peerId) != TierDisabled
+	}
+	return g.acct != nil && g.acct.unknown.allow(g.now(), unknownPerMinute)
 }
 
 // Status is the debug snapshot of the layer.
@@ -819,6 +880,11 @@ func (g *Global) Status() sdkp2p.GlobalStatus {
 	st.HomeRelay = homeRelay(st.Ticket)
 	for _, id := range g.store.AllGlobalPeers() {
 		st.Peers = append(st.Peers, g.PeerStatus(id))
+	}
+	if g.acct != nil {
+		g.acct.mu.Lock()
+		st.Account = sdkp2p.AccountStatus{Enabled: true, Devices: len(g.acct.peers), LastResolved: g.acct.lastOK}
+		g.acct.mu.Unlock()
 	}
 	return st
 }

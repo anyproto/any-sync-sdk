@@ -163,3 +163,40 @@ func TestPeerStoreGlobalOrderAndDisabled(t *testing.T) {
 	book.Seen("dead", now)
 	require.Equal(t, []string{"dead", "fresh", "mid", "old"}, s.GlobalPeerIds("s"))
 }
+
+func TestPeerStoreAccountSource(t *testing.T) {
+	st := NewPeerStore()
+	var presence []string
+	st.AddSourceObserver(func(src Source, peerId string, present bool) {
+		presence = append(presence, src.String()+":"+peerId+":"+map[bool]string{true: "in", false: "out"}[present])
+	})
+
+	st.UpdateGlobalPeer("g", []string{"s1"})
+	st.UpdateAccountPeer("a")
+
+	// an account peer counts for every space, listed after the space's
+	// own record peers, and is a global peer for the inbound gate
+	require.Equal(t, []string{"g", "a"}, st.GlobalPeerIds("s1"))
+	require.Equal(t, []string{"a"}, st.GlobalPeerIds("s2"))
+	require.Equal(t, []string{"g", "a"}, st.AllGlobalPeers())
+	require.Equal(t, []string{"a"}, st.AccountPeerIds())
+	require.True(t, st.HasGlobalPeer("a"))
+	require.True(t, st.HasAccountPeer("a"))
+	require.False(t, st.HasAccountPeer("g"))
+	require.True(t, st.HasSpace("a", "anything"))
+	require.True(t, st.HasSpace("g", "s1"))
+	require.False(t, st.HasSpace("g", "s2"))
+	require.Equal(t, []Source{SourceAccount}, st.Sources("a"))
+	require.Nil(t, st.SpaceIds("a"), "account peers carry no space set")
+
+	// a device known both ways is listed once
+	st.UpdateAccountPeer("g")
+	require.Equal(t, []string{"g", "a"}, st.GlobalPeerIds("s1"))
+
+	st.RemoveAccountPeer("a")
+	require.Equal(t, []string{"g"}, st.GlobalPeerIds("s1"))
+	require.False(t, st.HasGlobalPeer("a"))
+	require.Contains(t, presence, "account:a:in")
+	require.Contains(t, presence, "account:a:out")
+	require.Equal(t, "account", SourceAccount.String())
+}

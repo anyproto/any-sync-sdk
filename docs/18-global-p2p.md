@@ -27,10 +27,12 @@ each space's key-value store.
   re-set every 24 h while the space is loaded (on load when older than
   12 h): its timestamp, clamped to the reader's clock, is the remote
   liveness marker.
-- **Scope.** The tech space is shared by every device of the account —
-  account-wide device discovery. Shared spaces add the other members'
-  devices. Readers cannot write rows and stay dial-only; local-only and
-  guest-mode spaces take no part.
+- **Scope.** Shared spaces name the other members' devices; own devices
+  come from the account record (19-account-discovery) and count as
+  global peers of every space, so the tech space carries no device row.
+  A space's row is written only while its `Advertise` switch is on
+  (default on). Readers cannot write rows and stay dial-only; local-only
+  and guest-mode spaces take no part.
 - **Never blocking.** No sync path waits for a global dial. Global
   peers are used only while already connected; one background connector
   is the sole dialer and the only ctx that opts in to the iroh scheme
@@ -48,12 +50,14 @@ each space's key-value store.
   take over. Cold restore stays a LAN affair: a fresh device has no rows
   and nobody's allowlist knows it.
 - **Inbound gate.** The transport accepts a connection only from a
-  peer id present in the key-value records of a loaded space and not in
-  the disabled tier, and only while fewer than
+  peer id present in the records — a loaded space's rows or the account
+  record — and not in the disabled tier, and only while fewer than
   `MaxConnections + MaxInbound` distinct global peers hold a live
   connection (the layer's own count: connector dials plus inbound
   connections folded in by the 10 s sweep). The records are the
-  allowlist.
+  allowlist. With the account layer on, an unknown peer passes the
+  pre-handshake filter under a small budget and is admitted after the
+  handshake only if it proves this account's identity.
 
 ## Liveness tiers
 
@@ -174,7 +178,8 @@ The remaining fields are the budget above.
 
 `SDK.P2PStatus().Global` reports the endpoint id, the published ticket,
 the home relay and its session state, and every known global peer with
-`LastSeen`, `Tier`, `Failures`, `Sources`. LAN-only peers in
+`LastSeen`, `Tier`, `Failures`, `Sources` (`lan`, `global`, `account`);
+`Global.Account` is the account record's state. LAN-only peers in
 `Status.Peers` carry no liveness fields. Per space,
 `SpaceSyncStatus.GlobalPeers` counts connected global peers and `P2P`
 is `Connected` when any direct peer — LAN or global — is live; with

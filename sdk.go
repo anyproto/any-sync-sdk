@@ -223,6 +223,17 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 
 	tsp := techspace.New(app, db)
 	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
+	// Per-space p2p advertising: the tech-space row's switch, on unless
+	// set off; the tech space itself never carries a device row (own
+	// devices come from the account record). Wired before tsp.Open loads
+	// the tech space, so its load publishes nothing.
+	app.SetAdvertiseFn(func(spaceId string) bool {
+		if spaceId == tsp.SpaceId() {
+			return false
+		}
+		rec, ok := tsp.Get(context.Background(), spaceId)
+		return !ok || rec.Advertise
+	})
 
 	// Push notifications (SYN-47): the push node is a direct out-of-band
 	// peer — register its dial addresses so the pool can reach it, then

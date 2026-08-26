@@ -1,6 +1,9 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
+
 	"errors"
 	"time"
 
@@ -145,6 +148,18 @@ type GlobalP2P struct {
 	// the relay). Development and tests only.
 	InsecureRelay bool `yaml:"insecureRelay"`
 
+	// PkarrRelayURLs are the pkarr relays ("https://dns.example") that
+	// hold the account's device-discovery record: every device of the
+	// account registers itself there and resolves its siblings from it,
+	// which is also how a fresh device finds them with nothing but the
+	// mnemonic. Empty leaves the account layer off; devices then know
+	// each other only through the records of shared spaces.
+	PkarrRelayURLs []string `yaml:"pkarrRelayUrls"`
+
+	// InsecurePkarr admits http:// pkarr relay URLs. Development and
+	// tests only.
+	InsecurePkarr bool `yaml:"insecurePkarr"`
+
 	// Port fixes the UDP port of the iroh endpoint. Zero binds an
 	// ephemeral port.
 	Port int `yaml:"port"`
@@ -196,12 +211,31 @@ const (
 // IsEnabled reports whether the global layer is on (explicit opt-in).
 func (g GlobalP2P) IsEnabled() bool { return g.Enabled != nil && *g.Enabled }
 
+// AccountEnabled reports whether the account-level discovery record is
+// in use: the layer is on and at least one pkarr relay is configured.
+func (g GlobalP2P) AccountEnabled() bool { return g.IsEnabled() && len(g.PkarrRelayURLs) > 0 }
+
 // Validate reports a configuration the layer cannot run with: enabled
 // without a relay would publish this device's IP addresses into every
-// space's records.
+// space's records; a plaintext pkarr relay needs the explicit opt-in.
 func (g GlobalP2P) Validate() error {
 	if g.IsEnabled() && len(g.RelayURLs) == 0 {
 		return errors.New("p2p.global: relayUrls is required when enabled")
+	}
+	for _, raw := range g.PkarrRelayURLs {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("p2p.global: pkarrRelayUrls: %q is not a URL", raw)
+		}
+		switch u.Scheme {
+		case "https":
+		case "http":
+			if !g.InsecurePkarr {
+				return fmt.Errorf("p2p.global: pkarrRelayUrls: %q needs insecurePkarr", raw)
+			}
+		default:
+			return fmt.Errorf("p2p.global: pkarrRelayUrls: %q must be https", raw)
+		}
 	}
 	return nil
 }

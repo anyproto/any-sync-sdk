@@ -55,10 +55,11 @@ func mintTicket(t *testing.T, peerId, relay string) string {
 
 // fakeEndpoint stands in for the iroh transport.
 type fakeEndpoint struct {
-	mu      sync.Mutex
-	ticket  string
-	updates chan struct{}
-	filter  func(string) bool
+	mu       sync.Mutex
+	ticket   string
+	updates  chan struct{}
+	filter   func(string) bool
+	hsFilter func(string, crypto.PubKey) bool
 }
 
 func newFakeEndpoint(ticket string) *fakeEndpoint {
@@ -76,6 +77,11 @@ func (f *fakeEndpoint) SetIncomingFilter(fn func(string) bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.filter = fn
+}
+func (f *fakeEndpoint) SetHandshakeFilter(fn func(string, crypto.PubKey) bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hsFilter = fn
 }
 func (f *fakeEndpoint) setTicket(ticket string) {
 	f.mu.Lock()

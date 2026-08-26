@@ -337,6 +337,17 @@ func (s *Service) SetDerived(ctx context.Context, spaceId string) (object.WriteR
 	})
 }
 
+// SetAdvertise writes the per-space p2p advertising switch
+// (FieldAdvertise, synced account-wide).
+func (s *Service) SetAdvertise(ctx context.Context, spaceId string, on bool) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldAdvertise, false, func(a *anyenc.Arena) *anyenc.Value {
+		if on {
+			return a.NewTrue()
+		}
+		return a.NewFalse()
+	})
+}
+
 // SetPushKeys mirrors the space's derived push-notification key
 // material onto its row via the local-set path (FieldPushKeys,
 // device-local; never enters the DAG — every device derives the same

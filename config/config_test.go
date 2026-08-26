@@ -72,3 +72,34 @@ func TestGlobalDefaultsAndEnable(t *testing.T) {
 		t.Fatalf("unexpected resolve: %+v", r)
 	}
 }
+
+func TestGlobalPkarrValidation(t *testing.T) {
+	on := true
+	base := GlobalP2P{Enabled: &on, RelayURLs: []string{"https://relay.example"}}
+	if base.AccountEnabled() {
+		t.Fatal("no pkarr relay: account layer off")
+	}
+	g := base
+	g.PkarrRelayURLs = []string{"https://dns.example"}
+	if err := g.Validate(); err != nil || !g.AccountEnabled() {
+		t.Fatalf("https pkarr relay must validate: %v", err)
+	}
+	g.PkarrRelayURLs = []string{"http://127.0.0.1:1"}
+	if err := g.Validate(); err == nil {
+		t.Fatal("http pkarr relay needs InsecurePkarr")
+	}
+	g.InsecurePkarr = true
+	if err := g.Validate(); err != nil {
+		t.Fatalf("insecure opt-in must validate: %v", err)
+	}
+	for _, bad := range []string{"ws://x", "not a url", ""} {
+		g.PkarrRelayURLs = []string{bad}
+		if err := g.Validate(); err == nil {
+			t.Fatalf("%q must be rejected", bad)
+		}
+	}
+	off := GlobalP2P{PkarrRelayURLs: []string{"https://dns.example"}}
+	if off.AccountEnabled() {
+		t.Fatal("account layer needs the global layer on")
+	}
+}

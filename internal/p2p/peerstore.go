@@ -17,12 +17,18 @@ const (
 	SourceLAN Source = iota
 	// SourceGlobal — a key-value record in a shared space.
 	SourceGlobal
+	// SourceAccount — the account's device-discovery record: another
+	// device of this account, which holds every space this device holds.
+	SourceAccount
 )
 
 // String returns a stable lowercase token for logging / status.
 func (s Source) String() string {
-	if s == SourceGlobal {
+	switch s {
+	case SourceGlobal:
 		return "global"
+	case SourceAccount:
+		return "account"
 	}
 	return "lan"
 }
@@ -50,21 +56,24 @@ func newSourceIndex() *sourceIndex {
 
 // PeerStore tracks the peers that SHARE spaces with this device and
 // which spaces, per source: LAN peers from the space exchange, global
-// peers from key-value records. The per-space peer manager, pubsub and
-// the files p2p source read the two sources separately — LAN peers are
+// peers from key-value records, account peers from the account's
+// discovery record. The per-space peer manager, pubsub and the files
+// p2p source read LAN and global peers separately — LAN peers are
 // dialed inline, global peers are only used while already connected.
-// In-memory; the LAN side is rediscovered from scratch on restart, the
-// global side is rebuilt from the records of each loaded space.
+// Account peers are global peers of every space: they carry no space
+// set, GlobalPeerIds lists them for any space asked. In-memory; the
+// LAN side is rediscovered from scratch on restart, the others are
+// rebuilt from the records.
 type PeerStore struct {
 	mu        sync.Mutex
-	sources   [2]*sourceIndex
+	sources   [3]*sourceIndex
 	observers []Observer
 	srcObs    []SourceObserver
 	status    *StatusBook
 }
 
 func NewPeerStore() *PeerStore {
-	return &PeerStore{sources: [2]*sourceIndex{newSourceIndex(), newSourceIndex()}}
+	return &PeerStore{sources: [3]*sourceIndex{newSourceIndex(), newSourceIndex(), newSourceIndex()}}
 }
 
 func (p *PeerStore) Init(_ *app.App) error { return nil }
@@ -119,6 +128,47 @@ func (p *PeerStore) UpdateGlobalPeer(peerId string, spaceIds []string) {
 
 // RemoveGlobalPeer forgets a peer's global presence.
 func (p *PeerStore) RemoveGlobalPeer(peerId string) { p.remove(SourceGlobal, peerId) }
+
+// UpdateAccountPeer records a device of this account. It needs no
+// space set: it holds every space this device holds.
+func (p *PeerStore) UpdateAccountPeer(peerId string) { p.update(SourceAccount, peerId, nil) }
+
+// RemoveAccountPeer forgets a device of this account.
+func (p *PeerStore) RemoveAccountPeer(peerId string) { p.remove(SourceAccount, peerId) }
+
+// HasAccountPeer reports whether the peer is a device of this account.
+func (p *PeerStore) HasAccountPeer(peerId string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.sources[SourceAccount].byPeer[peerId]
+	return ok
+}
+
+// AccountPeerIds returns the account's other devices, most recently
+// seen first, disabled tier excluded.
+func (p *PeerStore) AccountPeerIds() []string {
+	p.mu.Lock()
+	ids := sortedKeys(p.sources[SourceAccount].byPeer)
+	status := p.status
+	p.mu.Unlock()
+	return p.rankGlobal(ids, status)
+}
+
+// HasSpace reports whether the peer is known to hold spaceId through
+// any source; a device of this account holds every space.
+func (p *PeerStore) HasSpace(peerId, spaceId string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.sources[SourceAccount].byPeer[peerId]; ok {
+		return true
+	}
+	for _, idx := range p.sources {
+		if slices.Contains(idx.byPeer[peerId], spaceId) {
+			return true
+		}
+	}
+	return false
+}
 
 // update records the full space set of a peer in one source, diffing
 // against the previous set. A no-change update fires no observers. An
@@ -200,14 +250,27 @@ func (p *PeerStore) LocalPeerIds(spaceId string) []string {
 	return slices.Clone(p.sources[SourceLAN].bySpace[spaceId])
 }
 
-// GlobalPeerIds returns the global peers known to have spaceId, most
+// GlobalPeerIds returns the global peers known to have spaceId — the
+// space's record peers plus every device of this account — most
 // recently seen first, disabled tier excluded.
 func (p *PeerStore) GlobalPeerIds(spaceId string) []string {
 	p.mu.Lock()
-	ids := slices.Clone(p.sources[SourceGlobal].bySpace[spaceId])
+	ids := p.globalUnionLocked(p.sources[SourceGlobal].bySpace[spaceId])
 	status := p.status
 	p.mu.Unlock()
 	return p.rankGlobal(ids, status)
+}
+
+// globalUnionLocked adds the account peers to ids, deduplicated, in a
+// stable order. Callers hold p.mu.
+func (p *PeerStore) globalUnionLocked(ids []string) []string {
+	out := slices.Clone(ids)
+	for _, id := range sortedKeys(p.sources[SourceAccount].byPeer) {
+		if !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // AllLocalPeers returns every known LAN peer id, sorted.
@@ -217,23 +280,25 @@ func (p *PeerStore) AllLocalPeers() []string {
 	return sortedKeys(p.sources[SourceLAN].byPeer)
 }
 
-// AllGlobalPeers returns every known global peer id, most recently
-// seen first, disabled tier excluded.
+// AllGlobalPeers returns every peer known through records — space
+// rows or the account record — most recently seen first, disabled tier
+// excluded.
 func (p *PeerStore) AllGlobalPeers() []string {
 	p.mu.Lock()
-	ids := sortedKeys(p.sources[SourceGlobal].byPeer)
+	ids := p.globalUnionLocked(sortedKeys(p.sources[SourceGlobal].byPeer))
 	status := p.status
 	p.mu.Unlock()
 	return p.rankGlobal(ids, status)
 }
 
-// HasGlobalPeer reports whether the peer is known through key-value
-// records (any tier).
+// HasGlobalPeer reports whether the peer is known through records —
+// a space row or the account record — in any tier.
 func (p *PeerStore) HasGlobalPeer(peerId string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_, ok := p.sources[SourceGlobal].byPeer[peerId]
-	return ok
+	_, global := p.sources[SourceGlobal].byPeer[peerId]
+	_, account := p.sources[SourceAccount].byPeer[peerId]
+	return global || account
 }
 
 // GlobalSpaceIds returns the spaces a global peer is known to have.

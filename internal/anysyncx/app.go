@@ -39,6 +39,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/filep2p"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/p2p"
+	"github.com/anyproto/any-sync-sdk/internal/p2p/account"
 	"github.com/anyproto/any-sync-sdk/internal/syncstatus"
 	sdkp2p "github.com/anyproto/any-sync-sdk/p2p"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -227,6 +228,24 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		stream.subs = subs
 		peerManagers.subs = subs
 		global.SetOnLive(func(string) { peerManagers.wakeGlobalAsks() })
+		// The account record: every device of the account registers
+		// itself under a key derived from the identity key and resolves
+		// its siblings from it — the same path a fresh restore takes.
+		if globalCfg.AccountEnabled() {
+			signKey, encKey, err := crypto.DeriveDiscoveryKeys(keys.SignKey)
+			if err != nil {
+				return nil, fmt.Errorf("anysyncx: discovery keys: %w", err)
+			}
+			acctKeys, err := account.NewKeys(signKey, encKey)
+			if err != nil {
+				return nil, fmt.Errorf("anysyncx: discovery keys: %w", err)
+			}
+			acctClient, err := account.NewClient(globalCfg.PkarrRelayURLs)
+			if err != nil {
+				return nil, fmt.Errorf("anysyncx: %w", err)
+			}
+			global.SetAccount(acctKeys, acctClient, globalCfg.InsecureRelay)
+		}
 	}
 	// A LAN entry that goes away hands the peer's addresses over to its
 	// iroh ticket, if any (addr book: LAN xor ticket).
@@ -312,14 +331,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// the union of both sources.
 	var fileP2PServer *filep2p.Server
 	if p2pCfg.IsEnabled() || globalEnabled {
-		fileP2PServer = filep2p.NewServer(func(peerId, spaceId string) bool {
-			for _, id := range peerStore.SpaceIds(peerId) {
-				if id == spaceId {
-					return true
-				}
-			}
-			return false
-		})
+		fileP2PServer = filep2p.NewServer(peerStore.HasSpace)
 		a.Register(fileP2PServer)
 	}
 
@@ -633,6 +645,24 @@ func (a *App) guestKeyFor(spaceId string) crypto.PrivKey {
 // negative cache is reset first — without that, a fresh join's failed
 // request-time derivation would suppress the space from the handshake
 // for up to negativeRetryAfter even though its ACL has synced in.
+// SetAdvertiseFn wires the per-space p2p advertising decision (the
+// tech-space row's switch; the tech space itself never gets a row —
+// own devices come from the account record). Set before the tech
+// space loads; loaded spaces are re-evaluated at once.
+func (a *App) SetAdvertiseFn(fn func(spaceId string) bool) {
+	if a.global != nil {
+		a.global.SetAdvertiseFn(fn)
+	}
+}
+
+// RepublishGlobalRecord re-sets this device's global p2p row in a space
+// (advertising switched on).
+func (a *App) RepublishGlobalRecord(spaceId string) {
+	if a.global != nil {
+		a.global.Republish(spaceId)
+	}
+}
+
 func (a *App) BroadcastP2P() {
 	a.discoveryKeys.ResetNegative()
 	go func() {

@@ -197,6 +197,19 @@ func lazySpaceTypeTag(rec techspace.SpaceIndexRecord) string {
 //
 // No permission gate in v1 — non-writers are rejected by any-sync
 // ACL on the apply path at peers. See PROMPT.md § "Open questions".
+// SetAdvertise writes the per-space p2p advertising switch onto the
+// space's tech-space row and, when switched on, republishes this
+// device's global p2p record into the space at once.
+func (s *spaceImpl) SetAdvertise(ctx context.Context, on bool) error {
+	if _, err := s.tsp.SetAdvertise(ctx, s.id, on); err != nil {
+		return fmt.Errorf("spaceimpl: SetAdvertise: %w", err)
+	}
+	if on {
+		s.app.RepublishGlobalRecord(s.id)
+	}
+	return nil
+}
+
 func (s *spaceImpl) SetMetadata(ctx context.Context, req space.SetMetadataRequest) error {
 	if req.Name == nil && req.Description == nil && req.IconCID == nil {
 		return errors.New("spaceimpl: SetMetadata: at least one field required")

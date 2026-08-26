@@ -41,8 +41,22 @@ type GlobalStatus struct {
 	HomeRelay string
 	// RelayConnected — the session to the home relay is up.
 	RelayConnected bool
-	// Peers lists every peer known through key-value records.
+	// Peers lists every peer known through records: space rows or the
+	// account record.
 	Peers []PeerStatus
+	// Account is the account-level discovery record.
+	Account AccountStatus
+}
+
+// AccountStatus is the snapshot of the account-level discovery record:
+// the pkarr record every device of the account registers itself in.
+type AccountStatus struct {
+	// Enabled — pkarr relays are configured.
+	Enabled bool
+	// Devices is the number of sibling devices the record names.
+	Devices int
+	// LastResolved is when the record was last read successfully.
+	LastResolved time.Time
 }
 
 // Status is the account-wide snapshot of the p2p layers, returned by

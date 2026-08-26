@@ -195,3 +195,5 @@ is never hidden by the global layer.
 - An idle relay connection is recycled every peer TTL (30 min): the
   pool closes it, the connector dials again on its next pass. That is
   a bounded, intentional cost (one handshake per half hour), not churn.
+
+Follow-up: [19-account-discovery](19-account-discovery.md) — own devices discovered through a record under a key derived from the identity key; space records become an optional per-space advertisement.

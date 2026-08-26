@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/any-sync/app"
@@ -44,6 +45,9 @@ const (
 	liveSkewWindow = 24 * time.Hour
 	// publishDebounce coalesces ticket changes before republishing.
 	publishDebounce = 3 * time.Second
+	// pendingInbound is how long a peer admitted by the handshake filter
+	// counts as connected before its connection reached the live set.
+	pendingInbound = 15 * time.Second
 	// opTimeout bounds one publish or reconcile of one space on the
 	// single worker.
 	opTimeout = 30 * time.Second
@@ -109,6 +113,9 @@ const (
 	taskPublish taskKind = iota
 	taskReconcile
 	taskApply
+	// taskRecompute folds one peer's records into the stores off the
+	// caller's goroutine (the handshake filter admitting a sibling).
+	taskRecompute
 )
 
 // task is one unit of worker work. Empty spaceId with publish /
@@ -157,13 +164,19 @@ type Global struct {
 	// in. The inbound gate and the connector read it — never the pool.
 	liveMu sync.Mutex
 	live   map[string]peer.Peer
+	// pending marks peers admitted by the handshake filter whose
+	// connection the pool has not handed over yet: the accepter's AddPeer
+	// follows within milliseconds, the sweep folds it in; until then the
+	// connector must not dial back into a peer that just connected.
+	pending map[string]time.Time
 	// onLive is told about every newly live global peer.
 	onLive func(peerId string)
 	// advertise decides whether a space gets this device's row; nil
 	// advertises everywhere.
 	advertise func(spaceId string) bool
-	// acct is the account-level discovery; nil when off.
-	acct *accountLayer
+	// acct is the account-level discovery; nil when off. Read from the
+	// transport's accept goroutines, so it is an atomic pointer.
+	acct atomic.Pointer[accountLayer]
 
 	tasks chan task
 	conn  *connector
@@ -187,6 +200,7 @@ func NewGlobal(cfg config.GlobalP2P, selfPeerId, selfIdentity string, store *Pee
 		publishDebounce: publishDebounce,
 		spaces:          map[string]*globalSpace{},
 		live:            map[string]peer.Peer{},
+		pending:         map[string]time.Time{},
 		tasks:           make(chan task, taskQueueSize),
 	}
 	g.conn = newConnector(g)
@@ -252,7 +266,7 @@ func (g *Global) Run(_ context.Context) error {
 	go g.watchTicket()
 	go g.tickers()
 	go g.conn.loop(g.runCtx, &g.wg)
-	if g.acct != nil {
+	if g.account() != nil {
 		g.wg.Add(1)
 		go g.accountLoop()
 	}
@@ -440,6 +454,8 @@ func (g *Global) handle(t task) {
 		g.forSpaces(t.spaceId, g.reconcile)
 	case taskApply:
 		g.apply(t.spaceId, t.peerId, t.rec)
+	case taskRecompute:
+		g.recompute(t.peerId)
 	}
 }
 
@@ -662,12 +678,17 @@ func (g *Global) recompute(peerIds ...string) {
 		}
 		g.mu.Unlock()
 		// a sibling's account entry is one more record: the newest of
-		// the two decides the ticket, its timestamp counts as seen
+		// the two decides the ticket, its timestamp counts as seen — but
+		// an entry without a relay (a sibling admitted by handshake)
+		// never clears a ticket a space row supplied
 		sibling, isSibling := g.accountEntryFor(peerId)
-		if isSibling && sibling.seen.After(latest.seen) {
-			latest = record{ticket: g.accountTicket(peerId, sibling), seen: sibling.seen}
-		} else if isSibling && latest.ticket == "" {
-			latest.ticket = g.accountTicket(peerId, sibling)
+		if isSibling {
+			if t := g.accountTicket(peerId, sibling); t != "" && (sibling.seen.After(latest.seen) || latest.ticket == "") {
+				latest.ticket = t
+			}
+			if sibling.seen.After(latest.seen) {
+				latest.seen = sibling.seen
+			}
 		}
 		if len(spaceIds) == 0 && !isSibling {
 			g.store.RemoveGlobalPeer(peerId)
@@ -775,7 +796,7 @@ func (g *Global) sweep() {
 		if g.runCtx != nil && g.runCtx.Err() != nil {
 			return
 		}
-		if !g.connected(id) {
+		if !g.hasLive(id) {
 			p := g.pickIroh(id)
 			if p == nil {
 				continue
@@ -810,6 +831,7 @@ func (g *Global) addLive(p peer.Peer) {
 		return
 	}
 	g.live[id] = p
+	delete(g.pending, id)
 	g.liveMu.Unlock()
 	if g.onLive != nil {
 		g.onLive(id)
@@ -831,13 +853,40 @@ func (g *Global) addLive(p peer.Peer) {
 	}()
 }
 
-// connected reports a live global connection to the peer. Reads the
-// layer's own set — never the pool, never blocks.
-func (g *Global) connected(peerId string) bool {
+// markPending records a peer the handshake filter just admitted, so it
+// counts as connected until the pool hands its connection over or the
+// mark expires.
+func (g *Global) markPending(peerId string) {
+	g.liveMu.Lock()
+	g.pending[peerId] = g.now().Add(pendingInbound)
+	g.liveMu.Unlock()
+}
+
+// hasLive reports a connection the layer holds itself.
+func (g *Global) hasLive(peerId string) bool {
 	g.liveMu.Lock()
 	p, ok := g.live[peerId]
 	g.liveMu.Unlock()
 	return ok && !p.IsClosed()
+}
+
+// connected reports a live global connection to the peer, or one the
+// handshake filter just admitted. Reads the layer's own sets — never
+// the pool, never blocks.
+func (g *Global) connected(peerId string) bool {
+	g.liveMu.Lock()
+	defer g.liveMu.Unlock()
+	if p, ok := g.live[peerId]; ok && !p.IsClosed() {
+		return true
+	}
+	until, ok := g.pending[peerId]
+	if ok && g.now().Before(until) {
+		return true
+	}
+	if ok {
+		delete(g.pending, peerId)
+	}
+	return false
 }
 
 // liveCount is the number of distinct global peers with a live
@@ -845,10 +894,25 @@ func (g *Global) connected(peerId string) bool {
 func (g *Global) liveCount() int {
 	g.liveMu.Lock()
 	defer g.liveMu.Unlock()
+	now := g.now()
 	n := 0
-	for _, p := range g.live {
+	for id, p := range g.live {
 		if !p.IsClosed() {
 			n++
+			continue
+		}
+		if until, ok := g.pending[id]; ok && now.Before(until) {
+			n++
+		}
+	}
+	for id, until := range g.pending {
+		if _, live := g.live[id]; live {
+			continue
+		}
+		if now.Before(until) {
+			n++
+		} else {
+			delete(g.pending, id)
 		}
 	}
 	return n
@@ -868,7 +932,8 @@ func (g *Global) allowInbound(peerId string) bool {
 	if g.store.HasGlobalPeer(peerId) {
 		return g.status.Tier(peerId) != TierDisabled
 	}
-	return g.acct != nil && g.acct.unknown.allow(g.now(), unknownPerMinute)
+	a := g.account()
+	return a != nil && a.unknown.allow(g.now(), peerId)
 }
 
 // Status is the debug snapshot of the layer.
@@ -881,10 +946,18 @@ func (g *Global) Status() sdkp2p.GlobalStatus {
 	for _, id := range g.store.AllGlobalPeers() {
 		st.Peers = append(st.Peers, g.PeerStatus(id))
 	}
-	if g.acct != nil {
-		g.acct.mu.Lock()
-		st.Account = sdkp2p.AccountStatus{Enabled: true, Devices: len(g.acct.peers), LastResolved: g.acct.lastOK}
-		g.acct.mu.Unlock()
+	if a := g.account(); a != nil {
+		devices, resolved, published, lastErr, own, ahead := a.status()
+		st.Account = sdkp2p.AccountStatus{
+			Enabled:       true,
+			Relays:        a.client.Relays(),
+			Devices:       devices,
+			OwnEntry:      own,
+			LastResolved:  resolved,
+			LastPublished: published,
+			LastError:     lastErr,
+			ClockAhead:    ahead,
+		}
 	}
 	return st
 }

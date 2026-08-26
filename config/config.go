@@ -145,7 +145,8 @@ type GlobalP2P struct {
 	RelayURLs []string `yaml:"relayUrls"`
 
 	// InsecureRelay admits http:// relay URLs (plaintext transport to
-	// the relay). Development and tests only.
+	// the relay), both in RelayURLs and in the relays the account record
+	// names for sibling devices. Development and tests only.
 	InsecureRelay bool `yaml:"insecureRelay"`
 
 	// PkarrRelayURLs are the pkarr relays ("https://dns.example") that

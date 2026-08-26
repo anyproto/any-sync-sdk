@@ -9,7 +9,7 @@ the same path as everyday discovery.
 
 | Layer | Peers come from | Who can find a device | On by default |
 |---|---|---|---|
-| Account | pkarr record under the derived p2p key; every device registers itself, every device resolves it | holders of the identity key only | always |
+| Account | pkarr record under the derived p2p key; every device registers itself, every device resolves it | holders of the identity key only | whenever the global layer is on and pkarr relays are configured |
 | Space | KV row `p2p/iroh` in the space (18-global-p2p) | members of that space | yes, per space (`advertise`) |
 
 Account peers are candidates for every loaded space except local-only ones, so
@@ -46,20 +46,36 @@ rejects older packets. One TXT record `_anydev` (relative to the key), value
 ```
 u8  version = 1
 u8  relay count, then per relay: u16 length + URL          (≤ 8)
-u8  device count, then per device:                          (≤ 64)
+u8  device count, then per device:                          (≤ 12)
     32 B endpoint key (= the peer id), u8 relay index, u32 unix seconds
 ```
 
-An entry is 37 B, so dozens of devices fit the ~1 KB pkarr limit; a record
-that still does not fit loses its oldest entries.
+An entry is 37 B. The plaintext is padded to 256-byte buckets (the
+ciphertext length then only reveals the device count to within a bucket),
+so twelve devices fit the ~1 KB pkarr packet with one relay in the table
+(measured); a record that still does not fit loses its oldest entries, and
+one naming more than eight relays keeps the devices on the eight most used.
+Entries whose stamp is ahead of the writer's clock are clamped; entries
+without a usable relay URL are dropped.
 
-Publish (`accountCycle`): every online device, at start, hourly and on
-ticket change, resolves → merges its own entry (peer id, home relay, now) →
-drops entries unseen for 30 days → seals → PUTs to every configured relay.
+Publish (`accountCycle`): every online device, at start, every 10 minutes
+and on ticket change, resolves (a GET per relay) and, when its own entry is
+missing, names another relay or is older than 30 minutes, merges its entry
+(peer id, home relay, now) → drops entries unseen for 30 days → seals → PUTs
+to every configured relay. Ten minutes is also how fast a relay wipe or a
+sibling's fresh entry heals.
 The own entry is rewritten only when missing, naming another relay, or
-older than 30 min. Any device holds the key, so last-writer-wins races heal
-on the next cycle (a relay answering "stale" means a sibling published
-first; the next cycle merges on top).
+older than 30 min. Every publish merges onto the newest record this device
+decoded (kept in memory and in `account_record.json` next to
+`p2p_peers.json`): an answer that is missing (a relay restart is not a sign
+the siblings are gone) or unreadable keeps the known siblings and is
+overwritten with them; a record written by a newer version is read as far
+as this layout goes and never overwritten. Any device holds the key, so
+last-writer-wins races heal on the next cycle: a relay answering "stale"
+means a sibling published first, or its clock runs ahead — the writer
+re-resolves, merges on top, and signs past the held packet's timestamp
+(`Status().Global.Account.ClockAhead` shows the lead). Failed cycles back
+off from 1 to 15 minutes.
 
 Resolve: GET from every configured relay, keep the newest packet whose
 signature verifies, decrypt, validate each relay URL (https, or http with
@@ -74,11 +90,18 @@ the two.
   and not disabled, under the live-connection cap. With the account layer on,
   unknown peers pass under a budget of 6 per minute.
 - Post-handshake (iroh handshake filter, identity proven by the any-sync
-  handshake): known peers pass; an unknown peer passes only when its identity
-  is this account's, and is then remembered as a sibling seen now — so a
-  device whose entry has not propagated yet, a fresh restore, connects after
-  one handshake. Everyone else is dropped there, at the cost of one
-  handshake.
+  handshake): a peer a space row names passes; a peer known only through the
+  account record, or unknown altogether, passes only when its identity is
+  this account's, and is then remembered as a sibling seen now — so a device
+  whose entry has not propagated yet, a fresh restore, connects after one
+  handshake. Everyone else is dropped there, at the cost of one handshake;
+  unknown peers get at most two handshakes in flight, thirty distinct ids a
+  minute, and a failed identity check bars the id for ten minutes.
+- An admitted peer counts as connected for the next 15 s even before the
+  pool hands its connection to the layer, so the connector never dials back
+  into a device that just connected (a dial-back replaces the accepted
+  connection and kills both). A peer that closes within 2 s of a successful
+  dial refused us: that is a failed dial with backoff, not a connection.
 
 ## Cold recovery
 
@@ -97,9 +120,11 @@ Needs a pkarr relay and an iroh relay reachable and one other device online.
 
 ## Per-space advertising
 
-`SpaceInfo.Advertise` / `Space.SetAdvertise` is the tech-space row's
-`p2pAdvertise` field (synced account-wide, absent = on). Off stops the row
-heartbeat for every device of the account; the old rows age out on other
+`SpaceInfo.P2PAdvertise` / `Space.SetP2PAdvertise` is the tech-space row's
+`p2pAdvertise` field (synced account-wide, absent = on; written through
+`Space.SetP2PAdvertise`). Off stops the row
+heartbeat on this device at once and on the account's other devices within
+a day (their next heartbeat or space load reads the switch); the old rows age out on other
 members' devices through the 30-day rule (KV has no delete). On republishes
 at once. The tech space never carries a device row. Own devices are
 unaffected either way.
@@ -117,7 +142,8 @@ last read.
 
 ## Costs
 
-One PUT per device per hour (~1 KB) and one GET per resolve; the relay session
+One PUT per device per hour (~1 KB) and one GET per resolve, to every
+configured pkarr relay; the relay session
 and connection costs are those of 18-global-p2p. The tech-space row is no
 longer written for own devices.
 
@@ -134,8 +160,8 @@ longer written for own devices.
 
 `internal/p2p/account` (record codec, pkarr relay client),
 `internal/p2p/accountlayer.go` (cycle, sibling set, admission),
-`PeerStore` source `account`, `SpaceIndexRecord.Advertise` /
-`Space.SetAdvertise`, `config.GlobalP2P.PkarrRelayURLs`; e2e
+`PeerStore` source `account`, `SpaceIndexRecord.P2PAdvertise` /
+`Space.SetP2PAdvertise`, `config.GlobalP2P.PkarrRelayURLs`; e2e
 `TestE2E_AccountRecovery` (embedded `dnsserver` + relay, dead nodes).
 
 Later: Mainline DHT as a second record store (no infra; needs a Go BEP44

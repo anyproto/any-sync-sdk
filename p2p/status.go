@@ -16,7 +16,8 @@ type PeerStatus struct {
 	// Connected — a live connection exists right now.
 	Connected bool
 	// Sources that know the peer: "lan" (space exchange), "global"
-	// (key-value records), or both.
+	// (space key-value records), "account" (the account's device
+	// record), in any combination.
 	Sources []string
 	// LastSeen is the newest liveness evidence: a key-value heartbeat
 	// or a local connection. Zero for LAN-only peers.
@@ -53,10 +54,23 @@ type GlobalStatus struct {
 type AccountStatus struct {
 	// Enabled — pkarr relays are configured.
 	Enabled bool
+	// Relays are the configured pkarr relay hosts.
+	Relays []string
 	// Devices is the number of sibling devices the record names.
 	Devices int
-	// LastResolved is when the record was last read successfully.
+	// OwnEntry — the record names this device with its current relay.
+	OwnEntry bool
+	// LastResolved is when a record was last decoded from a relay.
 	LastResolved time.Time
+	// LastPublished is when this device last stored the record.
+	LastPublished time.Time
+	// LastError is the last failed cycle's error; empty after a
+	// successful one.
+	LastError string
+	// ClockAhead is how far the record the relays hold was dated past
+	// this device's clock at the last cycle (a sibling's clock runs
+	// ahead; this device signs past it); zero when it was not.
+	ClockAhead time.Duration
 }
 
 // Status is the account-wide snapshot of the p2p layers, returned by

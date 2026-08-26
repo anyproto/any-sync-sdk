@@ -165,8 +165,8 @@ func (t *techSpace) Upsert(ctx context.Context, batch space.UpsertBatch) (space.
 	return t.inner.Upsert(ctx, batch)
 }
 
-func (t *techSpace) SetAdvertise(context.Context, bool) error {
-	return errUnsupported("SetAdvertise")
+func (t *techSpace) SetP2PAdvertise(context.Context, bool) error {
+	return errUnsupported("SetP2PAdvertise")
 }
 
 func (t *techSpace) SetMetadata(context.Context, space.SetMetadataRequest) error {

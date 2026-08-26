@@ -31,6 +31,9 @@ const (
 	addrsNotFoundRetry = 5 * time.Second
 	// minSleep keeps a clock hiccup from turning the loop hot.
 	minSleep = 10 * time.Millisecond
+	// refusedWindow is how long after a successful dial a close still
+	// counts as the peer refusing us.
+	refusedWindow = 2 * time.Second
 )
 
 // connector is the only dialer of global peers. It keeps at most
@@ -92,6 +95,10 @@ type peerInfo struct {
 	lastSeen  time.Time
 	own       bool
 	connected bool
+	// backoff marks a peer whose last dial failed and whose retry is not
+	// due: the cover looks past it, so one dead sibling does not block a
+	// space's other peers for the length of its backoff.
+	backoff bool
 }
 
 // step plans once and dials at most one peer. Returns how long to
@@ -118,28 +125,36 @@ func (c *connector) step(ctx context.Context) time.Duration {
 			}
 		}
 	}
-	targets := selectTargets(candidates, infos, g.cfg.MaxConnections)
 	now := g.now()
+	c.mu.Lock()
+	for id, info := range infos {
+		info.backoff = c.next[id].After(now)
+		infos[id] = info
+	}
+	c.mu.Unlock()
+	targets := selectTargets(candidates, infos, g.cfg.MaxConnections)
 	var (
 		dial   string
 		wakeAt time.Time
 	)
-	c.mu.Lock()
 	for _, id := range targets {
-		if infos[id].connected {
-			continue
-		}
-		at := c.next[id]
-		if !at.After(now) {
+		if !infos[id].connected {
 			dial = id
 			break
 		}
-		if wakeAt.IsZero() || at.Before(wakeAt) {
-			wakeAt = at
-		}
 	}
-	c.mu.Unlock()
 	if dial == "" {
+		// nothing dialable now: wake when the earliest backoff ends
+		c.mu.Lock()
+		for id, info := range infos {
+			if !info.backoff || info.connected {
+				continue
+			}
+			if at := c.next[id]; wakeAt.IsZero() || at.Before(wakeAt) {
+				wakeAt = at
+			}
+		}
+		c.mu.Unlock()
 		if wakeAt.IsZero() {
 			return idleCheck
 		}
@@ -208,6 +223,9 @@ func selectTargets(candidates map[string][]string, infos map[string]peerInfo, ma
 			if _, ok := chosen[id]; ok {
 				continue
 			}
+			if infos[id].backoff && !infos[id].connected {
+				continue
+			}
 			cov := 0
 			for _, s := range spaces {
 				if _, ok := uncovered[s]; ok {
@@ -272,6 +290,15 @@ func (c *connector) forget(peerId string) {
 func (c *connector) dial(ctx context.Context, peerId string) {
 	g := c.g
 	now := g.now()
+	// the plan is stale by now if the peer connected to us in between:
+	// dialing back would replace the accepted connection and kill both
+	if g.connected(peerId) {
+		return
+	}
+	if p := g.pickIroh(peerId); p != nil {
+		g.addLive(p)
+		return
+	}
 	c.mu.Lock()
 	c.attempts = append(c.attempts, now)
 	c.mu.Unlock()
@@ -294,6 +321,14 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 			_ = p.Close()
 		} else {
 			g.addLive(p)
+			// a peer that refuses us after the handshake closes at once:
+			// that is a failed dial, not a connection
+			select {
+			case <-p.CloseChan():
+				err = errRefusedAfterHandshake
+			case <-time.After(refusedWindow):
+			case <-ctx.Done():
+			}
 		}
 	}
 	ok := err == nil
@@ -312,6 +347,10 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 		log.Debug("global peer dial failed", zap.String("peerId", peerId), zap.Int("failures", rec.Failures), zap.Error(err))
 	}
 }
+
+// errRefusedAfterHandshake is a dial the peer closed within
+// refusedWindow of success: its handshake filter turned us down.
+var errRefusedAfterHandshake = errors.New("peer closed the connection after the handshake")
 
 // backoffFor is the wait after a failed dial, by tier: exponential for
 // active peers, a fixed slow cadence otherwise.

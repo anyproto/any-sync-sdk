@@ -244,7 +244,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 			if err != nil {
 				return nil, fmt.Errorf("anysyncx: %w", err)
 			}
-			global.SetAccount(acctKeys, acctClient, globalCfg.InsecureRelay)
+			global.SetAccount(acctKeys, acctClient, globalCfg.InsecureRelay, filepath.Join(cfg.Storage.DataDir, accountRecordFileName))
 		}
 	}
 	// A LAN entry that goes away hands the peer's addresses over to its
@@ -331,7 +331,11 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// the union of both sources.
 	var fileP2PServer *filep2p.Server
 	if p2pCfg.IsEnabled() || globalEnabled {
-		fileP2PServer = filep2p.NewServer(peerStore.HasSpace)
+		// a sibling holds every space of the account — except the ones
+		// pinned to this device
+		fileP2PServer = filep2p.NewServer(func(peerId, spaceId string) bool {
+			return !localOnly.has(spaceId) && peerStore.HasSpace(peerId, spaceId)
+		})
 		a.Register(fileP2PServer)
 	}
 
@@ -454,6 +458,13 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	})
 	discovery.RegisterPossibilityHook(func(sdkp2p.Possibility) {
 		out.syncStatus.RefreshAll()
+	})
+	// a sibling carries no space set, so the space observer above never
+	// fires for it; it counts for every space's GlobalPeers
+	peerStore.AddSourceObserver(func(src p2p.Source, _ string, _ bool) {
+		if src == p2p.SourceAccount {
+			out.syncStatus.RefreshAll()
+		}
 	})
 	// Start the rollup loop. The loop ticks once per second, drains
 	// the dirty set, and dispatches SpaceSyncStatus events to
@@ -645,6 +656,15 @@ func (a *App) guestKeyFor(spaceId string) crypto.PrivKey {
 // negative cache is reset first — without that, a fresh join's failed
 // request-time derivation would suppress the space from the handshake
 // for up to negativeRetryAfter even though its ACL has synced in.
+func (a *App) BroadcastP2P() {
+	a.discoveryKeys.ResetNegative()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		a.exchange.Broadcast(ctx)
+	}()
+}
+
 // SetAdvertiseFn wires the per-space p2p advertising decision (the
 // tech-space row's switch; the tech space itself never gets a row —
 // own devices come from the account record). Set before the tech
@@ -661,15 +681,6 @@ func (a *App) RepublishGlobalRecord(spaceId string) {
 	if a.global != nil {
 		a.global.Republish(spaceId)
 	}
-}
-
-func (a *App) BroadcastP2P() {
-	a.discoveryKeys.ResetNegative()
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		a.exchange.Broadcast(ctx)
-	}()
 }
 
 // SetSpaceRegistry wires the tree manager to a space-level registry.

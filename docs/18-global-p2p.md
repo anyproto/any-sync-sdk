@@ -47,8 +47,10 @@ each space's key-value store.
   the SDK directly and never in the peer store), so a LAN dial can never
   fall through into a relay dial. A LAN peer whose first handshake fails
   or that mDNS reports lost releases its addresses, so its ticket can
-  take over. Cold restore stays a LAN affair: a fresh device has no rows
-  and nobody's allowlist knows it.
+  take over. Cold restore through the space records alone stays a LAN
+  affair: a fresh device has no rows and nobody's allowlist knows it —
+  unless the account layer is on ([19-account-discovery](19-account-discovery.md)),
+  which finds the account's own devices from the mnemonic.
 - **Inbound gate.** The transport accepts a connection only from a
   peer id present in the records — a loaded space's rows or the account
   record — and not in the disabled tier, and only while fewer than
@@ -189,9 +191,10 @@ is never hidden by the global layer.
 
 ## Operational notes
 
-- Global p2p is not a cold-restore path: a device with an empty data
-  dir has no records to dial from and nobody's allowlist knows it yet,
-  so a first restore needs the nodes or the LAN. Once a device holds
+- The space records are not a cold-restore path: a device with an empty
+  data dir has no rows to dial from and nobody's allowlist knows it yet,
+  so a first restore needs the nodes, the LAN, or the account layer
+  ([19-account-discovery](19-account-discovery.md)). Once a device holds
   its spaces it reconnects to its global peers from the persisted
   records without any node.
 - One device key means one endpoint: the relay keeps a single session

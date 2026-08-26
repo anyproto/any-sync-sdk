@@ -337,10 +337,10 @@ func (s *Service) SetDerived(ctx context.Context, spaceId string) (object.WriteR
 	})
 }
 
-// SetAdvertise writes the per-space p2p advertising switch
-// (FieldAdvertise, synced account-wide).
-func (s *Service) SetAdvertise(ctx context.Context, spaceId string, on bool) (object.WriteResult, error) {
-	return s.setRowField(ctx, spaceId, FieldAdvertise, false, func(a *anyenc.Arena) *anyenc.Value {
+// SetP2PAdvertise writes the per-space p2p advertising switch
+// (FieldP2PAdvertise, synced account-wide).
+func (s *Service) SetP2PAdvertise(ctx context.Context, spaceId string, on bool) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldP2PAdvertise, false, func(a *anyenc.Arena) *anyenc.Value {
 		if on {
 			return a.NewTrue()
 		}

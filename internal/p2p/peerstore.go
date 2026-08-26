@@ -144,14 +144,15 @@ func (p *PeerStore) HasAccountPeer(peerId string) bool {
 	return ok
 }
 
-// AccountPeerIds returns the account's other devices, most recently
-// seen first, disabled tier excluded.
-func (p *PeerStore) AccountPeerIds() []string {
+// accountOnly reports whether the peer is known through the account
+// record alone: no space row and no LAN sighting vouches for it.
+func (p *PeerStore) accountOnly(peerId string) bool {
 	p.mu.Lock()
-	ids := sortedKeys(p.sources[SourceAccount].byPeer)
-	status := p.status
-	p.mu.Unlock()
-	return p.rankGlobal(ids, status)
+	defer p.mu.Unlock()
+	_, account := p.sources[SourceAccount].byPeer[peerId]
+	_, global := p.sources[SourceGlobal].byPeer[peerId]
+	_, lan := p.sources[SourceLAN].byPeer[peerId]
+	return account && !global && !lan
 }
 
 // HasSpace reports whether the peer is known to hold spaceId through

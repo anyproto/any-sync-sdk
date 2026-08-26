@@ -179,7 +179,6 @@ func TestPeerStoreAccountSource(t *testing.T) {
 	require.Equal(t, []string{"g", "a"}, st.GlobalPeerIds("s1"))
 	require.Equal(t, []string{"a"}, st.GlobalPeerIds("s2"))
 	require.Equal(t, []string{"g", "a"}, st.AllGlobalPeers())
-	require.Equal(t, []string{"a"}, st.AccountPeerIds())
 	require.True(t, st.HasGlobalPeer("a"))
 	require.True(t, st.HasAccountPeer("a"))
 	require.False(t, st.HasAccountPeer("g"))

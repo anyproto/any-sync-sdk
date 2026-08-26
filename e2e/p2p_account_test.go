@@ -94,7 +94,7 @@ func TestE2E_AccountRecovery(t *testing.T) {
 	require.NoError(t, err)
 	_, err = spA.Properties().Set(ctx, objId, typeId, map[string]any{propId: "through-a-sibling"})
 	require.NoError(t, err)
-	assert.True(t, spA.Info().Advertise, "advertising is on by default")
+	assert.True(t, spA.Info().P2PAdvertise, "advertising is on by default")
 
 	peerA := sdkA.P2PStatus().PeerId
 	keys := accountRecordKeys(t, providerA.account)
@@ -169,9 +169,15 @@ func TestE2E_AccountRecovery(t *testing.T) {
 		return lErr == nil && containsString(spaceIdsOnly(list), spaceId)
 	}), "device B never learned the space list from A; status=%+v", sdkB.Spaces().Status(sdkB.TechSpaceId()))
 
-	// The space itself is pulled from A and its object arrives.
+	// The index follower pulls the space from A on its own: its sync
+	// status appears without anything opening the space. Get then only
+	// reads what the loader fetched.
+	require.True(t, waitFor(ctx, 120*time.Second, 500*time.Millisecond, func() bool {
+		st := sdkB.Spaces().Status(spaceId)
+		return st.GlobalPeers >= 1 && st.Total > 0
+	}), "device B never pulled the space by itself; status=%+v", sdkB.Spaces().Status(spaceId))
 	spB, err := sdkB.Spaces().Get(ctx, spaceId)
-	require.NoError(t, err, "device B: pull the space from A")
+	require.NoError(t, err, "device B: open the pulled space")
 	require.True(t, waitFor(ctx, 120*time.Second, 500*time.Millisecond, func() bool {
 		_ = spB.SyncHeads(ctx)
 		row, rErr := spB.Properties().Get(ctx, objId)
@@ -204,12 +210,12 @@ func TestE2E_AccountRecovery(t *testing.T) {
 
 	// Advertising off hides A from the space's other members, not from
 	// its siblings: the switch syncs to B and the record path stays.
-	require.NoError(t, spA.SetAdvertise(ctx, false))
-	assert.False(t, spA.Info().Advertise)
+	require.NoError(t, spA.SetP2PAdvertise(ctx, false))
+	assert.False(t, spA.Info().P2PAdvertise)
 	require.True(t, waitFor(ctx, 60*time.Second, 500*time.Millisecond, func() bool {
-		return !spB.Info().Advertise
+		return !spB.Info().P2PAdvertise
 	}), "the advertising switch never synced to B")
 	assert.True(t, globalPeer(sdkB, peerA).Connected)
-	require.NoError(t, spA.SetAdvertise(ctx, true))
-	assert.True(t, spA.Info().Advertise)
+	require.NoError(t, spA.SetP2PAdvertise(ctx, true))
+	assert.True(t, spA.Info().P2PAdvertise)
 }

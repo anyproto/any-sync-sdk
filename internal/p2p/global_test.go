@@ -610,7 +610,11 @@ func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 	fx.pool.dialFn = func(ctx context.Context, id string) (peer.Peer, error) {
 		dl, ok := ctx.Deadline()
 		require.True(t, ok, "dial ctx carries DialTimeout")
-		require.WithinDuration(t, time.Now().Add(50*time.Millisecond), dl, 30*time.Millisecond)
+		// the deadline is set before the goroutine hop: a slow scheduler
+		// can only shrink what is left of it
+		left := time.Until(dl)
+		require.Greater(t, left, time.Duration(0))
+		require.LessOrEqual(t, left, 50*time.Millisecond)
 		mu.Lock()
 		inflight++
 		if inflight > maxInflight {
@@ -623,15 +627,23 @@ func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 		mu.Unlock()
 		return nil, ctx.Err()
 	}
+	// park the connector until every row is folded in: the first plan
+	// must see the whole store, or whichever s1 peer lands first is dialed
+	sdkp2p.SetPowerHint(sdkp2p.PowerLow)
+	t.Cleanup(func() { sdkp2p.SetPowerHint(sdkp2p.PowerNormal) })
 	fx.run(t)
 	fx.g.SpaceLoaded("s1", sp)
 	fx.g.SpaceLoaded("s2", sp2)
+	fx.drain(t)
+	sdkp2p.SetPowerHint(sdkp2p.PowerNormal)
 
-	// The cover is a (s1) + c (s2); b is never worth a dial.
+	// The cover is a (s1, the fresher row) + c (s2). a's dial fails, so
+	// the cover moves on to b for s1 at once; that spends the budget
+	// before c gets its turn.
 	require.Eventually(t, func() bool { return fx.pool.dialCount() == 2 }, 5*time.Second, 5*time.Millisecond)
 	time.Sleep(200 * time.Millisecond)
 	fx.pool.mu.Lock()
-	require.ElementsMatch(t, []string{a.peerId, c.peerId}, fx.pool.dials)
+	require.Equal(t, []string{a.peerId, b.peerId}, fx.pool.dials)
 	fx.pool.mu.Unlock()
 	mu.Lock()
 	require.Equal(t, 1, maxInflight, "one dial in flight")
@@ -645,12 +657,14 @@ func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	require.Equal(t, 2, fx.pool.dialCount(), "rate limit: 2 dials per minute")
 
-	// Budget back → the freshest due target is retried.
+	// Budget back → the freshest due target is retried first, then the
+	// next candidate once it fails again.
 	fx.advance(30 * time.Second)
 	fx.g.conn.wakeUp()
-	require.Eventually(t, func() bool { return fx.pool.dialCount() == 3 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return fx.pool.dialCount() == 4 }, 5*time.Second, 5*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	fx.pool.mu.Lock()
-	require.Equal(t, a.peerId, fx.pool.dials[2])
+	require.Equal(t, []string{a.peerId, b.peerId, a.peerId, b.peerId}, fx.pool.dials)
 	fx.pool.mu.Unlock()
 
 	// A connected peer is never dialed; a LAN-reachable one neither.
@@ -658,9 +672,10 @@ func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 	fx.book.SetLAN(c.peerId, []string{"yamux://10.0.0.1:1"})
 	fx.advance(2 * time.Minute)
 	fx.g.conn.reactivate(a.peerId)
+	fx.g.conn.reactivate(b.peerId)
 	fx.g.conn.reactivate(c.peerId)
 	time.Sleep(200 * time.Millisecond)
-	require.Equal(t, 3, fx.pool.dialCount())
+	require.Equal(t, 4, fx.pool.dialCount())
 }
 
 func TestConnectorPowerHintAndAddrsNotFound(t *testing.T) {

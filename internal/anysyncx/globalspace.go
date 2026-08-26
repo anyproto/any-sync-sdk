@@ -8,7 +8,10 @@ import (
 
 // p2pPeersFileName sits under DataDir next to the p2p port file: the
 // persisted liveness records of known peers.
-const p2pPeersFileName = "p2p_peers.json"
+const (
+	p2pPeersFileName      = "p2p_peers.json"
+	accountRecordFileName = "account_record.json"
+)
 
 // globalSpaceKV adapts a loaded commonspace to the slice the global p2p
 // layer needs: the default key-value store and two ACL answers.

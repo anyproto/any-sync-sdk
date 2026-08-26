@@ -14,13 +14,13 @@ func TestSpaceIndexRecordAdvertiseDefaultsOn(t *testing.T) {
 	arena := &anyenc.Arena{}
 	row := arena.NewObject()
 	row.Set("id", arena.NewString("s1"))
-	assert.True(t, techspace.DecodeSpaceIndexRecord(row).Advertise, "absent field")
+	assert.True(t, techspace.DecodeSpaceIndexRecord(row).P2PAdvertise, "absent field")
 
-	row.Set(techspace.FieldAdvertise, arena.NewFalse())
-	assert.False(t, techspace.DecodeSpaceIndexRecord(row).Advertise)
+	row.Set(techspace.FieldP2PAdvertise, arena.NewFalse())
+	assert.False(t, techspace.DecodeSpaceIndexRecord(row).P2PAdvertise)
 
-	row.Set(techspace.FieldAdvertise, arena.NewTrue())
-	assert.True(t, techspace.DecodeSpaceIndexRecord(row).Advertise)
+	row.Set(techspace.FieldP2PAdvertise, arena.NewTrue())
+	assert.True(t, techspace.DecodeSpaceIndexRecord(row).P2PAdvertise)
 
-	assert.True(t, techspace.DecodeSpaceIndexRecord(nil).Advertise == false, "zero record is not a decoded row")
+	assert.False(t, techspace.DecodeSpaceIndexRecord(nil).P2PAdvertise, "nil is not a decoded row")
 }

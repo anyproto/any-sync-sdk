@@ -88,7 +88,8 @@ func (s *spaceImpl) Info() space.SpaceInfo {
 	ctx := context.Background()
 	rec, ok := s.tsp.Get(ctx, s.id)
 	if !ok {
-		return space.SpaceInfo{Id: s.id}
+		// the row is the only carrier of the switch; without it the default holds
+		return space.SpaceInfo{Id: s.id, P2PAdvertise: true}
 	}
 	info := s.parent.recordToInfo(ctx, rec)
 	if info.Status == space.StatusJoining && s.localIdentityActive(ctx) {

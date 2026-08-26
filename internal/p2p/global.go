@@ -327,6 +327,9 @@ func (g *Global) SpaceLoaded(spaceId string, kv SpaceKV) {
 	}
 	g.enqueue(task{kind: taskReconcile, spaceId: spaceId})
 	g.enqueue(task{kind: taskPublish, spaceId: spaceId})
+	// the space brings its own peers, and a restore that was covering
+	// its account devices now has a space to cover
+	g.conn.wakeUp()
 }
 
 // SpaceUnloaded drops a space: its records stop contributing to the

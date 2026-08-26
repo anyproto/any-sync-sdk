@@ -167,22 +167,41 @@ func (c *connector) step(ctx context.Context) time.Duration {
 	return 0
 }
 
+// accountCover is the bucket the account's own devices are covered
+// under while no space is loaded. It cannot collide with a space id.
+const accountCover = "\x00account"
+
 // candidates lists, per loaded space, the global peers worth dialing:
-// not disabled, not reachable over the LAN, with a ticket.
+// not disabled, not reachable over the LAN, with a ticket. A device
+// that holds no space yet — a restore — covers its own devices
+// instead, otherwise it would wait for a space it can only get from
+// them.
 func (c *connector) candidates() map[string][]string {
 	g := c.g
 	out := map[string][]string{}
 	for _, spaceId := range g.LoadedSpaceIds() {
-		var ids []string
-		for _, id := range g.store.GlobalPeerIds(spaceId) {
-			if g.book.HasLAN(id) || g.book.Ticket(id) == "" {
-				continue
-			}
-			ids = append(ids, id)
-		}
-		if len(ids) > 0 {
+		if ids := c.dialable(g.store.GlobalPeerIds(spaceId)); len(ids) > 0 {
 			out[spaceId] = ids
 		}
+	}
+	if len(out) == 0 {
+		if ids := c.dialable(g.store.AccountPeerIds()); len(ids) > 0 {
+			out[accountCover] = ids
+		}
+	}
+	return out
+}
+
+// dialable keeps the peers the connector may dial: reachable only
+// through a ticket, not over the LAN.
+func (c *connector) dialable(ids []string) []string {
+	g := c.g
+	out := ids[:0:0]
+	for _, id := range ids {
+		if g.book.HasLAN(id) || g.book.Ticket(id) == "" {
+			continue
+		}
+		out = append(out, id)
 	}
 	return out
 }

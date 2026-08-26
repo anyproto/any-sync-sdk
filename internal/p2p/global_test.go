@@ -866,3 +866,60 @@ func TestGlobalLiveRowClockSkew(t *testing.T) {
 	require.Equal(t, TierStale, fx.status.Tier(stale.peerId))
 	require.Equal(t, fx.now, fx.status.LastSeen(ahead.peerId), "far-future rows clamp to now")
 }
+
+// A device that holds no space yet — a restore working off the
+// persisted account record — dials its own devices instead of waiting
+// for a space it can only get from them.
+func TestConnectorDialsAccountPeersWithoutSpaces(t *testing.T) {
+	fx := newGlobalFixture(t, config.GlobalP2P{MaxConnections: 2, DialTimeout: 50 * time.Millisecond})
+	sib := newTestPeer(t, "sibling")
+	dialed := make(chan string, 4)
+	fx.pool.dialFn = func(_ context.Context, id string) (peer.Peer, error) {
+		select {
+		case dialed <- id:
+		default:
+		}
+		return nil, errors.New("no answer")
+	}
+	fx.run(t)
+
+	// the account record named a sibling; no space is loaded
+	fx.store.UpdateAccountPeer(sib.peerId)
+	fx.book.SetTicket(sib.peerId, sib.ticket)
+	fx.status.Seen(sib.peerId, fx.clock())
+	fx.g.conn.wakeUp()
+
+	select {
+	case id := <-dialed:
+		require.Equal(t, sib.peerId, id)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a sibling known only through the account record was never dialed")
+	}
+	require.Empty(t, fx.g.LoadedSpaceIds())
+}
+
+// A space loading after boot re-plans at once instead of waiting out
+// the connector's idle check.
+func TestSpaceLoadWakesConnector(t *testing.T) {
+	fx := newGlobalFixture(t, config.GlobalP2P{MaxConnections: 2, DialTimeout: 50 * time.Millisecond})
+	a := newTestPeer(t, "a")
+	dialed := make(chan string, 4)
+	fx.pool.dialFn = func(_ context.Context, id string) (peer.Peer, error) {
+		select {
+		case dialed <- id:
+		default:
+		}
+		return nil, errors.New("no answer")
+	}
+	fx.run(t)
+	sp := fx.space(a)
+	sp.kv.put(a, a.ticket, fx.now)
+	fx.g.SpaceLoaded("s1", sp)
+
+	select {
+	case id := <-dialed:
+		require.Equal(t, a.peerId, id)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the peer of a freshly loaded space was never dialed")
+	}
+}

@@ -95,6 +95,11 @@ func TestSDK_OrphanCollectionGC(t *testing.T) {
 	seedLeak(orphanObj + "_blocks")
 	seedLeak(orphanObj + "__history")
 	seedLeak(ghostSpace + "_objects")
+	// Consumer-tagged collections (SDK.Store contract) sit next to the
+	// CRDT ones and are never swept, whatever their embedded space id.
+	seedLeak("l_a_keep")
+	seedLeak("l_s_" + spaceId + "_keep")
+	seedLeak("l_s_" + ghostSpace + "_keep")
 	require.NoError(t, db.Close())
 
 	// Reboot: the startup sweep runs before any space loads.
@@ -111,6 +116,16 @@ func TestSDK_OrphanCollectionGC(t *testing.T) {
 	recs, err := sp2.Query(objId, blocksDataset).Snapshot(ctx, space.QueryOpts{})
 	require.NoError(t, err)
 	require.Len(t, recs.Initial, 1, "object record must survive the sweep")
+
+	// SDK.Store hands out the same sdk.db the sweep ran on: the
+	// consumer-tagged collections are reachable through it, untouched.
+	for _, n := range []string{"l_a_keep", "l_s_" + spaceId + "_keep", "l_s_" + ghostSpace + "_keep"} {
+		coll, err := sdk2.Store().OpenCollection(ctx, n)
+		require.NoError(t, err, "consumer collection %s must survive the sweep", n)
+		cnt, err := coll.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, cnt, n)
+	}
 	require.NoError(t, sdk2.Close())
 
 	// The injected leaks are gone from sdk.db.

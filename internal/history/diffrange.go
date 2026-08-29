@@ -28,7 +28,10 @@ var ErrNotAncestor = errors.New("history: base is not an ancestor of version")
 // buffered delta applies on top and the snapshots are diffed. Sound
 // because CRDT gating is record-local — a change that doesn't touch
 // record R cannot affect R's bytes, so records untouched by the delta
-// are identical between the cuts and never need loading.
+// are identical between the cuts and never need loading. The one
+// cross-record effect, a per-object-dataset change stamping the
+// object's row in a shared dataset (crdt.ObjectStamper), is covered by
+// counting those rows as touched whenever the delta has such a change.
 //
 // The walk MUST be single-pass: objecttree caches each change's
 // decoded Model on first convert and drops the raw Data, so a second
@@ -121,6 +124,10 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 	txCtx := tx.Context()
 
 	type recKey struct{ dataset, record string }
+	sharedSet := make(map[string]struct{}, len(p.SharedDatasets))
+	for _, name := range p.SharedDatasets {
+		sharedSet[name] = struct{}{}
+	}
 	// deltaEntry defers one delta change past the base snapshot. The
 	// cached model's Records/Ops/envelope are per-decode allocations the
 	// tree keeps alive; only Op.Payload aliases the codec's parser arena
@@ -163,6 +170,13 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 			for _, rec := range recordIds {
 				if wantRecord(rec) {
 					touched[recKey{decoded.Dataset, rec}] = struct{}{}
+				}
+			}
+		}
+		if _, shared := sharedSet[decoded.Dataset]; !shared {
+			for _, name := range p.SharedDatasets {
+				if inScope(&crdt.Change{Dataset: name}) && wantRecord(p.ObjectId) {
+					touched[recKey{name, p.ObjectId}] = struct{}{}
 				}
 			}
 		}

@@ -173,6 +173,32 @@ type Handler interface {
 	BeforeDelete(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
 }
 
+// ObjectStamper is an optional interface for the handler of a SHARED
+// dataset (row id = ObjectId, see SharedCollections). StampObject runs
+// once per applied synced change on any OTHER dataset of the same
+// object — inside the apply tx, after the change's records landed, and
+// only when the change wrote something: a record materialized, an op
+// applied, or a tombstone was written (a fully rejected change stamps
+// nothing, matching the handler's own BeforeModify gate). Ops queued
+// on sink via Derive/DeriveOnce are applied to the object's row in the
+// stamper's dataset with the triggering change's VersionId, so the row
+// carries the "object changed" mark (modifiedAt) that per-dataset
+// handlers cannot see. Strict: an absent or tombstoned row is left
+// untouched — creation stamps it through BeforeCreate. Sink.Project
+// is not honored here.
+//
+// SDK-internal: not part of the consumer handler API. A stamper on a
+// dataset that is not shared never runs.
+//
+// ctx carries the change only (Before is nil); the determinism
+// contract of Handler hooks applies — the output must not depend on
+// replica-local state. Op payloads must live on memory owned by the
+// call (a fresh arena): they are retained past the store write, into
+// the event dispatched to subscribers.
+type ObjectStamper interface {
+	StampObject(ctx *ChangeCtx, sink *Sink)
+}
+
 // HandlerReg binds a dataset name to its handler behavior and the
 // metadata the Controller needs: the handler Version (persisted in _meta
 // for re-index decisions; defaults to 1) and any indexes to ensure on the

@@ -584,3 +584,52 @@ func stampSecs(t *testing.T, rec *anyenc.Value, field string) int64 {
 	require.NoError(t, err, "stamp %q is a datetime", field)
 	return ms / 1000
 }
+
+// A synced write to any other dataset of the object bumps the row's
+// modifiedAt (crdt.ObjectStamper) — the row is the object's recency
+// mark, not just the property store's.
+func TestSystemPropertiesHandler_ModifiedAtBumpsOnDatasetWrite(t *testing.T) {
+	const notes = "notes"
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := anystore.Open(context.Background(), dbPath, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	shared, err := db.Collection(context.Background(), "space_objects")
+	require.NoError(t, err)
+	ctrl, err := crdt.NewControllerWithShared(context.Background(), testObjectId, db,
+		crdt.SharedCollections{properties.Dataset: shared},
+		crdt.HandlerReg{Name: properties.Dataset, Handler: properties.New(defaultRegistry()), Schema: schema.Dataset{Dynamic: true}},
+		crdt.HandlerReg{Name: notes, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
+	)
+	require.NoError(t, err)
+	arena := &anyenc.Arena{}
+
+	create := makeChangeAt("v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")})
+	create.ObjectCreatedAt = 100
+	require.NoError(t, ctrl.ApplyChange(context.Background(), create))
+	notesWrite := func(ver crdt.VersionId, ts int64) crdt.Change {
+		return crdt.Change{
+			ObjectId: testObjectId, Dataset: notes, ChangeId: "ch-" + string(ver),
+			VersionId: ver, Timestamp: ts, DataVersion: "notes-v1",
+			Records: []crdt.RecordChange{{Id: "r1", Upsert: true, Ops: []crdt.Op{
+				{Type: crdt.OpSet, Path: []string{"text"}, Payload: arena.NewString("body")},
+			}}},
+		}
+	}
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), notesWrite("v2", 200))
+	require.NoError(t, err)
+	require.Len(t, res.ObjectStamps, 1)
+	assert.Equal(t, []string{"modifiedAt"}, res.ObjectStamps[0].Ops[0].Path)
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.EqualValues(t, 200, stampSecs(t, rec, "modifiedAt"), "dataset write bumps the object's modifiedAt")
+	assert.EqualValues(t, 100, stampSecs(t, rec, "createdAt"), "creation stamps untouched")
+	assert.Equal(t, anyenc.TypeDateTime, rec.Get("modifiedAt").Type())
+
+	// A second dataset write keeps it moving.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), notesWrite("v3", 300)))
+	rec = ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
+}

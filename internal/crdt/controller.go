@@ -70,6 +70,23 @@ type ApplyResult struct {
 	// change (0 when the Controller has no allocator — unit tests).
 	// Forwarded to the change-index feed so consumers cursor on it.
 	ApplySeq uint64
+	// ObjectStamps are the writes ObjectStampers landed on the
+	// object's rows in shared datasets alongside this change (see
+	// ObjectStamper). Empty when the change targets the shared dataset
+	// itself, arrived on the local/account route, wrote nothing, the
+	// row is absent/tombstoned, or the stamp lost its LWW gate. The
+	// dispatcher projects each as an update of that row so live queries
+	// on the shared dataset see it.
+	ObjectStamps []ObjectStamp
+}
+
+// ObjectStamp is one ObjectStamper write that landed: the shared
+// dataset, the row (the change's ObjectId) and the derived ops applied
+// to it with the change's VersionId.
+type ObjectStamp struct {
+	Dataset string
+	RowId   string
+	Ops     []Op
 }
 
 // Reserved field names.
@@ -154,6 +171,10 @@ type Controller struct {
 	// scopeByKey marks datasets whose undeclared field heads carry
 	// per-key scopes (HandlerReg.DynamicScopeByKey).
 	scopeByKey map[string]bool
+	// objectStampers are the shared datasets whose handler implements
+	// ObjectStamper, in registration order. Consulted once per applied
+	// synced change on any other dataset (see applyObjectStamps).
+	objectStampers []objectStamper
 
 	metaColl    anystore.Collection // _meta — persisted maxAddSeq/maxApplySeq + handler versions
 	maxAddSeq   uint64
@@ -323,6 +344,11 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 			c.scopeByKey = make(map[string]bool)
 		}
 		c.scopeByKey[name] = true
+	}
+	if st, ok := reg.Handler.(ObjectStamper); ok {
+		if _, isShared := c.shared[name]; isShared {
+			c.objectStampers = append(c.objectStampers, objectStamper{dataset: name, stamper: st})
+		}
 	}
 	// Per-object collections are opened lazily — on first write
 	// (creates) or on first read (no-create). This keeps unwritten
@@ -748,6 +774,13 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	if !ok {
 		return res, ErrUnknownDataset
 	}
+	// A change on a shared dataset may create its row: forget that it
+	// was absent (see objectStamper.absent).
+	for i := range c.objectStampers {
+		if c.objectStampers[i].dataset == ch.Dataset {
+			c.objectStampers[i].absent = false
+		}
+	}
 	// Lazy-open the per-object collection on first write. Reads stay
 	// tolerant of "not yet materialised" — see collectionForRead.
 	coll, err := c.collectionForWrite(ctx, ch.Dataset)
@@ -862,13 +895,19 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// One getter for the whole change — backs ChangeCtx.Get in every
 	// record's handler hooks (in-tx reads; see RecordGetter).
 	getter := c.RecordGetter(txCtx)
+	// landed: some record materialized, applied an op past every gate,
+	// or was tombstoned. Gates the object stamp below the same way
+	// BeforeModify gates the shared row's own stamp — a change that
+	// wrote nothing is not a modification.
+	landed := false
 	for i := range ch.Records {
 		id := resolvedIds[i]
-		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i], getter)
+		recRej, recDerived, wrote, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i], getter)
 		if err != nil {
 			_ = tx.Rollback()
 			return res, err
 		}
+		landed = landed || wrote
 		// Tag rejections with the record-level context for the caller.
 		for j := range recRej {
 			recRej[j].RecordIndex = i
@@ -882,6 +921,13 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 				res.DerivedOps = make([][]Op, len(ch.Records))
 			}
 			res.DerivedOps[i] = recDerived
+		}
+	}
+
+	if landed {
+		if err := c.applyObjectStamps(txCtx, &ch, getter, &res); err != nil {
+			_ = tx.Rollback()
+			return res, err
 		}
 	}
 
@@ -1058,8 +1104,9 @@ func filterOpFields(arena *anyenc.Arena, ds schema.Dataset, route schema.Scope, 
 // know the change committed with a hole — plus the extra ops the
 // modifier stamped beyond rc.Ops (handler-emitted derived ops,
 // _ver.id creation marker), which the dispatcher merges into the
-// EventRecord.
-func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange, getter func(dataset, id string) *anyenc.Value) ([]OpRejection, []Op, error) {
+// EventRecord, and wrote: whether the record materialized, applied
+// at least one op, or was tombstoned (recordModifier.wrote).
+func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange, getter func(dataset, id string) *anyenc.Value) ([]OpRejection, []Op, bool, error) {
 	sink := c.sinkPool.Get().(*Sink)
 	mod := c.modifierPool.Get().(*recordModifier)
 	mod.set(handler, ch, id, rc, sink, getter)
@@ -1073,7 +1120,7 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 
 	if hasDelete(rc.Ops) || rc.Upsert {
 		if _, err := coll.UpsertId(ctx, id, mod); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	} else {
 		if _, err := coll.UpdateId(ctx, id, mod); err != nil {
@@ -1084,14 +1131,15 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 				// per-record rejection so callers can distinguish "wrote
 				// successfully" from "structural id resolved but no
 				// projection happened".
-				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, nil
+				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, false, nil
 			}
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
 	rejections := mod.takeRejections()
 	derived := mod.takeDerived()
+	wrote := mod.wrote
 
 	// Sibling writes go on different collections and so cannot reuse
 	// the same modifier instance (collection-keyed locks). Each runs
@@ -1099,14 +1147,14 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 	// rejected by the handler, drop siblings too — Project calls
 	// before the rejection are honored only when the record lands.
 	if mod.recordErr() != nil {
-		return rejections, derived, nil
+		return rejections, derived, wrote, nil
 	}
 	if len(sink.sibling) > 0 {
 		if err := c.applySiblings(ctx, ch, sink.sibling); err != nil {
-			return rejections, derived, err
+			return rejections, derived, wrote, err
 		}
 	}
-	return rejections, derived, nil
+	return rejections, derived, wrote, nil
 }
 
 // applySiblings runs each Sibling as its own UpsertId on the matching
@@ -1141,6 +1189,79 @@ func (c *Controller) applySiblings(ctx context.Context, ch *Change, siblings []S
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// objectStamper pairs a shared dataset with its ObjectStamper handler.
+type objectStamper struct {
+	dataset string
+	stamper ObjectStamper
+	// absent memoizes a strict update that found no row, so an object
+	// that has no row in the shared dataset (tech-space and plaintext
+	// objects never write one) stops paying a failed lookup per
+	// change. Cleared by any change on the stamper's own dataset — the
+	// only path that creates the row through this controller; a row
+	// deleted behind the controller's back (re-index wipe) costs one
+	// more failed lookup before the memo is set again.
+	absent bool
+}
+
+// applyObjectStamps runs every registered ObjectStamper for a synced
+// change on another dataset and applies what each queued to the
+// object's row in the stamper's dataset — the sibling path (no hooks,
+// the change's VersionId, LWW-gated per field) as a strict update:
+// an absent row is not created and a tombstone is left as is. Local
+// and Injected changes never stamp — their VersionIds live in other
+// version domains and the shared row's derived fields are synced-
+// domain. The row's `_traces` stay the row's own: the stamp runs
+// without the change's TraceIds. Only stamps that took the LWW gate
+// are reported on res.ObjectStamps (a gated-out stamp must not reach
+// subscribers as a stale $set). Sink.Project from a stamper is ignored.
+func (c *Controller) applyObjectStamps(ctx context.Context, ch *Change, getter func(dataset, id string) *anyenc.Value, res *ApplyResult) error {
+	if len(c.objectStampers) == 0 || ch.Local || ch.Injected || ch.ObjectId == "" {
+		return nil
+	}
+	for i := range c.objectStampers {
+		st := &c.objectStampers[i]
+		if st.dataset == ch.Dataset || st.absent {
+			continue
+		}
+		sink := c.sinkPool.Get().(*Sink)
+		st.stamper.StampObject(&ChangeCtx{Change: ch, Get: getter}, sink)
+		if len(sink.derived) == 0 {
+			sink.reset()
+			c.sinkPool.Put(sink)
+			continue
+		}
+		ops := append([]Op(nil), sink.derived...)
+		sink.reset()
+		c.sinkPool.Put(sink)
+
+		coll, err := c.collectionForWrite(ctx, st.dataset)
+		if err != nil {
+			return err
+		}
+		stampCh := *ch
+		stampCh.TraceIds = nil
+		sib := Sibling{Dataset: st.dataset, Record: RecordChange{Id: ch.ObjectId, Ops: ops}}
+		mod := c.modifierPool.Get().(*recordModifier)
+		mod.setSibling(&stampCh, &sib)
+		_, err = coll.UpdateId(ctx, ch.ObjectId, mod)
+		landed := mod.wrote
+		mod.clear()
+		c.modifierPool.Put(mod)
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			st.absent = true
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("crdt: object stamp %q: %w", st.dataset, err)
+		}
+		if !landed {
+			continue
+		}
+		res.ObjectStamps = append(res.ObjectStamps, ObjectStamp{Dataset: st.dataset, RowId: ch.ObjectId, Ops: ops})
 	}
 	return nil
 }
@@ -1233,6 +1354,18 @@ type recordModifier struct {
 	// Buffer is pool-recycled; payloads live on appliedDerivedArena.
 	appliedDerived      []Op
 	appliedDerivedArena *anyenc.Arena
+
+	// wrote reports that Modify changed the record: it materialized,
+	// at least one op reached applyOp, or a tombstone was written.
+	// Rejected ops, delete-wins absorption and an idempotent re-delete
+	// leave it false. In sibling mode it means at least one op took
+	// the LWW gate (the record's version at the op's path is this
+	// change's) — the object-stamp path reports only those. That
+	// reading is exact for $set/$unset/$incGated; $inc/$addToSet/$pull
+	// never write _ver and a broad $set merged over a newer subtree
+	// keeps the survivor's version, so those read as not taken (a
+	// missed report, never a stale one).
+	wrote bool
 }
 
 func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange, sink *Sink, getter func(dataset, id string) *anyenc.Value) {
@@ -1248,6 +1381,7 @@ func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange,
 	m.rejections = m.rejections[:0]
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
+	m.wrote = false
 }
 
 func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
@@ -1263,6 +1397,7 @@ func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
 	m.rejections = m.rejections[:0]
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
+	m.wrote = false
 }
 
 func (m *recordModifier) clear() {
@@ -1277,6 +1412,7 @@ func (m *recordModifier) clear() {
 	m.rejections = m.rejections[:0]
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
+	m.wrote = false
 }
 
 func (m *recordModifier) recordErr() error { return m.recordedErr }
@@ -1355,6 +1491,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		}
 		tomb := newTombstone(a, m.id, *ch, existing)
 		updateTraces(a, tomb, *ch)
+		m.wrote = true
 		return tomb, true, nil
 	}
 
@@ -1388,6 +1525,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 				return existing, false, nil
 			}
 		}
+		m.wrote = true
 		for i := range rc.Ops {
 			applyOp(a, existing, *ch, rc.Ops[i])
 		}
@@ -1416,6 +1554,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			// validation/derivation, just the gated apply.
 			if ch.Local || ch.Injected {
 				applyOp(a, existing, *ch, *op)
+				m.wrote = true
 				continue
 			}
 			m.beforeModifyApply(a, existing, ctx, op, i)
@@ -1458,6 +1597,7 @@ func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Val
 	err := m.handler.BeforeModify(ctx, m.rec, op, m.sink)
 	if err == nil {
 		applyOp(a, existing, *m.ch, *op)
+		m.wrote = true
 		return
 	}
 	if !isMultiField {
@@ -1484,6 +1624,7 @@ func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Val
 		return
 	}
 	applyOp(a, existing, *m.ch, Op{Type: op.Type, Payload: kept})
+	m.wrote = true
 }
 
 // applySibling is the modifier path for a Sibling write — no handler, no
@@ -1505,6 +1646,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		}
 		tomb := newTombstone(a, m.id, *ch, existing)
 		updateTraces(a, tomb, *ch)
+		m.wrote = true
 		return tomb, true, nil
 	}
 
@@ -1525,12 +1667,37 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 
 	for i := range rc.Ops {
 		applyOp(a, existing, *ch, rc.Ops[i])
+		if !m.wrote && opTook(existing, ch.VersionId, rc.Ops[i]) {
+			m.wrote = true
+		}
 	}
 	stampAddSeq(a, existing, ch.AddSeq)
 	stampApplySeq(a, existing, ch.ApplySeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil
+}
+
+// opTook reports whether op's write took the LWW gate: the record's
+// version at the op's path (any key of a multi-field payload) is the
+// change's own. Read before compactVersions, while the leaf is
+// explicit. A replay of the same change reads as took — its stamp is
+// the value already there.
+func opTook(rec *anyenc.Value, version VersionId, op Op) bool {
+	if len(op.Path) > 0 {
+		return GetRecordVersion(rec, op.Path...) == version
+	}
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+		return false
+	}
+	took := false
+	obj, _ := op.Payload.Object()
+	obj.Visit(func(k []byte, _ *anyenc.Value) {
+		if !took && GetRecordVersion(rec, strings.Split(string(k), ".")...) == version {
+			took = true
+		}
+	})
+	return took
 }
 
 // drainDerivedTo applies and clears Sink.derived against target (the

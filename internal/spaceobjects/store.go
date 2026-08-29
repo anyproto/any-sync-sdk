@@ -217,6 +217,11 @@ type Store struct {
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *fanout.Registry[RowEvent]
 
+	// stampPending holds, per objectId, the object stamps landed during
+	// the current replay batch, emitted as one event per object by the
+	// AfterReplay hook. See dispatchObjectStamps.
+	stampPending sync.Map
+
 	// readTracking maps a tracked dataset to its registration;
 	// readState is the per-space read/unread engine. Both nil/empty
 	// when nothing in this space opted into tracking. selfIdentity is
@@ -1685,9 +1690,13 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		Allocator:      s.alloc,
 		Gate:           gate,
 		AfterApply:     s.afterApplyFor(),
+		AfterReplay:    s.afterReplayFor(),
 		WriteGate:      s.CheckWrite,
 		PlaintextSpecs: plaintextSpecs,
-		OnClose:        func() { s.releaseHistoryHandle(objectId) },
+		OnClose: func() {
+			s.releaseHistoryHandle(objectId)
+			s.stampPending.Delete(objectId)
+		},
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
 	})

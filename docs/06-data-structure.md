@@ -18,6 +18,9 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 | Scope | write route | version domain | syncs to | overridable |
 |------|------|------|------|------|
 | **derived** | handler-stamped (`id`, `author`, `spaceId`, `createdAt`, `modifiedAt` — the times are `datetime` instants) | triggering change | (computed convergently) | no (read-only) |
+| **synced** | the object's own CRDT change | object tree | everyone with access | n/a — no override stack |
+| **account** | carrier record in tech space + per-device mirror | tech tree | this account's devices | n/a |
+| **local** | `Object.LocalSet`, no DAG | local lexid | this device only | n/a |
 
 > **Reading the time stamps.** They are `datetime` instants, not epoch
 > numbers: a filter literal has to be one too (`{"createdAt": {"$gte":
@@ -31,9 +34,20 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 > re-index is in flight the collection can hold both shapes at once, so
 > that window sorts as two type-grouped blocks — it closes when the
 > space's sweep finishes (docs/08-versioning.md).
-| **synced** | the object's own CRDT change | object tree | everyone with access | n/a — no override stack |
-| **account** | carrier record in tech space + per-device mirror | tech tree | this account's devices | n/a |
-| **local** | `Object.LocalSet`, no DAG | local lexid | this device only | n/a |
+>
+> **`modifiedAt` is object-level.** It moves on every synced write to
+> the object — a property write and a write to any of its datasets
+> (editor blocks, chat messages, runtime datasets) alike — so
+> `-modifiedAt` orders objects by their latest change, whatever it
+> touched. The `objects` handler is a `crdt.ObjectStamper`: a change
+> on another dataset stamps the object's row in the same transaction,
+> with the change's VersionId (LWW like any field). Local- and
+> account-route writes never move it; a row that does not exist yet is
+> not created by a stamp — it gets `modifiedAt` when it is created.
+> That skip is order-dependent: a content change applied before the
+> row's creating change (a parked create draining later) leaves the
+> row with the creating change's stamp until the object's next synced
+> write.
 
 There is **no per-value override stack and no priority merge** — the
 earlier auto/base/account/device variant model (priority `device >

@@ -545,6 +545,17 @@ way, converging under the standard LWW gate), and
 `Project(dataset, rec)` queues a sibling write to another dataset on
 the same object, applied in the same transaction.
 
+**ObjectStamper** is the reverse direction, for the handler of a shared
+dataset (the per-space `objects` row): `StampObject(ctx, sink)` runs
+once per applied synced change on any *other* dataset of the object,
+after its records landed and only if the change wrote something; the
+ops it derives are applied to the object's row with the change's
+VersionId as a strict update (an absent or tombstoned row is left
+alone). This is how `modifiedAt` tracks writes to editor blocks, chat
+messages and runtime datasets, not just property writes. Local/account-
+route changes never trigger it — their versions belong to other
+domains. SDK-internal: consumer datasets cannot declare one.
+
 ### 8.1 Registration
 
 Consumers register handlers through the type catalog at `sdk.Open`:

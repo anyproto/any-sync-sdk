@@ -172,7 +172,16 @@ hidden:
   property variants) produce correct state for the *filtered* record;
   siblings are simply absent from the scratch. Record-scope queries
   only — enforced by the API shape (the fast path returns one record,
-  not a queryable store).
+  not a queryable store). The one exception to the record-local
+  argument is the `objects` row itself: its `modifiedAt` is also
+  stamped by changes on the object's other datasets
+  (`crdt.ObjectStamper`), which neither the row's filtered subsequence
+  nor a dataset-scoped slow-path view includes (`DisableFilteredReplay`
+  still scopes the replay to the requested dataset). Such views carry
+  the `modifiedAt` of the row's own last change; only a full-object
+  view (no dataset scope) reproduces the object-level value. DiffRange
+  accounts for it by counting shared rows as touched whenever the delta
+  has a per-object-dataset change.
 
 **Ancestor set amortization.** A record timeline UI walks versions
 newest→oldest. Compute the ancestor set once per view (one

@@ -27,6 +27,11 @@ import (
 // metadata (any.name etc.) lives in their per-type-object storage
 // behind a different dataset.
 //
+// The row also carries the object-level `modifiedAt`: the handler is
+// a crdt.ObjectStamper, so a synced change on ANY dataset of the
+// object (editor blocks, chat messages, runtime datasets) bumps it,
+// not only writes to the row itself.
+//
 // See docs/06-data-structure.md § "Storage" — the per-space
 // `objects` collection model.
 const Dataset = "objects"
@@ -43,8 +48,10 @@ const HandlerVersion = "systemPropertyHandler-v1"
 // — bumped when already-materialized rows would come out different, so
 // the SDK rebuilds them from the DAG (docs/08-versioning.md). v2: the
 // derived createdAt / modifiedAt stamps are TypeDateTime instants, not
-// epoch numbers.
-const LocalVersion = 2
+// epoch numbers. v3: modifiedAt is also stamped by changes on the
+// object's other datasets (StampObject), so rows stamped by property
+// writes alone are stale.
+const LocalVersion = 3
 
 // SystemPropertiesHandler validates property writes on every user
 // object. Corresponds to the `baseProperty` handler named in
@@ -177,14 +184,16 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // stampModifiedAt queues the derived row-root `modifiedAt` stamp — the
 // Unix-seconds timestamp of the change being applied (the per-change
 // envelope Timestamp, NOT the root-header ObjectCreatedAt the createdAt
-// stamp uses). Fired from both BeforeCreate (so every row carries it
-// from birth, initially equal to the creating change's time) and
-// BeforeModify (so any synced write bumps it).
+// stamp uses). Fired from BeforeCreate (so every row carries it from
+// birth, initially equal to the creating change's time), BeforeModify
+// (any synced write to the row) and StampObject (any synced write to
+// another dataset of the object), so the stamp reads as "the object
+// changed", whatever dataset the change landed on.
 //
 // Convergence: the stamp inherits the change's VersionId, so under
 // standard LWW every peer resolves modifiedAt to the timestamp of the
-// ordering-max change that touched the row — deterministic once all
-// changes are delivered. The value is the author's wall clock
+// ordering-max change that touched the object — deterministic once
+// all changes are delivered. The value is the author's wall clock
 // (display/sort quality only, never a fencing token), same contract as
 // version-history timestamps.
 //
@@ -233,6 +242,14 @@ func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.Reco
 	}
 	stampModifiedAt(ctx, sink)
 	return nil
+}
+
+// StampObject bumps the row's `modifiedAt` for a synced change on any
+// other dataset of the object (crdt.ObjectStamper). The controller
+// applies the stamp to the existing row only — a row that does not
+// exist yet gets its stamp from BeforeCreate when it is created.
+func (*SystemPropertiesHandler) StampObject(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+	stampModifiedAt(ctx, sink)
 }
 
 // BeforeDelete is a no-op — deleting a property record (the per-

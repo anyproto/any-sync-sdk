@@ -899,7 +899,7 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	// Dense ascending index on the derived `modifiedAt` stamp — the
 	// recency ordering (`sort: ["-modifiedAt"]`) is the default object-
 	// list sort for clients, which would otherwise scan the whole
-	// collection per query (SYN-98). Dense, not sparse: a sort index
+	// collection per query. Dense, not sparse: a sort index
 	// must cover every row.
 	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Fields: []string{"modifiedAt"},
@@ -1893,8 +1893,8 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // objectsDatasetSchema is the per-space `objects` (properties) dataset
 // schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
 // synced) with the built-in `any` fields declared by their unified
-// schema.Scope class — derived auto-fields (author/createdAt/spaceId/
-// id) are handler-only, the rest synced.
+// schema.Scope class — derived auto-fields (id/author/spaceId/
+// createdAt/modifiedAt/modifiedBy) are handler-only, the rest synced.
 //
 // Note this declares the TOP-LEVEL field heads only (`any`, typeIds are
 // dynamic). Per-PROPERTY scope (synced/account/local on a user propId)

@@ -85,6 +85,7 @@ func TestE2E_ModifiedAt_BumpsOnDatasetWrite(t *testing.T) {
 		require.Equal(t, anyenc.TypeDateTime, v.Type())
 		ms, merr := v.DateTimeMillis()
 		require.NoError(t, merr)
+		assert.Equal(t, sdk.Account().Id(), row.GetString("modifiedBy"), "modifiedBy names this account")
 		return ms
 	}
 
@@ -122,28 +123,31 @@ func TestE2E_ModifiedAt_BumpsOnDatasetWrite(t *testing.T) {
 		rec, where := receiveRecordFor(t, res.Sub, objId, 3*time.Second)
 		require.NotNil(t, rec, "objects subscription must see the row after dataset write %d", i+1)
 		assert.Equal(t, "updated", where)
-		stamps := 0
+		stamps := map[string]int{}
 		for _, op := range rec.Ops {
-			if len(op.Path) == 1 && op.Path[0] == "modifiedAt" {
-				stamps++
+			if len(op.Path) == 1 {
+				stamps[op.Path[0]]++
 			}
 		}
-		assert.Equal(t, 1, stamps, "update carries exactly one modifiedAt op")
+		assert.Equal(t, 1, stamps["modifiedAt"], "update carries exactly one modifiedAt op")
+		assert.Equal(t, 1, stamps["modifiedBy"], "update carries exactly one modifiedBy op")
 		require.NotNil(t, rec.Doc)
 		ms, merr := rec.Doc.Get("modifiedAt").DateTimeMillis()
 		require.NoError(t, merr)
 		assert.Equal(t, after, ms, "event Doc carries the post-apply stamp")
+		assert.Equal(t, sdk.Account().Id(), rec.Doc.GetString("modifiedBy"))
 
 		noteRec, _ := receiveRecordFor(t, notesSub.Sub, "rec-1", 3*time.Second)
 		require.NotNil(t, noteRec, "the dataset's own subscriber sees write %d", i+1)
 		assert.Equal(t, text, noteRec.Doc.GetString("text"))
 	}
 
-	// The notes record itself carries no object-level stamp.
+	// The notes record itself carries no object-level stamps.
 	note, err := sp.Query(objId, notesDataset).Filter(map[string]any{"id": "rec-1"}).One(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, note)
 	assert.Nil(t, note.Get("modifiedAt"))
+	assert.Nil(t, note.Get("modifiedBy"))
 }
 
 // TestE2E_ModifiedAt_ConvergesAcrossDevices: the stamp travels with the
@@ -189,6 +193,9 @@ func TestE2E_ModifiedAt_ConvergesAcrossDevices(t *testing.T) {
 	modifiedAt := func(sp space.Space) (int64, bool) {
 		row, qerr := sp.QueryObjects().Filter(map[string]any{"id": objId}).One(ctx)
 		if qerr != nil || row == nil || row.Get("modifiedAt") == nil {
+			return 0, false
+		}
+		if row.GetString("modifiedBy") != sdkA.Account().Id() {
 			return 0, false
 		}
 		ms, merr := row.Get("modifiedAt").DateTimeMillis()

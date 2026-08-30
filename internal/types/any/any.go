@@ -1,7 +1,8 @@
 // Package anytype is the built-in `any` type — the universal shape
 // every object in a space implements: name, description, icon
-// (synced, CRDT-mutable), plus id, author, spaceId, createdAt
-// (derived, read-only, stamped from any-sync context).
+// (synced, CRDT-mutable), plus id, author, spaceId, createdAt,
+// modifiedAt, modifiedBy (derived, read-only, stamped from any-sync
+// context).
 //
 // Directory is internal/types/any/; the package is declared `anytype`
 // because `any` is a predeclared identifier and shadowing it inside
@@ -57,6 +58,10 @@ var Properties = []BuiltInProperty{
 	{Id: "spaceId", Name: "Space", Kind: schema.KindString, Scope: schema.ScopeDerived},
 	{Id: "createdAt", Name: "Created at", Kind: schema.KindDatetime, Scope: schema.ScopeDerived},
 	{Id: "modifiedAt", Name: "Modified at", Kind: schema.KindDatetime, Scope: schema.ScopeDerived},
+	// `modifiedBy` is the account identity that signed the change
+	// `modifiedAt` points at — both are stamped by the same change and
+	// converge together (properties.SystemPropertiesHandler).
+	{Id: "modifiedBy", Name: "Modified by", Kind: schema.KindString, Scope: schema.ScopeDerived},
 	{Id: "name", Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	{Id: "description", Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	{Id: "icon", Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced},

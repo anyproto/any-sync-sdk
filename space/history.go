@@ -89,7 +89,7 @@ type ChangeList struct {
 // ChangeMeta describes one listed change (or coalesced group).
 type ChangeMeta struct {
 	Version   Version // ChangeId; for groups: the head (newest) member
-	Author    string  // per-change signer identity
+	Author    string  // per-change signer identity (the objects row's modifiedBy, not its author)
 	Timestamp int64   // author clock, Unix seconds — display-only
 	Dataset   string
 	TraceIds  []string

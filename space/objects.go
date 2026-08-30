@@ -12,6 +12,17 @@ import (
 // from ErrNotFound: the id existed and is gone for good.
 var ErrObjectDeleted = errors.New("space: object deleted")
 
+// ErrObjectNotFound is returned by every per-object operation that has
+// to open the object's tree (record reads, writes, subscriptions,
+// history) when this device has no such tree: the id is unknown here,
+// or the object was deleted. One sentinel for both because the caller
+// can act on neither — the object is not addressable on this device.
+//
+// Distinct from ErrObjectDeleted, which ObjectService.Get raises for
+// the narrower "this id existed and is gone for good"; a consumer that
+// needs the distinction reads the row through Get.
+var ErrObjectNotFound = errors.New("space: object not found")
+
 // ObjectService is the object lifecycle surface on a space, plus the
 // single-object row read. Record reads, writes and subscriptions
 // happen at the space level keyed by objectId.

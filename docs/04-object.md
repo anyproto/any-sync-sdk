@@ -128,6 +128,7 @@ space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|
   - Remote delete → SDK listens to the settings tree, deletes local data accordingly
   - Local delete → SDK adds entry to settings tree (any-sync side) + deletes local data
   - The objects row is hard-removed, so an absent row alone does not say whether the id ever existed. `Objects().Get` consults the tree's deleted status and returns `ErrObjectDeleted` for a deleted object, `ErrNotFound` otherwise
+  - Every other per-object operation opens the object's tree, and a deleted or unknown id has none: both return `ErrObjectNotFound`. Match that sentinel rather than any-sync's `treestorage.ErrUnknownTreeId` / `spacestorage.ErrTreeStorageAlreadyDeleted`, which stay in the chain but are storage internals
 - **No restore / time window** — a separate "bin" mechanism will be built later, based on system object properties. Not part of the Object layer
 
 ### Snapshots

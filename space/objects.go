@@ -18,9 +18,10 @@ var ErrObjectDeleted = errors.New("space: object deleted")
 // deleted. One sentinel for both because the caller can act on
 // neither — the object is not addressable on this device.
 //
-// Subscribe is the exception: an unknown object yields an empty initial
-// snapshot instead, so a subscription registered before the object
-// lands still receives its events.
+// Subscribe reports it for a DELETED object but not for an unknown one:
+// an id with no tree here yields an empty initial snapshot instead, so a
+// subscription registered before the object lands still receives its
+// events. Handle the sentinel on the subscribe path too.
 //
 // Distinct from ErrObjectDeleted, which ObjectService.Get raises for
 // the narrower "this id existed and is gone for good"; a consumer that

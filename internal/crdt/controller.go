@@ -74,9 +74,10 @@ type ApplyResult struct {
 	// object's rows in shared datasets alongside this change (see
 	// ObjectStamper). Empty when the change targets the shared dataset
 	// itself, arrived on the local/account route, wrote nothing, the
-	// row is absent/tombstoned, or the stamp lost its LWW gate. The
-	// dispatcher projects each as an update of that row so live queries
-	// on the shared dataset see it.
+	// row is absent/tombstoned, or every stamp op lost its LWW gate;
+	// Ops holds only the ops that took it. The dispatcher projects
+	// each as an update of that row so live queries on the shared
+	// dataset see it.
 	ObjectStamps []ObjectStamp
 }
 
@@ -1215,7 +1216,7 @@ type objectStamper struct {
 // and Injected changes never stamp — their VersionIds live in other
 // version domains and the shared row's derived fields are synced-
 // domain. The row's `_traces` stay the row's own: the stamp runs
-// without the change's TraceIds. Only stamps that took the LWW gate
+// without the change's TraceIds. Only the ops that took the LWW gate
 // are reported on res.ObjectStamps (a gated-out stamp must not reach
 // subscribers as a stale $set). Sink.Project from a stamper is ignored.
 func (c *Controller) applyObjectStamps(ctx context.Context, ch *Change, getter func(dataset, id string) *anyenc.Value, res *ApplyResult) error {
@@ -1248,7 +1249,16 @@ func (c *Controller) applyObjectStamps(ctx context.Context, ch *Change, getter f
 		mod := c.modifierPool.Get().(*recordModifier)
 		mod.setSibling(&stampCh, &sib)
 		_, err = coll.UpdateId(ctx, ch.ObjectId, mod)
-		landed := mod.wrote
+		// Keep only the ops that took the gate: stamps on a row whose
+		// leaves sit at different versions can land one and lose
+		// another, and the live dispatcher ships reported payloads
+		// verbatim.
+		taken := ops[:0]
+		for i, took := range mod.took {
+			if took {
+				taken = append(taken, ops[i])
+			}
+		}
 		mod.clear()
 		c.modifierPool.Put(mod)
 		if errors.Is(err, anystore.ErrDocNotFound) {
@@ -1258,10 +1268,10 @@ func (c *Controller) applyObjectStamps(ctx context.Context, ch *Change, getter f
 		if err != nil {
 			return fmt.Errorf("crdt: object stamp %q: %w", st.dataset, err)
 		}
-		if !landed {
+		if len(taken) == 0 {
 			continue
 		}
-		res.ObjectStamps = append(res.ObjectStamps, ObjectStamp{Dataset: st.dataset, RowId: ch.ObjectId, Ops: ops})
+		res.ObjectStamps = append(res.ObjectStamps, ObjectStamp{Dataset: st.dataset, RowId: ch.ObjectId, Ops: taken})
 	}
 	return nil
 }
@@ -1360,12 +1370,14 @@ type recordModifier struct {
 	// Rejected ops, delete-wins absorption and an idempotent re-delete
 	// leave it false. In sibling mode it means at least one op took
 	// the LWW gate (the record's version at the op's path is this
-	// change's) — the object-stamp path reports only those. That
-	// reading is exact for $set/$unset/$incGated; $inc/$addToSet/$pull
-	// never write _ver and a broad $set merged over a newer subtree
-	// keeps the survivor's version, so those read as not taken (a
-	// missed report, never a stale one).
+	// change's), and took records that per op — the object-stamp path
+	// reports only the ops that took. That reading is exact for
+	// $set/$unset/$incGated; $inc/$addToSet/$pull never write _ver and
+	// a broad $set merged over a newer subtree keeps the survivor's
+	// version, so those read as not taken (a missed report, never a
+	// stale one).
 	wrote bool
+	took  []bool
 }
 
 func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange, sink *Sink, getter func(dataset, id string) *anyenc.Value) {
@@ -1382,6 +1394,7 @@ func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange,
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
 	m.wrote = false
+	m.took = m.took[:0]
 }
 
 func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
@@ -1398,6 +1411,7 @@ func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
 	m.wrote = false
+	m.took = m.took[:0]
 }
 
 func (m *recordModifier) clear() {
@@ -1413,6 +1427,7 @@ func (m *recordModifier) clear() {
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
 	m.wrote = false
+	m.took = m.took[:0]
 }
 
 func (m *recordModifier) recordErr() error { return m.recordedErr }
@@ -1667,9 +1682,9 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 
 	for i := range rc.Ops {
 		applyOp(a, existing, *ch, rc.Ops[i])
-		if !m.wrote && opTook(existing, ch.VersionId, rc.Ops[i]) {
-			m.wrote = true
-		}
+		took := opTook(existing, ch.VersionId, rc.Ops[i])
+		m.took = append(m.took, took)
+		m.wrote = m.wrote || took
 	}
 	stampAddSeq(a, existing, ch.AddSeq)
 	stampApplySeq(a, existing, ch.ApplySeq)

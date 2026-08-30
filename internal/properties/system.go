@@ -197,13 +197,14 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // Convergence: both stamps inherit the change's VersionId, so under
 // standard LWW every peer resolves them to the ordering-max change
 // that touched the object — deterministic once all changes are
-// delivered, and always the same change for both fields. The time is
-// the author's wall clock (display/sort quality only, never a fencing
-// token), same contract as version-history timestamps.
-//
-// Each stamp is skipped on its own when its source is missing (a
-// hand-built change with no Timestamp or no Creator); a wired tree
-// always carries both.
+// delivered. The pair always moves together: a change whose signer is
+// unknown (no Creator — a hand-built change without a tree) unsets
+// modifiedBy at the same version rather than leaving an older signer
+// next to a newer time, so an absent modifiedBy reads "signer unknown
+// for the latest change", never someone else. No Timestamp (same
+// origin) stamps nothing. The time is the author's wall clock
+// (display/sort quality only, never a fencing token), same contract as
+// version-history timestamps.
 //
 // DeriveOnce, not Derive: BeforeModify runs per op, and a multi-op
 // RecordChange must stamp once, not once per op.
@@ -211,22 +212,22 @@ func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
+	ts := ctx.Change.Timestamp
+	if ts <= 0 {
+		return
+	}
 	a := &anyenc.Arena{}
-	if ts := ctx.Change.Timestamp; ts > 0 {
-		sink.DeriveOnce(crdt.Op{
-			Type: crdt.OpSet,
-			Path: []string{"modifiedAt"},
-			// TypeDateTime millis, as createdAt (envelope is seconds).
-			Payload: a.NewDateTimeMillis(ts * 1000),
-		})
-	}
+	sink.DeriveOnce(crdt.Op{
+		Type: crdt.OpSet,
+		Path: []string{"modifiedAt"},
+		// TypeDateTime millis, as createdAt (envelope is seconds).
+		Payload: a.NewDateTimeMillis(ts * 1000),
+	})
+	by := crdt.Op{Type: crdt.OpUnset, Path: []string{"modifiedBy"}}
 	if creator := ctx.Change.Creator; creator != "" {
-		sink.DeriveOnce(crdt.Op{
-			Type:    crdt.OpSet,
-			Path:    []string{"modifiedBy"},
-			Payload: a.NewString(creator),
-		})
+		by = crdt.Op{Type: crdt.OpSet, Path: []string{"modifiedBy"}, Payload: a.NewString(creator)}
 	}
+	sink.DeriveOnce(by)
 }
 
 // BeforeModify validates one inbound op against the current schema.

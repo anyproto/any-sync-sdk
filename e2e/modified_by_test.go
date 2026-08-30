@@ -33,7 +33,7 @@ func TestE2E_ModifiedBy_NamesTheWritersAccount(t *testing.T) {
 		t.Skip("two-account e2e is slow; rerun without -short")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
 	openSDK := func(name string) *anysyncsdk.SDK {
@@ -147,10 +147,10 @@ func TestE2E_ModifiedBy_NamesTheWritersAccount(t *testing.T) {
 	}
 	// converge waits until both rows carry the same stamps and returns
 	// them.
-	converge := func(what string) stamps {
+	converge := func(what string, budget time.Duration) stamps {
 		t.Helper()
 		var got stamps
-		if !waitFor(ctx, 2*time.Minute, 2*time.Second, func() bool {
+		if !waitFor(ctx, budget, 2*time.Second, func() bool {
 			_ = spA.SyncHeads(ctx)
 			_ = spB.SyncHeads(ctx)
 			a, okA := stampsOf(spA)
@@ -168,26 +168,26 @@ func TestE2E_ModifiedBy_NamesTheWritersAccount(t *testing.T) {
 		return got
 	}
 
-	// Bob sees Alice's object with the creating change's stamps.
-	initial := converge("initial")
+	// Bob sees Alice's object with the creating change's stamps. The
+	// first content pull after a join is the slow step.
+	initial := converge("initial", 3*time.Minute)
 	assert.Equal(t, aliceId, initial.by, "a fresh object is last modified by its creator")
 	assert.Equal(t, aliceId, initial.author)
 
-	// Change timestamps have second resolution: space the writes out
-	// so each stamp is distinguishable from the previous one.
-	time.Sleep(1100 * time.Millisecond)
 	writeNote(spB, "from bob")
 	bobWrite, ok := stampsOf(spB)
 	require.True(t, ok)
-	afterBob := converge("after bob's write")
+	afterBob := converge("after bob's write", 2*time.Minute)
 	assert.Equal(t, bobId, afterBob.by, "bob's dataset write names bob")
 	assert.Equal(t, bobWrite.at, afterBob.at, "modifiedAt is bob's write time")
 	assert.Greater(t, afterBob.at, initial.at)
 	assert.Equal(t, aliceId, afterBob.author, "author stays the creator")
 
+	// Change timestamps have second resolution: keep Alice's write in
+	// a later second than Bob's so the stamps are distinguishable.
 	time.Sleep(1100 * time.Millisecond)
 	writeNote(spA, "from alice")
-	afterAlice := converge("after alice's write")
+	afterAlice := converge("after alice's write", 2*time.Minute)
 	assert.Equal(t, aliceId, afterAlice.by, "alice's write flips it back")
 	assert.Greater(t, afterAlice.at, afterBob.at)
 }

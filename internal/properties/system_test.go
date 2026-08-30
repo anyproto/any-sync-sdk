@@ -607,37 +607,72 @@ func TestSystemPropertiesHandler_ModifiedAtClientWriteDropped(t *testing.T) {
 	assert.Equal(t, creatorAlice, rec.GetString("modifiedBy"), "handler stamp still lands at row root")
 }
 
-// Each stamp is gated on its own source: a change with no Creator
-// (hand-built, no tree) still moves modifiedAt and leaves modifiedBy
-// alone; a change with no Timestamp still moves modifiedBy.
-func TestSystemPropertiesHandler_ModifiedStampsGatedIndependently(t *testing.T) {
+// The pair always moves together: a change with no Creator (hand-
+// built, no tree) moves modifiedAt and unsets modifiedBy at the same
+// version, so the row never pairs a newer time with an older signer;
+// a change with no Timestamp stamps nothing.
+func TestSystemPropertiesHandler_ModifiedByUnsetWhenSignerUnknown(t *testing.T) {
 	ctrl := newPropsController(t, defaultRegistry())
 	arena := &anyenc.Arena{}
+	get := func() *anyenc.Value {
+		rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+		require.NotNil(t, rec)
+		return rec
+	}
 
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
 		"v1", 100, testObjectId, true,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
 	)))
-	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
-	require.NotNil(t, rec)
+	rec := get()
 	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"))
-	assert.Nil(t, rec.Get("modifiedBy"), "no Creator: modifiedBy not stamped")
+	assert.Nil(t, rec.Get("modifiedBy"), "no Creator: modifiedBy absent")
+	assert.Equal(t, crdt.VersionId("v1"), crdt.GetRecordVersion(rec, "modifiedBy"), "but versioned with modifiedAt")
 
 	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
-		"v2", 200, creatorBob, testObjectId, false,
+		"v3", 300, creatorBob, testObjectId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
 	)))
-	rec = ctrl.Get(context.Background(), properties.Dataset, testObjectId)
-	assert.EqualValues(t, 200, stampSecs(t, rec, "modifiedAt"))
-	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"), "first signed change seeds modifiedBy")
+	rec = get()
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
+	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"))
 
-	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
-		"v3", 0, creatorCarol, testObjectId, false,
+	// An older unsigned change arriving late loses both gates.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v2", 200, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("late")},
+	)))
+	rec = get()
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
+	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"), "older change must not split the pair")
+
+	// A newer unsigned change moves both: the signer becomes unknown.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v4", 400, testObjectId, false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("bye")},
 	)))
-	rec = ctrl.Get(context.Background(), properties.Dataset, testObjectId)
-	assert.EqualValues(t, 200, stampSecs(t, rec, "modifiedAt"), "no Timestamp: modifiedAt not stamped")
-	assert.Equal(t, creatorCarol, rec.GetString("modifiedBy"))
+	rec = get()
+	assert.EqualValues(t, 400, stampSecs(t, rec, "modifiedAt"))
+	assert.Nil(t, rec.Get("modifiedBy"), "unsigned change unsets modifiedBy")
+	assert.Equal(t, crdt.VersionId("v4"), crdt.GetRecordVersion(rec, "modifiedBy"))
+
+	// No Timestamp: nothing moves, signer or not.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v5", 0, creatorCarol, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(7)},
+	)))
+	rec = get()
+	assert.EqualValues(t, 400, stampSecs(t, rec, "modifiedAt"))
+	assert.Nil(t, rec.Get("modifiedBy"))
+}
+
+// stampPaths lists the paths of ops, for order-insensitive assertions.
+func stampPaths(ops []crdt.Op) [][]string {
+	paths := make([][]string, 0, len(ops))
+	for _, op := range ops {
+		paths = append(paths, op.Path)
+	}
+	return paths
 }
 
 // stampSecs reads a derived timestamp leaf as unix seconds, asserting it
@@ -689,9 +724,7 @@ func TestSystemPropertiesHandler_ModifiedAtBumpsOnDatasetWrite(t *testing.T) {
 	res, err := ctrl.ApplyChangeWithResult(context.Background(), notesWrite("v2", 200, creatorBob))
 	require.NoError(t, err)
 	require.Len(t, res.ObjectStamps, 1)
-	require.Len(t, res.ObjectStamps[0].Ops, 2)
-	assert.Equal(t, []string{"modifiedAt"}, res.ObjectStamps[0].Ops[0].Path)
-	assert.Equal(t, []string{"modifiedBy"}, res.ObjectStamps[0].Ops[1].Path)
+	assert.ElementsMatch(t, [][]string{{"modifiedAt"}, {"modifiedBy"}}, stampPaths(res.ObjectStamps[0].Ops))
 
 	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
 	require.NotNil(t, rec)

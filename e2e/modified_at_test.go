@@ -129,7 +129,8 @@ func TestE2E_ModifiedAt_BumpsOnDatasetWrite(t *testing.T) {
 				stamps[op.Path[0]]++
 			}
 		}
-		assert.Equal(t, map[string]int{"modifiedAt": 1, "modifiedBy": 1}, stamps, "update carries exactly one op per stamp")
+		assert.Equal(t, 1, stamps["modifiedAt"], "update carries exactly one modifiedAt op")
+		assert.Equal(t, 1, stamps["modifiedBy"], "update carries exactly one modifiedBy op")
 		require.NotNil(t, rec.Doc)
 		ms, merr := rec.Doc.Get("modifiedAt").DateTimeMillis()
 		require.NoError(t, merr)

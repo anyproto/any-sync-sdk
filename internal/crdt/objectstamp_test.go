@@ -85,6 +85,9 @@ func (rejectBadKeyHandler) BeforeModify(_ *ChangeCtx, _ *RecordChange, op *Op, _
 	return nil
 }
 
+// stampChange builds a change on dataset signed by "acct-<ver>", so
+// the stamper derives the modifiedAt / modifiedBy pair as the
+// production objects handler does.
 func stampChange(dataset string, ver VersionId, ts int64, recs ...RecordChange) Change {
 	return Change{
 		ObjectId:    stampObjectId,
@@ -92,9 +95,19 @@ func stampChange(dataset string, ver VersionId, ts int64, recs ...RecordChange) 
 		ChangeId:    "ch-" + string(ver),
 		VersionId:   ver,
 		Timestamp:   ts,
+		Creator:     "acct-" + string(ver),
 		DataVersion: dataset + "-v1",
 		Records:     recs,
 	}
+}
+
+// opPaths lists the paths of ops, for order-insensitive assertions.
+func opPaths(ops []Op) [][]string {
+	paths := make([][]string, 0, len(ops))
+	for _, op := range ops {
+		paths = append(paths, op.Path)
+	}
+	return paths
 }
 
 func setOp(a *anyenc.Arena, path, val string) Op {
@@ -139,8 +152,8 @@ func TestObjectStamp_DatasetWriteStampsSharedRow(t *testing.T) {
 	require.Len(t, res.ObjectStamps, 1)
 	assert.Equal(t, stampShared, res.ObjectStamps[0].Dataset)
 	assert.Equal(t, stampObjectId, res.ObjectStamps[0].RowId)
-	require.Len(t, res.ObjectStamps[0].Ops, 1)
-	assert.Equal(t, []string{"modifiedAt"}, res.ObjectStamps[0].Ops[0].Path)
+	assert.ElementsMatch(t, [][]string{{"modifiedAt"}, {"modifiedBy"}}, opPaths(res.ObjectStamps[0].Ops))
+	assert.Equal(t, "acct-v2", row.GetString("modifiedBy"))
 
 	// The notes record itself is untouched by the stamp.
 	rec := ctrl.Get(ctx, stampNotes, "r1")
@@ -161,9 +174,7 @@ func TestObjectStamp_MultiOpStampLandsAndReportsTogether(t *testing.T) {
 	res, err := ctrl.ApplyChangeWithResult(ctx, newer)
 	require.NoError(t, err)
 	require.Len(t, res.ObjectStamps, 1)
-	require.Len(t, res.ObjectStamps[0].Ops, 2)
-	assert.Equal(t, []string{"modifiedAt"}, res.ObjectStamps[0].Ops[0].Path)
-	assert.Equal(t, []string{"modifiedBy"}, res.ObjectStamps[0].Ops[1].Path)
+	assert.ElementsMatch(t, [][]string{{"modifiedAt"}, {"modifiedBy"}}, opPaths(res.ObjectStamps[0].Ops))
 	row := ctrl.Get(ctx, stampShared, stampObjectId)
 	assert.EqualValues(t, 300, row.Get("modifiedAt").GetFloat64())
 	assert.Equal(t, "acct-b", row.GetString("modifiedBy"))
@@ -178,6 +189,34 @@ func TestObjectStamp_MultiOpStampLandsAndReportsTogether(t *testing.T) {
 	row = ctrl.Get(ctx, stampShared, stampObjectId)
 	assert.EqualValues(t, 300, row.Get("modifiedAt").GetFloat64())
 	assert.Equal(t, "acct-b", row.GetString("modifiedBy"), "older change must not regress either stamp")
+}
+
+// Stamps on a row whose leaves sit at different versions can land one
+// op and lose another; only the ops that took the gate are reported,
+// since the live dispatcher ships reported payloads verbatim.
+func TestObjectStamp_SplitGateReportsOnlyTakenOps(t *testing.T) {
+	ctrl, _ := newStampFixture(t, notesSchema)
+	a := &anyenc.Arena{}
+	createObjectsRow(t, ctrl, "v1", 100)
+
+	// An unsigned change stamps modifiedAt alone (the test stamper
+	// derives modifiedBy only for a signed change).
+	unsigned := stampChange(stampNotes, "v5", 500, RecordChange{Id: "r1", Upsert: true, Ops: []Op{setOp(a, "text", "u")}})
+	unsigned.Creator = ""
+	res, err := ctrl.ApplyChangeWithResult(ctx, unsigned)
+	require.NoError(t, err)
+	require.Len(t, res.ObjectStamps, 1)
+	assert.Equal(t, [][]string{{"modifiedAt"}}, opPaths(res.ObjectStamps[0].Ops))
+
+	// An older signed change: modifiedAt loses to v5, modifiedBy lands.
+	res, err = ctrl.ApplyChangeWithResult(ctx, stampChange(stampNotes, "v3", 300,
+		RecordChange{Id: "r1", Ops: []Op{setOp(a, "text", "s")}}))
+	require.NoError(t, err)
+	require.Len(t, res.ObjectStamps, 1)
+	assert.Equal(t, [][]string{{"modifiedBy"}}, opPaths(res.ObjectStamps[0].Ops), "the gated-out modifiedAt is not reported")
+	row := ctrl.Get(ctx, stampShared, stampObjectId)
+	assert.EqualValues(t, 500, row.Get("modifiedAt").GetFloat64())
+	assert.Equal(t, "acct-v3", row.GetString("modifiedBy"))
 }
 
 func TestObjectStamp_MultiRecordChangeStampsOnce(t *testing.T) {
@@ -451,9 +490,6 @@ func benchDatasetWrite(b *testing.B, stamper bool) {
 		ver := VersionId("w" + padVersion(i))
 		ch := stampChange(stampNotes, ver, int64(i+3),
 			RecordChange{Id: "r1", Ops: []Op{setOp(a, "text", "t")}})
-		// A signed change: the stamper derives the modifiedAt /
-		// modifiedBy pair, as the production objects handler does.
-		ch.Creator = "acct-bench"
 		if err := ctrl.ApplyChange(ctx, ch); err != nil {
 			b.Fatal(err)
 		}

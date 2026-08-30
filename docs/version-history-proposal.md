@@ -164,8 +164,8 @@ hidden:
 **Caveats that bound the fast path:**
 
 - Handler hooks must not read *other records* during apply. Today they
-  only stamp envelope-derived fields (author/createdAt), which is
-  record-local. Make this an explicit invariant; any future handler
+  only stamp envelope-derived fields (author/createdAt/modifiedAt/
+  modifiedBy), which is record-local. Make this an explicit invariant; any future handler
   that breaks it must flag its dataset `DisableFilteredReplay`, forcing
   the slow path.
 - Apply paths that write sibling rows (e.g. shared `objects` dataset,

@@ -373,3 +373,54 @@ func TestReindex_StopSweepWithoutStart(t *testing.T) {
 	s.stopSweep()
 	s.stopSweep()
 }
+
+// A properties.LocalVersion bump marks the objects dataset stale on
+// every object built under the previous version; the rebuild's wipe
+// and replay land the current row shape (the modifiedBy stamp) and
+// re-stamp the handler version.
+func TestReindex_PropertiesVersionBumpRebuildsRow(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "reindex.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	s := &Store{db: db, spaceId: "spaceA"}
+	shared, err := s.SharedObjects(ctx)
+	require.NoError(t, err)
+	open := func(version int) *crdt.Controller {
+		ctrl, err := crdt.NewControllerWithShared(ctx, "obj1", db,
+			crdt.SharedCollections{properties.Dataset: shared},
+			crdt.HandlerReg{
+				Name: properties.Dataset, Handler: properties.New(nil),
+				Schema: schema.Dataset{Dynamic: true}, DynamicScopeByKey: true, Version: version,
+			},
+		)
+		require.NoError(t, err)
+		ctrl.SetSpaceId("spaceA")
+		return ctrl
+	}
+	a := &anyenc.Arena{}
+	create := crdt.Change{
+		SpaceId: "spaceA", ObjectId: "obj1", Dataset: properties.Dataset, ChangeId: "c1", VersionId: "v1",
+		Timestamp: 100, Creator: "acct-a", DataVersion: properties.HandlerVersion,
+		Records: []crdt.RecordChange{{Id: "obj1", Upsert: true, Ops: []crdt.Op{
+			{Type: crdt.OpSet, Path: []string{"any", "name"}, Payload: a.NewString("n")},
+		}}},
+	}
+
+	previous := open(properties.LocalVersion - 1)
+	require.NoError(t, previous.ApplyChange(ctx, create))
+	assert.Empty(t, previous.StaleDatasets())
+	// A row built under the previous version predates the stamp.
+	upsert(t, ctx, shared, "obj1", func(_ *anyenc.Arena, v *anyenc.Value) { v.Del("modifiedBy") })
+
+	current := open(properties.LocalVersion)
+	assert.Equal(t, []string{properties.Dataset}, current.StaleDatasets(), "rows built under the previous version are rebuilt")
+	require.NoError(t, s.wipeMaterialized(ctx, "obj1", current))
+	require.NoError(t, current.ResetForReindex(ctx, nil))
+	require.NoError(t, current.ApplyChange(ctx, create))
+
+	row := current.Get(ctx, properties.Dataset, "obj1")
+	require.NotNil(t, row)
+	assert.Equal(t, "acct-a", row.GetString("modifiedBy"), "the replay lands the stamp")
+	assert.Empty(t, open(properties.LocalVersion).StaleDatasets(), "the replay re-stamps the handler version")
+}

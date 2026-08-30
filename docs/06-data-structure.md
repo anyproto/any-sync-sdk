@@ -37,21 +37,33 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 >
 > **`modifiedAt` / `modifiedBy` are object-level.** They move on every
 > synced write to the object — a property write and a write to any of
-> its datasets (editor blocks, chat messages, runtime datasets) alike
-> — so `-modifiedAt` orders objects by their latest change, whatever
-> it touched, and `modifiedBy` names the account that signed that
-> change (resolve it to a profile through `SDK.Identities()`; `author`
-> stays the object's creator). The `objects` handler is a
-> `crdt.ObjectStamper`: a change on another dataset stamps the
-> object's row in the same transaction, with the change's VersionId
-> (LWW like any field). Both stamps come from the same change, so a
-> converged row always pairs the time with the signer of that very
-> change. Local- and account-route writes never move them; a row that
-> does not exist yet is not created by a stamp — it gets them when it
-> is created. That skip is order-dependent: a content change applied
-> before the row's creating change (a parked create draining later)
-> leaves the row with the creating change's stamps until the object's
-> next synced write.
+> its datasets (editor blocks, chat messages, runtime datasets) alike,
+> a record delete included — so `-modifiedAt` orders objects by their
+> latest change, whatever it touched, and `modifiedBy` names the
+> account that signed that change (`author` stays the creator). The
+> `objects` handler is a `crdt.ObjectStamper`: a change on another
+> dataset stamps the object's row in the same transaction, with the
+> change's VersionId (LWW like any field). One change stamps the pair
+> and it moves together, so a converged row pairs the time with the
+> signer of that very change; concurrent writers resolve by VersionId,
+> not by clock — the row names the ordering-max change's signer, which
+> need not be the one whose wall clock is latest. Local- and
+> account-route writes never move them. A row that does not exist yet
+> is not created by a stamp — it gets them when it is created
+> (order-dependent: a content change applied before the row's creating
+> change, a parked create draining later, leaves the row with the
+> creating change's stamps until the object's next synced write);
+> deleting the objects row itself does not move them, and a tombstoned
+> row keeps its last stamps.
+>
+> `modifiedBy` is an account id: resolve it through `Space.Members()`
+> for a current member or `SDK.Identities()` account-globally; it can
+> name an account since removed from the space. `modifiedAt` is
+> indexed (the default list sort), `modifiedBy` is not — filtering by
+> it scans the collection. An absent `modifiedBy` means the row was
+> built before the field existed and awaits its rebuild
+> (docs/08-versioning.md), or the latest change's signer is unknown —
+> never "nobody modified it".
 
 There is **no per-value override stack and no priority merge** — the
 earlier auto/base/account/device variant model (priority `device >
@@ -74,11 +86,20 @@ them disjoint — see CRDT spec §9).
 ```json
 {
   "id": "objectId",
+  "author": "accountId", "createdAt": { "$date": "…" },
+  "modifiedBy": "accountId", "modifiedAt": { "$date": "…" },
   "any":            { "name": "Heat" },
   "{movieTypeId}":  { "Y9Hxx5xmYmF": ["personA"], "EwyHGrtTdxB": 1995 },
   "_ver":           { "id": "…", "any": { "name": "…" } }
 }
 ```
+
+The derived built-ins are the one exception to the `{typeId}.{propId}`
+layout: `id`, `author`, `spaceId`, `createdAt`, `modifiedAt` and
+`modifiedBy` sit at the row root, not under `any.*`, although
+`Types().Properties("any")` lists them. Filter and sort them by their
+bare names (`{"modifiedBy": …}`, `sort: ["-modifiedAt"]`);
+`any.modifiedBy` matches nothing.
 
 In a shared space, account- and local-scoped values reflect THIS
 account/device — queries filtering on them select per-account /

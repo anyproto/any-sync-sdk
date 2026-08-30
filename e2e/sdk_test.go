@@ -520,11 +520,11 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	_, err = sp.Objects().Get(ctx, objectId)
 	require.ErrorIs(t, err, space.ErrObjectDeleted)
 
-	// A per-object op has to open the tree; a deleted or unknown id
-	// has none here, and both report ErrObjectNotFound so a consumer
-	// answers "not found" without matching any-sync storage errors.
+	// A per-object op has to open the tree, and the deleted object has
+	// none: ErrObjectNotFound, so a consumer answers "not found"
+	// without matching any-sync storage errors. (An id never seen here
+	// is fetched from peers first, so its failure mode is a transport
+	// error, not a local missing-tree one.)
 	_, err = sp.Query(objectId, "objects").Count(ctx)
-	require.ErrorIs(t, err, space.ErrObjectNotFound)
-	_, err = sp.Query("bafy-no-such-object", "objects").Count(ctx)
 	require.ErrorIs(t, err, space.ErrObjectNotFound)
 }

@@ -12,11 +12,15 @@ import (
 // from ErrNotFound: the id existed and is gone for good.
 var ErrObjectDeleted = errors.New("space: object deleted")
 
-// ErrObjectNotFound is returned by every per-object operation that has
-// to open the object's tree (record reads, writes, subscriptions,
-// history) when this device has no such tree: the id is unknown here,
-// or the object was deleted. One sentinel for both because the caller
-// can act on neither — the object is not addressable on this device.
+// ErrObjectNotFound is returned by a per-object operation that has to
+// open the object's tree — record reads, writes, history — when this
+// device has no such tree: the id is unknown here, or the object was
+// deleted. One sentinel for both because the caller can act on
+// neither — the object is not addressable on this device.
+//
+// Subscribe is the exception: an unknown object yields an empty initial
+// snapshot instead, so a subscription registered before the object
+// lands still receives its events.
 //
 // Distinct from ErrObjectDeleted, which ObjectService.Get raises for
 // the narrower "this id existed and is gone for good"; a consumer that

@@ -1818,7 +1818,9 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 			return tree, nil
 		}
 		if !errors.Is(err, treestorage.ErrTreeExists) {
-			return nil, fmt.Errorf("spaceobjects: PutTree %s: %w", objectId, err)
+			// PutTree checks the deleted status first, so a re-created
+			// id whose tree was deleted here reports it on this branch.
+			return nil, treeOpenError("PutTree", objectId, err)
 		}
 		// fall through to BuildTree on ErrTreeExists
 	}
@@ -1842,23 +1844,27 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 		})
 	}
 	if err != nil {
-		return nil, buildTreeError(objectId, err)
+		return nil, treeOpenError("BuildTree", objectId, err)
 	}
 	deferIfSyncTree(tree)
 	return tree, nil
 }
 
-// buildTreeError wraps a BuildTree failure, joining
+// treeOpenError wraps a failure to open an object's tree, joining
 // space.ErrObjectNotFound when the tree is unknown here or already
 // deleted — the two ways an object is not addressable on this device.
+// Both tree-open routes go through it: BuildTree reports a missing or
+// deleted tree, and PutTree reports a deleted one (it checks the
+// deleted status before creating storage).
+//
 // Consumers match that one sentinel at the API boundary instead of
 // any-sync's storage errors; the underlying error stays in the chain,
 // so callers branching on treestorage.ErrUnknownTreeId still match.
-func buildTreeError(objectId string, err error) error {
+func treeOpenError(op, objectId string, err error) error {
 	if errors.Is(err, treestorage.ErrUnknownTreeId) || errors.Is(err, spacestorage.ErrTreeStorageAlreadyDeleted) {
-		return fmt.Errorf("spaceobjects: BuildTree %s: %w: %w", objectId, space.ErrObjectNotFound, err)
+		return fmt.Errorf("spaceobjects: %s %s: %w: %w", op, objectId, space.ErrObjectNotFound, err)
 	}
-	return fmt.Errorf("spaceobjects: BuildTree %s: %w", objectId, err)
+	return fmt.Errorf("spaceobjects: %s %s: %w", op, objectId, err)
 }
 
 // deferIfSyncTree flips the SyncTree into deferred-updater mode (see

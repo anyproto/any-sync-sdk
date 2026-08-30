@@ -23,8 +23,9 @@ const (
 )
 
 // stampHandler is the shared dataset's handler: DefaultHandler plus an
-// ObjectStamper that stamps `modifiedAt` = the change Timestamp and
-// counts invocations.
+// ObjectStamper that stamps `modifiedAt` = the change Timestamp (and
+// `modifiedBy` = the change Creator when one is set) and counts
+// invocations.
 type stampHandler struct {
 	DefaultHandler
 	calls int
@@ -34,6 +35,9 @@ func (h *stampHandler) StampObject(ctx *ChangeCtx, sink *Sink) {
 	h.calls++
 	a := &anyenc.Arena{}
 	sink.DeriveOnce(Op{Type: OpSet, Path: []string{"modifiedAt"}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+	if ctx.Change.Creator != "" {
+		sink.DeriveOnce(Op{Type: OpSet, Path: []string{"modifiedBy"}, Payload: a.NewString(ctx.Change.Creator)})
+	}
 }
 
 // notesSchema declares one local and one account field next to the
@@ -142,6 +146,38 @@ func TestObjectStamp_DatasetWriteStampsSharedRow(t *testing.T) {
 	rec := ctrl.Get(ctx, stampNotes, "r1")
 	require.NotNil(t, rec)
 	assert.Nil(t, rec.Get("modifiedAt"))
+}
+
+// A stamper that derives several ops lands them as one row update
+// under one VersionId and reports them together; an out-of-order older
+// change loses the gate for all of them and reports none.
+func TestObjectStamp_MultiOpStampLandsAndReportsTogether(t *testing.T) {
+	ctrl, _ := newStampFixture(t, notesSchema)
+	a := &anyenc.Arena{}
+	createObjectsRow(t, ctrl, "v1", 100)
+
+	newer := stampChange(stampNotes, "v3", 300, RecordChange{Id: "r1", Upsert: true, Ops: []Op{setOp(a, "text", "b")}})
+	newer.Creator = "acct-b"
+	res, err := ctrl.ApplyChangeWithResult(ctx, newer)
+	require.NoError(t, err)
+	require.Len(t, res.ObjectStamps, 1)
+	require.Len(t, res.ObjectStamps[0].Ops, 2)
+	assert.Equal(t, []string{"modifiedAt"}, res.ObjectStamps[0].Ops[0].Path)
+	assert.Equal(t, []string{"modifiedBy"}, res.ObjectStamps[0].Ops[1].Path)
+	row := ctrl.Get(ctx, stampShared, stampObjectId)
+	assert.EqualValues(t, 300, row.Get("modifiedAt").GetFloat64())
+	assert.Equal(t, "acct-b", row.GetString("modifiedBy"))
+	assert.Equal(t, VersionId("v3"), GetRecordVersion(row, "modifiedAt"))
+	assert.Equal(t, VersionId("v3"), GetRecordVersion(row, "modifiedBy"))
+
+	older := stampChange(stampNotes, "v2", 200, RecordChange{Id: "r1", Upsert: true, Ops: []Op{setOp(a, "text", "a")}})
+	older.Creator = "acct-a"
+	res, err = ctrl.ApplyChangeWithResult(ctx, older)
+	require.NoError(t, err)
+	assert.Empty(t, res.ObjectStamps, "a gated-out stamp is not reported")
+	row = ctrl.Get(ctx, stampShared, stampObjectId)
+	assert.EqualValues(t, 300, row.Get("modifiedAt").GetFloat64())
+	assert.Equal(t, "acct-b", row.GetString("modifiedBy"), "older change must not regress either stamp")
 }
 
 func TestObjectStamp_MultiRecordChangeStampsOnce(t *testing.T) {
@@ -415,6 +451,9 @@ func benchDatasetWrite(b *testing.B, stamper bool) {
 		ver := VersionId("w" + padVersion(i))
 		ch := stampChange(stampNotes, ver, int64(i+3),
 			RecordChange{Id: "r1", Ops: []Op{setOp(a, "text", "t")}})
+		// A signed change: the stamper derives the modifiedAt /
+		// modifiedBy pair, as the production objects handler does.
+		ch.Creator = "acct-bench"
 		if err := ctrl.ApplyChange(ctx, ch); err != nil {
 			b.Fatal(err)
 		}

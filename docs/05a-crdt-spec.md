@@ -551,10 +551,10 @@ once per applied synced change on any *other* dataset of the object,
 after its records landed and only if the change wrote something; the
 ops it derives are applied to the object's row with the change's
 VersionId as a strict update (an absent or tombstoned row is left
-alone). This is how `modifiedAt` tracks writes to editor blocks, chat
-messages and runtime datasets, not just property writes. Local/account-
-route changes never trigger it — their versions belong to other
-domains. SDK-internal: consumer datasets cannot declare one.
+alone). This is how `modifiedAt` / `modifiedBy` track writes to editor
+blocks, chat messages and runtime datasets, not just property writes.
+Local/account-route changes never trigger it — their versions belong
+to other domains. SDK-internal: consumer datasets cannot declare one.
 
 ### 8.1 Registration
 

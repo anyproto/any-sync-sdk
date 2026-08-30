@@ -20,12 +20,14 @@ import (
 )
 
 // tsStamper is a shared-dataset handler whose only behavior is the
-// object stamp: modifiedAt = the change Timestamp.
+// object stamp pair: modifiedAt = the change Timestamp, modifiedBy =
+// the change Creator.
 type tsStamper struct{ crdt.DefaultHandler }
 
 func (tsStamper) StampObject(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	a := &anyenc.Arena{}
 	sink.DeriveOnce(crdt.Op{Type: crdt.OpSet, Path: []string{"modifiedAt"}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+	sink.DeriveOnce(crdt.Op{Type: crdt.OpSet, Path: []string{"modifiedBy"}, Payload: a.NewString(ctx.Change.Creator)})
 }
 
 type stampFixture struct {
@@ -67,13 +69,14 @@ func newStampFixture(t *testing.T) *stampFixture {
 	return &stampFixture{ctx: ctx, store: s, ctrl: ctrl, sub: sub}
 }
 
-// noteWrite applies a notes change and hands its stamps to the
-// dispatcher the way afterApplyFor does, with the given replay mode.
+// noteWrite applies a notes change signed by "acct-<ver>" and hands
+// its stamps to the dispatcher the way afterApplyFor does, with the
+// given replay mode.
 func (f *stampFixture) noteWrite(t *testing.T, ver crdt.VersionId, ts int64, replaying bool) {
 	t.Helper()
 	a := &anyenc.Arena{}
 	ch := crdt.Change{
-		ObjectId: stampObj, Dataset: "notes", ChangeId: "c-" + string(ver), VersionId: ver, Timestamp: ts, DataVersion: "notes-v1",
+		ObjectId: stampObj, Dataset: "notes", ChangeId: "c-" + string(ver), VersionId: ver, Timestamp: ts, Creator: "acct-" + string(ver), DataVersion: "notes-v1",
 		Records: []crdt.RecordChange{{Id: "r1", Upsert: true, Ops: []crdt.Op{{Type: crdt.OpSet, Path: []string{"text"}, Payload: a.NewString(string(ver))}}}},
 	}
 	res, err := f.ctrl.ApplyChangeWithResult(f.ctx, ch)
@@ -102,19 +105,21 @@ func (f *stampFixture) oneUpdate(t *testing.T) space.SubRecord {
 	return ev.Updated[0]
 }
 
-func stampOf(t *testing.T, rec space.SubRecord) float64 {
+// stampOf reads the stamp pair off an update event: the Doc values,
+// after checking the event carries exactly one op per stamped field.
+func stampOf(t *testing.T, rec space.SubRecord) (float64, string) {
 	t.Helper()
 	require.NotNil(t, rec.Doc)
 	v := rec.Doc.Get("modifiedAt")
 	require.NotNil(t, v)
-	stamps := 0
+	stamps := map[string]int{}
 	for _, op := range rec.Ops {
-		if len(op.Path) == 1 && op.Path[0] == "modifiedAt" {
-			stamps++
+		if len(op.Path) == 1 {
+			stamps[op.Path[0]]++
 		}
 	}
-	require.Equal(t, 1, stamps, "exactly one modifiedAt op")
-	return v.GetFloat64()
+	require.Equal(t, map[string]int{"modifiedAt": 1, "modifiedBy": 1}, stamps, "exactly one op per stamped field")
+	return v.GetFloat64(), rec.Doc.GetString("modifiedBy")
 }
 
 // A single write dispatches its stamp at once.
@@ -123,7 +128,9 @@ func TestObjectStamps_SingleWriteEmitsImmediately(t *testing.T) {
 	f.noteWrite(t, "v1", 200, false)
 	rec := f.oneUpdate(t)
 	assert.Equal(t, stampObj, rec.Id)
-	assert.EqualValues(t, 200, stampOf(t, rec))
+	at, by := stampOf(t, rec)
+	assert.EqualValues(t, 200, at)
+	assert.Equal(t, "acct-v1", by)
 	f.noEvent(t)
 }
 
@@ -139,7 +146,9 @@ func TestObjectStamps_ReplayBatchCoalesces(t *testing.T) {
 	f.store.flushObjectStamps(f.ctx, f.ctrl, stampObj)
 	rec := f.oneUpdate(t)
 	assert.Equal(t, stampObj, rec.Id)
-	assert.EqualValues(t, 400, stampOf(t, rec))
+	at, by := stampOf(t, rec)
+	assert.EqualValues(t, 400, at)
+	assert.Equal(t, "acct-v3", by, "the flush carries the batch's final values for every stamped field")
 	f.noEvent(t)
 
 	// Nothing pending: a second flush is a no-op.

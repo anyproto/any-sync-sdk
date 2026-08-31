@@ -91,10 +91,10 @@ func (s *Service) reconcileDeletions(ctx context.Context) {
 
 	// Read-frontier prune is coordinator-independent too: removed spaces'
 	// read/ rows in the tech-space KV are dead weight on every device and
-	// node (SYN-104), and joining re-seeds read state, so EVERY removed
-	// row qualifies — deleted, 1-1 deleted, and whatever removal statuses
-	// come later. Local-first (the watermark row syncs when connectivity
-	// allows) and a no-op once the prefix is empty.
+	// node (SYN-104), and joining re-seeds read state, so a removed space's
+	// frontiers have no restore value. Gated on synced removal markers only
+	// (shouldPruneReadState) — local-first, in that the watermark row syncs
+	// when connectivity allows, and a no-op once the prefix is empty.
 	s.pruneRemovedSpacesReadState(ctx, rows)
 
 	ids := make([]string, len(rows))
@@ -147,6 +147,8 @@ func (s *Service) offloadDeletedOneToOnes(ctx context.Context, rows []techspace.
 // device must never drive an account-wide destructive watermark for a
 // space the rest of the account actively uses. User-initiated Delete
 // stamps the synced RemoteStatus, so it qualifies immediately.
+// A closed switch on purpose: a new removal status must be added here
+// deliberately, having been checked for the device-local hazard above.
 func shouldPruneReadState(r techspace.SpaceIndexRecord) bool {
 	switch r.RemoteStatus {
 	case techspace.StatusDeleted, techspace.OneToOneDeletedStatus, techspace.GuestDeletedRemoteStatus:

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -26,11 +27,60 @@ import (
 // peer.
 const WellKnownDeriveSeed = "builtin:type"
 
+// MetaTypeMarker is the reserved label every type object carries in
+// its `any.types` list — what distinguishes a type object from a
+// regular one (see spaceobjects.LiveTypeRowsFilter).
+//
+// TypeId is the meta-type's id: the namespace its type-only property
+// values live under (`record.type.xkey`) and the id surfaced through
+// Space.Types(). The two differ because a `_`-prefixed top-level field
+// is protocol-owned (crdt.validatePath), so the marker cannot double
+// as a storage namespace.
+//
+// Both are reserved — user-derived type ids are content-addressable
+// and never produce either string.
+const (
+	MetaTypeMarker = "__type__"
+	TypeId         = "type"
+)
+
 // Display metadata for the `type` meta-type object.
 const (
 	Name        = "Type"
 	Description = "A type — defines properties (and optionally datasets) for the objects that implement it"
 )
+
+// FieldXKeyProp is the property id of the meta-type's `xkey` — the
+// caller-side programmatic handle for the type itself, stored at
+// `record.type.xkey`. Distinct from FieldXKey (`x-key`), which is the
+// same idea one level down, on a property DEFINITION record.
+const FieldXKeyProp = "xkey"
+
+// BuiltInProperty is one hardcoded property definition. Same shape as
+// anytype.BuiltInProperty so the types registry surfaces built-ins
+// uniformly with user-defined types.
+type BuiltInProperty struct {
+	Id    string
+	Name  string
+	Kind  schema.Kind
+	Scope schema.Scope
+}
+
+// Properties lists the meta-type's hardcoded property definitions —
+// the values that are meaningful only on a type object. They live in
+// the `type` namespace rather than `any` so the membership check in
+// properties.SystemPropertiesHandler fences them off: a row that
+// doesn't carry the marker cannot hold them at all.
+//
+// The `objects` DataVersion is deliberately NOT bumped for the move
+// off `any.xkey`: a peer that doesn't know a version parks every
+// change for that dataset, so bumping would halt all property sync
+// with older peers to protect one field. Mixed versions instead drop
+// the unknown-namespace op per-op — the type's other metadata still
+// applies, and its xkey resolves on upgraded peers only.
+var Properties = []BuiltInProperty{
+	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced},
+}
 
 // DatasetPropertyDefs is the dataset on a type object that holds its
 // property-*definition* records (id, name, kind, ...). On disk the
@@ -49,12 +99,26 @@ const DatasetPropertyDefs = "properties"
 // rules ever change in a way that must reject stale writers.
 const HandlerVersion = "typePropertyHandler-v1"
 
+// PropertyHandlerLocalVersion is this handler's LOCAL logic version
+// (HandlerReg.Version) — bumped when a validation change means an
+// already-materialized set of definitions would come out different, so
+// the SDK replays the type object's tree (docs/08-versioning.md).
+//
+// It is also how a peer recovers definitions its previous build dropped:
+// the wire DataVersion deliberately stays put (bumping it would park
+// every property change on peers that don't know the new version — see
+// the Properties note above), so an older build rejects a definition it
+// cannot validate, and the replay after the upgrade applies it.
+//
+// v2: `datetime` is a kind, and the date formats accept it.
+const PropertyHandlerLocalVersion = 2
+
 // Property-record field names. The shape is hardcoded in Go (no JSON
 // Schema applies on this dataset — see
 // docs/types-properties-proposal.md § "Schema format — decision").
 const (
 	FieldKey         = "key"         // user-facing stable identifier (e.g. "actors")
-	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"
+	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"/"datetime"
 	FieldScope       = "scope"       // "synced"/"account"/"local" — write/sync class, pinned
 	FieldName        = "name"        // human label, mutable
 	FieldDescription = "description" // mutable
@@ -93,17 +157,22 @@ const (
 	OptionKeyMeta  = "meta"  // per-option opaque bag (string→string), mutable
 )
 
-// formatTypeKindLabel maps each known format-type label to the `kind`
-// label it requires. The SDK checks only this structural coupling —
-// format semantics (ui vocabulary, filter syntax, value shapes) are a
-// consumer concern.
-var formatTypeKindLabel = map[string]string{
-	"links":       "array",
-	"date":        "string",
-	"datetime":    "string",
-	"tags":        "array",
-	"select":      "string",
-	"multiselect": "array",
+// formatTypeKinds maps each known format-type label to the `kind`
+// labels it accepts, first one canonical. The SDK checks only this
+// structural coupling — format semantics (ui vocabulary, filter syntax,
+// value shapes) are a consumer concern.
+//
+// The date formats accept two: `datetime` for the native instant, and
+// `string` for the ISO-8601 convention they carried before instants
+// existed. Kind is pinned for the life of a property, so properties
+// created under the old rule keep working exactly as they did.
+var formatTypeKinds = map[string][]string{
+	"links":       {"array"},
+	"date":        {"datetime", "string"},
+	"datetime":    {"datetime", "string"},
+	"tags":        {"array"},
+	"select":      {"string"},
+	"multiselect": {"array"},
 }
 
 // schemaBearingFields are pinned for the life of the property record.
@@ -240,13 +309,14 @@ func validateFormatCreate(ops []crdt.Op, kindLabel string) error {
 		return fmt.Errorf("%w: %w: missing or non-string `format.type`", crdt.ErrValidation, ErrBadFormatShape)
 	}
 	typeLabel := string(typeVal.GetStringBytes())
-	requiredKind, known := formatTypeKindLabel[typeLabel]
+	acceptedKinds, known := formatTypeKinds[typeLabel]
 	if !known {
 		return fmt.Errorf("%w: %w (got %q)", crdt.ErrValidation, ErrBadFormatType, typeLabel)
 	}
-	if kindLabel != requiredKind {
-		return fmt.Errorf("%w: %w: format %q requires kind %q, got %q",
-			crdt.ErrValidation, ErrFormatKindMismatch, typeLabel, requiredKind, kindLabel)
+	if !slices.Contains(acceptedKinds, kindLabel) {
+		return fmt.Errorf("%w: %w: format %q requires kind %s, got %q",
+			crdt.ErrValidation, ErrFormatKindMismatch, typeLabel,
+			strings.Join(acceptedKinds, " or "), kindLabel)
 	}
 	for _, key := range []string{FormatKeyUi, FormatKeyFilter} {
 		if v := format.Get(key); v != nil && v.Type() != anyenc.TypeString {

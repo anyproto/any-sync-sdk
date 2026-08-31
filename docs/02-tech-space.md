@@ -1,13 +1,14 @@
 # Tech Space
 
 ## Vision
-A derived space (deterministic from account key) that stores account-level data. One tech space per account. Hidden from the public SDK API — callers interact through dedicated methods, never with the space directly.
+A derived space (deterministic from account key) that stores account-level data. One tech space per account. Never listed; reachable as a restricted `Space` handle through `Spaces().Get(SDK.TechSpaceId())` for account-level bundles, otherwise used through dedicated methods.
 
 ## Key Decisions
 - **Derived** — created on first login if not on device; deterministic ID from account key, always re-derivable
 - **Derived ACL** — owner-only, network denies any new ACL changes. No shared accounts possible
-- **Hidden** — not exposed as a `Space` in SDK API, only through purpose-specific methods
-- **Same CRDT** — uses the same version-gated record store CRDT as regular spaces
+- **Restricted handle** — `Spaces().Get(SDK.TechSpaceId())` returns a `Space` (a dedicated `techSpace` type delegating explicitly to the regular implementation over the tech Store) that supports reads (`Query` — except `identities` on the index object, whose rows carry the profile-decryption `symKey`: `ErrUnsupported`, read them via `SDK.Identities()` — `QueryObjects`, `Aggregate`, `Datasets`, `Objects().Get`, `Types()` reads), dataset declarations on bundle roots only (`Types().AddDataset` / `AddDatasetField` / `RemoveDataset*` / `PatchDataset` refuse any `typeId` that is not a self-typed bundle root), `Bundles()` (`Datasets` required, roots minted by `Ensure` — derived or SDK-created; no `NewRoot`, no `RootTypes` / `RootProperties`; `ResolveLoser` wired), generic record writes (`Modify` / `ModifyMany` / `Delete` / `Upsert`) to bundle datasets only — the datasets a bundle root declared; the type-system built-ins (`objects`, `properties`, `shortIds`, `datasets`) and the system datasets (`spaces`, `profile`, `inboxCursor`, `identities`, `devices`, `account_values`) are readable but refuse generic writes — `Info()` (synthetic: owner-only, derived, `any.techspace`), `SyncStatus`, `Debug`, `SyncHeads`, `TreeHeads`, `WaitIndexSynced` (= `WaitListSynced`). `Objects().Delete` works on bundle roots only (uninstall of a created winner; derived roots refuse at the object layer). Everything else — `Objects().Create/Derive`, `Types().Create/Delete` and property definitions, `Properties()`, `Members()`, `ACL()`, `Files()`, `History()`, `ReadState()`, `PubSub()`, `Changes()`, `SetMetadata` — returns `space.ErrUnsupported`; the four `Subscribe`-style methods without an error return (`Members` / `Files` / `ReadState` / `Changes`) are inert no-ops. The handle never appears in `List` / `Subscribe`; `Delete` / `Track` refuse it (`ErrIsTechSpace`). See `bundles.md § Tech-space bundles`
+- **Rollout** — a device on an SDK build that still ran the raw tech Store (no gate, six handlers) cannot apply a `bundles` change on the tech index object: its index replay stops at that change and its space list freezes until it upgrades. Install the first tech bundle only once every device of the account runs a build with this Store path
+- **Same CRDT, same Store** — the tech space runs the regular `spaceobjects.Store` path (type registry, `<techSpaceId>_objects` collection, built-in handlers, runtime dataset catalog, schema gate). Its own datasets (`spaces`, `profile`, `inboxCursor`, `identities`, `devices`, `account_values`) are registered as type-less system built-ins (`StoreConfig.SystemDatasets`, `techspace.SystemDatasets()`), ungated like `payloads`/`bundles`. The index object and the account-values carriers carry no `objects` row. History indexing is off (`DisableHistory`): there is no tech-space history surface
 - **any-store first** — all data lives in any-store, SDK reads DB + listens to event flow, not in-memory state
 - **ocache pattern** — any-sync `CommonSpace` managed via ocache (like any-sync-node), init/close by activity. SDK doesn't depend on space being loaded in memory
 - **Sync priority** — tech space syncs first on startup, but sync is continuous (decentralized, never "done")
@@ -24,7 +25,7 @@ Records with fields:
 - `icon` — space icon
 - `localStatus` — local state
 - `remoteStatus` — remote state
-- `createdAt` — added-to-account time (unix seconds). Handler-derived
+- `createdAt` — added-to-account time, a `datetime` instant. Handler-derived
   (`ScopeDerived`): `SpaceIndexHandler.BeforeCreate` stamps it from the
   creating change's timestamp when the row first lands — Create for the
   author, Join for a joiner — so it's per-account, immutable, and
@@ -80,6 +81,18 @@ Records with fields:
   before the clear synced) is hidden by the read paths, which verify it
   against live ACL state before returning it. Distinct from `guestKey` so an
   issuer's own row never reads as guest-mode.
+- `derived` — synced (`ScopeSynced`) set-once bool: marks a row written by the
+  account's own `Spaces().Derive` (stamped at row create; healed onto a
+  pre-existing unflagged row by re-running Derive — `SetDerived`). Gates every
+  delete refusal for derived spaces (why they are permanent:
+  `space.ErrIsDerivedSpace`): `Service.Delete` refuses flagged rows, the
+  handler additionally rejects `remoteStatus=deleted` on them from ANY writer
+  (so a pre-flag peer's synced tombstone is dropped on apply), and the
+  deletion reconciler skips them entirely — a coordinator `NotExists` is
+  expected for a space derived offline before its first push and must not
+  tombstone the row. Pinned once true (the handler drops later edits, like
+  `type`). Absent on created / joined / tracked / 1-1 rows; surfaced as
+  `SpaceInfo.Derived`.
 - etc.
 
 ### Account Preferences (derived object, postponed)
@@ -99,6 +112,36 @@ device). See `docs/14-identities.md`.
 The tech space also hosts two account-scoped helper datasets: `profile` (the
 account's own profile, republished to identityRepo on boot) and `inboxCursor`
 (the synced 1-1 inbox read position — see `docs/13-one-to-one-spaces.md`).
+
+### Devices registry (`devices` dataset, SYN-165)
+One row per device of the account, keyed by the device's libp2p **peer id**
+(`SDK.PeerId()`). All fields **synced**: `name`, `os`, `version`, `apps`
+(free-form object keyed by app slug — presence = installed; slugs are an open
+set, nothing app-specific is hardcoded) and `activeClaims` (per-slug
+`{seq, at}` claims). Online status deliberately does not live here (KV /
+event-bus territory).
+
+System-owned like the space list: reads go through the generic dataset surface
+(`Spaces().Query(SpaceIndexObjectId(), "devices")` / `ListDevices`), writes
+only through the typed methods — `SetDevice` (self-row-only by construction:
+the row id is always the local peer id), `ClaimActive`, `DeleteDevice`.
+
+**Active-app election** — semantics live in the reader, not the write. A claim
+is writer-supplied `{seq: max+1, at: now}` data, NOT a CRDT version id
+(version ids are peer-locally allocated and not comparable across devices).
+Every consumer resolves the winner with the single rule implementation,
+`space.ActiveDevice`: among live rows with the app installed, highest `seq`
+wins, ties broken by highest `at`, then largest peer id. There is no un-claim;
+only a higher claim or a row deletion moves the winner. `DeleteDevice`
+tombstones are sticky — a pruned peer id can never re-register — so the local
+device's own row is refused (`ErrDeviceSelfDelete`: prune from another device),
+and a pruned device's later `SetDevice`/`ClaimActive` writes surface
+`ErrDevicePruned` instead of silently no-oping into the tombstone. Claims are
+decoded strictly (numeric integer `seq >= 1`, at most 2^53) so a malformed or
+out-of-range claim reads as absent on every architecture instead of electing
+different winners. Known v1 limit: `seq` is minted from the claiming replica's
+view, so a claim made on a stale (not-yet-synced) device can lose to an older
+unseen claim once heads converge — claims are cheap, re-claim after sync.
 
 ## Current any-sync Implementation
 

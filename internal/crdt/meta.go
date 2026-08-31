@@ -52,6 +52,13 @@ const (
 	// consumer uses to detect a renumbered applySeq axis and full-reindex.
 	metaGenerationKey = "gen"
 
+	// metaReindexLocalKey holds the local-scope leaves captured for a
+	// re-index that has not finished restoring them (reindex.go). Written
+	// in the same upsert as the watermark rewind, cleared by
+	// PersistVersions once the leaves are back — while it is present the
+	// object's rebuild is in flight and the next load resumes it.
+	metaReindexLocalKey = "rl"
+
 	// spaceMetaKeyPrefix namespaces space-scoped rows inside the same
 	// _meta collection. Colon is not a valid char in any-sync's
 	// content-addressable object IDs, so "space:<id>" rows can't
@@ -85,14 +92,28 @@ func SpaceMetaKey(spaceId string) string { return spaceMetaKeyPrefix + spaceId }
 // LoadMeta reads the per-object metadata from the _meta collection.
 // Returns zero values if the document doesn't exist yet.
 func LoadMeta(ctx context.Context, coll anystore.Collection, objectId string) (maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int, err error) {
-	doc, findErr := coll.FindId(ctx, objectId)
-	if findErr != nil {
-		if errors.Is(findErr, anystore.ErrDocNotFound) {
-			return 0, 0, nil, nil
-		}
-		return 0, 0, nil, findErr
+	v, err := loadMetaRow(ctx, coll, objectId)
+	if err != nil || v == nil {
+		return 0, 0, nil, err
 	}
-	v := doc.Value()
+	maxAddSeq, maxApplySeq, handlerVersions = decodeMetaRow(v)
+	return maxAddSeq, maxApplySeq, handlerVersions, nil
+}
+
+// loadMetaRow reads one _meta row; nil (no error) when it doesn't exist.
+// The returned value is only valid until the next call on the collection.
+func loadMetaRow(ctx context.Context, coll anystore.Collection, objectId string) (*anyenc.Value, error) {
+	doc, err := coll.FindId(ctx, objectId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return doc.Value(), nil
+}
+
+func decodeMetaRow(v *anyenc.Value) (maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int) {
 	maxAddSeq = uint64(v.GetInt(metaAddSeqKey))
 	maxApplySeq = uint64(v.GetInt(metaApplySeqKey))
 	if hv := v.Get(metaHandlerVersionsKey); hv != nil && hv.Type() == anyenc.TypeObject {
@@ -104,17 +125,24 @@ func LoadMeta(ctx context.Context, coll anystore.Collection, objectId string) (m
 			}
 		})
 	}
-	return maxAddSeq, maxApplySeq, handlerVersions, nil
+	return maxAddSeq, maxApplySeq, handlerVersions
 }
 
 // PersistMeta writes per-object metadata to the _meta collection. Call
 // inside the same WriteTx as the record mutations for atomicity.
 //
 // spaceId scopes the row for the change-index query; pass "" to leave it
-// unset (unit tests, raw mode without a space). An unset row is
+// unset (unit tests without a space). An unset row is
 // invisible to QueryChangedObjects, which is the accepted lazy-backfill
 // behaviour.
 func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string, maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int, spaceId string) error {
+	return persistMeta(ctx, coll, objectId, maxAddSeq, maxApplySeq, handlerVersions, spaceId, nil)
+}
+
+// persistMeta is PersistMeta with an optional extra mutation applied to
+// the row in the same upsert — the re-index path uses it to write and
+// clear its captured local leaves atomically with the watermark.
+func persistMeta(ctx context.Context, coll anystore.Collection, objectId string, maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int, spaceId string, extra func(a *anyenc.Arena, v *anyenc.Value)) error {
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set(metaAddSeqKey, a.NewNumberInt(int(maxAddSeq)))
 		if maxApplySeq > 0 {
@@ -129,6 +157,9 @@ func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string,
 				hv.Set(name, a.NewNumberInt(ver))
 			}
 			v.Set(metaHandlerVersionsKey, hv)
+		}
+		if extra != nil {
+			extra(a, v)
 		}
 		return v, true, nil
 	})
@@ -328,13 +359,18 @@ func (c *Controller) PersistMeta(ctx context.Context, metaColl anystore.Collecti
 // Controller's maxAddSeq, and returns the stored handler versions so the
 // caller can compare them with current versions for re-indexing decisions.
 func (c *Controller) LoadAndSeedMeta(ctx context.Context, metaColl anystore.Collection) (handlerVersions map[string]int, err error) {
-	maxAddSeq, maxApplySeq, hv, err := LoadMeta(ctx, metaColl, c.objectId)
-	if err != nil {
+	v, err := loadMetaRow(ctx, metaColl, c.objectId)
+	if err != nil || v == nil {
 		return nil, err
 	}
-	c.maxAddSeq = maxAddSeq
-	c.maxApplySeq = maxApplySeq
-	return hv, nil
+	c.maxAddSeq, c.maxApplySeq, handlerVersions = decodeMetaRow(v)
+	// An in-flight rebuild left its captured local leaves on the row;
+	// copied out because the row buffer dies with the read.
+	if rl := v.Get(metaReindexLocalKey); rl != nil {
+		c.reindexPending = true
+		c.reindexLocal = rl.MarshalTo(nil)
+	}
+	return handlerVersions, nil
 }
 
 // LoadSpaceMaxAddSeq reads the persisted space-level head-store

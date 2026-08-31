@@ -122,6 +122,13 @@ Used only for the detached-changes gating decision ("do I have the schema state 
 
 For data datasets in Phase 1, the "known versions" are a hardcoded allowlist compiled into the SDK — same shape of lookup, different source of truth.
 
+Runtime dataset definitions (docs/17-user-datasets.md) ride this exact
+machinery: the type's `datasets` dataset projects rows into the SAME
+shortIds collection (a `src: "datasets"` discriminator, `defId` in
+place of `propId`), so one `typeId:latestShortId` stamp gates data
+changes against the type's whole schema state — property definitions
+and dataset definitions alike — with no gate changes.
+
 ### Decision rule in `ApplyChange`
 
 1. `DataVersion` empty → **reject** (whole change).
@@ -174,7 +181,12 @@ Detached changes whose `DataVersion` never arrives stay in the collection indefi
 ## Schema format — decision
 
 - **Format**: JSON-Schema-like minimal subset. v1 record fields: `kind` (on every node), `items` (on arrays), `properties` (on objects). Other keywords (`enum`, `required`, `additionalProperties`, `default`) are deferred; added when a concrete need appears.
-- **Supported kinds** in v1: `string`, `number`, `boolean`, `null`, `array`, `object`.
+- **Supported kinds** in v1: `string`, `number`, `boolean`, `null`, `array`, `object`, `datetime`.
+  `datetime` is any-store's native instant (unix millis, memcmp-orderable, index-keyable,
+  `{"$date": …}` in JSON) — the shape the date operators compute on. The `date` /
+  `datetime` FORMATS imply it; they also still accept `kind: string` for the ISO-8601
+  convention they carried before instants existed, and kind is pinned for the life of a
+  property, so properties created under the old rule keep working.
 - **Recursive validation**: arrays with an `items` sub-schema check every element; objects with a `properties` map check every field and reject unknown fields. Arrays/objects without these keywords pass a shallow kind check only (any element / any shape). Progressive disclosure — simple schemas stay simple.
 - **Validator**: custom, operates natively on `*anyenc.Value`. No conversion between anyenc and `interface{}`/JSON on the validation path — validation runs on every write op, so the hot path must be allocation-free for scalar success cases. Schema is compiled once from property records.
 - **Duplicate keys in input**: last-wins. Writers resolve conflicts client-side before committing property changes; the validator doesn't police it.

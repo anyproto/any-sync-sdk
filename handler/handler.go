@@ -155,7 +155,24 @@ type Dataset struct {
 	// way that must reject older writers.
 	DataVersion string
 
+	// HandlerVersion is the LOCAL version of this dataset's handler
+	// logic. Bump it when a change to that logic makes rows already
+	// materialized on disk wrong — a derived field that now holds a
+	// different shape, a stamp computed differently. The next load of
+	// each object wipes its materialized rows and replays its tree
+	// through the current handlers. Zero means 1.
+	//
+	// This is not DataVersion. DataVersion gates PEERS: bumping it parks
+	// this dataset's changes on every peer still running older code.
+	// HandlerVersion never leaves the device and gates nothing — it only
+	// decides whether local state has to be rebuilt.
+	HandlerVersion int
+
 	// Handler implements the dataset's lifecycle (Init / Before*).
+	// Optional when Schema declares fields: a nil Handler gets the SDK's
+	// generic schema handler, which enforces the declaration (required,
+	// mutability, stamps, id rules, delete gates) with no bespoke code.
+	// Bespoke handlers remain for cross-field rules.
 	Handler Handler
 
 	// Indexes are ensured on the dataset's collection the first time it
@@ -258,6 +275,41 @@ const (
 // the schema.Scope label vocabulary.
 func ParseScope(label string) (Scope, bool) { return schema.ParseScope(label) }
 
+// Behavioral schema vocabulary, re-exported from the SDK's schema layer.
+// A dataset whose declaration uses these and leaves Dataset.Handler nil
+// gets the SDK's generic schema handler: required-on-create, write-once /
+// author-gated mutability, apply-time stamps, id rules, and delete gates
+// enforced without bespoke handler code.
+type (
+	// Mutability is a field's post-create write rule (zero = write-once).
+	Mutability = schema.Mutability
+	// Stamp marks a field derived from the change at apply time.
+	Stamp = schema.Stamp
+	// IdRule declares how record ids are produced (zero = auto-derived).
+	IdRule = schema.IdRule
+	// DeletePolicy is the dataset-level record-delete gate.
+	DeletePolicy = schema.DeletePolicy
+	// SearchFields is the dataset's search-extraction annotation.
+	SearchFields = schema.SearchFields
+)
+
+const (
+	MutableNever    = schema.MutableNever
+	MutableByAuthor = schema.MutableByAuthor
+	MutableByAnyone = schema.MutableByAnyone
+
+	StampNone       = schema.StampNone
+	StampCreator    = schema.StampCreator
+	StampCreateTime = schema.StampCreateTime
+	StampModifyTime = schema.StampModifyTime
+
+	IdAuto = schema.IdAuto
+	IdUser = schema.IdUser
+
+	DeleteByAnyone = schema.DeleteByAnyone
+	DeleteByAuthor = schema.DeleteByAuthor
+)
+
 // Leaf builds an unconstrained scalar value shape for a PropertyKind —
 // convenience for declaring simple Field shapes.
 func Leaf(k PropertyKind) *FieldShape { return schema.Leaf(schema.Kind(k)) }
@@ -328,6 +380,11 @@ const (
 	PropertyKindNull
 	PropertyKindArray
 	PropertyKindObject
+	// PropertyKindDatetime is an instant, stored as any-store's native
+	// TypeDateTime (unix millis, orderable, index-keyable, `{"$date": …}`
+	// in JSON) rather than as a string or an epoch number — the shape
+	// any-store's date operators compute on.
+	PropertyKindDatetime
 )
 
 // PropertyDecl is one property definition declared by an external

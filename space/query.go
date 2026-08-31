@@ -21,6 +21,10 @@ type Query interface {
 	// mongo-style operators ($eq, $gt, $in, $and, $or, …). The
 	// argument is parsed eagerly; a malformed filter surfaces on the
 	// first terminal call (Iter / All / One / Count), not silently.
+	// A map literal is converted like a record value (see Op.Value):
+	// a time.Time or []byte in it is typed, and a {"$date": …}
+	// literal is an instant, so a datetime field is filtered by either
+	// spelling.
 	Filter(filter any) Query
 
 	// Sort orders results by the given keys. Anything query.ParseSort

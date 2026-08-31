@@ -183,6 +183,15 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 	if st == nil {
 		return
 	}
+	if row.Derived {
+		// Derived rows never participate in deletion reconciliation
+		// (space.ErrIsDerivedSpace): inbound, a coordinator NotExists is
+		// expected for a space derived offline whose first push hasn't
+		// registered yet — tombstoning it would wedge the well-known id
+		// (and the handler rejects the write anyway); outbound, a
+		// derived row can never be locally deleted.
+		return
+	}
 	locallyDeleted := row.RemoteStatus == techspace.StatusDeleted
 
 	switch decideReconcile(locallyDeleted, st) {

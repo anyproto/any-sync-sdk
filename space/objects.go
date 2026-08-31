@@ -1,11 +1,45 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
 
-// ObjectService is the object lifecycle surface on a space.
-// Create/Derive/Delete only — reads, writes, and subscriptions happen
-// at the space level keyed by objectId.
+	"github.com/anyproto/any-store/v2/anyenc"
+)
+
+// ErrObjectDeleted is returned by ObjectService.Get for an object
+// whose tree any-sync records as deleted — here or on a peer. Distinct
+// from ErrNotFound: the id existed and is gone for good.
+var ErrObjectDeleted = errors.New("space: object deleted")
+
+// ErrObjectNotFound is returned by a per-object operation that has to
+// open the object's tree — record reads, writes, history — when this
+// device has no such tree: the id is unknown here, or the object was
+// deleted. One sentinel for both because the caller can act on
+// neither — the object is not addressable on this device.
+//
+// Subscribe reports it for a DELETED object but not for an unknown one:
+// an id with no tree here yields an empty initial snapshot instead, so a
+// subscription registered before the object lands still receives its
+// events. Handle the sentinel on the subscribe path too.
+//
+// Distinct from ErrObjectDeleted, which ObjectService.Get raises for
+// the narrower "this id existed and is gone for good"; a consumer that
+// needs the distinction reads the row through Get.
+var ErrObjectNotFound = errors.New("space: object not found")
+
+// ObjectService is the object lifecycle surface on a space, plus the
+// single-object row read. Record reads, writes and subscriptions
+// happen at the space level keyed by objectId.
 type ObjectService interface {
+	// Get returns the object's row from the per-space objects
+	// collection (any.types and property values). An object whose tree
+	// is present locally but that never wrote a row returns {id} only;
+	// ErrNotFound when the id is unknown here, ErrObjectDeleted when
+	// the object's tree is deleted — both read from the space's
+	// any-sync storage.
+	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
+
 	// Create a fresh object. Returns the any-sync-assigned objectId.
 	// Types attached here seed the object's any.types list at birth;
 	// InitialProperties seeds the per-space properties record.

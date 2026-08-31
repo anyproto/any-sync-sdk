@@ -224,6 +224,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{
 		Name:        "Movie",
 		Description: "A film",
+		XKey:        "movie",
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, typeId)
@@ -293,22 +294,46 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	}
 	assert.True(t, saw, "any.types must contain %s", typeId)
 
-	// Types.List returns the two synthetic built-ins (`any`,
-	// `spaceIndex`) plus the user-created Movie type, in that order.
+	// Types.List returns the three synthetic built-ins (`any`,
+	// `spaceIndex`, `type`) plus the user-created Movie type, in
+	// that order.
 	typeList, err := sp.Types().List(ctx)
 	require.NoError(t, err)
-	require.Len(t, typeList, 3)
+	require.Len(t, typeList, 4)
 	assert.Equal(t, "any", typeList[0].Id)
 	assert.True(t, typeList[0].BuiltIn)
 	assert.Equal(t, "spaceIndex", typeList[1].Id)
 	assert.True(t, typeList[1].BuiltIn)
-	assert.Equal(t, typeId, typeList[2].Id)
-	assert.Equal(t, "Movie", typeList[2].Name)
+	assert.Equal(t, "type", typeList[2].Id)
+	assert.True(t, typeList[2].BuiltIn)
+	assert.Equal(t, typeId, typeList[3].Id)
+	assert.Equal(t, "Movie", typeList[3].Name)
+	assert.Equal(t, "movie", typeList[3].XKey)
 
-	// Types.Get on the typeId returns the user-created row.
+	// Types.Get on the typeId returns the user-created row. XKey lives
+	// in the meta-type namespace (`type.xkey`) and round-trips.
 	tinfo, err := sp.Types().Get(ctx, typeId)
 	require.NoError(t, err)
 	assert.Equal(t, "Movie", tinfo.Name)
+	assert.Equal(t, "movie", tinfo.XKey)
+
+	// A type object is an ordinary row in the shared objects
+	// collection, so its own storage is readable — xkey sits in the
+	// meta-type namespace, name stays universal.
+	typeRec, err := sp.Properties().Get(ctx, typeId)
+	require.NoError(t, err)
+	require.NotNil(t, typeRec)
+	assert.Equal(t, "movie", typeRec.GetString("type", "xkey"))
+	assert.Empty(t, typeRec.GetString("any", "xkey"))
+	assert.Equal(t, "Movie", typeRec.GetString("any", "name"))
+
+	// The meta-type is introspectable like any other built-in: its
+	// property list is what a type object carries in its own namespace.
+	metaProps, err := sp.Types().Properties(ctx, "type")
+	require.NoError(t, err)
+	require.Len(t, metaProps, 1)
+	assert.Equal(t, "xkey", metaProps[0].Id)
+	assert.Equal(t, space.PropertyKindString, metaProps[0].Kind)
 
 	// Types.Get("any") returns the built-in.
 	anyInfo, err := sp.Types().Get(ctx, "any")
@@ -481,8 +506,25 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	})
 	require.Error(t, err)
 
+	// Objects.Get reads the row; an unknown id is not found.
+	row, err := sp.Objects().Get(ctx, objectId)
+	require.NoError(t, err)
+	require.Equal(t, objectId, row.GetString("id"))
+	_, err = sp.Objects().Get(ctx, "bafy-no-such-object")
+	require.ErrorIs(t, err, space.ErrNotFound)
+
 	// Objects.Delete: marks the tree deleted via settings tree, drops
-	// our cached state. After this, Get on the deleted id returns an
-	// any-sync deletion error.
+	// our cached state. After this, Get on the deleted id reports the
+	// deletion, distinct from an unknown id.
 	require.NoError(t, sp.Objects().Delete(ctx, objectId))
+	_, err = sp.Objects().Get(ctx, objectId)
+	require.ErrorIs(t, err, space.ErrObjectDeleted)
+
+	// A per-object op has to open the tree, and the deleted object has
+	// none: ErrObjectNotFound, so a consumer answers "not found"
+	// without matching any-sync storage errors. (An id never seen here
+	// is fetched from peers first, so its failure mode is a transport
+	// error, not a local missing-tree one.)
+	_, err = sp.Query(objectId, "objects").Count(ctx)
+	require.ErrorIs(t, err, space.ErrObjectNotFound)
 }

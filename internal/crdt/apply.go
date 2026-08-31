@@ -383,7 +383,10 @@ func newTombstone(arena *anyenc.Arena, id string, ch Change, existing *anyenc.Va
 	}
 	tomb := arena.NewObject()
 	tomb.Set(IdField, arena.NewString(id))
-	tomb.Set(DeletedAtField, arena.NewNumberInt(int(ch.Timestamp)))
+	// An instant, like every other change-timestamp stamp — and int()
+	// would truncate the int64 envelope on 32-bit builds (the mobile
+	// ABIs), recording a pre-1970 delete time past 2038.
+	tomb.Set(DeletedAtField, arena.NewDateTimeMillis(ch.Timestamp*1000))
 	o := arena.NewObject()
 	o.Set(IdField, arena.NewString(string(preservedIdVersion)))
 	o.Set(defaultKey, arena.NewString(string(ch.VersionId)))
@@ -426,40 +429,15 @@ func lowerCreationMarker(arena *anyenc.Arena, rec *anyenc.Value, version Version
 	return false
 }
 
-// cloneInto recursively rebuilds v using the given arena.
+// cloneInto deep-copies v onto the given arena. Delegates to
+// anyencutil.Copy so every anyenc type — including the ones a CRDT
+// payload gained later, like dateTime — is carried through; a
+// hand-rolled switch silently turned an unlisted type into null.
 func cloneInto(arena *anyenc.Arena, v *anyenc.Value) *anyenc.Value {
 	if v == nil {
 		return nil
 	}
-	switch v.Type() {
-	case anyenc.TypeObject:
-		obj := arena.NewObject()
-		o, _ := v.Object()
-		o.Visit(func(k []byte, vv *anyenc.Value) {
-			obj.Set(string(k), cloneInto(arena, vv))
-		})
-		return obj
-	case anyenc.TypeArray:
-		arr := arena.NewArray()
-		items, _ := v.Array()
-		for i, it := range items {
-			arr.SetArrayItem(i, cloneInto(arena, it))
-		}
-		return arr
-	case anyenc.TypeString:
-		return arena.NewStringBytes(v.GetStringBytes())
-	case anyenc.TypeNumber:
-		return arena.NewNumberFloat64(v.GetFloat64())
-	case anyenc.TypeBinary:
-		return arena.NewBinary(v.GetBytes())
-	case anyenc.TypeTrue:
-		return arena.NewTrue()
-	case anyenc.TypeFalse:
-		return arena.NewFalse()
-	case anyenc.TypeNull:
-		return arena.NewNull()
-	}
-	return nil
+	return anyencutil.Copy(arena, v)
 }
 
 // hasDelete returns true if any op in the list is OpDelete.

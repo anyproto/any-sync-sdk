@@ -773,11 +773,54 @@ func (s *SDK) Account() AccountAPI { return s.account }
 // space.ErrPushNotConfigured.
 func (s *SDK) Push() space.PushAPI { return s.push }
 
+// PubSub returns the account-wide ephemeral pub/sub surface: the same
+// API as Space.PubSub(), bound to the tech space. The tech space's ACL
+// is owner-only, so its peers are exactly this account's own devices —
+// publishes here fan out account-wide with no separate transport. In
+// headless mode the tech space is local-only, so delivery degrades to
+// in-process loopback (no error).
+func (s *SDK) PubSub() space.PubSubAPI { return spaceimpl.NewPubSubAPI(s.app, s.tsp.SpaceId()) }
+
 // PoolInternal exposes the any-sync peer pool (dial by peerId with this
 // account's identity in the handshake). Same-module internal surface —
 // mirrors the PayloadsInternal pattern — used by the e2e suite to speak
 // node-side protocols (e.g. fileprotov2 against a fileV2 broker).
 func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
+
+// PeerId returns this device's libp2p peer id — stable per device
+// installation, distinct from the account identity (Account().Id()).
+// It is the row id of this device's entry in the devices registry
+// (Spaces().SetDevice / ListDevices) and the value election consumers
+// compare against space.ActiveDevice's winner.
+func (s *SDK) PeerId() string { return s.tsp.PeerId() }
+
+// TechSpaceId returns the account's tech space id. Spaces().Get with
+// it yields the restricted tech-space handle — the home of
+// account-level bundles (see space.Service.Get, space.ErrUnsupported).
+func (s *SDK) TechSpaceId() string { return s.tsp.SpaceId() }
+
+// Store returns the SDK's any-store DB (sdk.db) for consumer-owned,
+// non-CRDT collections. The handle is the SDK's: it is open for the
+// SDK's lifetime and closed by Close — consumers never close it.
+//
+// Contract for consumers:
+//   - Create and address collections ONLY under a consumer tag that is
+//     not a content id — a name whose segment before the first "_" is
+//     neither a space id nor a cid. The boot-time orphan sweep
+//     classifies such names ownerNone and never touches them (see
+//     docs/03-space.md § Space Lifecycle); every other prefix belongs
+//     to the CRDT layer, is swept by owner, and is rewritten by
+//     re-index. The "l_" tag is reserved for the any server's local
+//     store.
+//   - Never write an SDK collection ("_meta", "<spaceId>_*",
+//     "<objectId>_*", "files_*", "_history_*", "_read_*"): a direct
+//     write bypasses the DAG and is reverted by the next re-index.
+//   - Never open a write tx that spans a consumer collection and an SDK
+//     one. Reads across both in one tx are fine (that is the point of
+//     sharing the file: one snapshot for $lookup).
+//   - Consumer collections are not rebuildable: a wiped sdk.db loses
+//     them, and the SDK's re-index paths leave them alone.
+func (s *SDK) Store() anystore.DB { return s.db }
 
 // P2PStatus reports the local-network layer: listener state, discovery
 // possibility, and every known LAN peer with its shared spaces and

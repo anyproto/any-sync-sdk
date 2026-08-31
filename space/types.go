@@ -19,6 +19,13 @@ var ErrPinnedField = errors.New("space: property field is pinned or immutable")
 // creation (format.type is pinned-absent). A client error → 400.
 var ErrPropertyNoFormat = errors.New("space: property has no format")
 
+// ErrInvalidFieldValue is returned by PatchDataset when a MUTABLE
+// leaf's value is malformed (e.g. a `search.text` mapping with empty
+// or duplicate keys, or an empty spelling where Unset is the clear
+// path) — distinct from ErrPinnedField, which reports an immutable
+// PATH. Consumers map it to a validation-class client error.
+var ErrInvalidFieldValue = errors.New("space: invalid dataset field value")
+
 // ErrTypeRegistered is returned by AddProperty / RemoveProperty /
 // PatchProperty when the target type is a registered built-in whose
 // properties are statically declared and cannot be mutated at runtime.
@@ -103,6 +110,175 @@ type TypesAPI interface {
 	// — define a new property to change them. Format-leaf paths require
 	// a property that declared a format at creation.
 	PatchProperty(ctx context.Context, typeId, propId string, patch PropertyPatch) error
+
+	// Datasets returns the type's runtime dataset definitions (the
+	// compiled view — orphan/invalid records folded out).
+	Datasets(ctx context.Context, typeId string) ([]DatasetDef, error)
+
+	// AddDataset defines a new dataset on the type at runtime. The
+	// definition syncs like any space data; peers register the dataset
+	// (enforced by the SDK's generic schema handler) as it applies.
+	// Returns the definition's stable id. Behavioral parts of the
+	// declaration (name, id rule, delete gate, field kinds/flags) are
+	// pinned — remove and re-add to change them; display parts patch
+	// via PatchDataset.
+	AddDataset(ctx context.Context, typeId string, draft DatasetDraft) (datasetDefId string, err error)
+
+	// AddDatasetField appends a field to an existing dataset definition
+	// (additive evolution). Returns the field definition's id. Additive
+	// fields cannot be Required — validation always runs against the
+	// current schema, so a required field added later would reject the
+	// dataset's own history on fresh devices. Declare required fields
+	// at AddDataset.
+	AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft DatasetFieldDraft) (fieldDefId string, err error)
+
+	// RemoveDataset drops a dataset definition. Existing record data is
+	// NOT cleaned up (the RemoveProperty stance); subsequent writes to
+	// the dataset drop once peers apply the removal.
+	RemoveDataset(ctx context.Context, typeId, datasetDefId string) error
+
+	// RemoveDatasetField drops one field definition. Existing values
+	// stay stored; subsequent writes to the field are rejected as
+	// undeclared (non-dynamic datasets).
+	RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error
+
+	// PatchDataset edits a definition's mutable leaves: displayName,
+	// description, name (field records' display label), search.title,
+	// search.text (a field key string or a non-empty array of unique
+	// keys; single-element arrays canonicalize to the bare string on
+	// the wire, and clearing the mapping is Unset's job), search.scope.
+	// Pinned paths are rejected up-front (ErrPinnedField); malformed
+	// values on mutable search leaves return ErrInvalidFieldValue.
+	PatchDataset(ctx context.Context, typeId, defId string, patch DatasetDefPatch) error
+}
+
+// Behavioral dataset-schema vocabulary, aliased from the handler
+// package (one vocabulary for compiled-in and runtime declarations).
+type (
+	Mutability   = handler.Mutability
+	Stamp        = handler.Stamp
+	IdRule       = handler.IdRule
+	DeletePolicy = handler.DeletePolicy
+	SearchFields = handler.SearchFields
+)
+
+const (
+	MutableNever    = handler.MutableNever
+	MutableByAuthor = handler.MutableByAuthor
+	MutableByAnyone = handler.MutableByAnyone
+
+	StampNone       = handler.StampNone
+	StampCreator    = handler.StampCreator
+	StampCreateTime = handler.StampCreateTime
+	StampModifyTime = handler.StampModifyTime
+
+	IdAuto = handler.IdAuto
+	IdUser = handler.IdUser
+
+	DeleteByAnyone = handler.DeleteByAnyone
+	DeleteByAuthor = handler.DeleteByAuthor
+)
+
+// DatasetDraft is the input to TypesAPI.AddDataset.
+type DatasetDraft struct {
+	// Name is the dataset's collection name — pinned for the life of
+	// the definition. No "_" prefix, dots, slashes or colons; built-in
+	// names are reserved.
+	Name        string
+	DisplayName string
+	Description string
+
+	// Dynamic keeps a free-form keyspace next to the declared fields.
+	Dynamic bool
+
+	// IdRule / IdPattern / IdMaxLen: record-id production. Zero rule =
+	// auto-derived ids; IdUser accepts caller ids (also the upsert
+	// idempotency key) constrained by pattern/length.
+	IdRule    IdRule
+	IdPattern string
+	IdMaxLen  int
+
+	// DeleteBy gates record deletes. DeleteByAuthor requires a
+	// StampCreator field among Fields.
+	DeleteBy DeletePolicy
+
+	// SkipHistory keeps the dataset out of the version-history index.
+	SkipHistory bool
+
+	// Search is the optional search-extraction annotation (x-search).
+	Search *SearchFields
+
+	// Fields are the initial field definitions.
+	Fields []DatasetFieldDraft
+}
+
+// DatasetFieldDraft is one field definition — input to AddDataset /
+// AddDatasetField.
+type DatasetFieldDraft struct {
+	// Key is the on-record field name — pinned.
+	Key         string
+	Name        string
+	Description string
+
+	// Kind is the value kind. Required unless Stamp implies one
+	// (creator ⇒ string, createTime/modifyTime ⇒ datetime).
+	Kind PropertyKind
+	// Shape optionally refines array/object values (items/properties).
+	Shape *handler.FieldShape
+
+	// Scope: zero = synced. Derived is implied by Stamp and rejected
+	// otherwise.
+	Scope Scope
+	// Required: must be present on create. Incompatible with Stamp.
+	Required bool
+	// MutableBy: post-create write rule. Zero = write-once.
+	MutableBy Mutability
+	// Stamp: apply-time derived value (handler-written).
+	Stamp Stamp
+}
+
+// DatasetDef is the compiled view of one runtime dataset definition.
+type DatasetDef struct {
+	Id          string // head record id, immutable
+	Name        string
+	DisplayName string
+	Description string
+	Dynamic     bool
+	IdRule      IdRule
+	IdPattern   string
+	IdMaxLen    int
+	DeleteBy    DeletePolicy
+	SkipHistory bool
+	Search      *SearchFields
+	Fields      []DatasetFieldDef
+
+	// Invalid marks a definition whose folded declaration fails
+	// validation (InvalidReason says why). Invalid definitions never
+	// register or accept data but stay listed so they can be repaired
+	// (AddDatasetField) or removed.
+	Invalid       bool
+	InvalidReason string
+}
+
+// DatasetFieldDef is the compiled view of one dataset field.
+type DatasetFieldDef struct {
+	// Id is the field definition record's id — the identity
+	// RemoveDatasetField targets.
+	Id        string
+	Key       string
+	Name      string
+	Kind      PropertyKind
+	Scope     Scope
+	Required  bool
+	MutableBy Mutability
+	Stamp     Stamp
+}
+
+// DatasetDefPatch is the input to PatchDataset — same per-path model
+// as PropertyPatch, over the dataset-def mutable leaves.
+type DatasetDefPatch struct {
+	Set   map[string]any
+	Unset []string
 }
 
 // TypeInfo is a point-in-time snapshot of a type object.
@@ -112,10 +288,12 @@ type TypeInfo struct {
 	Description string
 	IconCID     string
 	// XKey is the optional caller-side "programmatic" name set at
-	// Create. Empty if unset.
+	// Create, stored at `type.xkey` on the type object. Empty if
+	// unset.
 	XKey string
-	// BuiltIn marks `any` / `type` (immutable, always-present). User
-	// types return false.
+	// BuiltIn marks the synthetic types — `any`, `spaceIndex`,
+	// `type` and every caller-registered type (immutable,
+	// always-present). User types return false.
 	BuiltIn bool
 }
 
@@ -126,9 +304,10 @@ type TypeCreateParams struct {
 	IconCID     string
 
 	// XKey is an optional stable, caller-side "programmatic" name for
-	// the type (e.g. for generated client code mapping). Like Name and
-	// Description it's client-set display metadata — not unique, not
-	// enforced by the SDK.
+	// the type (e.g. for generated client code mapping). Client-set,
+	// not unique, not enforced by the SDK. Unlike Name/Description it
+	// is stored in the meta-type's own namespace (`type.xkey`), so
+	// only rows carrying the type marker can hold one.
 	XKey string
 }
 
@@ -262,8 +441,9 @@ type PropertyDraft struct {
 
 	// Format optionally declares the value convention. Format.Type
 	// constrains Kind (links/tags/multiselect ⇒ array of string;
-	// date/datetime/select ⇒ string) and, when Kind is zero, defaults
-	// it. Format.Type is pinned by the first write; UI, Filter, Options
+	// select ⇒ string; date/datetime ⇒ datetime, with string still
+	// accepted for the ISO-8601 text convention) and, when Kind is
+	// zero, defaults it. Format.Type is pinned by the first write; UI, Filter, Options
 	// and Meta stay mutable via PatchProperty. FormatTags is reserved
 	// until the space-level tags table lands and is rejected.
 	Format *PropertyFormatDraft
@@ -272,9 +452,9 @@ type PropertyDraft struct {
 // PropertyPatch is a generic per-path patch to a property definition,
 // the input to PatchProperty.
 //
-// Set maps a dotted field path to its new value (values are stored
-// verbatim; format.* leaves must be strings — the CRDT handler enforces
-// this). Unset lists dotted field paths to remove (subtree removals are
+// Set maps a dotted field path to its new value (values convert as
+// Op.Value describes and are not otherwise validated; format.* leaves
+// must be strings — the CRDT handler enforces this). Unset lists dotted field paths to remove (subtree removals are
 // allowed, e.g. "format.options.<key>" to delete a whole option). A path
 // present in neither is left unchanged. At least one entry across Set /
 // Unset is required.
@@ -301,6 +481,10 @@ const (
 	PropertyKindNull
 	PropertyKindArray
 	PropertyKindObject
+	// PropertyKindDatetime is an instant, stored as any-store's native
+	// TypeDateTime (unix millis, orderable, index-keyable, `{"$date": …}`
+	// in JSON). The kind the `date` / `datetime` formats imply.
+	PropertyKindDatetime
 )
 
 // FormatType declares a property's value convention beyond its
@@ -312,8 +496,11 @@ const (
 // Value conventions per format:
 //   - FormatLinks:       array of "any://<objectId>" URI strings (see
 //     github.com/anyproto/any/anyuri — the format's home)
-//   - FormatDate:        "2006-01-02" date string
-//   - FormatDatetime:    RFC 3339 datetime string
+//   - FormatDate:        a datetime value at midnight UTC (Kind
+//     datetime); "2006-01-02" strings when the property was declared
+//     with Kind string
+//   - FormatDatetime:    a datetime value (Kind datetime); RFC 3339
+//     strings when the property was declared with Kind string
 //   - FormatTags:        array of tag record ids referencing the space's
 //     tag table — reserved, not accepted by AddProperty yet
 //   - FormatSelect:      a single option key (string) chosen from the

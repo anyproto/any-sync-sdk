@@ -39,8 +39,8 @@ var ErrReadOnlySpace = errors.New("space: read-only")
 var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pending")
 
 // ErrSpaceUnknown is returned by id-addressed Service methods (Get,
-// SetSettings, the accept/decline families) when the spaceId has no
-// row in the account's space index.
+// Delete, SetSettings, the accept/decline families) when the spaceId
+// has no row in the account's space index.
 var ErrSpaceUnknown = errors.New("unknown space")
 
 // ErrJoinPending is returned by Join after the RequestToJoin was
@@ -67,6 +67,37 @@ var ErrIsOneToOne = errors.New("is a 1-1 space")
 // ErrSelfPair is returned by OneToOne / RegisterIncoming when the
 // given identity is the caller's own account.
 var ErrSelfPair = errors.New("cannot pair with self")
+
+// ErrBadSpaceId is returned by Track when the given id does not have
+// the any-sync spaceId shape (`<cid>.<replication key base36>`). A
+// malformed id would otherwise sit in the index and fail every Get
+// with an opaque remote error — Track rejects it up front instead.
+var ErrBadSpaceId = errors.New("invalid space id")
+
+// ErrIsTechSpace is returned by Track when the given id is the
+// account's own tech space — the tech space is system-owned and never
+// appears in the space list.
+var ErrIsTechSpace = errors.New("cannot track the tech space")
+
+// ErrIsDerivedSpace is returned by Delete when the target is a
+// seed-derived space (created via Derive). Derived spaces are
+// permanent: the deterministic id means a delete followed by a
+// re-derive would recreate the space with fresh history under the
+// same id — history replacement — and the sticky deleted tombstone
+// would otherwise wedge the account's well-known derived id forever.
+// The deriving account's row carries a synced set-once `derived` flag
+// (surfaced as SpaceInfo.Derived) that every enforcement point keys
+// on; a joiner of someone else's derived space never gets the flag —
+// they cannot re-derive it, so their removal stays allowed. 1-1
+// spaces keep their own re-derivable delete path.
+var ErrIsDerivedSpace = errors.New("derived spaces cannot be deleted")
+
+// ErrBadSpaceType is returned by Create when CreateRequest.SpaceType
+// is outside the allow-list (SpaceTypeAny or empty). The type is
+// content-addressed into the immutable space header and coordinator-
+// gated, so a bad value is rejected up front — classify with
+// errors.Is to turn it into a caller-facing 4xx.
+var ErrBadSpaceType = errors.New("unsupported space type")
 
 // Settings-patch sentinels — wrapped by SetSettings validation errors
 // so callers can classify with errors.Is.
@@ -102,6 +133,8 @@ type Service interface {
 
 	// Derive a deterministic space from the account keys. Used for
 	// the tech space (never returned here) and future derived spaces.
+	// Derived spaces are permanent — Delete refuses them with
+	// ErrIsDerivedSpace (see the sentinel for why).
 	Derive(ctx context.Context, req DeriveRequest) (Space, error)
 
 	// DeriveId returns the deterministic spaceId for a DeriveRequest
@@ -160,6 +193,13 @@ type Service interface {
 	// another of the account's devices (synced remote=active) is adopted
 	// transparently: Get materializes it locally, no per-device
 	// re-accept needed.
+	//
+	// The account's own tech space id (SDK.TechSpaceId) returns a
+	// restricted handle: reads, dataset declarations on bundle roots,
+	// derived-only Bundles() and generic record writes work; the
+	// system datasets are read-only through it and every lifecycle
+	// surface (objects, types, members, ACL, files, history, …)
+	// returns ErrUnsupported. It never appears in List / Subscribe.
 	Get(ctx context.Context, spaceId string) (Space, error)
 
 	// Track registers a foreign spaceId in the local space index without
@@ -194,10 +234,22 @@ type Service interface {
 	// the round completes.
 	SyncSpaceList(ctx context.Context) error
 
+	// WaitListSynced blocks until the tech space (the account's space
+	// list) has completed a clean head-sync round with no trees parked
+	// for retry — the restore-path gate before deciding "does space X
+	// exist on this account" (creation-vs-restore split): after it
+	// returns, List reflects the responsible node's converged view.
+	// Retries rounds until ctx expires; unlike SyncSpaceList (one round,
+	// error verbatim) a transiently offline node keeps it waiting rather
+	// than failing.
+	WaitListSynced(ctx context.Context) error
+
 	// Delete tears down a space locally. For regular spaces this also
 	// flags the space as deleted on the network; for 1-1 spaces it is
 	// local-only (the space is always re-derivable). The record stays
-	// in List with Status = StatusDeleted.
+	// in List with Status = StatusDeleted. Seed-derived spaces are
+	// refused with ErrIsDerivedSpace (permanent), the tech space with
+	// ErrIsTechSpace, and an id with no index row with ErrSpaceUnknown.
 	Delete(ctx context.Context, spaceId string) error
 
 	// SetSettings patches the account-private per-space client settings
@@ -220,13 +272,55 @@ type Service interface {
 	// where the subtree appears under the row's `settings` field.
 	SetSettings(ctx context.Context, spaceId string, set map[string]any, unset []string) error
 
+	// SetDevice upserts THIS device's row in the account's devices
+	// registry — a system dataset in the tech space, one row per device,
+	// synced account-wide (SYN-165). The row id is always the local peer
+	// id (SDK.PeerId()), never caller-supplied. Only non-empty fields are
+	// written; each Apps entry lands per-slug (nil value removes the
+	// slug), so writes touching different fields merge. At least one
+	// field must be non-empty (ErrDeviceEmptyUpsert). ErrDevicePruned
+	// when this device's row was deleted — the sticky tombstone
+	// absorbs the write and the id can never re-register.
+	//
+	// Read back via ListDevices, or generically via
+	// Query(SpaceIndexObjectId(), "devices").
+	SetDevice(ctx context.Context, up DeviceUpsert) error
+
+	// ClaimActive marks THIS device as the active instance of app: it
+	// writes an activeClaims.<app> = {seq, at} claim on the own row
+	// (seq = max existing + 1). Conflict-resolution semantics live in
+	// the reader — resolve the winner with ActiveDevice, never by
+	// comparing claims ad hoc. There is no un-claim: only a higher
+	// claim from another device or a row deletion moves the winner.
+	// ErrDevicePruned when this device's row was deleted (see
+	// SetDevice).
+	ClaimActive(ctx context.Context, app string) error
+
+	// DeleteDevice prunes peerId's row — the "device doesn't exist"
+	// signal that moves the active election away from it. The tombstone
+	// is sticky: the peer id can never re-register (a pruned device
+	// that comes back stays unlisted until it re-derives its peer
+	// keys). ErrDeviceUnknown when the row doesn't exist;
+	// ErrDeviceSelfDelete for the local device's own row (self-pruning
+	// would permanently lock this installation out of the registry —
+	// prune it from another device).
+	DeleteDevice(ctx context.Context, peerId string) error
+
+	// ListDevices returns a point-in-time snapshot of the devices
+	// registry (pruned rows excluded). Feed it to ActiveDevice to
+	// resolve the active instance of an app. Unavailability (tech
+	// space not open yet) is an error, never an empty snapshot — an
+	// election consumer must not mistake a closed service for an
+	// empty registry.
+	ListDevices(ctx context.Context) ([]Device, error)
+
 	// Subscribe delivers space-list changes (added / updated / removed).
 	// Returns a cancel function.
 	Subscribe(cb func(SpaceListEvent)) (cancel func())
 
 	// SpaceIndexObjectId returns the id of the tech-space index object —
 	// the handle for generic Query/Subscribe over the system datasets
-	// (spaces, profile). Future system objects expose their own ids.
+	// (spaces, profile, devices). Future system objects expose their own ids.
 	SpaceIndexObjectId() string
 
 	// Query builds a generic read query over a system object's dataset
@@ -237,7 +331,7 @@ type Service interface {
 	Query(objectId, dataset string) Query
 
 	// Datasets returns the JSON-Schema description of the tech-space
-	// system datasets (spaces, profile) — field names, value shapes, and
+	// system datasets (spaces, profile, devices) — field names, value shapes, and
 	// per-field class (synced / derived / local) via `x-scope`. For
 	// discovery, mirroring Space.Datasets.
 	Datasets() []DatasetSchema
@@ -290,6 +384,13 @@ type DeriveRequest struct {
 	// stays SpaceTypeAny and is coordinator-gated) and not stamped into
 	// the header as the type. Empty defaults to SpaceTypeAny.
 	SpaceType string
+
+	// Name is the initial display name, written on FIRST
+	// materialization only (a pre-existing row keeps its metadata) and
+	// NOT hashed into the derivation — the id is stable regardless.
+	// Propagates into the in-space spaceIndex via the owner-side lazy
+	// seed; rename later with Space.SetMetadata.
+	Name string
 }
 
 // SpaceListEvent is delivered to Service.Subscribe callbacks.

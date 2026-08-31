@@ -11,18 +11,15 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/history"
-	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
-// Raw-mode stores (tech space) carry internal bookkeeping only: no
-// history surface, no history hook, no index rows. Regular stores get
-// the hook and a working index.
-func TestHistoryHookDisabledForRawMode(t *testing.T) {
-	raw := &Store{customHandlers: []crdt.HandlerReg{
-		{Name: "spaces", Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
-	}}
-	assert.Nil(t, raw.historyApplyHook(), "raw mode must not index history")
-	_, err := raw.HistoryIndex(context.Background())
+// A DisableHistory store (tech space) carries internal bookkeeping
+// only: no history surface, no history hook, no index rows. Regular
+// stores get the hook and a working index.
+func TestHistoryHookDisabledWhenConfigured(t *testing.T) {
+	noHistory := &Store{disableHistory: true}
+	assert.Nil(t, noHistory.historyApplyHook(), "DisableHistory must not index history")
+	_, err := noHistory.HistoryIndex(context.Background())
 	require.ErrorIs(t, err, ErrHistoryUnavailable)
 
 	regular := &Store{}

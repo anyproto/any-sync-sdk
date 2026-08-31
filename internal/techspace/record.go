@@ -3,6 +3,7 @@ package techspace
 import (
 	"github.com/anyproto/any-store/v2/anyenc"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -95,6 +96,12 @@ type SpaceIndexRecord struct {
 	// all other rows; presence is the guest-mode discriminator.
 	GuestKey string
 
+	// Derived marks a row written by the account's own Spaces().Derive
+	// (FieldDerived, synced, set-once). Gates the Delete refusal —
+	// derived spaces are permanent. False on created / joined /
+	// tracked / 1-1 rows.
+	Derived bool
+
 	// IssuedInviteKeys is this account's custody of the invite private
 	// keys it issued for the space, keyed by kind — IssuedKeyMember /
 	// IssuedKeyGuest (FieldIssuedInviteKeys, synced). Nil / missing kind
@@ -131,9 +138,11 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		OneToOneInviteState: v.GetString(FieldOneToOneInviteState),
 		OwnRole:             space.ParsePermission(v.GetString(FieldOwnRole)),
 		GuestKey:            v.GetString(FieldGuestKey),
-		// Float64 read — GetInt narrows through `int` and would truncate
-		// on 32-bit platforms; anyenc numbers are float64 on the wire.
-		CreatedAt: int64(v.GetFloat64(FieldCreatedAt)),
+		Derived:             v.GetBool(FieldDerived),
+		// The stamp is a TypeDateTime instant; rows written before that
+		// carried epoch seconds and read the old way until the re-index
+		// reaches them (anyencx.StampSeconds handles both).
+		CreatedAt: anyencx.StampSeconds(v.Get(FieldCreatedAt)),
 	}
 	if arr := v.GetArray(FieldInviteNotifyPending); len(arr) > 0 {
 		r.InviteNotifyPending = make([]string, 0, len(arr))
@@ -216,6 +225,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	}
 	if r.GuestKey != "" {
 		obj.Set(FieldGuestKey, a.NewString(r.GuestKey))
+	}
+	if r.Derived {
+		obj.Set(FieldDerived, a.NewTrue())
 	}
 	// CreatedAt is intentionally NOT written here — it's handler-derived
 	// (ScopeDerived; BeforeCreate stamps it from the change timestamp)

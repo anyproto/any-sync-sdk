@@ -545,6 +545,17 @@ way, converging under the standard LWW gate), and
 `Project(dataset, rec)` queues a sibling write to another dataset on
 the same object, applied in the same transaction.
 
+**ObjectStamper** is the reverse direction, for the handler of a shared
+dataset (the per-space `objects` row): `StampObject(ctx, sink)` runs
+once per applied synced change on any *other* dataset of the object,
+after its records landed and only if the change wrote something; the
+ops it derives are applied to the object's row with the change's
+VersionId as a strict update (an absent or tombstoned row is left
+alone). This is how `modifiedAt` / `modifiedBy` track writes to editor
+blocks, chat messages and runtime datasets, not just property writes.
+Local/account-route changes never trigger it — their versions belong
+to other domains. SDK-internal: consumer datasets cannot declare one.
+
 ### 8.1 Registration
 
 Consumers register handlers through the type catalog at `sdk.Open`:
@@ -562,36 +573,48 @@ handler.Dataset{
 }
 ```
 
-Internally (and for the tech space's raw mode) the same bundle is a
+Internally (and for the tech space's system datasets) the same bundle is a
 `crdt.HandlerReg`, which additionally carries the handler `Version`
-persisted per collection for re-index decisions. The Controller also
-exposes `RegisterHandler` for late-bound datasets at runtime.
-Registration is not compile-time — the set of handlers can differ
-across app versions (ties into §Versioning / docs/08-versioning.md).
+persisted per collection for re-index decisions. A registration with a
+declared `Schema` and a nil `Handler` gets the SDK's generic schema
+handler — the declaration alone is the behavior (see
+docs/17-user-datasets.md). Registration is not compile-time — the set
+of handlers can differ across app versions (docs/08-versioning.md),
+and datasets defined at runtime on type objects register late-bound:
+the store's catalog carries them, and controllers pick them up by
+rebuild (eviction + reload), never by mutating a live Controller's
+handler maps (those stay immutable after construction).
 
 ### 8.2 Unknown Datasets
 
 Changes arriving for datasets with no registered handler are
 **persisted in any-sync** (they were already accepted into the tree)
-but **not applied** to any-store — the apply path returns
-`ErrUnknownDataset` and the projection skips them. The dataset is
-effectively invisible to queries until a handler exists, but data is
-preserved; a later registration rebuilds the projection through the
-versioning/replay flow (handler `Version` is persisted per collection
-precisely so a bump — or a first registration — can trigger
-re-indexing).
+but **not applied** to any-store. The space layer's apply gate parks
+them in the per-space `_detached` collection — the same machinery the
+DataVersion gate uses — and the drain replays them once a registration
+exists (a runtime definition applying refreshes the catalog and wakes
+the drainer; the drain evicts a stale resident controller before
+replay so the rebuilt registration is what applies the row). The
+dataset is invisible to queries until then, but nothing is lost and
+the object's replay never stalls on it. See docs/17-user-datasets.md
+§ Runtime registration. At the raw Controller level (no gate wired),
+`ApplyChange` still returns `ErrUnknownDataset`.
 
 ### 8.3 Validation
 
 Handler hooks are the SECOND of the two apply-time gates described in
-§7.2 (content/scope validation runs first, at the controller). Typical
-handler enforcement:
+§7.2 (content/scope validation runs first, at the controller). The
+common single-field vocabulary — required fields, write-once /
+author-gated mutability, apply-time stamps, id rules, delete gates —
+needs no bespoke handler: declare it on the dataset Schema and the
+generic schema handler enforces it (docs/17-user-datasets.md). Bespoke
+handler enforcement remains for what a declaration can't express:
 
-- Shape rules beyond the declared Schema (required fields, size
-  limits, allow-listed op paths).
-- Per-record permissions — e.g. "only the author of a chat message
-  can edit it": compare `ctx.Change.Creator` (the change's signer)
-  against a derived creation stamp on `ctx.Before`.
+- Cross-field rules and shape rules beyond the declared Schema (size
+  limits, allow-listed op paths, "field A requires field B").
+- Per-record permissions beyond the declared gates — the pattern is
+  always: compare `ctx.Change.Creator` (the change's signer) against a
+  derived creation stamp on `ctx.Before`.
 - Disposition follows §7.2: inbound/replay rejections drop the op (or
   record) and are recorded, never fatal; the writer-side
   `ValidateChange` path stays whole-change strict so a fresh local

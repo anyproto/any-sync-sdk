@@ -61,6 +61,6 @@ func TestNormalizeSpaceType(t *testing.T) {
 
 	for _, rejected := range []string{"anytype.space", "anytype.chatspace", space.SpaceTypeOneToOne, "other.space"} {
 		_, err := normalizeSpaceType(rejected)
-		assert.Error(t, err, rejected)
+		assert.ErrorIs(t, err, space.ErrBadSpaceType, rejected)
 	}
 }

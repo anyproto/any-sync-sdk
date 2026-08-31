@@ -24,6 +24,11 @@ var log = logger.NewNamed("sdk.object")
 // is somehow zeroed out (defensive).
 var ErrTreeNotSet = errors.New("object: tree not set")
 
+// ErrClosed rejects writes on a closed (evicted) Object. Callers that
+// resolved the Object before an eviction (e.g. the lazy schema-refresh
+// Drop) retry with a fresh Store.Get.
+var ErrClosed = errors.New("object: closed")
+
 // Object binds one any-sync object tree to one crdt.Controller.
 //
 // Constructed via object.New, which builds the Object, runs the
@@ -73,6 +78,13 @@ type ApplyGate func(ctx context.Context, ch *crdt.Change, rawPayload []byte) (pr
 // "auto" fields on the wire.
 type AfterApply func(ctx context.Context, o *Object, ch *crdt.Change, res *crdt.ApplyResult)
 
+// AfterReplay fires once after replayLocked finishes a batch of
+// inbound/replayed changes of which at least one applied — every
+// per-change AfterApply of the batch has run. The space layer flushes
+// work it coalesced per batch (object-stamp events for live queries).
+// Runs under the same tree lock as the applies.
+type AfterReplay func(ctx context.Context, o *Object)
+
 // PlaintextSpec declares a plaintext (node-readable) object class: an
 // object whose tree changes are written UNencrypted at the any-sync
 // level (ShouldBeEncrypted:false → ReadKeyId=="" on the wire), so a
@@ -89,13 +101,18 @@ type PlaintextSpec struct {
 }
 
 type Object struct {
-	signKey    crypto.PrivKey
-	codec      *Codec
-	alloc      *VersionAllocator
-	ctrl       *crdt.Controller
-	spaceId    string
-	gate       ApplyGate
-	afterApply AfterApply
+	signKey     crypto.PrivKey
+	codec       *Codec
+	alloc       *VersionAllocator
+	ctrl        *crdt.Controller
+	spaceId     string
+	gate        ApplyGate
+	afterApply  AfterApply
+	afterReplay AfterReplay
+	// replaying is true while replayLocked iterates a batch. Read by
+	// the AfterApply hook (same lock) to tell a bulk replay from a
+	// single local write. See Replaying.
+	replaying bool
 	// writeGate, when set, is consulted at the top of LocalWrite — the
 	// sole entry for user-authored DAG changes. A non-nil error rejects
 	// the write (read-only guest spaces). Local-set and inbound apply
@@ -131,6 +148,9 @@ type Config struct {
 	Allocator  *VersionAllocator
 	Gate       ApplyGate
 	AfterApply AfterApply
+	// AfterReplay runs once per replay batch after its applies (see
+	// the AfterReplay type). Optional.
+	AfterReplay AfterReplay
 	// WriteGate rejects user-authored DAG writes when it returns a
 	// non-nil error (read-only guest spaces). Optional — nil means
 	// writable.
@@ -181,6 +201,7 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 		spaceId:        cfg.SpaceId,
 		gate:           cfg.Gate,
 		afterApply:     cfg.AfterApply,
+		afterReplay:    cfg.AfterReplay,
 		writeGate:      cfg.WriteGate,
 		plaintextSpecs: cfg.PlaintextSpecs,
 		onClose:        cfg.OnClose,
@@ -315,7 +336,7 @@ func (o *Object) ApplyDecoded(ctx context.Context, ch crdt.Change) error {
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return errors.New("object: closed")
+		return ErrClosed
 	}
 	// Defense-in-depth for the drain path: replayLocked already skips
 	// non-allowlisted datasets on plaintext objects before parking, so
@@ -516,7 +537,7 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return WriteResult{}, errors.New("object: closed")
+		return WriteResult{}, ErrClosed
 	}
 
 	// Plaintext-class objects ship their changes UNencrypted, so only
@@ -629,7 +650,7 @@ func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, err
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return WriteResult{}, errors.New("object: closed")
+		return WriteResult{}, ErrClosed
 	}
 	ch.Local = true
 	ch.SpaceId = o.spaceId
@@ -673,7 +694,7 @@ func (o *Object) InjectedSet(ctx context.Context, ch crdt.Change) (WriteResult, 
 	o.tree.Lock()
 	defer o.tree.Unlock()
 	if o.closed {
-		return WriteResult{}, errors.New("object: closed")
+		return WriteResult{}, ErrClosed
 	}
 	ch.Injected = true
 	ch.SpaceId = o.spaceId
@@ -764,6 +785,7 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	// captured outside the iterate closure so we can surface fatal
 	// errors past IterateAfterAddSeq's bool return.
 	var fatalErr error
+	applied := 0
 
 	convert := func(ch *objecttree.Change, decrypted []byte) (any, error) {
 		// root has no CRDT payload by construction.
@@ -848,14 +870,31 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 			fatalErr = fmt.Errorf("object: apply %s: %w", ch.Id, applyErr)
 			return false
 		}
+		applied++
 		return true
 	}
 
-	if err := tree.IterateAfterAddSeq(ctx, from, convert, iter); err != nil {
-		return err
+	o.replaying = true
+	iterErr := func() error {
+		defer func() { o.replaying = false }()
+		return tree.IterateAfterAddSeq(ctx, from, convert, iter)
+	}()
+	// Applied changes are committed whatever ended the iteration, so
+	// the batch hook runs on the error paths too.
+	if applied > 0 && o.afterReplay != nil {
+		o.afterReplay(ctx, o)
+	}
+	if iterErr != nil {
+		return iterErr
 	}
 	return fatalErr
 }
+
+// Replaying reports whether the caller is inside a replayLocked batch
+// (inbound sync, cold restore, re-index rebuild) as opposed to a
+// single LocalWrite / drained change. Meaningful only from the
+// AfterApply hook, which runs under the same lock.
+func (o *Object) Replaying() bool { return o.replaying }
 
 // replayItem couples a decoded crdt.Change with the (cloned) decrypted
 // bytes that produced it. The bytes are needed by the schema gate's

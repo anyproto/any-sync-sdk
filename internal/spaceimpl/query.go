@@ -61,15 +61,15 @@ func newSharedQuery(store *spaceobjects.Store) *queryImpl {
 }
 
 // Filter parses the caller-supplied condition eagerly via
-// query.ParseCondition (which itself accepts an already-built
-// query.Filter, a JSON string, or a map literal). Multiple Filter
-// calls AND together. Parse errors are stashed and surfaced on the
-// first terminal call.
+// parseCondition (an already-built query.Filter, a JSON string, or a
+// map literal converted like a record value). Multiple Filter calls
+// AND together. Parse errors are stashed and surfaced on the first
+// terminal call.
 func (q *queryImpl) Filter(filter any) space.Query {
 	if q.parseErr != nil {
 		return q
 	}
-	parsed, err := query.ParseCondition(filter)
+	parsed, err := parseCondition(filter)
 	if err != nil {
 		q.parseErr = fmt.Errorf("query: filter: %w", err)
 		return q
@@ -494,6 +494,10 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	if dataset == sharedObjectsDataset {
 		return store.SharedObjects(ctx)
 	}
+	// A resident controller built before a runtime dataset was defined
+	// doesn't know its collection; reload it so a just-defined dataset
+	// reads back real rows instead of silently empty results.
+	store.EnsureDatasetRegistered(ctx, objectId, dataset)
 	obj, err := store.Get(ctx, objectId)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)

@@ -56,8 +56,8 @@ func normalizeSpaceType(t string) (string, error) {
 	case "", space.SpaceTypeAny:
 		return space.SpaceTypeAny, nil
 	default:
-		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s or empty)",
-			t, space.SpaceTypeAny)
+		return "", fmt.Errorf("spaceimpl: %w: %q (allowed: %s or empty)",
+			space.ErrBadSpaceType, t, space.SpaceTypeAny)
 	}
 }
 
@@ -119,6 +119,10 @@ type Service struct {
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
+	// techSpace is the restricted handle over the tech space, built on
+	// first Get(techSpaceId). One instance per process: its bundles
+	// API holds per-id install locks.
+	techSpace *techSpace
 
 	// spaceIndexIds caches the deterministic spaceIndex object id per
 	// spaceId so SetMetadata / Info-side reads don't re-derive on every
@@ -323,6 +327,10 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	_ = st.EnsureApplySeq(context.Background())
 	s.stores[spaceId] = st
 	s.mu.Unlock()
+	// Converge any pending re-index in the background instead of waiting
+	// for every object to be opened (spaceobjects/reindex.go). No-op when
+	// no handler version changed.
+	st.StartReindexSweep()
 	// Kick the drainer once so prior-session parked rows whose
 	// dependencies have since landed get picked up on first touch.
 	st.NotifyDrainer(types.DataVersionPair{})
@@ -640,7 +648,13 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 // to receive pushed changes for an arbitrarily long stretch.
 //
 // Mirrors the eager-load that Create / Derive / OneToOne already do.
+//
+// The tech space id returns the restricted tech handle (no registry
+// row, no load, no index wiring) — see space.ErrUnsupported.
 func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) {
+	if id := s.tsp.SpaceId(); id != "" && spaceId == id {
+		return s.techHandle(), nil
+	}
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
 		return nil, fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
@@ -672,6 +686,16 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 		return s.AcceptOneToOne(ctx, spaceId)
 	}
 	return s.load(ctx, spaceId)
+}
+
+// techHandle returns the process-wide tech-space handle.
+func (s *Service) techHandle() *techSpace {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.techSpace == nil {
+		s.techSpace = newTechSpace(s.app, s.tsp, s)
+	}
+	return s.techSpace
 }
 
 // MaterializeBlock reports why rec must not be materialized — loaded,
@@ -764,6 +788,37 @@ func (s *Service) SyncSpaceList(ctx context.Context) error {
 	return s.tsp.SyncHeads(ctx)
 }
 
+// WaitListSynced blocks until the tech space completes a clean
+// head-sync round with no parked trees (same convergence test as
+// inboxReplayGuard), retrying rounds until ctx expires. SyncHeads
+// no-ops (nil) on a not-open tech space — that must read as "not
+// ready", not as a clean round. A nil round alone is NOT proof of
+// convergence — any-sync's diffsyncer swallows per-peer sync failures
+// and returns nil — so the gate also requires the tracker rollup to
+// report Synced: that flips only on HeadsApply from a responsible
+// peer, stays Syncing on a swallowed failure, and reads Offline with
+// no peers, which is exactly the "empty list because nothing was
+// fetched" case this gate must not bless.
+func (s *Service) WaitListSynced(ctx context.Context) error {
+	backoff := time.Second
+	for {
+		if s.tsp.SpaceId() != "" &&
+			s.tsp.SyncHeads(ctx) == nil &&
+			s.app.ParkedTreeCount(s.tsp.SpaceId()) == 0 &&
+			s.app.SyncStatus().Status(s.tsp.SpaceId()).State == space.SyncStateSynced {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 // List returns the space-index snapshot.
 func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 	rows := s.tsp.List(ctx)
@@ -815,6 +870,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		OwnRole:     r.OwnRole,
 		Settings:    r.Settings,
 		PushKeys:    r.PushKeys,
+		Derived:     r.Derived,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
@@ -848,6 +904,36 @@ func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[strin
 	return err
 }
 
+// SetDevice upserts this device's row in the devices registry (see
+// space.Service.SetDevice for the contract). Thin wrapper — the
+// techspace method owns the peer-id resolution and op encoding.
+func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) error {
+	_, err := s.tsp.SetDevice(ctx, up)
+	return err
+}
+
+// ClaimActive claims the active role for app on this device (see
+// space.Service.ClaimActive for the contract).
+func (s *Service) ClaimActive(ctx context.Context, app string) error {
+	_, err := s.tsp.ClaimActive(ctx, app)
+	return err
+}
+
+// DeleteDevice prunes a device row (see space.Service.DeleteDevice
+// for the contract; the techspace method owns the exists-check that
+// keeps a typo from minting a permanent tombstone).
+func (s *Service) DeleteDevice(ctx context.Context, peerId string) error {
+	_, err := s.tsp.DeleteDevice(ctx, peerId)
+	return err
+}
+
+// ListDevices returns the devices-registry snapshot. Unavailability
+// (techspace not open, index object not loadable) surfaces as an
+// error — it must never read as an empty registry.
+func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
+	return s.tsp.ListDevices(ctx)
+}
+
 // Delete removes a space. It is offline-first and returns as soon as the
 // local work is done — no network round trip on the call path:
 //  1. write the SYNCED remoteStatus=deleted tombstone (propagates the
@@ -868,8 +954,17 @@ func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[strin
 // delete to the account's other devices — each offloads its local copy —
 // while the row stays re-creatable (a later OneToOne(peer) flips it back to
 // active). No coordinator SpaceDelete is ever sent.
+//
+// The tech space (system-owned, never in the list) and seed-derived
+// spaces (rows flagged FieldDerived — see space.ErrIsDerivedSpace) are
+// refused outright.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Type == space.SpaceTypeOneToOne {
+	if spaceId == s.tsp.SpaceId() {
+		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrIsTechSpace)
+	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	switch {
+	case ok && rec.Type == space.SpaceTypeOneToOne:
 		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.OneToOneDeletedStatus); err != nil {
 			return fmt.Errorf("spaceimpl: mark 1-1 deleted: %w", err)
 		}
@@ -877,8 +972,7 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		// No coordinator kick: a 1-1 is never node-deleted. Other devices
 		// offload via their own reconciler when the synced marker arrives.
 		return nil
-	}
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.GuestKey != "" {
+	case ok && rec.GuestKey != "":
 		// Guest-mode space: same shape as the 1-1 delete — synced,
 		// NON-terminal marker (a later JoinGuest re-adds), local offload,
 		// no coordinator SpaceDelete (the space isn't ours on the
@@ -889,6 +983,12 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		}
 		s.OffloadSpace(ctx, spaceId)
 		return nil
+	case ok && rec.Derived:
+		return space.ErrIsDerivedSpace
+	case !ok:
+		// No row = the account doesn't know this space; deleting would
+		// silently succeed while writing nothing (strict-skip modify).
+		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrSpaceUnknown)
 	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
@@ -976,7 +1076,7 @@ func (s *Service) toSpaceListEvent(ctx context.Context, ev space.SubscriptionEve
 
 // SpaceIndexObjectId returns the well-known id of the tech-space index
 // object. Pass it to Query/Subscribe to read the system datasets
-// (spaces, profile) generically. Future system objects expose their
+// (spaces, profile, devices) generically. Future system objects expose their
 // own ids the same way.
 func (s *Service) SpaceIndexObjectId() string { return s.tsp.IndexObjectId() }
 
@@ -989,9 +1089,11 @@ func (s *Service) Query(objectId, dataset string) space.Query {
 }
 
 // Datasets returns the JSON-Schema description of the tech-space system
-// datasets (spaces, profile) for discovery.
+// datasets (spaces, profile, devices, …) for discovery. The tech
+// handle's Space.Datasets lists everything the tech Store hosts,
+// bundle datasets included.
 func (s *Service) Datasets() []space.DatasetSchema {
-	return toDatasetSchemas(s.tsp.Store().Schemas())
+	return toDatasetSchemas(s.tsp.Store().SystemSchemas())
 }
 
 // toDatasetSchemas marshals each dataset's declared schema into a public
@@ -1004,7 +1106,7 @@ func toDatasetSchemas(named []spaceobjects.NamedSchema) []space.DatasetSchema {
 		if err != nil {
 			continue
 		}
-		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw})
+		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw, TypeId: ns.TypeId})
 	}
 	return out
 }
@@ -1047,15 +1149,25 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, err
 	}
-	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+	if rec, ok := s.tsp.Get(ctx, spaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
 			Type:         space.SpaceTypeAny,
 			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
+			Name:         req.Name,
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
+			// Synced: every device of the account refuses Delete, not
+			// just the device that ran Derive.
+			Derived: true,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
+		}
+	} else if !rec.Derived {
+		// Heal rows that predate the flag (older SDK, or a Track of the
+		// derived id): the set-once gate permits the first true write.
+		if _, err := s.tsp.SetDerived(ctx, spaceId); err != nil {
+			return nil, fmt.Errorf("spaceimpl: flag derived row: %w", err)
 		}
 	}
 	store := s.storeFor(spaceId)

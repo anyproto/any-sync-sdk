@@ -33,7 +33,7 @@ const (
 // Service.Subscribe for live changes.
 type SpaceInfo struct {
 	Id   string
-	Type string // on-wire header type (any.space, any.onetoone, … — never the tech type)
+	Type string // on-wire header type (any.space, any.onetoone, …; the tech type only on the tech handle)
 	// SpaceType is the app-level tag set via DeriveRequest.SpaceType,
 	// read from the in-space spaceIndex. Independent of the header Type;
 	// use it for client-side classification/filtering. Untagged spaces
@@ -81,6 +81,10 @@ type SpaceInfo struct {
 	// notably on a joiner whose access is still pending (no read key
 	// yet) and on rows whose space was never loaded by this device.
 	PushKeys *PushKeys
+	// Derived marks a space created by the account's own
+	// Service.Derive — Delete refuses it (see ErrIsDerivedSpace).
+	// Always false on created / joined / tracked / 1-1 spaces.
+	Derived bool
 }
 
 // PushKeys is the per-space key material a push RECEIVER needs,

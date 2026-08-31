@@ -1,6 +1,18 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrUnsupported is returned by every surface the tech-space handle
+// (Service.Get(techSpaceId)) does not offer: object and type
+// lifecycle, members and ACL, files, history, read state, pub/sub,
+// change feed, metadata, and generic writes to anything but a bundle
+// dataset. Classify with errors.Is. Subscribe-style methods whose
+// signature carries no error (Members / Files / ReadState / Changes)
+// are inert there: a no-op cancel, a callback that never fires.
+var ErrUnsupported = errors.New("space: unsupported on this space")
 
 // SetMetadataRequest is the input to Space.SetMetadata. Pointer
 // semantics: nil = leave-unchanged; non-nil empty string = set-empty.
@@ -66,6 +78,11 @@ type Space interface {
 	// See Files.
 	Files() Files
 
+	// PubSub is ephemeral space-scoped pub/sub — fire-and-forget,
+	// at-most-once messages between the space's online members, never
+	// persisted. See PubSubAPI.
+	PubSub() PubSubAPI
+
 	// ReadState tracks read/unread changes for datasets registered
 	// with handler.Dataset.ReadTracking. Methods return
 	// ErrReadTrackingDisabled when nothing in the space opted in.
@@ -91,8 +108,10 @@ type Space interface {
 	// (objectId, dataset) — the aggregation sibling of Query. The
 	// pipeline is accepted in the same forms Query.Filter takes a
 	// condition: a JSON string, *fastjson.Value, *anyenc.Value,
-	// marshaled-anyenc []byte, or any JSON-marshalable Go value.
-	// Snapshot-only. See Agg.
+	// marshaled-anyenc []byte, or a Go value converted like a record
+	// value (see Op.Value). A Go map has no key order, so a stage whose
+	// key order matters ($sort over several keys) is given as JSON
+	// text or *fastjson.Value. Snapshot-only. See Agg.
 	Aggregate(objectId, dataset string, pipeline any) Agg
 
 	// AggregateObjects builds an aggregation pipeline against the
@@ -138,6 +157,13 @@ type Space interface {
 	// Returned RecordIds mirror the input order.
 	Delete(ctx context.Context, batch DeleteBatch) (ModifyResult, error)
 
+	// Upsert is the generic schema-driven batch ingest: upsert by
+	// record id, diff only declared-mutable fields against stored
+	// values, skip identical records, one change per page. Requires an
+	// id:user dataset (the caller id is the idempotency key). See
+	// UpsertBatch for per-record semantics.
+	Upsert(ctx context.Context, batch UpsertBatch) (UpsertResult, error)
+
 	// SetMetadata mutates this space's display metadata (name,
 	// description, icon) by writing to the per-space `spaceIndex`
 	// derived object. The write is CRDT-replicated to every member;
@@ -162,6 +188,23 @@ type Space interface {
 	// wrappers that want to attach a Query.Subscribe stream on the
 	// spaceIndex's `objects` dataset for live UI updates.
 	SpaceIndexObjectId() string
+
+	// Bundles is the typed surface over the per-space installed-bundles
+	// registry on the spaceIndex object. See BundlesAPI.
+	Bundles() BundlesAPI
+
+	// WaitIndexSynced blocks until the local view of the space's index
+	// is trustworthy — the gate the restore path takes before reading
+	// the bundles registry ("wait for the space index, then see what is
+	// set up"). Two exits: the seeded metadata row is already projected
+	// locally (immediate, no network — offline-first), or a clean
+	// head-sync round completes with the sync-status rollup at Synced,
+	// which also covers spaces that never seed metadata (1-1 / nameless
+	// derived spaces) — there an absent index after convergence is the
+	// valid answer "nothing set up yet", not a wait-forever. While
+	// waiting it forces head-sync rounds; bounded only by ctx (an
+	// offline device with no local index keeps waiting).
+	WaitIndexSynced(ctx context.Context) error
 
 	// SyncHeads forces an immediate head-sync (diff) round on this
 	// space against its responsible nodes, instead of waiting for the

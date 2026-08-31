@@ -1,0 +1,60 @@
+package spaceimpl
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+)
+
+func TestLiveObjectRow(t *testing.T) {
+	a := &anyenc.Arena{}
+	assert.False(t, liveObjectRow(nil))
+	live := a.NewObject()
+	live.Set("id", a.NewString("o"))
+	assert.True(t, liveObjectRow(live))
+	tomb := a.NewObject()
+	tomb.Set("id", a.NewString("o"))
+	tomb.Set(crdt.DeletedAtField, a.NewNumberInt(1))
+	assert.False(t, liveObjectRow(tomb))
+}
+
+// The found path is a pure any-store read: the row comes back cloned
+// with its any.types. (The absent / deleted verdicts need a loaded
+// any-sync space and are covered end to end.)
+func TestObjectsGet_ReturnsLiveRow(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "objs.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	coll, err := db.Collection(ctx, "spaceA_"+spaceobjects.SpaceObjectsCollection)
+	require.NoError(t, err)
+	a := &anyenc.Arena{}
+	row := a.NewObject()
+	row.Set("id", a.NewString("obj-1"))
+	anyObj := a.NewObject()
+	typesArr := a.NewArray()
+	typesArr.SetArrayItem(0, a.NewString("type-x"))
+	anyObj.Set("types", typesArr)
+	row.Set("any", anyObj)
+	require.NoError(t, coll.UpsertOne(ctx, row))
+
+	store := spaceobjects.NewStore(nil, db, nil, "spaceA", nil, nil)
+	t.Cleanup(func() { _ = store.Close() })
+	s := &spaceImpl{id: "spaceA", store: store}
+	got, err := newObjectService(s).Get(ctx, "obj-1")
+	require.NoError(t, err)
+	assert.Equal(t, "obj-1", got.GetString("id"))
+	assert.Equal(t, "type-x", got.GetString("any", "types", "0"))
+
+	_, err = newObjectService(s).Get(ctx, "")
+	require.Error(t, err)
+}

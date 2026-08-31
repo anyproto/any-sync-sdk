@@ -19,6 +19,7 @@ import (
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/coordinator/inboxclient"
+	"github.com/anyproto/any-sync/commonspace/pubsub"
 	"github.com/anyproto/any-sync/coordinator/nodeconfsource"
 	"github.com/anyproto/any-sync/coordinator/subscribeclient"
 	"github.com/anyproto/any-sync/net/peerservice"
@@ -115,6 +116,11 @@ type App struct {
 	// localOnly pins spaces to this device — no node subscribe, no
 	// push, no coordinator receipt. See localOnlySpaces.
 	localOnly *localOnlySpaces
+
+	// pubsub is the commonspace/pubsub engine (ephemeral, ACL-gated
+	// pub/sub). Registered as an app component; reached through the
+	// PubSub* pass-throughs.
+	pubsub pubsub.Service
 }
 
 // New brings up the any-sync app. Order matters: keys first (provider
@@ -162,11 +168,27 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// space's first ACL read key, cached in memory. Spaces whose ACL
 	// isn't readable yet are skipped until it syncs in.
 	discoveryKeys := newDiscoveryKeySource(storage, keys)
+	// pubsub engine + its Deps adapters. The adapters are late-bound to
+	// the App below (their methods only run post-Start); the engine is
+	// registered as a component so the app drives its lifecycle.
+	psPeers := &pubsubPeers{}
+	psCrypto := &pubsubCrypto{}
+	psMembership := &pubsubMembership{}
+	psvc := pubsub.New(pubsub.Deps{
+		Membership: psMembership,
+		Crypto:     psCrypto,
+		Peers:      psPeers,
+		OnStatus:   logPubSubStatus,
+	})
 	// A handshaked local peer's shared space set changed — head-sync
 	// whatever we share with it right away rather than on the next
-	// diff tick.
+	// diff tick, and re-push pubsub interest so the fresh LAN peer
+	// starts relaying to us before the engine's next resync tick.
 	exchange := p2p.NewExchange(keys.PeerId, peerStore, advertisedSpaceIds, discoveryKeys.DiscoveryKeys, func(_ string, spaceIds []string) {
 		sync.SyncSpaces(spaceIds)
+		for _, id := range spaceIds {
+			pubsubSyncInterest(psvc, id)
+		}
 	})
 	exchange.SetAccountKeysFn(discoveryKeys.AccountDiscoveryKeys)
 	// Resolve the effective p2p config. Headless mode defaults p2p off
@@ -224,6 +246,12 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(subscribeclient.New()).
 		Register(inbox).
 		Register(peerStore).
+		// The pubsub engine owns a private streampool; pubsubRpc puts
+		// its stream handler on the DRPC mux during Init (before the
+		// accept loop), so both must be components. Registered after
+		// server (mux) and accountAdapter (engine Init resolves it).
+		Register(psvc).
+		Register(pubsubRpc{}).
 		Register(exchange).
 		// Discovery is registered last: by the time it announces and
 		// starts handshaking, every component it can trigger (server,
@@ -266,7 +294,11 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		selectiveTreeTypes: cfg.Sync.TreeTypes,
 		headless:           cfg.Headless,
 		localOnly:          localOnly,
+		pubsub:             psvc,
 	}
+	psPeers.app = out
+	psCrypto.app = out
+	psMembership.app = out
 
 	// Install the push forwarder BEFORE Start: inboxClient.Run rejects a
 	// nil receiver. The forwarder delegates to the notifier's handler
@@ -281,20 +313,26 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		return nil, fmt.Errorf("anysyncx: set inbox receiver: %w", err)
 	}
 
+	// Fields the pubsub adapters and inbound handlers read (a, nodeConf,
+	// spaceService, spaceCache) are assigned BEFORE Start: listeners
+	// come up during Start, and an early inbound frame reading a field
+	// assigned after Start returns would be a data race. MustComponent
+	// only needs registration, which is complete here.
+	out.a = a
+	out.nodeConf = a.MustComponent(nodeconf.CName).(nodeconf.Service)
+	out.spaceService = a.MustComponent(commonspace.CName).(commonspace.SpaceService)
+	out.spaceCache = out.newSpaceCache()
+
 	if err := a.Start(ctx); err != nil {
 		return nil, fmt.Errorf("anysyncx: app start: %w", err)
 	}
 
-	out.a = a
-	out.spaceService = a.MustComponent(commonspace.CName).(commonspace.SpaceService)
 	out.coord = a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
 	out.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
 	out.joining = a.MustComponent(aclclient.CName).(aclclient.AclJoiningClient)
 	// Wire the responsible-node resolver so per-space trackers can
-	// filter inbound HeadsApply senders. nodeconf is registered above;
-	// fetch the component once here so the closure stays cheap.
-	nc := a.MustComponent(nodeconf.CName).(nodeconf.Service)
-	out.nodeConf = nc
+	// filter inbound HeadsApply senders.
+	nc := out.nodeConf
 	out.syncStatus.SetNodeIdsFn(nc.NodeIds)
 	// Connected LAN peers are responsible senders too, so a space
 	// synced purely over the LAN still advances to Synced.
@@ -341,7 +379,6 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// the dirty set, and dispatches SpaceSyncStatus events to
 	// account-wide subscribers. Close() cancels via syncStatus.Close.
 	out.syncStatus.Run(context.Background())
-	out.spaceCache = out.newSpaceCache()
 	// Wire the head cache into the sync handler so HeadSync's fast
 	// path sees the same map updated by space loads, and the app
 	// back-reference the peer-facing SpacePush handler loads through.

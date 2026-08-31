@@ -65,6 +65,12 @@ func (s *Service) aclKickFanout(spaceId string, acl list.AclList) *aclKickMux {
 	m := s.aclMuxes[spaceId]
 	if m == nil {
 		m = &aclKickMux{}
+		// pubsub membership revalidation rides every mux: registering at
+		// creation (under s.mu) covers each path that wires ACL watchers
+		// — ensureSpaceIndexWiring on all load routes, members watcher —
+		// exactly once per loaded lifetime, and dies with the mux on
+		// offload.
+		m.add(&pubsubAclWatcher{spaceId: spaceId, app: s.app})
 		s.aclMuxes[spaceId] = m
 	}
 	s.mu.Unlock()

@@ -67,6 +67,8 @@ func setMulti(arena *anyenc.Arena, fields map[string]any) crdt.Op {
 			} else {
 				obj.Set(k, arena.NewFalse())
 			}
+		case *anyenc.Value:
+			obj.Set(k, x)
 		default:
 			panic("setMulti: unsupported type")
 		}

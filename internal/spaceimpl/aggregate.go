@@ -2,7 +2,6 @@ package spaceimpl
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -86,10 +85,7 @@ func (a *aggImpl) normalizePipeline(pipeline any) (*anyenc.Value, error) {
 	case []byte:
 		v, err = anyenc.Parse(p)
 	default:
-		var raw []byte
-		if raw, err = json.Marshal(p); err == nil {
-			v, err = anyenc.ParseJson(string(raw))
-		}
+		v, err = goToAnyenc(a.arena, p)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", space.ErrBadPipeline, err)
@@ -131,7 +127,9 @@ func (a *aggImpl) MemoryLimit(bytes int) space.Agg { a.memLimit = &bytes; return
 // applied. coll.Aggregate parses (and detaches from) the combined
 // pipeline; parse errors surface from the terminal call.
 func (a *aggImpl) buildAgg(coll anystore.Collection) anystore.AggQuery {
-	aq := coll.Aggregate(a.combined())
+	// The public aggregate surface is a read: $merge/$out sinks would
+	// write store collections past the CRDT and every write fence.
+	aq := coll.Aggregate(a.combined()).ReadOnly()
 	if a.groupLimit != nil {
 		aq = aq.GroupLimit(*a.groupLimit)
 	}
@@ -152,6 +150,9 @@ func (a *aggImpl) buildAgg(coll anystore.Collection) anystore.AggQuery {
 // pipeline — acceptable; the alternative (parse errors reading as
 // internal failures) is worse.
 func classifyAggErr(err error) error {
+	if errors.Is(err, anystore.ErrAggregateReadOnly) {
+		return fmt.Errorf("%w: %v", space.ErrBadPipeline, err)
+	}
 	if err == nil ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, space.ErrBadPipeline) ||

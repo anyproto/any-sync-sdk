@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
 // Dataset is the name every regular object uses for its base-scope
@@ -25,6 +26,11 @@ import (
 // ObjectId. Type objects don't register this handler; their own
 // metadata (any.name etc.) lives in their per-type-object storage
 // behind a different dataset.
+//
+// The row also carries the object-level `modifiedAt` / `modifiedBy`
+// pair: the handler is a crdt.ObjectStamper, so a synced change on
+// ANY dataset of the object (editor blocks, chat messages, runtime
+// datasets) stamps them, not only writes to the row itself.
 //
 // See docs/06-data-structure.md § "Storage" — the per-space
 // `objects` collection model.
@@ -37,6 +43,16 @@ const Dataset = "objects"
 // level DataVersion" — data-dataset version is a hardcoded handler
 // identifier in Phase 1).
 const HandlerVersion = "systemPropertyHandler-v1"
+
+// LocalVersion is the handler's LOCAL logic version (HandlerReg.Version)
+// — bumped when already-materialized rows would come out different, so
+// the SDK rebuilds them from the DAG (docs/08-versioning.md). v2: the
+// derived createdAt / modifiedAt stamps are TypeDateTime instants, not
+// epoch numbers. v3: modifiedAt is also stamped by changes on the
+// object's other datasets (StampObject), so rows stamped by property
+// writes alone are stale. v4: modifiedBy is stamped next to
+// modifiedAt.
+const LocalVersion = 4
 
 // SystemPropertiesHandler validates property writes on every user
 // object. Corresponds to the `baseProperty` handler named in
@@ -86,9 +102,9 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 
 // BeforeCreate validates every op in the creation payload, then
 // auto-stamps the `any`-scope auto fields (author, createdAt,
-// spaceId, modifiedAt) via sink.Derive so every newly minted row in
-// the per-space `objects` collection carries them. The stamps are derived
-// from the change envelope (Creator from the signing identity,
+// spaceId, modifiedAt, modifiedBy) via sink.Derive so every newly
+// minted row in the per-space `objects` collection carries them. The
+// stamps are derived from the change envelope (the signing identities,
 // Timestamp from the change wire, SpaceId from the apply context),
 // not from caller input — these fields are ScopeDerived in the `any`
 // type, read-only by contract (validateField rejects input ops on
@@ -121,8 +137,8 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 // — `author`, `createdAt`, `spaceId` — that live alongside `id` at
 // the top of the record (NOT under `any.*`). Stamped once at record
 // creation; BeforeCreate fires only on first-touch so they don't
-// re-apply. Also seeds the initial `modifiedAt` (per-change, keeps
-// moving on every modify — see stampModifiedAt).
+// re-apply. Also seeds the initial `modifiedAt` / `modifiedBy` (per-
+// change, keep moving on every modify — see stampModified).
 //
 // `author` and `createdAt` are taken from the tree's ROOT change
 // (immutable header), not from the per-change envelope — those are
@@ -150,10 +166,10 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 		sink.Derive(crdt.Op{
 			Type: crdt.OpSet,
 			Path: []string{"createdAt"},
-			// Float64, not NewNumberInt(int(ts)) — same wire encoding
-			// (anyenc numbers are float64), but int() would truncate the
-			// int64 timestamp on 32-bit platforms.
-			Payload: a.NewNumberFloat64(float64(ts)),
+			// A TypeDateTime instant, not an epoch number: the shape
+			// any-store orders, indexes and computes dates on. The
+			// envelope carries unix SECONDS; TypeDateTime is millis.
+			Payload: a.NewDateTimeMillis(ts * 1000),
 		})
 	}
 	if spaceId := ctx.Change.SpaceId; spaceId != "" {
@@ -163,26 +179,36 @@ func stampAutoFields(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 			Payload: a.NewString(spaceId),
 		})
 	}
-	stampModifiedAt(ctx, sink)
+	stampModified(ctx, sink)
 }
 
-// stampModifiedAt queues the derived row-root `modifiedAt` stamp — the
-// Unix-seconds timestamp of the change being applied (the per-change
-// envelope Timestamp, NOT the root-header ObjectCreatedAt the createdAt
-// stamp uses). Fired from both BeforeCreate (so every row carries it
-// from birth, initially equal to the creating change's time) and
-// BeforeModify (so any synced write bumps it).
+// stampModified queues the derived row-root `modifiedAt` /
+// `modifiedBy` pair: the Unix-seconds timestamp of the change being
+// applied (the per-change envelope Timestamp, NOT the root-header
+// ObjectCreatedAt the createdAt stamp uses) and the account identity
+// that signed it (the per-change Creator, NOT the root signer the
+// author stamp uses). Fired from BeforeCreate (so every row carries
+// them from birth, equal to the creating change's time and signer),
+// BeforeModify (any synced write to the row) and StampObject (any
+// synced write to another dataset of the object), so the pair reads
+// as "the object changed, when and by whom", whatever dataset the
+// change landed on.
 //
-// Convergence: the stamp inherits the change's VersionId, so under
-// standard LWW every peer resolves modifiedAt to the timestamp of the
-// ordering-max change that touched the row — deterministic once all
-// changes are delivered. The value is the author's wall clock
+// Convergence: both stamps inherit the change's VersionId, so under
+// standard LWW every peer resolves them to the ordering-max change
+// that touched the object — deterministic once all changes are
+// delivered. The pair always moves together: a change whose signer is
+// unknown (no Creator — a hand-built change without a tree) unsets
+// modifiedBy at the same version rather than leaving an older signer
+// next to a newer time, so an absent modifiedBy reads "signer unknown
+// for the latest change", never someone else. No Timestamp (same
+// origin) stamps nothing. The time is the author's wall clock
 // (display/sort quality only, never a fencing token), same contract as
 // version-history timestamps.
 //
 // DeriveOnce, not Derive: BeforeModify runs per op, and a multi-op
 // RecordChange must stamp once, not once per op.
-func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	if ctx == nil || ctx.Change == nil || sink == nil {
 		return
 	}
@@ -194,9 +220,14 @@ func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 	sink.DeriveOnce(crdt.Op{
 		Type: crdt.OpSet,
 		Path: []string{"modifiedAt"},
-		// Float64 for the same 32-bit-truncation reason as createdAt.
-		Payload: a.NewNumberFloat64(float64(ts)),
+		// TypeDateTime millis, as createdAt (envelope is seconds).
+		Payload: a.NewDateTimeMillis(ts * 1000),
 	})
+	by := crdt.Op{Type: crdt.OpUnset, Path: []string{"modifiedBy"}}
+	if creator := ctx.Change.Creator; creator != "" {
+		by = crdt.Op{Type: crdt.OpSet, Path: []string{"modifiedBy"}, Payload: a.NewString(creator)}
+	}
+	sink.DeriveOnce(by)
 }
 
 // BeforeModify validates one inbound op against the current schema.
@@ -211,20 +242,29 @@ func stampModifiedAt(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // would drop values written before the attach-type change arrives,
 // breaking out-of-order tolerance (docs/06-data-structure.md §397).
 //
-// Every op that passes validation stamps the derived `modifiedAt`
-// (deduped via DeriveOnce — one stamp per RecordChange). Stamping after
-// the validation gate means a fully-rejected change never bumps
-// modifiedAt; an op that passes here but later loses its per-field LWW
-// race still bumps it, which is deterministic (every peer runs the same
-// gates in the same order) and reads as "latest valid write attempt".
+// Every op that passes validation stamps the derived `modifiedAt` /
+// `modifiedBy` pair (deduped via DeriveOnce — one stamp per
+// RecordChange). Stamping after the validation gate means a fully-
+// rejected change never bumps them; an op that passes here but later
+// loses its per-field LWW race still bumps them, which is
+// deterministic (every peer runs the same gates in the same order)
+// and reads as "latest valid write attempt".
 func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
 	if h.Registry != nil {
 		if verr := h.validateOp(op, nil); verr != nil {
 			return verr
 		}
 	}
-	stampModifiedAt(ctx, sink)
+	stampModified(ctx, sink)
 	return nil
+}
+
+// StampObject bumps the row's `modifiedAt` / `modifiedBy` for a synced
+// change on any other dataset of the object (crdt.ObjectStamper). The
+// controller applies the stamps to the existing row only — a row that
+// does not exist yet gets them from BeforeCreate when it is created.
+func (*SystemPropertiesHandler) StampObject(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+	stampModified(ctx, sink)
 }
 
 // BeforeDelete is a no-op — deleting a property record (the per-
@@ -272,6 +312,12 @@ type preflight struct {
 // buildPreflight computes the set of typeIds the object implements
 // after this change: the universal `any` type, the types already in
 // the record's any.types, plus any types this change attaches.
+//
+// The meta-type is the one entry whose marker and namespace differ —
+// a type object carries `__type__` in any.types but stores its
+// type-only values under `type` (an underscore-prefixed top-level
+// field is protocol-owned). Grant the namespace off the marker so
+// only rows that declare themselves types can write there.
 func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc.Value) *preflight {
 	members := map[string]struct{}{anytype.TypeId: {}}
 	if before != nil {
@@ -283,6 +329,14 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 		for oi := range ch.Records[ri].Ops {
 			collectTypeAdditions(&ch.Records[ri].Ops[oi], members)
 		}
+	}
+	if _, isType := members[typetype.MetaTypeMarker]; isType {
+		members[typetype.TypeId] = struct{}{}
+	} else {
+		// The marker is the ONLY grant: an object that merely lists the
+		// meta-type id in any.types (nothing stops a client attaching
+		// it) must not reach the namespace.
+		delete(members, typetype.TypeId)
 	}
 	list := slices.Sorted(maps.Keys(members))
 	return &preflight{members: members, list: list}

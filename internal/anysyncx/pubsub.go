@@ -19,6 +19,9 @@ import (
 	"github.com/anyproto/any-sync/commonspace/pubsub"
 	"github.com/anyproto/any-sync/commonspace/pubsub/pubsubproto"
 	"github.com/anyproto/any-sync/net/peer"
+	"github.com/anyproto/any-sync/net/pool"
+
+	"github.com/anyproto/any-sync-sdk/internal/p2p"
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/util/crypto"
 	"go.uber.org/zap"
@@ -57,15 +60,24 @@ const aclOpTimeout = 10 * time.Second
 // miss.
 const pubsubKeyCacheLimit = 1024
 
-// pubsubPeers is the engine's PeerProvider: the responsible sync node
-// plus every connectable LAN peer sharing the space — the same
-// audience spacePeerManager.getBroadcastPeers resolves. Local-only
-// spaces resolve nobody (mirrors localPeerManager), so publishes on
-// them deliver loopback-only. Dial errors drop the peer silently: the
-// engine only logs peer-resolution failures and its resync loop
-// retries.
+// pubsubPeers is the engine's PeerProvider: the responsible sync node,
+// every connectable LAN peer sharing the space, and every global peer
+// sharing it that is ALREADY connected (pool.Pick — never a dial; the
+// global connector owns those). Local-only spaces resolve nobody
+// (mirrors localPeerManager), so publishes on them deliver
+// loopback-only. Dial errors drop the peer silently: the engine only
+// logs peer-resolution failures and its resync loop retries.
 type pubsubPeers struct {
 	app *App
+	// pool overrides the app's pool (tests).
+	pool pool.Pool
+}
+
+func (p *pubsubPeers) poolOf() pool.Pool {
+	if p.pool != nil {
+		return p.pool
+	}
+	return p.app.Pool()
 }
 
 func (p *pubsubPeers) SpacePeers(ctx context.Context, spaceId string) ([]peer.Peer, error) {
@@ -73,15 +85,23 @@ func (p *pubsubPeers) SpacePeers(ctx context.Context, spaceId string) ([]peer.Pe
 	if a == nil || a.localOnly.has(spaceId) {
 		return nil, nil
 	}
+	pl := p.poolOf()
 	var peers []peer.Peer
 	if nodeIds := a.nodeConf.NodeIds(spaceId); len(nodeIds) > 0 {
-		if np, err := a.Pool().GetOneOf(ctx, nodeIds); err == nil {
+		if np, err := pl.GetOneOf(ctx, nodeIds); err == nil {
 			peers = append(peers, np)
 		}
 	}
 	for _, id := range a.peerStore.LocalPeerIds(spaceId) {
-		if lp, err := a.Pool().Get(ctx, id); err == nil {
+		if lp, err := pl.Get(ctx, id); err == nil {
 			peers = append(peers, lp)
+		}
+	}
+	if a.globalEnabled {
+		for _, id := range a.peerStore.GlobalPeerIds(spaceId) {
+			if gp, err := p2p.PickLive(ctx, pl, id); err == nil {
+				peers = append(peers, gp)
+			}
 		}
 	}
 	return peers, nil

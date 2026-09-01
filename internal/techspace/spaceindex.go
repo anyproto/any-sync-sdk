@@ -35,6 +35,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
 		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
 		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced},
+		{Id: FieldP2PAdvertise, Name: "P2P advertise", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindDatetime), Scope: schema.ScopeDerived},
 		// KindObject with nil Properties = free-form shape: the schema
 		// validator accepts any nested keys (schema.validateValue stops at
@@ -215,6 +216,12 @@ const (
 	// space.ErrIsDerivedSpace. Absent on created / joined / tracked /
 	// 1-1 rows.
 	FieldDerived = "derived"
+	// FieldP2PAdvertise (synced, account-wide) is the per-space p2p
+	// advertising switch: false stops this account's devices from
+	// publishing their global p2p row into the space, so other members
+	// cannot dial them there; absent means on. Own devices find each
+	// other through the account record regardless.
+	FieldP2PAdvertise = "p2pAdvertise"
 )
 
 // FieldIssuedInviteKeys subkeys — the issued-key kinds. Slugs, not
@@ -476,4 +483,3 @@ func currentStatus(before *anyenc.Value, field string) string {
 	}
 	return string(v.GetStringBytes())
 }
-

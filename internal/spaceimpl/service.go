@@ -859,18 +859,19 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		typ = s.headerTypeFromHeader(peekCtx, r.Id)
 	}
 	info := space.SpaceInfo{
-		Id:          r.Id,
-		Type:        typ,
-		SpaceType:   s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
-		Author:      author,
-		Name:        r.Name,
-		Description: r.Description,
-		IconCID:     r.IconCID,
-		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
-		OwnRole:     r.OwnRole,
-		Settings:    r.Settings,
-		PushKeys:    r.PushKeys,
-		Derived:     r.Derived,
+		Id:           r.Id,
+		Type:         typ,
+		SpaceType:    s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
+		Author:       author,
+		Name:         r.Name,
+		Description:  r.Description,
+		IconCID:      r.IconCID,
+		Status:       mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		OwnRole:      r.OwnRole,
+		Settings:     r.Settings,
+		PushKeys:     r.PushKeys,
+		Derived:      r.Derived,
+		P2PAdvertise: r.P2PAdvertise,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
@@ -1885,6 +1886,14 @@ func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttr
 		return nil, fmt.Errorf("spaceimpl: tree %s/%s has no bound any-sync tree", spaceId, treeId)
 	}
 	return tree, nil
+}
+
+// HasTree reports whether (spaceId, treeId) is already in local storage.
+func (s *Service) HasTree(ctx context.Context, spaceId, treeId string) (bool, error) {
+	if spaceId == s.tsp.SpaceId() {
+		return s.tsp.HasTree(ctx, spaceId, treeId)
+	}
+	return s.storeFor(spaceId).HasTree(ctx, treeId)
 }
 
 // PutTree binds a remote-delivered tree payload. Tech-space's

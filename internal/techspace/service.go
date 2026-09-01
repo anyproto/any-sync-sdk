@@ -337,6 +337,17 @@ func (s *Service) SetDerived(ctx context.Context, spaceId string) (object.WriteR
 	})
 }
 
+// SetP2PAdvertise writes the per-space p2p advertising switch
+// (FieldP2PAdvertise, synced account-wide).
+func (s *Service) SetP2PAdvertise(ctx context.Context, spaceId string, on bool) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldP2PAdvertise, false, func(a *anyenc.Arena) *anyenc.Value {
+		if on {
+			return a.NewTrue()
+		}
+		return a.NewFalse()
+	})
+}
+
 // SetPushKeys mirrors the space's derived push-notification key
 // material onto its row via the local-set path (FieldPushKeys,
 // device-local; never enters the DAG — every device derives the same
@@ -918,6 +929,14 @@ func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttr
 // derived yet. (The index object is always derived locally at Open, so
 // it never arrives this way, but accepting it is harmless: Derive and
 // PutTree converge on the same deterministic tree.)
+// HasTree reports whether the tech space already stores treeId.
+func (s *Service) HasTree(ctx context.Context, spaceId, treeId string) (bool, error) {
+	if spaceId != s.spaceId {
+		return false, ErrSpaceRegistryUnknown
+	}
+	return s.store.HasTree(ctx, treeId)
+}
+
 func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {
 	if spaceId != s.spaceId {
 		return ErrSpaceRegistryUnknown

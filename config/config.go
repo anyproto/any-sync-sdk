@@ -1,6 +1,10 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
+
+	"errors"
 	"time"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -116,22 +120,171 @@ type P2P struct {
 	// e.g. e2e tests use a unique per-run name so developer machines on
 	// the same LAN don't discover each other.
 	ServiceName string `yaml:"serviceName"`
+
+	// Global is the internet-wide device-to-device layer (iroh: QUIC
+	// with relay fallback and hole punching, peers discovered through
+	// each space's key-value store). Independent of the LAN layer:
+	// Enabled=false above with Global.Enabled=true is a valid setup.
+	Global GlobalP2P `yaml:"global"`
 }
 
 // IsEnabled resolves the opt-out tristate: nil = enabled.
 func (p P2P) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+
+// GlobalP2P configures the internet-wide p2p layer. Opt-in: nil Enabled
+// means off until a relay is deployed for the network. Zero-valued
+// budget fields take the DefaultGlobalP2P* values; see
+// docs/18-global-p2p.md.
+type GlobalP2P struct {
+	// Enabled turns the layer on. nil and false both mean off.
+	Enabled *bool `yaml:"enabled"`
+
+	// RelayURLs are the home-relay candidates ("https://relay.example").
+	// Required when enabled: without a relay the published ticket would
+	// carry this device's IP addresses into every space's records.
+	RelayURLs []string `yaml:"relayUrls"`
+
+	// InsecureRelay admits http:// relay URLs (plaintext transport to
+	// the relay), both in RelayURLs and in the relays the account record
+	// names for sibling devices. Development and tests only.
+	InsecureRelay bool `yaml:"insecureRelay"`
+
+	// PkarrRelayURLs are the pkarr relays ("https://dns.example") that
+	// hold the account's device-discovery record: every device of the
+	// account registers itself there and resolves its siblings from it,
+	// which is also how a fresh device finds them with nothing but the
+	// mnemonic. Empty leaves the account layer off; devices then know
+	// each other only through the records of shared spaces.
+	PkarrRelayURLs []string `yaml:"pkarrRelayUrls"`
+
+	// InsecurePkarr admits http:// pkarr relay URLs. Development and
+	// tests only.
+	InsecurePkarr bool `yaml:"insecurePkarr"`
+
+	// Port fixes the UDP port of the iroh endpoint. Zero binds an
+	// ephemeral port.
+	Port int `yaml:"port"`
+
+	// MaxConnections caps the global connections this device maintains
+	// (outbound, chosen to cover the loaded spaces).
+	MaxConnections int `yaml:"maxConnections"`
+
+	// MaxInbound is the headroom above MaxConnections for connections
+	// initiated by other devices: once MaxConnections+MaxInbound distinct
+	// global peers hold a live connection, inbound ones are refused
+	// before the handshake.
+	MaxInbound int `yaml:"maxInbound"`
+
+	// MaxDialsPerMinute rate-limits the connector; dials are sequential
+	// (one in flight) regardless.
+	MaxDialsPerMinute int `yaml:"maxDialsPerMinute"`
+
+	// DialTimeout bounds one global dial (relay round trip included).
+	// A relay dial either completes in about a round trip or dies at
+	// QUIC's own handshake timeout of 5 s, so this only decides how long
+	// the connector's single dial slot stays busy on a dead peer.
+	DialTimeout time.Duration `yaml:"dialTimeout"`
+
+	// KeepAlive is the QUIC keep-alive period of global connections.
+	KeepAlive time.Duration `yaml:"keepAlive"`
+
+	// StaleAfter / DormantAfter / DisableAfter are the liveness tiers:
+	// a peer not seen for StaleAfter is probed on a slow cadence, past
+	// DormantAfter only at startup and every few hours, past
+	// DisableAfter never (its record is ignored until it moves).
+	StaleAfter   time.Duration `yaml:"staleAfter"`
+	DormantAfter time.Duration `yaml:"dormantAfter"`
+	DisableAfter time.Duration `yaml:"disableAfter"`
+}
+
+// Defaults for the zero-valued GlobalP2P budget fields.
+const (
+	DefaultGlobalP2PMaxConnections    = 4
+	DefaultGlobalP2PMaxInbound        = 8
+	DefaultGlobalP2PMaxDialsPerMinute = 6
+	DefaultGlobalP2PDialTimeout       = 6 * time.Second
+	DefaultGlobalP2PKeepAlive         = 60 * time.Second
+	DefaultGlobalP2PStaleAfter        = time.Hour
+	DefaultGlobalP2PDormantAfter      = 7 * 24 * time.Hour
+	DefaultGlobalP2PDisableAfter      = 30 * 24 * time.Hour
+)
+
+// IsEnabled reports whether the global layer is on (explicit opt-in).
+func (g GlobalP2P) IsEnabled() bool { return g.Enabled != nil && *g.Enabled }
+
+// AccountEnabled reports whether the account-level discovery record is
+// in use: the layer is on and at least one pkarr relay is configured.
+func (g GlobalP2P) AccountEnabled() bool { return g.IsEnabled() && len(g.PkarrRelayURLs) > 0 }
+
+// Validate reports a configuration the layer cannot run with: enabled
+// without a relay would publish this device's IP addresses into every
+// space's records; a plaintext pkarr relay needs the explicit opt-in.
+func (g GlobalP2P) Validate() error {
+	if g.IsEnabled() && len(g.RelayURLs) == 0 {
+		return errors.New("p2p.global: relayUrls is required when enabled")
+	}
+	for _, raw := range g.PkarrRelayURLs {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("p2p.global: pkarrRelayUrls: %q is not a URL", raw)
+		}
+		switch u.Scheme {
+		case "https":
+		case "http":
+			if !g.InsecurePkarr {
+				return fmt.Errorf("p2p.global: pkarrRelayUrls: %q needs insecurePkarr", raw)
+			}
+		default:
+			return fmt.Errorf("p2p.global: pkarrRelayUrls: %q must be https", raw)
+		}
+	}
+	return nil
+}
+
+// WithDefaults returns g with every zero budget field replaced by its
+// default.
+func (g GlobalP2P) WithDefaults() GlobalP2P {
+	if g.MaxConnections <= 0 {
+		g.MaxConnections = DefaultGlobalP2PMaxConnections
+	}
+	if g.MaxInbound <= 0 {
+		g.MaxInbound = DefaultGlobalP2PMaxInbound
+	}
+	if g.MaxDialsPerMinute <= 0 {
+		g.MaxDialsPerMinute = DefaultGlobalP2PMaxDialsPerMinute
+	}
+	if g.DialTimeout <= 0 {
+		g.DialTimeout = DefaultGlobalP2PDialTimeout
+	}
+	if g.KeepAlive <= 0 {
+		g.KeepAlive = DefaultGlobalP2PKeepAlive
+	}
+	if g.StaleAfter <= 0 {
+		g.StaleAfter = DefaultGlobalP2PStaleAfter
+	}
+	if g.DormantAfter <= 0 {
+		g.DormantAfter = DefaultGlobalP2PDormantAfter
+	}
+	if g.DisableAfter <= 0 {
+		g.DisableAfter = DefaultGlobalP2PDisableAfter
+	}
+	return g
+}
 
 // ResolveP2P returns the effective P2P config for this Config, applying
 // the headless default: in headless mode a nil (unset) Enabled resolves
 // to disabled, because an embedded backend has no reason to announce
 // over mDNS or accept LAN peers. An explicit Enabled — &true or &false —
 // is always honored, so a headless broker can opt back into local sync.
+// Global is opt-in in every mode, so it passes through with its budget
+// defaults filled in.
 func (c Config) ResolveP2P() P2P {
 	p := c.P2P
 	if c.Headless && p.Enabled == nil {
 		off := false
 		p.Enabled = &off
 	}
+	p.Global = p.Global.WithDefaults()
 	return p
 }
 

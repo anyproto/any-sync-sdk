@@ -142,6 +142,7 @@ type AclSpaceClient interface {
   - Can only be deleted locally
   - Still appear in the space index like regular spaces
 - **Offline-first** — everything works offline. Only exception: account recovery still requires p2p peers
+- **Direct peers** — besides the sync nodes, a space syncs with the devices that share it: LAN peers found over mDNS, and — with `P2P.Global` on — internet-wide peers discovered through the space's key-value records and reached over iroh (relay fallback, hole punching). Global peers are never dialed on a sync path; see docs/18-global-p2p.md.
 
 ### Sync
 - **Space loading** — every space still loads at boot, but OFF the `Open` path: `Open` returns after local wiring (any-sync app, sdk.db, tech space, files/push, readSync, pending-join resume, 1-1 inbox) and one SDK-owned background goroutine then runs the eager loop — tombstone offloads, space load, offline catch-up replay (`spacesync.Run`), deletion reconcile — plus profile republish and the read-state reconcile, **strictly serial** (concurrent commonspace builds spike RAM/CPU exactly on the constrained devices this targets). `SDK.BootstrapDone()` closes when the pass finishes; `Close` cancels+joins it before any teardown.

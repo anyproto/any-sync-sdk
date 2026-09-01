@@ -17,7 +17,6 @@ import (
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/clientspaceproto"
 	"github.com/anyproto/any-sync/net/peer"
-	"github.com/anyproto/any-sync/net/peerservice"
 	"github.com/anyproto/any-sync/net/pool"
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/transport"
@@ -61,7 +60,7 @@ var log = logger.NewNamed("sdk.p2p")
 // must never leave this device, and there is no fallback an attacker
 // could downgrade to. Pre-v2 peers simply don't pair over LAN.
 type Exchange struct {
-	peerService peerService
+	addrs       lanAddrs
 	pool        dialPool
 	store       *PeerStore
 	selfPeerId  string
@@ -89,10 +88,13 @@ type Exchange struct {
 	ownAddrs func() sdkp2p.OwnAddresses
 }
 
-// peerService / dialPool are the slices of any-sync this component
-// touches, held as narrow interfaces so tests can fake them.
-type peerService interface {
-	SetPeerAddrs(peerId string, addrs []string)
+// lanAddrs / dialPool are the slices of the addr book and any-sync
+// this component touches, held as narrow interfaces so tests can fake
+// them. LAN addresses go through the AddrBook, which keeps them apart
+// from a peer's iroh ticket.
+type lanAddrs interface {
+	SetLAN(peerId string, addrs []string)
+	ClearLAN(peerId string)
 }
 
 type dialPool interface {
@@ -104,8 +106,8 @@ func NewExchange(selfPeerId string, store *PeerStore, allSpaceIds func() []strin
 }
 
 func (e *Exchange) Init(a *app.App) error {
-	if e.peerService == nil {
-		e.peerService = a.MustComponent(peerservice.CName).(peerservice.PeerService)
+	if e.addrs == nil {
+		e.addrs = a.MustComponent(addrBookCName).(*AddrBook)
 	}
 	if e.pool == nil {
 		e.pool = a.MustComponent(pool.CName).(pool.Pool)
@@ -136,8 +138,20 @@ func (e *Exchange) SetKnownSpaceIdsFn(fn func() []string) { e.knownSpaceIds.Stor
 // returned — discovery re-announces periodically, so a failed attempt
 // retries on the next sighting.
 func (e *Exchange) PeerDiscovered(ctx context.Context, discovered sdkp2p.DiscoveredPeer, own sdkp2p.OwnAddresses) {
-	e.peerService.SetPeerAddrs(discovered.PeerId, addSchema(discovered.Addrs))
-	e.handshake(ctx, discovered.PeerId, own)
+	e.addrs.SetLAN(discovered.PeerId, addSchema(discovered.Addrs))
+	if !e.handshake(ctx, discovered.PeerId, own) && !e.store.HasLocalPeer(discovered.PeerId) {
+		// never handshaked: the addresses would otherwise pin the peer to
+		// the LAN and keep its iroh ticket, if any, from taking over
+		e.addrs.ClearLAN(discovered.PeerId)
+	}
+}
+
+// PeerLost is the discovery notifier for a peer that left the LAN: its
+// LAN addresses and presence go, so its iroh ticket, if any, takes
+// over. The next sighting re-adds it through PeerDiscovered.
+func (e *Exchange) PeerLost(peerId string) {
+	e.addrs.ClearLAN(peerId)
+	e.store.RemoveLocalPeer(peerId)
 }
 
 // Broadcast re-runs the handshake with every known local peer. Called
@@ -157,11 +171,12 @@ func (e *Exchange) Broadcast(ctx context.Context) {
 // handshake dials a peer whose addresses are already registered and
 // runs one SpaceExchangeV2 round, recording the result. A peer too old
 // to serve v2 just fails here (logged) — there is no v1 fallback.
-func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnAddresses) {
+// Reports whether the round completed.
+func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnAddresses) bool {
 	p, err := e.pool.Get(ctx, peerId)
 	if err != nil {
 		log.Info("dial local peer", zap.String("peerId", peerId), zap.Error(err))
-		return
+		return false
 	}
 	spaceIds := e.allSpaceIds()
 	keys := e.discoveryKeys(ctx, spaceIds)
@@ -169,7 +184,7 @@ func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnA
 	nonce, err := clientspaceproto.NewNonceV2()
 	if err != nil {
 		log.Error("space exchange v2: nonce", zap.Error(err))
-		return
+		return false
 	}
 	tokens := make([][]byte, 0, len(keys)+len(probeIds))
 	for _, spaceId := range spaceIds {
@@ -185,7 +200,7 @@ func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnA
 	tokens, err = clientspaceproto.PadTokensV2(tokens)
 	if err != nil {
 		log.Error("space exchange v2: pad", zap.Error(err))
-		return
+		return false
 	}
 	var resp *clientspaceproto.SpaceExchangeV2Response
 	err = p.DoDrpc(ctx, func(conn drpc.Conn) error {
@@ -202,7 +217,7 @@ func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnA
 	})
 	if err != nil {
 		log.Info("space exchange v2", zap.String("peerId", peerId), zap.Error(err))
-		return
+		return false
 	}
 	received := tokenSet(resp.SpaceTokens)
 	var shared []string
@@ -232,6 +247,7 @@ func (e *Exchange) handshake(ctx context.Context, peerId string, own sdkp2p.OwnA
 	if e.onPeerUpdated != nil {
 		e.onPeerUpdated(peerId, shared)
 	}
+	return true
 }
 
 // SpaceExchange refuses the legacy plaintext v1 handshake: it would
@@ -356,7 +372,7 @@ func (e *Exchange) recordPeerAddrs(ctx context.Context, peerId string, localServ
 		log.Info("space exchange with no usable addresses", zap.String("peerId", peerId))
 		return false
 	}
-	e.peerService.SetPeerAddrs(peerId, addSchema(addrs))
+	e.addrs.SetLAN(peerId, addSchema(addrs))
 	return true
 }
 

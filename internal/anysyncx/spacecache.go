@@ -67,6 +67,9 @@ func (s *spaceWrapper) SyncHeads(ctx context.Context) error { return s.cs.SyncHe
 // after a successful TryClose.
 func (s *spaceWrapper) Close() error {
 	s.app.sync.UnregisterSpace(s.id)
+	if s.app.global != nil {
+		s.app.global.SpaceUnloaded(s.id)
+	}
 	return s.cs.Close()
 }
 
@@ -76,6 +79,9 @@ func (s *spaceWrapper) TryClose(ttl time.Duration) (bool, error) {
 	closed, err := s.cs.TryClose(ttl)
 	if closed {
 		s.app.sync.UnregisterSpace(s.id)
+		if s.app.global != nil {
+			s.app.global.SpaceUnloaded(s.id)
+		}
 	}
 	return closed, err
 }
@@ -173,6 +179,13 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 		a.headCache.Set(id, state.NewHash)
 	}
 	cs.Storage().StateStorage().SetObserver(a.headCache.observerFor(id))
+
+	// Global p2p follows the space's key-value records and publishes
+	// this device's own. Local-only spaces never reach the network and
+	// guest-mode spaces sign as a shared identity, so neither takes part.
+	if a.global != nil && !a.localOnly.has(id) && a.guestKeyFor(id) == nil {
+		a.global.SpaceLoaded(id, globalSpaceKV{cs: cs})
+	}
 
 	return &spaceWrapper{id: id, cs: cs, app: a}, nil
 }

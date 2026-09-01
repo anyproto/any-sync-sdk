@@ -125,3 +125,70 @@ func PossibilityProbe() func(ctx context.Context, port int) Possibility {
 	defer injectMu.Unlock()
 	return possibilityProbe
 }
+
+// PowerHint tells the global p2p connector how eager to be. Platform
+// bridges report the app moving to the background or the OS entering a
+// low-power mode; the connector then stops probing and lets idle
+// connections lapse until PowerNormal is reported again.
+type PowerHint uint8
+
+const (
+	// PowerNormal — foreground, no power constraint.
+	PowerNormal PowerHint = iota
+	// PowerLow — background or low-power mode: no global dials.
+	PowerLow
+)
+
+// String returns a stable lowercase token for logging.
+func (p PowerHint) String() string {
+	if p == PowerLow {
+		return "low"
+	}
+	return "normal"
+}
+
+var (
+	powerHint     PowerHint
+	powerSubs     = map[int]func(PowerHint){}
+	powerSubsNext int
+)
+
+// SetPowerHint reports the current power state. Process-global like the
+// other injection points; safe to call from any goroutine at any time.
+func SetPowerHint(h PowerHint) {
+	injectMu.Lock()
+	powerHint = h
+	subs := make([]func(PowerHint), 0, len(powerSubs))
+	for _, fn := range powerSubs {
+		subs = append(subs, fn)
+	}
+	injectMu.Unlock()
+	for _, fn := range subs {
+		fn(h)
+	}
+}
+
+// CurrentPowerHint returns the last reported power state.
+func CurrentPowerHint() PowerHint {
+	injectMu.Lock()
+	defer injectMu.Unlock()
+	return powerHint
+}
+
+// SubscribePowerHint registers fn for future SetPowerHint calls. The
+// returned cancel is idempotent. SDK-internal.
+func SubscribePowerHint(fn func(PowerHint)) (cancel func()) {
+	injectMu.Lock()
+	id := powerSubsNext
+	powerSubsNext++
+	powerSubs[id] = fn
+	injectMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			injectMu.Lock()
+			delete(powerSubs, id)
+			injectMu.Unlock()
+		})
+	}
+}

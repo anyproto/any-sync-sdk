@@ -182,6 +182,15 @@ type Space interface {
 	// downstream by the ACL at apply time on peers.
 	SetMetadata(ctx context.Context, req SetMetadataRequest) error
 
+	// SetP2PAdvertise switches per-space p2p advertising
+	// (SpaceInfo.P2PAdvertise). On republishes this device's global p2p
+	// record into the space right away; off stops the heartbeat — the
+	// account's other devices follow within a day, and rows already
+	// written age out on the other members' devices over 30 days. Synced
+	// account-wide; a read-only member can flip it, but readers never
+	// write rows, so for them it changes nothing.
+	SetP2PAdvertise(ctx context.Context, on bool) error
+
 	// SpaceIndexObjectId returns the deterministic id of the in-space
 	// `spaceIndex` derived object. Stable across peers and across
 	// SDK reboots — same id on every member's device. Useful for

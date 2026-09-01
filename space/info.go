@@ -85,6 +85,13 @@ type SpaceInfo struct {
 	// Service.Derive — Delete refuses it (see ErrIsDerivedSpace).
 	// Always false on created / joined / tracked / 1-1 spaces.
 	Derived bool
+	// P2PAdvertise is the per-space p2p advertising switch (on by
+	// default): while on, this account's devices publish their global p2p
+	// record into the space so the other members can dial them; off
+	// hides them from those members. Own devices find each other through
+	// the account's discovery record either way. Synced account-wide;
+	// written via Space.SetP2PAdvertise.
+	P2PAdvertise bool
 }
 
 // PushKeys is the per-space key material a push RECEIVER needs,

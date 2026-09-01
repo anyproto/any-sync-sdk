@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -327,6 +328,14 @@ const nodeStreamTag = "anysyncx/node-stream"
 // "healthy" by a LAN stream while every node is unreachable.
 const p2pStreamTag = "anysyncx/p2p-stream"
 
+// peerKinds is the slice of the p2p peer store the stream handler
+// needs to tell a global-only peer from a node or LAN peer.
+type peerKinds interface {
+	HasLocalPeer(peerId string) bool
+	HasGlobalPeer(peerId string) bool
+	GlobalPeerIds(spaceId string) []string
+}
+
 // streamHandler is the StreamPool's outgoing-side handler. It opens
 // ObjectSyncStream connections, primes them with the current set of
 // subscribed spaces, and decodes inbound HeadUpdate / SpaceSubscription
@@ -335,6 +344,13 @@ type streamHandler struct {
 	syncHandler *spaceSyncHandler
 	streamPool  streampool.StreamPool
 	nodeConf    nodeconf.Service
+	// peers classifies remote peers for the global-subscription rules;
+	// nil keeps every stream on the node/LAN behaviour.
+	peers peerKinds
+	// subs records the global peers that asked for pushes; shared with
+	// the peer managers, which read it at send time. nil when the
+	// global layer is off.
+	subs *globalSubs
 	// resyncing coalesces concurrent recovery head-syncs: every node
 	// stream (re)open triggers kickResync, but only one pass runs at a
 	// time. See kickResync.
@@ -372,6 +388,12 @@ func (h *streamHandler) OpenStream(ctx context.Context, p peer.Peer) (drpc.Strea
 		return nil, nil, 0, err
 	}
 	ids := h.syncHandler.RegisteredSpaceIds()
+	// The preamble asks the peer to push every registered space. A
+	// global-only peer gets it only while no node stream is up: with
+	// a node reachable its pushes would duplicate the node's.
+	if h.isGlobalOnly(p.Id()) && len(h.streamPool.Streams(nodeStreamTag)) > 0 {
+		ids = nil
+	}
 	if len(ids) > 0 {
 		sub := &spacesyncproto.SpaceSubscription{
 			SpaceIds: ids,
@@ -459,6 +481,32 @@ func (h *streamHandler) kickResync() {
 	}()
 }
 
+// isGlobalOnly reports a peer known through space records only: not a
+// node, not on the LAN.
+func (h *streamHandler) isGlobalOnly(peerId string) bool {
+	if h.peers == nil || !h.peers.HasGlobalPeer(peerId) || h.peers.HasLocalPeer(peerId) {
+		return false
+	}
+	return len(h.nodeConf.NodeTypes(peerId)) == 0
+}
+
+// globalSubSpaces returns the spaces out of spaceIds a global peer's
+// ask is honoured for: the peer must be known through records for
+// that space and not reachable over the LAN (the LAN path pushes to it
+// already). Anyone else earns nothing.
+func (h *streamHandler) globalSubSpaces(peerId string, spaceIds []string) []string {
+	if h.subs == nil || h.peers == nil || !h.peers.HasGlobalPeer(peerId) || h.peers.HasLocalPeer(peerId) {
+		return nil
+	}
+	var out []string
+	for _, spaceId := range spaceIds {
+		if slices.Contains(h.peers.GlobalPeerIds(spaceId), peerId) {
+			out = append(out, spaceId)
+		}
+	}
+	return out
+}
+
 // HandleMessage processes one inbound stream message. It NEVER returns a
 // non-nil error: any-sync's streampool readLoop tears the whole shared
 // node stream down the moment a handler errors (net/streampool/stream.go:
@@ -484,14 +532,27 @@ func (h *streamHandler) HandleMessage(ctx context.Context, _ string, msg drpc.Me
 			streamLog.Debug("decode subscription control", zap.Error(err))
 			return nil
 		}
+		// the ids are remote input: only well-formed space ids reach the
+		// tag index or the subscription registry
+		spaceIds := validSpaceIds(sub.SpaceIds)
+		if len(spaceIds) == 0 {
+			return nil
+		}
+		peerId, _ := peer.CtxPeerId(ctx)
 		if sub.Action == spacesyncproto.SpaceSubscriptionAction_Subscribe {
-			if err := h.streamPool.AddTagsCtx(ctx, sub.SpaceIds...); err != nil {
+			if err := h.streamPool.AddTagsCtx(ctx, spaceIds...); err != nil {
 				streamLog.Debug("add stream tags", zap.Error(err))
+			}
+			if honoured := h.globalSubSpaces(peerId, spaceIds); len(honoured) > 0 {
+				h.subs.Add(peerId, honoured...)
 			}
 			return nil
 		}
-		if err := h.streamPool.RemoveTagsCtx(ctx, sub.SpaceIds...); err != nil {
+		if err := h.streamPool.RemoveTagsCtx(ctx, spaceIds...); err != nil {
 			streamLog.Debug("remove stream tags", zap.Error(err))
+		}
+		if h.subs != nil {
+			h.subs.Remove(peerId, spaceIds...)
 		}
 		return nil
 	}

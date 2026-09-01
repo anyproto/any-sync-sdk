@@ -2,7 +2,9 @@ package anysyncx
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/anyproto/any-sync/app"
@@ -10,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync/net/rpc"
 	"github.com/anyproto/any-sync/net/secureservice"
 	"github.com/anyproto/any-sync/net/streampool"
+	"github.com/anyproto/any-sync/net/transport/iroh"
 	"github.com/anyproto/any-sync/net/transport/quic"
 	"github.com/anyproto/any-sync/net/transport/webtransport"
 	"github.com/anyproto/any-sync/net/transport/yamux"
@@ -109,6 +112,28 @@ func (c *configAdapter) GetQuic() quic.Config {
 		MaxStreams:         128,
 		KeepAlivePeriodSec: 25,
 	}
+}
+
+// GetIroh maps the global p2p budget onto the iroh transport. The idle
+// timeout is three keep-alive periods so a quiet relay path survives a
+// missed probe; a dead peer is noticed within that window.
+func (c *configAdapter) GetIroh() iroh.Config {
+	g := c.sdk.ResolveP2P().Global
+	conf := iroh.Config{
+		RelayURLs:          g.RelayURLs,
+		InsecureRelay:      g.InsecureRelay,
+		WriteTimeoutSec:    int(c.dialSeconds()),
+		DialTimeoutSec:     int(g.DialTimeout / time.Second),
+		CloseTimeoutSec:    5,
+		MaxStreams:         128,
+		KeepAlivePeriodSec: int(g.KeepAlive / time.Second),
+		MaxIdleTimeoutSec:  int(3 * g.KeepAlive / time.Second),
+	}
+	if g.Port != 0 {
+		// dual-stack, like go-iroh's own default bind
+		conf.BindAddr = net.JoinHostPort("::", strconv.Itoa(g.Port))
+	}
+	return conf
 }
 
 func (c *configAdapter) GetWebTransport() webtransport.Config {

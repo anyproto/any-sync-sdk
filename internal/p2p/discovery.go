@@ -45,6 +45,8 @@ const (
 // Notifier consumes discovery results; implemented by Exchange.
 type Notifier interface {
 	PeerDiscovered(ctx context.Context, peer sdkp2p.DiscoveredPeer, own sdkp2p.OwnAddresses)
+	// PeerLost reports a peer that left the LAN (driver lost event).
+	PeerLost(peerId string)
 }
 
 type discoveryEvent struct {
@@ -272,6 +274,7 @@ func (d *Discovery) consumeLoop(ctx context.Context) {
 				}
 			case ev.lostPeerId != "":
 				delete(known, ev.lostPeerId)
+				d.notifier.PeerLost(ev.lostPeerId)
 			default:
 				if ev.peer.PeerId == "" || ev.peer.PeerId == d.peerId {
 					continue

@@ -56,9 +56,14 @@ type SDK struct {
 	filesGC    *gc.Service
 	readSync   *readsync.Service
 	// stopP2PIndexWatch stops the tech-space index watcher that kicks
-	// LAN re-handshakes when the known-space set grows; nil when p2p
-	// is disabled or in headless mode.
+	// LAN re-handshakes and the index follower when the known-space set
+	// grows; nil when both p2p layers are off or in headless mode.
 	stopP2PIndexWatch func()
+	// indexGrew wakes the index follower (one pending signal).
+	indexGrew chan struct{}
+	// followerDone is closed when the index follower exits; nil in
+	// headless mode.
+	followerDone chan struct{}
 
 	// bootstrapCancel / bootstrapDone track the SDK-owned background
 	// boot pass (see bootstrap): profile republish, the serial eager
@@ -223,6 +228,17 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 
 	tsp := techspace.New(app, db)
 	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
+	// Per-space p2p advertising: the tech-space row's switch, on unless
+	// set off; the tech space itself never carries a device row (own
+	// devices come from the account record). Wired before tsp.Open loads
+	// the tech space, so its load publishes nothing.
+	app.SetAdvertiseFn(func(spaceId string) bool {
+		if spaceId == tsp.SpaceId() {
+			return false
+		}
+		rec, ok := tsp.Get(context.Background(), spaceId)
+		return !ok || rec.P2PAdvertise
+	})
 
 	// Push notifications (SYN-47): the push node is a direct out-of-band
 	// peer — register its dial addresses so the pool can reach it, then
@@ -273,7 +289,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// P2P files (SYN-48): serve our stored CAR objects to LAN peers and
 	// prefer a LAN peer over the public GET when fetching. Rides the
 	// existing p2p toggle; the peer store + DRPC server come from the app.
-	if app.P2PEnabled() {
+	if app.P2PEnabled() || app.GlobalP2PEnabled() {
 		filesFetch.SetPeer(filep2p.NewSource(app.Pool(), app.PeerStore()))
 		// The server was registered on the DRPC mux during app start
 		// (as a component, to avoid a serving race); hand it the store now.
@@ -409,6 +425,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		filesQueue: filesQueue,
 		filesGC:    filesGC,
 		readSync:   readSync,
+		indexGrew:  make(chan struct{}, 1),
 	}
 	sdk.registerP2PIndexWatch()
 	// Born-clean: a space created or derived this session enters the
@@ -440,7 +457,64 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		}()
 		sdk.bootstrap(bootstrapCtx)
 	}()
+	// The index follower pulls spaces the index learns of after the
+	// boot pass — a recovering device gets its space list from a
+	// sibling long after Open. Serial with the pass: it starts once the
+	// pass is done.
+	sdk.followerDone = make(chan struct{})
+	go sdk.followIndex(bootstrapCtx)
 	return sdk, nil
+}
+
+// followIndex waits for the boot pass, then pulls every space the
+// tech-space index names but this device does not hold, each time the
+// index grows (coalesced) — one space at a time, best-effort, until
+// Close cancels it.
+func (s *SDK) followIndex(ctx context.Context) {
+	defer close(s.followerDone)
+	select {
+	case <-ctx.Done():
+		return
+	case <-s.bootstrapDone:
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.indexGrew:
+		}
+		s.pullMissingSpaces(ctx)
+	}
+}
+
+// kickIndexFollower asks the follower for a pass; pending kicks coalesce.
+func (s *SDK) kickIndexFollower() {
+	if s.indexGrew == nil {
+		return
+	}
+	select {
+	case s.indexGrew <- struct{}{}:
+	default:
+	}
+}
+
+// pullMissingSpaces pulls the spaces the index names, is not blocked on
+// and this device holds no storage for. A pull needs a source — a node
+// or a direct peer that has the space; a failure is retried on the next
+// index change.
+func (s *SDK) pullMissingSpaces(ctx context.Context) {
+	for _, boot := range s.tsp.List(ctx) {
+		if ctx.Err() != nil {
+			return
+		}
+		rec, ok := s.tsp.Get(ctx, boot.Id)
+		if !ok || rec.IsDeleted() || spaceimpl.MaterializeBlock(rec) != nil || s.app.SpaceExists(rec.Id) {
+			continue
+		}
+		if _, err := s.spaces.Get(ctx, rec.Id); err != nil && ctx.Err() == nil {
+			log.Debug("index follower: pull space", zap.String("spaceId", rec.Id), zap.Error(err))
+		}
+	}
 }
 
 // bootstrapTestHook, when non-nil, runs first inside bootstrap — a
@@ -578,20 +652,28 @@ func (s *SDK) bootstrap(ctx context.Context) {
 // source right away). Cheap and local-only — one sub on the tech-space
 // engine, no network — so it runs on Open's fast path.
 func (s *SDK) registerP2PIndexWatch() {
-	if !s.app.P2PEnabled() {
+	lan, global := s.app.P2PEnabled(), s.app.GlobalP2PEnabled()
+	if !lan && !global {
 		return
 	}
-	s.app.SetKnownSpaceIdsFn(func() []string {
-		recs := s.tsp.List(context.Background())
-		ids := make([]string, 0, len(recs))
-		for _, rec := range recs {
-			if !rec.IsDeleted() {
-				ids = append(ids, rec.Id)
+	if lan {
+		s.app.SetKnownSpaceIdsFn(func() []string {
+			recs := s.tsp.List(context.Background())
+			ids := make([]string, 0, len(recs))
+			for _, rec := range recs {
+				if !rec.IsDeleted() {
+					ids = append(ids, rec.Id)
+				}
 			}
+			return ids
+		})
+	}
+	s.stopP2PIndexWatch = watchSpaceIndex(s.tsp, func() {
+		if lan {
+			s.app.BroadcastP2P()
 		}
-		return ids
+		s.kickIndexFollower()
 	})
-	s.stopP2PIndexWatch = watchSpaceIndexForP2P(s.tsp, s.app)
 }
 
 // readSyncEngineFor wraps the per-space engine lookup with the
@@ -628,12 +710,12 @@ func readSyncEngineFor(
 	}
 }
 
-// watchSpaceIndexForP2P subscribes to the tech-space `spaces` dataset
-// and kicks a LAN re-handshake on every change, coalesced — the mirror
-// of spaceimpl's spaceIndexWatcher pattern. Best-effort: on mailbox
-// overflow the sub closes and the watcher exits; the periodic
-// discovery resweep still refreshes handshakes at its own cadence.
-func watchSpaceIndexForP2P(tsp *techspace.Service, app *anysyncx.App) (stop func()) {
+// watchSpaceIndex subscribes to the tech-space `spaces` dataset and
+// calls onChange on every change, coalesced — the mirror of spaceimpl's
+// spaceIndexWatcher pattern. Best-effort: on mailbox overflow the sub
+// closes and the watcher exits; the periodic discovery resweep and the
+// next boot cover what was missed.
+func watchSpaceIndex(tsp *techspace.Service, onChange func()) (stop func()) {
 	sub, err := tsp.SubEngine().Subscribe(subscribe.SubConfig{
 		Scope: subscribe.Scope{
 			Shared:   false,
@@ -656,7 +738,7 @@ func watchSpaceIndexForP2P(tsp *techspace.Service, app *anysyncx.App) (stop func
 			if _, err := mb.Wait(context.Background()); err != nil {
 				return // ErrClosed on stop / overflow
 			}
-			app.BroadcastP2P()
+			onChange()
 		}
 	}()
 	var once sync.Once
@@ -680,6 +762,9 @@ func (s *SDK) Close() error {
 	if s.bootstrapDone != nil {
 		s.bootstrapCancel()
 		<-s.bootstrapDone
+		if s.followerDone != nil {
+			<-s.followerDone
+		}
 		// Everything is still up — snapshot the per-space watermarks
 		// now, while head stores and sdk.db are readable.
 		s.snapshotWatermarks(ctx)

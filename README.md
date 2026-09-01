@@ -81,7 +81,7 @@ The split lets the SDK use any-store v2 (compressed objects, better query semant
 
 ## Custom types and datasets
 
-Built-in catalog: `any` (universal properties: id, author, createdAt, spaceId, name, description, …) and `type` (the meta-type that defines other types).
+Built-in catalog: `any` (universal properties: id, author, createdAt, modifiedAt, modifiedBy, spaceId, name, description, …) and `type` (the meta-type that defines other types).
 
 Callers extend the catalog at SDK init by registering `handler.Type` entries — each binds a typeId to one or more dataset handlers:
 
@@ -106,7 +106,7 @@ Registered types appear in `Space.Types().List()` alongside user-created types a
 
 Wired and tested:
 - CRDT apply (`$set`/`$unset`/`$inc`/`$incGated`/`$addToSet`/`$pull`, sticky tombstones, per-field `_ver` gating, strict-skip surfaced as `ApplyResult.Rejections`)
-- Auto-stamping of `id`, `author`, `createdAt`, `spaceId` at row root, sourced from the tree's immutable header
+- Auto-stamping of `id`, `author`, `createdAt`, `spaceId` at row root, sourced from the tree's immutable header; `modifiedAt` / `modifiedBy` from the object's latest synced change, whichever dataset it touched
 - Type catalog (built-in + caller-registered) with registered-type query API
 - Per-object query (`Space.Query`) and per-space cross-object query (`Space.QueryObjects`) with chained `Filter`/`Sort`/`Limit`/`Offset` and terminals `Iter`/`All`/`One`/`Count`/`Snapshot`/`Subscribe`
 - Live windowed subscriptions via `Query.Subscribe(ctx, opts)` — same builder, returns `*QueryResult{Initial, Total, Sub}`. `Sub.Events()` carries `SubscriptionEvent{VersionId, Added, Updated, Removed}` with the full post-apply doc + projected `$set`/`$unset` ops per record. `limit+1` sentinel absorbs single-arrival shifts without re-querying; overflow closes with `ErrSubscriptionOverflow`, drift past `DriftBudgetPercent` (default 30%) closes with `ErrSubscriptionDrifted` — resubscribe to recover

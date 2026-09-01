@@ -82,7 +82,8 @@ const InlineMaxSize = 4096
 const MaxNetworkSignLen = 2048
 
 // Row field names. Full names, matching the row-field convention of
-// the objects dataset (author/createdAt/spaceId); short keys are a
+// the objects dataset (author/createdAt/spaceId/modifiedAt/modifiedBy);
+// short keys are a
 // change-envelope concern, not a row concern.
 const (
 	FieldRootCid     = "rootCid"     // string; ABSENT for inline rows

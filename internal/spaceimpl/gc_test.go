@@ -165,6 +165,10 @@ func TestCollectionOwner(t *testing.T) {
 		{"_history_traces", "", ownerNone},
 		{"files_local", "", ownerNone},
 		{"noprefix", "", ownerNone},
+		// consumer-tagged collections (SDK.Store contract): the segment
+		// before the first "_" is a bare tag, never a content id.
+		{"l_a_scratch", "", ownerNone},
+		{"l_s_" + spId + "_cache", "", ownerNone},
 	}
 	for _, c := range cases {
 		owner, kind := collectionOwner(c.name)

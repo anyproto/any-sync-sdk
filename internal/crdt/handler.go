@@ -39,9 +39,10 @@ var ErrRecordDeleted = errors.New("crdt: record is deleted; the id cannot be reu
 // ObjectAuthor is the constant root-signer (object creator); Creator is the
 // per-change signer (who wrote THIS change). For the root change they
 // coincide; for shared spaces / multi-author objects they diverge — handlers
-// that gate "only the author of this message can edit it" should read
-// Creator, while handlers that stamp object-level provenance should read
-// ObjectAuthor.
+// that gate "only the author of this message can edit it" read Creator;
+// handlers stamping the object's creation facts (author, createdAt)
+// read ObjectAuthor, and per-change provenance (modifiedBy) reads
+// Creator.
 //
 // Before evolves across ops in the same RecordChange: op[1]'s Before is
 // op[0]'s after — but only counting ops that actually landed (rejected ops
@@ -171,6 +172,32 @@ type Handler interface {
 	BeforeCreate(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
 	BeforeModify(ctx *ChangeCtx, rec *RecordChange, op *Op, sink *Sink) error
 	BeforeDelete(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
+}
+
+// ObjectStamper is an optional interface for the handler of a SHARED
+// dataset (row id = ObjectId, see SharedCollections). StampObject runs
+// once per applied synced change on any OTHER dataset of the same
+// object — inside the apply tx, after the change's records landed, and
+// only when the change wrote something: a record materialized, an op
+// applied, or a tombstone was written (a fully rejected change stamps
+// nothing, matching the handler's own BeforeModify gate). Ops queued
+// on sink via Derive/DeriveOnce are applied to the object's row in the
+// stamper's dataset with the triggering change's VersionId, so the row
+// carries the "object changed" marks (modifiedAt / modifiedBy) that
+// per-dataset handlers cannot see. Strict: an absent or tombstoned row is left
+// untouched — creation stamps it through BeforeCreate. Sink.Project
+// is not honored here.
+//
+// SDK-internal: not part of the consumer handler API. A stamper on a
+// dataset that is not shared never runs.
+//
+// ctx carries the change only (Before is nil); the determinism
+// contract of Handler hooks applies — the output must not depend on
+// replica-local state. Op payloads must live on memory owned by the
+// call (a fresh arena): they are retained past the store write, into
+// the event dispatched to subscribers.
+type ObjectStamper interface {
+	StampObject(ctx *ChangeCtx, sink *Sink)
 }
 
 // HandlerReg binds a dataset name to its handler behavior and the

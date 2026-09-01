@@ -28,6 +28,7 @@ func TestSentinelMessages(t *testing.T) {
 		{ErrAclRecordNotFound, "no such record"},
 		{ErrUnsupported, "unsupported on this space"},
 		{ErrObjectDeleted, "object deleted"},
+		{ErrObjectNotFound, "object not found"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(c.err.Error(), c.phrase) {

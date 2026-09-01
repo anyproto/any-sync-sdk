@@ -116,6 +116,9 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			}
 			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
 			s.engine.OnApply(ev, postValue)
+			if res != nil && len(res.ObjectStamps) > 0 && obj != nil {
+				s.dispatchObjectStamps(ctx, obj.Controller(), obj.Replaying(), ch, res.ObjectStamps)
+			}
 		}
 
 		// Change-index feed: one notification per applied change across
@@ -168,6 +171,100 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		for _, id := range ids {
 			s.drainer.Notify(types.DataVersionPair{TypeId: ch.ObjectId, ShortId: id})
 		}
+	}
+}
+
+// pendingStamps is one object's coalesced stamp work for the current
+// replay batch: the last landed stamps (their datasets/rows/paths) and
+// the VersionId of the last change that landed one.
+type pendingStamps struct {
+	versionId crdt.VersionId
+	stamps    []crdt.ObjectStamp
+}
+
+// dispatchObjectStamps routes the object stamps a change landed on
+// shared rows (crdt.ObjectStamper — the objects row's modifiedAt bumped
+// by a write to another dataset) to live queries on those datasets.
+// A single write (LocalWrite, a drained parked change) emits at once.
+// Inside a replay batch (inbound sync, cold restore, re-index rebuild)
+// the stamps are only recorded and flushObjectStamps emits one event
+// per object after the batch, with the row's final values — so a bulk
+// catch-up of a large object cannot flood an objects subscription with
+// one event per change and overflow its mailbox.
+func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller, replaying bool, ch *crdt.Change, stamps []crdt.ObjectStamp) {
+	if len(stamps) == 0 || ctrl == nil {
+		return
+	}
+	if replaying {
+		s.stampPending.Store(ch.ObjectId, pendingStamps{versionId: ch.VersionId, stamps: stamps})
+		return
+	}
+	for _, st := range stamps {
+		s.emitObjectStamp(ctx, ctrl, ch.SpaceId, ch.ObjectId, ch.VersionId, st)
+	}
+}
+
+// flushObjectStamps emits the stamps recorded for objectId during a
+// replay batch as one update event per shared row, re-reading each
+// stamped path from the row so the event carries the batch's final
+// values. No-op when nothing was recorded or nobody listens.
+func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, objectId string) {
+	v, ok := s.stampPending.LoadAndDelete(objectId)
+	if !ok || ctrl == nil || s.engine == nil || !s.engine.HasSubscribers() {
+		return
+	}
+	pending := v.(pendingStamps)
+	for _, st := range pending.stamps {
+		row := ctrl.Get(ctx, st.Dataset, st.RowId)
+		if row == nil {
+			continue
+		}
+		ops := make([]crdt.Op, 0, len(st.Ops))
+		for _, op := range st.Ops {
+			if len(op.Path) == 0 {
+				continue
+			}
+			if val := row.Get(op.Path...); val != nil {
+				ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: op.Path, Payload: val})
+			}
+		}
+		if len(ops) == 0 {
+			continue
+		}
+		s.emitObjectStamp(ctx, ctrl, s.spaceId, objectId, pending.versionId,
+			crdt.ObjectStamp{Dataset: st.Dataset, RowId: st.RowId, Ops: ops})
+	}
+}
+
+// emitObjectStamp feeds the engine one event shaped like an update of
+// the stamped row carrying only the stamp ops; the row's post value is
+// read on demand like any other apply event.
+func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp) {
+	synthetic := crdt.Change{
+		SpaceId:   spaceId,
+		ObjectId:  objectId,
+		Dataset:   st.Dataset,
+		VersionId: versionId,
+		Records:   []crdt.RecordChange{{Id: st.RowId}},
+	}
+	postValue := func(i int) *anyenc.Value {
+		if i != 0 {
+			return nil
+		}
+		return ctrl.Get(ctx, st.Dataset, st.RowId)
+	}
+	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, postValue)
+	s.engine.OnApply(ev, postValue)
+}
+
+// afterReplayFor is the per-batch hook: flushes the object stamps
+// coalesced by dispatchObjectStamps during the batch.
+func (s *Store) afterReplayFor() object.AfterReplay {
+	return func(ctx context.Context, obj *object.Object) {
+		if obj == nil || obj.Controller() == nil {
+			return
+		}
+		s.flushObjectStamps(ctx, obj.Controller(), obj.Controller().ObjectId())
 	}
 }
 

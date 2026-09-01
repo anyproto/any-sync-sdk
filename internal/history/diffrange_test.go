@@ -5,10 +5,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // diffRangeFixture builds: create n1, create n2, edit n1, delete n2,
@@ -153,4 +155,66 @@ func TestDiffRangeNotAncestor(t *testing.T) {
 	_, err := DiffRange(ctx, rangeParams(fx.tree), []string{"cid-unknown"}, fx.cutVersion, DiffFilter{})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrNotAncestor))
+}
+
+// objectsStamper is a shared-dataset handler that stamps the object's
+// row on every other dataset's change (crdt.ObjectStamper): modifiedAt
+// = the change Timestamp.
+type objectsStamper struct{ crdt.DefaultHandler }
+
+func (objectsStamper) StampObject(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
+	a := &anyenc.Arena{}
+	sink.DeriveOnce(crdt.Op{Type: crdt.OpSet, Path: []string{"modifiedAt"}, Payload: a.NewNumberFloat64(float64(ctx.Change.Timestamp))})
+}
+
+func stampedRegs() []crdt.HandlerReg {
+	return append(testRegs(), crdt.HandlerReg{Name: "objects", Handler: objectsStamper{}, Schema: schema.Dataset{Dynamic: true}})
+}
+
+// A delta change on a per-object dataset also stamps the object's row
+// in the shared dataset; DiffRange counts that row as touched and
+// reports it exactly as the two-view diff does.
+func TestDiffRangeObjectStampTouched(t *testing.T) {
+	ctx := context.Background()
+	b := newTreeBuilder(t)
+	b.add("objects", upsert(t, testObjectId, `{"name":"n"}`))
+	cutBase := b.add("notes", upsert(t, "n1", `{"title":"first"}`))
+	prefixLen := len(b.tree.entries)
+	cutVersion := b.add("notes", crdt.RecordChange{Id: "n1", Ops: []crdt.Op{{
+		Type: crdt.OpSet, Path: []string{"title"}, Payload: mustVal(t, `"renamed"`),
+	}}})
+	params := func(tree *fakeHistoryTree) ViewParams {
+		return ViewParams{ObjectId: testObjectId, Tree: tree, Regs: stampedRegs(), SharedDatasets: []string{"objects"}}
+	}
+
+	got, err := DiffRange(ctx, params(b.tree), []string{cutBase}, cutVersion, DiffFilter{})
+	require.NoError(t, err)
+	require.Len(t, got.Datasets, 2)
+	assert.Equal(t, "notes", got.Datasets[0].Dataset)
+	objects := got.Datasets[1]
+	require.Equal(t, "objects", objects.Dataset)
+	require.Len(t, objects.Records, 1)
+	assert.Equal(t, testObjectId, objects.Records[0].Id)
+	assert.Equal(t, KindChanged, objects.Records[0].Kind)
+	require.Len(t, objects.Records[0].Fields, 1)
+	assert.Equal(t, []string{"modifiedAt"}, objects.Records[0].Fields[0].Path)
+
+	baseView, err := buildScratch(t, b.tree.freshTree(prefixLen), ViewParams{
+		ObjectId: testObjectId, Heads: []string{cutBase}, Regs: stampedRegs(), SharedDatasets: []string{"objects"},
+	})
+	require.NoError(t, err)
+	versionView, err := buildScratch(t, b.tree.freshTree(0), ViewParams{
+		ObjectId: testObjectId, Heads: []string{cutVersion}, Regs: stampedRegs(), SharedDatasets: []string{"objects"},
+	})
+	require.NoError(t, err)
+	want, err := DiffViews(ctx, baseView, versionView, DiffFilter{})
+	require.NoError(t, err)
+	require.Len(t, want.Datasets, 2)
+	assert.Equal(t, kindsOf(want.Datasets[1]), kindsOf(objects))
+
+	// A dataset-scoped diff leaves the shared row out.
+	scoped, err := DiffRange(ctx, params(b.tree.freshTree(0)), []string{cutBase}, cutVersion, DiffFilter{Dataset: "notes"})
+	require.NoError(t, err)
+	require.Len(t, scoped.Datasets, 1)
+	assert.Equal(t, "notes", scoped.Datasets[0].Dataset)
 }

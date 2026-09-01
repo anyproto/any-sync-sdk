@@ -22,7 +22,8 @@ One unified taxonomy everywhere (`schema.Scope`):
 - A property declares `scope` at creation; default `synced`; pinned
   first-write-wins exactly like `kind` (schema-bearing field). Changing
   scope = define a new property = new propId. `derived` is reserved for
-  built-ins (`any.id/author/spaceId/createdAt`).
+  built-ins (`id/author/spaceId/createdAt/modifiedAt/modifiedBy`, at
+  row root).
 - Dataset schema fields already declared `synced|derived|local`; they
   may now also declare `account` (e.g. a per-account `read` flag on
   `chat_messages`). Same enforcement, same transport.

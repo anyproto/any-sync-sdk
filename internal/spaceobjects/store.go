@@ -35,6 +35,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/util/crypto"
 	"go.uber.org/zap"
 
@@ -53,6 +54,7 @@ import (
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 var storeLog = logger.NewNamed("sdk.spaceobjects")
@@ -216,6 +218,11 @@ type Store struct {
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *fanout.Registry[RowEvent]
+
+	// stampPending holds, per objectId, the object stamps landed during
+	// the current replay batch, emitted as one event per object by the
+	// AfterReplay hook. See dispatchObjectStamps.
+	stampPending sync.Map
 
 	// readTracking maps a tracked dataset to its registration;
 	// readState is the per-space read/unread engine. Both nil/empty
@@ -892,7 +899,7 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	// Dense ascending index on the derived `modifiedAt` stamp — the
 	// recency ordering (`sort: ["-modifiedAt"]`) is the default object-
 	// list sort for clients, which would otherwise scan the whole
-	// collection per query (SYN-98). Dense, not sparse: a sort index
+	// collection per query. Dense, not sparse: a sort index
 	// must cover every row.
 	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Fields: []string{"modifiedAt"},
@@ -1685,9 +1692,13 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 		Allocator:      s.alloc,
 		Gate:           gate,
 		AfterApply:     s.afterApplyFor(),
+		AfterReplay:    s.afterReplayFor(),
 		WriteGate:      s.CheckWrite,
 		PlaintextSpecs: plaintextSpecs,
-		OnClose:        func() { s.releaseHistoryHandle(objectId) },
+		OnClose: func() {
+			s.releaseHistoryHandle(objectId)
+			s.stampPending.Delete(objectId)
+		},
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
 	})
@@ -1807,7 +1818,9 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 			return tree, nil
 		}
 		if !errors.Is(err, treestorage.ErrTreeExists) {
-			return nil, fmt.Errorf("spaceobjects: PutTree %s: %w", objectId, err)
+			// PutTree checks the deleted status first, so a re-created
+			// id whose tree was deleted here reports it on this branch.
+			return nil, treeOpenError("PutTree", objectId, err)
 		}
 		// fall through to BuildTree on ErrTreeExists
 	}
@@ -1831,10 +1844,27 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 		})
 	}
 	if err != nil {
-		return nil, fmt.Errorf("spaceobjects: BuildTree %s: %w", objectId, err)
+		return nil, treeOpenError("BuildTree", objectId, err)
 	}
 	deferIfSyncTree(tree)
 	return tree, nil
+}
+
+// treeOpenError wraps a failure to open an object's tree, joining
+// space.ErrObjectNotFound when the tree is unknown here or already
+// deleted — the two ways an object is not addressable on this device.
+// Both tree-open routes go through it: BuildTree reports a missing or
+// deleted tree, and PutTree reports a deleted one (it checks the
+// deleted status before creating storage).
+//
+// Consumers match that one sentinel at the API boundary instead of
+// any-sync's storage errors; the underlying error stays in the chain,
+// so callers branching on treestorage.ErrUnknownTreeId still match.
+func treeOpenError(op, objectId string, err error) error {
+	if errors.Is(err, treestorage.ErrUnknownTreeId) || errors.Is(err, spacestorage.ErrTreeStorageAlreadyDeleted) {
+		return fmt.Errorf("spaceobjects: %s %s: %w: %w", op, objectId, space.ErrObjectNotFound, err)
+	}
+	return fmt.Errorf("spaceobjects: %s %s: %w", op, objectId, err)
 }
 
 // deferIfSyncTree flips the SyncTree into deferred-updater mode (see
@@ -1863,8 +1893,8 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // objectsDatasetSchema is the per-space `objects` (properties) dataset
 // schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
 // synced) with the built-in `any` fields declared by their unified
-// schema.Scope class — derived auto-fields (author/createdAt/spaceId/
-// id) are handler-only, the rest synced.
+// schema.Scope class — derived auto-fields (id/author/spaceId/
+// createdAt/modifiedAt/modifiedBy) are handler-only, the rest synced.
 //
 // Note this declares the TOP-LEVEL field heads only (`any`, typeIds are
 // dynamic). Per-PROPERTY scope (synced/account/local on a user propId)

@@ -884,6 +884,29 @@ func (s *SDK) PeerId() string { return s.tsp.PeerId() }
 // account-level bundles (see space.Service.Get, space.ErrUnsupported).
 func (s *SDK) TechSpaceId() string { return s.tsp.SpaceId() }
 
+// Store returns the SDK's any-store DB (sdk.db) for consumer-owned,
+// non-CRDT collections. The handle is the SDK's: it is open for the
+// SDK's lifetime and closed by Close — consumers never close it.
+//
+// Contract for consumers:
+//   - Create and address collections ONLY under a consumer tag that is
+//     not a content id — a name whose segment before the first "_" is
+//     neither a space id nor a cid. The boot-time orphan sweep
+//     classifies such names ownerNone and never touches them (see
+//     docs/03-space.md § Space Lifecycle); every other prefix belongs
+//     to the CRDT layer, is swept by owner, and is rewritten by
+//     re-index. The "l_" tag is reserved for the any server's local
+//     store.
+//   - Never write an SDK collection ("_meta", "<spaceId>_*",
+//     "<objectId>_*", "files_*", "_history_*", "_read_*"): a direct
+//     write bypasses the DAG and is reverted by the next re-index.
+//   - Never open a write tx that spans a consumer collection and an SDK
+//     one. Reads across both in one tx are fine (that is the point of
+//     sharing the file: one snapshot for $lookup).
+//   - Consumer collections are not rebuildable: a wiped sdk.db loses
+//     them, and the SDK's re-index paths leave them alone.
+func (s *SDK) Store() anystore.DB { return s.db }
+
 // P2PStatus reports the local-network layer: listener state, discovery
 // possibility, and every known LAN peer with its shared spaces and
 // live-connection flag. Per-space p2p state lives in SpaceSyncStatus

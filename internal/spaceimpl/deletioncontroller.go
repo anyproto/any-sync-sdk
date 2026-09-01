@@ -89,6 +89,14 @@ func (s *Service) reconcileDeletions(ctx context.Context) {
 	// unreachable coordinator can't block it.
 	s.offloadDeletedOneToOnes(ctx, rows)
 
+	// Read-frontier prune is coordinator-independent too: removed spaces'
+	// read/ rows in the tech-space KV are dead weight on every device and
+	// node (SYN-104), and joining re-seeds read state, so a removed space's
+	// frontiers have no restore value. Gated on synced removal markers only
+	// (shouldPruneReadState) — local-first, in that the watermark row syncs
+	// when connectivity allows, and a no-op once the prefix is empty.
+	s.pruneRemovedSpacesReadState(ctx, rows)
+
 	ids := make([]string, len(rows))
 	for i, r := range rows {
 		ids[i] = r.Id
@@ -128,6 +136,44 @@ func (s *Service) offloadDeletedOneToOnes(ctx context.Context, rows []techspace.
 		if s.app.SpaceExists(r.Id) {
 			delLog.Info("offloading marker-deleted space", zap.String("spaceId", r.Id))
 			s.OffloadSpace(ctx, r.Id)
+		}
+	}
+}
+
+// shouldPruneReadState gates the read-frontier prune on SYNCED removal
+// markers only. Deliberately narrower than IsDeleted(): that also fires
+// on LocalStatus==deleted, a DEVICE-LOCAL marker (a declined join
+// recorded before the account was later added for real) — one stale
+// device must never drive an account-wide destructive watermark for a
+// space the rest of the account actively uses. User-initiated Delete
+// stamps the synced RemoteStatus, so it qualifies immediately.
+// A closed switch on purpose: a new removal status must be added here
+// deliberately, having been checked for the device-local hazard above.
+func shouldPruneReadState(r techspace.SpaceIndexRecord) bool {
+	switch r.RemoteStatus {
+	case techspace.StatusDeleted, techspace.OneToOneDeletedStatus, techspace.GuestDeletedRemoteStatus:
+		return true
+	}
+	return false
+}
+
+// pruneRemovedSpacesReadState issues the read-frontier watermark for
+// every removed space still holding visible read/ rows. Failures are
+// retried by the next pass.
+func (s *Service) pruneRemovedSpacesReadState(ctx context.Context, rows []techspace.SpaceIndexRecord) {
+	rs := s.readSync()
+	if rs == nil {
+		return
+	}
+	for _, r := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		if !shouldPruneReadState(r) {
+			continue
+		}
+		if err := rs.PruneSpace(ctx, r.Id); err != nil {
+			delLog.Warn("read-state prune failed", zap.String("spaceId", r.Id), zap.Error(err))
 		}
 	}
 }

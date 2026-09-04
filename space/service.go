@@ -22,7 +22,8 @@ var ErrSpaceNotAccepted = errors.New("space: not accepted; not materialized")
 // device-local ended join is not — Join revives it). The storage is
 // offloaded — loading would SpacePull a space the account removed,
 // which the nodes reject anyway. A deleted 1-1 is re-creatable via
-// Service.OneToOne; a regular deleted space is terminal.
+// Service.OneToOne, an ended join via Join; the synced tombstone Delete
+// writes is terminal.
 var ErrSpaceDeleted = errors.New("space: deleted")
 
 // ErrReadOnlySpace rejects synced writes into a space this account

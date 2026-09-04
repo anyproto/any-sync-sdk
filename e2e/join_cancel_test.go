@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -41,7 +40,9 @@ func TestE2E_JoinCancelRejoin(t *testing.T) {
 		t.Skip("join-cancel e2e is slow (~60-120s); rerun without -short")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	// Wider than the sum of the step budgets below, so a late step never
+	// reports a failure that happened earlier.
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
 	openSDK := func(name string) *anysyncsdk.SDK {
@@ -107,9 +108,11 @@ func TestE2E_JoinCancelRejoin(t *testing.T) {
 	}) {
 		t.Fatalf("alice's join requests never drained after bob's cancel")
 	}
-	if m, err := sp.Members().Get(ctx, bob.Account().Id()); err == nil {
-		require.Equal(t, space.MemberStatusCanceled, m.Status, "owner-side member row after cancel")
-	}
+	// The drain proves the cancel record applied, so the owner-side
+	// account state is deterministic here.
+	m, err := sp.Members().Get(ctx, bob.Account().Id())
+	require.NoError(t, err, "owner-side member row after cancel")
+	require.Equal(t, space.MemberStatusCanceled, m.Status, "owner-side member row after cancel")
 
 	// Bob re-requests with the same invite: the ended row revives.
 	_, err = bob.Spaces().Join(ctx, space.JoinRequest{Invite: token})
@@ -170,9 +173,6 @@ func awaitJoinRequest(t *testing.T, ctx context.Context, sp space.Space, identit
 		return false
 	}) {
 		t.Fatalf("owner never saw a join request from %s", identity)
-	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		t.Fatal("context expired while waiting for the join request")
 	}
 	return out
 }

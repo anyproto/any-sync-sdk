@@ -47,7 +47,9 @@ const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 // older build dropped because it could not validate them.
 //
 // v2: `datetime` is a kind, so a stamped time field validates.
-const DatasetDefsLocalVersion = 2
+// v3: field records carry an opaque `x-format` (an object, created
+// whole, mutable); head records carry none.
+const DatasetDefsLocalVersion = 3
 
 // Discriminator values of the pinned `def` field.
 const (
@@ -100,10 +102,13 @@ var reservedDatasetNames = map[string]struct{}{
 	"bundles":    {},
 }
 
-// datasetDefMutableTop are the top-level fields freely mutable on an
-// existing def record (either record kind; `name` doubles as the field
-// record's display label, `x-format` is the field's descriptor bag —
-// every path under it is mutable, see FieldXFormat).
+// datasetDefMutableTop are the top-level fields the apply-time handler
+// admits on an existing def record. The handler cannot tell record
+// kinds apart statelessly, so this is the union of what a head
+// (displayName) and a field (`x-format`, every path under it) may
+// mutate; the client-side preflights (IsDatasetDefPinnedPath for
+// heads, IsDatasetFieldPinnedPath for fields) are the kind-aware,
+// stricter rules.
 var datasetDefMutableTop = map[string]struct{}{
 	FieldName:           {},
 	FieldDescription:    {},
@@ -134,9 +139,16 @@ func isDatasetDefPinnedPath(path []string) bool {
 	return true
 }
 
-// IsDatasetDefPinnedPath is the exported form for client-side
-// preflights (PatchDataset), mirroring IsPinnedPath.
-func IsDatasetDefPinnedPath(path []string) bool { return isDatasetDefPinnedPath(path) }
+// IsDatasetDefPinnedPath is the client-side preflight for a HEAD record
+// (PatchDataset): the handler's rule, minus `x-format` — a head carries
+// no descriptor (nothing reads one back), so a write there would be a
+// permanent no-op in the DAG.
+func IsDatasetDefPinnedPath(path []string) bool {
+	if len(path) > 0 && path[0] == FieldXFormat {
+		return true
+	}
+	return isDatasetDefPinnedPath(path)
+}
 
 // datasetFieldMutableTop are the field-record fields a client-side
 // PatchDatasetField may target: the display pair and the descriptor
@@ -214,11 +226,15 @@ func ValidateDatasetName(name string) error {
 }
 
 // validateHeadCreate checks a dataset head record: collection name
-// sanity and parseable behavioral labels.
+// sanity, parseable behavioral labels, and no `x-format` — the
+// descriptor is a field-record member.
 func validateHeadCreate(ops []crdt.Op) error {
 	name, _ := extractField(ops, DefFieldName)
 	if err := ValidateDatasetName(name); err != nil {
 		return fmt.Errorf("%w: %w", crdt.ErrValidation, err)
+	}
+	if xf, err := extractObjectField(ops, FieldXFormat); err != nil || xf != nil {
+		return fmt.Errorf("%w: %w: a dataset head record carries no `%s`", crdt.ErrValidation, ErrBadDatasetDef, FieldXFormat)
 	}
 	if label, present := extractField(ops, DefFieldIdRule); present {
 		if _, ok := schema.ParseIdRule(label); !ok {
@@ -307,7 +323,7 @@ func (DatasetDefsHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, 
 	if op.Path[0] == DefFieldSearch {
 		return checkSearchLeafOp(op.Type, op.Path, op.Payload)
 	}
-	return nil
+	return checkXFormatWholeSet(op.Type, op.Path, op.Payload)
 }
 
 // checkSearchLeafOp validates a mutation of a search.* leaf: $unset
@@ -385,7 +401,9 @@ func rejectIfMultiFieldTouchesDefPinned(op *crdt.Op) error {
 		}
 		if path[0] == DefFieldSearch {
 			hit = checkSearchLeafOp(op.Type, path, v)
+			return
 		}
+		hit = checkXFormatWholeSet(op.Type, path, v)
 	})
 	return hit
 }

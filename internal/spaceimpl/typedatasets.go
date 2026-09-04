@@ -219,7 +219,7 @@ func encodeDatasetField(arena *anyenc.Arena, headId string, decl *schema.Field) 
 		payload.Set(typetype.FieldDescription, arena.NewString(decl.Description))
 	}
 	if len(decl.XFormat) > 0 {
-		xf, err := goToAnyenc(arena, decl.XFormat)
+		xf, err := encodeXFormat(arena, decl.XFormat)
 		if err != nil {
 			return nil, fmt.Errorf("typesAPI: field %q: XFormat: %w", decl.Id, err)
 		}

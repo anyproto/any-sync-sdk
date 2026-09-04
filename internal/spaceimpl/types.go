@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -124,9 +123,7 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	payload := arena.NewObject()
 	payload.Set(typetype.FieldKind, arena.NewString(propertyKindLabel(draft.Kind)))
 	if len(draft.XFormat) > 0 {
-		// One whole object — the handler's single creation shape. The
-		// bag is opaque: converted, never inspected.
-		xf, err := goToAnyenc(arena, draft.XFormat)
+		xf, err := encodeXFormat(arena, draft.XFormat)
 		if err != nil {
 			return "", fmt.Errorf("typesAPI: PropertyDraft.XFormat: %w", err)
 		}
@@ -501,9 +498,9 @@ func registeredTypeProperties(t handler.Type) []space.PropertyDef {
 		if def.Scope == 0 {
 			def.Scope = space.ScopeSynced
 		}
-		if len(p.XFormat) > 0 {
-			def.XFormat = maps.Clone(p.XFormat)
-		}
+		// Deep-copied: the registration is process-shared, a view is
+		// the caller's to mutate.
+		def.XFormat = types.CloneXFormat(p.XFormat)
 		out = append(out, def)
 	}
 	return out
@@ -748,6 +745,23 @@ func (t *typesAPI) findPropertyDef(ctx context.Context, typeId, propId string) (
 		return space.PropertyDef{}, space.ErrNotFound
 	}
 	return decodePropertyDef(v), nil
+}
+
+// encodeXFormat converts a descriptor bag for the record payload: one
+// whole object, the handler's single creation shape. The bag is
+// opaque — converted, never inspected — with one guard: a map whose
+// only key is an extended-JSON wrapper (`$date`, `$oid`, …) converts
+// to a scalar, which the handler would reject with a raw validation
+// error, so it is refused here with a clean one.
+func encodeXFormat(arena *anyenc.Arena, m map[string]any) (*anyenc.Value, error) {
+	xf, err := goToAnyenc(arena, m)
+	if err != nil {
+		return nil, err
+	}
+	if xf.Type() != anyenc.TypeObject {
+		return nil, errors.New("XFormat must be a JSON object (not an extended-JSON wrapper)")
+	}
+	return xf, nil
 }
 
 // propertyKindLabel maps the public PropertyKind enum to the on-wire

@@ -110,7 +110,9 @@ const HandlerVersion = "typePropertyHandler-v1"
 // cannot validate, and the replay after the upgrade applies it.
 //
 // v2: `datetime` is a kind, and the date formats accept it.
-const PropertyHandlerLocalVersion = 2
+// v3: the typed `format` object is gone (no format→kind coupling, no
+// pinned `format.type`); `x-format` must be an object, created whole.
+const PropertyHandlerLocalVersion = 3
 
 // Property-record field names. The shape is hardcoded in Go (no JSON
 // Schema applies on this dataset — see
@@ -292,8 +294,10 @@ func extractObjectField(ops []crdt.Op, field string) (*anyenc.Value, error) {
 // the schema-bearing fields (`key`, `kind`, `scope`, `items`,
 // `properties`). Everything else — `name`, `description`, `x-key`,
 // `required`, `meta.*` and every path under `x-format` — passes
-// through with no value checks. Not an "important" change — no shortId
-// minting.
+// through with no value checks, bar one: a $set of the whole
+// `x-format` must be an object (checkXFormatWholeSet), so the
+// create-time shape holds for the record's life. Not an "important"
+// change — no shortId minting.
 func (PropertyHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
 	if len(op.Path) == 0 {
 		// Multi-field $set/$unset — guard each key.
@@ -301,6 +305,20 @@ func (PropertyHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op 
 	}
 	if isPinnedPath(op.Path) {
 		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, strings.Join(op.Path, "."))
+	}
+	return checkXFormatWholeSet(op.Type, op.Path, op.Payload)
+}
+
+// checkXFormatWholeSet keeps `x-format` an object on every peer: a $set
+// whose path is exactly `x-format` must carry an object. Paths below it
+// are free, and $unset of the whole bag is a clear, not a shape change.
+// Shared by the property and dataset-def handlers.
+func checkXFormatWholeSet(opType crdt.OpType, path []string, payload *anyenc.Value) error {
+	if opType != crdt.OpSet || len(path) != 1 || path[0] != FieldXFormat {
+		return nil
+	}
+	if payload == nil || payload.Type() != anyenc.TypeObject {
+		return fmt.Errorf("%w: %w: a whole `%s` set must carry an object", crdt.ErrValidation, ErrBadXFormat, FieldXFormat)
 	}
 	return nil
 }
@@ -354,8 +372,10 @@ func extractField(ops []crdt.Op, field string) (string, bool) {
 }
 
 // rejectIfMultiFieldTouchesPinned scans a multi-field $set/$unset
-// payload for keys whose dotted path is pinned (isPinnedPath). Returns
-// an error wrapping crdt.ErrValidation on the first hit; nil otherwise.
+// payload for keys whose dotted path is pinned (isPinnedPath), and
+// applies the whole-`x-format` object rule to a bare `x-format` key.
+// Returns an error wrapping crdt.ErrValidation on the first hit; nil
+// otherwise.
 //
 // Dotted-path keys (e.g. "items.kind") count as touching the pinned
 // path that owns them.
@@ -365,13 +385,16 @@ func rejectIfMultiFieldTouchesPinned(op *crdt.Op) error {
 	}
 	obj, _ := op.Payload.Object()
 	var hit error
-	obj.Visit(func(k []byte, _ *anyenc.Value) {
+	obj.Visit(func(k []byte, v *anyenc.Value) {
 		if hit != nil {
 			return
 		}
-		if isPinnedPath(strings.Split(string(k), ".")) {
+		path := strings.Split(string(k), ".")
+		if isPinnedPath(path) {
 			hit = fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, string(k))
+			return
 		}
+		hit = checkXFormatWholeSet(op.Type, path, v)
 	})
 	return hit
 }

@@ -476,3 +476,76 @@ func TestCompileDatasetDefs_TombstonedHeadDropsDataset(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, compiled)
 }
+
+// A head record carries no descriptor: the create rule refuses one and
+// the head preflight pins the path, while the (kind-blind) apply-time
+// handler keeps admitting it for field records.
+func TestDatasetDefs_HeadCarriesNoXFormat(t *testing.T) {
+	ctrl, _ := newDefsController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+
+	xf := arena.NewObject()
+	xf.Set("icon", arena.NewString("book"))
+	res, err := ctrl.ApplyChangeWithResult(ctx, defsChange("h1", "ch1", "head-xf", true,
+		headPayload(arena, "notes", map[string]any{typetype.FieldXFormat: xf})))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1, "a head create carrying x-format must reject")
+
+	assert.True(t, typetype.IsDatasetDefPinnedPath([]string{typetype.FieldXFormat, "icon"}))
+	assert.True(t, typetype.IsDatasetDefPinnedPath([]string{typetype.FieldXFormat}))
+	assert.False(t, typetype.IsDatasetFieldPinnedPath([]string{typetype.FieldXFormat, "icon"}))
+
+	// On a field record the whole-bag set must be an object.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("h2", "ch2", "head-1", true, headPayload(arena, "notes", nil))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("f1", "cf1", "field-1", true,
+		fieldPayload(arena, "head-1", "title", "string", nil))))
+	res, err = ctrl.ApplyChangeWithResult(ctx, defsChange("f2", "cf2", "field-1", false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat}, Payload: arena.NewString("text")}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1, "scalar over a field's bag must drop")
+	bag := arena.NewObject()
+	bag.Set("type", arena.NewString("text"))
+	res, err = ctrl.ApplyChangeWithResult(ctx, defsChange("f3", "cf3", "field-1", false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat}, Payload: bag}))
+	require.NoError(t, err)
+	require.Empty(t, res.Rejections)
+}
+
+// Whatever a client-side preflight admits, the apply-time handler
+// admits too — otherwise a multi-op patch would half-apply. Pins the
+// containment for both record kinds over the discriminating paths.
+func TestDatasetDefs_PreflightSubsetOfHandler(t *testing.T) {
+	ctrl, _ := newDefsController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v1", "c1", "head-1", true, headPayload(arena, "notes", nil))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "field-1", true,
+		fieldPayload(arena, "head-1", "title", "string", nil))))
+
+	paths := [][]string{
+		{typetype.FieldName}, {typetype.FieldDescription}, {typetype.DefFieldDisplayName},
+		{typetype.DefFieldSearch, typetype.SearchKeyTitle}, {typetype.DefFieldSearch, typetype.SearchKeyText},
+		{typetype.DefFieldSearch, typetype.SearchKeyScope},
+		{typetype.FieldXFormat, "icon"}, {typetype.FieldXFormat, "options", "a", "name"},
+		{typetype.FieldKey}, {typetype.FieldKind}, {typetype.DefFieldRequired}, {typetype.DefFieldName},
+	}
+	for i, p := range paths {
+		op := crdt.Op{Type: crdt.OpSet, Path: p, Payload: arena.NewString("x")}
+		for _, rec := range []struct {
+			id      string
+			pinned  bool
+			preflit string
+		}{
+			{"head-1", typetype.IsDatasetDefPinnedPath(p), "head"},
+			{"field-1", typetype.IsDatasetFieldPinnedPath(p), "field"},
+		} {
+			res, err := ctrl.ApplyChangeWithResult(ctx, defsChange(
+				crdt.VersionId("s"+rec.preflit+string(rune('a'+i))), "cs"+rec.preflit+string(rune('a'+i)), rec.id, false, op))
+			require.NoError(t, err)
+			if !rec.pinned {
+				assert.Empty(t, res.Rejections, "%s preflight admits %v, the handler must too", rec.preflit, p)
+			}
+		}
+	}
+}

@@ -582,3 +582,50 @@ func TestPropertyHandler_ScopeEditDropped(t *testing.T) {
 	assert.Equal(t, "local", rec.GetString(typetype.FieldScope), "scope is pinned after first write")
 	assert.Equal(t, "Renamed", rec.GetString(typetype.FieldName), "bundled non-pinned key still landed")
 }
+
+func TestPropertyHandler_WholeXFormatSetMustBeObject(t *testing.T) {
+	// The create-time shape holds for the record's life: a $set of the
+	// whole bag carries an object (replacing it is legal — the
+	// consumer's leaf-only rule is not this layer's); a scalar there is
+	// dropped in both op shapes.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-whole-bag"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiXFormat(arena, "string", map[string]*anyenc.Value{"type": arena.NewString("text")}),
+	)))
+
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", "ch-scalar-path", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat}, Payload: arena.NewString("email")},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1, "scalar over the bag (single path) must drop")
+	multi := arena.NewObject()
+	multi.Set(typetype.FieldXFormat, arena.NewString("email"))
+	multi.Set(typetype.FieldName, arena.NewString("kept"))
+	res, err = ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", "ch-scalar-multi", propId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: multi},
+	))
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Rejections, "scalar over the bag (multi-field key) must drop")
+
+	bag := arena.NewObject()
+	bag.Set("type", arena.NewString("email"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", "ch-object", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat}, Payload: bag},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v5", "ch-unset", propId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{typetype.FieldXFormat}},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "kept", rec.GetString(typetype.FieldName), "the legal key of the multi-field set landed")
+	assert.Nil(t, rec.Get(typetype.FieldXFormat), "whole-bag unset is a clear")
+}

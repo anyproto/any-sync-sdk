@@ -359,9 +359,12 @@ type PropertyDef struct {
 	// icon, ordering key, option set, relation targets, per-format
 	// config — as the consumer wrote it. The SDK stores it verbatim,
 	// never interprets it, and lets every path under it mutate
-	// (PatchProperty). Nil for definitions that carry none. Decoded
-	// from the record with plain Go values: nested objects as
-	// map[string]any, arrays as []any, numbers as float64.
+	// (PatchProperty); a whole-bag write must be an object. Nil for
+	// definitions that carry none. Decoded from the record with plain
+	// Go values: nested objects as map[string]any, arrays as []any,
+	// numbers as float64, instants as time.Time, binaries as []byte,
+	// object ids as hex strings, float vectors as []float64. Every
+	// view is a fresh copy — the caller's to mutate.
 	XFormat map[string]any
 }
 

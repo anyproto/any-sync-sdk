@@ -251,7 +251,7 @@ any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": 
                 "options": { "lead": { "name": "Lead", "color": "grey", "pos": "a0" } } } }
 ```
 
-- **Two structural rules, nothing else.** It is an object, and a creation writes it whole (dotted `x-format.*` keys in a creation change are rejected, so there is exactly one creation shape to validate). No key inside is known to the SDK.
+- **Two structural rules, nothing else.** It is an object — at create and on any later whole-bag `$set` — and a creation writes it whole (dotted `x-format.*` keys in a creation change are rejected, so there is exactly one creation shape to validate). No key inside is known to the SDK.
 - **Every path under it is CRDT-mutable** — the slug included — with any JSON value, via `PatchProperty`. Members follow the documented per-path LWW: a nested object's keys are edited independently (two authors adding two options both land), a single leaf replaces whole. Which members are nested and which are single leaves is the consumer's design (e.g. a filter is stored as one JSON-text leaf so two conditions never field-merge into garbage).
 - **`kind` is the guarantee, `x-format` is a hint.** Values are validated against `kind` at apply on every peer, never against the descriptor. Whether a value fits the slug — a link is a well-formed `any://` URI, a `date` lands on midnight UTC — is checked by the consumer at its write boundary (the `any` server), and the leaf-only patch rule ("a set targets a leaf, never a container") is enforced there too. Reference integrity stays lazy/read-time.
 - A definition without `x-format` renders structurally from `kind`. Registered (built-in) types declare theirs through `handler.PropertyDecl.XFormat`, surfaced by `Types().Properties()` exactly as written.
@@ -261,6 +261,7 @@ any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": 
 **CRDT-hard (enforced at apply on every peer, convergent)**
 
 - **Per-record first-write-wins on `id` and `type`.** `id` is immutable (it's the record id); `type` is locked by the first write to the record. Each property is its own island — no cross-record binding, no silent-ignore rules between different property records.
+
 **Client-soft (SDK refuses to emit; honest clients comply, misbehaving peers bounded by read-tolerance)**
 
 - Changing a sub-field's primitive type.

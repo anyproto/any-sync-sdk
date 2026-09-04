@@ -82,8 +82,37 @@ func TestMapStatus_JoinLifecycle(t *testing.T) {
 	// Legacy shapes on their own keep their meaning.
 	assert.Equal(t, space.StatusJoining, mapStatus(reg, joiningLocalStatus, techspace.StatusActive), "legacy joining")
 	assert.Equal(t, space.StatusDeleted, mapStatus(reg, techspace.StatusDeleted, techspace.StatusActive), "legacy ended")
+	assert.Equal(t, space.StatusDeleted, mapStatus(reg, techspace.StatusDeleted, ""), "legacy ended, no synced status")
 
-	// A direct add registered over an ended join reads as the invite
-	// (the inbox path clears a legacy marker when it registers).
-	assert.Equal(t, space.StatusInvitePending, mapStatus(reg, "", techspace.InvitePendingRemoteStatus), "direct add over ended join")
+	// A direct add registered over an ended join reads as the invite —
+	// with or without the legacy marker still on the row.
+	assert.Equal(t, space.StatusInvitePending, mapStatus(reg, "", techspace.InvitePendingRemoteStatus), "direct add over a synced ended join")
+	assert.Equal(t, space.StatusInvitePending, mapStatus(reg, techspace.StatusDeleted, techspace.InvitePendingRemoteStatus), "direct add over a legacy ended join")
+}
+
+// TestLocalDeleteStands pins where the legacy device-local deleted marker
+// still decides the row (IsDeleted) and where a synced lifecycle state
+// landing over it reads through — so Subscribe's Removed, Get's refusal
+// and List's status never disagree on the same row.
+func TestLocalDeleteStands(t *testing.T) {
+	del := techspace.StatusDeleted
+	cases := []struct {
+		remote  string
+		deleted bool
+	}{
+		{"", true},
+		{techspace.StatusActive, true},
+		{techspace.JoiningRemoteStatus, false},
+		{techspace.InvitePendingRemoteStatus, false},
+		{techspace.InviteDeclinedRemoteStatus, false},
+		{techspace.JoinEndedRemoteStatus, true}, // by the synced marker, not the local one
+		{techspace.StatusDeleted, true},         // by the tombstone
+	}
+	for _, tc := range cases {
+		rec := techspace.SpaceIndexRecord{Id: "s", LocalStatus: del, RemoteStatus: tc.remote}
+		assert.Equal(t, tc.deleted, rec.IsDeleted(), "remote=%q", tc.remote)
+		if !tc.deleted {
+			assert.NotEqual(t, space.StatusDeleted, mapStatus(space.SpaceTypeAny, del, tc.remote), "remote=%q must read through the legacy marker", tc.remote)
+		}
+	}
 }

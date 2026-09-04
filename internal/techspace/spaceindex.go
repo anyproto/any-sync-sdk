@@ -81,19 +81,20 @@ const (
 	FieldDescription = "description"
 	FieldIcon        = "icon"
 	// FieldLocalStatus is a DEVICE-LOCAL field (schema.ScopeLocal):
-	// per-device lifecycle (active / loading markers / guest revoked)
-	// that must NOT sync — a space offloaded on one device must stay
-	// loaded on another, and the value is meaningless offline or on a
-	// different network. Written only via Service.SetLocalStatus →
-	// Object.LocalSet; never enters the DAG. Absence means active.
+	// per-device lifecycle (active, the incoming-1-1 pending prompt, the
+	// loading markers, guest revoked) that must NOT sync — a space
+	// offloaded on one device must stay loaded on another, and the value
+	// is meaningless offline or on a different network. Written only via
+	// Service.SetLocalStatus → Object.LocalSet; never enters the DAG.
+	// Absence means active.
 	//
 	// The join lifecycle does not live here: a pending join is
 	// account-wide state (FieldRemoteStatus = JoiningRemoteStatus /
 	// JoinEndedRemoteStatus). The legacy device-local shapes — "joining",
 	// and "deleted" over a synced active — are still READ (mapStatus,
-	// SpaceIndexRecord.JoinEnded) so rows written before the move keep
-	// their meaning, but nothing writes them any more; the next verdict
-	// on such a row lands in the synced form.
+	// SpaceIndexRecord.JoinEnded / LocalDeleteStands) so rows written
+	// before the move keep their meaning, but nothing writes them any
+	// more; the next verdict on such a row lands in the synced form.
 	FieldLocalStatus = "localStatus"
 	// FieldRemoteStatus is synced (account-wide). It carries the
 	// account-wide delete signal (StatusDeleted) so every device drops
@@ -114,9 +115,11 @@ const (
 	// requesting device stores the head RequestJoin returned, and a
 	// device that learns of the join from the synced row resolves one
 	// from the chain before it starts a waiter — an empty head means
-	// "acceptance only". Written via Service.SetAclHeadId →
-	// Object.LocalSet; stale once the row leaves joining (no further
-	// reads). Absent on rows that never went through Join.
+	// "acceptance only". Cleared whenever the row leaves joining: a head
+	// from an earlier request would satisfy the waiter's decline test
+	// while a later request is still pending on a lagging replica.
+	// Written via Service.SetAclHeadId → Object.LocalSet. Absent on rows
+	// that never went through Join.
 	FieldAclHeadId = "aclHeadId"
 	// FieldSpaceType mirrors the in-space spaceIndex.spaceType app tag.
 	// Distinct from FieldType (the on-wire header type): not pinned, so
@@ -330,15 +333,28 @@ const (
 )
 
 // IsDeleted reports whether a row is in any deleted/offloaded state — the
-// account-wide tombstone (StatusDeleted on either status field), the 1-1
-// and guest synced offload markers, or the ended-join marker. Used by the
-// boot eager-loader, the Subscribe translator, and the deletion
-// reconciler to treat them uniformly.
+// account-wide tombstone, the 1-1 and guest synced offload markers, the
+// ended-join marker, or a standing device-local deleted marker
+// (LocalDeleteStands). Used by the boot eager-loader, the Subscribe
+// translator, and the deletion reconciler to treat them uniformly.
 func (r SpaceIndexRecord) IsDeleted() bool {
-	return r.RemoteStatus == StatusDeleted || r.LocalStatus == StatusDeleted ||
-		r.RemoteStatus == OneToOneDeletedStatus ||
-		r.RemoteStatus == GuestDeletedRemoteStatus ||
-		r.RemoteStatus == JoinEndedRemoteStatus
+	switch r.RemoteStatus {
+	case StatusDeleted, OneToOneDeletedStatus, GuestDeletedRemoteStatus, JoinEndedRemoteStatus:
+		return true
+	}
+	return r.LocalDeleteStands()
+}
+
+// LocalDeleteStands reports whether the DEVICE-LOCAL deleted marker
+// decides the row: only while the synced status carries no lifecycle of
+// its own (active, or absent). Nothing writes the marker any more — it is
+// the legacy ended join, declined or withdrawn before the lifecycle was
+// synced — so a synced pending state that lands over it (joining from a
+// re-request on another device, invitePending from a direct add) is the
+// newer, account-wide truth and outranks it, and a synced tombstone
+// classifies the row on its own.
+func (r SpaceIndexRecord) LocalDeleteStands() bool {
+	return r.LocalStatus == StatusDeleted && (r.RemoteStatus == "" || r.RemoteStatus == StatusActive)
 }
 
 // JoinEnded reports a row left by a join that ended without membership

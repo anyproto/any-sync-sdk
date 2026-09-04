@@ -24,10 +24,13 @@ Records with fields:
 - `name` — display name
 - `icon` — space icon
 - `localStatus` — device-local (`ScopeLocal`) lifecycle: `active`, the
-  loading markers (`inviteLoading` / `guestLoading`), `guestRevoked`.
-  Absent means active. Legacy join markers — `joining`, and `deleted`
-  over a synced `active` — are still read as a pending / ended join
-  (mapStatus, `SpaceIndexRecord.JoinEnded`) but no longer written.
+  incoming-1-1 prompt (`oneToOnePending`), the loading markers
+  (`inviteLoading` / `guestLoading`), `guestRevoked`. Absent means
+  active. Legacy join markers — `joining`, and `deleted` over a synced
+  `active` — are still read as a pending / ended join (mapStatus,
+  `SpaceIndexRecord.JoinEnded`) but no longer written; a synced
+  lifecycle state landing over the `deleted` marker reads through it
+  (`LocalDeleteStands`).
 - `remoteStatus` — synced (account-wide) state: `active`; the terminal
   tombstone `deleted`; the non-terminal offload markers `oneToOneDeleted`
   / `guestDeleted`; the direct-add invite pair `invitePending` /
@@ -37,11 +40,13 @@ Records with fields:
   materializes a space the account is not a member of, and a verdict
   observed on one device converges the others.
 - `aclHeadId` — device-local (`ScopeLocal`): an ACL head at-or-after the
-  account's join request. A per-device credential, not lifecycle state:
-  the any-sync ACL waiter reports a decline only when the request is gone
-  AND the head it was given exists on the chain, so a device that learned
-  of the join from the synced row resolves one from the chain before it
-  starts a waiter.
+  account's CURRENT join request. A per-device credential, not lifecycle
+  state: the any-sync ACL waiter reports a decline only when the request
+  is gone AND the head it was given exists on the chain, so a device that
+  learned of the join from the synced row resolves one from the chain
+  before it starts a waiter, and every device clears it when the row
+  leaves joining (a head kept across requests would decline the next one
+  on a lagging replica).
 - `createdAt` — added-to-account time, a `datetime` instant. Handler-derived
   (`ScopeDerived`): `SpaceIndexHandler.BeforeCreate` stamps it from the
   creating change's timestamp when the row first lands — Create for the

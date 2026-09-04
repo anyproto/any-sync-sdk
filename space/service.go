@@ -57,8 +57,10 @@ var ErrJoinPending = errors.New("join pending owner approval")
 // while the cancel was in flight (the space loads and the row reaches
 // StatusActive — poll List / Subscribe), or a fresh request is on the
 // chain that the first snapshot missed (the join controller settles
-// it). A request gone with no membership behind it is not this error:
-// CancelJoin marks the row ended and returns nil.
+// it). Two outcomes are NOT this error: a request gone with no
+// membership behind it — CancelJoin marks the row ended and returns
+// nil — and a chain that could not be read, reported as the transport
+// error with the row untouched.
 var ErrJoinNotPending = errors.New("no pending join request")
 
 // ErrInviteAcceptPending is returned by AcceptInvite when the accept
@@ -150,10 +152,12 @@ type Service interface {
 	// owner decline leaves — and a later Join with a valid invite
 	// revives it. ErrSpaceUnknown for an id with no row;
 	// ErrJoinNotPending when the row is not joining or the owner
-	// resolved the request first (see the sentinel for what happens to
+	// accepted the request first (see the sentinel for what happens to
 	// the row then). A request already gone from the chain with no
 	// membership behind it — withdrawn or declined elsewhere before the
-	// marker synced — is settled here: the row is marked ended, nil.
+	// marker synced — is settled here: the row is marked ended, nil. A
+	// chain that cannot be read (offline) is reported as the transport
+	// error and the row is left as it is.
 	CancelJoin(ctx context.Context, spaceId string) error
 
 	// JoinGuest adds a space via a guest invite (InviteKindGuest): the
@@ -287,6 +291,12 @@ type Service interface {
 	// in List with Status = StatusDeleted. Seed-derived spaces are
 	// refused with ErrIsDerivedSpace (permanent), the tech space with
 	// ErrIsTechSpace, and an id with no index row with ErrSpaceUnknown.
+	// A row in StatusJoining is withdrawn (CancelJoin) rather than
+	// tombstoned: the request leaves the chain and the row reads
+	// StatusDeleted but stays re-joinable — a tombstone would leave the
+	// request pending and the space unjoinable for this account forever.
+	// If the owner accepted meanwhile, the delete proceeds as for any
+	// member's space.
 	Delete(ctx context.Context, spaceId string) error
 
 	// SetSettings patches the account-private per-space client settings

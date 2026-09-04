@@ -59,10 +59,18 @@ type joinResolution struct {
 	err     error
 }
 
+// joinResolveTimeout bounds one chain snapshot. The controller runs its
+// probes inline on its single loop goroutine, so an unreachable node
+// must not hold every other row's waiter lifecycle hostage; the any-sync
+// waiter bounds the same read the same way.
+const joinResolveTimeout = 20 * time.Second
+
 // resolveJoin snapshots the space's ACL through the joining client — no
 // local storage, nothing materialized — and classifies this account's
 // standing on it.
 func (s *Service) resolveJoin(ctx context.Context, spaceId string) joinResolution {
+	ctx, cancel := context.WithTimeout(ctx, joinResolveTimeout)
+	defer cancel()
 	acl, err := s.app.AclSnapshot(ctx, spaceId)
 	if err != nil {
 		return joinResolution{err: err}
@@ -144,6 +152,7 @@ func (s *Service) reconcileJoins(ctx context.Context, full bool) {
 		switch {
 		case mapStatus(r.Type, r.LocalStatus, r.RemoteStatus) == space.StatusJoining:
 			joining[r.Id] = r
+			continue
 		case full && r.JoinEnded() && s.app.SpaceExists(r.Id):
 			// Storage under an ended join is the accept-vs-cancel race:
 			// one device loaded the accepted space while another device's
@@ -153,6 +162,11 @@ func (s *Service) reconcileJoins(ctx context.Context, full bool) {
 			// the account's history.
 			s.probeEndedJoin(ctx, r.Id)
 		}
+		// A head outlives the request it was resolved for only until the
+		// row leaves joining — however it left (a verdict written here,
+		// one synced in, a boot after either). A revived row must resolve
+		// its own; see clearJoinHead.
+		s.clearJoinHead(ctx, r)
 		if r.LocalStatus == inviteLoadingLocalStatus || r.LocalStatus == guestLoadingLocalStatus {
 			// Same pull-until-available load for both: no ACL waiter —
 			// the account (or the shared guest identity) is already an
@@ -247,11 +261,9 @@ func (s *Service) storeJoinHead(ctx context.Context, spaceId, head string) {
 // probeEndedJoin runs the membership probe for an ended-join row that
 // still holds local storage (see reconcileJoins): granted means the
 // accept happened and the load flips the row active; anything else
-// leaves the row ended.
+// leaves the row ended. Tick-pass only, so the storage gate and the tick
+// are its bound.
 func (s *Service) probeEndedJoin(ctx context.Context, spaceId string) {
-	if !s.joinProbeDue(spaceId, true) {
-		return
-	}
 	res := s.resolveJoin(ctx, spaceId)
 	if res.granted {
 		joinLog.Info("ended join holds storage and the ACL grants membership; loading",
@@ -275,8 +287,10 @@ func (s *Service) startPendingLoad(ctx context.Context, spaceId string) {
 		return
 	}
 	s.pendingLoads[spaceId] = struct{}{}
-	s.mu.Unlock()
+	// Add under the lock that Close takes to set closing: a 0→1 after
+	// Close's Wait began would be a WaitGroup misuse panic.
 	s.joinWG.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer func() {
 			s.mu.Lock()
@@ -304,8 +318,8 @@ func (s *Service) startJoinLoad(spaceId string) {
 		return
 	}
 	s.pendingLoads[spaceId] = struct{}{}
+	s.joinWG.Add(1) // under the lock, as in startPendingLoad
 	s.mu.Unlock()
-	s.joinWG.Add(1)
 	go func() {
 		defer func() {
 			s.mu.Lock()
@@ -497,17 +511,20 @@ func (s *Service) loadJoinedSpace(ctx context.Context, spaceId string) {
 
 // flipJoinActive records membership on a join row after its space has
 // loaded here: the SYNCED active (the account's other devices converge
-// on it and load), then this device's local active. Written only after
-// a successful load, so the pending guard never releases a space that is
-// not local yet. A synced tombstone that landed meanwhile is left alone
-// — the delete wins; the eager-loader reclaims the storage on the next
-// boot.
+// on it and load), then this device's local active — which also retires
+// a legacy device-local join marker. Written only after a successful
+// load, so the pending guard never releases a space that is not local
+// yet. A synced tombstone that landed meanwhile is left alone — the
+// delete wins; the eager-loader reclaims the storage on the next boot.
+// The stored ACL head goes with the flip: the request it vouched for is
+// over.
 func (s *Service) flipJoinActive(ctx context.Context, spaceId string) error {
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
 		return nil
 	}
-	if rec.IsDeleted() && !rec.JoinEnded() {
+	switch rec.RemoteStatus {
+	case techspace.StatusDeleted, techspace.OneToOneDeletedStatus, techspace.GuestDeletedRemoteStatus:
 		joinLog.Info("joined space was deleted meanwhile; leaving the tombstone", zap.String("spaceId", spaceId))
 		return nil
 	}
@@ -521,6 +538,7 @@ func (s *Service) flipJoinActive(ctx context.Context, spaceId string) error {
 			return err
 		}
 	}
+	s.clearJoinHead(ctx, rec)
 	return nil
 }
 

@@ -215,11 +215,13 @@ func (s *Service) handleRegularInvite(ctx context.Context, m inbox.Message) erro
 		if !rec.JoinEnded() {
 			return nil
 		}
+		// The legacy marker first (a local set; the synced pending
+		// state reads through it either way), then the synced flip —
+		// retried on failure, so a crash between the two leaves a row
+		// that still reads ended and a redelivery completes it.
+		s.clearLegacyJoinMarker(ctx, rec)
 		if _, err := s.tsp.SetRemoteStatus(ctx, body.SpaceId, techspace.InvitePendingRemoteStatus); err != nil {
 			return fmt.Errorf("%w: register direct-add invite over an ended join: %v", inbox.ErrRetry, err)
-		}
-		if err := s.clearLegacyJoinMarker(ctx, rec); err != nil {
-			inboxLog.Warn("direct-add over an ended join", zap.String("spaceId", body.SpaceId), zap.Error(err))
 		}
 		// An ended join never loaded, so the row carries no name; the
 		// sender's hint fills it the way a fresh registration would.

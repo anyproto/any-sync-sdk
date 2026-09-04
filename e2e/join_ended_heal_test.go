@@ -26,8 +26,9 @@ import (
 //     token: the row revives to joining account-wide. Alice accepts; B
 //     reaches StatusActive.
 //  3. A never acts. The synced re-request gave A's controller a joining
-//     row to watch (its stored head from step 1 still detects a verdict),
-//     the acceptance is observed on both devices, and the synced active
+//     row to watch (its head from step 1 was dropped with the
+//     withdrawal; it resolves a fresh one from the chain), the
+//     acceptance is observed on both devices, and the synced active
 //     converges them — A reaches StatusActive and loads the space with
 //     no new request landing on Alice's side.
 //

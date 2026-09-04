@@ -53,9 +53,19 @@ type CompiledDataset struct {
 
 // schemaRev fingerprints a compiled declaration deterministically:
 // json.Marshal sorts object keys, fields ride in the compiler's stable
-// order, so equal declarations hash equal everywhere.
+// order, so equal declarations hash equal everywhere. The descriptive
+// slice (Description, XFormat) is stripped first — it is not enforced,
+// so a display edit must not rotate the revision and evict every
+// registered controller.
 func schemaRev(ds schema.Dataset) string {
-	raw, err := json.Marshal(ds)
+	behavioral := ds
+	behavioral.Fields = make([]schema.Field, len(ds.Fields))
+	for i, f := range ds.Fields {
+		f.Description = ""
+		f.XFormat = nil
+		behavioral.Fields[i] = f
+	}
+	raw, err := json.Marshal(behavioral)
 	if err != nil {
 		return ""
 	}
@@ -275,9 +285,11 @@ func CompileDatasetDefs(ctx context.Context, db anystore.DB, typeId string) ([]C
 				continue // unparsable shape: drop the field, not the dataset
 			}
 			f := schema.Field{
-				Id:     key,
-				Name:   v.GetString("name"),
-				Schema: shape,
+				Id:          key,
+				Name:        v.GetString("name"),
+				Description: v.GetString("description"),
+				Schema:      shape,
+				XFormat:     DecodeXFormat(v.Get("x-format")),
 			}
 			if sc, ok := schema.ParseScope(v.GetString("scope")); ok {
 				f.Scope = sc

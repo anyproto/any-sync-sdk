@@ -46,7 +46,7 @@
 **Type** — an object with `type = type`. Type-object's own properties are **hardcoded**. Built-ins (`any`, …) ship with the SDK.
 
 A type defines:
-- **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`, and optionally `format` (a `{type, ui, filter, options, meta}` object annotating the value convention — see docs/06 § "Property formats"; `options` is the `select`/`multiselect` enumerated choice set, the concrete realization of the deferred `enum` keyword). More fields (e.g. `required`, `default`) may be added later, when a concrete need appears.
+- **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`, and optionally `x-format` (the opaque descriptor — semantic slug, options, relation targets, config — see docs/06 § "The `x-format` descriptor"; its `options` member is the concrete realization of the deferred `enum` keyword, owned by the consumer). More fields (e.g. `required`, `default`) may be added later, when a concrete need appears.
 - **Optionally, versioned data schemas** for the object's datasets.
 
 Objects may implement **many types**, which coexist. No extension/inheritance in v1.
@@ -105,8 +105,7 @@ The `typePropertyHandler` (the built-in handler for type objects' `properties` d
 - **Add a property** — allowed. Mints a new shortId.
 - **Remove a property** — allowed. Mints a new shortId. Existing record data in any-store is **not** cleaned up; subsequent writes touching that property are dropped op-by-op (unknown-property rule).
 - **Modify an existing property's schema-bearing fields** (`kind`, `items`, `properties`) — **rejected at write time**. Kinds are pinned for life. To change a property's shape, remove it and re-add it as a new shortId; old-writer ops then either match (same kind by coincidence) or drop cleanly.
-- **Modify a pinned sub-path** — same rejection, at sub-path granularity: `format.type` (and broad replaces of the whole `format` object, which could smuggle a type change) drop at write time, while the string leaves under `format` — `format.ui`, `format.filter`, `format.meta.<k>`, and the `format.options.<key>.{name,color,pos}` / `format.options.<key>.meta.<k>` option leaves — stay freely mutable (per-path `$set`/`$unset` via `PatchProperty`; option adds of distinct keys converge). First-write-wins therefore covers whole fields (`kind`, `scope`, …) *and* declared sub-paths.
-- **Modify display-only fields** (`name`, `description`, `x-key`, `x-kind`, `format.ui`, `format.filter`) — allowed, does not mint a shortId.
+- **Modify display-only fields** (`name`, `description`, `x-key`, `meta.<k>`, and every path under the opaque `x-format` descriptor — per-path `$set`/`$unset` via `PatchProperty`; option adds of distinct keys converge) — allowed, does not mint a shortId. First-write-wins covers the whole schema-bearing fields (`kind`, `scope`, `items`, `properties`) and nothing below them.
 
 Effect: old-writer data against the current schema always type-matches on still-present properties (kind never changed) or drops cleanly on removed properties. No snapshot of historical schemas needed; **validation always runs against the current (latest merged) schema**.
 
@@ -183,10 +182,9 @@ Detached changes whose `DataVersion` never arrives stay in the collection indefi
 - **Format**: JSON-Schema-like minimal subset. v1 record fields: `kind` (on every node), `items` (on arrays), `properties` (on objects). Other keywords (`enum`, `required`, `additionalProperties`, `default`) are deferred; added when a concrete need appears.
 - **Supported kinds** in v1: `string`, `number`, `boolean`, `null`, `array`, `object`, `datetime`.
   `datetime` is any-store's native instant (unix millis, memcmp-orderable, index-keyable,
-  `{"$date": …}` in JSON) — the shape the date operators compute on. The `date` /
-  `datetime` FORMATS imply it; they also still accept `kind: string` for the ISO-8601
-  convention they carried before instants existed, and kind is pinned for the life of a
-  property, so properties created under the old rule keep working.
+  `{"$date": …}` in JSON) — the shape the date operators compute on. `kind` is always
+  explicit — nothing is defaulted from the `x-format` descriptor — and pinned for the
+  life of a property.
 - **Recursive validation**: arrays with an `items` sub-schema check every element; objects with a `properties` map check every field and reject unknown fields. Arrays/objects without these keywords pass a shallow kind check only (any element / any shape). Progressive disclosure — simple schemas stay simple.
 - **Validator**: custom, operates natively on `*anyenc.Value`. No conversion between anyenc and `interface{}`/JSON on the validation path — validation runs on every write op, so the hot path must be allocation-free for scalar success cases. Schema is compiled once from property records.
 - **Duplicate keys in input**: last-wins. Writers resolve conflicts client-side before committing property changes; the validator doesn't police it.

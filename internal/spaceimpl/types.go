@@ -2,9 +2,9 @@ package spaceimpl
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
@@ -111,10 +112,6 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
-	filterJSON, err := validateFormatDraft(&draft)
-	if err != nil {
-		return "", err
-	}
 	if draft.Kind == 0 {
 		return "", errors.New("typesAPI: PropertyDraft.Kind required")
 	}
@@ -126,22 +123,14 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
 	payload.Set(typetype.FieldKind, arena.NewString(propertyKindLabel(draft.Kind)))
-	if draft.Format != nil {
-		formatObj := arena.NewObject()
-		formatObj.Set(typetype.FormatKeyType, arena.NewString(draft.Format.Type.String()))
-		if draft.Format.UI != "" {
-			formatObj.Set(typetype.FormatKeyUi, arena.NewString(draft.Format.UI))
+	if len(draft.XFormat) > 0 {
+		// One whole object — the handler's single creation shape. The
+		// bag is opaque: converted, never inspected.
+		xf, err := goToAnyenc(arena, draft.XFormat)
+		if err != nil {
+			return "", fmt.Errorf("typesAPI: PropertyDraft.XFormat: %w", err)
 		}
-		if filterJSON != "" {
-			formatObj.Set(typetype.FormatKeyFilter, arena.NewString(filterJSON))
-		}
-		if len(draft.Format.Options) > 0 {
-			formatObj.Set(typetype.FormatKeyOptions, encodePropertyOptions(arena, draft.Format.Options))
-		}
-		if len(draft.Format.Meta) > 0 {
-			formatObj.Set(typetype.FormatKeyMeta, encodeStringMap(arena, draft.Format.Meta))
-		}
-		payload.Set(typetype.FieldFormat, formatObj)
+		payload.Set(typetype.FieldXFormat, xf)
 	}
 	if draft.Scope != 0 && draft.Scope != space.ScopeSynced {
 		// Synced is the implicit default — only non-default scopes are
@@ -157,9 +146,6 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	}
 	if draft.XKey != "" {
 		payload.Set(typetype.FieldXKey, arena.NewString(draft.XKey))
-	}
-	if draft.XKind != "" {
-		payload.Set(typetype.FieldXKind, arena.NewString(draft.XKind))
 	}
 	if len(draft.Meta) > 0 {
 		metaObj := arena.NewObject()
@@ -515,13 +501,8 @@ func registeredTypeProperties(t handler.Type) []space.PropertyDef {
 		if def.Scope == 0 {
 			def.Scope = space.ScopeSynced
 		}
-		if p.Format != nil {
-			def.Format = &space.PropertyFormat{
-				// handler.FormatType tracks space.FormatType 1:1.
-				Type:   space.FormatType(p.Format.Type),
-				UI:     p.Format.UI,
-				Filter: p.Format.Filter,
-			}
+		if len(p.XFormat) > 0 {
+			def.XFormat = maps.Clone(p.XFormat)
 		}
 		out = append(out, def)
 	}
@@ -563,7 +544,6 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 		Name:        v.GetString(typetype.FieldName),
 		Description: v.GetString(typetype.FieldDescription),
 		XKey:        v.GetString(typetype.FieldXKey),
-		XKind:       v.GetString(typetype.FieldXKind),
 		// Absent scope (pre-scope and default-synced definitions) reads
 		// as synced — the historical behavior.
 		Scope: space.ScopeSynced,
@@ -574,17 +554,7 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 	if sc, ok := schema.ParseScope(v.GetString(typetype.FieldScope)); ok {
 		def.Scope = sc
 	}
-	// A format whose type label this SDK doesn't know (written by a
-	// newer SDK) reads back as nil Format — read tolerance.
-	if ft, ok := space.ParseFormatType(v.GetString(typetype.FieldFormat, typetype.FormatKeyType)); ok {
-		def.Format = &space.PropertyFormat{
-			Type:    ft,
-			UI:      v.GetString(typetype.FieldFormat, typetype.FormatKeyUi),
-			Filter:  v.GetString(typetype.FieldFormat, typetype.FormatKeyFilter),
-			Options: decodePropertyOptions(v.GetObject(typetype.FieldFormat, typetype.FormatKeyOptions)),
-			Meta:    decodeStringMap(v.GetObject(typetype.FieldFormat, typetype.FormatKeyMeta)),
-		}
-	}
+	def.XFormat = types.DecodeXFormat(v.Get(typetype.FieldXFormat))
 	if meta := decodeStringMap(v.GetObject(typetype.FieldMeta)); meta != nil {
 		def.Meta = meta
 	}
@@ -607,63 +577,6 @@ func decodeStringMap(obj *anyenc.Object) map[string]string {
 		return nil
 	}
 	return out
-}
-
-// decodePropertyOptions reads a format.options object (key → {name,
-// color, pos, meta}) into the public map. Returns nil when absent/empty.
-func decodePropertyOptions(obj *anyenc.Object) map[string]space.PropertyOption {
-	if obj == nil {
-		return nil
-	}
-	out := map[string]space.PropertyOption{}
-	obj.Visit(func(key []byte, val *anyenc.Value) {
-		if val.Type() != anyenc.TypeObject {
-			return
-		}
-		out[string(key)] = space.PropertyOption{
-			Name:  val.GetString(typetype.OptionKeyName),
-			Color: val.GetString(typetype.OptionKeyColor),
-			Pos:   val.GetString(typetype.OptionKeyPos),
-			Meta:  decodeStringMap(val.GetObject(typetype.OptionKeyMeta)),
-		}
-	})
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// encodeStringMap builds an anyenc object from a string→string map.
-func encodeStringMap(arena *anyenc.Arena, m map[string]string) *anyenc.Value {
-	obj := arena.NewObject()
-	for k, v := range m {
-		obj.Set(k, arena.NewString(v))
-	}
-	return obj
-}
-
-// encodePropertyOptions builds a format.options object (key → {name,
-// color, pos, meta}) from the public map. Only non-empty leaves are
-// written, mirroring the create-time field-omission convention.
-func encodePropertyOptions(arena *anyenc.Arena, opts map[string]space.PropertyOption) *anyenc.Value {
-	obj := arena.NewObject()
-	for key, opt := range opts {
-		o := arena.NewObject()
-		if opt.Name != "" {
-			o.Set(typetype.OptionKeyName, arena.NewString(opt.Name))
-		}
-		if opt.Color != "" {
-			o.Set(typetype.OptionKeyColor, arena.NewString(opt.Color))
-		}
-		if opt.Pos != "" {
-			o.Set(typetype.OptionKeyPos, arena.NewString(opt.Pos))
-		}
-		if len(opt.Meta) > 0 {
-			o.Set(typetype.OptionKeyMeta, encodeStringMap(arena, opt.Meta))
-		}
-		obj.Set(key, o)
-	}
-	return obj
 }
 
 // schemaKindToPropertyKind maps the internal schema.Kind enum to the
@@ -726,16 +639,14 @@ func (t *typesAPI) RemoveProperty(ctx context.Context, typeId, propId string) er
 // PatchProperty applies a generic per-path patch to a property
 // definition via a single multi-field $set/$unset change on the type
 // object's defs dataset. Set assigns dotted-path values; Unset removes
-// dotted paths (subtree removals allowed, e.g. an entire option key).
+// dotted paths (subtree removals allowed, e.g. an entire option key
+// under x-format).
 //
-// Pinned paths (key, kind, scope, items, properties, the whole `format`
-// object, format.type) are rejected up-front — the WHOLE patch fails
-// rather than the handler silently dropping the offending op and
-// applying the rest. Format-leaf paths (format.*) require a property
-// that declared a format at creation, and their values must be strings
-// (the CRDT handler keeps format leaves scalar). All other value
-// semantics (ui vocabulary, filter syntax, option membership) stay a
-// consumer concern.
+// Pinned paths (key, kind, scope, items, properties) are rejected
+// up-front — the WHOLE patch fails rather than the handler silently
+// dropping the offending op and applying the rest. Every other path,
+// x-format included, takes any JSON value: the descriptor's vocabulary
+// and its leaf-only patch rule are the consumer's.
 func (t *typesAPI) PatchProperty(ctx context.Context, typeId, propId string, patch space.PropertyPatch) error {
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
@@ -747,57 +658,44 @@ func (t *typesAPI) PatchProperty(ctx context.Context, typeId, propId string, pat
 	arena := &anyenc.Arena{}
 	setObj := arena.NewObject()
 	unsetObj := arena.NewObject()
-	touchesFormat := false
 
-	checkPath := func(path string) ([]string, error) {
+	checkPath := func(path string) error {
 		if path == "" {
-			return nil, errors.New("typesAPI: patch path is empty")
+			return errors.New("typesAPI: patch path is empty")
 		}
 		segs := strings.Split(path, ".")
 		for _, s := range segs {
 			if s == "" {
-				return nil, fmt.Errorf("typesAPI: patch path %q has an empty segment", path)
+				return fmt.Errorf("typesAPI: patch path %q has an empty segment", path)
 			}
 		}
 		if typetype.IsPinnedPath(segs) {
-			return nil, fmt.Errorf("%w: path %q is pinned after first write", space.ErrPinnedField, path)
+			return fmt.Errorf("%w: path %q is pinned after first write", space.ErrPinnedField, path)
 		}
-		if segs[0] == typetype.FieldFormat {
-			touchesFormat = true
-		}
-		return segs, nil
+		return nil
 	}
 
 	for path, val := range patch.Set {
-		segs, err := checkPath(path)
-		if err != nil {
+		if err := checkPath(path); err != nil {
 			return err
 		}
 		v, err := goToAnyenc(arena, val)
 		if err != nil {
 			return fmt.Errorf("typesAPI: patch property: convert %q: %w", path, err)
 		}
-		if segs[0] == typetype.FieldFormat && v.Type() != anyenc.TypeString {
-			return fmt.Errorf("%w: format path %q must be a string", space.ErrPinnedField, path)
-		}
 		setObj.Set(path, v)
 	}
 	for _, path := range patch.Unset {
-		if _, err := checkPath(path); err != nil {
+		if err := checkPath(path); err != nil {
 			return err
 		}
 		unsetObj.Set(path, arena.NewNull())
 	}
 
 	// Existence pre-flight: with Upsert=false a modify against an
-	// unknown propId would silently no-op; and format-* writes are only
-	// legal on records that pinned a format.type at creation.
-	def, err := t.findPropertyDef(ctx, typeId, propId)
-	if err != nil {
+	// unknown propId would silently no-op.
+	if _, err := t.findPropertyDef(ctx, typeId, propId); err != nil {
 		return err
-	}
-	if touchesFormat && def.Format == nil {
-		return fmt.Errorf("%w: property %s", space.ErrPropertyNoFormat, propId)
 	}
 
 	var ops []crdt.Op
@@ -850,71 +748,6 @@ func (t *typesAPI) findPropertyDef(ctx context.Context, typeId, propId string) (
 		return space.PropertyDef{}, space.ErrNotFound
 	}
 	return decodePropertyDef(v), nil
-}
-
-// validateFormatDraft pre-flights draft.Format before the definition
-// write: the format type must be a known enum value (FormatTags is
-// rejected until the space-level tag table lands), the declared Kind —
-// defaulted from the format type when zero — must satisfy the
-// format→kind coupling (links ⇒ array of string; date/datetime ⇒
-// datetime, string accepted), and Filter is serialized to its JSON
-// text. Returns the
-// filter JSON to store ("" = none).
-//
-// Structure only: UI and the filter contents are stored opaquely — the
-// SDK does not validate ui vocabulary or filter syntax (a consumer
-// concern, e.g. the `any` server).
-func validateFormatDraft(draft *space.PropertyDraft) (filterJSON string, err error) {
-	f := draft.Format
-	if f == nil {
-		return "", nil
-	}
-	// altKind is a second kind the format tolerates (zero = none).
-	var requiredKind, altKind space.PropertyKind
-	switch f.Type {
-	case space.FormatLinks, space.FormatMultiselect:
-		requiredKind = space.PropertyKindArray
-	case space.FormatSelect:
-		requiredKind = space.PropertyKindString
-	case space.FormatDate, space.FormatDatetime:
-		// The instant itself, as a TypeDateTime value — the shape
-		// any-store's date operators compute on. `string` stays
-		// accepted for the ISO-8601 convention these formats carried
-		// before: kind is pinned on first write, so properties created
-		// under the old default can never move, and a caller keeping a
-		// string column has to be able to say so.
-		requiredKind, altKind = space.PropertyKindDatetime, space.PropertyKindString
-	case space.FormatTags:
-		return "", errors.New("typesAPI: format `tags` is not supported yet (space-level tag table pending)")
-	default:
-		return "", fmt.Errorf("typesAPI: unknown PropertyFormatDraft.Type %d", f.Type)
-	}
-	if draft.Kind == 0 {
-		draft.Kind = requiredKind
-	} else if draft.Kind != requiredKind && (altKind == 0 || draft.Kind != altKind) {
-		if altKind != 0 {
-			return "", fmt.Errorf("typesAPI: format %q requires Kind %s or %s; got %s",
-				f.Type, propertyKindLabel(requiredKind), propertyKindLabel(altKind), propertyKindLabel(draft.Kind))
-		}
-		return "", fmt.Errorf("typesAPI: format %q requires Kind %s; got %s",
-			f.Type, propertyKindLabel(requiredKind), propertyKindLabel(draft.Kind))
-	}
-	if requiredKind == space.PropertyKindArray && draft.Items != nil && draft.Items.Kind != space.PropertyKindString {
-		return "", fmt.Errorf("typesAPI: format %q requires string array items; got %s",
-			f.Type, propertyKindLabel(draft.Items.Kind))
-	}
-	switch filter := f.Filter.(type) {
-	case nil:
-		return "", nil
-	case string:
-		return filter, nil
-	default:
-		raw, err := json.Marshal(filter)
-		if err != nil {
-			return "", fmt.Errorf("typesAPI: marshal PropertyFormatDraft.Filter: %w", err)
-		}
-		return string(raw), nil
-	}
 }
 
 // propertyKindLabel maps the public PropertyKind enum to the on-wire

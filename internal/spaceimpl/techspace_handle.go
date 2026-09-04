@@ -323,6 +323,12 @@ func (x techTypes) PatchDataset(ctx context.Context, typeId, defId string, patch
 	}
 	return x.inner.PatchDataset(ctx, typeId, defId, patch)
 }
+func (x techTypes) PatchDatasetField(ctx context.Context, typeId, fieldDefId string, patch space.DatasetDefPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchDatasetField(ctx, typeId, fieldDefId, patch)
+}
 func (techTypes) Create(context.Context, space.TypeCreateParams) (string, error) {
 	return "", errUnsupported("Types().Create")
 }

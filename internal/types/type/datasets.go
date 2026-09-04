@@ -76,10 +76,10 @@ const (
 	DefFieldMutableBy   = "mutableBy"   // "never"/"author"/"any" (field), pinned
 )
 
-// Sub-keys of the head `search` object — mutable leaves (the
-// format.ui/filter model: broad `search` replaces are pinned, the
-// leaves mutate freely). `title` and `scope` are scalar strings; `text`
-// is a bare field key or a non-empty array of field keys.
+// Sub-keys of the head `search` object — mutable leaves (broad
+// `search` replaces are pinned, the leaves mutate freely). `title` and
+// `scope` are scalar strings; `text` is a bare field key or a non-empty
+// array of field keys.
 const (
 	SearchKeyTitle = "title"
 	SearchKeyText  = "text"
@@ -100,13 +100,15 @@ var reservedDatasetNames = map[string]struct{}{
 	"bundles":    {},
 }
 
-// datasetDefMutableTop are the head-level fields freely mutable on an
+// datasetDefMutableTop are the top-level fields freely mutable on an
 // existing def record (either record kind; `name` doubles as the field
-// record's display label).
+// record's display label, `x-format` is the field's descriptor bag —
+// every path under it is mutable, see FieldXFormat).
 var datasetDefMutableTop = map[string]struct{}{
 	FieldName:           {},
 	FieldDescription:    {},
 	DefFieldDisplayName: {},
+	FieldXFormat:        {},
 }
 
 // ErrBadDatasetDef indicates a structurally invalid dataset-definition
@@ -135,6 +137,28 @@ func isDatasetDefPinnedPath(path []string) bool {
 // IsDatasetDefPinnedPath is the exported form for client-side
 // preflights (PatchDataset), mirroring IsPinnedPath.
 func IsDatasetDefPinnedPath(path []string) bool { return isDatasetDefPinnedPath(path) }
+
+// datasetFieldMutableTop are the field-record fields a client-side
+// PatchDatasetField may target: the display pair and the descriptor
+// bag. The apply-time handler cannot tell record kinds apart
+// statelessly and admits the head's display fields on a field record
+// too; this preflight is the stricter, kind-aware rule.
+var datasetFieldMutableTop = map[string]struct{}{
+	FieldName:        {},
+	FieldDescription: {},
+	FieldXFormat:     {},
+}
+
+// IsDatasetFieldPinnedPath reports whether a PatchDatasetField path
+// touches pinned field-record state — everything but name, description
+// and x-format.*.
+func IsDatasetFieldPinnedPath(path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	_, mutable := datasetFieldMutableTop[path[0]]
+	return !mutable
+}
 
 // DatasetDefsHandler validates ops on a type object's `datasets`
 // dataset and projects shortId rows on every important change (def
@@ -267,7 +291,7 @@ func validateFieldCreate(ops []crdt.Op) error {
 			return fmt.Errorf("%w: %w: a stamped field cannot declare mutableBy", crdt.ErrValidation, ErrBadDatasetDef)
 		}
 	}
-	return nil
+	return validateXFormatCreate(ops)
 }
 
 // BeforeModify rejects edits to pinned dataset-def state; the mutable

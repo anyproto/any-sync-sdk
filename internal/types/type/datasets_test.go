@@ -171,6 +171,55 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		require.Empty(t, res.Rejections, "op %d must be mutable", i)
 	}
 
+	// A field record: the descriptor bag is created whole and then every
+	// path under it mutates with any value type; the behavioral
+	// declaration stays pinned.
+	xf := arena.NewObject()
+	xf.Set("type", arena.NewString("choice"))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("f1", "cf1", "field-1", true,
+		fieldPayload(arena, "head-1", "stage", "array", map[string]any{typetype.FieldXFormat: xf}))))
+	fieldMutable := []crdt.Op{
+		{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "type"}, Payload: arena.NewString("relation")},
+		{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "config", "multiple"}, Payload: arena.NewTrue()},
+		{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "options", "won", "name"}, Payload: arena.NewString("Won")},
+		{Type: crdt.OpUnset, Path: []string{typetype.FieldXFormat, "options", "won"}},
+		{Type: crdt.OpSet, Path: []string{typetype.FieldDescription}, Payload: arena.NewString("descr")},
+	}
+	for i, op := range fieldMutable {
+		res, err := ctrl.ApplyChangeWithResult(ctx,
+			defsChange(crdt.VersionId("fm"+string(rune('a'+i))), "cfm"+string(rune('a'+i)), "field-1", false, op))
+		require.NoError(t, err)
+		require.Empty(t, res.Rejections, "field op %d must be mutable", i)
+	}
+	fieldPinned := []crdt.Op{
+		{Type: crdt.OpSet, Path: []string{typetype.FieldKind}, Payload: arena.NewString("string")},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldRequired}, Payload: arena.NewTrue()},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldMutableBy}, Payload: arena.NewString("any")},
+	}
+	for i, op := range fieldPinned {
+		res, err := ctrl.ApplyChangeWithResult(ctx,
+			defsChange(crdt.VersionId("fp"+string(rune('a'+i))), "cfp"+string(rune('a'+i)), "field-1", false, op))
+		require.NoError(t, err)
+		require.Len(t, res.Rejections, 1, "field op %d must be pinned", i)
+	}
+	field := ctrl.Get(ctx, typetype.DatasetDefs, "field-1")
+	assert.Equal(t, "relation", field.GetString(typetype.FieldXFormat, "type"))
+	assert.True(t, field.GetBool(typetype.FieldXFormat, "config", "multiple"))
+	assert.Nil(t, field.Get(typetype.FieldXFormat, "options", "won"))
+	assert.Equal(t, "array", field.GetString(typetype.FieldKind))
+
+	// The one creation rule on the bag: an object, written whole.
+	bad := arena.NewObject()
+	bad.Set(typetype.DefFieldDef, arena.NewString(typetype.DefKindField))
+	bad.Set(typetype.DefFieldDataset, arena.NewString("head-1"))
+	bad.Set(typetype.FieldKey, arena.NewString("broken"))
+	bad.Set(typetype.FieldKind, arena.NewString("string"))
+	bad.Set(typetype.FieldXFormat, arena.NewString("email"))
+	badRes, badErr := ctrl.ApplyChangeWithResult(ctx, defsChange("fb", "cfb", "field-bad", true,
+		crdt.Op{Type: crdt.OpSet, Payload: bad}))
+	require.NoError(t, badErr)
+	require.Len(t, badRes.Rejections, 1, "a non-object x-format must reject the field create")
+
 	// title/scope leaves must stay scalar strings; text must be a
 	// string or a well-formed key array.
 	emptyArr := arena.NewArray()
@@ -250,8 +299,15 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 		}))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "f-title", true,
 		fieldPayload(arena, "head-1", "title", "string", map[string]any{typetype.DefFieldRequired: true}))))
+	bodyXF := arena.NewObject()
+	bodyXF.Set("type", arena.NewString("longtext"))
+	bodyXF.Set("icon", arena.NewString("text"))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v3", "c3", "f-body", true,
-		fieldPayload(arena, "head-1", "body", "string", map[string]any{typetype.DefFieldMutableBy: "author"}))))
+		fieldPayload(arena, "head-1", "body", "string", map[string]any{
+			typetype.DefFieldMutableBy: "author",
+			typetype.FieldDescription:  "The article body",
+			typetype.FieldXFormat:      bodyXF,
+		}))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v4", "c4", "f-creator", true,
 		fieldPayload(arena, "head-1", "creator", "string", map[string]any{typetype.DefFieldStamp: "creator"}))))
 	// Orphan field (unknown head) — folded out.
@@ -278,8 +334,34 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 	assert.Equal(t, schema.KindString, byId["title"].Schema.Kind, "first writer wins the duplicate key")
 	assert.True(t, byId["title"].Required)
 	assert.Equal(t, schema.MutableByAuthor, byId["body"].MutableBy)
+	assert.Equal(t, "The article body", byId["body"].Description)
+	assert.Equal(t, map[string]any{"type": "longtext", "icon": "text"}, byId["body"].XFormat)
 	assert.Equal(t, schema.StampCreator, byId["creator"].Stamp)
 	assert.Equal(t, schema.ScopeDerived, byId["creator"].Scope, "stamp normalizes to derived scope")
+
+	// The descriptive slice is outside the schema revision: editing it
+	// must not re-register the dataset.
+	rev := ds.SchemaRev
+	require.NotEmpty(t, rev)
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v7", "c7", "f-body", false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "type"}, Payload: arena.NewString("text")})))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v8", "c8", "f-body", false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldDescription}, Payload: arena.NewString("edited")})))
+	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId)
+	require.NoError(t, err)
+	require.Len(t, compiled, 1)
+	assert.Equal(t, rev, compiled[0].SchemaRev, "descriptive edits leave the schema revision alone")
+	for _, f := range compiled[0].Schema.Fields {
+		if f.Id == "body" {
+			assert.Equal(t, "text", f.XFormat["type"])
+			assert.Equal(t, "edited", f.Description)
+		}
+	}
+	// Discovery renders both.
+	raw, err := compiled[0].Schema.MarshalJSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"x-format":{"icon":"text","type":"text"}`)
+	assert.Contains(t, string(raw), `"description":"edited"`)
 }
 
 func TestCompileDatasetDefs_SearchTextForms(t *testing.T) {

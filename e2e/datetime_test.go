@@ -46,10 +46,10 @@ func TestSDK_DatetimeProperties(t *testing.T) {
 	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Task"})
 	require.NoError(t, err)
 
-	// Kind omitted: the date formats now imply the datetime kind.
 	dueProp, err := sp.Types().AddProperty(ctx, typeId, space.PropertyDraft{
-		Name:   "Due",
-		Format: &space.PropertyFormatDraft{Type: space.FormatDatetime},
+		Name:    "Due",
+		Kind:    space.PropertyKindDatetime,
+		XFormat: map[string]any{"type": "datetime"},
 	})
 	require.NoError(t, err)
 
@@ -61,7 +61,7 @@ func TestSDK_DatetimeProperties(t *testing.T) {
 			dueKind = d.Kind
 		}
 	}
-	assert.Equal(t, space.PropertyKindDatetime, dueKind, "a date format implies the datetime kind")
+	assert.Equal(t, space.PropertyKindDatetime, dueKind)
 
 	seed := func(due time.Time) string {
 		t.Helper()

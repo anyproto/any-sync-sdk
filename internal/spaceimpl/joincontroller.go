@@ -233,8 +233,10 @@ func (s *Service) loadAcceptedInvite(ctx context.Context, spaceId string) {
 
 // startJoinWaiter builds and runs an ACL waiter for one joining space.
 // onFinish (acceptance) spawns the space load; onReject (decline) marks
-// the row deleted. Both are quick and durable — the heavy load runs in a
-// tracked goroutine so the waiter's poll loop is never blocked.
+// the row deleted — the device-local ended-join marker (joinEnded) that
+// CancelJoin also writes and Join revives. Both are quick and durable —
+// the heavy load runs in a tracked goroutine so the waiter's poll loop
+// is never blocked.
 func (s *Service) startJoinWaiter(ctx context.Context, rec techspace.SpaceIndexRecord) {
 	spaceId := rec.Id
 	onFinish := func(list.AclList) error {

@@ -127,9 +127,13 @@ type Status uint8
 const (
 	StatusUnknown Status = iota
 	StatusActive
-	StatusJoining    // request-to-join pending approval
-	StatusLeaving    // local delete in flight
-	StatusDeleted    // marked as deleted locally
+	StatusJoining // request-to-join pending approval
+	StatusLeaving // local delete in flight
+	// StatusDeleted is a deleted row: the synced tombstone Delete writes,
+	// or — device-local — a join that ended without membership (the
+	// owner declined, or Service.CancelJoin withdrew it). The latter is
+	// re-joinable: Join with a valid invite returns it to StatusJoining.
+	StatusDeleted
 	StatusRemoteDead // network says space no longer exists
 	// StatusOneToOnePending is an incoming 1-1 (direct) space awaiting
 	// local approval. The space is not materialized or synced until

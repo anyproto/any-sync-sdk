@@ -246,7 +246,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	inst, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, Name: "Chat", DerivedRoot: true,
 		RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
-		Datasets:       []space.DatasetDraft{articleDatasetDraft()},
+		Parts:          []space.PartDraft{articlesPart()},
 	})
 	require.NoError(t, err, "device A: Ensure(derived)")
 	require.True(t, didInstall, "first derived Ensure must register the install")
@@ -255,15 +255,17 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.Equal(t, []string{wantRoot}, inst.Roots)
 	require.Empty(t, inst.Losers)
 
-	// A root declaring datasets is a type implementing itself: the
+	// A root declaring parts is a type implementing itself: the
 	// declaration is discoverable under typeId = rootId and records
 	// land on the root through the generic upsert path.
 	defs, err := spA.Types().Datasets(ctx, wantRoot)
 	require.NoError(t, err, "device A: Types().Datasets(root)")
 	require.Len(t, defs, 1)
-	require.Equal(t, "articles", defs[0].Name)
+	require.Equal(t, "articles", defs[0].Key)
+	articlesColl := defs[0].Collection
+	require.Equal(t, wantRoot+"_articles", articlesColl)
 	upRes, err := spA.Upsert(ctx, space.UpsertBatch{
-		ObjectId: wantRoot, Dataset: "articles",
+		ObjectId: wantRoot, Dataset: articlesColl,
 		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{"title": "One"}}},
 	})
 	require.NoError(t, err, "device A: Upsert on the bundle root")
@@ -316,7 +318,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	// B's registry has converged or not, it lands on the same root.
 	resB, _, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, Name: "Chat", DerivedRoot: true,
-		Datasets: []space.DatasetDraft{articleDatasetDraft()},
+		Parts: []space.PartDraft{articlesPart()},
 	})
 	require.NoError(t, err, "device B: Ensure(derived) without a convergence gate")
 	require.Equal(t, wantRoot, resB.RootId)
@@ -350,7 +352,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 		if aerr != nil || berr != nil || len(defsA) != 1 || len(defsB) != 1 || defsA[0].Id != defsB[0].Id {
 			return false
 		}
-		n, qerr := spB.Query(wantRoot, "articles").Count(ctx)
+		n, qerr := spB.Query(wantRoot, articlesColl).Count(ctx)
 		return qerr == nil && n == 1
 	}), "bundle datasets never converged: B defs=%+v", defsB)
 

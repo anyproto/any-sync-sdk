@@ -79,7 +79,18 @@ type BuiltInProperty struct {
 // applies, and its xkey resolves on upgraded peers only.
 var Properties = []BuiltInProperty{
 	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced},
+	{Id: FieldWeightProp, Name: "Weight", Kind: schema.KindNumber, Scope: schema.ScopeSynced},
+	{Id: FieldLayoutProp, Name: "Layout", Kind: schema.KindObject, Scope: schema.ScopeSynced},
 }
+
+// Rendering metadata a type object carries in its own namespace:
+// `type.weight` picks the primary type of a multi-typed object (highest
+// wins), `type.layout` is the primary type's layout descriptor ({type,
+// config}, written whole, opaque to the SDK).
+const (
+	FieldWeightProp = "weight"
+	FieldLayoutProp = "layout"
+)
 
 // DatasetPropertyDefs is the dataset on a type object that holds its
 // property-*definition* records (id, name, kind, ...). On disk the

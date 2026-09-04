@@ -29,8 +29,17 @@ import "encoding/json"
 type DatasetSchema struct {
 	Name       string
 	JSONSchema json.RawMessage
-	// TypeId is the owning type for type-owned datasets (registered via
-	// config or defined at runtime on a type object); empty for
-	// space-level built-ins. Consumers gate indexing/eviction on it.
-	TypeId string
+	// Owners are the types that declare the dataset: exactly one for a
+	// registered-type or namespaced dataset, every type declaring a
+	// shared dataset of the module for a canonical collection (empty
+	// while nothing declares it), none for space-level built-ins.
+	// Consumers gate indexing/eviction on it — an object may hold the
+	// dataset when it carries one of the owners.
+	Owners []string
+	// Module is the serving module ("records" for the generic
+	// schema-enforced kind, "editor" / "chat" for registered modules);
+	// empty for built-ins and registered-type datasets. Shared marks a
+	// module's canonical collection.
+	Module string
+	Shared bool
 }

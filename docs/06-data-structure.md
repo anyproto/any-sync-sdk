@@ -150,9 +150,13 @@ Space
 
 A **type** is an object with `type = type`. Its own shape is hardcoded in the SDK. Every type object implements two built-ins:
 - `any` — universal properties (name, description, icon, tags, id, author, createdAt, modifiedAt, modifiedBy)
-- `type` — the meta-type; contributes the `xkey` property (the type's programmatic handle) plus the `properties`, `shortIds`, and `datasets` datasets (`datasets` holds runtime dataset definitions — docs/17-user-datasets.md)
+- `type` — the meta-type; contributes the `xkey` property (the type's programmatic handle), `weight` (picks the primary type of a multi-typed object: highest wins, tie on type id) and `layout` (the primary type's layout descriptor — `{type, config}`, the x-format shape, written whole, opaque to the SDK) plus the `properties`, `shortIds`, and `datasets` datasets (`datasets` holds the type's parts and their dataset definitions — docs/17-user-datasets.md)
 
-Type objects carry the literal `__type__` in their `any.types` list (that marker is what identifies them), while the meta-type's values are stored under `type` — `record.type.xkey`. The two strings differ because a `_`-prefixed top-level field is protocol-owned, so the marker cannot double as a storage namespace; the handler grants the `type` namespace to rows carrying the marker. Keeping `xkey` there rather than on `any` is what makes it unwritable on a row that isn't a type.
+Type objects carry the literal `__type__` in their `any.types` list (that marker is what identifies them), while the meta-type's values are stored under `type` — `record.type.xkey`. The two strings differ because a `_`-prefixed top-level field is protocol-owned, so the marker cannot double as a storage namespace; the handler grants the `type` namespace to rows carrying the marker. Keeping `xkey` there rather than on `any` is what makes it unwritable on a row that isn't a type. `Types().Patch` rewrites the display and rendering metadata (`any.name` / `any.description` / `any.icon`, `type.weight` / `type.layout`) in one change.
+
+#### Module namespaces
+
+A registered module (`handler.Module.Properties`, docs/17) may declare values on the objects row under its own name — `chat.unreadCount`, `chat.notifyMode`. The namespace is never listed in `any.types`: the local write pre-flight grants it to a row when one of the row's types declares a dataset of that module (`Store.ModuleGrants`), and the read-tracking service writes a module collection's unread counters there. Same registry overlay as a registered type's properties, so `Properties().Set(objectId, "<module>", …)` routes by the declared scope.
 
 Built-ins are expected to exist as **derived objects** in every space (well-known ids, uniform with user types — no "built-in vs user" fork in query/UI code).
 

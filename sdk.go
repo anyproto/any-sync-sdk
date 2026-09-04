@@ -187,6 +187,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	if err := spaceobjects.ValidateExternalTypes(cfg.Types); err != nil {
 		return nil, fmt.Errorf("anysyncsdk: %w", err)
 	}
+	if err := spaceobjects.ValidateExternalModules(cfg.Types, cfg.Modules); err != nil {
+		return nil, fmt.Errorf("anysyncsdk: %w", err)
+	}
 
 	// any-sync stores its per-space state under <DataDir>/anysync (v1
 	// DB, owned by any-sync). The SDK's CRDT state lives at
@@ -227,7 +230,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	tsp := techspace.New(app, db)
-	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types)
+	spaces := spaceimpl.New(app, tsp, tsp, db, cfg.Types, cfg.Modules)
 	// Per-space p2p advertising: the tech-space row's switch, on unless
 	// set off; the tech space itself never carries a device row (own
 	// devices come from the account record). Wired before tsp.Open loads

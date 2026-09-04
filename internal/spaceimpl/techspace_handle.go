@@ -126,7 +126,7 @@ func (t *techSpace) checkWrite(objectId, dataset string) error {
 	if objectId == t.inner.techIndexId {
 		return fmt.Errorf("spaceimpl: the tech index object accepts no generic writes: %w", space.ErrUnsupported)
 	}
-	if _, owned := t.inner.store.DatasetOwner(dataset); owned {
+	if _, owned := t.inner.store.DatasetOwners(dataset); owned {
 		return nil
 	}
 	if _, err := t.inner.store.DataVersion(dataset); err == nil {
@@ -293,11 +293,32 @@ func (x techTypes) Properties(ctx context.Context, typeId string) ([]space.Prope
 func (x techTypes) Datasets(ctx context.Context, typeId string) ([]space.DatasetDef, error) {
 	return x.inner.Datasets(ctx, typeId)
 }
-func (x techTypes) AddDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
+func (x techTypes) Parts(ctx context.Context, typeId string) ([]space.PartDef, error) {
+	return x.inner.Parts(ctx, typeId)
+}
+func (x techTypes) AddPart(ctx context.Context, typeId string, draft space.PartDraft) (string, error) {
 	if err := x.root(ctx, typeId); err != nil {
 		return "", err
 	}
-	return x.inner.AddDataset(ctx, typeId, draft)
+	return x.inner.AddPart(ctx, typeId, draft)
+}
+func (x techTypes) PatchPart(ctx context.Context, typeId, partId string, patch space.DatasetDefPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchPart(ctx, typeId, partId, patch)
+}
+func (x techTypes) RemovePart(ctx context.Context, typeId, partId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemovePart(ctx, typeId, partId)
+}
+func (x techTypes) AddDataset(ctx context.Context, typeId, partId string, draft space.DatasetDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddDataset(ctx, typeId, partId, draft)
 }
 func (x techTypes) AddDatasetField(ctx context.Context, typeId, defId string, draft space.DatasetFieldDraft) (string, error) {
 	if err := x.root(ctx, typeId); err != nil {
@@ -333,6 +354,9 @@ func (techTypes) Create(context.Context, space.TypeCreateParams) (string, error)
 	return "", errUnsupported("Types().Create")
 }
 func (techTypes) Delete(context.Context, string) error { return errUnsupported("Types().Delete") }
+func (techTypes) Patch(context.Context, string, space.TypePatch) error {
+	return errUnsupported("Types().Patch")
+}
 func (techTypes) AddProperty(context.Context, string, space.PropertyDraft) (string, error) {
 	return "", errUnsupported("Types().AddProperty")
 }
@@ -388,8 +412,8 @@ func validateTechEnsureRequest(req space.EnsureBundleRequest) error {
 	if req.NewRoot != nil {
 		return fmt.Errorf("spaceimpl: %w: NewRoot is not available on the tech space — Ensure mints the root", space.ErrBundleBadRequest)
 	}
-	if len(req.Datasets) == 0 {
-		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Datasets", space.ErrBundleBadRequest)
+	if len(req.Parts) == 0 {
+		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Parts", space.ErrBundleBadRequest)
 	}
 	if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
 		return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties are not available on the tech space — a tech bundle root is its own type", space.ErrBundleBadRequest)

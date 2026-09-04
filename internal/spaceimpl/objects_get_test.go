@@ -47,7 +47,7 @@ func TestObjectsGet_ReturnsLiveRow(t *testing.T) {
 	row.Set("any", anyObj)
 	require.NoError(t, coll.UpsertOne(ctx, row))
 
-	store := spaceobjects.NewStore(nil, db, nil, "spaceA", nil, nil)
+	store := spaceobjects.NewStore(nil, db, nil, "spaceA", nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	s := &spaceImpl{id: "spaceA", store: store}
 	got, err := newObjectService(s).Get(ctx, "obj-1")

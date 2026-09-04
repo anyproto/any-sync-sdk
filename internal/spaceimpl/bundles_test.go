@@ -17,7 +17,7 @@ import (
 
 func entriesDraft() space.DatasetDraft {
 	return space.DatasetDraft{
-		Name:   "entries",
+		Key:    "entries",
 		IdRule: space.IdUser,
 		Fields: []space.DatasetFieldDraft{
 			{Key: "title", Kind: space.PropertyKindString, Required: true},
@@ -26,8 +26,19 @@ func entriesDraft() space.DatasetDraft {
 	}
 }
 
+func entriesPart(datasets ...space.DatasetDraft) []space.PartDraft {
+	if len(datasets) == 0 {
+		datasets = []space.DatasetDraft{entriesDraft()}
+	}
+	return []space.PartDraft{{Key: "entries", Datasets: datasets}}
+}
+
 func TestValidateEnsureRequest(t *testing.T) {
 	newRoot := func(context.Context) (string, error) { return "root", nil }
+	badKey := entriesDraft()
+	badKey.Key = "_private"
+	shared := entriesDraft()
+	shared.Shared = true
 	cases := []struct {
 		name string
 		req  space.EnsureBundleRequest
@@ -36,24 +47,28 @@ func TestValidateEnsureRequest(t *testing.T) {
 	}{
 		{name: "created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot}},
 		{name: "derived root", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}},
-		{name: "derived with datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}}},
+		{name: "derived with parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart()}},
 		{name: "both strategies", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, NewRoot: newRoot}, bad: true},
 		{name: "no strategy", req: space.EnsureBundleRequest{Id: "b"}, bad: true},
-		{name: "created root with datasets", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Datasets: []space.DatasetDraft{entriesDraft()}}},
-		{name: "sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Datasets: []space.DatasetDraft{entriesDraft()}}},
+		{name: "created root with parts", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Parts: entriesPart()}},
+		{name: "sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart()}},
 		{name: "created root with root types", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, RootTypes: []string{"t"}}, bad: true},
-		{name: "invalid draft", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{{Name: "_private"}}}, bad: true},
-		{name: "duplicate name", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft(), entriesDraft()}}, bad: true},
-		{name: "tech derived with datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}}, tech: true},
-		{name: "tech caller-created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Datasets: []space.DatasetDraft{entriesDraft()}}, tech: true, bad: true},
-		{name: "tech sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Datasets: []space.DatasetDraft{entriesDraft()}}, tech: true},
-		{name: "tech without datasets", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}, tech: true, bad: true},
-		{name: "tech with root types", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}, RootTypes: []string{"t"}}, tech: true, bad: true},
-		{name: "tech with root properties", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDraft()}, RootProperties: map[string]map[string]any{"t": {"a": 1}}}, tech: true, bad: true},
+		{name: "invalid dataset key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(badKey)}, bad: true},
+		{name: "invalid part key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: []space.PartDraft{{Key: "Bad Key"}}}, bad: true},
+		{name: "duplicate dataset key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(entriesDraft(), entriesDraft())}, bad: true},
+		{name: "duplicate part key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: []space.PartDraft{{Key: "a"}, {Key: "a"}}}, bad: true},
+		{name: "shared records", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(shared)}, bad: true},
+		{name: "tech derived with parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart()}, tech: true},
+		{name: "tech caller-created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Parts: entriesPart()}, tech: true, bad: true},
+		{name: "tech sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart()}, tech: true},
+		{name: "tech without parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}, tech: true, bad: true},
+		{name: "tech with root types", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(), RootTypes: []string{"t"}}, tech: true, bad: true},
+		{name: "tech with root properties", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(), RootProperties: map[string]map[string]any{"t": {"a": 1}}}, tech: true, bad: true},
 	}
+	b := newBundlesAPI(&spaceImpl{})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateEnsureRequest(tc.req)
+			err := b.validateEnsureRequest(tc.req)
 			if err == nil && tc.tech {
 				err = validateTechEnsureRequest(tc.req)
 			}
@@ -77,7 +92,7 @@ func TestEnsure_BadRequestBeforeStore(t *testing.T) {
 	require.ErrorIs(t, err, space.ErrBundleBadRequest)
 	_, _, err = tb.Ensure(context.Background(), space.EnsureBundleRequest{
 		Id: "b", NewRoot: func(context.Context) (string, error) { return "r", nil },
-		Datasets: []space.DatasetDraft{entriesDraft()},
+		Parts: entriesPart(),
 	})
 	require.ErrorIs(t, err, space.ErrBundleBadRequest, "NewRoot is refused on the tech space")
 }

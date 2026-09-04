@@ -90,12 +90,24 @@ type SystemPropertiesHandler struct {
 	// handler skips kind validation entirely (passes everything),
 	// which is the bring-up mode before the type system is wired.
 	Registry types.Registry
+
+	// Grants extends the local-write membership set: given the types an
+	// object implements, it returns the extra namespaces the row may
+	// hold — the modules those types declare datasets of. Nil grants
+	// nothing beyond any.types.
+	Grants func(members map[string]struct{}) []string
 }
 
 // New constructs a SystemPropertiesHandler bound to a Registry. Pass
 // nil to disable kind validation (early bring-up).
 func New(reg types.Registry) *SystemPropertiesHandler {
 	return &SystemPropertiesHandler{Registry: reg}
+}
+
+// NewWithGrants is New plus the namespace-grant resolver (module
+// namespaces on the objects row).
+func NewWithGrants(reg types.Registry, grants func(members map[string]struct{}) []string) *SystemPropertiesHandler {
+	return &SystemPropertiesHandler{Registry: reg, Grants: grants}
 }
 
 func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
@@ -337,6 +349,13 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 		// meta-type id in any.types (nothing stops a client attaching
 		// it) must not reach the namespace.
 		delete(members, typetype.TypeId)
+	}
+	// Module namespaces: granted off the types the object implements,
+	// never listed in any.types themselves.
+	if h.Grants != nil {
+		for _, ns := range h.Grants(members) {
+			members[ns] = struct{}{}
+		}
 	}
 	list := slices.Sorted(maps.Keys(members))
 	return &preflight{members: members, list: list}

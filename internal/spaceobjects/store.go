@@ -166,6 +166,20 @@ type Store struct {
 	// are absent.
 	datasetOwners map[string]string
 
+	// modules are the caller-registered dataset modules by name;
+	// moduleInfos is the compile-time catalog (records included).
+	// canonicalRegs are the shared canonical collections' registrations
+	// — identical on every controller, built once; canonicalModule maps
+	// each canonical collection back to its module. modulesTracked
+	// reports that some module instance opts into read tracking, which
+	// is what constructs the read-state engine when no static dataset
+	// does.
+	modules         map[string]handler.Module
+	moduleInfos     types.Modules
+	canonicalRegs   []crdt.HandlerReg
+	canonicalModule map[string]string
+	modulesTracked  bool
+
 	// catalog is the runtime dataset snapshot compiled from type
 	// objects' `datasets` records. Readers
 	// take the copy-on-write snapshot lock-free; refreshed only when a
@@ -349,6 +363,10 @@ type StoreConfig struct {
 	// ExtTypes is the caller-supplied type catalog.
 	ExtTypes []handler.Type
 
+	// Modules are the caller-supplied dataset modules (the built-in
+	// records module is always present).
+	Modules []handler.Module
+
 	// SystemDatasets are extra ungated built-ins for this store.
 	SystemDatasets []SystemDataset
 
@@ -365,18 +383,21 @@ type StoreConfig struct {
 // NewStore constructs a regular type/properties-backed Store. The
 // allocator is per-space (shared across all objects in this space).
 //
-// extTypes is the caller-supplied type catalog. Each type's handlers
-// are wired onto every per-object Controller built by this store,
-// alongside the built-in system handlers. Validation happens in
-// ValidateExternalTypes — call it before NewStore at the SDK
+// extTypes is the caller-supplied type catalog and modules the
+// caller-supplied dataset modules. Each type's handlers and each
+// module's canonical collection are wired onto every per-object
+// Controller built by this store, alongside the built-in system
+// handlers; module instances a type declares join through the runtime
+// catalog. Validation happens in ValidateExternalTypes /
+// ValidateExternalModules — call them before NewStore at the SDK
 // boundary so collisions are caught at Open time.
-func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type) *Store {
+func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type, modules []handler.Module) *Store {
 	var selectiveTypes []string
 	if app != nil {
 		selectiveTypes = app.SelectiveTreeTypes()
 	}
 	return NewStoreWithConfig(StoreConfig{
-		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes,
+		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes, Modules: modules,
 		SelectiveTypes: selectiveTypes,
 	})
 }
@@ -433,13 +454,48 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 			owners[d.Name] = t.Id
 		}
 	}
-	// System datasets get a stamp but no owner: DatasetOwner stays
+	// System datasets get a stamp but no owner: DatasetOwners stays
 	// false, so the type-membership check is a no-op for them.
 	for _, sd := range cfg.SystemDatasets {
 		dv[sd.Reg.Name] = sd.DataVersion
 		s.systemRegs = append(s.systemRegs, sd.Reg)
 	}
-	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes))
+	// Modules: the canonical collections register statically on every
+	// controller (so inbound changes apply without the declaring type's
+	// definitions), with the module's DataVersion; namespaced instances
+	// come from the catalog. The owner set of a canonical collection is
+	// catalog state, so it is absent from `owners` here.
+	s.modules = make(map[string]handler.Module, len(cfg.Modules))
+	s.canonicalModule = make(map[string]string, len(cfg.Modules))
+	infos := make([]types.ModuleInfo, 0, len(cfg.Modules))
+	for _, m := range cfg.Modules {
+		s.modules[m.Name] = m
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly})
+		if m.Canonical != "" {
+			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Shared: true})
+			if err != nil {
+				// ValidateExternalModules probes the same construction;
+				// a failure here is a programming error, not a runtime
+				// condition — refuse the module rather than a half set.
+				storeLog.Error("module: canonical registration failed", zap.String("module", m.Name), zap.Error(err))
+				continue
+			}
+			s.canonicalRegs = append(s.canonicalRegs, reg)
+			s.canonicalModule[m.Canonical] = m.Name
+			dv[m.Canonical] = m.DataVersion
+			if reg.ReadTracking != nil {
+				s.modulesTracked = true
+			}
+		}
+		if !m.SharedOnly {
+			probe := m.New(handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"})
+			if probe.ReadTracking != nil {
+				s.modulesTracked = true
+			}
+		}
+	}
+	s.moduleInfos = types.NewModules(infos...)
+	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, cfg.Modules))
 	s.extTypes = cfg.ExtTypes
 	s.dataVersions = dv
 	s.datasetOwners = owners
@@ -466,8 +522,8 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	if s.signKey != nil {
 		s.selfIdentity = s.signKey.GetPublic().Account()
 	}
-	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs)
-	if len(s.readTracking) > 0 {
+	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs, s.canonicalRegs)
+	if len(s.readTracking) > 0 || s.modulesTracked {
 		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
 		if needsReadMaterializer(s.readTracking) {
 			s.readMat = newReadMaterializer(s)
@@ -491,9 +547,19 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 // Properties. User types are absent (resolved from their defs
 // collection at lookup).
 //
+// Modules contribute their objects-row namespace the same way, keyed by
+// module name.
+//
 // Returns typeId → propId → PropInfo. Safe with nil/empty extTypes.
-func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.PropInfo {
-	static := make(map[string]map[string]types.PropInfo, 3+len(extTypes))
+func buildStaticSchema(extTypes []handler.Type, modules []handler.Module) map[string]map[string]types.PropInfo {
+	static := make(map[string]map[string]types.PropInfo, 3+len(extTypes)+len(modules))
+	for _, m := range modules {
+		props := make(map[string]types.PropInfo, len(m.Properties))
+		for _, p := range m.Properties {
+			props[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: propertyKindToSchema(p.Kind), Scope: p.Scope}
+		}
+		static[m.Name] = props
+	}
 
 	anyProps := make(map[string]types.PropInfo, len(anytype.Properties))
 	for _, p := range anytype.Properties {
@@ -652,6 +718,90 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 	return nil
 }
 
+// ValidateExternalModules checks the caller-supplied modules against
+// the built-in and external datasets, the reserved type ids, and each
+// other. Called once at sdk.Open after ValidateExternalTypes.
+func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) error {
+	names := make(map[string]struct{}, len(modules))
+	datasets := make(map[string]struct{})
+	for _, t := range extTypes {
+		for _, d := range t.Datasets {
+			datasets[d.Name] = struct{}{}
+		}
+	}
+	for i, m := range modules {
+		if m.Name == "" {
+			return fmt.Errorf("spaceobjects: module[%d]: empty Name", i)
+		}
+		if err := schema.ValidateSlug("module", m.Name); err != nil {
+			return fmt.Errorf("spaceobjects: module[%d]: %w", i, err)
+		}
+		if m.Name == types.RecordsModule {
+			return fmt.Errorf("spaceobjects: module[%d]: name %q is the built-in records module", i, m.Name)
+		}
+		if _, reserved := ReservedTypeIds[m.Name]; reserved {
+			return fmt.Errorf("spaceobjects: module[%d]: name %q is reserved for a built-in type", i, m.Name)
+		}
+		for _, t := range extTypes {
+			if t.Id == m.Name {
+				return fmt.Errorf("spaceobjects: module[%d]: name %q collides with a registered type id", i, m.Name)
+			}
+		}
+		if _, dup := names[m.Name]; dup {
+			return fmt.Errorf("spaceobjects: module[%d]: duplicate module name %q", i, m.Name)
+		}
+		names[m.Name] = struct{}{}
+		if m.New == nil {
+			return fmt.Errorf("spaceobjects: module[%d] (%q): New is required", i, m.Name)
+		}
+		if m.SharedOnly && m.Canonical == "" {
+			return fmt.Errorf("spaceobjects: module[%d] (%q): SharedOnly requires Canonical", i, m.Name)
+		}
+		if m.Canonical != "" {
+			if err := schema.ValidateSlug("canonical collection", m.Canonical); err != nil {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): %w", i, m.Name, err)
+			}
+			if _, dup := builtinDataVersions[m.Canonical]; dup {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical %q is reserved by a built-in", i, m.Name, m.Canonical)
+			}
+			if _, dup := datasets[m.Canonical]; dup {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical %q is already a registered dataset", i, m.Name, m.Canonical)
+			}
+			datasets[m.Canonical] = struct{}{}
+			if m.DataVersion == "" {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): empty DataVersion", i, m.Name)
+			}
+			if _, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Shared: true}); err != nil {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical instance: %w", i, m.Name, err)
+			}
+		}
+		if !m.SharedOnly {
+			if _, err := moduleReg(m, handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"}); err != nil {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): namespaced instance: %w", i, m.Name, err)
+			}
+		}
+		seenProps := make(map[string]struct{}, len(m.Properties))
+		for k, p := range m.Properties {
+			if p.Id == "" || p.Id == "id" || strings.HasPrefix(p.Id, "_") || strings.ContainsAny(p.Id, ".") {
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d]: reserved or invalid Id %q", i, m.Name, k, p.Id)
+			}
+			if propertyKindToSchema(p.Kind) == schema.KindUnknown {
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d] (%q): invalid Kind %d", i, m.Name, k, p.Id, p.Kind)
+			}
+			switch p.Scope {
+			case 0, schema.ScopeSynced, schema.ScopeAccount, schema.ScopeLocal:
+			default:
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d] (%q): invalid Scope %d (synced/account/local only)", i, m.Name, k, p.Id, p.Scope)
+			}
+			if _, dup := seenProps[p.Id]; dup {
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d]: duplicate property Id %q", i, m.Name, k, p.Id)
+			}
+			seenProps[p.Id] = struct{}{}
+		}
+	}
+	return nil
+}
+
 // Close shuts down per-Store background workers (drainer +
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
@@ -679,10 +829,16 @@ func (s *Store) SubEngine() *subscribe.Engine { return s.engine }
 type NamedSchema struct {
 	Name   string
 	Schema schema.Dataset
-	// TypeId is the owning type for type-owned datasets (registered or
-	// runtime); empty for space-level built-ins. External indexers key
-	// their type gating on it.
-	TypeId string
+	// Owners are the types that declare the dataset: one for a
+	// registered or namespaced dataset, every type declaring a shared
+	// dataset of the module for a canonical collection; empty for
+	// space-level built-ins. External indexers key their gating on it.
+	Owners []string
+	// Module is the serving module (records for the generic kind);
+	// empty for built-ins and registered-type datasets. Shared marks a
+	// module's canonical collection.
+	Module string
+	Shared bool
 }
 
 // Schemas returns the declared schema of every dataset this store hosts —
@@ -700,13 +856,20 @@ func (s *Store) Schemas() []NamedSchema {
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d), TypeId: t.Id})
+			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d), Owners: []string{t.Id}})
 		}
 	}
 	snap := s.catalog.snapshot()
+	for _, reg := range s.canonicalRegs {
+		out = append(out, NamedSchema{
+			Name: reg.Name, Schema: reg.Schema,
+			Owners: sortedOwners(snap.sharedOwners[reg.Name]),
+			Module: s.canonicalModule[reg.Name], Shared: true,
+		})
+	}
 	for _, name := range sortedCatalogNames(snap) {
 		ds := snap.byName[name]
-		out = append(out, NamedSchema{Name: ds.Name, Schema: ds.Schema, TypeId: ds.TypeId})
+		out = append(out, NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module})
 	}
 	return out
 }
@@ -732,22 +895,44 @@ func datasetSchema(d handler.Dataset) schema.Dataset {
 	return d.Schema.Normalized()
 }
 
-// DatasetDefs returns the compiled runtime dataset definitions of one
-// type object (deterministic fold of its `datasets` records).
+// DatasetDefs returns the compiled dataset definitions of one type
+// object (deterministic fold of its `datasets` records), every part's
+// datasets flattened.
 func (s *Store) DatasetDefs(ctx context.Context, typeId string) ([]types.CompiledDataset, error) {
-	return types.CompileDatasetDefs(ctx, s.db, typeId)
+	return types.CompileDatasetDefs(ctx, s.db, typeId, s.moduleInfos)
 }
 
-// DatasetHeadIds lists the live head ids declaring name on the type
+// TypeParts returns the compiled parts of one type object with their
+// datasets. Nil when the type declares nothing.
+func (s *Store) TypeParts(ctx context.Context, typeId string) (*types.CompiledType, error) {
+	return types.CompileTypeParts(ctx, s.db, typeId, s.moduleInfos)
+}
+
+// Modules returns the compile-time module catalog (records included).
+// Nil-safe: a nil store carries the built-in records module only.
+func (s *Store) Modules() types.Modules {
+	if s == nil || s.moduleInfos == nil {
+		return types.NewModules()
+	}
+	return s.moduleInfos
+}
+
+// DatasetHeadIds lists the live head ids declaring key on the type
 // object, duplicates included. See types.DatasetHeadIds.
-func (s *Store) DatasetHeadIds(ctx context.Context, typeId, name string) ([]string, error) {
-	return types.DatasetHeadIds(ctx, s.db, typeId, name)
+func (s *Store) DatasetHeadIds(ctx context.Context, typeId, key string) ([]string, error) {
+	return types.DatasetHeadIds(ctx, s.db, typeId, key)
 }
 
-// DatasetHeadName resolves a live head's dataset name by record id.
-// See types.DatasetHeadName.
-func (s *Store) DatasetHeadName(ctx context.Context, typeId, defId string) (string, error) {
-	return types.DatasetHeadName(ctx, s.db, typeId, defId)
+// PartIds lists the live part ids declaring key on the type object,
+// duplicates included. See types.PartIds.
+func (s *Store) PartIds(ctx context.Context, typeId, key string) ([]string, error) {
+	return types.PartIds(ctx, s.db, typeId, key)
+}
+
+// DatasetHeadKey resolves a live head's dataset key by record id.
+// See types.DatasetHeadKey.
+func (s *Store) DatasetHeadKey(ctx context.Context, typeId, defId string) (string, error) {
+	return types.DatasetHeadKey(ctx, s.db, typeId, defId)
 }
 
 // HasDatasetDefs reports whether anything was ever declared on the
@@ -779,18 +964,55 @@ func (s *Store) ExternalTypes() []handler.Type { return s.extTypes }
 // SpaceId returns the id of the space this store serves.
 func (s *Store) SpaceId() string { return s.spaceId }
 
-// DatasetOwner returns the typeId that owns an external type-owned
-// dataset, or ("", false) for built-in / unknown datasets. Used by the
-// write path to enforce that an object implements a type before writing
-// into one of its datasets.
-func (s *Store) DatasetOwner(dataset string) (string, bool) {
+// DatasetOwners returns the types that own a dataset — one for a
+// registered-type or namespaced dataset, the current declaring set for
+// a module's canonical collection (possibly empty: nothing declares it
+// yet) — and false for built-in / unknown datasets. Used by the write
+// path to enforce that an object implements an owner before writing
+// into the dataset.
+func (s *Store) DatasetOwners(dataset string) ([]string, bool) {
 	if owner, ok := s.datasetOwners[dataset]; ok {
-		return owner, ok
+		return []string{owner}, true
+	}
+	if _, canonical := s.canonicalModule[dataset]; canonical {
+		return sortedOwners(s.catalog.snapshot().sharedOwners[dataset]), true
 	}
 	if ds, ok := s.catalog.lookup(dataset); ok {
-		return ds.TypeId, true
+		return []string{ds.TypeId}, true
 	}
-	return "", false
+	return nil, false
+}
+
+// ModuleGrants returns the module namespaces an object carrying
+// `members` may hold on its objects row: every module one of the
+// member types declares a dataset of. The properties handler consults
+// it on the local write pre-flight.
+func (s *Store) ModuleGrants(members map[string]struct{}) []string {
+	snap := s.catalog.snapshot()
+	var out []string
+	for module, owners := range snap.moduleOwners {
+		for t := range members {
+			if _, ok := owners[t]; ok {
+				out = append(out, module)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// counterNamespace is the objects-row namespace a tracked dataset's
+// read counters land in: the owning type for a registered-type dataset,
+// the module name for a module collection (canonical or namespaced).
+func (s *Store) counterNamespace(dataset string) string {
+	if owner, ok := s.datasetOwners[dataset]; ok {
+		return owner
+	}
+	if module, ok := s.canonicalModule[dataset]; ok {
+		return module
+	}
+	return s.catalog.snapshot().moduleOf[dataset]
 }
 
 // ObjectTypes returns the typeIds an object implements (its any.types),
@@ -1952,8 +2174,9 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// per-PROPERTY scopes resolved from the type registry — the
 		// handler enforces them on the DAG route, Properties.Set on
 		// the local/account routes. Declared derived heads (author /
-		// createdAt / spaceId) stay controller-enforced.
-		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
+		// createdAt / spaceId) stay controller-enforced. Module
+		// namespaces are granted off the catalog's owner sets.
+		{Name: properties.Dataset, Handler: properties.NewWithGrants(s.reg, s.ModuleGrants), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
 		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.PropertyHandlerLocalVersion},
@@ -2017,41 +2240,20 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 			})
 		}
 	}
-	// Runtime datasets (SYN-147): one generic schema-handler reg per
-	// catalog entry. One atomic snapshot load, handlers pre-built per
-	// snapshot — no storage reads or declaration compiles on the
-	// controller-construction path.
+	// Module canonical collections: static on every controller, built
+	// once at store open.
+	regs = append(regs, s.canonicalRegs...)
+	// Namespaced runtime datasets: one pre-built reg per catalog entry
+	// (the generic schema handler for records, a module instance
+	// otherwise). One atomic snapshot load — no storage reads or
+	// declaration compiles on the controller-construction path.
 	snap := s.catalog.snapshot()
 	for _, name := range sortedCatalogNames(snap) {
-		ds := snap.byName[name]
-		sh := snap.handlers[name]
-		if sh == nil {
-			continue
+		if reg, ok := snap.regs[name]; ok {
+			regs = append(regs, reg)
 		}
-		regs = append(regs, crdt.HandlerReg{
-			Name:        ds.Name,
-			Handler:     sh,
-			Schema:      ds.Schema,
-			SchemaRev:   ds.SchemaRev,
-			SkipHistory: ds.SkipHistory,
-			Version:     crdt.SchemaHandlerVersion,
-		})
 	}
 	return regs, []string{properties.Dataset}, nil
-}
-
-// sortedCatalogNames returns the snapshot's dataset names in stable
-// order so controller reg sets are deterministic across loads.
-func sortedCatalogNames(snap *catalogSnapshot) []string {
-	if len(snap.byName) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(snap.byName))
-	for name := range snap.byName {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }
 
 // HistoryReplayRegs returns a fresh handler-reg set plus the shared

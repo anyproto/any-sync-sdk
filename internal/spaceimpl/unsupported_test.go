@@ -136,7 +136,9 @@ func TestTechHandle_WriteFence(t *testing.T) {
 	// Dataset mutators need a bundle root; an object without a row is
 	// not one.
 	tt := techTypes{inner: newTypesAPI(ts.inner), t: ts}
-	_, err = tt.AddDataset(ctx, "not-a-root", space.DatasetDraft{Name: "x"})
+	_, err = tt.AddDataset(ctx, "not-a-root", "p", space.DatasetDraft{Key: "x"})
+	assert.ErrorIs(t, err, space.ErrUnsupported)
+	_, err = tt.AddPart(ctx, "not-a-root", space.PartDraft{Key: "x"})
 	assert.ErrorIs(t, err, space.ErrUnsupported)
 	assert.ErrorIs(t, tt.RemoveDataset(ctx, "not-a-root", "d"), space.ErrUnsupported)
 }

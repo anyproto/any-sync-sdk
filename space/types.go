@@ -27,6 +27,20 @@ var ErrInvalidFieldValue = errors.New("space: invalid dataset field value")
 // A client error → 4xx.
 var ErrTypeRegistered = errors.New("space: type is registered — properties are statically declared")
 
+// ErrModuleOwned is returned by the field-level dataset methods
+// (AddDatasetField / RemoveDatasetField / PatchDatasetField) when the
+// dataset is served by a module: the module owns the schema, so a
+// declaration carries no fields. A client error → 4xx.
+var ErrModuleOwned = errors.New("space: dataset schema is owned by its module")
+
+// ErrDatasetNotDeclared is returned by the write surface (Modify /
+// ModifyMany / Delete / Upsert) when the target object carries no type
+// whose parts declare the dataset — a namespaced collection's one
+// owner, or any owner of a module's canonical collection. No type is
+// attached on write; the caller attaches one first. A client error →
+// 4xx.
+var ErrDatasetNotDeclared = errors.New("space: dataset is declared by none of the object's types")
+
 // Scope is the unified write/sync class shared by property definitions
 // and dataset schema fields — how a value is written, which version
 // domain stamps its `_ver` entries, and how far it syncs. A property
@@ -104,25 +118,52 @@ type TypesAPI interface {
 	// properties) are rejected — define a new property to change them.
 	PatchProperty(ctx context.Context, typeId, propId string, patch PropertyPatch) error
 
-	// Datasets returns the type's runtime dataset definitions (the
-	// compiled view — orphan/invalid records folded out).
+	// Patch edits a user type's display and rendering metadata: name,
+	// description, icon, weight, layout. Absent fields keep their
+	// value. Registered built-ins refuse (ErrTypeRegistered).
+	Patch(ctx context.Context, typeId string, patch TypePatch) error
+
+	// Parts returns the type's parts with their datasets (the compiled
+	// view — duplicate keys folded, orphan records dropped, invalid
+	// datasets flagged).
+	Parts(ctx context.Context, typeId string) ([]PartDef, error)
+
+	// AddPart declares a part with its initial datasets in one change.
+	// Returns the part's stable id. The key is pinned; the display
+	// slice patches via PatchPart; datasets evolve via AddDataset /
+	// RemoveDataset on the part.
+	AddPart(ctx context.Context, typeId string, draft PartDraft) (partId string, err error)
+
+	// PatchPart edits a part's mutable leaves: name, icon, pos, hidden,
+	// ui (written whole), uses. The key is pinned (ErrPinnedField).
+	PatchPart(ctx context.Context, typeId, partId string, patch DatasetDefPatch) error
+
+	// RemovePart tombstones a part and every dataset declared under it.
+	// Record data is NOT cleaned up (the RemoveProperty stance);
+	// subsequent writes to the datasets drop once peers apply the
+	// removal, and a shared dataset's removal only withdraws this
+	// type's ownership of the canonical collection.
+	RemovePart(ctx context.Context, typeId, partId string) error
+
+	// Datasets returns the type's dataset definitions across every part
+	// (the compiled view — orphan/invalid records folded out).
 	Datasets(ctx context.Context, typeId string) ([]DatasetDef, error)
 
-	// AddDataset defines a new dataset on the type at runtime. The
-	// definition syncs like any space data; peers register the dataset
-	// (enforced by the SDK's generic schema handler) as it applies.
-	// Returns the definition's stable id. Behavioral parts of the
-	// declaration (name, id rule, delete gate, field kinds/flags) are
-	// pinned — remove and re-add to change them; display parts patch
-	// via PatchDataset.
-	AddDataset(ctx context.Context, typeId string, draft DatasetDraft) (datasetDefId string, err error)
+	// AddDataset declares a dataset on an existing part. The definition
+	// syncs like any space data; peers register the dataset (the
+	// generic schema handler for records, the module's handler
+	// otherwise) as it applies. Returns the definition's stable id.
+	// Behavioral parts of the declaration (key, module, shared, id
+	// rule, delete gate, field kinds/flags) are pinned — remove and
+	// re-add to change them; display parts patch via PatchDataset.
+	AddDataset(ctx context.Context, typeId, partId string, draft DatasetDraft) (datasetDefId string, err error)
 
-	// AddDatasetField appends a field to an existing dataset definition
+	// AddDatasetField appends a field to an existing records dataset
 	// (additive evolution). Returns the field definition's id. Additive
 	// fields cannot be Required — validation always runs against the
 	// current schema, so a required field added later would reject the
 	// dataset's own history on fresh devices. Declare required fields
-	// at AddDataset.
+	// at AddDataset. A module-served dataset refuses (ErrModuleOwned).
 	AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft DatasetFieldDraft) (fieldDefId string, err error)
 
 	// RemoveDataset drops a dataset definition. Existing record data is
@@ -152,6 +193,53 @@ type TypesAPI interface {
 	PatchDatasetField(ctx context.Context, typeId, fieldDefId string, patch DatasetDefPatch) error
 }
 
+// TypePatch is the input to TypesAPI.Patch. Nil pointers keep the
+// current value; an empty string clears a text field. Layout replaces
+// the whole layout object when non-nil; ClearLayout removes it.
+type TypePatch struct {
+	Name        *string
+	Description *string
+	IconCID     *string
+	Weight      *int
+	Layout      map[string]any
+	ClearLayout bool
+}
+
+// PartDraft is the input to TypesAPI.AddPart: the part's key and
+// display slice plus its initial datasets.
+type PartDraft struct {
+	// Key is the part's slug, unique within the type — pinned.
+	Key string
+	// Name / Icon / Pos are the display slice; clients sort parts by
+	// Pos. Hidden parts are not shown by default but stay revealable.
+	Name   string
+	Icon   string
+	Pos    string
+	Hidden bool
+	// UI is the widget descriptor — a slug plus an opaque config in the
+	// x-format shape ({type, config}). Written whole; nil = the first
+	// dataset's module default.
+	UI map[string]any
+	// Uses names other datasets OF THIS TYPE the part renders without
+	// owning them (keys).
+	Uses []string
+	// Datasets are the part's initial dataset declarations.
+	Datasets []DatasetDraft
+}
+
+// PartDef is the compiled view of one part.
+type PartDef struct {
+	Id       string // part record id, immutable
+	Key      string
+	Name     string
+	Icon     string
+	Pos      string
+	Hidden   bool
+	UI       map[string]any
+	Uses     []string
+	Datasets []DatasetDef
+}
+
 // Behavioral dataset-schema vocabulary, aliased from the handler
 // package (one vocabulary for compiled-in and runtime declarations).
 type (
@@ -179,12 +267,28 @@ const (
 	DeleteByAuthor = handler.DeleteByAuthor
 )
 
-// DatasetDraft is the input to TypesAPI.AddDataset.
+// RecordsModule is the built-in generic module: a schema-enforced
+// dataset with no shared collection, always namespaced.
+const RecordsModule = "records"
+
+// DatasetDraft is the input to TypesAPI.AddDataset (and PartDraft's
+// Datasets).
 type DatasetDraft struct {
-	// Name is the dataset's collection name — pinned for the life of
-	// the definition. No "_" prefix, dots, slashes or colons; built-in
-	// names are reserved.
-	Name        string
+	// Key is the dataset's slug inside its type — pinned. Namespaced
+	// datasets live in the collection `<typeId>_<key>`; a shared
+	// dataset's key is its module's canonical collection name and may
+	// be left empty to default to it.
+	Key string
+	// Module is the serving module — "records" (the default when
+	// empty), or a registered module such as "editor" / "chat".
+	Module string
+	// Shared makes the type participate in the module's canonical
+	// collection instead of a namespaced one: two types sharing the
+	// editor give an object carrying both a single body. Legal only
+	// for modules with a canonical collection; at most one shared
+	// dataset per module per type. Never for records.
+	Shared bool
+
 	DisplayName string
 	Description string
 
@@ -208,7 +312,8 @@ type DatasetDraft struct {
 	// Search is the optional search-extraction annotation (x-search).
 	Search *SearchFields
 
-	// Fields are the initial field definitions.
+	// Fields are the initial field definitions. Records datasets only —
+	// a module owns its schema and refuses fields.
 	Fields []DatasetFieldDraft
 }
 
@@ -245,8 +350,16 @@ type DatasetFieldDraft struct {
 
 // DatasetDef is the compiled view of one runtime dataset definition.
 type DatasetDef struct {
-	Id          string // head record id, immutable
-	Name        string
+	Id string // head record id, immutable
+	// Key is the slug inside the type; Collection the name reads and
+	// writes address (the module's canonical collection when Shared,
+	// `<typeId>_<key>` otherwise) — server-computed, never client-set.
+	Key        string
+	Collection string
+	Module     string
+	Shared     bool
+	// PartId is the owning part's id.
+	PartId      string
 	DisplayName string
 	Description string
 	Dynamic     bool
@@ -304,6 +417,13 @@ type TypeInfo struct {
 	// Create, stored at `type.xkey` on the type object. Empty if
 	// unset.
 	XKey string
+	// Weight picks the primary type of a multi-typed object: the
+	// highest wins, tie broken by type id. Layout is how the primary
+	// type's header and parts compose — a slug plus config in the
+	// x-format shape ({type, config}), opaque to the SDK. Both live in
+	// the meta-type's namespace (`type.weight`, `type.layout`).
+	Weight int
+	Layout map[string]any
 	// BuiltIn marks the synthetic types — `any`, `spaceIndex`,
 	// `type` and every caller-registered type (immutable,
 	// always-present). User types return false.
@@ -322,6 +442,11 @@ type TypeCreateParams struct {
 	// is stored in the meta-type's own namespace (`type.xkey`), so
 	// only rows carrying the type marker can hold one.
 	XKey string
+
+	// Weight and Layout seed the rendering metadata — see TypeInfo.
+	// Both mutable through Patch.
+	Weight int
+	Layout map[string]any
 }
 
 // PropertyDef is the live shape of one property definition. All

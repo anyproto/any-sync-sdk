@@ -47,6 +47,14 @@ type Config struct {
 	// built-in datasets "objects", "properties", "shortIds", and no
 	// duplicates across other Types). Empty or nil = built-ins only.
 	Types []handler.Type
+
+	// Modules is the optional list of caller-defined dataset modules —
+	// compiled-in behaviours (an editor, a chat) that types declare at
+	// runtime inside their parts and the SDK instantiates per
+	// collection. Module names and canonical collection names must be
+	// unique across the catalog. Empty or nil = the built-in `records`
+	// module only.
+	Modules []handler.Module
 }
 
 // Storage controls on-disk layout.

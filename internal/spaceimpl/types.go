@@ -72,6 +72,16 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 	if params.XKey != "" {
 		multi.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(params.XKey))
 	}
+	if params.Weight != 0 {
+		multi.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(params.Weight))
+	}
+	if len(params.Layout) > 0 {
+		layout, err := encodeXFormat(arena, params.Layout)
+		if err != nil {
+			return "", fmt.Errorf("typesAPI: TypeCreateParams.Layout: %w", err)
+		}
+		multi.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+	}
 	// Mark the object as a meta-type instance — the convention we use
 	// in MVP to distinguish types from regular objects without a
 	// dedicated catalog. Set in the same change as the xkey write, so
@@ -353,8 +363,79 @@ func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 		Description: rec.GetString("any", "description"),
 		IconCID:     rec.GetString("any", "icon"),
 		XKey:        rec.GetString(typetype.TypeId, typetype.FieldXKeyProp),
+		Weight:      int(rec.GetFloat64(typetype.TypeId, typetype.FieldWeightProp)),
+		Layout:      types.DecodeXFormat(rec.Get(typetype.TypeId, typetype.FieldLayoutProp)),
 		BuiltIn:     false,
 	}
+}
+
+// Patch rewrites a user type's display and rendering metadata in one
+// change on its objects row: the universal fields under `any`, weight
+// and layout under the meta-type's namespace. Absent fields keep their
+// value; an empty string clears a text field; ClearLayout unsets the
+// layout.
+func (t *typesAPI) Patch(ctx context.Context, typeId string, patch space.TypePatch) error {
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if _, err := t.Get(ctx, typeId); err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	set := arena.NewObject()
+	unset := arena.NewObject()
+	text := func(path string, v *string) {
+		if v == nil {
+			return
+		}
+		if *v == "" {
+			unset.Set(path, arena.NewNull())
+			return
+		}
+		set.Set(path, arena.NewString(*v))
+	}
+	text("any.name", patch.Name)
+	text("any.description", patch.Description)
+	text("any.icon", patch.IconCID)
+	if patch.Weight != nil {
+		set.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(*patch.Weight))
+	}
+	switch {
+	case patch.ClearLayout:
+		unset.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, arena.NewNull())
+	case patch.Layout != nil:
+		layout, err := encodeXFormat(arena, patch.Layout)
+		if err != nil {
+			return fmt.Errorf("typesAPI: TypePatch.Layout: %w", err)
+		}
+		set.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+	}
+	var ops []crdt.Op
+	if set.GetObject() != nil && set.GetObject().Len() > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: set})
+	}
+	if unset.GetObject() != nil && unset.GetObject().Len() > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Payload: unset})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	dataVersion, err := t.parent.store.DataVersion(properties.Dataset)
+	if err != nil {
+		return err
+	}
+	obj, err := t.parent.store.Get(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	if _, err := t.parent.localWriteRetry(ctx, obj, typeId, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: dataVersion,
+		Records:     []crdt.RecordChange{{Id: typeId, Ops: ops}},
+	}); err != nil {
+		return fmt.Errorf("typesAPI: patch type: %w", err)
+	}
+	return nil
 }
 
 // hasTypeMarker reports whether `record.any.types` contains the

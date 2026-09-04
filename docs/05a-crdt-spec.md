@@ -585,6 +585,15 @@ the store's catalog carries them, and controllers pick them up by
 rebuild (eviction + reload), never by mutating a live Controller's
 handler maps (those stay immutable after construction).
 
+`config.Config.Modules` takes `handler.Module` entries — factories the
+store instantiates per collection. A module's canonical collection
+registers on every controller from store open (with the module's
+`DataVersion`); each namespaced instance a type declares
+(`<typeId>_<key>`) is built by `Module.New(instance)` into its own
+`HandlerReg` when the catalog compiles the declaration, with the
+module's `HandlerVersion` composed in. One module, many registrations,
+identical behaviour on each.
+
 ### 8.2 Unknown Datasets
 
 Changes arriving for datasets with no registered handler are

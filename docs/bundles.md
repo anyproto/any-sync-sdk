@@ -133,18 +133,21 @@ sitting on its root change, so a derived root that a device never
 stamped would sit outside that device's diff and never pull the peer's
 content.
 
-## Bundle datasets: self-typed roots
+## Bundle parts: self-typed roots
 
-`EnsureBundleRequest.Datasets` declares runtime datasets (the
-`DatasetDraft` vocabulary of `17-user-datasets.md`) on a derived root.
-The root then carries `any.types = ["__type__", rootId]`: it is a type
-object implementing itself, `typeId = rootId`. Nothing else is
-special-cased — the catalog's `__type__` scan finds it, the membership
-check (`any.types ∋ owner`) passes, the gate stamp is the ordinary
-`<rootId>:<shortId>`, `Types().Datasets(rootId)` and `Space.Datasets()`
-list the declarations with `TypeId = rootId`, and records go through
-`Upsert` / `Modify` / `Query` on the root. The bundle's setup state
-lives in records, not in child objects.
+`EnsureBundleRequest.Parts` declares parts with their datasets (the
+`PartDraft` / `DatasetDraft` vocabulary of `17-user-datasets.md`) on
+the root. The root then carries `any.types = ["__type__", rootId]`: it
+is a type object implementing itself, `typeId = rootId`. Nothing else
+is special-cased — the catalog's `__type__` scan finds it, the
+ownership check (the object carries a declaring type) passes, a
+namespaced dataset lives in `<rootId>_<key>` with the ordinary
+`<rootId>:<shortId>` gate stamp, a shared one participates in the
+module's canonical collection, `Types().Parts(rootId)` /
+`Datasets(rootId)` and `Space.Datasets()` list the declarations with
+`Owners = [rootId]`, and records go through `Upsert` / `Modify` /
+`Query` on the root. The bundle's setup state lives in records, not in
+child objects.
 
 - Declarations are written after the root's types and before the
   registry row, so a failed declaration leaves no install to adopt;
@@ -152,40 +155,34 @@ lives in records, not in child objects.
 - Declarations are one change. An adopt declares them only on a root
   that carries no declaration yet (crash before the row, a row
   adopted before the root tree synced); a root with any declaration —
-  live, or removed through `Types().RemoveDataset` (a tombstone keeps
-  no name) — is left alone: `Ensure` never patches, adds or
-  resurrects a dataset. Evolution goes through `Types().AddDataset` /
-  `AddDatasetField` / `PatchDataset` with `typeId = rootId`. Adopting
-  never renames the root either: the name stamp is written only when
-  the root carries none.
-- Dataset names are unique per space (the runtime catalog resolves
-  by name across types). A name another type or bundle already owns,
-  or one the store reserves (built-ins, the tech space's system
-  datasets), fails `Ensure` with `ErrBundleBadRequest` before the
-  permanent root is derived. Two bundles that must coexist in one
-  space prefix their dataset names (`favorites_entries`); a bundle
-  vocabulary version bump that keeps a name is a new root claiming an
-  owned name and is refused — rename the dataset with the version.
-- Adopting an install that lives on a created root with `Datasets`
-  set fails with `ErrBundleBadRequest` instead of dropping the
-  declarations.
-- Two devices declaring the same name concurrently write two heads;
-  `CompileDatasetDefs` resolves them to one per name (first creation
-  `_ver.id`), so every replica converges on one definition. A `DefId`
-  read on the losing device before sync changes after it: look
-  definitions up by name when evolving them.
+  live, or removed through `Types().RemovePart` / `RemoveDataset` (a
+  tombstone keeps no key) — is left alone: `Ensure` never patches,
+  adds or resurrects a declaration. Evolution goes through
+  `Types().AddPart` / `AddDataset` / `AddDatasetField` /
+  `PatchDataset` with `typeId = rootId`. Adopting never renames the
+  root either: the name stamp is written only when the root carries
+  none.
+- Collections cannot collide: a namespaced dataset is `<rootId>_<key>`
+  and a shared one is the module's canonical collection, so two
+  bundles in one space may use the same keys and there is no name
+  ownership to settle. An invalid or duplicate draft fails `Ensure`
+  with `ErrBundleBadRequest` before the permanent root is derived.
+- Two devices declaring the same key concurrently write two records;
+  `CompileTypeParts` folds them to one per key (first creation
+  `_ver.id`, datasets and fields unioned), so every replica converges
+  on one definition. A `DefId` read on the losing device before sync
+  changes after it: look definitions up by key when evolving them.
 - Both root strategies carry declarations, written AFTER the
   registering change: a failure between the two leaves a registered
   row whose root carries no declaration — the state the adopt path
   heals on the next Ensure (derived roots at every device's own
   materialization; a created winner when its tree is local). The
-  inverse order would strand an orphan root owning the dataset names
-  with no registry reference — unhealable, wedging the bundle id.
-  Concurrent created installs fork into roots that each carry their
-  own copy — clients merging a loser's records write them through the
-  winner's declaration, then `ResolveLoser` deletes the loser,
-  declarations included. A name held by a root no registry row
-  references answers `ErrDatasetNameUnsettled` — retry after sync.
+  inverse order would strand an orphan root with no registry
+  reference — unhealable, wedging the bundle id. Concurrent created
+  installs fork into roots that each carry their own copy — clients
+  merging a loser's records write them through the winner's
+  declaration, then `ResolveLoser` deletes the loser, declarations
+  included.
 - `RootProperties` keyed by the root's own id are rejected: the
   self-type grants a dataset namespace, not property definitions.
 
@@ -198,7 +195,7 @@ settings objects) lives in bundles on the tech space, reached through
 same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`, with
 two rules: roots are minted by `Ensure` only (`NewRoot` is refused —
 free object create is fenced on the tech handle; omit both strategies
-and `Ensure` creates the root itself), and `Datasets` required. Both
+and `Ensure` creates the root itself), and `Parts` required. Both
 strategies are available: `DerivedRoot` for bundles that must never
 fork or uninstall; the SDK-minted created root for ordinary app
 installs — deletable (`Objects().Delete` is allowed on bundle roots:
@@ -223,10 +220,10 @@ account's devices and nobody else.
   otherwise the root is minted (`NewRoot`, or the canonical derivation
   for `DerivedRoot`) and one change registers it. The returned winner is
   provisional until the space syncs — unless it is derived, which is the
-  same on every device by construction. `Datasets` declares runtime
-  datasets on the root — derived or created (see § Bundle datasets);
-  with neither `NewRoot` nor `DerivedRoot`, `Ensure` mints a created
-  root itself and stamps it as its own type.
+  same on every device by construction. `Parts` declares parts with
+  their datasets on the root — derived or created (see § Bundle
+  parts); with neither `NewRoot` nor `DerivedRoot`, `Ensure` mints a
+  created root itself and stamps it as its own type.
 - `DerivedRootId` — the canonical derived root id for a bundle id. Pure
   computation: no registry read, no materialization, no network.
 - `Get` / `List` — read the registry with `Losers` computed.

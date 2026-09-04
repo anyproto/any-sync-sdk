@@ -117,6 +117,29 @@ func ValidateSearchText(keys []string) error {
 	return nil
 }
 
+// Slug rules for part and dataset keys: lowercase ASCII letters,
+// digits and underscores, starting with a letter, at most MaxSlugLen
+// bytes. A key names a collection segment (`<typeId>_<key>`) and a
+// wire path segment, so nothing that needs quoting is admitted.
+const MaxSlugLen = 64
+
+var slugRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// ValidateSlug checks a part or dataset key against the slug rules;
+// `what` names the key's owner in the error.
+func ValidateSlug(what, s string) error {
+	if s == "" {
+		return fmt.Errorf("%w: %s key must be non-empty", ErrDecl, what)
+	}
+	if len(s) > MaxSlugLen {
+		return fmt.Errorf("%w: %s key %q exceeds %d bytes", ErrDecl, what, s, MaxSlugLen)
+	}
+	if !slugRe.MatchString(s) {
+		return fmt.Errorf("%w: %s key %q must match [a-z][a-z0-9_]*", ErrDecl, what, s)
+	}
+	return nil
+}
+
 // CompileIdPattern compiles the dataset's user-id constraint into a
 // full-match regexp, applying defaults. Call after ValidateDatasetDecl;
 // compile errors are impossible on a validated declaration.

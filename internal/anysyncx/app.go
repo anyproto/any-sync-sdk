@@ -17,6 +17,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/acl/recordverifier"
 	"github.com/anyproto/any-sync/commonspace/pubsub"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
@@ -511,6 +512,42 @@ func (a *App) StreamPool() streampool.StreamPool { return a.streamPool }
 // RequestJoin / CancelJoin RPCs to the coordinator+nodes for a space
 // the caller is not yet a member of.
 func (a *App) JoiningClient() aclclient.AclJoiningClient { return a.joining }
+
+// AclSnapshot builds an in-memory, verified ACL for spaceId from the
+// records the nodes serve — the read the joining client and the ACL
+// waiter each make on their own. It needs no local storage and
+// materializes nothing, so it is safe on a space this account is not a
+// member of: the join controller reads membership / the pending request
+// off it for a row whose request was posted elsewhere.
+func (a *App) AclSnapshot(ctx context.Context, spaceId string) (list.AclList, error) {
+	if a.joining == nil {
+		return nil, fmt.Errorf("anysyncx: acl snapshot %q: joining client unavailable", spaceId)
+	}
+	recs, err := a.joining.AclGetRecords(ctx, spaceId, "")
+	if err != nil {
+		return nil, fmt.Errorf("anysyncx: acl snapshot %q: %w", spaceId, err)
+	}
+	if len(recs) == 0 {
+		return nil, fmt.Errorf("anysyncx: acl snapshot %q: no records", spaceId)
+	}
+	storage, err := list.NewInMemoryStorage(recs[0].Id, recs)
+	if err != nil {
+		return nil, fmt.Errorf("anysyncx: acl snapshot %q: %w", spaceId, err)
+	}
+	verifier := recordverifier.AcceptorVerifier(recordverifier.NewValidateFull())
+	if networkId := a.nodeConf.Configuration().NetworkId; networkId != "" {
+		netKey, err := crypto.DecodeNetworkId(networkId)
+		if err != nil {
+			return nil, fmt.Errorf("anysyncx: acl snapshot: invalid networkId: %w", err)
+		}
+		verifier = recordverifier.New(netKey)
+	}
+	acl, err := list.BuildAclListWithIdentity(a.keys, storage, verifier)
+	if err != nil {
+		return nil, fmt.Errorf("anysyncx: acl snapshot %q: %w", spaceId, err)
+	}
+	return acl, nil
+}
 
 // InboxMessageHandler is the push callback the inbox notifier installs.
 // The body-less NotifySubscribeEvent only signals "new mail" — the

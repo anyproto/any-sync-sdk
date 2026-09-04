@@ -62,6 +62,65 @@ type AclJoiningClient interface {
 }
 ```
 
+#### Join lifecycle (SDK)
+
+A request-to-join is account-wide state: the tech-space row's synced
+`remoteStatus` carries it, so every device of the joiner's account
+classifies the row the same way and a verdict observed on any device
+converges the rest. Nothing is materialized until membership: `Service.Get`
+refuses a joining row (`ErrSpaceNotAccepted`), the boot eager-loader and the
+index follower skip it, and an unloaded space's ACL is watched only through
+the joining client (no storage, no pull).
+
+| remoteStatus (synced) | public Status   | written by |
+|-----------------------|-----------------|------------|
+| `joining`             | `StatusJoining` | `Join` — request posted, or found already on the chain (the joining client dedupes a repeat request from the same identity) |
+| `active`              | `StatusActive`  | the device whose waiter observes the acceptance, after its own load succeeds; the account's other devices converge and load lazily |
+| `joinEnded`           | `StatusDeleted` | a waiter observing the owner's decline (any device holding a head); `CancelJoin` (any device). Non-terminal, `IsDeleted`-classified: `Get` refuses it, `Subscribe` emits `Removed`, `Join` revives it, a direct add (`AddAccounts`) registers over it as `invitePending` (docs/15) |
+| `deleted`             | `StatusDeleted` | `Delete`; terminal, as everywhere |
+
+- **Waiters.** The join controller runs one any-sync ACL waiter per
+  joining row on every device. A waiter reports acceptance whenever the
+  ACL grants the identity, but a decline only when the request is gone
+  AND the head it was built on exists on the chain — so a head is a
+  per-device credential (device-local `aclHeadId`). The requesting device
+  stores the head `RequestJoin` returned; a device that learned of the
+  join from the synced row snapshots the chain first (`AclSnapshot`,
+  through the joining client): membership already granted → load, no
+  waiter; a pending request → the chain head, stored, waiter built on
+  it; neither → no waiter (nothing to wait for — the requesting device
+  syncs its verdict, or a local `CancelJoin` / `Join` settles the row);
+  chain unreadable → a head-less, acceptance-only waiter the next tick
+  tries to upgrade. Kick-driven passes (every tech-space index change)
+  throttle chain probes per row; the tick pass never does.
+- **`CancelJoin` from any device.** The withdrawal is identity-based on
+  the chain, so a device with no head can post it; the row is marked
+  ended synchronously. When the chain holds no request (the owner
+  resolved it first, or another device withdrew it), one snapshot
+  decides: membership granted → the space loads, `ErrJoinNotPending`;
+  request still there → the waiter settles it, `ErrJoinNotPending`;
+  neither → the request is gone and the row is marked ended, nil.
+- **Heals.** A loaded space whose row still reads joining or ended while
+  the live ACL grants membership (a withdrawal from another device
+  landing over the accept; a legacy device-local marker) is flipped to
+  active by `Info()` and the members watcher. An ended row that still
+  holds local storage — the same race, seen at boot — is probed by the
+  controller's tick pass and reloaded when the ACL grants membership;
+  the boot pass keeps its storage instead of offloading it.
+- **No handler transition rules for the new values.** The space-index
+  handler sees the local pre-op state at arrival and the CRDT is per-path
+  LWW, so a "refuse X after Y" rule would diverge across devices; only
+  the monotone terminal `deleted` is enforced, and it already covers
+  `joining` / `joinEnded`.
+- **Legacy rows.** Rows written before the move carry the join in the
+  device-local `localStatus` (`joining`; `deleted` over a synced
+  `active` for an ended join). They are still read — the controller runs
+  a waiter for a legacy joining row (it holds its own head), mapStatus
+  keeps their meaning — never written: the next verdict lands in the
+  synced form, and `Join` revives a legacy ended row in the synced form.
+  An un-upgraded device reads the new values through its default branch
+  as active, the same misread it has today for every pending row.
+
 ### ACL Permissions
 ```go
 const (

@@ -14,7 +14,6 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace"
-	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
@@ -24,6 +23,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -184,22 +184,30 @@ type Service struct {
 	delKick   chan struct{}
 
 	// Join controller: a background loop that drives joiner-side
-	// post-acceptance loading. For each tech-space row with
-	// localStatus="joining" it runs an any-sync ACL waiter; on
-	// acceptance it loads the space and flips the row to active, on
-	// decline it marks it deleted. joinKick wakes it immediately after
-	// a local Join; otherwise it ticks on joinReconcileInterval.
-	// joinWaiters holds the live waiter per spaceId (guarded by mu),
-	// like memberWatchers. joinCancel/joinWG are drained in Close.
+	// post-acceptance loading. For each tech-space row that reads
+	// StatusJoining it runs an any-sync ACL waiter; on acceptance it
+	// loads the space and flips the row to active, on decline it marks
+	// it ended. joinKick wakes it immediately after a local Join /
+	// CancelJoin and on every tech-space index change (a joining row
+	// synced in from another device); otherwise it ticks on
+	// joinReconcileInterval. joinWaiters holds the live waiter per
+	// spaceId (guarded by mu), like memberWatchers; joinProbes is the
+	// per-row throttle on chain probes a kick-driven pass may run.
+	// joinCtx is the loop's context, shared by the background loads it
+	// spawns from other goroutines; joinCancel/joinWG are drained in
+	// Close.
+	joinCtx     context.Context
 	joinCancel  context.CancelFunc
 	joinWG      sync.WaitGroup
 	joinKick    chan struct{}
-	joinWaiters map[string]aclwaiter.AclWaiter
+	joinWaiters map[string]*joinWaiter
+	joinProbes  map[string]time.Time
 
-	// pendingLoads dedups the join controller's accepted-invite load
-	// goroutines per spaceId (guarded by mu) — rows with
-	// localStatus="inviteLoading" need a pull-until-available load but no
-	// ACL waiter (the account is already a member).
+	// pendingLoads dedups the join controller's background load
+	// goroutines per spaceId (guarded by mu): the accepted-invite /
+	// guest pull-until-available loads (no ACL waiter — the account or
+	// the shared guest identity is already a member) and the accepted
+	// join loads.
 	pendingLoads map[string]struct{}
 
 	// pushKeys caches the per-space derived push-notification keys —
@@ -249,7 +257,8 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		aclMuxes:           make(map[string]*aclKickMux),
 		delKick:            make(chan struct{}, 1),
 		joinKick:           make(chan struct{}, 1),
-		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
+		joinWaiters:        make(map[string]*joinWaiter),
+		joinProbes:         make(map[string]time.Time),
 		pendingLoads:       make(map[string]struct{}),
 		inviteKick:         make(chan struct{}, 1),
 	}
@@ -1005,10 +1014,11 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 // deferred-updater listener) and translates each engine event into a
 // SpaceListEvent. Delta-only: callers seed current state via List.
 //
-// Mapping: a row whose localStatus is "deleted" (sticky soft-delete)
-// surfaces under Removed regardless of whether the engine classified it
-// Added/Updated; everything else maps to Added/Updated as the engine
-// saw it. The cancel func stops the drain goroutine and closes the sub.
+// Mapping: a row in any deleted shape (the synced tombstone, the 1-1 /
+// guest offload markers, an ended join) surfaces under Removed
+// regardless of whether the engine classified it Added/Updated;
+// everything else maps to Added/Updated as the engine saw it. The
+// cancel func stops the drain goroutine and closes the sub.
 func (s *Service) Subscribe(cb func(space.SpaceListEvent)) (cancel func()) {
 	sub, err := s.tsp.SubEngine().Subscribe(subscribe.SubConfig{
 		Scope: subscribe.Scope{ObjectId: s.tsp.IndexObjectId(), Dataset: techspace.SpaceIndexDataset},
@@ -1543,11 +1553,11 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 	// An existing row decides whether a request may be posted at all. A
 	// synced tombstone (Delete, the 1-1 / guest offload markers) is
 	// sticky: a request against it would land on the ACL with nothing
-	// local able to complete it. An ended join (joinEnded) is the one
-	// deleted shape a re-request revives — checked before the RPC so a
-	// refused Join leaves no dangling request on the chain.
+	// local able to complete it. An ended join is the one deleted shape
+	// a re-request revives — checked before the RPC so a refused Join
+	// leaves no dangling request on the chain.
 	rec, exists := s.tsp.Get(ctx, inv.SpaceId)
-	if exists && rec.IsDeleted() && !joinEnded(rec) {
+	if exists && rec.IsDeleted() && !rec.JoinEnded() {
 		return nil, fmt.Errorf("spaceimpl: Join: space %q was deleted on this account (tombstones are sticky): %w",
 			inv.SpaceId, space.ErrSpaceDeleted)
 	}
@@ -1561,40 +1571,49 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 		// another route — accepted after a join from another device, or
 		// added directly — while this device's row still reads ended or
 		// pending. Nothing watches the ACL of an unloaded space, so this
-		// is the moment to notice: the waiter the controller starts for a
-		// joining row sees the permissions on its first poll and loads
-		// the space. An active row keeps the error — it is a member
-		// asking to join again.
-		if errors.Is(err, list.ErrInsufficientPermissions) && exists &&
-			mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) != space.StatusActive {
-			aclHeadId = ""
-		} else {
+		// is the moment to notice: the account is a member, so the space
+		// loads now and the row flips to active after the load — no
+		// request, no waiter, and no synced "joining" that would briefly
+		// misreport a member on the account's other devices. An active
+		// row keeps the error — it is a member asking to join again.
+		if !errors.Is(err, list.ErrInsufficientPermissions) || !exists ||
+			mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) == space.StatusActive {
 			return nil, fmt.Errorf("spaceimpl: RequestJoin: %w", err)
 		}
+		if err := s.clearLegacyJoinMarker(ctx, rec); err != nil {
+			return nil, fmt.Errorf("spaceimpl: Join: %w", err)
+		}
+		s.stopJoinWaiter(inv.SpaceId)
+		s.startJoinLoad(inv.SpaceId)
+		return nil, ErrJoinPending
 	}
-	// Record the pending-join state in the tech space so it shows up
-	// in List with StatusJoining. The synced row carries the metadata;
-	// the joining lifecycle is per-device (localStatus is a local field),
-	// so it's set separately via SetLocalStatus after the row exists.
-	// A request stood (posted, deduped, or already granted) for an
-	// identity that is not an active member here, so whatever the row
-	// carried — nothing, an ended join, a synced-in row with no local
-	// status, a tracked row — it reads joining from now on. A guest row
-	// is left alone: its storage is opened under the shared guest
-	// identity, and a member upgrade in place is not a supported path.
-	if !exists {
+	// Record the pending join in the tech space — SYNCED, so every
+	// device of the account reads the row as joining: List shows
+	// StatusJoining, nothing materializes the space, and the verdict
+	// observed on any device converges the rest. A request stood (posted
+	// or deduped) for an identity that is not an active member here, so
+	// whatever the row carried — nothing, an ended join, a tracked row —
+	// it reads joining from now on. A guest row is left alone: its
+	// storage is opened under the shared guest identity, and a member
+	// upgrade in place is not a supported path.
+	switch {
+	case !exists:
 		// Type is unknown at join time (the header isn't readable until
 		// the space loads) — left empty, backfilled set-once by load.
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           inv.SpaceId,
-			RemoteStatus: techspace.StatusActive,
+			RemoteStatus: techspace.JoiningRemoteStatus,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 		}
-	}
-	if !exists || (rec.LocalStatus != joiningLocalStatus && rec.GuestKey == "") {
-		if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, joiningLocalStatus); err != nil {
+	case rec.GuestKey == "" && rec.RemoteStatus != techspace.JoiningRemoteStatus:
+		if _, err := s.tsp.SetRemoteStatus(ctx, inv.SpaceId, techspace.JoiningRemoteStatus); err != nil {
 			return nil, fmt.Errorf("spaceimpl: mark joining: %w", err)
+		}
+	}
+	if exists {
+		if err := s.clearLegacyJoinMarker(ctx, rec); err != nil {
+			return nil, fmt.Errorf("spaceimpl: Join: %w", err)
 		}
 	}
 	// Persist the ACL head so the post-acceptance waiter can detect a
@@ -1651,23 +1670,21 @@ func (s *Service) CancelJoin(ctx context.Context, spaceId string) error {
 	}
 	if err != nil {
 		if errors.Is(err, list.ErrNoSuchRecord) {
-			// The chain holds no pending request of ours: the owner
-			// accepted or declined first (consensus is linear — exactly
-			// one of accept / cancel lands). The row stays with the
-			// waiter, which lands the outcome on its next poll.
-			return fmt.Errorf("spaceimpl: CancelJoin: space %q: %w", spaceId, space.ErrJoinNotPending)
+			return s.cancelJoinWithoutRequest(ctx, spaceId)
 		}
 		return fmt.Errorf("spaceimpl: CancelJoin: %w", err)
 	}
-	// The cancel is on the chain. The waiter would read it as a decline
-	// on its next poll and stamp the same marker; stamp it now so the
-	// caller observes the end state synchronously. The write outlives
-	// the caller's ctx: the network side is done, and a row left
-	// joining with no request behind it would sit until the waiter's
-	// next poll — so on a failed write the waiter is kept (kicked) as
-	// the fallback, and only after a successful write is it dropped
-	// rather than left polling a request that no longer exists.
-	if _, wErr := s.tsp.SetLocalStatus(context.WithoutCancel(ctx), spaceId, techspace.StatusDeleted); wErr != nil {
+	// The cancel is on the chain. A waiter holding a head would read it
+	// as a decline on its next poll and stamp the same marker; stamp it
+	// now so the caller observes the end state synchronously, and so a
+	// device with no head (one that learned of the join from the synced
+	// row) converges too. The write outlives the caller's ctx: the
+	// network side is done, and a row left joining with no request
+	// behind it would sit until the waiter's next poll — so on a failed
+	// write the waiter is kept (kicked) as the fallback, and only after
+	// a successful write is it dropped rather than left polling a request
+	// that no longer exists.
+	if wErr := s.markJoinEnded(context.WithoutCancel(ctx), spaceId); wErr != nil {
 		s.kickJoinController()
 		return fmt.Errorf("spaceimpl: CancelJoin: mark ended: %w", wErr)
 	}
@@ -1676,22 +1693,76 @@ func (s *Service) CancelJoin(ctx context.Context, spaceId string) error {
 	return nil
 }
 
-// joiningLocalStatus is the localStatus value the SDK stamps on a
-// space-index entry while a RequestToJoin is still pending owner
-// approval. Maps to space.StatusJoining via mapStatus.
+// cancelJoinWithoutRequest settles a CancelJoin whose chain snapshot
+// held no pending request of ours. Consensus is linear, so exactly one
+// of accept / decline / cancel landed first — but the error does not say
+// which, and a device that learned of the join from the synced row holds
+// no head to tell a decline from a request that never existed. One more
+// snapshot decides: permissions granted means the owner accepted (the
+// space loads now, the request cannot be withdrawn); a request still on
+// the chain means the first snapshot was stale (the waiter settles it);
+// neither means the request is gone — declined, or withdrawn on another
+// device whose marker has not synced yet — and the caller asked for
+// exactly that end state, so the row is marked ended here.
+func (s *Service) cancelJoinWithoutRequest(ctx context.Context, spaceId string) error {
+	notPending := fmt.Errorf("spaceimpl: CancelJoin: space %q: %w", spaceId, space.ErrJoinNotPending)
+	res := s.resolveJoin(ctx, spaceId)
+	switch {
+	case res.err != nil:
+		joinLog.Debug("cancel join: chain unreadable", zap.String("spaceId", spaceId), zap.Error(res.err))
+		return notPending
+	case res.granted:
+		s.stopJoinWaiter(spaceId)
+		s.startJoinLoad(spaceId)
+		return notPending
+	case res.head != "":
+		s.kickJoinController()
+		return notPending
+	}
+	if err := s.markJoinEnded(context.WithoutCancel(ctx), spaceId); err != nil {
+		s.kickJoinController()
+		return fmt.Errorf("spaceimpl: CancelJoin: mark ended: %w", err)
+	}
+	s.stopJoinWaiter(spaceId)
+	s.kickJoinController()
+	return nil
+}
+
+// joiningLocalStatus is the LEGACY device-local localStatus the old Join
+// stamped while a RequestToJoin was pending. Still read — mapStatus maps
+// it to space.StatusJoining and the controller runs a waiter for it, so
+// a join left pending across the upgrade completes — never written: the
+// pending join lives in the synced techspace.JoiningRemoteStatus now.
 const joiningLocalStatus = "joining"
 
-// joinEnded reports a row left by a join that ended without membership
-// on this device — the owner declined, or CancelJoin withdrew it: the
-// device-local deleted marker over the synced remote=active that Join
-// wrote. Surfaces as StatusDeleted like a tombstone, but only the join
-// waiter and CancelJoin ever write local=deleted (Delete writes the
-// synced statuses), so the shape is unambiguous and Join revives it.
-// 1-1 and guest rows never go through Join and keep their own delete
-// markers; excluding them keeps the shape theirs to claim.
-func joinEnded(rec techspace.SpaceIndexRecord) bool {
-	return rec.LocalStatus == techspace.StatusDeleted && rec.RemoteStatus == techspace.StatusActive &&
-		rec.Type != space.SpaceTypeOneToOne && rec.GuestKey == ""
+// clearLegacyJoinMarker drops the device-local join marker of the
+// pre-synced lifecycle ("joining", or the "deleted" of an ended join)
+// off a row that now carries its lifecycle in the synced field. A local
+// set — no DAG change; the synced state outranks the marker anyway, so
+// this is hygiene, not correctness. Guest rows never carry one.
+func (s *Service) clearLegacyJoinMarker(ctx context.Context, rec techspace.SpaceIndexRecord) error {
+	if rec.GuestKey != "" || (rec.LocalStatus != joiningLocalStatus && rec.LocalStatus != techspace.StatusDeleted) {
+		return nil
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, rec.Id, ""); err != nil {
+		return fmt.Errorf("clear legacy join marker: %w", err)
+	}
+	return nil
+}
+
+// markJoinEnded records that the account's join ended without
+// membership — the synced techspace.JoinEndedRemoteStatus every device
+// converges on (Get refuses it, the eager-loader skips it, Subscribe
+// emits Removed, Join revives it). Written by the waiter's decline path
+// and by CancelJoin.
+func (s *Service) markJoinEnded(ctx context.Context, spaceId string) error {
+	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.JoinEndedRemoteStatus); err != nil {
+		return err
+	}
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok {
+		return s.clearLegacyJoinMarker(ctx, rec)
+	}
+	return nil
 }
 
 // guestLoadingLocalStatus is the DEVICE-LOCAL localStatus stamped by
@@ -1822,11 +1893,12 @@ func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space
 	if rec.IsDeleted() {
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is deleted", spaceId)
 	}
-	if rec.LocalStatus == joiningLocalStatus {
-		// A token-join awaiting owner approval rides the same
-		// remote=active row shape (Join stamps it at request time);
-		// accepting it here would clobber the joining marker and tear
-		// down its ACL waiter, silencing an eventual owner decline.
+	if rec.RemoteStatus == techspace.JoiningRemoteStatus || rec.LocalStatus == joiningLocalStatus {
+		// A token-join awaiting owner approval: accepting it here would
+		// clobber the joining state and tear down its ACL waiter,
+		// silencing an eventual owner decline. (The legacy device-local
+		// marker rides a remote=active row, which the switch below would
+		// otherwise take for an idempotent re-accept.)
 		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is awaiting join approval, not a direct-add invite", spaceId)
 	}
 	switch rec.RemoteStatus {
@@ -2072,14 +2144,6 @@ var _ anysyncx.SpaceRegistry = (*Service)(nil)
 // space.Status enum.
 func mapStatus(typ, local, remote string) space.Status {
 	switch {
-	case local == techspace.StatusDeleted:
-		// Device-local delete — the user removed this space on THIS device.
-		// Must report Deleted even when remote is still active, else a
-		// locally-deleted space surfaces as Active and clients trusting the
-		// mapped status re-adopt a space the user removed. Checked before
-		// the remote case so a local delete always wins locally. (Regressed
-		// when the index was Store-backed; this restores the prior case.)
-		return space.StatusDeleted
 	case remote == techspace.StatusDeleted:
 		// Account-wide delete (synced) — propagated to every device.
 		return space.StatusDeleted
@@ -2091,6 +2155,24 @@ func mapStatus(typ, local, remote string) space.Status {
 	case remote == techspace.GuestDeletedRemoteStatus:
 		// Guest-space delete (synced, non-terminal): offloaded
 		// everywhere, re-addable via JoinGuest. Surfaced as Deleted.
+		return space.StatusDeleted
+	case remote == techspace.JoinEndedRemoteStatus:
+		// Ended join (synced, non-terminal): the owner declined or the
+		// account withdrew, observed on any device. Surfaced as Deleted;
+		// Join revives it.
+		return space.StatusDeleted
+	case remote == techspace.JoiningRemoteStatus:
+		// Pending join (synced): the account-wide truth, ranked above the
+		// device-local cases so a legacy ended-join marker left on this
+		// device cannot hide a join re-requested from another one.
+		return space.StatusJoining
+	case local == techspace.StatusDeleted:
+		// Device-local deleted marker — the legacy ended join (declined
+		// or withdrawn before the lifecycle was synced). Must report
+		// Deleted even though remote is still active, else it surfaces as
+		// Active and clients trusting the mapped status adopt a space the
+		// account is not a member of. No current writer stamps it; it
+		// stays readable until Join revives the row in the synced form.
 		return space.StatusDeleted
 	case remote == oneToOneDeclinedRemoteStatus:
 		// Synced, sticky 1-1 decline — account-wide (could be declined on
@@ -2117,6 +2199,7 @@ func mapStatus(typ, local, remote string) space.Status {
 		// flip, the account-wide truth is still "pending".
 		return space.StatusInvitePending
 	case local == joiningLocalStatus:
+		// Legacy device-local pending join — see joiningLocalStatus.
 		return space.StatusJoining
 	case local == guestRevokedLocalStatus:
 		// Guest-mode space whose shared identity was removed from the

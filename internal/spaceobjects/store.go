@@ -560,7 +560,8 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 					zap.String("typeId", t.Id), zap.String("collection", md.collection), zap.Error(err))
 				continue
 			}
-			reg.SchemaRev = ""
+			// No SchemaRev: a static instance never rotates, so no
+			// controller is ever stale against it.
 			s.staticInstanceRegs = append(s.staticInstanceRegs, reg)
 			s.staticInstanceModule[md.collection] = md.module
 			dv[md.collection] = m.DataVersion

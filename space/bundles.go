@@ -147,9 +147,11 @@ type EnsureBundleRequest struct {
 	// property id is DERIVED from (root id, XKey), so two devices
 	// installing while apart mint one column per handle instead of
 	// two. Declared in one change after the registering write; on
-	// adopt only the definitions whose id is absent are written — a
-	// definition removed through Types().RemoveProperty stays removed,
-	// nothing is patched. Later evolution goes through
+	// adopt only the definitions the root lacks are written — one is
+	// present when its id exists (live, or removed through
+	// Types().RemoveProperty: the tombstone keeps the id) or a live
+	// definition carries its handle under any id, so nothing is
+	// patched, resurrected or doubled. Later evolution goes through
 	// Types().AddProperty / PatchProperty / RemoveProperty with typeId
 	// = rootId; a property added that way gets an ordinary
 	// change-derived id. Kind, Scope and XKey are validated as
@@ -158,29 +160,53 @@ type EnsureBundleRequest struct {
 
 	// Layout, Weight and Hidden seed the root type's rendering and
 	// listing metadata (TypeInfo.Layout / Weight / Hidden) with the
-	// name stamp, on install only — adopt never patches them. Any of
-	// them, like Parts or Properties, makes the root a type
-	// implementing itself. Hidden is EXPLICIT: a root that only hosts
-	// its bundle's records should ask for it, since a listed type is
-	// one a client may attach elsewhere, granting that object the
-	// bundle's collections; a root that is a type objects carry (a
+	// name stamp, on install only — adopt never patches them. They
+	// describe a type, so they need Parts or Properties
+	// (ErrBundleBadRequest otherwise). Hidden is EXPLICIT: a root that
+	// only hosts its bundle's records should ask for it, since a listed
+	// type is one a client may attach elsewhere, granting that object
+	// the bundle's collections; a root that is a type objects carry (a
 	// page, a wiki) stays listed.
 	Layout map[string]any
 	Weight int
 	Hidden bool
-
-	// SystemInstall marks the consumer's own catalog install: it lifts
-	// the reserved-module refusal (handler.Module.Reserved) for this
-	// request. Never set it from client input — the reservation exists
-	// so only the consumer's installs declare such a module.
-	SystemInstall bool
 }
 
 // DeclaresType reports whether the request makes the root a type
-// implementing itself — any of Parts, Properties, Layout, Weight or
-// Hidden.
+// implementing itself — Parts or Properties.
 func (r EnsureBundleRequest) DeclaresType() bool {
-	return len(r.Parts) > 0 || len(r.Properties) > 0 || len(r.Layout) > 0 || r.Weight != 0 || r.Hidden
+	return len(r.Parts) > 0 || len(r.Properties) > 0
+}
+
+// EnsureOption tunes one Ensure call. Options carry what must never
+// come from a request body: a consumer maps client input onto
+// EnsureBundleRequest and adds options from its own code paths only.
+type EnsureOption func(*EnsureOptions)
+
+// EnsureOptions is the resolved option set.
+type EnsureOptions struct {
+	// SystemInstall marks the consumer's own catalog install: it lifts
+	// the reserved-module refusal (handler.Module.Reserved) for this
+	// call. The reservation exists so only the consumer's installs
+	// declare such a module.
+	SystemInstall bool
+}
+
+// SystemInstall marks the call as the consumer's own install — see
+// EnsureOptions.SystemInstall.
+func SystemInstall() EnsureOption {
+	return func(o *EnsureOptions) { o.SystemInstall = true }
+}
+
+// ApplyEnsureOptions folds opts into an EnsureOptions.
+func ApplyEnsureOptions(opts ...EnsureOption) EnsureOptions {
+	var o EnsureOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
 }
 
 // BundlesAPI is the typed surface over the per-space bundles registry.
@@ -230,7 +256,11 @@ type BundlesAPI interface {
 	// The bool reports whether THIS call registered the install.
 	// False means an existing one was adopted — which for a derived
 	// root may still materialize its tree locally.
-	Ensure(ctx context.Context, req EnsureBundleRequest) (Bundle, bool, error)
+	//
+	// Options carry what a request body must never say: SystemInstall
+	// admits a reserved module (handler.Module.Reserved) for the
+	// consumer's own install.
+	Ensure(ctx context.Context, req EnsureBundleRequest, opts ...EnsureOption) (Bundle, bool, error)
 
 	// Get returns the bundle row. ErrBundleUnknown when no live record
 	// exists OR the winning root's tree is deleted — a dead winner

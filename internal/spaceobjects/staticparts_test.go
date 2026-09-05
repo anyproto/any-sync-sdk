@@ -114,6 +114,12 @@ func TestValidateExternalModules_StaticPartsAndReserved(t *testing.T) {
 			{Key: "p", Datasets: []handler.PartDataset{{Module: "blocks", Shared: true}}},
 			{Key: "q", Datasets: []handler.PartDataset{{Module: "blocks", Shared: true}}},
 		}}}, []handler.Module{testModule()}, "duplicate dataset key"},
+		// Keys are one namespace per type: a module key cannot reuse a
+		// static dataset's name.
+		{"module key collides with a static name", []handler.Type{{Id: "t",
+			Datasets: []handler.Dataset{{Name: "summary", DataVersion: "v", Handler: crdt.DefaultHandler{}}},
+			Parts:    []handler.Part{{Key: "p", Datasets: []handler.PartDataset{{Name: "summary"}, {Module: "blocks", Key: "summary"}}}},
+		}}, []handler.Module{testModule()}, "duplicate dataset key"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -224,6 +230,27 @@ func TestCatalog_StaticParts(t *testing.T) {
 	require.Len(t, meta.Datasets[0].Schema.Fields, 1)
 	assert.Equal(t, []string{"title"}, meta.Datasets[0].FieldDefIds)
 	assert.Len(t, ct.Datasets, 3)
+}
+
+// The static view follows the runtime compile's rules: parts and the
+// flat dataset view by key, `uses` filtered to the type's dataset
+// keys and sorted.
+func TestStaticTypeParts_OrderAndUses(t *testing.T) {
+	ct, err := StaticTypeParts(handler.Type{Id: "t",
+		Datasets: []handler.Dataset{{Name: "zeta", DataVersion: "v", Handler: stubHandler{}}},
+		Parts: []handler.Part{
+			{Key: "second", Uses: []string{"zeta", "nope", "alpha"}, Datasets: []handler.PartDataset{{Module: "blocks", Key: "alpha"}}},
+			{Key: "first", Datasets: []handler.PartDataset{{Name: "zeta"}}},
+		},
+	}, types.NewModules(types.ModuleInfo{Name: "blocks", Canonical: "blocks_shared"}))
+	require.NoError(t, err)
+	require.Len(t, ct.Parts, 2)
+	assert.Equal(t, "first", ct.Parts[0].Key)
+	assert.Equal(t, "second", ct.Parts[1].Key)
+	assert.Equal(t, []string{"alpha", "zeta"}, ct.Parts[1].Uses)
+	require.Len(t, ct.Datasets, 2)
+	assert.Equal(t, "alpha", ct.Datasets[0].Key)
+	assert.Equal(t, "zeta", ct.Datasets[1].Key)
 }
 
 // A type without declared parts reads back one implicit part per

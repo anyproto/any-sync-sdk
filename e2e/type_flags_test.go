@@ -82,14 +82,28 @@ func TestE2E_TypeHiddenAndMeta(t *testing.T) {
 	root, err := sp.Types().Get(ctx, b.RootId)
 	require.NoError(t, err)
 	assert.True(t, root.Hidden, "bundle root type must be hidden when asked")
-	page, _, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	pageReq := space.EnsureBundleRequest{
 		Id: "page/v1", Name: "Page", Layout: map[string]any{"type": "page"},
-		Parts: []space.PartDraft{{Key: "notes", Datasets: []space.DatasetDraft{entriesDatasetDraft()}}},
-	})
+		Parts:      []space.PartDraft{{Key: "notes", Datasets: []space.DatasetDraft{entriesDatasetDraft()}}},
+		Properties: []space.PropertyDraft{{XKey: "cover", Kind: space.PropertyKindString}},
+	}
+	page, didInstall, err := sp.Bundles().Ensure(ctx, pageReq)
 	require.NoError(t, err)
+	require.True(t, didInstall)
 	pageInfo, err := sp.Types().Get(ctx, page.RootId)
 	require.NoError(t, err)
 	assert.False(t, pageInfo.Hidden, "a declared type stays listed unless the install hides it")
+	// A created root declaring properties: adopt keeps the definition.
+	pageProps, err := sp.Types().Properties(ctx, page.RootId)
+	require.NoError(t, err)
+	require.Len(t, pageProps, 1)
+	_, didInstall, err = sp.Bundles().Ensure(ctx, pageReq)
+	require.NoError(t, err)
+	require.False(t, didInstall)
+	again, err := sp.Types().Properties(ctx, page.RootId)
+	require.NoError(t, err)
+	require.Len(t, again, 1, "adopt must not redeclare a property on a created root")
+	assert.Equal(t, pageProps[0].Id, again[0].Id)
 	list, err := sp.Types().List(ctx)
 	require.NoError(t, err)
 	var sawRoot, sawDraft, sawPage bool

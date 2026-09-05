@@ -35,9 +35,8 @@ var ErrModuleOwned = errors.New("space: dataset schema is owned by its module")
 
 // ErrModuleReserved is returned by AddPart / AddDataset and by
 // BundlesAPI.Ensure when a dataset draft names a module registered with
-// handler.Module.Reserved: only the consumer's own installs
-// (EnsureBundleRequest.SystemInstall) may declare it. A client error →
-// 4xx.
+// handler.Module.Reserved: only the consumer's own installs (the
+// SystemInstall ensure option) may declare it. A client error → 4xx.
 var ErrModuleReserved = errors.New("space: module is reserved for the consumer's own installs")
 
 // ErrDatasetNotDeclared is returned by the write surface (Modify /
@@ -437,9 +436,10 @@ type TypeInfo struct {
 	Weight int
 	Layout map[string]any
 	// Hidden keeps the type out of default listings and pickers: a
-	// client shows it only on request. Self-typed bundle roots are
-	// hidden by construction — they exist to host their bundle's
-	// datasets, not to be attached elsewhere. `type.hidden`.
+	// client shows it only on request. A bundle root asks for it
+	// (EnsureBundleRequest.Hidden) when it exists to host its bundle's
+	// records rather than to be attached elsewhere; a registered type
+	// declares it (handler.Type.Hidden). `type.hidden`.
 	Hidden bool
 	// Meta is the open bag of consumer flags on the type — one scalar
 	// (string, bool, number) per single-level key, written per key so

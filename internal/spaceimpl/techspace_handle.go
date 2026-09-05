@@ -264,9 +264,10 @@ func (techObjects) Derive(context.Context, space.DeriveObjectOpts) (string, erro
 	return "", errUnsupported("Objects().Derive")
 }
 
-// techTypes keeps reads, and the dataset-declaration methods for
-// bundle roots only (a bundle root is a type; its datasets evolve
-// through them); type lifecycle and property definitions refuse.
+// techTypes keeps reads, and the declaration methods — parts,
+// datasets, properties — for bundle roots only (a bundle root is a
+// type; its declarations evolve through them); type lifecycle and
+// the type's own metadata refuse.
 type techTypes struct {
 	inner *typesAPI
 	t     *techSpace
@@ -357,14 +358,27 @@ func (techTypes) Delete(context.Context, string) error { return errUnsupported("
 func (techTypes) Patch(context.Context, string, space.TypePatch) error {
 	return errUnsupported("Types().Patch")
 }
-func (techTypes) AddProperty(context.Context, string, space.PropertyDraft) (string, error) {
-	return "", errUnsupported("Types().AddProperty")
+
+// Property definitions evolve on bundle roots only, like parts: a
+// bundle declaring Properties is a type whose columns must stay
+// evolvable and removable here too.
+func (x techTypes) AddProperty(ctx context.Context, typeId string, draft space.PropertyDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddProperty(ctx, typeId, draft)
 }
-func (techTypes) RemoveProperty(context.Context, string, string) error {
-	return errUnsupported("Types().RemoveProperty")
+func (x techTypes) RemoveProperty(ctx context.Context, typeId, propId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveProperty(ctx, typeId, propId)
 }
-func (techTypes) PatchProperty(context.Context, string, string, space.PropertyPatch) error {
-	return errUnsupported("Types().PatchProperty")
+func (x techTypes) PatchProperty(ctx context.Context, typeId, propId string, patch space.PropertyPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchProperty(ctx, typeId, propId, patch)
 }
 
 // techBundles: derived-only installs that declare datasets; no loser
@@ -383,11 +397,11 @@ func (x techBundles) DerivedRootId(ctx context.Context, bundleId string) (string
 	return x.inner.DerivedRootId(ctx, bundleId)
 }
 
-func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, bool, error) {
+func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest, opts ...space.EnsureOption) (space.Bundle, bool, error) {
 	if err := validateTechEnsureRequest(req); err != nil {
 		return space.Bundle{}, false, err
 	}
-	return x.inner.Ensure(ctx, req)
+	return x.inner.Ensure(ctx, req, opts...)
 }
 
 func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {

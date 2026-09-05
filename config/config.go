@@ -55,7 +55,8 @@ type Config struct {
 	// runtime inside their parts (or registered types statically) and
 	// the SDK instantiates per collection. Module names and canonical
 	// collection names must be unique across the catalog. A Reserved
-	// module is declarable only by the caller's own bundle installs.
+	// module is declarable only by the caller's own bundle installs
+	// (the space.SystemInstall option) or a registered type's static part.
 	// Empty or nil = the built-in `records` module only.
 	Modules []handler.Module
 }

@@ -319,9 +319,25 @@ func extractObjectField(ops []crdt.Op, field string) (*anyenc.Value, error) {
 // through with no value checks, bar one: a $set of the whole
 // `x-format` must be an object (checkXFormatWholeSet), so the
 // create-time shape holds for the record's life. Not an "important"
-// change — no shortId minting.
-func (PropertyHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
+// change — no shortId minting — with one exception: a creation-shaped
+// upsert landing on an existing record.
+//
+// That is a concurrent duplicate create — two devices declaring a
+// bundle property under its deterministic id while apart. The change
+// is a create on its author's replica (BeforeCreate projected its
+// shortId row there) and a modify everywhere else. The author stamps
+// its later data writes with the newest shortId it knows, which may
+// be this one, so every replica must know it too or those writes park
+// forever: the row is projected here as well. Idempotent — the same
+// row id on every replica — and the record itself merges as any
+// modify does (the pinned keys are shed, the rest is identical).
+func (PropertyHandler) BeforeModify(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
 	if len(op.Path) == 0 {
+		if rec.Upsert && op.Type == crdt.OpSet {
+			if kindLabel, ok := extractKind([]crdt.Op{*op}); ok {
+				sink.Project(ShortIdsDataset, shortIdRow(ctx.Change.ChangeId, rec.Id, kindLabel))
+			}
+		}
 		// Multi-field $set/$unset — guard each key.
 		return rejectIfMultiFieldTouchesPinned(op)
 	}

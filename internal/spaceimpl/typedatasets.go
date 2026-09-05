@@ -119,8 +119,8 @@ func normalizeDatasetDraft(modules types.Modules, typeId string, draft *space.Da
 // (handler.Module.Reserved): the consumer's own installs declare it,
 // nothing else. Draft-time only — an applied declaration stays valid.
 func checkReservedModule(modules types.Modules, draft *space.DatasetDraft) error {
-	if err := modules.CheckReserved(draft.Module); err != nil {
-		return fmt.Errorf("typesAPI: dataset %q: %w: %w", draft.Key, space.ErrModuleReserved, err)
+	if modules.Reserved(draft.Module) {
+		return fmt.Errorf("typesAPI: dataset %q: %w: %q", draft.Key, space.ErrModuleReserved, draft.Module)
 	}
 	return nil
 }

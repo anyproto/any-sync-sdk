@@ -68,7 +68,7 @@ func TestValidateEnsureRequest(t *testing.T) {
 	b := newBundlesAPI(&spaceImpl{})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := b.validateEnsureRequest(tc.req)
+			err := b.validateEnsureRequest(tc.req, false)
 			if err == nil && tc.tech {
 				err = validateTechEnsureRequest(tc.req)
 			}

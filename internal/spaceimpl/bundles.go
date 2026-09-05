@@ -75,11 +75,12 @@ func (b *bundlesAPI) indexObj(ctx context.Context) (*object.Object, error) {
 	})
 }
 
-func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, bool, error) {
+func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest, opts ...space.EnsureOption) (space.Bundle, bool, error) {
 	if req.Id == "" {
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
 	}
-	if err := b.validateEnsureRequest(req); err != nil {
+	eo := space.ApplyEnsureOptions(opts...)
+	if err := b.validateEnsureRequest(req, eo.SystemInstall); err != nil {
 		return space.Bundle{}, false, err
 	}
 	if err := b.parent.writeGate(ctx); err != nil {
@@ -215,7 +216,9 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 
 // validateEnsureRequest is the structural gate on Ensure input, run
 // before any lock or write so a bad request mints nothing.
-func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest) error {
+// systemInstall is the consumer's own install (space.SystemInstall),
+// which may name a reserved module.
+func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, systemInstall bool) error {
 	if req.DerivedRoot {
 		if req.NewRoot != nil {
 			return fmt.Errorf("spaceimpl: %w: NewRoot and DerivedRoot are exclusive — a derived root is derived by Ensure", space.ErrBundleBadRequest)
@@ -226,13 +229,25 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest) error 
 		// a space whose free object create is fenced (the tech space)
 		// can use. The type declaration gives that root its purpose.
 		if req.NewRoot == nil && !req.DeclaresType() {
-			return fmt.Errorf("spaceimpl: %w: NewRoot or a type declaration (Parts / Properties / Layout / Weight / Hidden) required", space.ErrBundleBadRequest)
+			return fmt.Errorf("spaceimpl: %w: NewRoot or a type declaration (Parts / Properties) required", space.ErrBundleBadRequest)
 		}
 		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
 			return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
 		}
 	}
-	if err := b.validateBundleParts(req.Parts, req.SystemInstall); err != nil {
+	if !req.DeclaresType() && (len(req.Layout) > 0 || req.Weight != 0 || req.Hidden) {
+		// Rendering and listing metadata describe a type; a root with
+		// neither parts nor properties is not one.
+		return fmt.Errorf("spaceimpl: %w: Layout/Weight/Hidden need Parts or Properties", space.ErrBundleBadRequest)
+	}
+	if len(req.Layout) > 0 {
+		// Probed here so a bad layout fails before any root is minted,
+		// like every other part of the declaration.
+		if _, err := encodeXFormat(&anyenc.Arena{}, req.Layout); err != nil {
+			return fmt.Errorf("spaceimpl: %w: Layout: %w", space.ErrBundleBadRequest, err)
+		}
+	}
+	if err := b.validateBundleParts(req.Parts, systemInstall); err != nil {
 		return err
 	}
 	return validateBundleProperties(req.Properties)
@@ -301,23 +316,42 @@ func (b *bundlesAPI) declareType(ctx context.Context, rootId string, req space.E
 	return b.declareProperties(ctx, rootId, req.Properties)
 }
 
-// declareProperties writes the definitions absent from the root, each
-// under its deterministic id. A definition the root already carries —
-// live, or removed through Types().RemoveProperty (the tombstone keeps
-// the id) — is left alone: nothing is patched or resurrected.
+// declareProperties writes the definitions the root lacks, each under
+// its deterministic id. A definition is present — and left alone,
+// nothing patched or resurrected — when the root carries its id (live,
+// or removed through Types().RemoveProperty: the tombstone keeps the
+// id) or a live definition with its handle under any id: one column
+// per handle is the point, whichever install or AddProperty minted it.
+//
+// The root is loaded first so the presence check and the write see the
+// same materialized state: a created winner adopted before its tree
+// was ever loaded here would otherwise read as bare, and the write
+// would land as a modify on the definitions the load brings in. A
+// write the apply path still rejects for that reason (the definition
+// arrived between the check and the write) is treated as present.
 func (b *bundlesAPI) declareProperties(ctx context.Context, rootId string, drafts []space.PropertyDraft) error {
 	if len(drafts) == 0 {
 		return nil
+	}
+	obj, err := b.parent.store.Get(ctx, rootId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: bundles: load root %q: %w", rootId, err)
+	}
+	ctrl := obj.Controller()
+	handles := map[string]struct{}{}
+	for _, v := range ctrl.Records(ctx, typetype.DatasetPropertyDefs) {
+		if v == nil || v.Get(crdt.DeletedAtField) != nil {
+			continue
+		}
+		if xk := v.GetString(typetype.FieldXKey); xk != "" {
+			handles[xk] = struct{}{}
+		}
 	}
 	arena := &anyenc.Arena{}
 	var recs []crdt.RecordChange
 	for i := range drafts {
 		id := bundlePropertyId(rootId, drafts[i].XKey)
-		exists, err := b.parent.types.propertyDefExists(ctx, rootId, id)
-		if err != nil {
-			return fmt.Errorf("spaceimpl: bundles: read property %q of root %q: %w", drafts[i].XKey, rootId, err)
-		}
-		if exists {
+		if _, live := handles[drafts[i].XKey]; live || ctrl.Get(ctx, typetype.DatasetPropertyDefs, id) != nil {
 			continue
 		}
 		payload, err := propertyDefPayload(arena, &drafts[i])
@@ -332,12 +366,26 @@ func (b *bundlesAPI) declareProperties(ctx context.Context, rootId string, draft
 	if len(recs) == 0 {
 		return nil
 	}
-	res, err := b.parent.types.writePropertyDefs(ctx, rootId, recs...)
+	dataVersion, err := b.parent.store.DataVersion(typetype.DatasetPropertyDefs)
+	if err != nil {
+		return err
+	}
+	res, err := b.parent.localWriteRetry(ctx, obj, rootId, crdt.Change{
+		Dataset:     typetype.DatasetPropertyDefs,
+		DataVersion: dataVersion,
+		Records:     recs,
+	})
 	if err != nil {
 		return fmt.Errorf("spaceimpl: bundles: declare properties on root %q: %w", rootId, err)
 	}
-	if len(res.Rejections) > 0 {
-		return fmt.Errorf("spaceimpl: bundles: declare properties on root %q: %w", rootId, res.Rejections[0].Err)
+	for _, rej := range res.Rejections {
+		// The record exists after all (it landed between the check and
+		// the write): the definition is present, which is the goal.
+		if rej.RecordIndex >= 0 && rej.RecordIndex < len(recs) &&
+			ctrl.Get(ctx, typetype.DatasetPropertyDefs, recs[rej.RecordIndex].Id) != nil {
+			continue
+		}
+		return fmt.Errorf("spaceimpl: bundles: declare properties on root %q: %w", rootId, rej.Err)
 	}
 	return nil
 }
@@ -806,6 +854,7 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 			payload.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(req.Weight))
 		}
 		if len(req.Layout) > 0 {
+			// Already probed by validateEnsureRequest.
 			layout, err := encodeXFormat(arena, req.Layout)
 			if err != nil {
 				return fmt.Errorf("%w: Layout: %w", space.ErrBundleBadRequest, err)

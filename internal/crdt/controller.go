@@ -1602,9 +1602,11 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 // the field-class salvage filterOpFields does one layer up.
 //
 // Safe to call BeforeModify more than once: every handler's BeforeModify
-// is pure validation (no sink writes), so the combined-then-per-key
-// probing has no side effects, and each handler's single-path branch is
-// the per-key equivalent of its multi-field branch.
+// is pure validation, or writes the sink only from the multi-field
+// branch with an idempotent row (the property handler's duplicate-create
+// shortId), so the combined-then-per-key probing has no side effects,
+// and each handler's single-path branch is the per-key equivalent of its
+// multi-field branch.
 func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Value, ctx *ChangeCtx, op *Op, opIndex int) {
 	isMultiField := (op.Type == OpSet || op.Type == OpUnset) && len(op.Path) == 0 &&
 		op.Payload != nil && op.Payload.Type() == anyenc.TypeObject

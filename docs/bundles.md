@@ -174,8 +174,16 @@ therefore mint ONE column per handle — the one case where the
 `parentId` columns are a forked tree. The ids stay internal: clients
 resolve `xKey → propId` through `Types().Properties(rootId)`. A property
 added later through `Types().AddProperty(rootId, …)` gets an ordinary
-change-derived id. `Layout` / `Weight` / `Hidden` ride the name stamp
-(`type.layout` / `type.weight` / `type.hidden`) on install.
+change-derived id. Two devices creating the same deterministic id
+while apart reach every replica as one create and one creation-shaped
+modify; the property handler projects the change's shortId row from
+both, so the replica knows every schema state a peer may stamp its
+data writes with (otherwise those writes would park for good).
+`Layout` / `Weight` / `Hidden` ride the name stamp (`type.layout` /
+`type.weight` / `type.hidden`) on install; they describe a type, so
+they need `Parts` or `Properties` — alone they are
+`ErrBundleBadRequest`, like a `Layout` that cannot be encoded, before
+any root is minted.
 
 - Declarations are written after the root's types and the registry
   row (below), parts in one change, properties in one change.
@@ -184,20 +192,23 @@ change-derived id. `Layout` / `Weight` / `Hidden` ride the name stamp
   declaring write, a row adopted before the root tree synced); a root
   with any declaration — live, or removed through `Types().RemovePart`
   / `RemoveDataset` (a tombstone keeps no key) — is left alone.
-  Properties: per deterministic id — a definition the root lacks is
-  written, one it carries (live, or removed through
-  `Types().RemoveProperty` — the tombstone keeps the id) is not.
-  `Ensure` never resurrects a removed definition. Evolution goes
+  Properties: one at a time — a definition is present, and left
+  alone, when the root carries its deterministic id (live, or removed
+  through `Types().RemoveProperty`: the tombstone keeps the id) or a
+  live definition with its handle under any id, since one column per
+  handle is what the id exists for; only the rest are written.
+  `Ensure` never resurrects or doubles a definition. Evolution goes
   through `Types().AddPart` / `AddDataset` / `AddDatasetField` /
   `PatchDataset` / `AddProperty` / `PatchProperty` with `typeId =
   rootId`. Adopting never renames the root or touches its layout,
   weight or hidden flag either: the stamp is written only when the
   root carries no name.
 - A part naming a **reserved** module (`handler.Module.Reserved`) is
-  refused with `ErrModuleReserved` unless the request carries
-  `SystemInstall` — the consumer's own catalog install, never set from
-  client input. The refusal is draft-time only: a declaration that
-  reached the DAG stays valid on apply.
+  refused with `ErrModuleReserved` unless the call carries the
+  `space.SystemInstall()` option — the consumer's own catalog install.
+  Options are not request fields, so no body a consumer binds can
+  reach it. The refusal is draft-time only: a declaration that reached
+  the DAG stays valid on apply.
 - Collections cannot collide: a namespaced dataset is `<rootId>_<key>`
   and a shared one is the module's canonical collection, so two
   bundles in one space may use the same keys and there is no name
@@ -261,8 +272,8 @@ account's devices and nobody else.
   `Layout` / `Weight` / `Hidden` declare a type on the root — derived
   or created (see § Bundle-declared types); with neither `NewRoot`
   nor `DerivedRoot`, `Ensure` mints a created root itself and stamps
-  it as its own type. `SystemInstall` lifts the reserved-module
-  refusal for the consumer's own install.
+  it as its own type. The `SystemInstall()` option lifts the
+  reserved-module refusal for the consumer's own install.
 - `DerivedRootId` — the canonical derived root id for a bundle id. Pure
   computation: no registry read, no materialization, no network.
 - `Get` / `List` — read the registry with `Losers` computed.

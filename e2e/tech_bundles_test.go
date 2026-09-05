@@ -273,6 +273,27 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	_, err = techA.Modify(ctx, space.ModifyBatch{ObjectId: wantRoot, Dataset: "objects"})
 	require.ErrorIs(t, err, space.ErrUnsupported, "type-system built-ins are not writable generically")
 
+	// A properties-only tech bundle is a type too, and its columns
+	// evolve through the property mutators on the root — nowhere else.
+	labels, _, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "labels/v1", Name: "Labels", DerivedRoot: true, Hidden: true,
+		Properties: []space.PropertyDraft{{XKey: "color", Kind: space.PropertyKindString}},
+	})
+	require.NoError(t, err, "device A: Ensure(labels/v1) with properties only")
+	labelProps, err := techA.Types().Properties(ctx, labels.RootId)
+	require.NoError(t, err)
+	require.Len(t, labelProps, 1)
+	require.NoError(t, techA.Types().PatchProperty(ctx, labels.RootId, labelProps[0].Id, space.PropertyPatch{Set: map[string]any{"name": "Colour"}}))
+	extraId, err := techA.Types().AddProperty(ctx, labels.RootId, space.PropertyDraft{XKey: "icon", Kind: space.PropertyKindString})
+	require.NoError(t, err)
+	require.NoError(t, techA.Types().RemoveProperty(ctx, labels.RootId, extraId))
+	labelProps, err = techA.Types().Properties(ctx, labels.RootId)
+	require.NoError(t, err)
+	require.Len(t, labelProps, 1)
+	assert.Equal(t, "Colour", labelProps[0].Name)
+	_, err = techA.Types().AddProperty(ctx, techA.SpaceIndexObjectId(), space.PropertyDraft{XKey: "x", Kind: space.PropertyKindString})
+	require.ErrorIs(t, err, space.ErrUnsupported)
+
 	_ = sdkA.Spaces().SyncSpaceList(ctx)
 	_ = techA.SyncHeads(ctx)
 

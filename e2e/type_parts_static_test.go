@@ -15,7 +15,7 @@ import (
 )
 
 // secretModule is a reserved module: shared-only, declarable at runtime
-// only by the consumer's own install (EnsureBundleRequest.SystemInstall).
+// only by the consumer's own install (the space.SystemInstall option).
 func secretModule() handler.Module {
 	return handler.Module{
 		Name:        "secret",
@@ -111,6 +111,14 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	assert.Len(t, defs, 3)
 	_, err = sp.Types().AddPart(ctx, "doc", space.PartDraft{Key: "x", Datasets: []space.DatasetDraft{{Module: "notes", Key: "y"}}})
 	require.ErrorIs(t, err, space.ErrTypeRegistered)
+	_, err = sp.Types().AddDataset(ctx, "doc", "body", space.DatasetDraft{Module: "notes", Key: "y"})
+	require.ErrorIs(t, err, space.ErrTypeRegistered)
+	require.ErrorIs(t, sp.Types().PatchPart(ctx, "doc", "body", space.DatasetDefPatch{Set: map[string]any{"name": "x"}}), space.ErrTypeRegistered)
+	require.ErrorIs(t, sp.Types().RemovePart(ctx, "doc", "body"), space.ErrTypeRegistered)
+	_, err = sp.Types().AddDatasetField(ctx, "doc", "doc_meta", space.DatasetFieldDraft{Key: "x", Kind: space.PropertyKindString})
+	require.ErrorIs(t, err, space.ErrTypeRegistered)
+	_, err = sp.Types().AddProperty(ctx, "doc", space.PropertyDraft{XKey: "x", Kind: space.PropertyKindString})
+	require.ErrorIs(t, err, space.ErrTypeRegistered)
 
 	// Discovery: the static declarations own their collections.
 	seen := map[string]space.DatasetSchema{}
@@ -171,8 +179,8 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	_, err = sp.Bundles().Get(ctx, "room/v1")
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "a refused install leaves nothing behind")
 	inst, installed, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "room/v1", DerivedRoot: true, Parts: secretPart, Hidden: true, SystemInstall: true,
-	})
+		Id: "room/v1", DerivedRoot: true, Parts: secretPart, Hidden: true,
+	}, space.SystemInstall())
 	require.NoError(t, err, "the consumer's own install may declare the reserved module")
 	require.True(t, installed)
 	seen = map[string]space.DatasetSchema{}

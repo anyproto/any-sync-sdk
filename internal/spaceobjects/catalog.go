@@ -105,7 +105,16 @@ func (c *runtimeCatalog) lookup(name string) (types.CompiledDataset, bool) {
 // apply) — a store must open even when the objects collection doesn't
 // exist yet (fresh space).
 func (s *Store) initCatalog(ctx context.Context) {
-	if s.catalog == nil || s.db == nil {
+	if s.catalog == nil {
+		return
+	}
+	// Registered types' static declarations are constants: they own
+	// their collections before — and whether or not — the type scan
+	// below succeeds.
+	s.catalog.mu.Lock()
+	s.catalog.snap.Store(s.resolveCatalog(map[string]*types.CompiledType{}))
+	s.catalog.mu.Unlock()
+	if s.db == nil {
 		return
 	}
 	typeIds, err := s.catalogTypeIds(ctx)

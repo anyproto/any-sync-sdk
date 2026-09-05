@@ -49,10 +49,11 @@ Type
   docs/06 § Module namespaces. A **reserved** module (`Reserved`,
   requires `SharedOnly`) is refused to runtime declarations —
   `AddPart`, `AddDataset`, a bundle's `Parts` — with
-  `space.ErrModuleReserved`; only a bundle install the consumer marks
-  `SystemInstall`, or a registered type's static part, may declare
-  it. Draft-time only: the compile keeps an applied declaration valid,
-  since a peer that admitted it was the consumer's own install.
+  `space.ErrModuleReserved`; only a bundle install the consumer makes
+  with the `space.SystemInstall()` ensure option, or a registered
+  type's static part, may declare it. Draft-time only: the compile
+  keeps an applied declaration valid, since a peer that admitted it
+  was the consumer's own install.
 
 ### Static parts on registered types
 
@@ -454,7 +455,8 @@ handler.Type{…, Parts: []handler.Part{{Key, Name, Icon, Pos, Hidden, UI, Uses,
     Datasets: []handler.PartDataset{{Name} | {Module, Shared, Key}}}}, Hidden}
 
 // bundles declaring a type (space.EnsureBundleRequest)
-EnsureBundleRequest{…, Parts, Properties /* XKey required, deterministic ids */, Layout, Weight, Hidden, SystemInstall}
+EnsureBundleRequest{…, Parts, Properties /* XKey required, deterministic ids */, Layout, Weight, Hidden}
+Bundles().Ensure(ctx, req, space.SystemInstall())   // the consumer's own install: may name a reserved module
 
 // data (space.Space) — plus the existing Modify/Query surface
 Upsert(ctx, UpsertBatch) (UpsertResult, error)

@@ -24,22 +24,16 @@ type ModuleInfo struct {
 	Reserved   bool
 }
 
-// ErrModuleReserved marks a draft naming a module the consumer keeps
-// for its own installs.
-var ErrModuleReserved = errors.New("types: module is reserved")
-
-// CheckReserved refuses a draft naming a reserved module. Unknown
-// modules pass here — Collection reports them.
-func (m Modules) CheckReserved(module string) error {
-	if mi, ok := m[module]; ok && mi.Reserved {
-		return fmt.Errorf("%w: %q", ErrModuleReserved, module)
-	}
-	return nil
-}
-
 // Modules is the module catalog keyed by name. Always carries the
 // built-in records module.
 type Modules map[string]ModuleInfo
+
+// Reserved reports whether module is registered as reserved. Unknown
+// modules are not — Collection reports them.
+func (m Modules) Reserved(module string) bool {
+	mi, ok := m[module]
+	return ok && mi.Reserved
+}
 
 // NewModules builds a catalog from the caller's modules plus records.
 func NewModules(infos ...ModuleInfo) Modules {

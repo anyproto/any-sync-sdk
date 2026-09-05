@@ -90,10 +90,14 @@ func validateStaticParts(t handler.Type) error {
 
 // staticModuleDatasets resolves the module datasets a registered type
 // declares in its parts against the module catalog: the collection
-// rule, at most one shared dataset per module per type, unique keys.
+// rule, at most one shared dataset per module per type, unique keys —
+// across the static datasets too, since both are keys of one type.
 func staticModuleDatasets(t handler.Type, modules types.Modules) ([]staticModuleDataset, error) {
 	var out []staticModuleDataset
-	keys := make(map[string]struct{})
+	keys := make(map[string]struct{}, len(t.Datasets))
+	for _, d := range t.Datasets {
+		keys[d.Name] = struct{}{}
+	}
 	shared := make(map[string]struct{})
 	for _, p := range t.Parts {
 		for _, d := range p.Datasets {
@@ -133,7 +137,9 @@ func staticModuleDatasets(t handler.Type, modules types.Modules) ([]staticModule
 // (or one implicit part per dataset, keyed by the dataset name, when
 // the type declares none), each static dataset carrying its declared
 // schema under its own name, each module dataset its collection. Ids
-// are the keys — static declarations have no records.
+// are the keys — static declarations have no records. Same order and
+// folding rules as the runtime compile: parts and the flat dataset
+// view by key, `uses` filtered to the type's dataset keys and sorted.
 func StaticTypeParts(t handler.Type, modules types.Modules) (*types.CompiledType, error) {
 	byName := make(map[string]handler.Dataset, len(t.Datasets))
 	for _, d := range t.Datasets {
@@ -175,16 +181,28 @@ func StaticTypeParts(t handler.Type, modules types.Modules) (*types.CompiledType
 		return nil, err
 	}
 	modByPart := make(map[string][]staticModuleDataset, len(t.Parts))
+	known := make(map[string]struct{}, len(t.Datasets)+len(mods))
+	for _, d := range t.Datasets {
+		known[d.Name] = struct{}{}
+	}
 	for _, m := range mods {
 		modByPart[m.partKey] = append(modByPart[m.partKey], m)
+		known[m.key] = struct{}{}
 	}
-	for _, p := range t.Parts {
+	parts := append([]handler.Part(nil), t.Parts...)
+	sort.Slice(parts, func(i, j int) bool { return parts[i].Key < parts[j].Key })
+	for _, p := range parts {
 		cp := types.CompiledPart{
 			Id: p.Key, Key: p.Key, TypeId: t.Id,
 			Name: p.Name, Icon: p.Icon, Pos: p.Pos, Hidden: p.Hidden,
-			UI:   types.CloneXFormat(p.UI),
-			Uses: append([]string(nil), p.Uses...),
+			UI: types.CloneXFormat(p.UI),
 		}
+		for _, u := range p.Uses {
+			if _, ok := known[u]; ok {
+				cp.Uses = append(cp.Uses, u)
+			}
+		}
+		sort.Strings(cp.Uses)
 		for _, d := range p.Datasets {
 			if d.Name != "" {
 				cp.Datasets = append(cp.Datasets, staticDataset(byName[d.Name], p.Key))
@@ -200,5 +218,6 @@ func StaticTypeParts(t handler.Type, modules types.Modules) (*types.CompiledType
 		out.Parts = append(out.Parts, cp)
 		out.Datasets = append(out.Datasets, cp.Datasets...)
 	}
+	sort.Slice(out.Datasets, func(i, j int) bool { return out.Datasets[i].Key < out.Datasets[j].Key })
 	return out, nil
 }

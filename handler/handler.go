@@ -405,18 +405,23 @@ type Part struct {
 	Datasets []PartDataset
 }
 
-// PartDataset names one dataset a static part owns. Exactly one of
-// the two forms:
+// PartDataset names one dataset a static part owns — the static twin
+// of space.DatasetDraft, which a runtime part declares. Exactly one of
+// the two forms (sdk.Open rejects the rest):
 //
 //   - Name: one of the owning Type's Datasets, by name. The dataset's
 //     collection is its Name; its module reads as `records` when it
 //     runs on the generic schema handler (nil Handler), none when
-//     bespoke.
+//     bespoke. Shared and Key stay empty.
 //   - Module: a dataset of a registered module, declared as a runtime
 //     part would — Shared for the module's canonical collection (Key
 //     defaults to the canonical name), a namespaced `<typeId>_<Key>`
-//     instance otherwise. The `records` module has no place here: a
-//     static records dataset is a Type.Datasets entry with a Schema.
+//     instance otherwise (the module needs a DataVersion for that).
+//     The `records` module has no place here: a static records dataset
+//     is a Type.Datasets entry with a Schema.
+//
+// Keys are one namespace per type: a module Key must not equal a
+// static dataset's Name.
 type PartDataset struct {
 	Name   string
 	Module string
@@ -466,11 +471,11 @@ type Module struct {
 	// Reserved keeps the module out of runtime declarations: a part or
 	// dataset draft naming it — through TypesAPI.AddPart / AddDataset or
 	// a bundle's Parts — is refused with space.ErrModuleReserved, unless
-	// the bundle request carries SystemInstall (the consumer's own
-	// catalog install). Registered types may still declare it
-	// statically, and a declaration that reached the DAG stays valid
-	// on apply (a peer that admitted it was the consumer's own
-	// install). Requires SharedOnly.
+	// the Ensure call carries the space.SystemInstall option (the
+	// consumer's own catalog install). Registered types may still
+	// declare it statically, and a declaration that reached the DAG
+	// stays valid on apply (a peer that admitted it was the consumer's
+	// own install). Requires SharedOnly.
 	Reserved bool
 
 	// DataVersion is stamped on changes to the Canonical collection —

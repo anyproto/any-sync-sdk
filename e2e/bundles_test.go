@@ -420,6 +420,53 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	assert.Equal(t, 5, infoB.Weight)
 	assert.Equal(t, map[string]any{"type": "chat"}, infoB.Layout)
 
+	// Data written AFTER both installs crosses in both directions: each
+	// device stamps the root's newest schema state, which includes the
+	// property the other device created under the same id — every
+	// replica must know that change's shortId, or the write parks.
+	upB, err := spB.Upsert(ctx, space.UpsertBatch{
+		ObjectId: wantRoot, Dataset: articlesColl,
+		Records: []space.UpsertRecord{{Id: "a-2", Fields: map[string]any{"title": "Two"}}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, upB.Created)
+	upA, err := spA.Upsert(ctx, space.UpsertBatch{
+		ObjectId: wantRoot, Dataset: articlesColl,
+		Records: []space.UpsertRecord{{Id: "a-3", Fields: map[string]any{"title": "Three"}}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, upA.Created)
+	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
+		_ = spA.SyncHeads(ctx)
+		_ = spB.SyncHeads(ctx)
+		na, aerr := spA.Query(wantRoot, articlesColl).Count(ctx)
+		nb, berr := spB.Query(wantRoot, articlesColl).Count(ctx)
+		return aerr == nil && berr == nil && na == 3 && nb == 3
+	}), "records written after both installs never crossed")
+
+	// Adopt never patches the type's metadata: asking for Hidden on a
+	// listed install changes nothing.
+	hiddenReq := declaredType()
+	hiddenReq.Hidden = true
+	_, didInstall, err = spA.Bundles().Ensure(ctx, hiddenReq)
+	require.NoError(t, err)
+	require.False(t, didInstall)
+	rootInfo, err = spA.Types().Get(ctx, wantRoot)
+	require.NoError(t, err)
+	assert.False(t, rootInfo.Hidden, "adopt must not patch hidden")
+
+	// A declaration the gate refuses mints nothing: type metadata without
+	// parts or properties, and a layout that cannot be encoded.
+	_, _, err = spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: "bare/v1", DerivedRoot: true, Layout: map[string]any{"type": "page"}})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest)
+	_, _, err = spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "bare/v1", DerivedRoot: true, Parts: []space.PartDraft{articlesPart()},
+		Layout: map[string]any{"type": func() {}},
+	})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest)
+	_, err = spA.Bundles().Get(ctx, "bare/v1")
+	require.ErrorIs(t, err, space.ErrBundleUnknown, "a refused declaration must mint nothing")
+
 	// A removed property stays removed through later Ensures: the
 	// tombstone keeps the deterministic id. A property added through
 	// the type API gets an ordinary id.

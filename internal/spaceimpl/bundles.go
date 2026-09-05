@@ -698,6 +698,11 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
 	payload.Set("any.name", arena.NewString(name))
+	// A self-typed root is a type that exists to host its bundle's
+	// datasets, not to be offered in a picker: hidden by construction.
+	if len(req.Parts) > 0 {
+		payload.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
+	}
 	dataVersion, err := b.parent.store.DataVersion(properties.Dataset)
 	if err != nil {
 		return err

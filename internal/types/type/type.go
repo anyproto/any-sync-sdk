@@ -81,6 +81,8 @@ var Properties = []BuiltInProperty{
 	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced},
 	{Id: FieldWeightProp, Name: "Weight", Kind: schema.KindNumber, Scope: schema.ScopeSynced},
 	{Id: FieldLayoutProp, Name: "Layout", Kind: schema.KindObject, Scope: schema.ScopeSynced},
+	{Id: FieldHiddenProp, Name: "Hidden", Kind: schema.KindBoolean, Scope: schema.ScopeSynced},
+	{Id: FieldMetaProp, Name: "Meta", Kind: schema.KindObject, Scope: schema.ScopeSynced},
 }
 
 // Rendering metadata a type object carries in its own namespace:
@@ -90,6 +92,15 @@ var Properties = []BuiltInProperty{
 const (
 	FieldWeightProp = "weight"
 	FieldLayoutProp = "layout"
+)
+
+// `type.hidden` keeps a type out of default listings and pickers
+// (self-typed bundle roots carry it); `type.meta` is the open bag of
+// consumer flags — one scalar per key, written per key so writers
+// touching different keys merge (`meta.index`, a client's own tags).
+const (
+	FieldHiddenProp = "hidden"
+	FieldMetaProp   = "meta"
 )
 
 // DatasetPropertyDefs is the dataset on a type object that holds its

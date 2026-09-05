@@ -135,6 +135,11 @@ content.
 
 ## Bundle parts: self-typed roots
 
+A self-typed root is also a **hidden** type (`TypeInfo.Hidden`): it exists
+to host its bundle's datasets, and a picker offering it for attachment
+elsewhere would grant that object the bundle's collections. Consumers
+list hidden types only on request.
+
 `EnsureBundleRequest.Parts` declares parts with their datasets (the
 `PartDraft` / `DatasetDraft` vocabulary of `17-user-datasets.md`) on
 the root. The root then carries `any.types = ["__type__", rootId]`: it

@@ -421,12 +421,13 @@ func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *any
 	if len(path) < 2 {
 		return &ValidationError{Reason: ReasonInvalidPath, Path: path}
 	}
-	return h.validateField(path[0], path[1], payload, opType, pf)
+	return h.validateFieldPath(path[0], path[1], len(path) > 2, payload, opType, pf)
 }
 
 // validateMultiField walks a multi-field $set payload. Every top-level
-// key must be a dotted "typeId.propId" pair (no deeper nesting in v1);
-// the first failing key rejects the whole op.
+// key is a dotted "typeId.propId" pair, or "typeId.propId.sub…" for a
+// leaf under an object-kind property; the first failing key rejects
+// the whole op.
 func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight) *ValidationError {
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return nil
@@ -439,14 +440,53 @@ func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight)
 		}
 		key := string(k)
 		dot := strings.IndexByte(key, '.')
-		if dot <= 0 || dot == len(key)-1 || strings.IndexByte(key[dot+1:], '.') >= 0 {
+		if dot <= 0 || dot == len(key)-1 {
 			firstErr = &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
 			return
 		}
-		firstErr = h.validateField(key[:dot], key[dot+1:], v, op.Type, pf)
+		typeId, rest := key[:dot], key[dot+1:]
+		propId, nested := rest, false
+		if sub := strings.IndexByte(rest, '.'); sub >= 0 {
+			if sub == 0 || sub == len(rest)-1 {
+				firstErr = &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
+				return
+			}
+			propId, nested = rest[:sub], true
+		}
+		firstErr = h.validateFieldPath(typeId, propId, nested, v, op.Type, pf)
 	})
 	return firstErr
 }
+
+// validateFieldPath is validateField for a path that may descend below
+// the property: a nested write is admitted only under an object-kind
+// property (the value shape below it is the writer's — a free-form
+// object such as the meta-type's `meta` bag), and every op type on it
+// must be a $set (the container ops address the property itself).
+func (h *SystemPropertiesHandler) validateFieldPath(typeId, propId string, nested bool, payload *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
+	if !nested {
+		return h.validateField(typeId, propId, payload, opType, pf)
+	}
+	if opType != crdt.OpSet {
+		return &ValidationError{Reason: ReasonInvalidPath, Path: []string{typeId, propId}}
+	}
+	// Resolve and scope-check the property as a whole, then require an
+	// object kind instead of checking the leaf's kind: a kindCheck
+	// against a synthetic object payload would pass exactly when the
+	// declared kind is object.
+	if verr := h.validateField(typeId, propId, nestedProbe, crdt.OpSet, pf); verr != nil {
+		return verr
+	}
+	return nil
+}
+
+// nestedProbe is the payload validateFieldPath checks a nested write's
+// property with: an empty object, so the kind rule reads "declared
+// kind must be object".
+var nestedProbe = func() *anyenc.Value {
+	a := &anyenc.Arena{}
+	return a.NewObject()
+}()
 
 // validateField is the shared per-(typeId, propId) check. Order:
 // membership (pre-flight only) → type resolvable → property declared →

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -81,6 +83,19 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 			return "", fmt.Errorf("typesAPI: TypeCreateParams.Layout: %w", err)
 		}
 		multi.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+	}
+	if params.Hidden {
+		multi.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
+	}
+	for _, k := range slices.Sorted(maps.Keys(params.Meta)) {
+		v, err := typeMetaValue(arena, k, params.Meta[k])
+		if err != nil {
+			return "", fmt.Errorf("typesAPI: TypeCreateParams.Meta: %w", err)
+		}
+		if v == nil {
+			continue
+		}
+		multi.Set(typetype.TypeId+"."+typetype.FieldMetaProp+"."+k, v)
 	}
 	// Mark the object as a meta-type instance — the convention we use
 	// in MVP to distinguish types from regular objects without a
@@ -365,8 +380,38 @@ func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 		XKey:        rec.GetString(typetype.TypeId, typetype.FieldXKeyProp),
 		Weight:      int(rec.GetFloat64(typetype.TypeId, typetype.FieldWeightProp)),
 		Layout:      types.DecodeXFormat(rec.Get(typetype.TypeId, typetype.FieldLayoutProp)),
+		Hidden:      rec.GetBool(typetype.TypeId, typetype.FieldHiddenProp),
+		Meta:        types.DecodeXFormat(rec.Get(typetype.TypeId, typetype.FieldMetaProp)),
 		BuiltIn:     false,
 	}
+}
+
+// typeMetaValue validates one meta entry — a single-level key and a
+// scalar value — and encodes it. A nil value encodes to nil: the
+// caller's unset.
+func typeMetaValue(a *anyenc.Arena, key string, v any) (*anyenc.Value, error) {
+	if key == "" || strings.ContainsAny(key, ".$") || len(key) > 64 {
+		return nil, fmt.Errorf("%w: meta key %q must be a single-level key (no '.', no '$', at most 64 bytes)", space.ErrInvalidFieldValue, key)
+	}
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return a.NewString(t), nil
+	case bool:
+		return a.NewBool(t), nil
+	case int:
+		return a.NewNumberFloat64(float64(t)), nil
+	case int32:
+		return a.NewNumberFloat64(float64(t)), nil
+	case int64:
+		return a.NewNumberFloat64(float64(t)), nil
+	case float32:
+		return a.NewNumberFloat64(float64(t)), nil
+	case float64:
+		return a.NewNumberFloat64(t), nil
+	}
+	return nil, fmt.Errorf("%w: meta key %q: value must be a string, bool or number (got %T)", space.ErrInvalidFieldValue, key, v)
 }
 
 // Patch rewrites a user type's display and rendering metadata in one
@@ -399,6 +444,21 @@ func (t *typesAPI) Patch(ctx context.Context, typeId string, patch space.TypePat
 	text("any.icon", patch.IconCID)
 	if patch.Weight != nil {
 		set.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(*patch.Weight))
+	}
+	if patch.Hidden != nil {
+		set.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewBool(*patch.Hidden))
+	}
+	for _, k := range slices.Sorted(maps.Keys(patch.Meta)) {
+		v, err := typeMetaValue(arena, k, patch.Meta[k])
+		if err != nil {
+			return fmt.Errorf("typesAPI: TypePatch.Meta: %w", err)
+		}
+		path := typetype.TypeId + "." + typetype.FieldMetaProp + "." + k
+		if v == nil {
+			unset.Set(path, arena.NewNull())
+		} else {
+			set.Set(path, v)
+		}
 	}
 	switch {
 	case patch.ClearLayout:

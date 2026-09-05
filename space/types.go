@@ -203,6 +203,11 @@ type TypePatch struct {
 	Weight      *int
 	Layout      map[string]any
 	ClearLayout bool
+	Hidden      *bool
+	// Meta patches the flag bag per key: a scalar value sets the key,
+	// a nil value unsets it. Keys not named are untouched, so writers
+	// on different devices touching different keys merge.
+	Meta map[string]any
 }
 
 // PartDraft is the input to TypesAPI.AddPart: the part's key and
@@ -424,6 +429,17 @@ type TypeInfo struct {
 	// the meta-type's namespace (`type.weight`, `type.layout`).
 	Weight int
 	Layout map[string]any
+	// Hidden keeps the type out of default listings and pickers: a
+	// client shows it only on request. Self-typed bundle roots are
+	// hidden by construction — they exist to host their bundle's
+	// datasets, not to be attached elsewhere. `type.hidden`.
+	Hidden bool
+	// Meta is the open bag of consumer flags on the type — one scalar
+	// (string, bool, number) per single-level key, written per key so
+	// concurrent writers merge. Opaque to the SDK; consumers read the
+	// keys they own (an indexer's `index`, a client's tags).
+	// `type.meta`.
+	Meta map[string]any
 	// BuiltIn marks the synthetic types — `any`, `spaceIndex`,
 	// `type` and every caller-registered type (immutable,
 	// always-present). User types return false.
@@ -447,6 +463,11 @@ type TypeCreateParams struct {
 	// Both mutable through Patch.
 	Weight int
 	Layout map[string]any
+
+	// Hidden and Meta seed the listing flag and the consumer flag bag —
+	// see TypeInfo. Both mutable through Patch.
+	Hidden bool
+	Meta   map[string]any
 }
 
 // PropertyDef is the live shape of one property definition. All

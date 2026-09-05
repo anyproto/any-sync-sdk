@@ -30,7 +30,7 @@ const (
 // the umbrella crdt.ErrValidation. The handler package re-exports these
 // for external callers.
 var (
-	ErrInvalidPath        = errors.New("property write rejected: path must be {typeId}.{propId}")
+	ErrInvalidPath        = errors.New("property write rejected: path must be {typeId}.{propId}, or {typeId}.{propId}.{key…} under an object property")
 	ErrTypeNotImplemented = errors.New("property write rejected: object does not implement the type")
 	ErrTypeUnknown        = errors.New("property write rejected: type schema is not resolvable on this peer")
 	ErrUnknownProperty    = errors.New("property write rejected: type has no such property")
@@ -91,7 +91,7 @@ type ValidationError struct {
 func (e *ValidationError) Error() string {
 	switch e.Reason {
 	case ReasonInvalidPath:
-		return fmt.Sprintf("property write rejected: path must be {typeId}.{propId}; got %q",
+		return fmt.Sprintf("property write rejected: path must be {typeId}.{propId} (or deeper under an object property); got %q",
 			strings.Join(e.Path, "."))
 	case ReasonTypeNotImplemented:
 		return fmt.Sprintf("property write rejected: object does not implement type %s; attach it to any.types before writing %s.* values. Current types: [%s]",

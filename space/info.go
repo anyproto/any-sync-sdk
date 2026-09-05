@@ -127,12 +127,19 @@ type Status uint8
 const (
 	StatusUnknown Status = iota
 	StatusActive
-	StatusJoining // request-to-join pending approval
+	// StatusJoining is a request-to-join pending the owner's approval.
+	// Synced account-wide: every device of the account reads it, none
+	// materializes the space, and the device that observes the
+	// acceptance loads it and flips the row to StatusActive for the
+	// rest. Withdraw with Service.CancelJoin (any device).
+	StatusJoining
 	StatusLeaving // local delete in flight
 	// StatusDeleted is a deleted row: the synced tombstone Delete writes,
-	// or — device-local — a join that ended without membership (the
-	// owner declined, or Service.CancelJoin withdrew it). The latter is
-	// re-joinable: Join with a valid invite returns it to StatusJoining.
+	// or a join that ended without membership (the owner declined, or
+	// Service.CancelJoin withdrew it) — synced too, so the account's
+	// devices converge on it. The latter is re-joinable: Join with a
+	// valid invite returns it to StatusJoining, and a direct add by the
+	// owner surfaces it as StatusInvitePending.
 	StatusDeleted
 	StatusRemoteDead // network says space no longer exists
 	// StatusOneToOnePending is an incoming 1-1 (direct) space awaiting

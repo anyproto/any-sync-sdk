@@ -55,10 +55,11 @@ type SDK struct {
 	filesQueue *status.Queue
 	filesGC    *gc.Service
 	readSync   *readsync.Service
-	// stopP2PIndexWatch stops the tech-space index watcher that kicks
-	// LAN re-handshakes and the index follower when the known-space set
-	// grows; nil when both p2p layers are off or in headless mode.
-	stopP2PIndexWatch func()
+	// stopIndexWatch stops the tech-space index watcher that kicks the
+	// join controller on every index change and, with p2p on, LAN
+	// re-handshakes and the index follower when the known-space set
+	// grows; nil in headless mode.
+	stopIndexWatch func()
 	// indexGrew wakes the index follower (one pending signal).
 	indexGrew chan struct{}
 	// followerDone is closed when the index follower exits; nil in
@@ -427,7 +428,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		readSync:   readSync,
 		indexGrew:  make(chan struct{}, 1),
 	}
-	sdk.registerP2PIndexWatch()
+	sdk.registerIndexWatch()
 	// Born-clean: a space created or derived this session enters the
 	// watermark allowlist directly — see SDK.caughtUp.
 	spaces.SetOnSpaceBorn(sdk.markCaughtUp)
@@ -592,8 +593,13 @@ func (s *SDK) bootstrap(ctx context.Context) {
 		// reclaim it now — OffloadSpace is idempotent and best-effort.
 		// Includes the 1-1 synced offload marker (oneToOneDeleted) — a
 		// deleted 1-1 must be offloaded, not eager-loaded, on every device.
+		// An ended join is skipped but its storage is kept: storage under
+		// that marker is the accept-vs-cancel race (one device loaded the
+		// accepted space while another's withdrawal won the row), and the
+		// join controller reloads it when the ACL grants membership —
+		// offloading here would discard a member's local copy.
 		if rec.IsDeleted() {
-			if s.app.SpaceExists(rec.Id) {
+			if s.app.SpaceExists(rec.Id) && !rec.JoinEnded() {
 				s.spaces.OffloadSpace(ctx, rec.Id)
 			}
 			continue
@@ -645,17 +651,18 @@ func (s *SDK) bootstrap(ctx context.Context) {
 	warn("reconcile read state", s.readSync.ReconcileAll(ctx))
 }
 
-// registerP2PIndexWatch wires the LAN cold-restore hooks: the p2p
-// exchange probes for spaces this account knows of but hasn't pulled
-// yet, and known LAN peers are re-handshaken whenever the tech-space
-// index grows (a fresh device learns a space id and wants a pull
+// registerIndexWatch wires the tech-space index change hooks. Always:
+// the join controller is kicked so a join requested on another device
+// (its row synced in as joining) gets its ACL waiter here promptly, and
+// a verdict synced in stops one. With p2p on, the LAN cold-restore
+// hooks too: the p2p exchange probes for spaces this account knows of
+// but hasn't pulled yet, and known LAN peers are re-handshaken whenever
+// the index grows (a fresh device learns a space id and wants a pull
 // source right away). Cheap and local-only — one sub on the tech-space
-// engine, no network — so it runs on Open's fast path.
-func (s *SDK) registerP2PIndexWatch() {
+// engine, no network; the controller throttles its own chain probes —
+// so it runs on Open's fast path.
+func (s *SDK) registerIndexWatch() {
 	lan, global := s.app.P2PEnabled(), s.app.GlobalP2PEnabled()
-	if !lan && !global {
-		return
-	}
 	if lan {
 		s.app.SetKnownSpaceIdsFn(func() []string {
 			recs := s.tsp.List(context.Background())
@@ -668,7 +675,11 @@ func (s *SDK) registerP2PIndexWatch() {
 			return ids
 		})
 	}
-	s.stopP2PIndexWatch = watchSpaceIndex(s.tsp, func() {
+	s.stopIndexWatch = watchSpaceIndex(s.tsp, func() {
+		s.spaces.ResumePendingJoins()
+		if !lan && !global {
+			return
+		}
 		if lan {
 			s.app.BroadcastP2P()
 		}
@@ -769,8 +780,8 @@ func (s *SDK) Close() error {
 		// now, while head stores and sdk.db are readable.
 		s.snapshotWatermarks(ctx)
 	}
-	if s.stopP2PIndexWatch != nil {
-		s.stopP2PIndexWatch()
+	if s.stopIndexWatch != nil {
+		s.stopIndexWatch()
 	}
 	if s.readSync != nil {
 		s.readSync.Close()

@@ -458,6 +458,57 @@ func TestSpaceIndexHandler_InviteStatusesNonTerminal(t *testing.T) {
 	assert.Equal(t, techspace.StatusActive, rec.GetString(techspace.FieldRemoteStatus))
 }
 
+// The synced join lifecycle is non-terminal in every direction the SDK
+// writes it — joining → joinEnded (decline / cancel) → joining (re-request)
+// → active (accepted and loaded) — and joinEnded → invitePending (a
+// direct add over an ended join). Only StatusDeleted is terminal, and it
+// stays so after joining. The handler deliberately adds no before-state
+// rules for these values: it sees the local pre-op state at arrival, so
+// an order-dependent rule would diverge across devices.
+func TestSpaceIndexHandler_JoinStatusesNonTerminal(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+	const spaceId = "space-joined"
+	status := func() string {
+		rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+		require.NotNil(t, rec)
+		return rec.GetString(techspace.FieldRemoteStatus)
+	}
+	set := func(ver crdt.VersionId, value string) {
+		require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+			ver, spaceId, false,
+			crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(value)},
+		)))
+	}
+
+	// Join registers the row joining (no type yet — the header is
+	// unreadable until the space loads).
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldRemoteStatus: techspace.JoiningRemoteStatus}),
+	)))
+	assert.Equal(t, techspace.JoiningRemoteStatus, status())
+
+	set("v2", techspace.JoinEndedRemoteStatus)
+	assert.Equal(t, techspace.JoinEndedRemoteStatus, status(), "decline / cancel lands")
+	set("v3", techspace.JoiningRemoteStatus)
+	assert.Equal(t, techspace.JoiningRemoteStatus, status(), "re-request revives")
+	set("v4", techspace.StatusActive)
+	assert.Equal(t, techspace.StatusActive, status(), "accepted and loaded")
+
+	// A second lifecycle ends in a direct add over the ended join.
+	set("v5", techspace.JoiningRemoteStatus)
+	set("v6", techspace.JoinEndedRemoteStatus)
+	set("v7", techspace.InvitePendingRemoteStatus)
+	assert.Equal(t, techspace.InvitePendingRemoteStatus, status(), "direct add registers over an ended join")
+
+	// Deleted stays terminal after a join.
+	set("v8", techspace.JoiningRemoteStatus)
+	set("v9", techspace.StatusDeleted)
+	set("v10", techspace.JoiningRemoteStatus)
+	assert.Equal(t, techspace.StatusDeleted, status(), "a re-request cannot revive a tombstone")
+}
+
 // DecodeSpaceIndexRecord reads the device-local direct-add notify outbox
 // (InviteNotifyPending array) off a stored value.
 func TestSpaceIndexRecord_DecodeInviteNotifyPending(t *testing.T) {

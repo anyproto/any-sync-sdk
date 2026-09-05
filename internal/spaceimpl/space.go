@@ -76,14 +76,14 @@ func (s *spaceImpl) indexObjectId(ctx context.Context) (string, error) {
 
 // Info reads the space-index snapshot.
 //
-// LocalStatus="joining" is fact-checked against the live AclList: if
-// the local identity is already StatusActive in the ACL (owner accepted,
-// records replicated locally) we return StatusActive without waiting
-// for the tech-space record to flip. The self-heal write that updates
-// the cached tech-space row lives in the members watcher
-// (memberWatcher.tick), so the fix here covers the read path even when
-// the watcher hasn't been started yet (e.g. caller hits Info() before
-// any Members().Subscribe / Query).
+// A row still reading joining or ended is fact-checked against the live
+// AclList: if the local identity is already StatusActive in the ACL
+// (owner accepted, records replicated locally) we return StatusActive
+// without waiting for the tech-space record to flip. The self-heal
+// write that updates the cached tech-space row is the members watcher's
+// too (memberWatcher.tick), so the fix here covers the read path even
+// when the watcher hasn't been started yet (e.g. caller hits Info()
+// before any Members().Subscribe / Query).
 func (s *spaceImpl) Info() space.SpaceInfo {
 	ctx := context.Background()
 	rec, ok := s.tsp.Get(ctx, s.id)
@@ -92,35 +92,22 @@ func (s *spaceImpl) Info() space.SpaceInfo {
 		return space.SpaceInfo{Id: s.id, P2PAdvertise: true}
 	}
 	info := s.parent.recordToInfo(ctx, rec)
-	if info.Status == space.StatusJoining && s.localIdentityActive(ctx) {
+	if (info.Status == space.StatusJoining || rec.JoinEnded()) && s.localIdentityActive(ctx) {
 		info.Status = space.StatusActive
 		// Fire-and-forget self-heal so the next List() / Get() reads
 		// the right cached status without a live AclList round-trip.
 		// Members watcher does the same flip when running; this path
 		// covers callers that never start the watcher.
-		go s.healJoiningStatus()
+		go s.parent.healJoinMembership(context.Background(), s.id)
 	}
 	return info
 }
 
-// healJoiningStatus writes LocalStatus="active" if the cached row
-// still says "joining". Idempotent guard via the tsp Get; intended to
-// be called from a goroutine with no return path. Failures are
-// dropped — the next Info() / watcher tick retries.
-func (s *spaceImpl) healJoiningStatus() {
-	ctx := context.Background()
-	rec, ok := s.tsp.Get(ctx, s.id)
-	if !ok || rec.LocalStatus != joiningLocalStatus {
-		return
-	}
-	_, _ = s.tsp.SetLocalStatus(ctx, s.id, techspace.StatusActive)
-}
-
 // localIdentityActive returns true when the live AclList places our
-// account in StatusActive. Used by Info() to override a stale
-// LocalStatus="joining" left over from before the owner's accept
-// landed. Best-effort: any failure to load the space / read the ACL
-// returns false (caller falls back to the cached status).
+// account in StatusActive. Used by Info() to override a stale joining /
+// ended row left over from before the owner's accept landed.
+// Best-effort: any failure to load the space / read the ACL returns
+// false (caller falls back to the cached status).
 func (s *spaceImpl) localIdentityActive(ctx context.Context) bool {
 	handle, err := s.app.GetSpace(ctx, s.id)
 	if err != nil {

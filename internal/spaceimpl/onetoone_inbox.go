@@ -187,8 +187,12 @@ func (s *Service) handleOneToOneInvite(ctx context.Context, m inbox.Message) err
 //
 // Decode failures are non-retryable (the notifier logs and advances —
 // never wedge the cursor on a malformed body). An existing row for the
-// space no-ops: active membership, sticky decline, terminal delete, and
-// duplicate delivery are all respected by the same guard.
+// space no-ops — active membership, a pending join, sticky decline,
+// terminal delete, and duplicate delivery are all respected by the same
+// guard — with one exception: an ended join. That row records "not a
+// member" account-wide, and the direct add just made the account one,
+// so the invite registers over it and the accept path loads the space;
+// nothing else watches the ACL of a space this account never loaded.
 func (s *Service) handleRegularInvite(ctx context.Context, m inbox.Message) error {
 	body, err := decodeRegularInviteBody(m.Body)
 	if err != nil {
@@ -207,15 +211,32 @@ func (s *Service) handleRegularInvite(ctx context.Context, m inbox.Message) erro
 	// succeeded), so this is a cheap round; failure falls through to the
 	// local view.
 	_ = s.tsp.SyncHeads(ctx)
-	if _, ok := s.tsp.Get(ctx, body.SpaceId); ok {
-		return nil
-	}
-	// Name/SpaceType are unauthenticated display hints, replaced by the
-	// synced in-space values after accept. Type is left unknown — the
-	// field is set-once, so a sender-supplied value must not reach it;
-	// the post-accept load backfills it from the header. No storage is
-	// materialized and no localStatus is set: pending is synced-only.
-	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+	if rec, ok := s.tsp.Get(ctx, body.SpaceId); ok {
+		if !rec.JoinEnded() {
+			return nil
+		}
+		// The legacy marker first (a local set; the synced pending
+		// state reads through it either way), then the synced flip —
+		// retried on failure, so a crash between the two leaves a row
+		// that still reads ended and a redelivery completes it.
+		s.clearLegacyJoinMarker(ctx, rec)
+		if _, err := s.tsp.SetRemoteStatus(ctx, body.SpaceId, techspace.InvitePendingRemoteStatus); err != nil {
+			return fmt.Errorf("%w: register direct-add invite over an ended join: %v", inbox.ErrRetry, err)
+		}
+		// An ended join never loaded, so the row carries no name; the
+		// sender's hint fills it the way a fresh registration would.
+		if rec.Name == "" && body.Name != "" {
+			if _, err := s.tsp.SetSpaceMetadata(ctx, body.SpaceId, body.Name, "", "", body.SpaceType); err != nil {
+				inboxLog.Warn("direct-add name hint", zap.String("spaceId", body.SpaceId), zap.Error(err))
+			}
+		}
+	} else if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+		// Name/SpaceType are unauthenticated display hints, replaced by
+		// the synced in-space values after accept. Type is left unknown —
+		// the field is set-once, so a sender-supplied value must not
+		// reach it; the post-accept load backfills it from the header.
+		// No storage is materialized and no localStatus is set: pending
+		// is synced-only.
 		Id:           body.SpaceId,
 		SpaceType:    body.SpaceType,
 		Name:         body.Name,

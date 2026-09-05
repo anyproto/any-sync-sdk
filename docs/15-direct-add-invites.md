@@ -56,15 +56,20 @@ carry pending to the other devices.
 
 | remoteStatus (synced)   | public Status         | transition |
 |-------------------------|-----------------------|------------|
-| `invitePending`         | `StatusInvitePending` | written by the inbox handler on a fresh row |
+| `invitePending`         | `StatusInvitePending` | written by the inbox handler on a fresh row, or over an ended join (`joinEnded`, docs/03-space.md § Join lifecycle) |
 | `active`                | `StatusActive`        | `AcceptInvite` (any device; converges everywhere) |
 | `inviteDeclined`        | `StatusInviteDeclined`| `DeclineInvite`; sticky, NON-terminal — `AcceptInvite` overrides |
 
 - The inbox handler **no-clobbers**: an existing row (active
-  membership, sticky decline, terminal delete, duplicate delivery)
-  means no-op. It pulls the tech space current (`SyncHeads`) before the
-  check so a duplicate delivery on a lagging device sees another
-  device's registration/accept instead of re-writing pending over it.
+  membership, a pending join, sticky decline, terminal delete, duplicate
+  delivery) means no-op — with one exception, an ended join: that row
+  records "not a member" account-wide, the add just made the account
+  one, and nothing else watches the ACL of a space the account never
+  loaded, so the invite registers over it (the sender's name hint fills
+  the row's empty name). It pulls the tech space current (`SyncHeads`)
+  before the check so a duplicate delivery on a lagging device sees
+  another device's registration/accept instead of re-writing pending
+  over it.
   No storage is materialized while pending — `Service.Get` refuses to
   load rows in the invite-pending/declined states, so no read path
   (List handle probes, direct Get) can defeat the gate.

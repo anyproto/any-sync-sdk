@@ -318,6 +318,16 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
+	// The CRDT version mark: an account a newer SDK has written refuses
+	// to open (space.ErrCRDTVersionNewer); an older or unmarked one is
+	// stamped with this SDK's version. Before any other boot work so a
+	// refused account is touched by nothing.
+	if err := tsp.EnsureCRDTVersion(ctx); err != nil {
+		_ = tsp.Close(ctx)
+		_ = db.Close()
+		_ = app.Close(ctx)
+		return nil, fmt.Errorf("anysyncsdk: %w", err)
+	}
 	// Orphan-collection GC: drop CRDT collections whose owner space /
 	// object no longer exists — heals interrupted offloads and
 	// historical purge leaks. Deliberately synchronous, unlike the
@@ -881,6 +891,14 @@ func (s *SDK) PoolInternal() pool.Pool { return s.app.Pool() }
 // (Spaces().SetDevice / ListDevices) and the value election consumers
 // compare against space.ActiveDevice's winner.
 func (s *SDK) PeerId() string { return s.tsp.PeerId() }
+
+// CRDTVersion reports the account's CRDT version state: the version
+// this SDK supports, the highest one recorded on the tech space, and
+// whether the account is read-only because the recorded one is newer
+// (space.CRDTVersion). A newer mark arriving through sync flips Newer
+// at runtime; every synced write then fails with
+// space.ErrCRDTVersionNewer until the SDK is upgraded.
+func (s *SDK) CRDTVersion() space.CRDTVersionState { return s.tsp.CRDTVersion() }
 
 // TechSpaceId returns the account's tech space id. Spaces().Get with
 // it yields the restricted tech-space handle — the home of

@@ -57,6 +57,11 @@ type Service struct {
 	// their datasets live at <indexId>_spaces, <indexId>_profile, …
 	// History indexing is off: the tech space has no history surface.
 	store *spaceobjects.Store
+
+	// crdtVersionSeen is the highest CRDT version mark this replica has
+	// applied (crdtversion.go); above space.CRDTVersion the account is
+	// read-only.
+	crdtVersionSeen atomic.Int64
 }
 
 // TechSpaceType is the on-the-wire SpaceType stamped into the
@@ -143,9 +148,13 @@ func (s *Service) Open(ctx context.Context) error {
 		SignKey:        keys.SignKey,
 		SpaceId:        s.spaceId,
 		Alloc:          object.NewVersionAllocator(""),
-		SystemDatasets: SystemDatasets(),
+		SystemDatasets: s.systemDatasets(),
 		DisableHistory: true,
 	})
+	// The CRDT version mark gates every user-authored synced write on
+	// this store too — the same account-wide gate spaceimpl installs
+	// on the regular spaces (WriteGate).
+	s.store.SetGlobalGate(s.WriteGate)
 	// Gate is on: rows parked for a dataset that registers later (a
 	// bundle root's declarations) drain on first touch after restart.
 	s.store.NotifyDrainer(types.DataVersionPair{})
@@ -169,9 +178,23 @@ func (s *Service) Open(ctx context.Context) error {
 // SystemDatasets lists the tech-space datasets registered on every
 // controller of the tech Store as ungated built-ins, with the
 // DataVersion stamp their typed writers use. Also the set the public
-// write surface of the tech-space handle refuses.
+// write surface of the tech-space handle refuses. The CRDT version
+// handler here carries no service hook; a live service registers its
+// own through systemDatasets.
 func SystemDatasets() []spaceobjects.SystemDataset {
+	return systemDatasetsWith(CRDTVersionHandler{})
+}
+
+// systemDatasets is SystemDatasets with this service's CRDT version
+// hook wired in.
+func (s *Service) systemDatasets() []spaceobjects.SystemDataset {
+	return systemDatasetsWith(s.crdtVersionHandler())
+}
+
+func systemDatasetsWith(crdtVersion CRDTVersionHandler) []spaceobjects.SystemDataset {
 	return []spaceobjects.SystemDataset{
+		// The CRDT version mark — see crdtversion.go.
+		{Reg: crdt.HandlerReg{Name: CRDTVersionDataset, Handler: crdtVersion, Schema: CRDTVersionSchema()}, DataVersion: CRDTVersionHandlerVersion},
 		{Reg: crdt.HandlerReg{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema(), Version: SpaceIndexLocalVersion}, DataVersion: HandlerVersion},
 		{Reg: crdt.HandlerReg{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()}, DataVersion: ProfileHandlerVersion},
 		{Reg: crdt.HandlerReg{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()}, DataVersion: InboxCursorHandlerVersion},

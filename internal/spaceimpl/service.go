@@ -300,6 +300,10 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.modules)
+	// Account-wide gate: once the tech space carries a CRDT version
+	// above this SDK's, every synced write fails with
+	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).
+	st.SetGlobalGate(s.tsp.WriteGate)
 	// Read-only gate on every user-authored synced write
 	// (Object.LocalWrite, Store.Create). Guest-mode is fixed for the
 	// store's lifetime — a key refresh tears the runtime down — so it

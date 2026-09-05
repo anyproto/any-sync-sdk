@@ -315,6 +315,11 @@ type Store struct {
 	// (guest rows) and updated by the per-space ACL mirror on role
 	// changes. Inbound apply / local-set paths are never gated.
 	writeGateErr atomic.Pointer[error]
+	// globalGate, when set, is consulted by CheckWrite next to
+	// writeGateErr: an account-wide refusal (the CRDT version mark
+	// moved past what this SDK supports) that no per-space state may
+	// clear.
+	globalGate atomic.Pointer[func() error]
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -413,10 +418,25 @@ func (s *Store) SetWriteGateErr(err error) {
 	s.writeGateErr.Store(&err)
 }
 
-// CheckWrite applies the gate; nil = writable. Exposed for write entry
+// SetGlobalGate installs an account-wide write gate consulted on every
+// user-authored synced write next to the per-store gate. Nil clears it.
+func (s *Store) SetGlobalGate(fn func() error) {
+	if fn == nil {
+		s.globalGate.Store(nil)
+		return
+	}
+	s.globalGate.Store(&fn)
+}
+
+// CheckWrite applies the gates; nil = writable. Exposed for write entry
 // points that mutate outside the store's own DAG-write funnel (tree
 // deletion, file-node uploads).
 func (s *Store) CheckWrite() error {
+	if p := s.globalGate.Load(); p != nil {
+		if err := (*p)(); err != nil {
+			return err
+		}
+	}
 	if p := s.writeGateErr.Load(); p != nil {
 		return *p
 	}

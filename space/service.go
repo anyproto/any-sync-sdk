@@ -18,10 +18,12 @@ var ErrSpaceNotAccepted = errors.New("space: not accepted; not materialized")
 
 // ErrSpaceDeleted is returned by Service.Get for a space whose index
 // row carries a deletion marker (local or synced, including the 1-1
-// offload marker). The storage is offloaded — loading would SpacePull
-// a space the account removed, which the nodes reject anyway. A
-// deleted 1-1 is re-creatable via Service.OneToOne; a regular deleted
-// space is terminal.
+// offload marker), and by Join when the row is a synced tombstone (a
+// device-local ended join is not — Join revives it). The storage is
+// offloaded — loading would SpacePull a space the account removed,
+// which the nodes reject anyway. A deleted 1-1 is re-creatable via
+// Service.OneToOne, an ended join via Join; the synced tombstone Delete
+// writes is terminal.
 var ErrSpaceDeleted = errors.New("space: deleted")
 
 // ErrReadOnlySpace rejects synced writes into a space this account
@@ -48,6 +50,14 @@ var ErrSpaceUnknown = errors.New("unknown space")
 // the index with StatusJoining; callers poll List for the status flip
 // and then call Get.
 var ErrJoinPending = errors.New("join pending owner approval")
+
+// ErrJoinNotPending is returned by CancelJoin when there is no pending
+// join request to withdraw: the row is not StatusJoining, or the ACL
+// no longer holds the request because the owner already accepted or
+// declined it while the cancel was in flight. In the latter case the
+// row is left to the join controller, which drives it to StatusActive
+// (accepted) or StatusDeleted (declined) — poll List / Subscribe.
+var ErrJoinNotPending = errors.New("no pending join request")
 
 // ErrInviteAcceptPending is returned by AcceptInvite when the accept
 // was recorded (synced account-wide) but the space content is not
@@ -116,8 +126,25 @@ type Service interface {
 	Create(ctx context.Context, req CreateRequest) (Space, error)
 
 	// Join a space via an invite. Depending on the invite key mode the
-	// space is either immediately active or pending approval.
+	// space is either immediately active or pending approval. A row left
+	// by an earlier join that ended without membership on this device
+	// (owner declined, or withdrawn via CancelJoin — surfaced as
+	// StatusDeleted) is revived: the request is posted again and the row
+	// returns to StatusJoining. A synced tombstone (Delete) is sticky and
+	// refused with ErrSpaceDeleted before anything reaches the network.
 	Join(ctx context.Context, req JoinRequest) (Space, error)
+
+	// CancelJoin withdraws this account's pending join request for
+	// spaceId (a row in StatusJoining). Nothing local is materialized:
+	// the request record lives on the space's ACL chain, which the
+	// nodes serve directly, so the cancel is posted through the joining
+	// client the way Join posted the request. On success the row flips
+	// to StatusDeleted on this device — the same end state an owner
+	// decline leaves — and a later Join with a valid invite revives it.
+	// ErrSpaceUnknown for an id with no row; ErrJoinNotPending when the
+	// row is not joining or the owner resolved the request first (see
+	// the sentinel for what happens to the row then).
+	CancelJoin(ctx context.Context, spaceId string) error
 
 	// JoinGuest adds a space via a guest invite (InviteKindGuest): the
 	// invite carries the shared read-only guest identity, so there is no

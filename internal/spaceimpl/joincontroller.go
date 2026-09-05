@@ -233,8 +233,10 @@ func (s *Service) loadAcceptedInvite(ctx context.Context, spaceId string) {
 
 // startJoinWaiter builds and runs an ACL waiter for one joining space.
 // onFinish (acceptance) spawns the space load; onReject (decline) marks
-// the row deleted. Both are quick and durable — the heavy load runs in a
-// tracked goroutine so the waiter's poll loop is never blocked.
+// the row deleted — the device-local ended-join marker (joinEnded) that
+// CancelJoin also writes and Join revives. Both are quick and durable —
+// the heavy load runs in a tracked goroutine so the waiter's poll loop
+// is never blocked.
 func (s *Service) startJoinWaiter(ctx context.Context, rec techspace.SpaceIndexRecord) {
 	spaceId := rec.Id
 	onFinish := func(list.AclList) error {
@@ -256,18 +258,25 @@ func (s *Service) startJoinWaiter(ctx context.Context, rec techspace.SpaceIndexR
 		joinLog.Warn("build acl waiter", zap.String("spaceId", spaceId), zap.Error(err))
 		return
 	}
+	// Run before the map insert, both under the lock: Close is a no-op on
+	// a waiter that has not run, so a stopJoinWaiter (CancelJoin runs
+	// one from the caller's goroutine) slipping between insert and Run
+	// would delete the entry, "close" nothing, and leave the waiter
+	// running untracked past Service.Close. Run only spawns the loop,
+	// so the lock is held for no longer than the insert.
 	s.mu.Lock()
 	if _, dup := s.joinWaiters[spaceId]; dup {
 		s.mu.Unlock()
+		return
+	}
+	if err := w.Run(ctx); err != nil {
+		s.mu.Unlock()
+		joinLog.Warn("run acl waiter", zap.String("spaceId", spaceId), zap.Error(err))
 		_ = w.Close(ctx)
 		return
 	}
 	s.joinWaiters[spaceId] = w
 	s.mu.Unlock()
-	if err := w.Run(ctx); err != nil {
-		joinLog.Warn("run acl waiter", zap.String("spaceId", spaceId), zap.Error(err))
-		s.stopJoinWaiter(spaceId)
-	}
 }
 
 // loadJoinedSpace pulls and wires an accepted space, then flips the row

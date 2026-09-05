@@ -99,8 +99,11 @@ type ACL interface {
 	// — works for any non-owner, non-guest member.
 	RequestSelfRemove(ctx context.Context) error
 
-	// CancelJoinRequest withdraws a join request that the caller
-	// previously made and that has not yet been accepted/declined.
+	// CancelJoinRequest withdraws the caller's pending request on a
+	// LOADED space. A pending join is never loaded (Service.Get refuses
+	// it), so withdrawing a join request goes through the account-level
+	// Service.CancelJoin; this handle only reaches a request the loaded
+	// space can hold, i.e. a pending self-remove.
 	CancelJoinRequest(ctx context.Context) error
 
 	// StopSharing drops every non-owner member, revokes every invite,

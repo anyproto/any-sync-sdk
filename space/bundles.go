@@ -114,8 +114,8 @@ type EnsureBundleRequest struct {
 	// registered so a failed seed leaves no install to adopt. Every
 	// keyed type is attached along with RootTypes — a property write
 	// to a type the object does not implement is rejected. The root's
-	// own id is not a usable key: a self-typed root (Parts) grants a
-	// dataset namespace, not property definitions. DerivedRoot only.
+	// own id is not a usable key: the root's own property ids are not
+	// known before the install. DerivedRoot only.
 	RootProperties map[string]map[string]any
 
 	// Parts declares parts (with their datasets) on the root — derived
@@ -137,8 +137,50 @@ type EnsureBundleRequest struct {
 	// before any root is minted. With a created strategy, omit NewRoot
 	// and Ensure mints and self-types the root itself — the only create
 	// a space with a fenced object lifecycle (the tech space) allows.
-	// Required on the tech space.
+	// Parts or Properties are required on the tech space.
 	Parts []PartDraft
+
+	// Properties declares property definitions on the root, which then
+	// implements itself as a type like Parts does — for a bundle that
+	// IS a type other objects carry (a wiki's `parentId` / `pos`).
+	// Every draft needs an XKey, unique within the request: the
+	// property id is DERIVED from (root id, XKey), so two devices
+	// installing while apart mint one column per handle instead of
+	// two. Declared in one change after the registering write; on
+	// adopt only the definitions whose id is absent are written — a
+	// definition removed through Types().RemoveProperty stays removed,
+	// nothing is patched. Later evolution goes through
+	// Types().AddProperty / PatchProperty / RemoveProperty with typeId
+	// = rootId; a property added that way gets an ordinary
+	// change-derived id. Kind, Scope and XKey are validated as
+	// AddProperty validates them, before any root is minted.
+	Properties []PropertyDraft
+
+	// Layout, Weight and Hidden seed the root type's rendering and
+	// listing metadata (TypeInfo.Layout / Weight / Hidden) with the
+	// name stamp, on install only — adopt never patches them. Any of
+	// them, like Parts or Properties, makes the root a type
+	// implementing itself. Hidden is EXPLICIT: a root that only hosts
+	// its bundle's records should ask for it, since a listed type is
+	// one a client may attach elsewhere, granting that object the
+	// bundle's collections; a root that is a type objects carry (a
+	// page, a wiki) stays listed.
+	Layout map[string]any
+	Weight int
+	Hidden bool
+
+	// SystemInstall marks the consumer's own catalog install: it lifts
+	// the reserved-module refusal (handler.Module.Reserved) for this
+	// request. Never set it from client input — the reservation exists
+	// so only the consumer's installs declare such a module.
+	SystemInstall bool
+}
+
+// DeclaresType reports whether the request makes the root a type
+// implementing itself — any of Parts, Properties, Layout, Weight or
+// Hidden.
+func (r EnsureBundleRequest) DeclaresType() bool {
+	return len(r.Parts) > 0 || len(r.Properties) > 0 || len(r.Layout) > 0 || r.Weight != 0 || r.Hidden
 }
 
 // BundlesAPI is the typed surface over the per-space bundles registry.

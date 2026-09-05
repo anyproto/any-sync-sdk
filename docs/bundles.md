@@ -133,18 +133,28 @@ sitting on its root change, so a derived root that a device never
 stamped would sit outside that device's diff and never pull the peer's
 content.
 
-## Bundle parts: self-typed roots
+## Bundle-declared types: self-typed roots
 
-A self-typed root is also a **hidden** type (`TypeInfo.Hidden`): it exists
-to host its bundle's datasets, and a picker offering it for attachment
-elsewhere would grant that object the bundle's collections. Consumers
-list hidden types only on request.
+A bundle may declare a **full type** on its root: `Parts` (with their
+datasets), `Properties`, `Layout`, `Weight`, `Hidden` — any of them
+(`EnsureBundleRequest.DeclaresType`). The root then carries
+`any.types = ["__type__", rootId]`: it is a type object implementing
+itself, `typeId = rootId`. Two shapes come out of the same mechanism:
 
-`EnsureBundleRequest.Parts` declares parts with their datasets (the
-`PartDraft` / `DatasetDraft` vocabulary of `17-user-datasets.md`) on
-the root. The root then carries `any.types = ["__type__", rootId]`: it
-is a type object implementing itself, `typeId = rootId`. Nothing else
-is special-cased — the catalog's `__type__` scan finds it, the
+- a **records host** — a root that exists to hold its bundle's data
+  (favourites entries, an app's setup state). It asks for `Hidden`,
+  since a listed type is one a picker offers for attachment elsewhere,
+  which would grant that object the bundle's collections;
+- a **type objects carry** — a page whose part shares the editor, a
+  wiki whose properties are the tree (`parentId` / `pos`). It declares
+  `Properties` / `Layout` / `Weight` and stays listed.
+
+`Hidden` is explicit: nothing is implied from the shape of the
+declaration.
+
+`Parts` declares parts with their datasets (the `PartDraft` /
+`DatasetDraft` vocabulary of `17-user-datasets.md`). Nothing else is
+special-cased — the catalog's `__type__` scan finds the root, the
 ownership check (the object carries a declaring type) passes, a
 namespaced dataset lives in `<rootId>_<key>` with the ordinary
 `<rootId>:<shortId>` gate stamp, a shared one participates in the
@@ -154,19 +164,40 @@ module's canonical collection, `Types().Parts(rootId)` /
 `Query` on the root. The bundle's setup state lives in records, not in
 child objects.
 
-- Declarations are written after the root's types and before the
-  registry row, so a failed declaration leaves no install to adopt;
-  the retry declares only what is still missing.
-- Declarations are one change. An adopt declares them only on a root
-  that carries no declaration yet (crash before the row, a row
-  adopted before the root tree synced); a root with any declaration —
-  live, or removed through `Types().RemovePart` / `RemoveDataset` (a
-  tombstone keeps no key) — is left alone: `Ensure` never patches,
-  adds or resurrects a declaration. Evolution goes through
-  `Types().AddPart` / `AddDataset` / `AddDatasetField` /
-  `PatchDataset` with `typeId = rootId`. Adopting never renames the
-  root either: the name stamp is written only when the root carries
-  none.
+`Properties` declares property definitions (`PropertyDraft`, validated
+as `AddProperty` validates them) with **deterministic ids**: every
+draft needs an `XKey`, unique within the request, and the property id
+is derived from `(rootId, XKey)`. Two devices installing while apart
+therefore mint ONE column per handle — the one case where the
+"same-handle, two columns" outcome of the descriptor model
+(docs/06 § Property ids) is unacceptable, because a wiki's two
+`parentId` columns are a forked tree. The ids stay internal: clients
+resolve `xKey → propId` through `Types().Properties(rootId)`. A property
+added later through `Types().AddProperty(rootId, …)` gets an ordinary
+change-derived id. `Layout` / `Weight` / `Hidden` ride the name stamp
+(`type.layout` / `type.weight` / `type.hidden`) on install.
+
+- Declarations are written after the root's types and the registry
+  row (below), parts in one change, properties in one change.
+- An adopt heals what is **absent**, never patches. Parts: only on a
+  root that carries no part declaration at all (crash before the
+  declaring write, a row adopted before the root tree synced); a root
+  with any declaration — live, or removed through `Types().RemovePart`
+  / `RemoveDataset` (a tombstone keeps no key) — is left alone.
+  Properties: per deterministic id — a definition the root lacks is
+  written, one it carries (live, or removed through
+  `Types().RemoveProperty` — the tombstone keeps the id) is not.
+  `Ensure` never resurrects a removed definition. Evolution goes
+  through `Types().AddPart` / `AddDataset` / `AddDatasetField` /
+  `PatchDataset` / `AddProperty` / `PatchProperty` with `typeId =
+  rootId`. Adopting never renames the root or touches its layout,
+  weight or hidden flag either: the stamp is written only when the
+  root carries no name.
+- A part naming a **reserved** module (`handler.Module.Reserved`) is
+  refused with `ErrModuleReserved` unless the request carries
+  `SystemInstall` — the consumer's own catalog install, never set from
+  client input. The refusal is draft-time only: a declaration that
+  reached the DAG stays valid on apply.
 - Collections cannot collide: a namespaced dataset is `<rootId>_<key>`
   and a shared one is the module's canonical collection, so two
   bundles in one space may use the same keys and there is no name
@@ -188,8 +219,8 @@ child objects.
   merging a loser's records write them through the winner's
   declaration, then `ResolveLoser` deletes the loser, declarations
   included.
-- `RootProperties` keyed by the root's own id are rejected: the
-  self-type grants a dataset namespace, not property definitions.
+- `RootProperties` keyed by the root's own id are rejected: the root's
+  property ids exist only once the install has declared them.
 
 ## Tech-space bundles
 
@@ -200,7 +231,8 @@ settings objects) lives in bundles on the tech space, reached through
 same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`, with
 two rules: roots are minted by `Ensure` only (`NewRoot` is refused —
 free object create is fenced on the tech handle; omit both strategies
-and `Ensure` creates the root itself), and `Parts` required. Both
+and `Ensure` creates the root itself), and `Parts` or `Properties`
+required. Both
 strategies are available: `DerivedRoot` for bundles that must never
 fork or uninstall; the SDK-minted created root for ordinary app
 installs — deletable (`Objects().Delete` is allowed on bundle roots:
@@ -225,10 +257,12 @@ account's devices and nobody else.
   otherwise the root is minted (`NewRoot`, or the canonical derivation
   for `DerivedRoot`) and one change registers it. The returned winner is
   provisional until the space syncs — unless it is derived, which is the
-  same on every device by construction. `Parts` declares parts with
-  their datasets on the root — derived or created (see § Bundle
-  parts); with neither `NewRoot` nor `DerivedRoot`, `Ensure` mints a
-  created root itself and stamps it as its own type.
+  same on every device by construction. `Parts` / `Properties` /
+  `Layout` / `Weight` / `Hidden` declare a type on the root — derived
+  or created (see § Bundle-declared types); with neither `NewRoot`
+  nor `DerivedRoot`, `Ensure` mints a created root itself and stamps
+  it as its own type. `SystemInstall` lifts the reserved-module
+  refusal for the consumer's own install.
 - `DerivedRootId` — the canonical derived root id for a bundle id. Pure
   computation: no registry read, no materialization, no network.
 - `Get` / `List` — read the registry with `Losers` computed.

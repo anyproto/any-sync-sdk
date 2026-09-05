@@ -180,6 +180,17 @@ type Store struct {
 	canonicalModule map[string]string
 	modulesTracked  bool
 
+	// Static parts (handler.Type.Parts): a registered type's shared
+	// module datasets seed the canonical collections' owner sets
+	// (staticSharedOwners) and the module namespaces (staticModuleOwners)
+	// of every catalog snapshot; its namespaced module datasets are
+	// registrations built once here (staticInstanceRegs, module by
+	// collection in staticInstanceModule), owned through datasetOwners.
+	staticSharedOwners   map[string]map[string]struct{}
+	staticModuleOwners   map[string]map[string]struct{}
+	staticInstanceRegs   []crdt.HandlerReg
+	staticInstanceModule map[string]string
+
 	// catalog is the runtime dataset snapshot compiled from type
 	// objects' `datasets` records. Readers
 	// take the copy-on-write snapshot lock-free; refreshed only when a
@@ -490,7 +501,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	infos := make([]types.ModuleInfo, 0, len(cfg.Modules))
 	for _, m := range cfg.Modules {
 		s.modules[m.Name] = m
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly})
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly, Reserved: m.Reserved})
 		if m.Canonical != "" {
 			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Shared: true})
 			if err != nil {
@@ -515,6 +526,50 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	s.moduleInfos = types.NewModules(infos...)
+	// Static parts: a registered type's module datasets are ownership
+	// (shared) or registrations (namespaced), settled once here — the
+	// same footing a runtime declaration reaches through the catalog.
+	// ValidateExternalModules has already refused what cannot resolve.
+	s.staticSharedOwners = map[string]map[string]struct{}{}
+	s.staticModuleOwners = map[string]map[string]struct{}{}
+	s.staticInstanceModule = map[string]string{}
+	own := func(set map[string]map[string]struct{}, key, typeId string) {
+		m := set[key]
+		if m == nil {
+			m = map[string]struct{}{}
+			set[key] = m
+		}
+		m[typeId] = struct{}{}
+	}
+	for _, t := range cfg.ExtTypes {
+		mods, err := staticModuleDatasets(t, s.moduleInfos)
+		if err != nil {
+			storeLog.Error("static parts: module datasets", zap.String("typeId", t.Id), zap.Error(err))
+			continue
+		}
+		for _, md := range mods {
+			own(s.staticModuleOwners, md.module, t.Id)
+			if md.shared {
+				own(s.staticSharedOwners, md.collection, t.Id)
+				continue
+			}
+			m := s.modules[md.module]
+			reg, err := moduleReg(m, handler.ModuleInstance{TypeId: t.Id, Key: md.key, Collection: md.collection})
+			if err != nil {
+				storeLog.Error("static parts: instance registration failed",
+					zap.String("typeId", t.Id), zap.String("collection", md.collection), zap.Error(err))
+				continue
+			}
+			reg.SchemaRev = ""
+			s.staticInstanceRegs = append(s.staticInstanceRegs, reg)
+			s.staticInstanceModule[md.collection] = md.module
+			dv[md.collection] = m.DataVersion
+			owners[md.collection] = t.Id
+			if reg.ReadTracking != nil {
+				s.modulesTracked = true
+			}
+		}
+	}
 	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, cfg.Modules))
 	s.extTypes = cfg.ExtTypes
 	s.dataVersions = dv
@@ -542,7 +597,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	if s.signKey != nil {
 		s.selfIdentity = s.signKey.GetPublic().Account()
 	}
-	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs, s.canonicalRegs)
+	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs, append(append([]crdt.HandlerReg(nil), s.canonicalRegs...), s.staticInstanceRegs...))
 	if len(s.readTracking) > 0 || s.modulesTracked {
 		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
 		if needsReadMaterializer(s.readTracking) {
@@ -711,6 +766,9 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			}
 			seenDatasets[d.Name] = struct{}{}
 		}
+		if err := validateStaticParts(t); err != nil {
+			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
+		}
 		seenProps := make(map[string]struct{}, len(t.Properties))
 		for k, p := range t.Properties {
 			if p.Id == "" {
@@ -777,6 +835,12 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 		if m.SharedOnly && m.Canonical == "" {
 			return fmt.Errorf("spaceobjects: module[%d] (%q): SharedOnly requires Canonical", i, m.Name)
 		}
+		if m.Reserved && !m.SharedOnly {
+			// A namespaced instance of a reserved module would be a
+			// per-type collection nobody but the consumer may declare —
+			// reservation exists for the one canonical install.
+			return fmt.Errorf("spaceobjects: module[%d] (%q): Reserved requires SharedOnly", i, m.Name)
+		}
 		if m.Canonical != "" {
 			if err := schema.ValidateSlug("canonical collection", m.Canonical); err != nil {
 				return fmt.Errorf("spaceobjects: module[%d] (%q): %w", i, m.Name, err)
@@ -817,6 +881,40 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d]: duplicate property Id %q", i, m.Name, k, p.Id)
 			}
 			seenProps[p.Id] = struct{}{}
+		}
+	}
+	// Static parts naming a module: the collection rule against the
+	// registered modules, and the namespaced collections they mint must
+	// not collide with anything else the catalog registers.
+	infos := make([]types.ModuleInfo, 0, len(modules))
+	byName := make(map[string]handler.Module, len(modules))
+	for _, m := range modules {
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly, Reserved: m.Reserved})
+		byName[m.Name] = m
+	}
+	catalog := types.NewModules(infos...)
+	for i, t := range extTypes {
+		mods, err := staticModuleDatasets(t, catalog)
+		if err != nil {
+			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
+		}
+		for _, md := range mods {
+			if md.shared {
+				continue
+			}
+			if m, ok := byName[md.module]; ok && m.DataVersion == "" {
+				// A static instance has no declaring schema state to stamp
+				// (registered types mint no shortIds): the module's own
+				// version is what peers gate against.
+				return fmt.Errorf("spaceobjects: type[%d] (%q) part %q: module %q needs a DataVersion for a static namespaced instance", i, t.Id, md.partKey, md.module)
+			}
+			if _, dup := builtinDataVersions[md.collection]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) part %q: collection %q is reserved by a built-in", i, t.Id, md.partKey, md.collection)
+			}
+			if _, dup := datasets[md.collection]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) part %q: collection %q is already registered", i, t.Id, md.partKey, md.collection)
+			}
+			datasets[md.collection] = struct{}{}
 		}
 	}
 	return nil
@@ -885,6 +983,13 @@ func (s *Store) Schemas() []NamedSchema {
 			Name: reg.Name, Schema: reg.Schema,
 			Owners: sortedOwners(snap.sharedOwners[reg.Name]),
 			Module: s.canonicalModule[reg.Name], Shared: true,
+		})
+	}
+	for _, reg := range s.staticInstanceRegs {
+		out = append(out, NamedSchema{
+			Name: reg.Name, Schema: reg.Schema,
+			Owners: []string{s.datasetOwners[reg.Name]},
+			Module: s.staticInstanceModule[reg.Name],
 		})
 	}
 	for _, name := range sortedCatalogNames(snap) {
@@ -1026,6 +1131,9 @@ func (s *Store) ModuleGrants(members map[string]struct{}) []string {
 // read counters land in: the owning type for a registered-type dataset,
 // the module name for a module collection (canonical or namespaced).
 func (s *Store) counterNamespace(dataset string) string {
+	if module, ok := s.staticInstanceModule[dataset]; ok {
+		return module
+	}
 	if owner, ok := s.datasetOwners[dataset]; ok {
 		return owner
 	}
@@ -2260,9 +2368,11 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 			})
 		}
 	}
-	// Module canonical collections: static on every controller, built
+	// Module canonical collections and the namespaced instances
+	// registered types declare statically: on every controller, built
 	// once at store open.
 	regs = append(regs, s.canonicalRegs...)
+	regs = append(regs, s.staticInstanceRegs...)
 	// Namespaced runtime datasets: one pre-built reg per catalog entry
 	// (the generic schema handler for records, a module instance
 	// otherwise). One atomic snapshot load — no storage reads or

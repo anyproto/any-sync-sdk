@@ -364,6 +364,64 @@ type Type struct {
 	// the equivalent tables internally; external types declare theirs
 	// here so the SDK can resolve and enforce their schema.
 	Properties []PropertyDecl
+
+	// Parts are the type's display units, declared statically — the
+	// shape a user type declares at runtime through
+	// space.TypesAPI.AddPart. Each part names one or more datasets:
+	// entries of Datasets by Name, or module datasets (a shared
+	// canonical collection, or a namespaced `<typeId>_<key>` instance)
+	// the SDK instantiates exactly as it does for a runtime declaration
+	// — the write gate, discovery ownership and the module namespace on
+	// the objects row all follow. With Parts set, every entry of
+	// Datasets must be named by exactly one part (sdk.Open rejects the
+	// rest). Without Parts, a type with Datasets gets one implicit part
+	// per dataset, keyed by the dataset name. Read back through
+	// space.TypesAPI.Parts / Datasets; never mutable at runtime.
+	Parts []Part
+
+	// Hidden keeps the type out of default listings and pickers
+	// (space.TypeInfo.Hidden): a client shows it only on request. For a
+	// capability type an object opts into rather than a class a user
+	// picks.
+	Hidden bool
+}
+
+// Part is one display unit of a registered type: the display slice a
+// client renders plus the datasets the part owns. Mirrors
+// space.PartDraft; Key is the part's slug, unique within the type.
+type Part struct {
+	Key    string
+	Name   string
+	Icon   string
+	Pos    string
+	Hidden bool
+	// UI is the widget descriptor — {type, config} in the x-format
+	// shape, opaque to the SDK.
+	UI map[string]any
+	// Uses names other datasets of this type (their key) the part
+	// renders without owning them.
+	Uses []string
+	// Datasets are the part's datasets — at least one.
+	Datasets []PartDataset
+}
+
+// PartDataset names one dataset a static part owns. Exactly one of
+// the two forms:
+//
+//   - Name: one of the owning Type's Datasets, by name. The dataset's
+//     collection is its Name; its module reads as `records` when it
+//     runs on the generic schema handler (nil Handler), none when
+//     bespoke.
+//   - Module: a dataset of a registered module, declared as a runtime
+//     part would — Shared for the module's canonical collection (Key
+//     defaults to the canonical name), a namespaced `<typeId>_<Key>`
+//     instance otherwise. The `records` module has no place here: a
+//     static records dataset is a Type.Datasets entry with a Schema.
+type PartDataset struct {
+	Name   string
+	Module string
+	Shared bool
+	Key    string
 }
 
 // ModuleInstance identifies one collection a module serves: the type
@@ -404,6 +462,16 @@ type Module struct {
 	// read frontier and a single push group per object. Requires
 	// Canonical.
 	SharedOnly bool
+
+	// Reserved keeps the module out of runtime declarations: a part or
+	// dataset draft naming it — through TypesAPI.AddPart / AddDataset or
+	// a bundle's Parts — is refused with space.ErrModuleReserved, unless
+	// the bundle request carries SystemInstall (the consumer's own
+	// catalog install). Registered types may still declare it
+	// statically, and a declaration that reached the DAG stays valid
+	// on apply (a peer that admitted it was the consumer's own
+	// install). Requires SharedOnly.
+	Reserved bool
 
 	// DataVersion is stamped on changes to the Canonical collection —
 	// the same opaque string a Dataset carries. Namespaced instances

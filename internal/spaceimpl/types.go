@@ -13,6 +13,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -136,21 +137,52 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := validatePropertyDraft(&draft); err != nil {
+		return "", err
+	}
+	payload, err := propertyDefPayload(&anyenc.Arena{}, &draft)
+	if err != nil {
+		return "", err
+	}
+	res, err := t.writePropertyDefs(ctx, typeId, crdt.RecordChange{
+		Upsert: true, // empty Id → propId derived from ChangeId
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(res.RecordIds) == 0 {
+		return "", errors.New("typesAPI: write returned no record id")
+	}
+	return res.RecordIds[0], nil
+}
+
+// validatePropertyDraft is the caller-side gate every property
+// definition passes — AddProperty's and a bundle's alike.
+func validatePropertyDraft(draft *space.PropertyDraft) error {
 	if draft.Kind == 0 {
-		return "", errors.New("typesAPI: PropertyDraft.Kind required")
+		return errors.New("typesAPI: PropertyDraft.Kind required")
+	}
+	if propertyKindLabel(draft.Kind) == "" {
+		return fmt.Errorf("typesAPI: PropertyDraft.Kind %d is not a property kind", draft.Kind)
 	}
 	switch draft.Scope {
 	case 0, space.ScopeSynced, space.ScopeAccount, space.ScopeLocal:
 	default:
-		return "", fmt.Errorf("typesAPI: PropertyDraft.Scope must be synced/account/local (derived is reserved for built-ins); got %s", draft.Scope)
+		return fmt.Errorf("typesAPI: PropertyDraft.Scope must be synced/account/local (derived is reserved for built-ins); got %s", draft.Scope)
 	}
-	arena := &anyenc.Arena{}
+	return nil
+}
+
+// propertyDefPayload builds the definition record a draft describes —
+// the single creation shape the property handler validates.
+func propertyDefPayload(arena *anyenc.Arena, draft *space.PropertyDraft) (*anyenc.Value, error) {
 	payload := arena.NewObject()
 	payload.Set(typetype.FieldKind, arena.NewString(propertyKindLabel(draft.Kind)))
 	if len(draft.XFormat) > 0 {
 		xf, err := encodeXFormat(arena, draft.XFormat)
 		if err != nil {
-			return "", fmt.Errorf("typesAPI: PropertyDraft.XFormat: %w", err)
+			return nil, fmt.Errorf("typesAPI: PropertyDraft.XFormat: %w", err)
 		}
 		payload.Set(typetype.FieldXFormat, xf)
 	}
@@ -176,30 +208,46 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 		}
 		payload.Set(typetype.FieldMeta, metaObj)
 	}
+	return payload, nil
+}
 
+// writePropertyDefs is the shared LocalWrite helper for the property
+// definitions dataset.
+func (t *typesAPI) writePropertyDefs(ctx context.Context, typeId string, recs ...crdt.RecordChange) (object.WriteResult, error) {
 	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
 	if err != nil {
-		return "", err
+		return object.WriteResult{}, err
 	}
 	obj, err := t.parent.store.Get(ctx, typeId)
 	if err != nil {
-		return "", err
+		return object.WriteResult{}, err
 	}
-	res, err := obj.LocalWrite(ctx, crdt.Change{
+	return t.parent.localWriteRetry(ctx, obj, typeId, crdt.Change{
 		Dataset:     typetype.DatasetPropertyDefs,
 		DataVersion: dataVersion,
-		Records: []crdt.RecordChange{{
-			Upsert: true, // empty Id → propId derived from ChangeId
-			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
-		}},
+		Records:     recs,
 	})
+}
+
+// propertyDefExists reports whether the type object carries a property
+// definition record under propId — live or tombstoned. A removed
+// definition keeps its id, which is how a bundle's adopt path tells
+// "never declared" from "removed".
+func (t *typesAPI) propertyDefExists(ctx context.Context, typeId, propId string) (bool, error) {
+	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
 	if err != nil {
-		return "", err
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("typesAPI: open defs %s: %w", typeId, err)
 	}
-	if len(res.RecordIds) == 0 {
-		return "", errors.New("typesAPI: write returned no record id")
+	if _, err := coll.FindId(ctx, propId); err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("typesAPI: find def %s: %w", propId, err)
 	}
-	return res.RecordIds[0], nil
+	return true, nil
 }
 
 // builtInAnyTypeInfo describes the synthetic `any` type — present in
@@ -257,8 +305,19 @@ func registeredTypeInfo(t handler.Type) space.TypeInfo {
 		Name:        name,
 		Description: t.Description,
 		IconCID:     t.IconCID,
+		Hidden:      t.Hidden,
 		BuiltIn:     true,
 	}
+}
+
+// registeredTypeParts is the compiled view of a registered type's
+// static parts — the declared ones, or one implicit part per dataset.
+func (t *typesAPI) registeredTypeParts(rt handler.Type) (*types.CompiledType, error) {
+	ct, err := spaceobjects.StaticTypeParts(rt, t.parent.store.Modules())
+	if err != nil {
+		return nil, fmt.Errorf("typesAPI: static parts of %q: %w", rt.Id, err)
+	}
+	return ct, nil
 }
 
 // staticType reports whether typeId is a type whose declarations are

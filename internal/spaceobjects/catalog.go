@@ -195,6 +195,19 @@ func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSn
 		}
 		m[typeId] = struct{}{}
 	}
+	// Registered types' static module declarations are owners on every
+	// snapshot. Copied in, never aliased: a runtime fold mutates the
+	// per-key sets.
+	for coll, set := range s.staticSharedOwners {
+		for typeId := range set {
+			own(snap.sharedOwners, coll, typeId)
+		}
+	}
+	for module, set := range s.staticModuleOwners {
+		for typeId := range set {
+			own(snap.moduleOwners, module, typeId)
+		}
+	}
 	for _, ct := range byType {
 		for _, ds := range ct.Datasets {
 			if ds.Invalid {

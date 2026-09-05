@@ -93,7 +93,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	if err != nil {
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: load spaceIndex object: %w", err)
 	}
-	if err := b.preflightParts(ctx, req); err != nil {
+	if err := b.preflightType(ctx, req); err != nil {
 		return space.Bundle{}, false, err
 	}
 
@@ -122,27 +122,29 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 		// Parts ARE declared when the root carries none yet (crash
 		// between declaring and registering, a row adopted before the
 		// root tree synced); a root with any declaration — live or
-		// removed — is left alone. The name stamp is written only
-		// when the root carries none: adopting never renames.
+		// removed — is left alone. Properties heal per deterministic
+		// id: a definition absent from the root (never written, not
+		// removed) is written, nothing else. The name stamp is written
+		// only when the root carries none: adopting never renames.
 		if req.DerivedRoot && bd.Derived {
 			rootId, err := b.deriveRoot(ctx, req)
 			if err != nil {
 				return space.Bundle{}, false, err
 			}
-			if err := b.declareParts(ctx, rootId, req.Parts); err != nil {
+			if err := b.declareType(ctx, rootId, req); err != nil {
 				return space.Bundle{}, false, err
 			}
 			if err := b.stampRootName(ctx, rootId, req, true); err != nil {
 				return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 			}
-		} else if len(req.Parts) > 0 {
+		} else if len(req.Parts) > 0 || len(req.Properties) > 0 {
 			// Created winner: heal the declaration when the root's
 			// tree is local and carries none (crash between the
 			// registering write and declaring). A winner whose tree
 			// has not arrived is left alone — the installer's
 			// declaration syncs with it.
 			if _, present, perr := b.parent.store.TreeIsDerived(ctx, bd.RootId); perr == nil && present {
-				if err := b.declareParts(ctx, bd.RootId, req.Parts); err != nil {
+				if err := b.declareType(ctx, bd.RootId, req); err != nil {
 					return space.Bundle{}, false, err
 				}
 			}
@@ -198,7 +200,7 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest) 
 	// The inverse order would strand an ORPHAN root with no registry
 	// reference: nothing could ever adopt or heal it, and the bundle id
 	// would be wedged for good.
-	if err := b.declareParts(ctx, rootId, req.Parts); err != nil {
+	if err := b.declareType(ctx, rootId, req); err != nil {
 		return space.Bundle{}, false, err
 	}
 
@@ -222,25 +224,28 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest) error 
 		// NewRoot == nil is the SDK-minted created root: Ensure creates
 		// a bare object and stamps it as its own type — the only shape
 		// a space whose free object create is fenced (the tech space)
-		// can use. Parts give that root its purpose.
-		if req.NewRoot == nil && len(req.Parts) == 0 {
-			return fmt.Errorf("spaceimpl: %w: NewRoot or Parts required", space.ErrBundleBadRequest)
+		// can use. The type declaration gives that root its purpose.
+		if req.NewRoot == nil && !req.DeclaresType() {
+			return fmt.Errorf("spaceimpl: %w: NewRoot or a type declaration (Parts / Properties / Layout / Weight / Hidden) required", space.ErrBundleBadRequest)
 		}
 		if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
 			return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties apply to DerivedRoot only — a created root gets its initial state from NewRoot", space.ErrBundleBadRequest)
 		}
 	}
-	return b.validateBundleParts(req.Parts)
+	if err := b.validateBundleParts(req.Parts, req.SystemInstall); err != nil {
+		return err
+	}
+	return validateBundleProperties(req.Properties)
 }
 
-// preflightParts fails a Parts request before the permanent root is
-// derived: a RootProperties key equal to the root's own id (the
-// self-type grants a dataset namespace, not property definitions).
-// Collection names cannot collide — a namespaced dataset lives under
-// the root's own id and a shared one is the module's canonical
-// collection — so there is no name ownership to settle.
-func (b *bundlesAPI) preflightParts(ctx context.Context, req space.EnsureBundleRequest) error {
-	if len(req.Parts) == 0 {
+// preflightType fails a type-declaring request before the permanent
+// root is derived: a RootProperties key equal to the root's own id
+// (its property ids are not known before the install, so nothing can
+// seed them). Collection names cannot collide — a namespaced dataset
+// lives under the root's own id and a shared one is the module's
+// canonical collection — so there is no name ownership to settle.
+func (b *bundlesAPI) preflightType(ctx context.Context, req space.EnsureBundleRequest) error {
+	if !req.DeclaresType() {
 		return nil
 	}
 	canonical, err := b.canonicalRootId(ctx, req.Id)
@@ -248,7 +253,91 @@ func (b *bundlesAPI) preflightParts(ctx context.Context, req space.EnsureBundleR
 		return fmt.Errorf("spaceimpl: bundles: canonical root of %q: %w", req.Id, err)
 	}
 	if _, self := req.RootProperties[canonical]; self {
-		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — a self-typed root has no property definitions", space.ErrBundleBadRequest)
+		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — its property ids exist only once installed", space.ErrBundleBadRequest)
+	}
+	return nil
+}
+
+// validateBundleProperties rejects a property draft AddProperty would
+// refuse, a draft without an XKey (the deterministic id needs one) and
+// a duplicate XKey, up front.
+func validateBundleProperties(drafts []space.PropertyDraft) error {
+	seen := make(map[string]struct{}, len(drafts))
+	for i := range drafts {
+		p := &drafts[i]
+		if p.XKey == "" {
+			return fmt.Errorf("spaceimpl: %w: property[%d]: XKey required — the property id derives from it", space.ErrBundleBadRequest, i)
+		}
+		if _, dup := seen[p.XKey]; dup {
+			return fmt.Errorf("spaceimpl: %w: property %q declared twice", space.ErrBundleBadRequest, p.XKey)
+		}
+		seen[p.XKey] = struct{}{}
+		if err := validatePropertyDraft(p); err != nil {
+			return fmt.Errorf("spaceimpl: %w: property %q: %w", space.ErrBundleBadRequest, p.XKey, err)
+		}
+		if _, err := propertyDefPayload(&anyenc.Arena{}, p); err != nil {
+			return fmt.Errorf("spaceimpl: %w: property %q: %w", space.ErrBundleBadRequest, p.XKey, err)
+		}
+	}
+	return nil
+}
+
+// bundlePropertyId is the deterministic id of a bundle-declared
+// property: a function of the root id and the handle, so two devices
+// installing while apart mint one definition per handle. Same encoding
+// as a change-derived record id.
+func bundlePropertyId(rootId, xKey string) string {
+	return crdt.DeriveRecordId("bundle-property:" + rootId + ":" + xKey)
+}
+
+// declareType writes the type declaration on the root: the parts (one
+// change, only on a root with no declaration at all — see
+// declareParts) and the properties (one change, only the definitions
+// whose deterministic id the root does not carry yet).
+func (b *bundlesAPI) declareType(ctx context.Context, rootId string, req space.EnsureBundleRequest) error {
+	if err := b.declareParts(ctx, rootId, req.Parts); err != nil {
+		return err
+	}
+	return b.declareProperties(ctx, rootId, req.Properties)
+}
+
+// declareProperties writes the definitions absent from the root, each
+// under its deterministic id. A definition the root already carries —
+// live, or removed through Types().RemoveProperty (the tombstone keeps
+// the id) — is left alone: nothing is patched or resurrected.
+func (b *bundlesAPI) declareProperties(ctx context.Context, rootId string, drafts []space.PropertyDraft) error {
+	if len(drafts) == 0 {
+		return nil
+	}
+	arena := &anyenc.Arena{}
+	var recs []crdt.RecordChange
+	for i := range drafts {
+		id := bundlePropertyId(rootId, drafts[i].XKey)
+		exists, err := b.parent.types.propertyDefExists(ctx, rootId, id)
+		if err != nil {
+			return fmt.Errorf("spaceimpl: bundles: read property %q of root %q: %w", drafts[i].XKey, rootId, err)
+		}
+		if exists {
+			continue
+		}
+		payload, err := propertyDefPayload(arena, &drafts[i])
+		if err != nil {
+			return fmt.Errorf("spaceimpl: %w: property %q: %w", space.ErrBundleBadRequest, drafts[i].XKey, err)
+		}
+		recs = append(recs, crdt.RecordChange{
+			Id: id, Upsert: true,
+			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+		})
+	}
+	if len(recs) == 0 {
+		return nil
+	}
+	res, err := b.parent.types.writePropertyDefs(ctx, rootId, recs...)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: bundles: declare properties on root %q: %w", rootId, err)
+	}
+	if len(res.Rejections) > 0 {
+		return fmt.Errorf("spaceimpl: bundles: declare properties on root %q: %w", rootId, res.Rejections[0].Err)
 	}
 	return nil
 }
@@ -271,8 +360,9 @@ func (b *bundlesAPI) selfTyped(ctx context.Context, objectId string) (bool, erro
 // validateBundleParts rejects an invalid part or dataset draft, or a
 // duplicate key, up front — the same validation declareParts applies,
 // so nothing half-registers. Drafts are normalized in place (module
-// default, a shared dataset's canonical key).
-func (b *bundlesAPI) validateBundleParts(drafts []space.PartDraft) error {
+// default, a shared dataset's canonical key). A reserved module is
+// refused unless the request is the consumer's own install.
+func (b *bundlesAPI) validateBundleParts(drafts []space.PartDraft, systemInstall bool) error {
 	seen := make(map[string]struct{}, len(drafts))
 	keys := make(map[string]struct{})
 	shared := make(map[string]struct{})
@@ -289,6 +379,11 @@ func (b *bundlesAPI) validateBundleParts(drafts []space.PartDraft) error {
 			d := &p.Datasets[j]
 			if _, err := normalizeDatasetDraft(b.parent.store.Modules(), "", d); err != nil {
 				return fmt.Errorf("spaceimpl: %w: dataset %q: %w", space.ErrBundleBadRequest, d.Key, err)
+			}
+			if !systemInstall {
+				if err := checkReservedModule(b.parent.store.Modules(), d); err != nil {
+					return fmt.Errorf("spaceimpl: %w: %w", space.ErrBundleBadRequest, err)
+				}
 			}
 			if _, err := draftToDecl(d); err != nil {
 				return fmt.Errorf("spaceimpl: %w: dataset %q: %w", space.ErrBundleBadRequest, d.Key, err)
@@ -401,10 +496,10 @@ func (b *bundlesAPI) mintRoot(ctx context.Context, req space.EnsureBundleRequest
 		}
 		rootId = id
 	}
-	// A datasets-carrying created root is its own type, like the
-	// derived path: the marker plus its own id. $addToSet, so a NewRoot
-	// that already attached them is untouched.
-	if len(req.Parts) > 0 {
+	// A type-declaring created root is its own type, like the derived
+	// path: the marker plus its own id. $addToSet, so a NewRoot that
+	// already attached them is untouched.
+	if req.DeclaresType() {
 		for _, t := range []string{typetype.MetaTypeMarker, rootId} {
 			if _, err := b.parent.properties.AttachType(ctx, rootId, t); err != nil {
 				return "", fmt.Errorf("spaceimpl: bundles: self-type root %q: %w", rootId, err)
@@ -424,7 +519,7 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 		return "", fmt.Errorf("spaceimpl: bundles: canonical root of %q: %w", req.Id, err)
 	}
 	selfType := ""
-	if len(req.Parts) > 0 {
+	if req.DeclaresType() {
 		selfType = canonical
 	}
 	rootId, err := b.parent.objects.Derive(ctx, space.DeriveObjectOpts{
@@ -447,7 +542,7 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 // types plus every type RootProperties writes into. A property write
 // to a type the object does not implement is rejected, and the created
 // path attaches the same union through Objects().Create. With a
-// selfType (the root declares Parts) the root is also a type object
+// selfType (the root declares a type) the root is also a type object
 // implementing itself: the type marker plus its own id come first.
 func derivedRootTypes(req space.EnsureBundleRequest, selfType string) []string {
 	if len(req.RootProperties) == 0 && selfType == "" {
@@ -672,7 +767,9 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
 }
 
-// stampRootName writes `any.name` on a freshly created bundle root.
+// stampRootName writes `any.name` on a freshly created bundle root,
+// with the type's rendering and listing metadata (`type.layout` /
+// `type.weight` / `type.hidden`) when the root declares a type.
 // Load-bearing despite looking cosmetic: it guarantees the root tree
 // carries a non-root change (see the Ensure call site).
 func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space.EnsureBundleRequest, adopt bool) error {
@@ -698,10 +795,23 @@ func (b *bundlesAPI) stampRootName(ctx context.Context, rootId string, req space
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
 	payload.Set("any.name", arena.NewString(name))
-	// A self-typed root is a type that exists to host its bundle's
-	// datasets, not to be offered in a picker: hidden by construction.
-	if len(req.Parts) > 0 {
-		payload.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
+	// The type's own metadata rides the same change: what the request
+	// declares, nothing implied — a root hosting only its bundle's
+	// records asks for Hidden itself.
+	if req.DeclaresType() {
+		if req.Hidden {
+			payload.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
+		}
+		if req.Weight != 0 {
+			payload.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(req.Weight))
+		}
+		if len(req.Layout) > 0 {
+			layout, err := encodeXFormat(arena, req.Layout)
+			if err != nil {
+				return fmt.Errorf("%w: Layout: %w", space.ErrBundleBadRequest, err)
+			}
+			payload.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+		}
 	}
 	dataVersion, err := b.parent.store.DataVersion(properties.Dataset)
 	if err != nil {

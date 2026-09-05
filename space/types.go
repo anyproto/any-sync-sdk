@@ -33,6 +33,13 @@ var ErrTypeRegistered = errors.New("space: type is registered — properties are
 // declaration carries no fields. A client error → 4xx.
 var ErrModuleOwned = errors.New("space: dataset schema is owned by its module")
 
+// ErrModuleReserved is returned by AddPart / AddDataset and by
+// BundlesAPI.Ensure when a dataset draft names a module registered with
+// handler.Module.Reserved: only the consumer's own installs
+// (EnsureBundleRequest.SystemInstall) may declare it. A client error →
+// 4xx.
+var ErrModuleReserved = errors.New("space: module is reserved for the consumer's own installs")
+
 // ErrDatasetNotDeclared is returned by the write surface (Modify /
 // ModifyMany / Delete / Upsert) when the target object carries no type
 // whose parts declare the dataset — a namespaced collection's one

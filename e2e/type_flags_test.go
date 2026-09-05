@@ -71,18 +71,28 @@ func TestE2E_TypeHiddenAndMeta(t *testing.T) {
 	err = sp.Types().Patch(ctx, typeId, space.TypePatch{Meta: map[string]any{"obj": map[string]any{"x": 1}}})
 	require.ErrorIs(t, err, space.ErrInvalidFieldValue)
 
-	// A self-typed bundle root is a hidden type.
+	// A self-typed bundle root is hidden when the install says so — a
+	// root hosting only its records — and listed when it does not: a
+	// declared type objects carry.
 	b, _, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "notes/v1", Name: "Notes",
+		Id: "notes/v1", Name: "Notes", Hidden: true,
 		Parts: []space.PartDraft{{Key: "entries", Datasets: []space.DatasetDraft{entriesDatasetDraft()}}},
 	})
 	require.NoError(t, err)
 	root, err := sp.Types().Get(ctx, b.RootId)
 	require.NoError(t, err)
-	assert.True(t, root.Hidden, "bundle root type must be hidden")
+	assert.True(t, root.Hidden, "bundle root type must be hidden when asked")
+	page, _, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "page/v1", Name: "Page", Layout: map[string]any{"type": "page"},
+		Parts: []space.PartDraft{{Key: "notes", Datasets: []space.DatasetDraft{entriesDatasetDraft()}}},
+	})
+	require.NoError(t, err)
+	pageInfo, err := sp.Types().Get(ctx, page.RootId)
+	require.NoError(t, err)
+	assert.False(t, pageInfo.Hidden, "a declared type stays listed unless the install hides it")
 	list, err := sp.Types().List(ctx)
 	require.NoError(t, err)
-	var sawRoot, sawDraft bool
+	var sawRoot, sawDraft, sawPage bool
 	for _, ti := range list {
 		if ti.Id == b.RootId {
 			sawRoot = ti.Hidden
@@ -90,7 +100,11 @@ func TestE2E_TypeHiddenAndMeta(t *testing.T) {
 		if ti.Id == typeId {
 			sawDraft = true
 		}
+		if ti.Id == page.RootId {
+			sawPage = !ti.Hidden
+		}
 	}
 	assert.True(t, sawRoot, "List carries hidden types with the flag set")
 	assert.True(t, sawDraft)
+	assert.True(t, sawPage)
 }

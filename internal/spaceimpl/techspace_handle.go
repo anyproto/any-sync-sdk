@@ -399,10 +399,10 @@ func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 }
 
 // validateTechEnsureRequest adds the tech-space rules on top of the
-// structural gate: Datasets required (the root is its own type — that
-// declaration is the install), roots minted by Ensure only (free
-// object create is fenced, so NewRoot has nothing legal to call), and
-// no foreign types (a type from another space would stamp a
+// structural gate: Parts or Properties required (the root is its own
+// type — that declaration is the install), roots minted by Ensure only
+// (free object create is fenced, so NewRoot has nothing legal to
+// call), and no foreign types (a type from another space would stamp a
 // DataVersion the tech space can never satisfy on a device that lacks
 // that space). Both root strategies are allowed: DerivedRoot for
 // bundles that must never fork or uninstall, the SDK-minted created
@@ -412,8 +412,8 @@ func validateTechEnsureRequest(req space.EnsureBundleRequest) error {
 	if req.NewRoot != nil {
 		return fmt.Errorf("spaceimpl: %w: NewRoot is not available on the tech space — Ensure mints the root", space.ErrBundleBadRequest)
 	}
-	if len(req.Parts) == 0 {
-		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Parts", space.ErrBundleBadRequest)
+	if len(req.Parts) == 0 && len(req.Properties) == 0 {
+		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Parts or Properties", space.ErrBundleBadRequest)
 	}
 	if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
 		return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties are not available on the tech space — a tech bundle root is its own type", space.ErrBundleBadRequest)

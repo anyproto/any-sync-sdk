@@ -42,18 +42,21 @@ type Config struct {
 
 	// Types is the optional list of caller-defined types extending
 	// the SDK's built-in catalog. Each Type binds a typeId to the
-	// dataset handlers it owns; every handler's Dataset() name must
-	// be unique across the whole catalog (no collisions with the
-	// built-in datasets "objects", "properties", "shortIds", and no
-	// duplicates across other Types). Empty or nil = built-ins only.
+	// dataset handlers it owns, optionally arranged in static Parts
+	// (which may also declare module datasets), and a Hidden flag;
+	// every dataset name must be unique across the whole catalog (no
+	// collisions with the built-in datasets "objects", "properties",
+	// "shortIds", and no duplicates across other Types). Empty or nil
+	// = built-ins only.
 	Types []handler.Type
 
 	// Modules is the optional list of caller-defined dataset modules —
 	// compiled-in behaviours (an editor, a chat) that types declare at
-	// runtime inside their parts and the SDK instantiates per
-	// collection. Module names and canonical collection names must be
-	// unique across the catalog. Empty or nil = the built-in `records`
-	// module only.
+	// runtime inside their parts (or registered types statically) and
+	// the SDK instantiates per collection. Module names and canonical
+	// collection names must be unique across the catalog. A Reserved
+	// module is declarable only by the caller's own bundle installs.
+	// Empty or nil = the built-in `records` module only.
 	Modules []handler.Module
 }
 

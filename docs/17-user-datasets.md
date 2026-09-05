@@ -46,7 +46,37 @@ Type
   (`Canonical`); `SharedOnly` refuses namespaced instances so an object
   carries at most one collection of the module. A module may also
   declare a namespace on the objects row (`Properties`) — see
-  docs/06 § Module namespaces.
+  docs/06 § Module namespaces. A **reserved** module (`Reserved`,
+  requires `SharedOnly`) is refused to runtime declarations —
+  `AddPart`, `AddDataset`, a bundle's `Parts` — with
+  `space.ErrModuleReserved`; only a bundle install the consumer marks
+  `SystemInstall`, or a registered type's static part, may declare
+  it. Draft-time only: the compile keeps an applied declaration valid,
+  since a peer that admitted it was the consumer's own install.
+
+### Static parts on registered types
+
+A registered type (`config.Config.Types`) declares its parts at boot
+(`handler.Type.Parts`) in the shape a runtime declaration takes: each
+part names entries of the type's `Datasets` (`PartDataset.Name` — the
+collection is the dataset's name; the module reads as `records` on the
+generic schema handler, none for a bespoke handler) or module datasets
+(`PartDataset.Module` + `Shared` / `Key`, the collection rule below).
+The module datasets enter the catalog as if a type object had
+declared them: a shared one adds the type to the canonical collection's
+owner set, a namespaced one registers `<typeId>_<key>` on every
+controller with the module's `DataVersion` (registered types mint no
+schema state to gate on), the module namespace on the objects row
+follows (`Store.ModuleGrants`), and discovery lists them under
+`Owners = [typeId]`. Static declarations are validated at `sdk.Open`
+(`ValidateExternalTypes` / `ValidateExternalModules`: slug keys, each
+static dataset named by exactly one part once parts are declared,
+the collection rule, minted names free) and never mutate at runtime —
+`AddPart` & co. answer `ErrTypeRegistered`; `Types().Parts` /
+`Datasets` return the compiled view with the keys as ids. A type
+with `Datasets` and no `Parts` reads back one implicit part per
+dataset, keyed by the dataset name. `handler.Type.Hidden` keeps the
+type out of default listings (`TypeInfo.Hidden`).
 
 ### The collection rule
 
@@ -417,7 +447,14 @@ PatchDatasetField(ctx, typeId, fieldDefId, DatasetDefPatch) error
 Datasets(ctx, typeId) ([]DatasetDef, error)               // flat, with Collection
 
 // modules (config.Config.Modules)
-handler.Module{Name, Canonical, SharedOnly, DataVersion, HandlerVersion, Properties, New}
+handler.Module{Name, Canonical, SharedOnly, Reserved, DataVersion, HandlerVersion, Properties, New}
+
+// static parts (config.Config.Types)
+handler.Type{…, Parts: []handler.Part{{Key, Name, Icon, Pos, Hidden, UI, Uses,
+    Datasets: []handler.PartDataset{{Name} | {Module, Shared, Key}}}}, Hidden}
+
+// bundles declaring a type (space.EnsureBundleRequest)
+EnsureBundleRequest{…, Parts, Properties /* XKey required, deterministic ids */, Layout, Weight, Hidden, SystemInstall}
 
 // data (space.Space) — plus the existing Modify/Query surface
 Upsert(ctx, UpsertBatch) (UpsertResult, error)

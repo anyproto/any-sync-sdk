@@ -13,12 +13,28 @@ import (
 const RecordsModule = "records"
 
 // ModuleInfo is what the compiler needs to know about a module: its
-// name, the shared collection it owns (empty = none) and whether it
-// admits namespaced instances.
+// name, the shared collection it owns (empty = none), whether it
+// admits namespaced instances, and whether runtime declarations may
+// name it at all (Reserved — a draft-time refusal; the compile keeps
+// an applied declaration valid).
 type ModuleInfo struct {
 	Name       string
 	Canonical  string
 	SharedOnly bool
+	Reserved   bool
+}
+
+// ErrModuleReserved marks a draft naming a module the consumer keeps
+// for its own installs.
+var ErrModuleReserved = errors.New("types: module is reserved")
+
+// CheckReserved refuses a draft naming a reserved module. Unknown
+// modules pass here — Collection reports them.
+func (m Modules) CheckReserved(module string) error {
+	if mi, ok := m[module]; ok && mi.Reserved {
+		return fmt.Errorf("%w: %q", ErrModuleReserved, module)
+	}
+	return nil
 }
 
 // Modules is the module catalog keyed by name. Always carries the

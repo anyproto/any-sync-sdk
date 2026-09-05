@@ -115,6 +115,16 @@ func normalizeDatasetDraft(modules types.Modules, typeId string, draft *space.Da
 	return modules.Collection(typeId, draft.Key, draft.Module, draft.Shared)
 }
 
+// checkReservedModule refuses a runtime draft naming a reserved module
+// (handler.Module.Reserved): the consumer's own installs declare it,
+// nothing else. Draft-time only — an applied declaration stays valid.
+func checkReservedModule(modules types.Modules, draft *space.DatasetDraft) error {
+	if err := modules.CheckReserved(draft.Module); err != nil {
+		return fmt.Errorf("typesAPI: dataset %q: %w: %w", draft.Key, space.ErrModuleReserved, err)
+	}
+	return nil
+}
+
 // draftToDecl assembles and validates the full declaration a draft
 // describes — the same shape the catalog compiler will produce once the
 // records sync, so a draft rejected here can never half-register. A
@@ -345,6 +355,9 @@ func (t *typesAPI) preflightDataset(typeId string, draft *space.DatasetDraft, ex
 	if _, err := normalizeDatasetDraft(t.parent.store.Modules(), typeId, draft); err != nil {
 		return fmt.Errorf("typesAPI: dataset %q: %w", draft.Key, err)
 	}
+	if err := checkReservedModule(t.parent.store.Modules(), draft); err != nil {
+		return err
+	}
 	if _, err := draftToDecl(draft); err != nil {
 		return err
 	}
@@ -455,7 +468,13 @@ func datasetDefRecords(arena *anyenc.Arena, partId string, draft *space.DatasetD
 }
 
 func (t *typesAPI) Parts(ctx context.Context, typeId string) ([]space.PartDef, error) {
-	ct, err := t.compiled(ctx, typeId)
+	var ct *types.CompiledType
+	var err error
+	if rt, ok := t.findRegisteredType(typeId); ok {
+		ct, err = t.registeredTypeParts(rt)
+	} else {
+		ct, err = t.compiled(ctx, typeId)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -966,9 +985,18 @@ func (t *typesAPI) PatchDatasetField(ctx context.Context, typeId, fieldDefId str
 }
 
 func (t *typesAPI) Datasets(ctx context.Context, typeId string) ([]space.DatasetDef, error) {
-	compiled, err := t.parent.store.DatasetDefs(ctx, typeId)
-	if err != nil {
-		return nil, err
+	var compiled []types.CompiledDataset
+	if rt, ok := t.findRegisteredType(typeId); ok {
+		ct, err := t.registeredTypeParts(rt)
+		if err != nil {
+			return nil, err
+		}
+		compiled = ct.Datasets
+	} else {
+		var err error
+		if compiled, err = t.parent.store.DatasetDefs(ctx, typeId); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]space.DatasetDef, 0, len(compiled))
 	for i := range compiled {

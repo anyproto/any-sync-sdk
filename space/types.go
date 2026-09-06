@@ -7,17 +7,12 @@ import (
 	"github.com/anyproto/any-sync-sdk/handler"
 )
 
-// ErrPinnedField is returned by PatchProperty when a Set/Unset path
-// targets pinned state (key, kind, scope, items, properties, the whole
-// `format` object, or format.type), or when a format.* value is not a
-// string. Consumers (e.g. the `any` server) match it to surface a clean
-// 400 rather than the handler's per-op drop.
+// ErrPinnedField is returned by PatchProperty / PatchDataset /
+// PatchDatasetField when a Set/Unset path targets pinned state (key,
+// kind, scope, items, properties; a dataset head's behavioral fields).
+// Consumers (e.g. the `any` server) match it to surface a clean 400
+// rather than the handler's per-op drop.
 var ErrPinnedField = errors.New("space: property field is pinned or immutable")
-
-// ErrPropertyNoFormat is returned by PatchProperty when a Set/Unset path
-// descends into `format.*` on a property that declared no format at
-// creation (format.type is pinned-absent). A client error → 400.
-var ErrPropertyNoFormat = errors.New("space: property has no format")
 
 // ErrInvalidFieldValue is returned by PatchDataset when a MUTABLE
 // leaf's value is malformed (e.g. a `search.text` mapping with empty
@@ -98,17 +93,15 @@ type TypesAPI interface {
 	RemoveProperty(ctx context.Context, typeId, propId string) error
 
 	// PatchProperty applies a generic per-path patch to a property
-	// definition — the write half of #1 (rename) and #3/#5 (option
-	// CRUD, colors, order). Set assigns values at dotted paths; Unset
-	// removes them. Both merge per-path through the record's CRDT, so
+	// definition. Set assigns values at dotted paths; Unset removes
+	// them. Both merge per-path through the record's CRDT, so
 	// concurrent edits to different paths converge.
 	//
-	// Mutable paths: name, description, x-key, x-kind, format.ui,
-	// format.filter, format.options.<key>.{name,color,pos,meta.<k>},
-	// format.meta.<k>. Pinned paths (key, kind, scope, items,
-	// properties, the whole `format` object, format.type) are rejected
-	// — define a new property to change them. Format-leaf paths require
-	// a property that declared a format at creation.
+	// Mutable paths: name, description, x-key, meta.<k>, x-format and
+	// every path under it (any JSON value — the SDK stores the
+	// descriptor opaquely; the consumer owns its vocabulary and its
+	// leaf-only patch rule). Pinned paths (key, kind, scope, items,
+	// properties) are rejected — define a new property to change them.
 	PatchProperty(ctx context.Context, typeId, propId string, patch PropertyPatch) error
 
 	// Datasets returns the type's runtime dataset definitions (the
@@ -150,6 +143,13 @@ type TypesAPI interface {
 	// Pinned paths are rejected up-front (ErrPinnedField); malformed
 	// values on mutable search leaves return ErrInvalidFieldValue.
 	PatchDataset(ctx context.Context, typeId, defId string, patch DatasetDefPatch) error
+
+	// PatchDatasetField edits one field definition's mutable leaves:
+	// name, description, x-format and every path under it. The
+	// behavioral parts (key, kind, shape, scope, required, mutableBy,
+	// stamp) are pinned (ErrPinnedField). Unknown fieldDefId →
+	// ErrNotFound.
+	PatchDatasetField(ctx context.Context, typeId, fieldDefId string, patch DatasetDefPatch) error
 }
 
 // Behavioral dataset-schema vocabulary, aliased from the handler
@@ -235,6 +235,12 @@ type DatasetFieldDraft struct {
 	MutableBy Mutability
 	// Stamp: apply-time derived value (handler-written).
 	Stamp Stamp
+
+	// XFormat is the field's opaque descriptor (semantic slug, icon,
+	// options, …) — the same bag a property definition carries. Stored
+	// verbatim, mutable via PatchDatasetField, surfaced by Datasets()
+	// and as the `x-format` keyword in discovery. Nil when unset.
+	XFormat map[string]any
 }
 
 // DatasetDef is the compiled view of one runtime dataset definition.
@@ -263,15 +269,22 @@ type DatasetDef struct {
 // DatasetFieldDef is the compiled view of one dataset field.
 type DatasetFieldDef struct {
 	// Id is the field definition record's id — the identity
-	// RemoveDatasetField targets.
-	Id        string
-	Key       string
-	Name      string
-	Kind      PropertyKind
+	// RemoveDatasetField / PatchDatasetField target.
+	Id          string
+	Key         string
+	Name        string
+	Description string
+	Kind        PropertyKind
+	// Shape is the full declared value shape (kind plus items /
+	// properties); Kind is its top-level kind.
+	Shape     *handler.FieldShape
 	Scope     Scope
 	Required  bool
 	MutableBy Mutability
 	Stamp     Stamp
+	// XFormat is the opaque descriptor declared on the field, nil when
+	// unset. See DatasetFieldDraft.XFormat.
+	XFormat map[string]any
 }
 
 // DatasetDefPatch is the input to PatchDataset — same per-path model
@@ -323,9 +336,6 @@ type PropertyDef struct {
 	// client code mapping). Not unique, not enforced — metadata only.
 	XKey string
 
-	// XKind is a free-form classification hint. Opaque to the SDK.
-	XKind string
-
 	// Meta is an opaque consumer-controlled flag map. The SDK stores
 	// and returns it verbatim and never interprets it — e.g. the `any`
 	// server's search indexer reads meta["index"] = "<scope>" to mark
@@ -345,78 +355,17 @@ type PropertyDef struct {
 	// scopes existed read back as ScopeSynced.
 	Scope Scope
 
-	// Format is the property's value-format annotation (links / date /
-	// datetime / …). Nil for definitions that never declared one —
-	// including everything written before formats existed. Format.Type
-	// is pinned like Kind; UI and Filter are CRDT-mutable. A definition
-	// carrying a format type this SDK version doesn't know reads back
-	// as nil (read tolerance).
-	Format *PropertyFormat
-}
-
-// PropertyFormat is the live format annotation on a PropertyDef.
-//
-// The SDK validates only the structure (Type is a known enum because it
-// constrains Kind; UI and Filter are strings) — it never interprets UI
-// values or Filter contents. Semantic validation (UI enums, filter
-// syntax, value shapes) is a consumer concern, e.g. the `any` server.
-type PropertyFormat struct {
-	// Type declares the value convention — see FormatType. Pinned by
-	// the first write, like Kind.
-	Type FormatType
-	// UI is a presentation hint (e.g. "select", "multiselect", "link",
-	// "links"). Opaque to the SDK, like XKind. CRDT-mutable.
-	UI string
-	// Filter is a mongo-style condition over candidate objects, stored
-	// as its JSON text. Opaque to the SDK. Empty means "no filter".
-	// CRDT-mutable — concurrent edits replace each other as a unit.
-	Filter string
-	// Options is the enumerated option set for select / multiselect
-	// formats, keyed by the option's stable key — which IS the value a
-	// select/multiselect value stores. The key is immutable (changing it
-	// orphans existing values); name/color/pos/meta are CRDT-mutable per
-	// path. Nil when the format declares no options. See PropertyOption.
-	Options map[string]PropertyOption
-	// Meta is an opaque, CRDT-mutable format-level config bag (e.g. a
-	// date display pattern, number precision). String leaves only,
-	// stored verbatim. Distinct from PropertyDef.Meta (property-level
-	// consumer flags). Nil when unset.
-	Meta map[string]string
-}
-
-// PropertyOption is one enumerated choice on a select / multiselect
-// format. Its map key in Format.Options is the stored value; the fields
-// below are the CRDT-mutable display slice.
-type PropertyOption struct {
-	// Name is the display label. CRDT-mutable — renaming touches only
-	// this leaf, never the values that reference the option key.
-	Name string
-	// Color is an opaque presentation string (palette name or hex).
-	// CRDT-mutable.
-	Color string
-	// Pos is a lexid ordering key for display order. CRDT-mutable;
-	// reorder is a single-leaf write.
-	Pos string
-	// Meta is an opaque per-option string bag (icon, description, …).
-	// CRDT-mutable. Nil when unset.
-	Meta map[string]string
-}
-
-// PropertyFormatDraft is the format input on a PropertyDraft.
-type PropertyFormatDraft struct {
-	Type FormatType
-	UI   string
-	// Filter accepts the JSON text of a condition (stored verbatim) or
-	// any JSON-marshalable value (map/struct), which is serialized to
-	// its JSON text. The SDK does not parse or validate the condition.
-	Filter any
-	// Options optionally declares select / multiselect choices at
-	// creation. Options can also be added later via PatchProperty
-	// (format.options.<key>.* paths). Nil for non-enumerated formats.
-	Options map[string]PropertyOption
-	// Meta optionally declares format-level config at creation. Nil when
-	// unset.
-	Meta map[string]string
+	// XFormat is the property's opaque descriptor — semantic slug,
+	// icon, ordering key, option set, relation targets, per-format
+	// config — as the consumer wrote it. The SDK stores it verbatim,
+	// never interprets it, and lets every path under it mutate
+	// (PatchProperty); a whole-bag write must be an object. Nil for
+	// definitions that carry none. Decoded from the record with plain
+	// Go values: nested objects as map[string]any, arrays as []any,
+	// numbers as float64, instants as time.Time, binaries as []byte,
+	// object ids as hex strings, float vectors as []float64. Every
+	// view is a fresh copy — the caller's to mutate.
+	XFormat map[string]any
 }
 
 // PropertyDraft is the input to TypesAPI.AddProperty. Kind, Items,
@@ -426,7 +375,6 @@ type PropertyDraft struct {
 	Name        string
 	Description string
 	XKey        string
-	XKind       string
 	Meta        map[string]string // opaque consumer flags — see PropertyDef.Meta
 	Kind        PropertyKind
 	Items       *PropertyDraft
@@ -439,25 +387,22 @@ type PropertyDraft struct {
 	// a new property (which mints a new propId).
 	Scope Scope
 
-	// Format optionally declares the value convention. Format.Type
-	// constrains Kind (links/tags/multiselect ⇒ array of string;
-	// select ⇒ string; date/datetime ⇒ datetime, with string still
-	// accepted for the ISO-8601 text convention) and, when Kind is
-	// zero, defaults it. Format.Type is pinned by the first write; UI, Filter, Options
-	// and Meta stay mutable via PatchProperty. FormatTags is reserved
-	// until the space-level tags table lands and is rejected.
-	Format *PropertyFormatDraft
+	// XFormat optionally declares the descriptor at creation, written
+	// as one whole object (see PropertyDef.XFormat). Values convert as
+	// Op.Value describes; nothing inside is validated — the consumer
+	// owns the vocabulary.
+	XFormat map[string]any
 }
 
 // PropertyPatch is a generic per-path patch to a property definition,
 // the input to PatchProperty.
 //
 // Set maps a dotted field path to its new value (values convert as
-// Op.Value describes and are not otherwise validated; format.* leaves
-// must be strings — the CRDT handler enforces this). Unset lists dotted field paths to remove (subtree removals are
-// allowed, e.g. "format.options.<key>" to delete a whole option). A path
-// present in neither is left unchanged. At least one entry across Set /
-// Unset is required.
+// Op.Value describes and are not otherwise validated). Unset lists
+// dotted field paths to remove (subtree removals are allowed, e.g.
+// "x-format.options.<key>" to delete a whole option). A path present in
+// neither is left unchanged. At least one entry across Set / Unset is
+// required.
 //
 // Pinned paths are rejected before any write (see PatchProperty).
 type PropertyPatch struct {
@@ -486,81 +431,3 @@ const (
 	// in JSON). The kind the `date` / `datetime` formats imply.
 	PropertyKindDatetime
 )
-
-// FormatType declares a property's value convention beyond its
-// structural Kind. Formats are annotations: the SDK checks only that
-// the declared format is compatible with the Kind — it never validates
-// values against the format (that's a consumer concern, e.g. the `any`
-// server checks that a datetime value parses).
-//
-// Value conventions per format:
-//   - FormatLinks:       array of "any://<objectId>" URI strings (see
-//     github.com/anyproto/any/anyuri — the format's home)
-//   - FormatDate:        a datetime value at midnight UTC (Kind
-//     datetime); "2006-01-02" strings when the property was declared
-//     with Kind string
-//   - FormatDatetime:    a datetime value (Kind datetime); RFC 3339
-//     strings when the property was declared with Kind string
-//   - FormatTags:        array of tag record ids referencing the space's
-//     tag table — reserved, not accepted by AddProperty yet
-//   - FormatSelect:      a single option key (string) chosen from the
-//     property's Format.Options set
-//   - FormatMultiselect: an array of option keys (strings) from
-//     Format.Options
-//
-// FormatSelect / FormatMultiselect carry the enumerated option set in
-// Format.Options (key → {name, color, pos, meta}). The SDK stores those
-// options but does NOT validate that a value is a member of the set —
-// membership, like every other value semantic, is a consumer concern.
-//
-// The zero value means "no format declared".
-type FormatType uint8
-
-const (
-	FormatLinks FormatType = iota + 1
-	FormatDate
-	FormatDatetime
-	FormatTags
-	FormatSelect
-	FormatMultiselect
-)
-
-// String returns the on-wire label ("links", "date", "datetime",
-// "tags", "select", "multiselect"), or "" for the zero/unknown value.
-func (f FormatType) String() string {
-	switch f {
-	case FormatLinks:
-		return "links"
-	case FormatDate:
-		return "date"
-	case FormatDatetime:
-		return "datetime"
-	case FormatTags:
-		return "tags"
-	case FormatSelect:
-		return "select"
-	case FormatMultiselect:
-		return "multiselect"
-	}
-	return ""
-}
-
-// ParseFormatType decodes the on-wire format label. Returns false on an
-// unknown label.
-func ParseFormatType(s string) (FormatType, bool) {
-	switch s {
-	case "links":
-		return FormatLinks, true
-	case "date":
-		return FormatDate, true
-	case "datetime":
-		return FormatDatetime, true
-	case "tags":
-		return FormatTags, true
-	case "select":
-		return FormatSelect, true
-	case "multiselect":
-		return FormatMultiselect, true
-	}
-	return 0, false
-}

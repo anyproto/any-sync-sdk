@@ -115,21 +115,26 @@ other. A definition is CRDT records:
 A bundle root that declares `Datasets` is a type object implementing
 itself (`any.types = ["__type__", rootId]`, `typeId == objectId`): its
 definitions live on the root exactly like this, and evolve through
-`Types().AddDataset` / `AddDatasetField` / `PatchDataset` with
-`typeId = rootId`. See `bundles.md § Bundle datasets`.
+`Types().AddDataset` / `AddDatasetField` / `PatchDataset` /
+`PatchDatasetField` with `typeId = rootId`. See `bundles.md § Bundle
+datasets`.
 
 - **Head record** (one per dataset; id minted client-side, unique):
   `def:"dataset"`, `collection` (the dataset name), `dynamic`,
   `idRule`/`idPattern`/`idMaxLen`, `deleteBy`, `skipHistory` — all
   pinned first-write; `displayName`, `description`, and the
-  `search.title`/`search.text`/`search.scope` leaves stay mutable (the
-  `format.ui`/`format.filter` model). `title`/`scope` are scalar
-  strings; `text` is a bare field key or a non-empty array of unique
-  keys (SYN-179).
+  `search.title`/`search.text`/`search.scope` leaves stay mutable
+  (leaves mutate, a broad `search` replace is pinned). `title`/`scope`
+  are scalar strings; `text` is a bare field key or a non-empty array
+  of unique keys (SYN-179).
 - **Field record** (one per field; id derived from the change):
   `def:"field"`, `dataset` (owning head id), `key`, `kind`, `scope`,
   `stamp`, `required`, `mutableBy`, `items`/`properties` — pinned;
-  `name`, `description` mutable.
+  `name`, `description` and the opaque `x-format` descriptor (every
+  path under it, any value — the same bag a property definition
+  carries, docs/06 § "The `x-format` descriptor") mutable via
+  `PatchDatasetField`. The descriptive slice never enters the schema
+  revision: editing it re-registers nothing.
 
 Record-per-field is what makes concurrent edits merge for free:
 creates are stateless-accepted content-addressed records, pinning is
@@ -253,9 +258,12 @@ JSON Schema document grows the behavioral keywords: standard
 `x-delete-by`, `x-id` / `x-id-pattern` / `x-id-max-length`, and
 `x-search {title, text, scope}` (`text`: a field key or an array of
 keys; a single key marshals as the bare string) — defaults omitted.
-`Types().Datasets(typeId)`
-returns the management view (definition ids, invalid state, display
-fields).
+Each field node also carries its descriptive slice when set: standard
+`description` and the opaque `x-format` bag, verbatim. That holds for
+compiled-in datasets too — a `handler.Field` declares the same
+`Description` / `XFormat`. `Types().Datasets(typeId)` returns the
+management view (definition ids, invalid state, display fields, the
+full value shape, the descriptor).
 
 ## Out of scope / limitations (v1)
 

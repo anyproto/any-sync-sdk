@@ -198,9 +198,9 @@ One record per definition. Shape:
 | `name` | string (human label) | CRDT-mutable |
 | `description` | string | CRDT-mutable |
 | `x-key` | string (caller-side mapping key) | CRDT-mutable |
-| `x-refType` | string (typeId) | superseded by `format` (never implemented) |
-| `x-kind` | string | CRDT-mutable |
-| `format` | object `{type, ui, filter}` | `format.type` first-write-wins; `format.ui` / `format.filter` CRDT-mutable |
+| `x-refType` | string (typeId) | superseded by `x-format.relation` (never implemented) |
+| `meta` | object (string → string) | CRDT-mutable consumer flags |
+| `x-format` | object — the opaque descriptor | CRDT-mutable, every path (see below) |
 | `enum` | array | additive (client-soft) |
 | `items` | object | recursive sub-shape (arrays) |
 | `properties` | object | recursive sub-shape (objects) |
@@ -238,31 +238,29 @@ Array-typed:
 
 any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": {"type":"string"}}`). Concurrent additions of different sub-fields merge; edits to the same sub-field follow field-level LWW.
 
-**`x-refType`** — superseded by `format` before it was ever implemented. Its use case ("this value points to objects of this type") is now expressed as `format: {type: "links", filter: {"type": {"$in": ["…"]}}}`. Kept in the table for historical context only.
+**`x-refType`** — superseded before it was ever implemented. Its use case ("this value points to objects of this type") is a consumer convention inside `x-format` (`{"type": "relation", "relation": {"targetTypes": […]}}`). Kept in the table for historical context only.
 
-### Property formats
+### The `x-format` descriptor
 
-`format` annotates a property with a value convention beyond its structural kind:
+`x-format` is everything descriptive about a property beyond its structural `kind` — the semantic slug, icon, ordering key, option set, relation targets, per-format config. The same bag sits on a dataset field (docs/17). The SDK stores it **opaquely**:
 
 ```json
-{ "id": "3XEMVWA6EK", "name": "related", "kind": "array",
-  "format": { "type": "links", "ui": "multiselect",
-              "filter": "{\"type\":{\"$in\":[\"page\"]}}" } }
+{ "id": "3XEMVWA6EK", "name": "Stage", "kind": "array", "items": { "kind": "string" },
+  "x-format": { "type": "choice", "pos": "a0",
+                "config": { "multiple": false },
+                "options": { "lead": { "name": "Lead", "color": "grey", "pos": "a0" } } } }
 ```
 
-- `format.type` — `links` (array of `any://<objectId>` URI strings), `date` (a `datetime` instant at midnight UTC; a `2006-01-02` string when declared `kind: string`), `datetime` (a `datetime` instant; an RFC 3339 string when declared `kind: string`), `select` (one option key — string), `multiselect` (array of option keys), `tags` (array of tag record ids — reserved until the space-level tag table lands). Pinned by the first write, like `kind`, because it constrains the kind (`links`/`tags`/`multiselect` ⇒ `array` of `string`; `select` ⇒ `string`; `date`/`datetime` ⇒ `datetime`, `string` still accepted).
-- `format.options` — for `select`/`multiselect`: a map keyed by each option's stable key (the stored value) → `{name, color, pos, meta?}` (string leaves; `pos` is a lexid order key). CRDT-mutable per path via `PatchProperty` (`format.options.<key>.*`); the key itself is immutable (re-add after delete to reuse). `format.meta` is an opaque format-level string bag. The SDK stores both opaquely and does NOT enforce value↔option-key membership.
-- `format.ui` — presentation hint (`select` / `multiselect` / `link` / `links`). Opaque string to the SDK; CRDT-mutable leaf.
-- `format.filter` — mongo-style condition over candidate objects, stored as its JSON **text** (a string leaf, so concurrent edits replace each other as a unit instead of field-merging two conditions). Opaque to the SDK; CRDT-mutable leaf.
-
-Validation split: the SDK enforces only structure at definition-write time (known `format.type`, the format→kind coupling, `ui`/`filter` are strings; format must be created as a whole object — dotted `format.*` creation keys are rejected). Semantics — ui vocabulary, filter syntax, and whether values actually match the format (a datetime parses, a link is a well-formed `any://` URI) — are a consumer concern (the `any` server validates them at its API boundary). Like `x-refType` before it, a format is value **metadata, not apply-time value validation**: reference integrity stays lazy/read-time.
+- **Two structural rules, nothing else.** It is an object — at create and on any later whole-bag `$set` — and a creation writes it whole (dotted `x-format.*` keys in a creation change are rejected, so there is exactly one creation shape to validate). No key inside is known to the SDK.
+- **Every path under it is CRDT-mutable** — the slug included — with any JSON value, via `PatchProperty`. Members follow the documented per-path LWW: a nested object's keys are edited independently (two authors adding two options both land), a single leaf replaces whole. Which members are nested and which are single leaves is the consumer's design (e.g. a filter is stored as one JSON-text leaf so two conditions never field-merge into garbage).
+- **`kind` is the guarantee, `x-format` is a hint.** Values are validated against `kind` at apply on every peer, never against the descriptor. Whether a value fits the slug — a link is a well-formed `any://` URI, a `date` lands on midnight UTC — is checked by the consumer at its write boundary (the `any` server), and the leaf-only patch rule ("a set targets a leaf, never a container") is enforced there too. Reference integrity stays lazy/read-time.
+- A definition without `x-format` renders structurally from `kind`. Registered (built-in) types declare theirs through `handler.PropertyDecl.XFormat`, surfaced by `Types().Properties()` exactly as written.
 
 ### Immutability rules
 
 **CRDT-hard (enforced at apply on every peer, convergent)**
 
 - **Per-record first-write-wins on `id` and `type`.** `id` is immutable (it's the record id); `type` is locked by the first write to the record. Each property is its own island — no cross-record binding, no silent-ignore rules between different property records.
-- **`format.type` is pinned at sub-path granularity.** Edits to `format.type` and broad replaces of the whole `format` object drop at apply (a broad replace could smuggle a type change past a handler that has no prior state); the `format.ui` / `format.filter` leaves stay writable.
 
 **Client-soft (SDK refuses to emit; honest clients comply, misbehaving peers bounded by read-tolerance)**
 
@@ -274,7 +272,7 @@ Validation split: the SDK enforces only structure at definition-write time (know
 
 **Freely mutable**
 
-- `name`, `description`, `x-key`, `x-kind`, `format.ui`, `format.filter` (string leaves only), sub-field additions, enum additions, constraint loosening.
+- `name`, `description`, `x-key`, `meta.<k>`, `x-format` and every path under it, sub-field additions, enum additions, constraint loosening.
 
 ### Same-name properties are not a conflict
 

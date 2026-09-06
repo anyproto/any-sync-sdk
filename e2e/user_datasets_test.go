@@ -10,6 +10,7 @@ import (
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/config"
+	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -17,6 +18,8 @@ import (
 // author-mutable body, freely-mutable summary, full stamp set,
 // author-gated deletes, caller-supplied ids.
 func articleDatasetDraft() space.DatasetDraft {
+	stageShape := handler.Leaf(handler.PropertyKindArray)
+	stageShape.Items = handler.Leaf(handler.PropertyKindString)
 	return space.DatasetDraft{
 		Name:        "articles",
 		DisplayName: "Articles",
@@ -24,9 +27,13 @@ func articleDatasetDraft() space.DatasetDraft {
 		DeleteBy:    space.DeleteByAuthor,
 		Search:      &space.SearchFields{Title: "title", Text: []string{"body"}, Scope: "articles"},
 		Fields: []space.DatasetFieldDraft{
-			{Key: "title", Kind: space.PropertyKindString, Required: true},
+			{Key: "title", Kind: space.PropertyKindString, Required: true,
+				Description: "Headline", XFormat: map[string]any{"type": "text", "icon": "heading"}},
 			{Key: "body", Kind: space.PropertyKindString, MutableBy: space.MutableByAuthor},
 			{Key: "summary", Kind: space.PropertyKindString, MutableBy: space.MutableByAnyone},
+			{Key: "stage", Kind: space.PropertyKindArray, MutableBy: space.MutableByAnyone,
+				Shape:   stageShape,
+				XFormat: map[string]any{"type": "choice", "config": map[string]any{"multiple": true}}},
 			{Key: "creator", Stamp: space.StampCreator},
 			{Key: "createdAt", Stamp: space.StampCreateTime},
 			{Key: "modifiedAt", Stamp: space.StampModifyTime},
@@ -82,7 +89,28 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.NotNil(t, def.Search)
 	assert.Equal(t, "articles", def.Search.Scope)
 	assert.Equal(t, []string{"body"}, def.Search.Text)
-	require.Len(t, def.Fields, 6)
+	require.Len(t, def.Fields, 7)
+
+	// The descriptive slice and the full shape round-trip.
+	fieldByKey := func(defs []space.DatasetDef, key string) space.DatasetFieldDef {
+		for _, f := range defs[0].Fields {
+			if f.Key == key {
+				return f
+			}
+		}
+		t.Fatalf("field %q not found", key)
+		return space.DatasetFieldDef{}
+	}
+	title := fieldByKey(defs, "title")
+	assert.Equal(t, "Headline", title.Description)
+	assert.Equal(t, map[string]any{"type": "text", "icon": "heading"}, title.XFormat)
+	stage := fieldByKey(defs, "stage")
+	assert.Equal(t, space.PropertyKindArray, stage.Kind)
+	require.NotNil(t, stage.Shape)
+	require.NotNil(t, stage.Shape.Items, "the sub-shape reads back")
+	assert.Equal(t, handler.Leaf(handler.PropertyKindString).Kind, stage.Shape.Items.Kind)
+	assert.Equal(t, "choice", stage.XFormat["type"])
+	assert.Nil(t, fieldByKey(defs, "body").XFormat, "a field without a descriptor reads back nil")
 
 	// Discovery includes the runtime dataset with its owning type. A
 	// single-key text mapping surfaces as the bare string — discovery
@@ -95,9 +123,29 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 			assert.Contains(t, string(ds.JSONSchema), `"x-search"`)
 			assert.Contains(t, string(ds.JSONSchema), `"scope":"articles"`)
 			assert.Contains(t, string(ds.JSONSchema), `"text":"body"`)
+			assert.Contains(t, string(ds.JSONSchema), `"x-format":{"icon":"heading","type":"text"}`)
+			assert.Contains(t, string(ds.JSONSchema), `"description":"Headline"`)
 		}
 	}
 	assert.True(t, discovered, "Datasets() must list the runtime dataset")
+
+	// Field patch: the display pair and any path under x-format mutate;
+	// the behavioral declaration is pinned; an unknown id is not found.
+	require.NoError(t, sp.Types().PatchDatasetField(ctx, typeId, title.Id, space.DatasetDefPatch{
+		Set:   map[string]any{"description": "The headline", "x-format.icon": "title", "x-format.config.maxLen": 120},
+		Unset: []string{"x-format.type"},
+	}))
+	defs, err = sp.Types().Datasets(ctx, typeId)
+	require.NoError(t, err)
+	title = fieldByKey(defs, "title")
+	assert.Equal(t, "The headline", title.Description)
+	assert.Equal(t, map[string]any{"icon": "title", "config": map[string]any{"maxLen": float64(120)}}, title.XFormat)
+	require.ErrorIs(t, sp.Types().PatchDatasetField(ctx, typeId, title.Id, space.DatasetDefPatch{
+		Set: map[string]any{"required": false},
+	}), space.ErrPinnedField)
+	require.ErrorIs(t, sp.Types().PatchDatasetField(ctx, typeId, "no-such-field", space.DatasetDefPatch{
+		Set: map[string]any{"name": "x"},
+	}), space.ErrNotFound)
 
 	// The text mapping patches to a key array (the ensure-drift path);
 	// malformed values are rejected up-front with ErrInvalidFieldValue

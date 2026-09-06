@@ -310,6 +310,14 @@ type Field struct {
 	MutableBy Mutability
 	// Stamp: apply-time derived value. Non-zero forces ScopeDerived.
 	Stamp Stamp
+
+	// Description and XFormat are the field's descriptive slice: a
+	// display description and the opaque descriptor bag (semantic slug,
+	// icon, options, …). Neither is enforced by any handler and neither
+	// enters the schema revision — editing them never re-registers a
+	// dataset. Rendered by discovery as `description` / `x-format`.
+	Description string
+	XFormat     map[string]any
 }
 
 // Dataset is a dataset's required, JSON-Schema-compatible declaration.
@@ -417,6 +425,12 @@ func (d Dataset) MarshalJSON() ([]byte, error) {
 		node := schemaToJSON(f.Schema)
 		if f.Name != "" {
 			node["title"] = f.Name
+		}
+		if f.Description != "" {
+			node["description"] = f.Description
+		}
+		if len(f.XFormat) > 0 {
+			node["x-format"] = f.XFormat
 		}
 		node["x-scope"] = f.Scope.String()
 		if f.MutableBy != MutableNever {

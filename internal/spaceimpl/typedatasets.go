@@ -49,12 +49,14 @@ func datasetPropertyKindToSchema(k space.PropertyKind) schema.Kind {
 // defaulting stamped kinds (creator ⇒ string, times ⇒ datetime).
 func draftFieldDecl(draft *space.DatasetFieldDraft) (schema.Field, error) {
 	f := schema.Field{
-		Id:        draft.Key,
-		Name:      draft.Name,
-		Scope:     draft.Scope,
-		Required:  draft.Required,
-		MutableBy: draft.MutableBy,
-		Stamp:     draft.Stamp,
+		Id:          draft.Key,
+		Name:        draft.Name,
+		Description: draft.Description,
+		Scope:       draft.Scope,
+		Required:    draft.Required,
+		MutableBy:   draft.MutableBy,
+		Stamp:       draft.Stamp,
+		XFormat:     draft.XFormat,
 	}
 	kind := datasetPropertyKindToSchema(draft.Kind)
 	if draft.Shape != nil {
@@ -191,8 +193,9 @@ func encodeDatasetHead(arena *anyenc.Arena, draft *space.DatasetDraft) *anyenc.V
 }
 
 // encodeDatasetField builds a field record payload from its resolved
-// declaration.
-func encodeDatasetField(arena *anyenc.Arena, headId string, draft *space.DatasetFieldDraft, decl *schema.Field) *anyenc.Value {
+// declaration. The descriptor bag rides as one whole object — the
+// handler's single creation shape — converted, never inspected.
+func encodeDatasetField(arena *anyenc.Arena, headId string, decl *schema.Field) (*anyenc.Value, error) {
 	payload := arena.NewObject()
 	payload.Set(typetype.DefFieldDef, arena.NewString(typetype.DefKindField))
 	payload.Set(typetype.DefFieldDataset, arena.NewString(headId))
@@ -212,10 +215,17 @@ func encodeDatasetField(arena *anyenc.Arena, headId string, draft *space.Dataset
 	if decl.Name != "" {
 		payload.Set(typetype.FieldName, arena.NewString(decl.Name))
 	}
-	if draft.Description != "" {
-		payload.Set(typetype.FieldDescription, arena.NewString(draft.Description))
+	if decl.Description != "" {
+		payload.Set(typetype.FieldDescription, arena.NewString(decl.Description))
 	}
-	return payload
+	if len(decl.XFormat) > 0 {
+		xf, err := encodeXFormat(arena, decl.XFormat)
+		if err != nil {
+			return nil, fmt.Errorf("typesAPI: field %q: XFormat: %w", decl.Id, err)
+		}
+		payload.Set(typetype.FieldXFormat, xf)
+	}
+	return payload, nil
 }
 
 // writeDatasetDefs is the shared LocalWrite helper for the defs dataset.
@@ -306,9 +316,13 @@ func datasetDefRecords(arena *anyenc.Arena, draft *space.DatasetDraft) (string, 
 		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, draft)}},
 	})
 	for i := range draft.Fields {
+		payload, err := encodeDatasetField(arena, headId, &decl.Fields[i])
+		if err != nil {
+			return "", nil, err
+		}
 		recs = append(recs, crdt.RecordChange{
 			Upsert: true, // empty Id → fieldDefId derived from ChangeId
-			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetField(arena, headId, &draft.Fields[i], &decl.Fields[i])}},
+			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
 		})
 	}
 	return headId, recs, nil
@@ -348,9 +362,13 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 		return "", fmt.Errorf("typesAPI: field %q would invalidate dataset %q: %w", decl.Id, def.Name, err)
 	}
 	arena := &anyenc.Arena{}
+	payload, err := encodeDatasetField(arena, datasetDefId, &decl)
+	if err != nil {
+		return "", err
+	}
 	res, err := t.writeDatasetDefs(ctx, typeId, crdt.RecordChange{
 		Upsert: true,
-		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetField(arena, datasetDefId, &draft, &decl)}},
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
 	})
 	if err != nil {
 		return "", err
@@ -525,6 +543,87 @@ func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch
 	return nil
 }
 
+// PatchDatasetField edits one field record's mutable leaves — name,
+// description, x-format and every path under it — via one multi-field
+// $set/$unset change. Pinned paths (the behavioral declaration) are
+// rejected up-front so the whole patch fails rather than partially
+// applying; the record must be a live field of typeId (with
+// Upsert=false a modify against an unknown id would silently no-op).
+func (t *typesAPI) PatchDatasetField(ctx context.Context, typeId, fieldDefId string, patch space.DatasetDefPatch) error {
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if fieldDefId == "" {
+		return errors.New("typesAPI: field definition id required")
+	}
+	if len(patch.Set) == 0 && len(patch.Unset) == 0 {
+		return nil
+	}
+	arena := &anyenc.Arena{}
+	setObj := arena.NewObject()
+	unsetObj := arena.NewObject()
+
+	checkPath := func(path string) error {
+		if path == "" {
+			return errors.New("typesAPI: patch path is empty")
+		}
+		segs := strings.Split(path, ".")
+		for _, s := range segs {
+			if s == "" {
+				return fmt.Errorf("typesAPI: patch path %q has an empty segment", path)
+			}
+		}
+		if typetype.IsDatasetFieldPinnedPath(segs) {
+			return fmt.Errorf("%w: path %q is pinned after first write", space.ErrPinnedField, path)
+		}
+		return nil
+	}
+	for path, val := range patch.Set {
+		if err := checkPath(path); err != nil {
+			return err
+		}
+		v, err := goToAnyenc(arena, val)
+		if err != nil {
+			return fmt.Errorf("typesAPI: patch dataset field: convert %q: %w", path, err)
+		}
+		setObj.Set(path, v)
+	}
+	for _, path := range patch.Unset {
+		if err := checkPath(path); err != nil {
+			return err
+		}
+		unsetObj.Set(path, arena.NewNull())
+	}
+
+	defs, err := t.Datasets(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range defs {
+		for _, f := range defs[i].Fields {
+			if f.Id == fieldDefId {
+				found = true
+			}
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: field definition %q on type %q", space.ErrNotFound, fieldDefId, typeId)
+	}
+
+	var ops []crdt.Op
+	if len(patch.Set) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: setObj})
+	}
+	if len(patch.Unset) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Payload: unsetObj})
+	}
+	if _, err := t.writeDatasetDefs(ctx, typeId, crdt.RecordChange{Id: fieldDefId, Ops: ops}); err != nil {
+		return fmt.Errorf("typesAPI: patch dataset field: %w", err)
+	}
+	return nil
+}
+
 func (t *typesAPI) Datasets(ctx context.Context, typeId string) ([]space.DatasetDef, error) {
 	compiled, err := t.parent.store.DatasetDefs(ctx, typeId)
 	if err != nil {
@@ -552,9 +651,7 @@ func (t *typesAPI) findDatasetDef(ctx context.Context, typeId, defId string) (sp
 }
 
 // defToDecl rebuilds the schema declaration a compiled DatasetDef
-// describes — for combined re-validation on additive evolution. Value
-// shapes reduce to leaf kinds (sufficient for the decl rules, which
-// never inspect nested shapes).
+// describes — for combined re-validation on additive evolution.
 func defToDecl(def *space.DatasetDef) schema.Dataset {
 	ds := schema.Dataset{
 		Dynamic:   def.Dynamic,
@@ -565,14 +662,20 @@ func defToDecl(def *space.DatasetDef) schema.Dataset {
 		Search:    def.Search,
 	}
 	for _, f := range def.Fields {
+		shape := f.Shape
+		if shape == nil {
+			shape = schema.Leaf(datasetPropertyKindToSchema(f.Kind))
+		}
 		ds.Fields = append(ds.Fields, schema.Field{
-			Id:        f.Key,
-			Name:      f.Name,
-			Schema:    schema.Leaf(datasetPropertyKindToSchema(f.Kind)),
-			Scope:     f.Scope,
-			Required:  f.Required,
-			MutableBy: f.MutableBy,
-			Stamp:     f.Stamp,
+			Id:          f.Key,
+			Name:        f.Name,
+			Description: f.Description,
+			Schema:      shape,
+			Scope:       f.Scope,
+			Required:    f.Required,
+			MutableBy:   f.MutableBy,
+			Stamp:       f.Stamp,
+			XFormat:     f.XFormat,
 		})
 	}
 	return ds
@@ -596,12 +699,15 @@ func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 	}
 	for i, f := range c.Schema.Fields {
 		fd := space.DatasetFieldDef{
-			Key:       f.Id,
-			Name:      f.Name,
-			Scope:     f.Scope,
-			Required:  f.Required,
-			MutableBy: f.MutableBy,
-			Stamp:     f.Stamp,
+			Key:         f.Id,
+			Name:        f.Name,
+			Description: f.Description,
+			Shape:       f.Schema,
+			Scope:       f.Scope,
+			Required:    f.Required,
+			MutableBy:   f.MutableBy,
+			Stamp:       f.Stamp,
+			XFormat:     f.XFormat,
 		}
 		if i < len(c.FieldDefIds) {
 			fd.Id = c.FieldDefIds[i]

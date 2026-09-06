@@ -135,11 +135,13 @@ content.
 
 ## Bundle-declared types: self-typed roots
 
-A bundle may declare a **full type** on its root: `Parts` (with their
-datasets), `Properties`, `Layout`, `Weight`, `Hidden` — any of them
-(`EnsureBundleRequest.DeclaresType`). The root then carries
-`any.types = ["__type__", rootId]`: it is a type object implementing
-itself, `typeId = rootId`. Two shapes come out of the same mechanism:
+A bundle may declare a **full type** on its root: `XKey`, `Parts`
+(with their datasets), `Properties`, `Layout`, `Weight`, `Hidden` —
+a declaration is `Parts`, `Properties` or an `XKey`
+(`EnsureBundleRequest.DeclaresType`); the metadata needs one. The root
+then carries `any.types = ["__type__", rootId]`: it is a type object
+implementing itself, `typeId = rootId`. Three shapes come out of the
+same mechanism:
 
 - a **records host** — a root that exists to hold its bundle's data
   (favourites entries, an app's setup state). It asks for `Hidden`,
@@ -147,10 +149,35 @@ itself, `typeId = rootId`. Two shapes come out of the same mechanism:
   which would grant that object the bundle's collections;
 - a **type objects carry** — a page whose part shares the editor, a
   wiki whose properties are the tree (`parentId` / `pos`). It declares
-  `Properties` / `Layout` / `Weight` and stays listed.
+  `Properties` / `Layout` / `Weight` and stays listed;
+- a **marker type** — an `XKey` and nothing else: a flag objects carry
+  ("Template", "Archived"), resolvable by its handle, with no columns
+  and no parts.
 
 `Hidden` is explicit: nothing is implied from the shape of the
-declaration.
+declaration. `XKey` is the type's handle (`TypeInfo.XKey`, stored as
+`type.xkey`): what a consumer resolves the type by and what another
+declaration's `relation.targetTypes` names. The SDK stores it as
+non-unique metadata; handle uniqueness is the consumer's rule.
+
+**One stamp, root + 3 changes.** The root's first content change
+carries everything the row needs: the types it implements (the marker
+and its own id, `RootTypes`, every type `RootProperties` writes into —
+`$addToSet` each, never a whole-array set), `any.name`, the type
+metadata (`type.xkey` / `layout` / `weight` / `hidden`) and the seeded
+`RootProperties` values, in one `objects` change. The apply-side
+preflight grants every namespace the change itself attaches, so the
+metadata and the seeded values validate alongside the attach. Then the
+registry row (on the index object), then the declarations — one
+`properties` change, one `datasets` change. A whole type therefore
+takes three changes on its tree, each dataset landing atomically; a
+peer may briefly see the definitions before the parts. Landing all
+three in one any-sync change needs a multi-dataset change format
+(05a-crdt-spec § 6.3), which is deferred. `RootTypes` /
+`RootProperties` apply to every root Ensure mints — derived, or the
+SDK-minted created root of a type-declaring request (one object that
+is both a type and, say, a `miniapp` carrier) — and are refused with
+`NewRoot`, whose root got its state from the caller.
 
 `Parts` declares parts with their datasets (the `PartDraft` /
 `DatasetDraft` vocabulary of `17-user-datasets.md`). Nothing else is
@@ -185,8 +212,8 @@ they need `Parts` or `Properties` — alone they are
 `ErrBundleBadRequest`, like a `Layout` that cannot be encoded, before
 any root is minted.
 
-- Declarations are written after the root's types and the registry
-  row (below), parts in one change, properties in one change.
+- Declarations are written after the stamp and the registry row
+  (below), parts in one change, properties in one change.
 - An adopt heals what is **absent**, never patches. Parts: only on a
   root that carries no part declaration at all (crash before the
   declaring write, a row adopted before the root tree synced); a root
@@ -201,8 +228,8 @@ any root is minted.
   through `Types().AddPart` / `AddDataset` / `AddDatasetField` /
   `PatchDataset` / `AddProperty` / `PatchProperty` with `typeId =
   rootId`. Adopting never renames the root or touches its layout,
-  weight or hidden flag either: the stamp is written only when the
-  root carries no name.
+  weight, hidden flag or xKey either: the stamp is written only when
+  the root carries no name.
 - A part naming a **reserved** module (`handler.Module.Reserved`) is
   refused with `ErrModuleReserved` unless the call carries the
   `space.SystemInstall()` option — the consumer's own catalog install.

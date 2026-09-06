@@ -498,3 +498,141 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, childA, childB)
 }
+
+// TestE2E_BundlesSelfTypedCreatedRoot covers the SDK-minted created
+// root of a type-declaring request. The root's first change carries
+// its types, name, type metadata and seeded values together, so an
+// install is root + 3 changes (objects, properties, datasets); XKey
+// reads back as the type's handle; RootTypes / RootProperties land on
+// a created root; an XKey alone is a marker type (root + 1 change)
+// objects can carry; a derived root gets the same one-change stamp.
+func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
+	t.Parallel()
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+	t.Logf("using any-sync network config from %s", confPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	sdk, err := anysyncsdk.Open(ctx, config.Config{
+		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+		Network: config.Network{NodeConfYAML: yaml},
+	}, newFixedSeedProvider(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "SelfTypedRoot"})
+	if err != nil {
+		if isNoNetworkErr(err) {
+			t.Skipf("network unreachable on space create: %v", err)
+		}
+		t.Fatalf("Spaces().Create: %v", err)
+	}
+
+	changesByDataset := func(objectId string) map[string]int {
+		t.Helper()
+		list, err := sp.History().ListChanges(ctx, objectId, space.HistoryFilter{}, 0, "")
+		require.NoError(t, err, "ListChanges(%s)", objectId)
+		out := map[string]int{}
+		for _, c := range list.Changes {
+			out[c.Dataset]++
+		}
+		return out
+	}
+	typesOf := func(objectId string) []string {
+		t.Helper()
+		row, err := sp.Properties().Get(ctx, objectId)
+		require.NoError(t, err)
+		var out []string
+		for _, v := range row.GetArray("any", "types") {
+			out = append(out, string(v.GetStringBytes()))
+		}
+		return out
+	}
+
+	// A user type whose id and property the bundle root carries as an
+	// extra type with a seeded value — the miniapp shape.
+	movieType, titleProp := setupMovieType(t, ctx, sp)
+
+	req := space.EnsureBundleRequest{
+		Id: "wiki/v1", Name: "Wiki", XKey: "wiki", Hidden: true,
+		RootTypes:      []string{movieType},
+		RootProperties: map[string]map[string]any{movieType: {titleProp: "seeded"}},
+		Properties:     []space.PropertyDraft{{XKey: "parentId", Name: "Parent", Kind: space.PropertyKindString}},
+		Parts:          []space.PartDraft{articlesPart()},
+		Layout:         map[string]any{"type": "page"},
+	}
+	inst, didInstall, err := sp.Bundles().Ensure(ctx, req)
+	require.NoError(t, err, "Ensure(created, self-typed)")
+	require.True(t, didInstall)
+	require.False(t, inst.Derived)
+	root := inst.RootId
+
+	info, err := sp.Types().Get(ctx, root)
+	require.NoError(t, err)
+	assert.Equal(t, "wiki", info.XKey, "XKey is the type's handle")
+	assert.True(t, info.Hidden)
+	assert.Equal(t, map[string]any{"type": "page"}, info.Layout)
+	assert.Equal(t, "Wiki", info.Name)
+
+	assert.ElementsMatch(t, []string{"__type__", root, movieType}, typesOf(root),
+		"marker, self and the root types, attached in the stamp")
+	row, err := sp.Properties().Get(ctx, root)
+	require.NoError(t, err)
+	assert.Equal(t, "seeded", string(row.Get(movieType, titleProp).GetStringBytes()),
+		"RootProperties seed a created root")
+
+	// Root + 3: the stamp (objects), the definitions (properties), the
+	// parts (datasets) — no attach-then-name chatter.
+	assert.Equal(t, map[string]int{"objects": 1, "properties": 1, "datasets": 1}, changesByDataset(root))
+
+	props, err := sp.Types().Properties(ctx, root)
+	require.NoError(t, err)
+	require.Len(t, props, 1)
+	assert.Equal(t, "parentId", props[0].XKey)
+	defs, err := sp.Types().Datasets(ctx, root)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+
+	// Adopt writes nothing.
+	_, didInstall, err = sp.Bundles().Ensure(ctx, req)
+	require.NoError(t, err)
+	require.False(t, didInstall)
+	assert.Equal(t, map[string]int{"objects": 1, "properties": 1, "datasets": 1}, changesByDataset(root),
+		"adopt must not add a change")
+
+	// A marker type: an XKey alone, no columns, no parts. Root + 1.
+	flag, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: "flag/v1", Name: "Flag", XKey: "flag"})
+	require.NoError(t, err, "Ensure(marker type)")
+	require.True(t, didInstall)
+	flagInfo, err := sp.Types().Get(ctx, flag.RootId)
+	require.NoError(t, err)
+	assert.Equal(t, "flag", flagInfo.XKey)
+	assert.ElementsMatch(t, []string{"__type__", flag.RootId}, typesOf(flag.RootId))
+	assert.Equal(t, map[string]int{"objects": 1}, changesByDataset(flag.RootId))
+	carrier, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{flag.RootId}})
+	require.NoError(t, err)
+	assert.Contains(t, typesOf(carrier), flag.RootId, "objects carry a marker type")
+
+	// A derived root gets the same one-change stamp: types, name and
+	// seeded values together, then its declarations.
+	der, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "chat/v1", Name: "Chat", DerivedRoot: true, XKey: "general_chat", Hidden: true,
+		RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
+		Parts:          []space.PartDraft{articlesPart()},
+	})
+	require.NoError(t, err, "Ensure(derived)")
+	require.True(t, didInstall)
+	require.True(t, der.Derived)
+	assert.ElementsMatch(t, []string{"__type__", der.RootId}, typesOf(der.RootId), "`any` is never attached")
+	drow, err := sp.Properties().Get(ctx, der.RootId)
+	require.NoError(t, err)
+	assert.Equal(t, "seeded", string(drow.Get("any", "description").GetStringBytes()))
+	dinfo, err := sp.Types().Get(ctx, der.RootId)
+	require.NoError(t, err)
+	assert.Equal(t, "general_chat", dinfo.XKey)
+	assert.Equal(t, map[string]int{"objects": 1, "datasets": 1}, changesByDataset(der.RootId))
+}

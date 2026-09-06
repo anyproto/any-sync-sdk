@@ -186,8 +186,11 @@ type Store struct {
 	// of every catalog snapshot; its namespaced module datasets are
 	// registrations built once here (staticInstanceRegs, module by
 	// collection in staticInstanceModule), owned through datasetOwners.
-	staticSharedOwners   map[string]map[string]struct{}
-	staticModuleOwners   map[string]map[string]struct{}
+	staticSharedOwners map[string]map[string]struct{}
+	staticModuleOwners map[string]map[string]struct{}
+	// reservedModules are the configured modules with Reserved set —
+	// the one-branch fast path of ReservedCarrier when there are none.
+	reservedModules      []string
 	staticInstanceRegs   []crdt.HandlerReg
 	staticInstanceModule map[string]string
 
@@ -526,6 +529,11 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	s.moduleInfos = types.NewModules(infos...)
+	for _, m := range cfg.Modules {
+		if m.Reserved {
+			s.reservedModules = append(s.reservedModules, m.Name)
+		}
+	}
 	// Static parts: a registered type's module datasets are ownership
 	// (shared) or registrations (namespaced), settled once here — the
 	// same footing a runtime declaration reaches through the catalog.
@@ -1126,14 +1134,11 @@ func (s *Store) objectsHandler() *properties.SystemPropertiesHandler {
 // module attachable. The properties handler consults it on the local
 // write pre-flight.
 func (s *Store) ReservedCarrier(typeId string) bool {
-	if s == nil {
+	if s == nil || len(s.reservedModules) == 0 {
 		return false
 	}
 	snap := s.catalog.snapshot()
-	for module, mi := range s.Modules() {
-		if !mi.Reserved {
-			continue
-		}
+	for _, module := range s.reservedModules {
 		if _, static := s.staticModuleOwners[module][typeId]; static {
 			continue
 		}

@@ -310,10 +310,10 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 	if h.Registry == nil || ch == nil {
 		return nil
 	}
-	pf := h.buildPreflight(ch, before)
 	if verr := h.checkReservedCarriers(ch, before); verr != nil {
 		return verr
 	}
+	pf := h.buildPreflight(ch, before)
 	for ri := range ch.Records {
 		rc := &ch.Records[ri]
 		for oi := range rc.Ops {
@@ -328,11 +328,29 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 // checkReservedCarriers refuses a local change attaching a reserved
 // carrier type (ReservedCarrier) to any row but the type's own. Only
 // the types this change ADDS are checked — a row already carrying one
-// (its own root, or an inbound copy) keeps writing. The row id is the
-// record's: on the shared objects collection every record id is the
-// object id (the change's ObjectId is stamped later, by the pipeline).
+// (its own root, or an inbound copy) keeps writing. The row is the
+// change's ObjectId — on the shared objects collection the controller
+// stamps it before the pre-flight, and a caller's record id is never
+// the row — so an unstamped change fails closed. Allocates only when
+// an op touches any.types.
 func (h *SystemPropertiesHandler) checkReservedCarriers(ch *crdt.Change, before *anyenc.Value) *ValidationError {
 	if h.ReservedCarrier == nil {
+		return nil
+	}
+	var added map[string]struct{}
+	for ri := range ch.Records {
+		for oi := range ch.Records[ri].Ops {
+			op := &ch.Records[ri].Ops[oi]
+			if !touchesTypes(op) {
+				continue
+			}
+			if added == nil {
+				added = map[string]struct{}{}
+			}
+			collectTypeAdditions(op, added)
+		}
+	}
+	if len(added) == 0 {
 		return nil
 	}
 	existing := map[string]struct{}{}
@@ -341,29 +359,31 @@ func (h *SystemPropertiesHandler) checkReservedCarriers(ch *crdt.Change, before 
 			existing[string(v.GetStringBytes())] = struct{}{}
 		}
 	}
-	for ri := range ch.Records {
-		rc := &ch.Records[ri]
-		rowId := rc.Id
-		if rowId == "" {
-			rowId = ch.ObjectId
+	for typeId := range added {
+		if typeId == ch.ObjectId {
+			continue
 		}
-		added := map[string]struct{}{}
-		for oi := range rc.Ops {
-			collectTypeAdditions(&rc.Ops[oi], added)
+		if _, had := existing[typeId]; had {
+			continue
 		}
-		for typeId := range added {
-			if typeId == rowId {
-				continue
-			}
-			if _, had := existing[typeId]; had {
-				continue
-			}
-			if h.ReservedCarrier(typeId) {
-				return &ValidationError{Reason: ReasonReservedCarrier, TypeId: typeId, ObjectId: rowId}
-			}
+		if h.ReservedCarrier(typeId) {
+			return &ValidationError{Reason: ReasonReservedCarrier, TypeId: typeId, ObjectId: ch.ObjectId}
 		}
 	}
 	return nil
+}
+
+// touchesTypes reports whether collectTypeAdditions could read an
+// any.types addition off the op: the multi-field $set, or a
+// single-path op on ["any","types"].
+func touchesTypes(op *crdt.Op) bool {
+	switch {
+	case len(op.Path) == 0:
+		return op.Type == crdt.OpSet
+	case len(op.Path) == 2:
+		return op.Path[0] == anytype.TypeId && op.Path[1] == "types"
+	}
+	return false
 }
 
 // preflight carries the local-write membership set (the typeIds the

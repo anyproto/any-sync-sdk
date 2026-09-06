@@ -247,7 +247,7 @@ cannot be encoded, before any root is minted.
   the DAG stays valid on apply. The root that declares it is the
   module's only carrier: attaching its type to another object is
   refused at local write time (`handler.ErrValidationReservedCarrier`,
-  docs/17 § Model).
+  docs/17 § Model — the write side only; apply stays read-tolerant).
 - Collections cannot collide: a namespaced dataset is `<rootId>_<key>`
   and a shared one is the module's canonical collection, so two
   bundles in one space may use the same keys and there is no name

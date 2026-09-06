@@ -767,10 +767,21 @@ func TestPreValidate_ReservedCarrier(t *testing.T) {
 	payload.Set("any.types", arr)
 	require.ErrorIs(t, h.PreValidate(multiFieldChange(payload), nil), properties.ErrReservedCarrier)
 
-	// The type's own root, and a row already carrying it, pass.
+	// The type's own root passes — identified by the change's ObjectId
+	// (what the controller stamps for the shared objects row), in the
+	// empty-id upsert form too. A record id naming the root on another
+	// object's change is not the row and does not pass; an unstamped
+	// change fails closed.
 	own := singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT))
-	own.Records[0].Id = reservedT
+	own.ObjectId, own.Records[0].Id = reservedT, ""
 	require.NoError(t, h.PreValidate(own, nil))
+	spoof := singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT))
+	spoof.Records[0].Id = reservedT
+	require.ErrorIs(t, h.PreValidate(spoof, nil), properties.ErrReservedCarrier)
+	unstamped := singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT))
+	unstamped.ObjectId, unstamped.Records[0].Id = "", ""
+	require.ErrorIs(t, h.PreValidate(unstamped, nil), properties.ErrReservedCarrier)
+	// A row already carrying it passes.
 	require.NoError(t, h.PreValidate(
 		singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT)),
 		beforeWithTypes(a, reservedT)))

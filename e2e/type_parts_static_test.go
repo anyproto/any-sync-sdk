@@ -31,7 +31,8 @@ func secretModule() handler.Module {
 
 // docType is a registered, hidden type with static parts: a body that
 // shares the notes module and carries a namespaced notes instance, and
-// a hidden part owning a static records dataset.
+// a hidden part owning a static records dataset and a static
+// declaration of the reserved module.
 func docType() handler.Type {
 	return handler.Type{
 		Id: "doc", Name: "Document", Hidden: true,
@@ -44,7 +45,7 @@ func docType() handler.Type {
 		Parts: []handler.Part{
 			{Key: "body", Name: "Body", Pos: "a0", UI: map[string]any{"type": "document"},
 				Datasets: []handler.PartDataset{{Module: "notes", Shared: true}, {Module: "notes", Key: "summary"}}},
-			{Key: "meta", Hidden: true, Datasets: []handler.PartDataset{{Name: "doc_meta"}}},
+			{Key: "meta", Hidden: true, Datasets: []handler.PartDataset{{Name: "doc_meta"}, {Module: "secret", Shared: true}}},
 		},
 	}
 }
@@ -101,14 +102,15 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	assert.Equal(t, "doc_summary", parts[0].Datasets[1].Collection)
 	assert.Equal(t, "notes", parts[0].Datasets[1].Module)
 	assert.True(t, parts[1].Hidden)
-	require.Len(t, parts[1].Datasets, 1)
+	require.Len(t, parts[1].Datasets, 2)
+	assert.Equal(t, "secret_shared", parts[1].Datasets[1].Collection)
 	assert.Equal(t, "doc_meta", parts[1].Datasets[0].Collection)
 	assert.Equal(t, space.RecordsModule, parts[1].Datasets[0].Module)
 	require.Len(t, parts[1].Datasets[0].Fields, 1)
 	assert.Equal(t, "label", parts[1].Datasets[0].Fields[0].Key)
 	defs, err := sp.Types().Datasets(ctx, "doc")
 	require.NoError(t, err)
-	assert.Len(t, defs, 3)
+	assert.Len(t, defs, 4)
 	_, err = sp.Types().AddPart(ctx, "doc", space.PartDraft{Key: "x", Datasets: []space.DatasetDraft{{Module: "notes", Key: "y"}}})
 	require.ErrorIs(t, err, space.ErrTypeRegistered)
 	_, err = sp.Types().AddDataset(ctx, "doc", "body", space.DatasetDraft{Module: "notes", Key: "y"})
@@ -187,7 +189,7 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	for _, ds := range sp.Datasets() {
 		seen[ds.Name] = ds
 	}
-	assert.Equal(t, []string{inst.RootId}, seen["secret_shared"].Owners)
+	assert.ElementsMatch(t, []string{"doc", inst.RootId}, seen["secret_shared"].Owners)
 	require.NoError(t, write(inst.RootId, "secret_shared", "text", "hush"))
 	root, err := sp.Types().Get(ctx, inst.RootId)
 	require.NoError(t, err)
@@ -205,8 +207,16 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 		Records: []space.RecordModify{{Id: bare, Ops: []space.Op{{Type: space.OpAddToSet, Path: "any.types", Value: inst.RootId}}}},
 	})
 	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
+	// A record id naming the root is not the row: the objects
+	// collection's row is the change's object.
+	_, err = sp.Modify(ctx, space.ModifyBatch{
+		ObjectId: bare, Dataset: "objects",
+		Records: []space.RecordModify{{Id: inst.RootId, Upsert: true, Ops: []space.Op{{Type: space.OpAddToSet, Path: "any.types", Value: inst.RootId}}}},
+	})
+	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
 	require.ErrorIs(t, write(bare, "secret_shared", "text", "nope"), space.ErrDatasetNotDeclared)
 	_, err = sp.Properties().AttachType(ctx, bare, "doc")
 	require.NoError(t, err, "a registered type's static declaration of the module is attachable")
 	require.NoError(t, write(bare, "notes_shared", "text", "ok"))
+	require.NoError(t, write(bare, "secret_shared", "text", "through the static declaration"))
 }

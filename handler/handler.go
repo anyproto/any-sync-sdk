@@ -482,7 +482,12 @@ type Module struct {
 	// consumer's own catalog install). Registered types may still
 	// declare it statically, and a declaration that reached the DAG
 	// stays valid on apply (a peer that admitted it was the consumer's
-	// own install). Requires SharedOnly.
+	// own install). Requires SharedOnly. The install root is also the
+	// module's only carrier: a local write attaching a user type that
+	// declares a reserved module to any other row is refused
+	// (ErrValidationReservedCarrier) — no SystemInstall escape, the
+	// consumer's install attaches the type through its root alone. A
+	// registered type's static declaration stays attachable.
 	Reserved bool
 
 	// DataVersion is stamped on changes to the Canonical collection —

@@ -426,8 +426,8 @@ func validateTechEnsureRequest(req space.EnsureBundleRequest) error {
 	if req.NewRoot != nil {
 		return fmt.Errorf("spaceimpl: %w: NewRoot is not available on the tech space — Ensure mints the root", space.ErrBundleBadRequest)
 	}
-	if len(req.Parts) == 0 && len(req.Properties) == 0 {
-		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Parts or Properties", space.ErrBundleBadRequest)
+	if !req.DeclaresType() {
+		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare a type (Parts, Properties or XKey)", space.ErrBundleBadRequest)
 	}
 	if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
 		return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties are not available on the tech space — a tech bundle root is its own type", space.ErrBundleBadRequest)

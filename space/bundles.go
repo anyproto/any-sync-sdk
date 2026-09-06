@@ -22,9 +22,11 @@ var (
 	// ErrBundleUnknown — no live record for the bundle id.
 	ErrBundleUnknown = errors.New("bundle unknown")
 	// ErrBundleBadRequest — structurally invalid input: empty bundle
-	// id, nil NewRoot, empty root id, DerivedRoot-only fields on a
-	// created root, an invalid or duplicate part / dataset declaration,
-	// or a tech-space request that is not derived-only with Parts.
+	// id, no root strategy, both strategies, RootTypes / RootProperties
+	// next to NewRoot, a seeded value that cannot be encoded, an
+	// invalid or duplicate part / dataset / property declaration,
+	// metadata without a declaration, or a tech-space request with
+	// NewRoot or without a declaration.
 	ErrBundleBadRequest = errors.New("bundle bad request")
 	// ErrBundleNotLoser — ResolveLoser target is not a loser of the
 	// bundle: it is the current winner, or was never claimed in roots.
@@ -105,17 +107,24 @@ type EnsureBundleRequest struct {
 	// above all the 1-1 general chat, where the convergence gate cannot
 	// work — never for anything a user may remove or for id convenience.
 	DerivedRoot bool
-	// RootTypes are attached to the derived root at materialization,
-	// idempotently. DerivedRoot only — a created root gets its types
-	// from NewRoot.
+	// RootTypes are attached to the root Ensure mints — the derived
+	// root, or the SDK-minted created root of a type-declaring request
+	// — in the same change as its name and type metadata, and on every
+	// later Ensure a type the row lacks is attached ($addToSet,
+	// idempotent), so a request that gains a root type reaches an
+	// existing install. A caller-minted root (NewRoot) gets its types
+	// from NewRoot and refuses them here.
 	RootTypes []string
-	// RootProperties seeds the derived root's property values, keyed
-	// typeId → propId → value, written before the install is
-	// registered so a failed seed leaves no install to adopt. Every
-	// keyed type is attached along with RootTypes — a property write
-	// to a type the object does not implement is rejected. The root's
-	// own id is not a usable key: the root's own property ids are not
-	// known before the install. DerivedRoot only.
+	// RootProperties seeds the root's property values, keyed typeId →
+	// propId → value, in that same change (their own op), before the
+	// install is registered, so a failed seed leaves no install to
+	// adopt. Install only — an adopt never re-seeds, the installer's
+	// values sync in. Every keyed type is attached along with
+	// RootTypes — a property write to a type the object does not
+	// implement is rejected. Values are checked to encode before any
+	// root is minted. The root's own id is not a usable key: the
+	// root's own property ids are not known before the install. Roots
+	// Ensure mints only, like RootTypes.
 	RootProperties map[string]map[string]any
 
 	// Parts declares parts (with their datasets) on the root — derived
@@ -158,24 +167,34 @@ type EnsureBundleRequest struct {
 	// AddProperty validates them, before any root is minted.
 	Properties []PropertyDraft
 
+	// XKey is the root type's handle (TypeInfo.XKey, stored as
+	// `type.xkey`): the stable slug a consumer resolves the type by, and
+	// what `relation.targetTypes` in other declarations name. An XKey
+	// alone is a type declaration — a MARKER type objects carry as a
+	// flag, with no columns and no parts. Written with the name stamp
+	// on install; on adopt it is filled in only when the root carries
+	// none (an install that predates the handle), never changed. Not
+	// unique on the SDK side: the consumer enforces handle uniqueness.
+	XKey string
 	// Layout, Weight and Hidden seed the root type's rendering and
 	// listing metadata (TypeInfo.Layout / Weight / Hidden) with the
 	// name stamp, on install only — adopt never patches them. They
-	// describe a type, so they need Parts or Properties
-	// (ErrBundleBadRequest otherwise). Hidden is EXPLICIT: a root that
-	// only hosts its bundle's records should ask for it, since a listed
-	// type is one a client may attach elsewhere, granting that object
-	// the bundle's collections; a root that is a type objects carry (a
-	// page, a wiki) stays listed.
+	// describe a type, so they need a type declaration — Parts,
+	// Properties or XKey (ErrBundleBadRequest otherwise). Hidden is
+	// EXPLICIT: a root that only hosts its bundle's records should ask
+	// for it, since a listed type is one a client may attach elsewhere,
+	// granting that object the bundle's collections; a root that is a
+	// type objects carry (a page, a wiki) stays listed.
 	Layout map[string]any
 	Weight int
 	Hidden bool
 }
 
 // DeclaresType reports whether the request makes the root a type
-// implementing itself — Parts or Properties.
+// implementing itself — Parts, Properties, or an XKey alone (a marker
+// type).
 func (r EnsureBundleRequest) DeclaresType() bool {
-	return len(r.Parts) > 0 || len(r.Properties) > 0
+	return len(r.Parts) > 0 || len(r.Properties) > 0 || r.XKey != ""
 }
 
 // EnsureOption tunes one Ensure call. Options carry what must never
@@ -242,16 +261,22 @@ type BundlesAPI interface {
 	// may already carry a created install of the same id — see
 	// docs/bundles.md § Derived roots.
 	//
-	// With Parts the derived root is stamped as a type implementing
-	// itself and the declarations are written on it before the
-	// registry row, so a crash mid-install leaves no install to adopt
-	// and the retry re-runs idempotently. Two devices declaring the
-	// same name concurrently converge on one definition after sync;
-	// a DefId read before convergence may change — look definitions
-	// up by name when evolving them.
+	// A type-declaring root (Parts, Properties or XKey) is stamped as
+	// a type implementing itself: the root's first change carries its
+	// types (`__type__`, its own id, RootTypes), `any.name`, the type
+	// metadata (`type.xkey` / `weight` / `layout` / `hidden`) and the
+	// RootProperties values together — one `objects` change — then the
+	// registry row, then the declarations (one `properties` change,
+	// one `datasets` change): root + 3 changes. A crash mid-install
+	// leaves a registered row the retry heals idempotently. Two devices
+	// declaring the same name concurrently converge on one definition
+	// after sync; a DefId read before convergence may change — look
+	// definitions up by name when evolving them.
 	//
-	// On the tech space (Service.Get(SDK.TechSpaceId())) bundles are
-	// derived-only and must declare Parts; NewRoot is refused.
+	// On the tech space (Service.Get(SDK.TechSpaceId())) roots are
+	// minted by Ensure only — NewRoot is refused — and a type
+	// declaration (Parts, Properties or XKey) is required; both root
+	// strategies are available.
 	//
 	// The bool reports whether THIS call registered the install.
 	// False means an existing one was adopted — which for a derived

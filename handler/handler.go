@@ -92,6 +92,12 @@ var (
 	ErrValidationTypeUnknown        = properties.ErrTypeUnknown
 	ErrValidationUnknownProperty    = properties.ErrUnknownProperty
 	ErrValidationKindMismatch       = properties.ErrKindMismatch
+	// ErrValidationReservedCarrier — the write attaches a user type
+	// declaring a reserved module (Module.Reserved) to a row other
+	// than the type's own root. The consumer's install root is the
+	// only carrier; a client cannot mint another instance of a
+	// reserved module by attaching the type.
+	ErrValidationReservedCarrier = properties.ErrReservedCarrier
 )
 
 // ValidationReason is the machine-readable cause of a property-write
@@ -107,6 +113,7 @@ const (
 	ReasonTypeUnknown        ValidationReason = properties.ReasonTypeUnknown
 	ReasonUnknownProperty    ValidationReason = properties.ReasonUnknownProperty
 	ReasonKindMismatch       ValidationReason = properties.ReasonKindMismatch
+	ReasonReservedCarrier    ValidationReason = properties.ReasonReservedCarrier
 )
 
 // ClassifyValidation maps a property-validation rejection to its cause

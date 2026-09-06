@@ -96,6 +96,15 @@ type SystemPropertiesHandler struct {
 	// hold — the modules those types declare datasets of. Nil grants
 	// nothing beyond any.types.
 	Grants func(members map[string]struct{}) []string
+
+	// ReservedCarrier reports whether a user type declares a reserved
+	// module (handler.Module.Reserved). Such a type is carried only by
+	// the object that is the type itself — the consumer's own install
+	// root — so a local write attaching it to any other row is
+	// refused. Registered types are never reserved carriers: a static
+	// part is the consumer's compiled-in declaration, attachable by
+	// design. Nil reserves nothing.
+	ReservedCarrier func(typeId string) bool
 }
 
 // New constructs a SystemPropertiesHandler bound to a Registry. Pass
@@ -302,11 +311,55 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 		return nil
 	}
 	pf := h.buildPreflight(ch, before)
+	if verr := h.checkReservedCarriers(ch, before); verr != nil {
+		return verr
+	}
 	for ri := range ch.Records {
 		rc := &ch.Records[ri]
 		for oi := range rc.Ops {
 			if verr := h.validateOp(&rc.Ops[oi], pf); verr != nil {
 				return verr
+			}
+		}
+	}
+	return nil
+}
+
+// checkReservedCarriers refuses a local change attaching a reserved
+// carrier type (ReservedCarrier) to any row but the type's own. Only
+// the types this change ADDS are checked — a row already carrying one
+// (its own root, or an inbound copy) keeps writing. The row id is the
+// record's: on the shared objects collection every record id is the
+// object id (the change's ObjectId is stamped later, by the pipeline).
+func (h *SystemPropertiesHandler) checkReservedCarriers(ch *crdt.Change, before *anyenc.Value) *ValidationError {
+	if h.ReservedCarrier == nil {
+		return nil
+	}
+	existing := map[string]struct{}{}
+	if before != nil {
+		for _, v := range before.GetArray("any", "types") {
+			existing[string(v.GetStringBytes())] = struct{}{}
+		}
+	}
+	for ri := range ch.Records {
+		rc := &ch.Records[ri]
+		rowId := rc.Id
+		if rowId == "" {
+			rowId = ch.ObjectId
+		}
+		added := map[string]struct{}{}
+		for oi := range rc.Ops {
+			collectTypeAdditions(&rc.Ops[oi], added)
+		}
+		for typeId := range added {
+			if typeId == rowId {
+				continue
+			}
+			if _, had := existing[typeId]; had {
+				continue
+			}
+			if h.ReservedCarrier(typeId) {
+				return &ValidationError{Reason: ReasonReservedCarrier, TypeId: typeId, ObjectId: rowId}
 			}
 		}
 	}

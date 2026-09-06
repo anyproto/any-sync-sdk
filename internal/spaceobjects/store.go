@@ -1109,6 +1109,41 @@ func (s *Store) DatasetOwners(dataset string) ([]string, bool) {
 	return nil, false
 }
 
+// objectsHandler is the objects-row handler: kinds off the registry,
+// module namespaces off the catalog's owner sets, and the reserved
+// carrier rule off the same sets.
+func (s *Store) objectsHandler() *properties.SystemPropertiesHandler {
+	h := properties.NewWithGrants(s.reg, s.ModuleGrants)
+	h.ReservedCarrier = s.ReservedCarrier
+	return h
+}
+
+// ReservedCarrier reports whether typeId is a user type declaring a
+// dataset of a reserved module (handler.Module.Reserved): the
+// consumer's own install root, carried by nothing else. Registered
+// types with a static declaration of the module are not carriers —
+// the static part is the consumer's compiled-in choice to make the
+// module attachable. The properties handler consults it on the local
+// write pre-flight.
+func (s *Store) ReservedCarrier(typeId string) bool {
+	if s == nil {
+		return false
+	}
+	snap := s.catalog.snapshot()
+	for module, mi := range s.Modules() {
+		if !mi.Reserved {
+			continue
+		}
+		if _, static := s.staticModuleOwners[module][typeId]; static {
+			continue
+		}
+		if _, ok := snap.moduleOwners[module][typeId]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // ModuleGrants returns the module namespaces an object carrying
 // `members` may hold on its objects row: every module one of the
 // member types declares a dataset of. The properties handler consults
@@ -2305,7 +2340,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// the local/account routes. Declared derived heads (author /
 		// createdAt / spaceId) stay controller-enforced. Module
 		// namespaces are granted off the catalog's owner sets.
-		{Name: properties.Dataset, Handler: properties.NewWithGrants(s.reg, s.ModuleGrants), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
+		{Name: properties.Dataset, Handler: s.objectsHandler(), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
 		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.PropertyHandlerLocalVersion},

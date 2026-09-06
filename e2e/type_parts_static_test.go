@@ -192,4 +192,21 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	root, err := sp.Types().Get(ctx, inst.RootId)
 	require.NoError(t, err)
 	assert.True(t, root.Hidden)
+
+	// The install root is the reserved module's only carrier: the
+	// root's type attaches to no other row, on any local path that
+	// adds a type. The registered static declaration stays attachable.
+	_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{inst.RootId}})
+	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
+	_, err = sp.Properties().AttachType(ctx, bare, inst.RootId)
+	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
+	_, err = sp.Modify(ctx, space.ModifyBatch{
+		ObjectId: bare, Dataset: "objects",
+		Records: []space.RecordModify{{Id: bare, Ops: []space.Op{{Type: space.OpAddToSet, Path: "any.types", Value: inst.RootId}}}},
+	})
+	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
+	require.ErrorIs(t, write(bare, "secret_shared", "text", "nope"), space.ErrDatasetNotDeclared)
+	_, err = sp.Properties().AttachType(ctx, bare, "doc")
+	require.NoError(t, err, "a registered type's static declaration of the module is attachable")
+	require.NoError(t, write(bare, "notes_shared", "text", "ok"))
 }

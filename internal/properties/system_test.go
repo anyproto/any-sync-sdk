@@ -740,3 +740,43 @@ func TestSystemPropertiesHandler_ModifiedAtBumpsOnDatasetWrite(t *testing.T) {
 	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
 	assert.Equal(t, creatorCarol, rec.GetString("modifiedBy"))
 }
+
+// TestPreValidate_ReservedCarrier pins the carrier rule: a user type
+// declaring a reserved module attaches only to its own root. Any other
+// row is refused however the type arrives ($addToSet, an any.types
+// $set, the multi-field form); a row that already carries it keeps
+// writing; nothing is checked without a resolver.
+func TestPreValidate_ReservedCarrier(t *testing.T) {
+	const reservedT = "reservedT"
+	h := properties.New(preflightRegistry())
+	h.ReservedCarrier = func(typeId string) bool { return typeId == reservedT }
+	a := &anyenc.Arena{}
+
+	err := h.PreValidate(singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT)), nil)
+	require.ErrorIs(t, err, properties.ErrReservedCarrier)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonReservedCarrier, ve.Reason)
+	assert.Equal(t, reservedT, ve.TypeId)
+	assert.Equal(t, testObjectId, ve.ObjectId)
+
+	arr := a.NewArray()
+	arr.SetArrayItem(0, a.NewString(reservedT))
+	require.ErrorIs(t, h.PreValidate(singlePathChange(crdt.OpSet, []string{"any", "types"}, arr), nil), properties.ErrReservedCarrier)
+	payload := a.NewObject()
+	payload.Set("any.types", arr)
+	require.ErrorIs(t, h.PreValidate(multiFieldChange(payload), nil), properties.ErrReservedCarrier)
+
+	// The type's own root, and a row already carrying it, pass.
+	own := singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT))
+	own.Records[0].Id = reservedT
+	require.NoError(t, h.PreValidate(own, nil))
+	require.NoError(t, h.PreValidate(
+		singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT)),
+		beforeWithTypes(a, reservedT)))
+	// Another type stays attachable.
+	require.NoError(t, h.PreValidate(singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(propUserT)), nil))
+
+	bare := properties.New(preflightRegistry())
+	require.NoError(t, bare.PreValidate(singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT)), nil))
+}

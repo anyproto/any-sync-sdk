@@ -517,10 +517,11 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	provider := newFixedSeedProvider(t)
 	sdk, err := anysyncsdk.Open(ctx, config.Config{
 		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
 		Network: config.Network{NodeConfYAML: yaml},
-	}, newFixedSeedProvider(t))
+	}, provider)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk.Close() })
 
@@ -635,4 +636,101 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "general_chat", dinfo.XKey)
 	assert.Equal(t, map[string]int{"objects": 1, "datasets": 1}, changesByDataset(der.RootId))
+
+	// A caller-minted root that already carries a name still gets its
+	// types: the stamp attaches what the row lacks whatever the name
+	// says (an install writes the request's name; an adopt never
+	// renames).
+	named, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		InitialProperties: map[string]map[string]any{"any": {"name": "Named by the caller"}},
+	})
+	require.NoError(t, err)
+	nb, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "named/v1", Name: "Other", XKey: "named",
+		NewRoot: func(context.Context) (string, error) { return named, nil },
+	})
+	require.NoError(t, err, "Ensure(NewRoot, named)")
+	require.True(t, didInstall)
+	require.Equal(t, named, nb.RootId)
+	assert.ElementsMatch(t, []string{"__type__", named}, typesOf(named), "a named NewRoot is still self-typed")
+	ninfo, err := sp.Types().Get(ctx, named)
+	require.NoError(t, err)
+	assert.Equal(t, "named", ninfo.XKey)
+	assert.Equal(t, "Other", ninfo.Name, "the install writes the request's name — the documented $set")
+
+	// A request that gains a root type and a handle after the install
+	// reaches the existing root on adopt: attached and filled, the
+	// rest untouched, seeds never re-written.
+	plain, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "plain/v1", Name: "Plain", Parts: []space.PartDraft{articlesPart()}, Weight: 7,
+	})
+	require.NoError(t, err)
+	require.True(t, didInstall)
+	assert.ElementsMatch(t, []string{"__type__", plain.RootId}, typesOf(plain.RootId))
+	grown, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "plain/v1", Name: "Renamed", Parts: []space.PartDraft{articlesPart()}, Weight: 9,
+		XKey: "plain", RootTypes: []string{movieType},
+		RootProperties: map[string]map[string]any{movieType: {titleProp: "late seed"}},
+	})
+	require.NoError(t, err, "adopt with a gained type and handle")
+	require.False(t, didInstall)
+	require.Equal(t, plain.RootId, grown.RootId)
+	assert.ElementsMatch(t, []string{"__type__", plain.RootId, movieType}, typesOf(plain.RootId), "the gained root type is attached on adopt")
+	pinfo, err := sp.Types().Get(ctx, plain.RootId)
+	require.NoError(t, err)
+	assert.Equal(t, "plain", pinfo.XKey, "an absent handle is filled on adopt")
+	assert.Equal(t, "Plain", pinfo.Name, "adopt never renames")
+	assert.Equal(t, 7, pinfo.Weight, "adopt never patches metadata")
+	prow, err := sp.Properties().Get(ctx, plain.RootId)
+	require.NoError(t, err)
+	assert.Nil(t, prow.Get(movieType, titleProp), "adopt never seeds")
+	assert.Equal(t, map[string]int{"objects": 2, "datasets": 1}, changesByDataset(plain.RootId),
+		"the heal is one more objects change; a third Ensure adds none")
+	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "plain/v1", Parts: []space.PartDraft{articlesPart()}, XKey: "plain", RootTypes: []string{movieType},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"objects": 2, "datasets": 1}, changesByDataset(plain.RootId))
+
+	// A second device of the account adopts the created self-typed
+	// root: the same root, the same handle, the same property ids.
+	_ = sdk.Spaces().SyncSpaceList(ctx)
+	_ = sp.SyncHeads(ctx)
+	sdkB, err := anysyncsdk.Open(ctx, config.Config{
+		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+		Network: config.Network{NodeConfYAML: yaml},
+	}, provider)
+	require.NoError(t, err, "device B: Open")
+	t.Cleanup(func() { _ = sdkB.Close() })
+	waitCtx, waitCancel := context.WithTimeout(ctx, 90*time.Second)
+	require.NoError(t, sdkB.Spaces().WaitListSynced(waitCtx), "device B: WaitListSynced")
+	waitCancel()
+	var spB space.Space
+	require.True(t, waitFor(ctx, 30*time.Second, 250*time.Millisecond, func() bool {
+		spB, err = sdkB.Spaces().Get(ctx, sp.Id())
+		return err == nil
+	}), "device B: Spaces().Get never succeeded: %v", err)
+	waitCtx, waitCancel = context.WithTimeout(ctx, 90*time.Second)
+	require.NoError(t, spB.WaitIndexSynced(waitCtx), "device B: WaitIndexSynced")
+	waitCancel()
+	var adoptedB space.Bundle
+	require.True(t, waitFor(ctx, 60*time.Second, 500*time.Millisecond, func() bool {
+		b, installedB, err := spB.Bundles().Ensure(ctx, req)
+		if err != nil || installedB {
+			return false
+		}
+		adoptedB = b
+		if _, err := spB.Types().Get(ctx, b.RootId); err != nil {
+			return false
+		}
+		return true
+	}), "device B never adopted the created self-typed root")
+	require.Equal(t, root, adoptedB.RootId)
+	infoB, err := spB.Types().Get(ctx, root)
+	require.NoError(t, err)
+	assert.Equal(t, "wiki", infoB.XKey)
+	propsB, err := spB.Types().Properties(ctx, root)
+	require.NoError(t, err)
+	require.Len(t, propsB, 1)
+	assert.Equal(t, props[0].Id, propsB[0].Id, "the property id is the same on both devices")
 }

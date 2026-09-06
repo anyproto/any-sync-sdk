@@ -141,13 +141,18 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest, 
 			if err := b.declareType(ctx, rootId, req); err != nil {
 				return space.Bundle{}, false, err
 			}
-		} else if len(req.Parts) > 0 || len(req.Properties) > 0 {
-			// Created winner: heal the declaration when the root's
-			// tree is local and carries none (crash between the
-			// registering write and declaring). A winner whose tree
-			// has not arrived is left alone — the installer's
-			// declaration syncs with it.
+		} else if req.DeclaresType() {
+			// Created winner: heal what the root lacks when its tree is
+			// local — a type or handle the request gained since the
+			// install (the stamp attaches / fills only what is absent),
+			// then the declaration when the root carries none (crash
+			// between the registering write and declaring). A winner
+			// whose tree has not arrived is left alone — the
+			// installer's writes sync with it.
 			if _, present, perr := b.parent.store.TreeIsDerived(ctx, bd.RootId); perr == nil && present {
+				if err := b.stampRoot(ctx, bd.RootId, req, true); err != nil {
+					return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", bd.RootId, err)
+				}
 				if err := b.declareType(ctx, bd.RootId, req); err != nil {
 					return space.Bundle{}, false, err
 				}
@@ -170,6 +175,15 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest, 
 	// and never pull the peer's content. Must succeed BEFORE the
 	// registering write.
 	if err := b.stampRoot(ctx, rootId, req, false); err != nil {
+		// A created root Ensure minted itself is an orphan nothing
+		// references and nothing can adopt; a derived root is
+		// re-derivable and a NewRoot root is the caller's. Best effort.
+		if !req.DerivedRoot && req.NewRoot == nil {
+			if derr := b.parent.objects.Delete(ctx, rootId); derr != nil {
+				bundleLog.Warn("orphaned bundle root after a failed stamp",
+					zap.String("bundle", req.Id), zap.String("root", rootId), zap.Error(derr))
+			}
+		}
 		return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 	}
 
@@ -252,6 +266,24 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 		// like every other part of the declaration.
 		if _, err := encodeXFormat(&anyenc.Arena{}, req.Layout); err != nil {
 			return fmt.Errorf("spaceimpl: %w: Layout: %w", space.ErrBundleBadRequest, err)
+		}
+	}
+	// Seeded values likewise: an SDK-minted created root is minted
+	// before the stamp that carries them, so a value that cannot be
+	// encoded must fail here, not leave an orphan per attempt. Whether
+	// a seeded type resolves on this device is the write's verdict.
+	arena := &anyenc.Arena{}
+	for typeId, kv := range req.RootProperties {
+		if typeId == "" {
+			return fmt.Errorf("spaceimpl: %w: RootProperties: empty type id", space.ErrBundleBadRequest)
+		}
+		for propId, v := range kv {
+			if propId == "" {
+				return fmt.Errorf("spaceimpl: %w: RootProperties[%s]: empty property id", space.ErrBundleBadRequest, typeId)
+			}
+			if _, err := goToAnyenc(arena, v); err != nil {
+				return fmt.Errorf("spaceimpl: %w: RootProperties[%s.%s]: %w", space.ErrBundleBadRequest, typeId, propId, err)
+			}
 		}
 	}
 	if err := b.validateBundleParts(req.Parts, systemInstall); err != nil {
@@ -395,21 +427,6 @@ func (b *bundlesAPI) declareProperties(ctx context.Context, rootId string, draft
 		return fmt.Errorf("spaceimpl: bundles: declare properties on root %q: %w", rootId, rej.Err)
 	}
 	return nil
-}
-
-// selfTyped reports whether objectId carries the type marker plus its
-// own id — the bundle-root shape.
-func (b *bundlesAPI) selfTyped(ctx context.Context, objectId string) (bool, error) {
-	types, err := b.parent.store.ObjectTypes(ctx, objectId)
-	if err != nil {
-		return false, err
-	}
-	var marker, self bool
-	for _, t := range types {
-		marker = marker || t == typetype.MetaTypeMarker
-		self = self || t == objectId
-	}
-	return marker && self, nil
 }
 
 // validateBundleParts rejects an invalid part or dataset draft, or a
@@ -576,11 +593,9 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 // property write to a type the object does not implement is
 // rejected). With a selfType (the root declares a type) the root is
 // also a type object implementing itself: the type marker plus its own
-// id come first. `any` is universal and never listed.
+// id come first. `any` is universal and never listed. Nil when there is
+// nothing to attach.
 func installRootTypes(req space.EnsureBundleRequest, selfType string) []string {
-	if len(req.RootProperties) == 0 && selfType == "" {
-		return req.RootTypes
-	}
 	seen := map[string]struct{}{anytype.TypeId: {}}
 	out := make([]string, 0, len(req.RootTypes)+len(req.RootProperties)+2)
 	if selfType != "" {
@@ -603,6 +618,9 @@ func installRootTypes(req space.EnsureBundleRequest, selfType string) []string {
 		}
 		seen[t] = struct{}{}
 		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -788,16 +806,21 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 // type's metadata (`type.xkey` / `layout` / `weight` / `hidden`) and
 // the seeded RootProperties values — ONE `objects` change, so a peer
 // sees the row whole and the DAG carries no attach-then-name chatter.
-// The preflight grants every namespace the change itself attaches, so
-// `type.*` and the seeded types' values validate in the same change.
+// The local-write pre-flight grants every namespace the change itself
+// attaches, so `type.*` and the seeded types' values validate in the
+// same change. The seeds ride their own op: a value a peer cannot
+// resolve drops that op alone, never the types or the name.
 //
 // Load-bearing despite looking cosmetic: it guarantees the root tree
-// carries a non-root change (see the Ensure call site). Skipped when
-// the row already carries a name — a derived root is materialized by
-// every device that installs it, and re-writing the same stamp on each
-// would add a change per device for nothing; on adopt any existing
-// name is kept, so a later Ensure with a different (or no) Name never
-// renames the root, and nothing here is ever patched.
+// carries a non-root change (see the Ensure call site).
+//
+// A row that already carries a name — a derived root materialized by
+// every device that installs it, an adopted winner, a NewRoot the
+// caller named — is not renamed and its metadata is not patched; what
+// it LACKS is still written: a type the request lists that the row
+// does not carry ($addToSet, idempotent), and a handle when the row
+// has none. Seeds belong to the install: an adopt never writes them,
+// the installer's values sync in.
 func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.EnsureBundleRequest, adopt bool) error {
 	obj, err := b.parent.store.Get(ctx, rootId)
 	if err != nil {
@@ -807,39 +830,64 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 	if name == "" {
 		name = req.Id
 	}
-	if row := obj.Controller().Get(ctx, properties.Dataset, rootId); row != nil {
-		if cur := row.Get("any", "name"); cur != nil && (adopt || string(cur.GetStringBytes()) == name) {
-			return nil
-		}
-	}
 	selfType := ""
 	if req.DeclaresType() {
 		selfType = rootId
 	}
 	types := installRootTypes(req, selfType)
 
+	row := obj.Controller().Get(ctx, properties.Dataset, rootId)
+	have := map[string]struct{}{}
+	named := false
+	if row != nil {
+		for _, v := range row.GetArray(anytype.TypeId, "types") {
+			have[string(v.GetStringBytes())] = struct{}{}
+		}
+		if cur := row.Get(anytype.TypeId, "name"); cur != nil {
+			named = adopt || string(cur.GetStringBytes()) == name
+		}
+	}
+	var missing []string
+	for _, t := range types {
+		if _, ok := have[t]; !ok {
+			missing = append(missing, t)
+		}
+	}
+	healXKey := named && selfType != "" && req.XKey != "" &&
+		row.GetString(typetype.TypeId, typetype.FieldXKeyProp) == ""
+	if named && len(missing) == 0 && !healXKey {
+		return nil
+	}
+
 	arena := &anyenc.Arena{}
 	var ops []crdt.Op
 	// $addToSet per type, never a whole-array $set: a NewRoot that
 	// already attached types, or a peer's copy of a derived root, must
 	// not be clobbered.
-	for _, t := range types {
+	for _, t := range missing {
 		ops = append(ops, crdt.Op{Type: crdt.OpAddToSet, Path: []string{anytype.TypeId, "types"}, Payload: arena.NewString(t)})
 	}
 	payload := arena.NewObject()
-	payload.Set(anytype.TypeId+".name", arena.NewString(name))
+	payloadKeys := 0
+	if !named {
+		payload.Set(anytype.TypeId+".name", arena.NewString(name))
+		payloadKeys++
+	}
 	// The type's own metadata: what the request declares, nothing
 	// implied — a root hosting only its bundle's records asks for
-	// Hidden itself.
-	if req.DeclaresType() {
-		if req.XKey != "" {
-			payload.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(req.XKey))
-		}
+	// Hidden itself. On a named row only an absent handle is filled.
+	if selfType != "" && (!named || healXKey) && req.XKey != "" {
+		payload.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(req.XKey))
+		payloadKeys++
+	}
+	if selfType != "" && !named {
 		if req.Hidden {
 			payload.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
+			payloadKeys++
 		}
 		if req.Weight != 0 {
 			payload.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(req.Weight))
+			payloadKeys++
 		}
 		if len(req.Layout) > 0 {
 			// Already probed by validateEnsureRequest.
@@ -848,21 +896,36 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 				return fmt.Errorf("%w: Layout: %w", space.ErrBundleBadRequest, err)
 			}
 			payload.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+			payloadKeys++
 		}
 	}
-	// Seeded values, sorted so the change is the same on every
-	// installer of a derived root.
-	for _, typeId := range slices.Sorted(maps.Keys(req.RootProperties)) {
-		kv := req.RootProperties[typeId]
-		for _, propId := range slices.Sorted(maps.Keys(kv)) {
-			v, err := goToAnyenc(arena, kv[propId])
-			if err != nil {
-				return fmt.Errorf("%w: RootProperties[%s.%s]: %w", space.ErrBundleBadRequest, typeId, propId, err)
+	if payloadKeys > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: payload})
+	}
+	// Seeded values, on install only, sorted so the change is the same
+	// on every installer of a derived root. Their own op: independent
+	// failure domain from the name and the types.
+	if !adopt && !named && len(req.RootProperties) > 0 {
+		seeds := arena.NewObject()
+		seedKeys := 0
+		for _, typeId := range slices.Sorted(maps.Keys(req.RootProperties)) {
+			kv := req.RootProperties[typeId]
+			for _, propId := range slices.Sorted(maps.Keys(kv)) {
+				v, err := goToAnyenc(arena, kv[propId])
+				if err != nil {
+					return fmt.Errorf("%w: RootProperties[%s.%s]: %w", space.ErrBundleBadRequest, typeId, propId, err)
+				}
+				seeds.Set(typeId+"."+propId, v)
+				seedKeys++
 			}
-			payload.Set(typeId+"."+propId, v)
+		}
+		if seedKeys > 0 {
+			ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: seeds})
 		}
 	}
-	ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: payload})
+	if len(ops) == 0 {
+		return nil
+	}
 
 	// The DataVersion covers every type the change touches, as an
 	// attach or a create with initial values would.

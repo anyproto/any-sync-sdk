@@ -22,9 +22,11 @@ var (
 	// ErrBundleUnknown — no live record for the bundle id.
 	ErrBundleUnknown = errors.New("bundle unknown")
 	// ErrBundleBadRequest — structurally invalid input: empty bundle
-	// id, nil NewRoot, empty root id, DerivedRoot-only fields on a
-	// created root, an invalid or duplicate part / dataset declaration,
-	// or a tech-space request that is not derived-only with Parts.
+	// id, no root strategy, both strategies, RootTypes / RootProperties
+	// next to NewRoot, a seeded value that cannot be encoded, an
+	// invalid or duplicate part / dataset / property declaration,
+	// metadata without a declaration, or a tech-space request with
+	// NewRoot or without a declaration.
 	ErrBundleBadRequest = errors.New("bundle bad request")
 	// ErrBundleNotLoser — ResolveLoser target is not a loser of the
 	// bundle: it is the current winner, or was never claimed in roots.
@@ -107,18 +109,22 @@ type EnsureBundleRequest struct {
 	DerivedRoot bool
 	// RootTypes are attached to the root Ensure mints — the derived
 	// root, or the SDK-minted created root of a type-declaring request
-	// — in the same change as its name and type metadata. A
-	// caller-minted root (NewRoot) gets its types from NewRoot and
-	// refuses them here.
+	// — in the same change as its name and type metadata, and on every
+	// later Ensure a type the row lacks is attached ($addToSet,
+	// idempotent), so a request that gains a root type reaches an
+	// existing install. A caller-minted root (NewRoot) gets its types
+	// from NewRoot and refuses them here.
 	RootTypes []string
 	// RootProperties seeds the root's property values, keyed typeId →
-	// propId → value, in that same change, before the install is
-	// registered, so a failed seed leaves no install to adopt. Every
-	// keyed type is attached along with RootTypes — a property write
-	// to a type the object does not implement is rejected. The root's
-	// own id is not a usable key: the root's own property ids are not
-	// known before the install. Roots Ensure mints only, like
-	// RootTypes.
+	// propId → value, in that same change (their own op), before the
+	// install is registered, so a failed seed leaves no install to
+	// adopt. Install only — an adopt never re-seeds, the installer's
+	// values sync in. Every keyed type is attached along with
+	// RootTypes — a property write to a type the object does not
+	// implement is rejected. Values are checked to encode before any
+	// root is minted. The root's own id is not a usable key: the
+	// root's own property ids are not known before the install. Roots
+	// Ensure mints only, like RootTypes.
 	RootProperties map[string]map[string]any
 
 	// Parts declares parts (with their datasets) on the root — derived
@@ -166,8 +172,9 @@ type EnsureBundleRequest struct {
 	// what `relation.targetTypes` in other declarations name. An XKey
 	// alone is a type declaration — a MARKER type objects carry as a
 	// flag, with no columns and no parts. Written with the name stamp
-	// on install; adopt never patches it. Not unique on the SDK side:
-	// the consumer enforces handle uniqueness.
+	// on install; on adopt it is filled in only when the root carries
+	// none (an install that predates the handle), never changed. Not
+	// unique on the SDK side: the consumer enforces handle uniqueness.
 	XKey string
 	// Layout, Weight and Hidden seed the root type's rendering and
 	// listing metadata (TypeInfo.Layout / Weight / Hidden) with the
@@ -266,8 +273,10 @@ type BundlesAPI interface {
 	// after sync; a DefId read before convergence may change — look
 	// definitions up by name when evolving them.
 	//
-	// On the tech space (Service.Get(SDK.TechSpaceId())) bundles are
-	// derived-only and must declare Parts; NewRoot is refused.
+	// On the tech space (Service.Get(SDK.TechSpaceId())) roots are
+	// minted by Ensure only — NewRoot is refused — and a type
+	// declaration (Parts, Properties or XKey) is required; both root
+	// strategies are available.
 	//
 	// The bool reports whether THIS call registered the install.
 	// False means an existing one was adopted — which for a derived

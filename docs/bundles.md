@@ -115,12 +115,16 @@ canonical, so the children are just as deterministic. Nothing is lost —
 the ParentId binding buys cascade deletion, and a derived root is never
 deleted.
 
-Ensure derives the root itself, attaches `RootTypes` idempotently and
-seeds `RootProperties` before registering anything (a failed seed
-therefore leaves no install to adopt); `NewRoot` must be nil. Every type
-`RootProperties` writes into is attached along with `RootTypes` — a
-property write to a type the object does not implement is rejected, and
-the created path attaches the same union through `Objects().Create`.
+Ensure derives the root itself and writes its first content change —
+`RootTypes`, the name, the type metadata and the `RootProperties` seeds
+— before registering anything (a failed stamp therefore leaves no
+install to adopt); `NewRoot` must be nil. Every type `RootProperties`
+writes into is attached along with `RootTypes` — a property write to a
+type the object does not implement is rejected — and the SDK-minted
+created root of a type-declaring request gets the same union the same
+way. The attach is idempotent on every later Ensure: a type the row
+lacks is `$addToSet`, so a request that gains a root type reaches an
+existing install.
 
 On the adopt path Ensure materializes the canonical tree — and stamps it
 — when the row arrived before the tree did: the same device can mint it,
@@ -165,9 +169,11 @@ carries everything the row needs: the types it implements (the marker
 and its own id, `RootTypes`, every type `RootProperties` writes into —
 `$addToSet` each, never a whole-array set), `any.name`, the type
 metadata (`type.xkey` / `layout` / `weight` / `hidden`) and the seeded
-`RootProperties` values, in one `objects` change. The apply-side
-preflight grants every namespace the change itself attaches, so the
-metadata and the seeded values validate alongside the attach. Then the
+`RootProperties` values, in one `objects` change (the seeds as their
+own op, so a seed a peer cannot resolve drops alone). The local-write
+pre-flight grants every namespace the change itself attaches, so the
+metadata and the seeded values validate alongside the attach; the
+apply path does not re-check membership. Then the
 registry row (on the index object), then the declarations — one
 `properties` change, one `datasets` change. A whole type therefore
 takes three changes on its tree, each dataset landing atomically; a
@@ -208,9 +214,9 @@ both, so the replica knows every schema state a peer may stamp its
 data writes with (otherwise those writes would park for good).
 `Layout` / `Weight` / `Hidden` ride the name stamp (`type.layout` /
 `type.weight` / `type.hidden`) on install; they describe a type, so
-they need `Parts` or `Properties` — alone they are
-`ErrBundleBadRequest`, like a `Layout` that cannot be encoded, before
-any root is minted.
+they need a declaration — `Parts`, `Properties` or `XKey` — alone they
+are `ErrBundleBadRequest`, like a `Layout` or a seeded value that
+cannot be encoded, before any root is minted.
 
 - Declarations are written after the stamp and the registry row
   (below), parts in one change, properties in one change.
@@ -228,8 +234,11 @@ any root is minted.
   through `Types().AddPart` / `AddDataset` / `AddDatasetField` /
   `PatchDataset` / `AddProperty` / `PatchProperty` with `typeId =
   rootId`. Adopting never renames the root or touches its layout,
-  weight, hidden flag or xKey either: the stamp is written only when
-  the root carries no name.
+  weight or hidden flag either: the name and the metadata are written
+  only when the root carries no name. What the row LACKS is still
+  filled on adopt — a type the request lists (`$addToSet`) and a
+  handle when the root has none — the same heal-what-is-absent rule
+  the declarations follow; seeds are never re-written.
 - A part naming a **reserved** module (`handler.Module.Reserved`) is
   refused with `ErrModuleReserved` unless the call carries the
   `space.SystemInstall()` option — the consumer's own catalog install.

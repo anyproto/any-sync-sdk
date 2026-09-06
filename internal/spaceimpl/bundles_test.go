@@ -58,6 +58,9 @@ func TestValidateEnsureRequest(t *testing.T) {
 		{name: "xkey alone declares a marker type", req: space.EnsureBundleRequest{Id: "b", XKey: "flag"}},
 		{name: "xkey alone with metadata", req: space.EnsureBundleRequest{Id: "b", XKey: "flag", Hidden: true, Weight: 3}},
 		{name: "xkey on a caller-minted root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, XKey: "flag"}},
+		{name: "seeded value that cannot be encoded", req: space.EnsureBundleRequest{Id: "b", XKey: "flag", RootProperties: map[string]map[string]any{"t": {"a": make(chan int)}}}, bad: true},
+		{name: "seeded value under an empty type id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootProperties: map[string]map[string]any{"": {"a": 1}}}, bad: true},
+		{name: "tech xkey only", req: space.EnsureBundleRequest{Id: "b", XKey: "flag"}, tech: true},
 		{name: "metadata without a declaration", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Hidden: true}, bad: true},
 		{name: "layout without a declaration", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Layout: map[string]any{"type": "chat"}}, bad: true},
 		{name: "invalid dataset key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(badKey)}, bad: true},
@@ -119,6 +122,9 @@ func TestInstallRootTypes(t *testing.T) {
 	universal := space.EnsureBundleRequest{RootProperties: map[string]map[string]any{"any": {"description": "seeded"}}}
 	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(universal, "root"),
 		"`any` is universal — seeding its values attaches nothing")
+	assert.Equal(t, []string{"t1"}, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any", "t1"}}, ""),
+		"`any` requested as a root type is dropped on every path")
+	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any"}}, ""))
 }
 
 func TestDeclaresType(t *testing.T) {

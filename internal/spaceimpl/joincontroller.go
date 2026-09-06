@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 var joinLog = logger.NewNamed("sdk.spacejoin")
@@ -21,6 +22,12 @@ var joinLog = logger.NewNamed("sdk.spacejoin")
 // previous session. A var (not const) so tests can shorten it.
 var joinReconcileInterval = 180 * time.Second
 
+// joinProbeMinInterval bounds how often a kick-driven pass may probe the
+// chain for one row it could not settle yet. Index changes kick the
+// controller freely and a probe is a network round; the tick pass is
+// never throttled.
+const joinProbeMinInterval = 30 * time.Second
+
 // SetJoinReconcileIntervalForTest overrides the reconcile poll interval
 // and returns a func that restores the previous value. Test seam only —
 // the interval is read once when the loop starts, so call before opening
@@ -31,11 +38,58 @@ func SetJoinReconcileIntervalForTest(d time.Duration) (restore func()) {
 	return func() { joinReconcileInterval = prev }
 }
 
+// joinWaiter is a live ACL waiter plus whether it was built without a
+// head. A head-less waiter observes acceptance only — the any-sync
+// waiter reports a decline solely when the request is gone AND the head
+// it was given exists on the chain — so the tick pass keeps trying to
+// resolve a head for it.
+type joinWaiter struct {
+	w        aclwaiter.AclWaiter
+	headless bool
+}
+
+// joinResolution is what one chain snapshot says about this account's
+// join on a space: granted (a member — load, nothing to wait for), a
+// pending request (head is a chain head at-or-after it, so a waiter
+// built on it can detect a decline), or neither (the request is gone,
+// or never landed). err is an unreadable chain (offline).
+type joinResolution struct {
+	granted bool
+	head    string
+	err     error
+}
+
+// joinResolveTimeout bounds one chain snapshot. The controller runs its
+// probes inline on its single loop goroutine, so an unreachable node
+// must not hold every other row's waiter lifecycle hostage; the any-sync
+// waiter bounds the same read the same way.
+const joinResolveTimeout = 20 * time.Second
+
+// resolveJoin snapshots the space's ACL through the joining client — no
+// local storage, nothing materialized — and classifies this account's
+// standing on it.
+func (s *Service) resolveJoin(ctx context.Context, spaceId string) joinResolution {
+	ctx, cancel := context.WithTimeout(ctx, joinResolveTimeout)
+	defer cancel()
+	acl, err := s.app.AclSnapshot(ctx, spaceId)
+	if err != nil {
+		return joinResolution{err: err}
+	}
+	st := acl.AclState()
+	if !st.Permissions(st.Identity()).NoPermissions() {
+		return joinResolution{granted: true}
+	}
+	if _, err := st.JoinRecord(st.Identity(), false); err == nil {
+		return joinResolution{head: acl.Head().Id}
+	}
+	return joinResolution{}
+}
+
 // startJoinController launches the background join loop, bound to its own
 // cancellable context. Close cancels it and drains joinWG.
 func (s *Service) startJoinController() {
 	ctx, cancel := context.WithCancel(context.Background())
-	s.joinCancel = cancel
+	s.joinCtx, s.joinCancel = ctx, cancel
 	s.joinWG.Add(1)
 	go s.joinLoop(ctx)
 }
@@ -49,47 +103,70 @@ func (s *Service) kickJoinController() {
 	}
 }
 
-// ResumePendingJoins triggers an immediate scan for joining rows left
-// pending from a previous session, starting an ACL waiter for each.
-// Called once by sdk.Open after the tech space is open: New runs (and
-// starts the controller) before tsp.Open, so the controller's own
-// initial pass races the open and finds an empty list. This kick after
-// open makes boot resumption prompt instead of waiting for the tick.
+// ResumePendingJoins triggers an immediate scan for joining rows that
+// lack a waiter — joins left pending from a previous session, and rows
+// synced in from the account's other devices. Called by sdk.Open after
+// the tech space is open (New runs, and starts the controller, before
+// tsp.Open, so the controller's own initial pass races the open and
+// finds an empty list) and on every tech-space index change, so a join
+// requested on another device gets its waiter here promptly instead of
+// on the next tick.
 func (s *Service) ResumePendingJoins() { s.kickJoinController() }
 
 // joinLoop drives joiner-side post-acceptance loading until ctx is
-// cancelled. It runs one pass shortly after start (boot resumption of a
-// join left pending last session) and then on every tick or kick.
+// cancelled. It runs one full pass shortly after start (boot resumption
+// of a join left pending last session), a full pass on every tick, and
+// the cheap pass on every kick.
 func (s *Service) joinLoop(ctx context.Context) {
 	defer s.joinWG.Done()
 	t := time.NewTicker(joinReconcileInterval)
 	defer t.Stop()
-	s.reconcileJoins(ctx)
+	s.reconcileJoins(ctx, true)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.reconcileJoins(ctx)
+			s.reconcileJoins(ctx, true)
 		case <-s.joinKick:
-			s.reconcileJoins(ctx)
+			s.reconcileJoins(ctx, false)
 		}
 	}
 }
 
 // reconcileJoins owns the waiter lifecycle. It starts an ACL waiter for
 // each joining row that lacks one, and stops the waiter for any space
-// that has left the joining state (accepted→active or declined→deleted,
-// or its load completed). It also resumes accepted-invite loads
-// (localStatus="inviteLoading" — pull-until-available, no ACL waiter;
-// the account is already a member). Single-threaded: only joinLoop
-// calls it.
-func (s *Service) reconcileJoins(ctx context.Context) {
+// that has left the joining state (accepted→active or ended, on this or
+// another device, or its load completed). It also resumes accepted-
+// invite and guest loads (localStatus="inviteLoading"/"guestLoading" —
+// pull-until-available, no ACL waiter; the account is already a member).
+//
+// A full pass (boot, tick) additionally re-resolves a head for waiters
+// running without one and probes ended joins that still hold local
+// storage; a kick pass skips both and throttles per-row chain probes, so
+// a burst of index changes cannot turn into a burst of network rounds.
+// Single-threaded: only joinLoop calls it.
+func (s *Service) reconcileJoins(ctx context.Context, full bool) {
 	joining := make(map[string]techspace.SpaceIndexRecord)
 	for _, r := range s.tsp.List(ctx) {
-		if r.LocalStatus == joiningLocalStatus {
+		switch {
+		case mapStatus(r.Type, r.LocalStatus, r.RemoteStatus) == space.StatusJoining:
 			joining[r.Id] = r
+			continue
+		case full && r.JoinEnded() && s.app.SpaceExists(r.Id):
+			// Storage under an ended join is the accept-vs-cancel race:
+			// one device loaded the accepted space while another device's
+			// withdrawal won the row. Membership is the truth — when the
+			// ACL grants it, the space loads and the row flips active.
+			// Storage-gated so this never probes every declined join in
+			// the account's history.
+			s.probeEndedJoin(ctx, r.Id)
 		}
+		// A head outlives the request it was resolved for only until the
+		// row leaves joining — however it left (a verdict written here,
+		// one synced in, a boot after either). A revived row must resolve
+		// its own; see clearJoinHead.
+		s.clearJoinHead(ctx, r)
 		if r.LocalStatus == inviteLoadingLocalStatus || r.LocalStatus == guestLoadingLocalStatus {
 			// Same pull-until-available load for both: no ACL waiter —
 			// the account (or the shared guest identity) is already an
@@ -108,7 +185,8 @@ func (s *Service) reconcileJoins(ctx context.Context) {
 		}
 	}
 
-	// Stop waiters whose row is no longer joining.
+	// Stop waiters whose row is no longer joining; forget the probe
+	// throttle of rows that left the state.
 	s.mu.Lock()
 	var stale []string
 	for spaceId := range s.joinWaiters {
@@ -116,20 +194,81 @@ func (s *Service) reconcileJoins(ctx context.Context) {
 			stale = append(stale, spaceId)
 		}
 	}
+	for spaceId := range s.joinProbes {
+		if _, ok := joining[spaceId]; !ok {
+			delete(s.joinProbes, spaceId)
+		}
+	}
 	s.mu.Unlock()
 	for _, spaceId := range stale {
 		s.stopJoinWaiter(spaceId)
 	}
 
-	// Start a waiter for each joining row that lacks one.
+	// Start a waiter for each joining row that lacks one. A running
+	// head-less waiter is left alone on a kick pass; a full pass tries
+	// once more to give it a head, restarting it only when one is found
+	// (or membership is, in which case the load replaces it).
 	for spaceId, rec := range joining {
 		s.mu.Lock()
-		_, running := s.joinWaiters[spaceId]
+		jw, running := s.joinWaiters[spaceId]
 		s.mu.Unlock()
 		if running {
-			continue
+			if !full || !jw.headless {
+				continue
+			}
+			if rec.AclHeadId == "" {
+				res := s.resolveJoin(ctx, spaceId)
+				if res.err != nil || (!res.granted && res.head == "") {
+					continue
+				}
+				s.stopJoinWaiter(spaceId)
+				if res.granted {
+					s.startJoinLoad(spaceId)
+					continue
+				}
+				rec.AclHeadId = res.head
+				s.storeJoinHead(ctx, spaceId, res.head)
+			} else {
+				s.stopJoinWaiter(spaceId)
+			}
 		}
-		s.startJoinWaiter(ctx, rec)
+		s.startJoinWaiter(ctx, rec, full)
+	}
+}
+
+// joinProbeDue reports whether a chain probe for spaceId may run on a
+// kick pass, recording the attempt; a full pass always may.
+func (s *Service) joinProbeDue(spaceId string, full bool) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if last, ok := s.joinProbes[spaceId]; ok && !full && now.Sub(last) < joinProbeMinInterval {
+		return false
+	}
+	s.joinProbes[spaceId] = now
+	return true
+}
+
+// storeJoinHead records a resolved chain head on the row (device-local).
+// Best-effort: a failed write leaves the head empty and the next full
+// pass resolves it again.
+func (s *Service) storeJoinHead(ctx context.Context, spaceId, head string) {
+	if _, err := s.tsp.SetAclHeadId(ctx, spaceId, head); err != nil {
+		joinLog.Warn("record resolved acl head", zap.String("spaceId", spaceId), zap.Error(err))
+	}
+}
+
+// probeEndedJoin runs the membership probe for an ended-join row that
+// still holds local storage (see reconcileJoins): granted means the
+// accept happened and the load flips the row active; anything else
+// leaves the row ended. Tick-pass only, so the storage gate and the tick
+// are its bound.
+func (s *Service) probeEndedJoin(ctx context.Context, spaceId string) {
+	res := s.resolveJoin(ctx, spaceId)
+	if res.granted {
+		joinLog.Info("ended join holds storage and the ACL grants membership; loading",
+			zap.String("spaceId", spaceId))
+		s.startJoinLoad(spaceId)
 	}
 }
 
@@ -148,8 +287,10 @@ func (s *Service) startPendingLoad(ctx context.Context, spaceId string) {
 		return
 	}
 	s.pendingLoads[spaceId] = struct{}{}
-	s.mu.Unlock()
+	// Add under the lock that Close takes to set closing: a 0→1 after
+	// Close's Wait began would be a WaitGroup misuse panic.
 	s.joinWG.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer func() {
 			s.mu.Lock()
@@ -157,6 +298,35 @@ func (s *Service) startPendingLoad(ctx context.Context, spaceId string) {
 			s.mu.Unlock()
 		}()
 		s.loadAcceptedInvite(ctx, spaceId)
+	}()
+}
+
+// startJoinLoad spawns (at most one per spaceId) the background load of
+// a space whose join the ACL has granted, on the controller's context —
+// callable from any goroutine (the waiter's callback, Join, CancelJoin,
+// the reconcile pass). No-op while closing or before the controller
+// started.
+func (s *Service) startJoinLoad(spaceId string) {
+	s.mu.Lock()
+	ctx := s.joinCtx
+	if s.closing || ctx == nil {
+		s.mu.Unlock()
+		return
+	}
+	if _, running := s.pendingLoads[spaceId]; running {
+		s.mu.Unlock()
+		return
+	}
+	s.pendingLoads[spaceId] = struct{}{}
+	s.joinWG.Add(1) // under the lock, as in startPendingLoad
+	s.mu.Unlock()
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.pendingLoads, spaceId)
+			s.mu.Unlock()
+		}()
+		s.loadJoinedSpace(ctx, spaceId)
 	}()
 }
 
@@ -233,27 +403,56 @@ func (s *Service) loadAcceptedInvite(ctx context.Context, spaceId string) {
 
 // startJoinWaiter builds and runs an ACL waiter for one joining space.
 // onFinish (acceptance) spawns the space load; onReject (decline) marks
-// the row deleted — the device-local ended-join marker (joinEnded) that
-// CancelJoin also writes and Join revives. Both are quick and durable —
-// the heavy load runs in a tracked goroutine so the waiter's poll loop
-// is never blocked.
-func (s *Service) startJoinWaiter(ctx context.Context, rec techspace.SpaceIndexRecord) {
+// the row ended — the synced marker CancelJoin also writes and Join
+// revives. Both are quick and durable — the heavy load runs in a
+// tracked goroutine so the waiter's poll loop is never blocked.
+//
+// A row with no stored head — this device never posted the request; it
+// learned of the join from the synced row — first resolves one from the
+// chain: membership already granted skips the waiter for the load, a
+// pending request yields a head the waiter can detect a decline with,
+// neither means there is nothing to wait for (the requesting device
+// syncs its verdict, or a local CancelJoin / Join settles the row) so no
+// waiter starts. An unreadable chain (offline) starts a head-less waiter
+// — acceptance-only — that the next full pass tries to upgrade.
+func (s *Service) startJoinWaiter(ctx context.Context, rec techspace.SpaceIndexRecord, full bool) {
 	spaceId := rec.Id
+	head := rec.AclHeadId
+	headless := false
+	if head == "" {
+		if !s.joinProbeDue(spaceId, full) {
+			return
+		}
+		res := s.resolveJoin(ctx, spaceId)
+		switch {
+		case res.err != nil:
+			joinLog.Debug("resolve join head", zap.String("spaceId", spaceId), zap.Error(res.err))
+			headless = true
+		case res.granted:
+			s.startJoinLoad(spaceId)
+			return
+		case res.head != "":
+			head = res.head
+			s.storeJoinHead(ctx, spaceId, head)
+		default:
+			joinLog.Debug("joining row without a request on the chain", zap.String("spaceId", spaceId))
+			return
+		}
+	}
 	onFinish := func(list.AclList) error {
 		joinLog.Info("join accepted", zap.String("spaceId", spaceId))
-		s.joinWG.Add(1)
-		go s.loadJoinedSpace(ctx, spaceId)
+		s.startJoinLoad(spaceId)
 		return nil
 	}
 	onReject := func(list.AclList) error {
 		joinLog.Info("join declined", zap.String("spaceId", spaceId))
-		if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
+		if err := s.markJoinEnded(ctx, spaceId); err != nil {
 			return err
 		}
 		s.kickJoinController()
 		return nil
 	}
-	w, err := s.app.NewAclWaiter(spaceId, rec.AclHeadId, onFinish, onReject)
+	w, err := s.app.NewAclWaiter(spaceId, head, onFinish, onReject)
 	if err != nil {
 		joinLog.Warn("build acl waiter", zap.String("spaceId", spaceId), zap.Error(err))
 		return
@@ -275,7 +474,7 @@ func (s *Service) startJoinWaiter(ctx context.Context, rec techspace.SpaceIndexR
 		_ = w.Close(ctx)
 		return
 	}
-	s.joinWaiters[spaceId] = w
+	s.joinWaiters[spaceId] = &joinWaiter{w: w, headless: headless}
 	s.mu.Unlock()
 }
 
@@ -292,7 +491,7 @@ func (s *Service) loadJoinedSpace(ctx context.Context, spaceId string) {
 		// load, not Get: the row stays "joining" until the load succeeds,
 		// and the pending guard must not see it.
 		if _, err := s.load(ctx, spaceId); err == nil {
-			if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err == nil {
+			if err := s.flipJoinActive(ctx, spaceId); err == nil {
 				s.kickJoinController()
 				return
 			} else {
@@ -310,14 +509,69 @@ func (s *Service) loadJoinedSpace(ctx context.Context, spaceId string) {
 	}
 }
 
+// flipJoinActive records membership on a join row after its space has
+// loaded here: the SYNCED active (the account's other devices converge
+// on it and load), then this device's local active — which also retires
+// a legacy device-local join marker. Written only after a successful
+// load, so the pending guard never releases a space that is not local
+// yet. A synced tombstone that landed meanwhile is left alone — the
+// delete wins; the eager-loader reclaims the storage on the next boot.
+// The stored ACL head goes with the flip: the request it vouched for is
+// over.
+func (s *Service) flipJoinActive(ctx context.Context, spaceId string) error {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return nil
+	}
+	switch rec.RemoteStatus {
+	case techspace.StatusDeleted, techspace.OneToOneDeletedStatus, techspace.GuestDeletedRemoteStatus:
+		joinLog.Info("joined space was deleted meanwhile; leaving the tombstone", zap.String("spaceId", spaceId))
+		return nil
+	}
+	if rec.RemoteStatus != techspace.StatusActive {
+		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+			return err
+		}
+	}
+	if rec.LocalStatus != techspace.StatusActive {
+		if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+			return err
+		}
+	}
+	s.clearJoinHead(ctx, rec)
+	return nil
+}
+
+// healJoinMembership flips a join row to active when the live ACL of the
+// LOADED space already grants membership and the row still says
+// otherwise: its synced verdict lost a race with the acceptance (a
+// withdrawal from another device landing over the accept), or a legacy
+// device-local marker never flipped. Callers have verified membership on
+// the ACL; this only writes the row. Best-effort — the next Info() /
+// watcher tick retries.
+func (s *Service) healJoinMembership(ctx context.Context, spaceId string) {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return
+	}
+	if mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) != space.StatusJoining && !rec.JoinEnded() {
+		return
+	}
+	if err := s.flipJoinActive(ctx, spaceId); err != nil {
+		joinLog.Debug("heal join membership", zap.String("spaceId", spaceId), zap.Error(err))
+		return
+	}
+	s.kickJoinController()
+}
+
 // stopJoinWaiter closes and removes the waiter for spaceId, if any.
 func (s *Service) stopJoinWaiter(spaceId string) {
 	s.mu.Lock()
-	w := s.joinWaiters[spaceId]
+	jw := s.joinWaiters[spaceId]
 	delete(s.joinWaiters, spaceId)
 	s.mu.Unlock()
-	if w != nil {
-		_ = w.Close(context.Background())
+	if jw != nil {
+		_ = jw.w.Close(context.Background())
 	}
 }
 
@@ -326,9 +580,9 @@ func (s *Service) stopJoinWaiter(spaceId string) {
 func (s *Service) stopJoinWaiters() {
 	s.mu.Lock()
 	waiters := s.joinWaiters
-	s.joinWaiters = make(map[string]aclwaiter.AclWaiter)
+	s.joinWaiters = make(map[string]*joinWaiter)
 	s.mu.Unlock()
-	for _, w := range waiters {
-		_ = w.Close(context.Background())
+	for _, jw := range waiters {
+		_ = jw.w.Close(context.Background())
 	}
 }

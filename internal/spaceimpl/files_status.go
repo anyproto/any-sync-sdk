@@ -34,9 +34,11 @@ func takeoverDelay() time.Duration {
 // RunFileJob executes one queue job (the status.Runner wired by
 // sdk.Open). A job whose space or row disappeared (deleted) succeeds
 // vacuously so the queue drops it — it must never resurrect a deleted
-// space's storage by loading it.
+// space's storage by loading it. An ended join whose storage still
+// exists (the accept-vs-cancel race) is not a delete: its jobs wait for
+// the join controller's reload, Get refusing the row meanwhile.
 func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
-	if rec, ok := s.tsp.Get(ctx, job.SpaceId); !ok || rec.IsDeleted() {
+	if rec, ok := s.tsp.Get(ctx, job.SpaceId); !ok || (rec.IsDeleted() && !rec.JoinEnded()) {
 		return nil
 	}
 	sp, err := s.Get(ctx, job.SpaceId)

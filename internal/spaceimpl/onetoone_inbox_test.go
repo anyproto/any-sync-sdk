@@ -213,11 +213,16 @@ func TestMapStatus_InvitePendingDeclined(t *testing.T) {
 	assert.Equal(t, space.StatusInviteDeclined,
 		mapStatus(reg, "", techspace.InviteDeclinedRemoteStatus), "synced declined row → InviteDeclined")
 
-	// Deletion is terminal and beats both.
+	// The synced tombstone beats both. The device-local deleted marker
+	// does not: nothing writes it any more — it is the legacy ended join
+	// — and a direct add landing over one is the newer account-wide
+	// truth (techspace.SpaceIndexRecord.LocalDeleteStands).
 	assert.Equal(t, space.StatusDeleted,
-		mapStatus(reg, techspace.StatusDeleted, techspace.InvitePendingRemoteStatus), "local delete wins")
-	assert.Equal(t, space.StatusDeleted,
-		mapStatus(reg, techspace.StatusDeleted, techspace.InviteDeclinedRemoteStatus), "local delete wins over decline")
+		mapStatus(reg, "", techspace.StatusDeleted), "synced tombstone wins")
+	assert.Equal(t, space.StatusInvitePending,
+		mapStatus(reg, techspace.StatusDeleted, techspace.InvitePendingRemoteStatus), "direct add over a legacy ended join")
+	assert.Equal(t, space.StatusInviteDeclined,
+		mapStatus(reg, techspace.StatusDeleted, techspace.InviteDeclinedRemoteStatus), "decline over a legacy ended join")
 
 	// Accepting device mid-pull: synced accept + device-local loading →
 	// Active (matches what the account's other devices show).

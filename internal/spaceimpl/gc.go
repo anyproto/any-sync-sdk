@@ -65,8 +65,11 @@ func (s *Service) SweepOrphanCollections(ctx context.Context) {
 		// Pending rows (joining / incoming 1-1 / pending invite) count
 		// live: pre-guard builds may have materialized their storage,
 		// and the eager-loader's contract is that acceptance loads it
-		// as-is (see sdk.Open) — the sweep must honor the same rule.
-		if r.IsDeleted() {
+		// as-is (see sdk.Open) — the sweep must honor the same rule. So
+		// does an ended join: storage under it is the accept-vs-cancel
+		// race, which the boot pass keeps and the join controller
+		// reloads when the ACL grants membership.
+		if r.IsDeleted() && !r.JoinEnded() {
 			deadSpaces[r.Id] = struct{}{}
 		} else {
 			liveSpaces[r.Id] = struct{}{}

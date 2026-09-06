@@ -98,10 +98,11 @@ type Service struct {
 	readSyncMu  sync.RWMutex
 	readSyncSvc *readsync.Service
 
-	// extTypes carry through to every per-space Store created by
-	// storeFor — each type's handlers are applied alongside the
-	// built-in catalog.
+	// extTypes and modules carry through to every per-space Store
+	// created by storeFor — each type's handlers and each module's
+	// canonical collection are applied alongside the built-in catalog.
 	extTypes []handler.Type
+	modules  []handler.Module
 
 	// files/fetch/fstore/fqueue are the SDK-level byte-layer services
 	// behind every space's Files() surface. Set once by SetFiles right
@@ -240,13 +241,14 @@ type Service struct {
 // the seam through which the tech-space mirrors converged in-space
 // spaceIndex state into its rows; usually tsp itself (which
 // satisfies space.Indexer).
-func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type) *Service {
+func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type, modules []handler.Module) *Service {
 	s := &Service{
 		app:                app,
 		tsp:                tsp,
 		indexer:            indexer,
 		db:                 db,
 		extTypes:           extTypes,
+		modules:            modules,
 		stores:             make(map[string]*spaceobjects.Store),
 		allocs:             make(map[string]*object.VersionAllocator),
 		spaceIndexIds:      make(map[string]string),
@@ -306,7 +308,11 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	}
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
-	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
+	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.modules)
+	// Account-wide gate: once the tech space carries a CRDT version
+	// above this SDK's, every synced write fails with
+	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).
+	st.SetGlobalGate(s.tsp.WriteGate)
 	// Read-only gate on every user-authored synced write
 	// (Object.LocalWrite, Store.Create). Guest-mode is fixed for the
 	// store's lifetime — a key refresh tears the runtime down — so it
@@ -1137,7 +1143,7 @@ func toDatasetSchemas(named []spaceobjects.NamedSchema) []space.DatasetSchema {
 		if err != nil {
 			continue
 		}
-		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw, TypeId: ns.TypeId})
+		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw, Owners: ns.Owners, Module: ns.Module, Shared: ns.Shared})
 	}
 	return out
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -277,15 +278,18 @@ func checkPublicDataset(dataset string) error {
 	return nil
 }
 
-// checkDatasetMembership enforces the unified ownership invariant for
-// type-owned datasets: an object may only hold a type's dataset if it
-// implements that type (any.types ∋ owner). No-op for built-in / unknown
-// datasets (DatasetOwner returns false) — property-namespace membership
-// is enforced separately by SystemPropertiesHandler.PreValidate. Local
-// write-time only; inbound apply stays read-tolerant.
+// checkDatasetMembership enforces the ownership invariant for
+// type-declared datasets: an object may only hold a dataset if it
+// implements one of the types declaring it — the one owner of a
+// registered-type or namespaced dataset, any owner of a module's
+// canonical collection. No-op for built-in / unknown datasets
+// (DatasetOwners returns false) — property-namespace membership is
+// enforced separately by SystemPropertiesHandler.PreValidate. Local
+// write-time only; inbound apply stays read-tolerant, and no type is
+// ever attached on write.
 func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
-	owner, ok := s.store.DatasetOwner(dataset)
-	if !ok {
+	owners, gated := s.store.DatasetOwners(dataset)
+	if !gated {
 		return nil
 	}
 	types, err := s.store.ObjectTypes(ctx, objectId)
@@ -293,15 +297,14 @@ func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, datase
 		return err
 	}
 	for _, t := range types {
-		if t == owner {
-			return nil
+		for _, o := range owners {
+			if t == o {
+				return nil
+			}
 		}
 	}
-	return &properties.ValidationError{
-		Reason: properties.ReasonTypeNotImplemented,
-		TypeId: owner,
-		Types:  types,
-	}
+	return fmt.Errorf("%w: dataset %q on object %q — its types [%s] are not among the declaring types [%s]",
+		space.ErrDatasetNotDeclared, dataset, objectId, strings.Join(types, ", "), strings.Join(owners, ", "))
 }
 
 // localWriteRetry runs a LocalWrite, retrying once with a fresh

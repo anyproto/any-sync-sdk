@@ -243,11 +243,24 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	_, err = spA.Bundles().Get(ctx, bundleId)
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "computing the id must not install anything")
 
-	inst, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, Name: "Chat", DerivedRoot: true,
-		RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
-		Datasets:       []space.DatasetDraft{articleDatasetDraft()},
-	})
+	// The bundle declares a FULL type: a part, two properties with
+	// handles, a layout and a weight. Both devices send the same
+	// request; the property ids derive from (root, handle), so the
+	// two installs mint one column per handle.
+	declaredType := func() space.EnsureBundleRequest {
+		return space.EnsureBundleRequest{
+			Id: bundleId, Name: "Chat", DerivedRoot: true,
+			RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
+			Parts:          []space.PartDraft{articlesPart()},
+			Properties: []space.PropertyDraft{
+				{XKey: "parentId", Name: "Parent", Kind: space.PropertyKindString},
+				{XKey: "pos", Name: "Position", Kind: space.PropertyKindString, XFormat: map[string]any{"type": "text"}},
+			},
+			Layout: map[string]any{"type": "chat"},
+			Weight: 5,
+		}
+	}
+	inst, didInstall, err := spA.Bundles().Ensure(ctx, declaredType())
 	require.NoError(t, err, "device A: Ensure(derived)")
 	require.True(t, didInstall, "first derived Ensure must register the install")
 	require.Equal(t, wantRoot, inst.RootId, "installed root must be the canonical derived id")
@@ -255,20 +268,52 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.Equal(t, []string{wantRoot}, inst.Roots)
 	require.Empty(t, inst.Losers)
 
-	// A root declaring datasets is a type implementing itself: the
+	// A root declaring parts is a type implementing itself: the
 	// declaration is discoverable under typeId = rootId and records
 	// land on the root through the generic upsert path.
 	defs, err := spA.Types().Datasets(ctx, wantRoot)
 	require.NoError(t, err, "device A: Types().Datasets(root)")
 	require.Len(t, defs, 1)
-	require.Equal(t, "articles", defs[0].Name)
+	require.Equal(t, "articles", defs[0].Key)
+	articlesColl := defs[0].Collection
+	require.Equal(t, wantRoot+"_articles", articlesColl)
 	upRes, err := spA.Upsert(ctx, space.UpsertBatch{
-		ObjectId: wantRoot, Dataset: "articles",
+		ObjectId: wantRoot, Dataset: articlesColl,
 		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{"title": "One"}}},
 	})
 	require.NoError(t, err, "device A: Upsert on the bundle root")
 	require.Equal(t, 1, upRes.Created)
 	require.Empty(t, upRes.Rejections)
+
+	// The type's metadata and properties: weight / layout on the root,
+	// one definition per handle, listed (Hidden was not asked for), and
+	// usable on an object carrying the root as its type.
+	rootInfo, err := spA.Types().Get(ctx, wantRoot)
+	require.NoError(t, err)
+	assert.Equal(t, 5, rootInfo.Weight)
+	assert.Equal(t, map[string]any{"type": "chat"}, rootInfo.Layout)
+	assert.False(t, rootInfo.Hidden, "hidden is explicit — a declared type stays listed")
+	propsA, err := spA.Types().Properties(ctx, wantRoot)
+	require.NoError(t, err)
+	require.Len(t, propsA, 2)
+	propIdsA := map[string]string{}
+	for _, p := range propsA {
+		propIdsA[p.XKey] = p.Id
+	}
+	require.Len(t, propIdsA, 2)
+	assert.Equal(t, space.PropertyKindString, propsA[0].Kind)
+	carrier, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{wantRoot}})
+	require.NoError(t, err)
+	_, err = spA.Properties().Set(ctx, carrier, wantRoot, map[string]any{propIdsA["parentId"]: "any://o/x"})
+	require.NoError(t, err, "a bundle-declared property takes values on a carrier")
+
+	// Re-Ensure adopts and declares nothing twice: same ids, same count.
+	_, didInstall, err = spA.Bundles().Ensure(ctx, declaredType())
+	require.NoError(t, err)
+	require.False(t, didInstall)
+	propsA, err = spA.Types().Properties(ctx, wantRoot)
+	require.NoError(t, err)
+	require.Len(t, propsA, 2, "adopt must not redeclare a property")
 
 	// Initial property values land on the derived root — a created
 	// root gets them from Objects().Create, a derived one from the
@@ -313,11 +358,9 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.Equal(t, wantRoot, gotRoot, "the derived root id must not depend on the device")
 
 	// The offline-1-1 shape: install with no WaitIndexSynced. Whether
-	// B's registry has converged or not, it lands on the same root.
-	resB, _, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, Name: "Chat", DerivedRoot: true,
-		Datasets: []space.DatasetDraft{articleDatasetDraft()},
-	})
+	// B's registry has converged or not, it lands on the same root —
+	// and on the same property ids.
+	resB, _, err := spB.Bundles().Ensure(ctx, declaredType())
 	require.NoError(t, err, "device B: Ensure(derived) without a convergence gate")
 	require.Equal(t, wantRoot, resB.RootId)
 	require.True(t, resB.Derived)
@@ -350,9 +393,92 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 		if aerr != nil || berr != nil || len(defsA) != 1 || len(defsB) != 1 || defsA[0].Id != defsB[0].Id {
 			return false
 		}
-		n, qerr := spB.Query(wantRoot, "articles").Count(ctx)
+		n, qerr := spB.Query(wantRoot, articlesColl).Count(ctx)
 		return qerr == nil && n == 1
 	}), "bundle datasets never converged: B defs=%+v", defsB)
+
+	// Both devices declared the properties blind; the deterministic ids
+	// make them ONE definition per handle, not two columns.
+	var propsB []space.PropertyDef
+	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
+		_ = spA.SyncHeads(ctx)
+		_ = spB.SyncHeads(ctx)
+		var perr error
+		propsB, perr = spB.Types().Properties(ctx, wantRoot)
+		if perr != nil || len(propsB) != 2 {
+			return false
+		}
+		for _, p := range propsB {
+			if propIdsA[p.XKey] != p.Id {
+				return false
+			}
+		}
+		return true
+	}), "bundle properties never converged: B props=%+v", propsB)
+	infoB, err := spB.Types().Get(ctx, wantRoot)
+	require.NoError(t, err)
+	assert.Equal(t, 5, infoB.Weight)
+	assert.Equal(t, map[string]any{"type": "chat"}, infoB.Layout)
+
+	// Data written AFTER both installs crosses in both directions: each
+	// device stamps the root's newest schema state, which includes the
+	// property the other device created under the same id — every
+	// replica must know that change's shortId, or the write parks.
+	upB, err := spB.Upsert(ctx, space.UpsertBatch{
+		ObjectId: wantRoot, Dataset: articlesColl,
+		Records: []space.UpsertRecord{{Id: "a-2", Fields: map[string]any{"title": "Two"}}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, upB.Created)
+	upA, err := spA.Upsert(ctx, space.UpsertBatch{
+		ObjectId: wantRoot, Dataset: articlesColl,
+		Records: []space.UpsertRecord{{Id: "a-3", Fields: map[string]any{"title": "Three"}}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, upA.Created)
+	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
+		_ = spA.SyncHeads(ctx)
+		_ = spB.SyncHeads(ctx)
+		na, aerr := spA.Query(wantRoot, articlesColl).Count(ctx)
+		nb, berr := spB.Query(wantRoot, articlesColl).Count(ctx)
+		return aerr == nil && berr == nil && na == 3 && nb == 3
+	}), "records written after both installs never crossed")
+
+	// Adopt never patches the type's metadata: asking for Hidden on a
+	// listed install changes nothing.
+	hiddenReq := declaredType()
+	hiddenReq.Hidden = true
+	_, didInstall, err = spA.Bundles().Ensure(ctx, hiddenReq)
+	require.NoError(t, err)
+	require.False(t, didInstall)
+	rootInfo, err = spA.Types().Get(ctx, wantRoot)
+	require.NoError(t, err)
+	assert.False(t, rootInfo.Hidden, "adopt must not patch hidden")
+
+	// A declaration the gate refuses mints nothing: type metadata without
+	// parts or properties, and a layout that cannot be encoded.
+	_, _, err = spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: "bare/v1", DerivedRoot: true, Layout: map[string]any{"type": "page"}})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest)
+	_, _, err = spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "bare/v1", DerivedRoot: true, Parts: []space.PartDraft{articlesPart()},
+		Layout: map[string]any{"type": func() {}},
+	})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest)
+	_, err = spA.Bundles().Get(ctx, "bare/v1")
+	require.ErrorIs(t, err, space.ErrBundleUnknown, "a refused declaration must mint nothing")
+
+	// A removed property stays removed through later Ensures: the
+	// tombstone keeps the deterministic id. A property added through
+	// the type API gets an ordinary id.
+	require.NoError(t, spA.Types().RemoveProperty(ctx, wantRoot, propIdsA["pos"]))
+	_, _, err = spA.Bundles().Ensure(ctx, declaredType())
+	require.NoError(t, err)
+	propsA, err = spA.Types().Properties(ctx, wantRoot)
+	require.NoError(t, err)
+	require.Len(t, propsA, 1, "Ensure must not resurrect a removed property")
+	extra, err := spA.Types().AddProperty(ctx, wantRoot, space.PropertyDraft{XKey: "extra", Kind: space.PropertyKindNumber})
+	require.NoError(t, err)
+	require.NotEqual(t, propIdsA["pos"], extra)
 
 	// The derived root is permanent: the tree cannot be deleted, which
 	// is the price of never forking.

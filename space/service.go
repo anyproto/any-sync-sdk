@@ -3,6 +3,7 @@ package space
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // ErrSpaceNotAccepted is returned by Service.Get for a space this
@@ -33,6 +34,48 @@ var ErrSpaceDeleted = errors.New("space: deleted")
 // write up front with a typed error instead of letting local state
 // silently diverge or surfacing a low-level ACL rejection.
 var ErrReadOnlySpace = errors.New("space: read-only")
+
+// CRDTVersion is the version of the CRDT data model this SDK writes
+// and the newest one it can serve. The tech space records it (the
+// `crdtVersion` record on the space-index object) the first time an
+// SDK of this version opens the account, and the value never
+// decreases — a monotonic rule every replica enforces on apply. An SDK
+// that finds a higher stored version refuses to open
+// (ErrCRDTVersionNewer); one that sees the higher version arrive while
+// running keeps serving reads and refuses every user-authored synced
+// write with the same error (SDK.CRDTVersion reports the state). Bump
+// it when a release writes data the previous release cannot read or
+// would corrupt by writing.
+const CRDTVersion = 1
+
+// ErrCRDTVersionNewer: the account's data was written by a newer SDK
+// than this one — the tech space carries a CRDT version above
+// CRDTVersion. Returned by Open and, once the higher version arrives
+// at runtime, by every synced write. errors.As to
+// CRDTVersionNewerError for the versions.
+var ErrCRDTVersionNewer = errors.New("space: account CRDT version is newer than this SDK supports")
+
+// CRDTVersionNewerError carries the versions behind ErrCRDTVersionNewer.
+type CRDTVersionNewerError struct {
+	Stored    int
+	Supported int
+}
+
+func (e *CRDTVersionNewerError) Error() string {
+	return fmt.Sprintf("%v (stored %d, supported %d)", ErrCRDTVersionNewer, e.Stored, e.Supported)
+}
+
+func (e *CRDTVersionNewerError) Unwrap() error { return ErrCRDTVersionNewer }
+
+// CRDTVersionState is the account's CRDT-version state: the version
+// this SDK supports, the version the tech space records (0 until the
+// first SDK carrying the mark opens the account), and whether the
+// stored one is newer — in which case the SDK is read-only.
+type CRDTVersionState struct {
+	Supported int
+	Stored    int
+	Newer     bool
+}
 
 // ErrGuestJoinPending is returned by Service.JoinGuest when the guest
 // row was recorded durably but the space content isn't pullable yet.

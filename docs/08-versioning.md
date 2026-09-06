@@ -98,8 +98,30 @@ runtime-defined half without a replay:
   "new handler added" needs no wipe-and-rebuild for datasets whose
   changes arrived early.
 
-Still open: an SDK-wide version scope (today every trigger is
-per-dataset), a forced `Reindex(objectId)` entry point, and any-store
+**The CRDT version mark** (`space.CRDTVersion`, `techspace/crdtversion.go`)
+is the account-wide scope — not a rebuild trigger but a compatibility
+gate. The tech space's index object carries one system record
+(`crdtVersion` dataset, record `crdtVersion`, field `version`) naming
+the newest CRDT data-model version an SDK has written this account
+with. The handler makes it monotonic on every replica: a lower value
+is dropped on apply, so two devices racing to stamp it converge on
+the maximum. `Open` reads it after the tech space is up: above the
+SDK's own version it refuses with `space.ErrCRDTVersionNewer`
+(`space.CRDTVersionNewerError` carries both numbers) and touches
+nothing else; below or absent, it raises the mark in one synced
+write. A newer mark arriving THROUGH SYNC while running — a restore on
+a device with an older SDK, a second device upgraded first — flips the
+account read-only: every user-authored synced write, tech space
+included, fails with the same error, reads keep serving, and
+`SDK.CRDTVersion()` reports `{Supported, Stored, Newer}` for the
+embedder to show "upgrade required". Bump `space.CRDTVersion` when a
+release writes data the previous release cannot read or would corrupt
+by writing (a storage-model change like parts and modules, not a
+handler-logic fix — those are `HandlerVersion`). The gate can only
+protect releases that carry it: the version that introduced the mark
+is the oldest one that refuses.
+
+Still open: a forced `Reindex(objectId)` entry point and any-store
 schema-level migrations.
 
 ## Version Scopes
@@ -110,6 +132,7 @@ Candidate scopes (to refine during grooming):
 
 | Scope | Unit | Triggers rebuild of |
 |-------|------|---------------------|
+| **CRDT version** | whole account (tech-space mark) | Nothing — a newer mark refuses Open / turns the SDK read-only (implemented, above) |
 | **SDK version** | whole SDK | Everything (migration) |
 | **Handler version** | per dataset handler | All records in that dataset across all objects |
 | **Dataset version** | per dataset registration | Records of that dataset |

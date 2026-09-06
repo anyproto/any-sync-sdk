@@ -10,8 +10,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
+	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
@@ -34,12 +36,19 @@ func seedTypeObject(t *testing.T, ctx context.Context, db anystore.DB, spaceId, 
 	require.NoError(t, coll.UpsertOne(ctx, row))
 }
 
-// seedDatasetDefs applies head+field records through a real defs
+// seedDatasetDefs applies part+head+field records through a real defs
 // controller so records carry proper `_ver` state. verPrefix keeps
 // creation `_ver.id`s distinct across seeded type objects (real trees
-// never share orderIds; equal ids here would make the cross-type
-// name-conflict tiebreak ambiguous by test artifact).
-func seedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsName, verPrefix string) {
+// never share orderIds). The dataset is a records one keyed dsKey.
+func seedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, verPrefix string) {
+	t.Helper()
+	seedModuleDefs(t, ctx, db, typeId, dsKey, types.RecordsModule, false, verPrefix)
+}
+
+// seedModuleDefs declares one part keyed dsKey carrying one dataset
+// keyed dsKey of the given module (a records dataset also gets a
+// `title` field).
+func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, shared bool, verPrefix string) {
 	t.Helper()
 	ctrl, err := crdt.NewController(ctx, typeId, db,
 		crdt.HandlerReg{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}},
@@ -47,27 +56,46 @@ func seedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, 
 	)
 	require.NoError(t, err)
 	a := &anyenc.Arena{}
+	partId := typeId + "-part-" + dsKey
+	part := a.NewObject()
+	part.Set(typetype.DefFieldDef, a.NewString(typetype.DefKindPart))
+	part.Set(typetype.FieldKey, a.NewString(dsKey))
+	require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{
+		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-part-" + typeId + dsKey,
+		VersionId: crdt.VersionId(verPrefix + "0"), DataVersion: typetype.DatasetDefsHandlerVersion,
+		Records: []crdt.RecordChange{{Id: partId, Upsert: true,
+			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: part}}}},
+	}))
 	head := a.NewObject()
 	head.Set(typetype.DefFieldDef, a.NewString(typetype.DefKindDataset))
-	head.Set(typetype.DefFieldName, a.NewString(dsName))
-	head.Set(typetype.DefFieldIdRule, a.NewString("user"))
+	head.Set(typetype.FieldKey, a.NewString(dsKey))
+	head.Set(typetype.DefFieldModule, a.NewString(module))
+	head.Set(typetype.DefFieldPart, a.NewString(partId))
+	if shared {
+		head.Set(typetype.DefFieldShared, a.NewTrue())
+	}
+	if module == types.RecordsModule {
+		head.Set(typetype.DefFieldIdRule, a.NewString("user"))
+	}
 	require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{
-		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-head-" + dsName,
+		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-head-" + typeId + dsKey,
 		VersionId: crdt.VersionId(verPrefix + "1"), DataVersion: typetype.DatasetDefsHandlerVersion,
-		Records: []crdt.RecordChange{{Id: typeId + "-head-" + dsName, Upsert: true,
+		Records: []crdt.RecordChange{{Id: typeId + "-head-" + dsKey, Upsert: true,
 			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: head}}}},
 	}))
-	field := a.NewObject()
-	field.Set(typetype.DefFieldDef, a.NewString(typetype.DefKindField))
-	field.Set(typetype.DefFieldDataset, a.NewString(typeId+"-head-"+dsName))
-	field.Set(typetype.FieldKey, a.NewString("title"))
-	field.Set(typetype.FieldKind, a.NewString("string"))
-	require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{
-		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-field-" + dsName,
-		VersionId: crdt.VersionId(verPrefix + "2"), DataVersion: typetype.DatasetDefsHandlerVersion,
-		Records: []crdt.RecordChange{{Id: "field-" + dsName, Upsert: true,
-			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: field}}}},
-	}))
+	if module == types.RecordsModule {
+		field := a.NewObject()
+		field.Set(typetype.DefFieldDef, a.NewString(typetype.DefKindField))
+		field.Set(typetype.DefFieldDataset, a.NewString(typeId+"-head-"+dsKey))
+		field.Set(typetype.FieldKey, a.NewString("title"))
+		field.Set(typetype.FieldKind, a.NewString("string"))
+		require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{
+			ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-field-" + typeId + dsKey,
+			VersionId: crdt.VersionId(verPrefix + "2"), DataVersion: typetype.DatasetDefsHandlerVersion,
+			Records: []crdt.RecordChange{{Id: "field-" + typeId + dsKey, Upsert: true,
+				Ops: []crdt.Op{{Type: crdt.OpSet, Payload: field}}}},
+		}))
+	}
 	require.NoError(t, ctrl.CloseOwnedCollections())
 }
 
@@ -79,24 +107,28 @@ func TestCatalog_BootScanAndBuildRegs(t *testing.T) {
 
 	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
+	coll := types.CollectionName(catTypeId, "notes")
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 
-	ds, ok := store.RuntimeDataset("notes")
+	ds, ok := store.RuntimeDataset(coll)
 	require.True(t, ok, "boot scan must pick the runtime dataset up")
 	assert.Equal(t, catTypeId, ds.TypeId)
+	assert.Equal(t, "notes", ds.Key)
 	assert.Equal(t, schema.IdUser, ds.Schema.IdRule)
+	_, bare := store.RuntimeDataset("notes")
+	assert.False(t, bare, "the bare key is not a collection")
 
-	owner, ok := store.DatasetOwner("notes")
+	owners, ok := store.DatasetOwners(coll)
 	require.True(t, ok)
-	assert.Equal(t, catTypeId, owner)
+	assert.Equal(t, []string{catTypeId}, owners)
 
 	regs, _, err := store.buildRegs()
 	require.NoError(t, err)
 	var found bool
 	for _, reg := range regs {
-		if reg.Name == "notes" {
+		if reg.Name == coll {
 			found = true
 			_, isSchemaHandler := reg.Handler.(*crdt.SchemaHandler)
 			assert.True(t, isSchemaHandler)
@@ -105,9 +137,27 @@ func TestCatalog_BootScanAndBuildRegs(t *testing.T) {
 	assert.True(t, found, "buildRegs must include the runtime dataset")
 
 	// DataVersionFor stamps the owning type's latest shortId.
-	dv, err := store.DataVersionFor(ctx, "notes")
+	dv, err := store.DataVersionFor(ctx, coll)
 	require.NoError(t, err)
 	assert.Contains(t, dv, catTypeId+":")
+
+	// Discovery lists it under its owner and module.
+	var listed bool
+	for _, ns := range store.Schemas() {
+		if ns.Name == coll {
+			listed = true
+			assert.Equal(t, []string{catTypeId}, ns.Owners)
+			assert.Equal(t, types.RecordsModule, ns.Module)
+			assert.False(t, ns.Shared)
+		}
+	}
+	assert.True(t, listed)
+
+	// The compiled parts view is reachable through the store.
+	ct, err := store.TypeParts(ctx, catTypeId)
+	require.NoError(t, err)
+	require.Len(t, ct.Parts, 1)
+	assert.Equal(t, "notes", ct.Parts[0].Key)
 }
 
 func TestCatalog_RefreshTypeAddsAndRemoves(t *testing.T) {
@@ -116,24 +166,29 @@ func TestCatalog_RefreshTypeAddsAndRemoves(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
-	_, ok := store.RuntimeDataset("notes")
+	coll := types.CollectionName(catTypeId, "notes")
+	_, ok := store.RuntimeDataset(coll)
 	require.False(t, ok)
 
 	// Defs land after store open (the inbound-sync order): refreshType
 	// picks them up without a store reopen.
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
 	store.refreshType(ctx, catTypeId)
-	_, ok = store.RuntimeDataset("notes")
+	_, ok = store.RuntimeDataset(coll)
 	require.True(t, ok)
 
-	// A reserved/static name never enters the catalog.
+	// Another type declaring the same key gets its own collection —
+	// namespacing makes cross-type conflicts impossible.
 	seedDatasetDefs(t, ctx, db, "type-other", "notes", "b")
 	store.refreshType(ctx, "type-other")
-	ds, ok := store.RuntimeDataset("notes")
+	other, ok := store.RuntimeDataset(types.CollectionName("type-other", "notes"))
 	require.True(t, ok)
-	assert.Equal(t, catTypeId, ds.TypeId, "cross-type conflict resolves deterministically")
+	assert.Equal(t, "type-other", other.TypeId)
+	ds, ok := store.RuntimeDataset(coll)
+	require.True(t, ok)
+	assert.Equal(t, catTypeId, ds.TypeId)
 }
 
 func TestControllerStaleFor_RemovedDataset(t *testing.T) {
@@ -144,15 +199,16 @@ func TestControllerStaleFor_RemovedDataset(t *testing.T) {
 
 	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
-	store := NewStore(nil, db, nil, "spaceA", nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
+	coll := types.CollectionName(catTypeId, "notes")
 
 	regs, _, err := store.buildRegs()
 	require.NoError(t, err)
 	ctrl, err := crdt.NewController(ctx, "obj-X", db, regs...)
 	require.NoError(t, err)
 
-	require.False(t, store.controllerStaleFor(ctrl, "notes"), "fresh reg matches catalog rev")
+	require.False(t, store.controllerStaleFor(ctrl, coll), "fresh reg matches catalog rev")
 
 	// Definition removed: the resident controller (still carrying the
 	// reg) must go stale so it stops applying what fresh peers park.
@@ -160,9 +216,9 @@ func TestControllerStaleFor_RemovedDataset(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, headColl.DeleteId(ctx, catTypeId+"-head-notes"))
 	store.refreshType(ctx, catTypeId)
-	_, known := store.RuntimeDataset("notes")
+	_, known := store.RuntimeDataset(coll)
 	require.False(t, known)
-	assert.True(t, store.controllerStaleFor(ctrl, "notes"))
+	assert.True(t, store.controllerStaleFor(ctrl, coll))
 }
 
 func TestGate_ParksUnknownDatasetChange(t *testing.T) {
@@ -188,4 +244,184 @@ func TestGate_ParksUnknownDatasetChange(t *testing.T) {
 	ok, err = gate(ctx, ch2, []byte("payload"))
 	require.NoError(t, err)
 	assert.True(t, ok)
+}
+
+// blocksHandler is a stateless module handler whose identity the tests
+// can recognise on a registration.
+type blocksHandler struct {
+	crdt.DefaultHandler
+	inst handler.ModuleInstance
+}
+
+func (blocksHandler) Init(context.Context) error { return nil }
+
+func testModule() handler.Module {
+	return handler.Module{
+		Name:        "blocks",
+		Canonical:   "blocks_shared",
+		DataVersion: "blocks-v1",
+		Properties: []handler.PropertyDecl{
+			{Id: "count", Name: "Count", Kind: handler.PropertyKindNumber, Scope: handler.ScopeLocal},
+		},
+		New: func(inst handler.ModuleInstance) handler.Dataset {
+			return handler.Dataset{
+				Handler: blocksHandler{inst: inst},
+				Schema:  handler.Schema{Dynamic: true},
+			}
+		},
+	}
+}
+
+// A module registers its canonical collection on every controller
+// before any type declares it, owner sets follow the catalog, and a
+// namespaced instance is served by the module's handler rather than
+// the generic schema handler.
+func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "mod.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, []handler.Module{testModule()})
+	t.Cleanup(func() { _ = store.Close() })
+
+	regs, _, err := store.buildRegs()
+	require.NoError(t, err)
+	var canonical *crdt.HandlerReg
+	for i := range regs {
+		if regs[i].Name == "blocks_shared" {
+			canonical = &regs[i]
+		}
+	}
+	require.NotNil(t, canonical, "the canonical collection registers statically")
+	bh, ok := canonical.Handler.(blocksHandler)
+	require.True(t, ok)
+	assert.True(t, bh.inst.Shared)
+	assert.Equal(t, "blocks_shared", bh.inst.Collection)
+	dv, err := store.DataVersionFor(ctx, "blocks_shared")
+	require.NoError(t, err)
+	assert.Equal(t, "blocks-v1", dv)
+
+	owners, gated := store.DatasetOwners("blocks_shared")
+	require.True(t, gated, "a canonical collection is always gated")
+	assert.Empty(t, owners, "nothing declares it yet")
+	assert.Empty(t, store.ModuleGrants(map[string]struct{}{"type-a": {}}))
+
+	// Type A shares the module; type B declares a namespaced instance.
+	seedTypeObject(t, ctx, db, "spaceA", "type-a")
+	seedTypeObject(t, ctx, db, "spaceA", "type-b")
+	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", true, "a")
+	seedModuleDefs(t, ctx, db, "type-b", "notes", "blocks", false, "b")
+	store.refreshType(ctx, "type-a")
+	store.refreshType(ctx, "type-b")
+
+	owners, _ = store.DatasetOwners("blocks_shared")
+	assert.Equal(t, []string{"type-a"}, owners)
+	inst := types.CollectionName("type-b", "notes")
+	owners, gated = store.DatasetOwners(inst)
+	require.True(t, gated)
+	assert.Equal(t, []string{"type-b"}, owners)
+
+	regs, _, err = store.buildRegs()
+	require.NoError(t, err)
+	var instReg *crdt.HandlerReg
+	for i := range regs {
+		if regs[i].Name == inst {
+			instReg = &regs[i]
+		}
+	}
+	require.NotNil(t, instReg, "the namespaced instance registers")
+	bh, ok = instReg.Handler.(blocksHandler)
+	require.True(t, ok, "served by the module, not the schema handler")
+	assert.Equal(t, "type-b", bh.inst.TypeId)
+	assert.Equal(t, "notes", bh.inst.Key)
+	assert.False(t, bh.inst.Shared)
+	assert.NotEmpty(t, instReg.SchemaRev)
+
+	// The module namespace is granted off either declaration kind.
+	assert.Equal(t, []string{"blocks"}, store.ModuleGrants(map[string]struct{}{"type-a": {}}))
+	assert.Equal(t, []string{"blocks"}, store.ModuleGrants(map[string]struct{}{"type-b": {}}))
+	assert.Empty(t, store.ModuleGrants(map[string]struct{}{"type-c": {}}))
+	assert.Equal(t, "blocks", store.counterNamespace("blocks_shared"))
+	assert.Equal(t, "blocks", store.counterNamespace(inst))
+	props, ok := store.Registry().PropsOf("blocks")
+	require.True(t, ok, "the module's properties resolve as a namespace")
+	require.Len(t, props, 1)
+	assert.Equal(t, "count", props[0].Id)
+
+	// Discovery: the canonical carries its owner set, the instance its
+	// module.
+	var sawCanonical, sawInst bool
+	for _, ns := range store.Schemas() {
+		switch ns.Name {
+		case "blocks_shared":
+			sawCanonical = true
+			assert.Equal(t, []string{"type-a"}, ns.Owners)
+			assert.Equal(t, "blocks", ns.Module)
+			assert.True(t, ns.Shared)
+		case inst:
+			sawInst = true
+			assert.Equal(t, []string{"type-b"}, ns.Owners)
+			assert.Equal(t, "blocks", ns.Module)
+			assert.False(t, ns.Shared)
+		}
+	}
+	assert.True(t, sawCanonical && sawInst)
+
+	// A withdrawn shared declaration drops the owner; the canonical
+	// registration stays.
+	headColl, err := db.Collection(ctx, "type-a_datasets")
+	require.NoError(t, err)
+	require.NoError(t, headColl.DeleteId(ctx, "type-a-head-blocks_shared"))
+	store.refreshType(ctx, "type-a")
+	owners, gated = store.DatasetOwners("blocks_shared")
+	assert.True(t, gated)
+	assert.Empty(t, owners)
+}
+
+func TestValidateExternalModules(t *testing.T) {
+	good := testModule()
+	sharedOnly := testModule()
+	sharedOnly.Name = "chatty"
+	sharedOnly.Canonical = "chatty_shared"
+	sharedOnly.SharedOnly = true
+	noCanonical := testModule()
+	noCanonical.Name = "plain"
+	noCanonical.Canonical = ""
+	noCanonical.DataVersion = ""
+	require.NoError(t, ValidateExternalModules(nil, []handler.Module{good, sharedOnly, noCanonical}))
+
+	bad := func(mut func(m *handler.Module)) handler.Module {
+		m := testModule()
+		mut(&m)
+		return m
+	}
+	cases := []struct {
+		name  string
+		types []handler.Type
+		mods  []handler.Module
+	}{
+		{"empty name", nil, []handler.Module{bad(func(m *handler.Module) { m.Name = "" })}},
+		{"bad slug", nil, []handler.Module{bad(func(m *handler.Module) { m.Name = "Blocks" })}},
+		{"records reserved", nil, []handler.Module{bad(func(m *handler.Module) { m.Name = "records" })}},
+		{"reserved type id", nil, []handler.Module{bad(func(m *handler.Module) { m.Name = "any" })}},
+		{"type id collision", []handler.Type{{Id: "blocks"}}, []handler.Module{good}},
+		{"duplicate", nil, []handler.Module{good, good}},
+		{"nil New", nil, []handler.Module{bad(func(m *handler.Module) { m.New = nil })}},
+		{"shared-only without canonical", nil, []handler.Module{bad(func(m *handler.Module) { m.Canonical = ""; m.SharedOnly = true })}},
+		{"canonical reserved", nil, []handler.Module{bad(func(m *handler.Module) { m.Canonical = "objects" })}},
+		{"canonical collides with a type dataset", []handler.Type{{Id: "t", Datasets: []handler.Dataset{{Name: "blocks_shared", DataVersion: "v", Handler: crdt.DefaultHandler{}}}}}, []handler.Module{good}},
+		{"empty data version", nil, []handler.Module{bad(func(m *handler.Module) { m.DataVersion = "" })}},
+		{"bad property", nil, []handler.Module{bad(func(m *handler.Module) {
+			m.Properties = []handler.PropertyDecl{{Id: "_x", Kind: handler.PropertyKindString}}
+		})}},
+		{"derived property scope", nil, []handler.Module{bad(func(m *handler.Module) {
+			m.Properties = []handler.PropertyDecl{{Id: "x", Kind: handler.PropertyKindString, Scope: handler.ScopeDerived}}
+		})}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, ValidateExternalModules(tc.types, tc.mods))
+		})
+	}
 }

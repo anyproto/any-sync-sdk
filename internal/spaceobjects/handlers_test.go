@@ -191,7 +191,7 @@ func TestStore_DataVersion_External(t *testing.T) {
 	}
 	require.NoError(t, ValidateExternalTypes(extTypes))
 
-	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes)
+	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil)
 
 	// Built-in still resolves.
 	v, err := store.DataVersion("objects")
@@ -217,19 +217,19 @@ func TestStore_DatasetOwner(t *testing.T) {
 		{Id: "nav", Properties: []handler.PropertyDecl{{Id: "pos", Kind: handler.PropertyKindString}}},
 	}
 	require.NoError(t, ValidateExternalTypes(extTypes))
-	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes)
+	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil)
 
 	// Both datasets of one type map to that owner (N→1).
-	owner, ok := store.DatasetOwner("scenes")
+	owners, ok := store.DatasetOwners("scenes")
 	assert.True(t, ok)
-	assert.Equal(t, "movie", owner)
-	owner, ok = store.DatasetOwner("credits")
+	assert.Equal(t, []string{"movie"}, owners)
+	owners, ok = store.DatasetOwners("credits")
 	assert.True(t, ok)
-	assert.Equal(t, "movie", owner)
+	assert.Equal(t, []string{"movie"}, owners)
 
 	// Built-in and property-only types own no external dataset.
-	_, ok = store.DatasetOwner("objects")
+	_, ok = store.DatasetOwners("objects")
 	assert.False(t, ok)
-	_, ok = store.DatasetOwner("nope")
+	_, ok = store.DatasetOwners("nope")
 	assert.False(t, ok)
 }

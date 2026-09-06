@@ -364,6 +364,145 @@ type Type struct {
 	// the equivalent tables internally; external types declare theirs
 	// here so the SDK can resolve and enforce their schema.
 	Properties []PropertyDecl
+
+	// Parts are the type's display units, declared statically — the
+	// shape a user type declares at runtime through
+	// space.TypesAPI.AddPart. Each part names one or more datasets:
+	// entries of Datasets by Name, or module datasets (a shared
+	// canonical collection, or a namespaced `<typeId>_<key>` instance)
+	// the SDK instantiates exactly as it does for a runtime declaration
+	// — the write gate, discovery ownership and the module namespace on
+	// the objects row all follow. With Parts set, every entry of
+	// Datasets must be named by exactly one part (sdk.Open rejects the
+	// rest). Without Parts, a type with Datasets gets one implicit part
+	// per dataset, keyed by the dataset name. Read back through
+	// space.TypesAPI.Parts / Datasets; never mutable at runtime.
+	Parts []Part
+
+	// Hidden keeps the type out of default listings and pickers
+	// (space.TypeInfo.Hidden): a client shows it only on request. For a
+	// capability type an object opts into rather than a class a user
+	// picks.
+	Hidden bool
+}
+
+// Part is one display unit of a registered type: the display slice a
+// client renders plus the datasets the part owns. Mirrors
+// space.PartDraft; Key is the part's slug, unique within the type.
+type Part struct {
+	Key    string
+	Name   string
+	Icon   string
+	Pos    string
+	Hidden bool
+	// UI is the widget descriptor — {type, config} in the x-format
+	// shape, opaque to the SDK.
+	UI map[string]any
+	// Uses names other datasets of this type (their key) the part
+	// renders without owning them.
+	Uses []string
+	// Datasets are the part's datasets — at least one.
+	Datasets []PartDataset
+}
+
+// PartDataset names one dataset a static part owns — the static twin
+// of space.DatasetDraft, which a runtime part declares. Exactly one of
+// the two forms (sdk.Open rejects the rest):
+//
+//   - Name: one of the owning Type's Datasets, by name. The dataset's
+//     collection is its Name; its module reads as `records` when it
+//     runs on the generic schema handler (nil Handler), none when
+//     bespoke. Shared and Key stay empty.
+//   - Module: a dataset of a registered module, declared as a runtime
+//     part would — Shared for the module's canonical collection (Key
+//     defaults to the canonical name), a namespaced `<typeId>_<Key>`
+//     instance otherwise (the module needs a DataVersion for that).
+//     The `records` module has no place here: a static records dataset
+//     is a Type.Datasets entry with a Schema.
+//
+// Keys are one namespace per type: a module Key must not equal a
+// static dataset's Name.
+type PartDataset struct {
+	Name   string
+	Module string
+	Shared bool
+	Key    string
+}
+
+// ModuleInstance identifies one collection a module serves: the type
+// declaring it, the dataset key inside that type, the collection name
+// the instance reads and writes, and whether it is the module's shared
+// canonical collection — TypeId and Key are empty for that one, since
+// every type declaring a shared dataset of the module participates in
+// it.
+type ModuleInstance struct {
+	TypeId     string
+	Key        string
+	Collection string
+	Shared     bool
+}
+
+// Module is a compiled-in dataset behaviour a type declares at runtime
+// inside one of its parts: the block editor, the chat message stream.
+// Where a Type binds fixed dataset names, a Module is a factory the SDK
+// instantiates per collection — once for the shared Canonical
+// collection and once per namespaced `<typeId>_<key>` instance a type
+// declares — so derivation, authorisation, read tracking and indexes
+// behave identically on every instance. Callers register modules via
+// config.Config.Modules; `records` (the generic schema-enforced
+// dataset) is built in.
+type Module struct {
+	// Name is the slug types name in their dataset declarations
+	// ("editor", "chat"). Required; "records" is reserved.
+	Name string
+
+	// Canonical is the shared collection name ("editor_blocks"): a type
+	// declaring `shared: true` for this module participates in it.
+	// Empty means the module has no shared collection and every
+	// instance is namespaced.
+	Canonical string
+
+	// SharedOnly refuses namespaced instances, so an object carries at
+	// most one collection of the module — the invariant behind a single
+	// read frontier and a single push group per object. Requires
+	// Canonical.
+	SharedOnly bool
+
+	// Reserved keeps the module out of runtime declarations: a part or
+	// dataset draft naming it — through TypesAPI.AddPart / AddDataset or
+	// a bundle's Parts — is refused with space.ErrModuleReserved, unless
+	// the Ensure call carries the space.SystemInstall option (the
+	// consumer's own catalog install). Registered types may still
+	// declare it statically, and a declaration that reached the DAG
+	// stays valid on apply (a peer that admitted it was the consumer's
+	// own install). Requires SharedOnly.
+	Reserved bool
+
+	// DataVersion is stamped on changes to the Canonical collection —
+	// the same opaque string a Dataset carries. Namespaced instances
+	// stamp the declaring type's schema state instead.
+	DataVersion string
+
+	// HandlerVersion is the LOCAL logic version of the module's handler,
+	// applied to every instance: bumping it replays every collection
+	// the module serves. Zero means 1. See Dataset.HandlerVersion.
+	HandlerVersion int
+
+	// Properties declares the module's namespace on the objects row —
+	// values stored under `<module name>.<propId>` (a chat's unread
+	// counters, its notify mode). A row may carry the namespace when one
+	// of its types declares a dataset of this module; the read-tracking
+	// service writes the counters there.
+	Properties []PropertyDecl
+
+	// New builds the registration for one instance: Handler (nil for
+	// the generic schema handler), Schema, Indexes, ReadTracking,
+	// SkipHistory, DisableFilteredReplay. Name and DataVersion on the
+	// returned value are ignored — the SDK fills them from the instance.
+	// The handler must be safe to share across controllers: the SDK
+	// builds one per collection per catalog snapshot and reuses it,
+	// exactly as it shares the generic schema handler.
+	New func(ModuleInstance) Dataset
 }
 
 // PropertyKind mirrors the JSON-Schema-subset value kinds the SDK

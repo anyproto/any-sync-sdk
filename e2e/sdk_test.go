@@ -328,12 +328,21 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	assert.Equal(t, "Movie", typeRec.GetString("any", "name"))
 
 	// The meta-type is introspectable like any other built-in: its
-	// property list is what a type object carries in its own namespace.
+	// property list is what a type object carries in its own namespace
+	// — the handle plus the rendering and listing slice.
 	metaProps, err := sp.Types().Properties(ctx, "type")
 	require.NoError(t, err)
-	require.Len(t, metaProps, 1)
-	assert.Equal(t, "xkey", metaProps[0].Id)
-	assert.Equal(t, space.PropertyKindString, metaProps[0].Kind)
+	metaKinds := map[string]space.PropertyKind{}
+	for _, p := range metaProps {
+		metaKinds[p.Id] = p.Kind
+	}
+	assert.Equal(t, map[string]space.PropertyKind{
+		"xkey":   space.PropertyKindString,
+		"weight": space.PropertyKindNumber,
+		"layout": space.PropertyKindObject,
+		"hidden": space.PropertyKindBoolean,
+		"meta":   space.PropertyKindObject,
+	}, metaKinds)
 
 	// Types.Get("any") returns the built-in.
 	anyInfo, err := sp.Types().Get(ctx, "any")

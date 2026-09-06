@@ -21,7 +21,7 @@ func articleDatasetDraft() space.DatasetDraft {
 	stageShape := handler.Leaf(handler.PropertyKindArray)
 	stageShape.Items = handler.Leaf(handler.PropertyKindString)
 	return space.DatasetDraft{
-		Name:        "articles",
+		Key:         "articles",
 		DisplayName: "Articles",
 		IdRule:      space.IdUser,
 		DeleteBy:    space.DeleteByAuthor,
@@ -41,10 +41,21 @@ func articleDatasetDraft() space.DatasetDraft {
 	}
 }
 
+// articlesPart wraps the articles dataset in the part a type declares
+// it under.
+func articlesPart() space.PartDraft {
+	return space.PartDraft{
+		Key: "articles", Name: "Articles", Pos: "a0",
+		UI:       map[string]any{"type": "table"},
+		Datasets: []space.DatasetDraft{articleDatasetDraft()},
+	}
+}
+
 // TestE2E_UserDatasets_DefineAndUpsert is the single-device SYN-147
-// lifecycle: define a dataset on a runtime type, batch-upsert records
-// through the generic path, verify stamps / enforcement / idempotency /
-// discovery — all local reads, no network round-trip required.
+// lifecycle: declare a part with a records dataset on a runtime type,
+// batch-upsert records through the generic path, verify stamps /
+// enforcement / idempotency / discovery — all local reads, no network
+// round-trip required.
 func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -71,19 +82,39 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Article"})
+	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Article", Weight: 10,
+		Layout: map[string]any{"type": "page"}})
 	require.NoError(t, err)
-
-	defId, err := sp.Types().AddDataset(ctx, typeId, articleDatasetDraft())
+	ti, err := sp.Types().Get(ctx, typeId)
 	require.NoError(t, err)
-	require.NotEmpty(t, defId)
+	assert.Equal(t, 10, ti.Weight)
+	assert.Equal(t, map[string]any{"type": "page"}, ti.Layout)
 
-	// Compiled definition reads back.
+	partId, err := sp.Types().AddPart(ctx, typeId, articlesPart())
+	require.NoError(t, err)
+	require.NotEmpty(t, partId)
+
+	// The part and its dataset read back compiled.
+	parts, err := sp.Types().Parts(ctx, typeId)
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+	assert.Equal(t, partId, parts[0].Id)
+	assert.Equal(t, "articles", parts[0].Key)
+	assert.Equal(t, "Articles", parts[0].Name)
+	assert.Equal(t, map[string]any{"type": "table"}, parts[0].UI)
+	require.Len(t, parts[0].Datasets, 1)
+
 	defs, err := sp.Types().Datasets(ctx, typeId)
 	require.NoError(t, err)
 	require.Len(t, defs, 1)
 	def := defs[0]
-	assert.Equal(t, "articles", def.Name)
+	defId := def.Id
+	coll := def.Collection
+	assert.Equal(t, "articles", def.Key)
+	assert.Equal(t, typeId+"_articles", coll, "a records dataset is namespaced under its type")
+	assert.Equal(t, space.RecordsModule, def.Module)
+	assert.False(t, def.Shared)
+	assert.Equal(t, partId, def.PartId)
 	assert.Equal(t, space.IdUser, def.IdRule)
 	assert.Equal(t, space.DeleteByAuthor, def.DeleteBy)
 	require.NotNil(t, def.Search)
@@ -112,14 +143,16 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.Equal(t, "choice", stage.XFormat["type"])
 	assert.Nil(t, fieldByKey(defs, "body").XFormat, "a field without a descriptor reads back nil")
 
-	// Discovery includes the runtime dataset with its owning type. A
-	// single-key text mapping surfaces as the bare string — discovery
-	// output is unchanged for consumers of the single-field form.
+	// Discovery includes the runtime dataset under its collection with
+	// its owning type and module. A single-key text mapping surfaces as
+	// the bare string — discovery output is unchanged for consumers of
+	// the single-field form.
 	var discovered bool
 	for _, ds := range sp.Datasets() {
-		if ds.Name == "articles" {
+		if ds.Name == coll {
 			discovered = true
-			assert.Equal(t, typeId, ds.TypeId)
+			assert.Equal(t, []string{typeId}, ds.Owners)
+			assert.Equal(t, space.RecordsModule, ds.Module)
 			assert.Contains(t, string(ds.JSONSchema), `"x-search"`)
 			assert.Contains(t, string(ds.JSONSchema), `"scope":"articles"`)
 			assert.Contains(t, string(ds.JSONSchema), `"text":"body"`)
@@ -128,6 +161,38 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 		}
 	}
 	assert.True(t, discovered, "Datasets() must list the runtime dataset")
+
+	// Part patch: the display slice mutates, the key is pinned.
+	require.NoError(t, sp.Types().PatchPart(ctx, typeId, partId, space.DatasetDefPatch{
+		Set:   map[string]any{"name": "Pieces", "hidden": true, "ui": map[string]any{"type": "list"}},
+		Unset: []string{"pos"},
+	}))
+	parts, err = sp.Types().Parts(ctx, typeId)
+	require.NoError(t, err)
+	assert.Equal(t, "Pieces", parts[0].Name)
+	assert.True(t, parts[0].Hidden)
+	assert.Equal(t, map[string]any{"type": "list"}, parts[0].UI)
+	assert.Empty(t, parts[0].Pos)
+	require.ErrorIs(t, sp.Types().PatchPart(ctx, typeId, partId, space.DatasetDefPatch{
+		Set: map[string]any{"key": "other"},
+	}), space.ErrPinnedField)
+	require.ErrorIs(t, sp.Types().PatchPart(ctx, typeId, partId, space.DatasetDefPatch{
+		Set: map[string]any{"ui": "table"},
+	}), space.ErrInvalidFieldValue)
+
+	// Type patch: display and rendering metadata.
+	weight := 20
+	require.NoError(t, sp.Types().Patch(ctx, typeId, space.TypePatch{Name: strPtr("Articles"), Weight: &weight,
+		Layout: map[string]any{"type": "tabs", "config": map[string]any{"header": true}}}))
+	ti, err = sp.Types().Get(ctx, typeId)
+	require.NoError(t, err)
+	assert.Equal(t, "Articles", ti.Name)
+	assert.Equal(t, 20, ti.Weight)
+	assert.Equal(t, map[string]any{"type": "tabs", "config": map[string]any{"header": true}}, ti.Layout)
+	require.NoError(t, sp.Types().Patch(ctx, typeId, space.TypePatch{ClearLayout: true}))
+	ti, err = sp.Types().Get(ctx, typeId)
+	require.NoError(t, err)
+	assert.Nil(t, ti.Layout)
 
 	// Field patch: the display pair and any path under x-format mutate;
 	// the behavioral declaration is pinned; an unknown id is not found.
@@ -178,13 +243,23 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.NotNil(t, defs[0].Search)
 	assert.Equal(t, []string{"body"}, defs[0].Search.Text)
 
+	// An object that does not implement the type cannot hold its
+	// dataset — no type attaches on write.
+	stray, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	require.NoError(t, err)
+	_, err = sp.Upsert(ctx, space.UpsertBatch{
+		ObjectId: stray, Dataset: coll,
+		Records: []space.UpsertRecord{{Id: "s-1", Fields: map[string]any{"title": "Stray"}}},
+	})
+	require.ErrorIs(t, err, space.ErrDatasetNotDeclared)
+
 	// An instance object implementing the type hosts the records.
 	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
 
 	batch := space.UpsertBatch{
 		ObjectId: objId,
-		Dataset:  "articles",
+		Dataset:  coll,
 		Records: []space.UpsertRecord{
 			{Id: "a-1", Fields: map[string]any{"title": "One", "body": "b1", "summary": "s1"}},
 			{Id: "a-2", Fields: map[string]any{"title": "Two", "body": "b2"}},
@@ -197,7 +272,7 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.Empty(t, res.Rejections)
 
 	// Stamps landed; values readable.
-	row, err := sp.Query(objId, "articles").Filter(map[string]any{"id": "a-1"}).One(ctx)
+	row, err := sp.Query(objId, coll).Filter(map[string]any{"id": "a-1"}).One(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	assert.Equal(t, "One", string(row.GetStringBytes("title")))
@@ -219,7 +294,7 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 
 	// Mutable-field change updates; immutable change rejects the record.
 	res, err = sp.Upsert(ctx, space.UpsertBatch{
-		ObjectId: objId, Dataset: "articles",
+		ObjectId: objId, Dataset: coll,
 		Records: []space.UpsertRecord{
 			{Id: "a-1", Fields: map[string]any{"title": "One", "summary": "s1-edited"}},
 			{Id: "a-2", Fields: map[string]any{"title": "TWO-CHANGED"}},
@@ -231,14 +306,14 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.Equal(t, "a-2", res.Rejections[0].Id)
 	assert.ErrorIs(t, res.Rejections[0].Err, space.ErrImmutableFieldChanged)
 
-	row, err = sp.Query(objId, "articles").Filter(map[string]any{"id": "a-1"}).One(ctx)
+	row, err = sp.Query(objId, coll).Filter(map[string]any{"id": "a-1"}).One(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, "s1-edited", string(row.GetStringBytes("summary")))
 	assert.Equal(t, "One", string(row.GetStringBytes("title")))
 
 	// Direct Modify enforcement: a write-once field can't be rewritten.
 	mres, err := sp.Modify(ctx, space.ModifyBatch{
-		ObjectId: objId, Dataset: "articles",
+		ObjectId: objId, Dataset: coll,
 		Records: []space.RecordModify{{Id: "a-1", Ops: []space.Op{
 			{Type: space.OpSet, Path: "title", Value: "hax"},
 		}}},
@@ -250,12 +325,12 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	// Author delete works (same identity); the record tombstones and
 	// its id never reuses.
 	dres, err := sp.Delete(ctx, space.DeleteBatch{
-		ObjectId: objId, Dataset: "articles", RecordIds: []string{"a-3"},
+		ObjectId: objId, Dataset: coll, RecordIds: []string{"a-3"},
 	})
 	require.NoError(t, err)
 	assert.Empty(t, dres.Rejections)
 	res, err = sp.Upsert(ctx, space.UpsertBatch{
-		ObjectId: objId, Dataset: "articles",
+		ObjectId: objId, Dataset: coll,
 		Records: []space.UpsertRecord{{Id: "a-3", Fields: map[string]any{"title": "Back"}}},
 	})
 	require.NoError(t, err)
@@ -287,7 +362,7 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	})
 	require.NoError(t, err)
 	res, err = sp.Upsert(ctx, space.UpsertBatch{
-		ObjectId: objId, Dataset: "articles",
+		ObjectId: objId, Dataset: coll,
 		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{
 			"title": "One", "tags": []any{"go", "crdt"},
 		}}},
@@ -295,13 +370,35 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, res.Updated)
 	assert.Empty(t, res.Rejections)
+
+	// A second dataset joins the same part; a duplicate key is refused.
+	_, err = sp.Types().AddDataset(ctx, typeId, partId, space.DatasetDraft{
+		Key: "notes", Fields: []space.DatasetFieldDraft{{Key: "text", Kind: space.PropertyKindString, MutableBy: space.MutableByAnyone}},
+	})
+	require.NoError(t, err)
+	_, err = sp.Types().AddDataset(ctx, typeId, partId, space.DatasetDraft{Key: "notes"})
+	require.Error(t, err, "duplicate key within the type")
+	_, err = sp.Types().AddDataset(ctx, typeId, "no-such-part", space.DatasetDraft{Key: "more"})
+	require.ErrorIs(t, err, space.ErrNotFound)
+	parts, err = sp.Types().Parts(ctx, typeId)
+	require.NoError(t, err)
+	require.Len(t, parts[0].Datasets, 2)
+
+	// Removing the part removes its datasets.
+	require.NoError(t, sp.Types().RemovePart(ctx, typeId, partId))
+	parts, err = sp.Types().Parts(ctx, typeId)
+	require.NoError(t, err)
+	assert.Empty(t, parts)
+	defs, err = sp.Types().Datasets(ctx, typeId)
+	require.NoError(t, err)
+	assert.Empty(t, defs)
 }
 
-// TestE2E_UserDatasets_ColdSync: device A defines a runtime dataset and
-// upserts records; device B (same account, fresh DataDir) cold-syncs
-// and must converge on the schema (Types().Datasets), the registered
-// dataset, and the records — the schema-then-data ordering runs through
-// the park/drain gate on B.
+// TestE2E_UserDatasets_ColdSync: device A declares a part with a
+// records dataset and upserts records; device B (same account, fresh
+// DataDir) cold-syncs and must converge on the schema
+// (Types().Datasets), the registered dataset, and the records — the
+// schema-then-data ordering runs through the park/drain gate on B.
 func TestE2E_UserDatasets_ColdSync(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -333,12 +430,13 @@ func TestE2E_UserDatasets_ColdSync(t *testing.T) {
 	}
 	typeId, err := spA.Types().Create(ctx, space.TypeCreateParams{Name: "Article"})
 	require.NoError(t, err)
-	_, err = spA.Types().AddDataset(ctx, typeId, articleDatasetDraft())
+	_, err = spA.Types().AddPart(ctx, typeId, articlesPart())
 	require.NoError(t, err)
+	coll := typeId + "_articles"
 	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
 	require.NoError(t, err)
 	res, err := spA.Upsert(ctx, space.UpsertBatch{
-		ObjectId: objId, Dataset: "articles",
+		ObjectId: objId, Dataset: coll,
 		Records: []space.UpsertRecord{
 			{Id: "a-1", Fields: map[string]any{"title": "One", "body": "b1"}},
 			{Id: "a-2", Fields: map[string]any{"title": "Two"}},
@@ -369,27 +467,31 @@ func TestE2E_UserDatasets_ColdSync(t *testing.T) {
 		return true
 	}), "device B must see the space")
 
-	// Schema converges: the runtime dataset definition reads back on B.
+	// Schema converges: the part and its dataset definition read back on B.
 	require.True(t, waitFor(ctx, 120*time.Second, 500*time.Millisecond, func() bool {
 		_ = spB.SyncHeads(ctx)
 		defs, derr := spB.Types().Datasets(ctx, typeId)
-		return derr == nil && len(defs) == 1 && len(defs[0].Fields) == 6
+		return derr == nil && len(defs) == 1 && len(defs[0].Fields) == 7 && defs[0].Collection == coll
 	}), "device B must converge on the dataset definition")
+	parts, err := spB.Types().Parts(ctx, typeId)
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+	assert.Equal(t, "articles", parts[0].Key)
 
 	// Data converges: both records with their derived stamps.
 	require.True(t, waitFor(ctx, 120*time.Second, 500*time.Millisecond, func() bool {
-		rows, qerr := spB.Query(objId, "articles").All(ctx)
+		rows, qerr := spB.Query(objId, coll).All(ctx)
 		return qerr == nil && len(rows) == 2
 	}), "device B must converge on the upserted records")
 
-	row, err := spB.Query(objId, "articles").Filter(map[string]any{"id": "a-1"}).One(ctx)
+	row, err := spB.Query(objId, coll).Filter(map[string]any{"id": "a-1"}).One(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, "One", string(row.GetStringBytes("title")))
 	assert.Equal(t, sdkA.Account().Id(), string(row.GetStringBytes("creator")))
 
 	// B can write through the generic path too (same account = author).
 	bres, err := spB.Upsert(ctx, space.UpsertBatch{
-		ObjectId: objId, Dataset: "articles",
+		ObjectId: objId, Dataset: coll,
 		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{"title": "One", "body": "edited-on-B"}}},
 	})
 	require.NoError(t, err)

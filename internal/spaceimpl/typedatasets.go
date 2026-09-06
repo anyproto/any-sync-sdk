@@ -1,9 +1,10 @@
 package spaceimpl
 
-// Runtime dataset definitions — the TypesAPI dataset half (SYN-147).
+// Parts and dataset definitions — the TypesAPI dataset half.
 // Definitions live as CRDT records on the type object's `datasets`
-// dataset (typetype.DatasetDefs); writes here mirror the property-def
-// writers (AddProperty / RemoveProperty / PatchProperty) one file over.
+// dataset (typetype.DatasetDefs): one record per part, one head per
+// dataset, one per field. Writes here mirror the property-def writers
+// (AddProperty / RemoveProperty / PatchProperty) one file over.
 
 import (
 	"context"
@@ -96,9 +97,38 @@ func draftFieldDecl(draft *space.DatasetFieldDraft) (schema.Field, error) {
 	return f, nil
 }
 
+// normalizeDatasetDraft fills the draft's defaults — records when no
+// module is named, the canonical collection as the key of a shared
+// dataset — and applies the collection rule, returning the collection
+// the declaration will address. The same rule the compiler applies, so
+// a draft accepted here compiles valid on every peer that carries the
+// module.
+func normalizeDatasetDraft(modules types.Modules, typeId string, draft *space.DatasetDraft) (string, error) {
+	if draft.Module == "" {
+		draft.Module = space.RecordsModule
+	}
+	if draft.Shared && draft.Key == "" {
+		if mi, ok := modules[draft.Module]; ok {
+			draft.Key = mi.Canonical
+		}
+	}
+	return modules.Collection(typeId, draft.Key, draft.Module, draft.Shared)
+}
+
+// checkReservedModule refuses a runtime draft naming a reserved module
+// (handler.Module.Reserved): the consumer's own installs declare it,
+// nothing else. Draft-time only — an applied declaration stays valid.
+func checkReservedModule(modules types.Modules, draft *space.DatasetDraft) error {
+	if modules.Reserved(draft.Module) {
+		return fmt.Errorf("typesAPI: dataset %q: %w: %q", draft.Key, space.ErrModuleReserved, draft.Module)
+	}
+	return nil
+}
+
 // draftToDecl assembles and validates the full declaration a draft
 // describes — the same shape the catalog compiler will produce once the
-// records sync, so a draft rejected here can never half-register.
+// records sync, so a draft rejected here can never half-register. A
+// module-served dataset carries no declaration of its own.
 func draftToDecl(draft *space.DatasetDraft) (schema.Dataset, error) {
 	ds := schema.Dataset{
 		Dynamic:   draft.Dynamic,
@@ -108,15 +138,21 @@ func draftToDecl(draft *space.DatasetDraft) (schema.Dataset, error) {
 		IdMaxLen:  draft.IdMaxLen,
 		Search:    draft.Search,
 	}
+	if err := typetype.ValidateKey("dataset", draft.Key); err != nil {
+		return ds, err
+	}
+	if draft.Module != "" && draft.Module != space.RecordsModule {
+		if len(draft.Fields) > 0 {
+			return ds, fmt.Errorf("%w: dataset %q: a %q dataset declares no fields", space.ErrModuleOwned, draft.Key, draft.Module)
+		}
+		return ds, nil
+	}
 	for i := range draft.Fields {
 		f, err := draftFieldDecl(&draft.Fields[i])
 		if err != nil {
 			return ds, err
 		}
 		ds.Fields = append(ds.Fields, f)
-	}
-	if err := typetype.ValidateDatasetName(draft.Name); err != nil {
-		return ds, err
 	}
 	if err := schema.ValidateDatasetDecl(ds); err != nil {
 		return ds, err
@@ -144,11 +180,50 @@ func encodeShapeInto(arena *anyenc.Arena, obj *anyenc.Value, shape *schema.Schem
 	}
 }
 
+// encodePart builds the part record payload from a draft.
+func encodePart(arena *anyenc.Arena, draft *space.PartDraft) (*anyenc.Value, error) {
+	payload := arena.NewObject()
+	payload.Set(typetype.DefFieldDef, arena.NewString(typetype.DefKindPart))
+	payload.Set(typetype.FieldKey, arena.NewString(draft.Key))
+	if draft.Name != "" {
+		payload.Set(typetype.FieldName, arena.NewString(draft.Name))
+	}
+	if draft.Icon != "" {
+		payload.Set(typetype.PartFieldIcon, arena.NewString(draft.Icon))
+	}
+	if draft.Pos != "" {
+		payload.Set(typetype.PartFieldPos, arena.NewString(draft.Pos))
+	}
+	if draft.Hidden {
+		payload.Set(typetype.PartFieldHidden, arena.NewTrue())
+	}
+	if len(draft.UI) > 0 {
+		ui, err := encodeXFormat(arena, draft.UI)
+		if err != nil {
+			return nil, fmt.Errorf("typesAPI: part %q: UI: %w", draft.Key, err)
+		}
+		payload.Set(typetype.PartFieldUI, ui)
+	}
+	if len(draft.Uses) > 0 {
+		uses := arena.NewArray()
+		for i, u := range draft.Uses {
+			uses.SetArrayItem(i, arena.NewString(u))
+		}
+		payload.Set(typetype.PartFieldUses, uses)
+	}
+	return payload, nil
+}
+
 // encodeDatasetHead builds the head record payload from a draft.
-func encodeDatasetHead(arena *anyenc.Arena, draft *space.DatasetDraft) *anyenc.Value {
+func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetDraft) *anyenc.Value {
 	payload := arena.NewObject()
 	payload.Set(typetype.DefFieldDef, arena.NewString(typetype.DefKindDataset))
-	payload.Set(typetype.DefFieldName, arena.NewString(draft.Name))
+	payload.Set(typetype.FieldKey, arena.NewString(draft.Key))
+	payload.Set(typetype.DefFieldModule, arena.NewString(draft.Module))
+	payload.Set(typetype.DefFieldPart, arena.NewString(partId))
+	if draft.Shared {
+		payload.Set(typetype.DefFieldShared, arena.NewTrue())
+	}
 	if draft.Dynamic {
 		payload.Set(typetype.DefFieldDynamic, arena.NewTrue())
 	}
@@ -245,67 +320,131 @@ func (t *typesAPI) writeDatasetDefs(ctx context.Context, typeId string, recs ...
 	})
 }
 
-// newDatasetDefId mints the head record's id client-side. The head id
-// must be known before the write so the field records — which
-// reference it — can ride the SAME change: one atomic change means a
-// crash can never strand an orphan head with half its fields.
-// Uniqueness comes from randomness (concurrent same-name definitions
-// are distinct heads, resolved by the catalog's DefId tiebreak).
-func newDatasetDefId() (string, error) {
+// newDefId mints a part / head record id client-side. The id must be
+// known before the write so the records referencing it (heads on a
+// part, fields on a head) can ride the SAME change: one atomic change
+// means a crash can never strand an orphan. Uniqueness comes from
+// randomness (concurrent same-key definitions are distinct records,
+// folded by the compiler).
+func newDefId(prefix string) (string, error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("typesAPI: mint dataset def id: %w", err)
+		return "", fmt.Errorf("typesAPI: mint definition id: %w", err)
 	}
-	return "dsd" + hex.EncodeToString(b[:]), nil
+	return prefix + hex.EncodeToString(b[:]), nil
 }
 
-func (t *typesAPI) AddDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
-	if t.staticType(typeId) {
-		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
-	return t.declareDataset(ctx, typeId, draft)
-}
-
-// declareDataset validates the draft, preflights its name, and writes
-// head + field records in one change on typeId's `datasets` dataset.
-// Returns the head (definition) id.
-func (t *typesAPI) declareDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
-	if err := t.preflightDatasetName(draft.Name); err != nil {
-		return "", err
-	}
-	headId, recs, err := datasetDefRecords(&anyenc.Arena{}, &draft)
+// compiled returns the type's compiled parts and datasets (empty, not
+// nil, when nothing is declared).
+func (t *typesAPI) compiled(ctx context.Context, typeId string) (*types.CompiledType, error) {
+	ct, err := t.parent.store.TypeParts(ctx, typeId)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
-		return "", fmt.Errorf("typesAPI: dataset %q: %w", draft.Name, err)
+	if ct == nil {
+		ct = &types.CompiledType{}
 	}
-	return headId, nil
+	return ct, nil
 }
 
-// preflightDatasetName fails fast on a name collision with the static
-// catalog (built-ins + config-registered) or an already-active runtime
-// dataset. The compile layer resolves races deterministically anyway —
-// this just gives the obvious case a readable error.
-func (t *typesAPI) preflightDatasetName(name string) error {
-	if _, err := t.parent.store.DataVersion(name); err == nil {
-		return fmt.Errorf("typesAPI: dataset name %q is already registered", name)
+// preflightDataset normalizes and validates one dataset draft against
+// the module catalog and the type's current declarations: the key is
+// free (or the caller is re-declaring under a new part — refused), and
+// at most one shared dataset per module per type.
+func (t *typesAPI) preflightDataset(typeId string, draft *space.DatasetDraft, existing *types.CompiledType, sibling map[string]struct{}) error {
+	if _, err := normalizeDatasetDraft(t.parent.store.Modules(), typeId, draft); err != nil {
+		return fmt.Errorf("typesAPI: dataset %q: %w", draft.Key, err)
 	}
-	if existing, ok := t.parent.store.RuntimeDataset(name); ok {
-		return fmt.Errorf("typesAPI: dataset name %q is already defined on type %q", name, existing.TypeId)
+	if err := checkReservedModule(t.parent.store.Modules(), draft); err != nil {
+		return err
+	}
+	if _, err := draftToDecl(draft); err != nil {
+		return err
+	}
+	if _, dup := sibling[draft.Key]; dup {
+		return fmt.Errorf("typesAPI: dataset %q declared twice", draft.Key)
+	}
+	sibling[draft.Key] = struct{}{}
+	if existing == nil {
+		return nil
+	}
+	for _, ds := range existing.Datasets {
+		if ds.Key == draft.Key {
+			return fmt.Errorf("typesAPI: dataset %q is already declared on type %q", draft.Key, typeId)
+		}
+		if draft.Shared && ds.Shared && ds.Module == draft.Module && !ds.Invalid {
+			return fmt.Errorf("typesAPI: type %q already declares a shared %q dataset (%q)", typeId, draft.Module, ds.Key)
+		}
 	}
 	return nil
 }
 
+// preflightPart validates a part draft and its datasets against the
+// type's current declarations.
+func (t *typesAPI) preflightPart(typeId string, draft *space.PartDraft, existing *types.CompiledType) error {
+	if err := typetype.ValidateKey("part", draft.Key); err != nil {
+		return err
+	}
+	if existing != nil {
+		for _, p := range existing.Parts {
+			if p.Key == draft.Key {
+				return fmt.Errorf("typesAPI: part %q is already declared on type %q", draft.Key, typeId)
+			}
+		}
+	}
+	sibling := map[string]struct{}{}
+	shared := map[string]struct{}{}
+	for i := range draft.Datasets {
+		d := &draft.Datasets[i]
+		if err := t.preflightDataset(typeId, d, existing, sibling); err != nil {
+			return err
+		}
+		if d.Shared {
+			if _, dup := shared[d.Module]; dup {
+				return fmt.Errorf("typesAPI: part %q declares two shared %q datasets", draft.Key, d.Module)
+			}
+			shared[d.Module] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// partRecords builds the records of one part: the part record plus
+// every dataset's head and fields, all referencing ids minted here so
+// they ride one change. Returns the part id with the records.
+func partRecords(arena *anyenc.Arena, draft *space.PartDraft) (string, []crdt.RecordChange, error) {
+	partId, err := newDefId("prt")
+	if err != nil {
+		return "", nil, err
+	}
+	payload, err := encodePart(arena, draft)
+	if err != nil {
+		return "", nil, err
+	}
+	recs := []crdt.RecordChange{{
+		Id:     partId,
+		Upsert: true,
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+	}}
+	for i := range draft.Datasets {
+		_, r, err := datasetDefRecords(arena, partId, &draft.Datasets[i])
+		if err != nil {
+			return "", nil, err
+		}
+		recs = append(recs, r...)
+	}
+	return partId, recs, nil
+}
+
 // datasetDefRecords validates the draft and builds its head + field
-// records (one head, fields referencing it). Returns the minted head
-// id with the records.
-func datasetDefRecords(arena *anyenc.Arena, draft *space.DatasetDraft) (string, []crdt.RecordChange, error) {
+// records (one head under partId, fields referencing it). Returns the
+// minted head id with the records.
+func datasetDefRecords(arena *anyenc.Arena, partId string, draft *space.DatasetDraft) (string, []crdt.RecordChange, error) {
 	decl, err := draftToDecl(draft)
 	if err != nil {
 		return "", nil, err
 	}
-	headId, err := newDatasetDefId()
+	headId, err := newDefId("dsd")
 	if err != nil {
 		return "", nil, err
 	}
@@ -313,9 +452,9 @@ func datasetDefRecords(arena *anyenc.Arena, draft *space.DatasetDraft) (string, 
 	recs = append(recs, crdt.RecordChange{
 		Id:     headId,
 		Upsert: true,
-		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, draft)}},
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, partId, draft)}},
 	})
-	for i := range draft.Fields {
+	for i := range decl.Fields {
 		payload, err := encodeDatasetField(arena, headId, &decl.Fields[i])
 		if err != nil {
 			return "", nil, err
@@ -326,6 +465,224 @@ func datasetDefRecords(arena *anyenc.Arena, draft *space.DatasetDraft) (string, 
 		})
 	}
 	return headId, recs, nil
+}
+
+func (t *typesAPI) Parts(ctx context.Context, typeId string) ([]space.PartDef, error) {
+	var ct *types.CompiledType
+	var err error
+	if rt, ok := t.findRegisteredType(typeId); ok {
+		ct, err = t.registeredTypeParts(rt)
+	} else {
+		ct, err = t.compiled(ctx, typeId)
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]space.PartDef, 0, len(ct.Parts))
+	for i := range ct.Parts {
+		out = append(out, compiledToPartDef(&ct.Parts[i]))
+	}
+	return out, nil
+}
+
+func (t *typesAPI) AddPart(ctx context.Context, typeId string, draft space.PartDraft) (string, error) {
+	if t.staticType(typeId) {
+		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	existing, err := t.compiled(ctx, typeId)
+	if err != nil {
+		return "", err
+	}
+	if err := t.preflightPart(typeId, &draft, existing); err != nil {
+		return "", err
+	}
+	partId, recs, err := partRecords(&anyenc.Arena{}, &draft)
+	if err != nil {
+		return "", err
+	}
+	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
+		return "", fmt.Errorf("typesAPI: part %q: %w", draft.Key, err)
+	}
+	return partId, nil
+}
+
+func (t *typesAPI) PatchPart(ctx context.Context, typeId, partId string, patch space.DatasetDefPatch) error {
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if partId == "" {
+		return errors.New("typesAPI: part id required")
+	}
+	if len(patch.Set) == 0 && len(patch.Unset) == 0 {
+		return nil
+	}
+	arena := &anyenc.Arena{}
+	setObj := arena.NewObject()
+	unsetObj := arena.NewObject()
+	checkPath := func(path string) ([]string, error) {
+		if path == "" {
+			return nil, errors.New("typesAPI: patch path is empty")
+		}
+		segs := strings.Split(path, ".")
+		for _, s := range segs {
+			if s == "" {
+				return nil, fmt.Errorf("typesAPI: patch path %q has an empty segment", path)
+			}
+		}
+		if typetype.IsPartPinnedPath(segs) {
+			return nil, fmt.Errorf("%w: path %q is pinned after first write", space.ErrPinnedField, path)
+		}
+		return segs, nil
+	}
+	for path, val := range patch.Set {
+		segs, err := checkPath(path)
+		if err != nil {
+			return err
+		}
+		v, err := goToAnyenc(arena, val)
+		if err != nil {
+			return fmt.Errorf("typesAPI: patch part: convert %q: %w", path, err)
+		}
+		switch segs[0] {
+		case typetype.PartFieldUI:
+			if v.Type() != anyenc.TypeObject {
+				return fmt.Errorf("%w: ui must be an object", space.ErrInvalidFieldValue)
+			}
+		case typetype.PartFieldUses:
+			if v.Type() != anyenc.TypeArray {
+				return fmt.Errorf("%w: uses must be an array of dataset keys", space.ErrInvalidFieldValue)
+			}
+			arr, _ := v.Array()
+			for _, e := range arr {
+				if e == nil || e.Type() != anyenc.TypeString {
+					return fmt.Errorf("%w: uses entries must be strings", space.ErrInvalidFieldValue)
+				}
+			}
+		case typetype.PartFieldHidden:
+			if v.Type() != anyenc.TypeTrue && v.Type() != anyenc.TypeFalse {
+				return fmt.Errorf("%w: hidden must be a boolean", space.ErrInvalidFieldValue)
+			}
+		default:
+			if v.Type() != anyenc.TypeString {
+				return fmt.Errorf("%w: %s must be a string", space.ErrInvalidFieldValue, path)
+			}
+		}
+		setObj.Set(path, v)
+	}
+	for _, path := range patch.Unset {
+		if _, err := checkPath(path); err != nil {
+			return err
+		}
+		unsetObj.Set(path, arena.NewNull())
+	}
+	ct, err := t.compiled(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, p := range ct.Parts {
+		if p.Id == partId {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: part %q on type %q", space.ErrNotFound, partId, typeId)
+	}
+	var ops []crdt.Op
+	if len(patch.Set) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: setObj})
+	}
+	if len(patch.Unset) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Payload: unsetObj})
+	}
+	if _, err := t.writeDatasetDefs(ctx, typeId, crdt.RecordChange{Id: partId, Ops: ops}); err != nil {
+		return fmt.Errorf("typesAPI: patch part: %w", err)
+	}
+	return nil
+}
+
+// RemovePart tombstones the part, every concurrent duplicate of it
+// (same key), and every head declaring one of its datasets — the
+// winner and the hidden duplicates alike, so nothing resurfaces once
+// the winner is gone. Field records go orphan and fold out.
+func (t *typesAPI) RemovePart(ctx context.Context, typeId, partId string) error {
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if partId == "" {
+		return errors.New("typesAPI: part id required")
+	}
+	ct, err := t.compiled(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	var part *types.CompiledPart
+	for i := range ct.Parts {
+		if ct.Parts[i].Id == partId {
+			part = &ct.Parts[i]
+			break
+		}
+	}
+	if part == nil {
+		return fmt.Errorf("%w: part %q on type %q", space.ErrNotFound, partId, typeId)
+	}
+	ids, err := t.parent.store.PartIds(ctx, typeId, part.Key)
+	if err != nil {
+		return fmt.Errorf("typesAPI: remove part: %w", err)
+	}
+	if len(ids) == 0 {
+		ids = []string{partId}
+	}
+	for _, ds := range part.Datasets {
+		heads, err := t.parent.store.DatasetHeadIds(ctx, typeId, ds.Key)
+		if err != nil {
+			return fmt.Errorf("typesAPI: remove part: %w", err)
+		}
+		ids = append(ids, heads...)
+	}
+	recs := make([]crdt.RecordChange, 0, len(ids))
+	for _, id := range ids {
+		recs = append(recs, crdt.RecordChange{Id: id, Ops: []crdt.Op{{Type: crdt.OpDelete}}})
+	}
+	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
+		return fmt.Errorf("typesAPI: remove part: %w", err)
+	}
+	return nil
+}
+
+func (t *typesAPI) AddDataset(ctx context.Context, typeId, partId string, draft space.DatasetDraft) (string, error) {
+	if t.staticType(typeId) {
+		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if partId == "" {
+		return "", errors.New("typesAPI: part id required")
+	}
+	existing, err := t.compiled(ctx, typeId)
+	if err != nil {
+		return "", err
+	}
+	found := false
+	for _, p := range existing.Parts {
+		if p.Id == partId {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("%w: part %q on type %q", space.ErrNotFound, partId, typeId)
+	}
+	if err := t.preflightDataset(typeId, &draft, existing, map[string]struct{}{}); err != nil {
+		return "", err
+	}
+	headId, recs, err := datasetDefRecords(&anyenc.Arena{}, partId, &draft)
+	if err != nil {
+		return "", err
+	}
+	if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
+		return "", fmt.Errorf("typesAPI: dataset %q: %w", draft.Key, err)
+	}
+	return headId, nil
 }
 
 func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft space.DatasetFieldDraft) (string, error) {
@@ -346,9 +703,12 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 	if err != nil {
 		return "", err
 	}
+	if def.Module != space.RecordsModule {
+		return "", fmt.Errorf("%w: dataset %q is served by %q", space.ErrModuleOwned, def.Key, def.Module)
+	}
 	for _, f := range def.Fields {
 		if f.Key == decl.Id {
-			return "", fmt.Errorf("typesAPI: dataset %q already declares field %q", def.Name, decl.Id)
+			return "", fmt.Errorf("typesAPI: dataset %q already declares field %q", def.Key, decl.Id)
 		}
 	}
 	// Validate the COMBINED declaration, not the field in isolation: a
@@ -359,7 +719,7 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 	combined := defToDecl(&def)
 	combined.Fields = append(combined.Fields, decl)
 	if err := schema.ValidateDatasetDecl(combined); err != nil {
-		return "", fmt.Errorf("typesAPI: field %q would invalidate dataset %q: %w", decl.Id, def.Name, err)
+		return "", fmt.Errorf("typesAPI: field %q would invalidate dataset %q: %w", decl.Id, def.Key, err)
 	}
 	arena := &anyenc.Arena{}
 	payload, err := encodeDatasetField(arena, datasetDefId, &decl)
@@ -380,7 +740,7 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 }
 
 // RemoveDataset tombstones the definition and every live duplicate
-// head declaring the same name (concurrent declarations converge to
+// head declaring the same key (concurrent declarations converge to
 // one visible definition; the hidden duplicates would otherwise
 // resurface as the dataset the moment the winner is removed).
 func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId string) error {
@@ -390,17 +750,17 @@ func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId strin
 	if datasetDefId == "" {
 		return errors.New("typesAPI: definition id required")
 	}
-	// Resolve the id's dataset name from the raw heads — the caller may
+	// Resolve the id's dataset key from the raw heads — the caller may
 	// hold a LOSING duplicate's id (a DefId read before convergence),
 	// and removing by it must remove the DATASET: the winner and every
 	// duplicate, not just the hidden head.
 	ids := []string{datasetDefId}
-	name, err := t.parent.store.DatasetHeadName(ctx, typeId, datasetDefId)
+	key, err := t.parent.store.DatasetHeadKey(ctx, typeId, datasetDefId)
 	if err != nil {
 		return fmt.Errorf("typesAPI: remove dataset definition: %w", err)
 	}
-	if name != "" {
-		heads, err := t.parent.store.DatasetHeadIds(ctx, typeId, name)
+	if key != "" {
+		heads, err := t.parent.store.DatasetHeadIds(ctx, typeId, key)
 		if err != nil {
 			return fmt.Errorf("typesAPI: remove dataset definition: %w", err)
 		}
@@ -444,7 +804,7 @@ func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 				remaining := defToDecl(def)
 				remaining.Fields = append(remaining.Fields[:j], remaining.Fields[j+1:]...)
 				if verr := schema.ValidateDatasetDecl(remaining); verr != nil {
-					return fmt.Errorf("typesAPI: removing field %q would invalidate dataset %q: %w", def.Fields[j].Key, def.Name, verr)
+					return fmt.Errorf("typesAPI: removing field %q would invalidate dataset %q: %w", def.Fields[j].Key, def.Key, verr)
 				}
 			}
 			return t.removeDatasetDefRecord(ctx, typeId, fieldDefId)
@@ -625,9 +985,18 @@ func (t *typesAPI) PatchDatasetField(ctx context.Context, typeId, fieldDefId str
 }
 
 func (t *typesAPI) Datasets(ctx context.Context, typeId string) ([]space.DatasetDef, error) {
-	compiled, err := t.parent.store.DatasetDefs(ctx, typeId)
-	if err != nil {
-		return nil, err
+	var compiled []types.CompiledDataset
+	if rt, ok := t.findRegisteredType(typeId); ok {
+		ct, err := t.registeredTypeParts(rt)
+		if err != nil {
+			return nil, err
+		}
+		compiled = ct.Datasets
+	} else {
+		var err error
+		if compiled, err = t.parent.store.DatasetDefs(ctx, typeId); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]space.DatasetDef, 0, len(compiled))
 	for i := range compiled {
@@ -681,10 +1050,31 @@ func defToDecl(def *space.DatasetDef) schema.Dataset {
 	return ds
 }
 
+func compiledToPartDef(p *types.CompiledPart) space.PartDef {
+	def := space.PartDef{
+		Id:     p.Id,
+		Key:    p.Key,
+		Name:   p.Name,
+		Icon:   p.Icon,
+		Pos:    p.Pos,
+		Hidden: p.Hidden,
+		UI:     types.CloneXFormat(p.UI),
+		Uses:   append([]string(nil), p.Uses...),
+	}
+	for i := range p.Datasets {
+		def.Datasets = append(def.Datasets, compiledToDatasetDef(&p.Datasets[i]))
+	}
+	return def
+}
+
 func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 	def := space.DatasetDef{
 		Id:            c.DefId,
-		Name:          c.Name,
+		Key:           c.Key,
+		Collection:    c.Name,
+		Module:        c.Module,
+		Shared:        c.Shared,
+		PartId:        c.PartId,
 		DisplayName:   c.DisplayName,
 		Description:   c.Description,
 		Dynamic:       c.Schema.Dynamic,

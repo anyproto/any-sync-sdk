@@ -733,6 +733,10 @@ func (c *Controller) PreValidateLocal(ctx context.Context, ch *Change) error {
 	}
 	var before *anyenc.Value
 	if c.IsShared(ch.Dataset) {
+		// The row of a shared dataset is the controller's object,
+		// whatever record id the caller wrote; the pipeline stamps the
+		// same value on the change later, the validator needs it now.
+		ch.ObjectId = c.objectId
 		before = c.Get(ctx, ch.Dataset, c.objectId)
 	} else if ids, err := ResolveRecordIds(*ch); err == nil && len(ids) > 0 {
 		before = c.Get(ctx, ch.Dataset, ids[0])

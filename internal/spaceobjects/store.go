@@ -186,8 +186,11 @@ type Store struct {
 	// of every catalog snapshot; its namespaced module datasets are
 	// registrations built once here (staticInstanceRegs, module by
 	// collection in staticInstanceModule), owned through datasetOwners.
-	staticSharedOwners   map[string]map[string]struct{}
-	staticModuleOwners   map[string]map[string]struct{}
+	staticSharedOwners map[string]map[string]struct{}
+	staticModuleOwners map[string]map[string]struct{}
+	// reservedModules are the configured modules with Reserved set —
+	// the one-branch fast path of ReservedCarrier when there are none.
+	reservedModules      []string
 	staticInstanceRegs   []crdt.HandlerReg
 	staticInstanceModule map[string]string
 
@@ -526,6 +529,11 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	s.moduleInfos = types.NewModules(infos...)
+	for _, m := range cfg.Modules {
+		if m.Reserved {
+			s.reservedModules = append(s.reservedModules, m.Name)
+		}
+	}
 	// Static parts: a registered type's module datasets are ownership
 	// (shared) or registrations (namespaced), settled once here — the
 	// same footing a runtime declaration reaches through the catalog.
@@ -1107,6 +1115,38 @@ func (s *Store) DatasetOwners(dataset string) ([]string, bool) {
 		return []string{ds.TypeId}, true
 	}
 	return nil, false
+}
+
+// objectsHandler is the objects-row handler: kinds off the registry,
+// module namespaces off the catalog's owner sets, and the reserved
+// carrier rule off the same sets.
+func (s *Store) objectsHandler() *properties.SystemPropertiesHandler {
+	h := properties.NewWithGrants(s.reg, s.ModuleGrants)
+	h.ReservedCarrier = s.ReservedCarrier
+	return h
+}
+
+// ReservedCarrier reports whether typeId is a user type declaring a
+// dataset of a reserved module (handler.Module.Reserved): the
+// consumer's own install root, carried by nothing else. Registered
+// types with a static declaration of the module are not carriers —
+// the static part is the consumer's compiled-in choice to make the
+// module attachable. The properties handler consults it on the local
+// write pre-flight.
+func (s *Store) ReservedCarrier(typeId string) bool {
+	if s == nil || len(s.reservedModules) == 0 {
+		return false
+	}
+	snap := s.catalog.snapshot()
+	for _, module := range s.reservedModules {
+		if _, static := s.staticModuleOwners[module][typeId]; static {
+			continue
+		}
+		if _, ok := snap.moduleOwners[module][typeId]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ModuleGrants returns the module namespaces an object carrying
@@ -2305,7 +2345,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// the local/account routes. Declared derived heads (author /
 		// createdAt / spaceId) stay controller-enforced. Module
 		// namespaces are granted off the catalog's owner sets.
-		{Name: properties.Dataset, Handler: properties.NewWithGrants(s.reg, s.ModuleGrants), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
+		{Name: properties.Dataset, Handler: s.objectsHandler(), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
 		// `properties` defs + `shortIds` carry content-addressed / dynamic
 		// keyspaces — declared Dynamic (synced).
 		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.PropertyHandlerLocalVersion},

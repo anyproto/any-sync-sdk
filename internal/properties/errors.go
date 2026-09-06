@@ -22,6 +22,7 @@ const (
 	ReasonUnknownProperty    = "unknown_property"
 	ReasonKindMismatch       = "kind_mismatch"
 	ReasonScopeMismatch      = "scope_mismatch"
+	ReasonReservedCarrier    = "reserved_carrier"
 )
 
 // Per-reason sentinels. A ValidationError chains to exactly one of these
@@ -36,6 +37,7 @@ var (
 	ErrUnknownProperty    = errors.New("property write rejected: type has no such property")
 	ErrKindMismatch       = errors.New("property write rejected: value kind does not match the declared kind")
 	ErrScopeMismatch      = errors.New("property write rejected: write route does not match the property's declared scope")
+	ErrReservedCarrier    = errors.New("property write rejected: a type declaring a reserved module is carried only by its own root")
 )
 
 // reasonErr maps a Reason discriminant to its sentinel. Unknown reasons
@@ -54,6 +56,8 @@ func reasonErr(reason string) error {
 		return ErrKindMismatch
 	case ReasonScopeMismatch:
 		return ErrScopeMismatch
+	case ReasonReservedCarrier:
+		return ErrReservedCarrier
 	}
 	return nil
 }
@@ -85,6 +89,9 @@ type ValidationError struct {
 	Known []types.PropInfo // declared properties of the type (unknown_property)
 	Types []string         // the object's any.types (type_not_implemented)
 	Path  []string         // offending op path (invalid_path)
+
+	// ObjectId is the row the write targets (reserved_carrier).
+	ObjectId string
 }
 
 // Error renders an agent-readable, single-line rejection message.
@@ -108,6 +115,9 @@ func (e *ValidationError) Error() string {
 	case ReasonScopeMismatch:
 		return fmt.Sprintf("property write rejected: property %s on type %s is %s-scoped and cannot be written through the %s route",
 			e.propLabel(), e.typeLabel(), e.DeclaredScope, e.WriteRoute)
+	case ReasonReservedCarrier:
+		return fmt.Sprintf("property write rejected: type %s declares a reserved module and is carried only by its own root, not by object %s",
+			e.typeLabel(), e.ObjectId)
 	}
 	return fmt.Sprintf("property write rejected: %s.%s", e.TypeId, e.PropId)
 }

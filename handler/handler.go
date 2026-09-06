@@ -92,6 +92,12 @@ var (
 	ErrValidationTypeUnknown        = properties.ErrTypeUnknown
 	ErrValidationUnknownProperty    = properties.ErrUnknownProperty
 	ErrValidationKindMismatch       = properties.ErrKindMismatch
+	// ErrValidationReservedCarrier — the write attaches a user type
+	// declaring a reserved module (Module.Reserved) to a row other
+	// than the type's own root. The consumer's install root is the
+	// only carrier; a client cannot mint another instance of a
+	// reserved module by attaching the type.
+	ErrValidationReservedCarrier = properties.ErrReservedCarrier
 )
 
 // ValidationReason is the machine-readable cause of a property-write
@@ -107,6 +113,7 @@ const (
 	ReasonTypeUnknown        ValidationReason = properties.ReasonTypeUnknown
 	ReasonUnknownProperty    ValidationReason = properties.ReasonUnknownProperty
 	ReasonKindMismatch       ValidationReason = properties.ReasonKindMismatch
+	ReasonReservedCarrier    ValidationReason = properties.ReasonReservedCarrier
 )
 
 // ClassifyValidation maps a property-validation rejection to its cause
@@ -475,7 +482,12 @@ type Module struct {
 	// consumer's own catalog install). Registered types may still
 	// declare it statically, and a declaration that reached the DAG
 	// stays valid on apply (a peer that admitted it was the consumer's
-	// own install). Requires SharedOnly.
+	// own install). Requires SharedOnly. The install root is also the
+	// module's only carrier: a local write attaching a user type that
+	// declares a reserved module to any other row is refused
+	// (ErrValidationReservedCarrier) — no SystemInstall escape, the
+	// consumer's install attaches the type through its root alone. A
+	// registered type's static declaration stays attachable.
 	Reserved bool
 
 	// DataVersion is stamped on changes to the Canonical collection —

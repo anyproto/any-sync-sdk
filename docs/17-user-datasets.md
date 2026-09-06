@@ -53,7 +53,20 @@ Type
   with the `space.SystemInstall()` ensure option, or a registered
   type's static part, may declare it. Draft-time only: the compile
   keeps an applied declaration valid, since a peer that admitted it
-  was the consumer's own install.
+  was the consumer's own install. The install root is also the
+  module's **only carrier**: a local write attaching a user type that
+  declares a reserved module to any row but the type's own
+  (`Objects().Create` types, `AttachType`, an `any.types` op through
+  `Modify`) is refused with `handler.ErrValidationReservedCarrier`
+  (reason `reserved_carrier`), so a client cannot mint a second
+  instance by attaching the type. There is no `SystemInstall` escape:
+  the consumer's install attaches the type through its root alone. A
+  registered type's static declaration is not a carrier — attachable
+  by the consumer's design. Two limits: the guard reads this device's
+  catalog snapshot, so a declaration not yet compiled locally is not
+  reserved to it; and inbound apply stays read-tolerant, so a peer
+  that lands the type on another row is applied, after which that row
+  keeps writing (only additions are checked).
 
 ### Static parts on registered types
 

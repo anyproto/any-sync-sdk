@@ -13,10 +13,12 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 )
 
-// buildReadTracking collects the read-tracking registrations by
-// dataset from the type catalog and the store's system regs. Empty
-// map = nothing tracked in this space.
-func buildReadTracking(extTypes []handler.Type, system []crdt.HandlerReg) map[string]*crdt.ReadTracking {
+// buildReadTracking collects the static read-tracking registrations by
+// dataset: the type catalog, the store's system regs and the module
+// canonical collections. Namespaced module instances join through the
+// catalog snapshot (readTrackingFor). Empty map = nothing static is
+// tracked in this space.
+func buildReadTracking(extTypes []handler.Type, system, canonical []crdt.HandlerReg) map[string]*crdt.ReadTracking {
 	out := map[string]*crdt.ReadTracking{}
 	for _, t := range extTypes {
 		for _, d := range t.Datasets {
@@ -28,6 +30,40 @@ func buildReadTracking(extTypes []handler.Type, system []crdt.HandlerReg) map[st
 	for _, reg := range system {
 		if reg.ReadTracking != nil {
 			out[reg.Name] = reg.ReadTracking
+		}
+	}
+	for _, reg := range canonical {
+		if reg.ReadTracking != nil {
+			out[reg.Name] = reg.ReadTracking
+		}
+	}
+	return out
+}
+
+// readTrackingFor resolves a dataset's read-tracking registration:
+// the static map first, then the catalog snapshot's namespaced module
+// instances. Nil = untracked.
+func (s *Store) readTrackingFor(dataset string) *crdt.ReadTracking {
+	if rt := s.readTracking[dataset]; rt != nil {
+		return rt
+	}
+	if reg, ok := s.catalog.snapshot().regs[dataset]; ok {
+		return reg.ReadTracking
+	}
+	return nil
+}
+
+// trackedDatasets returns every tracked dataset the store currently
+// knows — static plus the catalog's namespaced module instances.
+func (s *Store) trackedDatasets() map[string]*crdt.ReadTracking {
+	snap := s.catalog.snapshot()
+	out := make(map[string]*crdt.ReadTracking, len(s.readTracking))
+	for name, rt := range s.readTracking {
+		out[name] = rt
+	}
+	for name, reg := range snap.regs {
+		if reg.ReadTracking != nil {
+			out[name] = reg.ReadTracking
 		}
 	}
 	return out
@@ -70,11 +106,11 @@ func (s *Store) readResolver() readstate.Resolver {
 // (ReadClassification.Audience) can point-read the target record
 // inside the same tx.
 func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
-	if len(s.readTracking) == 0 || s.readState == nil {
+	if s.readState == nil {
 		return nil
 	}
 	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, res *crdt.ApplyResult) error {
-		rt := s.readTracking[ch.Dataset]
+		rt := s.readTrackingFor(ch.Dataset)
 		if rt == nil || rt.Classify == nil || ch.Local || ch.Injected || ch.ChangeId == "" {
 			return nil
 		}

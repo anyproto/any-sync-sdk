@@ -1,18 +1,27 @@
 package spaceobjects
 
-// Runtime dataset catalog (SYN-147): the store-level snapshot of every
-// user-defined dataset compiled from type objects' `datasets` records.
+// Runtime dataset catalog: the store-level snapshot of every dataset a
+// type declares inside its parts, compiled from type objects'
+// `datasets` records.
 //
 // Built once at store open (one indexed pass over the shared objects
-// collection's `__type__` rows + one defs compile per type object) and
+// collection's `__type__` rows + one compile per type object) and
 // refreshed ONLY when a dataset-defs change applies (afterApplyFor →
 // refreshType) — never on controller construction, which happens on
 // every object load and must stay free of storage scans. Readers take
 // the copy-on-write snapshot through one atomic load.
+//
+// Two kinds of entry come out of a compile. A NAMESPACED dataset
+// (`<typeId>_<key>`) gets its own registration — the generic schema
+// handler for `records`, the module's factory for anything else — and
+// is owned by exactly one type. A SHARED dataset names the module's
+// canonical collection, which every controller registers statically;
+// the catalog only records which types own it.
 
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -21,6 +30,7 @@ import (
 	"github.com/anyproto/any-store/v2/query"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
@@ -38,18 +48,27 @@ var LiveTypeRowsFilter query.Filter = func() query.Filter {
 	}
 }()
 
-// catalogSnapshot is the immutable resolved catalog. byName excludes
-// invalid definitions and names shadowed by built-ins /
-// config-registered datasets (the static catalog always wins), and
-// resolves cross-type name conflicts to the smallest DefId. handlers
-// holds one SchemaHandler per registered dataset, built once per
-// snapshot and shared across controllers — SchemaHandler is read-only
-// after construction, so sharing is safe (unlike registry-holding
-// handlers).
+// catalogSnapshot is the immutable resolved catalog.
 type catalogSnapshot struct {
-	byName   map[string]types.CompiledDataset
-	byType   map[string][]types.CompiledDataset
-	handlers map[string]*crdt.SchemaHandler
+	// byName holds the namespaced datasets by collection name. Invalid
+	// definitions never enter; namespaced names cannot collide across
+	// types by construction.
+	byName map[string]types.CompiledDataset
+	// byType holds every compiled type, invalid entries included, for
+	// the management reads and the purge paths.
+	byType map[string]*types.CompiledType
+	// regs holds one pre-built registration per byName entry — the
+	// generic schema handler for records, a module instance otherwise.
+	// Handlers are read-only after construction, so sharing them across
+	// controllers is safe.
+	regs map[string]crdt.HandlerReg
+	// sharedOwners maps a module's canonical collection to the types
+	// declaring a shared dataset of it; moduleOwners maps a module name
+	// to the types declaring any dataset of it (shared or namespaced).
+	sharedOwners map[string]map[string]struct{}
+	moduleOwners map[string]map[string]struct{}
+	// moduleOf maps a namespaced collection to its module.
+	moduleOf map[string]string
 }
 
 var emptyCatalogSnapshot = &catalogSnapshot{}
@@ -75,7 +94,7 @@ func (c *runtimeCatalog) snapshot() *catalogSnapshot {
 	return c.snap.Load()
 }
 
-// lookup resolves a runtime dataset by collection name.
+// lookup resolves a namespaced runtime dataset by collection name.
 func (c *runtimeCatalog) lookup(name string) (types.CompiledDataset, bool) {
 	ds, ok := c.snapshot().byName[name]
 	return ds, ok
@@ -86,7 +105,16 @@ func (c *runtimeCatalog) lookup(name string) (types.CompiledDataset, bool) {
 // apply) — a store must open even when the objects collection doesn't
 // exist yet (fresh space).
 func (s *Store) initCatalog(ctx context.Context) {
-	if s.catalog == nil || s.db == nil {
+	if s.catalog == nil {
+		return
+	}
+	// Registered types' static declarations are constants: they own
+	// their collections before — and whether or not — the type scan
+	// below succeeds.
+	s.catalog.mu.Lock()
+	s.catalog.snap.Store(s.resolveCatalog(map[string]*types.CompiledType{}))
+	s.catalog.mu.Unlock()
+	if s.db == nil {
 		return
 	}
 	typeIds, err := s.catalogTypeIds(ctx)
@@ -94,14 +122,14 @@ func (s *Store) initCatalog(ctx context.Context) {
 		storeLog.Warn("catalog: initial type scan failed", zap.Error(err))
 		return
 	}
-	byType := make(map[string][]types.CompiledDataset, len(typeIds))
+	byType := make(map[string]*types.CompiledType, len(typeIds))
 	for _, typeId := range typeIds {
-		compiled, cerr := types.CompileDatasetDefs(ctx, s.db, typeId)
+		compiled, cerr := types.CompileTypeParts(ctx, s.db, typeId, s.moduleInfos)
 		if cerr != nil {
 			storeLog.Warn("catalog: compile failed", zap.String("typeId", typeId), zap.Error(cerr))
 			continue
 		}
-		if len(compiled) > 0 {
+		if compiled != nil && len(compiled.Datasets) > 0 {
 			byType[typeId] = compiled
 		}
 	}
@@ -134,7 +162,7 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 	if s.catalog == nil || typeId == "" {
 		return
 	}
-	compiled, err := types.CompileDatasetDefs(ctx, s.db, typeId)
+	compiled, err := types.CompileTypeParts(ctx, s.db, typeId, s.moduleInfos)
 	if err != nil {
 		storeLog.Warn("catalog: refresh compile failed", zap.String("typeId", typeId), zap.Error(err))
 		return
@@ -142,11 +170,11 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 	s.catalog.mu.Lock()
 	defer s.catalog.mu.Unlock()
 	prev := s.catalog.snap.Load()
-	byType := make(map[string][]types.CompiledDataset, len(prev.byType)+1)
+	byType := make(map[string]*types.CompiledType, len(prev.byType)+1)
 	for k, v := range prev.byType {
 		byType[k] = v
 	}
-	if len(compiled) == 0 {
+	if compiled == nil || len(compiled.Datasets) == 0 {
 		delete(byType, typeId)
 	} else {
 		byType[typeId] = compiled
@@ -154,18 +182,57 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 	s.catalog.snap.Store(s.resolveCatalog(byType))
 }
 
-// resolveCatalog folds per-type compiles into the name-resolved
-// snapshot: invalid definitions never register; static catalog names
-// (built-ins + config-registered datasets) always win; cross-type
-// conflicts resolve to the smallest DefId. DefId is content-addressed
-// and identical on every replica — creation `_ver.id`s are per-tree
-// and NOT comparable across type objects, so no first-writer order
-// exists to honor here.
-func (s *Store) resolveCatalog(byType map[string][]types.CompiledDataset) *catalogSnapshot {
-	byName := make(map[string]types.CompiledDataset)
-	for _, list := range byType {
-		for _, ds := range list {
+// resolveCatalog folds per-type compiles into the resolved snapshot:
+// invalid definitions never register; a shared dataset only adds its
+// type to the canonical collection's owner set; a namespaced dataset
+// gets its registration built from the module (or the generic schema
+// handler for records).
+func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSnapshot {
+	snap := &catalogSnapshot{
+		byName:       map[string]types.CompiledDataset{},
+		byType:       byType,
+		regs:         map[string]crdt.HandlerReg{},
+		sharedOwners: map[string]map[string]struct{}{},
+		moduleOwners: map[string]map[string]struct{}{},
+		moduleOf:     map[string]string{},
+	}
+	own := func(set map[string]map[string]struct{}, key, typeId string) {
+		m := set[key]
+		if m == nil {
+			m = map[string]struct{}{}
+			set[key] = m
+		}
+		m[typeId] = struct{}{}
+	}
+	// Registered types' static module declarations are owners on every
+	// snapshot. Copied in, never aliased: a runtime fold mutates the
+	// per-key sets.
+	for coll, set := range s.staticSharedOwners {
+		for typeId := range set {
+			own(snap.sharedOwners, coll, typeId)
+		}
+	}
+	for module, set := range s.staticModuleOwners {
+		for typeId := range set {
+			own(snap.moduleOwners, module, typeId)
+		}
+	}
+	for _, ct := range byType {
+		for _, ds := range ct.Datasets {
 			if ds.Invalid {
+				continue
+			}
+			if ds.Shared {
+				if _, static := s.dataVersions[ds.Name]; !static {
+					// The compile already refused a shared dataset of a
+					// module without a canonical; a canonical the store
+					// does not register is a module the config lacks.
+					storeLog.Warn("catalog: shared dataset of an unregistered module",
+						zap.String("collection", ds.Name), zap.String("typeId", ds.TypeId))
+					continue
+				}
+				own(snap.sharedOwners, ds.Name, ds.TypeId)
+				own(snap.moduleOwners, ds.Module, ds.TypeId)
 				continue
 			}
 			if _, static := s.dataVersions[ds.Name]; static {
@@ -173,37 +240,109 @@ func (s *Store) resolveCatalog(byType map[string][]types.CompiledDataset) *catal
 					zap.String("name", ds.Name), zap.String("typeId", ds.TypeId))
 				continue
 			}
-			if w, dup := byName[ds.Name]; dup && !catalogWins(ds, w) {
+			reg, err := s.instanceReg(ds)
+			if err != nil {
+				// A compiled (valid) declaration is also constructible;
+				// failure means catalog-layer drift — drop the dataset
+				// rather than wedge every object load.
+				storeLog.Warn("catalog: registration construction failed",
+					zap.String("dataset", ds.Name), zap.Error(err))
 				continue
 			}
-			byName[ds.Name] = ds
+			snap.byName[ds.Name] = ds
+			snap.regs[ds.Name] = reg
+			snap.moduleOf[ds.Name] = ds.Module
+			own(snap.moduleOwners, ds.Module, ds.TypeId)
 		}
 	}
-	handlers := make(map[string]*crdt.SchemaHandler, len(byName))
-	for name, ds := range byName {
-		sh, err := crdt.NewSchemaHandler(ds.Schema)
-		if err != nil {
-			// A compiled (valid) declaration is also constructible;
-			// failure means catalog-layer drift — drop the dataset
-			// rather than wedge every object load.
-			storeLog.Warn("catalog: schema handler construction failed",
-				zap.String("dataset", name), zap.Error(err))
-			delete(byName, name)
-			continue
-		}
-		handlers[name] = sh
-	}
-	return &catalogSnapshot{byName: byName, byType: byType, handlers: handlers}
+	return snap
 }
 
-// catalogWins resolves a cross-type name conflict: smallest DefId wins
-// — DefIds are unique and identical on every replica, so the pick is
-// replica-stable. TypeId breaks the (pathological) identical-DefId tie.
-func catalogWins(candidate, winner types.CompiledDataset) bool {
-	if candidate.DefId != winner.DefId {
-		return candidate.DefId < winner.DefId
+// instanceReg builds the registration for one namespaced dataset: the
+// generic schema handler over the compiled declaration for records, the
+// module's factory output for a module instance.
+func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
+	if ds.Module == types.RecordsModule {
+		sh, err := crdt.NewSchemaHandler(ds.Schema)
+		if err != nil {
+			return crdt.HandlerReg{}, err
+		}
+		return crdt.HandlerReg{
+			Name:        ds.Name,
+			Handler:     sh,
+			Schema:      ds.Schema,
+			SchemaRev:   ds.SchemaRev,
+			SkipHistory: ds.SkipHistory,
+			Version:     crdt.SchemaHandlerVersion,
+		}, nil
 	}
-	return candidate.TypeId < winner.TypeId
+	m, ok := s.modules[ds.Module]
+	if !ok {
+		return crdt.HandlerReg{}, errors.New("module not registered: " + ds.Module)
+	}
+	reg, err := moduleReg(m, handler.ModuleInstance{
+		TypeId: ds.TypeId, Key: ds.Key, Collection: ds.Name,
+	})
+	if err != nil {
+		return crdt.HandlerReg{}, err
+	}
+	reg.SchemaRev = ds.SchemaRev
+	return reg, nil
+}
+
+// moduleReg instantiates a module for one collection and turns the
+// returned dataset into a controller registration. A nil Handler gets
+// the generic schema handler over the module's schema.
+func moduleReg(m handler.Module, inst handler.ModuleInstance) (crdt.HandlerReg, error) {
+	d := m.New(inst)
+	h := d.Handler
+	version := crdt.NormalizedVersion(m.HandlerVersion)
+	if h == nil {
+		sh, err := crdt.NewSchemaHandler(datasetSchema(d))
+		if err != nil {
+			return crdt.HandlerReg{}, err
+		}
+		h = sh
+		version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, version)
+	}
+	return crdt.HandlerReg{
+		Name:                  inst.Collection,
+		Handler:               h,
+		Indexes:               d.Indexes,
+		Schema:                datasetSchema(d),
+		Version:               version,
+		ReadTracking:          d.ReadTracking,
+		SkipHistory:           d.SkipHistory,
+		DisableFilteredReplay: d.DisableFilteredReplay,
+	}, nil
+}
+
+// sortedCatalogNames returns the snapshot's namespaced collection
+// names in stable order so controller reg sets are deterministic across
+// loads.
+func sortedCatalogNames(snap *catalogSnapshot) []string {
+	if len(snap.byName) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(snap.byName))
+	for name := range snap.byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// sortedOwners returns an owner set as a sorted slice.
+func sortedOwners(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // catalogTypeIds scans the shared objects collection for live type

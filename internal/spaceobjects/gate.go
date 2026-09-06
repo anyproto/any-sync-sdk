@@ -134,7 +134,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// subscriber notification. Over-notifies (an apply whose
 		// classification changed nothing still pings) — consumers pull
 		// TransitionsSince and see an empty diff.
-		if s.readState != nil && s.readTracking[ch.Dataset] != nil && !ch.Local && !ch.Injected {
+		if s.readState != nil && s.readTrackingFor(ch.Dataset) != nil && !ch.Local && !ch.Injected {
 			s.readState.NotifyState(ch.ObjectId, applySeqOf(res))
 		}
 

@@ -18,6 +18,10 @@ import (
 
 const defsDataVer = "typeDatasetHandler-v1" // matches typetype.DatasetDefsHandlerVersion
 
+// testPartId is the part every head in these tests hangs off; seedPart
+// creates it.
+const testPartId = "part-1"
+
 func newDefsController(t *testing.T) (*crdt.Controller, anystore.DB) {
 	t.Helper()
 	db, err := anystore.Open(context.Background(), filepath.Join(t.TempDir(), "defs.db"), nil)
@@ -44,10 +48,30 @@ func defsChange(versionId crdt.VersionId, changeId, recId string, upsert bool, o
 	}
 }
 
-func headPayload(arena *anyenc.Arena, name string, extra map[string]any) crdt.Op {
+func partPayload(arena *anyenc.Arena, key string, extra map[string]any) crdt.Op {
 	fields := map[string]any{
-		typetype.DefFieldDef:  typetype.DefKindDataset,
-		typetype.DefFieldName: name,
+		typetype.DefFieldDef: typetype.DefKindPart,
+		typetype.FieldKey:    key,
+	}
+	for k, v := range extra {
+		fields[k] = v
+	}
+	return setMulti(arena, fields)
+}
+
+// seedPart creates the part the test heads reference.
+func seedPart(t *testing.T, ctrl *crdt.Controller, arena *anyenc.Arena) {
+	t.Helper()
+	require.NoError(t, ctrl.ApplyChange(context.Background(), defsChange("p0", "cp0", testPartId, true,
+		partPayload(arena, "body", nil))))
+}
+
+func headPayload(arena *anyenc.Arena, key string, extra map[string]any) crdt.Op {
+	fields := map[string]any{
+		typetype.DefFieldDef:    typetype.DefKindDataset,
+		typetype.FieldKey:       key,
+		typetype.DefFieldModule: types.RecordsModule,
+		typetype.DefFieldPart:   testPartId,
 	}
 	for k, v := range extra {
 		fields[k] = v
@@ -82,6 +106,13 @@ func TestDatasetDefs_CreateProjectsShortId(t *testing.T) {
 	assert.Equal(t, changeId, string(row.GetStringBytes(typetype.ShortIdFieldChangeId)))
 	assert.Equal(t, "head-1", string(row.GetStringBytes(typetype.ShortIdFieldDefId)))
 	assert.Equal(t, typetype.ShortIdSrcDatasets, string(row.GetStringBytes(typetype.ShortIdFieldSrc)))
+
+	// A part creation projects one too — parts are schema state.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "change-create-part", "part-x", true,
+		partPayload(arena, "body", nil))))
+	row = ctrl.Get(ctx, typetype.ShortIdsDataset, crdt.DeriveRecordId("change-create-part"))
+	require.NotNil(t, row)
+	assert.Equal(t, "part-x", string(row.GetStringBytes(typetype.ShortIdFieldDefId)))
 }
 
 func TestDatasetDefs_CreateRejections(t *testing.T) {
@@ -89,16 +120,32 @@ func TestDatasetDefs_CreateRejections(t *testing.T) {
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
 
+	noModule := map[string]any{
+		typetype.DefFieldDef:  typetype.DefKindDataset,
+		typetype.FieldKey:     "ok",
+		typetype.DefFieldPart: testPartId,
+	}
+	noPart := map[string]any{
+		typetype.DefFieldDef:    typetype.DefKindDataset,
+		typetype.FieldKey:       "ok",
+		typetype.DefFieldModule: types.RecordsModule,
+	}
 	cases := []struct {
 		name string
 		op   crdt.Op
 	}{
-		{"missing def", setMulti(arena, map[string]any{typetype.DefFieldName: "x"})},
+		{"missing def", setMulti(arena, map[string]any{typetype.FieldKey: "x"})},
 		{"unknown def", setMulti(arena, map[string]any{typetype.DefFieldDef: "bogus"})},
-		{"reserved name", headPayload(arena, "objects", nil)},
-		{"underscore name", headPayload(arena, "_sneaky", nil)},
+		{"underscore key", headPayload(arena, "_sneaky", nil)},
+		{"uppercase key", headPayload(arena, "Notes", nil)},
+		{"dotted key", headPayload(arena, "a.b", nil)},
+		{"missing module", setMulti(arena, noModule)},
+		{"bad module slug", headPayload(arena, "ok0", map[string]any{typetype.DefFieldModule: "Bad Module"})},
+		{"missing part", setMulti(arena, noPart)},
 		{"bad idRule", headPayload(arena, "ok1", map[string]any{typetype.DefFieldIdRule: "bogus"})},
 		{"bad deleteBy", headPayload(arena, "ok2", map[string]any{typetype.DefFieldDeleteBy: "bogus"})},
+		{"part bad key", partPayload(arena, "9lives", nil)},
+		{"part ui not an object", partPayload(arena, "ok3", map[string]any{typetype.PartFieldUI: "table"})},
 		{"field missing dataset ref", setMulti(arena, map[string]any{
 			typetype.DefFieldDef: typetype.DefKindField,
 			typetype.FieldKey:    "a",
@@ -135,14 +182,17 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		headPayload(arena, "notes", map[string]any{typetype.DefFieldDeleteBy: "author"}))))
 
 	pinned := []crdt.Op{
-		{Type: crdt.OpSet, Path: []string{typetype.DefFieldName}, Payload: arena.NewString("renamed")},
+		{Type: crdt.OpSet, Path: []string{typetype.FieldKey}, Payload: arena.NewString("renamed")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldDef}, Payload: arena.NewString("field")},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldModule}, Payload: arena.NewString("editor")},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldShared}, Payload: arena.NewTrue()},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldPart}, Payload: arena.NewString("part-2")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldIdRule}, Payload: arena.NewString("user")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldDeleteBy}, Payload: arena.NewString("anyone")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSkipHistory}, Payload: arena.NewTrue()},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch}, Payload: arena.NewObject()},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldSearch, "bogus"}, Payload: arena.NewString("x")},
-		{Type: crdt.OpUnset, Path: []string{typetype.DefFieldName}},
+		{Type: crdt.OpUnset, Path: []string{typetype.FieldKey}},
 	}
 	for i, op := range pinned {
 		res, err := ctrl.ApplyChangeWithResult(ctx,
@@ -170,6 +220,46 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, res.Rejections, "op %d must be mutable", i)
 	}
+
+	// A part record: the key is pinned, the display slice mutates, `ui`
+	// is written whole as an object.
+	ui := arena.NewObject()
+	ui.Set("type", arena.NewString("table"))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("q1", "cq1", "part-1", true,
+		partPayload(arena, "body", map[string]any{typetype.PartFieldUI: ui}))))
+	uses := arena.NewArray()
+	uses.SetArrayItem(0, arena.NewString("notes"))
+	ui2 := arena.NewObject()
+	ui2.Set("type", arena.NewString("list"))
+	partMutable := []crdt.Op{
+		{Type: crdt.OpSet, Path: []string{typetype.FieldName}, Payload: arena.NewString("Body")},
+		{Type: crdt.OpSet, Path: []string{typetype.PartFieldIcon}, Payload: arena.NewString("doc")},
+		{Type: crdt.OpSet, Path: []string{typetype.PartFieldPos}, Payload: arena.NewString("a1")},
+		{Type: crdt.OpSet, Path: []string{typetype.PartFieldHidden}, Payload: arena.NewTrue()},
+		{Type: crdt.OpSet, Path: []string{typetype.PartFieldUI}, Payload: ui2},
+		{Type: crdt.OpSet, Path: []string{typetype.PartFieldUses}, Payload: uses},
+		{Type: crdt.OpUnset, Path: []string{typetype.PartFieldUI}},
+	}
+	for i, op := range partMutable {
+		res, err := ctrl.ApplyChangeWithResult(ctx,
+			defsChange(crdt.VersionId("qm"+string(rune('a'+i))), "cqm"+string(rune('a'+i)), "part-1", false, op))
+		require.NoError(t, err)
+		require.Empty(t, res.Rejections, "part op %d must be mutable", i)
+	}
+	partPinned := []crdt.Op{
+		{Type: crdt.OpSet, Path: []string{typetype.FieldKey}, Payload: arena.NewString("other")},
+		{Type: crdt.OpSet, Path: []string{typetype.PartFieldUI}, Payload: arena.NewString("table")},
+	}
+	for i, op := range partPinned {
+		res, err := ctrl.ApplyChangeWithResult(ctx,
+			defsChange(crdt.VersionId("qp"+string(rune('a'+i))), "cqp"+string(rune('a'+i)), "part-1", false, op))
+		require.NoError(t, err)
+		require.Len(t, res.Rejections, 1, "part op %d must reject", i)
+	}
+	assert.True(t, typetype.IsPartPinnedPath([]string{typetype.FieldKey}))
+	assert.True(t, typetype.IsPartPinnedPath([]string{typetype.PartFieldUI, "type"}), "ui is written whole")
+	assert.False(t, typetype.IsPartPinnedPath([]string{typetype.PartFieldUI}))
+	assert.False(t, typetype.IsPartPinnedPath([]string{typetype.PartFieldPos}))
 
 	// A field record: the descriptor bag is created whole and then every
 	// path under it mutates with any value type; the behavioral
@@ -258,14 +348,14 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 	// Multi-field $set touching pinned state rejects (probed per key: the
 	// mutable key survives).
 	payload = arena.NewObject()
-	payload.Set(typetype.DefFieldName, arena.NewString("hax"))
+	payload.Set(typetype.FieldKey, arena.NewString("hax"))
 	payload.Set(typetype.DefFieldDisplayName, arena.NewString("kept"))
 	res, err = ctrl.ApplyChangeWithResult(ctx, defsChange("vy", "cy", "head-1", false,
 		crdt.Op{Type: crdt.OpSet, Payload: payload}))
 	require.NoError(t, err)
 	require.NotEmpty(t, res.Rejections)
 	head := ctrl.Get(ctx, typetype.DatasetDefs, "head-1")
-	assert.Equal(t, "notes", string(head.GetStringBytes(typetype.DefFieldName)))
+	assert.Equal(t, "notes", string(head.GetStringBytes(typetype.FieldKey)))
 	assert.Equal(t, "kept", string(head.GetStringBytes(typetype.DefFieldDisplayName)))
 }
 
@@ -290,6 +380,7 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
 
 	// Head + three fields (one stamped, one author-mutable, one shaped).
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v1", "c1", "head-1", true,
@@ -316,12 +407,18 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 	// Duplicate key — the earlier creation (_ver.id v2) wins.
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v6", "c6", "f-title-dup", true,
 		fieldPayload(arena, "head-1", "title", "number", nil))))
+	// Orphan head (unknown part) — folded out.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v7", "c7", "head-orphan", true,
+		headPayload(arena, "ghosts", map[string]any{typetype.DefFieldPart: "part-nope"}))))
 
-	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId)
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
 	require.NoError(t, err)
 	require.Len(t, compiled, 1)
 	ds := compiled[0]
-	assert.Equal(t, "notes", ds.Name)
+	assert.Equal(t, "notes", ds.Key)
+	assert.Equal(t, testObjectId+"_notes", ds.Name, "a records dataset is namespaced under its type")
+	assert.Equal(t, types.RecordsModule, ds.Module)
+	assert.Equal(t, testPartId, ds.PartId)
 	assert.Equal(t, "head-1", ds.DefId)
 	assert.Equal(t, schema.IdUser, ds.Schema.IdRule)
 	assert.Equal(t, schema.DeleteByAuthor, ds.Schema.DeleteBy)
@@ -343,11 +440,11 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 	// must not re-register the dataset.
 	rev := ds.SchemaRev
 	require.NotEmpty(t, rev)
-	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v7", "c7", "f-body", false,
-		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "type"}, Payload: arena.NewString("text")})))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v8", "c8", "f-body", false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "type"}, Payload: arena.NewString("text")})))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v9", "c9", "f-body", false,
 		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldDescription}, Payload: arena.NewString("edited")})))
-	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId)
+	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId, nil)
 	require.NoError(t, err)
 	require.Len(t, compiled, 1)
 	assert.Equal(t, rev, compiled[0].SchemaRev, "descriptive edits leave the schema revision alone")
@@ -362,12 +459,22 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(raw), `"x-format":{"icon":"text","type":"text"}`)
 	assert.Contains(t, string(raw), `"description":"edited"`)
+
+	// The part view carries the same dataset.
+	ct, err := types.CompileTypeParts(ctx, db, testObjectId, nil)
+	require.NoError(t, err)
+	require.Len(t, ct.Parts, 1)
+	assert.Equal(t, "body", ct.Parts[0].Key)
+	assert.Equal(t, testPartId, ct.Parts[0].Id)
+	require.Len(t, ct.Parts[0].Datasets, 1)
+	assert.Equal(t, "notes", ct.Parts[0].Datasets[0].Key)
 }
 
 func TestCompileDatasetDefs_SearchTextForms(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
 
 	// String wire form parses to a one-key mapping.
 	single := arena.NewObject()
@@ -397,27 +504,28 @@ func TestCompileDatasetDefs_SearchTextForms(t *testing.T) {
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v3", "c3", "head-dup", true,
 		headPayload(arena, "dups", map[string]any{typetype.DefFieldSearch: dup}))))
 
-	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId)
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
 	require.NoError(t, err)
 	require.Len(t, compiled, 3)
-	byName := map[string]types.CompiledDataset{}
+	byKey := map[string]types.CompiledDataset{}
 	for _, c := range compiled {
-		byName[c.Name] = c
+		byKey[c.Key] = c
 	}
 
-	require.NotNil(t, byName["articles"].Search)
-	assert.Equal(t, []string{"body"}, byName["articles"].Search.Text)
-	require.NotNil(t, byName["emails"].Search)
-	assert.Equal(t, []string{"body", "notes"}, byName["emails"].Search.Text)
-	assert.Equal(t, "email", byName["emails"].Search.Scope)
-	assert.True(t, byName["dups"].Invalid)
-	assert.NotEmpty(t, byName["dups"].InvalidReason)
+	require.NotNil(t, byKey["articles"].Search)
+	assert.Equal(t, []string{"body"}, byKey["articles"].Search.Text)
+	require.NotNil(t, byKey["emails"].Search)
+	assert.Equal(t, []string{"body", "notes"}, byKey["emails"].Search.Text)
+	assert.Equal(t, "email", byKey["emails"].Search.Scope)
+	assert.True(t, byKey["dups"].Invalid)
+	assert.NotEmpty(t, byKey["dups"].InvalidReason)
 }
 
 func TestCompileDatasetDefs_AuthorRuleWithoutCreatorStampMarksInvalid(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
 
 	// deleteBy author but no creator-stamped field: the folded decl
 	// fails validation. The dataset stays VISIBLE (so it can be
@@ -428,7 +536,7 @@ func TestCompileDatasetDefs_AuthorRuleWithoutCreatorStampMarksInvalid(t *testing
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "f-a", true,
 		fieldPayload(arena, "head-1", "a", "string", nil))))
 
-	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId)
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
 	require.NoError(t, err)
 	require.Len(t, compiled, 1)
 	assert.True(t, compiled[0].Invalid)
@@ -438,43 +546,192 @@ func TestCompileDatasetDefs_AuthorRuleWithoutCreatorStampMarksInvalid(t *testing
 	// Adding the creator stamp repairs the declaration.
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v3", "c3", "f-creator", true,
 		fieldPayload(arena, "head-1", "creator", "string", map[string]any{typetype.DefFieldStamp: "creator"}))))
-	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId)
+	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId, nil)
 	require.NoError(t, err)
 	require.Len(t, compiled, 1)
 	assert.False(t, compiled[0].Invalid)
 	assert.NotEmpty(t, compiled[0].SchemaRev)
 }
 
-func TestCompileDatasetDefs_DuplicateNameFirstWriterWins(t *testing.T) {
+// Two concurrent declarations of one key name the same collection by
+// construction: the earlier creation is the definition's identity,
+// fields union across both heads, and a disagreement on a pinned leaf
+// marks the definition invalid.
+func TestCompileDatasetDefs_DuplicateKeyUnionsFields(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
 
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v1", "c1", "head-1", true,
 		headPayload(arena, "notes", nil))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "head-2", true,
-		headPayload(arena, "notes", map[string]any{typetype.DefFieldDynamic: true}))))
+		headPayload(arena, "notes", nil))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v3", "c3", "f-a", true,
+		fieldPayload(arena, "head-1", "a", "string", nil))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v4", "c4", "f-b", true,
+		fieldPayload(arena, "head-2", "b", "string", nil))))
 
-	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId)
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
 	require.NoError(t, err)
 	require.Len(t, compiled, 1)
 	assert.Equal(t, "head-1", compiled[0].DefId)
-	assert.False(t, compiled[0].Schema.Dynamic)
+	assert.False(t, compiled[0].Invalid)
+	require.Len(t, compiled[0].Schema.Fields, 2, "fields union across duplicate heads")
+
+	// A third head disagreeing on a pinned leaf invalidates the fold.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v5", "c5", "head-3", true,
+		headPayload(arena, "notes", map[string]any{typetype.DefFieldDynamic: true}))))
+	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId, nil)
+	require.NoError(t, err)
+	require.Len(t, compiled, 1)
+	assert.True(t, compiled[0].Invalid)
+	assert.Contains(t, compiled[0].InvalidReason, "pinned")
 }
 
-func TestCompileDatasetDefs_TombstonedHeadDropsDataset(t *testing.T) {
+func TestCompileDatasetDefs_TombstonesDrop(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
 
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v1", "c1", "head-1", true,
 		headPayload(arena, "notes", nil))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "head-1", false,
 		crdt.Op{Type: crdt.OpDelete})))
 
-	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId)
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
 	require.NoError(t, err)
 	assert.Empty(t, compiled)
+
+	// A tombstoned part takes its datasets with it: the heads go orphan.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v3", "c3", "head-2", true,
+		headPayload(arena, "tasks", nil))))
+	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId, nil)
+	require.NoError(t, err)
+	require.Len(t, compiled, 1)
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v4", "c4", testPartId, false,
+		crdt.Op{Type: crdt.OpDelete})))
+	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId, nil)
+	require.NoError(t, err)
+	assert.Empty(t, compiled)
+}
+
+// Parts fold by key (display from the earlier creation, datasets and
+// uses unioned) and the collection rule places every dataset: a shared
+// dataset on the module's canonical collection, a namespaced one under
+// the type; module-served datasets carry no fields; violations of the
+// rule compile invalid.
+func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
+	ctrl, db := newDefsController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+	modules := types.NewModules(
+		types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"},
+		types.ModuleInfo{Name: "chat", Canonical: "chat_messages", SharedOnly: true},
+	)
+
+	usesA := arena.NewArray()
+	usesA.SetArrayItem(0, arena.NewString("summary"))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("p1", "cp1", "part-a", true,
+		partPayload(arena, "body", map[string]any{typetype.FieldName: "Body", typetype.PartFieldUses: usesA}))))
+	// Concurrent duplicate of the same part: later creation, its
+	// display loses, its datasets and uses join.
+	usesB := arena.NewArray()
+	usesB.SetArrayItem(0, arena.NewString("nope"))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("p2", "cp2", "part-b", true,
+		partPayload(arena, "body", map[string]any{typetype.FieldName: "Loser", typetype.PartFieldUses: usesB}))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("p3", "cp3", "part-c", true,
+		partPayload(arena, "chat", map[string]any{typetype.FieldName: "Chat"}))))
+
+	heads := []struct {
+		id, key, module, part string
+		shared                bool
+	}{
+		{"h-shared", "editor_blocks", "editor", "part-a", true},
+		{"h-summary", "summary", "editor", "part-b", false},
+		{"h-badkey", "notes", "editor", "part-a", true}, // shared key must be the canonical
+		{"h-thread", "thread", "chat", "part-c", false}, // chat admits shared only
+		{"h-chat", "chat_messages", "chat", "part-c", true},
+		{"h-unknown", "x", "sketch", "part-a", false}, // no such module
+		{"h-records", "segments", types.RecordsModule, "part-a", false},
+	}
+	for i, h := range heads {
+		extra := map[string]any{typetype.DefFieldModule: h.module, typetype.DefFieldPart: h.part}
+		if h.shared {
+			extra[typetype.DefFieldShared] = true
+		}
+		require.NoError(t, ctrl.ApplyChange(ctx, defsChange(crdt.VersionId("h"+string(rune('a'+i))), "ch"+h.id, h.id, true,
+			headPayload(arena, h.key, extra))))
+	}
+	// A field on a module-served dataset is an orphan: the module owns
+	// the schema.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("f1", "cf1", "f-editor", true,
+		fieldPayload(arena, "h-shared", "text", "string", nil))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("f2", "cf2", "f-seg", true,
+		fieldPayload(arena, "h-records", "speaker", "string", nil))))
+
+	ct, err := types.CompileTypeParts(ctx, db, testObjectId, modules)
+	require.NoError(t, err)
+	require.Len(t, ct.Parts, 2, "duplicate parts fold")
+	body := ct.Parts[0]
+	assert.Equal(t, "body", body.Key)
+	assert.Equal(t, "part-a", body.Id, "the earlier creation is the part's identity")
+	assert.Equal(t, "Body", body.Name)
+	assert.Equal(t, []string{"summary"}, body.Uses, "uses union, unknown keys dropped")
+	assert.Equal(t, "chat", ct.Parts[1].Key)
+
+	byKey := map[string]types.CompiledDataset{}
+	for _, ds := range ct.Datasets {
+		byKey[ds.Key] = ds
+	}
+	shared := byKey["editor_blocks"]
+	assert.Equal(t, "editor_blocks", shared.Name, "a shared dataset is the canonical collection")
+	assert.True(t, shared.Shared)
+	assert.False(t, shared.Invalid)
+	assert.NotEmpty(t, shared.SchemaRev)
+	assert.Empty(t, shared.Schema.Fields, "module-served: no fields")
+	assert.Equal(t, "part-a", shared.PartId)
+
+	summary := byKey["summary"]
+	assert.Equal(t, testObjectId+"_summary", summary.Name)
+	assert.Equal(t, "editor", summary.Module)
+	assert.False(t, summary.Invalid)
+	assert.Equal(t, "part-a", summary.PartId, "a head under the losing duplicate attaches to the winner")
+
+	assert.True(t, byKey["notes"].Invalid, "shared editor keyed other than the canonical")
+	assert.True(t, byKey["thread"].Invalid, "namespaced chat is refused")
+	assert.False(t, byKey["chat_messages"].Invalid)
+	assert.Equal(t, "chat_messages", byKey["chat_messages"].Name)
+	assert.True(t, byKey["x"].Invalid)
+	assert.Contains(t, byKey["x"].InvalidReason, "unknown module")
+
+	seg := byKey["segments"]
+	assert.False(t, seg.Invalid)
+	assert.Equal(t, testObjectId+"_segments", seg.Name)
+	require.Len(t, seg.Schema.Fields, 1, "records datasets keep their fields")
+
+	// Parts carry their datasets in key order, invalid ones included.
+	var bodyKeys []string
+	for _, ds := range body.Datasets {
+		bodyKeys = append(bodyKeys, ds.Key)
+	}
+	assert.Equal(t, []string{"editor_blocks", "notes", "segments", "summary", "x"}, bodyKeys)
+
+	// A second shared editor dataset (a different key cannot be the
+	// canonical, so re-declare the canonical under another part): the
+	// earlier creation keeps it.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("h9", "ch9", "h-shared-2", true,
+		headPayload(arena, "editor_blocks", map[string]any{
+			typetype.DefFieldModule: "editor", typetype.DefFieldPart: "part-c", typetype.DefFieldShared: true,
+		}))))
+	ct, err = types.CompileTypeParts(ctx, db, testObjectId, modules)
+	require.NoError(t, err)
+	byKey = map[string]types.CompiledDataset{}
+	for _, ds := range ct.Datasets {
+		byKey[ds.Key] = ds
+	}
+	assert.True(t, byKey["editor_blocks"].Invalid, "two heads of one key disagreeing on the part fold invalid")
 }
 
 // A head record carries no descriptor: the create rule refuses one and
@@ -514,11 +771,12 @@ func TestDatasetDefs_HeadCarriesNoXFormat(t *testing.T) {
 
 // Whatever a client-side preflight admits, the apply-time handler
 // admits too — otherwise a multi-op patch would half-apply. Pins the
-// containment for both record kinds over the discriminating paths.
+// containment for all three record kinds over the discriminating paths.
 func TestDatasetDefs_PreflightSubsetOfHandler(t *testing.T) {
 	ctrl, _ := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v0", "c0", "part-1", true, partPayload(arena, "body", nil))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v1", "c1", "head-1", true, headPayload(arena, "notes", nil))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "field-1", true,
 		fieldPayload(arena, "head-1", "title", "string", nil))))
@@ -528,7 +786,8 @@ func TestDatasetDefs_PreflightSubsetOfHandler(t *testing.T) {
 		{typetype.DefFieldSearch, typetype.SearchKeyTitle}, {typetype.DefFieldSearch, typetype.SearchKeyText},
 		{typetype.DefFieldSearch, typetype.SearchKeyScope},
 		{typetype.FieldXFormat, "icon"}, {typetype.FieldXFormat, "options", "a", "name"},
-		{typetype.FieldKey}, {typetype.FieldKind}, {typetype.DefFieldRequired}, {typetype.DefFieldName},
+		{typetype.PartFieldIcon}, {typetype.PartFieldPos},
+		{typetype.FieldKey}, {typetype.FieldKind}, {typetype.DefFieldRequired}, {typetype.DefFieldModule},
 	}
 	for i, p := range paths {
 		op := crdt.Op{Type: crdt.OpSet, Path: p, Payload: arena.NewString("x")}
@@ -537,6 +796,7 @@ func TestDatasetDefs_PreflightSubsetOfHandler(t *testing.T) {
 			pinned  bool
 			preflit string
 		}{
+			{"part-1", typetype.IsPartPinnedPath(p), "part"},
 			{"head-1", typetype.IsDatasetDefPinnedPath(p), "head"},
 			{"field-1", typetype.IsDatasetFieldPinnedPath(p), "field"},
 		} {

@@ -23,8 +23,8 @@ var (
 	ErrBundleUnknown = errors.New("bundle unknown")
 	// ErrBundleBadRequest — structurally invalid input: empty bundle
 	// id, nil NewRoot, empty root id, DerivedRoot-only fields on a
-	// created root, an invalid or duplicate dataset declaration, or a
-	// tech-space request that is not derived-only with Datasets.
+	// created root, an invalid or duplicate part / dataset declaration,
+	// or a tech-space request that is not derived-only with Parts.
 	ErrBundleBadRequest = errors.New("bundle bad request")
 	// ErrBundleNotLoser — ResolveLoser target is not a loser of the
 	// bundle: it is the current winner, or was never claimed in roots.
@@ -38,13 +38,6 @@ var (
 	// (or objects row) has not arrived on this device yet. Transient —
 	// retry after sync.
 	ErrBundleRootNotSynced = errors.New("bundle root not yet synced locally")
-
-	// ErrDatasetNameUnsettled: a requested dataset name is owned by a
-	// root no registry row references — an install mid-sync (the
-	// declaration's tree arrived before its registry row) or an orphan
-	// from a crashed install. Transient in the first case: retry after
-	// sync.
-	ErrDatasetNameUnsettled = errors.New("bundle dataset name owned by an unregistered root")
 )
 
 // Bundle is one row of the bundles registry.
@@ -121,33 +114,99 @@ type EnsureBundleRequest struct {
 	// registered so a failed seed leaves no install to adopt. Every
 	// keyed type is attached along with RootTypes — a property write
 	// to a type the object does not implement is rejected. The root's
-	// own id is not a usable key: a self-typed root (Datasets) grants a
-	// dataset namespace, not property definitions. DerivedRoot only.
+	// own id is not a usable key: the root's own property ids are not
+	// known before the install. DerivedRoot only.
 	RootProperties map[string]map[string]any
 
-	// Datasets declares runtime datasets on the root — derived or
-	// created — which then implements itself as a type: any.types =
+	// Parts declares parts (with their datasets) on the root — derived
+	// or created — which then implements itself as a type: any.types =
 	// ["__type__", rootId], typeId = rootId. Records live on the root
-	// under the declared names, discoverable through
-	// Types().Datasets(rootId) and Space.Datasets(), writable through
-	// Modify/Upsert on the root. Declared in one change after the
-	// registering write, and on adopt only when the root's tree is
-	// local and carries no declaration yet (crash between registering
-	// and declaring, a row adopted before the root tree synced); a
-	// root with any declaration — live, or removed through
-	// Types().RemoveDataset — is left alone: nothing is patched, added
-	// or resurrected by Ensure. Later evolution goes through
-	// Types().AddDataset / AddDatasetField / PatchDataset with typeId
-	// = rootId. Dataset names are unique per space: a name another
-	// type or bundle owns, or one the store reserves, fails the
-	// request with ErrBundleBadRequest before any root is minted, as
-	// does an invalid or duplicate draft; a name held by a root no
-	// registry row references is ErrDatasetNameUnsettled (retry after
-	// sync). With a created strategy, omit NewRoot and Ensure mints
-	// and self-types the root itself — the only create a space with a
-	// fenced object lifecycle (the tech space) allows. Required on the
-	// tech space.
-	Datasets []DatasetDraft
+	// in the declared collections (`<rootId>_<key>` for a namespaced
+	// dataset, the module's canonical collection for a shared one),
+	// discoverable through Types().Parts(rootId) / Datasets(rootId) and
+	// Space.Datasets(), writable through Modify/Upsert on the root.
+	// Declared in one change after the registering write, and on adopt
+	// only when the root's tree is local and carries no declaration
+	// yet (crash between registering and declaring, a row adopted
+	// before the root tree synced); a root with any declaration —
+	// live, or removed through Types().RemovePart — is left alone:
+	// nothing is patched, added or resurrected by Ensure. Later
+	// evolution goes through Types().AddPart / AddDataset /
+	// AddDatasetField / PatchDataset with typeId = rootId. An invalid
+	// or duplicate draft fails the request with ErrBundleBadRequest
+	// before any root is minted. With a created strategy, omit NewRoot
+	// and Ensure mints and self-types the root itself — the only create
+	// a space with a fenced object lifecycle (the tech space) allows.
+	// Parts or Properties are required on the tech space.
+	Parts []PartDraft
+
+	// Properties declares property definitions on the root, which then
+	// implements itself as a type like Parts does — for a bundle that
+	// IS a type other objects carry (a wiki's `parentId` / `pos`).
+	// Every draft needs an XKey, unique within the request: the
+	// property id is DERIVED from (root id, XKey), so two devices
+	// installing while apart mint one column per handle instead of
+	// two. Declared in one change after the registering write; on
+	// adopt only the definitions the root lacks are written — one is
+	// present when its id exists (live, or removed through
+	// Types().RemoveProperty: the tombstone keeps the id) or a live
+	// definition carries its handle under any id, so nothing is
+	// patched, resurrected or doubled. Later evolution goes through
+	// Types().AddProperty / PatchProperty / RemoveProperty with typeId
+	// = rootId; a property added that way gets an ordinary
+	// change-derived id. Kind, Scope and XKey are validated as
+	// AddProperty validates them, before any root is minted.
+	Properties []PropertyDraft
+
+	// Layout, Weight and Hidden seed the root type's rendering and
+	// listing metadata (TypeInfo.Layout / Weight / Hidden) with the
+	// name stamp, on install only — adopt never patches them. They
+	// describe a type, so they need Parts or Properties
+	// (ErrBundleBadRequest otherwise). Hidden is EXPLICIT: a root that
+	// only hosts its bundle's records should ask for it, since a listed
+	// type is one a client may attach elsewhere, granting that object
+	// the bundle's collections; a root that is a type objects carry (a
+	// page, a wiki) stays listed.
+	Layout map[string]any
+	Weight int
+	Hidden bool
+}
+
+// DeclaresType reports whether the request makes the root a type
+// implementing itself — Parts or Properties.
+func (r EnsureBundleRequest) DeclaresType() bool {
+	return len(r.Parts) > 0 || len(r.Properties) > 0
+}
+
+// EnsureOption tunes one Ensure call. Options carry what must never
+// come from a request body: a consumer maps client input onto
+// EnsureBundleRequest and adds options from its own code paths only.
+type EnsureOption func(*EnsureOptions)
+
+// EnsureOptions is the resolved option set.
+type EnsureOptions struct {
+	// SystemInstall marks the consumer's own catalog install: it lifts
+	// the reserved-module refusal (handler.Module.Reserved) for this
+	// call. The reservation exists so only the consumer's installs
+	// declare such a module.
+	SystemInstall bool
+}
+
+// SystemInstall marks the call as the consumer's own install — see
+// EnsureOptions.SystemInstall.
+func SystemInstall() EnsureOption {
+	return func(o *EnsureOptions) { o.SystemInstall = true }
+}
+
+// ApplyEnsureOptions folds opts into an EnsureOptions.
+func ApplyEnsureOptions(opts ...EnsureOption) EnsureOptions {
+	var o EnsureOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
 }
 
 // BundlesAPI is the typed surface over the per-space bundles registry.
@@ -183,7 +242,7 @@ type BundlesAPI interface {
 	// may already carry a created install of the same id — see
 	// docs/bundles.md § Derived roots.
 	//
-	// With Datasets the derived root is stamped as a type implementing
+	// With Parts the derived root is stamped as a type implementing
 	// itself and the declarations are written on it before the
 	// registry row, so a crash mid-install leaves no install to adopt
 	// and the retry re-runs idempotently. Two devices declaring the
@@ -192,12 +251,16 @@ type BundlesAPI interface {
 	// up by name when evolving them.
 	//
 	// On the tech space (Service.Get(SDK.TechSpaceId())) bundles are
-	// derived-only and must declare Datasets; NewRoot is refused.
+	// derived-only and must declare Parts; NewRoot is refused.
 	//
 	// The bool reports whether THIS call registered the install.
 	// False means an existing one was adopted — which for a derived
 	// root may still materialize its tree locally.
-	Ensure(ctx context.Context, req EnsureBundleRequest) (Bundle, bool, error)
+	//
+	// Options carry what a request body must never say: SystemInstall
+	// admits a reserved module (handler.Module.Reserved) for the
+	// consumer's own install.
+	Ensure(ctx context.Context, req EnsureBundleRequest, opts ...EnsureOption) (Bundle, bool, error)
 
 	// Get returns the bundle row. ErrBundleUnknown when no live record
 	// exists OR the winning root's tree is deleted — a dead winner

@@ -17,7 +17,7 @@ import (
 // resolves no type for the namespace and PreValidate rejects the whole
 // change.
 func TestBuildStaticSchema_MetaTypeNamespace(t *testing.T) {
-	static := buildStaticSchema(nil)
+	static := buildStaticSchema(nil, nil)
 
 	meta, ok := static[typetype.TypeId]
 	require.True(t, ok, "meta-type namespace must be registered")

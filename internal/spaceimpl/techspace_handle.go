@@ -126,7 +126,7 @@ func (t *techSpace) checkWrite(objectId, dataset string) error {
 	if objectId == t.inner.techIndexId {
 		return fmt.Errorf("spaceimpl: the tech index object accepts no generic writes: %w", space.ErrUnsupported)
 	}
-	if _, owned := t.inner.store.DatasetOwner(dataset); owned {
+	if _, owned := t.inner.store.DatasetOwners(dataset); owned {
 		return nil
 	}
 	if _, err := t.inner.store.DataVersion(dataset); err == nil {
@@ -264,9 +264,10 @@ func (techObjects) Derive(context.Context, space.DeriveObjectOpts) (string, erro
 	return "", errUnsupported("Objects().Derive")
 }
 
-// techTypes keeps reads, and the dataset-declaration methods for
-// bundle roots only (a bundle root is a type; its datasets evolve
-// through them); type lifecycle and property definitions refuse.
+// techTypes keeps reads, and the declaration methods — parts,
+// datasets, properties — for bundle roots only (a bundle root is a
+// type; its declarations evolve through them); type lifecycle and
+// the type's own metadata refuse.
 type techTypes struct {
 	inner *typesAPI
 	t     *techSpace
@@ -293,11 +294,32 @@ func (x techTypes) Properties(ctx context.Context, typeId string) ([]space.Prope
 func (x techTypes) Datasets(ctx context.Context, typeId string) ([]space.DatasetDef, error) {
 	return x.inner.Datasets(ctx, typeId)
 }
-func (x techTypes) AddDataset(ctx context.Context, typeId string, draft space.DatasetDraft) (string, error) {
+func (x techTypes) Parts(ctx context.Context, typeId string) ([]space.PartDef, error) {
+	return x.inner.Parts(ctx, typeId)
+}
+func (x techTypes) AddPart(ctx context.Context, typeId string, draft space.PartDraft) (string, error) {
 	if err := x.root(ctx, typeId); err != nil {
 		return "", err
 	}
-	return x.inner.AddDataset(ctx, typeId, draft)
+	return x.inner.AddPart(ctx, typeId, draft)
+}
+func (x techTypes) PatchPart(ctx context.Context, typeId, partId string, patch space.DatasetDefPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchPart(ctx, typeId, partId, patch)
+}
+func (x techTypes) RemovePart(ctx context.Context, typeId, partId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemovePart(ctx, typeId, partId)
+}
+func (x techTypes) AddDataset(ctx context.Context, typeId, partId string, draft space.DatasetDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddDataset(ctx, typeId, partId, draft)
 }
 func (x techTypes) AddDatasetField(ctx context.Context, typeId, defId string, draft space.DatasetFieldDraft) (string, error) {
 	if err := x.root(ctx, typeId); err != nil {
@@ -333,14 +355,30 @@ func (techTypes) Create(context.Context, space.TypeCreateParams) (string, error)
 	return "", errUnsupported("Types().Create")
 }
 func (techTypes) Delete(context.Context, string) error { return errUnsupported("Types().Delete") }
-func (techTypes) AddProperty(context.Context, string, space.PropertyDraft) (string, error) {
-	return "", errUnsupported("Types().AddProperty")
+func (techTypes) Patch(context.Context, string, space.TypePatch) error {
+	return errUnsupported("Types().Patch")
 }
-func (techTypes) RemoveProperty(context.Context, string, string) error {
-	return errUnsupported("Types().RemoveProperty")
+
+// Property definitions evolve on bundle roots only, like parts: a
+// bundle declaring Properties is a type whose columns must stay
+// evolvable and removable here too.
+func (x techTypes) AddProperty(ctx context.Context, typeId string, draft space.PropertyDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddProperty(ctx, typeId, draft)
 }
-func (techTypes) PatchProperty(context.Context, string, string, space.PropertyPatch) error {
-	return errUnsupported("Types().PatchProperty")
+func (x techTypes) RemoveProperty(ctx context.Context, typeId, propId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveProperty(ctx, typeId, propId)
+}
+func (x techTypes) PatchProperty(ctx context.Context, typeId, propId string, patch space.PropertyPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchProperty(ctx, typeId, propId, patch)
 }
 
 // techBundles: derived-only installs that declare datasets; no loser
@@ -359,11 +397,11 @@ func (x techBundles) DerivedRootId(ctx context.Context, bundleId string) (string
 	return x.inner.DerivedRootId(ctx, bundleId)
 }
 
-func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest) (space.Bundle, bool, error) {
+func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest, opts ...space.EnsureOption) (space.Bundle, bool, error) {
 	if err := validateTechEnsureRequest(req); err != nil {
 		return space.Bundle{}, false, err
 	}
-	return x.inner.Ensure(ctx, req)
+	return x.inner.Ensure(ctx, req, opts...)
 }
 
 func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {
@@ -375,10 +413,10 @@ func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 }
 
 // validateTechEnsureRequest adds the tech-space rules on top of the
-// structural gate: Datasets required (the root is its own type — that
-// declaration is the install), roots minted by Ensure only (free
-// object create is fenced, so NewRoot has nothing legal to call), and
-// no foreign types (a type from another space would stamp a
+// structural gate: Parts or Properties required (the root is its own
+// type — that declaration is the install), roots minted by Ensure only
+// (free object create is fenced, so NewRoot has nothing legal to
+// call), and no foreign types (a type from another space would stamp a
 // DataVersion the tech space can never satisfy on a device that lacks
 // that space). Both root strategies are allowed: DerivedRoot for
 // bundles that must never fork or uninstall, the SDK-minted created
@@ -388,8 +426,8 @@ func validateTechEnsureRequest(req space.EnsureBundleRequest) error {
 	if req.NewRoot != nil {
 		return fmt.Errorf("spaceimpl: %w: NewRoot is not available on the tech space — Ensure mints the root", space.ErrBundleBadRequest)
 	}
-	if len(req.Datasets) == 0 {
-		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Datasets", space.ErrBundleBadRequest)
+	if len(req.Parts) == 0 && len(req.Properties) == 0 {
+		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare Parts or Properties", space.ErrBundleBadRequest)
 	}
 	if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
 		return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties are not available on the tech space — a tech bundle root is its own type", space.ErrBundleBadRequest)

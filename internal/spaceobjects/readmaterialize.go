@@ -119,9 +119,12 @@ func (m *readMaterializer) processObject(ctx context.Context, objectId string) e
 	}
 	ctrl := obj.Controller()
 
-	// Per-record flags, per tracked dataset that declared them.
-	for dataset, rt := range s.readTracking {
-		if len(rt.RecordFlags) == 0 {
+	// Per-record flags, per tracked dataset that declared them. A
+	// namespaced module instance counts only on a controller that
+	// registered it.
+	tracked := s.trackedDatasets()
+	for dataset, rt := range tracked {
+		if len(rt.RecordFlags) == 0 || !ctrl.HasDataset(dataset) {
 			continue
 		}
 		desired := desiredFlagRecords(entries, dataset, rt.RecordFlags)
@@ -144,7 +147,9 @@ func (m *readMaterializer) processObject(ctx context.Context, objectId string) e
 		}
 	}
 
-	// Object-row counters. Raw stores (tech space) have no objects row.
+	// Object-row counters: they land in the owning type's namespace for
+	// a registered-type dataset and in the module's namespace for a
+	// module collection. Raw stores (tech space) have no objects row.
 	if s.datasetOwners == nil {
 		return nil
 	}
@@ -155,9 +160,9 @@ func (m *readMaterializer) processObject(ctx context.Context, objectId string) e
 	arena := &anyenc.Arena{}
 	row := ctrl.Get(ctx, properties.Dataset, objectId)
 	var ops []crdt.Op
-	for dataset, rt := range s.readTracking {
-		typeId := s.datasetOwners[dataset]
-		if typeId == "" || len(rt.CounterFields) == 0 {
+	for dataset, rt := range tracked {
+		typeId := s.counterNamespace(dataset)
+		if typeId == "" || len(rt.CounterFields) == 0 || !ctrl.HasDataset(dataset) {
 			continue
 		}
 		for tag, propId := range rt.CounterFields {

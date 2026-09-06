@@ -60,7 +60,7 @@ func TestStore_SystemDatasets(t *testing.T) {
 	for _, ns := range store.Schemas() {
 		if ns.Name == "sysA" {
 			listed = true
-			assert.Empty(t, ns.TypeId, "system datasets are type-less")
+			assert.Empty(t, ns.Owners, "system datasets are type-less")
 			assert.True(t, ns.Schema.Dynamic)
 		}
 	}
@@ -70,7 +70,7 @@ func TestStore_SystemDatasets(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "sysA-v1", dv)
 
-	_, owned := store.DatasetOwner("sysA")
+	_, owned := store.DatasetOwners("sysA")
 	assert.False(t, owned, "no owner: membership check stays a no-op")
 
 	assert.NotNil(t, store.Registry(), "regular path: registry present")

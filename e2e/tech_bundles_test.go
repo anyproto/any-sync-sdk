@@ -17,7 +17,7 @@ import (
 // user-minted ids, one required field, creator / create-time stamps.
 func entriesDatasetDraft() space.DatasetDraft {
 	return space.DatasetDraft{
-		Name:      "entries",
+		Key:       "entries",
 		IdRule:    space.IdUser,
 		IdPattern: "^(any://o/.+|f:[A-Za-z0-9_-]{1,64})$",
 		IdMaxLen:  256,
@@ -28,6 +28,14 @@ func entriesDatasetDraft() space.DatasetDraft {
 			{Key: "createdAt", Stamp: space.StampCreateTime},
 		},
 	}
+}
+
+// entriesParts wraps the drafts in one part keyed after the first.
+func entriesParts(datasets ...space.DatasetDraft) []space.PartDraft {
+	if len(datasets) == 0 {
+		datasets = []space.DatasetDraft{entriesDatasetDraft()}
+	}
+	return []space.PartDraft{{Key: datasets[0].Key, Datasets: datasets}}
 }
 
 func openTechDevice(t *testing.T, ctx context.Context, yaml []byte, provider *fixedSeedProvider, label string) *anysyncsdk.SDK {
@@ -48,7 +56,7 @@ func openTechDevice(t *testing.T, ctx context.Context, yaml []byte, provider *fi
 //  1. The tech handle: reachable by id, restricted — lifecycle
 //     surfaces refuse, reads of the system datasets work, writes to
 //     them do not.
-//  2. Device A installs favorites/v1 with an `entries` dataset: the
+//  2. Device A installs favorites/v1 with an `entries` part: the
 //     root is a type implementing itself, the declaration is
 //     discoverable, records land through the generic upsert path;
 //     re-Ensure adopts without declaring twice.
@@ -113,21 +121,22 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	})
 	require.Error(t, err, "device A: system datasets are typed-API-only")
 
-	// Bundles must declare datasets; roots are minted by Ensure only.
+	// Bundles must declare parts; roots are minted by Ensure only.
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: bundleId, DerivedRoot: true})
-	require.ErrorIs(t, err, space.ErrBundleBadRequest, "tech bundle without Datasets")
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "tech bundle without Parts")
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, NewRoot: func(context.Context) (string, error) { return "r", nil },
-		Datasets: []space.DatasetDraft{entriesDatasetDraft()},
+		Parts: entriesParts(),
 	})
 	require.ErrorIs(t, err, space.ErrBundleBadRequest, "tech bundle with a caller-created root")
 
 	wantRoot, err := techA.Bundles().DerivedRootId(ctx, bundleId)
 	require.NoError(t, err)
+	entriesColl := wantRoot + "_entries"
 
 	inst, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: bundleId, Name: "Favorites", DerivedRoot: true,
-		Datasets: []space.DatasetDraft{entriesDatasetDraft()},
+		Parts: entriesParts(),
 	})
 	require.NoError(t, err, "device A: Ensure(favorites/v1)")
 	require.True(t, didInstall)
@@ -149,19 +158,24 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	defs, err := techA.Types().Datasets(ctx, wantRoot)
 	require.NoError(t, err)
 	require.Len(t, defs, 1)
-	require.Equal(t, "entries", defs[0].Name)
+	require.Equal(t, "entries", defs[0].Key)
+	require.Equal(t, entriesColl, defs[0].Collection, "a bundle dataset is namespaced under the root")
+	parts, err := techA.Types().Parts(ctx, wantRoot)
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+	require.Equal(t, "entries", parts[0].Key)
 	var discovered bool
 	for _, ds := range techA.Datasets() {
-		if ds.Name == "entries" {
+		if ds.Name == entriesColl {
 			discovered = true
-			assert.Equal(t, wantRoot, ds.TypeId)
+			assert.Equal(t, []string{wantRoot}, ds.Owners)
 		}
 	}
-	assert.True(t, discovered, "Datasets() lists the bundle dataset under typeId = rootId")
+	assert.True(t, discovered, "Datasets() lists the bundle dataset under its owner = rootId")
 
 	// Records through the generic path.
 	res, err := techA.Upsert(ctx, space.UpsertBatch{
-		ObjectId: wantRoot, Dataset: "entries",
+		ObjectId: wantRoot, Dataset: entriesColl,
 		Records: []space.UpsertRecord{
 			{Id: "any://o/one", Fields: map[string]any{"title": "One"}},
 			{Id: "f:folder", Fields: map[string]any{"title": "Folder"}},
@@ -170,52 +184,51 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	require.NoError(t, err, "device A: Upsert(entries)")
 	require.Equal(t, 2, res.Created)
 	require.Empty(t, res.Rejections)
-	one, err := techA.Query(wantRoot, "entries").Filter(map[string]any{"id": "any://o/one"}).One(ctx)
+	one, err := techA.Query(wantRoot, entriesColl).Filter(map[string]any{"id": "any://o/one"}).One(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, sdkA.Account().Id(), string(one.GetStringBytes("creator")))
 
 	// Re-Ensure adopts, declares nothing twice and keeps the name.
 	adopted, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft()},
+		Id: bundleId, DerivedRoot: true, Parts: entriesParts(),
 	})
 	require.NoError(t, err)
 	require.False(t, didInstall)
 	require.Equal(t, wantRoot, adopted.RootId)
 	defs, err = techA.Types().Datasets(ctx, wantRoot)
 	require.NoError(t, err)
-	require.Len(t, defs, 1, "adopt must not redeclare an existing name")
+	require.Len(t, defs, 1, "adopt must not redeclare an existing key")
 	ti, err = techA.Types().Get(ctx, wantRoot)
 	require.NoError(t, err)
 	assert.Equal(t, "Favorites", ti.Name, "adopt must not rename the root")
 
-	// Dataset names are unique per space: another bundle claiming
-	// `entries` is refused before its root exists.
+	// Collections are namespaced under each root: another bundle
+	// declaring the same key gets its own.
 	otherRoot, err := techA.Bundles().DerivedRootId(ctx, "other/v1")
 	require.NoError(t, err)
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "other/v1", DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft()},
+		Id: "other/v1", DerivedRoot: true, Parts: entriesParts(),
 	})
-	require.ErrorIs(t, err, space.ErrBundleBadRequest, "owned dataset name")
-	_, err = techA.Objects().Get(ctx, otherRoot)
-	require.ErrorIs(t, err, space.ErrNotFound, "a refused install must mint no root")
-	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "other/v1", DerivedRoot: true, Datasets: []space.DatasetDraft{{Name: "spaces", IdRule: space.IdUser}},
-	})
-	require.ErrorIs(t, err, space.ErrBundleBadRequest, "reserved dataset name")
+	require.NoError(t, err, "same key on another root")
+	otherDefs, err := techA.Types().Datasets(ctx, otherRoot)
+	require.NoError(t, err)
+	require.Len(t, otherDefs, 1)
+	assert.Equal(t, otherRoot+"_entries", otherDefs[0].Collection)
 
 	// Created-root install: no DerivedRoot, no NewRoot — Ensure mints
 	// the root, stamps it as its own type, declares. Deletable, so it
 	// is the ordinary shape for app installs.
 	pinsDraft := entriesDatasetDraft()
-	pinsDraft.Name = "pins"
+	pinsDraft.Key = "pins"
 	pins, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "pins/v1", Name: "Pins",
-		Datasets: []space.DatasetDraft{pinsDraft},
+		Parts: entriesParts(pinsDraft),
 	})
 	require.NoError(t, err, "device A: Ensure(pins/v1) created root")
 	require.True(t, didInstall)
 	require.False(t, pins.Derived)
 	require.NotEmpty(t, pins.RootId)
+	pinsColl := pins.RootId + "_pins"
 	prow, err := techA.Objects().Get(ctx, pins.RootId)
 	require.NoError(t, err)
 	var ptypes []string
@@ -225,12 +238,12 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	assert.Contains(t, ptypes, "__type__")
 	assert.Contains(t, ptypes, pins.RootId, "created root implements itself")
 	_, err = techA.Upsert(ctx, space.UpsertBatch{
-		ObjectId: pins.RootId, Dataset: "pins",
+		ObjectId: pins.RootId, Dataset: pinsColl,
 		Records: []space.UpsertRecord{{Id: "any://o/two", Fields: map[string]any{"title": "Two"}}},
 	})
 	require.NoError(t, err, "device A: records on the created root")
 	padopt, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "pins/v1", Datasets: []space.DatasetDraft{pinsDraft},
+		Id: "pins/v1", Parts: entriesParts(pinsDraft),
 	})
 	require.NoError(t, err)
 	require.False(t, didInstall, "re-ensure adopts")
@@ -246,19 +259,40 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "deleted winner reads as uninstalled")
 	pins2, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "pins/v1", Name: "Pins",
-		Datasets: []space.DatasetDraft{pinsDraft},
+		Parts: entriesParts(pinsDraft),
 	})
-	require.NoError(t, err, "reinstall after uninstall — the deleted root's dataset name is released")
+	require.NoError(t, err, "reinstall after uninstall")
 	require.True(t, didInstall)
 	require.NotEqual(t, pins.RootId, pins2.RootId, "reinstall mints a fresh root")
 	require.Error(t, techA.Objects().Delete(ctx, wantRoot),
 		"a DERIVED bundle root stays undeletable (any-sync refuses derived deletion)")
 
 	// Dataset mutators reach bundle roots only.
-	_, err = techA.Types().AddDataset(ctx, techA.SpaceIndexObjectId(), entriesDatasetDraft())
+	_, err = techA.Types().AddPart(ctx, techA.SpaceIndexObjectId(), entriesParts()[0])
 	require.ErrorIs(t, err, space.ErrUnsupported)
 	_, err = techA.Modify(ctx, space.ModifyBatch{ObjectId: wantRoot, Dataset: "objects"})
 	require.ErrorIs(t, err, space.ErrUnsupported, "type-system built-ins are not writable generically")
+
+	// A properties-only tech bundle is a type too, and its columns
+	// evolve through the property mutators on the root — nowhere else.
+	labels, _, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "labels/v1", Name: "Labels", DerivedRoot: true, Hidden: true,
+		Properties: []space.PropertyDraft{{XKey: "color", Kind: space.PropertyKindString}},
+	})
+	require.NoError(t, err, "device A: Ensure(labels/v1) with properties only")
+	labelProps, err := techA.Types().Properties(ctx, labels.RootId)
+	require.NoError(t, err)
+	require.Len(t, labelProps, 1)
+	require.NoError(t, techA.Types().PatchProperty(ctx, labels.RootId, labelProps[0].Id, space.PropertyPatch{Set: map[string]any{"name": "Colour"}}))
+	extraId, err := techA.Types().AddProperty(ctx, labels.RootId, space.PropertyDraft{XKey: "icon", Kind: space.PropertyKindString})
+	require.NoError(t, err)
+	require.NoError(t, techA.Types().RemoveProperty(ctx, labels.RootId, extraId))
+	labelProps, err = techA.Types().Properties(ctx, labels.RootId)
+	require.NoError(t, err)
+	require.Len(t, labelProps, 1)
+	assert.Equal(t, "Colour", labelProps[0].Name)
+	_, err = techA.Types().AddProperty(ctx, techA.SpaceIndexObjectId(), space.PropertyDraft{XKey: "x", Kind: space.PropertyKindString})
+	require.ErrorIs(t, err, space.ErrUnsupported)
 
 	_ = sdkA.Spaces().SyncSpaceList(ctx)
 	_ = techA.SyncHeads(ctx)
@@ -287,13 +321,13 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	// A's records reach B through the root tree.
 	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
 		_ = techB.SyncHeads(ctx)
-		n, qerr := techB.Query(wantRoot, "entries").Count(ctx)
+		n, qerr := techB.Query(wantRoot, entriesColl).Count(ctx)
 		return qerr == nil && n == 2
 	}), "device B: entries never arrived")
 
 	// B writes; A converges.
 	resB, err := techB.Upsert(ctx, space.UpsertBatch{
-		ObjectId: wantRoot, Dataset: "entries",
+		ObjectId: wantRoot, Dataset: entriesColl,
 		Records: []space.UpsertRecord{{Id: "any://o/two", Fields: map[string]any{"title": "Two", "parentId": "f:folder"}}},
 	})
 	require.NoError(t, err, "device B: Upsert(entries)")
@@ -301,17 +335,17 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
 		_ = techB.SyncHeads(ctx)
 		_ = techA.SyncHeads(ctx)
-		n, qerr := techA.Query(wantRoot, "entries").Count(ctx)
+		n, qerr := techA.Query(wantRoot, entriesColl).Count(ctx)
 		return qerr == nil && n == 3
 	}), "device A: B's entry never arrived")
 }
 
 // TestE2E_TechBundle_AdoptReconcilesDatasets: two devices install the
-// same tech bundle with different dataset lists. Whether B's Ensure
-// ran before A's root tree reached it (both declare `entries`, the
-// duplicate heads converge to one) or after (B adopts A's
+// same tech bundle with different part lists. Whether B's Ensure ran
+// before A's root tree reached it (both declare `entries`, the
+// duplicate records converge to one) or after (B adopts A's
 // declarations and adds `tags` through Types().AddDataset), both end
-// with exactly one definition per name, the same on both devices.
+// with exactly one definition per key, the same on both devices.
 func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -329,7 +363,7 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	const bundleId = "pins/v1"
 	provider := newFixedSeedProvider(t)
 	tags := space.DatasetDraft{
-		Name:   "tags",
+		Key:    "tags",
 		IdRule: space.IdUser,
 		Fields: []space.DatasetFieldDraft{{Key: "label", Kind: space.PropertyKindString, Required: true}},
 	}
@@ -342,28 +376,35 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	require.NoError(t, err)
 
 	instA, _, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft()},
+		Id: bundleId, DerivedRoot: true, Parts: entriesParts(),
 	})
 	require.NoError(t, err, "device A: Ensure")
 	instB, _, err := techB.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft(), tags},
+		Id: bundleId, DerivedRoot: true, Parts: entriesParts(entriesDatasetDraft(), tags),
 	})
 	require.NoError(t, err, "device B: Ensure")
 	require.Equal(t, instA.RootId, instB.RootId, "derived root is device-independent")
 	root := instA.RootId
+	tagsColl := root + "_tags"
 
-	names := func(defs []space.DatasetDef) map[string]string {
+	keys := func(defs []space.DatasetDef) map[string]string {
 		out := map[string]string{}
 		for _, d := range defs {
-			out[d.Name] = d.Id
+			out[d.Key] = d.Id
 		}
 		return out
+	}
+	partIdOf := func(sp space.Space) string {
+		parts, perr := sp.Types().Parts(ctx, root)
+		require.NoError(t, perr)
+		require.NotEmpty(t, parts)
+		return parts[0].Id
 	}
 	// Adopted A's declarations (tree arrived first): evolve explicitly.
 	defsB, err := techB.Types().Datasets(ctx, root)
 	require.NoError(t, err)
-	if _, ok := names(defsB)["tags"]; !ok {
-		_, err = techB.Types().AddDataset(ctx, root, tags)
+	if _, ok := keys(defsB)["tags"]; !ok {
+		_, err = techB.Types().AddDataset(ctx, root, partIdOf(techB), tags)
 		require.NoError(t, err, "device B: AddDataset(tags) after adopting")
 	}
 
@@ -379,13 +420,13 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 		if aerr != nil || berr != nil || len(defsA) != 2 || len(defsB) != 2 {
 			return false
 		}
-		na, nb := names(defsA), names(defsB)
+		na, nb := keys(defsA), keys(defsB)
 		return na["entries"] != "" && na["entries"] == nb["entries"] && na["tags"] != "" && na["tags"] == nb["tags"]
 	}), "definitions never converged: A=%+v B=%+v", defsA, defsB)
 
 	// A re-Ensure with the union declares nothing new.
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft(), tags},
+		Id: bundleId, DerivedRoot: true, Parts: entriesParts(entriesDatasetDraft(), tags),
 	})
 	require.NoError(t, err)
 	defsA, err = techA.Types().Datasets(ctx, root)
@@ -393,29 +434,29 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	require.Len(t, defsA, 2)
 
 	// A removed dataset stays removed through later Ensures.
-	require.NoError(t, techA.Types().RemoveDataset(ctx, root, names(defsA)["tags"]))
+	require.NoError(t, techA.Types().RemoveDataset(ctx, root, keys(defsA)["tags"]))
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft(), tags},
+		Id: bundleId, DerivedRoot: true, Parts: entriesParts(entriesDatasetDraft(), tags),
 	})
 	require.NoError(t, err)
 	defsA, err = techA.Types().Datasets(ctx, root)
 	require.NoError(t, err)
 	require.Len(t, defsA, 1, "Ensure must not resurrect a removed dataset")
-	require.NoError(t, techA.Types().RemoveDataset(ctx, root, names(defsA)["entries"]))
+	require.NoError(t, techA.Types().RemoveDataset(ctx, root, keys(defsA)["entries"]))
 	_, _, err = techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: bundleId, DerivedRoot: true, Datasets: []space.DatasetDraft{entriesDatasetDraft(), tags},
+		Id: bundleId, DerivedRoot: true, Parts: entriesParts(entriesDatasetDraft(), tags),
 	})
 	require.NoError(t, err)
 	defsA, err = techA.Types().Datasets(ctx, root)
 	require.NoError(t, err)
 	require.Empty(t, defsA)
 	// Explicit re-add is the way back.
-	_, err = techA.Types().AddDataset(ctx, root, tags)
+	_, err = techA.Types().AddDataset(ctx, root, partIdOf(techA), tags)
 	require.NoError(t, err)
 
 	// Both datasets are writable on both devices.
 	res, err := techA.Upsert(ctx, space.UpsertBatch{
-		ObjectId: root, Dataset: "tags",
+		ObjectId: root, Dataset: tagsColl,
 		Records: []space.UpsertRecord{{Id: "t1", Fields: map[string]any{"label": "work"}}},
 	})
 	require.NoError(t, err)
@@ -423,7 +464,7 @@ func TestE2E_TechBundle_AdoptReconcilesDatasets(t *testing.T) {
 	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
 		_ = techA.SyncHeads(ctx)
 		_ = techB.SyncHeads(ctx)
-		n, qerr := techB.Query(root, "tags").Count(ctx)
+		n, qerr := techB.Query(root, tagsColl).Count(ctx)
 		return qerr == nil && n == 1
 	}), "device B: tag never arrived")
 }

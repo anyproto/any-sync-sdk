@@ -1,10 +1,11 @@
 // The dataset-definitions dataset — the third built-in on type objects
-// (next to `properties` and `shortIds`). Holds a type's runtime-defined
-// dataset schemas as CRDT records: one head record per dataset plus one
-// record per field, so concurrent edits by different members merge as
-// distinct records (the properties model). The catalog compiler
-// (types.CompileDatasetDefs) folds the records into schema.Dataset
-// declarations enforced by the generic schema handler.
+// (next to `properties` and `shortIds`). Holds a type's parts and their
+// datasets as CRDT records: one record per part, one head record per
+// dataset plus one record per field, so concurrent edits by different
+// members merge as distinct records (the properties model). The catalog
+// compiler (types.CompileTypeParts) folds the records into parts and
+// schema.Dataset declarations; the generic schema handler enforces
+// `records` datasets, a registered module serves the rest.
 
 package typetype
 
@@ -49,21 +50,28 @@ const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 // v2: `datetime` is a kind, so a stamped time field validates.
 // v3: field records carry an opaque `x-format` (an object, created
 // whole, mutable); head records carry none.
-const DatasetDefsLocalVersion = 3
+// v4: parts. A head is keyed (`key`, pinned) and bound to a part and a
+// module (`part`, `module`, `shared`, pinned); the `collection` field
+// is gone — the collection is computed at compile.
+const DatasetDefsLocalVersion = 4
 
 // Discriminator values of the pinned `def` field.
 const (
-	DefKindDataset = "dataset" // head record: one per defined dataset
-	DefKindField   = "field"   // field record: one per dataset field
+	DefKindPart    = "part"    // part record: one per part of the type
+	DefKindDataset = "dataset" // head record: one per dataset of a part
+	DefKindField   = "field"   // field record: one per field of a records dataset
 )
 
-// Dataset-def record field names. Head records use the Def* set; field
+// Dataset-def record field names. Part records use the Part* set plus
+// FieldKey / FieldName; head records the Def* set plus FieldKey; field
 // records reuse FieldKey/FieldKind/FieldName/FieldDescription/FieldItems/
 // FieldProperties from the property-record vocabulary plus the Field*
 // behavioral set below.
 const (
 	DefFieldDef         = "def"         // discriminator, pinned
-	DefFieldName        = "collection"  // dataset collection name (head), pinned — distinct from the mutable display `name`
+	DefFieldModule      = "module"      // module slug (head), pinned
+	DefFieldShared      = "shared"      // bool (head), pinned — the module's canonical collection
+	DefFieldPart        = "part"        // owning part record id (head), pinned
 	DefFieldDynamic     = "dynamic"     // bool (head), pinned
 	DefFieldIdRule      = "idRule"      // "auto"/"user" (head), pinned ("id" is a reserved head)
 	DefFieldIdPattern   = "idPattern"   // RE2 (head), pinned
@@ -78,6 +86,16 @@ const (
 	DefFieldMutableBy   = "mutableBy"   // "never"/"author"/"any" (field), pinned
 )
 
+// Part record fields — the display slice a client renders. All mutable;
+// `key` (FieldKey) is the only pinned one.
+const (
+	PartFieldIcon   = "icon"   // string
+	PartFieldPos    = "pos"    // string, clients sort parts by it
+	PartFieldHidden = "hidden" // bool, not shown by default
+	PartFieldUI     = "ui"     // object {type, config}, written whole
+	PartFieldUses   = "uses"   // array of dataset keys of this type
+)
+
 // Sub-keys of the head `search` object — mutable leaves (broad
 // `search` replaces are pinned, the leaves mutate freely). `title` and
 // `scope` are scalar strings; `text` is a bare field key or a non-empty
@@ -88,32 +106,48 @@ const (
 	SearchKeyScope = "scope"
 )
 
-// reservedDatasetNames are collection names a user dataset-def may not
-// claim: the built-in datasets every controller registers. Kept local
-// (the store's builtinDataVersions map lives a layer up); the catalog
-// compiler re-checks against the live reg set anyway — this create-time
-// gate just fails fast on the obvious collisions.
-var reservedDatasetNames = map[string]struct{}{
-	"objects":    {},
-	"properties": {},
-	"shortIds":   {},
-	"datasets":   {},
-	"payloads":   {},
-	"bundles":    {},
-}
-
 // datasetDefMutableTop are the top-level fields the apply-time handler
 // admits on an existing def record. The handler cannot tell record
-// kinds apart statelessly, so this is the union of what a head
-// (displayName) and a field (`x-format`, every path under it) may
-// mutate; the client-side preflights (IsDatasetDefPinnedPath for
-// heads, IsDatasetFieldPinnedPath for fields) are the kind-aware,
-// stricter rules.
+// kinds apart statelessly, so this is the union of what a part (the
+// display slice), a head (displayName) and a field (`x-format`, every
+// path under it) may mutate; the client-side preflights
+// (IsPartPinnedPath, IsDatasetDefPinnedPath, IsDatasetFieldPinnedPath)
+// are the kind-aware, stricter rules.
 var datasetDefMutableTop = map[string]struct{}{
 	FieldName:           {},
 	FieldDescription:    {},
 	DefFieldDisplayName: {},
 	FieldXFormat:        {},
+	PartFieldIcon:       {},
+	PartFieldPos:        {},
+	PartFieldHidden:     {},
+	PartFieldUI:         {},
+	PartFieldUses:       {},
+}
+
+// partMutableTop are the part-record fields a client-side PatchPart
+// may target.
+var partMutableTop = map[string]struct{}{
+	FieldName:       {},
+	PartFieldIcon:   {},
+	PartFieldPos:    {},
+	PartFieldHidden: {},
+	PartFieldUI:     {},
+	PartFieldUses:   {},
+}
+
+// IsPartPinnedPath reports whether a PatchPart path touches pinned
+// part-record state — everything but the display slice. `ui` is
+// written whole (like `x-format`), so a path below it is pinned too.
+func IsPartPinnedPath(path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	if path[0] == PartFieldUI || path[0] == PartFieldUses {
+		return len(path) != 1
+	}
+	_, mutable := partMutableTop[path[0]]
+	return !mutable
 }
 
 // ErrBadDatasetDef indicates a structurally invalid dataset-definition
@@ -193,6 +227,10 @@ func (DatasetDefsHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChan
 		return fmt.Errorf("%w: %w: missing `def` discriminator", crdt.ErrValidation, ErrBadDatasetDef)
 	}
 	switch defKind {
+	case DefKindPart:
+		if err := validatePartCreate(rec.Ops); err != nil {
+			return err
+		}
 	case DefKindDataset:
 		if err := validateHeadCreate(rec.Ops); err != nil {
 			return err
@@ -208,30 +246,47 @@ func (DatasetDefsHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChan
 	return nil
 }
 
-// ValidateDatasetName checks a user dataset's collection name: non-empty,
-// no "_" prefix (reserved for internal collections), no path/separator
-// characters, not a built-in name. Shared by the create-time handler gate
-// and the AddDataset preflight.
-func ValidateDatasetName(name string) error {
-	if name == "" {
-		return fmt.Errorf("%w: dataset name must be non-empty", ErrBadDatasetDef)
-	}
-	if strings.HasPrefix(name, "_") || strings.ContainsAny(name, "./:") {
-		return fmt.Errorf("%w: invalid dataset name %q", ErrBadDatasetDef, name)
-	}
-	if _, reserved := reservedDatasetNames[name]; reserved {
-		return fmt.Errorf("%w: dataset name %q is reserved", ErrBadDatasetDef, name)
+// ValidateKey checks a part or dataset key: the slug rules. Shared by
+// the create-time handler gate and the AddPart / AddDataset preflights.
+func ValidateKey(what, key string) error {
+	if err := schema.ValidateSlug(what, key); err != nil {
+		return fmt.Errorf("%w: %w", ErrBadDatasetDef, err)
 	}
 	return nil
 }
 
-// validateHeadCreate checks a dataset head record: collection name
-// sanity, parseable behavioral labels, and no `x-format` — the
-// descriptor is a field-record member.
-func validateHeadCreate(ops []crdt.Op) error {
-	name, _ := extractField(ops, DefFieldName)
-	if err := ValidateDatasetName(name); err != nil {
+// validatePartCreate checks a part record: a slug key, and `ui` — when
+// present — an object created whole (the descriptor rule).
+func validatePartCreate(ops []crdt.Op) error {
+	key, _ := extractField(ops, FieldKey)
+	if err := ValidateKey("part", key); err != nil {
 		return fmt.Errorf("%w: %w", crdt.ErrValidation, err)
+	}
+	if _, err := extractObjectField(ops, PartFieldUI); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateHeadCreate checks a dataset head record: a slug key (a shared
+// dataset's key is its module's canonical name, which is a slug too),
+// the module and part references, parseable behavioral labels, and no
+// `x-format` — the descriptor is a field-record member. Module
+// existence and the shared rule are compile-time facts (the handler
+// cannot see the module catalog, and a peer without the module still
+// stores the declaration).
+func validateHeadCreate(ops []crdt.Op) error {
+	key, _ := extractField(ops, FieldKey)
+	if err := ValidateKey("dataset", key); err != nil {
+		return fmt.Errorf("%w: %w", crdt.ErrValidation, err)
+	}
+	if module, ok := extractField(ops, DefFieldModule); !ok || module == "" {
+		return fmt.Errorf("%w: %w: dataset head requires a `%s`", crdt.ErrValidation, ErrBadDatasetDef, DefFieldModule)
+	} else if err := schema.ValidateSlug("module", module); err != nil {
+		return fmt.Errorf("%w: %w: %w", crdt.ErrValidation, ErrBadDatasetDef, err)
+	}
+	if partId, ok := extractField(ops, DefFieldPart); !ok || partId == "" {
+		return fmt.Errorf("%w: %w: dataset head requires its owning `%s` id", crdt.ErrValidation, ErrBadDatasetDef, DefFieldPart)
 	}
 	if xf, err := extractObjectField(ops, FieldXFormat); err != nil || xf != nil {
 		return fmt.Errorf("%w: %w: a dataset head record carries no `%s`", crdt.ErrValidation, ErrBadDatasetDef, FieldXFormat)
@@ -323,7 +378,23 @@ func (DatasetDefsHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, 
 	if op.Path[0] == DefFieldSearch {
 		return checkSearchLeafOp(op.Type, op.Path, op.Payload)
 	}
+	if err := checkPartUIWholeSet(op.Type, op.Path, op.Payload); err != nil {
+		return err
+	}
 	return checkXFormatWholeSet(op.Type, op.Path, op.Payload)
+}
+
+// checkPartUIWholeSet keeps a part's `ui` an object on every peer: a
+// $set whose path is exactly `ui` must carry an object (the x-format
+// rule, applied to the widget descriptor). $unset clears it.
+func checkPartUIWholeSet(opType crdt.OpType, path []string, payload *anyenc.Value) error {
+	if opType != crdt.OpSet || len(path) != 1 || path[0] != PartFieldUI {
+		return nil
+	}
+	if payload == nil || payload.Type() != anyenc.TypeObject {
+		return fmt.Errorf("%w: %w: a whole `%s` set must carry an object", crdt.ErrValidation, ErrBadDatasetDef, PartFieldUI)
+	}
+	return nil
 }
 
 // checkSearchLeafOp validates a mutation of a search.* leaf: $unset
@@ -401,6 +472,9 @@ func rejectIfMultiFieldTouchesDefPinned(op *crdt.Op) error {
 		}
 		if path[0] == DefFieldSearch {
 			hit = checkSearchLeafOp(op.Type, path, v)
+			return
+		}
+		if hit = checkPartUIWholeSet(op.Type, path, v); hit != nil {
 			return
 		}
 		hit = checkXFormatWholeSet(op.Type, path, v)

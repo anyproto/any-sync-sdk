@@ -89,10 +89,10 @@ func TestTechWrappers_RefuseLifecycle(t *testing.T) {
 	_, err = ty.Create(ctx, space.TypeCreateParams{})
 	assert.ErrorIs(t, err, space.ErrUnsupported)
 	assert.ErrorIs(t, ty.Delete(ctx, "t"), space.ErrUnsupported)
-	_, err = ty.AddProperty(ctx, "t", space.PropertyDraft{})
-	assert.ErrorIs(t, err, space.ErrUnsupported)
-	assert.ErrorIs(t, ty.RemoveProperty(ctx, "t", "p"), space.ErrUnsupported)
-	assert.ErrorIs(t, ty.PatchProperty(ctx, "t", "p", space.PropertyPatch{}), space.ErrUnsupported)
+	assert.ErrorIs(t, ty.Patch(ctx, "t", space.TypePatch{}), space.ErrUnsupported)
+	// AddProperty / RemoveProperty / PatchProperty are conditional like
+	// the part and dataset mutators — refused off bundle roots, allowed
+	// on them. Needs a store to decide; covered by the tech bundles e2e.
 
 	assert.ErrorIs(t, errUnsupported("x"), space.ErrUnsupported)
 }
@@ -136,7 +136,9 @@ func TestTechHandle_WriteFence(t *testing.T) {
 	// Dataset mutators need a bundle root; an object without a row is
 	// not one.
 	tt := techTypes{inner: newTypesAPI(ts.inner), t: ts}
-	_, err = tt.AddDataset(ctx, "not-a-root", space.DatasetDraft{Name: "x"})
+	_, err = tt.AddDataset(ctx, "not-a-root", "p", space.DatasetDraft{Key: "x"})
+	assert.ErrorIs(t, err, space.ErrUnsupported)
+	_, err = tt.AddPart(ctx, "not-a-root", space.PartDraft{Key: "x"})
 	assert.ErrorIs(t, err, space.ErrUnsupported)
 	assert.ErrorIs(t, tt.RemoveDataset(ctx, "not-a-root", "d"), space.ErrUnsupported)
 }

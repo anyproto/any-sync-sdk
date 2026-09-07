@@ -24,6 +24,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
@@ -261,6 +262,9 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 		// no declaration is not one.
 		return fmt.Errorf("spaceimpl: %w: Layout/Weight/Hidden need a type declaration (Parts / Properties / XKey)", space.ErrBundleBadRequest)
 	}
+	if !req.DeclaresType() && req.SelfTyped {
+		return fmt.Errorf("spaceimpl: %w: SelfTyped needs a type declaration (Parts / Properties / XKey) — there is no type for the root to carry", space.ErrBundleBadRequest)
+	}
 	if len(req.Layout) > 0 {
 		// Probed here so a bad layout fails before any root is minted,
 		// like every other part of the declaration.
@@ -308,6 +312,12 @@ func (b *bundlesAPI) preflightType(ctx context.Context, req space.EnsureBundleRe
 	}
 	if _, self := req.RootProperties[canonical]; self {
 		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — its property ids exist only once installed", space.ErrBundleBadRequest)
+	}
+	// The self type is SelfTyped's to ask for, so the flag stays the
+	// one record of that intent; a computable derived id must not
+	// smuggle it in through RootTypes.
+	if slices.Contains(req.RootTypes, canonical) {
+		return fmt.Errorf("spaceimpl: %w: RootTypes names the root's own id — ask for SelfTyped", space.ErrBundleBadRequest)
 	}
 	return nil
 }
@@ -591,17 +601,20 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 // installRootTypes is what a root Ensure mints implements: the
 // requested types plus every type RootProperties writes into (a
 // property write to a type the object does not implement is
-// rejected). With a selfType (the root declares a type) the root is
-// also a type object implementing itself: the type marker plus its own
-// id come first. `any` is universal and never listed. Nil when there is
-// nothing to attach.
-func installRootTypes(req space.EnsureBundleRequest, selfType string) []string {
+// rejected). A root that declares a type is a type object — the type
+// marker comes first; a self-typed one is also an instance of itself —
+// its own id follows the marker. `any` is universal and never listed.
+// Nil when there is nothing to attach.
+func installRootTypes(req space.EnsureBundleRequest, rootId string, declares, self bool) []string {
 	seen := map[string]struct{}{anytype.TypeId: {}}
 	out := make([]string, 0, len(req.RootTypes)+len(req.RootProperties)+2)
-	if selfType != "" {
+	if declares {
 		seen[typetype.MetaTypeMarker] = struct{}{}
-		seen[selfType] = struct{}{}
-		out = append(out, typetype.MetaTypeMarker, selfType)
+		out = append(out, typetype.MetaTypeMarker)
+		if self {
+			seen[rootId] = struct{}{}
+			out = append(out, rootId)
+		}
 	}
 	for _, t := range req.RootTypes {
 		if _, dup := seen[t]; dup {
@@ -623,6 +636,27 @@ func installRootTypes(req space.EnsureBundleRequest, selfType string) []string {
 		return nil
 	}
 	return out
+}
+
+// selfTyped reports whether the root carries the type it declares:
+// asked for, or forced by a part declaring a reserved module — such a
+// type is carried by its own root and nothing else, so a root that did
+// not carry it would leave the module's collection unreachable.
+func selfTyped(req space.EnsureBundleRequest, modules types.Modules) bool {
+	if !req.DeclaresType() {
+		return false
+	}
+	if req.SelfTyped {
+		return true
+	}
+	for i := range req.Parts {
+		for j := range req.Parts[i].Datasets {
+			if modules.Reserved(req.Parts[i].Datasets[j].Module) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // canonicalRootId is the id the bundle's derived root has in this
@@ -801,8 +835,8 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 }
 
 // stampRoot writes a bundle root's first content change: the types it
-// implements (the marker and its own id when it declares a type,
-// RootTypes, every type RootProperties writes into), `any.name`, the
+// implements (the marker when it declares a type, its own id when it is
+// self-typed, RootTypes, every type RootProperties writes into), `any.name`, the
 // type's metadata (`type.xkey` / `layout` / `weight` / `hidden`) and
 // the seeded RootProperties values — ONE `objects` change, so a peer
 // sees the row whole and the DAG carries no attach-then-name chatter.
@@ -830,11 +864,8 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 	if name == "" {
 		name = req.Id
 	}
-	selfType := ""
-	if req.DeclaresType() {
-		selfType = rootId
-	}
-	types := installRootTypes(req, selfType)
+	declares := req.DeclaresType()
+	types := installRootTypes(req, rootId, declares, selfTyped(req, b.parent.store.Modules()))
 
 	row := obj.Controller().Get(ctx, properties.Dataset, rootId)
 	have := map[string]struct{}{}
@@ -853,7 +884,7 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 			missing = append(missing, t)
 		}
 	}
-	healXKey := named && selfType != "" && req.XKey != "" &&
+	healXKey := named && declares && req.XKey != "" &&
 		row.GetString(typetype.TypeId, typetype.FieldXKeyProp) == ""
 	if named && len(missing) == 0 && !healXKey {
 		return nil
@@ -876,11 +907,11 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 	// The type's own metadata: what the request declares, nothing
 	// implied — a root hosting only its bundle's records asks for
 	// Hidden itself. On a named row only an absent handle is filled.
-	if selfType != "" && (!named || healXKey) && req.XKey != "" {
+	if declares && (!named || healXKey) && req.XKey != "" {
 		payload.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(req.XKey))
 		payloadKeys++
 	}
-	if selfType != "" && !named {
+	if declares && !named {
 		if req.Hidden {
 			payload.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
 			payloadKeys++

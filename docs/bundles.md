@@ -137,26 +137,40 @@ sitting on its root change, so a derived root that a device never
 stamped would sit outside that device's diff and never pull the peer's
 content.
 
-## Bundle-declared types: self-typed roots
+## Bundle-declared types: type roots and self-typed roots
 
 A bundle may declare a **full type** on its root: `XKey`, `Parts`
 (with their datasets), `Properties`, `Layout`, `Weight`, `Hidden` —
 a declaration is `Parts`, `Properties` or an `XKey`
 (`EnsureBundleRequest.DeclaresType`); the metadata needs one. The root
-then carries `any.types = ["__type__", rootId]`: it is a type object
-implementing itself, `typeId = rootId`. Three shapes come out of the
-same mechanism:
+then carries `any.types = ["__type__"]`: it is a type object,
+`typeId = rootId`. Whether the root also **carries** that type is the
+bundle's choice — `SelfTyped` adds the root's own id
+(`["__type__", rootId]`), making the root an instance of itself that
+holds the type's values and takes its datasets. Three shapes come out
+of the same mechanism:
 
-- a **records host** — a root that exists to hold its bundle's data
-  (favourites entries, an app's setup state). It asks for `Hidden`,
-  since a listed type is one a picker offers for attachment elsewhere,
-  which would grant that object the bundle's collections;
+- a **records host** — a `SelfTyped` root that exists to hold its
+  bundle's data (favourites entries, an app's setup state). It asks
+  for `Hidden`, since a listed type is one a picker offers for
+  attachment elsewhere, which would grant that object the bundle's
+  collections;
 - a **type objects carry** — a page whose part shares the editor, a
-  wiki whose properties are the tree (`parentId` / `pos`). It declares
-  `Properties` / `Layout` / `Weight` and stays listed;
+  wiki whose properties are the tree (`parentId` / `pos`), a person.
+  It declares `Properties` / `Layout` / `Weight` / `Parts`, stays
+  listed and is NOT self-typed: the definition does not match a query
+  for the type, takes none of its parts and holds none of its values;
 - a **marker type** — an `XKey` and nothing else: a flag objects carry
   ("Template", "Archived"), resolvable by its handle, with no columns
   and no parts.
+
+`SelfTyped` is implied where the model forces it: a part declaring a
+reserved module (the root is the type's sole carrier — a general chat)
+and every tech-space bundle (its roots exist to host records). It
+needs a declaration (`ErrBundleBadRequest` alone), and it is the one
+way to ask — `RootTypes` naming the root's own id is refused; on adopt
+a root that lacks the self type gains it like any listed root type,
+and it is never removed.
 
 `Hidden` is explicit: nothing is implied from the shape of the
 declaration. `XKey` is the type's handle (`TypeInfo.XKey`, stored as
@@ -165,8 +179,8 @@ declaration's `relation.targetTypes` names. The SDK stores it as
 non-unique metadata; handle uniqueness is the consumer's rule.
 
 **One stamp, root + 3 changes.** The root's first content change
-carries everything the row needs: the types it implements (the marker
-and its own id, `RootTypes`, every type `RootProperties` writes into —
+carries everything the row needs: the types it implements (the marker,
+its own id when self-typed, `RootTypes`, every type `RootProperties` writes into —
 `$addToSet` each, never a whole-array set), `any.name`, the type
 metadata (`type.xkey` / `layout` / `weight` / `hidden`) and the seeded
 `RootProperties` values, in one `objects` change (the seeds as their
@@ -188,14 +202,15 @@ is both a type and, say, a `miniapp` carrier) — and are refused with
 `Parts` declares parts with their datasets (the `PartDraft` /
 `DatasetDraft` vocabulary of `17-user-datasets.md`). Nothing else is
 special-cased — the catalog's `__type__` scan finds the root, the
-ownership check (the object carries a declaring type) passes, a
-namespaced dataset lives in `<rootId>_<key>` with the ordinary
-`<rootId>:<shortId>` gate stamp, a shared one participates in the
-module's canonical collection, `Types().Parts(rootId)` /
+ownership check (the object carries a declaring type) passes on every
+carrier, a namespaced dataset lives in `<rootId>_<key>` with the
+ordinary `<rootId>:<shortId>` gate stamp, a shared one participates in
+the module's canonical collection, `Types().Parts(rootId)` /
 `Datasets(rootId)` and `Space.Datasets()` list the declarations with
 `Owners = [rootId]`, and records go through `Upsert` / `Modify` /
-`Query` on the root. The bundle's setup state lives in records, not in
-child objects.
+`Query` on the carriers — the root itself when `SelfTyped`. A bundle's
+setup state lives in records on its self-typed root, not in child
+objects.
 
 `Properties` declares property definitions (`PropertyDraft`, validated
 as `AddProperty` validates them) with **deterministic ids**: every
@@ -279,10 +294,12 @@ settings objects) lives in bundles on the tech space, reached through
 `Spaces().Get(SDK.TechSpaceId())` — the restricted handle described in
 `02-tech-space.md`. Same registry (`bundles` on the tech index object),
 same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`, with
-two rules: roots are minted by `Ensure` only (`NewRoot` is refused —
+three rules: roots are minted by `Ensure` only (`NewRoot` is refused —
 free object create is fenced on the tech handle; omit both strategies
-and `Ensure` creates the root itself), and `Parts` or `Properties`
-required. Both
+and `Ensure` creates the root itself), `Parts` or `Properties`
+required, and every root is self-typed — a tech root exists to host
+its records, so `SelfTyped` is set by the handle whatever the request
+says. Both
 strategies are available: `DerivedRoot` for bundles that must never
 fork or uninstall; the SDK-minted created root for ordinary app
 installs — deletable (`Objects().Delete` is allowed on bundle roots:
@@ -311,7 +328,8 @@ account's devices and nobody else.
   `Layout` / `Weight` / `Hidden` declare a type on the root — derived
   or created (see § Bundle-declared types); with neither `NewRoot`
   nor `DerivedRoot`, `Ensure` mints a created root itself and stamps
-  it as its own type. The `SystemInstall()` option lifts the
+  it as a type definition (`SelfTyped` makes it carry that type too).
+  The `SystemInstall()` option lifts the
   reserved-module refusal for the consumer's own install.
 - `DerivedRootId` — the canonical derived root id for a bundle id. Pure
   computation: no registry read, no materialization, no network.

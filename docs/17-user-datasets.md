@@ -230,9 +230,10 @@ The `type` meta-type owns a third built-in dataset, **`datasets`**
 (next to `properties` and `shortIds`), registered compiled-in like any
 other. A type's parts are CRDT records there:
 
-A bundle root that declares `Parts` is a type object implementing
-itself (`any.types = ["__type__", rootId]`, `typeId == objectId`): its
-definitions live on the root exactly like this, and evolve through
+A bundle root that declares `Parts` is a type object (`any.types =
+["__type__"]`, `typeId == objectId`; a `SelfTyped` root also carries
+itself and hosts the records): its definitions live on the root exactly
+like this, and evolve through
 `Types().AddPart` / `AddDataset` / `AddDatasetField` / `PatchDataset` /
 `PatchDatasetField` with `typeId = rootId`. See `bundles.md § Bundle
 parts`.

@@ -401,6 +401,10 @@ func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest, 
 	if err := validateTechEnsureRequest(req); err != nil {
 		return space.Bundle{}, false, err
 	}
+	// A tech bundle root exists to host its bundle's records — there
+	// is no other object to carry the type — so it always carries the
+	// type it declares; isBundleRoot keys on exactly that.
+	req.SelfTyped = true
 	return x.inner.Ensure(ctx, req, opts...)
 }
 

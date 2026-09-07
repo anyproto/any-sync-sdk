@@ -631,15 +631,19 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 
 // builtInAnyProperties translates anytype.Properties into the public
 // PropertyDef shape. Built-ins use human-readable ids — they pass
-// through to the SDK's permissive validator unchanged.
+// through to the SDK's permissive validator unchanged. The descriptor
+// is deep-copied: the table is process-shared, a view is the caller's
+// to mutate.
 func builtInAnyProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
 		out = append(out, space.PropertyDef{
-			Id:    p.Id,
-			Name:  p.Name,
-			Kind:  schemaKindToPropertyKind(p.Kind),
-			Scope: p.Scope,
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        schemaKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
+			XFormat:     types.CloneXFormat(p.XFormat),
 		})
 	}
 	return out
@@ -652,10 +656,12 @@ func builtInSpaceIndexProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(spaceindex.Properties))
 	for _, p := range spaceindex.Properties {
 		out = append(out, space.PropertyDef{
-			Id:    p.Id,
-			Name:  p.Name,
-			Kind:  schemaKindToPropertyKind(p.Kind),
-			Scope: p.Scope,
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        schemaKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
+			XFormat:     types.CloneXFormat(p.XFormat),
 		})
 	}
 	return out
@@ -669,10 +675,12 @@ func builtInMetaTypeProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(typetype.Properties))
 	for _, p := range typetype.Properties {
 		out = append(out, space.PropertyDef{
-			Id:    p.Id,
-			Name:  p.Name,
-			Kind:  schemaKindToPropertyKind(p.Kind),
-			Scope: p.Scope,
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        schemaKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
+			XFormat:     types.CloneXFormat(p.XFormat),
 		})
 	}
 	return out

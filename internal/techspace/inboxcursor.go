@@ -44,7 +44,8 @@ const (
 // InboxCursorSchema declares the single synced offset field.
 func InboxCursorSchema() schema.Dataset {
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldInboxCursorOffset, Name: "Offset", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
+		{Id: FieldInboxCursorOffset, Name: "Offset", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced,
+			Description: "Coordinator inbox offset the account has consumed up to."},
 	}}
 }
 

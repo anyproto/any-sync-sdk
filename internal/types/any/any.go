@@ -47,30 +47,57 @@ type BuiltInProperty struct {
 	Name  string
 	Kind  schema.Kind
 	Scope schema.Scope
+	// Description and XFormat are the descriptive slice: a display
+	// description and the opaque descriptor bag (docs/06 § The
+	// `x-format` descriptor). Surfaced by Types().Properties and
+	// dataset discovery like a user definition's; never interpreted
+	// or enforced by the SDK.
+	Description string
+	XFormat     map[string]any
 }
 
 // Properties lists the `any` type's hardcoded property definitions in
 // canonical display order. Consumed by the types registry on space
 // init to seed the derived `any` type object.
+//
+// Descriptors follow the consumer vocabulary (the `any` server's
+// docs/27-descriptors.md): a slug only where one names the value —
+// display text and instants. Identities, ids, the icon and the two
+// system arrays are system values and carry a description alone.
 var Properties = []BuiltInProperty{
-	{Id: "id", Name: "Id", Kind: schema.KindString, Scope: schema.ScopeDerived},
-	{Id: "author", Name: "Author", Kind: schema.KindString, Scope: schema.ScopeDerived},
-	{Id: "spaceId", Name: "Space", Kind: schema.KindString, Scope: schema.ScopeDerived},
-	{Id: "createdAt", Name: "Created at", Kind: schema.KindDatetime, Scope: schema.ScopeDerived},
-	{Id: "modifiedAt", Name: "Modified at", Kind: schema.KindDatetime, Scope: schema.ScopeDerived},
+	{Id: "id", Name: "Id", Kind: schema.KindString, Scope: schema.ScopeDerived,
+		Description: "Object id; derived, never written."},
+	{Id: "author", Name: "Author", Kind: schema.KindString, Scope: schema.ScopeDerived,
+		Description: "Account identity that created the object; derived."},
+	{Id: "spaceId", Name: "Space", Kind: schema.KindString, Scope: schema.ScopeDerived,
+		Description: "Id of the space the object lives in; derived."},
+	{Id: "createdAt", Name: "Created at", Kind: schema.KindDatetime, Scope: schema.ScopeDerived,
+		Description: "Instant of the creating change (author's clock); derived.",
+		XFormat:     map[string]any{"type": "datetime"}},
+	{Id: "modifiedAt", Name: "Modified at", Kind: schema.KindDatetime, Scope: schema.ScopeDerived,
+		Description: "Instant of the latest valid synced change (author's clock); derived.",
+		XFormat:     map[string]any{"type": "datetime"}},
 	// `modifiedBy` is the account identity that signed the change
 	// `modifiedAt` points at — both are stamped by the same change and
 	// converge together (properties.SystemPropertiesHandler).
-	{Id: "modifiedBy", Name: "Modified by", Kind: schema.KindString, Scope: schema.ScopeDerived},
-	{Id: "name", Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced},
-	{Id: "description", Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced},
-	{Id: "icon", Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced},
+	{Id: "modifiedBy", Name: "Modified by", Kind: schema.KindString, Scope: schema.ScopeDerived,
+		Description: "Account identity that signed the change modifiedAt names; derived."},
+	{Id: "name", Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Display name.",
+		XFormat:     map[string]any{"type": "text"}},
+	{Id: "description", Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Display description.",
+		XFormat:     map[string]any{"type": "longtext"}},
+	{Id: "icon", Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Display icon; the encoding is the client's."},
 	// `types` is the list of type ids this object implements (docs 06
 	// §"Property ids" / §"types list"). Array of strings. Deliberately
 	// synced-only: type membership is structural and shared — never
 	// per-account or per-device.
-	{Id: "types", Name: "Types", Kind: schema.KindArray, Scope: schema.ScopeSynced},
+	{Id: "types", Name: "Types", Kind: schema.KindArray, Scope: schema.ScopeSynced,
+		Description: "Ids of the types the object carries."},
 	// `tags` is a free-form list of user labels. Array of strings.
 	// Synced: tags are shared object metadata, like name/description.
-	{Id: "tags", Name: "Tags", Kind: schema.KindArray, Scope: schema.ScopeSynced},
+	{Id: "tags", Name: "Tags", Kind: schema.KindArray, Scope: schema.ScopeSynced,
+		Description: "Free-form user labels."},
 }

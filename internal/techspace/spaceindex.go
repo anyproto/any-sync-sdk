@@ -24,32 +24,51 @@ import (
 func SpaceIndexSchema() schema.Dataset {
 	str := func() *schema.Schema { return schema.Leaf(schema.KindString) }
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldType, Name: "Type", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldSpaceType, Name: "Space type", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal},
-		{Id: FieldAclHeadId, Name: "Acl head id", Schema: str(), Scope: schema.ScopeLocal},
-		{Id: FieldOneToOneInviteState, Name: "One-to-one invite state", Schema: str(), Scope: schema.ScopeLocal},
-		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
-		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced},
-		{Id: FieldP2PAdvertise, Name: "P2P advertise", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced},
-		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindDatetime), Scope: schema.ScopeDerived},
+		{Id: FieldType, Name: "Type", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "On-wire space header type; pinned."},
+		{Id: FieldName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Space display name, mirrored from the in-space index.", XFormat: map[string]any{"type": "text"}},
+		{Id: FieldDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Space display description, mirrored from the in-space index.", XFormat: map[string]any{"type": "longtext"}},
+		{Id: FieldIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Space icon CID, mirrored from the in-space index."},
+		{Id: FieldSpaceType, Name: "Space type", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Application space type, mirrored from the in-space index."},
+		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Account-wide lifecycle: deleted, or a pending invite / join state."},
+		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "Per-device lifecycle; absent means active."},
+		{Id: FieldAclHeadId, Name: "Acl head id", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "ACL head recorded for a pending join, so the device can detect a decline."},
+		{Id: FieldOneToOneInviteState, Name: "One-to-one invite state", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "Whether this device still owes the peer a 1-1 inbox notification."},
+		{Id: FieldInviteNotifyPending, Name: "Invite notify pending", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal,
+			Description: "Identities this device still owes an invite inbox notification."},
+		{Id: FieldOneToOnePeer, Name: "One-to-one peer", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "The other participant's account identity on a 1-1 row."},
+		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced,
+			Description: "Well-known derived space; undeletable.", XFormat: map[string]any{"type": "checkbox"}},
+		{Id: FieldP2PAdvertise, Name: "P2P advertise", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced,
+			Description: "Advertise the space to local-network peers.", XFormat: map[string]any{"type": "checkbox"}},
+		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindDatetime), Scope: schema.ScopeDerived,
+			Description: "Instant the space was added to the account; derived.", XFormat: map[string]any{"type": "datetime"}},
 		// KindObject with nil Properties = free-form shape: the schema
 		// validator accepts any nested keys (schema.validateValue stops at
 		// an untyped object) and the controller's field-class enforcement
 		// only looks at the top-level head, so arbitrary client keys under
 		// `settings` are permitted by declaration.
-		{Id: FieldSettings, Name: "Settings", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
-		{Id: FieldPushKeys, Name: "Push keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeLocal},
-		{Id: FieldOwnRole, Name: "Own role", Schema: str(), Scope: schema.ScopeLocal},
-		{Id: FieldGuestKey, Name: "Guest key", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldSettings, Name: "Settings", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced,
+			Description: "Client-owned per-space settings, merged per key."},
+		{Id: FieldPushKeys, Name: "Push keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeLocal,
+			Description: "Push-notification key material mirrored from the ACL."},
+		{Id: FieldOwnRole, Name: "Own role", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "This account's ACL permission in the space; absent means not mirrored yet."},
+		{Id: FieldGuestKey, Name: "Guest key", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Guest identity key of a public-access space."},
 		// Free-form object like `settings`: subkeys are the issued-key
 		// kinds, validated by the setter, not the schema.
-		{Id: FieldIssuedInviteKeys, Name: "Issued invite keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
+		{Id: FieldIssuedInviteKeys, Name: "Issued invite keys", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced,
+			Description: "Invite keys this account issued, by kind."},
 	}}
 }
 

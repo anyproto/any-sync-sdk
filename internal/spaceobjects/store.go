@@ -2294,7 +2294,10 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 func objectsDatasetSchema() schema.Dataset {
 	fields := make([]schema.Field, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
-		fields = append(fields, schema.Field{Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: p.Scope})
+		fields = append(fields, schema.Field{
+			Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: p.Scope,
+			Description: p.Description, XFormat: types.CloneXFormat(p.XFormat),
+		})
 	}
 	return schema.Dataset{Fields: fields, Dynamic: true}
 }

@@ -63,9 +63,12 @@ func BundleRootSeed(bundleId string) []byte {
 // BundlesSchema declares the bundles dataset.
 func BundlesSchema() schema.Dataset {
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldBundleName, Name: "Name", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
-		{Id: FieldBundleRootId, Name: "Root object", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
-		{Id: FieldBundleRoots, Name: "Claimed roots", Schema: &schema.Schema{Kind: schema.KindArray, Items: schema.Leaf(schema.KindString)}, Scope: schema.ScopeSynced},
+		{Id: FieldBundleName, Name: "Name", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced,
+			Description: "Bundle display name.", XFormat: map[string]any{"type": "text"}},
+		{Id: FieldBundleRootId, Name: "Root object", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced,
+			Description: "Id of the winning root object; children derive from it."},
+		{Id: FieldBundleRoots, Name: "Claimed roots", Schema: &schema.Schema{Kind: schema.KindArray, Items: schema.Leaf(schema.KindString)}, Scope: schema.ScopeSynced,
+			Description: "Every root ever claimed for the id; never shrinks."},
 	}}
 }
 

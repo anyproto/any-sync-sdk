@@ -105,11 +105,17 @@ const (
 // inbound route, so the cleartext surface can never silently grow.
 func Schema() schema.Dataset {
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldRootCid, Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
-		{Id: FieldSize, Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeSynced},
-		{Id: FieldNetworkSign, Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
-		{Id: FieldAuthor, Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeDerived},
-		{Id: FieldObjectId, Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
-		{Id: FieldEnc, Schema: &schema.Schema{Kind: schema.KindObject}, Scope: schema.ScopeSynced},
+		{Id: FieldRootCid, Name: "Root CID", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced,
+			Description: "Root CID of the encrypted DAG; absent for an inline file."},
+		{Id: FieldSize, Name: "Size", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeSynced,
+			Description: "Plaintext size in bytes."},
+		{Id: FieldNetworkSign, Name: "Network sign", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced,
+			Description: "Broker signature; present once the file is durable on the network."},
+		{Id: FieldAuthor, Name: "Author", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeDerived,
+			Description: "Account identity that attached the file; derived."},
+		{Id: FieldObjectId, Name: "Object", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced,
+			Description: "Id of the object the file is bound to."},
+		{Id: FieldEnc, Name: "Sealed", Schema: &schema.Schema{Kind: schema.KindObject}, Scope: schema.ScopeSynced,
+			Description: "Member-only sealed secrets: {kid, ct}."},
 	}}
 }

@@ -49,6 +49,13 @@ type BuiltInProperty struct {
 	Name  string
 	Kind  schema.Kind
 	Scope schema.Scope
+	// Description and XFormat are the descriptive slice: a display
+	// description and the opaque descriptor bag (docs/06 § The
+	// `x-format` descriptor). Surfaced by Types().Properties and
+	// dataset discovery like a user definition's; never interpreted
+	// or enforced by the SDK.
+	Description string
+	XFormat     map[string]any
 }
 
 // Properties lists the spaceIndex type's hardcoded property
@@ -56,8 +63,12 @@ type BuiltInProperty struct {
 // strings — `spaceType` is intentionally writable through the CRDT
 // (first writer wins in practice via the initial Create write).
 var Properties = []BuiltInProperty{
-	{Id: FieldName, Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced},
-	{Id: FieldDescription, Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced},
-	{Id: FieldIcon, Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced},
-	{Id: FieldSpaceType, Name: "Space type", Kind: schema.KindString, Scope: schema.ScopeSynced},
+	{Id: FieldName, Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Space display name.", XFormat: map[string]any{"type": "text"}},
+	{Id: FieldDescription, Name: "Description", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Space display description.", XFormat: map[string]any{"type": "longtext"}},
+	{Id: FieldIcon, Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Space icon CID."},
+	{Id: FieldSpaceType, Name: "Space type", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Application space type; pinned by the creating write."},
 }

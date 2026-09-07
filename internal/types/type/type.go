@@ -86,7 +86,7 @@ type BuiltInProperty struct {
 // applies, and its xkey resolves on upgraded peers only.
 var Properties = []BuiltInProperty{
 	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced,
-		Description: "Programmatic handle of the type, unique in the space."},
+		Description: "Programmatic handle of the type; consumers keep it unique per space."},
 	{Id: FieldWeightProp, Name: "Weight", Kind: schema.KindNumber, Scope: schema.ScopeSynced,
 		Description: "Picks the primary type of a multi-typed object; highest wins."},
 	{Id: FieldLayoutProp, Name: "Layout", Kind: schema.KindObject, Scope: schema.ScopeSynced,

@@ -49,7 +49,7 @@ func SpaceIndexSchema() schema.Dataset {
 		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced,
 			Description: "Well-known derived space; undeletable.", XFormat: map[string]any{"type": "checkbox"}},
 		{Id: FieldP2PAdvertise, Name: "P2P advertise", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced,
-			Description: "Advertise the space to local-network peers.", XFormat: map[string]any{"type": "checkbox"}},
+			Description: "Publish this account's devices' p2p addresses into the space; absent means on.", XFormat: map[string]any{"type": "checkbox"}},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindDatetime), Scope: schema.ScopeDerived,
 			Description: "Instant the space was added to the account; derived.", XFormat: map[string]any{"type": "datetime"}},
 		// KindObject with nil Properties = free-form shape: the schema

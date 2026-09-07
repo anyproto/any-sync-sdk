@@ -2283,17 +2283,23 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // stays per-type-object.
 // objectsDatasetSchema is the per-space `objects` (properties) dataset
 // schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
-// synced) with the built-in `any` fields declared by their unified
-// schema.Scope class — derived auto-fields (id/author/spaceId/
-// createdAt/modifiedAt/modifiedBy) are handler-only, the rest synced.
+// synced) with the derived row-root fields (id/author/spaceId/
+// createdAt/modifiedAt/modifiedBy) declared handler-only.
 //
-// Note this declares the TOP-LEVEL field heads only (`any`, typeIds are
-// dynamic). Per-PROPERTY scope (synced/account/local on a user propId)
-// is enforced by SystemPropertiesHandler against the type Registry —
-// the dataset schema can't see second path segments.
+// Only TOP-LEVEL field heads can be declared, and the synced `any`
+// values (name/description/icon/types/tags) are not heads — they live
+// under the dynamic `any` namespace, described by the `any` type's
+// properties (Types().Properties), so declaring them here would
+// advertise a root path nothing accepts. Per-PROPERTY scope
+// (synced/account/local on a user propId) is enforced by
+// SystemPropertiesHandler against the type Registry — the dataset
+// schema can't see second path segments.
 func objectsDatasetSchema() schema.Dataset {
 	fields := make([]schema.Field, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
+		if p.Scope != schema.ScopeDerived {
+			continue
+		}
 		fields = append(fields, schema.Field{
 			Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: p.Scope,
 			Description: p.Description, XFormat: types.CloneXFormat(p.XFormat),

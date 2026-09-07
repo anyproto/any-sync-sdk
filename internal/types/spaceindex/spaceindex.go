@@ -70,5 +70,5 @@ var Properties = []BuiltInProperty{
 	{Id: FieldIcon, Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced,
 		Description: "Space icon CID."},
 	{Id: FieldSpaceType, Name: "Space type", Kind: schema.KindString, Scope: schema.ScopeSynced,
-		Description: "Application space type; pinned by the creating write."},
+		Description: "Application space type; not pinned, the initial Create write wins in practice."},
 }

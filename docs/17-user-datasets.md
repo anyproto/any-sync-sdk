@@ -421,7 +421,10 @@ keys; a single key marshals as the bare string) — defaults omitted.
 Each field node also carries its descriptive slice when set: standard
 `description` and the opaque `x-format` bag, verbatim. That holds for
 compiled-in datasets too — a `handler.Field` declares the same
-`Description` / `XFormat`. `Types().Parts(typeId)` and
+`Description` / `XFormat`, and every SDK-declared dataset (tech space,
+`bundles`, `payloads`, the `objects` row's derived root fields) ships with
+a description on each field and a descriptor where one fits (docs/06 § The `x-format`
+descriptor). `Types().Parts(typeId)` and
 `Types().Datasets(typeId)` return the management views (definition
 ids, invalid state, display fields, the computed `Collection`, the
 full value shape, the descriptor).

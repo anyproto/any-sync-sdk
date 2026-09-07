@@ -543,14 +543,16 @@ const (
 // value kind enforced on write; Name is an optional display label
 // surfaced through space.Types().Properties(). Scope is the property's
 // write/sync class — zero value means ScopeSynced; ScopeDerived is
-// reserved for SDK built-ins and rejected at registration. XFormat is
-// the optional opaque descriptor (semantic slug, icon, options, …)
+// reserved for SDK built-ins and rejected at registration. Description
+// and XFormat are the descriptive slice — a display description and the
+// optional opaque descriptor (semantic slug, icon, options, …) —
 // surfaced through space.Types().Properties() as declared; the SDK
-// never interprets it and never validates values against it.
+// never interprets them and never validates values against them.
 type PropertyDecl struct {
-	Id      string
-	Name    string
-	Kind    PropertyKind
-	Scope   Scope
-	XFormat map[string]any
+	Id          string
+	Name        string
+	Description string
+	Kind        PropertyKind
+	Scope       Scope
+	XFormat     map[string]any
 }

@@ -44,7 +44,8 @@ const (
 // CRDTVersionSchema declares the mark: one synced integer.
 func CRDTVersionSchema() schema.Dataset {
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldCRDTVersion, Name: "CRDT version", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeSynced},
+		{Id: FieldCRDTVersion, Name: "CRDT version", Schema: schema.Leaf(schema.KindNumber), Scope: schema.ScopeSynced,
+			Description: "Highest CRDT version any device of the account has written; never decreases."},
 	}}
 }
 

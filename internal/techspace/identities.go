@@ -51,11 +51,16 @@ const (
 func IdentitiesSchema() schema.Dataset {
 	str := func() *schema.Schema { return schema.Leaf(schema.KindString) }
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldIdentitySymKey, Name: "Sym key", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldIdentityName, Name: "Name", Schema: str(), Scope: schema.ScopeLocal},
-		{Id: FieldIdentityDescription, Name: "Description", Schema: str(), Scope: schema.ScopeLocal},
-		{Id: FieldIdentityIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeLocal},
-		{Id: FieldIdentitySpaceIds, Name: "Space ids", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal},
+		{Id: FieldIdentitySymKey, Name: "Sym key", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Key that decrypts the contact's published profile."},
+		{Id: FieldIdentityName, Name: "Name", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "Cached profile name; empty until the key arrives.", XFormat: map[string]any{"type": "text"}},
+		{Id: FieldIdentityDescription, Name: "Description", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "Cached profile description.", XFormat: map[string]any{"type": "longtext"}},
+		{Id: FieldIdentityIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "Cached profile icon CID."},
+		{Id: FieldIdentitySpaceIds, Name: "Space ids", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal,
+			Description: "Spaces this identity was seen in on this device."},
 	}}
 }
 

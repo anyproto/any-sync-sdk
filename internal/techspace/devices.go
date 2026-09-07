@@ -80,15 +80,20 @@ const (
 func DevicesSchema() schema.Dataset {
 	str := func() *schema.Schema { return schema.Leaf(schema.KindString) }
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldDeviceName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldDeviceOS, Name: "OS", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldDeviceVersion, Name: "Version", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldDeviceName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Device display name; hostname until the user sets one.", XFormat: map[string]any{"type": "text"}},
+		{Id: FieldDeviceOS, Name: "OS", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Operating system, GOOS vocabulary."},
+		{Id: FieldDeviceVersion, Name: "Version", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Engine build version."},
 		// KindObject with nil Properties = free-form shape (same
 		// declaration trick as `settings` on the spaces dataset):
 		// subkeys are app slugs, validated by the setter, not the
 		// schema.
-		{Id: FieldDeviceApps, Name: "Apps", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
-		{Id: FieldDeviceActiveClaims, Name: "Active claims", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced},
+		{Id: FieldDeviceApps, Name: "Apps", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced,
+			Description: "Installed apps by slug; presence means installed."},
+		{Id: FieldDeviceActiveClaims, Name: "Active claims", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced,
+			Description: "Per-slug {seq, at} claims the active-app election reads."},
 	}}
 }
 

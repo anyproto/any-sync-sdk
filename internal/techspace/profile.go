@@ -14,9 +14,12 @@ import (
 func ProfileSchema() schema.Dataset {
 	str := func() *schema.Schema { return schema.Leaf(schema.KindString) }
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldProfileName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldProfileDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced},
-		{Id: FieldProfileIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced},
+		{Id: FieldProfileName, Name: "Name", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Account display name, published to identityRepo.", XFormat: map[string]any{"type": "text"}},
+		{Id: FieldProfileDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Account description.", XFormat: map[string]any{"type": "longtext"}},
+		{Id: FieldProfileIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Account icon CID."},
 	}}
 }
 

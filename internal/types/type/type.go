@@ -63,6 +63,13 @@ type BuiltInProperty struct {
 	Name  string
 	Kind  schema.Kind
 	Scope schema.Scope
+	// Description and XFormat are the descriptive slice: a display
+	// description and the opaque descriptor bag (docs/06 § The
+	// `x-format` descriptor). Surfaced by Types().Properties and
+	// dataset discovery like a user definition's; never interpreted
+	// or enforced by the SDK.
+	Description string
+	XFormat     map[string]any
 }
 
 // Properties lists the meta-type's hardcoded property definitions —
@@ -78,11 +85,17 @@ type BuiltInProperty struct {
 // the unknown-namespace op per-op — the type's other metadata still
 // applies, and its xkey resolves on upgraded peers only.
 var Properties = []BuiltInProperty{
-	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced},
-	{Id: FieldWeightProp, Name: "Weight", Kind: schema.KindNumber, Scope: schema.ScopeSynced},
-	{Id: FieldLayoutProp, Name: "Layout", Kind: schema.KindObject, Scope: schema.ScopeSynced},
-	{Id: FieldHiddenProp, Name: "Hidden", Kind: schema.KindBoolean, Scope: schema.ScopeSynced},
-	{Id: FieldMetaProp, Name: "Meta", Kind: schema.KindObject, Scope: schema.ScopeSynced},
+	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Programmatic handle of the type; consumers keep it unique per space."},
+	{Id: FieldWeightProp, Name: "Weight", Kind: schema.KindNumber, Scope: schema.ScopeSynced,
+		Description: "Picks the primary type of a multi-typed object; highest wins."},
+	{Id: FieldLayoutProp, Name: "Layout", Kind: schema.KindObject, Scope: schema.ScopeSynced,
+		Description: "Layout descriptor of the primary type: {type, config}."},
+	{Id: FieldHiddenProp, Name: "Hidden", Kind: schema.KindBoolean, Scope: schema.ScopeSynced,
+		Description: "Keeps the type out of default listings and pickers.",
+		XFormat:     map[string]any{"type": "checkbox"}},
+	{Id: FieldMetaProp, Name: "Meta", Kind: schema.KindObject, Scope: schema.ScopeSynced,
+		Description: "Consumer flags, one scalar per key."},
 }
 
 // Rendering metadata a type object carries in its own namespace:

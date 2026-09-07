@@ -65,7 +65,7 @@ func mapPubSubErr(err error) error {
 		return fmt.Errorf("spaceimpl: pubsub: %w: %w", space.ErrPubSubTopicNotOwned, err)
 	case errors.Is(err, pubsubproto.ErrTooManyTopics):
 		return fmt.Errorf("spaceimpl: pubsub: %w: %w", space.ErrPubSubTooManyPatterns, err)
-	case errors.Is(err, anysyncx.ErrPubSubNoKey):
+	case errors.Is(err, anysyncx.ErrPubSubNoKey), errors.Is(err, anysyncx.ErrPubSubGuestSpace):
 		return fmt.Errorf("spaceimpl: pubsub: %w: %w", space.ErrPubSubNoReadKey, err)
 	}
 	return err

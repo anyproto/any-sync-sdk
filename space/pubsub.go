@@ -19,7 +19,8 @@ var (
 	// `acc/…/<accountId>` namespace of another account.
 	ErrPubSubTopicNotOwned = errors.New("space: pubsub topic owned by another account")
 	// ErrPubSubNoReadKey — this identity has no read key for the space
-	// (keyless reader / guest view), so it cannot encrypt a publish.
+	// (keyless reader, or a guest-mode space), so it can neither encrypt
+	// a publish nor decrypt a subscription.
 	ErrPubSubNoReadKey = errors.New("space: no read key for pubsub")
 	// ErrPubSubTooManyPatterns — the per-space subscription pattern cap
 	// (100 by default) is exhausted.

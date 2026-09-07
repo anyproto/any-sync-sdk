@@ -23,6 +23,7 @@ func TestMapPubSubErr(t *testing.T) {
 		{pubsubproto.ErrTopicNotOwned, space.ErrPubSubTopicNotOwned},
 		{pubsubproto.ErrTooManyTopics, space.ErrPubSubTooManyPatterns},
 		{anysyncx.ErrPubSubNoKey, space.ErrPubSubNoReadKey},
+		{anysyncx.ErrPubSubGuestSpace, space.ErrPubSubNoReadKey},
 		{passthrough, passthrough},
 	}
 	for _, c := range cases {

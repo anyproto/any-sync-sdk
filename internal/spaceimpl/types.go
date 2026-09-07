@@ -698,10 +698,11 @@ func registeredTypeProperties(t handler.Type) []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(t.Properties))
 	for _, p := range t.Properties {
 		def := space.PropertyDef{
-			Id:    p.Id,
-			Name:  p.Name,
-			Kind:  handlerKindToPropertyKind(p.Kind),
-			Scope: p.Scope,
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        handlerKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
 		}
 		if def.Scope == 0 {
 			def.Scope = space.ScopeSynced

@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -112,19 +113,35 @@ func TestInstallRootTypes(t *testing.T) {
 		RootTypes:      []string{"t2", "t1", "t2"},
 		RootProperties: map[string]map[string]any{"t3": {"a": 1}, "t1": {"b": 2}},
 	}
-	assert.Equal(t, []string{"t2", "t1", "t3"}, installRootTypes(req, ""))
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root", "t2", "t1", "t3"}, installRootTypes(req, "root"),
-		"self type: marker and own id first, then the union")
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(space.EnsureBundleRequest{}, "root"))
-	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{}, ""))
+	assert.Equal(t, []string{"t2", "t1", "t3"}, installRootTypes(req, "root", false, false))
+	assert.Equal(t, []string{typetype.MetaTypeMarker, "t2", "t1", "t3"}, installRootTypes(req, "root", true, false),
+		"a type definition: the marker first, then the union — never its own id unasked")
+	assert.Equal(t, []string{typetype.MetaTypeMarker, "root", "t2", "t1", "t3"}, installRootTypes(req, "root", true, true),
+		"self-typed: marker and own id first, then the union")
+	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(space.EnsureBundleRequest{}, "root", true, true))
+	assert.Equal(t, []string{typetype.MetaTypeMarker}, installRootTypes(space.EnsureBundleRequest{}, "root", true, false))
+	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{}, "root", false, false))
+	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{}, "root", false, true), "self without a declaration is nothing to carry")
 	dup := space.EnsureBundleRequest{RootTypes: []string{"root", typetype.MetaTypeMarker}}
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(dup, "root"), "requested types dedup against the self type")
+	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(dup, "root", true, true), "requested types dedup against the self type")
 	universal := space.EnsureBundleRequest{RootProperties: map[string]map[string]any{"any": {"description": "seeded"}}}
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(universal, "root"),
+	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(universal, "root", true, true),
 		"`any` is universal — seeding its values attaches nothing")
-	assert.Equal(t, []string{"t1"}, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any", "t1"}}, ""),
+	assert.Equal(t, []string{"t1"}, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any", "t1"}}, "root", false, false),
 		"`any` requested as a root type is dropped on every path")
-	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any"}}, ""))
+	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any"}}, "root", false, false))
+}
+
+func TestSelfTyped(t *testing.T) {
+	modules := types.NewModules(types.ModuleInfo{Name: "chat", Canonical: "chat_messages", SharedOnly: true, Reserved: true},
+		types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"})
+	reserved := []space.PartDraft{{Key: "chat", Datasets: []space.DatasetDraft{{Module: "chat", Shared: true}}}}
+	plain := []space.PartDraft{{Key: "body", Datasets: []space.DatasetDraft{{Module: "editor", Shared: true}}}}
+	assert.False(t, selfTyped(space.EnsureBundleRequest{Parts: plain}, modules), "a declaration alone never self-types")
+	assert.True(t, selfTyped(space.EnsureBundleRequest{Parts: plain, SelfTyped: true}, modules), "asked for")
+	assert.True(t, selfTyped(space.EnsureBundleRequest{Parts: reserved}, modules), "a reserved module's sole carrier is the root")
+	assert.False(t, selfTyped(space.EnsureBundleRequest{Parts: reserved}, types.NewModules()), "unknown module: nothing implied")
+	assert.False(t, selfTyped(space.EnsureBundleRequest{SelfTyped: true}, modules), "no declaration: nothing to carry")
 }
 
 func TestDeclaresType(t *testing.T) {

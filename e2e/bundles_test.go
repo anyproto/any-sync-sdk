@@ -249,7 +249,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	// two installs mint one column per handle.
 	declaredType := func() space.EnsureBundleRequest {
 		return space.EnsureBundleRequest{
-			Id: bundleId, Name: "Chat", DerivedRoot: true,
+			Id: bundleId, Name: "Chat", DerivedRoot: true, SelfTyped: true,
 			RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
 			Parts:          []space.PartDraft{articlesPart()},
 			Properties: []space.PropertyDraft{
@@ -268,8 +268,8 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.Equal(t, []string{wantRoot}, inst.Roots)
 	require.Empty(t, inst.Losers)
 
-	// A root declaring parts is a type implementing itself: the
-	// declaration is discoverable under typeId = rootId and records
+	// A self-typed root declaring parts is a type implementing itself:
+	// the declaration is discoverable under typeId = rootId and records
 	// land on the root through the generic upsert path.
 	defs, err := spA.Types().Datasets(ctx, wantRoot)
 	require.NoError(t, err, "device A: Types().Datasets(root)")
@@ -499,14 +499,16 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.Equal(t, childA, childB)
 }
 
-// TestE2E_BundlesSelfTypedCreatedRoot covers the SDK-minted created
-// root of a type-declaring request. The root's first change carries
-// its types, name, type metadata and seeded values together, so an
-// install is root + 3 changes (objects, properties, datasets); XKey
-// reads back as the type's handle; RootTypes / RootProperties land on
-// a created root; an XKey alone is a marker type (root + 1 change)
-// objects can carry; a derived root gets the same one-change stamp.
-func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
+// TestE2E_BundlesTypeDeclaringCreatedRoot covers the SDK-minted
+// created root of a type-declaring request. The root's first change
+// carries its types, name, type metadata and seeded values together,
+// so an install is root + 3 changes (objects, properties, datasets);
+// XKey reads back as the type's handle; RootTypes / RootProperties
+// land on a created root; the root is a definition and not an
+// instance unless SelfTyped; an XKey alone is a marker type (root + 1
+// change) objects can carry; a derived root gets the same one-change
+// stamp.
+func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
@@ -579,8 +581,24 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	assert.Equal(t, map[string]any{"type": "page"}, info.Layout)
 	assert.Equal(t, "Wiki", info.Name)
 
-	assert.ElementsMatch(t, []string{"__type__", root, movieType}, typesOf(root),
-		"marker, self and the root types, attached in the stamp")
+	assert.ElementsMatch(t, []string{"__type__", movieType}, typesOf(root),
+		"marker and the root types, attached in the stamp — a type objects carry does not carry itself")
+	// A definition is not an instance: it takes none of its own parts
+	// and answers no query for its type.
+	_, err = sp.Upsert(ctx, space.UpsertBatch{
+		ObjectId: root, Dataset: root + "_articles",
+		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{"title": "nope"}}},
+	})
+	require.ErrorIs(t, err, space.ErrDatasetNotDeclared, "records on a root that does not carry its type")
+	selfMatch, err := sp.QueryObjects().Filter(map[string]any{"any.types": root}).All(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, selfMatch, "a type query never returns the definition")
+	smuggleId, err := sp.Bundles().DerivedRootId(ctx, "self-by-roottypes/v1")
+	require.NoError(t, err)
+	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "self-by-roottypes/v1", DerivedRoot: true, XKey: "smuggle", RootTypes: []string{smuggleId},
+	})
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "the self type is SelfTyped's to ask for, not RootTypes'")
 	row, err := sp.Properties().Get(ctx, root)
 	require.NoError(t, err)
 	assert.Equal(t, "seeded", string(row.Get(movieType, titleProp).GetStringBytes()),
@@ -612,7 +630,7 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	flagInfo, err := sp.Types().Get(ctx, flag.RootId)
 	require.NoError(t, err)
 	assert.Equal(t, "flag", flagInfo.XKey)
-	assert.ElementsMatch(t, []string{"__type__", flag.RootId}, typesOf(flag.RootId))
+	assert.ElementsMatch(t, []string{"__type__"}, typesOf(flag.RootId))
 	assert.Equal(t, map[string]int{"objects": 1}, changesByDataset(flag.RootId))
 	carrier, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{flag.RootId}})
 	require.NoError(t, err)
@@ -621,14 +639,14 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	// A derived root gets the same one-change stamp: types, name and
 	// seeded values together, then its declarations.
 	der, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "chat/v1", Name: "Chat", DerivedRoot: true, XKey: "general_chat", Hidden: true,
+		Id: "chat/v1", Name: "Chat", DerivedRoot: true, XKey: "general_chat", Hidden: true, SelfTyped: true,
 		RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
 		Parts:          []space.PartDraft{articlesPart()},
 	})
 	require.NoError(t, err, "Ensure(derived)")
 	require.True(t, didInstall)
 	require.True(t, der.Derived)
-	assert.ElementsMatch(t, []string{"__type__", der.RootId}, typesOf(der.RootId), "`any` is never attached")
+	assert.ElementsMatch(t, []string{"__type__", der.RootId}, typesOf(der.RootId), "self-typed on request; `any` is never attached")
 	drow, err := sp.Properties().Get(ctx, der.RootId)
 	require.NoError(t, err)
 	assert.Equal(t, "seeded", string(drow.Get("any", "description").GetStringBytes()))
@@ -652,7 +670,7 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	require.NoError(t, err, "Ensure(NewRoot, named)")
 	require.True(t, didInstall)
 	require.Equal(t, named, nb.RootId)
-	assert.ElementsMatch(t, []string{"__type__", named}, typesOf(named), "a named NewRoot is still self-typed")
+	assert.ElementsMatch(t, []string{"__type__"}, typesOf(named), "a named NewRoot is still stamped as a type")
 	ninfo, err := sp.Types().Get(ctx, named)
 	require.NoError(t, err)
 	assert.Equal(t, "named", ninfo.XKey)
@@ -666,16 +684,16 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, didInstall)
-	assert.ElementsMatch(t, []string{"__type__", plain.RootId}, typesOf(plain.RootId))
+	assert.ElementsMatch(t, []string{"__type__"}, typesOf(plain.RootId))
 	grown, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "plain/v1", Name: "Renamed", Parts: []space.PartDraft{articlesPart()}, Weight: 9,
-		XKey: "plain", RootTypes: []string{movieType},
+		XKey: "plain", RootTypes: []string{movieType}, SelfTyped: true,
 		RootProperties: map[string]map[string]any{movieType: {titleProp: "late seed"}},
 	})
 	require.NoError(t, err, "adopt with a gained type and handle")
 	require.False(t, didInstall)
 	require.Equal(t, plain.RootId, grown.RootId)
-	assert.ElementsMatch(t, []string{"__type__", plain.RootId, movieType}, typesOf(plain.RootId), "the gained root type is attached on adopt")
+	assert.ElementsMatch(t, []string{"__type__", plain.RootId, movieType}, typesOf(plain.RootId), "the gained root type and self type are attached on adopt")
 	pinfo, err := sp.Types().Get(ctx, plain.RootId)
 	require.NoError(t, err)
 	assert.Equal(t, "plain", pinfo.XKey, "an absent handle is filled on adopt")
@@ -692,8 +710,8 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int{"objects": 2, "datasets": 1}, changesByDataset(plain.RootId))
 
-	// A second device of the account adopts the created self-typed
-	// root: the same root, the same handle, the same property ids.
+	// A second device of the account adopts the created root: the same
+	// root, the same handle, the same property ids.
 	_ = sdk.Spaces().SyncSpaceList(ctx)
 	_ = sp.SyncHeads(ctx)
 	sdkB, err := anysyncsdk.Open(ctx, config.Config{
@@ -724,7 +742,7 @@ func TestE2E_BundlesSelfTypedCreatedRoot(t *testing.T) {
 			return false
 		}
 		return true
-	}), "device B never adopted the created self-typed root")
+	}), "device B never adopted the created root")
 	require.Equal(t, root, adoptedB.RootId)
 	infoB, err := spB.Types().Get(ctx, root)
 	require.NoError(t, err)

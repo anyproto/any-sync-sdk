@@ -128,12 +128,13 @@ type EnsureBundleRequest struct {
 	RootProperties map[string]map[string]any
 
 	// Parts declares parts (with their datasets) on the root — derived
-	// or created — which then implements itself as a type: any.types =
-	// ["__type__", rootId], typeId = rootId. Records live on the root
+	// or created — which then defines a type: any.types = ["__type__"],
+	// typeId = rootId. Records live on the objects carrying that type
 	// in the declared collections (`<rootId>_<key>` for a namespaced
 	// dataset, the module's canonical collection for a shared one),
 	// discoverable through Types().Parts(rootId) / Datasets(rootId) and
-	// Space.Datasets(), writable through Modify/Upsert on the root.
+	// Space.Datasets(), writable through Modify/Upsert. The root itself
+	// carries them only when it is SelfTyped.
 	// Declared in one change after the registering write, and on adopt
 	// only when the root's tree is local and carries no declaration
 	// yet (crash between registering and declaring, a row adopted
@@ -144,14 +145,14 @@ type EnsureBundleRequest struct {
 	// AddDatasetField / PatchDataset with typeId = rootId. An invalid
 	// or duplicate draft fails the request with ErrBundleBadRequest
 	// before any root is minted. With a created strategy, omit NewRoot
-	// and Ensure mints and self-types the root itself — the only create
-	// a space with a fenced object lifecycle (the tech space) allows.
+	// and Ensure mints and stamps the root itself — the only create a
+	// space with a fenced object lifecycle (the tech space) allows.
 	// Parts or Properties are required on the tech space.
 	Parts []PartDraft
 
 	// Properties declares property definitions on the root, which then
-	// implements itself as a type like Parts does — for a bundle that
-	// IS a type other objects carry (a wiki's `parentId` / `pos`).
+	// defines a type like Parts does — for a bundle that IS a type
+	// other objects carry (a wiki's `parentId` / `pos`).
 	// Every draft needs an XKey, unique within the request: the
 	// property id is DERIVED from (root id, XKey), so two devices
 	// installing while apart mint one column per handle instead of
@@ -188,11 +189,26 @@ type EnsureBundleRequest struct {
 	Layout map[string]any
 	Weight int
 	Hidden bool
+
+	// SelfTyped makes the root also CARRY the type it declares
+	// (any.types = ["__type__", rootId]): the root is then an instance
+	// of itself, holds that type's property values and takes its
+	// datasets — the shape of a root that keeps its own bundle's
+	// records (favourites entries, an app's layouts). Off, the root is
+	// the type definition and nothing else: it does not match a query
+	// for the type, takes no editor/chat part of it and holds no values
+	// of it — the shape of a type OTHER objects carry (a wiki, a
+	// person). Needs a type declaration (ErrBundleBadRequest alone).
+	// Implied where the model forces it: a part declaring a Reserved
+	// module (the root is the type's sole carrier — a general chat) and
+	// every tech-space bundle (its roots exist to host records). On
+	// adopt a root that lacks the self type gains it like any listed
+	// root type; it is never removed.
+	SelfTyped bool
 }
 
 // DeclaresType reports whether the request makes the root a type
-// implementing itself — Parts, Properties, or an XKey alone (a marker
-// type).
+// definition — Parts, Properties, or an XKey alone (a marker type).
 func (r EnsureBundleRequest) DeclaresType() bool {
 	return len(r.Parts) > 0 || len(r.Properties) > 0 || r.XKey != ""
 }
@@ -262,8 +278,8 @@ type BundlesAPI interface {
 	// docs/bundles.md § Derived roots.
 	//
 	// A type-declaring root (Parts, Properties or XKey) is stamped as
-	// a type implementing itself: the root's first change carries its
-	// types (`__type__`, its own id, RootTypes), `any.name`, the type
+	// a type definition: the root's first change carries its types
+	// (`__type__`, its own id when SelfTyped, RootTypes), `any.name`, the type
 	// metadata (`type.xkey` / `weight` / `layout` / `hidden`) and the
 	// RootProperties values together — one `objects` change — then the
 	// registry row, then the declarations (one `properties` change,

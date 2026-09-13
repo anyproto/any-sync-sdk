@@ -320,6 +320,13 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		if err != nil && !errors.Is(err, treestorage.ErrUnknownTreeId) {
 			return nil, fmt.Errorf("query: %w", err)
 		}
+		if obj != nil {
+			// Warm the controller's handle: the first open of a dataset
+			// collection ensures its indexes in a write tx, which must
+			// not run under engine.mu. Under the fence the lookup is
+			// then a map hit; nil stays nil until a first row lands.
+			obj.Controller().Collection(ctx, q.dataset)
+		}
 	}
 	// collection resolves the dataset's collection from the already
 	// resident owner; nil means nothing materialised yet. Safe under

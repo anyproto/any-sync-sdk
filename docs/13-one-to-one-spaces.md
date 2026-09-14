@@ -304,8 +304,11 @@ channel: its read key is held by exactly the two participants.
   with a one-shot reconcile on start; the row keyed by the row's
   `OneToOnePeer` — and only that one — goes to the identities directory
   (`SetIdentityMetaKey`, no-op when equal) and kicks
-  `resolveOneToOnePeerName` in the background. Cold devices receive the
-  key through the synced directory as for any contact.
+  `resolveOneToOnePeerName` in the background. That fetch is one shot;
+  the space's member watcher refreshes every member's profile each
+  `identityRepoPollInterval` with the same directory key, so a missed
+  fetch retries within a minute. Cold devices receive the key through
+  the synced directory as for any contact.
 - **The inbox invite still carries the key.** It is the only pre-accept
   channel: a pending row shows the initiator's name before the receiver has
   materialized the space, and the in-space row is readable only after. The
@@ -318,7 +321,9 @@ channel: its read key is held by exactly the two participants.
   the peer's key for that reader for good, so the row grants nothing the
   reader lacks. This differs from the tech-space `identities` dataset,
   which holds every contact's key in one place and is kept off the
-  generic read surface for that reason.
+  generic read surface for that reason. A wrapper that serves local
+  clients over HTTP is a lower trust tier and refuses the rows on its
+  read routes, as `any` does.
 - Regular spaces are unchanged — their key rides the ACL join record.
 
 ### Receive (the notifier worker)

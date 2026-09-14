@@ -7,6 +7,7 @@ import (
 	mrand "math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -588,4 +589,57 @@ func TestCreateSparseRebuildsOrphan(t *testing.T) {
 	require.Equal(t, []string{"f"}, rinfo.Refs)
 	_, err = s.Open(ctx, spaceId, info.Root)
 	require.NoError(t, err)
+}
+
+// holdCarRemoval makes removing the file's CAR fail until the returned
+// func runs: on Windows through an open handle (a removal it refuses),
+// elsewhere through a read-only parent directory.
+func holdCarRemoval(t *testing.T, s *Store, root cid.Cid) (release func()) {
+	t.Helper()
+	path := s.carPath(spaceId, root)
+	if runtime.GOOS == "windows" {
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		return func() { _ = f.Close() }
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := filepath.Dir(path)
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	return func() { require.NoError(t, os.Chmod(dir, 0o755)) }
+}
+
+// TestOffloadRemovalFailureKeepsFile: when the CAR cannot be removed,
+// Offload and Delete fail without touching the row, so the file stays
+// readable and a later attempt succeeds.
+func TestOffloadRemovalFailureKeepsFile(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	plain, key := testPayload(t, 100_000)
+	info := addFile(t, s, plain, key, "f")
+
+	release := holdCarRemoval(t, s, info.Root)
+	require.Error(t, s.Offload(ctx, spaceId, info.Root))
+	require.Error(t, s.Delete(ctx, spaceId, info.Root))
+	release()
+
+	got, err := s.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	require.Equal(t, StateComplete, got.State)
+	require.Equal(t, []string{"f"}, got.Refs)
+	h, err := s.Open(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	read, err := io.ReadAll(openPlain(t, h, key, nil))
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(plain, read))
+	require.NoError(t, h.Close())
+
+	require.NoError(t, s.Offload(ctx, spaceId, info.Root))
+	got, err = s.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	require.Equal(t, StateOffload, got.State)
+	_, err = os.Stat(s.carPath(spaceId, info.Root))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }

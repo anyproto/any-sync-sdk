@@ -272,7 +272,10 @@ func checkPublicDataset(dataset string) error {
 	// claim invariant) and turn the genuine root into a deletable
 	// "loser", and a raw Delete would be signed into the DAG before the
 	// apply-time rejection.
-	if dataset == payloads.Dataset || dataset == spaceindex.BundlesDataset {
+	// identityKeys: the 1-1 key exchange is written by the SDK from the
+	// account's own key; a raw Delete would likewise be signed into the
+	// DAG before the apply-time rejection.
+	if dataset == payloads.Dataset || dataset == spaceindex.BundlesDataset || dataset == spaceindex.IdentityKeysDataset {
 		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
 	}
 	return nil

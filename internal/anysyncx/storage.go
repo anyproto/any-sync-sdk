@@ -86,6 +86,47 @@ func (r *storeRef) Close(context.Context) (err error) {
 	return err
 }
 
+// loadScope collects the references one space load takes. any-sync's
+// pull and space-assembly error paths return without closing a storage
+// they opened; the loader releases those through the scope, or the
+// entry stays held and every later delete of the space waits out
+// storeDrainTimeout.
+type loadScope struct {
+	mu   sync.Mutex
+	refs []*storeRef
+}
+
+type loadScopeKey struct{}
+
+func withLoadScope(ctx context.Context) (context.Context, *loadScope) {
+	scope := &loadScope{}
+	return context.WithValue(ctx, loadScopeKey{}, scope), scope
+}
+
+// releaseExcept closes every reference the load took other than keep,
+// the storage the loaded space owns (nil when the load failed).
+func (l *loadScope) releaseExcept(ctx context.Context, keep spacestorage.SpaceStorage) {
+	l.mu.Lock()
+	refs := l.refs
+	l.refs = nil
+	l.mu.Unlock()
+	for _, r := range refs {
+		if keep == nil || spacestorage.SpaceStorage(r) != keep {
+			_ = r.Close(ctx)
+		}
+	}
+}
+
+func (s *storageProvider) newRef(ctx context.Context, e *storeEntry) *storeRef {
+	r := &storeRef{SpaceStorage: e.st, p: s, e: e}
+	if scope, ok := ctx.Value(loadScopeKey{}).(*loadScope); ok {
+		scope.mu.Lock()
+		scope.refs = append(scope.refs, r)
+		scope.mu.Unlock()
+	}
+	return r
+}
+
 // SetOnSetChange installs the space-set change callback. Call during
 // app assembly, before any create/delete can happen.
 func (s *storageProvider) SetOnSetChange(fn func()) { s.onSetChange = fn }
@@ -244,7 +285,7 @@ func (s *storageProvider) acquire(ctx context.Context, id string, create bool, o
 			e = &storeEntry{id: id, pending: make(chan struct{})}
 			s.stores[id] = e
 			s.mu.Unlock()
-			return s.openEntry(e, open)
+			return s.openEntry(ctx, e, open)
 		case e.deleting:
 			s.mu.Unlock()
 			return nil, errStorageDeleting
@@ -262,12 +303,12 @@ func (s *storageProvider) acquire(ctx context.Context, id string, create bool, o
 		default:
 			e.refs++
 			s.mu.Unlock()
-			return &storeRef{SpaceStorage: e.st, p: s, e: e}, nil
+			return s.newRef(ctx, e), nil
 		}
 	}
 }
 
-func (s *storageProvider) openEntry(e *storeEntry, open func() (anystorev1.DB, spacestorage.SpaceStorage, error)) (spacestorage.SpaceStorage, error) {
+func (s *storageProvider) openEntry(ctx context.Context, e *storeEntry, open func() (anystorev1.DB, spacestorage.SpaceStorage, error)) (spacestorage.SpaceStorage, error) {
 	db, st, err := open()
 	s.mu.Lock()
 	pending := e.pending
@@ -282,7 +323,7 @@ func (s *storageProvider) openEntry(e *storeEntry, open func() (anystorev1.DB, s
 	if err != nil {
 		return nil, err
 	}
-	return &storeRef{SpaceStorage: st, p: s, e: e}, nil
+	return s.newRef(ctx, e), nil
 }
 
 // release drops one reference and closes the DB with the last one. A

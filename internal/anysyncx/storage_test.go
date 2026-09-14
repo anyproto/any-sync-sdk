@@ -2,7 +2,6 @@ package anysyncx
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -173,9 +172,13 @@ func TestStorageProviderDeleteWaitsForHolders(t *testing.T) {
 	deleted := make(chan error, 1)
 	go func() { deleted <- p.DeleteSpaceStorageFile(ctx, id) }()
 	require.Eventually(t, func() bool {
-		_, err := p.acquire(ctx, id, false, open)
-		return errors.Is(err, errStorageDeleting)
-	}, 5*time.Second, 5*time.Millisecond)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		e := p.stores[id]
+		return e != nil && e.deleting
+	}, 5*time.Second, time.Millisecond)
+	_, err = p.acquire(ctx, id, false, open)
+	require.ErrorIs(t, err, errStorageDeleting)
 	select {
 	case err := <-deleted:
 		t.Fatalf("delete finished under a holder: %v", err)
@@ -257,4 +260,33 @@ func TestStorageProviderCloseAll(t *testing.T) {
 	require.ErrorIs(t, err, errStorageClosed)
 	require.NoError(t, st.Close(ctx))
 	require.EqualValues(t, 1, opens.Load())
+}
+
+// A failed space load releases the references it took; a loaded space
+// keeps only its own.
+func TestStorageProviderLoadScope(t *testing.T) {
+	p := newTestProvider(t)
+	ctx := context.Background()
+	const id = "space.load"
+	var opens atomic.Int32
+	open := countingOpen(t, p, id, &opens)
+
+	loadCtx, scope := withLoadScope(ctx)
+	dropped, err := p.acquire(loadCtx, id, false, open)
+	require.NoError(t, err)
+	_, err = p.acquire(loadCtx, id, false, open)
+	require.NoError(t, err)
+	db := refDB(dropped)
+	scope.releaseExcept(ctx, nil)
+	requireDBClosed(t, db)
+
+	loadCtx, scope = withLoadScope(ctx)
+	_, err = p.acquire(loadCtx, id, false, open)
+	require.NoError(t, err)
+	kept, err := p.acquire(loadCtx, id, false, open)
+	require.NoError(t, err)
+	scope.releaseExcept(ctx, kept)
+	requireDBOpen(t, refDB(kept))
+	require.NoError(t, kept.Close(ctx))
+	requireDBClosed(t, refDB(kept))
 }

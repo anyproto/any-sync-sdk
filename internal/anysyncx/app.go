@@ -481,7 +481,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 
 // Close stops the any-sync app and releases resources. The space
 // cache is closed first so per-space goroutines wind down before the
-// app's components.
+// app's components; the space stores close last.
 func (a *App) Close(ctx context.Context) error {
 	if a.spaceCache != nil {
 		_ = a.spaceCache.Close()
@@ -489,7 +489,11 @@ func (a *App) Close(ctx context.Context) error {
 	if a.syncStatus != nil {
 		a.syncStatus.Close()
 	}
-	return a.a.Close(ctx)
+	err := a.a.Close(ctx)
+	if a.storage != nil {
+		a.storage.closeAll()
+	}
+	return err
 }
 
 // SyncStatus exposes the per-account sync-status registry. Wired

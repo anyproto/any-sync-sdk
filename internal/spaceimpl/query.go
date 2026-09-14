@@ -12,6 +12,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -267,6 +268,13 @@ func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, c
 // per-space engine; the snapshot read runs under engine.mu so apply
 // events are fenced between the snapshot and the sub's registration.
 //
+// The object is resolved BEFORE the engine lock. Store.Get can load
+// the object, and a load replays stored changes through Engine.OnApply,
+// which takes the same lock: a load started (or joined) from inside the
+// snapshot callback deadlocks the engine, and with it every apply in
+// the space. Under the fence only the collection lookup, the snapshot
+// read and the registration run.
+//
 // Initial in the returned QueryResult is the user-visible window
 // (limit rows excluding the sentinel; or all rows when limit == 0).
 // Subsequent live updates flow through QueryResult.Sub.
@@ -295,6 +303,44 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		return nil, err
 	}
 
+	var (
+		sharedColl anystore.Collection
+		obj        *object.Object
+	)
+	if scope.Shared {
+		if sharedColl, err = q.store.SharedObjects(ctx); err != nil {
+			return nil, err
+		}
+	} else {
+		q.store.EnsureDatasetRegistered(ctx, q.objectId, q.dataset)
+		// A missing object is an empty initial. The engine still
+		// registers the sub; if the object lands later, its events flow
+		// in — same as a not-yet-materialised dataset.
+		obj, err = q.store.Get(ctx, q.objectId)
+		if err != nil && !errors.Is(err, treestorage.ErrUnknownTreeId) {
+			return nil, fmt.Errorf("query: %w", err)
+		}
+		if obj != nil {
+			// Warm the controller's handle: the first open of a dataset
+			// collection ensures its indexes in a write tx, which must
+			// not run under engine.mu. Under the fence the lookup is
+			// then a map hit; nil stays nil until a first row lands.
+			obj.Controller().Collection(ctx, q.dataset)
+		}
+	}
+	// collection resolves the dataset's collection from the already
+	// resident owner; nil means nothing materialised yet. Safe under
+	// engine.mu: no object load, no DAG apply.
+	collection := func(ctx context.Context) anystore.Collection {
+		if scope.Shared {
+			return sharedColl
+		}
+		if obj == nil {
+			return nil
+		}
+		return obj.Controller().Collection(ctx, q.dataset)
+	}
+
 	// Hold the snapshot rows for both the engine's initial population
 	// AND the user-visible Initial slice. Same iteration, two outputs.
 	var snapshotRows []*anyenc.Value
@@ -311,17 +357,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	}
 
 	sub, err := q.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
-		coll, err := q.collection(ctx)
-		if err != nil {
-			// Object doesn't exist yet — treat as empty initial. The
-			// engine still registers; if the object lands later, events
-			// flow into this sub. Mirrors how a not-yet-materialised
-			// dataset gets a nil collection and an empty snapshot.
-			if errors.Is(err, treestorage.ErrUnknownTreeId) {
-				return nil
-			}
-			return err
-		}
+		coll := collection(ctx)
 		if coll == nil {
 			return nil // dataset has no materialised collection yet → empty
 		}
@@ -371,12 +407,15 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		// Run a separate Count(filter) outside the snapshot fence (engine.mu
 		// already released). Slightly stale relative to events that fired
 		// after we released, but documented as snapshot-only semantics.
-		n, cerr := q.countWithFilter(ctx, combined)
-		if cerr != nil {
-			_ = sub.Close()
-			return nil, cerr
+		totalCount = 0
+		if coll := collection(ctx); coll != nil {
+			n, cerr := coll.Find(combined).Count(ctx)
+			if cerr != nil {
+				_ = sub.Close()
+				return nil, cerr
+			}
+			totalCount = n
 		}
-		totalCount = n
 	}
 
 	// Initial = first limit rows (excluding the sentinel). When limit==0
@@ -412,20 +451,6 @@ func combineWithTombstoneSkip(userFilter query.Filter) (query.Filter, error) {
 		return skip, nil
 	}
 	return query.And{userFilter, skip}, nil
-}
-
-// countWithFilter runs Count against the resolved collection using the
-// given parsed filter. Used by Snapshot/Subscribe to populate
-// QueryResult.Total when QueryOpts.IncludeTotal is set.
-func (q *queryImpl) countWithFilter(ctx context.Context, f query.Filter) (int, error) {
-	coll, err := q.collection(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if coll == nil {
-		return 0, nil
-	}
-	return coll.Find(f).Count(ctx)
 }
 
 // Count returns the match count. The find path gates tombstones on

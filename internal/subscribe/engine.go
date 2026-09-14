@@ -44,6 +44,11 @@ type SubConfig struct {
 // waiting on engine.mu and process after the new sub is registered.
 // The callback yields each result row's (id, post-doc) to the engine,
 // which extracts the sort tuple via cfg.Sort and inserts the entry.
+//
+// The callback must only read already-materialised rows. Anything that
+// can apply a change — loading an object (its replay runs OnApply),
+// writing to the DAG — needs engine.mu itself and deadlocks the engine.
+// Resolve objects before calling Subscribe.
 type SnapshotFn func(yield func(id string, doc *anyenc.Value)) error
 
 // ErrEngineClosed is returned by Subscribe after Close.

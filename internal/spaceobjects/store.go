@@ -68,12 +68,13 @@ var ErrUnknownDataset = errors.New("spaceobjects: unknown dataset")
 // External Registrations supplied via NewStore extend this map at
 // construction time; collisions with built-ins are rejected up front.
 var builtinDataVersions = map[string]string{
-	properties.Dataset:           properties.HandlerVersion,
-	typetype.DatasetPropertyDefs: typetype.HandlerVersion,
-	typetype.ShortIdsDataset:     "shortIds-v1",
-	typetype.DatasetDefs:         typetype.DatasetDefsHandlerVersion,
-	payloads.Dataset:             payloads.HandlerVersion,
-	spaceindex.BundlesDataset:    spaceindex.BundlesHandlerVersion,
+	properties.Dataset:             properties.HandlerVersion,
+	typetype.DatasetPropertyDefs:   typetype.HandlerVersion,
+	typetype.ShortIdsDataset:       "shortIds-v1",
+	typetype.DatasetDefs:           typetype.DatasetDefsHandlerVersion,
+	payloads.Dataset:               payloads.HandlerVersion,
+	spaceindex.BundlesDataset:      spaceindex.BundlesHandlerVersion,
+	spaceindex.IdentityKeysDataset: spaceindex.IdentityKeysHandlerVersion,
 }
 
 // plaintextSpecs declares the plaintext (node-readable) object
@@ -2381,6 +2382,11 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// spaceIndex object carries rows by convention — the typed
 		// Bundles API always targets it.
 		{Name: spaceindex.BundlesDataset, Handler: spaceindex.BundlesHandler{}, Schema: spaceindex.BundlesSchema()},
+		// `identityKeys` — the one-to-one participants' metadata symkey
+		// exchange. Same footing as bundles: registered everywhere, rows
+		// only on a 1-1's spaceIndex object; the handler admits a row
+		// only from the identity it is keyed by.
+		{Name: spaceindex.IdentityKeysDataset, Handler: spaceindex.IdentityKeysHandler{}, Schema: spaceindex.IdentityKeysSchema()},
 	}
 	// Per-store system datasets: same footing as payloads/bundles.
 	regs = append(regs, s.systemRegs...)

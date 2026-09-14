@@ -43,7 +43,8 @@ longer carries inline name/icon (it carries the symkey only):
 | Channel | What it carries | Decrypted by |
 |---|---|---|
 | ACL `RequestMetadata` (join record, owner root) | the joining/owner account's **symkey** | the space metadata key (any member) |
-| 1-1 inbox invite body | the sender's **symkey** | ECIES to the receiver's account key |
+| 1-1 inbox invite body | the initiator's **symkey** | ECIES to the receiver's account key |
+| 1-1 `identityKeys` row on the space's spaceIndex object | each participant's **own symkey** | the 1-1 read key (both participants) |
 
 `internal/spaceimpl/acl.go` `encodeSelfSymKeyMetadata` / `decodeSymKeyMetadata`.
 
@@ -129,5 +130,8 @@ when a space is next entered (a sync-triggered resolve is a possible follow-up).
   names come from the same identityRepo resolution and the directory is the
   shared profile cache.
 - **1-1** (`docs/13-one-to-one-spaces.md`) surfaces the friend's identity as
-  `SpaceInfo.Author` and resolves the friend's name through the directory; the
-  1-1 invite distributes the symkey.
+  `SpaceInfo.Author` and resolves the friend's name through the directory. The
+  inbox invite carries the initiator's symkey for the pending row; once the
+  space is active on both sides each participant publishes its own symkey
+  inside the space (`identityKeys`), so the key crosses in both directions
+  without the inbox (§ Key exchange inside the space there).

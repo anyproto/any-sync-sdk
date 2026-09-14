@@ -129,6 +129,7 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	delete(s.allocs, spaceId)
 	delete(s.spaceIndexIds, spaceId)
 	delete(s.spaceIndexWatchers, spaceId)
+	delete(s.oneToOneKeyWatchers, spaceId)
 	delete(s.accountMirrors, spaceId)
 	delete(s.memberWatchers, spaceId)
 	delete(s.aclMirrorWatchers, spaceId)

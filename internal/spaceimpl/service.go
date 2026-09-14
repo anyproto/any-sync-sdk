@@ -135,6 +135,9 @@ type Service struct {
 	// and forwards converged state into the Indexer. Lifetime: until
 	// SDK.Close (mirrors the members-watcher sticky lifecycle).
 	spaceIndexWatchers map[string]*spaceIndexWatcher
+	// oneToOneKeyWatchers holds one identity-key watcher per loaded
+	// one-to-one spaceId (onetoone_keys.go).
+	oneToOneKeyWatchers map[string]*oneToOneKeysWatcher
 	// accountMirrors holds one account-values mirror per loaded
 	// spaceId — the tech-space → target-space apply side of
 	// account-scoped values (see accountmirror.go).
@@ -243,26 +246,27 @@ type Service struct {
 // satisfies space.Indexer).
 func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type, modules []handler.Module) *Service {
 	s := &Service{
-		app:                app,
-		tsp:                tsp,
-		indexer:            indexer,
-		db:                 db,
-		extTypes:           extTypes,
-		modules:            modules,
-		stores:             make(map[string]*spaceobjects.Store),
-		allocs:             make(map[string]*object.VersionAllocator),
-		spaceIndexIds:      make(map[string]string),
-		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
-		accountMirrors:     make(map[string]*accountMirror),
-		memberWatchers:     make(map[string]*memberWatcher),
-		aclMirrorWatchers:  make(map[string]*aclMirrorWatcher),
-		aclMuxes:           make(map[string]*aclKickMux),
-		delKick:            make(chan struct{}, 1),
-		joinKick:           make(chan struct{}, 1),
-		joinWaiters:        make(map[string]*joinWaiter),
-		joinProbes:         make(map[string]time.Time),
-		pendingLoads:       make(map[string]struct{}),
-		inviteKick:         make(chan struct{}, 1),
+		app:                 app,
+		tsp:                 tsp,
+		indexer:             indexer,
+		db:                  db,
+		extTypes:            extTypes,
+		modules:             modules,
+		stores:              make(map[string]*spaceobjects.Store),
+		allocs:              make(map[string]*object.VersionAllocator),
+		spaceIndexIds:       make(map[string]string),
+		spaceIndexWatchers:  make(map[string]*spaceIndexWatcher),
+		oneToOneKeyWatchers: make(map[string]*oneToOneKeysWatcher),
+		accountMirrors:      make(map[string]*accountMirror),
+		memberWatchers:      make(map[string]*memberWatcher),
+		aclMirrorWatchers:   make(map[string]*aclMirrorWatcher),
+		aclMuxes:            make(map[string]*aclKickMux),
+		delKick:             make(chan struct{}, 1),
+		joinKick:            make(chan struct{}, 1),
+		joinWaiters:         make(map[string]*joinWaiter),
+		joinProbes:          make(map[string]time.Time),
+		pendingLoads:        make(map[string]struct{}),
+		inviteKick:          make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	s.startDeletionReconciler()
@@ -472,6 +476,27 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 			s.spaceIndexWatchers[spaceId] = w
 			s.watchers.register(w)
 			s.mu.Unlock()
+		}
+	}
+
+	// One-to-one key exchange: the peer's identityKeys row → the
+	// identities directory (onetoone_keys.go). Same dedup dance; the
+	// initial pass runs inside newOneToOneKeysWatcher.
+	if store != nil && s.tsp != nil && s.isOneToOne(ctx, spaceId) {
+		s.mu.Lock()
+		_, dup := s.oneToOneKeyWatchers[spaceId]
+		s.mu.Unlock()
+		if !dup {
+			w := newOneToOneKeysWatcher(ctx, s, store, spaceId, objectId)
+			s.mu.Lock()
+			if _, raced := s.oneToOneKeyWatchers[spaceId]; raced {
+				s.mu.Unlock()
+				w.stop()
+			} else {
+				s.oneToOneKeyWatchers[spaceId] = w
+				s.watchers.register(w)
+				s.mu.Unlock()
+			}
 		}
 	}
 
@@ -2072,6 +2097,7 @@ func (s *Service) goSeed(sp *spaceImpl) {
 	go func() {
 		defer s.seedWG.Done()
 		sp.maybeLazySeedSpaceIndex(s.seedCtx)
+		sp.publishOneToOneKey(s.seedCtx)
 	}()
 }
 

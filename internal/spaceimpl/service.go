@@ -138,6 +138,9 @@ type Service struct {
 	// oneToOneKeyWatchers holds one identity-key watcher per loaded
 	// one-to-one spaceId (onetoone_keys.go).
 	oneToOneKeyWatchers map[string]*oneToOneKeysWatcher
+	// oneToOnePublishing holds the spaceIds with an identity-key
+	// publish in flight (one per space at a time).
+	oneToOnePublishing map[string]struct{}
 	// accountMirrors holds one account-values mirror per loaded
 	// spaceId — the tech-space → target-space apply side of
 	// account-scoped values (see accountmirror.go).
@@ -257,6 +260,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		spaceIndexIds:       make(map[string]string),
 		spaceIndexWatchers:  make(map[string]*spaceIndexWatcher),
 		oneToOneKeyWatchers: make(map[string]*oneToOneKeysWatcher),
+		oneToOnePublishing:  make(map[string]struct{}),
 		accountMirrors:      make(map[string]*accountMirror),
 		memberWatchers:      make(map[string]*memberWatcher),
 		aclMirrorWatchers:   make(map[string]*aclMirrorWatcher),

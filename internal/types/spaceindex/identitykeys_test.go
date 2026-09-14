@@ -1,6 +1,7 @@
 package spaceindex_test
 
 import (
+	"path/filepath"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
-	"path/filepath"
 )
 
 const (

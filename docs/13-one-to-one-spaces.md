@@ -291,22 +291,34 @@ channel: its read key is held by exactly the two participants.
   signer IS the row id, refuses a change without a creator, and refuses
   deletes (a tombstone would ban that participant's key for good).
 - **Publish** (`spaceImpl.publishOneToOneKey`, from the post-load seed
-  goroutine — so on `OneToOne`, `AcceptOneToOne` and every later load):
-  when the space is a one-to-one and the own row is absent or differs,
-  upsert it. The key is deterministic, so every device of the account
-  writes the same bytes and an equal row is left alone. Existing 1-1s heal
-  on the next load; no migration.
+  goroutine — so on `OneToOne`, `AcceptOneToOne` and every later
+  `Spaces().Get`; the boot eager-loader does not run it): when the space
+  is a one-to-one and the own row is absent or differs, upsert it, one
+  publish per space at a time. The key is a pure function of the account
+  key, so every device of the account writes the same bytes and an equal
+  row is left alone; a differing row can only mean the derivation changed,
+  which is a migration, not a race. Existing 1-1s heal on the first
+  `Get`; no migration.
 - **Watch** (`oneToOneKeysWatcher`, wired by `ensureSpaceIndexWiring` for
   one-to-one spaces only): a sub on `(spaceIndexObjectId, identityKeys)`
-  with a one-shot reconcile on start; every foreign row's key goes to the
-  identities directory (`SetIdentityMetaKey`, no-op when equal) and kicks
-  `resolveOneToOnePeerName`. Cold devices receive the key through the synced
-  directory as for any contact.
+  with a one-shot reconcile on start; the row keyed by the row's
+  `OneToOnePeer` — and only that one — goes to the identities directory
+  (`SetIdentityMetaKey`, no-op when equal) and kicks
+  `resolveOneToOnePeerName` in the background. Cold devices receive the
+  key through the synced directory as for any contact.
 - **The inbox invite still carries the key.** It is the only pre-accept
   channel: a pending row shows the initiator's name before the receiver has
   materialized the space, and the in-space row is readable only after. The
   row is the durable source; the invite is a notification with a display
   hint.
+- **Visibility.** The rows are refused on the public write surface
+  (`Modify` / `Delete` / `Upsert`, like `bundles`) and stay readable
+  through `Query`, `Aggregate` and history like any dataset: a reader is
+  one of the two key holders, and the identities directory already keeps
+  the peer's key for that reader for good, so the row grants nothing the
+  reader lacks. This differs from the tech-space `identities` dataset,
+  which holds every contact's key in one place and is kept off the
+  generic read surface for that reason.
 - Regular spaces are unchanged — their key rides the ACL join record.
 
 ### Receive (the notifier worker)

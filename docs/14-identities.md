@@ -29,7 +29,10 @@ space.DeriveAccountMetadataSymKey(accountSignKey) // SLIP-0021, SDK-specific pat
 
 Deterministic ⇒ no storage or rotation; anyone who has it can read this
 account's current and future profile. (It cannot be revoked — same trade-off as
-anytype-heart's account symkey.)
+anytype-heart's account symkey.) Every channel below carries the same bytes
+for an identity, so the directory's `symKey` needs no ordering rule: a
+differing value can only come from a changed derivation, which is a
+migration, not a last-writer race.
 
 **Push.** `account.UpdateMetadata` / boot republish encrypt the profile blob
 with the symkey and push it to identityRepo, signing the **ciphertext** so the

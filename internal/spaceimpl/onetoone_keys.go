@@ -28,10 +28,23 @@ import (
 var oneToOneKeysLog = logger.NewNamed("sdk.onetoone.keys")
 
 // isOneToOne reports whether spaceId's tech-space row is a one-to-one
-// space. False for an unknown row.
+// space. Keys on every marker the row can carry: the header type is
+// back-filled after the first load and a row registered before the
+// header was readable has none yet, while the peer identity is written
+// on every 1-1 row from the start. False for an unknown row.
 func (s *Service) isOneToOne(ctx context.Context, spaceId string) bool {
 	rec, ok := s.tsp.Get(ctx, spaceId)
-	return ok && rec.Type == space.SpaceTypeOneToOne
+	return ok && (rec.Type == space.SpaceTypeOneToOne || rec.SpaceType == space.SpaceTypeOneToOne || rec.OneToOnePeer != "")
+}
+
+// oneToOnePeerOf returns the other participant's identity off the
+// tech-space row, "" when unknown.
+func (s *Service) oneToOnePeerOf(ctx context.Context, spaceId string) string {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return ""
+	}
+	return rec.OneToOnePeer
 }
 
 // publishOneToOneKey writes this account's identity metadata symkey to
@@ -44,6 +57,13 @@ func (s *spaceImpl) publishOneToOneKey(ctx context.Context) {
 	if s.techIndexId != "" || !s.parent.isOneToOne(ctx, s.id) {
 		return
 	}
+	// One publish per space at a time: concurrent loads of the same
+	// space each run a seed goroutine, and two of them seeing the row
+	// absent would write two identical changes.
+	if !s.parent.beginOneToOnePublish(s.id) {
+		return
+	}
+	defer s.parent.endOneToOnePublish(s.id)
 	keys := s.app.AccountKeys()
 	if keys == nil {
 		return
@@ -51,6 +71,7 @@ func (s *spaceImpl) publishOneToOneKey(ctx context.Context) {
 	me := keys.SignKey.GetPublic().Account()
 	want, err := encodeSelfSymKeyMetadata(keys.SignKey)
 	if err != nil {
+		oneToOneKeysLog.Warn("derive own identity key", zap.String("spaceId", s.id), zap.Error(err))
 		return
 	}
 	obj, err := s.bundles.indexObj(ctx)
@@ -63,6 +84,7 @@ func (s *spaceImpl) publishOneToOneKey(ctx context.Context) {
 	}
 	dataVersion, err := s.store.DataVersion(spaceindex.IdentityKeysDataset)
 	if err != nil {
+		oneToOneKeysLog.Warn("identityKeys data version", zap.String("spaceId", s.id), zap.Error(err))
 		return
 	}
 	arena := &anyenc.Arena{}
@@ -84,18 +106,39 @@ func (s *spaceImpl) publishOneToOneKey(ctx context.Context) {
 	}
 }
 
+// beginOneToOnePublish claims the per-space publish slot; false when
+// another goroutine holds it.
+func (s *Service) beginOneToOnePublish(spaceId string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, busy := s.oneToOnePublishing[spaceId]; busy {
+		return false
+	}
+	s.oneToOnePublishing[spaceId] = struct{}{}
+	return true
+}
+
+func (s *Service) endOneToOnePublish(spaceId string) {
+	s.mu.Lock()
+	delete(s.oneToOnePublishing, spaceId)
+	s.mu.Unlock()
+}
+
 // oneToOneKeysWatcher folds the peer's identityKeys row of one
 // one-to-one space into the identities directory. Same shape as
-// spaceIndexWatcher: an unbounded sub on (spaceIndexObjectId,
-// identityKeys), a one-shot reconcile on start for state that landed
-// before the sub, then a reconcile per event batch. Best-effort: on
-// sub overflow the loop exits and the next load re-wires it.
+// spaceIndexWatcher: a sub on (spaceIndexObjectId, identityKeys) with
+// no window, a one-shot reconcile on start for state that landed before
+// the sub, then a reconcile per event batch. Best-effort: a sub closed
+// by mailbox overflow ends the loop, logged, and the watcher is wired
+// again when the space is next loaded after an offload or a restart.
+// Overflow takes more events than a two-row dataset produces.
 type oneToOneKeysWatcher struct {
 	parent   *Service
 	store    *spaceobjects.Store
 	spaceId  string
 	objectId string
 	self     string
+	peer     string
 	sub      *subscribe.Sub
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -103,14 +146,18 @@ type oneToOneKeysWatcher struct {
 }
 
 func newOneToOneKeysWatcher(ctx context.Context, parent *Service, store *spaceobjects.Store, spaceId, spaceIndexObjectId string) *oneToOneKeysWatcher {
-	sub, _ := store.SubEngine().Subscribe(subscribe.SubConfig{
+	sub, err := store.SubEngine().Subscribe(subscribe.SubConfig{
 		Scope: subscribe.Scope{ObjectId: spaceIndexObjectId, Dataset: spaceindex.IdentityKeysDataset},
 	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
+	if err != nil {
+		oneToOneKeysLog.Warn("subscribe identityKeys", zap.String("spaceId", spaceId), zap.Error(err))
+	}
 	w := &oneToOneKeysWatcher{
 		parent:   parent,
 		store:    store,
 		spaceId:  spaceId,
 		objectId: spaceIndexObjectId,
+		peer:     parent.oneToOnePeerOf(ctx, spaceId),
 		sub:      sub,
 		stopCh:   make(chan struct{}),
 	}
@@ -148,7 +195,12 @@ func (w *oneToOneKeysWatcher) loop() {
 		default:
 		}
 		if _, err := mb.Wait(context.Background()); err != nil {
-			return // ErrClosed on stop / overflow / drift
+			select {
+			case <-w.stopCh:
+			default:
+				oneToOneKeysLog.Warn("identityKeys sub closed", zap.String("spaceId", w.spaceId), zap.Error(err))
+			}
+			return
 		}
 		// Coalesce: the directory state is whatever the rows say now,
 		// so one pass covers every event since the last Wait.
@@ -156,30 +208,37 @@ func (w *oneToOneKeysWatcher) loop() {
 	}
 }
 
-// reconcileOnce reads every identityKeys row of the spaceIndex object
-// and caches each foreign key in the identities directory, kicking the
-// peer-name resolution for a key that is new. Silent on a spaceIndex
-// tree not present locally yet — the sub fires once it arrives.
+// reconcileOnce reads the peer's identityKeys row off the spaceIndex
+// object and caches its key in the identities directory, kicking the
+// peer-name resolution (a coordinator round-trip, so in the background
+// like every other caller) when the key is new. Only the row keyed by
+// the other participant counts: the directory is account-wide, so a
+// row under any other identity is ignored rather than cached. Silent on
+// a spaceIndex tree not present locally yet — the sub fires once it
+// arrives.
 func (w *oneToOneKeysWatcher) reconcileOnce(ctx context.Context) {
+	if w.peer == "" {
+		w.peer = w.parent.oneToOnePeerOf(ctx, w.spaceId)
+		if w.peer == "" {
+			return
+		}
+	}
 	obj, err := w.store.Get(ctx, w.objectId)
 	if err != nil {
 		return
 	}
-	for _, row := range obj.Controller().Records(ctx, spaceindex.IdentityKeysDataset) {
-		id := row.GetString(crdt.IdField)
-		symKey := spaceindex.IdentityKeyOf(row)
-		if id == "" || id == w.self || symKey == "" {
-			continue
-		}
-		if cur, ok := w.parent.tsp.GetIdentityMetaKey(ctx, id); ok && cur == symKey {
-			continue
-		}
-		if err := w.parent.tsp.SetIdentityMetaKey(ctx, id, symKey); err != nil {
-			oneToOneKeysLog.Warn("cache peer identity key", zap.String("spaceId", w.spaceId), zap.Error(err))
-			continue
-		}
-		w.parent.resolveOneToOnePeerName(ctx, id)
+	symKey := spaceindex.IdentityKeyOf(obj.Controller().Get(ctx, spaceindex.IdentityKeysDataset, w.peer))
+	if symKey == "" {
+		return
 	}
+	if cur, ok := w.parent.tsp.GetIdentityMetaKey(ctx, w.peer); ok && cur == symKey {
+		return
+	}
+	if err := w.parent.tsp.SetIdentityMetaKey(ctx, w.peer, symKey); err != nil {
+		oneToOneKeysLog.Warn("cache peer identity key", zap.String("spaceId", w.spaceId), zap.Error(err))
+		return
+	}
+	go w.parent.resolveOneToOnePeerName(context.Background(), w.peer)
 }
 
 var _ spaceScoped = (*oneToOneKeysWatcher)(nil)

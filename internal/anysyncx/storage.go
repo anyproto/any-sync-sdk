@@ -418,18 +418,16 @@ func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string)
 // every object tree — lives here, so this is the main disk-reclaim step
 // of an offload.
 //
-// Callers evict the space first (App.EvictSpace), which releases the
-// space's own reference. Any other holder gets storeDrainTimeout to
+// Callers claim before they evict the space (App.EvictSpace), so the
+// space's own reference is gone and only a passing holder (a
+// discovery-key derivation) can remain. It gets storeDrainTimeout to
 // release before the DB closes under it: Windows cannot delete an open
-// file, and an unreclaimed file would keep advertising the space. A ctx
-// cancelled during that wait releases the claim and keeps the files, so
-// shutdown is never held up and the next offload retries.
-func (c *storeClaim) Delete(ctx context.Context) error {
+// file, and an unreclaimed file would keep advertising the space. The
+// wait ignores ctx — an offload whose collections are already dropped
+// must not keep its file, which only a restart would retry.
+func (c *storeClaim) Delete(context.Context) error {
 	s, e := c.p, c.e
-	if err := s.drainForDelete(ctx, e); err != nil {
-		c.Release()
-		return err
-	}
+	s.drainForDelete(e)
 
 	var closeErr error
 	s.mu.Lock()
@@ -540,25 +538,18 @@ func (s *storageProvider) claimForDelete(ctx context.Context, id string) (*store
 }
 
 // drainForDelete waits up to storeDrainTimeout for the entry's holders
-// to release it, and returns ctx's error when ctx ends first.
-func (s *storageProvider) drainForDelete(ctx context.Context, e *storeEntry) error {
+// to release it.
+func (s *storageProvider) drainForDelete(e *storeEntry) {
 	s.mu.Lock()
 	drained := e.drained
 	s.mu.Unlock()
 	if drained == nil {
-		return nil
-	}
-	select {
-	case <-drained:
-		return nil
-	default:
+		return
 	}
 	timer := time.NewTimer(storeDrainTimeout)
 	defer timer.Stop()
 	select {
 	case <-drained:
-	case <-ctx.Done():
-		return ctx.Err()
 	case <-timer.C:
 		s.mu.Lock()
 		refs := e.refs
@@ -566,7 +557,6 @@ func (s *storageProvider) drainForDelete(ctx context.Context, e *storeEntry) err
 		storageLog.Warn("delete: closing a space store that is still held",
 			zap.String("spaceId", e.id), zap.Int("refs", refs))
 	}
-	return nil
 }
 
 // closeAll closes every open store and refuses later opens. It runs

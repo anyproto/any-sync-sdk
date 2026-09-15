@@ -361,28 +361,27 @@ func TestStorageProviderClaimRelease(t *testing.T) {
 	p.mu.Unlock()
 }
 
-// A delete whose ctx ends while a holder remains keeps the files and
-// gives the store back, instead of holding its caller for the drain.
-func TestStorageProviderDeleteCancelledKeepsStore(t *testing.T) {
+// A delete removes the files even when its ctx has ended: the offload
+// that calls it has already dropped the space's collections, and a kept
+// file would wait for a restart.
+func TestStorageProviderDeleteIgnoresCancelledCtx(t *testing.T) {
+	prev := storeDrainTimeout
+	storeDrainTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { storeDrainTimeout = prev })
+
 	p := newTestProvider(t)
 	const id = "space.cancelled"
 	var opens atomic.Int32
-	open := countingOpen(t, p, id, &opens)
-	held, err := p.acquire(context.Background(), id, false, open)
+	held, err := p.acquire(context.Background(), id, false, countingOpen(t, p, id, &opens))
 	require.NoError(t, err)
 	db := refDB(held)
 
+	claim, err := p.ClaimSpaceStorage(context.Background(), id)
+	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	start := time.Now()
-	require.ErrorIs(t, p.DeleteSpaceStorageFile(ctx, id), context.Canceled)
-	require.Less(t, time.Since(start), storeDrainTimeout)
-	requireDBOpen(t, db)
-	require.FileExists(t, p.dbPath(id))
-
-	again, err := p.acquire(context.Background(), id, false, open)
-	require.NoError(t, err)
-	require.NoError(t, again.Close(context.Background()))
-	require.NoError(t, held.Close(context.Background()))
+	require.NoError(t, claim.Delete(ctx))
 	requireDBClosed(t, db)
+	require.NoFileExists(t, p.dbPath(id))
+	require.NoError(t, held.Close(context.Background()))
 }

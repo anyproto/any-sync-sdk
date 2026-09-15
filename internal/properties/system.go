@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
@@ -72,11 +73,11 @@ const LocalVersion = 4
 // Two validation paths, split along the local/inbound line:
 //
 //   - PreValidate (local writes, before the DAG): STRICT. Path syntax,
-//     any.types membership, type resolvability, unknown property, and
+//     membership, type resolvability, unknown property, and
 //     kind. The first violation rejects the WHOLE write with an
 //     agent-readable *ValidationError.
 //   - BeforeCreate / BeforeModify (inbound + replay, schema known):
-//     DEFENSIVE per-op drop. Same checks minus the any.types membership
+//     DEFENSIVE per-op drop. Same checks minus the membership
 //     guard (which would break out-of-order tolerance); a failing op is
 //     dropped, the rest of the record still applies.
 //
@@ -91,11 +92,19 @@ type SystemPropertiesHandler struct {
 	// which is the bring-up mode before the type system is wired.
 	Registry types.Registry
 
-	// Grants extends the local-write membership set: given the types an
-	// object implements, it returns the extra namespaces the row may
-	// hold — the modules those types declare datasets of. Nil grants
-	// nothing beyond any.types.
+	// Grants extends the local-write membership set: given what the
+	// object is (its type, its collections, the markers), it returns
+	// the extra namespaces the row may hold — the modules its type
+	// declares datasets of. Nil grants nothing beyond the members.
 	Grants func(members map[string]struct{}) []string
+
+	// Classify reports what a definition id names (a type, a
+	// collection, or nothing resolvable here) so the local write
+	// pre-flight refuses a known id in the wrong slot: a collection
+	// set as `any.type`, a type added to `any.collections`. Unknown
+	// ids pass — the definition may not have synced yet. Nil classifies
+	// nothing.
+	Classify func(ctx context.Context, id string) OwnerKind
 
 	// ReservedCarrier reports whether a user type declares a reserved
 	// module (handler.Module.Reserved). Such a type is carried only by
@@ -138,7 +147,7 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 // (PreValidate rejected the whole write upstream); inbound creates
 // that reach here have passed the DataVersion gate, so a dropped op
 // means a removed-property replay or cross-peer bug, not a sync gap.
-// No any.types membership check (out-of-order tolerance).
+// No membership check (out-of-order tolerance).
 func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, sink *crdt.Sink) error {
 	if h.Registry != nil && len(rec.Ops) > 0 {
 		kept := rec.Ops[:0]
@@ -259,7 +268,7 @@ func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // so a drop here means a removed-property replay, a cross-peer bug, or
 // genuine junk — never data merely waiting on a schema sync.
 //
-// No any.types membership check here: an apply-time membership guard
+// No membership check here: an apply-time membership guard
 // would drop values written before the attach-type change arrives,
 // breaking out-of-order tolerance (docs/06-data-structure.md §397).
 //
@@ -297,7 +306,7 @@ func (*SystemPropertiesHandler) BeforeDelete(_ *crdt.ChangeCtx, _ *crdt.RecordCh
 
 // PreValidate is the local write-time pre-flight (LocalPreValidator).
 // It runs strict, full validation BEFORE the change enters the DAG:
-// path syntax, any.types membership, type resolvability, unknown
+// path syntax, membership, type resolvability, unknown
 // property, and kind. The FIRST violation rejects the WHOLE write with
 // an agent-readable *ValidationError — nothing is signed or shipped to
 // peers. `before` is the record's current value (nil on first write).
@@ -310,10 +319,14 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 	if h.Registry == nil || ch == nil {
 		return nil
 	}
-	if verr := h.checkReservedCarriers(ch, before); verr != nil {
+	adds := collectMembership(ch)
+	if verr := h.checkSlots(adds); verr != nil {
 		return verr
 	}
-	pf := h.buildPreflight(ch, before)
+	if verr := h.checkReservedCarriers(ch, before, adds); verr != nil {
+		return verr
+	}
+	pf := h.buildPreflight(ch, before, adds)
 	for ri := range ch.Records {
 		rc := &ch.Records[ri]
 		for oi := range rc.Ops {
@@ -325,106 +338,205 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 	return nil
 }
 
-// checkReservedCarriers refuses a local change attaching a reserved
-// carrier type (ReservedCarrier) to any row but the type's own. Only
-// the types this change ADDS are checked — a row already carrying one
-// (its own root, or an inbound copy) keeps writing. The row is the
-// change's ObjectId — on the shared objects collection the controller
-// stamps it before the pre-flight, and a caller's record id is never
-// the row — so an unstamped change fails closed. Allocates only when
-// an op touches any.types.
-func (h *SystemPropertiesHandler) checkReservedCarriers(ch *crdt.Change, before *anyenc.Value) *ValidationError {
-	if h.ReservedCarrier == nil {
-		return nil
-	}
-	var added map[string]struct{}
+// membershipAdds is what a change does to the object's membership
+// fields: the type it sets (typeSet reports a set even to the empty
+// string — an unset), and the collections it adds ($set array or
+// $addToSet).
+type membershipAdds struct {
+	typeSet     bool
+	typeId      string
+	collections map[string]struct{}
+}
+
+// collectMembership scans a change for writes to `any.type` and
+// `any.collections`: the multi-field $set (dotted keys), the
+// single-path $set on either field, $addToSet on the collections
+// list, and $unset of the type.
+func collectMembership(ch *crdt.Change) membershipAdds {
+	var m membershipAdds
 	for ri := range ch.Records {
 		for oi := range ch.Records[ri].Ops {
 			op := &ch.Records[ri].Ops[oi]
-			if !touchesTypes(op) {
-				continue
+			switch {
+			case len(op.Path) == 0 && op.Type == crdt.OpSet:
+				if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+					continue
+				}
+				obj, _ := op.Payload.Object()
+				obj.Visit(func(k []byte, v *anyenc.Value) {
+					switch string(k) {
+					case anytype.TypeId + "." + anytype.FieldType:
+						if v.Type() == anyenc.TypeString {
+							m.typeSet, m.typeId = true, string(v.GetStringBytes())
+						}
+					case anytype.TypeId + "." + anytype.FieldCollections:
+						m.addCollections(v)
+					}
+				})
+			case len(op.Path) == 0 && op.Type == crdt.OpUnset:
+				if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+					continue
+				}
+				obj, _ := op.Payload.Object()
+				obj.Visit(func(k []byte, _ *anyenc.Value) {
+					if string(k) == anytype.TypeId+"."+anytype.FieldType {
+						m.typeSet, m.typeId = true, ""
+					}
+				})
+			case len(op.Path) == 2 && op.Path[0] == anytype.TypeId && op.Path[1] == anytype.FieldType:
+				switch op.Type {
+				case crdt.OpSet:
+					if op.Payload != nil && op.Payload.Type() == anyenc.TypeString {
+						m.typeSet, m.typeId = true, string(op.Payload.GetStringBytes())
+					}
+				case crdt.OpUnset:
+					m.typeSet, m.typeId = true, ""
+				}
+			case len(op.Path) == 2 && op.Path[0] == anytype.TypeId && op.Path[1] == anytype.FieldCollections:
+				switch op.Type {
+				case crdt.OpSet:
+					m.addCollections(op.Payload)
+				case crdt.OpAddToSet:
+					if op.Payload != nil && op.Payload.Type() == anyenc.TypeString {
+						m.add(string(op.Payload.GetStringBytes()))
+					}
+				}
 			}
-			if added == nil {
-				added = map[string]struct{}{}
-			}
-			collectTypeAdditions(op, added)
 		}
 	}
-	if len(added) == 0 {
+	return m
+}
+
+func (m *membershipAdds) add(id string) {
+	if m.collections == nil {
+		m.collections = map[string]struct{}{}
+	}
+	m.collections[id] = struct{}{}
+}
+
+// addCollections unions the string elements of an array value. No-op
+// for non-array values.
+func (m *membershipAdds) addCollections(v *anyenc.Value) {
+	if v == nil || v.Type() != anyenc.TypeArray {
+		return
+	}
+	arr, _ := v.Array()
+	for _, e := range arr {
+		if e.Type() == anyenc.TypeString {
+			m.add(string(e.GetStringBytes()))
+		}
+	}
+}
+
+// checkSlots refuses a known id written to the wrong membership field:
+// a collection as `any.type`, a type in `any.collections`. The markers
+// and the universal type are not classified (they are the slot's own
+// vocabulary); an unknown id passes.
+func (h *SystemPropertiesHandler) checkSlots(adds membershipAdds) *ValidationError {
+	if h.Classify == nil {
 		return nil
 	}
-	existing := map[string]struct{}{}
-	if before != nil {
-		for _, v := range before.GetArray("any", "types") {
-			existing[string(v.GetStringBytes())] = struct{}{}
+	ctx := context.Background()
+	if adds.typeSet && adds.typeId != "" && !isMarker(adds.typeId) {
+		if k := h.Classify(ctx, adds.typeId); k == OwnerCollection {
+			return &ValidationError{Reason: ReasonWrongSlot, TypeId: adds.typeId, Slot: anytype.FieldType, Kind: k}
 		}
 	}
-	for typeId := range added {
-		if typeId == ch.ObjectId {
-			continue
+	for id := range adds.collections {
+		if isMarker(id) {
+			return &ValidationError{Reason: ReasonWrongSlot, TypeId: id, Slot: anytype.FieldCollections, Kind: OwnerType}
 		}
-		if _, had := existing[typeId]; had {
-			continue
-		}
-		if h.ReservedCarrier(typeId) {
-			return &ValidationError{Reason: ReasonReservedCarrier, TypeId: typeId, ObjectId: ch.ObjectId}
+		if k := h.Classify(ctx, id); k == OwnerType {
+			return &ValidationError{Reason: ReasonWrongSlot, TypeId: id, Slot: anytype.FieldCollections, Kind: k}
 		}
 	}
 	return nil
 }
 
-// touchesTypes reports whether collectTypeAdditions could read an
-// any.types addition off the op: the multi-field $set, or a
-// single-path op on ["any","types"].
-func touchesTypes(op *crdt.Op) bool {
-	switch {
-	case len(op.Path) == 0:
-		return op.Type == crdt.OpSet
-	case len(op.Path) == 2:
-		return op.Path[0] == anytype.TypeId && op.Path[1] == "types"
-	}
-	return false
+// isMarker reports whether id is one of the definition markers or the
+// universal type — vocabulary of the slot, never a definition to
+// classify.
+func isMarker(id string) bool {
+	return id == typetype.MetaTypeMarker || id == collectiontype.MetaMarker || id == anytype.TypeId
 }
 
-// preflight carries the local-write membership set (the typeIds the
-// object effectively implements) used only by PreValidate. nil means
-// apply-time mode — skip the membership check.
+// checkReservedCarriers refuses a local change setting a reserved
+// carrier type (ReservedCarrier) as any row's type but the type's own
+// — which is never the case: a definition object carries its marker,
+// and hosts its own datasets under the implicit self grant. Only the
+// type this change SETS is checked — a row already carrying one (an
+// inbound copy) keeps writing. The row is the change's ObjectId — on
+// the shared objects collection the controller stamps it before the
+// pre-flight, and a caller's record id is never the row — so an
+// unstamped change fails closed.
+func (h *SystemPropertiesHandler) checkReservedCarriers(ch *crdt.Change, before *anyenc.Value, adds membershipAdds) *ValidationError {
+	if h.ReservedCarrier == nil || !adds.typeSet || adds.typeId == "" {
+		return nil
+	}
+	if before != nil && before.GetString(anytype.TypeId, anytype.FieldType) == adds.typeId {
+		return nil
+	}
+	if adds.typeId == ch.ObjectId {
+		return nil
+	}
+	if h.ReservedCarrier(adds.typeId) {
+		return &ValidationError{Reason: ReasonReservedCarrier, TypeId: adds.typeId, ObjectId: ch.ObjectId}
+	}
+	return nil
+}
+
+// preflight carries the local-write membership set (the namespaces the
+// object may hold) used only by PreValidate. nil means apply-time mode
+// — skip the membership check.
 type preflight struct {
 	members map[string]struct{}
 	list    []string // sorted, for error messages
 }
 
-// buildPreflight computes the set of typeIds the object implements
-// after this change: the universal `any` type, the types already in
-// the record's any.types, plus any types this change attaches.
+// buildPreflight computes the namespaces the object holds after this
+// change: the universal `any`, its type (the row's, or the one this
+// change sets), its collections (the row's plus what this change
+// adds), the meta namespace its marker grants, its own id when it is
+// a definition (a type or collection object implicitly implements
+// itself — docs/06 § Type and collections), and the module namespaces
+// Grants derives from those.
 //
-// The meta-type is the one entry whose marker and namespace differ —
-// a type object carries `__type__` in any.types but stores its
-// type-only values under `type` (an underscore-prefixed top-level
-// field is protocol-owned). Grant the namespace off the marker so
-// only rows that declare themselves types can write there.
-func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc.Value) *preflight {
+// The markers are the one place value and namespace differ — a type
+// object carries `__type__` in `any.type` but stores its type-only
+// values under `type` (an underscore-prefixed top-level field is
+// protocol-owned). The namespace is granted off the marker alone, so
+// a row that merely names the meta id as its type cannot reach it.
+func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc.Value, adds membershipAdds) *preflight {
 	members := map[string]struct{}{anytype.TypeId: {}}
+	typeId := ""
 	if before != nil {
-		for _, v := range before.GetArray("any", "types") {
+		typeId = before.GetString(anytype.TypeId, anytype.FieldType)
+		for _, v := range before.GetArray(anytype.TypeId, anytype.FieldCollections) {
 			members[string(v.GetStringBytes())] = struct{}{}
 		}
 	}
-	for ri := range ch.Records {
-		for oi := range ch.Records[ri].Ops {
-			collectTypeAdditions(&ch.Records[ri].Ops[oi], members)
-		}
+	if adds.typeSet {
+		typeId = adds.typeId
 	}
-	if _, isType := members[typetype.MetaTypeMarker]; isType {
+	for id := range adds.collections {
+		members[id] = struct{}{}
+	}
+	if typeId != "" {
+		members[typeId] = struct{}{}
+	}
+	delete(members, typetype.TypeId)
+	delete(members, collectiontype.TypeId)
+	switch typeId {
+	case typetype.MetaTypeMarker:
 		members[typetype.TypeId] = struct{}{}
-	} else {
-		// The marker is the ONLY grant: an object that merely lists the
-		// meta-type id in any.types (nothing stops a client attaching
-		// it) must not reach the namespace.
-		delete(members, typetype.TypeId)
+		members[ch.ObjectId] = struct{}{}
+	case collectiontype.MetaMarker:
+		members[collectiontype.TypeId] = struct{}{}
+		members[ch.ObjectId] = struct{}{}
 	}
-	// Module namespaces: granted off the types the object implements,
-	// never listed in any.types themselves.
+	delete(members, "")
+	// Module namespaces: granted off the type the object has, never
+	// listed in a membership field themselves.
 	if h.Grants != nil {
 		for _, ns := range h.Grants(members) {
 			members[ns] = struct{}{}
@@ -432,49 +544,6 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 	}
 	list := slices.Sorted(maps.Keys(members))
 	return &preflight{members: members, list: list}
-}
-
-// collectTypeAdditions records typeIds an op adds to any.types, so a
-// batch that attaches a type and writes its values in one change
-// validates the new namespace. Handles the multi-field "any.types"
-// key, the single-path ["any","types"] $set (array payload), and the
-// ["any","types"] $addToSet (element payload).
-func collectTypeAdditions(op *crdt.Op, members map[string]struct{}) {
-	switch {
-	case len(op.Path) == 0 && op.Type == crdt.OpSet:
-		if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
-			return
-		}
-		obj, _ := op.Payload.Object()
-		obj.Visit(func(k []byte, v *anyenc.Value) {
-			if string(k) == anytype.TypeId+".types" {
-				addArrayStrings(v, members)
-			}
-		})
-	case len(op.Path) == 2 && op.Path[0] == anytype.TypeId && op.Path[1] == "types":
-		switch op.Type {
-		case crdt.OpSet:
-			addArrayStrings(op.Payload, members)
-		case crdt.OpAddToSet:
-			if op.Payload != nil && op.Payload.Type() == anyenc.TypeString {
-				members[string(op.Payload.GetStringBytes())] = struct{}{}
-			}
-		}
-	}
-}
-
-// addArrayStrings unions the string elements of an array value into
-// the set. No-op for non-array values.
-func addArrayStrings(v *anyenc.Value, members map[string]struct{}) {
-	if v == nil || v.Type() != anyenc.TypeArray {
-		return
-	}
-	arr, _ := v.Array()
-	for _, e := range arr {
-		if e.Type() == anyenc.TypeString {
-			members[string(e.GetStringBytes())] = struct{}{}
-		}
-	}
 }
 
 // validateOp routes by op shape. pf != nil enables the local pre-flight
@@ -578,7 +647,7 @@ var nestedProbe = func() *anyenc.Value {
 func (h *SystemPropertiesHandler) validateField(typeId, propId string, payload *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
 	if pf != nil {
 		if _, ok := pf.members[typeId]; !ok {
-			return &ValidationError{Reason: ReasonTypeNotImplemented, TypeId: typeId, Types: pf.list}
+			return &ValidationError{Reason: ReasonTypeNotImplemented, TypeId: typeId, Members: pf.list}
 		}
 	}
 	props, ok := h.Registry.PropsOf(typeId)

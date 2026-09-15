@@ -19,14 +19,15 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // listTypesFilter selects rows from the per-space `objects` collection
-// whose `any.types` array carries the meta-type marker and that aren't
-// tombstoned. One definition, shared with the store's catalog scan.
+// whose `any.type` is the meta-type marker and that aren't tombstoned.
+// One definition, shared with the store's catalog scan.
 var listTypesFilter = spaceobjects.LiveTypeRowsFilter
 
 // typesAPI implements space.TypesAPI. MVP scope: Create + AddProperty.
@@ -42,7 +43,7 @@ func newTypesAPI(parent *spaceImpl) *typesAPI { return &typesAPI{parent: parent}
 // Create mints a new type object: a fresh any-sync tree whose
 // `properties` dataset record carries the type's display metadata
 // (any.name / any.description / any.icon), its programmatic handle
-// (type.xkey) and `any.types = ["__type__"]` to mark it as a meta-type
+// (type.xkey) and `any.type = "__type__"` to mark it as a meta-type
 // instance.
 //
 // The universal fields stay under `any`; `xkey` is meaningful only on
@@ -75,9 +76,6 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 	if params.XKey != "" {
 		multi.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(params.XKey))
 	}
-	if params.Weight != 0 {
-		multi.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(params.Weight))
-	}
 	if len(params.Layout) > 0 {
 		layout, err := encodeXFormat(arena, params.Layout)
 		if err != nil {
@@ -98,13 +96,10 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 		}
 		multi.Set(typetype.TypeId+"."+typetype.FieldMetaProp+"."+k, v)
 	}
-	// Mark the object as a meta-type instance — the convention we use
-	// in MVP to distinguish types from regular objects without a
-	// dedicated catalog. Set in the same change as the xkey write, so
-	// the local pre-flight sees the namespace as implemented.
-	types := arena.NewArray()
-	types.SetArrayItem(0, arena.NewString(typetype.MetaTypeMarker))
-	multi.Set("any.types", types)
+	// The marker in the type slot is what makes the row a type object.
+	// Set in the same change as the xkey write, so the local pre-flight
+	// grants the `type` namespace.
+	multi.Set(anytype.TypeId+"."+anytype.FieldType, arena.NewString(typetype.MetaTypeMarker))
 
 	dataVersion, err := t.parent.store.DataVersion(properties.Dataset)
 	if err != nil {
@@ -277,13 +272,25 @@ func builtInSpaceIndexTypeInfo() space.TypeInfo {
 
 // builtInMetaTypeInfo describes the synthetic `type` meta-type —
 // the shape of type objects themselves. Every type object implements
-// it (that's what the marker in `any.types` says), so it belongs in
+// it (that's what the marker in `any.type` says), so it belongs in
 // the catalog next to `any` and `spaceIndex`.
 func builtInMetaTypeInfo() space.TypeInfo {
 	return space.TypeInfo{
 		Id:          typetype.TypeId,
 		Name:        typetype.Name,
 		Description: typetype.Description,
+		BuiltIn:     true,
+	}
+}
+
+// builtInMetaCollectionTypeInfo describes the synthetic `collection`
+// meta-type — the shape of collection objects. Listed with the other
+// built-ins so every namespace a row can hold has a type entry.
+func builtInMetaCollectionTypeInfo() space.TypeInfo {
+	return space.TypeInfo{
+		Id:          collectiontype.TypeId,
+		Name:        collectiontype.Name,
+		Description: collectiontype.Description,
 		BuiltIn:     true,
 	}
 }
@@ -320,19 +327,58 @@ func (t *typesAPI) registeredTypeParts(rt handler.Type) (*types.CompiledType, er
 	return ct, nil
 }
 
-// staticType reports whether typeId is a type whose declarations are
-// hardcoded — a caller-registered type from config.Config.Types, or
-// one of the synthetic built-ins (`any`, `spaceIndex`, `type`). Every
-// runtime mutator rejects them with ErrTypeRegistered; without the
-// built-in half a mutator called with an enumerable id like `type`
+// staticType reports whether id names a definition whose declarations
+// are hardcoded — a caller-registered type or collection, or one of the
+// synthetic built-ins (`any`, `spaceIndex`, `type`, `collection`).
+// Every runtime mutator rejects them with ErrTypeRegistered; without
+// the built-in half a mutator called with an enumerable id like `type`
 // (Types().List surfaces it) falls through to a tree build on that
 // literal id and surfaces an opaque CID error instead.
-func (t *typesAPI) staticType(typeId string) bool {
-	if _, reserved := spaceobjects.ReservedTypeIds[typeId]; reserved {
+func (t *typesAPI) staticType(id string) bool {
+	if _, reserved := spaceobjects.ReservedTypeIds[id]; reserved {
 		return true
 	}
-	_, ok := t.findRegisteredType(typeId)
+	if _, ok := t.findRegisteredType(id); ok {
+		return true
+	}
+	_, ok := t.findRegisteredCollection(id)
 	return ok
+}
+
+// findRegisteredCollection returns the registered collection for id,
+// or (zero, false) if none.
+func (t *typesAPI) findRegisteredCollection(id string) (handler.Collection, bool) {
+	for _, c := range t.parent.store.ExternalCollections() {
+		if c.Id == id {
+			return c, true
+		}
+	}
+	return handler.Collection{}, false
+}
+
+// requireType refuses the type-only surface on a collection object:
+// a row carrying the collection marker answers ErrNotAType. Any other
+// row — a type, or nothing resolvable here — passes, so the existing
+// failure modes (ErrNotFound, a tree that does not build) stay.
+func (t *typesAPI) requireType(ctx context.Context, id string) error {
+	if t.staticType(id) {
+		return nil
+	}
+	coll, err := t.parent.store.SharedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("typesAPI: shared objects: %w", err)
+	}
+	doc, err := coll.FindId(ctx, id)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return nil
+		}
+		return fmt.Errorf("typesAPI: find %s: %w", id, err)
+	}
+	if markerOf(doc.Value()) == collectiontype.MetaMarker {
+		return fmt.Errorf("%w: %q", space.ErrNotAType, id)
+	}
+	return nil
 }
 
 // findRegisteredType returns the catalog entry for typeId, or
@@ -347,7 +393,7 @@ func (t *typesAPI) findRegisteredType(typeId string) (handler.Type, bool) {
 }
 
 // List returns every object whose persisted `properties` row is a
-// meta-type instance (`any.types` contains "__type__"). One any-store
+// meta-type instance (`any.type == "__type__"`). One any-store
 // query against the per-space `objects` collection — no tree builds,
 // no any-sync calls. Eventual-consistency: rows that the controller
 // has applied are visible; whatever any-sync hasn't replayed yet
@@ -364,10 +410,11 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 	defer iter.Close()
 
 	registered := t.parent.store.ExternalTypes()
-	out := make([]space.TypeInfo, 0, 3+len(registered))
+	out := make([]space.TypeInfo, 0, 4+len(registered))
 	out = append(out, builtInAnyTypeInfo())
 	out = append(out, builtInSpaceIndexTypeInfo())
 	out = append(out, builtInMetaTypeInfo())
+	out = append(out, builtInMetaCollectionTypeInfo())
 	for _, rt := range registered {
 		out = append(out, registeredTypeInfo(rt))
 	}
@@ -406,6 +453,9 @@ func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, erro
 	if typeId == typetype.TypeId {
 		return builtInMetaTypeInfo(), nil
 	}
+	if typeId == collectiontype.TypeId {
+		return builtInMetaCollectionTypeInfo(), nil
+	}
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeInfo(rt), nil
 	}
@@ -421,15 +471,21 @@ func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, erro
 		return space.TypeInfo{}, fmt.Errorf("typesAPI: find %s: %w", typeId, err)
 	}
 	v := doc.Value()
-	if v == nil || v.Get(crdt.DeletedAtField) != nil || !hasTypeMarker(v) {
+	if v == nil || v.Get(crdt.DeletedAtField) != nil {
 		return space.TypeInfo{}, space.ErrNotFound
 	}
-	return typeInfoFromRow(v), nil
+	switch markerOf(v) {
+	case typetype.MetaTypeMarker:
+		return typeInfoFromRow(v), nil
+	case collectiontype.MetaMarker:
+		return space.TypeInfo{}, fmt.Errorf("%w: %q", space.ErrNotAType, typeId)
+	}
+	return space.TypeInfo{}, space.ErrNotFound
 }
 
 // typeInfoFromRow decodes a row from the per-space `objects`
 // collection into the public TypeInfo shape. Caller is responsible
-// for having checked hasTypeMarker.
+// for having checked the marker.
 func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 	return space.TypeInfo{
 		Id:          rec.GetString(crdt.IdField),
@@ -437,7 +493,6 @@ func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 		Description: rec.GetString("any", "description"),
 		IconCID:     rec.GetString("any", "icon"),
 		XKey:        rec.GetString(typetype.TypeId, typetype.FieldXKeyProp),
-		Weight:      int(rec.GetFloat64(typetype.TypeId, typetype.FieldWeightProp)),
 		Layout:      types.DecodeXFormat(rec.Get(typetype.TypeId, typetype.FieldLayoutProp)),
 		Hidden:      rec.GetBool(typetype.TypeId, typetype.FieldHiddenProp),
 		Meta:        types.DecodeXFormat(rec.Get(typetype.TypeId, typetype.FieldMetaProp)),
@@ -474,16 +529,16 @@ func typeMetaValue(a *anyenc.Arena, key string, v any) (*anyenc.Value, error) {
 }
 
 // Patch rewrites a user type's display and rendering metadata in one
-// change on its objects row: the universal fields under `any`, weight
-// and layout under the meta-type's namespace. Absent fields keep their
-// value; an empty string clears a text field; ClearLayout unsets the
-// layout.
+// change on its objects row: the universal fields under `any`, layout
+// and the flags under the meta-type's namespace. Absent fields keep
+// their value; an empty string clears a text field; ClearLayout unsets
+// the layout.
 func (t *typesAPI) Patch(ctx context.Context, typeId string, patch space.TypePatch) error {
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if _, err := t.Get(ctx, typeId); err != nil {
-		return err
+		return err // ErrNotAType on a collection row
 	}
 	arena := &anyenc.Arena{}
 	set := arena.NewObject()
@@ -501,9 +556,6 @@ func (t *typesAPI) Patch(ctx context.Context, typeId string, patch space.TypePat
 	text("any.name", patch.Name)
 	text("any.description", patch.Description)
 	text("any.icon", patch.IconCID)
-	if patch.Weight != nil {
-		set.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(*patch.Weight))
-	}
 	if patch.Hidden != nil {
 		set.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewBool(*patch.Hidden))
 	}
@@ -557,35 +609,40 @@ func (t *typesAPI) Patch(ctx context.Context, typeId string, patch space.TypePat
 	return nil
 }
 
-// hasTypeMarker reports whether `record.any.types` contains the
-// reserved meta-type label "__type__". Used to distinguish type
-// objects from regular objects without a separate catalog.
-func hasTypeMarker(rec *anyenc.Value) bool {
-	arr := rec.GetArray("any", "types")
-	for _, v := range arr {
-		if string(v.GetStringBytes()) == typetype.MetaTypeMarker {
-			return true
-		}
+// markerOf returns the definition marker in `record.any.type` —
+// "__type__" for a type object, "__collection__" for a collection
+// object — or "" for a regular row (or a nil one).
+func markerOf(rec *anyenc.Value) string {
+	if rec == nil {
+		return ""
 	}
-	return false
+	switch v := rec.GetString(anytype.TypeId, anytype.FieldType); v {
+	case typetype.MetaTypeMarker, collectiontype.MetaMarker:
+		return v
+	}
+	return ""
 }
 
 func (t *typesAPI) Delete(_ context.Context, _ string) error {
 	return errors.New("typesAPI: Delete not implemented")
 }
 
-// Properties returns the property definitions of a type. For the
-// built-in `any`, `spaceIndex` and `type` types, the list is
-// hardcoded (one entry per package-level Properties table, e.g.
-// anytype.Properties). Caller-registered types own datasets, not
-// property definitions, so an empty slice is returned (those types
-// expose state via custom datasets reached through Space.Modify /
-// Query, not through the property API). For user-created types, the
-// list is read off the type object's `defs` dataset.
+// builtInMetaCollectionProperties translates collectiontype.Properties
+// into the public PropertyDef shape.
+func builtInMetaCollectionProperties() []space.PropertyDef {
+	return builtInTypeProperties(collectiontype.Properties)
+}
+
+// Properties returns the property definitions of a type or a
+// collection. For the built-ins (`any`, `spaceIndex`, `type`,
+// `collection`) the list is hardcoded (one entry per package-level
+// Properties table); registered types and collections answer their
+// static declarations. For user-created definitions the list is read
+// off the owner object's `properties` dataset.
 //
 // Pure any-store read — no any-sync tree build. Empty slice if the
-// type has no `defs` writes yet (collection not initialised) or if
-// the typeId isn't a known type.
+// owner has no definition writes yet (collection not initialised) or
+// if the id isn't a known definition.
 func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.PropertyDef, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyProperties(), nil
@@ -596,8 +653,14 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 	if typeId == typetype.TypeId {
 		return builtInMetaTypeProperties(), nil
 	}
+	if typeId == collectiontype.TypeId {
+		return builtInMetaCollectionProperties(), nil
+	}
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeProperties(rt), nil
+	}
+	if rc, ok := t.findRegisteredCollection(typeId); ok {
+		return registeredPropertyDecls(rc.Properties), nil
 	}
 	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
 	if err != nil {
@@ -672,8 +735,14 @@ func builtInSpaceIndexProperties() []space.PropertyDef {
 // own namespace (`xkey`), as opposed to the universal ones it carries
 // under `any`.
 func builtInMetaTypeProperties() []space.PropertyDef {
-	out := make([]space.PropertyDef, 0, len(typetype.Properties))
-	for _, p := range typetype.Properties {
+	return builtInTypeProperties(typetype.Properties)
+}
+
+// builtInTypeProperties translates a meta-type's hardcoded table into
+// the public PropertyDef shape.
+func builtInTypeProperties(table []typetype.BuiltInProperty) []space.PropertyDef {
+	out := make([]space.PropertyDef, 0, len(table))
+	for _, p := range table {
 		out = append(out, space.PropertyDef{
 			Id:          p.Id,
 			Name:        p.Name,
@@ -692,11 +761,17 @@ func builtInMetaTypeProperties() []space.PropertyDef {
 // validates writes against. Returns nil for a type that declares no
 // properties (owns only separate datasets).
 func registeredTypeProperties(t handler.Type) []space.PropertyDef {
-	if len(t.Properties) == 0 {
+	return registeredPropertyDecls(t.Properties)
+}
+
+// registeredPropertyDecls maps static PropertyDecls (a registered type's
+// or collection's) into the public PropertyDef shape.
+func registeredPropertyDecls(decls []handler.PropertyDecl) []space.PropertyDef {
+	if len(decls) == 0 {
 		return nil
 	}
-	out := make([]space.PropertyDef, 0, len(t.Properties))
-	for _, p := range t.Properties {
+	out := make([]space.PropertyDef, 0, len(decls))
+	for _, p := range decls {
 		def := space.PropertyDef{
 			Id:          p.Id,
 			Name:        p.Name,

@@ -37,6 +37,15 @@ const (
 	Description = "Universal properties shared by every object"
 )
 
+// Membership fields on the objects row: `any.type` holds the object's
+// one type (a scalar LWW register — a definition object carries its
+// marker there instead), `any.collections` the set of collections it
+// belongs to.
+const (
+	FieldType        = "type"
+	FieldCollections = "collections"
+)
+
 // BuiltInProperty is one hardcoded property definition for the `any`
 // type. Uses human-readable ids (e.g. "name") that never collide with
 // generated user propIds (11-char base58). Scope uses the unified
@@ -90,12 +99,14 @@ var Properties = []BuiltInProperty{
 		XFormat:     map[string]any{"type": "longtext"}},
 	{Id: "icon", Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced,
 		Description: "Display icon; the encoding is the client's."},
-	// `types` is the list of type ids this object implements (docs 06
-	// §"Property ids" / §"types list"). Array of strings. Deliberately
-	// synced-only: type membership is structural and shared — never
+	// `type` is the ONE type the object has; `collections` the set of
+	// collections it belongs to (docs 06 § Type and collections). Both
+	// synced-only: membership is structural and shared — never
 	// per-account or per-device.
-	{Id: "types", Name: "Types", Kind: schema.KindArray, Scope: schema.ScopeSynced,
-		Description: "Ids of the types the object carries."},
+	{Id: FieldType, Name: "Type", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Id of the object's type; a definition object carries its marker here."},
+	{Id: FieldCollections, Name: "Collections", Kind: schema.KindArray, Scope: schema.ScopeSynced,
+		Description: "Ids of the collections the object belongs to."},
 	// `tags` is a free-form list of user labels. Array of strings.
 	// Synced: tags are shared object metadata, like name/description.
 	{Id: "tags", Name: "Tags", Kind: schema.KindArray, Scope: schema.ScopeSynced,

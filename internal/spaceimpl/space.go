@@ -44,8 +44,9 @@ type spaceImpl struct {
 	techIndexId string
 
 	objects    *objectService
-	types      *typesAPI
-	properties *propertiesAPI
+	types       *typesAPI
+	collections *collectionsAPI
+	properties  *propertiesAPI
 	acl        *aclAPI
 	members    *membersAPI
 	bundles    *bundlesAPI
@@ -55,6 +56,7 @@ func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *space
 	s := &spaceImpl{id: id, app: app, tsp: tsp, store: store, parent: parent}
 	s.objects = newObjectService(s)
 	s.types = newTypesAPI(s)
+	s.collections = newCollectionsAPI(s, s.types)
 	s.properties = newPropertiesAPI(s)
 	s.acl = newACLAPI(s)
 	s.members = newMembersAPI(s)
@@ -152,8 +154,9 @@ func (s *spaceImpl) canWrite(ctx context.Context) bool {
 }
 
 func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
-func (s *spaceImpl) Types() space.TypesAPI           { return s.types }
-func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
+func (s *spaceImpl) Types() space.TypesAPI             { return s.types }
+func (s *spaceImpl) Collections() space.CollectionsAPI { return s.collections }
+func (s *spaceImpl) Properties() space.PropertiesAPI   { return s.properties }
 
 func (s *spaceImpl) ACL() space.ACL            { return s.acl }
 func (s *spaceImpl) Members() space.MembersAPI { return s.members }
@@ -282,32 +285,32 @@ func checkPublicDataset(dataset string) error {
 }
 
 // checkDatasetMembership enforces the ownership invariant for
-// type-declared datasets: an object may only hold a dataset if it
-// implements one of the types declaring it — the one owner of a
-// registered-type or namespaced dataset, any owner of a module's
-// canonical collection. No-op for built-in / unknown datasets
-// (DatasetOwners returns false) — property-namespace membership is
-// enforced separately by SystemPropertiesHandler.PreValidate. Local
-// write-time only; inbound apply stays read-tolerant, and no type is
-// ever attached on write.
+// type-declared datasets: an object may only hold a dataset if its
+// type declares it — the one owner of a registered-type or namespaced
+// dataset, any owner of a module's canonical collection — or if the
+// object IS the declaring type (a definition object implicitly
+// implements itself, which is how a bundle root hosts its own
+// records). No-op for built-in / unknown datasets (DatasetOwners
+// returns false) — property-namespace membership is enforced
+// separately by SystemPropertiesHandler.PreValidate. Local write-time
+// only; inbound apply stays read-tolerant, and no type is ever set on
+// write.
 func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
 	owners, gated := s.store.DatasetOwners(dataset)
 	if !gated {
 		return nil
 	}
-	types, err := s.store.ObjectTypes(ctx, objectId)
+	members, err := s.store.ObjectMembers(ctx, objectId)
 	if err != nil {
 		return err
 	}
-	for _, t := range types {
-		for _, o := range owners {
-			if t == o {
-				return nil
-			}
+	for _, o := range owners {
+		if o == objectId || (members.Type != "" && members.Type == o) {
+			return nil
 		}
 	}
-	return fmt.Errorf("%w: dataset %q on object %q — its types [%s] are not among the declaring types [%s]",
-		space.ErrDatasetNotDeclared, dataset, objectId, strings.Join(types, ", "), strings.Join(owners, ", "))
+	return fmt.Errorf("%w: dataset %q on object %q — its type %q is not among the declaring types [%s]",
+		space.ErrDatasetNotDeclared, dataset, objectId, members.Type, strings.Join(owners, ", "))
 }
 
 // localWriteRetry runs a LocalWrite, retrying once with a fresh

@@ -473,6 +473,9 @@ func (t *typesAPI) Parts(ctx context.Context, typeId string) ([]space.PartDef, e
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		ct, err = t.registeredTypeParts(rt)
 	} else {
+		if err = t.requireType(ctx, typeId); err != nil {
+			return nil, err
+		}
 		ct, err = t.compiled(ctx, typeId)
 	}
 	if err != nil {
@@ -488,6 +491,9 @@ func (t *typesAPI) Parts(ctx context.Context, typeId string) ([]space.PartDef, e
 func (t *typesAPI) AddPart(ctx context.Context, typeId string, draft space.PartDraft) (string, error) {
 	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return "", err
 	}
 	existing, err := t.compiled(ctx, typeId)
 	if err != nil {
@@ -509,6 +515,9 @@ func (t *typesAPI) AddPart(ctx context.Context, typeId string, draft space.PartD
 func (t *typesAPI) PatchPart(ctx context.Context, typeId, partId string, patch space.DatasetDefPatch) error {
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
 	}
 	if partId == "" {
 		return errors.New("typesAPI: part id required")
@@ -610,6 +619,9 @@ func (t *typesAPI) RemovePart(ctx context.Context, typeId, partId string) error 
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
 	if partId == "" {
 		return errors.New("typesAPI: part id required")
 	}
@@ -655,6 +667,9 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId, partId string, draft 
 	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return "", err
+	}
 	if partId == "" {
 		return "", errors.New("typesAPI: part id required")
 	}
@@ -688,6 +703,9 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId, partId string, draft 
 func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft space.DatasetFieldDraft) (string, error) {
 	if t.staticType(typeId) {
 		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return "", err
 	}
 	if draft.Required {
 		// A required field added later would reject the dataset's own
@@ -747,6 +765,9 @@ func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId strin
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
 	if datasetDefId == "" {
 		return errors.New("typesAPI: definition id required")
 	}
@@ -784,6 +805,9 @@ func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
 	// Validate the declaration MINUS the field before writing the
 	// delete: removing e.g. the creator stamp of an author-gated
 	// dataset would invalidate the fold and drop the dataset from
@@ -817,6 +841,9 @@ func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId str
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
 	if defId == "" {
 		return errors.New("typesAPI: definition id required")
 	}
@@ -832,6 +859,9 @@ func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId str
 func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch space.DatasetDefPatch) error {
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
 	}
 	if len(patch.Set) == 0 && len(patch.Unset) == 0 {
 		return nil
@@ -913,6 +943,9 @@ func (t *typesAPI) PatchDatasetField(ctx context.Context, typeId, fieldDefId str
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
 	if fieldDefId == "" {
 		return errors.New("typesAPI: field definition id required")
 	}
@@ -993,6 +1026,9 @@ func (t *typesAPI) Datasets(ctx context.Context, typeId string) ([]space.Dataset
 		}
 		compiled = ct.Datasets
 	} else {
+		if err := t.requireType(ctx, typeId); err != nil {
+			return nil, err
+		}
 		var err error
 		if compiled, err = t.parent.store.DatasetDefs(ctx, typeId); err != nil {
 			return nil, err

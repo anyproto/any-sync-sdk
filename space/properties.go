@@ -34,18 +34,35 @@ import (
 // call per scope instead). One call = one route = one VersionId domain
 // in the returned ModifyResult.
 //
-// AttachType / DetachType modify the object's `any.types` list. Type
-// membership is structural and shared, so both always route through
-// the object's own CRDT (synced).
+// SetType / UnsetType write the object's one type (`any.type`, a
+// scalar LWW register); AttachCollection / DetachCollection edit its
+// collections set (`any.collections`). Membership is structural and
+// shared, so all four always route through the object's own CRDT
+// (synced).
 type PropertiesAPI interface {
 	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
 
-	// Set merges the patch into the object's property record. Patch
-	// keys are propIds; all keys must resolve to the SAME declared
-	// scope. Unknown keys, kind mismatches, and mixed-scope patches
-	// are rejected before anything is written.
-	Set(ctx context.Context, objectId, typeId string, patch map[string]any) (ModifyResult, error)
+	// Set merges the patch into the object's property record. ownerId
+	// is the type or collection whose properties the patch names; keys
+	// are propIds and all must resolve to the SAME declared scope.
+	// Unknown keys, kind mismatches, mixed-scope patches, and an owner
+	// the object does not have are rejected before anything is
+	// written.
+	Set(ctx context.Context, objectId, ownerId string, patch map[string]any) (ModifyResult, error)
 
-	AttachType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
-	DetachType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
+	// SetType replaces the object's type. The previous type's values
+	// and dataset records become orphan data, read-tolerant; its
+	// datasets refuse further writes. A known collection id is refused
+	// (ErrWrongSlot).
+	SetType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
+	// UnsetType clears the object's type: it then has no parts and
+	// renders as properties.
+	UnsetType(ctx context.Context, objectId string) (ModifyResult, error)
+
+	// AttachCollection adds the object to a collection ($addToSet —
+	// idempotent). A known type id is refused (ErrWrongSlot).
+	AttachCollection(ctx context.Context, objectId, collectionId string) (ModifyResult, error)
+	// DetachCollection removes the object from a collection ($pull).
+	// Values in that namespace become orphan data, read-tolerant.
+	DetachCollection(ctx context.Context, objectId, collectionId string) (ModifyResult, error)
 }

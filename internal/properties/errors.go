@@ -23,6 +23,19 @@ const (
 	ReasonKindMismatch       = "kind_mismatch"
 	ReasonScopeMismatch      = "scope_mismatch"
 	ReasonReservedCarrier    = "reserved_carrier"
+	ReasonWrongSlot          = "wrong_slot"
+)
+
+// OwnerKind classifies a definition id for the slot rule: a type
+// belongs in `any.type`, a collection in `any.collections`. Unknown
+// means the id resolves to neither on this device — no definition, or
+// one that has not synced yet — and passes.
+type OwnerKind uint8
+
+const (
+	OwnerUnknown OwnerKind = iota
+	OwnerType
+	OwnerCollection
 )
 
 // Per-reason sentinels. A ValidationError chains to exactly one of these
@@ -38,6 +51,7 @@ var (
 	ErrKindMismatch       = errors.New("property write rejected: value kind does not match the declared kind")
 	ErrScopeMismatch      = errors.New("property write rejected: write route does not match the property's declared scope")
 	ErrReservedCarrier    = errors.New("property write rejected: a type declaring a reserved module is carried only by its own root")
+	ErrWrongSlot          = errors.New("property write rejected: a type goes in any.type, a collection in any.collections")
 )
 
 // reasonErr maps a Reason discriminant to its sentinel. Unknown reasons
@@ -58,6 +72,8 @@ func reasonErr(reason string) error {
 		return ErrScopeMismatch
 	case ReasonReservedCarrier:
 		return ErrReservedCarrier
+	case ReasonWrongSlot:
+		return ErrWrongSlot
 	}
 	return nil
 }
@@ -87,8 +103,15 @@ type ValidationError struct {
 	WriteRoute    schema.Scope
 
 	Known []types.PropInfo // declared properties of the type (unknown_property)
-	Types []string         // the object's any.types (type_not_implemented)
-	Path  []string         // offending op path (invalid_path)
+	// Members is what the object is after the change — its type and
+	// its collections (type_not_implemented).
+	Members []string
+	Path    []string // offending op path (invalid_path)
+
+	// Slot is the membership field the id was written to and Kind
+	// what the id names (wrong_slot).
+	Slot string
+	Kind OwnerKind
 
 	// ObjectId is the row the write targets (reserved_carrier).
 	ObjectId string
@@ -101,8 +124,11 @@ func (e *ValidationError) Error() string {
 		return fmt.Sprintf("property write rejected: path must be {typeId}.{propId} (or deeper under an object property); got %q",
 			strings.Join(e.Path, "."))
 	case ReasonTypeNotImplemented:
-		return fmt.Sprintf("property write rejected: object does not implement type %s; attach it to any.types before writing %s.* values. Current types: [%s]",
-			e.typeLabel(), e.TypeId, strings.Join(e.Types, ", "))
+		return fmt.Sprintf("property write rejected: object does not have %s; set it as any.type or add it to any.collections before writing %s.* values. Current members: [%s]",
+			e.typeLabel(), e.TypeId, strings.Join(e.Members, ", "))
+	case ReasonWrongSlot:
+		return fmt.Sprintf("property write rejected: %s is a %s and cannot be written to any.%s",
+			e.typeLabel(), e.Kind, e.Slot)
 	case ReasonTypeUnknown:
 		return fmt.Sprintf("property write rejected: type %s has no resolvable schema on this peer; define its properties (or wait for the type to sync) before writing %s.* values",
 			e.typeLabel(), e.TypeId)
@@ -131,6 +157,17 @@ func (e *ValidationError) Unwrap() []error {
 		return []error{crdt.ErrValidation, r}
 	}
 	return []error{crdt.ErrValidation}
+}
+
+// String renders the OwnerKind for messages.
+func (k OwnerKind) String() string {
+	switch k {
+	case OwnerType:
+		return "type"
+	case OwnerCollection:
+		return "collection"
+	}
+	return "unknown"
 }
 
 // typeLabel is `"Name" (id)` when a display name is known, else `(id)`.

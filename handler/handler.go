@@ -329,8 +329,8 @@ func Leaf(k PropertyKind) *FieldShape { return schema.Leaf(schema.Kind(k)) }
 // A Type is a uniform declaration of what it owns: zero or more
 // Datasets and/or zero or more Properties. Any combination is valid —
 // dataset-only (e.g. an editor body tree), property-only (values in the
-// shared `objects` namespace, e.g. a nav type), both, or neither (a
-// pure declaration / tag in any.types). Only a non-empty Id is required.
+// shared `objects` namespace), both, or neither (a pure declaration an
+// object names as its `any.type`). Only a non-empty Id is required.
 //
 // Display metadata (Name / Description / IconCID) is surfaced via
 // space.Types().List() and Get() alongside user-created types, so
@@ -390,6 +390,34 @@ type Type struct {
 	// (space.TypeInfo.Hidden): a client shows it only on request. For a
 	// capability type an object opts into rather than a class a user
 	// picks.
+	Hidden bool
+}
+
+// Collection is a registered collection: a definition objects are
+// filed under, with property definitions and nothing else — no
+// datasets, no parts, no layout. The compiled-in twin of a collection
+// a user creates through space.CollectionsAPI.Create; surfaced by
+// Collections().List / Get with BuiltIn set, immutable at runtime.
+// Callers register them via config.Config.Collections.
+type Collection struct {
+	// Id is the collection identifier — a stable id the caller
+	// controls. Must be non-empty and distinct from every registered
+	// type and reserved id.
+	Id string
+
+	// Name / Description / IconCID are the display slice; Name falls
+	// back to Id when empty.
+	Name        string
+	Description string
+	IconCID     string
+
+	// Properties declares the collection's property definitions for
+	// the per-space `objects` namespace keyed by Id — validated on
+	// write exactly like a registered type's.
+	Properties []PropertyDecl
+
+	// Hidden keeps the collection out of default listings and pickers
+	// (space.CollectionInfo.Hidden).
 	Hidden bool
 }
 

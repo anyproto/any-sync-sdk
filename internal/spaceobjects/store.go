@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 
 	anystorev1 "github.com/anyproto/any-store"
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
@@ -52,6 +54,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -158,8 +161,12 @@ type Store struct {
 	// handlers are carried onto every per-object Controller
 	// alongside the built-ins. dataVersions overlays the built-in
 	// map with each type's registered handlers.
-	extTypes     []handler.Type
-	dataVersions map[string]string
+	extTypes []handler.Type
+	// extCollections are the caller-supplied registered collections:
+	// properties only, surfaced by Collections().List next to the
+	// user-created ones.
+	extCollections []handler.Collection
+	dataVersions   map[string]string
 	// datasetOwners maps an external type-owned dataset name to the
 	// typeId that owns it (N datasets → one owner). Built from extTypes.
 	// Used to enforce that an object implements a type before writing to
@@ -383,6 +390,9 @@ type StoreConfig struct {
 	// ExtTypes is the caller-supplied type catalog.
 	ExtTypes []handler.Type
 
+	// ExtCollections is the caller-supplied collection catalog.
+	ExtCollections []handler.Collection
+
 	// Modules are the caller-supplied dataset modules (the built-in
 	// records module is always present).
 	Modules []handler.Module
@@ -411,13 +421,13 @@ type StoreConfig struct {
 // catalog. Validation happens in ValidateExternalTypes /
 // ValidateExternalModules — call them before NewStore at the SDK
 // boundary so collisions are caught at Open time.
-func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type, modules []handler.Module) *Store {
+func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) *Store {
 	var selectiveTypes []string
 	if app != nil {
 		selectiveTypes = app.SelectiveTreeTypes()
 	}
 	return NewStoreWithConfig(StoreConfig{
-		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes, Modules: modules,
+		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes, ExtCollections: extCollections, Modules: modules,
 		SelectiveTypes: selectiveTypes,
 	})
 }
@@ -580,8 +590,9 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 			}
 		}
 	}
-	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, cfg.Modules))
+	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, cfg.ExtCollections, cfg.Modules))
 	s.extTypes = cfg.ExtTypes
+	s.extCollections = cfg.ExtCollections
 	s.dataVersions = dv
 	s.datasetOwners = owners
 	s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
@@ -636,8 +647,8 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 // module name.
 //
 // Returns typeId → propId → PropInfo. Safe with nil/empty extTypes.
-func buildStaticSchema(extTypes []handler.Type, modules []handler.Module) map[string]map[string]types.PropInfo {
-	static := make(map[string]map[string]types.PropInfo, 3+len(extTypes)+len(modules))
+func buildStaticSchema(extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) map[string]map[string]types.PropInfo {
+	static := make(map[string]map[string]types.PropInfo, 4+len(extTypes)+len(extCollections)+len(modules))
 	for _, m := range modules {
 		props := make(map[string]types.PropInfo, len(m.Properties))
 		for _, p := range m.Properties {
@@ -666,6 +677,21 @@ func buildStaticSchema(extTypes []handler.Type, modules []handler.Module) map[st
 		mtProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
 	}
 	static[typetype.TypeId] = mtProps
+
+	// The meta-collection's namespace, for the same reason.
+	mcProps := make(map[string]types.PropInfo, len(collectiontype.Properties))
+	for _, p := range collectiontype.Properties {
+		mcProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
+	}
+	static[collectiontype.TypeId] = mcProps
+
+	for _, c := range extCollections {
+		props := make(map[string]types.PropInfo, len(c.Properties))
+		for _, p := range c.Properties {
+			props[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: propertyKindToSchema(p.Kind), Scope: p.Scope}
+		}
+		static[c.Id] = props
+	}
 
 	for _, t := range extTypes {
 		if len(t.Properties) == 0 {
@@ -713,9 +739,44 @@ func propertyKindToSchema(k handler.PropertyKind) schema.Kind {
 // the static schema and a row in Types().List, so a caller-registered
 // type may not claim one.
 var ReservedTypeIds = map[string]struct{}{
-	anytype.TypeId:    {},
-	spaceindex.TypeId: {},
-	typetype.TypeId:   {},
+	anytype.TypeId:        {},
+	spaceindex.TypeId:     {},
+	typetype.TypeId:       {},
+	collectiontype.TypeId: {},
+}
+
+// ValidateExternalCollections checks the caller-supplied collections:
+// non-empty unique ids, disjoint from the registered types and the
+// reserved ids, and well-formed property declarations. Called once at
+// sdk.Open after ValidateExternalTypes.
+func ValidateExternalCollections(extTypes []handler.Type, extCollections []handler.Collection) error {
+	typeIds := make(map[string]struct{}, len(extTypes))
+	for _, t := range extTypes {
+		typeIds[t.Id] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(extCollections))
+	for i, c := range extCollections {
+		if c.Id == "" {
+			return fmt.Errorf("spaceobjects: collection[%d]: empty Id", i)
+		}
+		if _, dup := seen[c.Id]; dup {
+			return fmt.Errorf("spaceobjects: collection[%d]: duplicate collection Id %q", i, c.Id)
+		}
+		if _, reserved := ReservedTypeIds[c.Id]; reserved {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is reserved for a built-in", i, c.Id)
+		}
+		if c.Id == typetype.MetaTypeMarker || c.Id == collectiontype.MetaMarker {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is a reserved marker", i, c.Id)
+		}
+		if _, isType := typeIds[c.Id]; isType {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is also a registered type", i, c.Id)
+		}
+		seen[c.Id] = struct{}{}
+		if err := validatePropertyDecls(c.Id, c.Properties); err != nil {
+			return fmt.Errorf("spaceobjects: collection[%d]: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // ValidateExternalTypes checks the caller-supplied catalog against
@@ -779,29 +840,38 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 		if err := validateStaticParts(t); err != nil {
 			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
 		}
-		seenProps := make(map[string]struct{}, len(t.Properties))
-		for k, p := range t.Properties {
-			if p.Id == "" {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: empty Id", i, t.Id, k)
-			}
-			if p.Id == "id" || strings.HasPrefix(p.Id, "_") || strings.ContainsAny(p.Id, ".") {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: reserved or invalid Id %q (no \"id\", no \"_\" prefix, no dots)", i, t.Id, k, p.Id)
-			}
-			if propertyKindToSchema(p.Kind) == schema.KindUnknown {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d] (%q): invalid Kind %d", i, t.Id, k, p.Id, p.Kind)
-			}
-			// Scope: zero (defaults to synced) or an explicit creatable
-			// class. Derived is reserved for SDK built-ins.
-			switch p.Scope {
-			case 0, schema.ScopeSynced, schema.ScopeAccount, schema.ScopeLocal:
-			default:
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d] (%q): invalid Scope %d (synced/account/local only)", i, t.Id, k, p.Id, p.Scope)
-			}
-			if _, dup := seenProps[p.Id]; dup {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: duplicate property Id %q", i, t.Id, k, p.Id)
-			}
-			seenProps[p.Id] = struct{}{}
+		if err := validatePropertyDecls(t.Id, t.Properties); err != nil {
+			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
 		}
+	}
+	return nil
+}
+
+// validatePropertyDecls checks a registered type's or collection's
+// static property declarations: well-formed unique ids, a known kind,
+// a creatable scope (zero defaults to synced; derived is reserved for
+// SDK built-ins).
+func validatePropertyDecls(ownerId string, decls []handler.PropertyDecl) error {
+	seenProps := make(map[string]struct{}, len(decls))
+	for k, p := range decls {
+		if p.Id == "" {
+			return fmt.Errorf("(%q) property[%d]: empty Id", ownerId, k)
+		}
+		if p.Id == "id" || strings.HasPrefix(p.Id, "_") || strings.ContainsAny(p.Id, ".") {
+			return fmt.Errorf("(%q) property[%d]: reserved or invalid Id %q (no \"id\", no \"_\" prefix, no dots)", ownerId, k, p.Id)
+		}
+		if propertyKindToSchema(p.Kind) == schema.KindUnknown {
+			return fmt.Errorf("(%q) property[%d] (%q): invalid Kind %d", ownerId, k, p.Id, p.Kind)
+		}
+		switch p.Scope {
+		case 0, schema.ScopeSynced, schema.ScopeAccount, schema.ScopeLocal:
+		default:
+			return fmt.Errorf("(%q) property[%d] (%q): invalid Scope %d (synced/account/local only)", ownerId, k, p.Id, p.Scope)
+		}
+		if _, dup := seenProps[p.Id]; dup {
+			return fmt.Errorf("(%q) property[%d]: duplicate property Id %q", ownerId, k, p.Id)
+		}
+		seenProps[p.Id] = struct{}{}
 	}
 	return nil
 }
@@ -1096,6 +1166,10 @@ func (s *Store) Registry() *types.LiveRegistry { return s.reg }
 // alongside user-created types.
 func (s *Store) ExternalTypes() []handler.Type { return s.extTypes }
 
+// ExternalCollections returns the caller-registered collections
+// (config.Config.Collections).
+func (s *Store) ExternalCollections() []handler.Collection { return s.extCollections }
+
 // SpaceId returns the id of the space this store serves.
 func (s *Store) SpaceId() string { return s.spaceId }
 
@@ -1124,6 +1198,7 @@ func (s *Store) DatasetOwners(dataset string) ([]string, bool) {
 func (s *Store) objectsHandler() *properties.SystemPropertiesHandler {
 	h := properties.NewWithGrants(s.reg, s.ModuleGrants)
 	h.ReservedCarrier = s.ReservedCarrier
+	h.Classify = s.Classify
 	return h
 }
 
@@ -1185,31 +1260,98 @@ func (s *Store) counterNamespace(dataset string) string {
 	return s.catalog.snapshot().moduleOf[dataset]
 }
 
-// ObjectTypes returns the typeIds an object implements (its any.types),
-// read from the shared per-space `objects` row. Returns (nil, nil) when
-// the object has no row yet — callers treat that as "implements nothing".
-func (s *Store) ObjectTypes(ctx context.Context, objectId string) ([]string, error) {
+// ObjectMembers is what an object is: its one type (`any.type` — the
+// marker on a definition object, empty when it has none) and the
+// collections it belongs to (`any.collections`), read from the shared
+// per-space `objects` row. A missing row reads as nothing at all.
+type ObjectMembers struct {
+	Type        string
+	Collections []string
+}
+
+// Has reports whether ownerId is the object's type or one of its
+// collections.
+func (m ObjectMembers) Has(ownerId string) bool {
+	if ownerId != "" && m.Type == ownerId {
+		return true
+	}
+	return slices.Contains(m.Collections, ownerId)
+}
+
+// ObjectMembers reads the object's membership off its row.
+func (s *Store) ObjectMembers(ctx context.Context, objectId string) (ObjectMembers, error) {
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
-		return nil, err
+		return ObjectMembers{}, err
 	}
 	doc, err := coll.FindId(ctx, objectId)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
-			return nil, nil
+			return ObjectMembers{}, nil
 		}
-		return nil, err
+		return ObjectMembers{}, err
+	}
+	return ObjectMembersOfRow(doc.Value()), nil
+}
+
+// ObjectMembersOfRow decodes the membership fields of an objects row.
+func ObjectMembersOfRow(v *anyenc.Value) ObjectMembers {
+	if v == nil {
+		return ObjectMembers{}
+	}
+	m := ObjectMembers{Type: v.GetString(anytype.TypeId, anytype.FieldType)}
+	arr := v.GetArray(anytype.TypeId, anytype.FieldCollections)
+	if len(arr) > 0 {
+		m.Collections = make([]string, 0, len(arr))
+		for _, e := range arr {
+			m.Collections = append(m.Collections, string(e.GetStringBytes()))
+		}
+	}
+	return m
+}
+
+// Classify reports what a definition id names on this device: a type
+// (registered, reserved, or a live `__type__` row), a collection
+// (registered or a live `__collection__` row), or unknown (nothing
+// resolvable here — a definition that has not synced yet, or no
+// definition at all). The properties handler consults it on the local
+// write pre-flight so a known id lands only in its own slot.
+func (s *Store) Classify(ctx context.Context, id string) properties.OwnerKind {
+	if id == "" {
+		return properties.OwnerUnknown
+	}
+	if _, reserved := ReservedTypeIds[id]; reserved {
+		return properties.OwnerType
+	}
+	for _, t := range s.extTypes {
+		if t.Id == id {
+			return properties.OwnerType
+		}
+	}
+	for _, c := range s.extCollections {
+		if c.Id == id {
+			return properties.OwnerCollection
+		}
+	}
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return properties.OwnerUnknown
+	}
+	doc, err := coll.FindId(ctx, id)
+	if err != nil {
+		return properties.OwnerUnknown
 	}
 	v := doc.Value()
-	if v == nil {
-		return nil, nil
+	if v == nil || v.Get(crdt.DeletedAtField) != nil {
+		return properties.OwnerUnknown
 	}
-	arr := v.GetArray("any", "types")
-	out := make([]string, 0, len(arr))
-	for _, e := range arr {
-		out = append(out, string(e.GetStringBytes()))
+	switch v.GetString(anytype.TypeId, anytype.FieldType) {
+	case typetype.MetaTypeMarker:
+		return properties.OwnerType
+	case collectiontype.MetaMarker:
+		return properties.OwnerCollection
 	}
-	return out, nil
+	return properties.OwnerUnknown
 }
 
 // RegularObjectCount returns the count of rows in the per-space
@@ -1277,16 +1419,22 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
 	}
-	// Sparse index on `any.types` so the type-marker query
-	// (typesAPI.List → `any.types $in ["__type__"]`) doesn't scan
-	// every object's row. Sparse keeps the index small: only rows
-	// that actually carry a type list contribute entries. EnsureIndex
-	// is idempotent — safe to call on every fresh open.
-	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
-		Fields: []string{"any.types"},
-		Sparse: true,
-	}); err != nil {
-		return nil, fmt.Errorf("spaceobjects: ensure any.types index: %w", err)
+	// Sparse indexes on the membership fields: `any.type` serves the
+	// marker scans (Types().List → `any.type == "__type__"`, the
+	// catalog) and member queries by type, `any.collections` member
+	// queries by collection. Sparse keeps them small: only rows that
+	// carry the field contribute entries. EnsureIndex is idempotent —
+	// safe to call on every fresh open.
+	for _, field := range []string{
+		anytype.TypeId + "." + anytype.FieldType,
+		anytype.TypeId + "." + anytype.FieldCollections,
+	} {
+		if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+			Fields: []string{field},
+			Sparse: true,
+		}); err != nil {
+			return nil, fmt.Errorf("spaceobjects: ensure %s index: %w", field, err)
+		}
 	}
 	// Dense ascending index on the derived `modifiedAt` stamp — the
 	// recency ordering (`sort: ["-modifiedAt"]`) is the default object-

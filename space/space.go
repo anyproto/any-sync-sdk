@@ -46,8 +46,13 @@ type Space interface {
 	// Members returns the members-collection view.
 	Members() MembersAPI
 
-	// Types manages type objects and property definitions.
+	// Types manages type objects (and, through PropertyDefsAPI, the
+	// property definitions of types and collections alike).
 	Types() TypesAPI
+
+	// Collections manages collection objects — definitions with
+	// properties only, which objects are filed under.
+	Collections() CollectionsAPI
 
 	// Properties reads computed property values and performs
 	// base/account/device scope writes.

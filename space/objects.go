@@ -33,7 +33,7 @@ var ErrObjectNotFound = errors.New("space: object not found")
 // happen at the space level keyed by objectId.
 type ObjectService interface {
 	// Get returns the object's row from the per-space objects
-	// collection (any.types and property values). An object whose tree
+	// collection (membership and property values). An object whose tree
 	// is present locally but that never wrote a row returns {id} only;
 	// ErrNotFound when the id is unknown here, ErrObjectDeleted when
 	// the object's tree is deleted — both read from the space's
@@ -41,7 +41,7 @@ type ObjectService interface {
 	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
 
 	// Create a fresh object. Returns the any-sync-assigned objectId.
-	// Types attached here seed the object's any.types list at birth;
+	// Type and Collections seed the object's membership at birth;
 	// InitialProperties seeds the per-space properties record.
 	Create(ctx context.Context, opts CreateObjectOpts) (objectId string, err error)
 
@@ -56,21 +56,27 @@ type ObjectService interface {
 
 // CreateObjectOpts is the input to ObjectService.Create.
 type CreateObjectOpts struct {
-	// Types attaches type objects at birth. Each typeId is appended to
-	// any.types.
-	Types []string
+	// Type is the object's one type (`any.type`). Empty = no type: the
+	// object has no parts and renders as properties.
+	Type string
+	// Collections are the collections the object is filed under at
+	// birth (`any.collections`).
+	Collections []string
 
 	// InitialProperties seeds base-scope property values. Keyed by
-	// typeId → propId → value.
+	// owner (the type or a collection) → propId → value. An owner the
+	// object does not have is rejected — name it in Type / Collections.
 	InitialProperties map[string]map[string]any
 }
 
 // DeriveObjectOpts is the input to ObjectService.Derive.
 type DeriveObjectOpts struct {
 	Seed []byte
-	// Types to attach on first materialization. Ignored on subsequent
-	// calls once the object exists.
-	Types []string
+	// Type is set on first materialization when the object has none
+	// yet; a type it already has is never replaced. Collections it
+	// lacks are added on every call ($addToSet, idempotent).
+	Type        string
+	Collections []string
 
 	// ParentId derives the object as a child bound to this parent. The
 	// parent id is hashed into the child's derived id, so a child is

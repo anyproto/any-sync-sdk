@@ -81,7 +81,7 @@ func run() error {
 	// InitialProperties seeds base-scope values in one step (saves a
 	// separate SetBase roundtrip).
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 		InitialProperties: map[string]map[string]any{
 			typeId: {
 				"title": "Research",

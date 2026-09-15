@@ -24,9 +24,9 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
-	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -134,18 +134,19 @@ func (b *bundlesAPI) Ensure(ctx context.Context, req space.EnsureBundleRequest, 
 			if err != nil {
 				return space.Bundle{}, false, err
 			}
-			// Types before declarations: the declaring writes land on
-			// a type object, so the marker must be on the row first.
+			// Membership before declarations: the declaring writes land
+			// on a definition object, so the marker must be on the row
+			// first.
 			if err := b.stampRoot(ctx, rootId, req, true); err != nil {
 				return space.Bundle{}, false, fmt.Errorf("spaceimpl: bundles: stamp root %q: %w", rootId, err)
 			}
 			if err := b.declareType(ctx, rootId, req); err != nil {
 				return space.Bundle{}, false, err
 			}
-		} else if req.DeclaresType() {
+		} else if req.Declares() {
 			// Created winner: heal what the root lacks when its tree is
-			// local — a type or handle the request gained since the
-			// install (the stamp attaches / fills only what is absent),
+			// local — a collection or handle the request gained since
+			// the install (the stamp adds / fills only what is absent),
 			// then the declaration when the root carries none (crash
 			// between the registering write and declaring). A winner
 			// whose tree has not arrived is left alone — the
@@ -245,25 +246,48 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 		}
 	} else {
 		// NewRoot == nil is the SDK-minted created root: Ensure creates
-		// a bare object and stamps it as its own type — the only shape
-		// a space whose free object create is fenced (the tech space)
-		// can use. The type declaration gives that root its purpose.
-		if req.NewRoot == nil && !req.DeclaresType() {
-			return fmt.Errorf("spaceimpl: %w: NewRoot or a type declaration (Parts / Properties / XKey) required", space.ErrBundleBadRequest)
+		// a bare object and stamps it as its own definition — the only
+		// shape a space whose free object create is fenced (the tech
+		// space) can use. The declaration gives that root its purpose.
+		if req.NewRoot == nil && !req.Declares() {
+			return fmt.Errorf("spaceimpl: %w: NewRoot or a declaration (Parts / Properties / XKey) required", space.ErrBundleBadRequest)
 		}
 		// A caller-minted root got its initial state from NewRoot;
 		// only a root Ensure mints takes it from the request.
-		if req.NewRoot != nil && (len(req.RootTypes) > 0 || len(req.RootProperties) > 0) {
-			return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties apply to a root Ensure mints (DerivedRoot, or a created root with a type declaration) — a NewRoot root gets its initial state from NewRoot", space.ErrBundleBadRequest)
+		if req.NewRoot != nil && (req.RootType != "" || len(req.RootCollections) > 0 || len(req.RootProperties) > 0) {
+			return fmt.Errorf("spaceimpl: %w: RootType/RootCollections/RootProperties apply to a root Ensure mints (DerivedRoot, or a created root with a declaration) — a NewRoot root gets its initial state from NewRoot", space.ErrBundleBadRequest)
 		}
 	}
-	if !req.DeclaresType() && (len(req.Layout) > 0 || req.Weight != 0 || req.Hidden) {
-		// Rendering and listing metadata describe a type; a root with
-		// no declaration is not one.
-		return fmt.Errorf("spaceimpl: %w: Layout/Weight/Hidden need a type declaration (Parts / Properties / XKey)", space.ErrBundleBadRequest)
+	if req.Collection {
+		if len(req.Parts) > 0 {
+			return fmt.Errorf("spaceimpl: %w: a collection declares no parts", space.ErrBundleBadRequest)
+		}
+		if len(req.Layout) > 0 {
+			return fmt.Errorf("spaceimpl: %w: a collection has no layout", space.ErrBundleBadRequest)
+		}
+		if !req.DeclaresCollection() && req.Hidden {
+			return fmt.Errorf("spaceimpl: %w: Hidden needs a declaration (Properties / XKey)", space.ErrBundleBadRequest)
+		}
+	} else if !req.DeclaresType() && (len(req.Layout) > 0 || req.Hidden) {
+		// Rendering and listing metadata describe a definition; a root
+		// with no declaration is not one.
+		return fmt.Errorf("spaceimpl: %w: Layout/Hidden need a type declaration (Parts / Properties / XKey)", space.ErrBundleBadRequest)
 	}
-	if !req.DeclaresType() && req.SelfTyped {
-		return fmt.Errorf("spaceimpl: %w: SelfTyped needs a type declaration (Parts / Properties / XKey) — there is no type for the root to carry", space.ErrBundleBadRequest)
+	if req.Declares() && req.RootType != "" {
+		// A definition object carries its marker in the type slot; it
+		// has no type of its own.
+		return fmt.Errorf("spaceimpl: %w: RootType and a declaration are exclusive — a definition root carries its marker in any.type", space.ErrBundleBadRequest)
+	}
+	if req.RootType == typetype.MetaTypeMarker || req.RootType == collectiontype.MetaMarker {
+		return fmt.Errorf("spaceimpl: %w: RootType names a marker — declare instead", space.ErrBundleBadRequest)
+	}
+	for _, c := range req.RootCollections {
+		if c == "" {
+			return fmt.Errorf("spaceimpl: %w: RootCollections: empty id", space.ErrBundleBadRequest)
+		}
+		if c == typetype.MetaTypeMarker || c == collectiontype.MetaMarker || c == anytype.TypeId {
+			return fmt.Errorf("spaceimpl: %w: RootCollections names %q", space.ErrBundleBadRequest, c)
+		}
 	}
 	if len(req.Layout) > 0 {
 		// Probed here so a bad layout fails before any root is minted,
@@ -275,18 +299,18 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 	// Seeded values likewise: an SDK-minted created root is minted
 	// before the stamp that carries them, so a value that cannot be
 	// encoded must fail here, not leave an orphan per attempt. Whether
-	// a seeded type resolves on this device is the write's verdict.
+	// a seeded owner resolves on this device is the write's verdict.
 	arena := &anyenc.Arena{}
-	for typeId, kv := range req.RootProperties {
-		if typeId == "" {
-			return fmt.Errorf("spaceimpl: %w: RootProperties: empty type id", space.ErrBundleBadRequest)
+	for ownerId, kv := range req.RootProperties {
+		if ownerId == "" {
+			return fmt.Errorf("spaceimpl: %w: RootProperties: empty owner id", space.ErrBundleBadRequest)
 		}
 		for propId, v := range kv {
 			if propId == "" {
-				return fmt.Errorf("spaceimpl: %w: RootProperties[%s]: empty property id", space.ErrBundleBadRequest, typeId)
+				return fmt.Errorf("spaceimpl: %w: RootProperties[%s]: empty property id", space.ErrBundleBadRequest, ownerId)
 			}
 			if _, err := goToAnyenc(arena, v); err != nil {
-				return fmt.Errorf("spaceimpl: %w: RootProperties[%s.%s]: %w", space.ErrBundleBadRequest, typeId, propId, err)
+				return fmt.Errorf("spaceimpl: %w: RootProperties[%s.%s]: %w", space.ErrBundleBadRequest, ownerId, propId, err)
 			}
 		}
 	}
@@ -296,14 +320,16 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 	return validateBundleProperties(req.Properties)
 }
 
-// preflightType fails a type-declaring request before the permanent
-// root is derived: a RootProperties key equal to the root's own id
-// (its property ids are not known before the install, so nothing can
-// seed them). Collection names cannot collide — a namespaced dataset
-// lives under the root's own id and a shared one is the module's
-// canonical collection — so there is no name ownership to settle.
+// preflightType fails a declaring request before the permanent root
+// is derived: a RootProperties key or RootCollections entry equal to
+// the root's own id. The root's own values are seeded through its
+// declaration (Properties with deterministic ids), never by naming
+// the root as an owner. Collection names cannot collide — a namespaced
+// dataset lives under the root's own id and a shared one is the
+// module's canonical collection — so there is no name ownership to
+// settle.
 func (b *bundlesAPI) preflightType(ctx context.Context, req space.EnsureBundleRequest) error {
-	if !req.DeclaresType() {
+	if !req.Declares() {
 		return nil
 	}
 	canonical, err := b.canonicalRootId(ctx, req.Id)
@@ -311,13 +337,10 @@ func (b *bundlesAPI) preflightType(ctx context.Context, req space.EnsureBundleRe
 		return fmt.Errorf("spaceimpl: bundles: canonical root of %q: %w", req.Id, err)
 	}
 	if _, self := req.RootProperties[canonical]; self {
-		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — its property ids exist only once installed", space.ErrBundleBadRequest)
+		return fmt.Errorf("spaceimpl: %w: RootProperties keyed by the root's own id — a definition object implements itself; seed its values through Properties", space.ErrBundleBadRequest)
 	}
-	// The self type is SelfTyped's to ask for, so the flag stays the
-	// one record of that intent; a computable derived id must not
-	// smuggle it in through RootTypes.
-	if slices.Contains(req.RootTypes, canonical) {
-		return fmt.Errorf("spaceimpl: %w: RootTypes names the root's own id — ask for SelfTyped", space.ErrBundleBadRequest)
+	if slices.Contains(req.RootCollections, canonical) {
+		return fmt.Errorf("spaceimpl: %w: RootCollections names the root's own id — a definition object implements itself", space.ErrBundleBadRequest)
 	}
 	return nil
 }
@@ -598,65 +621,53 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 	return rootId, nil
 }
 
-// installRootTypes is what a root Ensure mints implements: the
-// requested types plus every type RootProperties writes into (a
-// property write to a type the object does not implement is
-// rejected). A root that declares a type is a type object — the type
-// marker comes first; a self-typed one is also an instance of itself —
-// its own id follows the marker. `any` is universal and never listed.
-// Nil when there is nothing to attach.
-func installRootTypes(req space.EnsureBundleRequest, rootId string, declares, self bool) []string {
-	seen := map[string]struct{}{anytype.TypeId: {}}
-	out := make([]string, 0, len(req.RootTypes)+len(req.RootProperties)+2)
-	if declares {
-		seen[typetype.MetaTypeMarker] = struct{}{}
-		out = append(out, typetype.MetaTypeMarker)
-		if self {
-			seen[rootId] = struct{}{}
-			out = append(out, rootId)
-		}
+// installRootMembers is what a root Ensure mints is: its type — the
+// marker when the request declares a definition, RootType otherwise,
+// empty for a bare root — and its collections: RootCollections plus
+// every RootProperties owner that is neither the type nor the root
+// itself (a property write to an owner the object does not have is
+// rejected). `any` is universal and never listed.
+func installRootMembers(req space.EnsureBundleRequest) spaceobjects.ObjectMembers {
+	m := spaceobjects.ObjectMembers{}
+	switch {
+	case req.DeclaresType():
+		m.Type = typetype.MetaTypeMarker
+	case req.DeclaresCollection():
+		m.Type = collectiontype.MetaMarker
+	default:
+		m.Type = req.RootType
 	}
-	for _, t := range req.RootTypes {
-		if _, dup := seen[t]; dup {
+	seen := map[string]struct{}{anytype.TypeId: {}}
+	if m.Type != "" {
+		seen[m.Type] = struct{}{}
+	}
+	for _, c := range req.RootCollections {
+		if _, dup := seen[c]; dup {
 			continue
 		}
-		seen[t] = struct{}{}
-		out = append(out, t)
+		seen[c] = struct{}{}
+		m.Collections = append(m.Collections, c)
 	}
 	// Sorted: map order would make the attach change differ per call
 	// for no reason.
-	for _, t := range slices.Sorted(maps.Keys(req.RootProperties)) {
-		if _, dup := seen[t]; dup {
+	for _, c := range slices.Sorted(maps.Keys(req.RootProperties)) {
+		if _, dup := seen[c]; dup {
 			continue
 		}
-		seen[t] = struct{}{}
-		out = append(out, t)
+		seen[c] = struct{}{}
+		m.Collections = append(m.Collections, c)
 	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return m
 }
 
-// selfTyped reports whether the root carries the type it declares:
-// asked for, or forced by a part declaring a reserved module — such a
-// type is carried by its own root and nothing else, so a root that did
-// not carry it would leave the module's collection unreachable.
-func selfTyped(req space.EnsureBundleRequest, modules types.Modules) bool {
-	if !req.DeclaresType() {
-		return false
+// metaNamespace is the objects-row namespace a declaring root's
+// metadata lives under: `type` for a type, `collection` for a
+// collection.
+func metaNamespace(req space.EnsureBundleRequest) string {
+	if req.DeclaresCollection() {
+		return collectiontype.TypeId
 	}
-	if req.SelfTyped {
-		return true
-	}
-	for i := range req.Parts {
-		for j := range req.Parts[i].Datasets {
-			if modules.Reserved(req.Parts[i].Datasets[j].Module) {
-				return true
-			}
-		}
-	}
-	return false
+	return typetype.TypeId
 }
 
 // canonicalRootId is the id the bundle's derived root has in this
@@ -834,16 +845,17 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
 }
 
-// stampRoot writes a bundle root's first content change: the types it
-// implements (the marker when it declares a type, its own id when it is
-// self-typed, RootTypes, every type RootProperties writes into), `any.name`, the
-// type's metadata (`type.xkey` / `layout` / `weight` / `hidden`) and
-// the seeded RootProperties values — ONE `objects` change, so a peer
-// sees the row whole and the DAG carries no attach-then-name chatter.
-// The local-write pre-flight grants every namespace the change itself
-// attaches, so `type.*` and the seeded types' values validate in the
-// same change. The seeds ride their own op: a value a peer cannot
-// resolve drops that op alone, never the types or the name.
+// stampRoot writes a bundle root's first content change: its
+// membership (the marker when it declares a definition, or RootType;
+// RootCollections and every collection RootProperties writes into),
+// `any.name`, the definition's metadata (`xkey` / `layout` / `hidden`
+// under `type` or `collection`) and the seeded RootProperties values
+// — ONE `objects` change, so a peer sees the row whole and the DAG
+// carries no attach-then-name chatter. The local-write pre-flight
+// grants every namespace the change itself sets, so the metadata and
+// the seeded values validate in the same change. The seeds ride their
+// own op: a value a peer cannot resolve drops that op alone, never
+// the membership or the name.
 //
 // Load-bearing despite looking cosmetic: it guarantees the root tree
 // carries a non-root change (see the Ensure call site).
@@ -851,10 +863,11 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 // A row that already carries a name — a derived root materialized by
 // every device that installs it, an adopted winner, a NewRoot the
 // caller named — is not renamed and its metadata is not patched; what
-// it LACKS is still written: a type the request lists that the row
-// does not carry ($addToSet, idempotent), and a handle when the row
-// has none. Seeds belong to the install: an adopt never writes them,
-// the installer's values sync in.
+// it LACKS is still written: a type when the row has none, a
+// collection the request lists that the row does not carry
+// ($addToSet, idempotent), and a handle when the row has none. Seeds
+// belong to the install: an adopt never writes them, the installer's
+// values sync in.
 func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.EnsureBundleRequest, adopt bool) error {
 	obj, err := b.parent.store.Get(ctx, rootId)
 	if err != nil {
@@ -864,39 +877,45 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 	if name == "" {
 		name = req.Id
 	}
-	declares := req.DeclaresType()
-	types := installRootTypes(req, rootId, declares, selfTyped(req, b.parent.store.Modules()))
+	declares := req.Declares()
+	ns := metaNamespace(req)
+	want := installRootMembers(req)
 
 	row := obj.Controller().Get(ctx, properties.Dataset, rootId)
-	have := map[string]struct{}{}
+	have := spaceobjects.ObjectMembers{}
 	named := false
 	if row != nil {
-		for _, v := range row.GetArray(anytype.TypeId, "types") {
-			have[string(v.GetStringBytes())] = struct{}{}
-		}
+		have = spaceobjects.ObjectMembersOfRow(row)
 		if cur := row.Get(anytype.TypeId, "name"); cur != nil {
 			named = adopt || string(cur.GetStringBytes()) == name
 		}
 	}
+	setType := ""
+	if want.Type != "" && have.Type == "" {
+		setType = want.Type
+	}
 	var missing []string
-	for _, t := range types {
-		if _, ok := have[t]; !ok {
-			missing = append(missing, t)
+	for _, c := range want.Collections {
+		if !slices.Contains(have.Collections, c) {
+			missing = append(missing, c)
 		}
 	}
 	healXKey := named && declares && req.XKey != "" &&
-		row.GetString(typetype.TypeId, typetype.FieldXKeyProp) == ""
-	if named && len(missing) == 0 && !healXKey {
+		row.GetString(ns, typetype.FieldXKeyProp) == ""
+	if named && setType == "" && len(missing) == 0 && !healXKey {
 		return nil
 	}
 
 	arena := &anyenc.Arena{}
 	var ops []crdt.Op
-	// $addToSet per type, never a whole-array $set: a NewRoot that
-	// already attached types, or a peer's copy of a derived root, must
-	// not be clobbered.
-	for _, t := range missing {
-		ops = append(ops, crdt.Op{Type: crdt.OpAddToSet, Path: []string{anytype.TypeId, "types"}, Payload: arena.NewString(t)})
+	// The type only when the row has none; $addToSet per collection,
+	// never a whole-array $set: a NewRoot that already has members, or
+	// a peer's copy of a derived root, must not be clobbered.
+	if setType != "" {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: []string{anytype.TypeId, anytype.FieldType}, Payload: arena.NewString(setType)})
+	}
+	for _, c := range missing {
+		ops = append(ops, crdt.Op{Type: crdt.OpAddToSet, Path: []string{anytype.TypeId, anytype.FieldCollections}, Payload: arena.NewString(c)})
 	}
 	payload := arena.NewObject()
 	payloadKeys := 0
@@ -904,20 +923,17 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 		payload.Set(anytype.TypeId+".name", arena.NewString(name))
 		payloadKeys++
 	}
-	// The type's own metadata: what the request declares, nothing
-	// implied — a root hosting only its bundle's records asks for
-	// Hidden itself. On a named row only an absent handle is filled.
+	// The definition's own metadata: what the request declares,
+	// nothing implied — a root hosting only its bundle's records asks
+	// for Hidden itself. On a named row only an absent handle is
+	// filled.
 	if declares && (!named || healXKey) && req.XKey != "" {
-		payload.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(req.XKey))
+		payload.Set(ns+"."+typetype.FieldXKeyProp, arena.NewString(req.XKey))
 		payloadKeys++
 	}
 	if declares && !named {
 		if req.Hidden {
-			payload.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
-			payloadKeys++
-		}
-		if req.Weight != 0 {
-			payload.Set(typetype.TypeId+"."+typetype.FieldWeightProp, arena.NewNumberInt(req.Weight))
+			payload.Set(ns+"."+typetype.FieldHiddenProp, arena.NewTrue())
 			payloadKeys++
 		}
 		if len(req.Layout) > 0 {
@@ -926,7 +942,7 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 			if err != nil {
 				return fmt.Errorf("%w: Layout: %w", space.ErrBundleBadRequest, err)
 			}
-			payload.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+			payload.Set(ns+"."+typetype.FieldLayoutProp, layout)
 			payloadKeys++
 		}
 	}
@@ -935,18 +951,18 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 	}
 	// Seeded values, on install only, sorted so the change is the same
 	// on every installer of a derived root. Their own op: independent
-	// failure domain from the name and the types.
+	// failure domain from the name and the membership.
 	if !adopt && !named && len(req.RootProperties) > 0 {
 		seeds := arena.NewObject()
 		seedKeys := 0
-		for _, typeId := range slices.Sorted(maps.Keys(req.RootProperties)) {
-			kv := req.RootProperties[typeId]
+		for _, ownerId := range slices.Sorted(maps.Keys(req.RootProperties)) {
+			kv := req.RootProperties[ownerId]
 			for _, propId := range slices.Sorted(maps.Keys(kv)) {
 				v, err := goToAnyenc(arena, kv[propId])
 				if err != nil {
-					return fmt.Errorf("%w: RootProperties[%s.%s]: %w", space.ErrBundleBadRequest, typeId, propId, err)
+					return fmt.Errorf("%w: RootProperties[%s.%s]: %w", space.ErrBundleBadRequest, ownerId, propId, err)
 				}
-				seeds.Set(typeId+"."+propId, v)
+				seeds.Set(ownerId+"."+propId, v)
 				seedKeys++
 			}
 		}
@@ -958,9 +974,14 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 		return nil
 	}
 
-	// The DataVersion covers every type the change touches, as an
-	// attach or a create with initial values would.
-	dataVersion, err := dataVersionForTypes(ctx, b.parent.store.Registry(), types)
+	// The DataVersion covers every owner the change touches, as a
+	// create with initial values would.
+	owners := make([]string, 0, 1+len(want.Collections))
+	if want.Type != "" {
+		owners = append(owners, want.Type)
+	}
+	owners = append(owners, want.Collections...)
+	dataVersion, err := dataVersionForOwners(ctx, b.parent.store.Registry(), owners)
 	if err != nil {
 		return err
 	}
@@ -974,7 +995,7 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 		}},
 	})
 	if err != nil {
-		return err
+		return wrapSlotErr(err)
 	}
 	if len(res.Rejections) > 0 {
 		return fmt.Errorf("write rejected: %w", res.Rejections[0].Err)

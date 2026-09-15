@@ -13,17 +13,22 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// uniqueTypes returns the deduplicated typeIds touched by a Create
-// bootstrap — opts.Types ∪ keys(opts.InitialProperties). Order is
-// stable (Types first, then InitialProperties keys in iteration
+// uniqueOwners returns the deduplicated owner ids a Create bootstrap
+// touches — the type, the collections and the InitialProperties keys.
+// Order is stable (type, collections, then the keys in iteration
 // order).
-func uniqueTypes(opts space.CreateObjectOpts) []string {
-	seen := make(map[string]struct{}, len(opts.Types)+len(opts.InitialProperties))
-	out := make([]string, 0, len(opts.Types)+len(opts.InitialProperties))
-	for _, t := range opts.Types {
+func uniqueOwners(opts space.CreateObjectOpts) []string {
+	seen := make(map[string]struct{}, 1+len(opts.Collections)+len(opts.InitialProperties))
+	out := make([]string, 0, 1+len(opts.Collections)+len(opts.InitialProperties))
+	if opts.Type != "" {
+		seen[opts.Type] = struct{}{}
+		out = append(out, opts.Type)
+	}
+	for _, t := range opts.Collections {
 		if _, dup := seen[t]; dup {
 			continue
 		}
@@ -40,23 +45,23 @@ func uniqueTypes(opts space.CreateObjectOpts) []string {
 	return out
 }
 
-// dataVersionForTypes encodes a multi-type DataVersion using the
-// registry's latest shortId per type. Skips types with no important
-// changes — their pair is omitted (an absent type contributes
-// nothing to the gate).
+// dataVersionForOwners encodes a multi-owner DataVersion using the
+// registry's latest shortId per owner (a type or a collection). Skips
+// owners with no important changes — their pair is omitted (an absent
+// owner contributes nothing to the gate).
 //
-// Empty result (no types known to the registry) falls back to the
+// Empty result (no owner known to the registry) falls back to the
 // hardcoded handler version, which the gate treats as "no schema
 // constraint".
-func dataVersionForTypes(ctx context.Context, reg *types.LiveRegistry, typeIds []string) (string, error) {
-	if reg == nil || len(typeIds) == 0 {
+func dataVersionForOwners(ctx context.Context, reg *types.LiveRegistry, ownerIds []string) (string, error) {
+	if reg == nil || len(ownerIds) == 0 {
 		return properties.HandlerVersion, nil
 	}
-	pairs := make([]types.DataVersionPair, 0, len(typeIds))
-	for _, t := range typeIds {
+	pairs := make([]types.DataVersionPair, 0, len(ownerIds))
+	for _, t := range ownerIds {
 		shortId, err := reg.LatestShortId(ctx, t)
 		if err != nil {
-			return "", fmt.Errorf("dataVersionForTypes[%s]: %w", t, err)
+			return "", fmt.Errorf("dataVersionForOwners[%s]: %w", t, err)
 		}
 		if shortId == "" {
 			continue
@@ -84,7 +89,7 @@ type objectService struct {
 func newObjectService(parent *spaceImpl) *objectService { return &objectService{parent: parent} }
 
 // Create makes a fresh object on the space, runs the optional
-// bootstrap modify (any.types + InitialProperties) in one extra
+// bootstrap modify (membership + InitialProperties) in one extra
 // change, and returns the new objectId.
 func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts) (string, error) {
 	obj, err := o.parent.store.Create(ctx, spaceobjects.CreateOpts{
@@ -168,21 +173,20 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 	}
 	objectId := obj.Id()
 
-	// Type-binding is idempotent in the DAG, not just in state: the
-	// requested types are compared against the object's current
-	// any.types and only the missing ones are attached, one $addToSet
-	// op each — never a whole-array $set, so a type attached
-	// concurrently (or by a later handler, e.g. a multitype object)
-	// is not clobbered. Derive runs on hot resolve paths ("the
-	// well-known chat/brain object of this space"), so a no-op call
-	// must not append a change.
-	if len(opts.Types) > 0 {
-		missing, err := o.missingTypes(ctx, objectId, opts.Types)
+	// Membership is idempotent in the DAG, not just in state: the
+	// requested type is set only when the row has none (a type it
+	// already has is never replaced), and only the collections the row
+	// lacks are added, one $addToSet op each — never a whole-array
+	// $set, so a collection attached concurrently is not clobbered.
+	// Derive runs on hot resolve paths ("the well-known chat/brain
+	// object of this space"), so a no-op call must not append a change.
+	if opts.Type != "" || len(opts.Collections) > 0 {
+		setType, missing, err := o.missingMembers(ctx, objectId, opts.Type, opts.Collections)
 		if err != nil {
 			return "", err
 		}
-		if len(missing) > 0 {
-			if err := o.attachTypes(ctx, objectId, missing); err != nil {
+		if setType != "" || len(missing) > 0 {
+			if err := o.attachMembers(ctx, objectId, setType, missing); err != nil {
 				return "", err
 			}
 		}
@@ -190,35 +194,46 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 	return objectId, nil
 }
 
-// missingTypes returns the entries of want absent from the object's
-// current any.types (deduplicated, input order preserved). A missing
-// row reads as "implements nothing", so every requested type is
-// reported missing on first derive.
-func (o *objectService) missingTypes(ctx context.Context, objectId string, want []string) ([]string, error) {
-	current, err := o.parent.store.ObjectTypes(ctx, objectId)
+// missingMembers compares the wanted membership against the object's
+// row: the type to set (empty when the row already has one, or none
+// is wanted) and the collections absent from the row (deduplicated,
+// input order preserved). A missing row reads as nothing, so
+// everything requested is reported on first derive.
+func (o *objectService) missingMembers(ctx context.Context, objectId, wantType string, wantCollections []string) (string, []string, error) {
+	current, err := o.parent.store.ObjectMembers(ctx, objectId)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	have := make(map[string]struct{}, len(current)+len(want))
-	for _, t := range current {
+	setType := ""
+	if wantType != "" && current.Type == "" {
+		setType = wantType
+	}
+	have := make(map[string]struct{}, len(current.Collections)+len(wantCollections))
+	for _, t := range current.Collections {
 		have[t] = struct{}{}
 	}
-	out := make([]string, 0, len(want))
-	for _, t := range want {
+	out := make([]string, 0, len(wantCollections))
+	for _, t := range wantCollections {
 		if _, dup := have[t]; dup {
 			continue
 		}
 		have[t] = struct{}{}
 		out = append(out, t)
 	}
-	return out, nil
+	return setType, out, nil
 }
 
-// attachTypes appends typeIds to the object's any.types in one change,
-// one $addToSet op per type — the same op AttachType uses, so
+// attachMembers writes the membership the object lacks in one change:
+// a $set of the type when setType is non-empty, one $addToSet per
+// collection — the same ops SetType / AttachCollection use, so
 // concurrent attaches merge instead of last-write-wins.
-func (o *objectService) attachTypes(ctx context.Context, objectId string, typeIds []string) error {
-	dataVersion, err := dataVersionForTypes(ctx, o.parent.store.Registry(), typeIds)
+func (o *objectService) attachMembers(ctx context.Context, objectId, setType string, collections []string) error {
+	owners := make([]string, 0, 1+len(collections))
+	if setType != "" {
+		owners = append(owners, setType)
+	}
+	owners = append(owners, collections...)
+	dataVersion, err := dataVersionForOwners(ctx, o.parent.store.Registry(), owners)
 	if err != nil {
 		return err
 	}
@@ -227,11 +242,18 @@ func (o *objectService) attachTypes(ctx context.Context, objectId string, typeId
 		return err
 	}
 	arena := &anyenc.Arena{}
-	ops := make([]crdt.Op, 0, len(typeIds))
-	for _, t := range typeIds {
+	ops := make([]crdt.Op, 0, 1+len(collections))
+	if setType != "" {
+		ops = append(ops, crdt.Op{
+			Type:    crdt.OpSet,
+			Path:    []string{anytype.TypeId, anytype.FieldType},
+			Payload: arena.NewString(setType),
+		})
+	}
+	for _, t := range collections {
 		ops = append(ops, crdt.Op{
 			Type:    crdt.OpAddToSet,
-			Path:    []string{"any", "types"},
+			Path:    []string{anytype.TypeId, anytype.FieldCollections},
 			Payload: arena.NewString(t),
 		})
 	}
@@ -244,7 +266,7 @@ func (o *objectService) attachTypes(ctx context.Context, objectId string, typeId
 			Ops:    ops,
 		}},
 	})
-	return err
+	return wrapSlotErr(err)
 }
 
 // Delete records the deletion in the any-sync settings tree — the
@@ -284,7 +306,7 @@ func (o *objectService) Delete(ctx context.Context, objectId string) error {
 // needsBootstrap returns true when CreateObjectOpts carries any
 // caller-supplied initial state.
 func needsBootstrap(opts space.CreateObjectOpts) bool {
-	if len(opts.Types) > 0 {
+	if opts.Type != "" || len(opts.Collections) > 0 {
 		return true
 	}
 	for _, props := range opts.InitialProperties {
@@ -295,20 +317,23 @@ func needsBootstrap(opts space.CreateObjectOpts) bool {
 	return false
 }
 
-// bootstrap writes the post-create initial state (any.types +
-// per-type property values) into the object's `properties` dataset.
-// One Modify call regardless of how many types / properties are
+// bootstrap writes the post-create initial state (membership +
+// per-owner property values) into the object's `properties` dataset.
+// One Modify call regardless of how many owners / properties are
 // being seeded — keeps the DAG clean.
 func (o *objectService) bootstrap(ctx context.Context, objectId string, opts space.CreateObjectOpts) (space.ModifyResult, error) {
 	arena := &anyenc.Arena{}
 	multi := arena.NewObject()
 
-	if len(opts.Types) > 0 {
+	if opts.Type != "" {
+		multi.Set(anytype.TypeId+"."+anytype.FieldType, arena.NewString(opts.Type))
+	}
+	if len(opts.Collections) > 0 {
 		arr := arena.NewArray()
-		for i, t := range opts.Types {
+		for i, t := range opts.Collections {
 			arr.SetArrayItem(i, arena.NewString(t))
 		}
-		multi.Set("any.types", arr)
+		multi.Set(anytype.TypeId+"."+anytype.FieldCollections, arr)
 	}
 	for typeId, kv := range opts.InitialProperties {
 		for propId, val := range kv {
@@ -320,12 +345,11 @@ func (o *objectService) bootstrap(ctx context.Context, objectId string, opts spa
 		}
 	}
 
-	// Compute DataVersion across every type touched: opts.Types
-	// (binding side-effect) and the keys of opts.InitialProperties
-	// (value writes). Each contributes one (typeId, latestShortId)
-	// pair if available.
-	touched := uniqueTypes(opts)
-	dataVersion, err := dataVersionForTypes(ctx, o.parent.store.Registry(), touched)
+	// Compute DataVersion across every owner touched: the type, the
+	// collections and the keys of opts.InitialProperties. Each
+	// contributes one (ownerId, latestShortId) pair if available.
+	touched := uniqueOwners(opts)
+	dataVersion, err := dataVersionForOwners(ctx, o.parent.store.Registry(), touched)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -345,7 +369,7 @@ func (o *objectService) bootstrap(ctx context.Context, objectId string, opts spa
 		},
 	})
 	if err != nil {
-		return space.ModifyResult{}, err
+		return space.ModifyResult{}, wrapSlotErr(err)
 	}
 	return modifyResultFromWrite(res), nil
 }

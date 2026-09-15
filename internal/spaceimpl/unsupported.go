@@ -28,11 +28,17 @@ func (unsupportedProperties) Get(context.Context, string) (*anyenc.Value, error)
 func (unsupportedProperties) Set(context.Context, string, string, map[string]any) (space.ModifyResult, error) {
 	return space.ModifyResult{}, errUnsupported("Properties().Set")
 }
-func (unsupportedProperties) AttachType(context.Context, string, string) (space.ModifyResult, error) {
-	return space.ModifyResult{}, errUnsupported("Properties().AttachType")
+func (unsupportedProperties) SetType(context.Context, string, string) (space.ModifyResult, error) {
+	return space.ModifyResult{}, errUnsupported("Properties().SetType")
 }
-func (unsupportedProperties) DetachType(context.Context, string, string) (space.ModifyResult, error) {
-	return space.ModifyResult{}, errUnsupported("Properties().DetachType")
+func (unsupportedProperties) UnsetType(context.Context, string) (space.ModifyResult, error) {
+	return space.ModifyResult{}, errUnsupported("Properties().UnsetType")
+}
+func (unsupportedProperties) AttachCollection(context.Context, string, string) (space.ModifyResult, error) {
+	return space.ModifyResult{}, errUnsupported("Properties().AttachCollection")
+}
+func (unsupportedProperties) DetachCollection(context.Context, string, string) (space.ModifyResult, error) {
+	return space.ModifyResult{}, errUnsupported("Properties().DetachCollection")
 }
 
 type unsupportedACL struct{}

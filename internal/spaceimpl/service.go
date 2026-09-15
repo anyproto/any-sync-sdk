@@ -101,7 +101,8 @@ type Service struct {
 	// extTypes and modules carry through to every per-space Store
 	// created by storeFor — each type's handlers and each module's
 	// canonical collection are applied alongside the built-in catalog.
-	extTypes []handler.Type
+	extTypes       []handler.Type
+	extCollections []handler.Collection
 	modules  []handler.Module
 
 	// files/fetch/fstore/fqueue are the SDK-level byte-layer services
@@ -247,13 +248,14 @@ type Service struct {
 // the seam through which the tech-space mirrors converged in-space
 // spaceIndex state into its rows; usually tsp itself (which
 // satisfies space.Indexer).
-func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type, modules []handler.Module) *Service {
+func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) *Service {
 	s := &Service{
 		app:                 app,
 		tsp:                 tsp,
 		indexer:             indexer,
 		db:                  db,
 		extTypes:            extTypes,
+		extCollections:      extCollections,
 		modules:             modules,
 		stores:              make(map[string]*spaceobjects.Store),
 		allocs:              make(map[string]*object.VersionAllocator),
@@ -316,7 +318,7 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	}
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
-	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.modules)
+	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.extCollections, s.modules)
 	// Account-wide gate: once the tech space carries a CRDT version
 	// above this SDK's, every synced write fails with
 	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).

@@ -48,7 +48,7 @@ func TestStore_SystemDatasets(t *testing.T) {
 	}
 	assert.Equal(t, []string{
 		properties.Dataset, typetype.DatasetPropertyDefs, typetype.ShortIdsDataset, typetype.DatasetDefs,
-		payloads.Dataset, spaceindex.BundlesDataset, "sysA",
+		payloads.Dataset, spaceindex.BundlesDataset, spaceindex.IdentityKeysDataset, "sysA",
 	}, names, "system reg follows the shared built-ins")
 	for _, r := range regs {
 		if r.Name == "sysA" {

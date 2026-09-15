@@ -274,6 +274,58 @@ treat re-sends as harmless because the receiver path is fully idempotent (fix
 out-of-band path. Sending is never required for correctness — the space is
 re-derivable — only for notification.
 
+### Key exchange inside the space
+
+The inbox carries the symkey one way only — `OneToOne` posts it, Accept
+sends nothing back — and the 1-1 ACL root is immutable with no per-writer
+metadata, so on its own the invite leaves the initiator unable to decrypt
+the acceptor's profile, and a missed or absent inbox leaves the acceptor
+unable to decrypt the initiator's. The space itself is the symmetric
+channel: its read key is held by exactly the two participants.
+
+- **Dataset `identityKeys`** on the space's derived spaceIndex object
+  (`internal/types/spaceindex/identitykeys.go`, registered next to
+  `bundles`): row id = the participant's account identity, one synced
+  field `symKey` in the `space.MarshalSymKey` string form the ACL blob and
+  the inbox body use. The handler admits a row only from the change whose
+  signer IS the row id, refuses a change without a creator, and refuses
+  deletes (a tombstone would ban that participant's key for good).
+- **Publish** (`spaceImpl.publishOneToOneKey`, from the post-load seed
+  goroutine — so on `OneToOne`, `AcceptOneToOne` and every later
+  `Spaces().Get`; the boot eager-loader does not run it): when the space
+  is a one-to-one and the own row is absent or differs, upsert it, one
+  publish per space at a time. The key is a pure function of the account
+  key, so every device of the account writes the same bytes and an equal
+  row is left alone; a differing row can only mean the derivation changed,
+  which is a migration, not a race. Existing 1-1s heal on the first
+  `Get`; no migration.
+- **Watch** (`oneToOneKeysWatcher`, wired by `ensureSpaceIndexWiring` for
+  one-to-one spaces only): a sub on `(spaceIndexObjectId, identityKeys)`
+  with a one-shot reconcile on start; the row keyed by the row's
+  `OneToOnePeer` — and only that one — goes to the identities directory
+  (`SetIdentityMetaKey`, no-op when equal) and kicks
+  `resolveOneToOnePeerName` in the background. That fetch is one shot;
+  the space's member watcher refreshes every member's profile each
+  `identityRepoPollInterval` with the same directory key, so a missed
+  fetch retries within a minute. Cold devices receive the key through
+  the synced directory as for any contact.
+- **The inbox invite still carries the key.** It is the only pre-accept
+  channel: a pending row shows the initiator's name before the receiver has
+  materialized the space, and the in-space row is readable only after. The
+  row is the durable source; the invite is a notification with a display
+  hint.
+- **Visibility.** The rows are refused on the public write surface
+  (`Modify` / `Delete` / `Upsert`, like `bundles`) and stay readable
+  through `Query`, `Aggregate` and history like any dataset: a reader is
+  one of the two key holders, and the identities directory already keeps
+  the peer's key for that reader for good, so the row grants nothing the
+  reader lacks. This differs from the tech-space `identities` dataset,
+  which holds every contact's key in one place and is kept off the
+  generic read surface for that reason. A wrapper that serves local
+  clients over HTTP is a lower trust tier and refuses the rows on its
+  read routes, as `any` does.
+- Regular spaces are unchanged — their key rides the ACL join record.
+
 ### Receive (the notifier worker)
 
 Per fetched `OneToOneInvite` message, **process first, advance cursor after**
@@ -503,7 +555,9 @@ not an ACL head.
    name from identityRepo via the cached symkey (see
    `docs/14-identities.md`). Out-of-band `RegisterIncoming(peer, displayHint)`
    may seed an inline name/icon for immediate display; absent both a hint and
-   a coordinator it stays identity-only.
+   a coordinator it stays identity-only until the space is active on both
+   sides, when the in-space `identityKeys` row delivers the key (§ Key
+   exchange inside the space).
 
 ## Open questions
 

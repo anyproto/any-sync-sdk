@@ -29,7 +29,10 @@ space.DeriveAccountMetadataSymKey(accountSignKey) // SLIP-0021, SDK-specific pat
 
 Deterministic ⇒ no storage or rotation; anyone who has it can read this
 account's current and future profile. (It cannot be revoked — same trade-off as
-anytype-heart's account symkey.)
+anytype-heart's account symkey.) Every channel below carries the same bytes
+for an identity, so the directory's `symKey` needs no ordering rule: a
+differing value can only come from a changed derivation, which is a
+migration, not a last-writer race.
 
 **Push.** `account.UpdateMetadata` / boot republish encrypt the profile blob
 with the symkey and push it to identityRepo, signing the **ciphertext** so the
@@ -43,7 +46,8 @@ longer carries inline name/icon (it carries the symkey only):
 | Channel | What it carries | Decrypted by |
 |---|---|---|
 | ACL `RequestMetadata` (join record, owner root) | the joining/owner account's **symkey** | the space metadata key (any member) |
-| 1-1 inbox invite body | the sender's **symkey** | ECIES to the receiver's account key |
+| 1-1 inbox invite body | the initiator's **symkey** | ECIES to the receiver's account key |
+| 1-1 `identityKeys` row on the space's spaceIndex object | each participant's **own symkey** | the 1-1 read key (both participants) |
 
 `internal/spaceimpl/acl.go` `encodeSelfSymKeyMetadata` / `decodeSymKeyMetadata`.
 
@@ -129,5 +133,8 @@ when a space is next entered (a sync-triggered resolve is a possible follow-up).
   names come from the same identityRepo resolution and the directory is the
   shared profile cache.
 - **1-1** (`docs/13-one-to-one-spaces.md`) surfaces the friend's identity as
-  `SpaceInfo.Author` and resolves the friend's name through the directory; the
-  1-1 invite distributes the symkey.
+  `SpaceInfo.Author` and resolves the friend's name through the directory. The
+  inbox invite carries the initiator's symkey for the pending row; once the
+  space is active on both sides each participant publishes its own symkey
+  inside the space (`identityKeys`), so the key crosses in both directions
+  without the inbox (§ Key exchange inside the space there).

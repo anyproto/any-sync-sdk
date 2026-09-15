@@ -764,11 +764,24 @@ func (a *App) MarkSpaceLocalOnly(spaceId string) { a.localOnly.mark(spaceId) }
 // Used by the space layer to decide between Open and Create paths.
 func (a *App) SpaceExists(spaceId string) bool { return a.storage.SpaceExists(spaceId) }
 
-// DeleteSpaceStorage closes and removes a space's any-sync on-disk
-// storage (`<DataDir>/anysync/<spaceId>.db`). Call after EvictSpace so
-// any-sync has released the space; part of the space-offload path.
-func (a *App) DeleteSpaceStorage(ctx context.Context, spaceId string) error {
-	return a.storage.DeleteSpaceStorageFile(ctx, spaceId)
+// SpaceStorageClaim holds a space's any-sync store for deletion: nothing
+// can open it until Delete removes it or Release gives it back.
+type SpaceStorageClaim interface {
+	// Delete closes the store and removes `<DataDir>/anysync/<spaceId>.db`.
+	Delete(ctx context.Context) error
+	// Release gives the store back without deleting it.
+	Release()
+}
+
+// ClaimSpaceStorage claims a space's any-sync store for deletion. The
+// offload path claims before EvictSpace, so no load can reopen the
+// space while it is torn down.
+func (a *App) ClaimSpaceStorage(ctx context.Context, spaceId string) (SpaceStorageClaim, error) {
+	c, err := a.storage.ClaimSpaceStorage(ctx, spaceId)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // HeadCache exposes the per-space hash cache. Useful for tests and

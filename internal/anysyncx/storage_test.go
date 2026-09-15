@@ -290,3 +290,99 @@ func TestStorageProviderLoadScope(t *testing.T) {
 	require.NoError(t, kept.Close(ctx))
 	requireDBClosed(t, refDB(kept))
 }
+
+// A claim refuses new holders before the space's own reference goes, so
+// no load can reopen the store between an eviction and the removal.
+func TestStorageProviderClaimBlocksOpens(t *testing.T) {
+	p := newTestProvider(t)
+	ctx := context.Background()
+	const id = "space.claimed"
+	var opens atomic.Int32
+	open := countingOpen(t, p, id, &opens)
+	loaded, err := p.acquire(ctx, id, false, open)
+	require.NoError(t, err)
+	db := refDB(loaded)
+
+	claim, err := p.ClaimSpaceStorage(ctx, id)
+	require.NoError(t, err)
+	_, err = p.acquire(ctx, id, false, open)
+	require.ErrorIs(t, err, errStorageDeleting)
+	_, err = p.ClaimSpaceStorage(ctx, id)
+	require.ErrorIs(t, err, errStorageDeleting)
+
+	require.NoError(t, loaded.Close(ctx))
+	requireDBOpen(t, db)
+	require.NoError(t, claim.Delete(ctx))
+	requireDBClosed(t, db)
+	require.NoFileExists(t, p.dbPath(id))
+	require.EqualValues(t, 1, opens.Load())
+}
+
+// Releasing a claim gives the store back: a held store stays open and
+// shared, and one whose last holder left during the claim closes.
+func TestStorageProviderClaimRelease(t *testing.T) {
+	p := newTestProvider(t)
+	ctx := context.Background()
+	const id = "space.released"
+	var opens atomic.Int32
+	open := countingOpen(t, p, id, &opens)
+	held, err := p.acquire(ctx, id, false, open)
+	require.NoError(t, err)
+	db := refDB(held)
+
+	claim, err := p.ClaimSpaceStorage(ctx, id)
+	require.NoError(t, err)
+	claim.Release()
+	again, err := p.acquire(ctx, id, false, open)
+	require.NoError(t, err)
+	require.Same(t, db, refDB(again))
+	require.NoError(t, again.Close(ctx))
+
+	claim, err = p.ClaimSpaceStorage(ctx, id)
+	require.NoError(t, err)
+	require.NoError(t, held.Close(ctx))
+	requireDBOpen(t, db)
+	claim.Release()
+	requireDBClosed(t, db)
+	require.FileExists(t, p.dbPath(id))
+
+	reopened, err := p.acquire(ctx, id, false, open)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, opens.Load())
+	require.NoError(t, reopened.Close(ctx))
+
+	// A claim on a store nobody holds is a placeholder; releasing it
+	// leaves nothing behind.
+	claim, err = p.ClaimSpaceStorage(ctx, id)
+	require.NoError(t, err)
+	claim.Release()
+	p.mu.Lock()
+	require.Empty(t, p.stores)
+	p.mu.Unlock()
+}
+
+// A delete whose ctx ends while a holder remains keeps the files and
+// gives the store back, instead of holding its caller for the drain.
+func TestStorageProviderDeleteCancelledKeepsStore(t *testing.T) {
+	p := newTestProvider(t)
+	const id = "space.cancelled"
+	var opens atomic.Int32
+	open := countingOpen(t, p, id, &opens)
+	held, err := p.acquire(context.Background(), id, false, open)
+	require.NoError(t, err)
+	db := refDB(held)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	require.ErrorIs(t, p.DeleteSpaceStorageFile(ctx, id), context.Canceled)
+	require.Less(t, time.Since(start), storeDrainTimeout)
+	requireDBOpen(t, db)
+	require.FileExists(t, p.dbPath(id))
+
+	again, err := p.acquire(context.Background(), id, false, open)
+	require.NoError(t, err)
+	require.NoError(t, again.Close(context.Background()))
+	require.NoError(t, held.Close(context.Background()))
+	requireDBClosed(t, db)
+}

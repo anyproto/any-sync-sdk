@@ -36,6 +36,15 @@ var offloadLog = logger.NewNamed("sdk.spaceoffload")
 // removal, since an orphaned job would retry against the deleted space
 // forever.
 func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
+	// 0. Claim the any-sync store before the space closes: a load racing
+	// the teardown (inbound sync, a follower pass) would otherwise reopen
+	// it between the eviction and the removal. A failed claim means the
+	// store is already being deleted, or the SDK is closing.
+	claim, claimErr := s.app.ClaimSpaceStorage(ctx, spaceId)
+	if claimErr != nil {
+		offloadLog.Warn("claim storage", zap.String("spaceId", spaceId), zap.Error(claimErr))
+	}
+
 	// 1–3. Stop watchers, close + forget the Store, evict the any-sync
 	// space — the shared close-without-delete teardown Evict also uses.
 	s.closeSpaceRuntime(ctx, spaceId)
@@ -51,9 +60,13 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	// footprint) — only when the sweep fully committed: the file is the
 	// retry gate, and removing it over a partial sweep would leak the
 	// remaining collections permanently.
-	if sweepErr == nil {
-		if err := s.app.DeleteSpaceStorage(ctx, spaceId); err != nil {
-			offloadLog.Warn("delete storage", zap.String("spaceId", spaceId), zap.Error(err))
+	if claim != nil {
+		if sweepErr == nil {
+			if err := claim.Delete(ctx); err != nil {
+				offloadLog.Warn("delete storage", zap.String("spaceId", spaceId), zap.Error(err))
+			}
+		} else {
+			claim.Release()
 		}
 	}
 

@@ -384,20 +384,49 @@ func (s *storageProvider) SpaceExists(id string) bool {
 	return err == nil
 }
 
-// DeleteSpaceStorageFile closes a space's any-sync storage and removes
-// its on-disk DB file (`<root>/<spaceId>.db`). The bulk of a space's
-// local footprint — every object tree — lives here, so this is the
-// main disk-reclaim step of an offload. A missing file is not an error.
-//
-// Callers evict the space first (App.EvictSpace), which releases the
-// space's own reference. Any other holder gets storeDrainTimeout to
-// release before the DB closes under it: Windows cannot delete an open
-// file, and an unreclaimed file would keep advertising the space.
-func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string) error {
+// storeClaim holds a space's store for deletion: until Delete or
+// Release, no holder can take a new reference to it.
+type storeClaim struct {
+	p *storageProvider
+	e *storeEntry
+}
+
+// ClaimSpaceStorage claims a space's store for deletion. An offload
+// claims before it evicts the space, so a load racing the teardown
+// (inbound sync, a follower pass) cannot reopen the store between the
+// eviction and the removal.
+func (s *storageProvider) ClaimSpaceStorage(ctx context.Context, id string) (*storeClaim, error) {
 	e, err := s.claimForDelete(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &storeClaim{p: s, e: e}, nil
+}
+
+// DeleteSpaceStorageFile claims a space's store and deletes it (see
+// storeClaim.Delete). A missing file is not an error.
+func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string) error {
+	c, err := s.ClaimSpaceStorage(ctx, id)
 	if err != nil {
 		return err
 	}
+	return c.Delete(ctx)
+}
+
+// Delete closes the claimed store and removes its on-disk DB file
+// (`<root>/<spaceId>.db`). The bulk of a space's local footprint —
+// every object tree — lives here, so this is the main disk-reclaim step
+// of an offload.
+//
+// Callers claim before they evict the space (App.EvictSpace), so the
+// space's own reference is gone and only a passing holder (a
+// discovery-key derivation) can remain. It gets storeDrainTimeout to
+// release before the DB closes under it: Windows cannot delete an open
+// file, and an unreclaimed file would keep advertising the space. The
+// wait ignores ctx — an offload whose collections are already dropped
+// must not keep its file, which only a restart would retry.
+func (c *storeClaim) Delete(context.Context) error {
+	s, e := c.p, c.e
 	s.drainForDelete(e)
 
 	var closeErr error
@@ -410,7 +439,8 @@ func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string)
 		closeErr = db.Close()
 	}
 
-	removeErr := os.Remove(s.dbPath(id))
+	path := s.dbPath(e.id)
+	removeErr := os.Remove(path)
 	if errors.Is(removeErr, os.ErrNotExist) {
 		removeErr = nil
 	}
@@ -420,13 +450,13 @@ func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string)
 		// re-created space DB would corrupt it, so sweep them with the
 		// main file.
 		for _, suffix := range []string{"-wal", "-shm", ".lock"} {
-			_ = os.Remove(s.dbPath(id) + suffix)
+			_ = os.Remove(path + suffix)
 		}
 	}
 
 	s.mu.Lock()
-	if s.stores[id] == e {
-		delete(s.stores, id)
+	if s.stores[e.id] == e {
+		delete(s.stores, e.id)
 	}
 	pending := e.pending
 	e.pending = nil
@@ -438,6 +468,34 @@ func (s *storageProvider) DeleteSpaceStorageFile(ctx context.Context, id string)
 	}
 	s.notifySetChange()
 	return nil
+}
+
+// Release gives the claimed store back without deleting it: holders can
+// take references again, and a DB nobody holds closes. The entry stays
+// deleting while that DB closes, so no open races the close.
+func (c *storeClaim) Release() {
+	s, e := c.p, c.e
+	for {
+		s.mu.Lock()
+		if e.refs > 0 || e.dbClosed {
+			e.deleting = false
+			e.drained = nil
+			if e.dbClosed && s.stores[e.id] == e {
+				delete(s.stores, e.id)
+			}
+			pending := e.pending
+			e.pending = nil
+			s.mu.Unlock()
+			close(pending)
+			return
+		}
+		db := e.db
+		e.dbClosed = true
+		s.mu.Unlock()
+		if err := db.Close(); err != nil {
+			storageLog.Warn("release: close space store", zap.String("spaceId", e.id), zap.Error(err))
+		}
+	}
 }
 
 // claimForDelete marks the space's entry as deleting, creating a
@@ -480,8 +538,7 @@ func (s *storageProvider) claimForDelete(ctx context.Context, id string) (*store
 }
 
 // drainForDelete waits up to storeDrainTimeout for the entry's holders
-// to release it. The wait ignores the caller's ctx: closing a DB under
-// a running statement is unsafe, and the bound is short.
+// to release it.
 func (s *storageProvider) drainForDelete(e *storeEntry) {
 	s.mu.Lock()
 	drained := e.drained

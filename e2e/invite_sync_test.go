@@ -103,7 +103,7 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 
 	objs := make([]objFix, 0, 2)
 	for _, title := range []string{"Casablanca", "Vertigo"} {
-		objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+		objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 		require.NoError(t, err)
 		_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{propId: title})
 		require.NoError(t, err)
@@ -199,11 +199,11 @@ func TestE2E_AliceBobInviteAndContent(t *testing.T) {
 	// objects, AND per-object property values must all converge.
 	//
 	// The value check belongs INSIDE this wait, not after it. Each
-	// object reaches Bob as two separate DAG changes — the `any.types`
+	// object reaches Bob as two separate DAG changes — the `any.type`
 	// bootstrap and the `Properties().Set` value — both parked behind the type
 	// def's shortId (the DataVersion gate). When the type def lands they
 	// drain in one pass but apply non-atomically per object: the
-	// `any.types` replay creates the object's row (so it shows up in
+	// `any.type` replay creates the object's row (so it shows up in
 	// QueryObjects) microseconds before the value replay lands. Gating
 	// only on object presence and then reading the value once races that
 	// gap — the value is correct on the very next read, but a one-shot

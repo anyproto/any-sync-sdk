@@ -25,8 +25,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
-	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )

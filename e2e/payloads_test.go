@@ -72,7 +72,7 @@ func TestE2E_Payloads(t *testing.T) {
 	// (objecttree.CreateStorage hard-requires the parent). Flagged as
 	// an any-sync gap; real owners always have content.
 	typeId, _ := setupMovieType(t, ctx, sp)
-	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 
 	pa := payloadsSurface(t, sp)

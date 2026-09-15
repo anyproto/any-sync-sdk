@@ -56,7 +56,7 @@ func TestSDK_OrphanCollectionGC(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	spaceId := sp.Id()
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "blocks-type"})
 	require.NoError(t, err)
 	_, err = sp.Modify(ctx, space.ModifyBatch{
 		ObjectId: objId,

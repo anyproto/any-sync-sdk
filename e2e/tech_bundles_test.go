@@ -143,15 +143,12 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	require.Equal(t, wantRoot, inst.RootId)
 	require.True(t, inst.Derived)
 
-	// The root is a type implementing itself.
+	// The root is a type implementing itself: the marker alone in the
+	// type slot, and it never names itself.
 	row, err := techA.Objects().Get(ctx, wantRoot)
 	require.NoError(t, err, "device A: Objects().Get(root)")
-	var types []string
-	for _, v := range row.GetArray("any", "types") {
-		types = append(types, string(v.GetStringBytes()))
-	}
-	assert.Contains(t, types, "__type__")
-	assert.Contains(t, types, wantRoot)
+	assert.Equal(t, "__type__", row.GetString("any", "type"))
+	assert.Empty(t, row.GetArray("any", "collections"))
 	ti, err := techA.Types().Get(ctx, wantRoot)
 	require.NoError(t, err, "device A: Types().Get(root)")
 	assert.Equal(t, "Favorites", ti.Name)
@@ -231,12 +228,8 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	pinsColl := pins.RootId + "_pins"
 	prow, err := techA.Objects().Get(ctx, pins.RootId)
 	require.NoError(t, err)
-	var ptypes []string
-	for _, v := range prow.GetArray("any", "types") {
-		ptypes = append(ptypes, string(v.GetStringBytes()))
-	}
-	assert.Contains(t, ptypes, "__type__")
-	assert.Contains(t, ptypes, pins.RootId, "created root implements itself")
+	assert.Equal(t, "__type__", prow.GetString("any", "type"), "created root implements itself")
+	assert.Empty(t, prow.GetArray("any", "collections"))
 	_, err = techA.Upsert(ctx, space.UpsertBatch{
 		ObjectId: pins.RootId, Dataset: pinsColl,
 		Records: []space.UpsertRecord{{Id: "any://o/two", Fields: map[string]any{"title": "Two"}}},

@@ -116,15 +116,17 @@ the ParentId binding buys cascade deletion, and a derived root is never
 deleted.
 
 Ensure derives the root itself and writes its first content change —
-`RootTypes`, the name, the type metadata and the `RootProperties` seeds
-— before registering anything (a failed stamp therefore leaves no
-install to adopt); `NewRoot` must be nil. Every type `RootProperties`
-writes into is attached along with `RootTypes` — a property write to a
-type the object does not implement is rejected — and the SDK-minted
-created root of a type-declaring request gets the same union the same
-way. The attach is idempotent on every later Ensure: a type the row
-lacks is `$addToSet`, so a request that gains a root type reaches an
-existing install.
+the root's membership, the name, the definition metadata and the
+`RootProperties` seeds — before registering anything (a failed stamp
+therefore leaves no install to adopt); `NewRoot` must be nil. The
+membership is the marker when the request declares a definition and
+`RootType` otherwise, plus `RootCollections` and every
+`RootProperties` owner that is neither — a property write to an owner
+the object does not have is rejected — and the SDK-minted created root
+of a declaring request gets the same union the same way. Later Ensures
+are idempotent: the type is set only when the row has none, and a
+collection the row lacks is `$addToSet`, so a request that gains a
+root collection reaches an existing install.
 
 On the adopt path Ensure materializes the canonical tree — and stamps it
 — when the row arrived before the tree did: the same device can mint it,
@@ -137,80 +139,85 @@ sitting on its root change, so a derived root that a device never
 stamped would sit outside that device's diff and never pull the peer's
 content.
 
-## Bundle-declared types: type roots and self-typed roots
+## Bundle-declared definitions: type roots and collection roots
 
-A bundle may declare a **full type** on its root: `XKey`, `Parts`
-(with their datasets), `Properties`, `Layout`, `Weight`, `Hidden` —
-a declaration is `Parts`, `Properties` or an `XKey`
-(`EnsureBundleRequest.DeclaresType`); the metadata needs one. The root
-then carries `any.types = ["__type__"]`: it is a type object,
-`typeId = rootId`. Whether the root also **carries** that type is the
-bundle's choice — `SelfTyped` adds the root's own id
-(`["__type__", rootId]`), making the root an instance of itself that
-holds the type's values and takes its datasets. Three shapes come out
-of the same mechanism:
+A bundle may declare a **type** on its root — `XKey`, `Parts` (with
+their datasets), `Properties`, `Layout`, `Hidden` — or a
+**collection** — `Collection: true` with `XKey` and `Properties`.
+A declaration is `Parts`, `Properties` or an `XKey`
+(`EnsureBundleRequest.DeclaresType` / `DeclaresCollection`); the
+metadata needs one. `Parts` and `Layout` are refused with `Collection`
+(`ErrBundleBadRequest`): a collection has neither. The root then
+carries the matching marker in `any.type` — `__type__` or
+`__collection__` — and its id IS the definition's id.
 
-- a **records host** — a `SelfTyped` root that exists to hold its
-  bundle's data (favourites entries, an app's setup state). It asks
-  for `Hidden`, since a listed type is one a picker offers for
-  attachment elsewhere, which would grant that object the bundle's
-  collections;
-- a **type objects carry** — a page whose part shares the editor, a
-  wiki whose properties are the tree (`parentId` / `pos`), a person.
-  It declares `Properties` / `Layout` / `Weight` / `Parts`, stays
-  listed and is NOT self-typed: the definition does not match a query
-  for the type, takes none of its parts and holds none of its values;
-- a **marker type** — an `XKey` and nothing else: a flag objects carry
-  ("Template", "Archived"), resolvable by its handle, with no columns
+A declaring root therefore has no type of its own: `RootType` next to
+a declaration is refused. It may still carry `RootCollections` (an app
+root filed under `miniapp`), which is what most app roots do.
+
+The root **hosts its own records and values** with no flag: a
+definition object implicitly implements itself (docs/06 § Type and
+collections), so a root's `<rootId>.<propId>` values and the records
+of the datasets it declares live on the root. Three shapes come out of
+the one mechanism:
+
+- a **records host** — a root that exists to hold its bundle's data
+  (favourites entries, an app's setup state). It asks for `Hidden`,
+  since a listed type is one a picker offers for other objects, which
+  would grant them the bundle's storage collections;
+- a **definition objects use** — a page whose part shares the editor,
+  a person; or, as a collection, a wiki whose properties are the tree
+  (`parentId` / `pos`). It declares `Properties` / `Layout` / `Parts`
+  and stays listed. The definition never matches a query for itself:
+  `{"any.type": rootId}` returns its objects, `{"any.collections":
+  rootId}` its members;
+- a **marker definition** — an `XKey` and nothing else: a flag an
+  object carries as its type ("Template") or is filed under as a
+  collection ("Archived"), resolvable by its handle, with no columns
   and no parts.
 
-`SelfTyped` is implied where the model forces it: a part declaring a
-reserved module (the root is the type's sole carrier — a general chat)
-and every tech-space bundle (its roots exist to host records). It
-needs a declaration (`ErrBundleBadRequest` alone), and it is the one
-way to ask — `RootTypes` naming the root's own id is refused; on adopt
-a root that lacks the self type gains it like any listed root type,
-and it is never removed.
-
 `Hidden` is explicit: nothing is implied from the shape of the
-declaration. `XKey` is the type's handle (`TypeInfo.XKey`, stored as
-`type.xkey`): what a consumer resolves the type by and what another
+declaration. `XKey` is the definition's handle (`TypeInfo.XKey` /
+`CollectionInfo.XKey`, stored as `type.xkey` / `collection.xkey`):
+what a consumer resolves the definition by and what another
 declaration's `relation.targetTypes` names. The SDK stores it as
 non-unique metadata; handle uniqueness is the consumer's rule.
 
 **One stamp, root + 3 changes.** The root's first content change
-carries everything the row needs: the types it implements (the marker,
-its own id when self-typed, `RootTypes`, every type `RootProperties` writes into —
-`$addToSet` each, never a whole-array set), `any.name`, the type
-metadata (`type.xkey` / `layout` / `weight` / `hidden`) and the seeded
-`RootProperties` values, in one `objects` change (the seeds as their
-own op, so a seed a peer cannot resolve drops alone). The local-write
-pre-flight grants every namespace the change itself attaches, so the
-metadata and the seeded values validate alongside the attach; the
-apply path does not re-check membership. Then the
-registry row (on the index object), then the declarations — one
-`properties` change, one `datasets` change. A whole type therefore
-takes three changes on its tree, each dataset landing atomically; a
-peer may briefly see the definitions before the parts. Landing all
-three in one any-sync change needs a multi-dataset change format
-(05a-crdt-spec § 6.3), which is deferred. `RootTypes` /
-`RootProperties` apply to every root Ensure mints — derived, or the
-SDK-minted created root of a type-declaring request (one object that
-is both a type and, say, a `miniapp` carrier) — and are refused with
-`NewRoot`, whose root got its state from the caller.
+carries everything the row needs: its membership (`any.type` — the
+marker when it declares, `RootType` otherwise; `any.collections` —
+`RootCollections` plus every other `RootProperties` owner,
+`$addToSet` each, never a whole-array set), `any.name`, the definition
+metadata (`type.xkey` / `layout` / `hidden`, or `collection.xkey` /
+`hidden`) and the seeded `RootProperties` values, in one `objects`
+change (the seeds as their own op, so a seed a peer cannot resolve
+drops alone). The local-write pre-flight grants every namespace the
+change itself sets — including the root's own, which a declaring root
+holds implicitly — so the metadata and the seeded values validate
+alongside the membership write; the apply path does not re-check
+membership. Then the registry row (on the index object), then the
+declarations — one `properties` change, one `datasets` change. A whole
+type therefore takes three changes on its tree, each dataset landing
+atomically; a peer may briefly see the definitions before the parts.
+Landing all three in one any-sync change needs a multi-dataset change
+format (05a-crdt-spec § 6.3), which is deferred. `RootType` /
+`RootCollections` / `RootProperties` apply to every root Ensure mints —
+derived, or the SDK-minted created root of a declaring request (one
+object that is a definition and, say, a `miniapp` carrier) — and are
+refused with `NewRoot`, whose root got its state from the caller.
 
 `Parts` declares parts with their datasets (the `PartDraft` /
 `DatasetDraft` vocabulary of `17-user-datasets.md`). Nothing else is
 special-cased — the catalog's `__type__` scan finds the root, the
-ownership check (the object carries a declaring type) passes on every
-carrier, a namespaced dataset lives in `<rootId>_<key>` with the
-ordinary `<rootId>:<shortId>` gate stamp, a shared one participates in
-the module's canonical collection, `Types().Parts(rootId)` /
+ownership check (the object's type declares the dataset, or the object
+IS the declaring type) passes on every carrier and on the root itself,
+a namespaced dataset lives in `<rootId>_<key>` with the ordinary
+`<rootId>:<shortId>` gate stamp, a shared one participates in the
+module's canonical storage collection, `Types().Parts(rootId)` /
 `Datasets(rootId)` and `Space.Datasets()` list the declarations with
 `Owners = [rootId]`, and records go through `Upsert` / `Modify` /
-`Query` on the carriers — the root itself when `SelfTyped`. A bundle's
-setup state lives in records on its self-typed root, not in child
-objects.
+`Query` on the carriers — the root included. A bundle's setup state
+lives in records on its root, not in child objects.
 
 `Properties` declares property definitions (`PropertyDraft`, validated
 as `AddProperty` validates them) with **deterministic ids**: every
@@ -220,18 +227,21 @@ therefore mint ONE column per handle — the one case where the
 "same-handle, two columns" outcome of the descriptor model
 (docs/06 § Property ids) is unacceptable, because a wiki's two
 `parentId` columns are a forked tree. The ids stay internal: clients
-resolve `xKey → propId` through `Types().Properties(rootId)`. A property
-added later through `Types().AddProperty(rootId, …)` gets an ordinary
-change-derived id. Two devices creating the same deterministic id
-while apart reach every replica as one create and one creation-shaped
-modify; the property handler projects the change's shortId row from
-both, so the replica knows every schema state a peer may stamp its
-data writes with (otherwise those writes would park for good).
-`Layout` / `Weight` / `Hidden` ride the name stamp (`type.layout` /
-`type.weight` / `type.hidden`) on install; they describe a type, so
-they need a declaration — `Parts`, `Properties` or `XKey` — alone they
-are `ErrBundleBadRequest`, like a `Layout` or a seeded value that
-cannot be encoded, before any root is minted.
+resolve `xKey → propId` through `Types().Properties(rootId)` —
+`Collections().Properties(rootId)` is the same surface and answers the
+same for a collection root. A property added later through
+`AddProperty(rootId, …)` gets an ordinary change-derived id. Two
+devices creating the same deterministic id while apart reach every
+replica as one create and one creation-shaped modify; the property
+handler projects the change's shortId row from both, so the replica
+knows every schema state a peer may stamp its data writes with
+(otherwise those writes would park for good).
+`Layout` / `Hidden` ride the name stamp (`type.layout` /
+`type.hidden`, or `collection.hidden`) on install; they describe a
+definition, so they need one — `Parts`, `Properties` or `XKey` — alone
+they are `ErrBundleBadRequest`, like a `Layout` on a `Collection`
+request or a seeded value that cannot be encoded, before any root is
+minted.
 
 - Declarations are written after the stamp and the registry row
   (below), parts in one change, properties in one change.
@@ -248,12 +258,13 @@ cannot be encoded, before any root is minted.
   `Ensure` never resurrects or doubles a definition. Evolution goes
   through `Types().AddPart` / `AddDataset` / `AddDatasetField` /
   `PatchDataset` / `AddProperty` / `PatchProperty` with `typeId =
-  rootId`. Adopting never renames the root or touches its layout,
-  weight or hidden flag either: the name and the metadata are written
-  only when the root carries no name. What the row LACKS is still
-  filled on adopt — a type the request lists (`$addToSet`) and a
-  handle when the root has none — the same heal-what-is-absent rule
-  the declarations follow; seeds are never re-written.
+  rootId`. Adopting never renames the root or touches its layout or
+  hidden flag either: the name and the metadata are written only when
+  the root carries no name. What the row LACKS is still filled on
+  adopt — the type when it has none, a collection the request lists
+  (`$addToSet`), a handle when the root has none — the same
+  heal-what-is-absent rule the declarations follow; seeds are never
+  re-written.
 - A part naming a **reserved** module (`handler.Module.Reserved`) is
   refused with `ErrModuleReserved` unless the call carries the
   `space.SystemInstall()` option — the consumer's own catalog install.
@@ -284,8 +295,12 @@ cannot be encoded, before any root is minted.
   merging a loser's records write them through the winner's
   declaration, then `ResolveLoser` deletes the loser, declarations
   included.
-- `RootProperties` keyed by the root's own id are rejected: the root's
-  property ids exist only once the install has declared them.
+- On a declaring request, `RootProperties` and `RootCollections`
+  naming the root's own id are rejected — a definition object
+  implements itself, so there is nothing to name. Its own property
+  ids derive from `(rootId, XKey)` and are known before the install,
+  so the consumer writes those values with an ordinary
+  `Properties().Set(rootId, rootId, …)` after it.
 
 ## Tech-space bundles
 
@@ -296,10 +311,11 @@ settings objects) lives in bundles on the tech space, reached through
 same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`, with
 three rules: roots are minted by `Ensure` only (`NewRoot` is refused —
 free object create is fenced on the tech handle; omit both strategies
-and `Ensure` creates the root itself), `Parts` or `Properties`
-required, and every root is self-typed — a tech root exists to host
-its records, so `SelfTyped` is set by the handle whatever the request
-says. Both
+and `Ensure` creates the root itself), a declaration (`Parts`,
+`Properties` or `XKey`) required — a tech root exists to host its
+records, which it does as its own definition — and no `RootType` /
+`RootCollections` / `RootProperties`: a tech bundle root IS the
+definition. Both
 strategies are available: `DerivedRoot` for bundles that must never
 fork or uninstall; the SDK-minted created root for ordinary app
 installs — deletable (`Objects().Delete` is allowed on bundle roots:
@@ -324,13 +340,14 @@ account's devices and nobody else.
   otherwise the root is minted (`NewRoot`, or the canonical derivation
   for `DerivedRoot`) and one change registers it. The returned winner is
   provisional until the space syncs — unless it is derived, which is the
-  same on every device by construction. `Parts` / `Properties` /
-  `Layout` / `Weight` / `Hidden` declare a type on the root — derived
-  or created (see § Bundle-declared types); with neither `NewRoot`
-  nor `DerivedRoot`, `Ensure` mints a created root itself and stamps
-  it as a type definition (`SelfTyped` makes it carry that type too).
-  The `SystemInstall()` option lifts the
-  reserved-module refusal for the consumer's own install.
+  same on every device by construction. `XKey` / `Parts` /
+  `Properties` / `Layout` / `Hidden` declare a type on the root, and
+  `Collection: true` a collection — derived or created (see
+  § Bundle-declared definitions); with neither `NewRoot` nor
+  `DerivedRoot`, `Ensure` mints a created root itself and stamps it as
+  the definition, which then hosts its own records. The
+  `SystemInstall()` option lifts the reserved-module refusal for the
+  consumer's own install.
 - `DerivedRootId` — the canonical derived root id for a bundle id. Pure
   computation: no registry read, no materialization, no network.
 - `Get` / `List` — read the registry with `Losers` computed.

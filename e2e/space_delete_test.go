@@ -53,7 +53,7 @@ func TestSDK_SpaceDelete_OffloadsLocally(t *testing.T) {
 
 	// Seed an object + record so the space has real per-object state on
 	// disk to offload.
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "blocks-type"})
 	require.NoError(t, err)
 	_, err = sp.Modify(ctx, space.ModifyBatch{
 		ObjectId: objId,

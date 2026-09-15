@@ -66,7 +66,7 @@ func TestE2E_QuerySubscribe_ColdObjectLoad(t *testing.T) {
 	}
 	spaceId := spA.Id()
 
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"notes-type"}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: "notes-type"})
 	require.NoError(t, err, "device A: Objects().Create")
 	// Separate Modify calls: one DAG change each, so device B's cold load
 	// replays them one by one through the apply hook.

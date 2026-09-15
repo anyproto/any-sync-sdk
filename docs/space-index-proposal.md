@@ -12,7 +12,7 @@ We need a per-space, member-visible source-of-truth for these fields.
 
 ## Proposal
 
-A derived object inside every space, type `"spaceIndex"`, holding a single row
+A derived object inside every space, `any.type = "spaceIndex"`, holding a single row
 with name/icon/description as properties. Synced via the regular DAG, no new
 infra.
 

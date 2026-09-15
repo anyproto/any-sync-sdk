@@ -71,7 +71,7 @@ func wmRead(t *testing.T, dataDir, spaceId string) uint64 {
 
 func wmWrite(t *testing.T, ctx context.Context, sp space.Space, n int) {
 	t.Helper()
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"wm-blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "wm-blocks-type"})
 	require.NoError(t, err)
 	for k := 0; k < n; k++ {
 		_, err := sp.Modify(ctx, space.ModifyBatch{

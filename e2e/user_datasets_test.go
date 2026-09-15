@@ -82,12 +82,11 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Article", Weight: 10,
+	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Article",
 		Layout: map[string]any{"type": "page"}})
 	require.NoError(t, err)
 	ti, err := sp.Types().Get(ctx, typeId)
 	require.NoError(t, err)
-	assert.Equal(t, 10, ti.Weight)
 	assert.Equal(t, map[string]any{"type": "page"}, ti.Layout)
 
 	partId, err := sp.Types().AddPart(ctx, typeId, articlesPart())
@@ -181,13 +180,11 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	}), space.ErrInvalidFieldValue)
 
 	// Type patch: display and rendering metadata.
-	weight := 20
-	require.NoError(t, sp.Types().Patch(ctx, typeId, space.TypePatch{Name: strPtr("Articles"), Weight: &weight,
+	require.NoError(t, sp.Types().Patch(ctx, typeId, space.TypePatch{Name: strPtr("Articles"),
 		Layout: map[string]any{"type": "tabs", "config": map[string]any{"header": true}}}))
 	ti, err = sp.Types().Get(ctx, typeId)
 	require.NoError(t, err)
 	assert.Equal(t, "Articles", ti.Name)
-	assert.Equal(t, 20, ti.Weight)
 	assert.Equal(t, map[string]any{"type": "tabs", "config": map[string]any{"header": true}}, ti.Layout)
 	require.NoError(t, sp.Types().Patch(ctx, typeId, space.TypePatch{ClearLayout: true}))
 	ti, err = sp.Types().Get(ctx, typeId)
@@ -254,7 +251,7 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.ErrorIs(t, err, space.ErrDatasetNotDeclared)
 
 	// An instance object implementing the type hosts the records.
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 
 	batch := space.UpsertBatch{
@@ -433,7 +430,7 @@ func TestE2E_UserDatasets_ColdSync(t *testing.T) {
 	_, err = spA.Types().AddPart(ctx, typeId, articlesPart())
 	require.NoError(t, err)
 	coll := typeId + "_articles"
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	res, err := spA.Upsert(ctx, space.UpsertBatch{
 		ObjectId: objId, Dataset: coll,

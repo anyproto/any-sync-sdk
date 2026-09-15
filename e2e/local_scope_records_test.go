@@ -88,7 +88,7 @@ func TestE2E_LocalScopeDatasetRecords(t *testing.T) {
 	}
 	spaceId := spA.Id()
 
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"notes-type"}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: "notes-type"})
 	require.NoError(t, err, "device A: Objects().Create")
 
 	const recId = "rec-1"

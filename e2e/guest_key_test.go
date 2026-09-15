@@ -75,7 +75,7 @@ func TestE2E_GuestKeyLifecycle(t *testing.T) {
 		Name: "Title", XKey: "title", Kind: space.PropertyKindString,
 	})
 	require.NoError(t, err)
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{propId: "Casablanca"})
 	require.NoError(t, err)
@@ -150,7 +150,7 @@ func TestE2E_GuestKeyLifecycle(t *testing.T) {
 	require.True(t, converged, "bob: guest content never converged")
 
 	// Read-only enforcement, typed.
-	_, err = bobSpace.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	_, err = bobSpace.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	assert.ErrorIs(t, err, space.ErrReadOnlySpace, "guest Objects().Create must be gated")
 	_, err = bobSpace.Properties().Set(ctx, objId, typeId, map[string]any{propId: "Vertigo"})
 	assert.ErrorIs(t, err, space.ErrReadOnlySpace, "guest Properties().Set must be gated")
@@ -248,6 +248,6 @@ func TestE2E_GuestKeyLifecycle(t *testing.T) {
 		return rErr == nil && rec != nil && rec.GetString(typeId, propId) == "Casablanca"
 	})
 	require.True(t, reconverged, "bob: content never re-converged after rejoin")
-	_, err = bobSpace2.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	_, err = bobSpace2.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	assert.ErrorIs(t, err, space.ErrReadOnlySpace, "re-joined guest space must stay read-only")
 }

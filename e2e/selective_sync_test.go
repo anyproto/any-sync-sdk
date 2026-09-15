@@ -68,11 +68,11 @@ func TestE2E_SelectiveSyncPayloads(t *testing.T) {
 	}
 
 	typeId, propId := setupMovieType(t, ctx, sp)
-	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, ownerId, typeId, map[string]any{propId: "Owner"})
 	require.NoError(t, err)
-	otherId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	otherId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, otherId, typeId, map[string]any{propId: "Bystander"})
 	require.NoError(t, err)

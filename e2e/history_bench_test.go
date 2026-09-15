@@ -79,7 +79,7 @@ func newHistBench(b *testing.B) *histBench {
 	require.NoError(b, err)
 	e.sp = sp
 	e.spaceId = sp.Id()
-	objId, err := sp.Objects().Create(e.ctx, space.CreateObjectOpts{Types: []string{histTypeId}})
+	objId, err := sp.Objects().Create(e.ctx, space.CreateObjectOpts{Type: histTypeId})
 	require.NoError(b, err)
 	e.objId = objId
 	return e

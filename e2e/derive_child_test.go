@@ -53,14 +53,14 @@ func TestSDK_Objects_DeriveUnderParent(t *testing.T) {
 
 	// The parent is a regular object: any-sync forbids deleting derived
 	// objects directly, so a cascade parent must be a normal object.
-	parentId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	parentId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 
 	seed := []byte("payloads")
 
 	// Derive is idempotent for the same (seed, parent).
 	childId, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{
-		Seed: seed, ParentId: parentId, Types: []string{typeId},
+		Seed: seed, ParentId: parentId, Type: typeId,
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, childId)
@@ -71,7 +71,7 @@ func TestSDK_Objects_DeriveUnderParent(t *testing.T) {
 
 	// The parent is hashed into the derived id: same seed, different
 	// parent → different id.
-	otherParent, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	otherParent, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	childUnderOther, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed, ParentId: otherParent})
 	require.NoError(t, err)

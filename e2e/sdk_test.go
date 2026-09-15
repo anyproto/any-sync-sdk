@@ -197,7 +197,7 @@ func TestSDK_OpenSurvivesRestart(t *testing.T) {
 // All writes are local (no network). Asserts both the user-observable
 // state (the value lands and reads back) and the SDK-internal
 // invariants (auto-derived propId equals shortId(changeId), bind
-// shows up in any.types).
+// shows up in any.type).
 func TestSDK_TypesAndProperties(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -260,7 +260,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 
 	// 4. Object — bind type at birth via InitialProperties.
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, objectId)
@@ -281,34 +281,28 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	got := rec.GetString(typeId, titleProp)
 	assert.Equal(t, "Casablanca", got)
 
-	// Bind side-effect: any.types should include the typeId we passed
-	// in CreateObjectOpts.
-	types := rec.GetArray("any", "types")
-	require.NotEmpty(t, types)
-	var saw bool
-	for _, v := range types {
-		if string(v.GetStringBytes()) == typeId {
-			saw = true
-			break
-		}
-	}
-	assert.True(t, saw, "any.types must contain %s", typeId)
+	// Bind side-effect: any.type holds the typeId we passed in
+	// CreateObjectOpts, and nothing lands in any.collections.
+	assert.Equal(t, typeId, rec.GetString("any", "type"), "any.type must be %s", typeId)
+	assert.Empty(t, rec.GetArray("any", "collections"))
 
-	// Types.List returns the three synthetic built-ins (`any`,
-	// `spaceIndex`, `type`) plus the user-created Movie type, in
-	// that order.
+	// Types.List returns the four synthetic built-ins (`any`,
+	// `spaceIndex`, `type`, `collection`) plus the user-created Movie
+	// type, in that order.
 	typeList, err := sp.Types().List(ctx)
 	require.NoError(t, err)
-	require.Len(t, typeList, 4)
+	require.Len(t, typeList, 5)
 	assert.Equal(t, "any", typeList[0].Id)
 	assert.True(t, typeList[0].BuiltIn)
 	assert.Equal(t, "spaceIndex", typeList[1].Id)
 	assert.True(t, typeList[1].BuiltIn)
 	assert.Equal(t, "type", typeList[2].Id)
 	assert.True(t, typeList[2].BuiltIn)
-	assert.Equal(t, typeId, typeList[3].Id)
-	assert.Equal(t, "Movie", typeList[3].Name)
-	assert.Equal(t, "movie", typeList[3].XKey)
+	assert.Equal(t, "collection", typeList[3].Id)
+	assert.True(t, typeList[3].BuiltIn)
+	assert.Equal(t, typeId, typeList[4].Id)
+	assert.Equal(t, "Movie", typeList[4].Name)
+	assert.Equal(t, "movie", typeList[4].XKey)
 
 	// Types.Get on the typeId returns the user-created row. XKey lives
 	// in the meta-type namespace (`type.xkey`) and round-trips.
@@ -338,11 +332,24 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	}
 	assert.Equal(t, map[string]space.PropertyKind{
 		"xkey":   space.PropertyKindString,
-		"weight": space.PropertyKindNumber,
 		"layout": space.PropertyKindObject,
 		"hidden": space.PropertyKindBoolean,
 		"meta":   space.PropertyKindObject,
 	}, metaKinds)
+
+	// The `collection` meta-type carries the same slice minus layout —
+	// a collection describes a definition, not how objects render.
+	collProps, err := sp.Collections().Properties(ctx, "collection")
+	require.NoError(t, err)
+	collKinds := map[string]space.PropertyKind{}
+	for _, p := range collProps {
+		collKinds[p.Id] = p.Kind
+	}
+	assert.Equal(t, map[string]space.PropertyKind{
+		"xkey":   space.PropertyKindString,
+		"hidden": space.PropertyKindBoolean,
+		"meta":   space.PropertyKindObject,
+	}, collKinds)
 
 	// Types.Get("any") returns the built-in.
 	anyInfo, err := sp.Types().Get(ctx, "any")
@@ -361,7 +368,8 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	assert.Equal(t, space.PropertyKindString, gotProps["name"])
 	assert.Equal(t, space.PropertyKindString, gotProps["description"])
 	assert.Equal(t, space.PropertyKindString, gotProps["icon"])
-	assert.Equal(t, space.PropertyKindArray, gotProps["types"])
+	assert.Equal(t, space.PropertyKindString, gotProps["type"])
+	assert.Equal(t, space.PropertyKindArray, gotProps["collections"])
 
 	// User-type properties: the Title + Year we added show up via the
 	// type's `defs` dataset.
@@ -407,7 +415,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	// confirm both rows show up in the per-space collection and a
 	// filter narrows correctly.
 	objectId2, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, objectId2, typeId, map[string]any{

@@ -65,7 +65,7 @@ func TestSDK_DatetimeProperties(t *testing.T) {
 
 	seed := func(due time.Time) string {
 		t.Helper()
-		id, cerr := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+		id, cerr := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 		require.NoError(t, cerr)
 		_, serr := sp.Properties().Set(ctx, id, typeId, map[string]any{dueProp: due})
 		require.NoError(t, serr, "a time.Time writes as a dateTime value")

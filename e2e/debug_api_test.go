@@ -58,7 +58,7 @@ func TestSDK_DebugAPI(t *testing.T) {
 	require.NoError(t, err)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 

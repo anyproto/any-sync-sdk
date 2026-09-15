@@ -118,7 +118,8 @@ Set(ctx, objectId, typeId string, patch map[string]any) (ModifyResult, error)
 - `Set` on local-scoped props returns the locally-minted lexid as
   VersionId (uniform optimistic-UI recipe across scopes).
 - `Get(ctx, objectId)` returns the row verbatim (no opts, nothing to
-  strip). `AttachType`/`DetachType` unchanged (synced-only).
+  strip). The membership writes — `SetType` / `UnsetType` /
+  `AttachCollection` / `DetachCollection` — are synced-only.
 
 ## Account transport (slice 4 — landed 2026-06-12)
 

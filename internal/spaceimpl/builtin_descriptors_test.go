@@ -9,6 +9,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -57,11 +58,15 @@ func TestBuiltInDescriptiveSlice(t *testing.T) {
 	for _, p := range typetype.Properties {
 		check(t, typetype.TypeId+"."+p.Id, p.Name, p.Description, p.Kind, p.XFormat)
 	}
+	for _, p := range collectiontype.Properties {
+		check(t, collectiontype.TypeId+"."+p.Id, p.Name, p.Description, p.Kind, p.XFormat)
+	}
 	// The public views carry the slice through, deep-copied.
 	for typeId, defs := range map[string][]space.PropertyDef{
-		anytype.TypeId:    builtInAnyProperties(),
-		spaceindex.TypeId: builtInSpaceIndexProperties(),
-		typetype.TypeId:   builtInMetaTypeProperties(),
+		anytype.TypeId:        builtInAnyProperties(),
+		spaceindex.TypeId:     builtInSpaceIndexProperties(),
+		typetype.TypeId:       builtInMetaTypeProperties(),
+		collectiontype.TypeId: builtInMetaCollectionProperties(),
 	} {
 		for _, d := range defs {
 			assert.NotEmpty(t, d.Description, "%s.%s: description dropped by the view", typeId, d.Id)

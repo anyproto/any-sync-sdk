@@ -60,7 +60,7 @@ func TestE2E_ModifiedBy_NamesTheWritersAccount(t *testing.T) {
 		}
 		t.Fatalf("alice: Spaces().Create: %v", err)
 	}
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"notes-type"}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: "notes-type"})
 	require.NoError(t, err)
 
 	// Bob joins as a writer.

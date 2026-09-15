@@ -8,8 +8,8 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
-	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )

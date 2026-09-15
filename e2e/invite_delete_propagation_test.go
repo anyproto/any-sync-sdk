@@ -113,7 +113,7 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 		t.Fatalf("alice: Spaces().Create: %v", err)
 	}
 
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "blocks-type"})
 	require.NoError(t, err, "alice: Objects().Create")
 
 	const recId = "rec-X"

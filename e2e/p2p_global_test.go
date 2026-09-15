@@ -139,7 +139,7 @@ func TestE2E_GlobalP2PSync(t *testing.T) {
 		Name: "Title", XKey: "title", Kind: space.PropertyKindString,
 	})
 	require.NoError(t, err)
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = spA.Properties().Set(ctx, objId, typeId, map[string]any{propId: "through-the-nodes"})
 	require.NoError(t, err)
@@ -243,7 +243,7 @@ func TestE2E_GlobalP2PSync(t *testing.T) {
 		sdkA2.P2PStatus().Global, sdkB2.P2PStatus().Global)
 
 	// A writes with nothing but the iroh connection available.
-	objId2, err := spA2.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId2, err := spA2.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = spA2.Properties().Set(ctx, objId2, typeId, map[string]any{propId: "over-iroh"})
 	require.NoError(t, err)

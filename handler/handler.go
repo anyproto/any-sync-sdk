@@ -98,6 +98,9 @@ var (
 	// only carrier; a client cannot mint another instance of a
 	// reserved module by attaching the type.
 	ErrValidationReservedCarrier = properties.ErrReservedCarrier
+	// ErrValidationWrongSlot — the write puts a known collection id in
+	// `any.type` or a known type id in `any.collections`.
+	ErrValidationWrongSlot = properties.ErrWrongSlot
 )
 
 // ValidationReason is the machine-readable cause of a property-write
@@ -114,6 +117,7 @@ const (
 	ReasonUnknownProperty    ValidationReason = properties.ReasonUnknownProperty
 	ReasonKindMismatch       ValidationReason = properties.ReasonKindMismatch
 	ReasonReservedCarrier    ValidationReason = properties.ReasonReservedCarrier
+	ReasonWrongSlot          ValidationReason = properties.ReasonWrongSlot
 )
 
 // ClassifyValidation maps a property-validation rejection to its cause

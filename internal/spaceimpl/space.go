@@ -43,13 +43,13 @@ type spaceImpl struct {
 	// spaceIndex object (no derive, no index watcher wiring).
 	techIndexId string
 
-	objects    *objectService
+	objects     *objectService
 	types       *typesAPI
 	collections *collectionsAPI
 	properties  *propertiesAPI
-	acl        *aclAPI
-	members    *membersAPI
-	bundles    *bundlesAPI
+	acl         *aclAPI
+	members     *membersAPI
+	bundles     *bundlesAPI
 }
 
 func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *spaceobjects.Store, parent *Service) *spaceImpl {
@@ -153,7 +153,7 @@ func (s *spaceImpl) canWrite(ctx context.Context) bool {
 	return state.Permissions(state.Identity()).CanWrite()
 }
 
-func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
+func (s *spaceImpl) Objects() space.ObjectService      { return s.objects }
 func (s *spaceImpl) Types() space.TypesAPI             { return s.types }
 func (s *spaceImpl) Collections() space.CollectionsAPI { return s.collections }
 func (s *spaceImpl) Properties() space.PropertiesAPI   { return s.properties }
@@ -321,13 +321,14 @@ func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, datase
 func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
 	res, err := obj.LocalWrite(ctx, ch)
 	if !errors.Is(err, object.ErrClosed) {
-		return res, err
+		return res, wrapSlotErr(err)
 	}
 	obj, gerr := s.store.Get(ctx, objectId)
 	if gerr != nil {
 		return object.WriteResult{}, gerr
 	}
-	return obj.LocalWrite(ctx, ch)
+	res, err = obj.LocalWrite(ctx, ch)
+	return res, wrapSlotErr(err)
 }
 
 // localSetRetry is localWriteRetry for the LocalSet route.

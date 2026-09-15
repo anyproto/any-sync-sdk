@@ -17,8 +17,8 @@ import (
 func staticOverlay() map[string]map[string]types.PropInfo {
 	return map[string]map[string]types.PropInfo{
 		"any": {
-			"name": {Id: "name", Name: "Name", Kind: schema.KindString},
-			"types": {Id: "types", Name: "Types", Kind: schema.KindArray},
+			"name":        {Id: "name", Name: "Name", Kind: schema.KindString},
+			"collections": {Id: "collections", Name: "Collections", Kind: schema.KindArray},
 		},
 		// A registered type that owns only datasets: known, zero props.
 		"editor": {},

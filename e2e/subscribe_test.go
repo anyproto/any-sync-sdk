@@ -99,7 +99,7 @@ func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 	typeId, titleProp := setupMovieType(t, ctx, sp)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 
@@ -209,7 +209,7 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 	t.Cleanup(func() { _ = res.Sub.Close() })
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 
@@ -295,7 +295,7 @@ func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
 	typeId, _ := setupMovieType(t, ctx, sp)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 

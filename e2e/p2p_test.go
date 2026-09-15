@@ -154,7 +154,7 @@ func TestE2E_P2POfflineSync(t *testing.T) {
 		Name: "Title", XKey: "title", Kind: space.PropertyKindString,
 	})
 	require.NoError(t, err)
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{propId: "over-the-lan"})
 	require.NoError(t, err)
@@ -228,7 +228,7 @@ func TestE2E_P2POfflineSync(t *testing.T) {
 	// responsible-sender fix — a LAN peer counts as responsible, so
 	// pending heads drain even with no node reachable. Without it B
 	// would sit in "syncing" forever.
-	objId2, err := spB.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId2, err := spB.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = spB.Properties().Set(ctx, objId2, typeId, map[string]any{propId: "from-B"})
 	require.NoError(t, err)

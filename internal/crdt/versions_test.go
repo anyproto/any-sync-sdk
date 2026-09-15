@@ -373,15 +373,15 @@ func TestCompact_SubtreeMixedNotCollapsed(t *testing.T) {
 	rec := buildRecord(t, arena, map[string]any{
 		IdField: "v1",
 		"any": map[string]any{
-			"types": "v5",
-			"name":  "v3", // mixed — must stay expanded
+			"collections": "v5",
+			"name":        "v3", // mixed — must stay expanded
 		},
 	})
 	compactVersions(arena, rec)
 	any := rec.Get(VersionsKey).Get("any")
 	require.NotNil(t, any)
 	assert.Equal(t, anyenc.TypeObject, any.Type())
-	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "any", "types"))
+	assert.Equal(t, VersionId("v5"), GetRecordVersion(rec, "any", "collections"))
 	assert.Equal(t, VersionId("v3"), GetRecordVersion(rec, "any", "name"))
 }
 

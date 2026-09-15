@@ -103,7 +103,7 @@ type Service struct {
 	// canonical collection are applied alongside the built-in catalog.
 	extTypes       []handler.Type
 	extCollections []handler.Collection
-	modules  []handler.Module
+	modules        []handler.Module
 
 	// files/fetch/fstore/fqueue are the SDK-level byte-layer services
 	// behind every space's Files() surface. Set once by SetFiles right

@@ -63,7 +63,7 @@ func TestSDK_Aggregate(t *testing.T) {
 
 	seed := func(title string, year int) string {
 		t.Helper()
-		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 		require.NoError(t, err)
 		_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{
 			titleProp: title, yearProp: year,
@@ -120,7 +120,7 @@ func TestSDK_Aggregate(t *testing.T) {
 	assert.ErrorIs(t, err, space.ErrBadPipeline)
 
 	// Per-object dataset aggregation over the blocks handler type.
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "blocks-type"})
 	require.NoError(t, err)
 	for recId, kind := range map[string]string{
 		"b1": "paragraph", "b2": "heading", "b3": "paragraph",

@@ -48,9 +48,9 @@ func TestE2E_FilesV2_Delete(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	typeId, _ := setupMovieType(t, ctx, spA)
-	owner1, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	owner1, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
-	owner2, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	owner2, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_ = sdkA.Spaces().SyncSpaceList(ctx)
 	_ = spA.SyncHeads(ctx)

@@ -1,5 +1,11 @@
 # Types & Properties — Proposal
 
+> Historical proposal. The shipped model is one type per object at
+> `any.type` plus any number of collections at `any.collections` —
+> see [06-data-structure.md](06-data-structure.md) § Type and
+> collections. Read "the types an object implements" below as "its
+> type and its collections".
+
 ## System — structure & abilities
 
 **Space** — a container of objects.
@@ -26,7 +32,7 @@
 **On objects**
 - Create / derive / delete
 - Hold multiple datasets
-- Attach one or more "types" (each type brings handlers for certain datasets)
+- Take one type and any number of collections (a type brings handlers for certain datasets)
 
 **On spaces**
 - Create / join / delete
@@ -49,7 +55,7 @@ A type defines:
 - **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`, and optionally `x-format` (the opaque descriptor — semantic slug, options, relation targets, config — see docs/06 § "The `x-format` descriptor"; its `options` member is the concrete realization of the deferred `enum` keyword, owned by the consumer). More fields (e.g. `required`, `default`) may be added later, when a concrete need appears.
 - **Optionally, versioned data schemas** for the object's datasets.
 
-Objects may implement **many types**, which coexist. No extension/inheritance in v1.
+An object has **one type** and any number of **collections**, whose namespaces coexist. No extension/inheritance in v1.
 
 ### Property record shape
 

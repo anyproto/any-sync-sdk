@@ -64,7 +64,7 @@ func TestSDK_DeletionFeed_AndRebuild(t *testing.T) {
 	require.NoError(t, err)
 
 	// A live object with a content write, so it has a real content applySeq.
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{titleProp: "doomed"})
 	require.NoError(t, err)

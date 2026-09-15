@@ -22,7 +22,7 @@ func gateStore(t *testing.T) (context.Context, *Store) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "gate.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	return ctx, store
 }
 

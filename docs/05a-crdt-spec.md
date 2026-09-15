@@ -766,7 +766,7 @@ type ModifyResult struct {
 One auto-routing setter; the SDK picks the write route from each propId's declared scope (§9):
 
 ```go
-Set(objectId, typeId, patch) -> (ModifyResult, error)
+Set(objectId, ownerId, patch) -> (ModifyResult, error)   // ownerId: the object's type or one of its collections
 ```
 
 All keys in a `patch` must resolve to the SAME scope — mixed-scope patches are rejected, since the routes commit independently and cannot be rolled back together. `synced` props go through the regular `Modify()` pipeline on the object; `account` props through the tech-space carrier record; `local` props through `Object.LocalSet`. The returned `VersionId` is in whatever route's domain handled the write.

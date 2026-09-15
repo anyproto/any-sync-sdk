@@ -73,7 +73,7 @@ func TestE2E_LocalScopeIsolation(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 
 	// Local write FIRST (this is the value B must never see), then the
@@ -139,7 +139,7 @@ func TestE2E_LocalScopeIsolation(t *testing.T) {
 	// of the title value observed above, so wait for both explicitly:
 	// the type DEFS travel on a separate tree (without the local-scoped
 	// def, resolveRoute would fall back to synced and B's write would
-	// corrupt the shared value), and the object's any.types membership
+	// corrupt the shared value), and the object's any.type membership
 	// travels on its own change (without it, the strict local-write
 	// gate rejects the synced Set with type_not_implemented).
 	require.Eventually(t, func() bool {
@@ -150,12 +150,7 @@ func TestE2E_LocalScopeIsolation(t *testing.T) {
 		if gerr != nil || row == nil {
 			return false
 		}
-		for _, v := range row.GetArray("any", "types") {
-			if string(v.GetStringBytes()) == typeId {
-				return true
-			}
-		}
-		return false
+		return row.GetString("any", "type") == typeId
 	}, 2*time.Minute, 3*time.Second, "device B: local-scoped def or type membership never resolved")
 	_, err = spB.Properties().Set(ctx, objId, typeId, map[string]any{pinProp: false})
 	require.NoError(t, err, "device B: own local-scope Set")

@@ -244,12 +244,12 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "computing the id must not install anything")
 
 	// The bundle declares a FULL type: a part, two properties with
-	// handles, a layout and a weight. Both devices send the same
-	// request; the property ids derive from (root, handle), so the
-	// two installs mint one column per handle.
+	// handles and a layout. Both devices send the same request; the
+	// property ids derive from (root, handle), so the two installs mint
+	// one column per handle.
 	declaredType := func() space.EnsureBundleRequest {
 		return space.EnsureBundleRequest{
-			Id: bundleId, Name: "Chat", DerivedRoot: true, SelfTyped: true,
+			Id: bundleId, Name: "Chat", DerivedRoot: true,
 			RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
 			Parts:          []space.PartDraft{articlesPart()},
 			Properties: []space.PropertyDraft{
@@ -257,7 +257,6 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 				{XKey: "pos", Name: "Position", Kind: space.PropertyKindString, XFormat: map[string]any{"type": "text"}},
 			},
 			Layout: map[string]any{"type": "chat"},
-			Weight: 5,
 		}
 	}
 	inst, didInstall, err := spA.Bundles().Ensure(ctx, declaredType())
@@ -268,9 +267,9 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.Equal(t, []string{wantRoot}, inst.Roots)
 	require.Empty(t, inst.Losers)
 
-	// A self-typed root declaring parts is a type implementing itself:
-	// the declaration is discoverable under typeId = rootId and records
-	// land on the root through the generic upsert path.
+	// A declaring root implements itself: the declaration is
+	// discoverable under typeId = rootId and records land on the root
+	// through the generic upsert path.
 	defs, err := spA.Types().Datasets(ctx, wantRoot)
 	require.NoError(t, err, "device A: Types().Datasets(root)")
 	require.Len(t, defs, 1)
@@ -285,12 +284,11 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.Equal(t, 1, upRes.Created)
 	require.Empty(t, upRes.Rejections)
 
-	// The type's metadata and properties: weight / layout on the root,
-	// one definition per handle, listed (Hidden was not asked for), and
+	// The type's metadata and properties: the layout on the root, one
+	// definition per handle, listed (Hidden was not asked for), and
 	// usable on an object carrying the root as its type.
 	rootInfo, err := spA.Types().Get(ctx, wantRoot)
 	require.NoError(t, err)
-	assert.Equal(t, 5, rootInfo.Weight)
 	assert.Equal(t, map[string]any{"type": "chat"}, rootInfo.Layout)
 	assert.False(t, rootInfo.Hidden, "hidden is explicit — a declared type stays listed")
 	propsA, err := spA.Types().Properties(ctx, wantRoot)
@@ -302,7 +300,7 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	}
 	require.Len(t, propIdsA, 2)
 	assert.Equal(t, space.PropertyKindString, propsA[0].Kind)
-	carrier, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{wantRoot}})
+	carrier, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: wantRoot})
 	require.NoError(t, err)
 	_, err = spA.Properties().Set(ctx, carrier, wantRoot, map[string]any{propIdsA["parentId"]: "any://o/x"})
 	require.NoError(t, err, "a bundle-declared property takes values on a carrier")
@@ -322,6 +320,9 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, props)
 	require.Equal(t, "seeded", string(props.Get("any", "description").GetStringBytes()))
+	assert.Equal(t, "__type__", props.GetString("any", "type"),
+		"a declaring root holds only the marker — it never names itself")
+	assert.Empty(t, props.GetArray("any", "collections"))
 
 	// A created-root request cannot fork a live install.
 	adopted, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
@@ -417,7 +418,6 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	}), "bundle properties never converged: B props=%+v", propsB)
 	infoB, err := spB.Types().Get(ctx, wantRoot)
 	require.NoError(t, err)
-	assert.Equal(t, 5, infoB.Weight)
 	assert.Equal(t, map[string]any{"type": "chat"}, infoB.Layout)
 
 	// Data written AFTER both installs crosses in both directions: each
@@ -501,13 +501,14 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 
 // TestE2E_BundlesTypeDeclaringCreatedRoot covers the SDK-minted
 // created root of a type-declaring request. The root's first change
-// carries its types, name, type metadata and seeded values together,
-// so an install is root + 3 changes (objects, properties, datasets);
-// XKey reads back as the type's handle; RootTypes / RootProperties
-// land on a created root; the root is a definition and not an
-// instance unless SelfTyped; an XKey alone is a marker type (root + 1
-// change) objects can carry; a derived root gets the same one-change
-// stamp.
+// carries its membership, name, type metadata and seeded values
+// together, so an install is root + 3 changes (objects, properties,
+// datasets); XKey reads back as the type's handle; RootCollections /
+// RootProperties land on a created root; the root carries only the
+// marker in `any.type`, implements itself, and matches no query for
+// its own id; RootType next to a declaration is refused; an XKey alone
+// is a marker type (root + 1 change) objects can carry; a derived root
+// gets the same one-change stamp.
 func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -545,28 +546,35 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 		}
 		return out
 	}
-	typesOf := func(objectId string) []string {
+	typeOf := func(objectId string) string {
+		t.Helper()
+		row, err := sp.Properties().Get(ctx, objectId)
+		require.NoError(t, err)
+		return row.GetString("any", "type")
+	}
+	collectionsOf := func(objectId string) []string {
 		t.Helper()
 		row, err := sp.Properties().Get(ctx, objectId)
 		require.NoError(t, err)
 		var out []string
-		for _, v := range row.GetArray("any", "types") {
+		for _, v := range row.GetArray("any", "collections") {
 			out = append(out, string(v.GetStringBytes()))
 		}
 		return out
 	}
 
-	// A user type whose id and property the bundle root carries as an
-	// extra type with a seeded value — the miniapp shape.
-	movieType, titleProp := setupMovieType(t, ctx, sp)
+	// A user type, and a collection whose id and property the bundle
+	// root carries with a seeded value — the miniapp shape.
+	movieType, _ := setupMovieType(t, ctx, sp)
+	tagColl, tagTitle := setupTagCollection(t, ctx, sp)
 
 	req := space.EnsureBundleRequest{
 		Id: "wiki/v1", Name: "Wiki", XKey: "wiki", Hidden: true,
-		RootTypes:      []string{movieType},
-		RootProperties: map[string]map[string]any{movieType: {titleProp: "seeded"}},
-		Properties:     []space.PropertyDraft{{XKey: "parentId", Name: "Parent", Kind: space.PropertyKindString}},
-		Parts:          []space.PartDraft{articlesPart()},
-		Layout:         map[string]any{"type": "page"},
+		RootCollections: []string{tagColl},
+		RootProperties:  map[string]map[string]any{tagColl: {tagTitle: "seeded"}},
+		Properties:      []space.PropertyDraft{{XKey: "parentId", Name: "Parent", Kind: space.PropertyKindString}},
+		Parts:           []space.PartDraft{articlesPart()},
+		Layout:          map[string]any{"type": "page"},
 	}
 	inst, didInstall, err := sp.Bundles().Ensure(ctx, req)
 	require.NoError(t, err, "Ensure(created, self-typed)")
@@ -581,27 +589,21 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	assert.Equal(t, map[string]any{"type": "page"}, info.Layout)
 	assert.Equal(t, "Wiki", info.Name)
 
-	assert.ElementsMatch(t, []string{"__type__", movieType}, typesOf(root),
-		"marker and the root types, attached in the stamp — a type objects carry does not carry itself")
-	// A definition is not an instance: it takes none of its own parts
-	// and answers no query for its type.
-	_, err = sp.Upsert(ctx, space.UpsertBatch{
-		ObjectId: root, Dataset: root + "_articles",
-		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{"title": "nope"}}},
-	})
-	require.ErrorIs(t, err, space.ErrDatasetNotDeclared, "records on a root that does not carry its type")
-	selfMatch, err := sp.QueryObjects().Filter(map[string]any{"any.types": root}).All(ctx)
+	assert.Equal(t, "__type__", typeOf(root),
+		"the marker alone in the type slot — a definition object has no type of its own")
+	assert.ElementsMatch(t, []string{tagColl}, collectionsOf(root),
+		"RootCollections and the seeded owner, attached in the stamp")
+	// A definition answers no query for its own id, whatever it hosts.
+	selfMatch, err := sp.QueryObjects().Filter(map[string]any{"any.type": root}).All(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, selfMatch, "a type query never returns the definition")
-	smuggleId, err := sp.Bundles().DerivedRootId(ctx, "self-by-roottypes/v1")
-	require.NoError(t, err)
 	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "self-by-roottypes/v1", DerivedRoot: true, XKey: "smuggle", RootTypes: []string{smuggleId},
+		Id: "roottype-with-declaration/v1", DerivedRoot: true, XKey: "smuggle", RootType: movieType,
 	})
-	require.ErrorIs(t, err, space.ErrBundleBadRequest, "the self type is SelfTyped's to ask for, not RootTypes'")
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "a declaring root's type slot holds the marker, not RootType")
 	row, err := sp.Properties().Get(ctx, root)
 	require.NoError(t, err)
-	assert.Equal(t, "seeded", string(row.Get(movieType, titleProp).GetStringBytes()),
+	assert.Equal(t, "seeded", string(row.Get(tagColl, tagTitle).GetStringBytes()),
 		"RootProperties seed a created root")
 
 	// Root + 3: the stamp (objects), the definitions (properties), the
@@ -623,6 +625,16 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	assert.Equal(t, map[string]int{"objects": 1, "properties": 1, "datasets": 1}, changesByDataset(root),
 		"adopt must not add a change")
 
+	// A definition implicitly implements itself: the root hosts records
+	// in its own parts' collections without carrying its own id.
+	upSelf, err := sp.Upsert(ctx, space.UpsertBatch{
+		ObjectId: root, Dataset: root + "_articles",
+		Records: []space.UpsertRecord{{Id: "a-1", Fields: map[string]any{"title": "own record"}}},
+	})
+	require.NoError(t, err, "a declaring root hosts its own bundle's records")
+	require.Equal(t, 1, upSelf.Created)
+	require.Empty(t, upSelf.Rejections)
+
 	// A marker type: an XKey alone, no columns, no parts. Root + 1.
 	flag, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: "flag/v1", Name: "Flag", XKey: "flag"})
 	require.NoError(t, err, "Ensure(marker type)")
@@ -630,23 +642,24 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	flagInfo, err := sp.Types().Get(ctx, flag.RootId)
 	require.NoError(t, err)
 	assert.Equal(t, "flag", flagInfo.XKey)
-	assert.ElementsMatch(t, []string{"__type__"}, typesOf(flag.RootId))
+	assert.Equal(t, "__type__", typeOf(flag.RootId))
 	assert.Equal(t, map[string]int{"objects": 1}, changesByDataset(flag.RootId))
-	carrier, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{flag.RootId}})
+	carrier, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: flag.RootId})
 	require.NoError(t, err)
-	assert.Contains(t, typesOf(carrier), flag.RootId, "objects carry a marker type")
+	assert.Equal(t, flag.RootId, typeOf(carrier), "objects carry a marker type")
 
-	// A derived root gets the same one-change stamp: types, name and
-	// seeded values together, then its declarations.
+	// A derived root gets the same one-change stamp: membership, name
+	// and seeded values together, then its declarations.
 	der, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "chat/v1", Name: "Chat", DerivedRoot: true, XKey: "general_chat", Hidden: true, SelfTyped: true,
+		Id: "chat/v1", Name: "Chat", DerivedRoot: true, XKey: "general_chat", Hidden: true,
 		RootProperties: map[string]map[string]any{"any": {"description": "seeded"}},
 		Parts:          []space.PartDraft{articlesPart()},
 	})
 	require.NoError(t, err, "Ensure(derived)")
 	require.True(t, didInstall)
 	require.True(t, der.Derived)
-	assert.ElementsMatch(t, []string{"__type__", der.RootId}, typesOf(der.RootId), "self-typed on request; `any` is never attached")
+	assert.Equal(t, "__type__", typeOf(der.RootId), "the marker alone; `any` is never attached")
+	assert.Empty(t, collectionsOf(der.RootId))
 	drow, err := sp.Properties().Get(ctx, der.RootId)
 	require.NoError(t, err)
 	assert.Equal(t, "seeded", string(drow.Get("any", "description").GetStringBytes()))
@@ -656,7 +669,7 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	assert.Equal(t, map[string]int{"objects": 1, "datasets": 1}, changesByDataset(der.RootId))
 
 	// A caller-minted root that already carries a name still gets its
-	// types: the stamp attaches what the row lacks whatever the name
+	// membership: the stamp writes what the row lacks whatever the name
 	// says (an install writes the request's name; an adopt never
 	// renames).
 	named, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
@@ -670,42 +683,46 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	require.NoError(t, err, "Ensure(NewRoot, named)")
 	require.True(t, didInstall)
 	require.Equal(t, named, nb.RootId)
-	assert.ElementsMatch(t, []string{"__type__"}, typesOf(named), "a named NewRoot is still stamped as a type")
+	assert.Equal(t, "__type__", typeOf(named), "a named NewRoot is still stamped as a type")
 	ninfo, err := sp.Types().Get(ctx, named)
 	require.NoError(t, err)
 	assert.Equal(t, "named", ninfo.XKey)
 	assert.Equal(t, "Other", ninfo.Name, "the install writes the request's name — the documented $set")
 
-	// A request that gains a root type and a handle after the install
-	// reaches the existing root on adopt: attached and filled, the
-	// rest untouched, seeds never re-written.
+	// A request that gains a root collection and a handle after the
+	// install reaches the existing root on adopt: attached and filled,
+	// the rest untouched, seeds never re-written.
 	plain, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "plain/v1", Name: "Plain", Parts: []space.PartDraft{articlesPart()}, Weight: 7,
+		Id: "plain/v1", Name: "Plain", Parts: []space.PartDraft{articlesPart()},
+		Layout: map[string]any{"type": "page"},
 	})
 	require.NoError(t, err)
 	require.True(t, didInstall)
-	assert.ElementsMatch(t, []string{"__type__"}, typesOf(plain.RootId))
+	assert.Equal(t, "__type__", typeOf(plain.RootId))
+	assert.Empty(t, collectionsOf(plain.RootId))
 	grown, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "plain/v1", Name: "Renamed", Parts: []space.PartDraft{articlesPart()}, Weight: 9,
-		XKey: "plain", RootTypes: []string{movieType}, SelfTyped: true,
-		RootProperties: map[string]map[string]any{movieType: {titleProp: "late seed"}},
+		Id: "plain/v1", Name: "Renamed", Parts: []space.PartDraft{articlesPart()},
+		Layout: map[string]any{"type": "tabs"},
+		XKey:   "plain", RootCollections: []string{tagColl},
+		RootProperties: map[string]map[string]any{tagColl: {tagTitle: "late seed"}},
 	})
-	require.NoError(t, err, "adopt with a gained type and handle")
+	require.NoError(t, err, "adopt with a gained collection and handle")
 	require.False(t, didInstall)
 	require.Equal(t, plain.RootId, grown.RootId)
-	assert.ElementsMatch(t, []string{"__type__", plain.RootId, movieType}, typesOf(plain.RootId), "the gained root type and self type are attached on adopt")
+	assert.Equal(t, "__type__", typeOf(plain.RootId), "the marker stays in the type slot")
+	assert.ElementsMatch(t, []string{tagColl}, collectionsOf(plain.RootId), "the gained root collection is attached on adopt")
 	pinfo, err := sp.Types().Get(ctx, plain.RootId)
 	require.NoError(t, err)
 	assert.Equal(t, "plain", pinfo.XKey, "an absent handle is filled on adopt")
 	assert.Equal(t, "Plain", pinfo.Name, "adopt never renames")
-	assert.Equal(t, 7, pinfo.Weight, "adopt never patches metadata")
+	assert.Equal(t, map[string]any{"type": "page"}, pinfo.Layout, "adopt never patches metadata")
 	prow, err := sp.Properties().Get(ctx, plain.RootId)
 	require.NoError(t, err)
-	assert.Nil(t, prow.Get(movieType, titleProp), "adopt never seeds")
+	assert.Nil(t, prow.Get(tagColl, tagTitle), "adopt never seeds")
 	assert.Equal(t, map[string]int{"objects": 2, "datasets": 1}, changesByDataset(plain.RootId),
 		"the heal is one more objects change; a third Ensure adds none")
 	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
-		Id: "plain/v1", Parts: []space.PartDraft{articlesPart()}, XKey: "plain", RootTypes: []string{movieType},
+		Id: "plain/v1", Parts: []space.PartDraft{articlesPart()}, XKey: "plain", RootCollections: []string{tagColl},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int{"objects": 2, "datasets": 1}, changesByDataset(plain.RootId))

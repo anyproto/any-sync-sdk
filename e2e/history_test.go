@@ -71,7 +71,7 @@ func TestSDK_History(t *testing.T) {
 
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "History"})
 	require.NoError(t, err)
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{histTypeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: histTypeId})
 	require.NoError(t, err)
 	self := sdk.Account().Id()
 	require.NotEmpty(t, self)
@@ -294,7 +294,7 @@ func TestSDK_HistoryDiffValues(t *testing.T) {
 
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "DiffValues"})
 	require.NoError(t, err)
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{histTypeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: histTypeId})
 	require.NoError(t, err)
 
 	var versions []space.Version

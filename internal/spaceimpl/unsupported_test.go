@@ -94,6 +94,14 @@ func TestTechWrappers_RefuseLifecycle(t *testing.T) {
 	// the part and dataset mutators — refused off bundle roots, allowed
 	// on them. Needs a store to decide; covered by the tech bundles e2e.
 
+	// Collections share that fence: a tech-space definition is minted
+	// by a bundle install, never directly.
+	c := techCollections{}
+	_, err = c.Create(ctx, space.CollectionCreateParams{})
+	assert.ErrorIs(t, err, space.ErrUnsupported)
+	assert.ErrorIs(t, c.Delete(ctx, "c"), space.ErrUnsupported)
+	assert.ErrorIs(t, c.Patch(ctx, "c", space.CollectionPatch{}), space.ErrUnsupported)
+
 	assert.ErrorIs(t, errUnsupported("x"), space.ErrUnsupported)
 }
 

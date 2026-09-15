@@ -489,11 +489,11 @@ func (t *typesAPI) Parts(ctx context.Context, typeId string) ([]space.PartDef, e
 }
 
 func (t *typesAPI) AddPart(ctx context.Context, typeId string, draft space.PartDraft) (string, error) {
-	if t.staticType(typeId) {
-		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return "", err
+	}
+	if t.staticType(typeId) {
+		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	existing, err := t.compiled(ctx, typeId)
 	if err != nil {
@@ -513,11 +513,11 @@ func (t *typesAPI) AddPart(ctx context.Context, typeId string, draft space.PartD
 }
 
 func (t *typesAPI) PatchPart(ctx context.Context, typeId, partId string, patch space.DatasetDefPatch) error {
-	if t.staticType(typeId) {
-		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if partId == "" {
 		return errors.New("typesAPI: part id required")
@@ -616,11 +616,11 @@ func (t *typesAPI) PatchPart(ctx context.Context, typeId, partId string, patch s
 // winner and the hidden duplicates alike, so nothing resurfaces once
 // the winner is gone. Field records go orphan and fold out.
 func (t *typesAPI) RemovePart(ctx context.Context, typeId, partId string) error {
-	if t.staticType(typeId) {
-		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if partId == "" {
 		return errors.New("typesAPI: part id required")
@@ -664,11 +664,11 @@ func (t *typesAPI) RemovePart(ctx context.Context, typeId, partId string) error 
 }
 
 func (t *typesAPI) AddDataset(ctx context.Context, typeId, partId string, draft space.DatasetDraft) (string, error) {
-	if t.staticType(typeId) {
-		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return "", err
+	}
+	if t.staticType(typeId) {
+		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if partId == "" {
 		return "", errors.New("typesAPI: part id required")
@@ -701,11 +701,11 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId, partId string, draft 
 }
 
 func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft space.DatasetFieldDraft) (string, error) {
-	if t.staticType(typeId) {
-		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return "", err
+	}
+	if t.staticType(typeId) {
+		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if draft.Required {
 		// A required field added later would reject the dataset's own
@@ -762,11 +762,11 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 // one visible definition; the hidden duplicates would otherwise
 // resurface as the dataset the moment the winner is removed).
 func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId string) error {
-	if t.staticType(typeId) {
-		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if datasetDefId == "" {
 		return errors.New("typesAPI: definition id required")
@@ -802,11 +802,11 @@ func (t *typesAPI) RemoveDataset(ctx context.Context, typeId, datasetDefId strin
 }
 
 func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error {
-	if t.staticType(typeId) {
-		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	// Validate the declaration MINUS the field before writing the
 	// delete: removing e.g. the creator stamp of an author-gated
@@ -838,11 +838,11 @@ func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 }
 
 func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId string) error {
-	if t.staticType(typeId) {
-		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if defId == "" {
 		return errors.New("typesAPI: definition id required")
@@ -857,11 +857,11 @@ func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId str
 }
 
 func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch space.DatasetDefPatch) error {
-	if t.staticType(typeId) {
-		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if len(patch.Set) == 0 && len(patch.Unset) == 0 {
 		return nil
@@ -940,11 +940,11 @@ func (t *typesAPI) PatchDataset(ctx context.Context, typeId, defId string, patch
 // applying; the record must be a live field of typeId (with
 // Upsert=false a modify against an unknown id would silently no-op).
 func (t *typesAPI) PatchDatasetField(ctx context.Context, typeId, fieldDefId string, patch space.DatasetDefPatch) error {
-	if t.staticType(typeId) {
-		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
-	}
 	if err := t.requireType(ctx, typeId); err != nil {
 		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
 	if fieldDefId == "" {
 		return errors.New("typesAPI: field definition id required")

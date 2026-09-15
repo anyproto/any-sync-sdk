@@ -178,14 +178,14 @@ func TestPreValidate_DefinitionImplementsItself(t *testing.T) {
 // classifier stubs the definition lookup the store provides in
 // production: movieT is a type, shelfC a collection, everything else
 // unresolvable here.
-func classifier(_ context.Context, id string) properties.OwnerKind {
+func classifier(_ context.Context, id string) (properties.OwnerKind, error) {
 	switch id {
 	case movieT:
-		return properties.OwnerType
+		return properties.OwnerType, nil
 	case shelfC:
-		return properties.OwnerCollection
+		return properties.OwnerCollection, nil
 	}
-	return properties.OwnerUnknown
+	return properties.OwnerUnknown, nil
 }
 
 // TestPreValidate_WrongSlot pins the slot rule: a known collection is

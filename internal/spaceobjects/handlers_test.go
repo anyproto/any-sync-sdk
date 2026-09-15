@@ -190,8 +190,8 @@ func TestValidateExternalCollections(t *testing.T) {
 	extTypes := []handler.Type{{Id: "movie"}}
 	goodColl := handler.Collection{Id: "shelf", Name: "Shelf",
 		Properties: []handler.PropertyDecl{{Id: "pos", Kind: handler.PropertyKindString}}}
-	require.NoError(t, ValidateExternalCollections(extTypes, []handler.Collection{goodColl}))
-	require.NoError(t, ValidateExternalCollections(nil, nil))
+	require.NoError(t, ValidateExternalCollections(extTypes, []handler.Collection{goodColl}, nil))
+	require.NoError(t, ValidateExternalCollections(nil, nil, nil))
 
 	cases := []struct {
 		name  string
@@ -205,16 +205,21 @@ func TestValidateExternalCollections(t *testing.T) {
 		{"reserved any id", []handler.Collection{{Id: "any"}}, `"any" is reserved for a built-in`},
 		{"type marker id", []handler.Collection{{Id: "__type__"}}, `"__type__" is a reserved marker`},
 		{"collection marker id", []handler.Collection{{Id: "__collection__"}}, `"__collection__" is a reserved marker`},
+		{"records module name", []handler.Collection{{Id: "records"}}, `"records" is also a module name`},
 		{"bad property", []handler.Collection{{Id: "shelf",
 			Properties: []handler.PropertyDecl{{Id: "_pos", Kind: handler.PropertyKindString}}}}, "_pos"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateExternalCollections(extTypes, tc.colls)
+			err := ValidateExternalCollections(extTypes, tc.colls, nil)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.err)
 		})
 	}
+	// A registered module owns an objects-row namespace under its name.
+	err := ValidateExternalCollections(nil, []handler.Collection{{Id: "chat"}}, []handler.Module{{Name: "chat"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"chat" is also a module name`)
 }
 
 func TestStore_DataVersion_External(t *testing.T) {

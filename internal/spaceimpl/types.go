@@ -361,6 +361,9 @@ func (t *typesAPI) findRegisteredCollection(id string) (handler.Collection, bool
 // row — a type, or nothing resolvable here — passes, so the existing
 // failure modes (ErrNotFound, a tree that does not build) stay.
 func (t *typesAPI) requireType(ctx context.Context, id string) error {
+	if _, ok := t.findRegisteredCollection(id); ok {
+		return fmt.Errorf("%w: %q", space.ErrNotAType, id)
+	}
 	if t.staticType(id) {
 		return nil
 	}
@@ -534,6 +537,9 @@ func typeMetaValue(a *anyenc.Arena, key string, v any) (*anyenc.Value, error) {
 // their value; an empty string clears a text field; ClearLayout unsets
 // the layout.
 func (t *typesAPI) Patch(ctx context.Context, typeId string, patch space.TypePatch) error {
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}

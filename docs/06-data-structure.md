@@ -168,6 +168,8 @@ Registered types (`config.Config.Types`) carry the type shape statically: `handl
 
 Built-ins exist as **derived objects** in every space (well-known ids, uniform with user definitions — no "built-in vs user" fork in query/UI code).
 
+The membership fields are a fresh on-disk and wire shape — accepted without migration as a pre-release decision (new accounts); no rebuild version was bumped, since a replay could not translate the old list.
+
 #### Membership and the local write pre-flight
 
 A local write to `{ownerId}.{propId}` is admitted when ownerId is one of the object's members AFTER this change: the universal `any`, its type (the row's, or the one this change sets), its collections (the row's plus the ones this change adds), the meta namespace its marker grants, its own id when it carries a marker, and the module namespaces those members grant. Anything else rejects the write whole with reason `type_not_implemented` — "set it as any.type or add it to any.collections".

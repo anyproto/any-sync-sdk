@@ -873,3 +873,51 @@ func collDrainSub(sub space.QuerySubscription, window time.Duration, match func(
 }
 
 func collPtr(s string) *string { return &s }
+
+// TestE2E_BundleDeclarationTakesMarker pins the stamp on a root that
+// already has a type: a later Ensure that gains a declaration puts the
+// marker in `any.type` over the type the root had (a definition has no
+// type of its own), and the root resolves as a type from then on.
+func TestE2E_BundleDeclarationTakesMarker(t *testing.T) {
+	t.Parallel()
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+	t.Logf("using any-sync network config from %s", confPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	sdk, err := anysyncsdk.Open(ctx, config.Config{
+		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+		Network: config.Network{NodeConfYAML: yaml},
+	}, newFixedSeedProvider(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "MarkerHeal"})
+	if err != nil {
+		if isNoNetworkErr(err) {
+			t.Skipf("network unreachable on space create: %v", err)
+		}
+		t.Fatalf("Spaces().Create: %v", err)
+	}
+	typeId, _ := setupMovieType(t, ctx, sp)
+
+	const bundleId = "marker-heal/v1"
+	b, _, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: bundleId, DerivedRoot: true, RootType: typeId})
+	require.NoError(t, err)
+	row, err := sp.Objects().Get(ctx, b.RootId)
+	require.NoError(t, err)
+	require.Equal(t, typeId, row.GetString("any", "type"))
+
+	// The next version declares: RootType must go, the marker takes
+	// the slot, the handle lands, the root is a type.
+	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: bundleId, DerivedRoot: true, XKey: "marker_heal"})
+	require.NoError(t, err)
+	row, err = sp.Objects().Get(ctx, b.RootId)
+	require.NoError(t, err)
+	assert.Equal(t, space.TypeMarker, row.GetString("any", "type"))
+	info, err := sp.Types().Get(ctx, b.RootId)
+	require.NoError(t, err)
+	assert.Equal(t, "marker_heal", info.XKey)
+}

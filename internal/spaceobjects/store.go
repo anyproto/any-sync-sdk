@@ -20,7 +20,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -749,10 +748,14 @@ var ReservedTypeIds = map[string]struct{}{
 // non-empty unique ids, disjoint from the registered types and the
 // reserved ids, and well-formed property declarations. Called once at
 // sdk.Open after ValidateExternalTypes.
-func ValidateExternalCollections(extTypes []handler.Type, extCollections []handler.Collection) error {
+func ValidateExternalCollections(extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) error {
 	typeIds := make(map[string]struct{}, len(extTypes))
 	for _, t := range extTypes {
 		typeIds[t.Id] = struct{}{}
+	}
+	moduleNames := map[string]struct{}{types.RecordsModule: {}}
+	for _, m := range modules {
+		moduleNames[m.Name] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(extCollections))
 	for i, c := range extCollections {
@@ -770,6 +773,11 @@ func ValidateExternalCollections(extTypes []handler.Type, extCollections []handl
 		}
 		if _, isType := typeIds[c.Id]; isType {
 			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is also a registered type", i, c.Id)
+		}
+		if _, isModule := moduleNames[c.Id]; isModule {
+			// Modules own an objects-row namespace under their name;
+			// a collection under the same id would shadow it.
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is also a module name", i, c.Id)
 		}
 		seen[c.Id] = struct{}{}
 		if err := validatePropertyDecls(c.Id, c.Properties); err != nil {
@@ -1269,15 +1277,6 @@ type ObjectMembers struct {
 	Collections []string
 }
 
-// Has reports whether ownerId is the object's type or one of its
-// collections.
-func (m ObjectMembers) Has(ownerId string) bool {
-	if ownerId != "" && m.Type == ownerId {
-		return true
-	}
-	return slices.Contains(m.Collections, ownerId)
-}
-
 // ObjectMembers reads the object's membership off its row.
 func (s *Store) ObjectMembers(ctx context.Context, objectId string) (ObjectMembers, error) {
 	coll, err := s.SharedObjects(ctx)
@@ -1316,42 +1315,45 @@ func ObjectMembersOfRow(v *anyenc.Value) ObjectMembers {
 // resolvable here — a definition that has not synced yet, or no
 // definition at all). The properties handler consults it on the local
 // write pre-flight so a known id lands only in its own slot.
-func (s *Store) Classify(ctx context.Context, id string) properties.OwnerKind {
+func (s *Store) Classify(ctx context.Context, id string) (properties.OwnerKind, error) {
 	if id == "" {
-		return properties.OwnerUnknown
+		return properties.OwnerUnknown, nil
 	}
 	if _, reserved := ReservedTypeIds[id]; reserved {
-		return properties.OwnerType
+		return properties.OwnerType, nil
 	}
 	for _, t := range s.extTypes {
 		if t.Id == id {
-			return properties.OwnerType
+			return properties.OwnerType, nil
 		}
 	}
 	for _, c := range s.extCollections {
 		if c.Id == id {
-			return properties.OwnerCollection
+			return properties.OwnerCollection, nil
 		}
 	}
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
-		return properties.OwnerUnknown
+		return properties.OwnerUnknown, err
 	}
 	doc, err := coll.FindId(ctx, id)
 	if err != nil {
-		return properties.OwnerUnknown
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return properties.OwnerUnknown, nil
+		}
+		return properties.OwnerUnknown, err
 	}
 	v := doc.Value()
 	if v == nil || v.Get(crdt.DeletedAtField) != nil {
-		return properties.OwnerUnknown
+		return properties.OwnerUnknown, nil
 	}
 	switch v.GetString(anytype.TypeId, anytype.FieldType) {
 	case typetype.MetaTypeMarker:
-		return properties.OwnerType
+		return properties.OwnerType, nil
 	case collectiontype.MetaMarker:
-		return properties.OwnerCollection
+		return properties.OwnerCollection, nil
 	}
-	return properties.OwnerUnknown
+	return properties.OwnerUnknown, nil
 }
 
 // RegularObjectCount returns the count of rows in the per-space

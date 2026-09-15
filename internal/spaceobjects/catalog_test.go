@@ -270,7 +270,9 @@ func TestStore_Classify(t *testing.T) {
 		"not-synced-yet":      properties.OwnerUnknown,
 		"":                    properties.OwnerUnknown,
 	} {
-		assert.Equal(t, want, store.Classify(ctx, id), id)
+		got, err := store.Classify(ctx, id)
+		require.NoError(t, err, id)
+		assert.Equal(t, want, got, id)
 	}
 
 	// A tombstoned definition stops resolving.
@@ -284,7 +286,9 @@ func TestStore_Classify(t *testing.T) {
 	row.Set(anytype.TypeId, anyObj)
 	row.Set(crdt.DeletedAtField, a.NewNumberInt(1))
 	require.NoError(t, objs.UpsertOne(ctx, row))
-	assert.Equal(t, properties.OwnerUnknown, store.Classify(ctx, "live-coll"))
+	got, err := store.Classify(ctx, "live-coll")
+	require.NoError(t, err)
+	assert.Equal(t, properties.OwnerUnknown, got)
 }
 
 func TestCatalog_RefreshTypeAddsAndRemoves(t *testing.T) {

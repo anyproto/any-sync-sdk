@@ -102,6 +102,10 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 
 	if needsBootstrap(opts) {
 		if _, err := o.bootstrap(ctx, objectId, opts); err != nil {
+			// A refused bootstrap (a wrong slot, an owner the object
+			// does not have) would leave a bare tree nothing references;
+			// reclaim it best-effort, the error is the caller's answer.
+			_ = o.Delete(ctx, objectId)
 			return "", err
 		}
 	}

@@ -890,8 +890,14 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 			named = adopt || string(cur.GetStringBytes()) == name
 		}
 	}
+	// A declaring root carries its marker whatever type the row has
+	// (a definition has no type of its own); a RootType only fills an
+	// empty slot — a type the row already has is never replaced.
 	setType := ""
-	if want.Type != "" && have.Type == "" {
+	switch {
+	case declares && have.Type != want.Type:
+		setType = want.Type
+	case !declares && want.Type != "" && have.Type == "":
 		setType = want.Type
 	}
 	var missing []string

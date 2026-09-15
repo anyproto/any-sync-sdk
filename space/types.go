@@ -538,8 +538,8 @@ type CollectionsAPI interface {
 	// collection and every user collection of this space. Hidden ones
 	// are included; the consumer filters.
 	List(ctx context.Context) ([]CollectionInfo, error)
-	// Get returns one collection, ErrNotFound for anything else (a
-	// type id included).
+	// Get returns one collection; ErrNotACollection for a type id,
+	// ErrNotFound for anything else.
 	Get(ctx context.Context, collectionId string) (CollectionInfo, error)
 
 	// Create a new user-defined collection. Returns the new object's

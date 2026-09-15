@@ -188,7 +188,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	if err := spaceobjects.ValidateExternalTypes(cfg.Types); err != nil {
 		return nil, fmt.Errorf("anysyncsdk: %w", err)
 	}
-	if err := spaceobjects.ValidateExternalCollections(cfg.Types, cfg.Collections); err != nil {
+	if err := spaceobjects.ValidateExternalCollections(cfg.Types, cfg.Collections, cfg.Modules); err != nil {
 		return nil, fmt.Errorf("anysyncsdk: %w", err)
 	}
 	if err := spaceobjects.ValidateExternalModules(cfg.Types, cfg.Modules); err != nil {

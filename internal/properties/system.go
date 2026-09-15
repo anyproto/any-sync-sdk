@@ -5,6 +5,7 @@ package properties
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -102,9 +103,9 @@ type SystemPropertiesHandler struct {
 	// collection, or nothing resolvable here) so the local write
 	// pre-flight refuses a known id in the wrong slot: a collection
 	// set as `any.type`, a type added to `any.collections`. Unknown
-	// ids pass — the definition may not have synced yet. Nil classifies
-	// nothing.
-	Classify func(ctx context.Context, id string) OwnerKind
+	// ids pass — the definition may not have synced yet; a read
+	// failure fails the write closed. Nil classifies nothing.
+	Classify func(ctx context.Context, id string) (OwnerKind, error)
 
 	// ReservedCarrier reports whether a user type declares a reserved
 	// module (handler.Module.Reserved). Such a type is carried only by
@@ -320,8 +321,8 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 		return nil
 	}
 	adds := collectMembership(ch)
-	if verr := h.checkSlots(adds); verr != nil {
-		return verr
+	if err := h.checkSlots(adds); err != nil {
+		return err
 	}
 	if verr := h.checkReservedCarriers(ch, before, adds); verr != nil {
 		return verr
@@ -432,13 +433,17 @@ func (m *membershipAdds) addCollections(v *anyenc.Value) {
 // a collection as `any.type`, a type in `any.collections`. The markers
 // and the universal type are not classified (they are the slot's own
 // vocabulary); an unknown id passes.
-func (h *SystemPropertiesHandler) checkSlots(adds membershipAdds) *ValidationError {
+func (h *SystemPropertiesHandler) checkSlots(adds membershipAdds) error {
 	if h.Classify == nil {
 		return nil
 	}
 	ctx := context.Background()
 	if adds.typeSet && adds.typeId != "" && !isMarker(adds.typeId) {
-		if k := h.Classify(ctx, adds.typeId); k == OwnerCollection {
+		k, err := h.Classify(ctx, adds.typeId)
+		if err != nil {
+			return fmt.Errorf("properties: classify %s: %w", adds.typeId, err)
+		}
+		if k == OwnerCollection {
 			return &ValidationError{Reason: ReasonWrongSlot, TypeId: adds.typeId, Slot: anytype.FieldType, Kind: k}
 		}
 	}
@@ -446,7 +451,11 @@ func (h *SystemPropertiesHandler) checkSlots(adds membershipAdds) *ValidationErr
 		if isMarker(id) {
 			return &ValidationError{Reason: ReasonWrongSlot, TypeId: id, Slot: anytype.FieldCollections, Kind: OwnerType}
 		}
-		if k := h.Classify(ctx, id); k == OwnerType {
+		k, err := h.Classify(ctx, id)
+		if err != nil {
+			return fmt.Errorf("properties: classify %s: %w", id, err)
+		}
+		if k == OwnerType {
 			return &ValidationError{Reason: ReasonWrongSlot, TypeId: id, Slot: anytype.FieldCollections, Kind: k}
 		}
 	}
@@ -535,10 +544,18 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 		members[ch.ObjectId] = struct{}{}
 	}
 	delete(members, "")
-	// Module namespaces: granted off the type the object has, never
-	// listed in a membership field themselves.
+	// Module namespaces: granted off the type the object has (or is),
+	// never off its collections, and never listed in a membership
+	// field themselves.
 	if h.Grants != nil {
-		for _, ns := range h.Grants(members) {
+		granting := map[string]struct{}{}
+		if typeId != "" {
+			granting[typeId] = struct{}{}
+		}
+		if _, self := members[ch.ObjectId]; self && ch.ObjectId != "" {
+			granting[ch.ObjectId] = struct{}{}
+		}
+		for _, ns := range h.Grants(granting) {
 			members[ns] = struct{}{}
 		}
 	}

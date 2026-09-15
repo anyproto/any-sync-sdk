@@ -198,7 +198,7 @@ func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, 
 		}},
 	})
 	if err != nil {
-		return space.ModifyResult{}, err
+		return space.ModifyResult{}, wrapSlotErr(err)
 	}
 	return modifyResultFromWrite(res), nil
 }
@@ -400,39 +400,20 @@ func wrapSlotErr(err error) error {
 // SetType replaces the object's one type (`any.type`, a $set). The
 // previous type's values and dataset records become orphan data,
 // read-tolerant; its datasets refuse further writes. A known
-// collection id is refused by the pre-flight (ErrWrongSlot). The
-// DataVersion carries the type's schema state, as an attach with
-// initial values would.
+// collection id is refused by the pre-flight (ErrWrongSlot). A pure
+// membership write carries no values, so it stamps no schema
+// constraint: a peer behind on the type's definitions still applies
+// it.
 func (p *propertiesAPI) SetType(ctx context.Context, objectId, typeId string) (space.ModifyResult, error) {
 	if objectId == "" || typeId == "" {
 		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and typeId required")
 	}
-	obj, err := p.parent.store.Get(ctx, objectId)
-	if err != nil {
-		return space.ModifyResult{}, err
-	}
-	dataVersion, err := dataVersionForType(ctx, p.parent.store.Registry(), typeId)
-	if err != nil {
-		return space.ModifyResult{}, err
-	}
 	arena := &anyenc.Arena{}
-	res, err := obj.LocalWrite(ctx, crdt.Change{
-		Dataset:     properties.Dataset,
-		DataVersion: dataVersion,
-		Records: []crdt.RecordChange{{
-			Id:     objectId,
-			Upsert: true,
-			Ops: []crdt.Op{{
-				Type:    crdt.OpSet,
-				Path:    []string{anytype.TypeId, anytype.FieldType},
-				Payload: arena.NewString(typeId),
-			}},
-		}},
+	return p.membershipWrite(ctx, objectId, crdt.Op{
+		Type:    crdt.OpSet,
+		Path:    []string{anytype.TypeId, anytype.FieldType},
+		Payload: arena.NewString(typeId),
 	})
-	if err != nil {
-		return space.ModifyResult{}, wrapSlotErr(err)
-	}
-	return modifyResultFromWrite(res), nil
 }
 
 // UnsetType clears the object's type ($unset any.type).

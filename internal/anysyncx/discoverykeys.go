@@ -140,6 +140,7 @@ func (d *discoveryKeySource) derive(ctx context.Context, spaceId string) ([]byte
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = st.Close(ctx) }()
 	aclStorage, err := st.AclStorage()
 	if err != nil {
 		return nil, err

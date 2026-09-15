@@ -122,13 +122,18 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 	if guestKey := a.guestKeyFor(id); guestKey != nil {
 		deps.AccountService = newAccount(accountdata.New(a.keys.PeerKey, guestKey))
 	}
+	ctx, storeRefs := withLoadScope(ctx)
 	cs, err := a.spaceService.NewSpace(ctx, id, deps)
 	if err != nil {
+		storeRefs.releaseExcept(ctx, nil)
 		if errors.Is(err, spacestorage.ErrSpaceStorageMissing) {
 			return nil, fmt.Errorf("anysyncx: space %s not found locally: %w", id, err)
 		}
 		return nil, fmt.Errorf("anysyncx: NewSpace %s: %w", id, err)
 	}
+	// The space owns its storage reference; nothing else the load took
+	// has an owner.
+	storeRefs.releaseExcept(ctx, cs.Storage())
 	if err := cs.Init(ctx); err != nil {
 		// Bounded cleanup: the space app's Close can wedge under
 		// unreachable nodes — its deletion loop joins an in-flight

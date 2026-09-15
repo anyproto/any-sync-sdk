@@ -304,9 +304,18 @@ func (s *Store) RemoveRef(ctx context.Context, spaceId string, root cid.Cid, fil
 // Open handles observe the flip through the shared row state and stop
 // mutating. The caller is responsible for the durability gate (only
 // files with a verified networkSign may be offloaded).
+//
+// The bytes go before the row flips: Windows refuses to remove a file
+// an open handle holds, and a row marked offloaded over bytes still on
+// disk would leave the file unreadable. A failed removal changes
+// nothing; a failed row write after it leaves a row with no bytes,
+// which the next read refetches.
 func (s *Store) Offload(ctx context.Context, spaceId string, root cid.Cid) error {
 	id := rowId(spaceId, root)
 	return s.withRow(id, func(rs *rowState) error {
+		if err := removeCar(s.carPath(spaceId, root)); err != nil {
+			return err
+		}
 		if err := s.updateExisting(ctx, id, func(a *anyenc.Arena, v *anyenc.Value) {
 			v.Set(fieldState, a.NewString(StateOffload))
 			v.Del(fieldHave)
@@ -316,23 +325,26 @@ func (s *Store) Offload(ctx context.Context, spaceId string, root cid.Cid) error
 		rs.state = StateOffload
 		rs.have = nil
 		rs.loaded = true
-		return removeCar(s.carPath(spaceId, root))
+		return nil
 	})
 }
 
 // Delete removes the file and its row entirely (the owning rows are
 // gone). Dedup entries pointing at the root stay: a later BIND reuses
-// remote content, not local bytes.
+// remote content, not local bytes. The bytes go first, as in Offload.
 func (s *Store) Delete(ctx context.Context, spaceId string, root cid.Cid) error {
 	id := rowId(spaceId, root)
 	return s.withRow(id, func(rs *rowState) error {
+		if err := removeCar(s.carPath(spaceId, root)); err != nil {
+			return err
+		}
 		if err := s.files.DeleteId(ctx, id); err != nil && !errors.Is(err, anystore.ErrDocNotFound) {
 			return err
 		}
 		rs.state = stateGone
 		rs.have = nil
 		rs.loaded = true
-		return removeCar(s.carPath(spaceId, root))
+		return nil
 	})
 }
 

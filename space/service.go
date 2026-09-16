@@ -46,7 +46,11 @@ var ErrReadOnlySpace = errors.New("space: read-only")
 // write with the same error (SDK.CRDTVersion reports the state). Bump
 // it when a release writes data the previous release cannot read or
 // would corrupt by writing.
-const CRDTVersion = 1
+//
+// 2: one type per object — `any.type` and `any.collections` replace
+// the `any.types` list; a release that reads the list sees every
+// object as typeless.
+const CRDTVersion = 2
 
 // ErrCRDTVersionNewer: the account's data was written by a newer SDK
 // than this one — the tech space carries a CRDT version above

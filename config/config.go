@@ -50,6 +50,13 @@ type Config struct {
 	// = built-ins only.
 	Types []handler.Type
 
+	// Collections is the optional list of caller-defined collections —
+	// definitions with properties only, which objects are filed under
+	// (`any.collections`) next to their one type. Ids must be unique
+	// and disjoint from Types and the reserved ids. Empty or nil =
+	// none registered.
+	Collections []handler.Collection
+
 	// Modules is the optional list of caller-defined dataset modules —
 	// compiled-in behaviours (an editor, a chat) that types declare at
 	// runtime inside their parts (or registered types statically) and

@@ -23,7 +23,7 @@ handler registration), [types-properties-proposal.md](types-properties-proposal.
 ```
 Type
  ├─ properties            (docs/06)
- ├─ weight, layout        (rendering metadata, docs/06)
+ ├─ layout                (rendering metadata, docs/06)
  └─ parts[]               display units, keyed
      ├─ name/icon/pos/hidden/ui/uses
      └─ datasets[]        keyed; module + shared; the declaration
@@ -54,15 +54,16 @@ Type
   type's static part, may declare it. Draft-time only: the compile
   keeps an applied declaration valid, since a peer that admitted it
   was the consumer's own install. The install root is also the
-  module's **only carrier**: a local write attaching a user type that
-  declares a reserved module to any row but the type's own
-  (`Objects().Create` types, `AttachType`, an `any.types` op through
+  module's **only carrier**: a local write setting a user type that
+  declares a reserved module as any row's type but the type's own
+  (`Objects().Create` with `Type`, `SetType`, an `any.type` op through
   `Modify`) is refused with `handler.ErrValidationReservedCarrier`
   (reason `reserved_carrier`), so a client cannot mint a second
-  instance by attaching the type. There is no `SystemInstall` escape:
-  the consumer's install attaches the type through its root alone. A
-  registered type's static declaration is not a carrier — attachable
-  by the consumer's design. Two limits: the guard reads this device's
+  instance by retyping an object. There is no `SystemInstall` escape:
+  the definition root carries the module under the implicit self
+  grant, and nothing else does. A registered type's static declaration
+  is not a carrier — any object may take it as its type, by the
+  consumer's design. Two limits: the guard reads this device's
   catalog snapshot, so a declaration not yet compiled locally is not
   reserved to it; and inbound apply stays read-tolerant, so a peer
   that lands the type on another row is applied, after which that row
@@ -118,18 +119,22 @@ shared: false  →  <typeId>_<key>                bafyrei…_segments
 
 ### Ownership and the write gate
 
-A write to a collection is admitted at local write time when the object
-carries **any** type whose parts declare it — the one owner of a
-namespaced collection, any owner of a canonical one
-(`Store.DatasetOwners`, `spaceImpl.checkDatasetMembership`). No type is
-attached on write: a write to a collection none of the object's types
-declare fails with `space.ErrDatasetNotDeclared`. Inbound apply stays
-read-tolerant, as before: canonical collections register statically on
-every controller (a peer applies an inbound `editor_blocks` change
-without the declaring type's definitions), namespaced instances go
-through the catalog and park until the declaring type's schema state
-arrives (below). Removing a shared dataset withdraws that type's
-ownership of the canonical collection and nothing else.
+A write to a storage collection is admitted at local write time when
+the object's **one type** declares it — the one owner of a namespaced
+collection, any owner of a canonical one — or when the object IS a
+declaring type, which implicitly implements itself (docs/06 § Type and
+collections): that is how a bundle root writes its own records
+(`Store.DatasetOwners`, `spaceImpl.checkDatasetMembership`).
+Collections (`any.collections`) declare properties only and never a
+dataset. No type is set on write: a write to a storage collection the
+object's type does not declare fails with
+`space.ErrDatasetNotDeclared`. Inbound apply stays read-tolerant, as
+before: canonical collections register statically on every controller
+(a peer applies an inbound `editor_blocks` change without the
+declaring type's definitions), namespaced instances go through the
+catalog and park until the declaring type's schema state arrives
+(below). Removing a shared dataset withdraws that type's ownership of
+the canonical collection and nothing else.
 
 ## Declaration vocabulary (records datasets)
 
@@ -230,13 +235,13 @@ The `type` meta-type owns a third built-in dataset, **`datasets`**
 (next to `properties` and `shortIds`), registered compiled-in like any
 other. A type's parts are CRDT records there:
 
-A bundle root that declares `Parts` is a type object (`any.types =
-["__type__"]`, `typeId == objectId`; a `SelfTyped` root also carries
-itself and hosts the records): its definitions live on the root exactly
-like this, and evolve through
+A bundle root that declares `Parts` is a type object (`any.type =
+"__type__"`, `typeId == objectId`) and hosts the records itself under
+the implicit self grant: its definitions live on the root exactly like
+this, and evolve through
 `Types().AddPart` / `AddDataset` / `AddDatasetField` / `PatchDataset` /
-`PatchDatasetField` with `typeId = rootId`. See `bundles.md § Bundle
-parts`.
+`PatchDatasetField` with `typeId = rootId`. See `bundles.md
+§ Bundle-declared definitions`.
 
 - **Part record** (one per part; id minted client-side, unique):
   `def:"part"`, `key` (slug, pinned); `name`, `icon`, `pos`, `hidden`,
@@ -443,15 +448,15 @@ full value shape, the descriptor).
   applies from the next index open.
 - No handler-version re-index machinery beyond SchemaRev-driven
   registration refresh (docs/08-versioning.md remains the vision).
-- A module's `SharedOnly` is the only per-object cardinality rule: an
-  object carrying two types with namespaced datasets of one module
-  carries two collections of it.
+- A module's `SharedOnly` is the only per-object cardinality rule: a
+  type declaring two namespaced datasets of one module gives its
+  objects two storage collections of it.
 
 ## API surface
 
 ```go
 // definitions (space.TypesAPI)
-Patch(ctx, typeId, TypePatch) error                       // name/description/icon/weight/layout
+Patch(ctx, typeId, TypePatch) error                       // name/description/icon/layout/hidden/meta
 Parts(ctx, typeId) ([]PartDef, error)
 AddPart(ctx, typeId, PartDraft) (partId, error)           // part + datasets + fields, one change
 PatchPart(ctx, typeId, partId, DatasetDefPatch) error     // display slice, ui (whole), uses
@@ -471,8 +476,9 @@ handler.Module{Name, Canonical, SharedOnly, Reserved, DataVersion, HandlerVersio
 handler.Type{…, Parts: []handler.Part{{Key, Name, Icon, Pos, Hidden, UI, Uses,
     Datasets: []handler.PartDataset{{Name} | {Module, Shared, Key}}}}, Hidden}
 
-// bundles declaring a type (space.EnsureBundleRequest)
-EnsureBundleRequest{…, Parts, Properties /* XKey required, deterministic ids */, Layout, Weight, Hidden}
+// bundles declaring a definition (space.EnsureBundleRequest)
+EnsureBundleRequest{…, XKey, Parts, Properties /* XKey required, deterministic ids */, Layout, Hidden}
+EnsureBundleRequest{…, Collection: true, XKey, Properties, Hidden}   // Parts/Layout refused with it
 Bundles().Ensure(ctx, req, space.SystemInstall())   // the consumer's own install: may name a reserved module
 
 // data (space.Space) — plus the existing Modify/Query surface

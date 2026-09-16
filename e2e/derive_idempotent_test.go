@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -14,13 +15,12 @@ import (
 )
 
 // TestSDK_Objects_DeriveIdempotentInDAG pins the DAG-level idempotence
-// contract of Objects().Derive: a derive whose Types are already
-// attached writes no change at all. Derive is the resolve primitive
+// contract of Objects().Derive: a derive whose membership is already
+// on the row writes no change at all. Derive is the resolve primitive
 // for well-known objects (general chat, agent brain, space index) and
-// runs on hot read paths — before this contract, every resolve
-// appended a no-op `$set any.types` change that synced to all peers,
-// grew the DAG forever, and could clobber types attached by other
-// writers (whole-array $set vs the sanctioned $addToSet).
+// runs on hot read paths — a resolve must not append a no-op
+// membership change that syncs to all peers, grows the DAG forever,
+// and clobbers collections attached by other writers.
 func TestSDK_Objects_DeriveIdempotentInDAG(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -49,51 +49,76 @@ func TestSDK_Objects_DeriveIdempotentInDAG(t *testing.T) {
 
 	typeA, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "A"})
 	require.NoError(t, err)
-	typeB, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "B"})
+	typeD, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "D"})
+	require.NoError(t, err)
+	collB, err := sp.Collections().Create(ctx, space.CollectionCreateParams{Name: "B"})
 	require.NoError(t, err)
 
 	seed := []byte("well-known/v1")
+
+	// First materialization must name a type: every object has one.
+	_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed})
+	require.ErrorIs(t, err, space.ErrTypeRequired)
+
 	objectId, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{
-		Seed: seed, Types: []string{typeA},
+		Seed: seed, Type: typeA,
 	})
 	require.NoError(t, err)
 	baseline := treeLen(t, ctx, sp, objectId)
 
-	// Re-derive with the same types: same id, zero new changes.
+	// Re-derive with the same membership: same id, zero new changes.
 	again, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{
-		Seed: seed, Types: []string{typeA},
+		Seed: seed, Type: typeA,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, objectId, again)
 	assert.Equal(t, baseline, treeLen(t, ctx, sp, objectId),
-		"derive with already-attached types must not append a change")
+		"derive with the membership already on the row must not append a change")
 
-	// A type attached by another writer survives a subset re-derive
-	// (the old whole-array $set clobbered it).
-	_, err = sp.Properties().AttachType(ctx, objectId, typeB)
+	// A row that already has a type needs none: the resolve is a no-op.
+	again, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed})
+	require.NoError(t, err)
+	assert.Equal(t, objectId, again)
+	assert.Equal(t, baseline, treeLen(t, ctx, sp, objectId),
+		"a typeless re-derive of a typed row must not append a change")
+	assert.Equal(t, typeA, objectTypeOf(t, ctx, sp, objectId))
+
+	// A derive naming another type never replaces the one the row has.
+	_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{
+		Seed: seed, Type: typeD,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, baseline, treeLen(t, ctx, sp, objectId),
+		"a type the row already has is never replaced")
+	assert.Equal(t, typeA, objectTypeOf(t, ctx, sp, objectId))
+
+	// A collection attached by another writer survives a subset
+	// re-derive (a whole-array $set would clobber it).
+	_, err = sp.Properties().AttachCollection(ctx, objectId, collB)
 	require.NoError(t, err)
 	afterAttach := treeLen(t, ctx, sp, objectId)
 
 	_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{
-		Seed: seed, Types: []string{typeA},
+		Seed: seed, Type: typeA,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, afterAttach, treeLen(t, ctx, sp, objectId),
 		"subset re-derive must not write")
-	assert.ElementsMatch(t, []string{typeA, typeB}, objectTypesOf(t, ctx, sp, objectId),
-		"subset re-derive must not clobber independently attached types")
+	assert.ElementsMatch(t, []string{collB}, objectCollectionsOf(t, ctx, sp, objectId),
+		"subset re-derive must not clobber independently attached collections")
 
-	// Superset derive attaches only the missing type: exactly one new
+	// Superset derive adds only the missing collection: exactly one new
 	// change, existing attachments intact.
-	typeC, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "C"})
+	collC, err := sp.Collections().Create(ctx, space.CollectionCreateParams{Name: "C"})
 	require.NoError(t, err)
 	_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{
-		Seed: seed, Types: []string{typeA, typeC},
+		Seed: seed, Type: typeA, Collections: []string{collB, collC},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, afterAttach+1, treeLen(t, ctx, sp, objectId),
-		"one missing type ⇒ exactly one attach change")
-	assert.ElementsMatch(t, []string{typeA, typeB, typeC}, objectTypesOf(t, ctx, sp, objectId))
+		"one missing collection ⇒ exactly one attach change")
+	assert.Equal(t, typeA, objectTypeOf(t, ctx, sp, objectId))
+	assert.ElementsMatch(t, []string{collB, collC}, objectCollectionsOf(t, ctx, sp, objectId))
 }
 
 // treeLen reads the object's change count via the debug surface.
@@ -104,22 +129,34 @@ func treeLen(t *testing.T, ctx context.Context, sp space.Space, objectId string)
 	return got.TreeLen
 }
 
-// objectTypesOf reads any.types off the object's shared `objects` row.
-func objectTypesOf(t *testing.T, ctx context.Context, sp space.Space, objectId string) []string {
+// objectRowOf reads the object's shared `objects` row.
+func objectRowOf(t *testing.T, ctx context.Context, sp space.Space, objectId string) *anyenc.Value {
 	t.Helper()
 	rows, err := sp.QueryObjects().All(ctx)
 	require.NoError(t, err)
 	for _, row := range rows {
-		if string(row.GetStringBytes("id")) != objectId {
-			continue
+		if string(row.GetStringBytes("id")) == objectId {
+			return row
 		}
-		arr := row.GetArray("any", "types")
-		out := make([]string, 0, len(arr))
-		for _, e := range arr {
-			out = append(out, string(e.GetStringBytes()))
-		}
-		return out
 	}
 	t.Fatalf("object %s not found in QueryObjects", objectId)
 	return nil
+}
+
+// objectTypeOf reads any.type off the object's shared `objects` row.
+func objectTypeOf(t *testing.T, ctx context.Context, sp space.Space, objectId string) string {
+	t.Helper()
+	return objectRowOf(t, ctx, sp, objectId).GetString("any", "type")
+}
+
+// objectCollectionsOf reads any.collections off the object's shared
+// `objects` row.
+func objectCollectionsOf(t *testing.T, ctx context.Context, sp space.Space, objectId string) []string {
+	t.Helper()
+	arr := objectRowOf(t, ctx, sp, objectId).GetArray("any", "collections")
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		out = append(out, string(e.GetStringBytes()))
+	}
+	return out
 }

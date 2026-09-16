@@ -90,7 +90,7 @@ func TestE2E_AccountRecovery(t *testing.T) {
 		Name: "Title", XKey: "title", Kind: space.PropertyKindString,
 	})
 	require.NoError(t, err)
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = spA.Properties().Set(ctx, objId, typeId, map[string]any{propId: "through-a-sibling"})
 	require.NoError(t, err)

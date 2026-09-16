@@ -86,13 +86,13 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 
 	// Page and Meeting both share the module; Meeting adds a namespaced
 	// summary instance under a second part.
-	pageId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Page", Weight: 1})
+	pageId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Page"})
 	require.NoError(t, err)
 	_, err = sp.Types().AddPart(ctx, pageId, space.PartDraft{
 		Key: "body", Datasets: []space.DatasetDraft{{Module: "notes", Shared: true}},
 	})
 	require.NoError(t, err, "a shared dataset defaults its key to the canonical")
-	meetingId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Meeting", Weight: 50})
+	meetingId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Meeting"})
 	require.NoError(t, err)
 	bodyPart, err := sp.Types().AddPart(ctx, meetingId, space.PartDraft{
 		Key: "description", Name: "Description",
@@ -155,7 +155,7 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	}
 
 	// An object carrying only Page writes the shared body.
-	obj, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{pageId}})
+	obj, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: pageId})
 	require.NoError(t, err)
 	write := func(dataset, text string) (space.ModifyResult, error) {
 		return sp.Modify(ctx, space.ModifyBatch{
@@ -174,25 +174,50 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	require.ErrorIs(t, err, space.ErrDatasetNotDeclared)
 	row, err := sp.Objects().Get(ctx, obj)
 	require.NoError(t, err)
-	require.Len(t, row.GetArray("any", "types"), 1, "no type attaches on write")
+	require.Equal(t, pageId, row.GetString("any", "type"), "no type attaches on write")
+	require.Empty(t, row.GetArray("any", "collections"), "no collection attaches on write")
 
 	// The module namespace on the objects row opens with the
-	// declaration: a Page carries `notes.*`, a bare object does not.
+	// declaration: a Page carries `notes.*`, an object whose type
+	// declares nothing does not.
 	_, err = sp.Properties().Set(ctx, obj, "notes", map[string]any{"pinned": true})
 	require.NoError(t, err, "module namespace granted through the declaring type")
 	row, err = sp.Objects().Get(ctx, obj)
 	require.NoError(t, err)
 	assert.True(t, row.GetBool("notes", "pinned"))
-	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: markerTypeId(t, ctx, sp, "Bare"),
+	})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, bare, "notes", map[string]any{"pinned": true})
 	require.Error(t, err, "no declaring type, no namespace")
 
+	// The slots are enforced for ids this device resolves: a collection
+	// is not a type and a type is not a collection.
+	tagColl, tagTitle := setupTagCollection(t, ctx, sp)
+	_, err = sp.Properties().SetType(ctx, bare, tagColl)
+	require.ErrorIs(t, err, space.ErrWrongSlot)
+	_, err = sp.Properties().AttachCollection(ctx, bare, pageId)
+	require.ErrorIs(t, err, space.ErrWrongSlot)
+	_, err = sp.Types().Get(ctx, tagColl)
+	require.ErrorIs(t, err, space.ErrNotAType)
+	_, err = sp.Collections().Get(ctx, pageId)
+	require.ErrorIs(t, err, space.ErrNotACollection)
+
+	// A collection's namespace opens once the object is filed under it,
+	// alongside its type's.
+	_, err = sp.Properties().AttachCollection(ctx, obj, tagColl)
+	require.NoError(t, err)
+	_, err = sp.Properties().Set(ctx, obj, tagColl, map[string]any{tagTitle: "filed"})
+	require.NoError(t, err)
+	row, err = sp.Objects().Get(ctx, obj)
+	require.NoError(t, err)
+	assert.Equal(t, "filed", row.GetString(tagColl, tagTitle))
+	assert.Equal(t, pageId, row.GetString("any", "type"), "filing changes no type")
+
 	// Retyping Page → Meeting keeps the body (same canonical
 	// collection) and opens the summary.
-	_, err = sp.Properties().AttachType(ctx, obj, meetingId)
-	require.NoError(t, err)
-	_, err = sp.Properties().DetachType(ctx, obj, pageId)
+	_, err = sp.Properties().SetType(ctx, obj, meetingId)
 	require.NoError(t, err)
 	rows, err := sp.Query(obj, "notes_shared").All(ctx)
 	require.NoError(t, err)

@@ -63,7 +63,7 @@ func TestE2E_P2PFileFetch(t *testing.T) {
 	require.NoError(t, err)
 	typeId, err := spA.Types().Create(ctx, space.TypeCreateParams{Name: "Doc"})
 	require.NoError(t, err)
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 
 	content := make([]byte, 300_000) // well above the inline tier → real CAR

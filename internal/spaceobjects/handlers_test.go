@@ -183,6 +183,45 @@ func TestValidateExternalTypes(t *testing.T) {
 	}
 }
 
+// A registered collection declares properties under an id that must be
+// its own: unique among collections, disjoint from the registered types
+// and from every reserved id, and never a definition marker.
+func TestValidateExternalCollections(t *testing.T) {
+	extTypes := []handler.Type{{Id: "movie"}}
+	goodColl := handler.Collection{Id: "shelf", Name: "Shelf",
+		Properties: []handler.PropertyDecl{{Id: "pos", Kind: handler.PropertyKindString}}}
+	require.NoError(t, ValidateExternalCollections(extTypes, []handler.Collection{goodColl}, nil))
+	require.NoError(t, ValidateExternalCollections(nil, nil, nil))
+
+	cases := []struct {
+		name  string
+		colls []handler.Collection
+		err   string
+	}{
+		{"empty id", []handler.Collection{{Id: ""}}, "empty Id"},
+		{"duplicate id", []handler.Collection{goodColl, {Id: "shelf"}}, `duplicate collection Id "shelf"`},
+		{"clashes with a type", []handler.Collection{{Id: "movie"}}, `"movie" is also a registered type`},
+		{"reserved collection id", []handler.Collection{{Id: "collection"}}, `"collection" is reserved for a built-in`},
+		{"reserved any id", []handler.Collection{{Id: "any"}}, `"any" is reserved for a built-in`},
+		{"type marker id", []handler.Collection{{Id: "__type__"}}, `"__type__" is a reserved marker`},
+		{"collection marker id", []handler.Collection{{Id: "__collection__"}}, `"__collection__" is a reserved marker`},
+		{"records module name", []handler.Collection{{Id: "records"}}, `"records" is also a module name`},
+		{"bad property", []handler.Collection{{Id: "shelf",
+			Properties: []handler.PropertyDecl{{Id: "_pos", Kind: handler.PropertyKindString}}}}, "_pos"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateExternalCollections(extTypes, tc.colls, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.err)
+		})
+	}
+	// A registered module owns an objects-row namespace under its name.
+	err := ValidateExternalCollections(nil, []handler.Collection{{Id: "chat"}}, []handler.Module{{Name: "chat"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"chat" is also a module name`)
+}
+
 func TestStore_DataVersion_External(t *testing.T) {
 	extTypes := []handler.Type{
 		{Id: "movie", Datasets: []handler.Dataset{
@@ -191,7 +230,7 @@ func TestStore_DataVersion_External(t *testing.T) {
 	}
 	require.NoError(t, ValidateExternalTypes(extTypes))
 
-	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil)
+	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil, nil)
 
 	// Built-in still resolves.
 	v, err := store.DataVersion("objects")
@@ -217,7 +256,7 @@ func TestStore_DatasetOwner(t *testing.T) {
 		{Id: "nav", Properties: []handler.PropertyDecl{{Id: "pos", Kind: handler.PropertyKindString}}},
 	}
 	require.NoError(t, ValidateExternalTypes(extTypes))
-	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil)
+	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil, nil)
 
 	// Both datasets of one type map to that owner (N→1).
 	owners, ok := store.DatasetOwners("scenes")

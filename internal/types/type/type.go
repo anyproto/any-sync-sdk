@@ -26,9 +26,10 @@ import (
 // peer.
 const WellKnownDeriveSeed = "builtin:type"
 
-// MetaTypeMarker is the reserved label every type object carries in
-// its `any.types` list — what distinguishes a type object from a
-// regular one (see spaceobjects.LiveTypeRowsFilter).
+// MetaTypeMarker is the reserved value every type object carries in
+// `any.type` — what distinguishes a type object from a regular one
+// (see spaceobjects.LiveTypeRowsFilter). A definition object has no
+// type of its own: the slot holds the marker.
 //
 // TypeId is the meta-type's id: the namespace its type-only property
 // values live under (`record.type.xkey`) and the id surfaced through
@@ -46,7 +47,7 @@ const (
 // Display metadata for the `type` meta-type object.
 const (
 	Name        = "Type"
-	Description = "A type — defines properties (and optionally datasets) for the objects that implement it"
+	Description = "A type — defines the properties, parts and layout of the objects that have it"
 )
 
 // FieldXKeyProp is the property id of the meta-type's `xkey` — the
@@ -87,8 +88,6 @@ type BuiltInProperty struct {
 var Properties = []BuiltInProperty{
 	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced,
 		Description: "Programmatic handle of the type; consumers keep it unique per space."},
-	{Id: FieldWeightProp, Name: "Weight", Kind: schema.KindNumber, Scope: schema.ScopeSynced,
-		Description: "Picks the primary type of a multi-typed object; highest wins."},
 	{Id: FieldLayoutProp, Name: "Layout", Kind: schema.KindObject, Scope: schema.ScopeSynced,
 		Description: "Layout descriptor of the primary type: {type, config}."},
 	{Id: FieldHiddenProp, Name: "Hidden", Kind: schema.KindBoolean, Scope: schema.ScopeSynced,
@@ -99,13 +98,9 @@ var Properties = []BuiltInProperty{
 }
 
 // Rendering metadata a type object carries in its own namespace:
-// `type.weight` picks the primary type of a multi-typed object (highest
-// wins), `type.layout` is the primary type's layout descriptor ({type,
-// config}, written whole, opaque to the SDK).
-const (
-	FieldWeightProp = "weight"
-	FieldLayoutProp = "layout"
-)
+// `type.layout` is the type's layout descriptor ({type, config},
+// written whole, opaque to the SDK).
+const FieldLayoutProp = "layout"
 
 // `type.hidden` keeps a type out of default listings and pickers
 // (self-typed bundle roots carry it); `type.meta` is the open bag of

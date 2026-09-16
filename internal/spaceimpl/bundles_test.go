@@ -7,7 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -47,20 +48,37 @@ func TestValidateEnsureRequest(t *testing.T) {
 		bad  bool
 	}{
 		{name: "created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot}},
-		{name: "derived root", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}},
+		// Every object has a type: a derived root that declares nothing
+		// takes it from RootType.
+		{name: "bare derived root", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}, bad: true},
 		{name: "derived with parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart()}},
 		{name: "both strategies", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, NewRoot: newRoot}, bad: true},
 		{name: "no strategy", req: space.EnsureBundleRequest{Id: "b"}, bad: true},
 		{name: "created root with parts", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Parts: entriesPart()}},
 		{name: "sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart()}},
-		{name: "created root with root types", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, RootTypes: []string{"t"}}, bad: true},
-		{name: "sdk-minted created root with root types", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart(), RootTypes: []string{"t"}}},
+		{name: "created root with a root type", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, RootType: "t"}, bad: true},
+		{name: "created root with root collections", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, RootCollections: []string{"c"}}, bad: true},
+		{name: "declaring root with a root type", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart(), RootType: "t"}, bad: true},
+		{name: "declaring collection with a root type", req: space.EnsureBundleRequest{Id: "b", Collection: true, XKey: "shelf", RootType: "t"}, bad: true},
+		{name: "derived root with a root type", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t"}},
+		{name: "derived root with root collections", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{"c1", "c2"}}},
+		{name: "declaring root with root collections", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart(), RootCollections: []string{"c1"}}},
+		{name: "root type names the type marker", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: typetype.MetaTypeMarker}, bad: true},
+		{name: "root type names the collection marker", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: collectiontype.MetaMarker}, bad: true},
+		{name: "root collection with an empty id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{""}}, bad: true},
+		{name: "root collection names a marker", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{collectiontype.MetaMarker}}, bad: true},
+		{name: "root collection names `any`", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{anytype.TypeId}}, bad: true},
 		{name: "sdk-minted created root with root properties", req: space.EnsureBundleRequest{Id: "b", XKey: "wiki", RootProperties: map[string]map[string]any{"t": {"a": 1}}}},
 		{name: "xkey alone declares a marker type", req: space.EnsureBundleRequest{Id: "b", XKey: "flag"}},
-		{name: "xkey alone with metadata", req: space.EnsureBundleRequest{Id: "b", XKey: "flag", Hidden: true, Weight: 3}},
+		{name: "xkey alone with metadata", req: space.EnsureBundleRequest{Id: "b", XKey: "flag", Hidden: true}},
 		{name: "xkey on a caller-minted root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, XKey: "flag"}},
+		{name: "collection declared by xkey", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, XKey: "shelf"}},
+		{name: "collection declared by properties", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, Properties: []space.PropertyDraft{{XKey: "pos", Kind: space.PropertyKindString}}}},
+		{name: "collection with parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, XKey: "shelf", Parts: entriesPart()}, bad: true},
+		{name: "collection with a layout", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, XKey: "shelf", Layout: map[string]any{"type": "chat"}}, bad: true},
+		{name: "collection metadata without a declaration", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, Hidden: true}, bad: true},
 		{name: "seeded value that cannot be encoded", req: space.EnsureBundleRequest{Id: "b", XKey: "flag", RootProperties: map[string]map[string]any{"t": {"a": make(chan int)}}}, bad: true},
-		{name: "seeded value under an empty type id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootProperties: map[string]map[string]any{"": {"a": 1}}}, bad: true},
+		{name: "seeded value under an empty type id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootProperties: map[string]map[string]any{"": {"a": 1}}}, bad: true},
 		{name: "tech xkey only", req: space.EnsureBundleRequest{Id: "b", XKey: "flag"}, tech: true},
 		{name: "metadata without a declaration", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Hidden: true}, bad: true},
 		{name: "layout without a declaration", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Layout: map[string]any{"type": "chat"}}, bad: true},
@@ -72,8 +90,10 @@ func TestValidateEnsureRequest(t *testing.T) {
 		{name: "tech derived with parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart()}, tech: true},
 		{name: "tech caller-created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Parts: entriesPart()}, tech: true, bad: true},
 		{name: "tech sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart()}, tech: true},
+		{name: "tech collection", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, XKey: "shelf"}, tech: true},
 		{name: "tech without parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}, tech: true, bad: true},
-		{name: "tech with root types", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(), RootTypes: []string{"t"}}, tech: true, bad: true},
+		{name: "tech with a root type", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(), RootType: "t"}, tech: true, bad: true},
+		{name: "tech with root collections", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(), RootCollections: []string{"c"}}, tech: true, bad: true},
 		{name: "tech with root properties", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(), RootProperties: map[string]map[string]any{"t": {"a": 1}}}, tech: true, bad: true},
 	}
 	b := newBundlesAPI(&spaceImpl{})
@@ -108,45 +128,66 @@ func TestEnsure_BadRequestBeforeStore(t *testing.T) {
 	require.ErrorIs(t, err, space.ErrBundleBadRequest, "NewRoot is refused on the tech space")
 }
 
-func TestInstallRootTypes(t *testing.T) {
+func TestInstallRootMembers(t *testing.T) {
 	req := space.EnsureBundleRequest{
-		RootTypes:      []string{"t2", "t1", "t2"},
-		RootProperties: map[string]map[string]any{"t3": {"a": 1}, "t1": {"b": 2}},
+		RootType:        "t1",
+		RootCollections: []string{"c2", "c1", "c2"},
+		RootProperties:  map[string]map[string]any{"c3": {"a": 1}, "c1": {"b": 2}},
 	}
-	assert.Equal(t, []string{"t2", "t1", "t3"}, installRootTypes(req, "root", false, false))
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "t2", "t1", "t3"}, installRootTypes(req, "root", true, false),
-		"a type definition: the marker first, then the union — never its own id unasked")
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root", "t2", "t1", "t3"}, installRootTypes(req, "root", true, true),
-		"self-typed: marker and own id first, then the union")
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(space.EnsureBundleRequest{}, "root", true, true))
-	assert.Equal(t, []string{typetype.MetaTypeMarker}, installRootTypes(space.EnsureBundleRequest{}, "root", true, false))
-	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{}, "root", false, false))
-	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{}, "root", false, true), "self without a declaration is nothing to carry")
-	dup := space.EnsureBundleRequest{RootTypes: []string{"root", typetype.MetaTypeMarker}}
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(dup, "root", true, true), "requested types dedup against the self type")
-	universal := space.EnsureBundleRequest{RootProperties: map[string]map[string]any{"any": {"description": "seeded"}}}
-	assert.Equal(t, []string{typetype.MetaTypeMarker, "root"}, installRootTypes(universal, "root", true, true),
-		"`any` is universal — seeding its values attaches nothing")
-	assert.Equal(t, []string{"t1"}, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any", "t1"}}, "root", false, false),
-		"`any` requested as a root type is dropped on every path")
-	assert.Nil(t, installRootTypes(space.EnsureBundleRequest{RootTypes: []string{"any"}}, "root", false, false))
+	m := installRootMembers(req)
+	assert.Equal(t, "t1", m.Type)
+	assert.Equal(t, []string{"c2", "c1", "c3"}, m.Collections,
+		"RootCollections in order, then the seeded owners sorted, deduped")
+
+	// A declaring root has no type of its own: the slot holds its
+	// marker, and its own id is never listed — it implements itself.
+	decl := req
+	decl.RootType = ""
+	decl.Parts = entriesPart()
+	m = installRootMembers(decl)
+	assert.Equal(t, typetype.MetaTypeMarker, m.Type)
+	assert.Equal(t, []string{"c2", "c1", "c3"}, m.Collections)
+
+	coll := space.EnsureBundleRequest{Collection: true, XKey: "shelf", RootCollections: []string{"c1"}}
+	m = installRootMembers(coll)
+	assert.Equal(t, collectiontype.MetaMarker, m.Type)
+	assert.Equal(t, []string{"c1"}, m.Collections)
+
+	// A bare root is nothing at all.
+	m = installRootMembers(space.EnsureBundleRequest{})
+	assert.Empty(t, m.Type)
+	assert.Nil(t, m.Collections)
+
+	// `any` is universal — seeding its values files the root nowhere.
+	m = installRootMembers(space.EnsureBundleRequest{
+		RootProperties: map[string]map[string]any{anytype.TypeId: {"description": "seeded"}}})
+	assert.Nil(t, m.Collections)
+	m = installRootMembers(space.EnsureBundleRequest{RootCollections: []string{anytype.TypeId, "c1"}})
+	assert.Equal(t, []string{"c1"}, m.Collections)
+
+	// A seeded owner that is already the type is not filed again.
+	m = installRootMembers(space.EnsureBundleRequest{
+		RootType: "t1", RootProperties: map[string]map[string]any{"t1": {"a": 1}}})
+	assert.Equal(t, "t1", m.Type)
+	assert.Nil(t, m.Collections)
 }
 
-func TestSelfTyped(t *testing.T) {
-	modules := types.NewModules(types.ModuleInfo{Name: "chat", Canonical: "chat_messages", SharedOnly: true, Reserved: true},
-		types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"})
-	reserved := []space.PartDraft{{Key: "chat", Datasets: []space.DatasetDraft{{Module: "chat", Shared: true}}}}
-	plain := []space.PartDraft{{Key: "body", Datasets: []space.DatasetDraft{{Module: "editor", Shared: true}}}}
-	assert.False(t, selfTyped(space.EnsureBundleRequest{Parts: plain}, modules), "a declaration alone never self-types")
-	assert.True(t, selfTyped(space.EnsureBundleRequest{Parts: plain, SelfTyped: true}, modules), "asked for")
-	assert.True(t, selfTyped(space.EnsureBundleRequest{Parts: reserved}, modules), "a reserved module's sole carrier is the root")
-	assert.False(t, selfTyped(space.EnsureBundleRequest{Parts: reserved}, types.NewModules()), "unknown module: nothing implied")
-	assert.False(t, selfTyped(space.EnsureBundleRequest{SelfTyped: true}, modules), "no declaration: nothing to carry")
-}
+func TestDeclares(t *testing.T) {
+	bare := space.EnsureBundleRequest{Id: "b"}
+	assert.False(t, bare.DeclaresType())
+	assert.False(t, bare.DeclaresCollection())
+	assert.False(t, bare.Declares())
 
-func TestDeclaresType(t *testing.T) {
-	assert.False(t, space.EnsureBundleRequest{Id: "b"}.DeclaresType())
 	assert.True(t, space.EnsureBundleRequest{Id: "b", XKey: "flag"}.DeclaresType(), "an xKey alone is a marker type")
 	assert.True(t, space.EnsureBundleRequest{Id: "b", Parts: entriesPart()}.DeclaresType())
-	assert.True(t, space.EnsureBundleRequest{Id: "b", Properties: []space.PropertyDraft{{XKey: "a", Kind: space.PropertyKindString}}}.DeclaresType())
+	props := []space.PropertyDraft{{XKey: "a", Kind: space.PropertyKindString}}
+	assert.True(t, space.EnsureBundleRequest{Id: "b", Properties: props}.DeclaresType())
+
+	// Collection routes the same declaration to the other slot.
+	c := space.EnsureBundleRequest{Id: "b", Collection: true, Properties: props}
+	assert.False(t, c.DeclaresType())
+	assert.True(t, c.DeclaresCollection())
+	assert.True(t, c.Declares())
+	assert.True(t, space.EnsureBundleRequest{Id: "b", Collection: true, XKey: "shelf"}.DeclaresCollection())
+	assert.False(t, space.EnsureBundleRequest{Id: "b", Collection: true}.Declares(), "the flag alone declares nothing")
 }

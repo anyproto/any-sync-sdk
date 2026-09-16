@@ -154,7 +154,7 @@ func TestE2E_ReadTracking(t *testing.T) {
 		}
 		t.Fatalf("owner: Spaces().Create: %v", err)
 	}
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{rtTypeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: rtTypeId})
 	require.NoError(t, err)
 
 	ownerId := owner.Account().Id()

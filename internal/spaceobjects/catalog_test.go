@@ -3,17 +3,22 @@ package spaceobjects
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
@@ -23,16 +28,22 @@ const catTypeId = "type-notes"
 // objects collection so the catalog's boot scan finds it.
 func seedTypeObject(t *testing.T, ctx context.Context, db anystore.DB, spaceId, typeId string) {
 	t.Helper()
+	seedDefinitionObject(t, ctx, db, spaceId, typeId, typetype.MetaTypeMarker)
+}
+
+// seedDefinitionObject writes a definition row carrying `marker` in
+// `any.type` — the one slot that tells a type object from a collection
+// object.
+func seedDefinitionObject(t *testing.T, ctx context.Context, db anystore.DB, spaceId, id, marker string) {
+	t.Helper()
 	coll, err := db.Collection(ctx, spaceId+"_"+SpaceObjectsCollection)
 	require.NoError(t, err)
 	a := &anyenc.Arena{}
 	row := a.NewObject()
-	row.Set("id", a.NewString(typeId))
+	row.Set("id", a.NewString(id))
 	anyObj := a.NewObject()
-	typesArr := a.NewArray()
-	typesArr.SetArrayItem(0, a.NewString("__type__"))
-	anyObj.Set("types", typesArr)
-	row.Set("any", anyObj)
+	anyObj.Set(anytype.FieldType, a.NewString(marker))
+	row.Set(anytype.TypeId, anyObj)
 	require.NoError(t, coll.UpsertOne(ctx, row))
 }
 
@@ -109,7 +120,7 @@ func TestCatalog_BootScanAndBuildRegs(t *testing.T) {
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
 	coll := types.CollectionName(catTypeId, "notes")
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 
 	ds, ok := store.RuntimeDataset(coll)
@@ -160,13 +171,133 @@ func TestCatalog_BootScanAndBuildRegs(t *testing.T) {
 	assert.Equal(t, "notes", ct.Parts[0].Key)
 }
 
+// markerRowIds lists the ids a live-rows filter selects from the shared
+// objects collection.
+func markerRowIds(t *testing.T, ctx context.Context, db anystore.DB, spaceId string, f query.Filter) []string {
+	t.Helper()
+	coll, err := db.Collection(ctx, spaceId+"_"+SpaceObjectsCollection)
+	require.NoError(t, err)
+	iter, err := coll.Find(f).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		require.NoError(t, derr)
+		out = append(out, doc.Value().GetString("id"))
+	}
+	require.NoError(t, iter.Err())
+	sort.Strings(out)
+	return out
+}
+
+// A collection carries properties only: its `__collection__` row is not
+// a type, so the boot scan skips it and nothing it declares reaches the
+// parts catalog. LiveCollectionRowsFilter is the mirror selector, and
+// both filters exclude tombstones.
+func TestCatalog_CollectionRowIsNotAType(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "coll.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	const collId = "coll-shelf"
+	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
+	seedDefinitionObject(t, ctx, db, "spaceA", collId, collectiontype.MetaMarker)
+	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
+	// Defs written under a collection id are never compiled — the id is
+	// not scanned as a type.
+	seedDatasetDefs(t, ctx, db, collId, "notes", "b")
+
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	t.Cleanup(func() { _ = store.Close() })
+
+	ids, err := store.catalogTypeIds(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{catTypeId}, ids, "only `__type__` rows are types")
+
+	_, ok := store.RuntimeDataset(types.CollectionName(catTypeId, "notes"))
+	assert.True(t, ok)
+	_, ok = store.RuntimeDataset(types.CollectionName(collId, "notes"))
+	assert.False(t, ok, "a collection row contributes no runtime dataset")
+	assert.False(t, store.catalogHasType(collId))
+
+	// The two filters partition the definition rows.
+	assert.Equal(t, []string{catTypeId}, markerRowIds(t, ctx, db, "spaceA", LiveTypeRowsFilter))
+	assert.Equal(t, []string{collId}, markerRowIds(t, ctx, db, "spaceA", LiveCollectionRowsFilter))
+
+	// A tombstoned collection row leaves the live set.
+	objs, err := db.Collection(ctx, "spaceA_"+SpaceObjectsCollection)
+	require.NoError(t, err)
+	a := &anyenc.Arena{}
+	row := a.NewObject()
+	row.Set("id", a.NewString(collId))
+	anyObj := a.NewObject()
+	anyObj.Set(anytype.FieldType, a.NewString(collectiontype.MetaMarker))
+	row.Set(anytype.TypeId, anyObj)
+	row.Set(crdt.DeletedAtField, a.NewNumberInt(1))
+	require.NoError(t, objs.UpsertOne(ctx, row))
+	assert.Empty(t, markerRowIds(t, ctx, db, "spaceA", LiveCollectionRowsFilter))
+}
+
+// Classify is what tells the local write pre-flight which slot an id
+// belongs in: registered and reserved ids, then the live definition
+// rows. A tombstone, a plain object and an unknown id are all unknown —
+// the definition may simply not have synced yet.
+func TestStore_Classify(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "classify.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	seedDefinitionObject(t, ctx, db, "spaceA", "live-type", typetype.MetaTypeMarker)
+	seedDefinitionObject(t, ctx, db, "spaceA", "live-coll", collectiontype.MetaMarker)
+	seedDefinitionObject(t, ctx, db, "spaceA", "plain", "live-type")
+
+	store := NewStore(nil, db, nil, "spaceA", nil,
+		[]handler.Type{{Id: "reg-type"}}, []handler.Collection{{Id: "reg-coll"}}, nil)
+	t.Cleanup(func() { _ = store.Close() })
+
+	for id, want := range map[string]properties.OwnerKind{
+		anytype.TypeId:        properties.OwnerType,
+		typetype.TypeId:       properties.OwnerType,
+		collectiontype.TypeId: properties.OwnerType,
+		"reg-type":            properties.OwnerType,
+		"reg-coll":            properties.OwnerCollection,
+		"live-type":           properties.OwnerType,
+		"live-coll":           properties.OwnerCollection,
+		"plain":               properties.OwnerUnknown,
+		"not-synced-yet":      properties.OwnerUnknown,
+		"":                    properties.OwnerUnknown,
+	} {
+		got, err := store.Classify(ctx, id)
+		require.NoError(t, err, id)
+		assert.Equal(t, want, got, id)
+	}
+
+	// A tombstoned definition stops resolving.
+	a := &anyenc.Arena{}
+	objs, err := db.Collection(ctx, "spaceA_"+SpaceObjectsCollection)
+	require.NoError(t, err)
+	row := a.NewObject()
+	row.Set("id", a.NewString("live-coll"))
+	anyObj := a.NewObject()
+	anyObj.Set(anytype.FieldType, a.NewString(collectiontype.MetaMarker))
+	row.Set(anytype.TypeId, anyObj)
+	row.Set(crdt.DeletedAtField, a.NewNumberInt(1))
+	require.NoError(t, objs.UpsertOne(ctx, row))
+	got, err := store.Classify(ctx, "live-coll")
+	require.NoError(t, err)
+	assert.Equal(t, properties.OwnerUnknown, got)
+}
+
 func TestCatalog_RefreshTypeAddsAndRemoves(t *testing.T) {
 	ctx := context.Background()
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "cat.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	coll := types.CollectionName(catTypeId, "notes")
 	_, ok := store.RuntimeDataset(coll)
@@ -199,7 +330,7 @@ func TestControllerStaleFor_RemovedDataset(t *testing.T) {
 
 	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	coll := types.CollectionName(catTypeId, "notes")
 
@@ -282,7 +413,7 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, []handler.Module{testModule()})
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, []handler.Module{testModule()})
 	t.Cleanup(func() { _ = store.Close() })
 
 	regs, _, err := store.buildRegs()

@@ -47,9 +47,9 @@ func TestE2E_FilesV2_Surface(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	typeId, _ := setupMovieType(t, ctx, sp)
-	owner1, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	owner1, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
-	owner2, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	owner2, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_ = sdk.Spaces().SyncSpaceList(ctx)
 	_ = sp.SyncHeads(ctx)
@@ -144,7 +144,7 @@ func TestE2E_FilesV2_Surface(t *testing.T) {
 
 	// A never-attached object has no files dataset yet: typed
 	// ErrNotFound, not a broken query.
-	owner3, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	owner3, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Files().Query(owner3)
 	require.ErrorIs(t, err, space.ErrNotFound)

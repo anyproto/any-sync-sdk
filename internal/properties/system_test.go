@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 )
 
 const (
@@ -280,22 +281,31 @@ func TestSystemPropertiesHandler_NilRegistryPasses(t *testing.T) {
 const propUserT = "userT" // a non-universal user type for membership tests
 
 func preflightRegistry() *types.StubRegistry {
-	r := defaultRegistry()                    // any: p-name(string), p-rating(number), p-tags(array)
-	r.Set(typeAny, "types", schema.KindArray) // any.types is a real built-in prop
+	r := defaultRegistry() // any: p-name(string), p-rating(number), p-tags(array)
+	// The membership fields are real built-in props: one type in a
+	// scalar slot, many collections in an array.
+	r.Set(typeAny, anytype.FieldType, schema.KindString)
+	r.Set(typeAny, anytype.FieldCollections, schema.KindArray)
 	r.Set(propUserT, "p1", schema.KindString)
 	return r
 }
 
-// beforeWithTypes builds a record pre-state carrying any.types.
-func beforeWithTypes(arena *anyenc.Arena, typeIds ...string) *anyenc.Value {
+// beforeWithMembers builds a record pre-state carrying any.type (an
+// empty typeId leaves the slot unset) and any.collections.
+func beforeWithMembers(arena *anyenc.Arena, typeId string, collections ...string) *anyenc.Value {
 	rec := arena.NewObject()
 	anyNs := arena.NewObject()
-	arr := arena.NewArray()
-	for i, t := range typeIds {
-		arr.SetArrayItem(i, arena.NewString(t))
+	if typeId != "" {
+		anyNs.Set(anytype.FieldType, arena.NewString(typeId))
 	}
-	anyNs.Set("types", arr)
-	rec.Set("any", anyNs)
+	if len(collections) > 0 {
+		arr := arena.NewArray()
+		for i, c := range collections {
+			arr.SetArrayItem(i, arena.NewString(c))
+		}
+		anyNs.Set(anytype.FieldCollections, arr)
+	}
+	rec.Set(typeAny, anyNs)
 	return rec
 }
 
@@ -325,10 +335,15 @@ func TestPreValidate_GoodWrites(t *testing.T) {
 	require.NoError(t, h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{typeAny, propName}, a.NewString("x")), nil))
 
-	// User type present in any.types, valid prop + kind.
+	// User type in the object's any.type slot, valid prop + kind.
 	require.NoError(t, h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")),
-		beforeWithTypes(a, propUserT)))
+		beforeWithMembers(a, propUserT)))
+
+	// Same namespace reached through any.collections instead.
+	require.NoError(t, h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")),
+		beforeWithMembers(a, "", propUserT)))
 }
 
 func TestPreValidate_UnknownProperty(t *testing.T) {
@@ -359,7 +374,8 @@ func TestPreValidate_KindMismatch(t *testing.T) {
 func TestPreValidate_TypeNotImplemented(t *testing.T) {
 	h := properties.New(preflightRegistry())
 	a := &anyenc.Arena{}
-	// userT is known to the registry but NOT in the object's any.types.
+	// userT is known to the registry but is neither the object's
+	// any.type nor one of its any.collections.
 	err := h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")), nil)
 	require.ErrorIs(t, err, crdt.ErrValidation)
@@ -371,10 +387,10 @@ func TestPreValidate_TypeNotImplemented(t *testing.T) {
 func TestPreValidate_TypeUnknown(t *testing.T) {
 	h := properties.New(preflightRegistry())
 	a := &anyenc.Arena{}
-	// ghostT is in any.types (member) but not in the registry.
+	// ghostT is the object's type (a member) but not in the registry.
 	err := h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{"ghostT", "x"}, a.NewString("v")),
-		beforeWithTypes(a, "ghostT"))
+		beforeWithMembers(a, "ghostT"))
 	require.ErrorIs(t, err, crdt.ErrValidation)
 	var ve *properties.ValidationError
 	require.True(t, errors.As(err, &ve))
@@ -384,13 +400,18 @@ func TestPreValidate_TypeUnknown(t *testing.T) {
 func TestPreValidate_AttachAndWriteInSameChange(t *testing.T) {
 	h := properties.New(preflightRegistry())
 	a := &anyenc.Arena{}
-	// Multi-field $set that both adds userT to any.types and writes its prop.
+	// Multi-field $set that both sets userT as any.type and writes its prop.
 	payload := a.NewObject()
-	arr := a.NewArray()
-	arr.SetArrayItem(0, a.NewString(propUserT))
-	payload.Set("any.types", arr)
+	payload.Set(typeAny+"."+anytype.FieldType, a.NewString(propUserT))
 	payload.Set(propUserT+".p1", a.NewString("v"))
 	require.NoError(t, h.PreValidate(multiFieldChange(payload), nil))
+
+	// Same, with userT arriving as a collection via $addToSet.
+	attach := singlePathChange(crdt.OpAddToSet,
+		[]string{typeAny, anytype.FieldCollections}, a.NewString(propUserT))
+	attach.Records[0].Ops = append(attach.Records[0].Ops,
+		crdt.Op{Type: crdt.OpSet, Path: []string{propUserT, "p1"}, Payload: a.NewString("v")})
+	require.NoError(t, h.PreValidate(attach, nil))
 }
 
 func TestPreValidate_InvalidPath(t *testing.T) {
@@ -742,17 +763,20 @@ func TestSystemPropertiesHandler_ModifiedAtBumpsOnDatasetWrite(t *testing.T) {
 }
 
 // TestPreValidate_ReservedCarrier pins the carrier rule: a user type
-// declaring a reserved module attaches only to its own root. Any other
-// row is refused however the type arrives ($addToSet, an any.types
-// $set, the multi-field form); a row that already carries it keeps
-// writing; nothing is checked without a resolver.
+// declaring a reserved module is the type of its own root only. Any
+// other row is refused however the type arrives (a single-path any.type
+// $set, the multi-field form); a row that already has it keeps writing;
+// nothing is checked without a resolver.
 func TestPreValidate_ReservedCarrier(t *testing.T) {
 	const reservedT = "reservedT"
 	h := properties.New(preflightRegistry())
 	h.ReservedCarrier = func(typeId string) bool { return typeId == reservedT }
 	a := &anyenc.Arena{}
+	setType := func(id string) *crdt.Change {
+		return singlePathChange(crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(id))
+	}
 
-	err := h.PreValidate(singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT)), nil)
+	err := h.PreValidate(setType(reservedT), nil)
 	require.ErrorIs(t, err, properties.ErrReservedCarrier)
 	var ve *properties.ValidationError
 	require.True(t, errors.As(err, &ve))
@@ -760,11 +784,8 @@ func TestPreValidate_ReservedCarrier(t *testing.T) {
 	assert.Equal(t, reservedT, ve.TypeId)
 	assert.Equal(t, testObjectId, ve.ObjectId)
 
-	arr := a.NewArray()
-	arr.SetArrayItem(0, a.NewString(reservedT))
-	require.ErrorIs(t, h.PreValidate(singlePathChange(crdt.OpSet, []string{"any", "types"}, arr), nil), properties.ErrReservedCarrier)
 	payload := a.NewObject()
-	payload.Set("any.types", arr)
+	payload.Set(typeAny+"."+anytype.FieldType, a.NewString(reservedT))
 	require.ErrorIs(t, h.PreValidate(multiFieldChange(payload), nil), properties.ErrReservedCarrier)
 
 	// The type's own root passes — identified by the change's ObjectId
@@ -772,22 +793,20 @@ func TestPreValidate_ReservedCarrier(t *testing.T) {
 	// empty-id upsert form too. A record id naming the root on another
 	// object's change is not the row and does not pass; an unstamped
 	// change fails closed.
-	own := singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT))
+	own := setType(reservedT)
 	own.ObjectId, own.Records[0].Id = reservedT, ""
 	require.NoError(t, h.PreValidate(own, nil))
-	spoof := singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT))
+	spoof := setType(reservedT)
 	spoof.Records[0].Id = reservedT
 	require.ErrorIs(t, h.PreValidate(spoof, nil), properties.ErrReservedCarrier)
-	unstamped := singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT))
+	unstamped := setType(reservedT)
 	unstamped.ObjectId, unstamped.Records[0].Id = "", ""
 	require.ErrorIs(t, h.PreValidate(unstamped, nil), properties.ErrReservedCarrier)
 	// A row already carrying it passes.
-	require.NoError(t, h.PreValidate(
-		singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT)),
-		beforeWithTypes(a, reservedT)))
-	// Another type stays attachable.
-	require.NoError(t, h.PreValidate(singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(propUserT)), nil))
+	require.NoError(t, h.PreValidate(setType(reservedT), beforeWithMembers(a, reservedT)))
+	// Another type stays settable.
+	require.NoError(t, h.PreValidate(setType(propUserT), nil))
 
 	bare := properties.New(preflightRegistry())
-	require.NoError(t, bare.PreValidate(singlePathChange(crdt.OpAddToSet, []string{"any", "types"}, a.NewString(reservedT)), nil))
+	require.NoError(t, bare.PreValidate(setType(reservedT), nil))
 }

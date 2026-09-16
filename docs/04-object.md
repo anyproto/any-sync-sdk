@@ -105,7 +105,7 @@ Changes are signed by the creator's key and optionally encrypted with the space 
 ### Abstraction Level
 - **CRDT-level only** — in v1 the DAG is fully hidden. No `ObjectTree` access for callers; hiding this complexity is a primary SDK goal
 - **Explicit creation** — callers create objects explicitly, not implicitly via first write
-- **Object ↔ datasets (many)** — one object can hold many datasets. An object may have multiple types; each type contributes handlers (schema + rules) for certain datasets
+- **Object ↔ datasets (many)** — one object can hold many datasets. An object has one type (`any.type`), which contributes handlers (schema + rules) for the datasets it declares, and any number of collections (`any.collections`), which contribute properties only
 - **System-level index dataset** — one dataset is implemented at the system level to serve as an object index (discussed in Data Structure section)
 - **Permissionless in v1** — no schema/type validation yet. v1 is a permissionless DB for experimenting with schemas and validations. Types/schemas/validation come later
 
@@ -160,11 +160,11 @@ space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|
 ## Grooming Questions (open)
 
 ### Object API
-1. Object creation — minimal payload? `space.Objects().Create(opts) → objectId` or does it need a "type"/"typeList" argument even in permissionless v1?
+1. ~Object creation — minimal payload?~ → resolved: `space.Objects().Create(CreateObjectOpts{Type, Collections, InitialProperties}) → objectId`. Both membership fields are optional.
 2. `Derive` — what are the inputs? Derived from what (keys? parent object? external seed)?
 3. ~Subscribe at object level vs dataset level?~ → resolved: subscription scope is `(objectId, dataset)` via `space.Query(objectId, dataset).Subscribe(...)`. The shared cross-object firehose uses `space.QueryObjects().Subscribe(...)`. No "whole object" subscribe — callers chain per dataset.
 4. ~`query(datasetName, filter, sort)` on the object level?~ → resolved: `space.Query(objectId, dataset)` is the only path; same builder, same terminal verbs (Iter/All/One/Count/Snapshot/Subscribe).
-5. How does a caller attach multiple "types" to an object if we're going permissionless in v1? Free-form list that can be validated later?
+5. ~How does a caller attach multiple "types" to an object?~ → resolved: it cannot. An object has one type (`any.type`, `Properties().SetType`) and any number of collections (`any.collections`, `AttachCollection` / `DetachCollection`) — docs/06 § Type and collections.
 
 ### Deletion & Settings Tree
 6. SDK listens to the settings tree for deletions. Does this land in any-store as a deleted marker the caller can observe? Or does the object simply disappear from queries?

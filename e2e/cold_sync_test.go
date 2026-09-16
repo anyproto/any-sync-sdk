@@ -102,7 +102,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 
 		for _, title := range []string{label + "-One", label + "-Two"} {
 			objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-				Types: []string{typeId},
+				Type: typeId,
 			})
 			require.NoError(t, err)
 			_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{
@@ -184,7 +184,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 	// Step 2: per-space — types and objects must converge. Event-
 	// driven via QueryObjects().Subscribe: the per-space `objects`
 	// dataset writes fire for BOTH type creates (typesAPI.Create
-	// writes any.types=["__type__"] to objects) AND instance creates
+	// writes any.type="__type__" to objects) AND instance creates
 	// / Properties().Set. We register before re-checking and recheck on every
 	// event arrival until the local snapshot satisfies the fixture.
 	for _, fix := range wantSpaces {
@@ -317,6 +317,16 @@ func waitFor(ctx context.Context, deadline, interval time.Duration, fn func() bo
 		}
 	}
 	return false
+}
+
+// markerTypeId creates a type that declares nothing — no parts, no
+// properties, no layout. Every object has a type, so tests needing one
+// without caring which mint it here.
+func markerTypeId(t *testing.T, ctx context.Context, sp space.Space, name string) string {
+	t.Helper()
+	id, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: name})
+	require.NoError(t, err)
+	return id
 }
 
 // userTypeIds returns the ids of types on sp that are NOT marked

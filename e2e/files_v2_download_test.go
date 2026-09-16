@@ -64,7 +64,7 @@ func TestE2E_FilesV2_SDKDownload(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	typeId, _ := setupMovieType(t, ctx, spA)
-	ownerId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	ownerId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_ = sdkA.Spaces().SyncSpaceList(ctx)
 	_ = spA.SyncHeads(ctx)

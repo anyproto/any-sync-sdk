@@ -60,14 +60,14 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	require.NoError(t, err)
 
 	// Seed two movies BEFORE subscribing — they show up in Initial.
-	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idA, typeId, map[string]any{
 		titleProp: "Aliens", yearProp: 1986,
 	})
 	require.NoError(t, err)
 
-	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idB, typeId, map[string]any{
 		titleProp: "Brazil", yearProp: 1985,
@@ -131,7 +131,7 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	// new arrival has the smallest tuple (sorted first), so it enters
 	// visible at the top; the prior visible-bottom (Brazil 1985) gets
 	// demoted to sentinel.
-	idC, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idC, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idC, typeId, map[string]any{
 		titleProp: "Dune Part Two", yearProp: 2024,
@@ -218,14 +218,14 @@ func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
 
 	// Subscribe, then close immediately.
 	res1, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
 	require.NoError(t, err)
 	beforeIds := idsOfInitial(res1.Initial)
 	require.Len(t, beforeIds, 3)
 
 	res2, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
 	require.NotNil(t, res2.Sub)
@@ -237,7 +237,7 @@ func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
 
 	// Resubscribe — same data, same ids.
 	res3, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = res3.Sub.Close() })
@@ -297,7 +297,7 @@ func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
 		require.NoError(t, err)
 
 		res, err := sp.QueryObjects().
-			Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+			Filter(map[string]any{"any.type": typeId}).
 			Sort(typeId+"."+titleProp).
 			Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
 		require.NoError(t, err)
@@ -343,7 +343,7 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	require.Len(t, ids, 10)
 
 	res, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Sort(typeId+"."+titleProp).
 		Limit(10).
 		Subscribe(ctx, space.QueryOpts{})
@@ -370,7 +370,7 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 
 	// Resubscribe — fresh snapshot of the *current* state.
 	res2, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Sort(typeId+"."+titleProp).
 		Limit(10).
 		Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
@@ -396,13 +396,27 @@ func setupMovieType(t *testing.T, ctx context.Context, sp space.Space) (string, 
 	return typeId, titleProp
 }
 
+// setupTagCollection creates a "Tag" collection carrying one Title
+// property and returns (collectionId, titleProp). A collection has
+// properties and nothing else — no parts, no layout.
+func setupTagCollection(t *testing.T, ctx context.Context, sp space.Space) (string, string) {
+	t.Helper()
+	collId, err := sp.Collections().Create(ctx, space.CollectionCreateParams{Name: "Tag"})
+	require.NoError(t, err)
+	titleProp, err := sp.Collections().AddProperty(ctx, collId, space.PropertyDraft{
+		Name: "Title", XKey: "title", Kind: space.PropertyKindString,
+	})
+	require.NoError(t, err)
+	return collId, titleProp
+}
+
 // seedMovies writes one Movie per title with titleProp set; returns
 // the created object ids in order.
 func seedMovies(t *testing.T, ctx context.Context, sp space.Space, typeId, titleProp string, titles []string) []string {
 	t.Helper()
 	ids := make([]string, 0, len(titles))
 	for _, title := range titles {
-		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 		require.NoError(t, err)
 		_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{titleProp: title})
 		require.NoError(t, err)

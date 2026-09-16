@@ -7,6 +7,12 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
+// ErrTypeRequired is returned by Objects().Create without a Type, by
+// Derive when the object has no type and none is given, and by a raw
+// write that clears `any.type`: every object has exactly one type.
+// A client error → 4xx.
+var ErrTypeRequired = errors.New("space: an object needs a type")
+
 // ErrObjectDeleted is returned by ObjectService.Get for an object
 // whose tree any-sync records as deleted — here or on a peer. Distinct
 // from ErrNotFound: the id existed and is gone for good.
@@ -33,7 +39,7 @@ var ErrObjectNotFound = errors.New("space: object not found")
 // happen at the space level keyed by objectId.
 type ObjectService interface {
 	// Get returns the object's row from the per-space objects
-	// collection (any.types and property values). An object whose tree
+	// collection (membership and property values). An object whose tree
 	// is present locally but that never wrote a row returns {id} only;
 	// ErrNotFound when the id is unknown here, ErrObjectDeleted when
 	// the object's tree is deleted — both read from the space's
@@ -41,7 +47,7 @@ type ObjectService interface {
 	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
 
 	// Create a fresh object. Returns the any-sync-assigned objectId.
-	// Types attached here seed the object's any.types list at birth;
+	// Type and Collections seed the object's membership at birth;
 	// InitialProperties seeds the per-space properties record.
 	Create(ctx context.Context, opts CreateObjectOpts) (objectId string, err error)
 
@@ -56,21 +62,28 @@ type ObjectService interface {
 
 // CreateObjectOpts is the input to ObjectService.Create.
 type CreateObjectOpts struct {
-	// Types attaches type objects at birth. Each typeId is appended to
-	// any.types.
-	Types []string
+	// Type is the object's one type (`any.type`). Required: every
+	// object has exactly one type (ErrTypeRequired otherwise).
+	Type string
+	// Collections are the collections the object is filed under at
+	// birth (`any.collections`). Optional.
+	Collections []string
 
 	// InitialProperties seeds base-scope property values. Keyed by
-	// typeId → propId → value.
+	// owner (the type or a collection) → propId → value. An owner the
+	// object does not have is rejected — name it in Type / Collections.
 	InitialProperties map[string]map[string]any
 }
 
 // DeriveObjectOpts is the input to ObjectService.Derive.
 type DeriveObjectOpts struct {
 	Seed []byte
-	// Types to attach on first materialization. Ignored on subsequent
-	// calls once the object exists.
-	Types []string
+	// Type is set on first materialization; a type the object already
+	// has is never replaced. Required unless the object already has one
+	// (ErrTypeRequired). Collections it lacks are added on every call
+	// ($addToSet, idempotent); optional.
+	Type        string
+	Collections []string
 
 	// ParentId derives the object as a child bound to this parent. The
 	// parent id is hashed into the child's derived id, so a child is

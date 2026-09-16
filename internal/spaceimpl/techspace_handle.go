@@ -8,6 +8,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -26,6 +27,41 @@ type techSpace struct {
 	objects techObjects
 	types   techTypes
 	bundles techBundles
+}
+
+// Collections: the property-definition surface reaches bundle roots
+// (through the same root fence techTypes applies); collection
+// lifecycle refuses like type lifecycle does.
+func (t *techSpace) Collections() space.CollectionsAPI { return techCollections{types: t.types} }
+
+type techCollections struct{ types techTypes }
+
+func (x techCollections) Properties(ctx context.Context, ownerId string) ([]space.PropertyDef, error) {
+	return x.types.Properties(ctx, ownerId)
+}
+func (x techCollections) AddProperty(ctx context.Context, ownerId string, draft space.PropertyDraft) (string, error) {
+	return x.types.AddProperty(ctx, ownerId, draft)
+}
+func (x techCollections) RemoveProperty(ctx context.Context, ownerId, propId string) error {
+	return x.types.RemoveProperty(ctx, ownerId, propId)
+}
+func (x techCollections) PatchProperty(ctx context.Context, ownerId, propId string, patch space.PropertyPatch) error {
+	return x.types.PatchProperty(ctx, ownerId, propId, patch)
+}
+func (x techCollections) List(ctx context.Context) ([]space.CollectionInfo, error) {
+	return x.types.t.inner.collections.List(ctx)
+}
+func (x techCollections) Get(ctx context.Context, id string) (space.CollectionInfo, error) {
+	return x.types.t.inner.collections.Get(ctx, id)
+}
+func (techCollections) Create(context.Context, space.CollectionCreateParams) (string, error) {
+	return "", errUnsupported("Collections().Create")
+}
+func (techCollections) Delete(context.Context, string) error {
+	return errUnsupported("Collections().Delete")
+}
+func (techCollections) Patch(context.Context, string, space.CollectionPatch) error {
+	return errUnsupported("Collections().Patch")
 }
 
 var _ space.Space = (*techSpace)(nil)
@@ -183,22 +219,19 @@ func (t *techSpace) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
 	return t.inner.TreeHeads(ctx)
 }
 
-// isBundleRoot reports whether objectId is a self-typed bundle root:
-// its row lists both the type marker and its own id.
+// isBundleRoot reports whether objectId is a bundle root: its row
+// carries a definition marker in `any.type` (a tech bundle root is
+// its own type or collection, and hosts its records under the
+// implicit self grant).
 func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, error) {
-	types, err := t.inner.store.ObjectTypes(ctx, objectId)
+	members, err := t.inner.store.ObjectMembers(ctx, objectId)
 	if err != nil {
 		return false, err
 	}
-	var marker, self bool
-	for _, ty := range types {
-		marker = marker || ty == typetype.MetaTypeMarker
-		self = self || ty == objectId
-	}
-	if marker && self {
+	if members.Type == typetype.MetaTypeMarker || members.Type == collectiontype.MetaMarker {
 		return true, nil
 	}
-	// No self-typed row. When the registry references the id as a
+	// No definition row. When the registry references the id as a
 	// bundle root, that is a root whose tree/row has not applied here
 	// yet — a retryable state, not the hard fence: without this, a
 	// device that received the registry row before the root tree would
@@ -402,9 +435,9 @@ func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest, 
 		return space.Bundle{}, false, err
 	}
 	// A tech bundle root exists to host its bundle's records — there
-	// is no other object to carry the type — so it always carries the
-	// type it declares; isBundleRoot keys on exactly that.
-	req.SelfTyped = true
+	// is no other object to carry the type — which the implicit self
+	// grant of every definition object provides; isBundleRoot keys on
+	// the marker.
 	return x.inner.Ensure(ctx, req, opts...)
 }
 
@@ -430,11 +463,11 @@ func validateTechEnsureRequest(req space.EnsureBundleRequest) error {
 	if req.NewRoot != nil {
 		return fmt.Errorf("spaceimpl: %w: NewRoot is not available on the tech space — Ensure mints the root", space.ErrBundleBadRequest)
 	}
-	if !req.DeclaresType() {
-		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare a type (Parts, Properties or XKey)", space.ErrBundleBadRequest)
+	if !req.Declares() {
+		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare a type or collection (Parts, Properties or XKey)", space.ErrBundleBadRequest)
 	}
-	if len(req.RootTypes) > 0 || len(req.RootProperties) > 0 {
-		return fmt.Errorf("spaceimpl: %w: RootTypes/RootProperties are not available on the tech space — a tech bundle root is its own type", space.ErrBundleBadRequest)
+	if req.RootType != "" || len(req.RootCollections) > 0 || len(req.RootProperties) > 0 {
+		return fmt.Errorf("spaceimpl: %w: RootType/RootCollections/RootProperties are not available on the tech space — a tech bundle root is its own definition", space.ErrBundleBadRequest)
 	}
 	return nil
 }

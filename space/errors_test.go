@@ -29,6 +29,9 @@ func TestSentinelMessages(t *testing.T) {
 		{ErrUnsupported, "unsupported on this space"},
 		{ErrObjectDeleted, "object deleted"},
 		{ErrObjectNotFound, "object not found"},
+		{ErrNotAType, "names a collection, not a type"},
+		{ErrNotACollection, "names a type, not a collection"},
+		{ErrWrongSlot, "a type goes in any.type, a collection in any.collections"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(c.err.Error(), c.phrase) {

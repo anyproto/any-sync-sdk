@@ -132,9 +132,10 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	assert.Equal(t, "notes", seen["doc_summary"].Module)
 	assert.Equal(t, []string{"doc"}, seen["doc_meta"].Owners)
 
-	// The write gate: an object carrying doc holds all three; a bare
-	// object none. The module namespace opens with the declaration.
-	obj, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"doc"}})
+	// The write gate: an object carrying doc holds all three; an object
+	// whose type declares nothing holds none. The module namespace
+	// opens with the declaration.
+	obj, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "doc"})
 	require.NoError(t, err)
 	write := func(objectId, dataset, field, value string) error {
 		res, err := sp.Modify(ctx, space.ModifyBatch{
@@ -157,7 +158,9 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	require.Len(t, rows, 1)
 	_, err = sp.Properties().Set(ctx, obj, "notes", map[string]any{"pinned": true})
 	require.NoError(t, err, "the module namespace is granted through the static declaration")
-	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: markerTypeId(t, ctx, sp, "Bare"),
+	})
 	require.NoError(t, err)
 	require.ErrorIs(t, write(bare, "notes_shared", "text", "nope"), space.ErrDatasetNotDeclared)
 	require.ErrorIs(t, write(bare, "doc_summary", "text", "nope"), space.ErrDatasetNotDeclared)
@@ -196,26 +199,26 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	assert.True(t, root.Hidden)
 
 	// The install root is the reserved module's only carrier: the
-	// root's type attaches to no other row, on any local path that
-	// adds a type. The registered static declaration stays attachable.
-	_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{inst.RootId}})
+	// root is no other row's type, on any local path that sets one.
+	// The registered static declaration stays attachable.
+	_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Type: inst.RootId})
 	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
-	_, err = sp.Properties().AttachType(ctx, bare, inst.RootId)
+	_, err = sp.Properties().SetType(ctx, bare, inst.RootId)
 	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
 	_, err = sp.Modify(ctx, space.ModifyBatch{
 		ObjectId: bare, Dataset: "objects",
-		Records: []space.RecordModify{{Id: bare, Ops: []space.Op{{Type: space.OpAddToSet, Path: "any.types", Value: inst.RootId}}}},
+		Records: []space.RecordModify{{Id: bare, Ops: []space.Op{{Type: space.OpSet, Path: "any.type", Value: inst.RootId}}}},
 	})
 	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
 	// A record id naming the root is not the row: the objects
 	// collection's row is the change's object.
 	_, err = sp.Modify(ctx, space.ModifyBatch{
 		ObjectId: bare, Dataset: "objects",
-		Records: []space.RecordModify{{Id: inst.RootId, Upsert: true, Ops: []space.Op{{Type: space.OpAddToSet, Path: "any.types", Value: inst.RootId}}}},
+		Records: []space.RecordModify{{Id: inst.RootId, Upsert: true, Ops: []space.Op{{Type: space.OpSet, Path: "any.type", Value: inst.RootId}}}},
 	})
 	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
 	require.ErrorIs(t, write(bare, "secret_shared", "text", "nope"), space.ErrDatasetNotDeclared)
-	_, err = sp.Properties().AttachType(ctx, bare, "doc")
+	_, err = sp.Properties().SetType(ctx, bare, "doc")
 	require.NoError(t, err, "a registered type's static declaration of the module is attachable")
 	require.NoError(t, write(bare, "notes_shared", "text", "ok"))
 	require.NoError(t, write(bare, "secret_shared", "text", "through the static declaration"))

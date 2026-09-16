@@ -75,7 +75,7 @@ func TestE2E_CRDTVersionMark(t *testing.T) {
 		t.Skipf("network unreachable on space create: %v", err)
 	}
 	require.NoError(t, err)
-	_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Type: markerTypeId(t, ctx, sp, "Doc")})
 	require.NoError(t, err)
 
 	// Re-open on the same data: equal mark, nothing rewritten.

@@ -120,7 +120,7 @@ func TestE2E_ReindexOnHandlerVersionBump(t *testing.T) {
 	}
 	spaceId := sp1.Id()
 
-	objId, err := sp1.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{reindexTypeId}})
+	objId, err := sp1.Objects().Create(ctx, space.CreateObjectOpts{Type: reindexTypeId})
 	require.NoError(t, err, "Objects().Create")
 
 	for _, id := range []string{reindexRecA, reindexRecB} {
@@ -280,7 +280,7 @@ func TestE2E_ReindexConvertsNumberStampsToInstants(t *testing.T) {
 		t.Fatalf("Spaces().Create: %v", err)
 	}
 	spaceId := sp1.Id()
-	objId, err := sp1.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"stamp-kind-type"}})
+	objId, err := sp1.Objects().Create(ctx, space.CreateObjectOpts{Type: "stamp-kind-type"})
 	require.NoError(t, err)
 	_, err = sp1.Modify(ctx, space.ModifyBatch{
 		ObjectId: objId,

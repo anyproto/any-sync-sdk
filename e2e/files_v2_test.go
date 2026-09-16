@@ -129,7 +129,7 @@ func TestE2E_FilesV2(t *testing.T) {
 	// The owner carries a type binding so its tree has content (see
 	// TestE2E_Payloads for why a root-only owner never reaches the node).
 	typeId, _ := setupMovieType(t, ctx, sp)
-	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 
 	// Two payloads with REAL CIDv1 roots computed over the bytes.

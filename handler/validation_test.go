@@ -47,6 +47,18 @@ func TestClassifyValidation_PerReason(t *testing.T) {
 	}
 }
 
+// A reason with no exported constant still classifies: the
+// discriminant passes through as its stable string.
+func TestClassifyValidation_UnexportedReasons(t *testing.T) {
+	for _, reason := range []string{properties.ReasonWrongSlot, properties.ReasonScopeMismatch} {
+		var err error = &properties.ValidationError{Reason: reason}
+		r, ok := handler.ClassifyValidation(err)
+		assert.True(t, ok, reason)
+		assert.Equal(t, handler.ValidationReason(reason), r)
+		assert.True(t, errors.Is(err, handler.ErrValidation), reason)
+	}
+}
+
 func TestClassifyValidation_NonValidationError(t *testing.T) {
 	r, ok := handler.ClassifyValidation(errors.New("boom"))
 	assert.False(t, ok)

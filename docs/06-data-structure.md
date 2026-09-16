@@ -5,7 +5,7 @@ Main interface for data retrieval: any-store queries + subscription to event flo
 
 ## Object Properties
 
-Every object has properties — a map with required fields (`id`, `name`, `description`, `author`, optionally `[]types`). All objects in a space share one system collection `objects`: **one record per object**, `id` = any-sync objectId.
+Every object has properties — a map with required fields (`id`, `name`, `description`, `author`, optionally `type` and `collections`). All objects in a space share one system collection `objects`: **one record per object**, `id` = any-sync objectId.
 
 ### Property scopes (decision 2026-06-12 — scope on the declaration)
 
@@ -76,7 +76,7 @@ clients compose if they care.
 
 ### Storage
 
-Values of every scope sit at their normal `{typeId}.{propId}` paths in
+Values of every scope sit at their normal `{ownerId}.{propId}` paths in
 the object's row — no reserved scope fields, no migration from the
 pre-scope layout (everything that existed was synced-scope). One `_ver`
 tree per record; version domains coexist because no two routes ever
@@ -94,7 +94,7 @@ them disjoint — see CRDT spec §9).
 }
 ```
 
-The derived built-ins are the one exception to the `{typeId}.{propId}`
+The derived built-ins are the one exception to the `{ownerId}.{propId}`
 layout: `id`, `author`, `spaceId`, `createdAt`, `modifiedAt` and
 `modifiedBy` sit at the row root, not under `any.*`, although
 `Types().Properties("any")` lists them. Filter and sort them by their
@@ -139,28 +139,71 @@ shadowing — it is just a field with a different write route.
 
 Refines and extends the "Object Properties" section above. Covers what types are, how property definitions are stored, how schemas evolve under CRDT, and what's deferred to later versions.
 
-### Structure
+### Type and collections
 
 ```
 Space
  └─ Object
-     ├─ implements N types (coexist, no inheritance in v1)
-     └─ owns N datasets (Mongo-like record collections)
+     ├─ any.type          exactly one type — what the object IS
+     ├─ any.collections   any number of collections — what it is filed UNDER
+     └─ owns the datasets its type declares (Mongo-like record collections)
 ```
 
-A **type** is an object with `type = type`. Its own shape is hardcoded in the SDK. Every type object implements two built-ins:
-- `any` — universal properties (name, description, icon, tags, id, author, createdAt, modifiedAt, modifiedBy)
-- `type` — the meta-type; contributes the `xkey` property (the type's programmatic handle), `weight` (picks the primary type of a multi-typed object: highest wins, tie on type id) and `layout` (the primary type's layout descriptor — `{type, config}`, the x-format shape, written whole, opaque to the SDK), `hidden` (keeps the type out of default listings and pickers; a bundle root asks for it when it only hosts its records — docs/bundles.md § Bundle-declared types) and `meta` (the open bag of consumer flags — one scalar per single-level key, written per key so concurrent writers merge; opaque to the SDK) plus the `properties`, `shortIds`, and `datasets` datasets (`datasets` holds the type's parts and their dataset definitions — docs/17-user-datasets.md)
+An object has exactly ONE type and any number of collections. A **type** is functional: property definitions, parts (the datasets its objects carry) and a layout. A **collection** is categorizing: property definitions only — no parts, no layout. Values live at `{ownerId}.{propId}` on the object's row for the type and for every collection alike.
 
-Registered types (`config.Config.Types`) carry the same shape statically: `handler.Type.Parts` declares their parts (static datasets by name, module datasets by module — docs/17 § Static parts on registered types) and `handler.Type.Hidden` their listing flag; `Types().Parts` / `Datasets` return the compiled view and the runtime mutators answer `ErrTypeRegistered`. A bundle may declare a full type on its root — parts, properties with ids derived from `(rootId, xKey)`, layout, weight, hidden — so one install converges on one definition across devices (docs/bundles.md).
+`any.type` is a scalar LWW register: retyping is a `$set` (`Properties().SetType`). It is never absent on an object that has a row — `Objects().Create` and `Derive` refuse before minting anything without a type, and a write that clears it (the field or the whole `any` container) is refused (`type_required`, `space.ErrTypeRequired`). Trees that never write a row — a payloads carrier, a tech-space carrier, a definition or bundle root between its tree and its first change after a crash — have no type and no row: they match no member query, sit outside head-sync until a change lands, and are reclaimed or completed by the next attempt. `any.collections` is a set, edited with `$addToSet` / `$pull` (`Properties().AttachCollection` / `DetachCollection`); an object may belong to none. Membership is structural and shared, so all three writes route through the object's own CRDT (synced scope).
 
-Type objects carry the literal `__type__` in their `any.types` list (that marker is what identifies them), while the meta-type's values are stored under `type` — `record.type.xkey`. The two strings differ because a `_`-prefixed top-level field is protocol-owned, so the marker cannot double as a storage namespace; the handler grants the `type` namespace to rows carrying the marker. Keeping `xkey` there rather than on `any` is what makes it unwritable on a row that isn't a type. `Types().Patch` rewrites the display and rendering metadata (`any.name` / `any.description` / `any.icon`, `type.weight` / `type.layout` / `type.hidden`) in one change, and patches `type.meta` per key (a nil value unsets). Nested writes on the objects row — `{typeId}.{propId}.{key…}` — are admitted only under an object-kind property, `$set` only, and merge per leaf; below any other kind the op is dropped (`SystemPropertiesHandler`), and the container ops (`$inc`, `$addToSet`, `$pull`) address the property itself.
+Both kinds are objects in the space, and both carry a reserved **marker** in `any.type`: `__type__` on a type object, `__collection__` on a collection object. The marker is what identifies a definition — a definition object has no type of its own.
+
+Every object implements the built-in `any` — universal properties (name, description, icon, tags, `type`, `collections`, id, author, createdAt, modifiedAt, modifiedBy). Two more built-ins describe definitions:
+
+- `type` — the meta-type namespace, granted to rows carrying `__type__`. Contributes `xkey` (the type's programmatic handle), `layout` (the rendering descriptor — `{type, config}`, the x-format shape, written whole, opaque to the SDK), `hidden` (keeps the type out of default listings and pickers; a bundle root asks for it when it only hosts its records — docs/bundles.md § Bundle-declared definitions) and `meta` (the open bag of consumer flags — one scalar per single-level key, written per key so concurrent writers merge; opaque to the SDK), plus the `properties`, `shortIds` and `datasets` datasets (`datasets` holds the type's parts and their dataset definitions — docs/17-user-datasets.md).
+- `collection` — the meta-collection namespace, granted to rows carrying `__collection__`. Contributes the same `xkey` / `hidden` / `meta` and the same `properties` / `shortIds` datasets, and nothing else: a collection has no layout and no `datasets`.
+
+Marker and namespace are different strings because a `_`-prefixed top-level field is protocol-owned, so the marker cannot double as a storage namespace; the handler grants `type.*` / `collection.*` off the marker alone, and a row that merely names the meta id as its type reaches neither. Keeping `xkey` there rather than on `any` is what makes it unwritable on a row that is not a definition. `Types().Patch` rewrites the display and rendering metadata (`any.name` / `any.description` / `any.icon`, `type.layout` / `type.hidden`) in one change and patches `type.meta` per key (a nil value unsets); `Collections().Patch` does the same over `collection.*`. Nested writes on the objects row — `{ownerId}.{propId}.{key…}` — are admitted only under an object-kind property, `$set` only, and merge per leaf; below any other kind the op is dropped (`SystemPropertiesHandler`), and the container ops (`$inc`, `$addToSet`, `$pull`) address the property itself.
+
+A definition object **implicitly implements itself**: its row carries only the marker, yet it may hold `{ownId}.{propId}` values and the records of the datasets it declares. That is how a bundle root keeps its own data on the root (favourites entries, an app's layouts) with no extra flag. It never matches a member query — `{"any.type": typeId}` returns the objects of that type, never the type object.
+
+Registered types (`config.Config.Types`) carry the type shape statically: `handler.Type.Parts` declares their parts (static datasets by name, module datasets by module — docs/17 § Static parts on registered types) and `handler.Type.Hidden` their listing flag; `Types().Parts` / `Datasets` return the compiled view and the runtime mutators answer `ErrTypeRegistered`. Registered collections (`config.Config.Collections`) carry the collection shape the same way — see § Collections. A bundle may declare either kind on its root — parts, properties with ids derived from `(rootId, xKey)`, layout, hidden — so one install converges on one definition across devices (docs/bundles.md).
+
+Built-ins exist as **derived objects** in every space (well-known ids, uniform with user definitions — no "built-in vs user" fork in query/UI code).
+
+The membership fields are a fresh on-disk and wire shape — accepted without migration as a pre-release decision (new accounts); no rebuild version was bumped, since a replay could not translate the old list.
+
+#### Membership and the local write pre-flight
+
+A local write to `{ownerId}.{propId}` is admitted when ownerId is one of the object's members AFTER this change: the universal `any`, its type (the row's, or the one this change sets), its collections (the row's plus the ones this change adds), the meta namespace its marker grants, its own id when it carries a marker, and the module namespaces those members grant. Anything else rejects the write whole with reason `type_not_implemented` — "set it as any.type or add it to any.collections".
+
+Slots are strict. A KNOWN collection id written to `any.type`, or a KNOWN type id (or a marker) added to `any.collections`, is refused with reason `wrong_slot` (`space.ErrWrongSlot`). An id this device cannot resolve — a definition that has not synced yet — passes: offline-first outranks slot hygiene. The check lives in the handler's pre-flight, so a raw `$set` through `Modify` is covered, not just the typed API.
+
+Inbound apply stays read-tolerant: there is **no apply-side membership guard**. `any.type` and `any.collections` are themselves concurrent CRDT values, so gating applies on them would make the outcome apply-order-dependent (non-convergent). A value written concurrently with a retype or a detach lands as orphan on every peer and converges — see §"Types & Property Lifecycle".
+
+#### Querying membership
+
+`{"any.type": typeId}` returns the objects of that type; `{"any.collections": collectionId}` the members of that collection (any-store matches an array field element-wise). Neither ever returns the definition object itself, which carries a marker rather than its own id — client filters need no marker exclusion. `any.type` carries a dense index on the per-space `objects` collection (every object has a type or a marker), `any.collections` a sparse one.
+
+#### Collections
+
+```go
+// space.CollectionsAPI, from Space.Collections()
+List(ctx) ([]CollectionInfo, error)                 // meta `collection` + registered + user; Hidden included
+Get(ctx, collectionId) (CollectionInfo, error)      // a type id → ErrNotACollection
+Create(ctx, CollectionCreateParams) (id, error)     // Name, Description, IconCID, XKey, Hidden, Meta
+Patch(ctx, collectionId, CollectionPatch) error     // registered → ErrTypeRegistered; a type id → ErrNotACollection
+Delete(ctx, collectionId) error                     // declared, not implemented — mirrors Types().Delete
+```
+
+`Create` mints the collection object and writes `any.{name,description,icon}`, `collection.{xkey,hidden,meta}` and `any.type = "__collection__"` in one change.
+
+The two listings are disjoint over objects: `Types().List` returns the built-ins (`any`, `spaceIndex`, `type`, `collection`), every registered type and every user type object, never a collection object; `Collections().List` the mirror.
+
+Property definitions are ONE surface, `space.PropertyDefsAPI`, embedded by both `TypesAPI` and `CollectionsAPI` and addressed by the owning definition's id: `Properties(ownerId)` / `AddProperty(ownerId, draft)` / `RemoveProperty` / `PatchProperty` accept a type id or a collection id through either accessor. The type-only surface (`Parts`, `AddPart`, `AddDataset*`, `Patch`, `Datasets`, …) answers `ErrNotAType` on a collection id, and `Types().Get` does the same.
+
+A **registered collection** is the compiled-in twin: `config.Config.Collections []handler.Collection{Id, Name, Description, IconCID, Properties []PropertyDecl, Hidden}`, validated at `sdk.Open` (unique ids, disjoint from `Types` and the reserved ids). It surfaces through `Collections().List` / `Get` with `BuiltIn` set, its properties validate on write exactly like a registered type's, and its declarations never mutate at runtime (`ErrTypeRegistered`).
 
 #### Module namespaces
 
-A registered module (`handler.Module.Properties`, docs/17) may declare values on the objects row under its own name — `chat.unreadCount`, `chat.notifyMode`. The namespace is never listed in `any.types`: the local write pre-flight grants it to a row when one of the row's types declares a dataset of that module (`Store.ModuleGrants`) — at runtime or statically through `handler.Type.Parts` — and the read-tracking service writes a module collection's unread counters there. Same registry overlay as a registered type's properties, so `Properties().Set(objectId, "<module>", …)` routes by the declared scope. A module the consumer keeps for its own installs is registered `Reserved` (docs/17 § Model).
-
-Built-ins are expected to exist as **derived objects** in every space (well-known ids, uniform with user types — no "built-in vs user" fork in query/UI code).
+A registered module (`handler.Module.Properties`, docs/17) may declare values on the objects row under its own name — `chat.unreadCount`, `chat.notifyMode`. The namespace is never a membership value: the local write pre-flight grants it to a row when the row's type declares a dataset of that module (`Store.ModuleGrants`) — at runtime or statically through `handler.Type.Parts` — and the read-tracking service writes a module collection's unread counters there. Same registry overlay as a registered type's properties, so `Properties().Set(objectId, "<module>", …)` routes by the declared scope. A module the consumer keeps for its own installs is registered `Reserved` (docs/17 § Model).
 
 ### Property ids
 
@@ -172,28 +215,29 @@ propId = base58(xxh3-64(changeId))   // up to 11 chars
 
 This is the default empty-id resolution the CRDT layer already produces (see CRDT spec §3.3 / `crdt.DeriveRecordId`). Properties use it directly as their record id, and the same string is used as the field key under which values are stored on objects (see below).
 
-Built-in properties (on `any`, `type`) use **hardcoded human-readable ids** like `"name"`, `"description"`, `"icon"`. They never collide with user property ids — 11-char base58 never produces those strings.
+Built-in properties (on `any`, `type`, `collection`) use **hardcoded human-readable ids** like `"name"`, `"description"`, `"icon"`. They never collide with user property ids — 11-char base58 never produces those strings.
 
 ### Property record shape (in the space's `objects` system collection)
 
-One record per regular object, `id = objectId`. Values are namespaced by `typeId` (or short id for built-ins), and within each namespace keyed by `propId`:
+One record per regular object, `id = objectId`. Values are namespaced by the owning definition's id — the object's type or one of its collections (a short id for built-ins) — and within each namespace keyed by `propId`:
 
 The CRDT-side dataset name on regular objects is also `objects` — the `properties.SystemPropertiesHandler` is wired against the per-space `objects` collection via the Controller's shared-collection override, so every regular object's writes coalesce into one row in that collection. Type objects do NOT register this handler; their own `any.name`/`any.description`/etc. live on per-type-object storage and don't appear in the per-space `objects` collection.
 
 ```json
 {
   "id": "objectId",
-  "any":             { "name": "Heat", "description": "…" },
-  "{movieTypeId}":   { "Y9Hxx5xmYmF": ["personA","personB"], "EwyHGrtTdxB": 1995 },
-  "{reviewTypeId}":  { "e5vwLLgBRiM": 8.2 }
+  "any":              { "name": "Heat", "description": "…",
+                        "type": "{movieTypeId}", "collections": ["{watchedCollectionId}"] },
+  "{movieTypeId}":    { "Y9Hxx5xmYmF": ["personA","personB"], "EwyHGrtTdxB": 1995 },
+  "{watchedCollectionId}": { "e5vwLLgBRiM": 8.2 }
 }
 ```
 
-Storage path is `{typeId}.{propId}`. The human `name` ("actors", "year", …) lives only on the property definition record — renaming never touches stored values.
+Storage path is `{ownerId}.{propId}` — one shape for the type and every collection. The human `name` ("actors", "rating", …) lives only on the property definition record; renaming never touches stored values.
 
-The list of types an object implements lives at `any.types: [typeId, …]`. Adopting = appending its id; dropping = removing it (values in that namespace become orphan data, read-tolerant).
+Retyping and detaching leave the old namespace's values in place: they become orphan data, read-tolerant.
 
-### Property definitions (inside a type object's `properties` dataset)
+### Property definitions (inside a definition object's `properties` dataset)
 
 One record per definition. Shape:
 
@@ -259,7 +303,7 @@ any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": 
 
 - **Two structural rules, nothing else.** It is an object — at create and on any later whole-bag `$set` — and a creation writes it whole (dotted `x-format.*` keys in a creation change are rejected, so there is exactly one creation shape to validate). No key inside is known to the SDK.
 - **Every path under it is CRDT-mutable** — the slug included — with any JSON value, via `PatchProperty`. Members follow the documented per-path LWW: a nested object's keys are edited independently (two authors adding two options both land), a single leaf replaces whole. Which members are nested and which are single leaves is the consumer's design (e.g. a filter is stored as one JSON-text leaf so two conditions never field-merge into garbage).
-- **Built-ins carry the same slice.** The hardcoded properties of `any`, `type` and `spaceIndex` and every SDK-declared dataset field (the tech-space datasets, `bundles`, `payloads`, the `objects` row's derived root fields) declare a `description`, and an `x-format` where the consumer vocabulary names the value — display text, instants, flags. `Types().Properties` and discovery return them exactly like a user definition's; system values (identities, ids, CIDs, numbers, enums, opaque objects) carry a description alone. The synced `any.*` values are described on the `any` type's properties, not on the `objects` discovery document — they are not row-root heads.
+- **Built-ins carry the same slice.** The hardcoded properties of `any`, `type`, `collection` and `spaceIndex` and every SDK-declared dataset field (the tech-space datasets, `bundles`, `payloads`, the `objects` row's derived root fields) declare a `description`, and an `x-format` where the consumer vocabulary names the value — display text, instants, flags. `Types().Properties` and discovery return them exactly like a user definition's; system values (identities, ids, CIDs, numbers, enums, opaque objects) carry a description alone. The synced `any.*` values are described on the `any` type's properties, not on the `objects` discovery document — they are not row-root heads.
 - **`kind` is the guarantee, `x-format` is a hint.** Values are validated against `kind` at apply on every peer, never against the descriptor. Whether a value fits the slug — a link is a well-formed `any://` URI, a `date` lands on midnight UTC — is checked by the consumer at its write boundary (the `any` server), and the leaf-only patch rule ("a set targets a leaf, never a container") is enforced there too. Reference integrity stays lazy/read-time.
 - A definition without `x-format` renders structurally from `kind`. Registered (built-in) types declare theirs through `handler.PropertyDecl.Description` / `.XFormat`, surfaced by `Types().Properties()` exactly as written.
 
@@ -318,8 +362,7 @@ The property-definition shape is expressible in the same JSON-Schema-subset we u
 
 ### Open points
 
-- Object-level `types` list at `any.types` vs a dedicated field — pick during implementation.
-- Concrete built-in set beyond `any` + `type` — candidates: `relation`, `file`, `member`. Not in v1.
+- Concrete built-in set beyond `any` / `type` / `collection` — candidates: `relation`, `file`, `member`. Not in v1.
 - Built-in dataset catalog API for introspection — deferred.
 - Reference-integrity surfacing (broken refs) — deferred, probably a `_refs` annotation at read/query time.
 - Whether derived built-in type objects materialize on first touch or exist from space creation — both work; pick during implementation.
@@ -477,39 +520,25 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 12. Do we enumerate a minimum set of system collections for v1? (`spaces`, `objects`, `members` at least?)
 
 ### Write Methods
-13. ~What do the dedicated write methods look like for `device` and `account` scopes?~ → resolved: no per-scope methods. A single auto-routing `Properties.Set(ctx, objectId, typeId, patch)` resolves each propId's declared scope and writes on that route (`space/properties.go`); mixed-scope patches are rejected.
+13. ~What do the dedicated write methods look like for `device` and `account` scopes?~ → resolved: no per-scope methods. A single auto-routing `Properties.Set(ctx, objectId, ownerId, patch)` resolves each propId's declared scope and writes on that route (`space/properties.go`); mixed-scope patches are rejected.
 14. ~Are device/account writes atomic with the event emission, or eventually consistent?~ → resolved by scope-on-declaration (§"Property Types", CRDT spec §9): `synced` commits through the object's CRDT, `account` through the tech-space carrier mirrored per-device, `local` straight into the device row. Each route emits one event in its own version domain; there is no cross-route atomicity (callers issue one `Set` per scope).
 
 ### Types & Property Lifecycle
-16. **What happens to property values when a user removes or adds a type on an object?** The current note ("values in that namespace become orphan data, read-tolerant") is a one-liner; we need a real answer covering the points below. Code-state anchors are inlined so we know what's already implemented vs. open design:
+16. **What happens to property values when the type changes or a collection is detached?** Resolved — orphan-resurrection, no SDK projection, client ignores unknown.
 
-    **Current state in code (2026-05-11):**
-    - No dedicated `AttachType` / `DetachType` API — both are declared in `space/properties.go:37` but return "not implemented" in `internal/spaceimpl/properties.go:139`. Today `any.types` is written as a freeform `$set` array during `objects.bootstrap()` and `typesAPI.Create()`.
-    - `SystemPropertiesHandler` (`internal/properties/system.go:59`) validates by `Registry.LookupKind(typeId, propId)` only — it does **not** consult `any.types`. Writes for a type not in the object's `any.types` list apply blindly.
-    - `Properties.Get()` (`internal/spaceimpl/properties.go:36`) returns the full record verbatim — no filter/projection by current `any.types`. Orphan values are visible to callers as-is.
-    - No cleanup / GC / `dropType` / `removeType` code exists anywhere in the tree. "Read tolerance" is documented intent, not active behavior.
-    - `any` and `type` built-ins are synthesized on read but **not guarded** against removal from `any.types` at the handler level.
-    - `RemoveProperty` (`internal/spaceimpl/types.go:425`) is "not implemented"; `PropertyHandler.BeforeDelete` marks the shortId but does not cascade to per-object values.
-    - Tests: `sdk_test.go:183` (`TestSDK_TypesAndProperties`) covers type binding at create only; no remove / re-add / orphan-value tests exist.
-
-    **Decision (2026-06-02) — orphan-resurrection, no SDK projection, client ignores unknown.**
-
-    Resolved after tracing the gate + handler + propId model:
-
-    - **Drop / re-add — orphan-resurrection.** Detaching a type (`$pull any.types`) never wipes the `{typeId}.*` value bag; re-attaching reveals it unchanged. This is convergent and free — the value record is plain LWW data, independent of `any.types`. No wipe, no GC on detach.
-    - **Concurrent drop vs write — no apply-side membership guard.** Inbound property validation deliberately does NOT consult `any.types` (`internal/properties/system.go:169`, nil preflight). A value written concurrently with a detach lands as orphan on *every* peer and converges. An apply-side membership guard is **forbidden**: `any.types` is itself a concurrent CRDT value, so gating on it makes the outcome apply-order-dependent (non-convergent). Parking such writes (an earlier proposal) has the same defect — same conclusion.
+    - **Retype / detach / re-attach — orphan-resurrection.** `SetType` to another type and `DetachCollection` never wipe the `{ownerId}.*` value bag; setting or attaching that owner again reveals it unchanged. Convergent and free — the value record is plain LWW data, independent of the membership fields. No wipe, no GC.
+    - **Concurrent detach vs write — no apply-side membership guard.** Inbound property validation deliberately does NOT consult `any.type` / `any.collections` (nil preflight). A value written concurrently with a retype or a detach lands as orphan on *every* peer and converges. An apply-side membership guard is **forbidden**: both fields are themselves concurrent CRDT values, so gating on them makes the outcome apply-order-dependent (non-convergent). Parking such writes has the same defect — same conclusion.
     - **Wrong-kind writes are impossible per propId.** `propId = base58(xxh3-64(changeId))` (see §"Property ids") — unique per definition. A propId's kind is pinned for life; "changing" a kind means remove + re-add, which mints a *new* propId. So a live propId always validates identically on all peers, and a removed propId's writes drop cleanly everywhere via the unknown-property rule. Stale values linger only under dead propIds, which can never be resurrected (a new definition gets a new hash). There is no convergence hole here.
-    - **No read projection — client ignores unknown.** `Properties.Get()` returns the raw record verbatim; the SDK does **not** filter by current schema (clients read near-raw for speed, that's the point). **Contract: a client MUST ignore any propId not present in the type's current schema.** That hides orphan garbage under dead/detached propIds at the render layer with zero SDK-side projection cost. This replaces the vague "read tolerance" note with an explicit client obligation.
-    - **Required fields / events.** No `required` keyword in v1, so orphan values raise no validation error. Attach/detach stays a generic `$set`/`$pull` on `any.types`; no synthetic per-field events for the namespace.
+    - **No read projection — client ignores unknown.** `Properties.Get()` returns the raw record verbatim; the SDK does **not** filter by current schema (clients read near-raw for speed, that's the point). **Contract: a client MUST ignore any propId not present in the owner's current schema, and any namespace the object no longer has.** That hides orphan garbage at the render layer with zero SDK-side projection cost.
+    - **Required fields / events.** No `required` keyword in v1, so orphan values raise no validation error. Membership stays a generic `$set` / `$unset` on `any.type` and `$addToSet` / `$pull` on `any.collections`; no synthetic per-field events for the namespace.
+    - **Typed API.** `SetType` / `AttachCollection` / `DetachCollection` are the sanctioned mutation path; the slot and membership rules also cover a raw `Modify` on the two fields, since they run in the handler pre-flight (§"Membership and the local write pre-flight").
 
     **Still open:**
-    - **P1 — coarse DataVersion over-gates (liveness, not correctness).** A property write is stamped `LatestShortId(typeId)` (`internal/spaceimpl/properties.go:118`) — the type's *single latest* schema version, not the versions the written props actually need. A write to a stable `propX` gets pinned to a shortId minted by an unrelated `propY` addition, so a peer that hasn't yet received that `propY`-add **parks the write** until it does (indefinitely if that unrelated change is slow/lost). Converges once delivered. Fix: per-prop (multi-pair) DataVersion so a write depends only on the schema it touches. Self-healing, so not blocking.
+    - **P1 — coarse DataVersion over-gates (liveness, not correctness).** A property write is stamped with the owner's *single latest* schema version, not the versions the written props actually need. A write to a stable `propX` gets pinned to a shortId minted by an unrelated `propY` addition, so a peer that hasn't yet received that `propY`-add **parks the write** until it does (indefinitely if that unrelated change is slow/lost). Converges once delivered. Fix: per-prop (multi-pair) DataVersion so a write depends only on the schema it touches. Self-healing, so not blocking.
     - **Value-scan queries leak orphans.** "Client ignores unknown" covers field rendering, not value scans: `find({"{deadPropId}": x})` (or a cross-field value scan) can still match orphan data. If it ever matters, that's a query-layer filter, not a storage change.
-    - **Built-in types (`any`, `type`).** No handler guard against removal from `any.types` today. Decide: enforce non-removability at apply time (convergent), SDK-write-time only (client-soft), or leave it (the read-side synthesizer masks it).
-    - **Property-definition deletion.** Deleting a property definition leaves per-object values behind (no cascade in `PropertyHandler.BeforeDelete`); future writes drop via the unknown-property rule. Same orphan policy as type-drop — confirm we want them identical.
-    - **Test gap.** No detach → concurrent-write → re-attach convergence test exists (`sdk_test.go` covers bind-at-create only). Add one to lock the orphan-resurrection guarantee and guard against a future apply-side membership guard regressing it.
+    - **Property-definition deletion.** Deleting a property definition leaves per-object values behind (no cascade in `PropertyHandler.BeforeDelete`); future writes drop via the unknown-property rule. Same orphan policy as a retype — confirm we want them identical.
 
-    **Dedicated API.** Whatever we decide, `AttachType` / `DetachType` should be the only sanctioned mutation path — freeform `$set` on `any.types` makes some of the policies above (e.g. cascade-wipe, built-in guard) un-enforceable without inspecting every op.
+    The built-in namespaces need no guard: `any` is universal and never named in a membership field, and `type` / `collection` are granted off the marker alone, so neither can be detached.
 
 ### Dependencies
 15. ~Event format for property variants~ → resolved with question 6 (scope-on-declaration; CRDT spec §9).

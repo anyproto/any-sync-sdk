@@ -72,7 +72,7 @@ func TestE2E_DirectAdd_InboxInvite(t *testing.T) {
 	require.NoError(t, err, "alice: Spaces().Create")
 	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Note"})
 	require.NoError(t, err)
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	t.Logf("alice: spaceId=%s objId=%s", sp.Id(), objId)
 

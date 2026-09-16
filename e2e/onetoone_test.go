@@ -293,7 +293,9 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	assert.Equal(t, space.SpaceTypeOneToOne, si.Type)
 
 	// Alice writes content before Bob accepts.
-	objID, err := aliceSp.Objects().Create(ctx, space.CreateObjectOpts{})
+	objID, err := aliceSp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: markerTypeId(t, ctx, aliceSp, "Note"),
+	})
 	require.NoError(t, err, "alice: create object")
 
 	// Bob learns Alice's identity out-of-band → pending row on the SAME id

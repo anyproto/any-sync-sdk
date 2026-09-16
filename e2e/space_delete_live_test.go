@@ -74,7 +74,7 @@ func TestE2E_OwnerDeletePropagatesToMember(t *testing.T) {
 		}
 		t.Fatalf("alice create: %v", err)
 	}
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "blocks-type"})
 	require.NoError(t, err)
 	_, err = sp.Modify(ctx, space.ModifyBatch{
 		ObjectId: objId,

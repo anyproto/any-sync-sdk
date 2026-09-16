@@ -21,11 +21,28 @@ var ErrPinnedField = errors.New("space: property field is pinned or immutable")
 // PATH. Consumers map it to a validation-class client error.
 var ErrInvalidFieldValue = errors.New("space: invalid dataset field value")
 
-// ErrTypeRegistered is returned by AddProperty / RemoveProperty /
-// PatchProperty when the target type is a registered built-in whose
-// properties are statically declared and cannot be mutated at runtime.
-// A client error → 4xx.
-var ErrTypeRegistered = errors.New("space: type is registered — properties are statically declared")
+// ErrTypeRegistered is returned by the runtime mutators (AddProperty /
+// RemoveProperty / PatchProperty / Patch and the part methods) when the
+// target type or collection is a registered built-in whose declarations
+// are static and cannot be mutated at runtime. A client error → 4xx.
+var ErrTypeRegistered = errors.New("space: definition is registered — its declarations are static")
+
+// ErrNotAType is returned by the type-only surface (Parts / AddPart /
+// AddDataset / Patch / … on TypesAPI) when the id names a collection
+// object; ErrNotACollection by CollectionsAPI.Patch when the id names
+// a type object. The shared property-definition methods accept either.
+// Client errors → 4xx.
+var (
+	ErrNotAType       = errors.New("space: the id names a collection, not a type")
+	ErrNotACollection = errors.New("space: the id names a type, not a collection")
+)
+
+// ErrWrongSlot is returned by the membership writes (SetType /
+// AttachCollection / Objects().Create / Derive / Bundles().Ensure) and
+// by a raw Modify on the objects row when a known collection id is set
+// as `any.type` or a known type id is added to `any.collections`. An
+// id this device cannot resolve passes. A client error → 4xx.
+var ErrWrongSlot = errors.New("space: a type goes in any.type, a collection in any.collections")
 
 // ErrModuleOwned is returned by the field-level dataset methods
 // (AddDatasetField / RemoveDatasetField / PatchDatasetField) when the
@@ -76,41 +93,26 @@ const (
 // (0, false) on an unknown label.
 func ParseScope(label string) (Scope, bool) { return handler.ParseScope(label) }
 
-// TypesAPI manages type objects and property definitions inside a space.
-//
-// A type is an object with `type = type`. Each type defines properties
-// (field-level schemas) stored on the type object itself. Instance
-// objects reference types via their `any.types` list; property values
-// for those instances live in the per-space `properties` system
-// dataset, namespaced by typeId (see PropertiesAPI).
-//
-// Built-in types (`any`, `type`) are derived on demand — callers don't
-// create them. List returns them alongside user-defined types.
-type TypesAPI interface {
-	List(ctx context.Context) ([]TypeInfo, error)
-	Get(ctx context.Context, typeId string) (TypeInfo, error)
+// PropertyDefsAPI is the property-definition surface shared by types
+// and collections: one implementation, addressed by the owning
+// definition's id (a type id or a collection id) through either
+// Space.Types() or Space.Collections(). Definitions live on the owner
+// object; values live on the objects row under `<ownerId>.<propId>`.
+type PropertyDefsAPI interface {
+	// Properties returns the current property definitions of the
+	// owner. Built-ins (`any`, `type`, `collection`, `spaceIndex`) and
+	// registered definitions answer their static tables.
+	Properties(ctx context.Context, ownerId string) ([]PropertyDef, error)
 
-	// Create a new user-defined type in this space. Returns the new
-	// type object's id.
-	Create(ctx context.Context, params TypeCreateParams) (typeId string, err error)
-
-	// Delete a type. Existing instance references in `any.types` stay
-	// as-is (orphan), per docs §"read tolerance".
-	Delete(ctx context.Context, typeId string) error
-
-	// Properties returns the current property definitions for a type.
-	// Includes definitions inherited from `any` / `type` built-ins.
-	Properties(ctx context.Context, typeId string) ([]PropertyDef, error)
-
-	// AddProperty mints a new property on the type. The returned
+	// AddProperty mints a new property on the owner. The returned
 	// propId is base58(xxh3-64(changeId)) — immutable for the life of
-	// the property.
-	AddProperty(ctx context.Context, typeId string, draft PropertyDraft) (propId string, err error)
+	// the property. Registered owners refuse (ErrTypeRegistered).
+	AddProperty(ctx context.Context, ownerId string, draft PropertyDraft) (propId string, err error)
 
 	// RemoveProperty drops a property definition. Existing value
 	// records are NOT cleaned up; subsequent writes touching that
 	// property are dropped op-by-op via the unknown-property rule.
-	RemoveProperty(ctx context.Context, typeId, propId string) error
+	RemoveProperty(ctx context.Context, ownerId, propId string) error
 
 	// PatchProperty applies a generic per-path patch to a property
 	// definition. Set assigns values at dotted paths; Unset removes
@@ -122,11 +124,40 @@ type TypesAPI interface {
 	// descriptor opaquely; the consumer owns its vocabulary and its
 	// leaf-only patch rule). Pinned paths (key, kind, scope, items,
 	// properties) are rejected — define a new property to change them.
-	PatchProperty(ctx context.Context, typeId, propId string, patch PropertyPatch) error
+	PatchProperty(ctx context.Context, ownerId, propId string, patch PropertyPatch) error
+}
+
+// TypesAPI manages type objects inside a space.
+//
+// A type is what an object IS: property definitions, parts (the
+// datasets it renders) and a layout. An object has exactly one type,
+// named in `any.type`; a type object itself carries the reserved
+// marker `__type__` there (it has no type of its own). Property
+// values for an object live on the per-space objects row under
+// `<typeId>.<propId>` (see PropertiesAPI). What an object is filed
+// UNDER is a collection — see CollectionsAPI.
+//
+// Built-in types (`any`, `type`, `collection`, `spaceIndex`) are
+// derived on demand — callers don't create them. List returns them,
+// and every registered type, alongside user-defined types.
+type TypesAPI interface {
+	PropertyDefsAPI
+
+	List(ctx context.Context) ([]TypeInfo, error)
+	Get(ctx context.Context, typeId string) (TypeInfo, error)
+
+	// Create a new user-defined type in this space. Returns the new
+	// type object's id.
+	Create(ctx context.Context, params TypeCreateParams) (typeId string, err error)
+
+	// Delete a type. Objects naming it in `any.type` keep the
+	// reference (orphan), per docs §"read tolerance".
+	Delete(ctx context.Context, typeId string) error
 
 	// Patch edits a user type's display and rendering metadata: name,
-	// description, icon, weight, layout. Absent fields keep their
-	// value. Registered built-ins refuse (ErrTypeRegistered).
+	// description, icon, layout, hidden, meta. Absent fields keep
+	// their value. Registered built-ins refuse (ErrTypeRegistered); a
+	// collection id refuses (ErrNotAType).
 	Patch(ctx context.Context, typeId string, patch TypePatch) error
 
 	// Parts returns the type's parts with their datasets (the compiled
@@ -206,7 +237,6 @@ type TypePatch struct {
 	Name        *string
 	Description *string
 	IconCID     *string
-	Weight      *int
 	Layout      map[string]any
 	ClearLayout bool
 	Hidden      *bool
@@ -428,12 +458,9 @@ type TypeInfo struct {
 	// Create, stored at `type.xkey` on the type object. Empty if
 	// unset.
 	XKey string
-	// Weight picks the primary type of a multi-typed object: the
-	// highest wins, tie broken by type id. Layout is how the primary
-	// type's header and parts compose — a slug plus config in the
-	// x-format shape ({type, config}), opaque to the SDK. Both live in
-	// the meta-type's namespace (`type.weight`, `type.layout`).
-	Weight int
+	// Layout is how the type's header and parts compose — a slug plus
+	// config in the x-format shape ({type, config}), opaque to the
+	// SDK. Lives in the meta-type's namespace (`type.layout`).
 	Layout map[string]any
 	// Hidden keeps the type out of default listings and pickers: a
 	// client shows it only on request. A bundle root asks for it
@@ -447,10 +474,86 @@ type TypeInfo struct {
 	// keys they own (an indexer's `index`, a client's tags).
 	// `type.meta`.
 	Meta map[string]any
-	// BuiltIn marks the synthetic types — `any`, `spaceIndex`,
-	// `type` and every caller-registered type (immutable,
+	// BuiltIn marks the synthetic types — `any`, `spaceIndex`, `type`,
+	// `collection` and every caller-registered type (immutable,
 	// always-present). User types return false.
 	BuiltIn bool
+}
+
+// CollectionInfo is a point-in-time snapshot of a collection object —
+// the type-side subset that describes a definition rather than how
+// its objects render: no layout, no parts. `collection.xkey` /
+// `hidden` / `meta` hold XKey / Hidden / Meta.
+type CollectionInfo struct {
+	Id          string
+	Name        string
+	Description string
+	IconCID     string
+	XKey        string
+	Hidden      bool
+	Meta        map[string]any
+	// BuiltIn marks the synthetic `collection` meta-type and every
+	// caller-registered collection. User collections return false.
+	BuiltIn bool
+}
+
+// CollectionCreateParams is the input to CollectionsAPI.Create.
+type CollectionCreateParams struct {
+	Name        string
+	Description string
+	IconCID     string
+	XKey        string
+	Hidden      bool
+	Meta        map[string]any
+}
+
+// CollectionPatch is the input to CollectionsAPI.Patch. Nil pointers
+// keep the current value; an empty string clears a text field; Meta
+// patches per key, a nil value unsets.
+type CollectionPatch struct {
+	Name        *string
+	Description *string
+	IconCID     *string
+	Hidden      *bool
+	Meta        map[string]any
+}
+
+// CollectionsAPI manages collection objects inside a space.
+//
+// A collection is what an object is filed UNDER: property definitions
+// and nothing else — no parts, no layout. An object belongs to any
+// number of collections, listed in `any.collections`; a collection
+// object itself carries the reserved marker `__collection__` in
+// `any.type`. Values for an object live on the objects row under
+// `<collectionId>.<propId>`, exactly like a type's. A query on
+// `any.collections` returns members only — a collection object never
+// lists its own id.
+//
+// The property-definition methods are the same surface TypesAPI
+// exposes (PropertyDefsAPI) and accept a type id as well.
+type CollectionsAPI interface {
+	PropertyDefsAPI
+
+	// List returns the meta `collection` built-in, every registered
+	// collection and every user collection of this space. Hidden ones
+	// are included; the consumer filters.
+	List(ctx context.Context) ([]CollectionInfo, error)
+	// Get returns one collection; ErrNotACollection for a type id,
+	// ErrNotFound for anything else.
+	Get(ctx context.Context, collectionId string) (CollectionInfo, error)
+
+	// Create a new user-defined collection. Returns the new object's
+	// id.
+	Create(ctx context.Context, params CollectionCreateParams) (collectionId string, err error)
+
+	// Delete a collection. Objects listing it keep the reference
+	// (orphan), per docs §"read tolerance".
+	Delete(ctx context.Context, collectionId string) error
+
+	// Patch edits a user collection's display and listing metadata.
+	// Registered built-ins refuse (ErrTypeRegistered); a type id
+	// refuses (ErrNotACollection).
+	Patch(ctx context.Context, collectionId string, patch CollectionPatch) error
 }
 
 // TypeCreateParams is the input to TypesAPI.Create.
@@ -466,9 +569,8 @@ type TypeCreateParams struct {
 	// only rows carrying the type marker can hold one.
 	XKey string
 
-	// Weight and Layout seed the rendering metadata — see TypeInfo.
-	// Both mutable through Patch.
-	Weight int
+	// Layout seeds the rendering metadata — see TypeInfo. Mutable
+	// through Patch.
 	Layout map[string]any
 
 	// Hidden and Meta seed the listing flag and the consumer flag bag —

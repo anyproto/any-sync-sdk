@@ -59,7 +59,7 @@ func TestE2E_FilesV2_SDKAttach(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	typeId, _ := setupMovieType(t, ctx, sp)
-	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 
 	// Push the space to the tree nodes BEFORE attaching, so the broker's
@@ -124,7 +124,7 @@ func TestE2E_FilesV2_SDKAttach(t *testing.T) {
 	require.Equal(t, small, inlineRow.Enc.Inline)
 
 	// --- 4) BIND: same content on a second object reuses everything.
-	owner2, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	owner2, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	bindStart := time.Now()
 	bindInfo, err := sp.Files().Attach(ctx, owner2, bytes.NewReader(content),

@@ -143,7 +143,7 @@ func TestCatalog_StaticParts(t *testing.T) {
 	mods := []handler.Module{testModule()}
 	require.NoError(t, ValidateExternalTypes(extTypes))
 	require.NoError(t, ValidateExternalModules(extTypes, mods))
-	store := NewStore(nil, db, nil, "spaceA", nil, extTypes, mods)
+	store := NewStore(nil, db, nil, "spaceA", nil, extTypes, nil, mods)
 	t.Cleanup(func() { _ = store.Close() })
 
 	// Ownership before any runtime type exists.

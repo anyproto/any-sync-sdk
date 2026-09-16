@@ -55,12 +55,12 @@ func TestSDK_ChangeIndex(t *testing.T) {
 	defer cancelSub()
 
 	// Two objects, each with a property write.
-	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idA, typeId, map[string]any{titleProp: "alpha"})
 	require.NoError(t, err)
 
-	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idB, typeId, map[string]any{titleProp: "beta"})
 	require.NoError(t, err)
@@ -155,7 +155,7 @@ func TestSDK_ObjectDelete_PurgesLocalState(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{titleProp: "doomed"})
 	require.NoError(t, err)

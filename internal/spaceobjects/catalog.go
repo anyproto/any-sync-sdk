@@ -33,20 +33,28 @@ import (
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
-// LiveTypeRowsFilter selects live `__type__` rows from the per-space
-// objects collection. Built once with the typed query package; shared
-// with the types API's List so the marker/tombstone condition has a
-// single definition.
-var LiveTypeRowsFilter query.Filter = func() query.Filter {
+// LiveTypeRowsFilter selects live type objects (`any.type ==
+// "__type__"`) from the per-space objects collection;
+// LiveCollectionRowsFilter the live collection objects. Built once
+// with the typed query package; shared with the API listings so the
+// marker/tombstone condition has a single definition.
+var (
+	LiveTypeRowsFilter       = liveMarkerRowsFilter(typetype.MetaTypeMarker)
+	LiveCollectionRowsFilter = liveMarkerRowsFilter(collectiontype.MetaMarker)
+)
+
+func liveMarkerRowsFilter(marker string) query.Filter {
 	a := &anyenc.Arena{}
 	return query.And{
-		query.Key{Path: []string{"any", "types"}, Filter: query.NewInValue(a.NewString(typetype.MetaTypeMarker))},
+		query.Key{Path: []string{anytype.TypeId, anytype.FieldType}, Filter: query.NewCompValue(query.CompOpEq, a.NewString(marker))},
 		query.Key{Path: []string{"_deletedAt"}, Filter: query.Not{Filter: query.Exists{}}},
 	}
-}()
+}
 
 // catalogSnapshot is the immutable resolved catalog.
 type catalogSnapshot struct {

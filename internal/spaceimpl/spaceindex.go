@@ -15,19 +15,15 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// spaceIndexTypesArray builds the any.types value for the spaceIndex
-// object: the single built-in spaceIndex type it implements. Declared
-// on seed so the write-time pre-flight admits the spaceIndex.*
-// namespace.
-func spaceIndexTypesArray(arena *anyenc.Arena) *anyenc.Value {
-	arr := arena.NewArray()
-	arr.SetArrayItem(0, arena.NewString(spaceindex.TypeId))
-	return arr
-}
+// spaceIndexTypeKey is the dotted `any.type` key the spaceIndex object
+// writes its built-in type under. Declared on seed so the write-time
+// pre-flight admits the spaceIndex.* namespace.
+const spaceIndexTypeKey = anytype.TypeId + "." + anytype.FieldType
 
 // seedSpaceIndexOnCreate is the owner-side initial write of the
 // in-space spaceIndex object. Runs once during Service.Create after
@@ -56,11 +52,10 @@ func (s *Service) seedSpaceIndexOnCreate(ctx context.Context, store *spaceobject
 	// Always set all four keys, even when empty — keeps the row's
 	// `spaceIndex.*` namespace present on disk so subsequent reads
 	// distinguish "seeded with blanks" from "never seeded".
-	// Declare the type this object implements so the write-time schema
-	// pre-flight admits the spaceIndex.* namespace (any.types
-	// membership). Same change as the values — collectTypeAdditions
-	// picks it up.
-	payload.Set("any.types", spaceIndexTypesArray(arena))
+	// Declare the type this object has so the write-time schema
+	// pre-flight admits the spaceIndex.* namespace. Same change as the
+	// values — the membership scan picks it up.
+	payload.Set(spaceIndexTypeKey, arena.NewString(spaceindex.TypeId))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldName, arena.NewString(req.Name))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldDescription, arena.NewString(req.Description))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldIcon, arena.NewString(req.IconCID))
@@ -155,7 +150,7 @@ func (s *spaceImpl) maybeLazySeedSpaceIndex(ctx context.Context) {
 	}
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
-	payload.Set("any.types", spaceIndexTypesArray(arena))
+	payload.Set(spaceIndexTypeKey, arena.NewString(spaceindex.TypeId))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldName, arena.NewString(rec.Name))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldDescription, arena.NewString(rec.Description))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldIcon, arena.NewString(rec.IconCID))

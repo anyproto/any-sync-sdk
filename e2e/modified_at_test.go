@@ -73,7 +73,7 @@ func TestE2E_ModifiedAt_BumpsOnDatasetWrite(t *testing.T) {
 		t.Fatalf("Spaces().Create: %v", err)
 	}
 
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"notes-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "notes-type"})
 	require.NoError(t, err)
 
 	modifiedAt := func() int64 {
@@ -187,7 +187,7 @@ func TestE2E_ModifiedAt_ConvergesAcrossDevices(t *testing.T) {
 		t.Fatalf("device A: Spaces().Create: %v", err)
 	}
 	spaceId := spA.Id()
-	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"notes-type"}})
+	objId, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: "notes-type"})
 	require.NoError(t, err)
 
 	modifiedAt := func(sp space.Space) (int64, bool) {

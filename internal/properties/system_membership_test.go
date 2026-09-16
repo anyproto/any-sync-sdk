@@ -250,3 +250,70 @@ func TestPreValidate_WrongSlotUnknownIdsPass(t *testing.T) {
 	require.NoError(t, bare.PreValidate(singlePathChange(
 		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(shelfC)), nil))
 }
+
+// TestPreValidate_TypeRequired pins the one-type rule on the local
+// write path: every object has exactly one type, so a change that
+// empties `any.type` is refused whatever shape it takes.
+func TestPreValidate_TypeRequired(t *testing.T) {
+	h := properties.New(membersRegistry())
+	h.Classify = classifier
+	a := &anyenc.Arena{}
+	before := beforeWithMembers(a, movieT)
+
+	refused := func(label string, ch *crdt.Change) {
+		t.Helper()
+		err := h.PreValidate(ch, before)
+		require.ErrorIs(t, err, properties.ErrTypeRequired, label)
+		var ve *properties.ValidationError
+		require.ErrorAs(t, err, &ve, label)
+		assert.Equal(t, properties.ReasonTypeRequired, ve.Reason, label)
+		assert.Equal(t, testObjectId, ve.ObjectId, label)
+	}
+
+	refused("$unset any.type", singlePathChange(
+		crdt.OpUnset, []string{typeAny, anytype.FieldType}, nil))
+	refused(`$set any.type = ""`, singlePathChange(
+		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString("")))
+
+	// The multi-field create shape is checked the same way.
+	payload := a.NewObject()
+	payload.Set(typeAny+"."+anytype.FieldType, a.NewString(""))
+	refused(`multi-field any.type = ""`, multiFieldChange(payload))
+
+	// Collections carry no such rule: an object files itself nowhere.
+	require.NoError(t, h.PreValidate(singlePathChange(
+		crdt.OpPull, []string{typeAny, anytype.FieldCollections}, a.NewString(shelfC)), before))
+}
+
+// TestSystemPropertiesHandler_InboundToleratesClearedType is the other
+// half of that rule: only the LOCAL path refuses. A peer's change that
+// clears `any.type` applies as written — dropping the op would leave
+// the row diverged from every other device.
+func TestSystemPropertiesHandler_InboundToleratesClearedType(t *testing.T) {
+	ctx := context.Background()
+	ctrl := newPropsController(t, membersRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v1", testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, anytype.FieldType}, Payload: arena.NewString(movieT)},
+	)))
+	rec := ctrl.Get(ctx, properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	require.Equal(t, movieT, rec.GetString(typeAny, anytype.FieldType))
+
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v2", testObjectId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{typeAny, anytype.FieldType}},
+	)))
+	rec = ctrl.Get(ctx, properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(typeAny, anytype.FieldType), "inbound $unset clears the slot")
+
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v3", testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, anytype.FieldType}, Payload: arena.NewString("")},
+	)))
+	rec = ctrl.Get(ctx, properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	slot := rec.Get(typeAny, anytype.FieldType)
+	require.NotNil(t, slot, `inbound $set to "" lands`)
+	assert.Empty(t, string(slot.GetStringBytes()))
+}

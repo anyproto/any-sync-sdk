@@ -178,13 +178,16 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	require.Empty(t, row.GetArray("any", "collections"), "no collection attaches on write")
 
 	// The module namespace on the objects row opens with the
-	// declaration: a Page carries `notes.*`, a bare object does not.
+	// declaration: a Page carries `notes.*`, an object whose type
+	// declares nothing does not.
 	_, err = sp.Properties().Set(ctx, obj, "notes", map[string]any{"pinned": true})
 	require.NoError(t, err, "module namespace granted through the declaring type")
 	row, err = sp.Objects().Get(ctx, obj)
 	require.NoError(t, err)
 	assert.True(t, row.GetBool("notes", "pinned"))
-	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: markerTypeId(t, ctx, sp, "Bare"),
+	})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, bare, "notes", map[string]any{"pinned": true})
 	require.Error(t, err, "no declaring type, no namespace")

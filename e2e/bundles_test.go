@@ -54,9 +54,12 @@ func TestE2E_BundlesConvergeAndRestore(t *testing.T) {
 		return sdk
 	}
 
+	// A caller-minted root is an ordinary object, so it needs a type
+	// like any other; a declaring Ensure restamps it with the marker.
+	var rootType string
 	newRootVia := func(sp space.Space) func(ctx context.Context) (string, error) {
 		return func(ctx context.Context) (string, error) {
-			return sp.Objects().Create(ctx, space.CreateObjectOpts{})
+			return sp.Objects().Create(ctx, space.CreateObjectOpts{Type: rootType})
 		}
 	}
 	// mustAdopt fails the test if Ensure reaches NewRoot — the adopt
@@ -76,6 +79,7 @@ func TestE2E_BundlesConvergeAndRestore(t *testing.T) {
 		}
 		t.Fatalf("device A: Spaces().Create: %v", err)
 	}
+	rootType = markerTypeId(t, ctx, spA, "BundleRoot")
 
 	installed, didInstall, err := spA.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "bao/v1", Name: "Bao", NewRoot: newRootVia(spA),
@@ -489,12 +493,18 @@ func TestE2E_BundlesDerivedRoot(t *testing.T) {
 	// off it by seed instead — which converges the same way and needs
 	// no cascade, the root being undeletable anyway. Pinned because
 	// both halves of the rule are permanent.
-	_, err = spA.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: []byte("inbox"), ParentId: wantRoot})
+	_, err = spA.Objects().Derive(ctx, space.DeriveObjectOpts{
+		Seed: []byte("inbox"), ParentId: wantRoot, Type: wantRoot,
+	})
 	require.Error(t, err, "a derived root must not be usable as a parent")
 
-	childA, err := spA.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: []byte(wantRoot + "/inbox")})
+	childA, err := spA.Objects().Derive(ctx, space.DeriveObjectOpts{
+		Seed: []byte(wantRoot + "/inbox"), Type: wantRoot,
+	})
 	require.NoError(t, err)
-	childB, err := spB.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: []byte(wantRoot + "/inbox")})
+	childB, err := spB.Objects().Derive(ctx, space.DeriveObjectOpts{
+		Seed: []byte(wantRoot + "/inbox"), Type: wantRoot,
+	})
 	require.NoError(t, err)
 	require.Equal(t, childA, childB)
 }
@@ -673,6 +683,7 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	// says (an install writes the request's name; an adopt never
 	// renames).
 	named, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type:              flag.RootId,
 		InitialProperties: map[string]map[string]any{"any": {"name": "Named by the caller"}},
 	})
 	require.NoError(t, err)

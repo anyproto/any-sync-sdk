@@ -319,6 +319,16 @@ func waitFor(ctx context.Context, deadline, interval time.Duration, fn func() bo
 	return false
 }
 
+// markerTypeId creates a type that declares nothing — no parts, no
+// properties, no layout. Every object has a type, so tests needing one
+// without caring which mint it here.
+func markerTypeId(t *testing.T, ctx context.Context, sp space.Space, name string) string {
+	t.Helper()
+	id, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: name})
+	require.NoError(t, err)
+	return id
+}
+
 // userTypeIds returns the ids of types on sp that are NOT marked
 // BuiltIn. The SDK ships a small set of synthetic built-ins (Any,
 // Markdown, Chat, Nav) which would otherwise mask whether the user

@@ -240,9 +240,11 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.NotNil(t, defs[0].Search)
 	assert.Equal(t, []string{"body"}, defs[0].Search.Text)
 
-	// An object that does not implement the type cannot hold its
-	// dataset — no type attaches on write.
-	stray, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	// An object of another type cannot hold this type's dataset — no
+	// type attaches on write.
+	stray, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: markerTypeId(t, ctx, sp, "Stray"),
+	})
 	require.NoError(t, err)
 	_, err = sp.Upsert(ctx, space.UpsertBatch{
 		ObjectId: stray, Dataset: coll,

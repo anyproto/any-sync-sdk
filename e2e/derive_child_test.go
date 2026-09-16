@@ -65,15 +65,21 @@ func TestSDK_Objects_DeriveUnderParent(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, childId)
 
+	// A re-derive of an object that already carries a type needs none.
 	childIdAgain, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed, ParentId: parentId})
 	require.NoError(t, err)
 	assert.Equal(t, childId, childIdAgain, "Derive must be idempotent for the same seed+parent")
 
 	// The parent is hashed into the derived id: same seed, different
-	// parent → different id.
+	// parent → different id. First materialization under a new parent
+	// needs a type.
 	otherParent, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
-	childUnderOther, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed, ParentId: otherParent})
+	_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed, ParentId: otherParent})
+	require.ErrorIs(t, err, space.ErrTypeRequired, "a first derive must name a type")
+	childUnderOther, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{
+		Seed: seed, ParentId: otherParent, Type: typeId,
+	})
 	require.NoError(t, err)
 	assert.NotEqual(t, childId, childUnderOther, "same seed under a different parent must derive a different id")
 

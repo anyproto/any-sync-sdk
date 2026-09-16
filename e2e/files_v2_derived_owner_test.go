@@ -64,10 +64,11 @@ func TestE2E_FilesV2_DerivedOwnerAttach(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// A DERIVED owner (Objects().Derive → store.Derive → IsDerived root),
-	// deliberately typeless (no content of its own).
+	// A DERIVED owner (Objects().Derive → store.Derive → IsDerived root)
+	// whose type declares no content of its own.
 	ownerId, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{
 		Seed: []byte("derived-owner-for-files"),
+		Type: markerTypeId(t, ctx, sp, "FileHolder"),
 	})
 	require.NoError(t, err)
 

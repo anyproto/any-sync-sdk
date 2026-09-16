@@ -279,14 +279,52 @@ func TestE2E_Collections(t *testing.T) {
 		assert.Equal(t, "Casablanca", row.GetString(typeId, titleProp), "the old type's values orphan in place")
 		assert.ElementsMatch(t, []string{cId}, collArrayOf(row, "any", "collections"), "retyping leaves collections alone")
 
-		// UnsetType clears the slot: the object has no parts and
-		// renders as properties.
-		_, err = sp.Properties().UnsetType(ctx, objId)
-		require.NoError(t, err)
+		// The type slot cannot be emptied: a raw write that clears it
+		// is refused, and the row keeps the type it had.
+		_, err = sp.Modify(ctx, space.ModifyBatch{
+			ObjectId: objId, Dataset: "objects",
+			Records: []space.RecordModify{{
+				Id: objId, Upsert: true,
+				Ops: []space.Op{{Type: space.OpUnset, Path: "any.type"}},
+			}},
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, space.ErrTypeRequired, "raw Modify must surface the public sentinel: %v", err)
+		reason, ok = handler.ClassifyValidation(err)
+		require.True(t, ok, "rejection must classify: %v", err)
+		assert.Equal(t, handler.ReasonTypeRequired, reason)
+		assert.ErrorIs(t, err, handler.ErrValidationTypeRequired)
 		row, err = sp.Objects().Get(ctx, objId)
 		require.NoError(t, err)
-		assert.Nil(t, row.Get("any", "type"), "UnsetType clears the type slot")
+		assert.Equal(t, bookType, row.GetString("any", "type"), "the refused op must not land")
 		assert.ElementsMatch(t, []string{cId}, collArrayOf(row, "any", "collections"))
+	})
+
+	// Every object has exactly one type, so Create refuses without one
+	// — and mints nothing on the way out.
+	t.Run("TypeRequired", func(t *testing.T) {
+		allIds := func() []string {
+			rows, err := sp.QueryObjects().All(ctx)
+			require.NoError(t, err)
+			return collRowIds(rows)
+		}
+		before := allIds()
+		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+		assert.ErrorIs(t, err, space.ErrTypeRequired)
+		assert.Empty(t, id, "a refused Create returns no id")
+		_, err = sp.Objects().Get(ctx, id)
+		require.Error(t, err, "there is no object to read back")
+		assert.ElementsMatch(t, before, allIds(), "a refused Create leaves no object behind")
+
+		// Collections stay optional: a type alone is a whole object.
+		typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Typed"})
+		require.NoError(t, err)
+		id, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
+		require.NoError(t, err)
+		row, err := sp.Objects().Get(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, typeId, row.GetString("any", "type"))
+		assert.Empty(t, collArrayOf(row, "any", "collections"))
 	})
 
 	// The slot rule: a known id goes where its kind belongs; an id this
@@ -323,7 +361,7 @@ func TestE2E_Collections(t *testing.T) {
 		// Creating with the slots crossed is refused the same way.
 		_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Type: cId})
 		assert.ErrorIs(t, err, space.ErrWrongSlot)
-		_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Collections: []string{typeId}})
+		_, err = sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId, Collections: []string{typeId}})
 		assert.ErrorIs(t, err, space.ErrWrongSlot)
 
 		// An id that resolves to neither passes — a definition that has

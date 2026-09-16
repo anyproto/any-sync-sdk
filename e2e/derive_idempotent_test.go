@@ -55,6 +55,11 @@ func TestSDK_Objects_DeriveIdempotentInDAG(t *testing.T) {
 	require.NoError(t, err)
 
 	seed := []byte("well-known/v1")
+
+	// First materialization must name a type: every object has one.
+	_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed})
+	require.ErrorIs(t, err, space.ErrTypeRequired)
+
 	objectId, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{
 		Seed: seed, Type: typeA,
 	})
@@ -69,6 +74,14 @@ func TestSDK_Objects_DeriveIdempotentInDAG(t *testing.T) {
 	assert.Equal(t, objectId, again)
 	assert.Equal(t, baseline, treeLen(t, ctx, sp, objectId),
 		"derive with the membership already on the row must not append a change")
+
+	// A row that already has a type needs none: the resolve is a no-op.
+	again, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: seed})
+	require.NoError(t, err)
+	assert.Equal(t, objectId, again)
+	assert.Equal(t, baseline, treeLen(t, ctx, sp, objectId),
+		"a typeless re-derive of a typed row must not append a change")
+	assert.Equal(t, typeA, objectTypeOf(t, ctx, sp, objectId))
 
 	// A derive naming another type never replaces the one the row has.
 	_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{

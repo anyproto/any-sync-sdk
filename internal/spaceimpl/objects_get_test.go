@@ -13,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 func TestLiveObjectRow(t *testing.T) {
@@ -60,4 +61,14 @@ func TestObjectsGet_ReturnsLiveRow(t *testing.T) {
 
 	_, err = newObjectService(s).Get(ctx, "")
 	require.Error(t, err)
+}
+
+// Create refuses a typeless request before it touches the store, so a
+// refused Create leaves no tree behind: a spaceImpl with no store
+// would panic on the first store access.
+func TestObjectsCreate_TypeRequiredBeforeStore(t *testing.T) {
+	s := &spaceImpl{id: "spaceA"}
+	id, err := newObjectService(s).Create(context.Background(), space.CreateObjectOpts{})
+	require.ErrorIs(t, err, space.ErrTypeRequired)
+	require.Empty(t, id)
 }

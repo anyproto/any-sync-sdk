@@ -48,7 +48,9 @@ func TestValidateEnsureRequest(t *testing.T) {
 		bad  bool
 	}{
 		{name: "created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot}},
-		{name: "derived root", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}},
+		// Every object has a type: a derived root that declares nothing
+		// takes it from RootType.
+		{name: "bare derived root", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true}, bad: true},
 		{name: "derived with parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart()}},
 		{name: "both strategies", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, NewRoot: newRoot}, bad: true},
 		{name: "no strategy", req: space.EnsureBundleRequest{Id: "b"}, bad: true},
@@ -59,13 +61,13 @@ func TestValidateEnsureRequest(t *testing.T) {
 		{name: "declaring root with a root type", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart(), RootType: "t"}, bad: true},
 		{name: "declaring collection with a root type", req: space.EnsureBundleRequest{Id: "b", Collection: true, XKey: "shelf", RootType: "t"}, bad: true},
 		{name: "derived root with a root type", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t"}},
-		{name: "derived root with root collections", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootCollections: []string{"c1", "c2"}}},
+		{name: "derived root with root collections", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{"c1", "c2"}}},
 		{name: "declaring root with root collections", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart(), RootCollections: []string{"c1"}}},
 		{name: "root type names the type marker", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: typetype.MetaTypeMarker}, bad: true},
 		{name: "root type names the collection marker", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: collectiontype.MetaMarker}, bad: true},
-		{name: "root collection with an empty id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootCollections: []string{""}}, bad: true},
-		{name: "root collection names a marker", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootCollections: []string{collectiontype.MetaMarker}}, bad: true},
-		{name: "root collection names `any`", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootCollections: []string{anytype.TypeId}}, bad: true},
+		{name: "root collection with an empty id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{""}}, bad: true},
+		{name: "root collection names a marker", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{collectiontype.MetaMarker}}, bad: true},
+		{name: "root collection names `any`", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootCollections: []string{anytype.TypeId}}, bad: true},
 		{name: "sdk-minted created root with root properties", req: space.EnsureBundleRequest{Id: "b", XKey: "wiki", RootProperties: map[string]map[string]any{"t": {"a": 1}}}},
 		{name: "xkey alone declares a marker type", req: space.EnsureBundleRequest{Id: "b", XKey: "flag"}},
 		{name: "xkey alone with metadata", req: space.EnsureBundleRequest{Id: "b", XKey: "flag", Hidden: true}},
@@ -76,7 +78,7 @@ func TestValidateEnsureRequest(t *testing.T) {
 		{name: "collection with a layout", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, XKey: "shelf", Layout: map[string]any{"type": "chat"}}, bad: true},
 		{name: "collection metadata without a declaration", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Collection: true, Hidden: true}, bad: true},
 		{name: "seeded value that cannot be encoded", req: space.EnsureBundleRequest{Id: "b", XKey: "flag", RootProperties: map[string]map[string]any{"t": {"a": make(chan int)}}}, bad: true},
-		{name: "seeded value under an empty type id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootProperties: map[string]map[string]any{"": {"a": 1}}}, bad: true},
+		{name: "seeded value under an empty type id", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, RootType: "t", RootProperties: map[string]map[string]any{"": {"a": 1}}}, bad: true},
 		{name: "tech xkey only", req: space.EnsureBundleRequest{Id: "b", XKey: "flag"}, tech: true},
 		{name: "metadata without a declaration", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Hidden: true}, bad: true},
 		{name: "layout without a declaration", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Layout: map[string]any{"type": "chat"}}, bad: true},

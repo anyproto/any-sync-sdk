@@ -132,8 +132,9 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	assert.Equal(t, "notes", seen["doc_summary"].Module)
 	assert.Equal(t, []string{"doc"}, seen["doc_meta"].Owners)
 
-	// The write gate: an object carrying doc holds all three; a bare
-	// object none. The module namespace opens with the declaration.
+	// The write gate: an object carrying doc holds all three; an object
+	// whose type declares nothing holds none. The module namespace
+	// opens with the declaration.
 	obj, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "doc"})
 	require.NoError(t, err)
 	write := func(objectId, dataset, field, value string) error {
@@ -157,7 +158,9 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	require.Len(t, rows, 1)
 	_, err = sp.Properties().Set(ctx, obj, "notes", map[string]any{"pinned": true})
 	require.NoError(t, err, "the module namespace is granted through the static declaration")
-	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
+	bare, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: markerTypeId(t, ctx, sp, "Bare"),
+	})
 	require.NoError(t, err)
 	require.ErrorIs(t, write(bare, "notes_shared", "text", "nope"), space.ErrDatasetNotDeclared)
 	require.ErrorIs(t, write(bare, "doc_summary", "text", "nope"), space.ErrDatasetNotDeclared)

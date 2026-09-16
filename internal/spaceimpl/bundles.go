@@ -611,12 +611,17 @@ func (b *bundlesAPI) deriveRoot(ctx context.Context, req space.EnsureBundleReque
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: bundles: canonical root of %q: %w", req.Id, err)
 	}
-	rootId, err := b.parent.objects.Derive(ctx, space.DeriveObjectOpts{
-		Seed: spaceindex.BundleRootSeed(req.Id),
+	// The store-level derive: the tree only, no membership — the
+	// stamp writes the marker or RootType in the root's first change,
+	// the same shape the SDK-minted created root takes.
+	obj, err := b.parent.store.Derive(ctx, spaceobjects.DeriveOpts{
+		ChangeType:    objectChangeType,
+		ChangePayload: spaceindex.BundleRootSeed(req.Id),
 	})
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: bundles: derive root of %q: %w", req.Id, err)
 	}
+	rootId := obj.Id()
 	if rootId != canonical {
 		// Unreachable unless derivation itself changed shape.
 		// Registering a root other devices would not recognize as

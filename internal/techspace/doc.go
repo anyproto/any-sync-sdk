@@ -16,5 +16,5 @@
 //     derived space-index object (one record per space). Unique to
 //     the tech space; does not appear on regular user objects.
 //
-// See docs/02-tech-space.md.
+// See docs/tech-space.md.
 package techspace

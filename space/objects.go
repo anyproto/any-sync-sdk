@@ -56,7 +56,7 @@ type ObjectService interface {
 	Derive(ctx context.Context, opts DeriveObjectOpts) (objectId string, err error)
 
 	// Delete marks the object as deleted (any-sync settings tree) and
-	// wipes local any-store state. See docs/04-object.md §"Deletion".
+	// wipes local any-store state. See docs/object.md §"Deletion".
 	Delete(ctx context.Context, objectId string) error
 }
 

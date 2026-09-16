@@ -7,5 +7,5 @@
 //
 // Ships a built-in mnemonic provider (BIP-39 / SLIP-10 at
 // m/44'/2046'/[index]'). Key persistence is the caller's responsibility —
-// the SDK does not store keys or mnemonics. See docs/01-auth-module.md.
+// the SDK does not store keys or mnemonics. See docs/auth-module.md.
 package auth

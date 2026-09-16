@@ -21,7 +21,7 @@ const accountMetadataSymKeyPath = "m/SLIP-0021/anysync-sdk/account/metadata"
 // metadata symmetric key from its private account (sign) key. The key is
 // shared with contacts through already-encrypted channels (a shared
 // space's ACL metadata, a 1-1 invite) so they can decrypt this account's
-// identityRepo profile; see docs/13 and EncryptProfile.
+// identityRepo profile; see docs/one-to-one-spaces.md and EncryptProfile.
 func DeriveAccountMetadataSymKey(accountKey crypto.PrivKey) (crypto.SymKey, error) {
 	raw, err := accountKey.Raw()
 	if err != nil {
@@ -128,7 +128,7 @@ const minProfileCiphertext = crypto.NonceBytes + 16
 // yields a garbage name; a legacy plaintext record stays unresolved
 // until a re-push overwrites it with ciphertext). A reader without the
 // contact's symkey simply can't resolve the profile yet; it surfaces from
-// identity alone until the key arrives (see docs/13, the identityMetaKeys
+// identity alone until the key arrives (see docs/one-to-one-spaces.md, the identityMetaKeys
 // cache).
 func DecryptProfile(data []byte, key crypto.SymKey) (AccountMetadata, bool) {
 	if key == nil || len(data) < minProfileCiphertext {

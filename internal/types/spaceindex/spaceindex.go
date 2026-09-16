@@ -50,7 +50,7 @@ type BuiltInProperty struct {
 	Kind  schema.Kind
 	Scope schema.Scope
 	// Description and XFormat are the descriptive slice: a display
-	// description and the opaque descriptor bag (docs/06 § The
+	// description and the opaque descriptor bag (docs/data-structure.md § The
 	// `x-format` descriptor). Surfaced by Types().Properties and
 	// dataset discovery like a user definition's; never interpreted
 	// or enforced by the SDK.

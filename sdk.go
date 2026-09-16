@@ -928,7 +928,7 @@ func (s *SDK) TechSpaceId() string { return s.tsp.SpaceId() }
 //     not a content id — a name whose segment before the first "_" is
 //     neither a space id nor a cid. The boot-time orphan sweep
 //     classifies such names ownerNone and never touches them (see
-//     docs/03-space.md § Space Lifecycle); every other prefix belongs
+//     docs/space.md § Space Lifecycle); every other prefix belongs
 //     to the CRDT layer, is swept by owner, and is rewritten by
 //     re-index. The "l_" tag is reserved for the any server's local
 //     store.

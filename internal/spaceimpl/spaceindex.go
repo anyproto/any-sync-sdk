@@ -190,8 +190,8 @@ func lazySpaceTypeTag(rec techspace.SpaceIndexRecord) string {
 // resulting LocalWrite carries one multi-field $set so all three
 // columns land under one VersionId.
 //
-// No permission gate in v1 — non-writers are rejected by any-sync
-// ACL on the apply path at peers. See PROMPT.md § "Open questions".
+// No local permission gate: peers reject non-writers against the
+// any-sync ACL on the apply path.
 func (s *spaceImpl) SetMetadata(ctx context.Context, req space.SetMetadataRequest) error {
 	if req.Name == nil && req.Description == nil && req.IconCID == nil {
 		return errors.New("spaceimpl: SetMetadata: at least one field required")

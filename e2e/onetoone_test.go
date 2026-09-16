@@ -42,7 +42,7 @@ func firstOneToOne(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK) (spac
 	return space.SpaceInfo{}, false
 }
 
-// TestE2E_OneToOne_DeclineSticky exercises the Phase-1 serverless state
+// TestE2E_OneToOne_DeclineSticky exercises the serverless state
 // machine with a single account and an out-of-band peer identity — no
 // cross-account sync needed, so it runs fast.
 //
@@ -144,7 +144,7 @@ func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
 
 	// The members view must surface exactly the two real writers (us +
 	// the peer) — the synthetic ACL owner (sharedPk, ECDH-derived, held
-	// by nobody) is filtered out, per docs/13-one-to-one-spaces.md. See
+	// by nobody) is filtered out, per docs/one-to-one-spaces.md. See
 	// SYN-63: it used to leak as a nameless third "owner" member.
 	members, err := sp.Members().List(ctx)
 	require.NoError(t, err)
@@ -364,11 +364,10 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	assert.Equal(t, space.StatusActive, si.Status)
 
 	// Content convergence is the only cross-account step and depends on the
-	// 1-1's derived replication-key nodes being reachable — that is Phase-2
-	// transport territory, not the Phase-1 serverless primitive this test
-	// covers. Best-effort: log if it lands, don't fail the suite on node
-	// reachability. (Promote to a hard require once Phase 2 wires/validates
-	// 1-1 cross-account sync against the local coordinator.)
+	// 1-1's derived replication-key nodes being reachable, which is
+	// transport, not the serverless primitive this test covers.
+	// Best-effort: log if it lands, don't fail the suite on node
+	// reachability.
 	converged := false
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
@@ -388,6 +387,6 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	if converged {
 		t.Logf("1-1 content converged: bob synced alice's object %s", objID)
 	} else {
-		t.Logf("1-1 content did NOT converge in time (object %s) — likely cross-account transport / node reachability, a Phase-2 concern", objID)
+		t.Logf("1-1 content did NOT converge in time (object %s) — likely cross-account transport / node reachability", objID)
 	}
 }

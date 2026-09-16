@@ -81,7 +81,7 @@ const SpaceIndexDeriveSeed = "builtin:spaceIndex"
 // SpaceIndexDataset is the name of the dataset on the space-index
 // object that holds one record per space. Record id is the spaceId;
 // fields are the caller-visible space metadata (type, name, icon,
-// localStatus, remoteStatus, …) per docs/02-tech-space.md § "Space
+// localStatus, remoteStatus, …) per docs/tech-space.md § "Space
 // Index".
 const SpaceIndexDataset = "spaces"
 
@@ -203,7 +203,7 @@ const (
 // SpaceIndexLocalVersion is the spaces handler's LOCAL logic version
 // (HandlerReg.Version) — bumped when already-materialized rows would
 // come out different, so the SDK rebuilds them from the DAG
-// (docs/08-versioning.md). v2: the derived createdAt stamp is a
+// (docs/versioning.md). v2: the derived createdAt stamp is a
 // TypeDateTime instant, not an epoch number.
 const SpaceIndexLocalVersion = 2
 
@@ -290,7 +290,7 @@ const (
 
 // Status lattice values. `Deleted` is terminal — once a record's
 // localStatus or remoteStatus reaches it, no further status edits land.
-// Per docs/02-tech-space.md § "Key Decisions (continued)":
+// Per docs/tech-space.md § "Key Decisions (continued)":
 // "deleted spaces stay in the index with status=deleted, never
 // physically removed."
 const (
@@ -410,7 +410,7 @@ var statusFields = map[string]struct{}{
 }
 
 // SpaceIndexHandler validates ops on the tech-space space-index
-// dataset. Per docs/02-tech-space.md § "Space Index" and § "Key
+// dataset. Per docs/tech-space.md § "Space Index" and § "Key
 // Decisions (continued)":
 //
 //   - `type` is set-once: empty/absent means "unknown" (rows created

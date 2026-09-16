@@ -44,7 +44,7 @@ var gcLog = logger.NewNamed("sdk.collectiongc")
 //
 // The sweep is scoped to one DB: names, rosters and meta rows are all
 // read from s.db. If storage ever moves to per-space DBs (dbRouter,
-// docs/06 § Storage Topology), space offload becomes a file delete and
+// docs/data-structure.md § Storage Topology), space offload becomes a file delete and
 // this same per-DB pass — run against each space DB — keeps healing
 // object-purge leaks inside live spaces.
 func (s *Service) SweepOrphanCollections(ctx context.Context) {

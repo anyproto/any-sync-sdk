@@ -13,5 +13,5 @@
 //   - Indexer               — seam the techspace implementation plugs into
 //   - VersionId             — re-exported alias of internal/crdt.VersionId
 //
-// See docs/03-space.md, docs/06-data-structure.md, and docs/05-crdt.md.
+// See docs/space.md, docs/data-structure.md, and docs/crdt.md.
 package space

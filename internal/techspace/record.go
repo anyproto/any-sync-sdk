@@ -8,7 +8,7 @@ import (
 )
 
 // SpaceIndexRecord is the typed view of one row in the space-index
-// dataset. Mirrors docs/02-tech-space.md § "Space Index" + the field
+// dataset. Mirrors docs/tech-space.md § "Space Index" + the field
 // constants in spaceindex.go (Field*).
 //
 // Decoded from the on-disk anyenc value via DecodeSpaceIndexRecord;

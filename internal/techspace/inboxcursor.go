@@ -22,7 +22,7 @@ import (
 //
 // Re-processing is idempotent (the 1-1 row is the handled-marker), so a
 // momentary cross-device regression of this value just causes a harmless,
-// deduplicated re-fetch — never loss. (See docs/13 § "Heart bugs we fix"
+// deduplicated re-fetch — never loss. (See docs/one-to-one-spaces.md § "Heart bugs we fix"
 // #3: idempotent receive is what makes the synced cursor safe.)
 
 const (

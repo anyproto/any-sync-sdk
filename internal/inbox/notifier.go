@@ -1,17 +1,17 @@
 // Package inbox is the coordinator-inbox notifier: the optional Layer-2
-// discovery for 1-1 spaces (docs/13). It funnels the coordinator's push
+// discovery for 1-1 spaces (docs/one-to-one-spaces.md). It funnels the coordinator's push
 // stream and a periodic poll into a single serialized worker that fetches
 // inbox messages, verifies + decrypts each, and hands the result to a
-// caller-supplied handler — advancing a device-local cursor only after a
-// message is handled.
+// caller-supplied handler.
 //
-// It deliberately fixes the heart inbox bugs catalogued in docs/13:
-// the cursor advances per-message AFTER the handler commits (no
-// process-before-persist loss); content failures (verify/decrypt) are
-// skipped with a loud log while transient handler failures (ErrRetry)
-// halt the cursor and retry; both triggers feed one worker so there is
-// no double-process race; the cursor is device-local (a plain any-store
-// collection in sdk.db, never synced).
+// Guarantees (docs/one-to-one-spaces.md § "Heart bugs we fix"): the
+// cursor advances once per batch, after the handler commits, to the
+// furthest handled message (no process-before-persist loss); content
+// failures (verify/decrypt) are skipped with a loud log while transient
+// failures (Fetch error, handler ErrRetry) halt the cursor and retry;
+// both triggers feed one worker, so nothing is processed twice
+// concurrently. The cursor is synced and account-scoped; load/save are
+// injected.
 package inbox
 
 import (
@@ -74,7 +74,7 @@ type Deps struct {
 	// cursor — so a fresh device seeds from the account's read position
 	// instead of replaying the whole inbox; everything below it is already
 	// represented by synced 1-1 rows (the correctness truth). Idempotent
-	// processing makes a synced cursor safe (see docs/13 § "Heart bugs we
+	// processing makes a synced cursor safe (see docs/one-to-one-spaces.md § "Heart bugs we
 	// fix" #3).
 	LoadCursor func(ctx context.Context) (string, error)
 	SaveCursor func(ctx context.Context, offset string) error

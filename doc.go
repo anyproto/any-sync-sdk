@@ -2,7 +2,7 @@
 // the public type aliases that middleware uses across packages.
 //
 // The SDK is consumed in-process by a middleware layer (see
-// docs/00-common-context.md). There are exactly three public import paths:
+// docs/common-context.md). There are exactly three public import paths:
 //
 //   - github.com/anyproto/any-sync-sdk        — Open, Close, Config
 //   - github.com/anyproto/any-sync-sdk/auth   — AuthProvider + mnemonic helper

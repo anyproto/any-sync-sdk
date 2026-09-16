@@ -25,19 +25,15 @@ var (
 	ErrFileVariantInvalid = errors.New("space: invalid file variant options")
 )
 
-// Files is the per-space file surface (files v2, docs/07c). Files
+// Files is the per-space file surface (docs/files.md). Files
 // always bind to an existing object — there are no standalone file
 // objects; the first Attach lazily creates the object's derived
 // payloads child, and the space-wide files listing is the payloads
-// dataset itself (see PayloadsView; the queryable files view lands
-// with SYN-30).
+// dataset itself (see PayloadsView).
 //
 // The storage tiers (inline vs content-addressed + node backup) are
 // invisible here: Attach picks the tier from the content, and Open
 // resolves it through the availability ladder (local cache → network).
-//
-// SYN-27 shipped Attach, SYN-28 Open/Get; Pin / Offload / Status
-// follow in SYN-29/26/30.
 type Files interface {
 	// Attach ingests r as a file bound to objectId. The whole reader is
 	// consumed. Registration is durable in the CRDT immediately; for

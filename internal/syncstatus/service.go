@@ -60,7 +60,7 @@ type Service struct {
 	localPeerIds NodeIdsFn
 
 	// totalFn supplies the per-space regular-object count for the
-	// rollup. May be nil in tests / Phase 1 — then Total reports 0.
+	// rollup. May be nil in tests; then Total reports 0.
 	totalFn TotalFn
 
 	// peerCountsFn / p2pStateFn supply the peer-presence slice of the
@@ -217,8 +217,8 @@ func (s *Service) SetExcludedTreesFn(fn func(spaceId string) []string) {
 // For returns the Tracker for spaceId, constructing one on first
 // access. The same Tracker is returned on every call until Close.
 //
-// Phase 2 wires the returned Tracker into commonspace.Deps.SyncStatus
-// inside loadSpaceForCache.
+// The space cache wires the returned Tracker into
+// commonspace.Deps.SyncStatus when the space loads.
 func (s *Service) For(spaceId string) *Tracker {
 	s.mu.Lock()
 	if s.closed {
@@ -240,10 +240,9 @@ func (s *Service) For(spaceId string) *Tracker {
 	return t
 }
 
-// Status returns a snapshot of spaceId's rollup. Phase 1 does the
-// composition inline (no debounce loop yet) — every call reads the
-// tracker state, the connection status (none in Phase 1), and the
-// Total source, then computes State. Cheap.
+// Status returns a snapshot of spaceId's rollup, composed inline on
+// every call from the tracker state, peer counts, P2P state and the
+// Total source. Cheap.
 func (s *Service) Status(spaceId string) space.SpaceSyncStatus {
 	t := s.trackerNoCreate(spaceId)
 	out := space.SpaceSyncStatus{SpaceId: spaceId}
@@ -429,10 +428,10 @@ func (s *Service) totalFor(spaceId string) int {
 }
 
 // computeRollup picks the SyncState for a SpaceSyncStatus given its
-// counts. Pulled out so Phase 3's network-compatibility / peer-flap
-// inputs can layer in without touching Status() callers.
+// counts. Peer connectivity is reported through the peer counts and
+// P2P state, not through the rollup.
 //
-// Phase 1 priority (no peer/network signals yet):
+// Priority:
 //   - pending > 0       → Syncing
 //   - Total == 0        → Unknown (no trees seen yet)
 //   - default           → Synced

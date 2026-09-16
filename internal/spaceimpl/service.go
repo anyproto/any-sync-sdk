@@ -228,7 +228,7 @@ type Service struct {
 	// own writes by definition. Guarded by mu; set once from sdk.Open.
 	onSpaceBorn func(spaceId string)
 
-	// One-to-one inbox (Layer-2 discovery, docs/13). inboxNotifier is the
+	// One-to-one inbox (Layer-2 discovery, docs/one-to-one-spaces.md). inboxNotifier is the
 	// receive worker (coordinator push + poll → RegisterIncoming); the
 	// invite* fields drive the send-retry loop that (re)delivers
 	// initiated-1-1 notifications. Wired and started by StartOneToOneInbox
@@ -622,7 +622,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	// Reuse the tech-space's replication key so all spaces for this
 	// account land on the same coordinator shard. The tech space is
 	// derived deterministically from the account key, so its repKey
-	// is the canonical per-account value (per docs/03-space.md
+	// is the canonical per-account value (per docs/space.md
 	// § "Replication key").
 	// Owner metadata in the ACL root is the owner's metadata symkey only,
 	// so joiners learn the key and resolve the owner's profile from
@@ -888,7 +888,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	peekCtx, cancelPeek := context.WithTimeout(ctx, time.Second)
 	defer cancelPeek()
 	// A 1-1 space's ACL "owner" is a synthetic shared key nobody holds
-	// (see docs/13), so resolveAuthor returns nothing meaningful. The
+	// (see docs/one-to-one-spaces.md), so resolveAuthor returns nothing meaningful. The
 	// useful value is the other participant's account identity, recorded
 	// on the row as OneToOnePeer; surface it as Author so clients can tell
 	// who a 1-1 is with — and resolve their profile — straight from

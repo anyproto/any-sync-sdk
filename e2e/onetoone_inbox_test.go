@@ -14,7 +14,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_OneToOne_InboxDiscovery is the Phase-2 happy path: Alice
+// TestE2E_OneToOne_InboxDiscovery is the inbox-discovery happy path: Alice
 // initiates a 1-1, the SDK posts an inbox notification, and Bob's inbox
 // notifier surfaces the incoming request as a pending row WITHOUT any
 // out-of-band identity exchange (no RegisterIncoming call on Bob's side).
@@ -23,7 +23,7 @@ import (
 // Requires a coordinator that implements the inbox RPCs. If the
 // configured network doesn't (the notification never reaches Bob), the
 // test skips rather than fails — Layer-2 discovery is optional, and
-// Phase-1 (out-of-band) is covered separately.
+// out-of-band discovery is covered separately.
 func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -80,7 +80,7 @@ func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
 	}
 	if pending == nil {
 		t.Skipf("inbox notification never reached bob — coordinator likely lacks inbox support; "+
-			"Phase-1 out-of-band path is covered by TestE2E_OneToOne_ApproveIncoming (space %s)", id)
+			"the out-of-band path is covered by TestE2E_OneToOne_ApproveIncoming (space %s)", id)
 	}
 
 	// Discovered via inbox alone. The pending row surfaces Alice's account

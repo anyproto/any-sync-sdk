@@ -2,7 +2,7 @@
 // device of an account registers itself in one pkarr record addressed
 // by a key derived from the identity key, and every device — a fresh
 // restore included — resolves its siblings from it. See
-// docs/19-account-discovery.md.
+// docs/account-discovery.md.
 package account
 
 import (

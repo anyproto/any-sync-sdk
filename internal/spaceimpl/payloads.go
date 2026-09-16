@@ -356,8 +356,8 @@ func (p *PayloadsAPI) getRowIn(ctx context.Context, payloadsObjId, fileId string
 }
 
 // fileIndexKey is the local-only fileId → payloads-object mapping in
-// the files-store KV (07c keeps the network unindexed; locally we saw
-// every row). Written on Attach, backfilled on scan hits.
+// the files-store KV (the network keeps no such index; locally every row
+// is seen). Written on Attach, backfilled on scan hits.
 func fileIndexKey(spaceId, fileId string) string {
 	return "fidx/" + spaceId + "/" + fileId
 }

@@ -429,7 +429,7 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.Len(t, all, 2)
 	assert.NotEqual(t, all[0].GetString("id"), all[1].GetString("id"))
 
-	// Phase 3: identityRepo. The owner publishes a profile; the
+	// identityRepo: the owner publishes a profile; the
 	// per-space members watcher fetches it (immediately, because
 	// UpdateMetadata kicks every running watcher) and overrides the
 	// owner's Member.Name. The override path doesn't depend on the

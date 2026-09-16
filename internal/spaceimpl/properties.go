@@ -436,7 +436,7 @@ func (p *propertiesAPI) AttachCollection(ctx context.Context, objectId, collecti
 
 // DetachCollection removes the object from a collection ($pull).
 // Values in that namespace become orphan data, read-tolerant
-// (docs/06-data-structure.md §"read tolerance").
+// (docs/data-structure.md §"read tolerance").
 func (p *propertiesAPI) DetachCollection(ctx context.Context, objectId, collectionId string) (space.ModifyResult, error) {
 	if objectId == "" || collectionId == "" {
 		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and collectionId required")

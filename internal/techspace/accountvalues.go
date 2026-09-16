@@ -176,8 +176,7 @@ func (s *Service) DeleteAccountValuesForObject(ctx context.Context, targetSpaceI
 // DropAccountValues deletes the whole carrier object for
 // targetSpaceId — the space-leave/delete GC.
 //
-// KNOWN PROTOCOL VIOLATION, to be replaced (see the proposal's
-// follow-up ledger): any-sync forbids deleting DERIVED trees —
+// KNOWN PROTOCOL VIOLATION, to be replaced (docs/scoped-properties-proposal.md): any-sync forbids deleting DERIVED trees —
 // deterministic ids mean delete + re-derive = the same identity with
 // fresh history (history replacement). This must become record-level
 // GC (tombstone every carrier record, keep the empty derived tree).

@@ -12,7 +12,7 @@ import (
 
 // The identities collection — one account-global directory of every
 // account identity this account has encountered, keyed by the account
-// address. One row mixes two sync classes on purpose (see docs/13):
+// address. One row mixes two sync classes on purpose (see docs/one-to-one-spaces.md):
 //
 //   - symKey  (ScopeSynced)  — the contact's metadata symkey, the secret
 //     a device needs to decrypt their identityRepo profile. It MUST cross

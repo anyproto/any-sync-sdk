@@ -478,7 +478,7 @@ func memberFromJoinRecord(r list.RequestRecord) space.Member {
 // (sharedPk, derived via ECDH from both peers' account keys) purely to
 // satisfy any-sync's "every ACL has an owner" invariant — nobody holds
 // its private key and it has no identity profile. It is ignored in
-// business logic (docs/13-one-to-one-spaces.md), so member views exclude
+// business logic (docs/one-to-one-spaces.md), so member views exclude
 // it and surface only the two real writers. Best-effort: if the space is
 // a 1-1 but the owner key can't be read, returns nil (no filtering) —
 // the raw view is a strictly better failure than a panic. Caller holds

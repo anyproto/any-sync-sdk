@@ -99,7 +99,7 @@ type Member struct {
 // MemberStatus is the membership lifecycle stage. Mirrors any-sync's
 // list.AclStatus, plus MemberStatusJoining for pending join requests
 // (which any-sync tracks in a separate map but the SDK surfaces as
-// part of the same members view — see docs/03-space.md § "Members as
+// part of the same members view — see docs/space.md § "Members as
 // a collection").
 type MemberStatus uint8
 

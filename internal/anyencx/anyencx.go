@@ -29,7 +29,7 @@ func Clone(v *anyenc.Value) *anyenc.Value {
 //
 // Stamps are datetime instants (unix millis). Rows materialized before
 // that carried a plain epoch-seconds number and are read the old way
-// until the re-index reaches them (docs/08-versioning.md), so both
+// until the re-index reaches them (docs/versioning.md), so both
 // shapes resolve here.
 func StampSeconds(v *anyenc.Value) int64 {
 	if v == nil {

@@ -1,430 +1,329 @@
 # Read Tracking (read/unread changes)
 
-Status: proposal. First consumer: chat (`any` app, `chat_messages`
-dataset); the mechanism itself is generic and opt-in per dataset.
+Tracks which changes of an object the account has read. Opt-in per
+dataset; the first consumer is chat (the `any` app's `chat_messages`
+dataset). Consumers use `Space.ReadState()` (`space.ReadStateAPI`).
 
 ## Model
 
-Read state per tracked object is a single **seen-heads frontier** — a
-cut of the change DAG. A change is read iff it is an ancestor of (or
-member of) the frontier. One common unread set per object; there are
-no per-counter-type frontiers (heart's `messages` / `mentions` /
-`reactions` split is replaced by tags on unread entries, see
-Classification).
+Read state per tracked object is a **seen-heads frontier**: a cut of the
+change DAG. A change is read iff it is in the frontier or an ancestor of
+it. Each object has one unread set; message, mention and reaction
+counts are tags on its entries, not separate frontiers.
 
-- **Forward-only.** `MarkRead(objectId, changeIds)` moves the frontier
-  via ancestor closure: the named changes and their entire causal past
-  become read. There is no mark-unread operation.
-- **Self-authored changes are born read** — compared by identity
-  (accountId), not peerId, so all of the account's devices agree.
-- Marking accepts arbitrary change ids (what the UI actually
-  displayed), not just tree heads — concurrent branches inside the
-  viewed range are marked explicitly, so devices converge even though
-  their local display orders differ.
+- **Forward-only.** `MarkRead(objectId, changeIds)` marks the named
+  changes and their entire causal past read. There is no mark-unread.
+- **Self-authored changes are born read.** Authorship compares account
+  identity, not peerId, so all of the account's devices agree.
+- **Marks name arbitrary changes**, not just tree heads: the UI marks
+  what it displayed, including concurrent branches inside the viewed
+  range, so devices converge even though their local display orders
+  differ.
+- **Private.** Read state syncs only between the account's own devices
+  (through the tech space) and is never visible to other members. There
+  are no read receipts.
 
-## Storage
+A frontier replaces the "last read message" cursor that server-ordered
+messengers use: without a server-assigned total order, a late change can
+land below already-read messages, and it must still count as unread.
 
-**Synced (cross-device): tech-space KV.** One key per tracked object,
-`read/<objectId>`, value = the frontier (change ids). any-sync's
-keyvaluestorage gives per-device rows for free (`key + "-" + peerId`,
-LWW per device on writer timestamp, devices never overwrite each
-other); the logical frontier is the union of all device rows, merged
-by feeding each into the closure. Tech space (not the target space's
-own KV) because read positions are private: a target-space KV value is
-decryptable by every member. KV, not an account-values carrier,
-because read markers are written constantly and KV is LWW with no
-history — a carrier tree's DAG would grow forever.
+## Registration and classification
 
-**Local (per space, same DB/tx discipline as apply):**
-
-- `unread` rows: `{objectId, changeId, versionId, addSeq, applySeq,
-  recordIds, tags, prevIds}`. A row exists while the change is unread.
-  `prevIds` is copied from the any-sync change at apply time so the
-  ancestor closure never needs the tree.
-- frontier mirror per object: `{objectId, heads, stateSeq}` — the
-  local materialization of the KV union.
-- counters per `(objectId, tag)` — maintained transactionally
-  (increment on unread insert, decrement on closure removal), so
-  counter reads are O(1) with no tree or row scan.
-- NO transitions log: the feed is dirty-OBJECT, read straight off the
-  per-object state rows (stateSeq watermark, `(sp, ss)`-indexed) — it
-  never grows and never needs pruning. Consumers re-pull the object's
-  unread snapshot and diff against what they hold.
-- pending remote heads: KV heads not yet present in the local tree
-  (`notFound`), persisted so a crash between KV arrival and tree sync
-  loses nothing; resolved when the change applies.
-
-## Classification (the "enrich incoming changes" step)
-
-Runs inside the existing apply pipeline, under the tree lock, in the
-same transaction as the change itself — crash-recoverable at any line,
-no extra locks (heart interleaved tree lock / subscription lock /
-store tx; we add nothing).
-
-A dataset opts in at registration (`handler.Dataset`):
+A dataset opts in through `handler.Dataset.ReadTracking`:
 
 ```go
 ReadTracking: &handler.ReadTracking{
-    // Classify runs per applied record change. Track=false skips the
-    // change (edits, typing indicators, plain deletes). Tags label
-    // the unread entry: chat returns "message", "mention" (the derived
-    // mentions array names me — text links and reply fold-ins alike),
-    // "reaction" (op under reactions.*). Key is an
-    // optional supersede key: a new unread entry with the same key
-    // REPLACES the previous one, and Track=false with a Key CLEARS
-    // it — one rule covers reaction toggles (react → un-react leaves
-    // nothing: key "reaction:<emoji>:<account>:<recordId>") and, if a
-    // consumer ever tracks edits, edit-replaces-prior-unread-edit.
-    Classify func(ctx ChangeCtx, rec RecordChange) Classification
-    Seed     SeedMode // SeedReadAtJoin (default) | SeedAllUnread
+    Classify:      func(ctx *ChangeCtx, rec *RecordChange) ReadClassification,
+    Seed:          handler.ReadSeedAtFirstSight, // or ReadSeedAllUnread
+    CounterFields: map[string]string{"message": "unreadCount"},  // optional
+    RecordFlags:   map[string]string{"message": "unread"},       // optional
 }
 
-type Classification struct {
+type ReadClassification struct {
     Track    bool
-    Tags     []string
+    Tags     []string     // e.g. "message", "mention", "reaction"
     Key      string       // optional supersede key
-    Audience query.Filter // optional audience restriction, see below
+    Audience query.Filter // optional audience restriction
 }
 ```
 
-Per applied change on a tracked dataset: self-authored or covered by
-the frontier → read (no row); otherwise insert an unread row with the
-classifier's tags and bump counters. Untracked datasets pay nothing.
+Classification runs inside the apply pipeline, under the tree lock, in
+the same transaction as the change. It runs after the record loop, so
+`ChangeCtx.Before` is nil. Local and injected changes are not
+classified. Per applied change on a tracked dataset:
 
-**Audience-restricted entries.** A verdict may carry `Audience`, a
-typed any-store filter the engine matches against the TARGET record
-(one in-tx point read, post-apply). The entry tracks only on replicas
-where the record matches; everywhere else the change applies untracked
-— the Key still supersedes/clears. Read state is device-local, so
-per-replica divergence here is by design. The classifier builds
-identity-relative filters from `ChangeCtx.SelfIdentity` (populated on
-the classify path only — handler validation stays replica-independent).
-Canonical use: a reaction badges only the reacted-to message's author
-(`creator == SelfIdentity`). Audience filters must consult only
-fields immutable post-create (derived creation stamps), or replays
-diverge.
+- Self-authored or already covered by the frontier: read, no entry. The
+  classifier still runs, so a `Key` can clear an entry another device
+  tracked.
+- Otherwise, if `Track` is true: insert an unread entry with the tags
+  and bump the per-tag counters.
 
-**Post-apply point reads (shipped with chat mentions).** An `Audience`
-filter gates the WHOLE verdict — every tag — so it cannot express
-"message for everyone + mention for the mentioned account". For that
-the classifier itself point-reads the post-apply record via
-`ChangeCtx.Get` + `ChangeCtx.RecordId` (both populated on the classify
-path; classification runs after the record loop in the same tx, so
-handler-derived fields are visible). Verdicts are device-local, so
-combining `SelfIdentity` with post-apply state is sound; incremental
-replays reapply from the persisted watermark, so state at
-re-classification matches the original run.
+**Supersede key.** A new entry with the same key replaces the previous
+one; `Track=false` with a key clears it. One rule covers reaction
+toggles (react then un-react leaves nothing; key
+`reaction:<emoji>:<account>:<recordId>`) and edit-replaces-edit. One key
+per change: the first record's key wins.
 
-**Rejections never classify.** The classify hook narrows each record
-change to the ops the apply step actually landed
-(`ApplyResult.Rejections`): a handler-rejected op never mutated the
-record, so it must not create, clear, or supersede unread state — a
-rejected delete must not wipe the victim's unread entries, a rejected
-edit must not forge or clear keyed entries. Whole-record rejections
-skip the record; a partially-salvaged multi-field op is dropped from
-classification conservatively (a rejection can only suppress tracking,
-never forge it).
+**Audience.** `Audience` is a typed any-store filter matched against the
+target record after the change applies (one in-transaction point read).
+The entry tracks only on replicas where the record matches; elsewhere
+the change applies untracked, and the key still supersedes or clears. A
+missing record tracks for nobody. Classifiers build identity-relative
+filters from `ChangeCtx.SelfIdentity` (set only on this path; handler
+validation stays replica-independent), e.g. a reaction counts only for
+the reacted-to message's author (`creator == SelfIdentity`). The filter
+must read only fields immutable after create, or replays diverge.
 
-**Record deletion** clears every unread row referencing the deleted
-recordIds in the same tx (counters and flags drop, the object surfaces
-on the dirty feed) — the delete change itself is typically
-not tracked; a deleted unread message must simply stop counting.
-Whole-object deletion purges the object's readstate rows and its KV
-key alongside the SYN-20 purge.
+`Audience` gates the whole entry, every tag. When only part of the
+verdict depends on record state (a "mention" tag next to an
+unconditional "message" tag), the classifier point-reads the post-apply
+record via `ChangeCtx.Get` + `ChangeCtx.RecordId`. Verdicts are
+device-local and incremental replays resume from the persisted
+watermark, so post-apply state at re-classification matches the
+original run.
 
-## Closure engine: any-store rows, not objecttree.DiffManager
+**Rejections never classify.** The hook narrows each record change to
+the ops that landed (`ApplyResult.Rejections`). A rejected delete must
+not wipe the victim's unread entries; a rejected edit must not create or
+clear keyed entries. Whole-record rejections skip the record; a
+partially salvaged multi-field op is dropped from classification (a
+rejection can only suppress tracking, never forge it).
 
-any-sync ships `objecttree.DiffManager` (heart's engine). We do not
-use it. Its real price is materializing the whole tree in memory;
-benchmarked on a synthetic 100k-change DAG (~5% forks/merges,
-CID-length ids, Ryzen 9950X, any-store v0.4.7):
+**Record deletion** clears every unread entry referencing the deleted
+records in the same transaction; counters and flags drop and the object
+shows up on the feed.
 
-| scenario | U=100 | U=1k | U=10k |
-|---|---|---|---|
-| DiffManager cold build (CPU only, tree already loaded/decrypted) | 27.4 ms / 58 MB | — | — |
-| DiffManager cold build + mark all | 53.1 ms / 89 MB | — | — |
-| DiffManager steady-state mark (resident in memory) | 12 µs | 128 µs | 1.7 ms |
-| **rows: indexed scan of unread rows + in-memory walk** | **32 µs** | **272 µs** | **3.0 ms** |
-| rows: FindId-per-node BFS (rejected) | 273 µs | 2.6 ms | 28 ms |
-| rows: persist mark (tx: delete U rows + frontier upsert + commit) | 0.97 ms | 10 ms | 93 ms |
-| changeId→row point lookup in a 100k-row collection | 3.9 µs | — | — |
+## Storage
 
-U = unread count. The row engine scales with U and is independent of
-tree size N; it is within ~2× of a *resident* DiffManager in absolute
-microseconds, while never paying the cold build — which at N=100k
-costs 27 ms CPU + 58 MB *before* storage I/O and decryption, per
-object, and heart keeps that resident per open chat forever. Mark
-implementation: one indexed range scan of the object's unread rows →
-in-memory BFS over `prevIds` from the marked ids → delete covered
-rows, adjust counters, advance frontier and its watermark — one tx.
-The persist cost is fsync-bound (~1 ms floor), same budget as any
-apply.
+Local, per space, in the space DB:
 
-Bench source: scratchpad `readbench` module (can be committed under
-`internal/readstate/` as a regression bench when implementation
-starts).
+- `_read_unread`: one row per unread change: object, dataset, changeId,
+  versionId, addSeq, applySeq, recordIds, tags, supersede key, prevIds,
+  stateSeq. The row is deleted when the change is read. `prevIds` is
+  copied from the change at apply time, so the closure walk usually
+  needs no tree access.
+- `_read_state`: one row per tracked object: frontier heads, pending
+  remote heads, per-tag counters, last stateSeq, seeded bit. Counters are
+  maintained transactionally, so reading them is O(1).
 
-## Delivery: dirty ping + cursor pull (mirrors ChangeIndexAPI)
+Pending remote heads are frontier heads from another device whose change
+has not arrived locally yet. They persist, so a crash between the KV
+update and tree sync loses nothing, and resolve when the change applies.
 
-Same contract as `space.ChangeIndexAPI`, which the `any` app already
-consumes in its indexer (Subscribe for liveness, `ChangedSince` from a
-persisted cursor for durability, `Generation` for epoch resets):
+Synced, cross-device: the tech-space key-value store, one key per
+tracked object, `read/<spaceId>/<objectId>`, value `{"h": [heads]}`.
+any-sync stores one row per (key, peerId), LWW on the writer timestamp,
+so devices never overwrite each other; the logical frontier is the union
+of all rows. The tech space keeps positions private: a target-space KV
+value is decryptable by every member. KV rather than a carrier tree,
+because read marks are frequent and KV keeps no history.
 
-The feed is dirty-OBJECT, not per-change: reads delete their state, so
-itemizing them would require an append-only log with retention policy
-and pruned-cursor edge cases. Since consumers hold their rendered set
-anyway (a UI its window, an indexer its flags), "this object changed,
-re-pull and diff" carries the same information with zero growth —
-exactly how the change-index feed already works. New-unread stays
-itemizable for free (live unread rows carry their stateSeq).
+The engine holds no locks and no in-memory state. Callers serialize per
+object: the apply path through the tree lock, marks and merges through a
+per-object mutex in the sync service.
+
+## Marking
+
+`MarkRead` in one transaction: an indexed scan of the object's unread
+rows, a breadth-first walk over `prevIds` from the marked ids, delete
+covered rows, adjust counters, advance the frontier and stateSeq. Gaps in
+the walk (read, self-authored or untracked changes between unread ones)
+resolve through a point lookup in any-sync's change storage, never a
+tree load. The walk stops below the object's minimum unread versionId:
+an ancestor's versionId is always smaller than its descendant's, so
+nothing unread lies below that line.
+
+`MarkReadUpTo(objectId, upTo)` covers every unread change with
+`versionId <= upTo` (`""` = all) as a range, with no walk. It resolves to
+explicit changes, so the synced frontier stays id-based even though
+versionIds are peer-local. It commits in chunks of 2048 entries (any
+versionId prefix is a valid forward-only advance, so a crash mid-way
+resumes) and publishes the frontier once at the end.
+
+After a local mark commits, the device publishes its frontier to its KV
+row.
+
+Bounds:
+
+- The frontier is capped at 64 heads; over the cap, the oldest by local
+  versionId drop first. Locally safe: the frontier is only a classify
+  shortcut and a walk stop. A dropped head that was not an ancestor of
+  the rest costs other devices a bounded re-read, never corruption.
+- A first-sight object's initial restore skips tracking entirely (see
+  Seeding).
+
+## Delivery
+
+Same consumption contract as `space.ChangeIndexAPI`: `Subscribe` for
+liveness, `ChangedSince` from a persisted cursor for durability,
+`Generation` for epoch resets.
 
 ```go
-type ObjectReadState struct {
-    ObjectId string
-    StateSeq uint64 // cursor axis — persist the last seen value
-}
-
-type UnreadChange struct { // snapshot element
-    ObjectId  string
-    Dataset   string
-    ChangeId  string
-    VersionId crdt.VersionId // consumer's local sort/join key (== _ver.id for created records)
-    AddSeq    uint64
-    ApplySeq  uint64
-    RecordIds []string
-    Tags      []string
-    StateSeq  uint64
-}
-
 type ReadStateAPI interface {
     Subscribe(cb func(objectId string, stateSeq uint64)) (cancel func())
     ChangedSince(ctx context.Context, since uint64, limit int) ([]ObjectReadState, error)
     UnreadSnapshot(ctx context.Context, objectId string) ([]UnreadChange, uint64, error)
     UnreadCounts(ctx context.Context, objectId string) (map[string]int, error) // per tag
     MarkRead(ctx context.Context, objectId string, changeIds []string) error
-    // MarkReadUpTo marks every unread change with versionId <= upTo
-    // ("this and everything before" in local display order). Sugar
-    // over MarkRead: resolves the cutoff to the explicit set of
-    // unread changeIds (indexed range query on the unread rows), so
-    // the synced frontier stays id-based and devices converge even
-    // though versionIds are peer-local. upTo == "" means read all.
     MarkReadUpTo(ctx context.Context, objectId string, upTo crdt.VersionId) error
     Generation(ctx context.Context) (string, error)
 }
-
-App-facing chat sugar (`any` side) maps 1:1: `ReadAll()` →
-`MarkReadUpTo(chatId, "")`; `Read(messageId)` → resolve the message's
-`_ver.id` (== its creating change's versionId) and `MarkReadUpTo` with
-it. versionId order is safe as the cutoff axis because any-sync's
-orderIds respect causality — a late-arriving old branch is slotted
-into order, not appended — so the cutoff matches what the UI actually
-rendered above the message. Edge case: an unread reaction/edit change
-that *targets* a message at-or-below the cutoff but was written after
-it has versionId > upTo and stays unread — correct by default (the
-user hasn't seen it); a client that renders reactions on visible
-messages can clear those explicitly via MarkRead with the row ids from
-UnreadSnapshot.
 ```
 
-`StateSeq` comes off the per-space applySeq allocator: transitions
-caused by an apply reuse that apply's ApplySeq; transitions caused by
-a KV merge or local MarkRead allocate fresh from the same axis. One
-monotonic cursor, one Generation story. Nothing prunes and nothing can
-fall off: the feed reads per-object state rows, so a stale cursor just
-returns more dirty objects; only a Generation change forces the full
-`UnreadSnapshot` resync.
+The feed lists dirty objects, not per-change transitions. Reads delete
+state, so itemizing them would need an append-only log with retention.
+Consumers already hold their rendered set, so "this object changed,
+re-pull `UnreadSnapshot` and diff" carries the same information, and the
+feed never grows or needs pruning. A stale cursor just returns more
+dirty objects; only a `Generation` change forces a full resync.
 
-A record-creating change's `versionId` equals the record's `_ver.id`,
-so chat joins transitions to messages (ordered by `_ver.id`) with no
-extra lookup.
+`StateSeq` shares the per-space applySeq axis: a transition caused by an
+apply reuses that apply's ApplySeq; marks and merges allocate from the
+same allocator.
 
-## Materialization (opt-in, tag-driven)
+A record-creating change's `versionId` equals the record's `_ver.id`, so
+unread entries join to records with no extra lookup.
 
-Both materializations are projections of the same unread rows/tags,
-written through the existing `LocalSet` route (local-scope fields:
-handler-exclusive, device-local, re-derived per device from the synced
-frontier, and they flow through the normal query/subscribe engine).
+Errors: `ErrReadTrackingDisabled` when no dataset in the space opted in;
+`ErrSpaceNotTracked` from marks when the space is unknown, deleted or
+pending on this device.
 
-**1. Object counters (chat list UI).** Registration declares
-`CounterFields map[string]string` (tag → local-scope property on the
-object's `objects` row, e.g. `"message" → "unreadCount"`,
-`"mention" → "unreadMentions"`, `"reaction" → "unreadReactions"`).
-Counters are durable per `(objectId, tag)`; after a transition batch
-commits the service debounce-writes the changed ones. A chat list
-sorts/filters on unread with zero extra plumbing. (An app can instead
-do this itself: transition ping → `UnreadCounts` → `LocalSet`.)
+**Chat sugar** (`any` side): `ReadAll()` → `MarkReadUpTo(chatId, "")`;
+`Read(messageId)` → `MarkReadUpTo` with the message's `_ver.id`. any-sync
+orderIds respect causality (a late-arriving old branch is slotted into
+order, not appended), so the cutoff matches what the UI rendered above
+the message. An unread reaction or edit written after the message has a
+larger versionId and stays unread; a client that renders reactions on
+visible messages clears those via `MarkRead` with ids from
+`UnreadSnapshot`.
 
-**2. Per-record flags (message list filtering).** Registration
-declares `RecordFlags map[string]string` (tag → local-scope bool field
-on the dataset's records, e.g. `"message" → "unread"`,
-`"mention" → "unreadMention"`, `"reaction" → "unreadReactions"`).
-Invariant: flag is true ⇔ at least one unread row with that tag
-references the record. Unread rows already carry `recordIds`; the
-closure knows exactly which rows it removed, so it re-checks only the
-affected `(recordId, tag)` pairs (indexed query on the unread rows)
-and flips flags via `LocalSet` on the tracked object itself — same
-tree-lock section, so subscribers see `updated` events with flag flips
-in apply order. Whether an edit re-marks a message unread is the
-classifier's call (tag the edit change "message" or not) — the flag
-rule itself never special-cases. The handler declares any-store
-indexes on these fields (chat already declares `idx_ver_id` the same
-way), so `Filter(unread == true)` and "unread mentions only" queries
-are index-backed.
+## Materialization
 
-## Messenger semantics vs Slack / Telegram
+Two optional projections of the unread entries into local-scope fields,
+written through the normal `LocalSet` route, so they ride the regular
+query and subscribe engine:
 
-|  | Slack | Telegram | here |
-|---|---|---|---|
-| Read-state shape | per-channel `last_read` timestamp cursor | per-chat max-read message id | seen-heads frontier (a DAG cut) |
-| Why it works | server assigns total order; nothing appears behind the cursor | same | no server order exists; the frontier is the cursor generalized to a DAG |
-| Late message lands mid-history | near-impossible (server ts) | impossible (server ids) | expected; not an ancestor of the frontier → unread automatically, even below read messages |
-| Edit of a read message | stays read, shows "(edited)" | stays read | edit changes untracked → stays read |
-| Edit of an unread message | stays unread | stays unread | creating change still uncovered → stays unread |
-| Delete of an unread message | counter drops | counter drops | rows cleared on record delete, same tx |
-| Reaction then un-reaction, unseen | nothing left | nothing left | supersede key clears the entry |
-| Mention badge | separate badge, same read cursor | separate counter | `mention` tag on the same unread set — one frontier, per-tag counts |
-| Read receipts (sender sees reader) | none | double-check via public read state | **none — decided**: read state is private (tech space, invisible to other members), Slack semantics. Not a v1 deferral; nothing in this mechanism may ever leak read positions to the space |
-| Cross-device read sync | via server | via server | per-device KV rows, union-merged |
+- **Counters** (`CounterFields`, tag → property on the object's row in
+  the shared `objects` dataset, e.g. `"message" → "unreadCount"`). A chat
+  list sorts and filters on unread with no extra calls.
+- **Record flags** (`RecordFlags`, tag → local-scope bool field on the
+  dataset's records, e.g. `"mention" → "unreadMention"`). A flag is true
+  iff at least one unread entry with that tag references the record. The
+  fields must be declared local-scope; the handler declares indexes on
+  them, so `Filter(unread == true)` is index-backed.
 
-Mid-history unreads change one piece of UI vocabulary: Slack's single
-"New messages" divider becomes possible-multiple unread regions. The
-client needs no new API for it — `unread == true` is an indexed record
-filter, so "first unread" is `Filter(unread).Sort(_ver.id).Limit(1)`,
-"N unread above/below the viewport" are two indexed counts against the
-current window boundary, and the live subscription delivers an
-`updated` frame when a mid-history record flips its flag.
+A materializer worker listens to state pings, debounces 50 ms, coalesces
+per object, recomputes desired values from the unread entries and diffs
+against stored values. A dropped ping self-heals on the next one. Local
+writes don't ping, so there is no feedback loop.
 
-What a messenger client actually touches (the transparent-API test):
-records with `unread` / `unreadMention` / `unreadReactions` fields
-riding the normal query/subscribe flow, `unreadCount` /
-`unreadMentions` / `unreadReactions` on the chat's object row for the
-chat list, and `Read(msg)` / `ReadAll()`. Counters, flags, frontier,
-KV, closure — all invisible. The transitions feed exists only for
-indexer-style consumers; a UI never needs it.
+Whether an edit re-marks a message unread is the classifier's call; the
+flag rule has no special cases.
 
-## Cross-device flow
+## Behavior
 
-Remote device marks read → its per-device KV row updates → head-sync /
-broadcast lands it locally → KV `Indexer` hook pings the service →
-merge (closure over unread rows), transitions + counters update,
-subscribers pinged.
+| Scenario | Result |
+|---|---|
+| Late message lands mid-history | Not an ancestor of the frontier → unread, even below read messages |
+| Edit of a read message | Untracked (chat) → stays read |
+| Edit of an unread message | Creating change still uncovered → stays unread |
+| Delete of an unread message | Entries cleared in the same transaction |
+| Reaction then un-reaction, unseen | Supersede key clears the entry |
+| Mention | `mention` tag on the same unread set; per-tag counts |
+| Cross-device | Per-device KV rows, union-merged |
+
+Mid-history unreads mean a chat can have several unread regions instead
+of a single "New messages" divider. No extra API is needed: "first
+unread" is `Filter(unread).Sort(_ver.id).Limit(1)`, "N unread above/below"
+are two indexed counts, and a live subscription delivers an `updated`
+frame when a record's flag flips.
+
+A messenger UI touches only the flag fields on records, the counter
+properties on the chat row, and `Read(msg)` / `ReadAll()`. The feed is
+for indexer-style consumers.
+
+## Cross-device sync
+
+A remote mark updates that device's KV row → head-sync or broadcast
+delivers it → the KV hook hands it to a single worker → merge.
 
 **A merge never loads the object.** Each incoming head either has an
-unread row (→ closure over rows), or it doesn't — then it is either
-already read or not yet synced, distinguished by a point lookup in
-any-sync's changes collection (3.9 µs benched), and stored as a
-pending head if absent. Heart's KV callback instead takes the
-ObjectTree lock, forcing the chat resident. Serialization: a per-object
-mutex in the readstate service orders merges against MarkRead; the
-apply-time classification path is already serialized by the tree lock
-it runs under, and both routes commit through the same space DB, so
-row state stays consistent. The Indexer is best-effort
-(errors only logged), so durability comes from a startup reconcile:
-compare each tracked key's per-device KV values against a persisted
-last-merged stamp and replay the difference (same shape as the SYN-20
-deletion reconcile). The reconcile also covers KV rows that arrived
-while the object was untracked or unloaded.
+unread row (closure over rows), or is already read, or has not synced
+yet; a point lookup in any-sync's change storage distinguishes the last
+two, and an unsynced head is stored as pending. Merges serialize against
+marks through the per-object mutex and commit in their own transaction.
+
+The KV hook is best-effort, so durability comes from a boot reconcile
+(`ReconcileAll`): one pass over the tech-space KV store replays every
+published frontier through the same idempotent merge (one state read per
+already-merged object), then republishes this device's frontier where
+its published row diverges from the local one (a publish that failed
+after its mark committed). It also covers rows that arrived while an
+object was unloaded.
+
+When a space is removed, the sync service publishes a deletion watermark
+for the space's `read/<spaceId>/` key prefix, dropping its frontiers on
+every replica. Joining again re-seeds.
 
 ## Seeding
 
-On an object's first tracked load, the seed consults the account's
-published frontiers FIRST (tech-space KV — it usually syncs before
-chat trees do):
+On an object's first tracked load, the seed checks the account's
+published frontiers first (tech-space KV usually syncs before chat
+trees):
 
-- **Frontiers published** → merge them instead of seeding: the restore
-  tracks history normally and the merges flip exactly what the account
-  already read — a fresh device of an established account lands on the
-  REAL read state (a message the phone hasn't read stays unread here
-  too; Telegram-correct). Costs insert+cover bookkeeping for the
-  covered history, once per object per fresh device.
-- **Nothing published** → `ReadSeedAtFirstSight` (default): frontier
-  := tree heads, everything present starts read, and tracking is
-  skipped during the restore (no per-change bookkeeping). Recorded
-  durably via a seeded bit written in the seed's own tx, so a crash on
-  either side of the restore re-seeds instead of skipping.
-- `ReadSeedAllUnread` for datasets where full history matters.
+- **Frontiers published:** the restore tracks history normally and the
+  published frontiers merge in, so a fresh device lands on the account's
+  real read state. Costs insert-then-cover bookkeeping for the history,
+  once per object per fresh device.
+- **Nothing published, `ReadSeedAtFirstSight` (default):** the frontier
+  becomes the tree heads, everything present starts read, and tracking
+  is skipped during the restore. A seeded bit written in the seed's own
+  transaction makes a crash on either side of the restore re-seed
+  instead of skipping.
+- **`ReadSeedAllUnread`:** empty frontier; the whole tracked history is
+  unread.
 
-Residual race: an object loading before its KV key synced falls back
-to first-sight and diverges until the next mark — boot ordering (tech
-space first) makes this window small.
+An object loading before its KV key syncs falls back to first-sight and
+diverges until the next mark. Booting the tech space first keeps this
+window small.
 
-## Performance model: many big chats
+## Performance
 
-Heart's costs are structural: read state is derived from tree
-topology, so nearly every operation forces the tree resident — and it
-keeps *three* DiffManagers (messages / mentions / reactions) per open
-chat, each built by iterating the tree. Every cost below that scales
-with tree size N here scales with unread count U (or is O(1)) in this
-design. N = changes in the chat, C = number of chats.
+The engine scales with unread count U and is independent of tree size
+N. The alternative, any-sync's `objecttree.DiffManager`, must
+materialize the whole tree: on a synthetic 100k-change DAG a cold build
+costs 27 ms CPU and 58 MB per object before storage I/O and decryption,
+and it stays resident per open object. Here closed objects cost no
+memory, idle objects cost nothing, and chat-list badges are ordinary
+fields on rows the list query already reads.
 
-| operation | heart | here |
-|---|---|---|
-| chat list with unread badges (startup) | per chat: load tree + decrypt, build 3 DiffManagers, KV Get per device, `Count(read==false)` — O(C × N) | the list query the client already runs returns materialized counter properties on the object rows — one indexed query, O(list) |
-| idle chat, nothing changed | resident DiffManagers + subscription manager + parent-updater goroutine per open chat | zero: no resident state, no goroutines per object |
-| open a big chat | 3 × tree iteration for DiffManagers (27 ms CPU + 58 MB per manager at N=100k, before storage I/O) | nothing read-state-specific; flags are ordinary record fields already in the rows |
-| incoming message | DiffManager.Add + flag write + counter update + subscription event | one unread row insert + counter bump inside the apply tx it already pays |
-| mark read (U marked) | Remove on resident differ, O(U) — but only if the chat is open | indexed scan + walk: 32 µs (U=100) … 3 ms (U=10k); persist ~1 ms fsync floor |
-| KV merge for a *closed* chat | load tree + build DiffManagers under the ObjectTree lock, O(N) | closure over unread rows + 3.9 µs point lookups for pending heads; object stays closed |
-| startup reconcile | init per chat regardless of activity | gated on per-device KV stamps — untouched chats cost one stamp compare, no rows read |
-| memory per chat (open / closed) | O(N) / 0 (but reopening pays O(N) again) | 0 / 0 |
+Measured on the engine (linear chat-shaped DAGs, per-op transactions
+with real commits, Ryzen 9950X):
 
-### Measured (shipped engine)
-
-Scenario benchmarks against the real `internal/readstate` engine
-(linear chat-shaped DAGs, per-op transactions with real commits, Ryzen
-9950X; bench source is throwaway — rebuild from this table's shapes if
-needed):
-
-| scenario | cost |
+| Scenario | Cost |
 |---|---|
-| inbound tracked message, marginal cost inside the apply tx (batched) | 7.5 µs |
-| inbound tracked message when it pays its own commit (worst case) | 51 µs (fsync floor) |
-| self-authored message (frontier advance, no row) | 13 µs |
-| ReadAll, U = 10 / 100 / 1 000 / 10 000 unread | 121 µs / 764 µs / 8.6 ms / 93 ms |
-| partial mark: 500 of 1 000 unread by versionId cutoff | 4.3 ms |
-| boot reconcile per chat, nothing new (fast path, one state read) | 2.3 µs → 1 000 idle chats ≈ 2.4 ms |
-| per-tag counters read from the engine | 1.6 µs per chat (the chat list itself reads the materialized row properties — no engine call at all) |
+| Inbound tracked message, marginal cost inside the apply transaction | 7.5 µs |
+| Inbound tracked message paying its own commit (worst case) | 51 µs (fsync floor) |
+| Self-authored message (frontier advance, no row) | 13 µs |
+| ReadAll, U = 10 / 100 / 1 000 / 10 000 | 121 µs / 764 µs / 8.6 ms / 93 ms |
+| Partial mark: 500 of 1 000 unread by versionId cutoff | 4.3 ms |
+| Boot reconcile per chat, nothing new | 2.3 µs (1 000 idle chats ≈ 2.4 ms) |
+| Per-tag counters from the engine | 1.6 µs per chat |
 
-The two numbers that define UX: a 1 000-chat account boots its read
-state in ~2 ms, and the everyday "open chat, read all" on a hundred
-unread costs under a millisecond including the commit. The 10 k-unread
-ReadAll (93 ms, one tx) is the chunking case below.
+## Non-goals
 
-Three guards for pathological sizes, all implemented: `ReadAll` over a
-huge unread set commits in bounded chunks of 2048 (forward-only
-marking makes any versionId prefix a valid frontier advance, so a
-crash mid-way just resumes, and the frontier publishes once at the
-end); the frontier itself is capped at 64 members (over the cap, the
-oldest by local versionId drop first — locally safe since coverage of
-applied changes is the watermark's job, and the published-coverage
-trade-off costs another device at most a bounded re-read); and a
-first-sight object's initial restore skips tracking entirely (the seed
-covers everything present), so a fresh joiner pays no per-change
-bookkeeping for pre-join history.
-
-## What is deliberately absent (heart lessons)
-
-- No second source of truth reconciled by hooks. Heart's per-message
-  booleans are what its counters are *counted from*, kept in sync with
-  seen-heads only via the onRemove hook chain (and distrusted — it
-  falls back to full Count reloads). Here unread rows + counters are
-  the single local source, derived from the frontier in the same tx;
-  record flags and counter properties are opt-in *projections* of that
-  source, recomputable from it at any time, never read back as input.
-- No mark-unread (heart pays a full DiffManager teardown + tree walk
-  for it, and only for one of its three counter types).
-- Nothing on the generic `Object`/`source` surface: the service hooks
-  the existing apply pipeline and KV Indexer; `internal/object` stays
-  read-tracking-free.
-- No resident per-object diff structures; memory cost is zero for
-  closed objects.
+- Mark-unread.
+- Read receipts or any other exposure of read positions to the space.
+- Read-state hooks on the generic object surface: the service attaches
+  to the apply pipeline and the KV hook; `internal/object` knows nothing
+  about read tracking.
+- Resident per-object diff structures.
 
 ## Open questions
 
-- Whether `subscribe.Event` should also carry the unread flag inline
-  for live-query consumers, or the transition feed stays the only
-  surface (start: feed-only).
-
-- KV key privacy: keys are visible to nodes (values encrypted).
-  objectIds are already visible to nodes via trees; confirm no
-  hashing needed (heart hashes with an ACL-salt).
+- **Object deletion cleanup.** Deleting an object clears nothing in
+  `_read_unread` / `_read_state` and leaves its `read/` KV key; only
+  space removal prunes keys.
+- **KV key privacy.** Keys are visible to nodes (values are encrypted).
+  Object ids are already visible to nodes through trees; confirm no
+  hashing is needed.

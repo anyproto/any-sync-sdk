@@ -451,7 +451,7 @@ func hasDelete(ops []Op) bool {
 }
 
 // ----------------------------------------------------------------------------
-// Value helpers (unchanged from Phase 1)
+// Value helpers
 // ----------------------------------------------------------------------------
 
 func setNested(arena *anyenc.Arena, record *anyenc.Value, path []string, value *anyenc.Value) {

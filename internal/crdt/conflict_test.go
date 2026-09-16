@@ -44,10 +44,10 @@ func TestVersionGenIsMonotonic(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// Spec §16 conflict examples
+// crdt-spec.md §15 conflict examples
 // ----------------------------------------------------------------------------
 
-// §16.1 — two devices rename the same record. Both writes should land in the
+// §15.1 — two devices rename the same record. Both writes should land in the
 // expected order; the higher-version one wins.
 func TestConflict_TwoDevicesRename(t *testing.T) {
 	g := newVersionGen()
@@ -83,7 +83,7 @@ func TestConflict_TwoDevicesRename(t *testing.T) {
 	}
 }
 
-// §16.2 — out-of-order delivery. An ancient $set arriving after a newer one
+// §15.2 — out-of-order delivery. An ancient $set arriving after a newer one
 // is silently dropped.
 func TestConflict_OutOfOrderDelivery(t *testing.T) {
 	st := newTestController(t)
@@ -109,7 +109,7 @@ func TestConflict_OutOfOrderDelivery(t *testing.T) {
 	assert.Equal(t, vNew, GetRecordVersion(rec, "name"))
 }
 
-// §16.3 — delete races insert. Final state must always be the tombstone,
+// §15.3 — delete races insert. Final state must always be the tombstone,
 // regardless of delivery order.
 func TestConflict_DeleteRacesInsert(t *testing.T) {
 	g := newVersionGen()
@@ -139,7 +139,7 @@ func TestConflict_DeleteRacesInsert(t *testing.T) {
 	}
 }
 
-// §16.4 — $addToSet racing $set on the same field. Both orders converge to
+// §15.4 — $addToSet racing $set on the same field. Both orders converge to
 // the $set's value because $addToSet is gated against a newer $set.
 func TestConflict_AddToSetVsSet(t *testing.T) {
 	g := newVersionGen()
@@ -173,7 +173,7 @@ func TestConflict_AddToSetVsSet(t *testing.T) {
 	}
 }
 
-// §16.5 — concurrent $inc. Both increments apply regardless of order.
+// §15.5 — concurrent $inc. Both increments apply regardless of order.
 func TestConflict_ConcurrentInc(t *testing.T) {
 	g := newVersionGen()
 	vInsert := g.Next()
@@ -181,7 +181,7 @@ func TestConflict_ConcurrentInc(t *testing.T) {
 	vB := g.Next()
 
 	// Insert pinned first; the two concurrent $inc calls permute. Per spec
-	// §16.5, a $inc started before its target's insert can't compose with
+	// §15.5, a $inc started before its target's insert can't compose with
 	// the insert's base value, so we don't test that case.
 	for _, order := range [][]int{{0, 1, 2}, {0, 2, 1}} {
 		st := newTestController(t)
@@ -202,7 +202,7 @@ func TestConflict_ConcurrentInc(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// §16.7 — $inc causally after $set: convergent under DAG delivery
+// $inc causally after $set: convergent under DAG delivery
 // ----------------------------------------------------------------------------
 
 // The only causally-legal delivery order for a sequence of (create → $set →
@@ -243,7 +243,7 @@ func TestIncAfterSet_CausalConvergent(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// §16.8 — Multiple concurrent $inc ops are commutative among themselves
+// Multiple concurrent $inc ops are commutative among themselves
 // ----------------------------------------------------------------------------
 
 // Three peers each issue a `$inc` on the same counter after seeing the
@@ -285,7 +285,7 @@ func TestMultipleIncs_CommutativeAfterCreate(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// §16.9 — $set + $inc concurrent on the SAME field: anti-pattern demo
+// $set + $inc concurrent on the SAME field: anti-pattern demo
 // ----------------------------------------------------------------------------
 
 // Two peers author a `$set` and a `$inc` on the same counter field without
@@ -353,7 +353,7 @@ func TestConcurrentSetAndIncOnSameField_AntiPattern(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// §16.10 — $set and $inc on DIFFERENT fields: always converges
+// $set and $inc on DIFFERENT fields: always converges
 // ----------------------------------------------------------------------------
 
 // Sanity check: $set on "name" and $inc on "count" are independent; any

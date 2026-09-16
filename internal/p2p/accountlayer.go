@@ -157,7 +157,7 @@ func (g *Global) RepublishAccount() {
 	}
 }
 
-// accountLoop drives the record cycle: at start, hourly, on wake, and
+// accountLoop drives the record cycle: at start, every accountInterval, on wake, and
 // after a failure with exponential backoff.
 func (g *Global) accountLoop() {
 	defer g.wg.Done()

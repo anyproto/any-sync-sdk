@@ -39,11 +39,8 @@ import (
 const Dataset = "objects"
 
 // HandlerVersion is the DataVersion string stamped on every change
-// this handler emits against an object's `properties` dataset. Bump
-// the suffix when validation rules change in a way that must reject
-// stale writers (see docs/types-properties-proposal.md § "Change-
-// level DataVersion" — data-dataset version is a hardcoded handler
-// identifier in Phase 1).
+// this handler emits when a write carries no schema pairs (see
+// docs/types-properties-proposal.md § "Change-level DataVersion").
 const HandlerVersion = "systemPropertyHandler-v1"
 
 // LocalVersion is the handler's LOCAL logic version (HandlerReg.Version)
@@ -271,7 +268,7 @@ func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 //
 // No membership check here: an apply-time membership guard
 // would drop values written before the attach-type change arrives,
-// breaking out-of-order tolerance (docs/data-structure.md §397).
+// breaking out-of-order tolerance (docs/data-structure.md § Membership and the local write pre-flight).
 //
 // Every op that passes validation stamps the derived `modifiedAt` /
 // `modifiedBy` pair (deduped via DeriveOnce — one stamp per

@@ -1,6 +1,5 @@
 // Package payloads is the built-in file `payloads` dataset — the
-// node-readable per-file index of the files subsystem (docs/07b, 07c
-// on the files-design branch; SYN-21).
+// node-readable per-file index of the files subsystem (docs/files.md).
 //
 // One row per file, living in a plaintext (node-readable) derived
 // child object under the file's owner:

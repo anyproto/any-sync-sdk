@@ -50,7 +50,8 @@ type Op struct {
 // batch:
 //
 //   - false (default, strict): if the target id has no record, every modify
-//     in Ops is a silent no-op. Use this for "update if exists" semantics —
+//     in Ops is skipped and reported as an ErrStrictSkipAbsent rejection. Use
+//     this for "update if exists" semantics —
 //     the safe default that prevents accidental record creation from typos
 //     or stale ids.
 //
@@ -110,17 +111,13 @@ type Change struct {
 	// device-local writes). Zero when the Controller has no allocator.
 	ApplySeq uint64
 	Records  []RecordChange
-	// DataVersion pins the change to a specific schema/handler version. Its
-	// meaning depends on the dataset:
-	//
-	//   - Data dataset on a user object: handler version (Phase 1: hardcoded
-	//     in the SDK; later: a user-type-defined schema version).
-	//   - `properties` dataset (per-space or per-type-object): shortId of the
-	//     last "important" change to the governing type object.
+	// DataVersion pins the change to the schema or handler state its writer
+	// used: `typeId:shortId` pairs for schema state, or a handler version
+	// string. The per-dataset mapping is in
+	// docs/types-properties-proposal.md § "Change-level DataVersion".
 	//
 	// The string is opaque to the CRDT layer — only equality matters, not
 	// ordering. Empty is invalid and causes ApplyChange to reject the change.
-	// See docs/types-properties-proposal.md § "Change-level DataVersion".
 	DataVersion string
 	// Timestamp carried alongside the change for tombstones (delete writes a
 	// `deletedAt` field). The CRDT layer treats it as advisory metadata; it is

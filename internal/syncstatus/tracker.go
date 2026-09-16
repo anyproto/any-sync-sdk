@@ -20,13 +20,7 @@ var _ anysyncstatus.StatusUpdater = (*Tracker)(nil)
 // Tracker holds per-space sync status: the per-tree state machine
 // fed by any-sync's StatusUpdater hooks, plus the per-object
 // subscriber registry. One Tracker per space, constructed lazily by
-// Service.For.
-//
-// Phase 1 lands the state machine and subscribe registry; the
-// any-sync StatusUpdater wiring (commonspace.Deps.SyncStatus) is
-// added in Phase 2 along with the rollup loop. The hook methods
-// (HeadsChange / ObjectReceive / HeadsApply) are already implemented
-// so Phase 2 is just a wire-up change.
+// Service.For and wired into commonspace.Deps.SyncStatus.
 type Tracker struct {
 	spaceId  string
 	parent   *Service // for cross-tracker access (refresh, conn status); may be nil in tests
@@ -375,9 +369,8 @@ func (t *Tracker) skipTreeLocked(treeId string) bool {
 }
 
 // isResponsibleSender reports whether senderId is in this space's
-// responsible-node list. Phase 1 returns true unconditionally when
-// no parent is wired (test mode); Phase 2 will route through
-// Service.nodeIdsFor(spaceId).
+// responsible-node list. Without a parent (test mode) every sender
+// counts.
 func (t *Tracker) isResponsibleSender(senderId string) bool {
 	if t.parent == nil {
 		return true

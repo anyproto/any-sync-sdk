@@ -39,7 +39,7 @@ func membersRegistry() *types.StubRegistry {
 
 // TestSystemPropertiesHandler_InboundIgnoresMembership pins the
 // load-bearing asymmetry behind the orphan-resurrection decision
-// (docs/data-structure.md §16): the inbound apply path does NOT
+// (docs/data-structure.md § Orphan values): the inbound apply path does NOT
 // consult any.type / any.collections. A value written under a
 // definition the object does not have lands as orphan on every peer,
 // which is what makes concurrent detach-vs-write convergent.

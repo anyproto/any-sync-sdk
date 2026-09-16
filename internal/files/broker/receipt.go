@@ -140,7 +140,7 @@ func VerifyReceipt(rcpt *fileprotov2.NetworkSignReceipt, p VerifyParams) (string
 }
 
 // NetworkSign formats the payloads-row receipt value
-// ("{fileNetworkId}/{sign}", 07c).
+// ("{fileNetworkId}/{sign}", docs/files.md).
 func NetworkSign(fileNetworkId string, signature []byte) string {
 	return fileNetworkId + "/" + base64.StdEncoding.EncodeToString(signature)
 }

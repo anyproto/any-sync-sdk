@@ -2,16 +2,16 @@
 // discovery for 1-1 spaces (docs/one-to-one-spaces.md). It funnels the coordinator's push
 // stream and a periodic poll into a single serialized worker that fetches
 // inbox messages, verifies + decrypts each, and hands the result to a
-// caller-supplied handler — advancing a device-local cursor only after a
-// message is handled.
+// caller-supplied handler.
 //
-// It deliberately fixes the heart inbox bugs catalogued in docs/one-to-one-spaces.md:
-// the cursor advances per-message AFTER the handler commits (no
-// process-before-persist loss); content failures (verify/decrypt) are
-// skipped with a loud log while transient handler failures (ErrRetry)
-// halt the cursor and retry; both triggers feed one worker so there is
-// no double-process race; the cursor is device-local (a plain any-store
-// collection in sdk.db, never synced).
+// Guarantees (docs/one-to-one-spaces.md § "Heart bugs we fix"): the
+// cursor advances once per batch, after the handler commits, to the
+// furthest handled message (no process-before-persist loss); content
+// failures (verify/decrypt) are skipped with a loud log while transient
+// failures (Fetch error, handler ErrRetry) halt the cursor and retry;
+// both triggers feed one worker, so nothing is processed twice
+// concurrently. The cursor is synced and account-scoped; load/save are
+// injected.
 package inbox
 
 import (

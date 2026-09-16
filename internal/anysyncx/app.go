@@ -422,8 +422,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	}
 	// Peer presence for sync status: live-connection counts via the
 	// non-dialing pool.Pick, refreshed when the p2p peer store or the
-	// discovery possibility changes. (The "Phase 3 peer-presence
-	// reader" slot from docs/sync-status-proposal.md.)
+	// discovery possibility changes (docs/sync-status-proposal.md).
 	poolComp := a.MustComponent(pool.CName).(pool.Pool)
 	pickable := func(id string) bool { return pickLive(poolComp, id) }
 	out.syncStatus.SetPeerCountsFn(func(spaceId string) (networkPeers, localPeers, globalPeers int) {
@@ -496,9 +495,9 @@ func (a *App) Close(ctx context.Context) error {
 	return err
 }
 
-// SyncStatus exposes the per-account sync-status registry. Wired
-// into commonspace.Deps.SyncStatus in Phase 2; for now the space
-// layer reads it for snapshot + subscribe.
+// SyncStatus exposes the per-account sync-status registry. Its
+// Trackers feed commonspace.Deps.SyncStatus; the space layer reads it
+// for snapshot + subscribe.
 func (a *App) SyncStatus() *syncstatus.Service { return a.syncStatus }
 
 // SpaceService is any-sync's per-account space create/derive/join surface.

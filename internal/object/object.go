@@ -48,7 +48,7 @@ var ErrClosed = errors.New("object: closed")
 // through a per-Object mutex.
 // ApplyGate is the optional pre-apply hook the space layer wires to
 // implement DataVersion-based deferral (the schema gate from
-// docs/types-properties-proposal.md § "Detached changes"). Called
+// docs/types-properties-proposal.md § "Detached-changes collection"). Called
 // before each ApplyChange in the replay path; rawPayload is the
 // decoded wire bytes (for parking).
 //

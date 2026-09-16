@@ -754,19 +754,18 @@ func (c *Controller) ApplyChange(ctx context.Context, ch Change) error {
 }
 
 // ApplyChangeWithResult applies a single change per spec §7 and
-// returns the list of per-op handler rejections. The change still
-// commits even when ops are rejected — silent drops were the
-// previous behavior; surfacing them here lets the writer detect
+// returns the list of per-op rejections. The change still commits
+// when ops are rejected; the rejections let the writer detect
 // "committed with a hole" without scanning post-state.
 //
 // Wraps all mutations in a WriteTx for atomicity. When the ctx
 // already carries a WriteTx (batch mode), a savepoint is used
 // instead — lightweight and correct.
 //
-// Path syntax validation is performed up-front and aborts the whole
-// Change on failure (protocol-level bug). Handler validation runs
-// inside the per-record Modify callback and drops only the
-// offending op (recorded into ApplyResult.Rejections).
+// Content validation (op-path syntax, field class) and handler
+// validation drop only the offending op or key, recorded into
+// ApplyResult.Rejections. Local writers fail fast in ValidateChange
+// before the change enters the DAG.
 func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (ApplyResult, error) {
 	var res ApplyResult
 	if ch.DataVersion == "" {

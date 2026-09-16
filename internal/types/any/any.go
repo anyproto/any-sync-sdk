@@ -50,7 +50,7 @@ const (
 // type. Uses human-readable ids (e.g. "name") that never collide with
 // generated user propIds (11-char base58). Scope uses the unified
 // schema.Scope taxonomy — the same vocabulary user property
-// definitions declare (docs/data-structure.md §"Property Types").
+// definitions declare (docs/data-structure.md § Property scopes).
 type BuiltInProperty struct {
 	Id    string
 	Name  string

@@ -9,10 +9,6 @@
 //
 // The Service owns one Tracker per space (lazy, via For(spaceId)) and
 // the account-wide subscriber registry. The Tracker holds the
-// per-tree state machine and per-object subscriber registry.
-//
-// Phase 1 (this commit) lands types + skeleton + Service/Tracker
-// construction wired through anysyncx.App. Phase 2 will plug Tracker
-// into commonspace.Deps.SyncStatus and start the rollup loop;
-// Phase 3 adds the peer-presence reader.
+// per-tree state machine and per-object subscriber registry. Each
+// Tracker is wired into commonspace.Deps.SyncStatus when its space loads.
 package syncstatus

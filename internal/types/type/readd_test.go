@@ -12,8 +12,8 @@ import (
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
-// TestPropertyHandler_RemoveReaddMintsNewPropId proves the claim the
-// §16 decision rests on: a property's kind is pinned to its propId for
+// TestPropertyHandler_RemoveReaddMintsNewPropId proves the claim orphan
+// values (docs/data-structure.md § Orphan values) rest on: a property's kind is pinned to its propId for
 // life, because "changing" a kind means remove + re-add, and re-add
 // (a new changeId) mints a NEW propId. The old propId is dead forever;
 // the live property carries the new kind. This is why a wrong-kind

@@ -109,8 +109,7 @@ func TestSpaceIndex_RoundTrip(t *testing.T) {
 	assert.Equal(t, "Renamed", sp.Info().Name)
 }
 
-// TestE2E_SpaceIndexMultiPeerConvergence is the convergence story
-// PROMPT.md calls out: Alice creates a space, shares with Bob via
+// TestE2E_SpaceIndexMultiPeerConvergence: Alice creates a space, shares with Bob via
 // RequestToJoin, both see name="Original"; Alice renames to
 // "Updated"; Bob's sp.Info() AND Service.List must eventually show
 // the new value too.

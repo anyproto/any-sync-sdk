@@ -2,11 +2,6 @@
 // define a user type with properties, create an object of that type,
 // write property values at multiple scopes (base, account, device),
 // write user data to a type-owned dataset, query, subscribe.
-//
-// Compiles against the current public interfaces. The internal layers
-// are stubbed, so running this will currently return nil handles and
-// panic on the first method call — its purpose today is to pressure-test
-// the API shape from a caller's perspective.
 package main
 
 import (

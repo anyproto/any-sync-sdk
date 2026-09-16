@@ -124,8 +124,11 @@ membership is the marker when the request declares a definition and
 `RootProperties` owner that is neither — a property write to an owner
 the object does not have is rejected — and the SDK-minted created root
 of a declaring request gets the same union the same way. Later Ensures
-are idempotent: the type is set only when the row has none, and a
-collection the row lacks is `$addToSet`, so a request that gains a
+are idempotent: a `RootType` is set only when the row has none, a
+declaring request puts the marker over a `RootType` an earlier version
+gave a root Ensure minted (never over a marker of the other kind, and
+never over the type of a `NewRoot` root — both `ErrBundleBadRequest`),
+and a collection the row lacks is `$addToSet`, so a request that gains a
 root collection reaches an existing install.
 
 On the adopt path Ensure materializes the canonical tree — and stamps it
@@ -204,7 +207,8 @@ format (05a-crdt-spec § 6.3), which is deferred. `RootType` /
 `RootCollections` / `RootProperties` apply to every root Ensure mints —
 derived, or the SDK-minted created root of a declaring request (one
 object that is a definition and, say, a `miniapp` carrier) — and are
-refused with `NewRoot`, whose root got its state from the caller.
+refused with `NewRoot`, whose root got its state — its type included —
+from the caller; a declaring request over such a root is refused.
 
 `Parts` declares parts with their datasets (the `PartDraft` /
 `DatasetDraft` vocabulary of `17-user-datasets.md`). Nothing else is

@@ -10,6 +10,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -114,6 +115,11 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
 		}},
 	}); err != nil {
+		// A tree without its marker row is an object with no type;
+		// reclaim it locally (root-only, outside head-sync).
+		if derr := t.parent.store.DeleteTree(ctx, typeId); derr != nil {
+			objectLog.Warn("orphaned tree after a refused type stamp", zap.String("typeId", typeId), zap.Error(derr))
+		}
 		return "", fmt.Errorf("typesAPI: seed type metadata: %w", err)
 	}
 	return typeId, nil

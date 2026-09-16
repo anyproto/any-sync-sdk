@@ -280,6 +280,20 @@ func TestPreValidate_TypeRequired(t *testing.T) {
 	payload.Set(typeAny+"."+anytype.FieldType, a.NewString(""))
 	refused(`multi-field any.type = ""`, multiFieldChange(payload))
 
+	// Dropping the whole `any` container takes the type with it — the
+	// single-path and the multi-field $unset alike, and the multi-field
+	// $unset of the field itself.
+	refused("$unset any", singlePathChange(crdt.OpUnset, []string{typeAny}, nil))
+	for _, key := range []string{typeAny, typeAny + "." + anytype.FieldType} {
+		unset := a.NewObject()
+		unset.Set(key, a.NewNull())
+		refused("multi-field $unset "+key, &crdt.Change{
+			ObjectId: testObjectId, Dataset: properties.Dataset, DataVersion: testDataVer,
+			Records: []crdt.RecordChange{{Id: testObjectId, Upsert: true,
+				Ops: []crdt.Op{{Type: crdt.OpUnset, Payload: unset}}}},
+		})
+	}
+
 	// Collections carry no such rule: an object files itself nowhere.
 	require.NoError(t, h.PreValidate(singlePathChange(
 		crdt.OpPull, []string{typeAny, anytype.FieldCollections}, a.NewString(shelfC)), before))

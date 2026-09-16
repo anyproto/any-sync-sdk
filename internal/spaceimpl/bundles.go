@@ -906,6 +906,17 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 	setType := ""
 	switch {
 	case declares && have.Type != want.Type:
+		// A marker never flips: a type root stays a type root. A root
+		// the caller minted keeps the type the caller gave it — a
+		// declaring request over a NewRoot with a type is a conflict,
+		// not a retype. A root Ensure minted (derived, or created for
+		// an earlier version's RootType) takes the marker.
+		if have.Type == typetype.MetaTypeMarker || have.Type == collectiontype.MetaMarker {
+			return fmt.Errorf("spaceimpl: %w: root %q is a %s; a declaration never changes kind", space.ErrBundleBadRequest, rootId, have.Type)
+		}
+		if req.NewRoot != nil && have.Type != "" {
+			return fmt.Errorf("spaceimpl: %w: NewRoot root %q already has type %q — a declaring root carries its marker in any.type; mint the root with Ensure instead", space.ErrBundleBadRequest, rootId, have.Type)
+		}
 		setType = want.Type
 	case !declares && want.Type != "" && have.Type == "":
 		setType = want.Type
@@ -968,6 +979,7 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 	// Seeded values, on install only, sorted so the change is the same
 	// on every installer of a derived root. Their own op: independent
 	// failure domain from the name and the membership.
+	seeded := false
 	if !adopt && !named && len(req.RootProperties) > 0 {
 		seeds := arena.NewObject()
 		seedKeys := 0
@@ -984,22 +996,28 @@ func (b *bundlesAPI) stampRoot(ctx context.Context, rootId string, req space.Ens
 		}
 		if seedKeys > 0 {
 			ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: seeds})
+			seeded = true
 		}
 	}
 	if len(ops) == 0 {
 		return nil
 	}
 
-	// The DataVersion covers every owner the change touches, as a
-	// create with initial values would.
-	owners := make([]string, 0, 1+len(want.Collections))
-	if want.Type != "" {
-		owners = append(owners, want.Type)
-	}
-	owners = append(owners, want.Collections...)
-	dataVersion, err := dataVersionForOwners(ctx, b.parent.store.Registry(), owners)
-	if err != nil {
-		return err
+	// The DataVersion pins the owners' schema state only when seeded
+	// values ride along, as a create with initial values would;
+	// membership and metadata alone stamp no constraint, so a peer
+	// behind on the definitions applies them rather than parking the
+	// root typeless.
+	dataVersion := properties.HandlerVersion
+	if seeded {
+		owners := make([]string, 0, 1+len(want.Collections))
+		if want.Type != "" {
+			owners = append(owners, want.Type)
+		}
+		owners = append(owners, want.Collections...)
+		if dataVersion, err = dataVersionForOwners(ctx, b.parent.store.Registry(), owners); err != nil {
+			return err
+		}
 	}
 	res, err := b.parent.localWriteRetry(ctx, obj, rootId, crdt.Change{
 		Dataset:     properties.Dataset,

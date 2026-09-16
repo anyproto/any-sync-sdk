@@ -1421,19 +1421,28 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
 	}
-	// Indexes on the membership fields. `any.type` is dense: every
-	// object carries a type (or a marker), and a dense index also
-	// serves sorts and absence checks — it backs the marker scans
-	// (Types().List → `any.type == "__type__"`, the catalog) and member
-	// queries by type. `any.collections` is sparse: only rows filed
-	// under something contribute entries, one per element. EnsureIndex
-	// is idempotent — safe to call on every fresh open.
+	// Indexes on the membership fields, under explicit names so a
+	// changed definition never collides with an index an earlier build
+	// left under the auto name (any-store refuses a same-name index
+	// with a different definition). `any.type` is dense: every object
+	// carries a type (or a marker), and a dense index also serves sorts
+	// and absence checks — it backs the marker scans (Types().List →
+	// `any.type == "__type__"`, the catalog) and member queries by
+	// type. `any.collections` is sparse: only rows filed under
+	// something contribute entries, one per element. EnsureIndex is
+	// idempotent — safe to call on every fresh open. Indexes earlier
+	// builds created under the auto names are dropped best-effort.
+	for _, stale := range []string{"any.types", anytype.TypeId + "." + anytype.FieldType} {
+		_ = coll.DropIndex(ctx, stale)
+	}
 	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Name:   "idx_any_type",
 		Fields: []string{anytype.TypeId + "." + anytype.FieldType},
 	}); err != nil {
 		return nil, fmt.Errorf("spaceobjects: ensure any.type index: %w", err)
 	}
 	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Name:   "idx_any_collections",
 		Fields: []string{anytype.TypeId + "." + anytype.FieldCollections},
 		Sparse: true,
 	}); err != nil {

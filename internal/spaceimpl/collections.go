@@ -9,6 +9,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -101,6 +102,9 @@ func (c *collectionsAPI) Create(ctx context.Context, params space.CollectionCrea
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
 		}},
 	}); err != nil {
+		if derr := c.parent.store.DeleteTree(ctx, id); derr != nil {
+			objectLog.Warn("orphaned tree after a refused collection stamp", zap.String("collectionId", id), zap.Error(derr))
+		}
 		return "", fmt.Errorf("collectionsAPI: seed collection metadata: %w", err)
 	}
 	return id, nil

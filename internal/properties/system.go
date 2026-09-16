@@ -385,10 +385,13 @@ func collectMembership(ch *crdt.Change) membershipAdds {
 				}
 				obj, _ := op.Payload.Object()
 				obj.Visit(func(k []byte, _ *anyenc.Value) {
-					if string(k) == anytype.TypeId+"."+anytype.FieldType {
+					// The whole `any` container going takes the type with it.
+					if k := string(k); k == anytype.TypeId+"."+anytype.FieldType || k == anytype.TypeId {
 						m.typeSet, m.typeId = true, ""
 					}
 				})
+			case len(op.Path) == 1 && op.Path[0] == anytype.TypeId && op.Type == crdt.OpUnset:
+				m.typeSet, m.typeId = true, ""
 			case len(op.Path) == 2 && op.Path[0] == anytype.TypeId && op.Path[1] == anytype.FieldType:
 				switch op.Type {
 				case crdt.OpSet:
@@ -442,6 +445,10 @@ func (h *SystemPropertiesHandler) checkSlots(adds membershipAdds) error {
 	if h.Classify == nil {
 		return nil
 	}
+	// PreValidate carries no ctx (it runs under the object's tree
+	// lock); the classifier's read is one row lookup on a warm store —
+	// the first membership write on a cold store pays the objects
+	// collection's open, index ensure included.
 	ctx := context.Background()
 	if adds.typeSet && adds.typeId != "" && !isMarker(adds.typeId) {
 		k, err := h.Classify(ctx, adds.typeId)

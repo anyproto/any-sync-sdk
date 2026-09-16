@@ -678,27 +678,25 @@ func TestE2E_BundlesTypeDeclaringCreatedRoot(t *testing.T) {
 	assert.Equal(t, "general_chat", dinfo.XKey)
 	assert.Equal(t, map[string]int{"objects": 1, "datasets": 1}, changesByDataset(der.RootId))
 
-	// A caller-minted root that already carries a name still gets its
-	// membership: the stamp writes what the row lacks whatever the name
-	// says (an install writes the request's name; an adopt never
-	// renames).
+	// A caller-minted root has the type the caller gave it: a declaring
+	// request over it is a conflict, not a retype — the root keeps its
+	// type and its name, and nothing is registered.
 	named, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
 		Type:              flag.RootId,
 		InitialProperties: map[string]map[string]any{"any": {"name": "Named by the caller"}},
 	})
 	require.NoError(t, err)
-	nb, didInstall, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "named/v1", Name: "Other", XKey: "named",
 		NewRoot: func(context.Context) (string, error) { return named, nil },
 	})
-	require.NoError(t, err, "Ensure(NewRoot, named)")
-	require.True(t, didInstall)
-	require.Equal(t, named, nb.RootId)
-	assert.Equal(t, "__type__", typeOf(named), "a named NewRoot is still stamped as a type")
-	ninfo, err := sp.Types().Get(ctx, named)
+	require.ErrorIs(t, err, space.ErrBundleBadRequest, "a declaring Ensure over a typed NewRoot root")
+	assert.Equal(t, flag.RootId, typeOf(named), "the caller's type stays")
+	_, err = sp.Bundles().Get(ctx, "named/v1")
+	require.ErrorIs(t, err, space.ErrBundleUnknown, "a refused stamp registers nothing")
+	namedRow, err := sp.Objects().Get(ctx, named)
 	require.NoError(t, err)
-	assert.Equal(t, "named", ninfo.XKey)
-	assert.Equal(t, "Other", ninfo.Name, "the install writes the request's name — the documented $set")
+	assert.Equal(t, "Named by the caller", namedRow.GetString("any", "name"))
 
 	// A request that gains a root collection and a handle after the
 	// install reaches the existing root on adopt: attached and filled,

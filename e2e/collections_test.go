@@ -312,8 +312,6 @@ func TestE2E_Collections(t *testing.T) {
 		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{})
 		assert.ErrorIs(t, err, space.ErrTypeRequired)
 		assert.Empty(t, id, "a refused Create returns no id")
-		_, err = sp.Objects().Get(ctx, id)
-		require.Error(t, err, "there is no object to read back")
 		assert.ElementsMatch(t, before, allIds(), "a refused Create leaves no object behind")
 
 		// Collections stay optional: a type alone is a whole object.

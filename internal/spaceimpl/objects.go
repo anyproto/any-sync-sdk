@@ -7,6 +7,8 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/app/logger"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -75,6 +77,8 @@ func dataVersionForOwners(ctx context.Context, reg *types.LiveRegistry, ownerIds
 	return encoded, nil
 }
 
+var objectLog = logger.NewNamed("sdk.objects")
+
 // objectChangeType is the tree change-type every user-space object is
 // created and derived with. It is part of a derived object's id, so
 // every deriver of the same object must pass the same value.
@@ -106,9 +110,12 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 	if needsBootstrap(opts) {
 		if _, err := o.bootstrap(ctx, objectId, opts); err != nil {
 			// A refused bootstrap (a wrong slot, an owner the object
-			// does not have) would leave a bare tree nothing references;
-			// reclaim it best-effort, the error is the caller's answer.
-			_ = o.Delete(ctx, objectId)
+			// does not have) would leave a bare tree nothing references.
+			// A root-only tree is outside head-sync, so a local purge
+			// reclaims it without a settings-tree deletion record.
+			if derr := o.parent.store.DeleteTree(ctx, objectId); derr != nil {
+				objectLog.Warn("orphaned tree after a refused bootstrap", zap.String("objectId", objectId), zap.Error(derr))
+			}
 			return "", err
 		}
 	}
@@ -170,11 +177,28 @@ func liveObjectRow(v *anyenc.Value) bool {
 // second call with the same seed returns the same id and, when the
 // requested Types are already attached, writes no change at all.
 func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts) (string, error) {
-	obj, err := o.parent.store.Derive(ctx, spaceobjects.DeriveOpts{
+	derive := spaceobjects.DeriveOpts{
 		ChangeType:    objectChangeType,
 		ChangePayload: opts.Seed,
 		ParentId:      opts.ParentId,
-	})
+	}
+	if opts.Type == "" {
+		// The rule is checked before anything is minted, like Create:
+		// the id is a pure function of the seed, and the row tells
+		// whether the object already has a type.
+		id, err := o.parent.store.DeriveId(ctx, derive)
+		if err != nil {
+			return "", err
+		}
+		members, err := o.parent.store.ObjectMembers(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		if members.Type == "" {
+			return "", fmt.Errorf("%w: DeriveObjectOpts.Type on an object with no type yet", space.ErrTypeRequired)
+		}
+	}
+	obj, err := o.parent.store.Derive(ctx, derive)
 	if err != nil {
 		return "", err
 	}
@@ -237,15 +261,9 @@ func (o *objectService) missingMembers(ctx context.Context, objectId, wantType s
 // collection — the same ops SetType / AttachCollection use, so
 // concurrent attaches merge instead of last-write-wins.
 func (o *objectService) attachMembers(ctx context.Context, objectId, setType string, collections []string) error {
-	owners := make([]string, 0, 1+len(collections))
-	if setType != "" {
-		owners = append(owners, setType)
-	}
-	owners = append(owners, collections...)
-	dataVersion, err := dataVersionForOwners(ctx, o.parent.store.Registry(), owners)
-	if err != nil {
-		return err
-	}
+	// Membership alone carries no values, so it stamps no schema
+	// constraint: a peer behind on the owners' definitions applies it
+	// rather than parking the object typeless.
 	obj, err := o.parent.store.Get(ctx, objectId)
 	if err != nil {
 		return err
@@ -268,7 +286,7 @@ func (o *objectService) attachMembers(ctx context.Context, objectId, setType str
 	}
 	_, err = obj.LocalWrite(ctx, crdt.Change{
 		Dataset:     properties.Dataset,
-		DataVersion: dataVersion,
+		DataVersion: properties.HandlerVersion,
 		Records: []crdt.RecordChange{{
 			Id:     objectId,
 			Upsert: true,

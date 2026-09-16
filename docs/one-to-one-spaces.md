@@ -1,686 +1,442 @@
 # One-to-One Spaces
 
-## Vision
+A 1-1 (direct) space is shared by exactly two identities and derived
+deterministically from their keys: both peers compute the same space id,
+ACL and read key with no owner or invite handshake. It is the substrate for
+direct messaging and any two-party shared state.
 
-A 1-1 (direct) space is a space shared by **exactly two identities**, derived
-deterministically from their keys — both peers compute the same space id,
-the same ACL, the same read key, with **no owner/invite handshake**. It is the
-substrate for direct messaging and any two-party shared state.
+Two requirements shape the design:
 
-Requirements driving this design:
+1. **Incoming requests need approval.** An incoming 1-1 stays pending until
+   the local user accepts it. Declining is sticky.
+2. **No hard server dependency.** Derive, materialize and approve work with
+   no coordinator and no sync nodes. Server-backed discovery is an optional
+   layer on top.
 
-1. **Approve incoming.** Unlike anytype-heart (which auto-materializes a 1-1 the
-   moment an invite lands), an incoming 1-1 must sit in a *pending* state until
-   the local user explicitly accepts. Declining is sticky.
-2. **No hard server dependency.** The core mechanism — derive, materialize,
-   approve — must work with **zero server infrastructure** (no coordinator, no
-   sync nodes). Server-backed discovery is an *optional layer*, never a
-   prerequisite. (We do not ship a p2p transport here; the constraint is that
-   the design must not be *architecturally* coupled to servers.)
+## What any-sync provides
 
-## What any-sync already gives us
+any-sync implements the 1-1 primitive; the SDK drives existing calls and
+adds no crypto or ACL shapes.
 
-any-sync ships the full 1-1 primitive. We do **not** invent crypto or ACL
-shapes — we drive existing calls.
+`spacepayloads.StoragePayloadForOneToOneSpaceWithType(aSk, bPk, spaceType)`
+builds the whole space locally and offline:
 
-**Symmetric derivation** (`commonspace/spaceservice.go`):
-```go
-DeriveOneToOneSpace(ctx, aSk crypto.PrivKey, bPk crypto.PubKey) (id string, err error)
-```
-The whole space is built locally and offline by
-`spacepayloads.StoragePayloadForOneToOneSpace(aSk, bPk)`:
-
-- A **shared secret** is computed by ECDH:
-  `crypto.GenerateSharedKey(myPriv, otherPub, path)`. Since
-  `ECDH(aSk, bPk) == ECDH(bSk, aPk)`, both peers derive the *identical* key
-  material from **only the other party's public account identity**.
-- Derivation paths (`util/crypto/derived.go`):
-  `AnysyncOneToOneSpacePath` (owner/space key), `AnysyncReadOneToOneSpacePath`
-  (read key), `AnysyncMetadataOneToOnePath` (metadata key).
+- A shared secret comes from ECDH, `crypto.GenerateSharedKey(myPriv,
+  otherPub, path)`. Since `ECDH(aSk, bPk) == ECDH(bSk, aPk)`, each peer
+  derives identical key material from only the other party's public
+  account identity.
+- Derivation paths (`util/crypto/derived.go`): `AnysyncOneToOneSpacePath`
+  (owner/space key), `AnysyncReadOneToOneSpacePath` (read key),
+  `AnysyncMetadataOneToOnePath` (metadata key).
 - The ACL root (`BuildOneToOneRoot`) embeds `AclOneToOneInfo`:
-  - `Owner = sharedPk` — a **synthetic** identity nobody holds as a member;
-    exists only to satisfy any-sync's "ACL must have an owner" invariant. It is
-    ignored in business logic.
-  - `Writers = [aPk, bPk]` — the two real identities, **sorted** for an
-    idempotent space id, both granted `AclPermissionsWriter` from the root.
-- Replication key = `fnv64(sharedPubKey)` — self-contained, independent of the
-  account's replication key.
-- On-wire header `SpaceType = "any.onetoone"` (coordinator-gated allow-list,
-  see `docs/space.md`; irrelevant in a no-coordinator deployment).
+  - `Owner = sharedPk`: a synthetic identity no member holds. It exists
+    only to satisfy any-sync's "ACL must have an owner" invariant and is
+    ignored by business logic.
+  - `Writers = [aPk, bPk]`: the two real identities, sorted so the space id
+    is order-independent, both granted `AclPermissionsWriter` at the root.
+- Replication key = `fnv64(sharedPubKey)`, independent of either account's
+  replication key.
+- On-wire header `SpaceType = "any.onetoone"` (coordinator allow-list, see
+  `docs/space.md`).
 
-**Consequence that shapes everything below:** the ACL is **immutable** — just a
-root with two writers, no invite/request/accept records. There is *nothing to
-accept cryptographically*. Either party who knows the other's account identity
-can derive and join unilaterally.
-
-Therefore **"approve incoming" is a local SDK gate, not an ACL operation.** It
-governs whether *this device* materializes storage and participates in syncing
-the derived space — it cannot and need not gate ACL membership.
+The ACL is **immutable**: a root with two writers and no
+invite/request/accept records. Either party who knows the other's identity
+can derive and join unilaterally. **"Approve incoming" is therefore a local
+SDK gate, not an ACL operation.** It decides whether this device
+materializes storage and syncs the space; it cannot gate membership.
 
 ## Architecture: two layers
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Layer 2 — Discovery / notification  (OPTIONAL, pluggable)   │
+│  Layer 2 — Discovery / notification  (OPTIONAL)              │
 │  "Bob, Alice wants a 1-1 with you."                          │
-│  Shipped impl: coordinator Inbox (InboxFetch/InboxAddMessage)│
-│  Fallbacks: out-of-band identity exchange; future p2p        │
+│  Coordinator inbox (InboxFetch / InboxAddMessage)            │
+│  Without it: out-of-band identity exchange                   │
 └─────────────────────────────────────────────────────────────┘
-                              │ surfaces "incoming" → creates Pending row
+                              │ surfaces "incoming" → pending row
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  Layer 1 — 1-1 primitive  (REQUIRED, zero server deps)       │
-│  derive → local state machine (Pending/Active/Declined)      │
-│  → materialize + sync + seed   (Accept) / tombstone (Decline)│
+│  derive → local state machine (pending/active/declined)      │
+│  → materialize + sync + seed (accept) / marker (decline)     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-This split is exactly how the two requirements reconcile: discovery *uses* the
-coordinator inbox when present, but Layer 1 never depends on it. Strip Layer 2
-and the primitive still works — the app just supplies the peer identity
-out-of-band and calls `OneToOne` / `Accept` directly.
+Layer 2 uses the coordinator inbox when present; Layer 1 never depends on
+it. Without Layer 2 the app supplies the peer identity out-of-band and
+calls `OneToOne` / `RegisterIncoming` directly.
 
 ## Layer 1 — the 1-1 primitive
 
 ### Local state machine
 
-State lives in the **tech-space index row** for the derived space id. The split
-between device-local and synced fields is deliberate and is what makes the
-multi-device behavior (groomed below) fall out correctly:
+State lives on the tech-space index row for the derived space id. The row's
+synced `FieldOneToOnePeer` carries the other identity, the one thing a
+space id doesn't encode invertibly; accept and every device of the account
+need it to materialize storage.
 
-| State              | Field / scope                          | Materialized? | Crosses devices? |
-|--------------------|----------------------------------------|---------------|------------------|
-| `oneToOnePending`  | `LocalStatus` (**device-local**)       | No — row only | No — each device discovers via its own inbox |
-| `active`           | synced space membership (normal)       | Yes           | Yes — accept propagates as a real space |
-| `oneToOneDeclined` | dedicated **synced** sticky marker     | No            | Yes — decline silences all devices |
-| `deleted`          | `RemoteStatus=deleted` (synced, local offload) | No   | Yes (sticky) |
+| State              | Field / scope                         | Materialized? | Crosses devices? |
+|--------------------|---------------------------------------|---------------|------------------|
+| `oneToOnePending`  | `LocalStatus` (device-local)          | No, row only  | No: each device discovers through the shared inbox cursor or its own `RegisterIncoming` |
+| `active`           | `RemoteStatus=active` (synced)        | Yes           | Yes: accept is account-scoped |
+| `oneToOneDeclined` | `RemoteStatus` (synced, non-terminal) | No            | Yes: decline silences every device |
+| `oneToOneDeleted`  | `RemoteStatus` (synced, non-terminal) | No, offloaded | Yes: every device offloads |
 
-Why pending is device-local but declined is synced: each device runs its own
-inbox notifier, so the *pending* prompt can arise independently on a device
-(the notifier shares one account-scoped read cursor, but the per-device
-`oneToOnePending` localStatus is set as each device materializes the prompt).
-**Accept** materializes a
-real space whose membership syncs through the normal tech-space list, so it
-reaches the other devices for free. **Decline** has no space to sync, so to
-silence the prompt account-wide (groom decision) it writes its own synced
-marker. This marker is **distinct from `RemoteStatus=deleted`** (which is
-hard-sticky — the index handler refuses to move out of it): `oneToOneDeclined`
-must stay overridable by a later explicit `OneToOne(peer)` (un-decline), so it
-is a separate synced status value, not a reuse of `deleted`.
+Pending is device-local because it is only this device's unresolved view.
+Accept and decline are account-wide decisions, so both are synced. Decline
+and delete use their own non-terminal status values rather than the regular
+`deleted`, which is terminal (the index handler refuses to move out of it):
+a later explicit `OneToOne(peer)` must be able to override both.
 
 Transitions:
 
 ```
-                 OneToOne(peer)            Accept(id)
-   (none) ───────────────────────► active ◄──────────── oneToOnePending
-      │  self-initiated, implicit self-approve   ▲          ▲
-      │            OneToOne(peer) un-decline ─────┘          │ inbox notifier /
-      │                                                      │ RegisterIncoming(peer)
-      └──────────────────────────────────────────────────────
-                                                             │
-   oneToOnePending ─ Decline(id) ─► oneToOneDeclined (synced) ┘ (re-delivery: ignored, sticky)
-   active ──── Delete(id) ──► deleted  (local offload, synced tombstone)
+(none)            ── OneToOne(peer) ─────────────────► active
+(none)            ── inbox / RegisterIncoming(peer) ─► oneToOnePending
+oneToOnePending   ── Accept(id) / OneToOne(peer) ────► active
+oneToOnePending   ── Decline(id) ────────────────────► oneToOneDeclined
+oneToOneDeclined  ── Accept(id) / OneToOne(peer) ────► active
+active            ── Delete(id) ─────────────────────► oneToOneDeleted
+oneToOneDeleted   ── OneToOne(peer) ─────────────────► active
 ```
+
+Inbox re-delivery onto an existing row changes nothing.
 
 Rules:
 
-- **Self-initiated is implicit approval.** `OneToOne(peer)` (I reached out, or I
-  pasted Alice's invite link) goes straight to `active`. The row I create is
-  *my* decision; there is no one to ask. v1 surfaces no "has the peer accepted?"
-  signal — the immutable ACL carries none; acceptance is inferable only from the
-  peer's first write, deferred to a later chat layer.
-- **Incoming starts Pending (device-local).** The inbox notifier (Layer 2) — or
-  an explicit `RegisterIncoming(peerIdentity, displayHint)` for the out-of-band
-  path — creates the row as `oneToOnePending` **without** deriving storage and
-  **without** writing any synced field. The pending row carries the peer's
-  account identity (surfaced as `SpaceInfo.Author`); the name/icon resolve from
-  identityRepo via the symkey the invite carried (or an out-of-band
-  `displayHint`), so the UI can render "Alice wants to chat" without syncing
-  anything.
-- **Accept** (`AcceptOneToOne(spaceId)`, or equivalently `OneToOne(peer)` again)
-  flips Pending→active and runs materialization. Idempotent. **Acceptance is
-  account-scoped**: it writes the synced `RemoteStatus=active`, and on the
-  account's other devices that wins over a stale device-local pending (or a
-  bare row that synced in before the device set any status) — the status maps
-  to Active, the materialization guard passes, and the next `Get` *adopts* the
-  1-1: derives storage locally and stamps the device active. No per-device
-  re-accept. A device-local delete is never adopted over.
-- **Decline** (`DeclineOneToOne(spaceId)`) writes the **synced** `oneToOneDeclined`
-  marker, sticky against the automatic discovery path on **every** device:
-  later inbox re-deliveries / peer writes never re-surface it as incoming. A
-  notifier that finds a synced `oneToOneDeclined` for a derived id suppresses
-  its local pending row. Decline is automatic-path sticky only — a deliberate
-  `OneToOne(peer)` later **overrides** the marker to `active` (un-decline).
+- **Self-initiated is implicit approval.** `OneToOne(peer)` goes straight to
+  active. There is no "has the peer accepted?" signal: the immutable ACL
+  carries none, and inferring it from the peer's first write is left to a
+  chat layer.
+- **Incoming starts pending.** The inbox notifier, or `RegisterIncoming`
+  for the out-of-band path, creates the row with device-local
+  `oneToOnePending`, without deriving storage and without writing a synced
+  status. The row carries the peer's identity (surfaced as
+  `SpaceInfo.Author`); name and icon resolve from identityRepo via the
+  symkey the invite carried, or from an out-of-band `displayHint`.
+- **Accept is account-scoped.** `AcceptOneToOne(spaceId)`, or
+  `OneToOne(peer)` again, writes synced `RemoteStatus=active` and
+  materializes. On the account's other devices the synced active status
+  wins over a stale device-local pending (or a bare row with no status
+  yet), and the next `Get` adopts the 1-1 through the accept path. No
+  per-device re-accept. A device-local delete is never adopted over.
+- **Decline** (`DeclineOneToOne(spaceId)`) writes synced `oneToOneDeclined`.
+  Inbox re-deliveries on any device never re-surface the request. An
+  explicit `OneToOne(peer)` or `AcceptOneToOne` overrides it.
 
-### Materialization (Accept / self-initiate)
+### Materialization (accept / self-initiate)
 
-Reuses the existing path in `OneToOne` (`service.go:720`), refactored so the
-**activation** half is callable from both the initiate and the accept entry
-points:
+`OneToOne` builds the storage payload and passes it to `activateOneToOne`,
+which both entry points share:
 
-1. `DeriveOneToOneSpace(myKey, peerPub)` → `spaceId` (pure, offline).
-2. Upsert tech-space row: `Type = SpaceTypeOneToOne`, `LocalStatus = active`.
-3. `app.GetSpace(ctx, spaceId)` — materializes storage via
-   `StoragePayloadForOneToOneSpace` if absent; loads if present.
-4. `ensureSpaceIndexWiring` + `newSpace` + `goSeed`.
+1. `app.GetSpace` loads the space, creating storage from the payload when
+   absent.
+2. The index row is upserted: `RemoteStatus = active`, `LocalStatus =
+   active` (or a new row with `Type = SpaceTypeOneToOne` and the peer).
+3. `ensureSpaceIndexWiring`, `newSpace`, `goSeed`.
+4. The peer's name resolves onto the row in the background.
 
-All four steps are server-free. Sync (over nodes today, p2p later) is whatever
-transport is configured; the primitive doesn't care.
+`deriveOneToOneId` computes the id without creating storage;
+`RegisterIncoming` uses it for the pending row. Every step is server-free;
+sync runs over whatever transport is configured.
 
-### Decline / Delete semantics
+### Delete
 
-- **Decline** → synced `oneToOneDeclined` marker, no storage ever created.
-  Account-wide sticky against the automatic discovery path; overridable only by
-  an explicit `OneToOne(peer)`.
-- **Delete** of an *active* 1-1 → local-only offload (per `docs/space.md`:
-  1-1 spaces are "not removable from the network, derived, always
-  re-creatable"). Sets `LocalStatus = deleted`, offloads local state, but does
-  **not** send `coordinator.SpaceDelete`. A subsequent `OneToOne(peer)`
-  re-derives and re-materializes from scratch.
+A 1-1 is derived and not node-owned, so `Delete` never removes it from the
+nodes and never sends `coordinator.SpaceDelete`:
+
+- `Delete` writes the synced `techspace.OneToOneDeletedStatus`
+  (`oneToOneDeleted`) and offloads local state.
+- The marker syncs to the account's other devices. The deletion
+  reconciler's coordinator-independent scan (`offloadDeletedOneToOnes`, run
+  first on every pass) offloads any such 1-1 that still has local storage;
+  it works offline. The boot eager-loader skips these rows via
+  `SpaceIndexRecord.IsDeleted()`.
+- `mapStatus` reports `space.StatusDeleted`, and `Subscribe` emits
+  `Removed`.
+- The marker is non-terminal, so a later `OneToOne(peer)` re-derives storage
+  and flips the row back to active.
 
 ### Surfacing to callers
 
-The space list / `SpaceInfo.Status` gains mapped values (extend `mapStatus`,
-`service.go:948`):
+`List` and `Subscribe` return every row; `SpaceInfo.Status` distinguishes
+them:
 
-- `oneToOnePending` → a **dedicated** `space.StatusOneToOnePending` (groom
-  decision: not a generic "incoming request" status — clearer for clients
-  filtering "1-1 chats to approve"; a future regular-invite-via-inbox would add
-  its own status).
-- `oneToOneDeclined` → filtered out of the default list (like `deleted`);
-  surfaced only under an explicit filter.
+- `oneToOnePending` → `space.StatusOneToOnePending`. A 1-1 row with no
+  active, declined or pending signal (synced in from the registering device
+  before this device set a status) also maps here.
+- `oneToOneDeclined` → `space.StatusOneToOneDeclined`.
+- `oneToOneDeleted` → `space.StatusDeleted`.
 
-Callers discover incoming requests by `Subscribe`/`List` filtering on
-`Status == OneToOnePending`, then call `AcceptOneToOne` / `DeclineOneToOne`.
-Members of an active 1-1 are read through the normal members collection
-(`docs/space.md`), which reads the two Writers from the immutable ACL.
-The synthetic `sharedPk` owner (above) is filtered out of every member
-view — `Members().List` / `Get` / `Query` / `Subscribe` all surface only
-the two real writers, matching "ignored in business logic." (Filter:
-`AclState.IsOneToOne()` + `OwnerPubKey()` in `collectMembers`.)
+`Get` refuses pending and declined rows with `ErrSpaceNotAccepted` and
+deleted rows with `ErrSpaceDeleted`. Callers find incoming requests by
+filtering on `StatusOneToOnePending`, then call `AcceptOneToOne` or
+`DeclineOneToOne`.
+
+Members of an active 1-1 come from the normal members collection
+(`docs/space.md`), which reads the two writers from the ACL. The
+synthetic `sharedPk` owner is filtered out of every member view (`List`,
+`Get`, `Query`, `Subscribe`) in `collectMembers`, via
+`AclState.IsOneToOne()` and `OwnerPubKey()`.
 
 ## Layer 2 — discovery via coordinator inbox
 
-The shipped notifier. We **reuse any-sync's transport and crypto** and build
-only the dispatch/cursor/dedup wrapper on top — the wrapper is exactly where
-every heart bug lives (see "Heart bugs we fix" below), so it is the part worth
-owning.
+The SDK reuses any-sync's inbox transport and crypto and owns only the
+dispatch, cursor and dedup wrapper (`internal/inbox`), which is where the
+correctness rules in "Heart bugs we fix" apply.
 
-### What any-sync gives us (verified in 0.12.11)
+### What any-sync provides
 
-`coordinator/inboxclient` (`inboxclient.New()`, registered as a component):
+`coordinator/inboxclient` and `coordinator/subscribeclient`, registered in
+the anysyncx app next to the coordinator client:
 
-- `InboxAddMessage(ctx, receiverPubKey, message)` — **ECIES-encrypts the body to
-  the receiver's account pubkey and signs the ciphertext** (`client.go:122`).
-  So the body is encrypted on the wire for free; we do *not* hand-roll
-  encryption. (This already improves on heart's `create.go:65` TODO — though
-  note the *profile bytes inside* the body still carry whatever the sender put
-  there; see authenticity below.)
-- `InboxFetch(ctx, offset) → []InboxMessage, hasMore` — returns bodies **still
-  encrypted**; decrypt + verify is the caller's job (`client.go:104`).
-- `SetMessageReceiver(cb)` — registers a push callback; on `Run` it subscribes
-  to `coordinatorproto.NotifyEventType_InboxNewMessageEvent` via
-  `coordinator/subscribeclient`, whose `streamWatcher` owns stream open +
-  reconnect (linear backoff to 60s) and is torn down on `Close`.
+- `InboxAddMessage(ctx, receiverPubKey, message)` ECIES-encrypts the body
+  to the receiver's account key and signs the ciphertext.
+- `InboxFetch(ctx, offset) → []InboxMessage, hasMore` returns bodies still
+  encrypted; verify and decrypt are the caller's job.
+- `SetMessageReceiver(cb)` subscribes to
+  `NotifyEventType_InboxNewMessageEvent`; `subscribeclient` owns stream
+  open and reconnect.
 
-We register `subscribeclient` + `inboxclient` into the anysyncx app alongside
-the existing coordinator client.
+`App.InboxClient()` exposes the transport; nil means no inbox, and the
+subsystem stays off.
 
-### Inbox message shape (any-sync proto, already defined)
+### Inbox message shape
 
 ```
 InboxPacket{ keyType, senderIdentity, receiverIdentity, senderSignature, payload }
 InboxPayload{ payloadType = InboxPayloadOneToOneInvite, timestamp, body }
 ```
 
-### Subscription layer: push + poll, one funnel
+The 1-1 invite body is the sender's metadata symkey. Direct-add invites
+(`InboxPayloadRegularInvite`) share the transport, see
+`docs/direct-add-invites.md`.
 
-The push event is **body-less** — `InboxNewMessageEvent` only says "you have
-mail", so it is a *wake-up* that triggers a fetch, never a delivery. Heart runs
-the push callback and an independent 30s poll, and they both call the same
-fetch+dispatch with no mutual exclusion — the source of its double-process race
-(see fix #1, #4). Our shape instead funnels both triggers into a **single
-serialized worker**:
+### Subscription: push + poll, one worker
+
+The push event carries no body: it only says "you have mail", so it
+triggers a fetch. Push and a periodic poll (60s) both kick one serialized
+worker:
 
 ```
 push InboxNewMessageEvent ─┐
-                           ├─► kick(buffered 1) ─► notifier worker (one goroutine)
-periodic tick (fallback) ──┘                         └─ fetch → process → advance cursor
+                           ├─► kick (buffered 1) ─► notifier worker (one goroutine)
+periodic tick (fallback) ──┘                          └─ fetch → process → advance cursor
 ```
 
-- One worker goroutine, own cancellable context (the `joinController` /
-  `deletionController` shape: ticker + buffered kick, bound to `Close`).
-- Push and poll both just `kick`; the worker is the only thing that fetches and
-  the only thing that touches the cursor — no lock needed because there is one
-  writer. The poll is a safety net (missed/disconnected stream); push is for
-  latency.
+The worker is the only fetcher and the only cursor writer, so no lock is
+needed. The poll covers a missed or disconnected stream; push provides
+latency. A push forwarder is installed before `app.Start` (the inbox client
+rejects a nil receiver) and delegates to the handler the notifier installs
+via `App.OnInboxMessage`.
 
-### Send (outbound, optional)
+### Send
 
-When `OneToOne(peer)` runs *and a coordinator is configured*, after local
-activation the SDK posts one `InboxAddMessage(peerPubKey, …)`:
+`OneToOne` (the initiate path only; accept never notifies back) stamps the
+device-local `FieldOneToOneInviteState = "toSend"` and kicks the send-retry
+loop. The loop posts `InboxPayloadOneToOneInvite` to the peer and clears the
+marker on confirmed delivery; a transient failure keeps the marker for the
+next pass (60s tick or kick), so the marker survives restarts and an
+offline initiate delivers once online. Re-sends are harmless because
+receive is idempotent. Without an inbox transport no marker is written:
+the space is re-derivable, so sending matters only for notification.
 
-- `payloadType = InboxPayloadOneToOneInvite`
-- `body` = the sender's **metadata symkey** (the key that decrypts the
-  sender's identityRepo profile — see `docs/identities.md`). any-sync
-  ECIES-encrypts it to `peerPubKey` on send. The receiver caches the key and
-  resolves the name/icon from identityRepo; the body carries no name/icon
-  itself.
-
-Send is **best-effort** and gated by an idempotent local send-status (fix #6):
-flip the row to a `oneToOneInviteSent` marker only *after* a confirmed send, and
-treat re-sends as harmless because the receiver path is fully idempotent (fix
-#3). If no coordinator is configured, send is skipped; discovery falls to the
-out-of-band path. Sending is never required for correctness — the space is
-re-derivable — only for notification.
+The body is the sender's metadata symkey (the key that decrypts the sender's
+identityRepo profile, see `docs/identities.md`). The receiver caches it
+and resolves name and icon from identityRepo; the body carries no name or
+icon.
 
 ### Key exchange inside the space
 
-The inbox carries the symkey one way only — `OneToOne` posts it, Accept
-sends nothing back — and the 1-1 ACL root is immutable with no per-writer
-metadata, so on its own the invite leaves the initiator unable to decrypt
+The inbox carries the symkey one way only (`OneToOne` posts it, accept
+sends nothing back), and the immutable 1-1 ACL root has no per-writer
+metadata. The invite alone therefore leaves the initiator unable to decrypt
 the acceptor's profile, and a missed or absent inbox leaves the acceptor
 unable to decrypt the initiator's. The space itself is the symmetric
 channel: its read key is held by exactly the two participants.
 
 - **Dataset `identityKeys`** on the space's derived spaceIndex object
   (`internal/types/spaceindex/identitykeys.go`, registered next to
-  `bundles`): row id = the participant's account identity, one synced
-  field `symKey` in the `space.MarshalSymKey` string form the ACL blob and
-  the inbox body use. The handler admits a row only from the change whose
-  signer IS the row id, refuses a change without a creator, and refuses
-  deletes (a tombstone would ban that participant's key for good).
+  `bundles`): row id = the participant's account identity, one synced field
+  `symKey` in the `space.MarshalSymKey` string form the ACL blob and the
+  inbox body use. The handler admits a row only from a change whose signer
+  is the row id, refuses a change without a creator, and refuses deletes (a
+  tombstone would ban that participant's key for good).
 - **Publish** (`spaceImpl.publishOneToOneKey`, from the post-load seed
-  goroutine — so on `OneToOne`, `AcceptOneToOne` and every later
-  `Spaces().Get`; the boot eager-loader does not run it): when the space
-  is a one-to-one and the own row is absent or differs, upsert it, one
-  publish per space at a time. The key is a pure function of the account
-  key, so every device of the account writes the same bytes and an equal
-  row is left alone; a differing row can only mean the derivation changed,
-  which is a migration, not a race. Existing 1-1s heal on the first
-  `Get`; no migration.
+  goroutine, so on `OneToOne`, `AcceptOneToOne` and every later
+  `Spaces().Get`; the boot eager-loader does not run it): for a 1-1 whose
+  own row is absent or differs, upsert it, one publish per space at a time.
+  The key is a pure function of the account key, so every device of the
+  account writes the same bytes and an equal row is left alone; a differing
+  row can only mean the derivation changed. Existing 1-1s heal on the first
+  `Get`.
 - **Watch** (`oneToOneKeysWatcher`, wired by `ensureSpaceIndexWiring` for
-  one-to-one spaces only): a sub on `(spaceIndexObjectId, identityKeys)`
-  with a one-shot reconcile on start; the row keyed by the row's
-  `OneToOnePeer` — and only that one — goes to the identities directory
-  (`SetIdentityMetaKey`, no-op when equal) and kicks
-  `resolveOneToOnePeerName` in the background. That fetch is one shot;
-  the space's member watcher refreshes every member's profile each
-  `identityRepoPollInterval` with the same directory key, so a missed
-  fetch retries within a minute. Cold devices receive the key through
-  the synced directory as for any contact.
+  1-1 spaces only): a subscription on `(spaceIndexObjectId, identityKeys)`
+  with a one-shot reconcile on start. Only the row keyed by the row's
+  `OneToOnePeer` goes to the identities directory (`SetIdentityMetaKey`,
+  no-op when equal) and triggers `resolveOneToOnePeerName` in the
+  background. That fetch is one-shot; the space's member watcher refreshes
+  every member's profile each `identityRepoPollInterval` (60s) with the same
+  directory key, so a missed fetch retries within a minute. Cold devices
+  receive the key through the synced directory, as for any contact.
 - **The inbox invite still carries the key.** It is the only pre-accept
-  channel: a pending row shows the initiator's name before the receiver has
-  materialized the space, and the in-space row is readable only after. The
-  row is the durable source; the invite is a notification with a display
-  hint.
+  channel: a pending row shows the initiator's name before the space is
+  materialized, and the in-space row is readable only after. The row is the
+  durable source; the invite is a notification with a display hint.
 - **Visibility.** The rows are refused on the public write surface
-  (`Modify` / `Delete` / `Upsert`, like `bundles`) and stay readable
-  through `Query`, `Aggregate` and history like any dataset: a reader is
-  one of the two key holders, and the identities directory already keeps
-  the peer's key for that reader for good, so the row grants nothing the
-  reader lacks. This differs from the tech-space `identities` dataset,
-  which holds every contact's key in one place and is kept off the
-  generic read surface for that reason. A wrapper that serves local
-  clients over HTTP is a lower trust tier and refuses the rows on its
-  read routes, as `any` does.
-- Regular spaces are unchanged — their key rides the ACL join record.
+  (`Modify` / `Delete` / `Upsert`, like `bundles`) and stay readable through
+  `Query`, `Aggregate` and history like any dataset: a reader is one of the
+  two key holders, and the identities directory already keeps the peer's key
+  for that reader, so the row grants nothing new. The tech-space
+  `identities` dataset differs: it holds every contact's key in one place
+  and stays off the generic read surface. A wrapper serving local clients
+  over HTTP is a lower trust tier and refuses the rows on its read routes,
+  as `any` does.
+- Regular spaces don't need this: their key rides the ACL join record.
 
-### Receive (the notifier worker)
+### Receive
 
-Per fetched `OneToOneInvite` message, **process first, advance cursor after**
-(fix #1):
+Per fetched message:
 
-1. **Verify** `senderSignature` over the (still-encrypted) body against
-   `senderIdentity` (`senderPub.Verify(body, sig)`).
-2. **Decrypt** body with my account sign key → the sender's metadata symkey.
-   The body carries **no identity** — `packet.SenderIdentity`
-   (coordinator-verified) is the authoritative peer identity, so there is
-   nothing self-declared to spoof (fix #5; nothing to "bind"). Cache the
-   symkey in the identities directory (`SetIdentityMetaKey`) so the sender's
-   profile resolves from identityRepo.
-3. **Dispatch** to the handler: `RegisterIncoming(senderIdentity, hint)` →
-   `deriveOneToOneId` then reconcile the (possibly synced) row:
-   - synced `oneToOneDeclined` present → **ignore** (sticky, account-wide —
-     could have been declined on another device);
-   - no row → add device-local `oneToOnePending` row (identity-only; the
-     name resolves asynchronously from identityRepo via the cached symkey);
-   - `active` / `oneToOnePending` → idempotent (no-op / refresh). This
-     idempotence is why no separate processed-id ledger is needed (fix #3).
-4. **Advance the cursor AFTER handling, once PER BATCH** (fix #1) — the synced
-   account cursor (`SetInboxCursor`, monotonic-forward) moves to the furthest
-   handled id at the end of the batch. Per-batch (not per-message) because it is
-   a synced write; idempotent processing makes that crash-safe (a crash re-runs
-   the batch and dedups against the rows).
-5. **Failure split** (fix #2): a *content* failure (nil packet / bad sender /
-   bad signature / decrypt failure) is non-transient → log + advance past **that
-   message only** (skip; does NOT wedge). A *transient* failure (offline
-   `Fetch`, or the handler returning `ErrRetry` for a transient tech-space
-   write) → halt the cursor and retry the next pass.
+1. **Verify** `senderSignature` over the still-encrypted body against
+   `senderIdentity`.
+2. **Decrypt** the body with the account key. For a 1-1 invite that yields
+   the sender's metadata symkey, cached with `SetIdentityMetaKey`. The body
+   carries no identity; `packet.SenderIdentity` (verified by the
+   coordinator) is the peer identity.
+3. **Dispatch** (`handleInboxMessage`, by payload type; unknown types are
+   skipped). A 1-1 invite calls `RegisterIncoming(senderIdentity, {})`,
+   which derives the id and checks the row:
+   - an existing row (active, pending, synced decline, delete) → no-op; a
+     still-pending row retries the name resolution;
+   - no row → a device-local `oneToOnePending` row, identity-only until the
+     name resolves from identityRepo.
+4. **Advance the cursor after handling, once per batch**, to the furthest
+   handled message id. The cursor is the synced, account-scoped
+   `InboxCursor` in the tech space (`SetInboxCursor`, monotonic-forward).
+   Per batch keeps synced writes low; idempotent receive makes it
+   crash-safe (a crash re-runs the batch, which dedups against the rows).
+5. **Failure split.** A content failure (nil packet, bad sender, bad
+   signature, decrypt failure, non-retry handler error) is permanent: log
+   it and count the message as handled. A transient failure (`Fetch` error,
+   or a handler `ErrRetry` for a tech-space write) halts the cursor before
+   that message; the next pass retries.
 
-The worker only runs when a coordinator is present (`app.Coordinator() != nil`).
-Absent one, Layer 2 is simply off and the primitive stands alone.
+An empty cursor passes through a **replay guard** first. On an established
+account an empty cursor may only mean the synced cursor hasn't reached this
+device, and replaying the whole inbox would resurrect resolved invites as
+pending rows. The guard runs one tech-space head-sync round and requires
+zero parked trees; until then the pass is deferred. The first success is
+latched for the notifier's lifetime.
 
-## Heart bugs we fix (do not port)
+### Lifecycle
 
-A close read of heart's inbox (`core/inbox/inboxclient/inboxclient.go`,
-`core/inbox/inboxservice/onetoone.go`) surfaced concrete defects. Each maps to a
-design rule above:
+`Service.StartOneToOneInbox`, called from `sdk.Open` after the tech space
+opens, installs the push handler, starts the send-retry loop, then runs the
+notifier. It is a no-op without an inbox transport. `Close` stops both loops
+before the tech space is torn down. Both loops run on
+`context.Background()`-derived contexts, so the `Open` context expiring
+doesn't stop them.
 
-1. **Cursor advances before processing → permanent message loss.** Heart
-   persists the batch-tail offset in `fetchMessages`, *then* runs handlers in
-   `handleMessages`; a crash or a handler error between them loses the message
-   forever (the coordinator won't re-deliver). **Fix:** advance the cursor only
-   after the message's side effect commits, in the same transaction.
-2. **Batch-tail advance loses good messages.** Heart `continue`s over a bad
-   message while the offset is already the *batch tail*, so the good messages
-   between a bad one and the tail are skipped along with it (never re-fetched).
-   **Fix:** advance the cursor **per-message**, and split by failure type — a
-   *content* failure (nil packet / bad sender / bad signature / decrypt) is
-   non-transient, so log it and skip past **that one message only** (advance);
-   a *transient* failure (offline fetch, or a handler `ErrRetry`) halts the
-   cursor and retries the next pass. This deliberately does NOT wedge on a
-   permanently-bad message: it is skipped, not looped forever. (Heart's other
-   sin — advancing before processing — is fix #1.)
-3. **Replay re-runs side effects.** Heart relies on deterministic space-id
-   derivation + the space ocache to avoid duplicate spaces, but still re-runs
-   side effects (`SpaceInitChat`, `AddIdentityProfile`, `SpaceViewSetData`) on
-   every replay. **Fix:** the receive handler is **fully idempotent** — the
-   synced 1-1 row is the account-scoped "handled" marker, so `RegisterIncoming`
-   is a no-op on an existing row (active / pending / declined / deleted). A
-   re-delivered or replayed message is harmless. This needs no processed-id
-   ledger — the row IS the dedup key. **This idempotence is also what makes the
-   synced cursor (below) safe — it is the real fix that subsumes heart's #8.**
-4. **Two triggers, no mutual exclusion.** Push callback and 30s poll both call
-   the dispatch with the offset read released between fetch and process →
-   double-process. **Fix:** single serialized worker; both triggers only kick.
-5. **Self-declared identity in the body.** Heart embeds the sender's identity
-   inside the (decrypted) profile body and trusts it, so a sender could
-   impersonate a third party in the surfaced "incoming from X". **Fix:** carry
-   **no identity in the body** — it holds only the sender's metadata symkey;
-   the peer identity is solely the coordinator-verified `packet.SenderIdentity`.
-   Nothing to spoof, nothing to bind.
-6. **Send→status-flip not atomic.** Heart sends then writes `Sent` as a separate
-   CRDT op; a crash between re-sends the invite. **Fix:** idempotent receiver +
-   send-marker written only post-confirmation; re-send is harmless.
-7. **Unlocked receivers-map read** and a `context.TODO()` in the subscribe
-   stream mailbox `Add` (unbounded block) — both in any-sync/heart shared code;
-   we don't reintroduce them in our wrapper, and we freeze our handler set at
-   construction.
-8. **Synced offset diverges — *only because heart's processing wasn't
-   idempotent*.** Heart keeps the inbox offset in a synced CRDT object, and a
-   lagging device's last-writer-wins write rewinds a leading device → re-delivery
-   → and because heart's receive *re-runs side effects* (#3), that re-delivery
-   duplicates work. The root cause is #3, not the syncing. **So we do NOT make
-   the cursor device-local** (an earlier draft did — it was treating the
-   symptom). Instead, the cursor is a **synced, account-scoped** value
-   (`InboxCursor` in the tech space): the coordinator inbox is per-receiver and
-   its messages are **immutable + ObjectID-ordered** (the offset is an ObjectID
-   hex; the server fetches `_id $gt offset` sorted `_id:1`), so the
-   furthest-processed offset is a single shared high-water-mark. Writes are
-   **monotonic-forward** (`max` via lexical hex compare in `SetInboxCursor`);
-   everything below it is already covered by synced 1-1 rows; and idempotent
-   processing (#3) makes any cross-device regression a harmless, deduplicated
-   re-fetch. A fresh device **seeds from this cursor instead of replaying the
-   whole inbox** — and because the cursor only reaches the device via sync, an
-   **empty cursor is gated by a replay guard**: the notifier defers any
-   from-the-beginning pass until the tech space has completed one clean
-   head-sync round (diff applied, nothing parked in the treesyncer; the
-   first success is latched per process — convergence can't regress). Without
-   the gate a cold-restored device races its own tech-space catch-up and
-   replays the inbox, resurrecting long-accepted 1-1s as pending join
-   requests for as long as the sync nodes stay unreachable. (The *decline*
-   marker is separately synced because it is an account-wide user decision —
-   see groom decisions.)
+## Heart bugs we fix
 
-### Out-of-band / p2p fallback (no server)
+anytype-heart's inbox (`core/inbox/inboxclient`, `core/inbox/inboxservice`)
+has defects that must not be ported. Each rule below is a guarantee of this
+implementation.
 
-With no coordinator, discovery is the app's job (exchange identities via QR,
-link, username lookup, an existing space's member list, …). The app then calls:
+1. **The cursor advances only after the side effect commits.** Heart
+   persists the batch-tail offset before running handlers, so a crash or
+   handler error in between loses messages for good.
+2. **A bad message costs nothing but itself.** Heart skips a bad message
+   while the offset already sits at the batch tail, losing the good messages
+   after it. Here every message up to the cursor was handled; a content
+   failure is skipped individually, a transient failure halts the cursor
+   before the message, and nothing wedges.
+3. **Receive is idempotent.** The synced 1-1 row is the account-scoped
+   "handled" marker, so `RegisterIncoming` on an existing row is a no-op and
+   a re-delivered or replayed message is harmless. No processed-id ledger is
+   needed. This is also what makes a synced cursor safe (rule 8). Heart
+   re-runs side effects on every replay.
+4. **One worker serves both triggers.** Heart's push callback and poll run
+   fetch and dispatch concurrently and double-process.
+5. **No self-declared identity.** The body holds only the symkey; the peer
+   identity is the coordinator-verified `SenderIdentity`. Heart trusts an
+   identity embedded in the body, which lets a sender impersonate a third
+   party.
+6. **The send marker clears only after confirmed delivery.** A crash
+   re-sends, which the idempotent receiver absorbs.
+7. **The handler set is fixed at construction** and the wrapper takes no
+   unlocked map reads or unbounded blocking sends.
+8. **The cursor is synced and account-scoped.** Heart's synced offset
+   diverges only because its processing isn't idempotent. The coordinator
+   inbox is per receiver, and its messages are immutable and ordered by
+   ObjectID (the offset is an ObjectID hex; the server fetches `_id $gt
+   offset` sorted ascending), so the furthest-processed offset is one shared
+   high-water mark. Writes are monotonic-forward (lexical hex `max` in
+   `SetInboxCursor`), everything below the cursor is covered by synced 1-1
+   rows, and rule 3 makes a cross-device regression a harmless re-fetch. A
+   fresh device seeds from the cursor instead of replaying the inbox, behind
+   the replay guard described under Receive.
 
-- `OneToOne(peerIdentity)` — to reach out (active immediately), or
-- `RegisterIncoming(peerIdentity, displayHint)` — to drop an incoming request
-  into `oneToOnePending` for the user to approve, when the app learned of the
-  intent through its own channel.
+## Out-of-band discovery (no server)
 
-Same Layer-1 state machine, same Accept/Decline. This is the path that
-satisfies "must work with no server infra."
+With no coordinator, discovery is the app's job (QR, link, username lookup,
+an existing space's member list). The app calls:
+
+- `OneToOne(peerIdentity)` to reach out (active immediately), or
+- `RegisterIncoming(peerIdentity, displayHint)` to record an incoming
+  request the app learned of through its own channel.
+
+The state machine, accept and decline are the same.
 
 ## API surface
 
-Additions to `space.Service` (`space/service.go`); `OneToOne` already exists and
-keeps its meaning (self-initiate / explicit accept):
+On `space.Service` (`space/service.go`):
 
 ```go
-// OneToOne reaches out to / accepts a 1-1 with otherIdentity. Derives the
-// shared space and activates it locally (implicit self-approval). Idempotent;
-// clears any pending/declined state for that peer. (existing — unchanged shape)
-OneToOne(ctx, otherIdentity string) (Space, error)
+// OneToOne reaches out to — or explicitly accepts / un-declines — the
+// derived 1-1 space shared with otherIdentity. Materializes and activates
+// it locally. Same id regardless of key order. Idempotent.
+OneToOne(ctx context.Context, otherIdentity string) (Space, error)
 
-// AcceptOneToOne approves an incoming pending 1-1 by space id: materializes
-// and syncs it. Equivalent to OneToOne(peer) but keyed by the id surfaced in
-// the space list, so the caller needn't re-derive the peer identity.
-AcceptOneToOne(ctx, spaceId string) (Space, error)
+// AcceptOneToOne approves an incoming pending 1-1 by space id. The peer
+// identity is read off the row. Equivalent to OneToOne(peer).
+AcceptOneToOne(ctx context.Context, spaceId string) (Space, error)
 
-// DeclineOneToOne rejects an incoming pending 1-1. Writes a synced sticky
-// marker so the request is suppressed on all the account's devices; never
-// auto-materialized or re-surfaced from the discovery layer again (a
-// deliberate OneToOne(peer) still overrides it).
-DeclineOneToOne(ctx, spaceId string) error
+// DeclineOneToOne writes a synced sticky marker so the request is
+// suppressed on all the account's devices; a later OneToOne(peer)
+// overrides it.
+DeclineOneToOne(ctx context.Context, spaceId string) error
 
-// RegisterIncoming records an incoming 1-1 request learned out-of-band (no
-// coordinator) as a pending row for the user to approve. displayHint is an
-// optional name/icon snapshot for the UI. No-op if the row already exists.
-RegisterIncoming(ctx, peerIdentity string, displayHint AccountMetadata) error
+// RegisterIncoming records an incoming 1-1 learned out-of-band as a
+// pending row, without materializing storage. displayHint is an optional
+// name/icon snapshot. No-op if a row for the derived space exists.
+RegisterIncoming(ctx context.Context, peerIdentity string, displayHint AccountMetadata) error
 ```
 
-`SpaceInfo.Status` gains a pending-1-1 value; `List`/`Subscribe` are the
-discovery surface for the UI.
-
-## What changes in existing code
-
-- `internal/spaceimpl/service.go:720 OneToOne` — split into `deriveOneToOneId` +
-  `activateOneToOne` so Accept and Initiate share the activation half. Stop
-  unconditionally writing `active`; Initiate writes `active`, the notifier
-  writes `oneToOnePending`.
-- `internal/spaceimpl/service.go:948 mapStatus` — map `oneToOnePending` /
-  `oneToOneDeclined`.
-- `internal/techspace/spaceindex.go:113` — add `oneToOnePending` (device-local
-  status value, like `joiningLocalStatus`) and `oneToOneDeclined` (a **synced**
-  status value, distinct from the hard-sticky `deleted`, kept overridable).
-- `space/service.go` + `space/types.go` — new methods + `SpaceInfo.Status` value.
-- New `internal/inbox/` — a notifier built on any-sync's `inboxclient` +
-  `subscribeclient` (registered in `internal/anysyncx/app.go`): single
-  serialized worker, push+poll funnel, verify/decrypt, per-batch cursor advance,
-  idempotent dispatch (no processed-id ledger needed). Cursor load/save +
-  replay guard are injected (the notifier is storage-agnostic). Started from
-  `sdk.Open` (guarded by coordinator presence), torn down in `Close`.
-- New `internal/techspace/inboxcursor.go` — the **synced, account-scoped** inbox
-  cursor (`InboxCursor` dataset on the space-index tree; `GetInboxCursor` /
-  `SetInboxCursor` monotonic-forward). A fresh device seeds from it instead of
-  replaying the whole inbox.
-
-The existing `joinController` (ACL-waiter based) is **not** reused — derived 1-1
-has an immutable ACL with no acceptance record for a waiter to observe. The
-notifier is the 1-1 analogue and is structurally similar but watches the inbox,
-not an ACL head.
+`OneToOne` and `RegisterIncoming` return `ErrSelfPair` for the caller's own
+identity.
 
 ## Security & abuse
 
-- **Sender authenticity:** the inbox body is signed; the notifier verifies
-  `senderSignature` *and* binds the decrypted profile identity to
-  `SenderIdentity` (fix #5). In the no-coordinator path the app vouches for the
-  identity it passes to `RegisterIncoming`.
-- **Profile privacy:** the body is ECIES-encrypted to the receiver's account key
-  by any-sync's `InboxAddMessage` — handled, not an open item.
-- **Spam / unsolicited requests:** Pending rows are inert (no storage, no sync)
-  until accepted, so an unsolicited request costs only a tech-space row. Decline
-  is sticky. A future allow/block list (e.g. only surface incoming from known
-  contacts) layers on top of the notifier without touching Layer 1.
-- **Self-pairing guard:** reject `OneToOne(myOwnIdentity)`.
-
-## Groom decisions (2026-06-19)
-
-1. **Pending status value → dedicated `space.StatusOneToOnePending`.** Not a
-   generic "incoming request" status; clearer for client filtering. A future
-   regular-invite-via-inbox gets its own status.
-2. **Cross-device decline → synced.** `DeclineOneToOne` writes a synced sticky
-   marker keyed by the derived id; every device's notifier honors it and
-   suppresses its local pending row. Distinct from `deleted` so an explicit
-   later `OneToOne(peer)` can un-decline. (Pending stays device-local; accept
-   propagates via normal space-membership sync — see the state-machine table.)
-3. **Initiator delivery state → none in v1.** Initiator's side is just `active`;
-   no "has the peer accepted?" signal (the immutable ACL carries none).
-   Read-receipt / presence is a later chat-layer feature.
-4. **Send-failure handling → background retry loop.** A pending-send marker +
-   retry (heart's `ToSend` shape, our `deletionController` structure) re-sends
-   until the coordinator confirms; idempotent receiver makes re-sends harmless.
-5. **Dead-letter policy → split by failure type.** Infra/transient failure
-   (offline `Fetch`, or a handler `ErrRetry` for a tech-space write) → retry, do
-   **not** advance the cursor. Content failure (nil packet / bad sender / bad
-   signature / decrypt) is non-transient → log loudly and advance the cursor
-   past **that one message** so the queue can't wedge (no infinite loop). No
-   app-facing surface in v1.
-6. **Inbox cursor → SYNCED, account-scoped** (`InboxCursor` in the tech space),
-   monotonic-forward. "Processed is account-scoped" applies to the read position
-   too: a fresh device seeds from it instead of replaying the whole inbox.
-   *Revised from an earlier draft that made it device-local* — that was treating
-   the symptom of heart's #8, whose real cause is non-idempotent processing
-   (#3). The offset is a coordinator ObjectID hex (immutable, `_id`-ordered), so
-   `max` is computable and a synced high-water-mark merges safely; idempotent
-   processing makes any regression a harmless re-fetch.
-7. **Profile freshness.** The inbox invite carries the sender's symkey, not a
-   name/icon snapshot, so a pending row starts identity-only and resolves the
-   name from identityRepo via the cached symkey (see
-   `docs/identities.md`). Out-of-band `RegisterIncoming(peer, displayHint)`
-   may seed an inline name/icon for immediate display; absent both a hint and
-   a coordinator it stays identity-only until the space is active on both
-   sides, when the in-space `identityKeys` row delivers the key (§ Key
-   exchange inside the space).
+- **Sender authenticity.** The notifier verifies `senderSignature`, and the
+  peer identity is the coordinator-verified `SenderIdentity`; nothing in the
+  body identifies the sender. In the out-of-band path the app vouches for
+  the identity it passes to `RegisterIncoming`.
+- **Privacy.** `InboxAddMessage` ECIES-encrypts the body to the receiver's
+  account key.
+- **Spam.** A pending row is inert (no storage, no sync), so an unsolicited
+  request costs one tech-space row, and decline is sticky. An allow/block
+  list (for example, surfacing only known contacts) would sit on top of the
+  notifier without touching Layer 1.
+- **Self-pairing** is rejected.
 
 ## Open questions
 
-- **Un-decline UX surface.** `OneToOne(peer)` overriding a synced
-  `oneToOneDeclined` is the mechanism; whether the SDK also exposes an explicit
-  `UndoDecline`/list-of-declined surface is deferred until a client needs it.
-- **Dead-letter escape hatch.** If a permanently-bad message ever sits at the
-  cursor head before any good message, the split policy (5) advances past it;
-  confirm there's no scenario where we'd rather hard-stop and alert instead of
-  dropping.
-
-## Layer 1 — implementation status (landed)
-
-Serverless primitive + approval gate, shipped and tested:
-
-- **States.** Pending → device-local `oneToOnePending` (`FieldLocalStatus`);
-  declined → synced non-terminal `oneToOneDeclined` (`FieldRemoteStatus`, so
-  `OneToOne` can un-decline); active → synced via the normal space row. Public
-  `space.StatusOneToOnePending` / `StatusOneToOneDeclined`.
-- **Peer identity.** A new synced `FieldOneToOnePeer` on the index row (declared
-  in `SpaceIndexSchema`) carries the other identity — the one thing a spaceId
-  doesn't encode invertibly, needed to materialize storage on accept and on any
-  of the account's devices.
-- **API.** `OneToOne` split into `deriveOneToOneId` (pure id, no storage — used
-  by `RegisterIncoming`) + `activateOneToOne` (shared by initiate/accept).
-  `AcceptOneToOne(spaceId)`, `DeclineOneToOne(spaceId)`,
-  `RegisterIncoming(peerIdentity, displayHint)` on `space.Service`. Self-pairing
-  guarded.
-- **mapStatus** now takes `Type`: a bare synced 1-1 row (no active/declined/
-  pending signal, e.g. synced from the registering device) surfaces as pending
-  rather than `Unknown`.
-- **Tests.** `e2e/onetoone_test.go`: `DeclineSticky` (fast, serverless —
-  pending→decline→sticky-no-reprompt→un-decline) and `ApproveIncoming` (two
-  accounts, out-of-band identity, symmetric-derivation + accept + content
-  convergence).
-
-Deferred to follow-up: cross-device active materialization of a 1-1 initiated
-elsewhere. (1-1 `Delete` semantics landed — see "1-1 deletion" below.)
-
-### 1-1 deletion (landed)
-
-A 1-1 is derived and not node-owned, so deleting one must **not** remove it from
-the nodes — only offload it, and propagate that to the account's other devices:
-
-- **`techspace.OneToOneDeletedStatus`** ("oneToOneDeleted") is a **synced**
-  `remoteStatus` value that is **non-terminal** (distinct from the regular,
-  terminal `StatusDeleted`). `Delete` branches on `Type == SpaceTypeOneToOne`:
-  it writes this marker and offloads locally, and **never** kicks the deletion
-  reconciler's coordinator path (no `SpaceDelete` RPC — the space stays on the
-  nodes).
-- **Propagation + offload on other devices.** The marker rides tech-space sync
-  to the account's other devices. A coordinator-independent scan in the deletion
-  reconciler (`offloadDeletedOneToOnes`, run first each pass) offloads any
-  oneToOneDeleted 1-1 that still has local storage — works offline, and on the
-  boot eager-loader via `SpaceIndexRecord.IsDeleted()`.
-- **Surfacing.** `mapStatus` and the `Subscribe` translator map oneToOneDeleted
-  to `space.StatusDeleted` / a `Removed` event — clients see it as deleted.
-- **Re-creatable.** Because the marker is non-terminal, a later `OneToOne(peer)`
-  re-derives storage and flips the row back to active (the handler only blocks
-  moves out of the terminal regular `deleted`). This is the property that
-  reusing `StatusDeleted` would have broken.
-- **Tests.** `e2e/onetoone_test.go`: `DeleteAndRecreate` (serverless: delete →
-  Deleted → re-create → active) and `DeleteSyncsToOtherDevice` (two devices, one
-  account: A deletes, B converges on Deleted and offloads, no node removal —
-  passed against staging).
-
-## Layer 2 — implementation status (landed)
-
-Coordinator-inbox notifier (Layer-2 discovery), shipped and tested end-to-end
-against the live staging coordinator:
-
-- **Transport reused from any-sync.** `coordinator/inboxclient` +
-  `subscribeclient` are registered in the anysyncx app. `InboxAddMessage`
-  ECIES-encrypts the body to the receiver's account key and signs it;
-  `InboxFetch` returns still-encrypted bodies; `subscribeclient` provides the
-  `InboxNewMessageEvent` push stream. We build only the dispatch wrapper.
-- **`App` wiring.** A push forwarder is installed *before* `app.Start`
-  (`inboxClient.Run` rejects a nil receiver), delegating to an atomic handler
-  the notifier installs via `App.OnInboxMessage`. `App.InboxClient()` exposes the
-  transport; nil-return is treated as "inbox unavailable" (degrades to
-  out-of-band).
-- **`internal/inbox` notifier** (`notifier.go`). Single serialized worker;
-  coordinator push and a poll fallback both just `Notify()` (buffered-1 kick) —
-  one writer, no lock. Per message: verify signature over the ciphertext against
-  the coordinator-supplied `SenderIdentity`, decrypt with our account key,
-  dispatch. **Cursor advances per-batch AFTER handling**, to the
-  **synced, account-scoped** `InboxCursor` in the tech space (monotonic-forward;
-  load/save injected so the notifier is storage-agnostic) — a fresh device seeds
-  from it instead of replaying the inbox. The
-  dead-letter split is realized: a `Fetch` error or a handler `ErrRetry` halts
-  the cursor (transient → retry next pass); a content failure (nil packet / bad
-  sender / bad signature / decrypt failure) is logged and skipped past (non-
-  transient → no wedge). This is the concrete fix for heart bugs #1, #2, #4, #6,
-  #8 from "Heart bugs we fix".
-- **Sender↔body trust (fix #5).** The body carries only the sender's metadata
-  symkey; the authoritative peer identity is the coordinator-verified
-  `SenderIdentity`, never anything self-declared in the body — so there is
-  nothing to spoof.
-- **Receive → pending.** `spaceimpl.handleInboxMessage` caches the sender's
-  symkey (`SetIdentityMetaKey`) and calls `RegisterIncoming(senderIdentity, {})`
-  → device-local pending row (identity-only), honoring a synced
-  `oneToOneDeclined`. A background resolve fills the name from identityRepo via
-  the cached symkey. Idempotent, so re-delivery is harmless.
-- **Send-on-initiate + retry (decision 4 / fix #6).** `OneToOne` (initiate path
-  only — `Accept` never notifies back) stamps a device-local
-  `FieldOneToOneInviteState = "toSend"` and kicks a send-retry loop
-  (`deletionController` shape) that posts the `InboxPayloadOneToOneInvite` and
-  clears the marker on confirmed delivery. Durable across restart; offline at
-  initiate just retries.
-- **Lifecycle.** `Service.StartOneToOneInbox` (called from `sdk.Open` after the
-  tech space opens) wires the push handler, runs the notifier, and starts the
-  retry loop; `Close` drains both before tearing down the tech space. Both loops
-  own `context.Background()`-derived contexts, so the `Open` context expiring
-  doesn't kill them.
-- **Tests.** `internal/inbox/notifier_test.go` (5 unit tests, no network):
-  verify/decrypt/advance, bad-signature skip-and-advance, `ErrRetry` halt +
-  reprocess, fetch-error no-advance, Run/Notify/Close lifecycle.
-  `e2e/onetoone_inbox_test.go`: Alice `OneToOne(bob)` → Bob's notifier surfaces
-  the pending row with **no** out-of-band `RegisterIncoming` (the pending row
-  carries Alice's account identity as Author, and her name resolves from
-  identityRepo via the symkey the invite carried), then accepts. Passed against
-  staging (the coordinator implements the inbox RPCs); skips gracefully if a
-  network lacks inbox support.
-
-Open question 2 (dead-letter hard-stop escape hatch) remains as designed: a
-permanently-bad message at the cursor head is skipped past, never wedges; revisit
-only if a scenario wants a hard-stop-and-alert instead.
+- **Un-decline surface.** `OneToOne(peer)` overriding a synced decline is
+  the mechanism. Whether the SDK also needs an explicit `UndoDecline` or a
+  list-of-declined surface waits for a client that needs it.
+- **Dead-letter escape hatch.** A permanently bad message at the cursor
+  head is skipped, never wedged. Open whether any scenario should instead
+  hard-stop and alert.

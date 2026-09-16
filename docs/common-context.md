@@ -1,9 +1,11 @@
 # any-sync-sdk — Common Context
 
-## Goal
-Create a Go library wrapping `any-sync` with a high-level API that hides offline-first / E2E-encrypted / P2P sync complexity. The SDK exposes queries over `any-store` plus an event flow. It is consumed **in-process by a middleware layer**, not directly by end-user clients.
+any-sync-sdk is a Go library over `any-sync` and `any-store`. It hides
+offline-first, end-to-end-encrypted, peer-to-peer sync behind queries
+over a local store, writes, and live subscriptions. It runs in-process
+inside a middleware layer, not in end-user clients.
 
-## Full Stack
+## Stack
 
 ```
 ┌─────────────────────────────────────┐
@@ -23,11 +25,10 @@ Create a Go library wrapping `any-sync` with a high-level API that hides offline
               │  Go in-process
               ▼
 ┌─────────────────────────────────────┐
-│  any-sync-sdk  (THIS PROJECT)       │
+│  any-sync-sdk                       │
 │  - Queries over any-store           │
 │  - Writes (CRDT ops + versionId)    │
-│  - Event stream                     │
-│  - Offline-first, E2E, P2P hidden   │
+│  - Live subscriptions               │
 └─────────────────────────────────────┘
               │
               ▼
@@ -36,37 +37,50 @@ Create a Go library wrapping `any-sync` with a high-level API that hides offline
 └─────────────────────────────────────┘
 ```
 
-### What this means for the SDK
-- **"Caller" = middleware**, not end-user client. The SDK's external API is a Go interface consumed in-process.
-- **No transport** in the SDK — no gRPC, no REST, no JSON wire format. Middleware handles all of that.
-- **No session management, no payments, no product logic** — middleware owns these concerns.
-- **Client-local auth (app login, passwords, biometrics)** lives in middleware. The SDK's auth module only consumes private keys and doesn't know how the caller obtained them.
-- **Simplified event view** (Simplified events in CRDT spec §14.2) is a convenience, not a requirement — middleware can always transform raw ops before shipping them to clients over the wire.
-- **Error handling** — SDK returns Go errors; middleware translates them into protocol-level error responses.
+The SDK's caller is the middleware:
 
-## Key Source Repos
-- **any-sync** (`../any-sync`) — core sync engine: spaces, ACL, object trees (DAG), key-value, crypto, sync protocols.
-- **any-store** (`../any-store`) — embedded document DB on SQLite with MongoDB-like query language, CBO query planner, streaming iterators, ACID transactions.
+- The public API is Go interfaces and Go types. The SDK has no gRPC,
+  REST or JSON wire format; middleware serializes for its own protocol.
+- Sessions, payments, product logic and client-local auth (app login,
+  passwords, biometrics) belong to middleware. The auth module only
+  consumes private keys ([auth-module.md](auth-module.md)).
+- Subscription events carry each record's full post-apply document and
+  its changes projected to `$set` / `$unset`
+  ([crdt-spec.md](crdt-spec.md) §13), so middleware can forward
+  them to clients that have no CRDT engine.
+- Errors are Go errors; middleware maps them to its protocol's error
+  responses.
 
-## Architectural Primitives
+## Upstream libraries
 
-| Concept | Where it lives | One-liner |
-|---------|---------------|-----------|
-| Account keys | `any-sync/util/crypto`, `accountservice` | Ed25519 + AES-256-GCM derived via BIP-39 / SLIP-10 / SLIP-21 |
-| Space | `any-sync/commonspace` | Permission-controlled encrypted container for objects |
-| ACL | `any-sync/commonspace/object/acl` | Immutable record chain governing membership & permissions |
-| Object tree | `any-sync/commonspace/object/tree/objecttree` | Content-addressable DAG of signed, encrypted changes |
-| Key-value | `any-sync/commonspace/object/keyvalue` | Per-space KV with diff-based sync and LWW conflict resolution |
-| any-store | `any-store/` | Document collections, filters, modifiers ($set, $inc, …), indexes |
-| anyenc | `any-store/anyenc` | Fast binary encoding for JSON-like values (arena/pool based) |
+- **any-sync** (`github.com/anyproto/any-sync`) — sync engine: spaces,
+  ACL, object trees (DAG), key-value store, crypto, sync protocols.
+- **any-store** (`github.com/anyproto/any-store`) — embedded document
+  database with a MongoDB-style query language, indexes, streaming
+  iterators and transactions.
 
-## SDK Sections (to groom separately)
-1. **Auth module** — key derivation, account identity
-2. **Tech space** — account-level index of spaces, preferences
-3. **Space** — creation, joining, ACL management
-4. **Object** — content-addressable DAG, changes, encryption
-5. **CRDT** — record sets, field-level operations ([full spec](crdt-spec.md))
-6. **Data structure** — queries, subscriptions, system collections, local/account settings layering
-7. **Files** — file storage (filenode vs any-sync-native, TBD)
-8. **Versioning** — handler/schema versions, re-indexing flow
-9. **Sync status** — per-space/object/peer status tracking (separate subsystem, TBD)
+| Concept | Where it lives | Summary |
+|---------|----------------|---------|
+| Account keys | `any-sync/util/crypto`, `accountservice` | Ed25519 keys derived via BIP-39 / SLIP-10 |
+| Space | `any-sync/commonspace` | permission-controlled encrypted container for objects |
+| ACL | `any-sync/commonspace/object/acl` | immutable record chain governing membership and permissions |
+| Object tree | `any-sync/commonspace/object/tree/objecttree` | content-addressed DAG of signed, encrypted changes |
+| Key-value | `any-sync/commonspace/object/keyvalue` | per-space KV with diff-based sync and LWW merge |
+| any-store | `any-store` | document collections, filters, modifiers, indexes |
+| anyenc | `any-store/anyenc` | binary encoding for JSON-like values, arena-based |
+
+## Doc map
+
+1. [Auth module](auth-module.md) — account and device keys
+2. [Tech space](tech-space.md) — per-account index of spaces and settings
+3. [Space](space.md) — lifecycle, joining, ACL
+4. [Object](object.md) — object trees and changes
+5. [CRDT](crdt.md) — record stores and field-level operations; [full spec](crdt-spec.md)
+6. [Data structure](data-structure.md) — records, datasets, queries, property scopes
+7. [Files](files.md) — file storage
+8. [Versioning](versioning.md) — handler and schema versions, re-indexing
+9. [Sync status](sync-status-proposal.md) — per-space, per-object and per-peer sync state
+
+Feature designs (one-to-one spaces, identities, invites, datasets, p2p,
+read tracking, version history, bundles and others) have their own
+documents in this directory.

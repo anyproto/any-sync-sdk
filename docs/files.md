@@ -1,133 +1,200 @@
 # Files
 
-## Current State (Anytype today) — what's wrong with it
+Files are encrypted on the client, bound to an object, and registered in
+the space's CRDT. Content is cached locally and backed up to the
+network's fileV2 nodes. There are no standalone file objects.
 
-**Architecture**:
-- **File objects** (normal any-sync objects) store the encryption key + metadata + filenode sync status
-- **Payload flow**: the client encrypts the file, splits the encrypted bytes into chunks, builds an IPLD/IPFS merkle tree over those encrypted chunks, and pushes the resulting **binary (encrypted) blocks** to filenode. Filenode never sees plaintext.
-- Filenodes **are ACL-aware**: they know `spaceId` and `identity`, validate writers against the space ACL, enforce per-space and per-account quotas, and gate BlockPush by permission
-- Reading flow: client fetches blocks by CID, reassembles the encrypted payload, decrypts with the key stored on the file object
+Surface: `Space.Files()` (`space/files.go`) for members,
+`Space.Payloads()` (`space/payloads.go`) for keyless readers, and the
+cache controls on `SDK` (`FileCacheSize`, `FreeUpFileCache`,
+`SweepFileCache`).
 
-**Deduplication model**:
-- Filenode deduplicates blocks by CID and maintains **ref counters at three scopes**: global, per-account, and per-space. A single stored block can be referenced by multiple spaces/accounts; the block is only actually removed when all scope counters drop to zero
-- This is efficient on storage but makes the ownership/lifetime model complex
+## The `payloads` dataset
 
-**P2P**:
-- P2P does apply to files, but differently from object trees. Object trees sync via the regular P2P protocol; file blocks have their own P2P exchange path between peers, separate from the tree sync. It works, but is a second mechanism layered on top of the first
+Each file is one row in the `payloads` dataset on a **payloads object**:
+a derived child of the object the file is bound to, created on the
+first `Attach`.
 
-**Problems**:
-- **Two parallel sync mechanisms** — object tree sync + file block sync. Both have P2P paths, but the flows, error handling, and status reporting are separate. Filenodes maintain their own index, are slower than the regular node sync path, and the two systems don't share observability
-- **Inconsistent deletion** — deleting a file offline has to later propagate to filenode, decrementing the appropriate ref counter. The local object is deleted but the block lives on until the counter reaches zero. The window between local delete and counter update is the root of most file bugs
-- **Refcount complexity at three scopes** — global + account + space counters are correct in principle but hard to keep consistent in practice, especially under concurrent writes and partial connectivity. Bugs here cause either leaks (blocks that should be GC'd) or premature deletion
-- **Separate consistency story** — file sync status, upload state, quota, and ref counters are all in a different mental model than the CRDT data. Callers end up managing two sync stories and two error surfaces
+- Signed owner: seed `builtin:payloads` with `ParentId = ownerId`.
+  any-sync cascade-deletes it with the owner.
+- Derived owner: unparented seed `builtin:payloads/<ownerId>`. any-sync
+  rejects a derived object as a parent, so the owner id goes into the
+  seed to keep the child id unique per owner.
 
-## Proposed Direction — files as a first-class type in any-sync
+A payloads object's tree changes are **plaintext** at the any-sync
+level, so nodes can read rows for refcount, GC, quota and durability
+without a space key. The privacy boundary is the sealed `enc` field.
 
-**Idea**: store file payloads on **any-sync-node as a new data type, alongside object trees and key-value**, scoped to a space. Files then sync with the **same rules, same CRDT, same ACL, same encryption as other space data**.
+| Field | Scope | Meaning |
+|---|---|---|
+| row id | — | `fileId`, derived from the creating change |
+| `rootCid` | synced | UnixFS root of the encrypted file; absent for inline files |
+| `size` | synced | plaintext size in bytes |
+| `networkSign` | synced | verified custody receipt `{fileNetworkId}/{base64(sig)}`; absent until durable, never on inline rows |
+| `objectId` | synced | the object the file is bound to |
+| `author` | derived | account that attached the file |
+| `enc` | synced | `{kid, ct}`: member-only secrets |
+
+`ct` is AES-256-GCM under a key derived from the space read key; `kid`
+is the ACL key-record id of that read key, so rows sealed before a key
+rotation still open. The sealed payload is
+`{key, name, sha256, mime, inline, variant, variantOf}`. Unknown keys
+are ignored on read, so metadata can grow without breaking older
+readers. The schema is non-dynamic: undeclared cleartext fields are
+rejected on both routes.
+
+## Storage tiers
+
+`Attach` picks the tier from the content; callers never choose.
+
+- **Inline** — size < 4096 bytes. The bytes ride inside `enc`. No
+  `rootCid`, no upload, durable by construction.
+- **Bound** — the per-space dedup index (plaintext SHA-256) finds an
+  existing file with the same content. The new row reuses the donor's
+  `rootCid`, wrapped key and receipt; no bytes move. A row bound to a
+  not-yet-durable donor gets its own backup job.
+- **Full** — a random per-file key, AES-256-CFB with a zero IV
+  (byte-compatible with anytype-heart), a UnixFS DAG over the
+  ciphertext, and one CARv2 per file keyed by its root CID. The zero IV
+  is safe because keys are never reused. Integrity comes from the CIDs,
+  so only CID-verified bytes reach the decryptor.
+
+Dedup is per space. Per-file random keys mean a `rootCid` never repeats
+across spaces.
+
+## Attach and backup
+
+1. Spool the reader, compute SHA-256, choose the tier.
+2. Full tier: encrypt, build the DAG, finalize the local CAR.
+3. Register the row: one CRDT change. The file now exists for every
+   member, whether or not backup succeeds.
+4. Enqueue a `durable` job, then run the durable phase within `ctx`:
+   broker `Upload` → presigned HTTP PUT of the CAR → `RequestSign` →
+   verify the receipt → write `networkSign`.
+
+The receipt is signed by the file fleet key (`fileNetworkId` from the
+network config) over `{networkId, spaceId, rootCid, size, signedAt}`;
+every field is checked before `networkSign` is recorded. A network
+config without `fileNetworkId` leaves files registered but never
+durable.
+
+Transport failures (offline, node down, object store unreachable) return
+immediately and leave the job queued. Broker outcomes from lazy space
+activation, `NotResponsible` routing and the post-PUT visibility window
+retry inline within the durable-wait budget. Limit and auth refusals are
+terminal for the attempt.
+
+Crash safety: an intent marker pins the root before the row write, and
+the job is persisted before the first attempt, so a crash never leaves
+an unsigned row that GC treats as garbage or the queue forgets.
+
+## Background work
+
+One persistent queue (`internal/files/status`) with two job kinds:
+
+- `durable` — drive an unsigned row to a verified receipt.
+- `pin` — fetch a file's full content (`Files().Pin`).
+
+Jobs survive restarts. Failures back off from 30 s, doubling to 10 min;
+a storage-limit refusal parks the job on a 10-minute cadence.
+`Files().Retry` makes pending work due immediately (e.g. after a quota
+raise).
+
+## Open
+
+`Open(ctx, fileId, variant)` returns a seekable reader over verified
+plaintext. Content resolves through a source ladder:
+
+1. Local store.
+2. A peer holding the CAR, when p2p is enabled (`internal/files/filep2p`).
+   Peers serve ciphertext and every block is CID-verified, so a peer
+   can neither read nor corrupt content.
+3. Public HTTP GET with Range on `{publicReadBaseUrl}/blob/{spaceId}/{rootCid}`,
+   for durable files only. The base URL is resolved once from the
+   network's fileV2 nodes and cached; `config.Files.PublicReadBaseUrl`
+   overrides it for deployments that front the object store themselves.
+
+Every fetched block is verified and persisted into a sparse local CAR,
+so streaming, seeking and interrupted reads accrete toward a complete
+copy. A file that is neither local, durable, nor held by a reachable
+peer fails with `ErrFileNotAvailable`.
+
+## Status
+
+`Status` derives state on read from the row and the queue:
+
+| State | Meaning |
+|---|---|
+| `durable` | receipt recorded, or inline |
+| `inflight` | registered; backup queued, running, or driven by another device |
+| `limited` | the network refused backup for storage limit |
+
+`FileStatus` also reports `Cached` (complete local copy), `Attempts` and
+`LastErr`. `SubscribeStatus` delivers local transitions only (attach,
+backup progress and failure, pin completion, retries); a backup finished
+by another device shows up through `Status` / `Get`. `Stats` returns
+per-space counts.
+
+## Variants
+
+A variant (e.g. a thumbnail the embedder rendered) is an ordinary sibling
+row on the same object, tagged with `variant` / `variantOf` inside `enc`.
+It has its own tier, durability and lifecycle; the network sees
+independent files. `Attach` requires both fields together and an original
+bound to the same object (`ErrFileVariantInvalid`).
+`Open(originalId, variant)` resolves the sibling.
+
+## Delete
+
+`Delete` removes the row in one synced change, cancels pending work and
+releases the local content ref. Deleting an original also deletes its
+variants; a keyless reader cannot see `variantOf` and deletes only the
+addressed row. Content shared with a surviving row stays. fileprotov2
+has no delete RPC: the broker's row-driven accounting stops counting a
+file once the deletion syncs. A second `Delete` returns `ErrNotFound`.
+
+## Local cache
+
+Layout under the store root:
 
 ```
-Current:
-  Space {
-    ObjectTrees (sync via any-sync)
-    KeyValue    (sync via any-sync)
-  }
-  ─ refers to ─→ Filenode {
-    Blocks (sync via separate system, refcount hell)
-  }
-
-Proposed:
-  Space {
-    ObjectTrees (sync via any-sync)
-    KeyValue    (sync via any-sync)
-    Files       (sync via any-sync, NEW TYPE)
-  }
+<root>/tmp/<rand>.car                    in-progress builds, swept on open
+<root>/<spaceId>/<shard>/<rootCid>.car   one CARv2 per file
 ```
 
-### Benefits
-- **One sync system** — files sync alongside everything else
-- **Clean deletion** — delete a space, files are gone; delete a file object, its blocks are gone. No refcount headaches because blocks are bound to the file object, not globally deduplicated across spaces
-- **Natural ACL inheritance** — if you can read the space, you can read its files; if you're removed from the space, you lose access (including re-encryption on key rotation, handled by any-sync)
-- **End-to-end encryption by default** — uses the space read key, same as object changes
-- **P2P / offline-first works for files too** — same rules as other space data
-- **Deduplication within a space** — still possible via content-addressing (chunks share CIDs within one space)
-- **No deduplication across spaces** — accepted tradeoff. Uploading the same file to two different spaces stores it twice. This is the cost of making files space-local.
+The CAR is byte-identical to the uploaded object. Hot metadata
+(download bitmap, refs, dedup index, LRU access time) lives in any-store;
+blob bytes never enter the DB. Space deletion is one recursive remove.
 
-### What any-sync needs
-This is a **significant change on the any-sync side**. The node storage layer has to grow a third data type for file blocks, with its own sync protocol (or an extension of the existing one). Current `commonfile/fileservice` is IPLD-based and can be reused for chunking/CID, but block storage and sync flow need to move from filenode to any-sync-node.
+Reclamation is embedder-driven. The rule everywhere: bytes are dropped
+only when refetchable (a referencing row carries a receipt) or
+unreferenced; the only copy of a not-yet-durable file is never dropped.
 
-**Status**: design idea, not implemented yet. Coordinate with the any-sync team before committing SDK timelines.
+- `Files().Offload(fileId)` — drop one file's local bytes.
+  `ErrFileNotBackedUp` unless durable; inline files are a no-op. Content
+  shared through dedup is offloaded for every row that uses it.
+- `SDK.FreeUpFileCache(bytes)` — LRU sweep toward a byte target; returns
+  what was actually freed.
+- `SDK.SweepFileCache` — safety pass: prune refs of deleted rows, delete
+  CARs unreferenced for 24 h, offload partials of durable files untouched
+  for 7 days. Runs periodically only when `config.Files.GCInterval > 0`.
+- `SDK.FileCacheSize` — local bytes across all spaces.
 
-## Implications for the SDK
+## Listing and queries
 
-### If files-as-first-class ships in any-sync before SDK v1
-The SDK wraps the new file type and presents a clean API:
-- Files are just another thing you read/write inside a space
-- The SDK reuses space keys for encryption (or any-sync handles it end-to-end and the SDK never sees plaintext on the wire)
-- Records reference files by CID; the CID is meaningful only inside the space
-- GC is trivial — file blocks live with the space and die with it
+- `List(opts)` — typed `FileInfo`s; `ObjectId` is the indexed fast path,
+  `Limit` caps the result. An unfiltered listing walks every file in the
+  space; large-space consumers page or use `Query` / `Changes`.
+- `Query(objectId)` — the generic query surface over one object's rows
+  (cleartext fields only). `ErrNotFound` until the object's first file is
+  attached.
+- `Get(fileId)` — one `FileInfo`. Member-only fields (`Name`, `Mime`,
+  `Variant`, `VariantOf`) are empty without the space key.
 
-### If it doesn't ship in time for SDK v1
-Two options:
-- **A. Ship SDK v1 without file support.** File APIs come in SDK v1.1 after any-sync lands the new type. Middleware / clients use the current Anytype filenode path directly for files in the interim.
-- **B. Ship SDK v1 with a thin filenode wrapper** that mirrors the current Anytype approach. Clean up later when any-sync grows the new type. Downside: we inherit all the consistency problems, and the SDK API may have to break or dual-path when the migration happens.
+## Keyless readers
 
-Strong preference: **Option A**. It avoids building (and later discarding) a wrapper around a system we already know is problematic. Files ship when any-sync has the primitive.
-
-## v1 Decision
-**Files are out of SDK v1 scope.** The plan:
-1. Flag files-as-first-class as a required any-sync prerequisite
-2. Sketch the SDK file API shape now so v1 can be designed without painting us into a corner
-3. Ship real file support in SDK v1.1 once any-sync lands the new data type
-
-## Sketched SDK File API (for forward compatibility)
-
-Rough shape so we don't lock v1 into something incompatible:
-
-```go
-// Within a space
-type Files interface {
-    Upload(ctx, reader) (cid string, err error)             // stream in
-    Open(ctx, cid) (ReadSeekCloser, err error)              // stream out
-    Delete(ctx, cid) error                                  // mark for GC
-    Has(ctx, cid) (bool, err error)                         // local presence check
-}
-```
-
-References in records are plain CID strings. Higher-level helpers (progress, metadata, typed `{cid, size, mime}` wrappers) can layer on later.
-
-## Grooming Questions (open)
-
-### Any-sync prerequisites
-1. Timeline — when does the new file type in any-sync land? Who owns it?
-2. Does the any-sync team agree with the model (files-as-third-type, space-scoped, no cross-space dedup)?
-3. Migration — do existing Anytype file objects need to move to the new system, or do we leave them in filenode and only new files use the new system?
-
-### SDK API shape (v1.1)
-4. Encryption — inherited from space read key automatically, or explicit per-upload key option?
-5. Upload return — just CID, or metadata struct (`{cid, size, mime, uploadedAt}`)?
-6. Records — CID string only, or structured reference?
-7. Streaming — `io.Reader` / `io.ReadSeekCloser` style, or chunked callback?
-8. Progress reporting — built-in or caller wraps the reader?
-9. Offline uploads — queued and flushed on reconnect. CID known immediately (content-addressable). SDK surfaces upload state how?
-10. Local cache — same any-store DB or separate file blob store?
-
-### Integration with other sections
-11. Do file operations appear in the external API as `space.Files()`, or `sdk.Files(spaceId)`?
-12. File sync status — part of the general Sync Status subsystem, or a dedicated File status?
-13. Handler for file-referencing datasets — does CRDT section need a convention for file fields, or is a CID just a string?
-
-### v1 placeholder
-14. Should the SDK v1 `Space` interface return a `Files()` method that panics / errors until v1.1, or omit it entirely and add it in v1.1?
-15. Does middleware need a bridge to current Anytype filenode for v1, or does it bypass the SDK entirely for files?
-
-## Source Files (for reference)
-- `any-sync/commonfile/fileservice/` — current IPLD chunking/CID code (can be reused)
-- `any-sync/commonfile/fileblockstore/` — block store interfaces
-- `any-sync/commonfile/fileproto/` — dRPC protocol (will likely need replacement/extension)
-- Anytype filenode repo (external) — what we're moving away from
-
-## Dependencies
-- **any-sync** — requires the new file type in the node storage layer (blocking prerequisite)
-- **Space** — files live inside a space, ACL/encryption inherited
-- **CRDT** — file refs stored as plain string fields in records
-- **Sync status** — file upload/download status surfaces here
+`Space.Payloads()` exposes the cleartext index for an embedder without
+the space key, such as the filenode-v2 broker running headless with
+selective sync: `ListObjects` returns payloads objects classified by their
+signed root change type, `ListRows` returns one object's rows with the
+sealed secrets withheld.

@@ -1,180 +1,143 @@
 # Object
 
-## Vision
-An object is a content-addressable DAG (like git). Members of the DAG are "changes" — each contains links to previous changes, a link to the ACL record, and encrypted CRDT data.
+An object is an any-sync object tree: a content-addressed DAG of signed
+changes, each linking to its parents and to the ACL state it was written
+under, carrying encrypted CRDT data. The SDK hides the DAG. Callers see
+objects, datasets, records and fields; trees, heads and sync modes stay
+internal.
 
-**SDK v1 philosophy**: hide the DAG. The caller sees only CRDT-level operations (datasets, records, fields). All DAG complexity is an internal implementation detail.
+## any-sync object trees
 
-## Current any-sync Implementation
-
-### Change Structure
 ```go
 type Change struct {
-    Id           string        // content-addressable CID
-    PreviousIds  []string      // DAG edges to parent changes
-    AclHeadId    string        // ACL state at change time
-    SnapshotId   string        // reference to snapshot node
-    ReadKeyId    string        // encryption key ID
-    Identity     crypto.PubKey // creator's public key
-    Data         []byte        // encrypted payload
-    Signature    []byte        // cryptographic signature
-    DataType     string        // e.g., "ObjectDelete"
-    IsSnapshot   bool          // marks snapshot nodes
-    Timestamp    int64
-    AddSeq       uint64        // space-global monotonic sequence
+    Id          string        // CID of the serialized RawTreeChange
+    PreviousIds []string      // parent changes (multi-parent DAG)
+    AclHeadId   string        // ACL state at change time
+    SnapshotId  string        // snapshot this change builds on
+    ReadKeyId   string        // read key used to encrypt Data
+    Identity    crypto.PubKey // signer
+    Data        []byte        // encrypted payload (the SDK's CRDT change)
+    Signature   []byte
+    DataType    string        // the SDK stores the dataset name here
+    IsSnapshot  bool
+    Timestamp   int64
+    AddSeq      uint64        // per-space monotonic counter for incremental sync
 }
 ```
 
-### DAG Structure (Tree)
+- The root change is a snapshot and carries the tree's header.
+- Changes arrive out of order; any-sync holds unattached changes until their
+  parents land, so a receiver never applies a change before its ancestors.
+- `AddSeq` lets a peer fetch only changes it hasn't seen
+  (`Storage.GetAfterAddSeq`). `AddResult.Mode` (`Append` / `Rebuild` /
+  `Nothing`) reports how a tree absorbed new changes.
+- Changes are signed by the author's key and encrypted with the space read
+  key named by `ReadKeyId` (plaintext-class objects skip encryption). Key
+  rotation and re-encryption after a member is removed are handled entirely
+  by any-sync.
+
+Sources: `commonspace/object/tree/objecttree` (change, tree, storage, change
+builder), `commonspace/object/tree/treechangeproto`,
+`commonspace/object/tree/synctree`.
+
+## Model
+
+- **The DAG is hidden.** Callers never get an `ObjectTree` handle; they
+  address objects by id at the space level.
+- **Objects are created explicitly** with `Objects().Create` or
+  `Objects().Derive`. A write to an unknown object fails with
+  `ErrObjectNotFound`; it never creates one.
+- **One object, many datasets.** Every object has exactly one type
+  (`any.type`, required: `ErrTypeRequired`), which contributes the handlers
+  (schema and rules) for the datasets it declares, and any number of
+  collections (`any.collections`), which contribute properties only. See
+  docs/data-structure.md § Type and collections.
+- **The per-space `objects` dataset** holds each object's row: membership
+  and property values. It is the object index (docs/data-structure.md).
+- **CRDT changes exist only inside an object.** One DAG change is one
+  write batch on one dataset (docs/crdt.md).
+
+## Object API
+
 ```go
-type Tree struct {
-    root           *Change
-    headIds        []string              // current branch heads
-    attached       map[string]*Change    // resolved changes
-    unAttached     map[string]*Change    // pending (missing deps)
-    waitList       map[string][]string   // dependency waitlist
-}
-```
+space.Objects().Create(ctx, CreateObjectOpts{Type, Collections, InitialProperties}) // → objectId
+space.Objects().Derive(ctx, DeriveObjectOpts{Seed, Type, Collections, ParentId})    // → objectId, idempotent
+space.Objects().Get(ctx, objectId)    // the objects row; ErrNotFound / ErrObjectDeleted
+space.Objects().Delete(ctx, objectId)
 
-- Root is a snapshot (`IsSnapshot=true`)
-- `PreviousIds` is a slice → supports merge (multi-parent DAG)
-- `headIds` tracks current tips
-- Changes arrive out of order — `unAttached` + `waitList` handle dependency resolution
-
-### ObjectTree Interface
-```go
-type ObjectTree interface {
-    Id() string
-    Root() *Change
-    Heads() []string
-    Len() int
-
-    // Add new content
-    AddContent(ctx, SignableChangeContent) (AddResult, error)
-    AddRawChanges(ctx, RawChangesPayload) (AddResult, error)
-
-    // Iterate
-    IterateRoot(convert, iterate) error
-    IterateFrom(id, convert, iterate) error
-
-    // Sync
-    SnapshotPath() ([]string, error)
-    ChangesAfterCommonSnapshotLoader(snapshotPath, heads) (LoadIterator, error)
-}
-```
-
-### Content-Addressable IDs
-Each change ID = CID computed from serialized `RawTreeChange` bytes (`cidutil.NewCidFromBytes()`).
-
-### Signing & Encryption
-```go
-type SignableChangeContent struct {
-    Data              []byte
-    Key               crypto.PrivKey   // signing key
-    IsSnapshot        bool
-    ShouldBeEncrypted bool
-    Timestamp         int64
-    DataType          string
-}
-```
-
-Changes are signed by the creator's key and optionally encrypted with the space read key (identified by `ReadKeyId`).
-
-### Protocol (protobuf)
-- `RootChange` — initial snapshot: changeType, payload, aclHeadId, spaceId, identity, seed
-- `TreeChange` — regular: treeHeadIds (prev), snapshotBaseId, changesData, readKeyId, isSnapshot
-- `RawTreeChange` — serialized payload + signature
-- `RawTreeChangeWithId` — adds CID
-
-### Sync
-- `AddSeq` — per-space monotonic counter for incremental sync
-- `Storage.GetAfterAddSeq(ctx, lastSeq, iter)` — fetch only new changes
-- `AddResult.Mode`: `Append` (fast-forward), `Rebuild` (full rescan), `Nothing`
-
-### Source files
-- `any-sync/commonspace/object/tree/objecttree/change.go` — Change struct
-- `any-sync/commonspace/object/tree/objecttree/objecttree.go` — ObjectTree interface
-- `any-sync/commonspace/object/tree/objecttree/tree.go` — Tree (DAG) struct
-- `any-sync/commonspace/object/tree/objecttree/storage.go` — Storage interface
-- `any-sync/commonspace/object/tree/objecttree/changebuilder.go` — building & signing changes
-- `any-sync/commonspace/object/tree/treechangeproto/` — protobuf definitions
-- `any-sync/commonspace/object/tree/synctree/` — sync wrapper
-
-## Key Decisions
-
-### Abstraction Level
-- **CRDT-level only** — in v1 the DAG is fully hidden. No `ObjectTree` access for callers; hiding this complexity is a primary SDK goal
-- **Explicit creation** — callers create objects explicitly, not implicitly via first write
-- **Object ↔ datasets (many)** — one object can hold many datasets. An object has one type (`any.type`), which contributes handlers (schema + rules) for the datasets it declares, and any number of collections (`any.collections`), which contribute properties only
-- **System-level index dataset** — one dataset is implemented at the system level to serve as an object index (discussed in Data Structure section)
-- **Permissionless in v1** — no schema/type validation yet. v1 is a permissionless DB for experimenting with schemas and validations. Types/schemas/validation come later
-
-### Object API (v1)
-```
-space.Objects().Create(opts)
-space.Objects().Derive(opts)
-space.Objects().Delete(objectId)
-space.Objects().Get(objectId)   // the objects row; ErrNotFound / ErrObjectDeleted
-
-// Reads + live updates: chained query builder on the Space.
+// Records: reads and live updates through the query builder.
 space.Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe
 space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe
+
+// Writes.
+space.Modify(ctx, ModifyBatch)  // → ModifyResult{VersionId, ChangeId, RecordIds, Rejections}
+space.Delete(ctx, DeleteBatch)
+space.Upsert(ctx, UpsertBatch)
 ```
 
-### Lifecycle
-- **No open/close in caller API** — SDK internally uses `ocache` to hand any-sync live object instances. Callers never open objects; they read/subscribe via any-store
-- **TTL auto-close** — handled internally (any-sync requirement), not caller-visible
-- **Deletion**:
-  - Remote delete → SDK listens to the settings tree, deletes local data accordingly
-  - Local delete → SDK adds entry to settings tree (any-sync side) + deletes local data
-  - The objects row is hard-removed, so an absent row alone does not say whether the id ever existed. `Objects().Get` consults the tree's deleted status and returns `ErrObjectDeleted` for a deleted object, `ErrNotFound` otherwise
-  - Every other per-object operation opens the object's tree, and a deleted or unknown id has none: both return `ErrObjectNotFound`. Match that sentinel rather than any-sync's `treestorage.ErrUnknownTreeId` / `spacestorage.ErrTreeStorageAlreadyDeleted`, which stay in the chain but are storage internals. `Subscribe` is the exception — an unknown object yields an empty initial snapshot, so a subscription registered before the object lands still receives its events
-- **No restore / time window** — a separate "bin" mechanism will be built later, based on system object properties. Not part of the Object layer
+`Derive` with a `ParentId` binds the child to its parent: the parent id is
+hashed into the child's id, and deleting the parent deletes the child.
 
-### Snapshots
-- **SDK-internal only** — CRDT doesn't need snapshots from the data perspective (any-store already holds materialized state). any-sync needs snapshots to optimize internal sync mechanics
-- **Strategy from anytype-heart** — will reuse the approach used in `../anytype-heart` (chats, store source) for when to snapshot
-- **Decided by SDK internally** — never caller-triggered
-- **Old changes** — any-sync keeps them in its own storage. Version history mechanism comes later
+## Lifecycle
 
-### Sync / Conflicts
-- **AddSeq** — internal mechanism: any-sync + SDK use it to apply only unseen changes to the CRDT layer
-- **versionId / orderId** — client-side ordering key for consistency between any-store and the event stream
-- **Automatic merge** — CRDT auto-merges everything. No multi-head or conflict state ever surfaced to the caller
-- **Change flow (writes)** — caller sees `addChange(change) → versionId`. `AddResult.Mode` (Append/Rebuild/Nothing) is internal
-- **Linear iteration** — reads look like a linear list (how `any-sync tree.Iterate` works); version history (if any) comes later
+Callers never open or close objects. The SDK loads trees on demand into a
+per-space cache and closes them after one idle minute.
 
-### Encryption
-- **Key rotation** — supported (different changes can use different `ReadKeyId`s), fully handled inside any-sync
-- **Re-encryption on ACL change** (member removed) — any-sync handles it, SDK does nothing
+### Deletion
 
-### Performance
-- **Loading model** — reads work like `openTx → tree.Iterate(applyChange(N)) → commit`
-- **Parallelism limits** — any-sync has its own caps on parallel syncs. No explicit SDK-level limits in v1; priority system is future work
-- **unAttached / waitlist** — entirely any-sync's concern
+- **Local delete.** `Objects().Delete` records the deletion in the space's
+  settings tree (any-sync `DeleteTree`, which syncs to every member), then
+  purges local state.
+- **Remote delete.** any-sync's deletion manager calls the SDK per tree:
+  `DeleteTree` for a tree present locally (mark the tree deleted, purge the
+  materialized state, evict the cache) and `MarkTreeDeleted` for one never
+  synced here (purge only). A purge failure is returned so any-sync retries
+  until the purge commits.
+- **No SDK tombstone.** The objects row is removed; any-sync's deleted-tree
+  record is the durable fact. `Objects().Get` consults it and returns
+  `ErrObjectDeleted` for a deleted object, `ErrNotFound` for an unknown id.
+- **Every other per-object operation** opens the object's tree, and a
+  deleted or unknown id has none: both return `ErrObjectNotFound`. Match
+  that sentinel, not any-sync's `treestorage.ErrUnknownTreeId` /
+  `spacestorage.ErrTreeStorageAlreadyDeleted`, which stay in the error
+  chain as storage internals. `Subscribe` differs for an unknown object:
+  it yields an empty initial snapshot, so a subscription registered before
+  the object lands still receives its events.
+- **Consumers learn of deletions** through the change index
+  (`ObjectChange.Deleted`, docs/change-index-proposal.md).
+- **Deletion is final.** The object layer has no restore window.
 
-### Dependencies
-- CRDT changes can only be produced in an object context — no object, no changes
-- v1 is permissionless; types/schemas/validation layer on top later
+## Snapshots
 
-## Grooming Questions (open)
+The SDK writes no snapshot changes; the root is each tree's only snapshot.
+The CRDT doesn't need snapshots, because any-store holds the materialized
+state. Snapshots would only shorten any-sync's sync and load paths, and when
+to write them is an open question (below). Old changes stay in any-sync
+storage, where version history reads them
+(docs/version-history-proposal.md).
 
-### Object API
-1. ~Object creation — minimal payload?~ → resolved: `space.Objects().Create(CreateObjectOpts{Type, Collections, InitialProperties}) → objectId`. Both membership fields are optional.
-2. `Derive` — what are the inputs? Derived from what (keys? parent object? external seed)?
-3. ~Subscribe at object level vs dataset level?~ → resolved: subscription scope is `(objectId, dataset)` via `space.Query(objectId, dataset).Subscribe(...)`. The shared cross-object firehose uses `space.QueryObjects().Subscribe(...)`. No "whole object" subscribe — callers chain per dataset.
-4. ~`query(datasetName, filter, sort)` on the object level?~ → resolved: `space.Query(objectId, dataset)` is the only path; same builder, same terminal verbs (Iter/All/One/Count/Snapshot/Subscribe).
-5. ~How does a caller attach multiple "types" to an object?~ → resolved: it cannot. An object has one type (`any.type`, `Properties().SetType`) and any number of collections (`any.collections`, `AttachCollection` / `DetachCollection`) — docs/data-structure.md § Type and collections.
+## Sync and conflicts
 
-### Deletion & Settings Tree
-6. SDK listens to the settings tree for deletions. Does this land in any-store as a deleted marker the caller can observe? Or does the object simply disappear from queries?
-7. Local delete path — write to settings tree first, then wipe local data, or parallel? Atomicity considerations.
+- **Catch-up by AddSeq.** The SDK tracks the highest AddSeq applied per
+  object and replays only newer changes (docs/crdt.md § AddSeq
+  watermark).
+- **VersionId is the change's any-sync orderId**, assigned when the change is
+  added to the local tree. A local write applies immediately, offline
+  included; there is no tentative state to reconcile.
+- **Everything auto-merges.** The CRDT never surfaces multiple heads or a
+  conflict state to the caller.
+- **Rejected writes.** A space the account can't write to fails up front
+  with `ErrReadOnlySpace`; a schema violation fails the writer-side
+  pre-flight before the change enters the DAG; a handler rejection of
+  individual ops lands in `ModifyResult.Rejections` while the rest of the
+  change commits.
+- **Loading** replays the tree in order and applies each change into
+  any-store inside write transactions.
+- **Parallelism.** any-sync caps concurrent syncs; the SDK adds no limits of
+  its own.
 
-### Snapshots (internal)
-8. Concrete snapshot heuristic from anytype-heart — which rules do we reuse? (N changes? size threshold? time?)
-9. When SDK creates a snapshot, it uses the current any-store state. Confirm this is always safe (no mid-write races).
+## Open questions
 
-### Write Flow
-10. `addChange(change) → versionId` — when is versionId assigned? On local apply, or only after any-sync accepts?
-11. Optimistic apply for offline writes — local versionId first, reconciled on sync?
-12. Error handling — what happens if a change is rejected (invalid signature, ACL denied)?
+1. **Snapshot policy.** When the SDK should write snapshot changes to bound
+   sync and load cost; anytype-heart's chat and store-source heuristics are
+   the reference.

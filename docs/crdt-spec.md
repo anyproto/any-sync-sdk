@@ -1,30 +1,26 @@
 # CRDT Full Spec
 
-Companion to `crdt.md`. Complete specification of the version-gated record store CRDT for SDK v1. Names are examples and may change, but shapes and semantics are binding.
+Specification of the version-gated record store CRDT. [crdt.md](crdt.md) is the overview.
 
-The spec is organized in two parts:
-- **Part I: Protocol** — how changes are stored in any-sync and applied to any-store. This is what you implement inside the SDK.
-- **Part II: External API** — how the protocol is exposed to callers. This is the contract with users.
-
-Part III covers examples, deferred features, and open items.
+- **Part I — Protocol:** how changes are stored in any-sync and applied to any-store.
+- **Part II — External API:** how callers read, write and subscribe.
+- **Part III — Reference:** conflict examples, scope limits, design notes.
 
 ---
 
 # Part I — Protocol
 
-Everything in this part is about how the SDK stores and applies changes. Callers don't interact with these artifacts directly.
-
 ## 1. Overview
 
-A **record** is an anyenc document stored in a **dataset**. A dataset is a named collection inside an **object** (any-sync object tree). An object can hold many datasets.
+A **record** is an anyenc document in a **dataset**, a named collection inside an **object** (an any-sync object tree). An object holds many datasets.
 
-Writes are **changes** — batches of per-record edits. A change is one any-sync DAG change. Each peer's local any-sync maintains a lexicographically sortable `versionId` (= `orderId`) per change for its own view of the tree. VersionIds are **local to one peer's view of one object tree**: two peers may encode the "same" logical DAG change with different versionId strings, and versionIds from different trees are not comparable at all. The CRDT layer always compares versionIds locally, inside one Controller — never across peers.
+A write is a **change**: a batch of record edits stored as one any-sync DAG change. Each peer's any-sync gives every change a lexicographically sortable `versionId` (its local `orderId`). A versionId is meaningful only within one peer's view of one object tree; the CRDT never compares versionIds across peers or trees.
 
-Each record carries a hidden `_ver` map of per-field version IDs. Consistency rule:
+Each record carries a `_ver` map of per-field versionIds. The core rule:
 
 > A field is updated only if the incoming `versionId` is strictly greater than the field's stored version.
 
-Out-of-order delivery is safe. There is no multi-head / conflict state — everything merges deterministically.
+Delivery order doesn't matter, and there is no multi-head or conflict state.
 
 ---
 
@@ -32,14 +28,14 @@ Out-of-order delivery is safe. There is no multi-head / conflict state — every
 
 | Term | Meaning |
 |------|---------|
-| **object** | any-sync object tree; unit of encryption, ACL, and sync |
+| **object** | any-sync object tree; the unit of encryption, ACL and sync |
 | **dataset** | named record collection inside an object |
-| **record** | single anyenc document in a dataset, identified by `id` |
-| **change** | atomic batch of edits, maps 1:1 to an any-sync DAG change |
-| **versionId** | lexicographically sortable local ordering key maintained by any-sync (= local `orderId`). Scoped to **one peer's view of one object tree** — never compared across trees, never assumed to match across peers |
-| **_ver** | per-field order map on each record, tracking last-applied `versionId` per field path |
-| **handler** | code registered for a dataset that validates and applies changes |
-| **operation** | one edit inside a change (`$set`, `$inc`, etc.) |
+| **record** | one anyenc document in a dataset, identified by `id` |
+| **change** | atomic batch of edits; one any-sync DAG change |
+| **versionId** | local ordering key from any-sync (`orderId`), scoped to one peer's view of one object tree |
+| **_ver** | per-record tree of the last-applied `versionId` per field path |
+| **handler** | per-dataset hooks that validate changes and derive fields (§8) |
+| **operation** | one edit inside a change (`$set`, `$inc`, …) |
 
 ---
 
@@ -61,21 +57,21 @@ Out-of-order delivery is safe. There is no multi-head / conflict state — every
 }
 ```
 
-- `id` is required and immutable. The SDK rejects any op (including a multi-field `$set` payload) that tries to write `id` — the whole change is dropped at pre-apply validation
-- `_ver.id` holds the record's **creation version** (§3.5) — stamped once, preserved across delete
-- `_ver` is caller-facing: queries return it attached to each record so clients can reconcile their own in-memory state per field
-- Reserved field names: `id` and any top-level name starting with `_`. `_ver`, `_deletedAt`, `_traces`, and any future protocol field use the underscore prefix. User ops cannot write to reserved names — writes are rejected at pre-apply validation, not silently dropped
-- All other fields are defined by the dataset's handler
+- `id` is required and immutable.
+- `_ver.id` is the record's creation version (§3.5).
+- `_ver` ships with query results so clients can reconcile per-field state.
+- Reserved names are `id` and every top-level name starting with `_`: `_ver`, `_deletedAt`, `_traces`, `_addSeq`, `_applySeq`. Input ops can't write them (§5.0).
+- All other fields belong to the dataset (schema and handler, §8).
 
-`_ver` is a tree. Each entry value is either:
-- A **string** (a versionId) — collapsed: every subkey at and below this point shares this version
-- An **object** with explicit per-key entries plus an optional `*` default key. The `*` default holds the version inherited by any sibling not enumerated in the object — this is how expansion preserves precision when a finer write splits a previously-collapsed subtree. `*` is chosen because it only ever appears inside `_ver` subtrees (never in the user-facing record body), is visually distinct from real field names, and avoids anyenc's special empty-key byte encoding.
+`_ver` is a tree. Each entry is either:
+- a **string** versionId: the path and everything below it share that version; or
+- an **object** of per-key entries plus an optional `*` default, the version of every key not listed. `*` can't be a field name (§5.0) and avoids anyenc's special empty-key encoding.
 
-Lookup descends `_ver` along the path; if it falls off into unenumerated territory, the `*` default at the node where the walk fell off applies, otherwise the version is `""` (the empty string is the "no version" sentinel, smaller than any real versionId). The node-local `*` is always sufficient because splitting a covered entry propagates the inherited version onto every created intermediate (§3.2).
+Lookup walks `_ver` along the path. If the walk leaves the enumerated keys, the `*` at the node where it left applies; with no `*`, the version is `""`, the "no version" sentinel that sorts below every real versionId. The node-local `*` is always enough because splitting a covered entry copies the inherited version onto every intermediate node it creates (§3.2).
 
 ### 3.2 `_ver` Collapsing Rules
 
-Collapsing is **authority-bound**: a collapsed entry (a single string, or a `*` default inside an object) may exist only where a write had explicit whole-subtree authority — a whole-subtree `$set`/`$unset`, or `delete`. A write at a path claims that path and everything below it, nothing else:
+A collapsed entry (a single string, or a `*` inside an object) may exist only where a write had authority over the whole subtree: a whole-subtree `$set`/`$unset`, or `delete`. A write at a path claims that path and everything below it, nothing else:
 
 ```
 $set { "a.b.c": 1 }  at v5        →  _ver: { "a": { "b": { "c": "v5" } } }
@@ -83,40 +79,71 @@ $set { "a.b":   {c: 1, d: 2} } v5 →  _ver: { "a": { "b": "v5" } }
 $set { "a":     {b: {c:1}} }   v5 →  _ver: { "a": "v5" }
 ```
 
-Sibling fields that merely happen to share a version are NEVER factored into a `*` or collapsed into their parent. Inventing a default would claim a version for never-written fields, gate out concurrent lower-version writes to them on whichever peer compacted first, and diverge. Compaction performs only **lossless** rewrites — every lookup (explicit or unenumerated) returns the same version before and after:
+Siblings that happen to share a version are never factored into a `*` or collapsed into their parent. An invented default would claim a version for fields nobody wrote, gate out concurrent lower-version writes to them on whichever peer compacted first, and diverge. Compaction only performs lossless rewrites, where every lookup returns the same version before and after:
 
-1. Inside an object with a `*`, explicit string entries equal to the `*` are dropped (lookup falls back to the same value).
-2. An object whose `*` is present and whose entries all equal it collapses to that single string.
+1. Inside an object with a `*`, explicit string entries equal to the `*` are dropped.
+2. An object whose `*` is present and whose entries all equal it collapses to that string.
 
-**Broad writes over finer entries merge per-leaf (no wholesale gate).** A `$set`/`$unset` at a path whose `_ver` entry is an object (finer writes exist below) is decomposed: each existing leaf with version ≥ the incoming version survives with its value; older parts are replaced (or removed when the incoming value doesn't cover them); the write stamps `*` at the subtree, claiming every unenumerated key. When nothing survives, the write takes whole-subtree authority and the entry collapses to its version. A non-object payload lands only when nothing survives — surviving newer leaves keep the position an object. This is what makes broad-replace vs per-leaf races converge in every delivery order; gating a broad write against an aggregate (e.g. the max leaf version) is delivery-order-dependent and forbidden.
+**Broad writes over finer entries merge per leaf.** A `$set`/`$unset` at a path whose `_ver` entry is an object (finer writes exist below) is decomposed: each existing leaf with version ≥ the incoming version survives with its value; older parts are replaced, or removed where the incoming value doesn't cover them; the write stamps `*` on the subtree, claiming every unenumerated key. When nothing survives, the write has whole-subtree authority and the entry collapses to its version. A non-object payload lands only when nothing survives, since surviving newer leaves keep the position an object. This makes broad-replace vs per-leaf races converge in every delivery order. Gating a broad write against an aggregate such as the max leaf version depends on delivery order and is forbidden.
 
-When a finer write splits a collapsed (or `*`-covered) entry, the inherited version is propagated as a `*` onto every intermediate object the split creates, so the broad write's coverage of unenumerated deeper siblings is preserved exactly.
+When a finer write splits a collapsed or `*`-covered entry, the inherited version is copied as a `*` onto every intermediate object the split creates, so the broad write still covers unenumerated deeper siblings.
 
 ### 3.3 Auto-creation via Upsert
-There is **no `insert` op**. Record creation is controlled by a per-`RecordChange` boolean flag `upsert`:
 
-- `upsert: false` (default, **strict**) — if the target id has no record, every modify op in the batch is a silent no-op. Matches mongo's "update if exists" semantics and is the safe default that prevents accidental record creation from typos or stale ids.
-- `upsert: true` — if the target id is absent, an empty record is allocated first and the ops then run normally. The fresh record is stamped with `_ver.id = versionId` as its creation-version marker (see §3.5).
+There is no `insert` op. `RecordChange.upsert` controls creation:
 
-To create a record, send a `RecordChange` with `upsert: true` and typically a multi-field `$set` op (§5.1) carrying the initial fields. Two concurrent creates targeting the same id merge per-field via gating — there is no dual-insert convergence problem because there is no "skip if exists" rule.
+- `false` (default, strict): when no record has the id, the record's modify ops don't apply, and the apply result carries an `ErrStrictSkipAbsent` rejection for it. Typos and stale ids can't create records.
+- `true`: an absent record is created empty, stamped `_ver.id = versionId` (§3.5), and the ops run.
 
-`delete` ignores the flag: a delete on an absent record always writes a tombstone so concurrent deletes win against unseen creates.
+A create is usually `upsert: true` with a multi-field `$set` (§5.1). Concurrent creates of one id merge per field through gating.
+
+`delete` ignores the flag: deleting an absent record writes a tombstone, so a delete beats a create it hasn't seen.
+
+#### Empty record id
+
+A `RecordChange` with an empty `id` gets one derived from the change's `changeId`:
+
+```
+DeriveRecordId(changeId) = base58(xxh3-64(changeId))   // up to 11 chars
+```
+
+`changeId` is any-sync's content-addressed DAG change id: globally unique and uniformly distributed. xxh3-64 keeps it uniform (P(collision) < 1e-6 up to ~6M derived ids in one storage namespace). The full changeId is 50–60 chars, too bulky for records keyed by many ids such as property rows. Implementation: `crdt.DeriveRecordId` in `internal/crdt/idderive.go`.
+
+Resolution, per change, before validation:
+
+1. An empty `id` requires `upsert: true`, otherwise `ErrEmptyIdRequiresUpsert`. A strict modify on a freshly derived id could never match a record.
+2. The first empty-id record gets `DeriveRecordId(changeId)`.
+3. Later empty-id records get `DeriveRecordId(changeId) + ":" + index`, where `index` counts empty-id records only (1, 2, …). `:` keeps ids safe in URL path segments.
+4. An empty `id` with an empty `changeId` fails with `ErrMissingRecordId`.
+5. Handlers see the resolved id.
+
+On a shared dataset (the per-space `objects` row) every record resolves to the change's `objectId`.
+
+### 3.4 Soft Delete
+
+Delete keeps the record as a tombstone:
+```json
+{ "id": "block_42", "_deletedAt": "2024-05-06T12:53:20Z", "_ver": { "id": "!A0", "*": "!C9" } }
+```
+`_deletedAt` is a datetime taken from the change timestamp. Content fields are wiped. `_ver` shrinks to `id` (the preserved creation version, §3.5) and `*` (the delete version). `_traces` carry over as in §3.6. Sorting by `_ver.id` still places the tombstone at its creation point.
+
+**Tombstones are sticky.** Every later modify on a tombstone is dropped regardless of version; the CRDT has no resurrection. An undelete feature belongs above the CRDT.
+
+The local writer sees the drop: a non-delete modify (upsert included) on a tombstone adds a whole-record rejection (`OpIndex -1`, `ErrRecordDeleted`, re-exported as `space.ErrRecordDeleted`) to the apply result. The creation-marker min rule still applies. Deleting a tombstone is not a rejection; repeated deletes are idempotent.
 
 ### 3.5 `_ver.id` creation-version marker
 
-Every record carries `_ver.id = versionId-of-earliest-upsert`. It records "when was this record first materialized" and callers rely on it as an indexable query key — for example, chat datasets sort messages by `_ver.id DESC` to show newest-first conversation order without a separate creation-timestamp field.
+`_ver.id` holds the version of the record's earliest upsert. Callers use it as an indexed creation-order key; chat datasets, for example, sort messages by `_ver.id` descending.
 
-**Min-update rule (mandatory for cross-peer convergence).** Every **upsert** sets `_ver.id = min(current, incomingVersion)`. The marker only moves *downward*, never upward. Strict (non-upsert) modifies and idempotent deletes on existing tombstones leave it alone. `delete` on a live record preserves the existing `_ver.id` (it's already ≤ the delete version in practice, because the upsert that created the record preceded the delete that wipes it). `delete` on an absent record seeds `_ver.id = deleteVersion` — a subsequent older upsert still lowers it via the min rule.
+**Min rule.** Every upsert sets `_ver.id = min(current, incoming)`; the marker only moves down. Strict modifies leave it alone. Deleting a live record keeps its `_ver.id`; deleting an absent record seeds it with the delete version, which an older upsert can still lower. `min` is commutative and associative, so peers that receive concurrent upserts in different orders converge on the causally earliest one.
 
-**Why min.** Two peers may receive concurrent upserts to the same id in different delivery orders. Without a deterministic update rule, each peer stamps `_ver.id` with whichever upsert ran first and they diverge. `min` is commutative and associative, so every peer converges to the same value: the smallest versionId across all upserts and initial-delete seeds on that id. The chosen marker is the causally-earliest upsert, which matches the intuitive "creation" for a chat-style sort.
+**Not a default.** Looking up an unenumerated field never falls back to `_ver.id`; it returns `""` unless a `*` applies. Per-field gating stays intact.
 
-**Not a fallback/default.** `_ver.id` is a marker, not a whole-record version. Looking up an unenumerated field does NOT fall back to `_ver.id` — it returns `""` unless a nested `*` default applies. This preserves per-field gating and avoids the convergence break discussed for whole-record assertions.
-
-**Preserved across delete.** When a live record is tombstoned, the existing `_ver.id` stays on the tombstone. Sort by `_ver.id` therefore places a deleted record where it was created, not where it died. When a later concurrent upsert hits the tombstone, it's still gated out at the field level (sticky tombstone), but the min rule lowers `_ver.id` if needed so peers that saw the upsert first agree with peers that saw the delete first.
+**Across delete.** A tombstone keeps `_ver.id`, so a deleted record sorts where it was created. An upsert that hits the tombstone is still dropped, but lowers the marker when older, so peers that saw the delete first agree with peers that saw the upsert first.
 
 ### 3.6 `_traces` — trace-id correlation map
 
-Every `Change` carries an optional `TraceIds []string` — opaque correlation tokens picked by the caller (e.g. a UI session id, an AI agent's operation id, a BSON ObjectId, a UUID). They travel with the change through any-sync (stored in a dedicated, non-encrypted field on the wire so any-sync can index them space-wide) and are stamped onto the record via a reserved `_traces` map:
+`Change.TraceIds` are opaque correlation tokens chosen by the caller: a UI session id, an agent's operation id, a UUID. They travel inside the change payload (§6.4), the local version-history index makes a space's changes listable by trace, and the apply path stamps them on the record:
 
 ```json
 {
@@ -130,100 +157,63 @@ Every `Change` carries an optional `TraceIds []string` — opaque correlation to
 }
 ```
 
-**Keyed by versionId** purely for compaction: one change that touches N fields produces one `_traces[versionId]` entry, not N. To answer "which traces touched field X?" the caller reads `_ver[X]` to get a versionId and then looks up `_traces[versionId]`. To answer "which traces touched this record?" they union the map's values.
+The map is keyed by versionId, so a change touching N fields adds one entry. Traces of field X: `_traces[_ver[X]]`. Traces of the record: the union of all values.
 
-**Stamping rules** (run inside the same apply modifier, after the ops):
+Stamping runs in the same apply step, after the ops:
 
-1. If `ch.VersionId` ends up referenced anywhere in the record's `_ver` (any leaf or `*` default) **and** `len(ch.TraceIds) > 0`: write `_traces[ch.VersionId] = ch.TraceIds`. Same versionId ⇒ same change ⇒ same traces, so overwrite is idempotent.
-2. If `ch.VersionId` is referenced in `_ver` and `len(ch.TraceIds) == 0`: delete `_traces[ch.VersionId]` (explicit clear semantic — empty means "no trace for this version").
-3. **GC**: walk `_ver`, collect every string version value, and drop any `_traces[v]` whose versionId is no longer present. If `_traces` becomes empty, remove the field entirely.
+1. If the change's versionId appears anywhere in `_ver` (a leaf or a `*`) and `TraceIds` is non-empty: `_traces[versionId] = TraceIds`. The same versionId always carries the same traces, so rewriting is idempotent.
+2. If it appears in `_ver` and `TraceIds` is empty: delete `_traces[versionId]`.
+3. GC: drop every `_traces[v]` whose `v` no longer appears in `_ver`; remove `_traces` when it becomes empty.
 
-The GC rule keeps the map bounded by the number of **distinct versionIds currently live on the record** — not the historical total. When a later `$set` overwrites a field (bumping `_ver[field]` to a newer version), the superseded version's trace falls out unless it's still anchored somewhere else (typically the `_ver.id` creation marker).
+The map stays bounded by the distinct versionIds live in `_ver`. When a later `$set` supersedes a field's version, that version's traces fall out unless another entry, typically `_ver.id`, still references it.
 
-**Commutative ops don't trace.** `$addToSet`/`$pull`/`$inc` don't update `_ver[field]`, so their versionId never lands in `_ver` and their traces aren't retained. This is a known limitation tied to those ops being non-LWW — per-element trace tracking is future work if needed.
+`$addToSet`, `$pull` and `$inc` don't update `_ver`, so their traces are not kept on the record.
 
-**Tombstones preserve traces.** Delete copies the existing `_traces` onto the tombstone, then GC prunes to whatever survives in the shrunken `_ver = { id: creationVer, *: deleteVer }` — typically the creation-marker entry plus the delete's own trace entry. History queries across deleted records therefore still find them.
+Delete copies `_traces` onto the tombstone; GC then keeps the entries for the creation marker and the delete itself, so history queries still find deleted records.
 
-**Convergence.** Traces are a deterministic function of `_ver` (which versionId landed) plus the change's content (TraceIds), so two peers applying the same set of changes converge to the same `_traces` regardless of order, modulo the peer-local versionId caveat from §4.
-
-**Name reservation.** `_traces` uses the underscore-prefix rule from §3.1 — user ops cannot write to it. No validation relaxation needed.
-
-#### Empty id → `base58(xxh3-64(changeId))` sugar
-
-When a `RecordChange` carries an empty `id`, the CRDT layer auto-assigns it from the enclosing `Change.changeId` via:
-
-```
-DeriveRecordId(changeId) = base58(xxh3-64(changeId))   // up to 11 chars
-```
-
-`changeId` is any-sync's content-addressable, immutable DAG change id — globally unique by construction and uniformly distributed. Hashing it with xxh3-64 preserves the uniformity (collision space 2⁶⁴; P(collision) < 1e-6 up to ~6M derived ids per storage namespace), and base58 encodes the 8-byte digest in a compact ~11-char form. Using the full changeId verbatim was rejected because it's ~50–60 chars, making storage-heavy records (e.g. per-object property records carrying many property-id keys) unnecessarily bulky. Implementation: `crdt.DeriveRecordId` in `crdt/idderive.go`, using `github.com/zeebo/xxh3` (≈2.5× faster than `cespare/xxhash` on CID-length inputs) and `github.com/mr-tron/base58` (the latter is the base58 library any-sync already depends on).
-
-Resolution rules (per change, before validation):
-
-1. **Empty `id` requires `upsert: true`.** A strict modify on an empty id is rejected with `ErrEmptyIdRequiresUpsert` before any state mutation — the resolved id would be freshly derived from `changeId`, so no existing record could possibly match and the operation would always be a no-op. Rejecting it loudly surfaces a programming error that would otherwise silently drop writes.
-2. The **first** empty-id record in the batch gets `DeriveRecordId(changeId)`.
-3. Subsequent empty-id records get `DeriveRecordId(changeId) + "/" + index`, where `index` counts empty-id records only (1, 2, 3, …). Explicit-id records don't affect the counter.
-4. If a record has an empty `id` AND the enclosing `changeId` is also empty → `ErrMissingRecordId`.
-5. Handlers see the **resolved** id in `RecordChange.id` during validation, so id-pattern rules apply to the final value.
-
-Typical usage: a caller issuing a "create a new record" writes `RecordChange{Upsert: true, Ops: [{$set, multiField}]}` with no `Id`. The resulting record lands under `DeriveRecordId(changeId)`, and subsequent modifies target it by that derived id.
-
-### 3.4 Soft Delete
-Delete keeps the record visible as a tombstone:
-```json
-{ "id": "block_42", "_deletedAt": 1715000000, "_ver": { "id": "!A0", "*": "v9" } }
-```
-All other fields are wiped. `_ver` shrinks to two entries: `id` (the preserved creation version, §3.5) and `*` (the delete version as the default for every other field). Sorting by `_ver.id` still places the tombstone at its creation point.
-
-**Tombstones are sticky.** Every subsequent modify on a tombstoned record is dropped at the protocol level regardless of version — there is no way to resurrect a record at the CRDT layer in v1. This gives "delete wins absolutely" without depending on handlers to reject undeletes. Higher-level resurrect (e.g. user undelete UI) is out of scope for v1; callers that need it must layer their own mechanism on top.
-
-The drop is not silent to the local writer: applying a non-delete modify (upsert included) onto a tombstone emits a whole-record rejection (`OpIndex -1`, sentinel `ErrRecordDeleted`, re-exported as `space.ErrRecordDeleted`) into the apply result. State transitions are unchanged — the record stays a tombstone and the convergence bookkeeping (creation-marker min rule, `_addSeq`/trace stamps) still applies; only the reporting is new. Rationale: a caller writing with an explicit reused id (e.g. a seq-derived id after a range wipe) previously got a `ModifyResult` with recordIds and no rejections while nothing was stored — silent data loss (anyproto/any#141). Deleting an already-deleted record remains rejection-free (idempotent re-delete is a supported pattern in wipe flows).
+Traces are a function of `_ver` and change content, so they converge like `_ver`, with the peer-local versionId caveat of §4.
 
 ---
 
 ## 4. Version IDs
 
-- **Source**: each peer's local any-sync tree storage maintains a `versionId` (= local `orderId`) for every change it has observed. The SDK never invents real versionIds.
-- **Locality**: versionIds are **peer-local**. Two peers may hold different versionId strings for the same logical DAG change, and neither is authoritative. Do not compare versionIds across peers, serialize them to clients as identities, or assume a change's versionId is stable over the network.
-- **Shape**: opaque string, lexicographically comparable within one peer's view. "Newer" ⇔ greater string when compared locally.
-- **One change = one versionId (locally)**: every operation in a batch shares the same local versionId when a peer applies it.
-- **Two uses inside the SDK**:
-  1. CRDT gating, always comparing local versionIds against the same peer's `_ver` map.
-  2. As an ordered index key for queries against the local store (e.g. `_ver.id` creation order, §3.5).
-- **Convergence argument**: each peer applies its locally-delivered changes under locally-consistent gating. Two peers holding the same DAG end up with the same *logical* record content — not with the same `_ver` strings. Cross-peer events exchange DAG changes, not versionIds; the receiver assigns its own local versionIds on apply.
+- **Source:** any-sync's local tree storage assigns each change a `versionId` (its `orderId`). The SDK never mints versionIds for DAG changes; local-scope writes mint their own (§9.1).
+- **Locality:** peer-local. Two peers may hold different strings for one DAG change. Never compare versionIds across peers, expose them as identities, or assume a change keeps its versionId over the network.
+- **Shape:** opaque string, lexicographically ordered within one peer's view of one tree.
+- **One change, one versionId:** every op in a change shares it.
+- **Uses:** CRDT gating against the same peer's `_ver`, and ordering keys in the local store such as `_ver.id` (§3.5). The consumer change feed is keyed on applySeq, not versionId (§4a).
+- **Convergence:** each peer gates its delivered changes against its own versionIds. Peers holding the same DAG reach the same logical record content, not the same `_ver` strings.
 
 ## 4a. AddSeq (delivery watermark)
 
-Both `versionId` and `addSeq` are **peer-local** counters, but they answer different questions and have different shapes:
+`addSeq` is a monotonic `uint64` that any-sync's `spacestorage` assigns as changes arrive locally. It is space-wide in any-sync; the SDK tracks it per object because restore works per object. A versionId says where a change sits in the DAG; its addSeq says when this peer received it.
 
-- **versionId** (= local any-sync orderId): lexicographically sortable string. Used for CRDT gating (locally) and as the ordered index key for change queries. Peer-local and scoped to one object tree.
-- **addSeq**: monotonic `uint64` assigned by any-sync's `spacestorage` as changes are received locally. Space-wide in any-sync's implementation (see `any-sync/commonspace/spacestorage/spacestorage.go`), but the SDK tracks it **per object** because the restore contract is per-object:
+The CRDT Controller:
 
-Per-object tracking in the CRDT Controller:
-
-- `Controller.MaxAddSeq()` returns the highest AddSeq observed by that object.
-- `Controller.SetMaxAddSeq(seq)` seeds the watermark on restore (once, before any `ApplyChange`).
-- `ApplyChange` bumps the watermark monotonically after a successful apply. A replay with a lower AddSeq still applies (CRDT is idempotent) but does **not** regress the watermark.
-- Zero means "no changes observed yet". A failed `ApplyChange` (e.g. unknown dataset, validation rejection, empty-id rule violation) does not touch the watermark.
+- `MaxAddSeq()` returns the highest AddSeq the object has applied.
+- `SetMaxAddSeq(seq)` seeds the watermark on restore, once, before any `ApplyChange`.
+- `ApplyChange` raises the watermark monotonically. Replaying a lower AddSeq applies idempotently and doesn't lower it.
+- Zero means nothing observed yet. A change that fails as a whole (unknown dataset, empty `DataVersion`, empty-id rule) leaves the watermark alone. Op rejections don't fail a change: it commits and the watermark advances.
+- The Controller persists the watermark inside the change's WriteTx, atomically with the records it covers, and stamps `_addSeq` on each written record.
 
 ### Restore / reindex contract
 
 1. Read `MaxAddSeq()` for every Controller.
 2. Ask any-sync for heads whose `LastAddSeq` is greater.
-3. For each such object, fetch the new DAG changes and replay them through `ApplyChange`.
-4. Controllers bump their watermarks as changes land, and the space layer persists them atomically with the any-store write tx.
+3. Fetch those objects' new DAG changes and replay them through `ApplyChange`.
 
-The CRDT's idempotency means the contract tolerates crash-after-apply-before-watermark-persist: on restart the replay sees the same changes again and they become no-ops via gating and sticky tombstones.
+Replaying an already-applied change is a no-op (gating and sticky tombstones), so a restore that re-reads changes at or below the watermark is harmless.
 
 ### ApplySeq (consumer-feed watermark)
 
-`applySeq` is a third counter, SDK-owned, per-space: allocated inside the apply transaction for EVERY apply that writes records — DAG changes, the tech-space account mirror's applies, and device-local writes. Stamped on written records as `_applySeq` and persisted as the per-object `maxApplySeq` in the same WriteTx (which is also what makes the allocator crash-safe without a counter row: re-seeding reads the max persisted stamp).
+`applySeq` is SDK-owned and per space. It is allocated inside the apply WriteTx for every apply that writes records: DAG changes, the account mirror's applies, and device-local writes. It is stamped on written records as `_applySeq` and persisted per object as `maxApplySeq` in the same WriteTx. Re-seeding reads the highest persisted value, so the allocator needs no counter row.
 
-Division of labor: **AddSeq answers "is any-store caught up with any-sync"** (the per-object restore watermark; only DAG changes have one); **applySeq answers "is a consumer caught up with any-store"** (the change-index feed `Space.Changes()` is keyed on it, so non-DAG mutations surface to indexers). Allocation happens after the WriteTx is acquired — any-store's single writer makes allocation order = commit order, so ascending-cursor consumers can't skip a late-committing seq. Gaps (rolled-back txs) are normal; replays of already-applied changes may re-stamp (a spurious bump costs one idempotent re-chunk, never a miss). Legacy rows are backfilled `applySeq := addSeq` once per space, and the allocator seeds past the historical max, so pre-existing consumer cursors stay valid on one axis.
+AddSeq answers "is any-store caught up with any-sync" and exists only for DAG changes. ApplySeq answers "is a consumer caught up with any-store": the change feed `Space.Changes()` is keyed on it, so non-DAG writes reach indexers.
 
-### Why not a separate per-record `_seq`?
-
-Deferred at the time; `_applySeq` (above) is exactly this, added once the account/local routes made AddSeq an incomplete feed coordinate.
+- Allocation happens after the WriteTx is acquired. any-store has a single writer, so allocation order is commit order and an ascending cursor can't skip a late commit.
+- Gaps from rolled-back transactions are normal.
+- Replaying an applied change may re-stamp it; a consumer then re-reads the record once and never misses one.
+- Per-object rows that predate applySeq are backfilled `applySeq := addSeq` once per space, and the allocator seeds past the historical maximum, so cursors held in AddSeq units stay valid.
 
 ---
 
@@ -231,83 +221,75 @@ Deferred at the time; `_applySeq` (above) is exactly this, added once the accoun
 
 ### 5.0 Path rules (apply to every op with a field path)
 
-Every op that targets a field path is validated *before* the apply phase runs — a malformed path fails the whole change with `ErrInvalidPath` (wrapped in `ErrValidation`). Rules:
+Every op with a field path is checked before it applies. A violation is `ErrInvalidPath`, wrapped in `ErrValidation`. The local writer rejects the whole change (`ValidateChange`); on the inbound/replay path only the offending op, or the offending key of a multi-field op, is dropped (§7.2).
 
-1. **Path must be non-empty.** `$set` and `$unset` can have an empty `path` only when the multi-field form is in use (payload is an object of dotted keys).
-2. **No empty path segments.** `["a", "", "b"]` is rejected. In the multi-field form, a dotted key like `"a."` splits into `["a", ""]` and is also rejected.
-3. **No `.` inside a path segment.** A single-path op must supply its path as already-split components — `["meta.color"]` is rejected because it would silently clash with multi-field parsing. Write `["meta", "color"]` instead.
-4. **No `*` path segment.** `*` is the `_ver` defaultKey (§3.1); a field named `*` would collide with the per-level default-version entry and corrupt gating for its whole sibling set.
-5. **Top-level reservation.** The first segment may not be `id` (immutable) and may not start with `_` (all protocol-owned fields live under the underscore prefix: `_ver`, `_deletedAt`, and any future system field). Users choose their own field names from outside those namespaces.
+1. **Non-empty path.** `$set` and `$unset` omit it only in the multi-field form.
+2. **No empty segments.** `["a", "", "b"]` is rejected, and so is the multi-field key `"a."`.
+3. **No `.` inside a segment.** Single-path ops pass pre-split segments: `["meta", "color"]`, not `["meta.color"]`, which would clash with multi-field parsing.
+4. **No `*` segment.** It is the `_ver` default key (§3.1); a field named `*` would corrupt gating for all its siblings.
+5. **Top-level reservation.** The first segment may not be `id` or start with `_`.
 
-Handlers can layer additional validation on top (e.g. schema shape, permissions).
+Datasets add their own rules: field scope (§9) at the controller, then schema and handler checks (§8).
 
 ### 5.1 `$set`
 
-Two forms:
-
-**Single-path form** — `op.path` is a non-empty dotted path, `op.payload` is the value:
+**Single-path form:** `op.path` holds the segments, `op.payload` the value.
 ```
-$set "name" → "Hello"
+$set ["name"] → "Hello"
 ```
 
-**Multi-field form** — `op.path` is empty, `op.payload` is an object whose keys are dotted paths and whose values are the values to assign:
+**Multi-field form:** `op.path` is empty and `op.payload` is an object keyed by dotted path.
 ```json
 { "$set": { "name": "Hello", "count": 7, "meta.color": "red" } }
 ```
 
-Each entry of a multi-field `$set` is applied as an independent gated single-path `$set` sharing the change's versionId. Use the multi-field form to "create" a record atomically (it's the closest analogue to the removed `insert` op): if the target id doesn't exist, the record is auto-created and every field lands as a single batch.
+Each entry of a multi-field `$set` is an independent gated single-path `$set` sharing the change's versionId. Validation is per entry as well (§7.2): an offending key is dropped and reported while its siblings apply.
 
-Validation is likewise **per entry** on the inbound/replay path — both the controller's content checks (path syntax + field-class scope) and the handler's `BeforeModify` rules (pins, terminal-status, shape). A key that violates a rule is shed individually and recorded as a rejection while the op's valid siblings still apply; the whole op is dropped only when every key offends. This matters whenever a constraint tightened after the change was written: a field reclassified to another scope (e.g. spaceIndex `localStatus` synced→local), a field pinned, or a status turned terminal. An old create that bundled such a field with its still-valid siblings materializes the record minus the offending key rather than vanishing wholesale. (Writer-side `ValidateChange` stays whole-change strict — a fresh local change with any bad key is rejected before it reaches the DAG.)
-
-For each path, if `_ver[path] < versionId`, write value and set `_ver[path] = versionId`. Else skip that path.
-
-Writes targeting the immutable `id` field (single-path or as a key in the multi-field payload) reject the whole change at pre-apply validation (§3.1), consistent with the path rules in §5.0.
+For each path: if `_ver[path] < versionId`, write the value and set `_ver[path] = versionId`; otherwise skip. When finer entries exist below the path, the per-leaf merge of §3.2 applies instead.
 
 ### 5.2 `$unset`
 ```json
 { "$unset": { "description": "" } }
 ```
-Gated like `$set`. If newer, remove field and set `_ver[path] = versionId`. Multi-field form mirrors `$set`: empty `op.path`, payload object whose keys (dotted paths) are unset; values are ignored.
+Gated like `$set`. When newer, removes the field and sets `_ver[path] = versionId`. The multi-field form takes an object whose keys are unset; values are ignored.
 
 ### 5.3 `$addToSet` (commutative)
 ```json
 { "$addToSet": { "tags": "urgent" } }
 ```
-1. If `_ver[field] ≥ versionId` → skip (a newer `$set`/`$unset` superseded the whole field)
-2. Else: add element if not present. **Do not update `_ver[field]`**.
-
-Rationale: sets are commutative; multiple concurrent adds should all land. The check against `_ver[field]` preserves correctness when a `$set` replaces the whole field.
+- Skipped when `_ver[field] ≥ versionId`: a newer `$set`/`$unset` replaced the whole field.
+- Skipped when the field holds a non-array value.
+- Otherwise adds the element if absent. `_ver[field]` is not updated, so concurrent adds all land.
 
 ### 5.4 `$pull` (commutative)
 ```json
 { "$pull": { "tags": "urgent" } }
 ```
-Same check as `$addToSet`. If allowed, remove matching element(s). Do not update `_ver[field]`.
+Same checks as `$addToSet`; removes matching elements; doesn't update `_ver[field]`.
 
-**Known limitation** (v1): concurrent `$addToSet` + `$pull` of the same element has no per-element ordering guarantee. Per-element version tracking is future work.
+Concurrent `$addToSet` and `$pull` of the same element have no per-element ordering, so the result depends on delivery order.
 
 ### 5.5 `$inc` (commutative counter)
 ```json
 { "$inc": { "count": 1 } }
 ```
-Unconditionally add delta to the field. **Does not update `_ver[field]`**. Purely commutative.
-
-**Edge case**: if `_ver[field] ≥ versionId` → skip `$inc`. Avoids clobbering a recent `$set` with a stale increment.
+Adds the delta. Skipped when `_ver[field] ≥ versionId` (a newer `$set` owns the field), when the payload isn't a number, or when the field holds a non-number. Doesn't update `_ver[field]`, so concurrent increments all land.
 
 ### 5.6 `$incGated` (LWW-style increment)
 ```json
 { "$incGated": { "priority": 1 } }
 ```
-Equivalent to `$set(field, currentValue + delta)` with full version gating. Updates `_ver[field]`.
+`$set(field, current + delta)` with full gating; updates `_ver[field]`. Not convergent under arbitrary delivery (§15.6).
 
 ### 5.7 `delete`
 
-Payload is unused (the record id comes from `RecordChange.id`).
+No payload; the id comes from `RecordChange.id`.
 
-- If record absent → create a tombstone with `deletedAt = change.timestamp` and `_ver = { "id": versionId, "*": versionId }` (the delete seeds both its own creation marker and the default)
-- If record exists (live) → replace it with the tombstone shape above, preserving the existing `_ver.id` as the tombstone's creation marker; all other fields are dropped
-- If record is already a tombstone → idempotent no-op
-- **Sticky tombstones**: every subsequent modify on a tombstoned record is dropped at the protocol level regardless of version. There is no insert to race against, and no version of any modify can resurrect a tombstone in v1.
+- Absent record → a tombstone with `_deletedAt` from the change timestamp and `_ver = { "id": versionId, "*": versionId }`.
+- Live record → replaced by a tombstone that keeps the existing `_ver.id`.
+- Tombstone → no-op.
+
+Tombstones are sticky (§3.4).
 
 ### 5.8 Operation Summary
 
@@ -318,58 +300,71 @@ Payload is unused (the record id comes from `RecordChange.id`).
 | `$addToSet` | yes | no | yes (set merge) |
 | `$pull` | yes | no | yes (set merge) |
 | `$inc` | yes (against `$set`) | no | yes (counter) |
-| `$incGated` | yes | yes | no (LWW; non-convergent under arbitrary delivery — see §15) |
-| `delete` | sticky tombstone | collapses `_ver` to `{ "*": v }` | N/A — wins absolutely |
+| `$incGated` | yes | yes | no (LWW; not convergent, §15.6) |
+| `delete` | sticky tombstone | `_ver` becomes `{ "id": creation, "*": v }` | n/a, delete wins |
 
-**Auto-create** (no explicit row): controlled by `RecordChange.upsert`. When `upsert: true`, any modify op targeting a non-existent id auto-creates an empty record `{id, _ver: {}}` first, then applies. When `upsert: false` (the default, strict), modifies on absent records are no-ops. `delete` ignores the flag. There is no `insert` op.
+Record creation is covered in §3.3.
 
 ---
 
-## 6. Change Format (wire)
+## 6. Change Format
 
-### 6.1 Batch structure
-One batch = one any-sync DAG change = one `versionId`.
+### 6.1 Change
+One change = one any-sync DAG change = one `versionId`.
 
 ```
 Change {
-  spaceId:    string            // any-sync space ID
-  objectId:   string            // any-sync object ID
-  dataset:    string            // dataset name inside the object
-  changeId:   string            // DAG change identity (distinct from versionId)
-  versionId:  string            // peer-local any-sync orderId — used for gating AND as a local sort key
-  addSeq:     uint64            // any-sync local delivery sequence; §4a
-  traceIds:   [string, ...]     // opaque caller-supplied correlation tokens; §3.6
+  spaceId:      string            // any-sync space id
+  objectId:     string            // any-sync object tree id
+  dataset:      string            // exactly one dataset per change
+  dataVersion:  string            // schema/handler version peers gate on; required
+  changeId:     string            // content-addressed DAG change id
+  versionId:    string            // peer-local orderId (§4)
+  addSeq:       uint64            // local delivery sequence (§4a)
+  applySeq:     uint64            // per-space apply sequence, allocated at apply (§4a)
+  timestamp:    int64             // change time; source of _deletedAt
+  creator:      string            // identity that signed this change
+  objectAuthor: string            // identity that signed the tree's root change
+  traceIds:     [string, ...]     // correlation tokens (§3.6)
   records: [
     RecordChange {
-      id:     string            // record ID; empty → derived from changeId, see §3.3
-      upsert: bool              // if true, auto-create the record when absent; §3.3
-      ops:    [Operation, ...]  // ordered list of operations for this record
+      id:     string              // empty → derived from changeId (§3.3)
+      upsert: bool                // create when absent (§3.3)
+      ops:    [Operation, ...]    // applied in order
     },
     ...
   ]
 }
 ```
 
-`changeId` and `versionId` are **distinct**:
-- `versionId` is the any-sync orderId — lexicographically comparable within one tree, used for gating.
-- `changeId` is the any-sync **content-addressable, immutable** DAG change id (a hash of the change's contents). It is globally unique, cannot change across replays, and requires no coordination. That uniqueness — combined with the hash derivation described in §3.3 — makes it safe to use as a derived record id.
+An empty `dataVersion` fails with `ErrMissingDataVersion`; its meaning is defined in [types-properties-proposal.md](types-properties-proposal.md) § Change-level DataVersion.
 
-The CRDT layer uses `changeId` for observability and as the seed for empty-id resolution (§3.3). It MUST be provided when the batch contains a `RecordChange` with an empty `id`.
+`versionId` orders and gates. `changeId` is content-addressed: stable across peers and replays, with no coordination. It seeds empty-id derivation (§3.3) and must be set when any record has an empty id.
+
+Two route flags mark changes that don't come from this object's DAG: `local` (a device-local write with a locally minted versionId) and `injected` (the account mirror, with the tech-space tree's versionId). See §9.1.
 
 ### 6.2 Operation
 ```
 Operation {
   type:    "$set" | "$unset" | "$addToSet" | "$pull" | "$inc" | "$incGated" | "delete"
-  path:    [string, ...]        // dotted field path; empty for multi-field $set/$unset and for delete
-  payload: anyenc.Value         // operation-specific; see §5
+  path:    [string, ...]        // field path segments; empty for multi-field $set/$unset and for delete
+  payload: anyenc.Value         // per §5
 }
 ```
 
 ### 6.3 Multiple records, multiple datasets
-One batch touches many records but belongs to **exactly one dataset**. Multi-dataset atomic writes are out of scope for v1.
+A change touches any number of records in exactly one dataset. There are no atomic multi-dataset changes; `Space.ModifyMany` validates several batches together and writes one change per batch (§12.2).
 
 ### 6.4 Encoding
-A change is marshalled into the `Data` field of an any-sync `TreeChange`. The encoding is `anyenc`. any-sync signs and encrypts the outer `TreeChange`; the CRDT protocol is agnostic to that.
+The payload is the `Data` of an any-sync tree change; any-sync signs and encrypts the outer change. The payload is an anyenc object with short keys:
+
+```
+{ d: dataset, v: dataVersion, t?: [traceId, ...], r: [record, ...] }
+record: { i?: id, u?: upsert, o: [op, ...] }
+op:     { t: type, p?: [segment, ...], v?: payload }
+```
+
+Payloads above a size threshold are S2-compressed; decoding accepts both forms. `versionId`, `changeId`, `addSeq`, the object and space ids, and the timestamp come from the any-sync envelope. Codec: `internal/object/wire.go`.
 
 ---
 
@@ -377,135 +372,136 @@ A change is marshalled into the `Data` field of an any-sync `TreeChange`. The en
 
 ```
 applyChange(change):
-    handler = handlers[change.dataset]      // ErrUnknownDataset if missing
-    resolvedIds = resolveRecordIds(change)  // §3.3: empty id → changeId[/idx]
-                                            //  ErrMissingRecordId if both empty
-    for i, rc in change.records:            // pre-validate every op first
-        rcResolved = rc with id=resolvedIds[i]
-        for op in rc.ops:
-            handler.validate(rcResolved, op) // any error → drop the WHOLE change
-    for i, rc in change.records:
-        for op in rc.ops:
-            applyOp(resolvedIds[i], rc.upsert, op, change)
+    // Whole-change failures: nothing applies, watermarks unchanged.
+    if change.dataVersion == "": fail ErrMissingDataVersion
+    handler = handlers[change.dataset]                 // else ErrUnknownDataset
+    ids = resolveRecordIds(change)                     // §3.3
 
-applyOp(recordId, upsert, op, change):
-    if op.type == delete:
-        if records[recordId] is tombstone: return       // idempotent
-        preservedIdVer = records[recordId]?._ver.id or change.v
-        records[recordId] = tombstone(
-            deletedAt = change.ts,
-            _ver      = { "id": preservedIdVer, "*": change.v },
+    // Content gate (§7.2): path rules (§5.0) + field scope (§9).
+    // Offending ops, or keys of multi-field ops, are dropped and reported.
+    for rc in change.records:
+        rc.ops = contentFilter(rc.ops)
+
+    in one WriteTx:
+        change.applySeq = nextApplySeq()               // §4a
+        for i, rc in change.records:
+            applyRecord(ids[i], rc, change)
+        persist maxAddSeq, maxApplySeq
+    emit subscription events                           // after commit, §13
+
+applyRecord(id, rc, change):
+    rec = records[id]
+    if rc has a delete op:
+        if rec is tombstone: return                    // idempotent
+        handler.BeforeDelete                           // error → reject record
+        records[id] = tombstone(
+            _deletedAt = change.timestamp,
+            _ver       = { "id": rec?._ver.id or change.v, "*": change.v },
         )
-        return                                           // delete ignores `upsert`
+        return
 
-    rec = ensureRecord(recordId, upsert, change.v)
-    if rec is nil: return                    // sticky tombstone OR strict-absent
+    if rec is absent:
+        if not rc.upsert:
+            reject record (ErrStrictSkipAbsent); return
+        rec = { id, _ver: { "id": change.v } }         // §3.5
+        records[id] = rec
+        handler.BeforeCreate                           // error → reject record
+        for op in rc.ops: applyOp(rec, op, change.v)
+    else if rec is tombstone:
+        reject record (ErrRecordDeleted)               // sticky, §3.4
+        if rc.upsert: lowerCreationMarker(rec, change.v)
+        return
+    else:
+        if rc.upsert: lowerCreationMarker(rec, change.v)
+        for op in rc.ops:
+            handler.BeforeModify(op)                   // error → reject op (per key for multi-field)
+            applyOp(rec, op, change.v)
+    apply handler-derived ops (Sink, §8)
+    stamp _addSeq, _applySeq, _traces (§3.6); compact _ver (§7.1)
 
-ensureRecord(id, upsert, version):
-    r = records[id]
-    if r is tombstone:
-        if upsert: lowerCreationMarker(r, version)       // keep §3.5 min-rule
-        return nil
-    if r exists:
-        if upsert: lowerCreationMarker(r, version)       // keep §3.5 min-rule
-        return r
-    if not upsert: return nil                            // strict — skip
-    r = { id, _ver: { "id": version } }                  // §3.5 creation-version marker
-    records[id] = r
-    return r
+lowerCreationMarker(rec, v):
+    if rec._ver.id is missing or v < rec._ver.id:
+        rec._ver.id = v
 
-lowerCreationMarker(rec, version):
-    // Min-rule: _ver.id only moves downward.
-    if rec._ver.id is missing or version < rec._ver.id:
-        rec._ver.id = version
-
+applyOp(rec, op, v):
     switch op.type:
         case $set:
-            if op.path is empty:            // multi-field form
+            if op.path is empty:                       // multi-field form
                 for (key, value) in op.payload:
-                    gatedSet(rec, change.v, splitDots(key), value)
+                    gatedSet(rec, v, splitDots(key), value)
             else:
-                gatedSet(rec, change.v, op.path, op.payload)
+                gatedSet(rec, v, op.path, op.payload)
         case $unset:
             if op.path is empty:
                 for (key, _) in op.payload:
-                    gatedUnset(rec, change.v, splitDots(key))
+                    gatedUnset(rec, v, splitDots(key))
             else:
-                gatedUnset(rec, change.v, op.path)
-        case $addToSet:
-            if compareVersion(getOrder(rec, op.path), change.v) >= 0: skip
-            else: addToSet(rec, op.path, op.payload)        // _ver NOT updated
-        case $pull:
-            if compareVersion(getOrder(rec, op.path), change.v) >= 0: skip
-            else: pullFromSet(rec, op.path, op.payload)     // _ver NOT updated
+                gatedUnset(rec, v, op.path)
+        case $addToSet, $pull:
+            if getOrder(rec, op.path) >= v or field is not an array: skip
+            add or remove the element                  // _ver NOT updated
         case $inc:
-            if compareVersion(getOrder(rec, op.path), change.v) >= 0: skip
-            else: rec[op.path] = (rec[op.path] or 0) + op.payload   // _ver NOT updated
+            if getOrder(rec, op.path) >= v or field is not a number: skip
+            rec[op.path] = (rec[op.path] or 0) + op.payload   // _ver NOT updated
         case $incGated:
-            // treat as $set(path, currentValue + delta) — gated, updates _ver
-            if compareVersion(getOrder(rec, op.path), change.v) < 0:
-                rec[op.path] = (rec[op.path] or 0) + op.payload
-                setOrder(rec, change.v, op.path)
+            if getOrder(rec, op.path) >= v or field is not a number: skip
+            rec[op.path] = (rec[op.path] or 0) + op.payload
+            setOrder(rec, v, op.path)
 
 gatedSet(rec, v, path, value):
-    if path[0] is reserved (id, _ver): return               // immutable / protocol-owned
     (gate, subtree) = gateVersion(rec, path)
-    if subtree is nil:                       // single authoritative version for the path
-        if compareVersion(gate, v) < 0:
+    if subtree is nil:                                 // one authoritative version
+        if gate < v:
             writeValue(rec, path, value)
             setOrder(rec, v, path)
         return
-    // Finer-grained _ver entries exist below the path: no single gate.
-    mergeReplace(rec, path, subtree, value, v)              // §3.2 per-leaf merge
+    mergeReplace(rec, path, subtree, value, v)         // finer entries below, §3.2
 
 gatedUnset(rec, v, path):
-    if path[0] is reserved: return
     (gate, subtree) = gateVersion(rec, path)
     if subtree is nil:
-        if compareVersion(gate, v) < 0:
+        if gate < v:
             removeValue(rec, path)
             setOrder(rec, v, path)
         return
-    mergeReplace(rec, path, subtree, nil, v)                // broad unset, same merge
+    mergeReplace(rec, path, subtree, nil, v)
 
-mergeReplace(rec, path, verSubtree, value, v):              // value nil = unset
-    // Per-leaf merge (§3.2): existing parts with version >= v survive
-    // with their values; older parts are replaced by `value` (or removed
-    // where it doesn't cover them); the merged _ver node carries `*: v`
-    // claiming every unenumerated key. Recurse into nested subtrees.
-    // No survivors → whole-subtree authority: write value outright,
-    // collapse _ver at path to the string v. A non-object value lands
-    // only when nothing survives.
+mergeReplace(rec, path, verSubtree, value, v):         // value nil = unset
+    // Existing parts with version >= v survive with their values; older
+    // parts are replaced by value, or removed where it doesn't cover them;
+    // the merged _ver node gets `*: v` for every unenumerated key.
+    // No survivors → write value outright and collapse _ver at path to v.
+    // A non-object value lands only when nothing survives.
 ```
 
-`gateVersion(rec, path)` walks `_ver` along the path and returns either a single authoritative version (an explicit string, a collapsed ancestor, the local `*` default, or `""` when untracked) or — when the entry AT the path is an object — the subtree itself, signalling that finer writes exist below and the per-leaf merge must run.
+`gateVersion(rec, path)` walks `_ver` along the path and returns either one authoritative version (an explicit string, a collapsed ancestor, the local `*`, or `""` when untracked) or, when the entry at the path is an object, that subtree, meaning finer writes exist below and the per-leaf merge must run.
 
-`getOrder(rec, path)` is the gate for the commutative ops (`$addToSet`/`$pull`/`$inc`/`$incGated`): same walk as `gateVersion`, except that when the entry at the path is an object it returns the **maximum** version below it. The conservative aggregate is safe here because these ops never produce a per-leaf merge — they additionally type-check the existing value (array for set ops, number for counters), and a position with finer `_ver` entries below it holds an object, so the op skips regardless.
+`getOrder(rec, path)` gates the commutative ops and `$incGated`. It walks like `gateVersion`, but when the entry at the path is an object it returns the maximum version below it. The aggregate is safe here: a position with finer entries below holds an object, and these ops skip non-array or non-number values anyway.
 
-`compareVersion(a, b)` returns `< 0` if `a < b`, `0` if equal, `> 0` if `a > b`. The empty string compares less than any non-empty version.
+Versions compare as strings; `""` sorts before every real version (`space.CompareVersion`).
+
+Local and injected changes (§9.1) skip the handler hooks; their writers validate them.
 
 ### 7.1 Collapse
-After each apply, rewrite `_ver` to its canonical compact form using only the lossless rules from §3.2 (drop explicit entries equal to their level's `*`; collapse a node whose `*` is present and whose entries all equal it). Never invent a `*` or collapse sibling enumerations that merely share a version — that claims authority no write had and breaks convergence. Implementations may defer compaction; correctness does not depend on it.
+After each apply, `_ver` is rewritten to canonical form using only the lossless rules of §3.2: drop explicit entries equal to their level's `*`, and collapse a node whose `*` is present and whose entries all equal it. Never invent a `*` or merge siblings that merely share a version. Correctness doesn't depend on compaction.
 
 ### 7.2 Write transaction
-All ops within one change are applied atomically (one any-store `WriteTx`). Events fire **after** the transaction commits.
+All records of one change apply in one any-store `WriteTx`, or a savepoint when the caller already holds one, as batch restore does. Events fire after the commit.
 
-Validation is non-fatal on the inbound/replay path and operates at op (and, for the multi-field form, key) granularity, not whole-change. Two gates run:
+On the inbound/replay path validation never fails the change. It drops the smallest offending unit and records a rejection:
 
-- **Content validation** (path syntax + field-class scope) — controller-level, before the handler.
-- **Handler validation** (`BeforeCreate`/`BeforeModify` — pins, terminal-status, shape) — per op on the modify path.
+- **Content gate** (controller, before handlers): path rules (§5.0) and field scope (§9).
+- **Handler gate** (§8): a `BeforeCreate` or `BeforeDelete` error rejects the record; a `BeforeModify` error rejects the op.
 
-An op that fails either gate is dropped and recorded as a rejection while the rest of the change still commits (watermark advances, causality preserved). Inside a multi-field `$set`/`$unset` the offending **key** is shed individually and the surviving keys still apply; the whole op is dropped only when every key fails. This is what keeps one bad historical change — or a constraint that tightened after a change was written (a field pinned/closed, a status turned terminal, a scope reclassified) — from wedging cold restore or silently losing the change's unrelated edits. Writer-side `ValidateChange` stays whole-change strict, so fresh local changes can't enter the DAG with a bad op in the first place.
+Inside a multi-field `$set`/`$unset` both gates shed individual keys, and the op is dropped only when every key fails. The rest of the change commits and the watermark advances. One bad historical change, or a rule tightened after a change was written (a field pinned, a status made terminal, a field moved to another scope), can't wedge restore or lose the change's other edits.
+
+The local writer is strict: `ValidateChange` rejects a fresh change with any structurally invalid op before it enters the DAG.
 
 ---
 
 ## 8. Handlers
 
-A handler is pure per-dataset behavior — lifecycle hooks the apply
-path invokes from inside the write transaction (§7.2). Its dataset
-name, wire `DataVersion`, indexes, field schema, and read-tracking
-opt-in are NOT methods on the handler; they are declared alongside it
-at registration (§8.1).
+A handler is per-dataset behavior: lifecycle hooks the apply path calls inside the write transaction (§7.2). The dataset's name, wire `DataVersion`, indexes, field schema and read-tracking opt-in are declared next to the handler at registration (§8.1), not implemented by it.
 
 ```go
 type Handler interface {
@@ -517,292 +513,214 @@ type Handler interface {
 }
 ```
 
-All three `Before*` hooks may be no-ops (`DefaultHandler` is the
-embeddable no-op base). Error semantics follow §7.2's op-granular
-rejection rule: a `BeforeModify` error drops just the offending op
-(with per-key salvage for the multi-field form); `BeforeCreate` /
-`BeforeDelete` errors drop the whole RecordChange. Rejections wrap
-`ErrValidation` and surface in the apply result; the change itself
-still commits to the tree.
+Any hook may be a no-op; `DefaultHandler` is the embeddable no-op base. Errors follow §7.2: a `BeforeModify` error drops the op (per key for the multi-field form); a `BeforeCreate` or `BeforeDelete` error drops the whole `RecordChange`. Rejections wrap `ErrValidation` and appear in the apply result; the change still commits to the tree.
 
-**ChangeCtx** carries the change envelope (`VersionId`, `Timestamp`,
-`Creator` — the per-change signer — vs `ObjectAuthor`, the constant
-root signer) and `Before`, the target record's pre-op state, which
-evolves across ops in the same RecordChange (nil in `BeforeCreate`).
-`Get(dataset, id)` (v0.1.7) point-reads another record of the same
-object inside the apply tx; because hooks run on every replica and
-must not diverge, handlers may consult only fields immutable
-post-create (derived creation stamps) on records that are causal
-ancestors of the triggering change. `SelfIdentity` and `RecordId` are
-populated only on the read-tracking classify path (see
-read-tracking-proposal.md) — handler validation stays
-replica-independent by construction.
+**ChangeCtx** carries:
 
-**Sink** is how hooks write: `Derive(op)` queues a same-record derived
-op folded into the same store write (inheriting the change's
-VersionId — server-stamped fields like `creator`/`createdAt` land this
-way, converging under the standard LWW gate), and
-`Project(dataset, rec)` queues a sibling write to another dataset on
-the same object, applied in the same transaction.
+- `Change`: the envelope (§6.1), including `Creator` (the signer of this change) and `ObjectAuthor` (the signer of the root change).
+- `Before`: the record's state before the op, updated across ops of the same `RecordChange`; nil in `BeforeCreate`.
+- `Get(dataset, id)`: reads another record of the same object inside the apply transaction. Hooks run on every replica and must not diverge, so a handler may read only fields that are immutable after creation (derived creation stamps) on records that are causal ancestors of the triggering change.
+- `SelfIdentity`, `RecordId`: set only on the read-tracking classify path ([read-tracking-proposal.md](read-tracking-proposal.md)), so handler validation stays replica-independent.
 
-**ObjectStamper** is the reverse direction, for the handler of a shared
-dataset (the per-space `objects` row): `StampObject(ctx, sink)` runs
-once per applied synced change on any *other* dataset of the object,
-after its records landed and only if the change wrote something; the
-ops it derives are applied to the object's row with the change's
-VersionId as a strict update (an absent or tombstoned row is left
-alone). This is how `modifiedAt` / `modifiedBy` track writes to editor
-blocks, chat messages and runtime datasets, not just property writes.
-Local/account-route changes never trigger it — their versions belong
-to other domains. SDK-internal: consumer datasets cannot declare one.
+**Sink** is how hooks write:
+
+- `Derive(op)` queues an op on the same record, folded into the same store write and inheriting the change's versionId. Creation stamps such as `creator` and `createdAt` land this way and converge under the normal gate.
+- `DeriveOnce(op)` does the same unless an op on that path is already queued; per-change stamps emitted from `BeforeModify` use it.
+- `Project(dataset, rec)` queues a write to a record in another dataset of the same object, in the same transaction.
+
+Fields a schema declares `derived` are writable only through `Sink`: the content gate rejects input ops on them.
+
+**ObjectStamper** is the reverse direction, for the handler of a shared dataset (the per-space `objects` row). `StampObject(ctx, sink)` runs once per applied synced change on any other dataset of the object, after its records landed and only if the change wrote something. The derived ops apply to the object's row with the change's versionId as a strict update; an absent or tombstoned row is left alone. This is how `modifiedAt` / `modifiedBy` track writes to editor blocks, chat messages and runtime datasets. Local and account-route changes never trigger it, because their versions belong to other domains. It is SDK-internal; consumer datasets can't declare one.
 
 ### 8.1 Registration
 
-Consumers register handlers through the type catalog at `sdk.Open`:
-`config.Config.Types` takes `handler.Type` entries, each owning zero
-or more `handler.Dataset` registrations:
+Consumers register datasets at `sdk.Open` through `config.Config.Types`: each `handler.Type` owns zero or more `handler.Dataset`s.
 
 ```go
 handler.Dataset{
-    Name:         "chat_messages",      // unique across the whole catalog
-    DataVersion:  "chat_messages-v2",   // stamped on every change; peers gate on it
-    Handler:      messagesHandler{},
-    Schema:       …,                    // field classes (§9); zero value = Dynamic
-    Indexes:      …,                    // ensured on the dataset's collection
-    ReadTracking: …,                    // optional unread-tracking opt-in
+    Name:           "chat_messages",     // unique across the whole catalog
+    DataVersion:    "chat_messages-v2",  // stamped on every change; peers gate on it
+    HandlerVersion: 2,                   // local; a bump rebuilds materialized rows
+    Handler:        messagesHandler{},   // nil with a declared Schema → generic schema handler
+    Schema:         …,                   // field classes (§9); zero value = Dynamic
+    Indexes:        …,                   // ensured on the dataset's collection
+    ReadTracking:   …,                   // optional unread tracking
 }
 ```
 
-Internally (and for the tech space's system datasets) the same bundle is a
-`crdt.HandlerReg`, which additionally carries the handler `Version`
-persisted per collection for re-index decisions. A registration with a
-declared `Schema` and a nil `Handler` gets the SDK's generic schema
-handler — the declaration alone is the behavior (see
-docs/user-datasets.md). Registration is not compile-time — the set
-of handlers can differ across app versions (docs/versioning.md),
-and datasets defined at runtime on type objects register late-bound:
-the store's catalog carries them, and controllers pick them up by
-rebuild (eviction + reload), never by mutating a live Controller's
-handler maps (those stay immutable after construction).
+Internally, and for the tech space's system datasets, the same bundle is a `crdt.HandlerReg`. A `HandlerVersion` bump makes the next load of each object wipe its materialized rows and replay its tree ([versioning.md](versioning.md)). A declared `Schema` with a nil `Handler` gets the generic schema handler, so the declaration alone is the behavior ([user-datasets.md](user-datasets.md)).
 
-`config.Config.Modules` takes `handler.Module` entries — factories the
-store instantiates per collection. A module's canonical collection
-registers on every controller from store open (with the module's
-`DataVersion`); each namespaced instance a type declares
-(`<typeId>_<key>`) is built by `Module.New(instance)` into its own
-`HandlerReg` when the catalog compiles the declaration, with the
-module's `HandlerVersion` composed in. One module, many registrations,
-identical behaviour on each.
+The handler set isn't fixed at compile time. It can differ across app versions, and datasets defined at runtime on type objects register late: the store's catalog carries them, and a controller picks them up by being rebuilt (evicted and reloaded). A live Controller's handler maps never change.
+
+`config.Config.Modules` takes `handler.Module` entries, factories the store instantiates per collection. A module's canonical collection registers on every controller when the store opens, with the module's `DataVersion`. Each namespaced instance a type declares (`<typeId>_<key>`) is built by `Module.New(instance)` into its own `HandlerReg` when the catalog compiles the declaration, with the module's `HandlerVersion` composed in. One module, many registrations, identical behavior.
 
 ### 8.2 Unknown Datasets
 
-Changes arriving for datasets with no registered handler are
-**persisted in any-sync** (they were already accepted into the tree)
-but **not applied** to any-store. The space layer's apply gate parks
-them in the per-space `_detached` collection — the same machinery the
-DataVersion gate uses — and the drain replays them once a registration
-exists (a runtime definition applying refreshes the catalog and wakes
-the drainer; the drain evicts a stale resident controller before
-replay so the rebuilt registration is what applies the row). The
-dataset is invisible to queries until then, but nothing is lost and
-the object's replay never stalls on it. See docs/user-datasets.md
-§ Runtime registration. At the raw Controller level (no gate wired),
-`ApplyChange` still returns `ErrUnknownDataset`.
+A change for a dataset with no registered handler is already accepted into the any-sync tree but is not applied to any-store. The space layer's apply gate parks it in the per-space detached-changes collection (`<spaceId>__detached`), the same machinery the DataVersion gate uses, and the drain replays it once a registration exists. A runtime definition applying refreshes the catalog and wakes the drainer, which evicts a stale resident controller so the rebuilt registration applies the row. Until then the dataset is invisible to queries, nothing is lost, and the object's replay doesn't stall. See [user-datasets.md](user-datasets.md) § Runtime registration. A raw Controller with no gate returns `ErrUnknownDataset`.
 
 ### 8.3 Validation
 
-Handler hooks are the SECOND of the two apply-time gates described in
-§7.2 (content/scope validation runs first, at the controller). The
-common single-field vocabulary — required fields, write-once /
-author-gated mutability, apply-time stamps, id rules, delete gates —
-needs no bespoke handler: declare it on the dataset Schema and the
-generic schema handler enforces it (docs/user-datasets.md). Bespoke
-handler enforcement remains for what a declaration can't express:
+Handler hooks are the second of the two apply-time gates in §7.2; content and scope validation runs first, at the controller. The common single-field rules (required fields, write-once or author-gated mutability, apply-time stamps, id rules, delete gates) need no custom handler: declare them on the dataset `Schema` and the generic schema handler enforces them ([user-datasets.md](user-datasets.md)). Custom handlers cover what a declaration can't express:
 
-- Cross-field rules and shape rules beyond the declared Schema (size
-  limits, allow-listed op paths, "field A requires field B").
-- Per-record permissions beyond the declared gates — the pattern is
-  always: compare `ctx.Change.Creator` (the change's signer) against a
-  derived creation stamp on `ctx.Before`.
-- Disposition follows §7.2: inbound/replay rejections drop the op (or
-  record) and are recorded, never fatal; the writer-side
-  `ValidateChange` path stays whole-change strict so a fresh local
-  change can't enter the DAG with a bad op. Handlers needing stricter
-  local-only checks with caller-readable errors implement the
-  optional `LocalPreValidator` / `LocalPreValidatorMulti` interfaces,
-  which run only on the local-write path before the change is minted.
+- Cross-field and shape rules beyond the schema: size limits, allowed op paths, "field A requires field B".
+- Per-record permissions beyond the declared gates. The pattern: compare `ctx.Change.Creator` with a derived creation stamp on `ctx.Before`.
+
+Inbound rejections drop the op or record and are recorded, never fatal (§7.2). Handlers that need stricter checks with caller-readable errors on local writes implement `LocalPreValidator` / `LocalPreValidatorMulti`, which run only on the local-write path before the change is created.
 
 ---
 
 ## 9. Property Scopes (protocol)
 
-Every property (and every declared dataset field) lives in exactly ONE
-scope, fixed on its DECLARATION — there are no per-value variants and
-no priority merge. See `docs/scoped-properties-proposal.md` for the
-full design; the protocol-relevant rules are:
+Every property and every declared dataset field has exactly one scope, fixed by its declaration. There are no per-value variants and no priority merge. Full design: [scoped-properties-proposal.md](scoped-properties-proposal.md).
 
 ### 9.1 One path, one write route
-- `synced` — written via the regular CRDT pipeline on the object
-  itself. `_ver` entries for these paths hold the object tree's local
-  versionIds.
-- `account` — written to a carrier record in the account's private
-  tech space; a per-device watcher mirrors converged values into the
-  target record at the SAME paths, stamping the tech tree's local
-  versionIds.
-- `local` — written via `Object.LocalSet`, no DAG involved; versions
-  are locally-minted lexids (`NextVersion` of the path's current
-  version).
-- `derived` — handler-stamped, never writable by input ops.
+- `synced` — the regular CRDT pipeline on the object. `_ver` holds the object tree's versionIds.
+- `account` — a carrier record in the account's private tech space. A per-device mirror writes converged values into the target record at the same paths (`injected` changes), stamping the tech tree's versionIds. Covers property values on `objects` rows.
+- `local` — `Object.LocalSet` (`local` changes), no DAG, never synced. Versions are locally minted lexids: `NextVersion` of the path's current version.
+- `derived` — written only by handlers (§8).
 
 ### 9.2 One `_ver` tree, disjoint domains
-The record keeps its single `_ver` tree (§3). Version domains never
-compare because no two routes ever write the same path: a property's
-scope is pinned for its propId's life (first-write-wins on the
-definition, like `kind`), and the apply path enforces route-vs-scope —
-an inbound DAG op addressing an account/local-scoped propId is dropped
-per-op, identically on every peer (the DataVersion gate parks changes
-whose schema hasn't synced, so the scope lookup never races the
-definition).
+A record keeps a single `_ver` tree (§3). No two routes write the same path: a property's scope is pinned for its life (first write wins on the definition, like `kind`), and the apply path drops an op whose route doesn't match its field's scope, identically on every peer. The DataVersion gate parks changes whose schema hasn't synced, so the scope lookup never races the definition.
 
-VersionIds from different scopes are still **not comparable** — but
-nothing ever needs to compare them.
+VersionIds from different scopes aren't comparable, and nothing compares them.
 
 ### 9.3 No computed root
-There is no merge step. The value at a path IS the value its one scope
-last wrote. Events carry one versionId per change (the domain of
-whatever route produced it) — the client recipe `_ver.<op.path> =
-event.versionId` is domain-agnostic and unchanged.
+The value at a path is the value its one scope last wrote. Events carry one versionId per change, in the domain of the route that produced it, so the client rule `_ver.<op.path> = event.versionId` works for every scope.
 
 ---
 
 # Part II — External API
 
-This part defines what callers see. The protocol in Part I is the implementation; this is the contract.
-
 ## 10. External API Overview
 
-The external API exposes the protocol as a small, stable surface: **queries**, **writes**, and **subscriptions**. `versionId` is the shared consistency primitive tying all three together.
+Callers query, write and subscribe, and `versionId` ties the three together. The caller is middleware ([common-context.md](common-context.md)):
 
-**The caller is middleware, not an end-user client.** The SDK is a Go library consumed in-process. Middleware handles transport (gRPC/REST), sessions, client-local auth, and product logic. See `common-context.md` for the full stack. Implications:
-
-- API methods take Go types (not JSON/protobuf). Middleware serializes for its own wire protocol.
-- No session-awareness in v1 (confirmed deferred, since middleware already has sessions)
-- "Callback to the client" is not the SDK's job — middleware consumes SDK events and pushes them over its own transport
+- Methods take and return Go types; middleware serializes for its own protocol.
+- There is no session awareness; middleware owns sessions.
+- Middleware consumes events and pushes them over its own transport.
 
 ### 10.1 Consistency Model
-`versionId` is **caller-facing**. It appears in:
-- Query results (per record, indicating the latest change version that touched the record)
-- Subscription events (per event, indicating the change version that produced it)
-- Write return values (the final versionId any-sync assigned)
+`versionId` appears in:
+- query results, through each record's `_ver` (§3);
+- subscription events, one per event (§13);
+- write results (`ModifyResult.VersionId`).
 
-Callers use versionIds to:
-- Recognize their own writes in the event stream (match returned versionId against incoming events)
-- Order events if their UI needs strict sorting
-- Reconcile their own optimistic in-memory state with the SDK's any-store. The client (or the middleware consuming the SDK) holds its own state, applies optimistic writes, and needs per-field version info to know which fields have been server-confirmed vs still local-only. Query results carry `_ver` attached to the record; clients walk it using the shape documented in §3.
-- Apply their own version-gating rule on top of the SDK when maintaining derived state outside any-store
+Callers use it to:
+- recognize their own writes in the event stream;
+- order events;
+- reconcile optimistic in-memory state per field, walking `_ver` with the rules of §3.1–3.2;
+- apply the same gating rule to derived state kept outside any-store.
 
-What callers never see:
-- Handler internals
-- Re-indexing machinery
+`space.CompareVersion` compares two versions from this peer. Handler internals and re-indexing are not visible to callers.
 
 ---
 
 ## 11. Queries
 
 ```go
-Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Offset(n)
-QueryObjects().Filter(...).Sort(...).Limit(n).Offset(n)
+space.Query(objectId, dataset)   // one object's dataset
+space.QueryObjects()             // the per-space objects collection
+
+q.Filter(f).Sort(keys...).Limit(n).Offset(n).Projection(opts)
 ```
 
-Terminal calls:
+Terminals:
 
-- `Iter(ctx) -> Iterator` — streaming.
-- `All(ctx) -> []anyenc.Value` — materialise all.
-- `One(ctx) -> anyenc.Value` — first match or `ErrNotFound`.
-- `Count(ctx) -> int` — match count.
-- `Snapshot(ctx, opts) -> *QueryResult` — point-in-time view + optional total (§13).
-- `Subscribe(ctx, opts) -> *QueryResult` — initial view + live `Sub` (§13).
+- `Iter(ctx)` — streaming iterator.
+- `All(ctx)` — every match.
+- `One(ctx)` — first match or `ErrNotFound`.
+- `Count(ctx)` — match count.
+- `Snapshot(ctx, opts)` — `*QueryResult` with an optional total (§13).
+- `Subscribe(ctx, opts)` — the snapshot plus a live `Sub` (§13).
 
-`Filter` accepts anything `query.ParseCondition` accepts (already-built `query.Filter`, JSON string, or map literal with mongo operators). `Sort` accepts anything `query.ParseSort` accepts (`"name"`, `"-_ver.id"` for descending, or already-built `query.Sort`). Parse errors are stashed eagerly and surfaced on the first terminal call.
+`Filter` accepts whatever `query.ParseCondition` accepts: a built `query.Filter`, a JSON string, or a map with Mongo-style operators. `Sort` accepts `query.ParseSort` input: `"name"`, `"-_ver.id"` for descending, or a built `query.Sort`. Parse errors surface on the first terminal call. `Aggregate` and `AggregateObjects` run aggregation pipelines over the same collections, snapshot only.
 
 ### 11.1 Projections
 
-By default tombstones are excluded. The caller sees the record verbatim with `_ver` attached in the same tree shape used internally — clients that mirror SDK state per field parse `_ver` using the same lookup rules as the SDK (the shape is documented in §3.1 and §3.2). Values of every property scope sit at their normal paths; there is nothing to strip or collapse.
+Records come back verbatim, with `_ver` and `_traces`, in the shape the SDK stores. Values of every scope sit at their normal paths.
 
-Opt-in flags:
+Tombstones are excluded by default. `Projection(ProjectionOpts{IncludeDeleted: true})` returns tombstone rows from `Iter`, `All`, `One` and `Count`; `Snapshot` and `Subscribe` always skip them. A deleted object is purged rather than tombstoned, so it never appears in results; observe object deletion through a `deleted` removal (§13.3).
 
-- **`WithTombstones()`** (`ProjectionOpts.IncludeDeleted`) — include tombstones in the result.
-
-Defining a stable client-facing version accessor (single-path lookup, walker) is deferred to a later iteration. For now the tree shape documented in §3 is the contract.
+The `_ver` shape (§3.1–3.2) is the client contract; there is no separate accessor.
 
 ### 11.2 Record-level versionId
-The record-level versionId is the greatest versionId in the record's `_ver` tree (after collapsing). Useful when a client only cares about "has this record changed since I last looked" rather than per-field reconciliation.
+No record-level version is returned. The greatest version in `_ver` moves whenever a gated op lands, but it misses `$addToSet`, `$pull` and `$inc`, which don't touch `_ver`.
 
 ---
 
 ## 12. Writes
 
-Two methods, both accept raw operations.
-
 ```go
-Modify(objectId, datasetName, id, ops, opts...) -> (ModifyResult, error)
-Delete(objectId, datasetName, id) -> (ModifyResult, error)
+Modify(ctx, ModifyBatch) (ModifyResult, error)
+ModifyMany(ctx, []ModifyBatch) ([]ModifyResult, error)
+Delete(ctx, DeleteBatch) (ModifyResult, error)
+
+type ModifyBatch struct {
+    ObjectId string
+    Dataset  string
+    Records  []RecordModify  // {Id, Upsert, Ops}
+    TraceIds []string
+    Scope    Scope           // ScopeSynced (default) or ScopeLocal
+}
 
 type ModifyResult struct {
-    VersionId string   // peer-local lexid stamped on the records
-    ChangeId  string   // any-sync DAG change id (content-addressable, stable across peers)
-    RecordIds []string // per-record id, aligned to input order
+    VersionId  VersionId     // this peer's version of the change (§4)
+    ChangeId   string        // DAG change id, stable across peers
+    RecordIds  []string      // resolved ids, input order
+    Rejections []OpRejection // ops and records that didn't land (§7.2)
 }
 ```
 
-- `ops` is a list of operations from §5 — callers write `$set`, `$addToSet`, `$inc`, etc. directly
-- `Modify` defaults to strict (no record creation). Pass `WithUpsert()` (or equivalent option) to enable auto-creation — this is the "create" path. A typical create is `Modify(id, [{$set: multiFieldPayload}], WithUpsert())`
-- `VersionId` is synchronous — any-sync is offline-first and commits locally before returning
-- `ChangeId` is the any-sync DAG hash; use it for tracing and cross-peer correlation
-- `RecordIds[i]` is the resolved id of record `i`. For records the caller submitted with empty Id, the resolved value is `base58(xxh3-64(ChangeId))` (with `:<index>` for the second-and-later empty ids in a batch; `:` rather than `/` so the id is safe in URL path segments). This is the propId / shortId convention — property creates read it from `RecordIds[0]`
+- Ops are the §5 operations, with a dotted `Path` string and a Go `Value`.
+- Records are strict by default; `RecordModify.Upsert` creates absent records. A typical create is one multi-field `$set` with `Upsert: true`.
+- `Modify` returns once any-sync has committed the change locally, online or not.
+- `RecordIds[i]` is the resolved id. Empty ids become `base58(xxh3-64(ChangeId))`, with `:<index>` from the second empty id on (§3.3). Type and property creates read their id from `RecordIds[0]`.
+- `Rejections` lists what the change carried but didn't apply; the change still committed.
+- `Delete` writes sticky tombstones for `RecordIds`, including ids with no local record.
+- `ScopeLocal` writes device-local fields on existing records without a DAG change (§9.1).
 
 ### 12.1 Property-scope Writes
 
-One auto-routing setter; the SDK picks the write route from each propId's declared scope (§9):
+One setter picks the write route from each property's declared scope (§9):
 
 ```go
-Set(objectId, ownerId, patch) -> (ModifyResult, error)   // ownerId: the object's type or one of its collections
+Properties().Set(ctx, objectId, ownerId, patch) (ModifyResult, error)  // ownerId: the object's type or one of its collections
 ```
 
-All keys in a `patch` must resolve to the SAME scope — mixed-scope patches are rejected, since the routes commit independently and cannot be rolled back together. `synced` props go through the regular `Modify()` pipeline on the object; `account` props through the tech-space carrier record; `local` props through `Object.LocalSet`. The returned `VersionId` is in whatever route's domain handled the write.
+All keys in a patch must share one scope, because routes commit independently and can't roll back together; mixed-scope patches are rejected. `synced` properties go through the object's CRDT, `account` properties through the tech-space carrier record, `local` properties through `Object.LocalSet`. The returned `VersionId` is in the domain of the route that wrote.
 
 ### 12.2 Batches
-A single `Modify` can target multiple records (as one batch) if the API supports it. Final API shape for multi-record batches is in §17.
+One `ModifyBatch` is one change on one dataset of one object, with any number of records. `ModifyMany` takes several batches for the same object, possibly on different datasets: it validates all of them first and writes none if any fails, then writes one change per batch in input order. There is no cross-object atomicity. `Space.Upsert(UpsertBatch)` is the schema-driven bulk ingest ([user-datasets.md](user-datasets.md)).
 
 ---
 
 ## 13. Subscriptions and Events
 
-Single surface: windowed live queries.
+Live queries are windowed:
 
 ```go
 Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
 QueryObjects().Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
 ```
 
-Returns `*QueryResult{Initial, Total, Sub}` where `Sub` is the live `QuerySubscription`. Both call shapes also support `Snapshot(ctx, opts)` for a point-in-time read with the same result shape (no live `Sub`).
+`Subscribe` returns `*QueryResult{Initial, Total, HasNext, Sub}`, where `Sub` is the live `QuerySubscription`. `Snapshot(ctx, opts)` returns the same shape without `Sub`. `QueryOpts.IncludeTotal` requests a one-time count.
 
 ### 13.1 Event Shape
 
-One `SubscriptionEvent` per CRDT apply that touches the sub's scope; emitted **after** the any-store write tx commits (read-your-writes safe).
+One `SubscriptionEvent` per apply that touches the subscription's scope, emitted after the write transaction commits, so a query run on receipt sees the new state.
 
 ```
 SubscriptionEvent {
-  versionId: string             // per-change DAG order; for fence-and-replay
+  versionId: string             // version of the change that produced the event
   added:   [SubRecord, ...]     // records that entered the visible window
-  updated: [SubRecord, ...]     // records already in the window, changed
-  removed: [RemovedRecord, ...] // records that left the visible window, tagged with cause
+  updated: [SubRecord, ...]     // records in the window that changed
+  removed: [RemovedRecord, ...] // records that left the visible window, with the reason
 }
 
 SubRecord {
   id:  string
   doc: anyenc.Value             // full post-apply value, deep-cloned
-  ops: [EventOp, ...]           // projected $set / $unset ops from the change
+  ops: [EventOp, ...]           // the change projected to $set / $unset
 }
 
 RemovedRecord {
@@ -811,65 +729,56 @@ RemovedRecord {
 }
 ```
 
-`ops` is post-projection: every `$inc` / `$addToSet` / `$pull` / `$incGated` has been merged on the SDK side and ships as a `$set` against the post-apply value (or `$unset` when the path went away). A thin client can apply `ops` against a JSON-like local mirror without a CRDT engine. `doc` carries the full post-apply state for clients that prefer to rerender from scratch.
+`ops` are projected: `$inc`, `$addToSet`, `$pull` and `$incGated` arrive as a `$set` of the post-apply value, or an `$unset` when the path is gone. A client can apply `ops` to a JSON mirror without a CRDT engine, or rerender from `doc`.
 
-`removed` carries each id that left the visible window, tagged with **why** so clients can tell "the object is gone" from "it left my result set but still exists":
-
-- `deleted` — the record was tombstoned; gone from the database. A `Query.One` now returns `ErrNotFound`.
-- `filtered-out` — an update changed a field so the query filter no longer matches; the record still exists.
-- `displaced` — a higher-priority arrival (or the record's own sort-key change) pushed it past the `Limit` boundary; it still matches the filter, just sits outside the visible window.
-
-Branch on `deleted` to drop the object for good; the other two mean a `Snapshot`/`Query.One` would still return it.
+Deleting an object removes its local state without a CRDT apply. The resulting `deleted` removal carries an empty `versionId`; act on it directly rather than filtering it by version.
 
 ### 13.2 Window Semantics
 
-The window tracks filter + sort + limit incrementally.
-
-- When `Limit > 0`, the engine internally holds `Limit + 1` rows; the largest-tuple row is the *sentinel* — kept but not visible to the consumer. Single new arrivals at the top of the sort cause an `Added` (the new row) + `Removed` (the previous bottom-visible row that demoted to sentinel) without any any-store re-query.
-- `Limit == 0` is unbounded; RAM grows with the matching set.
-- `Offset` applies to the initial snapshot only; the live window has no offset.
+- `Limit > 0` needs a `Sort`; `Subscribe` fails without one. The engine holds `Limit + 1` rows, the last being a hidden sentinel, so a single arrival at the top emits `added` for it and a `displaced` removal for the row it pushes out, without re-querying any-store.
+- `Limit == 0` is unbounded; memory grows with the matching set.
+- `Offset` applies to the initial snapshot only.
 
 ### 13.3 Removed Semantics
 
-Each `RemovedRecord` carries the id plus a `reason` so consumers can tell "the object is gone" from "it left my result set but still exists":
-- `deleted` — the record was tombstoned in the DB; a `Query.One` for the id now returns `ErrNotFound`.
-- `filtered-out` — an update changed a field so the filter no longer matches; the record still exists.
-- `displaced` — a higher-priority arrival (or the record's own sort-key change) pushed it past `Limit`; it still matches the filter, just sits outside the visible window.
+- `deleted` — the record was tombstoned or its object deleted; `Query.One` for the id returns `ErrNotFound`.
+- `filtered-out` — an update made the record stop matching the filter; it still exists.
+- `displaced` — an arrival or the record's own sort-key change pushed it past `Limit`; it still matches the filter.
 
-Branch on `deleted` to drop the object for good. For `filtered-out` / `displaced`, a `Snapshot` / `Query.One` with the id still returns the doc (filtered-out ⇒ doesn't match the active filter; displaced ⇒ does).
+Drop the record for good only on `deleted`. After the other two, `Snapshot` or `Query.One` still returns it.
 
 ### 13.4 Property Scopes in Events
-Account- and local-scoped writes flow through the same event stream as synced ones: one event per applied change, `VersionId` from that change's own domain (already the case for local writes today). Consumers don't need to know a path's scope to apply the ops.
+Account- and local-scope writes produce events like synced ones: one per applied change, with the versionId of that change's domain. Consumers don't need a path's scope to apply the ops.
 
 ### 13.5 Ordering
-- Events are emitted in `applyChange` order (strictly after tx commit).
-- Within one change, all record transitions ship in a single `SubscriptionEvent`.
-- Cross-object ordering is not guaranteed.
+- Events follow apply order, after commit.
+- All record transitions of one change arrive in one event.
+- There is no ordering across objects.
 
 ### 13.6 Own-write events
-Caller receives their own writes as events. They recognize them by matching the returned versionId on the change against `SubscriptionEvent.VersionId`. Session-based suppression is deferred.
+Callers receive their own writes and recognize them by matching `ModifyResult.VersionId` with `SubscriptionEvent.VersionId`. The SDK doesn't suppress them.
 
 ### 13.7 Backpressure + Recovery
 
-Per-sub mailbox is `mb/v3`-bounded (default 256, min 16). There is no silent-drop policy: on overflow the engine closes the sub with `ErrSubscriptionOverflow`. A second close mode is `ErrSubscriptionDrifted` — fired when more than `DriftBudgetPercent` (default 30) of `Limit` records leave the held window without replacements (the engine never re-queries any-store on the hot path to backfill).
+Each subscription has a bounded mailbox (`QueryOpts.MailboxCapacity`, default 256, minimum 16). When it fills, the subscription closes with `ErrSubscriptionOverflow`. It closes with `ErrSubscriptionDrifted` when more than `DriftBudgetPercent` (default 30) of `Limit` records leave the held window without replacements; the engine never re-queries any-store to backfill.
 
-Either error is the only recovery contract: the client resubscribes and the new snapshot reconciles state. There is no `Dropped()` counter or partial-delivery mode.
+Either error means: resubscribe, and the new snapshot reconciles state. Nothing is dropped silently.
 
 ### 13.8 Initial Snapshot Fence
 
-`Subscribe`'s snapshot read runs UNDER the engine's mutex; apply events that fire during the read queue on the lock and process correctly after the new sub is registered. No per-event `VersionId` dedupe needed.
+`Subscribe` reads its snapshot while holding the engine lock. Applies that finish in the meantime wait for the lock and are delivered after the subscription is registered, so no event is missed.
 
 ---
 
 ## 14. What the External API Does NOT Expose
 
-- Handler registration / lifecycle
-- Internal write flow (tree writes, reconciliation, re-indexing)
-- Carrier-record internals of the account mirror (tech-space transport is invisible; callers see values at their normal paths)
+- Handler internals and invocation.
+- The internal write flow: tree writes, re-indexing.
+- The account mirror's carrier records; callers see values at their normal paths.
 
-Note that `_ver` itself IS caller-facing — it ships with each queried record in the same tree shape the SDK stores it. Clients use the documented lookup rules (§3) to walk it. This is the full contract; there's no "internal vs external" representation split for `_ver` in v1.
+`_ver` is caller-facing and ships in the shape the SDK stores; there is no separate external representation.
 
-The stability contract: the external API (shape of queries, writes, events, versionId semantics) does not change between SDK minor versions. Protocol internals can change freely.
+The external API (queries, writes, events, versionId semantics) stays stable across SDK minor versions; protocol internals may change.
 
 ---
 
@@ -877,43 +786,43 @@ The stability contract: the external API (shape of queries, writes, events, vers
 
 ## 15. Conflict Examples
 
-### 15.1 Two devices rename same record
+### 15.1 Two devices rename the same record
 ```
-Device A: $set(name="Alpha")  at vA (sent first, accepted at v10)
-Device B: $set(name="Beta")   at vB (sent after seeing v10, accepted at v11)
+Device A: $set(name="Alpha")
+Device B: $set(name="Beta")   written after B received A's change
 ```
-Both apply. Final state: `name = "Beta"`, `_ver.name = "v11"`. Device A gets an event for v11 and updates local state.
+B's change descends from A's, so it orders after A's on every peer. Final state: `name = "Beta"`, `_ver.name` = B's version. A receives an event for B's change.
 
 ### 15.2 Out-of-order delivery
-Device C already has `_ver.name = "v15"`. An old event arrives with `$set(name="Old")` at `v7`. Since `v7 < v15`, op is skipped. State stays consistent.
+Device C holds `_ver.name = "v15"`. An old change arrives with `$set(name="Old")` at `v7`. Since `v7 < v15`, the op is skipped.
 
 ### 15.3 Delete races a creating `$set`
-Device A creates `block_42` via a multi-field `$set` (recall: there is no `insert` op). Device B (having not seen the create) deletes `block_42`. Both reach every peer:
-- If the `$set` has lower versionId: `$set` auto-creates the record, then delete replaces it with a tombstone → final state is tombstone.
-- If the delete has lower versionId: delete writes a tombstone first. The `$set` arrives later, `ensureRecord` sees the sticky tombstone and returns nil → the entire `$set` is dropped, including any merge of unrelated fields.
+Device A creates `block_42` with a multi-field `$set`. Device B, not having seen the create, deletes `block_42`. Both reach every peer:
+- `$set` has the lower versionId: it creates the record, then the delete replaces it with a tombstone.
+- The delete has the lower versionId: it writes a tombstone, and the later `$set` hits the sticky tombstone and is dropped entirely.
 
-Either way, **delete wins absolutely**. There is no version of any modify that can resurrect a tombstoned record at the protocol level in v1.
+Either way the delete wins.
 
 ### 15.4 `$addToSet` racing `$set` on the same field
 Device A at v20: `$addToSet(tags, "urgent")`
 Device B at v21: `$set(tags, ["done"])`
 Device C receives them out of order.
 
-- If A arrives first: `tags = ["urgent"]`, `_ver.tags = nil`. Then B at v21 > nil → applies → `tags = ["done"]`, `_ver.tags = "v21"`
-- If B arrives first: `tags = ["done"]`, `_ver.tags = "v21"`. Then A at v20 ≤ v21 → skipped
+- A first: `tags = ["urgent"]`, `_ver.tags` untracked (`""`). Then B at v21 applies: `tags = ["done"]`, `_ver.tags = "v21"`.
+- B first: `tags = ["done"]`, `_ver.tags = "v21"`. Then A at v20 ≤ v21 is skipped.
 
-Both orderings converge to `["done"]`.
+Both orders converge to `["done"]`.
 
 ### 15.5 Concurrent `$inc`
 ```
 Device A: $inc(views, 1) at v30
 Device B: $inc(views, 1) at v31
 ```
-Both apply regardless of order. Final `views = previous + 2`. `_ver.views` untouched.
+Both apply in either order: `views = previous + 2`, `_ver.views` untouched.
 
-`$inc` requires a previous value to compose with — a `$inc` that arrives before the creating `$set` would compose against `0` and then be overwritten when the create lands. In practice this race does not happen because any-sync's DAG enforces causality between the create and any modify.
+A `$inc` never arrives before the change that created its record: the DAG delivers ancestors first (§17).
 
-### 15.6 Concurrent `$incGated` (intentionally non-convergent)
+### 15.6 Concurrent `$incGated` (not convergent)
 
 ```
 Device A: $incGated(count, 1) at vA
@@ -921,51 +830,33 @@ Device B: $incGated(count, 1) at vB
 Device C: $incGated(count, 1) at vC    (vA < vB < vC)
 ```
 
-`$incGated` is "$set(field, current+delta) with version gating", **not** a CRDT counter. Different delivery orders reach different final values for the same set of ops:
+`$incGated` is `$set(field, current + delta)` with version gating, not a CRDT counter. Different delivery orders reach different values:
 
-- Apply [vA, vB, vC] (canonical): 0 → 1 → 2 → 3
-- Apply [vC, vB, vA]: vC applies (0→1), then vB and vA are gated against vC and skipped → 1
-- Apply [vB, vA, vC]: vB applies (0→1), vA gated against vB → skip, vC applies on top of 1 (→2)
+- [vA, vB, vC]: 0 → 1 → 2 → 3
+- [vC, vB, vA]: vC applies (0 → 1); vB and vA are gated out → 1
+- [vB, vA, vC]: vB applies (0 → 1); vA is gated out; vC applies (→ 2)
 
-Use `$inc` for counters. Use `$incGated` only when the absolute post-mutation value matters and you accept LWW semantics on whichever op wins the version race.
-
----
-
-## 16. Deferred / Out of Scope (v1)
-
-- **Text CRDT** — rich text with per-character merging
-- **Per-element versioning for sets/arrays** — would fix `$addToSet`/`$pull` race
-- **Snapshots / compaction** — no pruning of old state
-- **Schema validation** (beyond what handlers implement ad-hoc)
-- **Cross-dataset atomic writes** in one batch
-- **Session-based own-write filtering**
-- **Ordered lists / CRDT arrays** — only commutative set operations are supported
+Use `$inc` for counters. Use `$incGated` only when the absolute post-mutation value matters and last-writer-wins on the highest version is acceptable.
 
 ---
 
-## 17. Open Items
+## 16. Out of Scope
 
-### Protocol
-1. Local version ID generator — `local`-scope writes never touch any-sync; they mint lexids via `NextVersion` of the path's current version (§9.1), unrelated to any-sync orderIds. Confirm the generator/seed is final.
-2. Final handler interface — method names, error types (§8)
+- **Text CRDT** — rich text with per-character merging.
+- **Per-element versions for sets** — concurrent `$addToSet` and `$pull` of one element depend on delivery order (§5.4).
+- **Ordered lists / CRDT arrays** — only commutative set operations exist.
+- **Atomic multi-dataset changes** (§6.3).
+- **Tombstone pruning** — record tombstones are kept.
+- **Own-write suppression** in events.
 
-### External API
-3. Final write method naming (`Modify` vs `Update`; no `Insert`/`Create` — auto-creation makes them unnecessary)
-4. Multi-record batch writes — is `Modify` plural-friendly?
-5. Record-level versionId on query results — is it always the max of `_ver`, or the versionId of the most recent change that touched any field?
-6. Event batcher tuning — `mb` buffer size, overflow policy
+---
 
-### Cross-cutting
-7. How to represent ordered lists if/when needed (not v1)
+## 17. Design Notes
 
-### Design decisions
+1. **Modify-before-create can't happen.** any-sync is a DAG: every change lists its causal parents in `prevIds`, and a receiver applies a change only after all of them. A modify of a record has the creating change in its ancestry, so it can't be delivered first by a correct peer. The strict-modify skip on an absent record is a backstop against buggy or adversarial peers, not a race to design for.
 
-8. **Modify-before-create races — protocol-impossible.** any-sync is a Git-like DAG: every change carries a `prevIds` chain pointing to the changes it causally depends on, and a receiver cannot apply a change until all of its `prevIds` are already applied. If a peer authored a modify referencing some record, the creating change is in that modify's ancestry by construction. A modify delivered before its creating change can only happen if the delivering peer is buggy or adversarial — it's not a race the CRDT needs to tolerate as a legitimate case. The CRDT layer's "strict modify on absent = silent skip" behavior is a defensive backstop for the pathological case, not a first-class edge case.
+2. **`$inc` converges under DAG delivery.** `$inc` doesn't update `_ver`, which makes it commute with itself. A stale `$set` can't clobber an increment that saw it: the `$set` is in the `$inc`'s ancestry and always applies first. Divergence needs a `$set` and an `$inc` on the same field that are concurrent, which has no correct answer ("reset to 100" and "add 1" in parallel) and signals a schema mistake: a field is either a counter (only `$inc`) or a settable value (only `$set`). `$incGated` exists for the last-writer-wins case.
 
-9. **`$inc` convergence under DAG delivery — accepted.** `$inc` doesn't update `_ver`, which is what gives it commutativity with itself. The "stale `$set` delivered after an `$inc` clobbers the increment" scenario cannot happen under DAG delivery for causally-ordered ops: if `$inc` exists at version vInc, its author had already seen the `$set` at version vSet in its state, so vSet is in vInc's `prevIds` chain; no receiver ever applies vInc before vSet. The only way to get apparent divergence is if `$set` and `$inc` are **concurrent** on the same field (two peers that hadn't seen each other's writes), which is a semantically ill-defined user pattern ("reset to 100 AND add 1 in parallel" has no correct answer) and a schema-design anti-pattern: a field is either a counter (only `$inc`) or a settable value (only `$set`). `$incGated` remains available for the LWW-on-post-mutation-value semantic when you explicitly want it.
+3. **`_ver.id` min-update is transactional.** `lowerCreationMarker` mutates the record even when every op is otherwise dropped (the sticky-tombstone case). It runs inside the change's `WriteTx`, so a crash can't persist the marker without the rest of the change.
 
-10. **Transactional atomicity of `_ver.id` min-update.** `lowerCreationMarker` mutates the record even when the op is otherwise skipped (sticky-tombstone case). It runs inside the change's apply `WriteTx`, so a crash between the mutation and the commit can't leak inconsistency.
-
-11. **Handler-derived fields go through `Sink`.** The `_` prefix is reserved at the path-validation layer, so user ops can't reach SDK-internal fields. Handlers derive fields by queueing ops on the `Sink` (`Derive`, `Project`) inside the apply tx, gated like any other write (§8).
-
-12. **Duplicate `RecordChange.Id` in one batch — allowed, applied sequentially.** A batch's `Records` slice has strict internal order; two `RecordChange` entries targeting the same id apply one after the other, with the second seeing the first's effects. This is intentional: it matches how generated code, split validation phases, and merged transport batches produce payloads. Two empty-id records in the same batch are not duplicates — they auto-suffix to distinct ids per §3.3.
+4. **Duplicate `RecordChange.Id` in one change is allowed and applies in order.** Records apply in slice order; a second entry for the same id sees the first one's effects. Generated code, split validation and merged transport batches all produce such payloads. Empty-id records are never duplicates: they resolve to distinct ids (§3.3).

@@ -1,411 +1,398 @@
-# Bundles Registry
+# Bundles registry
 
-Per-space registry of everything installed into the space — marketplace
-bundles or hardcoded setups (e.g. bao). Lives as the `bundles` dataset
+A per-space registry of everything installed into the space: marketplace
+bundles or hardcoded setups (e.g. `bao/v1`). It is the `bundles` dataset
 on the in-space spaceIndex object, so one derived tree carries both the
 space's display metadata and its setup state, and one wait covers both.
 
-## Problem
+## Why a registry
 
-Setup used to be derive-only: deterministic ids, no data written, so
-concurrent multi-device setup converged by construction. Once a setup
-creates a *non-derived* root object (needed the moment setup writes
-data), two devices installing concurrently mint two different roots.
-Without a registry there is no deterministic winner, no way to find the
-loser's objects, and restore has to pull everything before knowing what
-is set up.
+Setup that only derives objects converges by construction: ids are
+deterministic and no data is written. Once setup writes data it needs a
+non-derived root, and two devices installing concurrently mint two
+different roots. The registry gives a deterministic winner, keeps the
+loser's objects findable, and lets restore learn what is installed
+before pulling everything.
 
 ## Data model
 
-One record per bundle in the `bundles` dataset on the spaceIndex
-object (`internal/types/spaceindex/bundles.go`):
+One record per bundle (`internal/types/spaceindex/bundles.go`):
 
 | Field | Op | Semantics |
 |---|---|---|
-| record id | — | Stable bundle identifier (marketplace id, `bao/v1`). Permanent — record deletes are rejected (the sticky tombstone would ban the id forever). |
+| record id | — | Stable bundle id (marketplace id, `bao/v1`). Record deletes are rejected: the sticky tombstone would ban the id forever. |
 | `name` | `$set` | Display name. |
-| `rootId` | `$set` | The winning root object id — a plain LWW register; concurrent installs converge to one deterministic winner (canonical DAG order). |
-| `roots` | `$addToSet` only | Every root ever claimed. Add-only: a `$set` would stamp `_ver[roots]` and gate out concurrent adds, hiding the losing device's objects. Never shrunk — losers stay listed as the audit trail; their death is recorded by tree deletion, not by mutating the array. |
+| `rootId` | `$set` | The winning root, an LWW register; concurrent installs converge on one winner in canonical DAG order. |
+| `roots` | `$addToSet` only | Every root ever claimed. A `$set` would stamp `_ver[roots]` and gate out concurrent adds, hiding the losing device's objects. Never shrunk; a loser's removal is recorded by its tree deletion. |
 
-Handler-enforced invariants (deterministic, so they cover every writer):
-explicit single-field paths only; `rootId` writes must claim the same id
-in `roots` within the same change (`roots ⊇ {rootId}` in every reachable
-state); `roots` accepts only `$addToSet` of non-empty strings; no record
-deletes. Losers are always computable as `roots − rootId − deleted`.
+The handler enforces, for every writer: explicit single-field paths
+only; a `rootId` write claims the same id in `roots` within the same
+change, so `roots ⊇ {rootId}` in every reachable state; `roots` accepts
+only `$addToSet` of non-empty strings; no record deletes. Losers are
+always `roots − rootId − deleted`.
 
-## Root and children
+The dataset is fenced off the public `Modify` / `Delete` surface (like
+`payloads`); writes go through the typed API. Reads and subscriptions
+use `Space.Query(SpaceIndexObjectId(), "bundles")`. A runtime dataset
+named `bundles` is shadowed by the built-in.
 
-The registered root is one non-derived object (`Objects().Create`);
-everything else in the setup is derived from it with
-`DeriveObjectOpts.ParentId = rootId`. Consequences:
+## Root strategies
 
-- The single `rootId` transitively names the whole install — restore
-  derives the children ids from it, opens them immediately, and their
-  content syncs in the background.
-- Deleting a losing root cascade-deletes its derived children — cleanup
-  is one tree delete, no enumeration.
-- A root passed through `NewRoot` must NOT be derived (derived trees
-  cannot be deleted, so a losing install would be unresolvable). Ensure
-  rejects a root it can prove is derived. The opt-in derived root below
-  is the one exception, and it earns it by never losing.
-- Ensure stamps `any.name` on a freshly created root. Load-bearing:
-  any-sync's head-sync diff skips root-only trees, so a root whose data
-  lives entirely in derived children would never sync — and a losing
-  root that never syncs could never be resolved from another device.
+`EnsureBundleRequest` takes exactly one:
+
+- **`NewRoot`** — the caller creates the root (`Objects().Create`) and
+  returns its id.
+- **Neither, with a declaration** — Ensure creates the root itself and
+  stamps it as the definition (§ Bundle-declared definitions). This is
+  the only created root the tech space allows.
+- **`DerivedRoot`** — the root is derived from the bundle id
+  (§ Derived roots).
+
+## Created roots
+
+Everything else in the setup derives from the root with
+`DeriveObjectOpts.ParentId = rootId`:
+
+- The single `rootId` names the whole install. Restore derives the
+  children ids from it, opens them immediately, and their content syncs
+  in the background.
+- Deleting a losing root cascade-deletes its children: cleanup is one
+  tree delete.
+- A `NewRoot` root must not be derived: derived trees cannot be deleted,
+  so a losing install would be unresolvable. Ensure rejects a root it can
+  prove is derived.
+- Ensure stamps `any.name` (`Name`, falling back to the bundle id) on a
+  new root. any-sync's head-sync diff skips root-only trees, so a root
+  whose data lives entirely in children would never sync, and a losing
+  root that never syncs cannot be resolved from another device.
 
 ## Derived roots
 
-`EnsureBundleRequest.DerivedRoot` installs the bundle on a root derived
-from the bundle id (`spaceindex.BundleRootSeed`) instead of a created
-one. A derived root change carries only (spaceId, changeType, payload,
-parentId) — no identity, no signature, no timestamp — so **the root id
-is a pure function of (space, bundle id)**: every device and every
-member computes it offline, with zero communication.
+With `DerivedRoot`, the root is derived from the bundle id
+(`spaceindex.BundleRootSeed`). A derived root change carries only
+(spaceId, changeType, payload, parentId), with no identity, signature or
+timestamp, so **the root id is a pure function of (space, bundle id)**:
+every device and every member computes it offline.
 
-That removes the reason the convergence gate exists. A device that
-installs without having synced the registry cannot mint a *different*
-id, so there is no fork to prevent: the `rootId` register converges on
-an identical value, `roots` converges to one element, `Losers` is empty
-by construction. Both sides of a partition — including the two writers
-of a 1-1 space, where nobody is the owner and nobody can claim "no one
-else could have installed" — get the same working install immediately.
+A device that installs without having synced the registry therefore
+cannot mint a different id. The `rootId` register converges on one
+value, `roots` has one element, and `Losers` is empty. Both sides of a
+partition get the same working install immediately, including the two
+writers of a 1-1 space, where neither side can assume nobody else
+installed.
 
-`DerivedRootId(bundleId)` exposes the same computation on its own: it
-answers "where would this bundle live" without reading the registry,
-installing anything, or touching the network.
+`DerivedRootId(bundleId)` returns the same id without reading the
+registry, installing, or touching the network. It answers "where would
+this bundle live", not "is it installed".
 
-**A claimed canonical derived root always wins.** If both a created and
-a derived root are ever claimed for one bundle id, every replica reports
-the derived one as `rootId` regardless of what the LWW register
-converged to, and the created root becomes an ordinary resolvable loser.
-The verdict reads only the add-only claim set, so every replica reaches
-it from any prefix containing the claim. Without it the LWW register
-could strand the derived root as a loser — and a derived tree cannot be
-deleted, which is the one conflict the registry could never resolve.
+**A claimed derived root always wins.** If a created and a derived root
+are both claimed for one bundle id, every replica reports the derived one
+as `rootId` regardless of the LWW register, and the created root becomes
+an ordinary resolvable loser. The verdict reads only the add-only claim
+set, so every replica reaches it from any prefix containing the claim.
+Otherwise the register could leave the derived root as a loser, which
+could never be deleted.
 
-**The verdict is not a race; the claim can be.** A device that installs
-derived without a converged registry cannot fork *among derived
-installs* — but if the space already carried a **created** install it has
-not seen, its claim demotes that install to a loser on every replica,
-irreversibly. The demoted root keeps its content and stays deletable, so
-nothing is destroyed; what is lost is the app's pointer to it, and for
-content that cannot be merged across objects (chat) that is the same
-thing. This is the one protection the convergence wait still buys a
-derived install, and the deliberate trade of installing anyway: converge
-before installing derived into a space that may already carry a created
-install of the same id, and treat expiring the wait as accepting that
-demotion.
+**The claim can race.** A device that installs derived without a
+converged registry demotes an unseen created install of the same id to a
+loser, on every replica, irreversibly. The demoted root keeps its content
+and stays deletable, but the app loses its pointer to it; for content
+that cannot be merged across objects (chat) that is the same as losing
+it. Before installing derived into a space that may already carry a
+created install, wait for convergence (§ Restore flow); installing after
+the wait expires accepts that demotion.
 
-**The costs, both permanent:**
+Permanent costs:
 
 - **No uninstall.** any-sync refuses to delete a derived tree
-  (`ErrCantDeleteDerivedObject`), so the dead-winner escape below does
-  not apply: the bundle id stays bound to that root forever. Choose a
-  derived root for setups that must exist on both sides of a partition
-  (a space's chat), not for anything a user may remove.
-- **Adoption still wins.** A bundle already installed on a created root
-  stays on it, even when a later call asks for `DerivedRoot` — nothing
-  migrates behind the app's back. `Bundle.Derived` reports what the
-  install actually is.
+  (`ErrCantDeleteDerivedObject`), so the dead-winner reinstall (§ Known
+  edges) does not apply. Use a derived root for setups that must exist
+  on both sides of a partition (a space's chat), never for anything a
+  user may remove.
+- **Adoption wins.** A bundle already installed on a created root stays
+  there even when a later call asks for `DerivedRoot`. `Bundle.Derived`
+  reports what the install is.
 
-**Setup objects hang off a derived root by SEED, not by `ParentId`** —
-any-sync rejects a derived object as a parent (`ErrDerivedParent`). Seed
-them with the root id folded in (`<rootId>/<seed>`): the root id is
-canonical, so the children are just as deterministic. Nothing is lost —
-the ParentId binding buys cascade deletion, and a derived root is never
-deleted.
+**Children hang off a derived root by seed, not `ParentId`**: any-sync
+rejects a derived parent (`ErrDerivedParent`). Seed them as
+`<rootId>/<seed>`; the root id is canonical, so the children are equally
+deterministic. `ParentId` only buys cascade deletion, and a derived root
+is never deleted.
 
-Ensure derives the root itself and writes its first content change —
-the root's membership, the name, the definition metadata and the
-`RootProperties` seeds — before registering anything (a failed stamp
-therefore leaves no install to adopt); `NewRoot` must be nil. The
-membership is the marker when the request declares a definition and
-`RootType` otherwise, plus `RootCollections` and every
-`RootProperties` owner that is neither — a property write to an owner
-the object does not have is rejected — and the SDK-minted created root
-of a declaring request gets the same union the same way. Later Ensures
-are idempotent: a `RootType` is set only when the row has none, a
-declaring request puts the marker over a `RootType` an earlier version
-gave a root Ensure minted (never over a marker of the other kind, and
-never over the type of a `NewRoot` root — both `ErrBundleBadRequest`),
-and a collection the row lacks is `$addToSet`, so a request that gains a
-root collection reaches an existing install.
+## Roots Ensure mints
 
-On the adopt path Ensure materializes the canonical tree — and stamps it
-— when the row arrived before the tree did: the same device can mint it,
-so there is no reason to hand back an id that is not yet writable, and
-the stamp is what puts the fresh local copy back in that device's
-head-sync diff. `RootProperties` are not re-seeded there; seeding
-belongs to the install, and the installer's values sync in. The `any.name` stamp applies here too and is
-load-bearing for a different reason: head-sync skips a tree still
-sitting on its root change, so a derived root that a device never
-stamped would sit outside that device's diff and never pull the peer's
-content.
+For a derived root and for the SDK-created root of a declaring request,
+Ensure writes the root's first content change before registering
+anything, so a failed stamp leaves no install to adopt. That change
+carries:
+
+- membership: the definition marker when the request declares, otherwise
+  `RootType`; plus `RootCollections` and every `RootProperties` owner that
+  is neither (a property write to an owner the object lacks is rejected);
+- `any.name`;
+- the definition metadata;
+- the `RootProperties` seeds.
+
+`RootType`, `RootCollections` and `RootProperties` are refused with
+`NewRoot`: that root got its state, type included, from the caller.
+
+Later Ensures are idempotent:
+
+- `RootType` is set only when the row has no type.
+- A declaring request replaces a `RootType` that an earlier, non-declaring
+  request gave an Ensure-minted root with the marker. It never replaces a
+  marker of the other kind or the type of a `NewRoot` root (both
+  `ErrBundleBadRequest`).
+- A collection the row lacks is added (`$addToSet`), so a request that
+  gains a root collection reaches an existing install.
+
+On adopt, when the registry row arrived before the derived root's tree,
+Ensure materializes the tree and stamps it: the device can mint it, so
+there is no reason to return an id that isn't writable yet.
+`RootProperties` are not re-seeded; the installer's values sync in. The
+`any.name` stamp matters here too: head-sync skips a tree still on its
+root change, so an unstamped local copy would never enter the diff or
+pull the peer's content.
 
 ## Bundle-declared definitions: type roots and collection roots
 
-A bundle may declare a **type** on its root — `XKey`, `Parts` (with
-their datasets), `Properties`, `Layout`, `Hidden` — or a
-**collection** — `Collection: true` with `XKey` and `Properties`.
-A declaration is `Parts`, `Properties` or an `XKey`
-(`EnsureBundleRequest.DeclaresType` / `DeclaresCollection`); the
-metadata needs one. `Parts` and `Layout` are refused with `Collection`
-(`ErrBundleBadRequest`): a collection has neither. The root then
-carries the matching marker in `any.type` — `__type__` or
-`__collection__` — and its id IS the definition's id.
+A request declares a **type** on its root with `XKey`, `Parts`,
+`Properties`, `Layout` and `Hidden`, or a **collection** with
+`Collection: true`, `XKey` and `Properties`. A declaration is `Parts`,
+`Properties` or `XKey` (`DeclaresType` / `DeclaresCollection`).
+Metadata without a declaration, and `Parts` or `Layout` with
+`Collection`, are `ErrBundleBadRequest`.
 
-A declaring root therefore has no type of its own: `RootType` next to
-a declaration is refused. It may still carry `RootCollections` (an app
-root filed under `miniapp`), which is what most app roots do.
+The root carries the marker in `any.type` (`__type__` or
+`__collection__`) and its id is the definition's id. It has no type of
+its own, so `RootType` next to a declaration is refused. It may carry
+`RootCollections` (an app root filed under `miniapp`).
 
-The root **hosts its own records and values** with no flag: a
-definition object implicitly implements itself (docs/data-structure.md § Type and
-collections), so a root's `<rootId>.<propId>` values and the records
-of the datasets it declares live on the root. Three shapes come out of
-the one mechanism:
+A definition object implicitly implements itself (docs/data-structure.md § Type and
+collections): the root holds its own `<rootId>.<propId>` values and the
+records of the datasets it declares. Three shapes:
 
-- a **records host** — a root that exists to hold its bundle's data
-  (favourites entries, an app's setup state). It asks for `Hidden`,
-  since a listed type is one a picker offers for other objects, which
-  would grant them the bundle's storage collections;
-- a **definition objects use** — a page whose part shares the editor,
-  a person; or, as a collection, a wiki whose properties are the tree
-  (`parentId` / `pos`). It declares `Properties` / `Layout` / `Parts`
-  and stays listed. The definition never matches a query for itself:
-  `{"any.type": rootId}` returns its objects, `{"any.collections":
-  rootId}` its members;
-- a **marker definition** — an `XKey` and nothing else: a flag an
-  object carries as its type ("Template") or is filed under as a
-  collection ("Archived"), resolvable by its handle, with no columns
-  and no parts.
+- **Records host** — a root that holds its bundle's data (favourites
+  entries, an app's setup state). It sets `Hidden`: a listed type is one
+  a picker offers for other objects, which would grant them the bundle's
+  collections.
+- **Definition objects use** — a page whose part shares the editor, a
+  person, or a wiki collection whose properties form the tree
+  (`parentId` / `pos`). It stays listed. `{"any.type": rootId}` returns
+  its objects and `{"any.collections": rootId}` its members, never the
+  definition itself.
+- **Marker** — an `XKey` alone: a flag an object carries as its type
+  ("Template") or is filed under as a collection ("Archived"), with no
+  columns or parts.
 
-`Hidden` is explicit: nothing is implied from the shape of the
-declaration. `XKey` is the definition's handle (`TypeInfo.XKey` /
-`CollectionInfo.XKey`, stored as `type.xkey` / `collection.xkey`):
-what a consumer resolves the definition by and what another
-declaration's `relation.targetTypes` names. The SDK stores it as
-non-unique metadata; handle uniqueness is the consumer's rule.
+`Hidden` is always explicit. `XKey` is the definition's handle
+(`TypeInfo.XKey` / `CollectionInfo.XKey`, stored as `type.xkey` /
+`collection.xkey`): what consumers resolve the definition by and what
+`relation.targetTypes` names. The SDK stores it as non-unique metadata;
+uniqueness is the consumer's rule.
 
-**One stamp, root + 3 changes.** The root's first content change
-carries everything the row needs: its membership (`any.type` — the
-marker when it declares, `RootType` otherwise; `any.collections` —
-`RootCollections` plus every other `RootProperties` owner,
-`$addToSet` each, never a whole-array set), `any.name`, the definition
-metadata (`type.xkey` / `layout` / `hidden`, or `collection.xkey` /
-`hidden`) and the seeded `RootProperties` values, in one `objects`
-change (the seeds as their own op, so a seed a peer cannot resolve
-drops alone). The local-write pre-flight grants every namespace the
-change itself sets — including the root's own, which a declaring root
-holds implicitly — so the metadata and the seeded values validate
-alongside the membership write; the apply path does not re-check
-membership. Then the registry row (on the index object), then the
-declarations — one `properties` change, one `datasets` change. A whole
-type therefore takes three changes on its tree, each dataset landing
-atomically; a peer may briefly see the definitions before the parts.
-Landing all three in one any-sync change needs a multi-dataset change
-format (05a-crdt-spec § 6.3), which is deferred. `RootType` /
-`RootCollections` / `RootProperties` apply to every root Ensure mints —
-derived, or the SDK-minted created root of a declaring request (one
-object that is a definition and, say, a `miniapp` carrier) — and are
-refused with `NewRoot`, whose root got its state — its type included —
-from the caller; a declaring request over such a root is refused.
+### Install sequence
 
-`Parts` declares parts with their datasets (the `PartDraft` /
-`DatasetDraft` vocabulary of `user-datasets.md`). Nothing else is
-special-cased — the catalog's `__type__` scan finds the root, the
-ownership check (the object's type declares the dataset, or the object
-IS the declaring type) passes on every carrier and on the root itself,
-a namespaced dataset lives in `<rootId>_<key>` with the ordinary
-`<rootId>:<shortId>` gate stamp, a shared one participates in the
-module's canonical storage collection, `Types().Parts(rootId)` /
-`Datasets(rootId)` and `Space.Datasets()` list the declarations with
-`Owners = [rootId]`, and records go through `Upsert` / `Modify` /
-`Query` on the carriers — the root included. A bundle's setup state
-lives in records on its root, not in child objects.
+A declaring install is the root plus up to three changes:
 
-`Properties` declares property definitions (`PropertyDraft`, validated
-as `AddProperty` validates them) with **deterministic ids**: every
-draft needs an `XKey`, unique within the request, and the property id
-is derived from `(rootId, XKey)`. Two devices installing while apart
-therefore mint ONE column per handle — the one case where the
-"same-handle, two columns" outcome of the descriptor model
-(docs/data-structure.md § Property ids) is unacceptable, because a wiki's two
-`parentId` columns are a forked tree. The ids stay internal: clients
-resolve `xKey → propId` through `Types().Properties(rootId)` —
-`Collections().Properties(rootId)` is the same surface and answers the
-same for a collection root. A property added later through
-`AddProperty(rootId, …)` gets an ordinary change-derived id. Two
-devices creating the same deterministic id while apart reach every
-replica as one create and one creation-shaped modify; the property
-handler projects the change's shortId row from both, so the replica
-knows every schema state a peer may stamp its data writes with
-(otherwise those writes would park for good).
-`Layout` / `Hidden` ride the name stamp (`type.layout` /
-`type.hidden`, or `collection.hidden`) on install; they describe a
-definition, so they need one — `Parts`, `Properties` or `XKey` — alone
-they are `ErrBundleBadRequest`, like a `Layout` on a `Collection`
-request or a seeded value that cannot be encoded, before any root is
-minted.
+1. **Stamp** — one `objects` change on the root: membership
+   (`any.type`; `any.collections` via `$addToSet` per entry, never a
+   whole-array set), `any.name`, the metadata (`type.xkey` / `layout` /
+   `hidden`, or `collection.xkey` / `hidden`) and the `RootProperties`
+   seeds as their own op, so a seed a peer cannot resolve drops alone.
+   The local-write pre-flight grants every namespace the change sets,
+   including the root's own, so metadata and seeds validate alongside
+   the membership write.
+2. **Registry row** on the index object.
+3. **Declarations** — one `properties` change and one `datasets` change.
 
-- Declarations are written after the stamp and the registry row
-  (below), parts in one change, properties in one change.
-- An adopt heals what is **absent**, never patches. Parts: only on a
-  root that carries no part declaration at all (crash before the
-  declaring write, a row adopted before the root tree synced); a root
-  with any declaration — live, or removed through `Types().RemovePart`
-  / `RemoveDataset` (a tombstone keeps no key) — is left alone.
-  Properties: one at a time — a definition is present, and left
-  alone, when the root carries its deterministic id (live, or removed
-  through `Types().RemoveProperty`: the tombstone keeps the id) or a
-  live definition with its handle under any id, since one column per
-  handle is what the id exists for; only the rest are written.
-  `Ensure` never resurrects or doubles a definition. Evolution goes
-  through `Types().AddPart` / `AddDataset` / `AddDatasetField` /
-  `PatchDataset` / `AddProperty` / `PatchProperty` with `typeId =
-  rootId`. Adopting never renames the root or touches its layout or
-  hidden flag either: the name and the metadata are written only when
-  the root carries no name. What the row LACKS is still filled on
-  adopt — the type when it has none, a collection the request lists
-  (`$addToSet`), a handle when the root has none — the same
-  heal-what-is-absent rule the declarations follow; seeds are never
-  re-written.
-- A part naming a **reserved** module (`handler.Module.Reserved`) is
-  refused with `ErrModuleReserved` unless the call carries the
-  `space.SystemInstall()` option — the consumer's own catalog install.
-  Options are not request fields, so no body a consumer binds can
-  reach it. The refusal is draft-time only: a declaration that reached
-  the DAG stays valid on apply. The root that declares it is the
-  module's only carrier: attaching its type to another object is
-  refused at local write time (`handler.ErrValidationReservedCarrier`,
-  docs/user-datasets.md § Model — the write side only; apply stays read-tolerant).
-- Collections cannot collide: a namespaced dataset is `<rootId>_<key>`
-  and a shared one is the module's canonical collection, so two
-  bundles in one space may use the same keys and there is no name
-  ownership to settle. An invalid or duplicate draft fails `Ensure`
-  with `ErrBundleBadRequest` before the permanent root is derived.
-- Two devices declaring the same key concurrently write two records;
-  `CompileTypeParts` folds them to one per key (first creation
-  `_ver.id`, datasets and fields unioned), so every replica converges
-  on one definition. A `DefId` read on the losing device before sync
-  changes after it: look definitions up by key when evolving them.
-- Both root strategies carry declarations, written AFTER the
-  registering change: a failure between the two leaves a registered
-  row whose root carries no declaration — the state the adopt path
-  heals on the next Ensure (derived roots at every device's own
-  materialization; a created winner when its tree is local). The
-  inverse order would strand an orphan root with no registry
-  reference — unhealable, wedging the bundle id. Concurrent created
-  installs fork into roots that each carry their own copy — clients
-  merging a loser's records write them through the winner's
+Each dataset lands atomically, but a change covers one dataset
+(05a-crdt-spec § 6.3), so a peer may briefly see the definitions before
+the parts. Validation runs before any root is minted: an invalid or
+duplicate draft, or a seed that cannot be encoded, fails with
+`ErrBundleBadRequest`.
+
+### Parts
+
+`Parts` uses the `PartDraft` / `DatasetDraft` vocabulary of
+`user-datasets.md`. Nothing is special-cased: the catalog's `__type__`
+scan finds the root; the ownership check (the object's type declares the
+dataset, or the object is the declaring type) passes on every carrier
+and on the root itself; a namespaced dataset lives in `<rootId>_<key>` with the
+`<rootId>:<shortId>` gate stamp; a shared one uses the module's canonical
+collection; `Types().Parts(rootId)` / `Datasets(rootId)` and
+`Space.Datasets()` list the declarations with `Owners = [rootId]`; records
+go through `Upsert` / `Modify` / `Query`. A bundle's setup state lives in
+records on its root, not in child objects.
+
+Collections cannot collide: a namespaced dataset is `<rootId>_<key>` and
+a shared one belongs to its module, so two bundles in one space may use
+the same keys.
+
+A part naming a **reserved** module (`handler.Module.Reserved`) is
+refused with `ErrModuleReserved` unless the call passes the
+`space.SystemInstall()` option, which marks the consumer's own catalog
+install. Options are not request fields, so no request body can reach it.
+The refusal is draft-time only: a declaration in the DAG stays valid on
+apply. The declaring root is the module's only carrier; attaching its
+type to another object is refused at local write time
+(`handler.ErrValidationReservedCarrier`, docs/user-datasets.md § Model).
+
+### Properties
+
+`Properties` drafts (`PropertyDraft`, validated as `AddProperty`
+validates them) get **deterministic ids**: every draft needs an `XKey`
+unique within the request, and the id derives from `(rootId, XKey)`. Two
+devices installing apart mint one column per handle. The descriptor
+model otherwise allows two columns per handle (docs/data-structure.md § Property ids),
+which is unacceptable here: a wiki with two `parentId` columns is a
+forked tree.
+
+Clients resolve `xKey → propId` through `Types().Properties(rootId)`
+(`Collections().Properties(rootId)` answers the same for a collection).
+A property added later with `AddProperty(rootId, …)` gets an ordinary
+change-derived id. When two devices create the same deterministic id
+apart, replicas see one create and one creation-shaped modify; the
+property handler projects the shortId row from both, so every schema
+state a peer may stamp on data writes is known and those writes don't
+park.
+
+On a declaring request, `RootProperties` and `RootCollections` naming the
+root's own id are rejected: the root implements itself. Its property ids
+are known before the install, so the consumer writes those values with
+`Properties().Set(rootId, rootId, …)` afterwards.
+
+### Adopt heals what is absent
+
+Ensure never patches, resurrects or doubles a definition.
+
+- **Parts** are written only on a root with no part declaration at all
+  (crash before the declaring write, or a row adopted before the root
+  tree synced). A root with any declaration, live or removed through
+  `Types().RemovePart` / `RemoveDataset`, is left alone.
+- **Properties** are checked one at a time. A definition is present when
+  the root carries its deterministic id (live, or removed through
+  `Types().RemoveProperty`: the tombstone keeps the id) or a live
+  definition with its handle under any id. Only the rest are written.
+- **Root metadata**: name, layout and hidden are written only when the
+  root has no name. What the row lacks is still filled: the type when it
+  has none, a listed collection (`$addToSet`), a handle when the root has
+  none. Seeds are never re-written.
+
+Evolution goes through `Types().AddPart` / `AddDataset` /
+`AddDatasetField` / `PatchDataset` / `AddProperty` / `PatchProperty` with
+`typeId = rootId`.
+
+### Concurrency and crashes
+
+- Declarations are written after the registering change. A failure in
+  between leaves a registered row whose root has no declaration, which
+  the next Ensure heals (a derived root at each device's own
+  materialization; a created winner once its tree is local). The reverse
+  order would strand an unreferenced root and wedge the bundle id.
+- Two devices declaring the same key write two records;
+  `CompileTypeParts` folds them to one per key (earliest `_ver.id`,
+  datasets and fields unioned), so every replica converges on one
+  definition. A `DefId` read before sync may change after it: look
+  definitions up by key when evolving them.
+- Concurrent created installs fork into roots that each carry their own
+  declarations. Clients merge a loser's records through the winner's
   declaration, then `ResolveLoser` deletes the loser, declarations
   included.
-- On a declaring request, `RootProperties` and `RootCollections`
-  naming the root's own id are rejected — a definition object
-  implements itself, so there is nothing to name. Its own property
-  ids derive from `(rootId, XKey)` and are known before the install,
-  so the consumer writes those values with an ordinary
-  `Properties().Set(rootId, rootId, …)` after it.
 
 ## Tech-space bundles
 
-Account-level product data (favourites, pinned items, personal
-settings objects) lives in bundles on the tech space, reached through
-`Spaces().Get(SDK.TechSpaceId())` — the restricted handle described in
-`tech-space.md`. Same registry (`bundles` on the tech index object),
-same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`, with
-three rules: roots are minted by `Ensure` only (`NewRoot` is refused —
-free object create is fenced on the tech handle; omit both strategies
-and `Ensure` creates the root itself), a declaration (`Parts`,
-`Properties` or `XKey`) required — a tech root exists to host its
-records, which it does as its own definition — and no `RootType` /
-`RootCollections` / `RootProperties`: a tech bundle root IS the
-definition. Both
-strategies are available: `DerivedRoot` for bundles that must never
-fork or uninstall; the SDK-minted created root for ordinary app
-installs — deletable (`Objects().Delete` is allowed on bundle roots:
-deleting the created winner reads as uninstalled; a derived root stays
-undeletable at the object layer), forking on concurrent offline
-installs and resolving like in any space (the account is always owner,
-so the convergence wait's owner escape always applies on expiry).
-Bundle ids are a versioned vocabulary (`favorites/v1`), never a
+Account-level product data (favourites, pinned items, personal settings)
+lives in bundles on the tech space, reached through
+`Spaces().Get(SDK.TechSpaceId())`, the restricted handle described in
+`tech-space.md`. Same registry (`bundles` on the tech index object)
+and the same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`,
+with three rules:
+
+- Roots are minted by `Ensure` only: `NewRoot` is refused because free
+  object create is fenced on the tech handle.
+- A declaration (`Parts`, `Properties` or `XKey`) is required: a tech
+  root exists to host its records as its own definition.
+- No `RootType` / `RootCollections` / `RootProperties`.
+
+Both strategies are available. `DerivedRoot` suits bundles that must
+never fork or uninstall. The SDK-created root suits ordinary app
+installs: `Objects().Delete` works on bundle roots, so deleting the
+created winner reads as uninstalled (derived roots refuse at the object
+layer), and concurrent offline installs fork and resolve as in any
+space. The account is always the tech space's owner, so an app rule
+letting the owner install after the convergence wait expires always
+applies. Bundle ids are a versioned vocabulary (`favorites/v1`), never a
 scratch namespace.
 
-Restore on a second device: `WaitListSynced` → `Spaces().Get(TechSpaceId())`
-→ `WaitIndexSynced` (delegates to the list gate) → `Bundles().Get` /
-`Ensure`; records on the root sync in like any tree. The tech space is
-owner-only, so everything in it is synced scope shared by the
-account's devices and nobody else.
+Restore on a second device: `WaitListSynced` →
+`Spaces().Get(TechSpaceId())` → `WaitIndexSynced` (delegates to the list
+gate) → `Bundles().Get` / `Ensure`. Records on the root sync like any
+tree. The tech space is owner-only, so everything in it is synced scope
+shared by the account's devices and nobody else.
 
 ## API (`space/bundles.go`)
 
-- `Space.Bundles().Ensure` — adopt-or-install, returning the row and
-  whether THIS call registered it. Fully local, no network wait
-  (offline-first): a winner exists → return it, no root minted;
-  otherwise the root is minted (`NewRoot`, or the canonical derivation
-  for `DerivedRoot`) and one change registers it. The returned winner is
-  provisional until the space syncs — unless it is derived, which is the
-  same on every device by construction. `XKey` / `Parts` /
-  `Properties` / `Layout` / `Hidden` declare a type on the root, and
-  `Collection: true` a collection — derived or created (see
-  § Bundle-declared definitions); with neither `NewRoot` nor
-  `DerivedRoot`, `Ensure` mints a created root itself and stamps it as
-  the definition, which then hosts its own records. The
-  `SystemInstall()` option lifts the reserved-module refusal for the
-  consumer's own install.
-- `DerivedRootId` — the canonical derived root id for a bundle id. Pure
-  computation: no registry read, no materialization, no network.
-- `Get` / `List` — read the registry with `Losers` computed.
-- `ResolveLoser` — deletes a losing root (cascade) after the caller has
-  merged whatever content mattered out of it. Never auto-invoked: two
-  installs can carry real user data for days before they meet (offline),
-  so loser cleanup is always an explicit app decision. Idempotent.
-  Deletion needs the loser's tree synced locally (any-sync's
-  settings-tree delete reads the local head entry); until then the call
-  errors and the app retries after sync.
-- Generic reads/subscriptions:
-  `Space.Query(SpaceIndexObjectId(), "bundles").Subscribe(...)`.
+- **`Ensure(req, opts...)`** — adopt or install; returns the row and
+  whether this call registered it. Fully local, no network wait: if a
+  winner exists it is returned and no root is minted; otherwise the root
+  is minted and one change registers it (`$set rootId` + `$addToSet
+  roots`). A created winner is provisional until the space syncs; a
+  derived one is the same on every device.
+- **`DerivedRootId(bundleId)`** — the canonical derived root id; pure
+  computation.
+- **`Get` / `List`** — registry rows with `Losers` computed and
+  `Derived` reported.
+- **`ResolveLoser(bundleId, loserRootId)`** — deletes a losing root and
+  its children after the caller has merged what mattered. Never invoked
+  automatically: two installs can hold real user data for days before
+  they meet. Idempotent. `ErrBundleNotLoser` for the winner or an
+  unclaimed root; `ErrLoserNotSynced` until the loser's tree is local
+  (any-sync's settings-tree delete reads the local head entry).
+
+Errors: `ErrBundleUnknown`, `ErrBundleBadRequest`, `ErrBundleNotLoser`,
+`ErrLoserNotSynced`, `ErrBundleRootNotSynced` (the registry references a
+root whose tree or row hasn't arrived; retry after sync).
 
 ## Wait primitives
 
-- `Service.WaitListSynced` — tech-space gate for the creation-vs-restore
-  split: after it returns, `List` reflects the responsible node's
-  converged view (clean head-sync round, no parked trees). Retries until
-  ctx expires.
-- `Space.WaitIndexSynced` — blocks until the local index view is
-  trustworthy: seeded metadata row projected locally (immediate,
-  offline-capable), or a clean head-sync round with the Synced rollup —
-  the latter covers 1-1 / nameless derived spaces that never seed
-  metadata (an absent index after convergence reads as "nothing set
-  up", not wait-forever). Covers projection, not just heads.
+- **`Service.WaitListSynced`** — tech-space gate for the create-vs-restore
+  decision. After it returns, `List` reflects the responsible node's
+  converged view (a clean head-sync round, no parked trees). Retries
+  until `ctx` expires.
+- **`Space.WaitIndexSynced`** — blocks until the local index view is
+  trustworthy: the seeded metadata row is projected locally (immediate,
+  works offline), or a clean head-sync round reports Synced. The second
+  condition covers 1-1 and nameless derived spaces that never seed
+  metadata: an absent index after convergence reads as "nothing set up".
+  It covers projection, not just heads.
 
-## Restore flow (app side)
+## Restore flow
 
-1. `WaitListSynced` → does the (derive-ahead) space id exist in the
-   list?
-2. Exists → open it → `WaitIndexSynced` → `Bundles().Get/Ensure` →
-   derive children from the winner, open immediately, content syncs in
+1. `WaitListSynced`, then check whether the (derive-ahead) space id is in
+   the list.
+2. If it exists: open it, run the **convergence gate**
+   (`WaitIndexSynced`), then `Bundles().Get` / `Ensure`. Derive children
+   from the winner and open them immediately; content syncs in the
    background.
-3. Doesn't exist → derive + create the space, run setup via `Ensure`.
+3. Otherwise: derive and create the space, then run setup via `Ensure`.
+
+The convergence gate lets a created install adopt a winner that already
+synced instead of forking against it. A derived install needs it only to
+avoid demoting an unseen created install (§ Derived roots).
 
 ## Known edges
 
-- A deleted winning root reads as **uninstalled** on every surface
-  (Get/List report absent, Ensure reinstalls fresh) — without this the
-  bundle id would be permanently wedged, since record deletes are
+- A deleted winning root reads as **uninstalled** everywhere: `Get` /
+  `List` report it absent and `Ensure` reinstalls on a fresh root.
+  Otherwise the bundle id would be wedged, since record deletes are
   rejected and `rootId` has no unset.
-- The `bundles` dataset is fenced off the public Modify/Delete surface
-  (like `payloads`); writes go through the typed API only.
-- The dataset name `bundles` is reserved retroactively: a pre-existing
-  runtime dataset with that name (legal before this shipped) is
-  shadowed by the built-in. Accepted without migration — pre-release
-  decision.
-
-- Crash between `NewRoot` and the registering write leaves one
+- A crash between `NewRoot` and the registering write leaves one
   unreferenced object; the retried Ensure installs a fresh root. The
-  orphan is unlisted junk, not a conflict.
+  orphan is unlisted, not a conflict.
 - A never-seeded index blocks `WaitIndexSynced` only while offline: a
-  converged round returns "nothing set up" and the caller reads an
-  empty registry; a hard re-setup mechanism is future work.
-- `Losers` counts a root with unknown deletion status (tree not present
-  locally) as live; `ResolveLoser` re-validates and deletion is
-  idempotent, so over-reporting is safe.
+  converged round returns and the caller reads an empty registry. There
+  is no forced re-setup.
+- `Losers` counts a root whose deletion status is unknown (tree not
+  local) as live. `ResolveLoser` re-validates and deletion is idempotent,
+  so over-reporting is safe.

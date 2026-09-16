@@ -1,341 +1,211 @@
-# Scoped Properties — scope on the declaration, not on the value
+# Scoped properties
 
-Status: **accepted** (2026-06-12). Supersedes the variant-bag model in
-`crdt-spec.md` §9 ("Property Variants") and `data-structure.md`
-§"Storage — Proposal 2" / §"Conflict Resolution"; those sections are
-rewritten as part of slice 1. Expert-reviewed (two consults; key
-findings folded in below).
-
-## Decision
-
-**Scope is a fixed attribute of a declaration** — of a property
-definition, or of a dataset schema field — never a per-value overlay.
-One unified taxonomy everywhere (`schema.Scope`):
+Scope is a fixed attribute of a **declaration** (a property definition or
+a dataset schema field), never of a value. One taxonomy, `schema.Scope`,
+covers both:
 
 | scope | write route | version domain | syncs to |
 |---|---|---|---|
-| `synced` | object's own DAG change | object tree orderId | everyone with space access |
-| `derived` | handler-only (sink.Derive) | triggering change's | (computed convergently) |
-| `account` | carrier record in tech space → per-device mirror | tech tree orderId | same account's devices |
+| `synced` | the object's own DAG change | object tree orderId | everyone with space access |
+| `derived` | handler only (`Sink.Derive`) | the triggering change's | computed convergently |
+| `account` | carrier record in the tech space → per-device mirror | tech tree orderId | the same account's devices |
 | `local` | `Object.LocalSet`, no DAG | local lexid allocator | this device only |
 
-- A property declares `scope` at creation; default `synced`; pinned
-  first-write-wins exactly like `kind` (schema-bearing field). Changing
-  scope = define a new property = new propId. `derived` is reserved for
-  built-ins (`id/author/spaceId/createdAt/modifiedAt/modifiedBy`, at
-  row root).
-- Dataset schema fields already declared `synced|derived|local`; they
-  may now also declare `account` (e.g. a per-account `read` flag on
-  `chat_messages`). Same enforcement, same transport.
-- **No priority merge, no fallback stack, no `_base`/`_account`/
-  `_device` record fields.** A value lives at its normal path
-  (`record[{typeId}][{propId}]`, or the dataset field), written from
-  exactly one route. Wanting both a shared and a personal "favorite"
-  means two properties; clients compose if they care.
+- A property declares `scope` at creation; the default is `synced`. Scope
+  is pinned first-write-wins like `kind` (a schema-bearing field):
+  changing it means defining a new property with a new propId. `derived`
+  is reserved for the built-ins at row root (`id`, `author`, `spaceId`,
+  `createdAt`, `modifiedAt`, `modifiedBy`).
+- A dataset schema field may declare any of the four scopes, with the
+  same enforcement.
+- A value lives at its normal path (`{ownerId}.{propId}` on the objects
+  row, or the dataset field) and is written from exactly one route.
+  There is no priority merge or fallback stack: a shared and a personal
+  "favorite" are two properties, and clients compose them. An override
+  stack would need row migration, computed roots, projection stripping
+  and shadowed-write events for no capability two properties lack.
 
-### Rejected: the variant-bag model (docs' "Proposal 2")
+## Why one `_ver` tree stays safe
 
-Per-record `_base`/`_account`/`_device` bags + computed root + priority
-`device > account > base` was rejected because ~80% of its complexity
-(row migration, computed-root derivation hooks, projection stripping,
-shadowed-write event edge cases, three-domain `_ver` presentation) paid
-for the override stack alone. The half-built machinery on main
-(`RecordChange.Variant`, wire `x` key, `variantTarget`, event variant
-prefixing, `ProjectionOpts.IncludeVariants`/`PropertyReadOpts`) is
-**deleted** in slice 1.
-
-This also supersedes 06's §"Not Expanding This Pattern to All CRDT
-Data": that rejection targeted the override model (shadow-variant GC,
-merge consistency). A scope-declared dataset field has no shadowing —
-it's just a field with a different write route — so extending scopes to
-dataset fields is now in scope and resolves real product needs
-(read/unread, per-account pins, last-seen) without bespoke side objects.
-
-## Why `_ver` stops being a problem
-
-Domain safety comes from **path-disjointness**: a given path is only
-ever written from its one declared scope's version domain, so versions
-from different domains never gate against each other inside the single
-per-record `_ver` tree. This generalizes a shipped precedent — the
-tech-space `spaces` dataset already mixes synced fields and a local
-field (`localStatus`) on the same records, one `_ver` map, mixed-domain
-versionIds on one event stream.
+A path is only ever written from its declared scope's version domain,
+so versions from different domains never gate against each other inside
+a record's single `_ver` tree. The tech-space `spaces` dataset relies on
+the same property: synced fields and the local `localStatus` share one
+`_ver` map.
 
 Consequences:
-- Record shape, query reads, `_ver.id` creation marker, sort/paging:
-  **unchanged**.
-- Subscribe frames: one versionId per frame (the domain of whatever
-  change produced it — already true for local writes today). The
-  documented client recipe `_ver.<op.path> = frame.versionId` holds
-  verbatim. No shadowed writes, no derived root ops, no empty-frame
-  suppression.
-- `ModifyResult.VersionId` is meaningful per call because a write call
-  is single-scope (below).
 
-## Enforcement matrix (who rejects what, where)
+- Record shape, query reads, the `_ver.id` creation marker, sorting and
+  paging are scope-agnostic.
+- A subscribe frame carries one versionId, from whatever change produced
+  it. The client recipe `_ver.<op.path> = frame.versionId` holds for
+  every scope.
+- `ModifyResult.VersionId` is meaningful because a write call is
+  single-scope.
 
-Scope resolution = registry lookup by (typeId, propId) for properties;
-dataset schema `ScopeOf(field)` for dataset fields.
+## Enforcement
 
-- **Writer-side, strict** (keeps bad changes out of the DAG): the
-  routing layer resolves every patch key's scope; `Set()` routes by it;
-  kind+scope validated before any write. Local/account routes don't run
-  dataset handlers, so writer-side validation is their primary guard —
-  acceptable because those routes are SDK-internal APIs, not inbound
+Scope resolves by `(ownerId, propId)` in the registry for properties and
+by the dataset schema for dataset fields.
+
+- **Writer side, strict.** `Properties().Set` resolves every patch key's
+  scope, routes by it, and validates kind and scope before writing. The
+  local and account routes skip dataset handlers, so writer-side
+  validation is their guard; both are SDK-internal routes, not inbound
   network surface.
-- **Apply-side, defensive per-op drop** (convergent guard against
-  malicious/buggy peers): `SystemPropertiesHandler.BeforeCreate/
-  BeforeModify` drop an inbound DAG op whose target propId is declared
-  `account`/`local`/`derived` — same machinery and rejection surface as
-  kind mismatch. `classifyFieldWrite` does the equivalent for declared
-  dataset fields. The DataVersion gate already parks inbound changes
-  whose schema hasn't synced, closing the unknown-definition window for
-  the DAG route.
-- **Mirror-side** (account route): the watcher resolves scope before
-  applying; ops for **unknown propIds are skipped, not dropped
-  permanently** — the state-based re-mirror retries them once the
-  target space's definitions sync (expert "Hole A"). No parking
-  machinery needed; the re-mirror IS the retry.
-- **FWW scope conflicts don't exist**: propIds are
-  `base58(xxh3-64(changeId))` — content-addressed, concurrent creates
-  mint different ids. The only needed rule is the immutability pin
-  (scope joins `kind` in `schemaBearingFields`).
+- **Apply side, per-op drop.** `SystemPropertiesHandler.BeforeCreate` /
+  `BeforeModify` drop an inbound DAG op whose property is declared
+  `account`, `local` or `derived` (reason `scope_mismatch`, same surface
+  as a kind mismatch). `classifyFieldWrite` does the same for declared
+  dataset fields. The DataVersion gate parks changes whose definitions
+  haven't synced.
+- **Mirror side.** The mirror resolves scope before applying. An op for
+  an unknown propId is skipped, not dropped: the carrier keeps the value
+  and the next re-mirror retries once the definition syncs.
+- **No scope conflicts.** PropIds are `base58(xxh3-64(changeId))`, so
+  concurrent creates mint different ids; the scope pin is the only rule
+  needed.
 
 ## Write API
 
-`PropertiesAPI` (replaces `SetBase`/`SetAccount`/`SetDevice`):
-
 ```go
-Set(ctx, objectId, typeId string, patch map[string]any) (ModifyResult, error)
+Set(ctx, objectId, ownerId string, patch map[string]any) (ModifyResult, error)
 ```
 
-- Auto-routes: resolves each key's declared scope, issues the write on
-  that scope's route.
-- **Single-scope per call**: a patch spanning scopes is rejected with
-  an error listing the split (expert pushback accepted — avoids
-  unrollbackable partial writes across version domains; one call = one
-  version domain = clean ModifyResult).
-- `Set` on local-scoped props returns the locally-minted lexid as
-  VersionId (uniform optimistic-UI recipe across scopes).
-- `Get(ctx, objectId)` returns the row verbatim (no opts, nothing to
-  strip). The membership writes — `SetType` /
-  `AttachCollection` / `DetachCollection` — are synced-only.
+- Routes by each key's declared scope. Keys that don't resolve fall
+  through to the chosen route's strict validation, which produces the
+  precise rejection (`unknown_property`, `type_unknown`,
+  `scope_mismatch`).
+- **One scope per call.** A patch spanning scopes is rejected with the
+  per-scope key split. Routes commit in different version domains with
+  no cross-route rollback.
+- Local-scope writes return the locally minted lexid as `VersionId`;
+  account-scope writes return the carrier tree's version.
+- `Get(ctx, objectId)` returns the row verbatim. `SetType`,
+  `AttachCollection` and `DetachCollection` are synced-only.
 
-## Account transport (slice 4 — landed 2026-06-12)
+Dataset records: `ModifyBatch.Scope = ScopeLocal` routes a batch through
+`Object.LocalSet`. Records must already exist (explicit ids, no
+`Upsert`), `TraceIds` are rejected, and the `objects` dataset is refused
+(local property values go through `Properties().Set`). Wrong-scope ops
+surface as `ModifyResult.Rejections`; absent records as
+`ErrStrictSkipAbsent` rejections. `ModifyMany` and `Delete` are
+synced-only. `ScopeAccount` and `ScopeDerived` are rejected.
 
-- Tech space hosts **one derived carrier object per target space**
-  (seed: `builtin:accountValues/<spaceId>`, dataset `account_values`,
-  package `internal/accountvalues`); bounded DAG, 1:1 space lifecycle,
-  trivial GC on leave. The names cover internals only — values sit at
-  their normal `{typeId}.{propId}` paths in carrier records AND target
-  rows; no new user-visible namespace exists.
-- One carrier record per **(objectId, dataset, recordId)**, record key
-  `objectId:dataset:recordId` (colon never appears in CIDs) — the
-  objects row is the degenerate case (`<objId>:objects:<objId>`).
-  Record fields are the account-scoped paths; the record's own `_ver`
-  (tech domain) is the version source, including retained entries for
-  unset paths. v1 mirror coverage: objects rows only; dataset-field
-  transport is a mechanical follow-up on the same key/Diff path.
-- **Injected applies** (`Change.Injected` + `Object.InjectedSet`): no
-  DAG, dataset handler skipped (like Local), but the versionId is
-  caller-supplied (the tech tree's) instead of locally minted; events
-  + applySeq flow through the one apply path. classifyFieldWrite
-  permits the injected route on declared account fields and undeclared
-  heads of DynamicScopeByKey datasets only. Injected applies always go
-  through the object's CACHED controller (store.Get) — a second bare
-  controller would persist stale in-memory maxApplySeq/maxAddSeq
-  mirrors into _meta and regress the feed/restore watermarks.
-- **`Diff` is a pure function** — `Diff(carrierRec, targetRec,
-  scopeResolver) []InjectedBatch`: value present ⇒ $set; absent with a
-  retained version ⇒ $unset; unknown propId ⇒ skip (Hole A — the next
-  re-mirror retries); already applied ⇒ no-op. Ops are GROUPED BY each
-  path's retained carrier version, one InjectedSet per distinct
-  version — never a max-version over-claim. Both mirror paths (live
-  event + on-load state re-mirror) share it.
-- **State-based full re-mirror on space load** (no cross-space replay
-  cursors); live path is a windowed Query.Subscribe on the carrier
-  dataset whose overflow/drift recovery IS "re-run the re-mirror and
-  resubscribe". Fast-path per-record watermark skip: follow-up.
-- **No orphan rows / replay-log semantics**: a remote-originated
-  carrier value for an object not present locally just WAITS in the
-  carrier (the carrier record is the replay log); the row-created hook
-  (afterApply creation-marker detection on the objects dataset) and
-  the on-load re-mirror are the two replay triggers. A LOCAL
-  `Set(account)` call addressing an object whose row doesn't exist on
-  this device errors, symmetric with the local route (caller bug, not
-  a sync state).
-- **Read-your-writes**: Set's account branch writes the carrier, then
-  runs the injected apply inline for this device; the watcher's later
-  double-apply gates to a no-op.
+## Account transport
 
-## Removal / GC
+- The tech space hosts one **carrier object** per target space: derived
+  from seed `builtin:accountValues/<spaceId>`, dataset `account_values`
+  (`internal/accountvalues`). Bounded DAG, lifecycle 1:1 with the target
+  space.
+- One carrier record per target `(objectId, dataset, recordId)`, keyed
+  `objectId:dataset:recordId` (a colon never appears in CIDs). The
+  objects row is `<objId>:objects:<objId>`. Record fields are the
+  account-scoped paths verbatim; the record's `_ver` (tech domain),
+  including entries retained by `$unset`, is the version source.
+- **Injected applies** (`Change.Injected`, `Object.InjectedSet`): no DAG
+  and no dataset handler, like a local write, but the versionId is the
+  carrier's instead of locally minted. Events and applySeq flow through
+  the normal apply path. `classifyFieldWrite` admits the injected route
+  only on declared account fields and undeclared heads of
+  `DynamicScopeByKey` datasets. Injected applies always use the object's
+  cached controller (`store.Get`); a second controller would persist
+  stale in-memory watermarks and regress the feed and restore cursors.
+- **`Diff(carrierRec, targetRec, scopeResolver)`** is pure: value
+  present → `$set`; absent with a retained version → `$unset`; unknown
+  propId → skip; already applied → no-op. Ops are grouped by each path's
+  carrier version, one `InjectedSet` per version, so no batch claims a
+  version it doesn't carry.
+- **Mirror** (`internal/spaceimpl/accountmirror.go`), one per loaded
+  space. Every trigger runs the same idempotent reconcile:
+  - space load: full re-mirror of every carrier record;
+  - carrier events: coalesced into full reconciles;
+  - target row created: replay that object's carrier record;
+  - target row tombstoned: delete that object's carrier records;
+  - periodic tick: retries skipped unknown-definition values and keeps
+    the carrier resident between head-sync rounds.
+- **The carrier is the replay log.** A carrier value for an object not
+  present locally waits in the carrier until the row appears. A local
+  `Set` with account scope on an object this device doesn't hold is a
+  caller error.
+- **Read-your-writes.** `Set` writes the carrier, then runs the injected
+  apply inline; the mirror's later apply of the same change gates to a
+  no-op.
+- **Coverage.** The mirror handles objects rows only. Dataset fields may
+  declare `account` and are enforced, but have no transport:
+  `ModifyBatch.Scope = ScopeAccount` is rejected.
 
-Every remove path has a defined owner; nothing relies on "unknown ⇒
-delete" (which would race the schema-sync window):
+## Removal
 
-- **Unset a value** (`$unset` via Set): synced — normal CRDT op;
-  account — carrier-record `$unset` with retained `_ver` entry, so the
-  re-mirror propagates the unset to devices that were offline; local —
-  sidecar + row unset.
-- **Object deleted** (target row tombstoned): the watcher observes the
-  tombstone and **deletes the object's carrier records in tech space**
-  (all `(objectId, *, *)` keys) and its local sidecar rows. Every
-  device may issue the same carrier delete — CRDT deletes are
-  idempotent and tombstones sticky, so this converges. A racing account
-  write loses to the sticky carrier tombstone; injected applies already
-  short-circuit on tombstoned target rows, so nothing resurrects.
-- **Space left/deleted**: drop the whole per-space carrier object in
-  tech space + the space's sidecar rows.
-- **Property definition removed**: carrier values under the dead propId
-  become orphans, same policy as base-value orphans (docs/data-structure.md §"read
-  tolerance") — deliberately NOT GC'd by the mirror, because the mirror
-  cannot distinguish "removed" from "definition not synced yet" (the
-  Hole-A skip rule). Bounded: dead propIds can't be resurrected
-  (content-addressed ids), and the object-delete / space-leave paths
-  reclaim them eventually.
+Every removal has a defined owner; nothing treats "unknown" as "delete",
+which would race the schema-sync window.
 
-## Local route (slice 3 — landed)
+- **Unset a value.** Synced: a CRDT `$unset`. Account: a carrier
+  `$unset` whose retained `_ver` entry lets the re-mirror propagate it to
+  devices that were offline. Local: a row unset.
+- **Object deleted.** The mirror observes the tombstone and tombstones
+  the object's carrier records. Any device may issue the same deletes;
+  CRDT deletes are idempotent and tombstones sticky, so this converges.
+  A racing account write loses to the carrier tombstone, and injected
+  applies skip tombstoned rows, so nothing resurrects.
+- **Space left or deleted.** `DropAccountValues` deletes the carrier
+  tree. This violates an any-sync rule: derived trees must not be
+  deleted, because delete + re-derive yields the same id with fresh
+  history. It needs to become record-level GC (tombstone every carrier
+  record, keep the empty derived tree).
+- **Property definition removed.** Carrier values under the dead propId
+  are orphans with the same read tolerance as synced orphans (docs/data-structure.md).
+  The mirror does not GC them: it cannot tell "removed" from "not synced
+  yet". Dead propIds cannot come back (content-addressed ids), and object
+  delete or space leave reclaims them.
 
-`Properties.Set` routes local-scoped patches through `Object.LocalSet`
-(strict mode — the row must exist; no local-domain creation markers).
-Writer-side strict validation (unknown property / kind) replaces the
-handler pass local writes skip. The controller's head-level class check
-gets `HandlerReg.DynamicScopeByKey`: undeclared heads on the objects
-dataset carry per-property scopes the controller can't see, so the
-direction check is skipped for them (declared derived heads stay
-enforced); per-prop enforcement lives in the handler (DAG route) and
-`Set` (local/account routes).
+## Rebuilds and local values
 
-**Dataset records (landed 2026-07-03).** The local route is public for
-dataset records too: `ModifyBatch.Scope = ScopeLocal` routes the batch
-through `Object.LocalSet` (`spaceimpl.modifyLocal`) — the same
-materialization techspace uses for `localStatus` / `identities`,
-opened to declared local-scope dataset fields (e.g. a read-tracking
-`unread` flag on `chat_messages`). Single-scope per call, like
-`Properties.Set`. Strict by construction: explicit record ids, no
-Upsert (local fields annotate synced records, never create them), no
-TraceIds. Scope enforcement is the apply layer's `classifyFieldWrite`
-(route=local): wrong-scope ops surface as `ModifyResult.Rejections`,
-absent records as `ErrStrictSkipAbsent` rejections. `ModifyMany` and
-`Delete` stay synced-only. Contract test:
-`e2e/local_scope_records_test.go` (the dataset-record sibling of
-`local_scope_test.go`).
+A handler version bump rebuilds an object by wiping its materialized rows
+and replaying the tree (`internal/spaceobjects/reindex.go`). Local-scope
+leaves never entered the DAG, so they are captured onto the object's
+`_meta` row before the wipe and re-applied after the replay; an
+interrupted rebuild resumes from that row on the next load. Account
+values need no capture: the mirror replays the carrier when the row
+re-materializes.
 
-**Sidecar deferred.** The expert-recommended local sidecar collection
-(`(objectId, dataset, recordId) → {values, vers}` as the durable source
-of truth, row value a materialization) only matters for the
-wipe-and-rebuild re-index path — machinery that does not exist yet
-(docs/versioning.md is all open questions). Local values are durable in any-store
-today. The sidecar lands WITH the rebuild machinery; until then a
-handler-version-bump wipe (if implemented naively) must not be shipped
-without it.
+## applySeq
 
-## applySeq (slice 2) — consumer-feed watermark
+Account and local writes never enter the target space's DAG, so they
+have no AddSeq and would be invisible to a feed keyed on it.
 
-Account/local writes never enter the target space's DAG ⇒ no AddSeq ⇒
-invisible to `ChangedSince`/`_addSeq > since` (the `any` indexer's
-freshness signal would silently go stale on those writes).
+- `applySeq` is a per-space, SDK-owned monotonic counter, allocated on
+  every apply that mutates a record (DAG, mirror, local), stamped on the
+  row as `_applySeq` and persisted in the same WriteTx as the stamp. A
+  lazily persisted counter could regress after a crash and re-mint seqs
+  a consumer cursor already passed.
+- `Space.Changes()` (`ChangedSince`, `Subscribe`) is keyed on applySeq.
+  AddSeq keeps its own job as the any-sync → any-store restore watermark
+  (per-object `MaxAddSeq`). AddSeq answers "is any-store caught up with
+  any-sync"; applySeq answers "is the consumer caught up with any-store".
+- Boot replay of already-applied changes is a content no-op, so the feed
+  stays quiet. A rebuild mints fresh seqs for rows whose content changed,
+  so downstream indexers re-feed incrementally.
+- Tombstones carry `_applySeq`, so deletions stream in the same order.
+- Rows written before applySeq existed are backfilled `applySeq :=
+  addSeq` once per space, and the allocator seeds past the maximum, so
+  cursors persisted in AddSeq units stay valid.
 
-- New per-space, SDK-owned monotonic `applySeq`: minted on every apply
-  that actually mutates a record (DAG, mirror, local), stamped on the
-  row as `_applySeq`, **persisted in the same WriteTx** as the stamp
-  (lazily-persisted counters can regress on crash and re-mint seqs a
-  consumer cursor already passed).
-- `Space.Changes()` feed and `ChangedSince` re-key onto applySeq.
-  **AddSeq keeps its real job**: the any-sync→any-store restore
-  watermark (per-object `MaxAddSeq`, `IterateAfterAddSeq`). Two
-  reconciliation links, each keyed by its upstream's coordinate:
-  AddSeq answers "is any-store caught up with any-sync"; applySeq
-  answers "is the index caught up with any-store".
-- Boot replay of already-applied changes gates to content no-ops ⇒ no
-  bump ⇒ quiet feed. Handler-version rebuilds mint fresh seqs for rows
-  whose content changed ⇒ downstream indexers re-feed incrementally
-  (today's answer is `rm <data-dir>/index`).
-- Tombstones carry `_applySeq` like they carry `_addSeq` (deletion
-  streaming).
-- Existing rows: seed `_applySeq` from `_addSeq` lazily (first stamp
-  wins) or at first open; consumers' cursors reset per-space via the
-  feed's documented "cursor is local" contract.
+## Consumer caveats
 
-## Migration
+- Account and local properties in shared spaces mean "my value": queries
+  filtering on them select per-account or per-device result sets.
+- Agents and automations must not condition shared mutations on account
+  or local values ("delete where my-review-status = rejected" deletes
+  the shared object for everyone).
+- A local search index covers what the local account sees, account and
+  local values included; per-device index divergence is correct.
 
-**None.** Values already sit at their final paths; everything existing
-is synced-scope; definitions without a `scope` field read as `synced`.
+## Open items
 
-## Documented footguns (docs slices, both repos)
-
-- Account/local props in shared spaces mean **"my value"** in queries —
-  filters on them select per-account/per-device result sets.
-- Agents/automations must not condition **shared** mutations on
-  account/local-scoped values ("delete where my-review-status =
-  rejected" deletes the shared object for everyone).
-- The local search index intentionally indexes what the local account
-  sees (account/local values included) — per-device index divergence is
-  correct.
-
-## Implementation slices (SDK, this branch)
-
-Slices 1–4 are landed on feat/scoped-properties; remaining follow-ups
-are listed at the end of this section.
-
-1. **Scope on declarations + enforcement + cleanup** — `schema.
-   ScopeAccount` (+ ParseScope); unify `anytype`/`spaceindex` mini-enums
-   onto schema.Scope; `PropertyDraft/Def.Scope` (+ space-package alias);
-   `typetype` pins `scope` (schemaBearingFields) and validates labels on
-   create; `PropInfo.Scope` through LiveRegistry/Stub; handler drops
-   wrong-route ops (new `scope_mismatch` validation reason); auto-routing
-   `Set()` (synced route live; account/local return clear not-implemented
-   until slices 3/4); **delete variant machinery**; docs/crdt-spec.md §9 + 06
-   rewrite.
-2. **applySeq** — counter + stamping + feed re-key + tests (crash
-   semantics, rebuild re-feed).
-3. **Local scope end-to-end** — Set() local route via LocalSet on the
-   objects row; sidecar source of truth + rebuild re-injection;
-   classifyFieldWrite allows declared-local dataset fields via LocalSet
-   (already does) and the objects carve-out.
-4. **Account scope end-to-end** — carrier object + dataset, injected
-   apply path (explicit versionId), watcher (live + on-load re-mirror +
-   row-creation pull + leave-space GC); account dataset fields ride the
-   same carrier keying.
-5. **Docs final pass** — 02-tech-space (carrier), 04/05 cross-refs,
-   README status.
-
-## `any` server follow-ups (separate repo, after SDK tags)
-
-- Property create/read endpoints + CLI gain `scope` (wire strings =
-  schema.Scope labels; `x-scope` discovery unchanged and now shares the
-  vocabulary).
-- `Properties.Set` replaces per-scope endpoints 1:1; docs/space.md/08/09.
-- Indexer/chunkers swap `_addSeq` → `_applySeq` (docs/one-to-one-spaces.md § freshness +
-  the "index reflects local view" note).
-
-## Follow-up ledger (post slices 1–4)
-
-- **Carrier GC must not tree-delete (any-sync rule on derived trees).**
-  any-sync forbids deleting DERIVED objects — deletion is allowed only
-  for ordinary (non-derived) trees — because a derived tree's id is
-  deterministic: delete + re-derive yields the SAME identity with
-  fresh history, i.e. history replacement. The carrier is derived
-  (`builtin:accountValues/<spaceId>`), so `DropAccountValues`'s
-  `tree.Delete` on space leave is invalid under the protocol. Replace
-  with record-level GC: tombstone every carrier record (CRDT deletes,
-  converge normally) and leave the empty derived tree in place;
-  storage reclamation is whatever any-sync ever offers for derived
-  trees. The per-object delete GC (DeleteAccountValuesForObject) is
-  already record-level and unaffected.
-
-- **Dataset-field account transport**: declaration + enforcement are
-  live; the mirror handles the objects rows only. Extending it = key
-  records by their real (dataset, recordId) and target per-object
-  dataset collections in mirrorRecord.
-- **Local sidecar** for local-scope durability — lands WITH the
-  wipe-and-rebuild re-index machinery it serves (docs/versioning.md).
-- **Re-mirror fast path**: per-carrier-record applied-watermark skip
-  for spaces with very many overridden objects.
-- **Carrier residency**: the mirror keeps the carrier object resident
-  while reconciling; a TTL-evicted carrier delays remote account
-  values until the next event/reconcile (same residency semantics as
-  the tech index object).
-- **`any` server follow-ups**: scope on property endpoints/CLI,
-  `_addSeq` → `_applySeq` in chunkers/indexer, docs/space.md/08/09/13, the
-  two shared-space footguns documented in client recipes.
+- Record-level carrier GC on space leave (see Removal).
+- Account transport for dataset records: key records by their real
+  `(dataset, recordId)` and target per-object dataset collections in the
+  mirror.
+- Re-mirror fast path: a per-record applied watermark to skip unchanged
+  carrier records in spaces with many account values.

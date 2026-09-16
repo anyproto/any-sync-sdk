@@ -1,205 +1,210 @@
-# Types & Properties — Proposal
+# Types & Properties
 
-> Historical proposal. The shipped model is one type per object at
-> `any.type` plus any number of collections at `any.collections` —
-> see [data-structure.md](data-structure.md) § Type and
-> collections. Read "the types an object implements" below as "its
-> type and its collections".
+How type and collection schemas are versioned, and how data changes are
+gated on the schema state their writer had. The object model (one type per
+object, collections, the `objects` row) is in
+[data-structure.md](data-structure.md); runtime datasets are in
+[user-datasets.md](user-datasets.md).
 
-## System — structure & abilities
+## Model
 
-**Space** — a container of objects.
+- Every object has one type (`any.type`) and any number of collections
+  (`any.collections`).
+- A type or collection is an object whose `properties` dataset holds one
+  record per property, keyed by propId: `kind`, optional `scope`, `items`
+  and `properties`, display fields (`name`, `description`, …), and the
+  opaque `x-format` descriptor.
+- Property values live on the object's row in the per-space `objects`
+  collection at `{ownerId}.{propId}`; built-in owners use short ids (`any`).
+  A type's namespaced datasets are collections named `<typeId>_<key>`.
+- Two definitions with the same `name` are distinct properties with
+  distinct propIds. Values under one path converge per field like any CRDT
+  write.
+- There is no type inheritance or templating.
 
-**Object** — belongs to a space. Can hold **many datasets**.
+## Change-level `DataVersion`
 
-**Dataset** — a MongoDB-like collection of records, scoped to its object. One object → N named datasets.
+Every CRDT `Change` carries a `DataVersion` string naming the schema or
+handler state its writer used. An empty `DataVersion` is invalid: the
+Controller rejects the change (`crdt.ErrMissingDataVersion`).
 
-**Record** — a document inside a dataset.
+Schema state is encoded as `typeId:shortId` pairs separated by `;`
+(`internal/types/dataversion.go`), where the id may be a type or a
+collection. An owner with no shortId yet contributes no pair. Handler
+versions are opaque strings, conventionally `<name>-v<n>`; only equality
+matters, never order.
 
-### Abilities
-
-**On records**
-- Create (implicit on first write)
-- Update fields: `$set`, `$unset`, `$inc`, `$addToSet`, `$pull`
-- Delete (tombstoned)
-- Address nested fields by dotted path
-
-**On datasets**
-- Query: filter, sort, limit, offset (Mongo-style operators)
-- Indexes
-- Read within a transaction
-
-**On objects**
-- Create / derive / delete
-- Hold multiple datasets
-- Take one type and any number of collections (a type brings handlers for certain datasets)
-
-**On spaces**
-- Create / join / delete
-- Enumerate objects
-
-**Cross-cutting**
-- Subscribe to changes (per document or id-set) — `inserted / updated / deleted` events
-- Offline-first; automatic CRDT merge, no conflict surfaces
-- Read-your-writes; events arrive after commit
-
----
-
-## Proposal — types & properties
-
-**`properties`** — per-space system dataset, one record per object (`id` = objectId). Holds namespaced property values for the types the object implements.
-
-**Type** — an object with `type = type`. Type-object's own properties are **hardcoded**. Built-ins (`any`, …) ship with the SDK.
-
-A type defines:
-- **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`, and optionally `x-format` (the opaque descriptor — semantic slug, options, relation targets, config — see docs/data-structure.md § "The `x-format` descriptor"; its `options` member is the concrete realization of the deferred `enum` keyword, owned by the consumer). More fields (e.g. `required`, `default`) may be added later, when a concrete need appears.
-- **Optionally, versioned data schemas** for the object's datasets.
-
-An object has **one type** and any number of **collections**, whose namespaces coexist. No extension/inheritance in v1.
-
-### Property record shape
-
-Namespace key = `typeId` for user types, short id for built-ins.
-
-```json
-{
-  "id": "objectId",
-  "any": { "name": "Movie name", "description": "..." },
-  "{movieTypeId}":  { "actors": ["actorId1"], "year": 2004 },
-  "{reviewTypeId}": { "score": 5.6 }
-}
-```
-
-Type-owned datasets on the object also use `typeId` as the dataset key.
-
-### Property key conflicts — LWW
-
-If two peers add the same key under the same type with different value shapes, **LWW** decides. SDK applies all keys as-is; clients must be ready to see mixed values.
-
-### Change-level `DataVersion`
-
-Every CRDT `Change` carries a `DataVersion` string that pins the change to a specific schema/handler version. The meaning depends on the dataset.
-
-| Change target                                  | `DataVersion` meaning                                                                    |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Property values on the per-space `objects` row | `ownerId:shortId` pairs, `;`-separated: the latest shortId of each type or collection owning a touched property. No known owner → the hardcoded `systemPropertyHandler-v1`. |
-| Namespaced dataset declared by a type          | `typeId:latestShortId` of the declaring type (docs/user-datasets.md § DataVersion & gating). |
-| Module canonical collection                    | The module's opaque `DataVersion`, compiled into the SDK.                                |
-| Definition datasets on a type object           | Hardcoded handler version, e.g. `typePropertyHandler-v1`. Bumped by the SDK handler, not derived from the DAG. |
-
-**Empty `DataVersion` is invalid — the change is rejected.**
-
-The string format is opaque to the CRDT layer (shortIds for types, handler-chosen identifiers like `chat-v1` for data). Only equality matters — **versions are not comparable**, just known or unknown.
+| Change | `DataVersion` |
+|---|---|
+| `Objects().Create` bootstrap row | a pair per owner the create names (type, collections, `InitialProperties` owners); `systemPropertyHandler-v1` when none has a shortId |
+| `Properties().Set`, synced route | a pair for the owner written; `systemPropertyHandler-v1` when it has no shortId |
+| Membership writes (`SetType`, `AttachCollection`, `DetachCollection`, `Derive`), local-scope property writes | `systemPropertyHandler-v1` |
+| Runtime namespaced dataset | a pair for the declaring type's latest shortId; `typeDatasetHandler-v1` when the type has none |
+| Registered type's static namespaced module instance | the module's `DataVersion` (registered types mint no schema state) |
+| Module canonical collection | the module's `DataVersion` (`config.Config.Modules`) |
+| Registered dataset (`handler.Dataset` in `Type.Datasets`), tech-space system dataset | the registration's `DataVersion` |
+| Definition datasets on a type object | `typePropertyHandler-v1` (properties), `typeDatasetHandler-v1` (dataset definitions) |
+| Other built-in datasets | `shortIds-v1`, `payloads-v1`, `bundles-v1`, `identityKeys-v1` |
 
 ### ShortId — derivation
 
-`shortId = base58(truncate(hash(changeId), 8 bytes))` — the leading 8 bytes of a hash over the ChangeId of the last "important" change to the type object's `properties` dataset.
+`shortId = base58(xxh3-64(changeId))` (`crdt.DeriveRecordId`), over the
+ChangeId of an important change to the type object's definitions.
 
-**"Important" change** — any change that:
-- adds a property record, or
-- removes a property record.
+An important change:
 
-Re-adding a previously-removed property (same `key`, any `kind`) counts as an addition and mints a new shortId. All other edits (future cosmetic fields, display-only metadata) leave the shortId unchanged. Classification is owned by the `typePropertyHandler`.
+- creates a property record, including a concurrent duplicate create of a
+  deterministic property id that lands as a modify on other replicas;
+- deletes a property record;
+- creates or deletes a dataset-definition record (part, dataset head,
+  field).
 
-**Genesis** — before any important change has landed, the shortId is empty. Writes stamped with empty `DataVersion` are invalid (see above), so concrete data can't flow until the type has its first property.
-
-### Schema evolution rules
-
-The `typePropertyHandler` (the built-in handler for type objects' `properties` dataset) enforces:
-
-- **Add a property** — allowed. Mints a new shortId.
-- **Remove a property** — allowed. Mints a new shortId. Existing record data in any-store is **not** cleaned up; subsequent writes touching that property are dropped op-by-op (unknown-property rule).
-- **Modify an existing property's schema-bearing fields** (`kind`, `items`, `properties`) — **rejected at write time**. Kinds are pinned for life. To change a property's shape, remove it and re-add it as a new shortId; old-writer ops then either match (same kind by coincidence) or drop cleanly.
-- **Modify display-only fields** (`name`, `description`, `x-key`, `meta.<k>`, and every path under the opaque `x-format` descriptor — per-path `$set`/`$unset` via `PatchProperty`; option adds of distinct keys converge) — allowed, does not mint a shortId. First-write-wins covers the whole schema-bearing fields (`kind`, `scope`, `items`, `properties`) and nothing below them.
-
-Effect: old-writer data against the current schema always type-matches on still-present properties (kind never changed) or drops cleanly on removed properties. No snapshot of historical schemas needed; **validation always runs against the current (latest merged) schema**.
+Other edits leave the shortId unchanged. The `typePropertyHandler` and
+`typeDatasetHandler` classify changes and project the rows.
 
 ### Known-shortIds set
 
-Each type object owns a local collection of known shortIds — one row per important change:
+Each type or collection object keeps a `<ownerId>_shortIds` collection, one
+row per important change:
 
 ```
-{ shortId, versionId, changeId }
+{
+  id:       shortId,
+  changeId: string,
+  propId:   string,      // property rows
+  defId:    string,      // dataset-definition rows
+  src:      "datasets",  // dataset-definition rows only
+  kind:     string,      // property add rows
+  removed:  true         // removal rows
+}
 ```
 
-Used only for the detached-changes gating decision ("do I have the schema state this change was written against?"). No compiled schema or property-record snapshot is stored — the schema is derived on demand from the type's current `properties` dataset. Append-only in v1; no GC.
+The row's `_ver.id` carries its versionId; the latest shortId is the row
+with the greatest `_ver.id`. Property and dataset-definition
+rows share one stream, so a single `typeId:latestShortId` stamp covers the
+type's whole schema state. The set is append-only with no GC, and stores no
+compiled schema: the schema is derived on demand from the current
+definitions.
 
-Opaque handler-version strings don't parse as `ownerId:shortId` pairs and pass the gate unconstrained.
+### Schema evolution rules
 
-Runtime dataset definitions (docs/user-datasets.md) ride this exact
-machinery: the type's `datasets` dataset projects rows into the SAME
-shortIds collection (a `src: "datasets"` discriminator, `defId` in
-place of `propId`), so one `typeId:latestShortId` stamp gates data
-changes against the type's whole schema state — property definitions
-and dataset definitions alike — with no gate changes.
+The `typePropertyHandler` enforces:
 
-### Decision rule in `ApplyChange`
+- **Add a property**: allowed; mints a shortId.
+- **Remove a property**: allowed; mints a shortId. Stored values stay on
+  object rows; later ops touching the property are dropped (unknown
+  property).
+- **Schema-bearing fields** (`key`, `kind`, `scope`, `items`, `properties`,
+  with their subtrees) are pinned after the first write. An op editing them
+  on an existing record is dropped, and `PatchProperty` refuses such a patch
+  up front. To change a shape, define a new property (a new propId).
+- **Display fields** (`name`, `description`, `x-key`, `required`,
+  `meta.<k>`, every path under `x-format`) are mutable per path and mint no
+  shortId. A `$set` of the whole `x-format` must be an object.
 
-1. `DataVersion` empty → **reject** (whole change).
-2. Every `ownerId:shortId` pair in the known-shortIds set, or an opaque handler-version string → **apply**. Each op is validated per-op against the current schema; ops that fail (kind mismatch, unknown property) are silently dropped, others apply.
-3. `DataVersion` not known → **detach** (see below).
+Kinds never change, so data written against any earlier schema either
+matches a still-present property or drops on a removed one. Validation
+always runs against the current merged schema; no historical snapshots are
+kept.
 
-No max/min comparison — known or unknown, nothing else.
+### Gate
+
+Every inbound or replayed change passes the DataVersion gate
+(`spaceobjects.gateFor`) before the Controller applies it:
+
+1. Each `typeId:shortId` pair in `DataVersion` is looked up in that owner's
+   known-shortIds set (`KnownShortId`, an id lookup). Unknown pairs are
+   missing.
+2. The object's Controller must hold a current registration for the
+   change's dataset: one exists and, for a runtime dataset, its `SchemaRev`
+   matches the catalog's.
+3. No missing pair and a current registration: the change applies.
+   Otherwise it parks in the detached-changes collection.
+
+ShortIds have no order: a pair is known or not.
 
 ### Validation atomicity
 
-- **Pre-apply, per-op**: each op in a `RecordChange` is validated against the current schema before being applied.
-- **Per-op**: ops that fail schema validation are dropped silently; other ops in the same change still apply. If all ops in a record change are dropped, that record is skipped but the Change as a whole still commits (watermark advances, causality preserved).
-- **Per-key inside a multi-field `$set`/`$unset`**: dropping granularity goes one level finer than the op. A key that fails field-class (scope) or path validation is shed individually; the op's surviving keys still apply, and the op is dropped wholesale only when every key offends. This keeps a create that bundled a since-reclassified field (e.g. a synced field later moved to `local` scope) from disappearing on replay — the record materializes from its still-valid keys.
-- **Path syntax validation** (reserved `_*` prefix, empty path segments, dots inside segments) is separate and aborts the whole change — path issues indicate a protocol-level bug.
-- **Writer-side responsibility**: the SDK's write API prevalidates both path syntax and schema before submitting to the DAG. Per-op drops on receive are defensive — they exist for cross-peer bugs and removed-property replays, not for programmer mistakes in the local client.
+Applying a change is tolerant per op (crdt-spec.md §7.2):
 
-### Dataset ownership
+- An op that fails content validation (path syntax, field class) or handler
+  validation (unknown property, kind mismatch, pinned field) is dropped and
+  recorded as a rejection; the rest of the change commits and the watermark
+  advances. A record whose ops all drop is skipped.
+- Inside a multi-field `$set`/`$unset`, an offending key is shed on its own
+  and the surviving keys apply; the op drops only when every key fails. A
+  create that bundled a since-reclassified field still materializes from its
+  valid keys on replay.
 
-- **One type owns one namespaced dataset**: a namespaced dataset has exactly one declaring type and gates on that type's shortId. A module's canonical collection is shared by several types and gates on the module's opaque `DataVersion` instead.
+Local writes are strict. `ValidateChange` refuses a change with an illegal
+path or a field-class violation, and the `objects` handler's `PreValidate`
+refuses the whole write on its first membership, type, unknown-property or
+kind violation. Nothing invalid enters the DAG; inbound drops cover
+cross-peer bugs and definitions that changed after the write.
 
 ### Detached-changes collection
 
-One per space. Schema:
+One per space, `<spaceId>__detached`:
 
 ```
-{ id: changeId, objectId, versionId, dataVersion }
+{
+  id:        changeId,
+  spaceId:   string,
+  objectId:  string,
+  addSeq:    number,
+  orderId:   string,                   // any-sync orderId, reused as VersionId on replay
+  timestamp: number,
+  payload:   binary,                   // wire-format change bytes
+  pending:   ["typeId:shortId", ...],  // missing pairs; empty when parked for a registration
+  dataset:   string
+}
 ```
 
-Index on `dataVersion`.
+**Park.** The gate upserts the row and the change does not apply. A row
+parked only for a missing or stale registration wakes the drainer at once,
+since the schema may already be present.
 
-**Populate** — on rule (3) above, insert a row. The change body is **not** stored — re-fetched from any-sync's local `changes` collection (keyed by changeId) on re-apply. That collection already holds every change the peer has received, so fetch is a cheap primary-key lookup.
+**Drain.** A per-space worker runs off the apply path. Applies to
+definition datasets wake it (a dataset-definition apply refreshes the
+runtime catalog first), and bursts of wake-ups coalesce into one pass. A pass scans the whole
+collection. A row is ready when every pending pair is known and its dataset
+is registered. Each ready row is decoded and applied through its object,
+bypassing the gate, with `orderId` as the VersionId; a Controller with a
+stale registration is evicted and reloaded first. An applied row is
+deleted; a failing row stays for the next pass.
 
-**Drain** — every time the registry gains a new row with shortId `X`:
-
-1. `find({dataVersion: X})` in the detached collection.
-2. For each hit, fetch the change from any-sync's `changes` collection and call `ApplyChange`.
-3. Re-apply in **ascending `versionId`** order so DAG causality is preserved when one registry insert unblocks many detached changes.
-4. On successful apply, delete the detached row.
-
-Detached changes whose `DataVersion` never arrives stay in the collection indefinitely. That's safe (never applied, never cause damage) — GC is a future operational concern, not a correctness one.
-
-### Deferred
-
-- Type extension / templating.
-- Per-property conflict policies beyond LWW.
-- Detached-collection GC (stale fabricated entries).
-
----
+A row whose schema never arrives stays parked. It is never applied, so it
+does no damage; there is no GC.
 
 ## Schema format — decision
 
-- **Format**: JSON-Schema-like minimal subset. v1 record fields: `kind` (on every node), `items` (on arrays), `properties` (on objects). Other keywords (`enum`, `required`, `additionalProperties`, `default`) are deferred; added when a concrete need appears.
-- **Supported kinds** in v1: `string`, `number`, `boolean`, `null`, `array`, `object`, `datetime`.
-  `datetime` is any-store's native instant (unix millis, memcmp-orderable, index-keyable,
-  `{"$date": …}` in JSON) — the shape the date operators compute on. `kind` is always
-  explicit — nothing is defaulted from the `x-format` descriptor — and pinned for the
-  life of a property.
-- **Recursive validation**: arrays with an `items` sub-schema check every element; objects with a `properties` map check every field and reject unknown fields. Arrays/objects without these keywords pass a shallow kind check only (any element / any shape). Progressive disclosure — simple schemas stay simple.
-- **Validator**: custom, operates natively on `*anyenc.Value`. No conversion between anyenc and `interface{}`/JSON on the validation path — validation runs on every write op, so the hot path must be allocation-free for scalar success cases. Schema is compiled once from property records.
-- **Duplicate keys in input**: last-wins. Writers resolve conflicts client-side before committing property changes; the validator doesn't police it.
-- **Where schemas live**:
-  - **Properties dataset on type objects** — shape is hardcoded in Go (a built-in dataset handler validates `key`, `kind` directly). No JSON Schema applies here.
-  - **Data datasets on user objects** — validated against a JSON Schema synthesized from the type object's property records.
-- **Absent field (`$unset`)**: always valid in v1. Without a `required` keyword, removing a field is a no-op from the schema's perspective.
-
-Validation always runs against the **current** schema — see "Schema evolution rules" above for why this is safe (kinds are pinned, removals drop cleanly).
-
-### Still open
-
-- Prior art review from other local-first systems (Automerge, Yjs, Jazz, DXOS, …) — not blocking, but worth a pass before the validator design freezes.
+- **Format**: a minimal JSON-Schema subset. `kind` on every node, `items`
+  on arrays, `properties` on objects.
+- **Kinds**: `string`, `number`, `boolean`, `null`, `array`, `object`,
+  `datetime`. `datetime` is any-store's native instant (unix millis,
+  memcmp-orderable, index-keyable, `{"$date": …}` in JSON), the shape the
+  date operators compute on. `kind` is always explicit, never defaulted from
+  `x-format`, and pinned for the life of a property.
+- **Recursive validation**: an array with `items` checks every element; an
+  object with `properties` checks every field and rejects unknown ones.
+  Without those keywords only the kind is checked.
+- **Not validated**: `enum`, `required`, `additionalProperties`, `default`.
+  A property record may store `required`, but values are not checked
+  against it. An absent field (`$unset`) is always valid. Option sets live
+  in the consumer-owned `x-format` descriptor.
+- **Validator** (`internal/schema`): custom, operating natively on
+  `*anyenc.Value` with no conversion to `interface{}` or JSON. It runs on
+  every write op, so scalar success allocates nothing. A shape compiles once
+  per definition (`schema.CompileShape`).
+- **Where schemas apply**:
+  - Definition datasets on type objects have a shape hardcoded in Go,
+    checked by the built-in handler.
+  - Property values on the `objects` row get a kind check against the
+    registry: a `$set` value must have the declared kind, `$addToSet` /
+    `$pull` need an array property (element kinds are not checked), `$inc` /
+    `$incGated` need a number. Sub-shapes (`items`, `properties`) are not
+    checked for property values.
+  - Fields of schema-declared datasets served by the generic schema
+    handler (runtime datasets, registered datasets with a `Schema` and no
+    bespoke `Handler`) are validated recursively against their compiled
+    shape.

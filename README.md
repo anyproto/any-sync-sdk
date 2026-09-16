@@ -2,8 +2,6 @@
 
 A Go SDK on top of [any-sync](https://github.com/anyproto/any-sync), built around a CRDT data plane: Mongo-style record stores per object, per-field version gating, and an apply pipeline that converges across peers.
 
-Status: **Phase 2** — CRDT data plane, query, subscriptions, collaboration v1 (ACL, members, invites), a change-index surface for consumer-side incremental indexers (`Space.Changes()`), and identityRepo-backed account metadata are wired. Sync-status, change history, files, and a few schema-edit APIs are still stubs; see *Status* below.
-
 ## Install
 
 ```

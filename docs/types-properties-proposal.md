@@ -80,13 +80,12 @@ If two peers add the same key under the same type with different value shapes, *
 
 Every CRDT `Change` carries a `DataVersion` string that pins the change to a specific schema/handler version. The meaning depends on the dataset.
 
-**Phase-0 mapping** (provisional — revisited when user-defined types land):
-
-| Dataset kind                                   | `DataVersion` meaning                                                                    |
+| Change target                                  | `DataVersion` meaning                                                                    |
 | ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Data dataset on a user object                  | Hardcoded handler version baked into the SDK.                                            |
-| Per-space `properties` dataset                 | ShortId of the last "important" change to the governing type object.                     |
-| `properties` dataset on a type object          | Hardcoded handler version, e.g. `typePropertyHandler-v1`. Bumped by the SDK handler, not derived from the DAG. |
+| Property values on the per-space `objects` row | `ownerId:shortId` pairs, `;`-separated: the latest shortId of each type or collection owning a touched property. No known owner → the hardcoded `systemPropertyHandler-v1`. |
+| Namespaced dataset declared by a type          | `typeId:latestShortId` of the declaring type (docs/17-user-datasets.md § DataVersion & gating). |
+| Module canonical collection                    | The module's opaque `DataVersion`, compiled into the SDK.                                |
+| Definition datasets on a type object           | Hardcoded handler version, e.g. `typePropertyHandler-v1`. Bumped by the SDK handler, not derived from the DAG. |
 
 **Empty `DataVersion` is invalid — the change is rejected.**
 
@@ -125,7 +124,7 @@ Each type object owns a local collection of known shortIds — one row per impor
 
 Used only for the detached-changes gating decision ("do I have the schema state this change was written against?"). No compiled schema or property-record snapshot is stored — the schema is derived on demand from the type's current `properties` dataset. Append-only in v1; no GC.
 
-For data datasets in Phase 1, the "known versions" are a hardcoded allowlist compiled into the SDK — same shape of lookup, different source of truth.
+Opaque handler-version strings don't parse as `ownerId:shortId` pairs and pass the gate unconstrained.
 
 Runtime dataset definitions (docs/17-user-datasets.md) ride this exact
 machinery: the type's `datasets` dataset projects rows into the SAME
@@ -137,7 +136,7 @@ and dataset definitions alike — with no gate changes.
 ### Decision rule in `ApplyChange`
 
 1. `DataVersion` empty → **reject** (whole change).
-2. `DataVersion` in known-shortIds set (or hardcoded allowlist for data) → **apply**. Each op is validated per-op against the current schema; ops that fail (kind mismatch, unknown property) are silently dropped, others apply.
+2. Every `ownerId:shortId` pair in the known-shortIds set, or an opaque handler-version string → **apply**. Each op is validated per-op against the current schema; ops that fail (kind mismatch, unknown property) are silently dropped, others apply.
 3. `DataVersion` not known → **detach** (see below).
 
 No max/min comparison — known or unknown, nothing else.
@@ -150,9 +149,9 @@ No max/min comparison — known or unknown, nothing else.
 - **Path syntax validation** (reserved `_*` prefix, empty path segments, dots inside segments) is separate and aborts the whole change — path issues indicate a protocol-level bug.
 - **Writer-side responsibility**: the SDK's write API prevalidates both path syntax and schema before submitting to the DAG. Per-op drops on receive are defensive — they exist for cross-peer bugs and removed-property replays, not for programmer mistakes in the local client.
 
-### Phase-1 invariants
+### Dataset ownership
 
-- **One type owns one dataset**: data datasets are keyed by `typeId`; each dataset has exactly one governing type. Multi-type-owned datasets are deferred past Phase 1.
+- **One type owns one namespaced dataset**: a namespaced dataset has exactly one declaring type and gates on that type's shortId. A module's canonical collection is shared by several types and gates on the module's opaque `DataVersion` instead.
 
 ### Detached-changes collection
 

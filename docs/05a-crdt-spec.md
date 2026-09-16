@@ -189,7 +189,7 @@ The drop is not silent to the local writer: applying a non-delete modify (upsert
 - **One change = one versionId (locally)**: every operation in a batch shares the same local versionId when a peer applies it.
 - **Two uses inside the SDK**:
   1. CRDT gating, always comparing local versionIds against the same peer's `_ver` map.
-  2. As the ordered index key for efficient change queries against the local store (Phase 2: "give me changes in apply order").
+  2. As an ordered index key for queries against the local store (e.g. `_ver.id` creation order, §3.5).
 - **Convergence argument**: each peer applies its locally-delivered changes under locally-consistent gating. Two peers holding the same DAG end up with the same *logical* record content — not with the same `_ver` strings. Cross-peer events exchange DAG changes, not versionIds; the receiver assigns its own local versionIds on apply.
 
 ## 4a. AddSeq (delivery watermark)
@@ -211,7 +211,7 @@ Per-object tracking in the CRDT Controller:
 1. Read `MaxAddSeq()` for every Controller.
 2. Ask any-sync for heads whose `LastAddSeq` is greater.
 3. For each such object, fetch the new DAG changes and replay them through `ApplyChange`.
-4. Controllers bump their watermarks as changes land, and the space layer persists them atomically with the any-store write tx (Phase 2).
+4. Controllers bump their watermarks as changes land, and the space layer persists them atomically with the any-store write tx.
 
 The CRDT's idempotency means the contract tolerates crash-after-apply-before-watermark-persist: on restart the replay sees the same changes again and they become no-ops via gating and sticky tombstones.
 
@@ -488,7 +488,7 @@ mergeReplace(rec, path, verSubtree, value, v):              // value nil = unset
 After each apply, rewrite `_ver` to its canonical compact form using only the lossless rules from §3.2 (drop explicit entries equal to their level's `*`; collapse a node whose `*` is present and whose entries all equal it). Never invent a `*` or collapse sibling enumerations that merely share a version — that claims authority no write had and breaks convergence. Implementations may defer compaction; correctness does not depend on it.
 
 ### 7.2 Write transaction
-All ops within one change are applied atomically (one any-store `WriteTx` in Phase 2). Events fire **after** the transaction commits.
+All ops within one change are applied atomically (one any-store `WriteTx`). Events fire **after** the transaction commits.
 
 Validation is non-fatal on the inbound/replay path and operates at op (and, for the multi-field form, key) granularity, not whole-change. Two gates run:
 
@@ -958,14 +958,14 @@ Use `$inc` for counters. Use `$incGated` only when the absolute post-mutation va
 ### Cross-cutting
 7. How to represent ordered lists if/when needed (not v1)
 
-### Design decisions from the Phase 1 review
+### Design decisions
 
 8. **Modify-before-create races — protocol-impossible.** any-sync is a Git-like DAG: every change carries a `prevIds` chain pointing to the changes it causally depends on, and a receiver cannot apply a change until all of its `prevIds` are already applied. If a peer authored a modify referencing some record, the creating change is in that modify's ancestry by construction. A modify delivered before its creating change can only happen if the delivering peer is buggy or adversarial — it's not a race the CRDT needs to tolerate as a legitimate case. The CRDT layer's "strict modify on absent = silent skip" behavior is a defensive backstop for the pathological case, not a first-class edge case.
 
 9. **`$inc` convergence under DAG delivery — accepted.** `$inc` doesn't update `_ver`, which is what gives it commutativity with itself. The "stale `$set` delivered after an `$inc` clobbers the increment" scenario cannot happen under DAG delivery for causally-ordered ops: if `$inc` exists at version vInc, its author had already seen the `$set` at version vSet in its state, so vSet is in vInc's `prevIds` chain; no receiver ever applies vInc before vSet. The only way to get apparent divergence is if `$set` and `$inc` are **concurrent** on the same field (two peers that hadn't seen each other's writes), which is a semantically ill-defined user pattern ("reset to 100 AND add 1 in parallel" has no correct answer) and a schema-design anti-pattern: a field is either a counter (only `$inc`) or a settable value (only `$set`). `$incGated` remains available for the LWW-on-post-mutation-value semantic when you explicitly want it.
 
-10. **Transactional atomicity of `_ver.id` min-update — Phase 2 requirement, noted in code.** `lowerCreationMarker` mutates the record even when the op is otherwise skipped (sticky-tombstone case). Phase 2's any-store integration must run it inside the same `WriteTx` as the rest of the change so a crash between the mutation and the commit can't leak inconsistency. A code comment at the function's docstring spells this out so it's hard to miss during wiring.
+10. **Transactional atomicity of `_ver.id` min-update.** `lowerCreationMarker` mutates the record even when the op is otherwise skipped (sticky-tombstone case). It runs inside the change's apply `WriteTx`, so a crash between the mutation and the commit can't leak inconsistency.
 
-11. **Handler-writable derived-field namespace — design deferred.** The `_` prefix is reserved at the path-validation layer, so a future `_h.*` sub-namespace is already unreachable from user ops. When Phase 2 designs the handler-hook interface, the current plan is a per-record `AfterApply(rec, change)` callback that runs inside the same tx and is allowed to write to `_h.*`. Re-indexing (running `AfterApply` over existing records when handler logic changes) is a separate question for that design round.
+11. **Handler-derived fields go through `Sink`.** The `_` prefix is reserved at the path-validation layer, so user ops can't reach SDK-internal fields. Handlers derive fields by queueing ops on the `Sink` (`Derive`, `Project`) inside the apply tx, gated like any other write (§8).
 
 12. **Duplicate `RecordChange.Id` in one batch — allowed, applied sequentially.** A batch's `Records` slice has strict internal order; two `RecordChange` entries targeting the same id apply one after the other, with the second seeing the first's effects. This is intentional: it matches how generated code, split validation phases, and merged transport batches produce payloads. Two empty-id records in the same batch are not duplicates — they auto-suffix to distinct ids per §3.3.

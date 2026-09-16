@@ -535,7 +535,6 @@ not an ACL head.
 4. **Send-failure handling → background retry loop.** A pending-send marker +
    retry (heart's `ToSend` shape, our `deletionController` structure) re-sends
    until the coordinator confirms; idempotent receiver makes re-sends harmless.
-   Phase 2.
 5. **Dead-letter policy → split by failure type.** Infra/transient failure
    (offline `Fetch`, or a handler `ErrRetry` for a tech-space write) → retry, do
    **not** advance the cursor. Content failure (nil packet / bad sender / bad
@@ -567,25 +566,9 @@ not an ACL head.
 - **Dead-letter escape hatch.** If a permanently-bad message ever sits at the
   cursor head before any good message, the split policy (5) advances past it;
   confirm there's no scenario where we'd rather hard-stop and alert instead of
-  dropping. Revisit if it bites in Phase 2 testing.
+  dropping.
 
-## Phasing
-
-1. **Primitive + approval gate (no server):** state machine, `OneToOne` split,
-   `AcceptOneToOne` / `DeclineOneToOne` / `RegisterIncoming`, status mapping,
-   `SpaceInfo` surface, e2e test driving two in-process accounts via
-   out-of-band identity exchange. Satisfies requirement 1 and the
-   "no server infra" half of requirement 2 entirely.
-2. **Inbox notifier (coordinator discovery):** register any-sync
-   `inboxclient`/`subscribeclient`; build the single-worker notifier
-   (push+poll funnel, verify/decrypt, per-message cursor advance, idempotent
-   dispatch); send-on-initiate; wiring + lifecycle. Encryption is inherited from
-   any-sync, not built here. e2e test against the local coordinator, including
-   the bug-regression cases from "Heart bugs we fix" (crash-between-fetch-and-
-   process, double-trigger replay, impersonated profile). Layered on top;
-   Phase 1 stays valid if Phase 2 is absent.
-
-## Phase 1 — implementation status (landed)
+## Layer 1 — implementation status (landed)
 
 Serverless primitive + approval gate, shipped and tested:
 
@@ -640,7 +623,7 @@ the nodes — only offload it, and propagate that to the account's other devices
   account: A deletes, B converges on Deleted and offloads, no node removal —
   passed against staging).
 
-## Phase 2 — implementation status (landed)
+## Layer 2 — implementation status (landed)
 
 Coordinator-inbox notifier (Layer-2 discovery), shipped and tested end-to-end
 against the live staging coordinator:

@@ -15,7 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// The one-to-one identity-key exchange (docs/13-one-to-one-spaces.md
+// The one-to-one identity-key exchange (docs/one-to-one-spaces.md
 // § Key exchange inside the space). A 1-1 ACL is immutable and carries
 // no per-writer metadata, and the coordinator inbox invite ships the
 // INITIATOR's metadata symkey one way only, so the rows are the only

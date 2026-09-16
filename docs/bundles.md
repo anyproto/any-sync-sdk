@@ -159,7 +159,7 @@ a declaration is refused. It may still carry `RootCollections` (an app
 root filed under `miniapp`), which is what most app roots do.
 
 The root **hosts its own records and values** with no flag: a
-definition object implicitly implements itself (docs/06 § Type and
+definition object implicitly implements itself (docs/data-structure.md § Type and
 collections), so a root's `<rootId>.<propId>` values and the records
 of the datasets it declares live on the root. Three shapes come out of
 the one mechanism:
@@ -211,7 +211,7 @@ refused with `NewRoot`, whose root got its state — its type included —
 from the caller; a declaring request over such a root is refused.
 
 `Parts` declares parts with their datasets (the `PartDraft` /
-`DatasetDraft` vocabulary of `17-user-datasets.md`). Nothing else is
+`DatasetDraft` vocabulary of `user-datasets.md`). Nothing else is
 special-cased — the catalog's `__type__` scan finds the root, the
 ownership check (the object's type declares the dataset, or the object
 IS the declaring type) passes on every carrier and on the root itself,
@@ -229,7 +229,7 @@ draft needs an `XKey`, unique within the request, and the property id
 is derived from `(rootId, XKey)`. Two devices installing while apart
 therefore mint ONE column per handle — the one case where the
 "same-handle, two columns" outcome of the descriptor model
-(docs/06 § Property ids) is unacceptable, because a wiki's two
+(docs/data-structure.md § Property ids) is unacceptable, because a wiki's two
 `parentId` columns are a forked tree. The ids stay internal: clients
 resolve `xKey → propId` through `Types().Properties(rootId)` —
 `Collections().Properties(rootId)` is the same surface and answers the
@@ -277,7 +277,7 @@ minted.
   the DAG stays valid on apply. The root that declares it is the
   module's only carrier: attaching its type to another object is
   refused at local write time (`handler.ErrValidationReservedCarrier`,
-  docs/17 § Model — the write side only; apply stays read-tolerant).
+  docs/user-datasets.md § Model — the write side only; apply stays read-tolerant).
 - Collections cannot collide: a namespaced dataset is `<rootId>_<key>`
   and a shared one is the module's canonical collection, so two
   bundles in one space may use the same keys and there is no name
@@ -311,7 +311,7 @@ minted.
 Account-level product data (favourites, pinned items, personal
 settings objects) lives in bundles on the tech space, reached through
 `Spaces().Get(SDK.TechSpaceId())` — the restricted handle described in
-`02-tech-space.md`. Same registry (`bundles` on the tech index object),
+`tech-space.md`. Same registry (`bundles` on the tech index object),
 same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`, with
 three rules: roots are minted by `Ensure` only (`NewRoot` is refused —
 free object create is fenced on the tech handle; omit both strategies

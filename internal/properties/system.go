@@ -34,7 +34,7 @@ import (
 // ANY dataset of the object (editor blocks, chat messages, runtime
 // datasets) stamps them, not only writes to the row itself.
 //
-// See docs/06-data-structure.md § "Storage" — the per-space
+// See docs/data-structure.md § "Storage" — the per-space
 // `objects` collection model.
 const Dataset = "objects"
 
@@ -48,7 +48,7 @@ const HandlerVersion = "systemPropertyHandler-v1"
 
 // LocalVersion is the handler's LOCAL logic version (HandlerReg.Version)
 // — bumped when already-materialized rows would come out different, so
-// the SDK rebuilds them from the DAG (docs/08-versioning.md). v2: the
+// the SDK rebuilds them from the DAG (docs/versioning.md). v2: the
 // derived createdAt / modifiedAt stamps are TypeDateTime instants, not
 // epoch numbers. v3: modifiedAt is also stamped by changes on the
 // object's other datasets (StampObject), so rows stamped by property
@@ -58,7 +58,7 @@ const LocalVersion = 4
 
 // SystemPropertiesHandler validates property writes on every user
 // object. Corresponds to the `baseProperty` handler named in
-// docs/06-data-structure.md § "Handlers" — renamed to emphasize its
+// docs/data-structure.md § "Handlers" — renamed to emphasize its
 // scope (the per-space `properties` system dataset) and to
 // distinguish it from typetype.PropertyHandler (which governs
 // property definitions on type objects).
@@ -271,7 +271,7 @@ func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 //
 // No membership check here: an apply-time membership guard
 // would drop values written before the attach-type change arrives,
-// breaking out-of-order tolerance (docs/06-data-structure.md §397).
+// breaking out-of-order tolerance (docs/data-structure.md §397).
 //
 // Every op that passes validation stamps the derived `modifiedAt` /
 // `modifiedBy` pair (deduped via DeriveOnce — one stamp per
@@ -519,7 +519,7 @@ type preflight struct {
 // change sets), its collections (the row's plus what this change
 // adds), the meta namespace its marker grants, its own id when it is
 // a definition (a type or collection object implicitly implements
-// itself — docs/06 § Type and collections), and the module namespaces
+// itself — docs/data-structure.md § Type and collections), and the module namespaces
 // Grants derives from those.
 //
 // The markers are the one place value and namespace differ — a type

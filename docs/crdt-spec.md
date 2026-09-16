@@ -1,6 +1,6 @@
 # CRDT Full Spec
 
-Companion to `05-crdt.md`. Complete specification of the version-gated record store CRDT for SDK v1. Names are examples and may change, but shapes and semantics are binding.
+Companion to `crdt.md`. Complete specification of the version-gated record store CRDT for SDK v1. Names are examples and may change, but shapes and semantics are binding.
 
 The spec is organized in two parts:
 - **Part I: Protocol** — how changes are stored in any-sync and applied to any-store. This is what you implement inside the SDK.
@@ -578,8 +578,8 @@ Internally (and for the tech space's system datasets) the same bundle is a
 persisted per collection for re-index decisions. A registration with a
 declared `Schema` and a nil `Handler` gets the SDK's generic schema
 handler — the declaration alone is the behavior (see
-docs/17-user-datasets.md). Registration is not compile-time — the set
-of handlers can differ across app versions (docs/08-versioning.md),
+docs/user-datasets.md). Registration is not compile-time — the set
+of handlers can differ across app versions (docs/versioning.md),
 and datasets defined at runtime on type objects register late-bound:
 the store's catalog carries them, and controllers pick them up by
 rebuild (eviction + reload), never by mutating a live Controller's
@@ -605,7 +605,7 @@ exists (a runtime definition applying refreshes the catalog and wakes
 the drainer; the drain evicts a stale resident controller before
 replay so the rebuilt registration is what applies the row). The
 dataset is invisible to queries until then, but nothing is lost and
-the object's replay never stalls on it. See docs/17-user-datasets.md
+the object's replay never stalls on it. See docs/user-datasets.md
 § Runtime registration. At the raw Controller level (no gate wired),
 `ApplyChange` still returns `ErrUnknownDataset`.
 
@@ -616,7 +616,7 @@ Handler hooks are the SECOND of the two apply-time gates described in
 common single-field vocabulary — required fields, write-once /
 author-gated mutability, apply-time stamps, id rules, delete gates —
 needs no bespoke handler: declare it on the dataset Schema and the
-generic schema handler enforces it (docs/17-user-datasets.md). Bespoke
+generic schema handler enforces it (docs/user-datasets.md). Bespoke
 handler enforcement remains for what a declaration can't express:
 
 - Cross-field rules and shape rules beyond the declared Schema (size
@@ -683,7 +683,7 @@ This part defines what callers see. The protocol in Part I is the implementation
 
 The external API exposes the protocol as a small, stable surface: **queries**, **writes**, and **subscriptions**. `versionId` is the shared consistency primitive tying all three together.
 
-**The caller is middleware, not an end-user client.** The SDK is a Go library consumed in-process. Middleware handles transport (gRPC/REST), sessions, client-local auth, and product logic. See `00-common-context.md` for the full stack. Implications:
+**The caller is middleware, not an end-user client.** The SDK is a Go library consumed in-process. Middleware handles transport (gRPC/REST), sessions, client-local auth, and product logic. See `common-context.md` for the full stack. Implications:
 
 - API methods take Go types (not JSON/protobuf). Middleware serializes for its own wire protocol.
 - No session-awareness in v1 (confirmed deferred, since middleware already has sessions)

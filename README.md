@@ -121,24 +121,24 @@ Not wired yet:
 - `TypesAPI.Delete` (`RemoveProperty` and `PatchProperty` are wired; `Delete` still a stub)
 - `PropertiesAPI.SetAccount` / `SetDevice` / `AttachType` / `DetachType`
 - Versioning APIs / change history (`internal/versioning` is doc-only)
-- Files / blobs (deferred; see `docs/07-files.md`)
+- Files / blobs (deferred; see `docs/files.md`)
 
 ## Specs
 
 See [`docs/`](docs/):
 
-- `00-common-context.md` — the layer model and design principles
-- `01-auth-module.md` — wallet / provider contract
-- `02-tech-space.md` — derived per-account index
-- `03-space.md` — space lifecycle, ACL surface
-- `04-object.md` — object lifecycle
-- `05-crdt.md`, `05a-crdt-spec.md` — apply algorithm and invariants
-- `06-data-structure.md` — record shape, datasets, variants
-- `07-files.md` — file/blob handling (deferred)
-- `08-versioning.md` — schema evolution, versioning hooks
-- `17-user-datasets.md` — runtime dataset schemas, generic schema handler, batch upsert
+- `common-context.md` — the layer model and design principles
+- `auth-module.md` — wallet / provider contract
+- `tech-space.md` — derived per-account index
+- `space.md` — space lifecycle, ACL surface
+- `object.md` — object lifecycle
+- `crdt.md`, `crdt-spec.md` — apply algorithm and invariants
+- `data-structure.md` — record shape, datasets, variants
+- `files.md` — file/blob handling (deferred)
+- `versioning.md` — schema evolution, versioning hooks
+- `user-datasets.md` — runtime dataset schemas, generic schema handler, batch upsert
 
 ## Compatibility note
 
-The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's allow-list: the `any` product's `any.space` / `any.techspace` / `any.onetoone` (fileproto v2 required) plus anytype's `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. The SDK mints only the any.* family (anytype.* spaces belong to heart clients; the SDK can join them but never creates them) — see `docs/03-space.md § Space type strings`.
+The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's allow-list: the `any` product's `any.space` / `any.techspace` / `any.onetoone` (fileproto v2 required) plus anytype's `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. The SDK mints only the any.* family (anytype.* spaces belong to heart clients; the SDK can join them but never creates them) — see `docs/space.md § Space type strings`.
 

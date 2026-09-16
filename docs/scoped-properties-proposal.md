@@ -1,7 +1,7 @@
 # Scoped Properties — scope on the declaration, not on the value
 
 Status: **accepted** (2026-06-12). Supersedes the variant-bag model in
-`05a-crdt-spec.md` §9 ("Property Variants") and `06-data-structure.md`
+`crdt-spec.md` §9 ("Property Variants") and `data-structure.md`
 §"Storage — Proposal 2" / §"Conflict Resolution"; those sections are
 rewritten as part of slice 1. Expert-reviewed (two consults; key
 findings folded in below).
@@ -187,7 +187,7 @@ delete" (which would race the schema-sync window):
 - **Space left/deleted**: drop the whole per-space carrier object in
   tech space + the space's sidecar rows.
 - **Property definition removed**: carrier values under the dead propId
-  become orphans, same policy as base-value orphans (docs 06 §"read
+  become orphans, same policy as base-value orphans (docs/data-structure.md §"read
   tolerance") — deliberately NOT GC'd by the mirror, because the mirror
   cannot distinguish "removed" from "definition not synced yet" (the
   Hole-A skip rule). Bounded: dead propIds can't be resurrected
@@ -225,7 +225,7 @@ absent records as `ErrStrictSkipAbsent` rejections. `ModifyMany` and
 (`(objectId, dataset, recordId) → {values, vers}` as the durable source
 of truth, row value a materialization) only matters for the
 wipe-and-rebuild re-index path — machinery that does not exist yet
-(docs/08 is all open questions). Local values are durable in any-store
+(docs/versioning.md is all open questions). Local values are durable in any-store
 today. The sidecar lands WITH the rebuild machinery; until then a
 handler-version-bump wipe (if implemented naively) must not be shipped
 without it.
@@ -285,7 +285,7 @@ are listed at the end of this section.
    create; `PropInfo.Scope` through LiveRegistry/Stub; handler drops
    wrong-route ops (new `scope_mismatch` validation reason); auto-routing
    `Set()` (synced route live; account/local return clear not-implemented
-   until slices 3/4); **delete variant machinery**; docs 05a §9 + 06
+   until slices 3/4); **delete variant machinery**; docs/crdt-spec.md §9 + 06
    rewrite.
 2. **applySeq** — counter + stamping + feed re-key + tests (crash
    semantics, rebuild re-feed).
@@ -305,8 +305,8 @@ are listed at the end of this section.
 - Property create/read endpoints + CLI gain `scope` (wire strings =
   schema.Scope labels; `x-scope` discovery unchanged and now shares the
   vocabulary).
-- `Properties.Set` replaces per-scope endpoints 1:1; docs 03/08/09.
-- Indexer/chunkers swap `_addSeq` → `_applySeq` (docs/13 § freshness +
+- `Properties.Set` replaces per-scope endpoints 1:1; docs/space.md/08/09.
+- Indexer/chunkers swap `_addSeq` → `_applySeq` (docs/one-to-one-spaces.md § freshness +
   the "index reflects local view" note).
 
 ## Follow-up ledger (post slices 1–4)
@@ -329,7 +329,7 @@ are listed at the end of this section.
   records by their real (dataset, recordId) and target per-object
   dataset collections in mirrorRecord.
 - **Local sidecar** for local-scope durability — lands WITH the
-  wipe-and-rebuild re-index machinery it serves (docs/08).
+  wipe-and-rebuild re-index machinery it serves (docs/versioning.md).
 - **Re-mirror fast path**: per-carrier-record applied-watermark skip
   for spaces with very many overridden objects.
 - **Carrier residency**: the mirror keeps the carrier object resident
@@ -337,5 +337,5 @@ are listed at the end of this section.
   values until the next event/reconcile (same residency semantics as
   the tech index object).
 - **`any` server follow-ups**: scope on property endpoints/CLI,
-  `_addSeq` → `_applySeq` in chunkers/indexer, docs 03/08/09/13, the
+  `_addSeq` → `_applySeq` in chunkers/indexer, docs/space.md/08/09/13, the
   two shared-space footguns documented in client recipes.

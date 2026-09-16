@@ -1,11 +1,11 @@
 // Package inbox is the coordinator-inbox notifier: the optional Layer-2
-// discovery for 1-1 spaces (docs/13). It funnels the coordinator's push
+// discovery for 1-1 spaces (docs/one-to-one-spaces.md). It funnels the coordinator's push
 // stream and a periodic poll into a single serialized worker that fetches
 // inbox messages, verifies + decrypts each, and hands the result to a
 // caller-supplied handler — advancing a device-local cursor only after a
 // message is handled.
 //
-// It deliberately fixes the heart inbox bugs catalogued in docs/13:
+// It deliberately fixes the heart inbox bugs catalogued in docs/one-to-one-spaces.md:
 // the cursor advances per-message AFTER the handler commits (no
 // process-before-persist loss); content failures (verify/decrypt) are
 // skipped with a loud log while transient handler failures (ErrRetry)
@@ -74,7 +74,7 @@ type Deps struct {
 	// cursor — so a fresh device seeds from the account's read position
 	// instead of replaying the whole inbox; everything below it is already
 	// represented by synced 1-1 rows (the correctness truth). Idempotent
-	// processing makes a synced cursor safe (see docs/13 § "Heart bugs we
+	// processing makes a synced cursor safe (see docs/one-to-one-spaces.md § "Heart bugs we
 	// fix" #3).
 	LoadCursor func(ctx context.Context) (string, error)
 	SaveCursor func(ctx context.Context, offset string) error

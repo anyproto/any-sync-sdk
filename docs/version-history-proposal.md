@@ -20,7 +20,7 @@ the filtered-replay soundness test referenced throughout).
 The design leans on the fact that **any-store state is a pure,
 order-tolerant function of the change set**: replaying any
 causally-closed subset of changes through the CRDT converges to the
-same logical state regardless of order (`docs/05a-crdt-spec.md` §4, §7).
+same logical state regardless of order (`docs/crdt-spec.md` §4, §7).
 
 | Building block | Where | What it gives us |
 |---|---|---|
@@ -124,7 +124,7 @@ Notes:
 - Handler-derived fields are recomputed by the **current** handler
   set. If handler logic changed since the historical change was
   written, derived fields reflect today's logic — same contract as
-  re-indexing (docs/08).
+  re-indexing (docs/versioning.md).
 
 ### 4.2 Engine A fast path: record-filtered replay
 
@@ -378,7 +378,7 @@ records' before/after copies.
   from the decoded payload. E2EE means this local index is the *only*
   viable spot — server-side indexing would require moving traceIds out
   of the encrypted payload.
-- Note: `docs/05a-crdt-spec.md` §3.6 envisions traceIds "on the wire in
+- Note: `docs/crdt-spec.md` §3.6 envisions traceIds "on the wire in
   a dedicated non-encrypted field so any-sync can index them
   space-wide". That is **not implemented** (the codec puts `t:` inside
   the encrypted payload) and this proposal does not need it. Keep the

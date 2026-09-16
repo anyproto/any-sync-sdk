@@ -164,7 +164,7 @@ space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|
 2. `Derive` — what are the inputs? Derived from what (keys? parent object? external seed)?
 3. ~Subscribe at object level vs dataset level?~ → resolved: subscription scope is `(objectId, dataset)` via `space.Query(objectId, dataset).Subscribe(...)`. The shared cross-object firehose uses `space.QueryObjects().Subscribe(...)`. No "whole object" subscribe — callers chain per dataset.
 4. ~`query(datasetName, filter, sort)` on the object level?~ → resolved: `space.Query(objectId, dataset)` is the only path; same builder, same terminal verbs (Iter/All/One/Count/Snapshot/Subscribe).
-5. ~How does a caller attach multiple "types" to an object?~ → resolved: it cannot. An object has one type (`any.type`, `Properties().SetType`) and any number of collections (`any.collections`, `AttachCollection` / `DetachCollection`) — docs/06 § Type and collections.
+5. ~How does a caller attach multiple "types" to an object?~ → resolved: it cannot. An object has one type (`any.type`, `Properties().SetType`) and any number of collections (`any.collections`, `AttachCollection` / `DetachCollection`) — docs/data-structure.md § Type and collections.
 
 ### Deletion & Settings Tree
 6. SDK listens to the settings tree for deletions. Does this land in any-store as a deleted marker the caller can observe? Or does the object simply disappear from queries?

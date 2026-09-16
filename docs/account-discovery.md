@@ -1,6 +1,6 @@
 # 19. Account-level device discovery
 
-Follow-up to [18-global-p2p](18-global-p2p.md). Own devices find each other
+Follow-up to [18-global-p2p](global-p2p.md). Own devices find each other
 through a record addressed by a key derived from the identity key; space
 records become an optional advertisement to other members. Cold recovery is
 the same path as everyday discovery.

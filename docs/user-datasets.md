@@ -12,9 +12,9 @@ author-only delete, apply-time stamps, record-id rules, a
 search-extraction annotation); a module declaration instantiates the
 module's compiled-in behaviour on a collection of the type's own.
 
-Related docs: [05a-crdt-spec.md](05a-crdt-spec.md) §7–8 (apply gates,
+Related docs: [crdt-spec.md](crdt-spec.md) §7–8 (apply gates,
 handler registration), [types-properties-proposal.md](types-properties-proposal.md)
-(the property machinery this reuses), [06-data-structure.md](06-data-structure.md)
+(the property machinery this reuses), [data-structure.md](data-structure.md)
 (the `type` meta-type's datasets and rendering metadata),
 [bundles.md](bundles.md) (bundle roots declaring parts).
 
@@ -22,8 +22,8 @@ handler registration), [types-properties-proposal.md](types-properties-proposal.
 
 ```
 Type
- ├─ properties            (docs/06)
- ├─ layout                (rendering metadata, docs/06)
+ ├─ properties            (docs/data-structure.md)
+ ├─ layout                (rendering metadata, docs/data-structure.md)
  └─ parts[]               display units, keyed
      ├─ name/icon/pos/hidden/ui/uses
      └─ datasets[]        keyed; module + shared; the declaration
@@ -46,7 +46,7 @@ Type
   (`Canonical`); `SharedOnly` refuses namespaced instances so an object
   carries at most one collection of the module. A module may also
   declare a namespace on the objects row (`Properties`) — see
-  docs/06 § Module namespaces. A **reserved** module (`Reserved`,
+  docs/data-structure.md § Module namespaces. A **reserved** module (`Reserved`,
   requires `SharedOnly`) is refused to runtime declarations —
   `AddPart`, `AddDataset`, a bundle's `Parts` — with
   `space.ErrModuleReserved`; only a bundle install the consumer makes
@@ -122,7 +122,7 @@ shared: false  →  <typeId>_<key>                bafyrei…_segments
 A write to a storage collection is admitted at local write time when
 the object's **one type** declares it — the one owner of a namespaced
 collection, any owner of a canonical one — or when the object IS a
-declaring type, which implicitly implements itself (docs/06 § Type and
+declaring type, which implicitly implements itself (docs/data-structure.md § Type and
 collections): that is how a bundle root writes its own records
 (`Store.DatasetOwners`, `spaceImpl.checkDatasetMembership`).
 Collections (`any.collections`) declare properties only and never a
@@ -262,7 +262,7 @@ this, and evolve through
   `kind`, `scope`, `stamp`, `required`, `mutableBy`, `items`/`properties`
   — pinned; `name`, `description` and the opaque `x-format` descriptor
   (every path under it, any value — the same bag a property definition
-  carries, docs/06 § "The `x-format` descriptor") mutable via
+  carries, docs/data-structure.md § "The `x-format` descriptor") mutable via
   `PatchDatasetField`. The descriptive slice never enters the schema
   revision: editing it re-registers nothing.
 
@@ -429,7 +429,7 @@ Each field node also carries its descriptive slice when set: standard
 compiled-in datasets too — a `handler.Field` declares the same
 `Description` / `XFormat`, and every SDK-declared dataset (tech space,
 `bundles`, `payloads`, the `objects` row's derived root fields) ships with
-a description on each field and a descriptor where one fits (docs/06 § The `x-format`
+a description on each field and a descriptor where one fits (docs/data-structure.md § The `x-format`
 descriptor). `Types().Parts(typeId)` and
 `Types().Datasets(typeId)` return the management views (definition
 ids, invalid state, display fields, the computed `Collection`, the
@@ -447,7 +447,7 @@ full value shape, the descriptor).
 - `SkipHistory` on a dataset defined after the history index opened
   applies from the next index open.
 - No handler-version re-index machinery beyond SchemaRev-driven
-  registration refresh (docs/08-versioning.md remains the vision).
+  registration refresh (docs/versioning.md remains the vision).
 - A module's `SharedOnly` is the only per-object cardinality rule: a
   type declaring two namespaced datasets of one module gives its
   objects two storage collections of it.

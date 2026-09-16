@@ -144,7 +144,7 @@ func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
 
 	// The members view must surface exactly the two real writers (us +
 	// the peer) — the synthetic ACL owner (sharedPk, ECDH-derived, held
-	// by nobody) is filtered out, per docs/13-one-to-one-spaces.md. See
+	// by nobody) is filtered out, per docs/one-to-one-spaces.md. See
 	// SYN-63: it used to leak as a nameless third "owner" member.
 	members, err := sp.Members().List(ctx)
 	require.NoError(t, err)

@@ -65,7 +65,7 @@ type BuiltInProperty struct {
 	Kind  schema.Kind
 	Scope schema.Scope
 	// Description and XFormat are the descriptive slice: a display
-	// description and the opaque descriptor bag (docs/06 § The
+	// description and the opaque descriptor bag (docs/data-structure.md § The
 	// `x-format` descriptor). Surfaced by Types().Properties and
 	// dataset discovery like a user definition's; never interpreted
 	// or enforced by the SDK.
@@ -131,7 +131,7 @@ const HandlerVersion = "typePropertyHandler-v1"
 // PropertyHandlerLocalVersion is this handler's LOCAL logic version
 // (HandlerReg.Version) — bumped when a validation change means an
 // already-materialized set of definitions would come out different, so
-// the SDK replays the type object's tree (docs/08-versioning.md).
+// the SDK replays the type object's tree (docs/versioning.md).
 //
 // It is also how a peer recovers definitions its previous build dropped:
 // the wire DataVersion deliberately stays put (bumping it would park
@@ -156,7 +156,7 @@ const (
 	FieldXKey        = "x-key"       // caller-side handle, mutable
 	FieldItems       = "items"       // recursive sub-shape for arrays
 	FieldProperties  = "properties"  // recursive sub-shape for objects
-	FieldRequired    = "required"    // []string, mutable per docs/06
+	FieldRequired    = "required"    // []string, mutable per docs/data-structure.md
 	FieldMeta        = "meta"        // opaque consumer flag map (string→string), mutable
 	FieldXFormat     = "x-format"    // opaque descriptor object, mutable — see below
 )

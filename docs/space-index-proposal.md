@@ -3,7 +3,7 @@
 ## Problem
 
 Space `Name`, `IconCID`, `Description` currently live only in the per-account
-tech-space (the `spaces` dataset, see [02-tech-space.md](02-tech-space.md)).
+tech-space (the `spaces` dataset, see [tech-space.md](tech-space.md)).
 That gives Alice's own devices a synced view of her spaces, but other members
 joining her space see nothing — their tech-space record holds whatever they
 typed locally (often empty), not what Alice configured.

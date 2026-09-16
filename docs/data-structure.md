@@ -33,7 +33,7 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 > Sorting (`-modifiedAt`) is unaffected in a converged store. While a
 > re-index is in flight the collection can hold both shapes at once, so
 > that window sorts as two type-grouped blocks — it closes when the
-> space's sweep finishes (docs/08-versioning.md).
+> space's sweep finishes (docs/versioning.md).
 >
 > **`modifiedAt` / `modifiedBy` are object-level.** They move on every
 > synced write to the object — a property write and a write to any of
@@ -62,7 +62,7 @@ rationale: [`scoped-properties-proposal.md`](scoped-properties-proposal.md).
 > indexed (the default list sort), `modifiedBy` is not — filtering by
 > it scans the collection. An absent `modifiedBy` means the row was
 > built before the field existed and awaits its rebuild
-> (docs/08-versioning.md), or the latest change's signer is unknown —
+> (docs/versioning.md), or the latest change's signer is unknown —
 > never "nobody modified it".
 
 There is **no per-value override stack and no priority merge** — the
@@ -157,14 +157,14 @@ Both kinds are objects in the space, and both carry a reserved **marker** in `an
 
 Every object implements the built-in `any` — universal properties (name, description, icon, tags, `type`, `collections`, id, author, createdAt, modifiedAt, modifiedBy). Two more built-ins describe definitions:
 
-- `type` — the meta-type namespace, granted to rows carrying `__type__`. Contributes `xkey` (the type's programmatic handle), `layout` (the rendering descriptor — `{type, config}`, the x-format shape, written whole, opaque to the SDK), `hidden` (keeps the type out of default listings and pickers; a bundle root asks for it when it only hosts its records — docs/bundles.md § Bundle-declared definitions) and `meta` (the open bag of consumer flags — one scalar per single-level key, written per key so concurrent writers merge; opaque to the SDK), plus the `properties`, `shortIds` and `datasets` datasets (`datasets` holds the type's parts and their dataset definitions — docs/17-user-datasets.md).
+- `type` — the meta-type namespace, granted to rows carrying `__type__`. Contributes `xkey` (the type's programmatic handle), `layout` (the rendering descriptor — `{type, config}`, the x-format shape, written whole, opaque to the SDK), `hidden` (keeps the type out of default listings and pickers; a bundle root asks for it when it only hosts its records — docs/bundles.md § Bundle-declared definitions) and `meta` (the open bag of consumer flags — one scalar per single-level key, written per key so concurrent writers merge; opaque to the SDK), plus the `properties`, `shortIds` and `datasets` datasets (`datasets` holds the type's parts and their dataset definitions — docs/user-datasets.md).
 - `collection` — the meta-collection namespace, granted to rows carrying `__collection__`. Contributes the same `xkey` / `hidden` / `meta` and the same `properties` / `shortIds` datasets, and nothing else: a collection has no layout and no `datasets`.
 
 Marker and namespace are different strings because a `_`-prefixed top-level field is protocol-owned, so the marker cannot double as a storage namespace; the handler grants `type.*` / `collection.*` off the marker alone, and a row that merely names the meta id as its type reaches neither. Keeping `xkey` there rather than on `any` is what makes it unwritable on a row that is not a definition. `Types().Patch` rewrites the display and rendering metadata (`any.name` / `any.description` / `any.icon`, `type.layout` / `type.hidden`) in one change and patches `type.meta` per key (a nil value unsets); `Collections().Patch` does the same over `collection.*`. Nested writes on the objects row — `{ownerId}.{propId}.{key…}` — are admitted only under an object-kind property, `$set` only, and merge per leaf; below any other kind the op is dropped (`SystemPropertiesHandler`), and the container ops (`$inc`, `$addToSet`, `$pull`) address the property itself.
 
 A definition object **implicitly implements itself**: its row carries only the marker, yet it may hold `{ownId}.{propId}` values and the records of the datasets it declares. That is how a bundle root keeps its own data on the root (favourites entries, an app's layouts) with no extra flag. It never matches a member query — `{"any.type": typeId}` returns the objects of that type, never the type object.
 
-Registered types (`config.Config.Types`) carry the type shape statically: `handler.Type.Parts` declares their parts (static datasets by name, module datasets by module — docs/17 § Static parts on registered types) and `handler.Type.Hidden` their listing flag; `Types().Parts` / `Datasets` return the compiled view and the runtime mutators answer `ErrTypeRegistered`. Registered collections (`config.Config.Collections`) carry the collection shape the same way — see § Collections. A bundle may declare either kind on its root — parts, properties with ids derived from `(rootId, xKey)`, layout, hidden — so one install converges on one definition across devices (docs/bundles.md).
+Registered types (`config.Config.Types`) carry the type shape statically: `handler.Type.Parts` declares their parts (static datasets by name, module datasets by module — docs/user-datasets.md § Static parts on registered types) and `handler.Type.Hidden` their listing flag; `Types().Parts` / `Datasets` return the compiled view and the runtime mutators answer `ErrTypeRegistered`. Registered collections (`config.Config.Collections`) carry the collection shape the same way — see § Collections. A bundle may declare either kind on its root — parts, properties with ids derived from `(rootId, xKey)`, layout, hidden — so one install converges on one definition across devices (docs/bundles.md).
 
 Built-ins exist as **derived objects** in every space (well-known ids, uniform with user definitions — no "built-in vs user" fork in query/UI code).
 
@@ -203,7 +203,7 @@ A **registered collection** is the compiled-in twin: `config.Config.Collections 
 
 #### Module namespaces
 
-A registered module (`handler.Module.Properties`, docs/17) may declare values on the objects row under its own name — `chat.unreadCount`, `chat.notifyMode`. The namespace is never a membership value: the local write pre-flight grants it to a row when the row's type declares a dataset of that module (`Store.ModuleGrants`) — at runtime or statically through `handler.Type.Parts` — and the read-tracking service writes a module collection's unread counters there. Same registry overlay as a registered type's properties, so `Properties().Set(objectId, "<module>", …)` routes by the declared scope. A module the consumer keeps for its own installs is registered `Reserved` (docs/17 § Model).
+A registered module (`handler.Module.Properties`, docs/user-datasets.md) may declare values on the objects row under its own name — `chat.unreadCount`, `chat.notifyMode`. The namespace is never a membership value: the local write pre-flight grants it to a row when the row's type declares a dataset of that module (`Store.ModuleGrants`) — at runtime or statically through `handler.Type.Parts` — and the read-tracking service writes a module collection's unread counters there. Same registry overlay as a registered type's properties, so `Properties().Set(objectId, "<module>", …)` routes by the declared scope. A module the consumer keeps for its own installs is registered `Reserved` (docs/user-datasets.md § Model).
 
 ### Property ids
 
@@ -292,7 +292,7 @@ any-store's dotted-path `$set` handles deep edits (`$set: {"properties.editor": 
 
 ### The `x-format` descriptor
 
-`x-format` is everything descriptive about a property beyond its structural `kind` — the semantic slug, icon, ordering key, option set, relation targets, per-format config. The same bag sits on a dataset field (docs/17). The SDK stores it **opaquely**:
+`x-format` is everything descriptive about a property beyond its structural `kind` — the semantic slug, icon, ordering key, option set, relation targets, per-format config. The same bag sits on a dataset field (docs/user-datasets.md). The SDK stores it **opaquely**:
 
 ```json
 { "id": "3XEMVWA6EK", "name": "Stage", "kind": "array", "items": { "kind": "string" },

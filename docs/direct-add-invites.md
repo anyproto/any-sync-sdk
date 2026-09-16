@@ -2,7 +2,7 @@
 
 Add users to a regular space by account identity alone — no invite token,
 no join-request round-trip. The receiver sees the space as pending in
-their list and accepts or declines, like an incoming 1-1 (docs/13).
+their list and accepts or declines, like an incoming 1-1 (docs/one-to-one-spaces.md).
 
 ## Model
 
@@ -56,7 +56,7 @@ carry pending to the other devices.
 
 | remoteStatus (synced)   | public Status         | transition |
 |-------------------------|-----------------------|------------|
-| `invitePending`         | `StatusInvitePending` | written by the inbox handler on a fresh row, or over an ended join (`joinEnded`, docs/03-space.md § Join lifecycle) |
+| `invitePending`         | `StatusInvitePending` | written by the inbox handler on a fresh row, or over an ended join (`joinEnded`, docs/space.md § Join lifecycle) |
 | `active`                | `StatusActive`        | `AcceptInvite` (any device; converges everywhere) |
 | `inviteDeclined`        | `StatusInviteDeclined`| `DeclineInvite`; sticky, NON-terminal — `AcceptInvite` overrides |
 

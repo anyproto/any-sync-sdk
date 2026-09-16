@@ -76,7 +76,7 @@ type Storage struct {
 	// Topology picks one-DB-for-everything vs one-DB-per-space. Shared
 	// is the simpler default; PerSpace isolates parallel writers and
 	// makes deletion cheap but rules out cross-space transactions.
-	// See docs/06-data-structure.md §"Storage Topology".
+	// See docs/data-structure.md §"Storage Topology".
 	Topology StorageTopology
 
 	// AnyStore is a reserved hook for per-DB tuning. v1: leave zero.
@@ -153,7 +153,7 @@ func (p P2P) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
 // GlobalP2P configures the internet-wide p2p layer. Opt-in: nil Enabled
 // means off until a relay is deployed for the network. Zero-valued
 // budget fields take the DefaultGlobalP2P* values; see
-// docs/18-global-p2p.md.
+// docs/global-p2p.md.
 type GlobalP2P struct {
 	// Enabled turns the layer on. nil and false both mean off.
 	Enabled *bool `yaml:"enabled"`

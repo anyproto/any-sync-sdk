@@ -6,5 +6,5 @@
 //
 // Not caller-facing. Middleware never holds an Object handle — it
 // operates at the space level and references objects by objectId.
-// See docs/04-object.md.
+// See docs/object.md.
 package object

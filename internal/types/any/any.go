@@ -50,14 +50,14 @@ const (
 // type. Uses human-readable ids (e.g. "name") that never collide with
 // generated user propIds (11-char base58). Scope uses the unified
 // schema.Scope taxonomy — the same vocabulary user property
-// definitions declare (docs/06-data-structure.md §"Property Types").
+// definitions declare (docs/data-structure.md §"Property Types").
 type BuiltInProperty struct {
 	Id    string
 	Name  string
 	Kind  schema.Kind
 	Scope schema.Scope
 	// Description and XFormat are the descriptive slice: a display
-	// description and the opaque descriptor bag (docs/06 § The
+	// description and the opaque descriptor bag (docs/data-structure.md § The
 	// `x-format` descriptor). Surfaced by Types().Properties and
 	// dataset discovery like a user definition's; never interpreted
 	// or enforced by the SDK.
@@ -100,7 +100,7 @@ var Properties = []BuiltInProperty{
 	{Id: "icon", Name: "Icon", Kind: schema.KindString, Scope: schema.ScopeSynced,
 		Description: "Display icon; the encoding is the client's."},
 	// `type` is the ONE type the object has; `collections` the set of
-	// collections it belongs to (docs 06 § Type and collections). Both
+	// collections it belongs to (docs/data-structure.md § Type and collections). Both
 	// synced-only: membership is structural and shared — never
 	// per-account or per-device.
 	{Id: FieldType, Name: "Type", Kind: schema.KindString, Scope: schema.ScopeSynced,

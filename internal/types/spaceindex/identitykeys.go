@@ -5,7 +5,7 @@
 // participant's identityRepo profile. A 1-1 ACL is immutable and carries
 // no per-writer metadata, so this dataset is the in-space channel that
 // replaces the join-record metadata a regular space uses. See
-// docs/13-one-to-one-spaces.md § Key exchange inside the space.
+// docs/one-to-one-spaces.md § Key exchange inside the space.
 
 package spaceindex
 

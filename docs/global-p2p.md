@@ -1,7 +1,7 @@
 # Global p2p
 
 Direct device-to-device sync across the internet, next to the LAN layer
-(docs/03-space.md § Sync). Transport: any-sync's iroh transport (QUIC,
+(docs/space.md § Sync). Transport: any-sync's iroh transport (QUIC,
 relay fallback, hole punching — `github.com/tmc/go-iroh`). Discovery:
 each space's key-value store.
 
@@ -49,7 +49,7 @@ each space's key-value store.
   or that mDNS reports lost releases its addresses, so its ticket can
   take over. Cold restore through the space records alone stays a LAN
   affair: a fresh device has no rows and nobody's allowlist knows it —
-  unless the account layer is on ([19-account-discovery](19-account-discovery.md)),
+  unless the account layer is on ([19-account-discovery](account-discovery.md)),
   which finds the account's own devices from the mnemonic.
 - **Inbound gate.** The transport accepts a connection only from a
   peer id present in the records — a loaded space's rows or the account
@@ -194,7 +194,7 @@ is never hidden by the global layer.
 - The space records are not a cold-restore path: a device with an empty
   data dir has no rows to dial from and nobody's allowlist knows it yet,
   so a first restore needs the nodes, the LAN, or the account layer
-  ([19-account-discovery](19-account-discovery.md)). Once a device holds
+  ([19-account-discovery](account-discovery.md)). Once a device holds
   its spaces it reconnects to its global peers from the persisted
   records without any node.
 - One device key means one endpoint: the relay keeps a single session
@@ -204,4 +204,4 @@ is never hidden by the global layer.
   pool closes it, the connector dials again on its next pass. That is
   a bounded, intentional cost (one handshake per half hour), not churn.
 
-Follow-up: [19-account-discovery](19-account-discovery.md) — own devices discovered through a record under a key derived from the identity key; space records become an optional per-space advertisement.
+Follow-up: [19-account-discovery](account-discovery.md) — own devices discovered through a record under a key derived from the identity key; space records become an optional per-space advertisement.

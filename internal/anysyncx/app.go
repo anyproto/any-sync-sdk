@@ -423,7 +423,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// Peer presence for sync status: live-connection counts via the
 	// non-dialing pool.Pick, refreshed when the p2p peer store or the
 	// discovery possibility changes. (The "Phase 3 peer-presence
-	// reader" slot from docs/09-sync-status-proposal.md.)
+	// reader" slot from docs/sync-status-proposal.md.)
 	poolComp := a.MustComponent(pool.CName).(pool.Pool)
 	pickable := func(id string) bool { return pickLive(poolComp, id) }
 	out.syncStatus.SetPeerCountsFn(func(spaceId string) (networkPeers, localPeers, globalPeers int) {

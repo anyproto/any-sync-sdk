@@ -643,7 +643,7 @@ func (s *Service) ownRole(ctx context.Context, spaceId string) (space.Permission
 // returns its marshalled bytes for the ACL RequestMetadata / create
 // payload. The ACL carries ONLY the symkey, never inline name/icon —
 // co-members cache the key and resolve the profile from identityRepo
-// (see docs/13). any-sync encrypts these bytes at rest with the space
+// (see docs/one-to-one-spaces.md). any-sync encrypts these bytes at rest with the space
 // metadata key, so only members can read the symkey. Returns nil bytes
 // on derive/marshal failure (the member still joins; their profile just
 // stays unresolved until a later key arrival).

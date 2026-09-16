@@ -76,7 +76,7 @@ type SpaceInfo struct {
 	Settings map[string]any
 	// PushKeys is the space's push-notification key material, mirrored
 	// from ACL state so clients can cache it and decrypt push payloads
-	// while the SDK process is down (see docs/02-tech-space.md
+	// while the SDK process is down (see docs/tech-space.md
 	// § "Space Index"). Nil until the per-space mirror has run —
 	// notably on a joiner whose access is still pending (no read key
 	// yet) and on rows whose space was never loaded by this device.

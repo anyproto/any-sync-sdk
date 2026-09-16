@@ -36,7 +36,7 @@ func lexIds() func() crdt.VersionId {
 
 // TestProperties_DetachConcurrentWriteReattach_Converges is the
 // end-to-end proof of the orphan-resurrection decision
-// (docs/06-data-structure.md §16): one peer removes a collection while
+// (docs/data-structure.md §16): one peer removes a collection while
 // another concurrently writes a value under it; after both peers see
 // both changes (in opposite orders) they converge, the value survives
 // as orphan, and re-adding reveals the identical value on both.

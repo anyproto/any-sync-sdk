@@ -46,7 +46,7 @@ The whole space is built locally and offline by
 - Replication key = `fnv64(sharedPubKey)` — self-contained, independent of the
   account's replication key.
 - On-wire header `SpaceType = "any.onetoone"` (coordinator-gated allow-list,
-  see `docs/03-space.md`; irrelevant in a no-coordinator deployment).
+  see `docs/space.md`; irrelevant in a no-coordinator deployment).
 
 **Consequence that shapes everything below:** the ACL is **immutable** — just a
 root with two writers, no invite/request/accept records. There is *nothing to
@@ -172,7 +172,7 @@ transport is configured; the primitive doesn't care.
 - **Decline** → synced `oneToOneDeclined` marker, no storage ever created.
   Account-wide sticky against the automatic discovery path; overridable only by
   an explicit `OneToOne(peer)`.
-- **Delete** of an *active* 1-1 → local-only offload (per `docs/03-space.md`:
+- **Delete** of an *active* 1-1 → local-only offload (per `docs/space.md`:
   1-1 spaces are "not removable from the network, derived, always
   re-creatable"). Sets `LocalStatus = deleted`, offloads local state, but does
   **not** send `coordinator.SpaceDelete`. A subsequent `OneToOne(peer)`
@@ -193,7 +193,7 @@ The space list / `SpaceInfo.Status` gains mapped values (extend `mapStatus`,
 Callers discover incoming requests by `Subscribe`/`List` filtering on
 `Status == OneToOnePending`, then call `AcceptOneToOne` / `DeclineOneToOne`.
 Members of an active 1-1 are read through the normal members collection
-(`docs/03-space.md`), which reads the two Writers from the immutable ACL.
+(`docs/space.md`), which reads the two Writers from the immutable ACL.
 The synthetic `sharedPk` owner (above) is filtered out of every member
 view — `Members().List` / `Get` / `Query` / `Subscribe` all surface only
 the two real writers, matching "ignored in business logic." (Filter:
@@ -262,7 +262,7 @@ activation the SDK posts one `InboxAddMessage(peerPubKey, …)`:
 
 - `payloadType = InboxPayloadOneToOneInvite`
 - `body` = the sender's **metadata symkey** (the key that decrypts the
-  sender's identityRepo profile — see `docs/14-identities.md`). any-sync
+  sender's identityRepo profile — see `docs/identities.md`). any-sync
   ECIES-encrypts it to `peerPubKey` on send. The receiver caches the key and
   resolves the name/icon from identityRepo; the body carries no name/icon
   itself.
@@ -552,7 +552,7 @@ not an ACL head.
 7. **Profile freshness.** The inbox invite carries the sender's symkey, not a
    name/icon snapshot, so a pending row starts identity-only and resolves the
    name from identityRepo via the cached symkey (see
-   `docs/14-identities.md`). Out-of-band `RegisterIncoming(peer, displayHint)`
+   `docs/identities.md`). Out-of-band `RegisterIncoming(peer, displayHint)`
    may seed an inline name/icon for immediate display; absent both a hint and
    a coordinator it stays identity-only until the space is active on both
    sides, when the in-space `identityKeys` row delivers the key (§ Key

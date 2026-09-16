@@ -32,7 +32,7 @@ type SpaceCreatePayload struct {
     ReadKey         crypto.SymKey   // first read key for encryption
     MetadataKey     crypto.PrivKey
     Metadata        []byte          // owner metadata: the owner's metadata symkey
-                                    // (NOT inline name/icon) — see docs/14-identities.md
+                                    // (NOT inline name/icon) — see docs/identities.md
     Options         *AclSpaceOptions
 }
 ```
@@ -76,7 +76,7 @@ the joining client (no storage, no pull).
 |-----------------------|-----------------|------------|
 | `joining`             | `StatusJoining` | `Join` — request posted, or found already on the chain (the joining client dedupes a repeat request from the same identity) |
 | `active`              | `StatusActive`  | the device whose waiter observes the acceptance, after its own load succeeds; the account's other devices converge and load lazily |
-| `joinEnded`           | `StatusDeleted` | a waiter observing the owner's decline (any device holding a head); `CancelJoin` (any device). Non-terminal, `IsDeleted`-classified: `Get` refuses it, `Subscribe` emits `Removed`, `Join` revives it, a direct add (`AddAccounts`) registers over it as `invitePending` (docs/15) |
+| `joinEnded`           | `StatusDeleted` | a waiter observing the owner's decline (any device holding a head); `CancelJoin` (any device). Non-terminal, `IsDeleted`-classified: `Get` refuses it, `Subscribe` emits `Removed`, `Join` revives it, a direct add (`AddAccounts`) registers over it as `invitePending` (docs/direct-add-invites.md) |
 | `deleted`             | `StatusDeleted` | `Delete`; terminal, as everywhere |
 
 - **Waiters.** The join controller runs one any-sync ACL waiter per
@@ -208,7 +208,7 @@ type AclSpaceClient interface {
 - **Full ACL feature set** — SDK exposes all ACL operations available in any-sync (invite, accept/decline, remove, change permissions, ownership transfer, etc.). All 6 permission levels.
 - **API shape** — mirror `AclClient` one-to-one
 - **Invite format** — whatever any-sync requires (inherits format from any-sync, not reinvented)
-- **Metadata & member names** — symkey-only model (see `docs/14-identities.md`): the ACL `RequestMetadata` carries each account's **metadata symkey**, not an inline name/icon; member names resolve from the encrypted `identityRepo` profile using that key. SDK wraps any-sync's metadata-key mechanism, doesn't invent its own
+- **Metadata & member names** — symkey-only model (see `docs/identities.md`): the ACL `RequestMetadata` carries each account's **metadata symkey**, not an inline name/icon; member names resolve from the encrypted `identityRepo` profile using that key. SDK wraps any-sync's metadata-key mechanism, doesn't invent its own
 - **identityRepo integration** — handled internally by the SDK (background fetch + decrypt, write-through to the account-global identities directory). Public surface: `account.UpdateMetadata` (own profile) and `sdk.Identities()` (the resolved directory)
 - **Members as a collection** — members are exposed as an any-store system collection with the same query/subscription rules as any other data. Callers read members via `Find()` + event flow
 - **Join request notifications** — a new ACL record is added; SDK reacts to ACL changes via event flow and surfaces pending requests to the caller (likely as `status=pending` in the members collection, TBD)
@@ -227,7 +227,7 @@ type AclSpaceClient interface {
   - Can only be deleted locally
   - Still appear in the space index like regular spaces
 - **Offline-first** — everything works offline. Only exception: account recovery still requires p2p peers
-- **Direct peers** — besides the sync nodes, a space syncs with the devices that share it: LAN peers found over mDNS, and — with `P2P.Global` on — internet-wide peers discovered through the space's key-value records and reached over iroh (relay fallback, hole punching). Global peers are never dialed on a sync path; see docs/18-global-p2p.md.
+- **Direct peers** — besides the sync nodes, a space syncs with the devices that share it: LAN peers found over mDNS, and — with `P2P.Global` on — internet-wide peers discovered through the space's key-value records and reached over iroh (relay fallback, hole punching). Global peers are never dialed on a sync path; see docs/global-p2p.md.
 
 ### Sync
 - **Space loading** — every space still loads at boot, but OFF the `Open` path: `Open` returns after local wiring (any-sync app, sdk.db, tech space, files/push, readSync, pending-join resume, 1-1 inbox) and one SDK-owned background goroutine then runs the eager loop — tombstone offloads, space load, offline catch-up replay (`spacesync.Run`), deletion reconcile — plus profile republish and the read-state reconcile, **strictly serial** (concurrent commonspace builds spike RAM/CPU exactly on the constrained devices this targets). `SDK.BootstrapDone()` closes when the pass finishes; `Close` cancels+joins it before any teardown.
@@ -237,7 +237,7 @@ type AclSpaceClient interface {
 - **Sync status** — a separate SDK subsystem that tracks per-space, per-object, and peer connection status. Will be designed separately
 
 ### Files
-- **Deferred** — will be covered in a separate section (07-files.md). Open question: keep the existing filenode system or move files to the any-sync level
+- **Deferred** — will be covered in a separate section (files.md). Open question: keep the existing filenode system or move files to the any-sync level
 
 ### Storage Topology
 - **One vs many any-store DBs** — deferred to Data Structure section
@@ -272,5 +272,5 @@ type AclSpaceClient interface {
 8. `status=pending` vs separate join-requests collection — decide during implementation.
 
 ### Dependencies
-9. Files → separate section (07-files.md)
+9. Files → separate section (files.md)
 10. Sync status → separate subsystem, designed later

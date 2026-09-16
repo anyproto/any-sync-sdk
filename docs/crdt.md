@@ -124,7 +124,7 @@ Every change carries optional `traceIds` — opaque caller-supplied correlation 
 - **Permissions**:
   - ACL enforcement on any-sync side (who can write to this object at all)
   - Logical per-record permissions (e.g., "edit only your own chat message") handled by dataset handlers
-- **Versioning & re-indexing** — handlers have versions. When the app adds a new handler or changes handler logic, the SDK must re-iterate the object tree and rebuild the any-store state. See `08-versioning.md`.
+- **Versioning & re-indexing** — handlers have versions. When the app adds a new handler or changes handler logic, the SDK must re-iterate the object tree and rebuild the any-store state. See `versioning.md`.
 
 ### AddSeq watermark
 - **Two different peer-local counters.** `versionId` is the local any-sync orderId (used for gating and as a DB sort key); `addSeq` is the local delivery counter (used for catch-up). Both are maintained by the peer's local any-sync; neither is guaranteed to match another peer's values.
@@ -134,7 +134,7 @@ Every change carries optional `traceIds` — opaque caller-supplied correlation 
 - **Per-record `_addSeq`.** The apply path stamps the change's AddSeq onto every record it writes (root field `_addSeq`, monotonic max — a lower out-of-order replay never regresses it). Tombstones carry it too. An `_addSeq` index is ensured on every collection. This is storage metadata, kept off the `Query.Subscribe` wire projection; it surfaces only through explicit reads and the change-index query.
 - **Per-object `_meta` index.** Each per-object `_meta` row already persists the object's max AddSeq atomically in the apply tx; it now also carries the `spaceId` (`sp` field, indexed as `(sp, q)`) so the change-index query can scope "objects in this space with AddSeq > N" against the shared SDK DB.
 - **Per-space boot watermark persists at Close too.** The space-level "highest LastAddSeq seen" row (`spacesync`) is written at the end of a boot catch-up pass AND snapshotted on clean SDK Close for every open, caught-up space — session-live applies already materialized everything below `MaxLastAddSeq`, so without the close snapshot every tree touched during a session sits above the boot value and the next boot force-loads all of them for nothing. Crash ⇒ no snapshot ⇒ boot replay fallback (idempotent, same as the crash-safety bullet above). Allowlist-gated (absent = dirty = keep the boot replay): a space qualifies via a successful boot catch-up Run or by being created/derived this session (born clean); joins/accepts never qualify. A non-empty treesyncer parked set (trees committed to storage but never materialized — the boot replay is their only cross-restart recovery) also skips the space, and the write never regresses (`persistWatermarkIfAhead`).
-- **Change-index surface.** `Space.Changes()` (`ChangeIndexAPI`) exposes `ChangedSince(since, limit)` (catch-up pull, ascending by AddSeq), `MaxAddSeq()` (cursor ceiling), and `Subscribe(cb)` (best-effort live feed of `(objectId, addSeq)`). Built for consumer-side incremental indexers (full-text / vector search): the consumer owns the cursor; the two paths reconcile because both order on AddSeq. See `12-change-index-proposal.md`.
+- **Change-index surface.** `Space.Changes()` (`ChangeIndexAPI`) exposes `ChangedSince(since, limit)` (catch-up pull, ascending by AddSeq), `MaxAddSeq()` (cursor ceiling), and `Subscribe(cb)` (best-effort live feed of `(objectId, addSeq)`). Built for consumer-side incremental indexers (full-text / vector search): the consumer owns the cursor; the two paths reconcile because both order on AddSeq. See `change-index-proposal.md`.
 
 ### Conflict Rules
 - **LWW by versionId** (v1) — acceptable for all ops except `$inc` (commutative counter) and the commutative set ops `$addToSet` / `$pull`
@@ -155,7 +155,7 @@ Every change carries optional `traceIds` — opaque caller-supplied correlation 
 - **Caller view** — SDK may wrap events into a simplified view for the client
 
 ## Full Spec
-See **`05a-crdt-spec.md`** for the complete specification (operations, change format, event format, application algorithm, property scopes, conflict examples).
+See **`crdt-spec.md`** for the complete specification (operations, change format, event format, application algorithm, property scopes, conflict examples).
 
 ## Grooming Questions (open)
 

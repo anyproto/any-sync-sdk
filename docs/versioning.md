@@ -85,7 +85,7 @@ Properties of the mechanism:
   with the wipe and the object is marked stale, so the existing lazy
   backfill re-indexes it.
 
-**Runtime dataset schemas** (docs/17-user-datasets.md) cover the
+**Runtime dataset schemas** (docs/user-datasets.md) cover the
 runtime-defined half without a replay:
 
 - **SchemaRev** — a fingerprint of the compiled declaration, stamped on

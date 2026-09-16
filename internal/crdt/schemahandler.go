@@ -14,7 +14,7 @@ import (
 // SchemaHandlerVersion is the generic schema handler's LOCAL logic
 // version (HandlerReg.Version). Every dataset the SDK applies through
 // this handler carries it, so a change here rebuilds their rows from the
-// DAG (docs/08-versioning.md). v2: the createTime / modifyTime stamps
+// DAG (docs/versioning.md). v2: the createTime / modifyTime stamps
 // are TypeDateTime instants, not epoch numbers.
 const SchemaHandlerVersion = 2
 

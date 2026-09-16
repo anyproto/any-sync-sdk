@@ -13,7 +13,7 @@ A derived space (deterministic from account key) that stores account-level data.
 - **ocache pattern** — any-sync `CommonSpace` managed via ocache (like any-sync-node), init/close by activity. SDK doesn't depend on space being loaded in memory
 - **Sync priority** — tech space syncs first on startup, but sync is continuous (decentralized, never "done")
 - **Tech space loads before regular spaces** — space list comes from tech space
-- **SpaceType** — always `any.techspace` (`techspace.TechSpaceType`) with `fileprotoVersion=2`, for every account regardless of derivation index. Distinct from anytype-heart's `anytype.techspace`, so an SDK account never shares a tech space with a heart client even at index 0. The header feeds the derived tech-space id (pinned by `TestDeriveCfg_Stable`) — changing it orphans every account's tech space. Accepted pre-production break: accounts created before this shipped derive a new (empty) tech-space id on upgrade. The coordinator gates the allow-list (`spacestatus/changeverifier.go`); the library default `spacepayloads.SpaceReserved` (`any-sync.space`) is rejected. See `03-space.md § Space type strings`.
+- **SpaceType** — always `any.techspace` (`techspace.TechSpaceType`) with `fileprotoVersion=2`, for every account regardless of derivation index. Distinct from anytype-heart's `anytype.techspace`, so an SDK account never shares a tech space with a heart client even at index 0. The header feeds the derived tech-space id (pinned by `TestDeriveCfg_Stable`) — changing it orphans every account's tech space. Accepted pre-production break: accounts created before this shipped derive a new (empty) tech-space id on upgrade. The coordinator gates the allow-list (`spacestatus/changeverifier.go`); the library default `spacepayloads.SpaceReserved` (`any-sync.space`) is rejected. See `space.md § Space type strings`.
 
 ## What Tech Space Stores
 
@@ -34,8 +34,8 @@ Records with fields:
 - `remoteStatus` — synced (account-wide) state: `active`; the terminal
   tombstone `deleted`; the non-terminal offload markers `oneToOneDeleted`
   / `guestDeleted`; the direct-add invite pair `invitePending` /
-  `inviteDeclined` (docs/15); and the request-to-join pair `joining` /
-  `joinEnded` (docs/03-space.md § Join lifecycle). Pending states are
+  `inviteDeclined` (docs/direct-add-invites.md); and the request-to-join pair `joining` /
+  `joinEnded` (docs/space.md § Join lifecycle). Pending states are
   synced so every device classifies a row the same way: none
   materializes a space the account is not a member of, and a verdict
   observed on one device converges the others.
@@ -129,11 +129,11 @@ and inbox invites — backs `sdk.Identities()`. One row per identity, **mixing
 sync classes**: `symKey` is **synced** (a device needs it to decrypt that
 contact's identityRepo profile), while the resolved `name`/`description`/
 `iconCID` and the `spaceIds` sighting set are **device-local** (re-derived per
-device). See `docs/14-identities.md`.
+device). See `docs/identities.md`.
 
 The tech space also hosts two account-scoped helper datasets: `profile` (the
 account's own profile, republished to identityRepo on boot) and `inboxCursor`
-(the synced 1-1 inbox read position — see `docs/13-one-to-one-spaces.md`).
+(the synced 1-1 inbox read position — see `docs/one-to-one-spaces.md`).
 
 ### Devices registry (`devices` dataset, SYN-165)
 One row per device of the account, keyed by the device's libp2p **peer id**
@@ -174,7 +174,7 @@ absent or lower; a higher stored value refuses `Open` with
 turns every synced write read-only (`SDK.CRDTVersion()`). Reads go through
 the generic dataset surface (`Query(SpaceIndexObjectId(), "crdtVersion")`);
 there is no write surface — the SDK is the only writer. Contract and
-rationale: `08-versioning.md`.
+rationale: `versioning.md`.
 
 ## Current any-sync Implementation
 

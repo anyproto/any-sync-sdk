@@ -65,7 +65,7 @@ Create a Go library wrapping `any-sync` with a high-level API that hides offline
 2. **Tech space** — account-level index of spaces, preferences
 3. **Space** — creation, joining, ACL management
 4. **Object** — content-addressable DAG, changes, encryption
-5. **CRDT** — record sets, field-level operations ([full spec](05a-crdt-spec.md))
+5. **CRDT** — record sets, field-level operations ([full spec](crdt-spec.md))
 6. **Data structure** — queries, subscriptions, system collections, local/account settings layering
 7. **Files** — file storage (filenode vs any-sync-native, TBD)
 8. **Versioning** — handler/schema versions, re-indexing flow

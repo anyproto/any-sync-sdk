@@ -10,7 +10,7 @@ import (
 // targets a non-existent id (the record starts empty with `_ver = {}` and the
 // op then runs as normal). This eliminates the dual-insert convergence
 // problem and the "skip if exists" footgun. See the spec divergence memory
-// note and docs/05a-crdt-spec.md §5 for rationale.
+// note and docs/crdt-spec.md §5 for rationale.
 type OpType string
 
 const (

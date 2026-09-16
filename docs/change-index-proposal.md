@@ -31,7 +31,7 @@ Three capabilities, matching the original proposal:
 ## What AddSeq is (grounding)
 
 - `AddSeq` is any-sync's **per-space monotonic delivery counter**
-  (`docs/04-object.md`: "per-space monotonic counter for incremental
+  (`docs/object.md`: "per-space monotonic counter for incremental
   sync"). any-sync stamps it on `StorageChange.AddSeq` for every change
   — local writes (`object.go:415`, from `AddContent` result) and inbound
   replays alike. It already rides on `crdt.Change.AddSeq`.
@@ -208,7 +208,7 @@ avoid collision.
 17. spaceimpl/e2e: two objects, write to each, `ChangedSince(0)` returns
     both ordered; `ChangedSince(firstSeq)` returns only the later;
     `Subscribe` observes live writes; `Properties().Get` shows `_addSeq`.
-18. Update `docs/05-crdt.md` (AddSeq section) and `README.md` status.
+18. Update `docs/crdt.md` (AddSeq section) and `README.md` status.
 
 ## Impact / blast radius
 

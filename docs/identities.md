@@ -129,10 +129,10 @@ when a space is next entered (a sync-triggered resolve is a possible follow-up).
 
 ## Relationship to members & 1-1
 
-- **Members** (`docs/03-space.md`) is the per-space, ACL-derived view; member
+- **Members** (`docs/space.md`) is the per-space, ACL-derived view; member
   names come from the same identityRepo resolution and the directory is the
   shared profile cache.
-- **1-1** (`docs/13-one-to-one-spaces.md`) surfaces the friend's identity as
+- **1-1** (`docs/one-to-one-spaces.md`) surfaces the friend's identity as
   `SpaceInfo.Author` and resolves the friend's name through the directory. The
   inbox invite carries the initiator's symkey for the pending row; once the
   space is active on both sides each participant publishes its own symkey

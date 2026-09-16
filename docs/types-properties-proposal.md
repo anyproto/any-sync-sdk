@@ -2,7 +2,7 @@
 
 > Historical proposal. The shipped model is one type per object at
 > `any.type` plus any number of collections at `any.collections` —
-> see [06-data-structure.md](06-data-structure.md) § Type and
+> see [data-structure.md](data-structure.md) § Type and
 > collections. Read "the types an object implements" below as "its
 > type and its collections".
 
@@ -52,7 +52,7 @@
 **Type** — an object with `type = type`. Type-object's own properties are **hardcoded**. Built-ins (`any`, …) ship with the SDK.
 
 A type defines:
-- **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`, and optionally `x-format` (the opaque descriptor — semantic slug, options, relation targets, config — see docs/06 § "The `x-format` descriptor"; its `options` member is the concrete realization of the deferred `enum` keyword, owned by the consumer). More fields (e.g. `required`, `default`) may be added later, when a concrete need appears.
+- **Its properties** — one record per property in a `properties` dataset on the type object. Fields: `key`, `kind`, and optionally `x-format` (the opaque descriptor — semantic slug, options, relation targets, config — see docs/data-structure.md § "The `x-format` descriptor"; its `options` member is the concrete realization of the deferred `enum` keyword, owned by the consumer). More fields (e.g. `required`, `default`) may be added later, when a concrete need appears.
 - **Optionally, versioned data schemas** for the object's datasets.
 
 An object has **one type** and any number of **collections**, whose namespaces coexist. No extension/inheritance in v1.
@@ -83,7 +83,7 @@ Every CRDT `Change` carries a `DataVersion` string that pins the change to a spe
 | Change target                                  | `DataVersion` meaning                                                                    |
 | ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | Property values on the per-space `objects` row | `ownerId:shortId` pairs, `;`-separated: the latest shortId of each type or collection owning a touched property. No known owner → the hardcoded `systemPropertyHandler-v1`. |
-| Namespaced dataset declared by a type          | `typeId:latestShortId` of the declaring type (docs/17-user-datasets.md § DataVersion & gating). |
+| Namespaced dataset declared by a type          | `typeId:latestShortId` of the declaring type (docs/user-datasets.md § DataVersion & gating). |
 | Module canonical collection                    | The module's opaque `DataVersion`, compiled into the SDK.                                |
 | Definition datasets on a type object           | Hardcoded handler version, e.g. `typePropertyHandler-v1`. Bumped by the SDK handler, not derived from the DAG. |
 
@@ -126,7 +126,7 @@ Used only for the detached-changes gating decision ("do I have the schema state 
 
 Opaque handler-version strings don't parse as `ownerId:shortId` pairs and pass the gate unconstrained.
 
-Runtime dataset definitions (docs/17-user-datasets.md) ride this exact
+Runtime dataset definitions (docs/user-datasets.md) ride this exact
 machinery: the type's `datasets` dataset projects rows into the SAME
 shortIds collection (a `src: "datasets"` discriminator, `defId` in
 place of `propId`), so one `typeId:latestShortId` stamp gates data

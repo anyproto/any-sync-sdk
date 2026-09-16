@@ -144,14 +144,14 @@ Refines and extends the "Object Properties" section above. Covers what types are
 ```
 Space
  └─ Object
-     ├─ any.type          one type, or none — what the object IS
+     ├─ any.type          exactly one type — what the object IS
      ├─ any.collections   any number of collections — what it is filed UNDER
      └─ owns the datasets its type declares (Mongo-like record collections)
 ```
 
 An object has exactly ONE type and any number of collections. A **type** is functional: property definitions, parts (the datasets its objects carry) and a layout. A **collection** is categorizing: property definitions only — no parts, no layout. Values live at `{ownerId}.{propId}` on the object's row for the type and for every collection alike.
 
-`any.type` is a scalar LWW register: retyping is a `$set` (`Properties().SetType`), clearing it an `$unset` (`UnsetType`), and it may be absent — the object then has no parts and renders as properties. `any.collections` is a set, edited with `$addToSet` / `$pull` (`Properties().AttachCollection` / `DetachCollection`). Membership is structural and shared, so all four writes route through the object's own CRDT (synced scope).
+`any.type` is a scalar LWW register: retyping is a `$set` (`Properties().SetType`). It is never absent — `Objects().Create` requires a type, `Derive` requires one on first materialization, and a write that clears it is refused (`type_required`, `space.ErrTypeRequired`). `any.collections` is a set, edited with `$addToSet` / `$pull` (`Properties().AttachCollection` / `DetachCollection`); an object may belong to none. Membership is structural and shared, so all three writes route through the object's own CRDT (synced scope).
 
 Both kinds are objects in the space, and both carry a reserved **marker** in `any.type`: `__type__` on a type object, `__collection__` on a collection object. The marker is what identifies a definition — a definition object has no type of its own.
 
@@ -526,12 +526,12 @@ Query result = merge(deviceLocal, accountLevel, defaults)
 ### Types & Property Lifecycle
 16. **What happens to property values when the type changes or a collection is detached?** Resolved — orphan-resurrection, no SDK projection, client ignores unknown.
 
-    - **Retype / detach / re-attach — orphan-resurrection.** `SetType` to another type, `UnsetType` and `DetachCollection` never wipe the `{ownerId}.*` value bag; setting or attaching that owner again reveals it unchanged. Convergent and free — the value record is plain LWW data, independent of the membership fields. No wipe, no GC.
+    - **Retype / detach / re-attach — orphan-resurrection.** `SetType` to another type and `DetachCollection` never wipe the `{ownerId}.*` value bag; setting or attaching that owner again reveals it unchanged. Convergent and free — the value record is plain LWW data, independent of the membership fields. No wipe, no GC.
     - **Concurrent detach vs write — no apply-side membership guard.** Inbound property validation deliberately does NOT consult `any.type` / `any.collections` (nil preflight). A value written concurrently with a retype or a detach lands as orphan on *every* peer and converges. An apply-side membership guard is **forbidden**: both fields are themselves concurrent CRDT values, so gating on them makes the outcome apply-order-dependent (non-convergent). Parking such writes has the same defect — same conclusion.
     - **Wrong-kind writes are impossible per propId.** `propId = base58(xxh3-64(changeId))` (see §"Property ids") — unique per definition. A propId's kind is pinned for life; "changing" a kind means remove + re-add, which mints a *new* propId. So a live propId always validates identically on all peers, and a removed propId's writes drop cleanly everywhere via the unknown-property rule. Stale values linger only under dead propIds, which can never be resurrected (a new definition gets a new hash). There is no convergence hole here.
     - **No read projection — client ignores unknown.** `Properties.Get()` returns the raw record verbatim; the SDK does **not** filter by current schema (clients read near-raw for speed, that's the point). **Contract: a client MUST ignore any propId not present in the owner's current schema, and any namespace the object no longer has.** That hides orphan garbage at the render layer with zero SDK-side projection cost.
     - **Required fields / events.** No `required` keyword in v1, so orphan values raise no validation error. Membership stays a generic `$set` / `$unset` on `any.type` and `$addToSet` / `$pull` on `any.collections`; no synthetic per-field events for the namespace.
-    - **Typed API.** `SetType` / `UnsetType` / `AttachCollection` / `DetachCollection` are the sanctioned mutation path; the slot and membership rules also cover a raw `Modify` on the two fields, since they run in the handler pre-flight (§"Membership and the local write pre-flight").
+    - **Typed API.** `SetType` / `AttachCollection` / `DetachCollection` are the sanctioned mutation path; the slot and membership rules also cover a raw `Modify` on the two fields, since they run in the handler pre-flight (§"Membership and the local write pre-flight").
 
     **Still open:**
     - **P1 — coarse DataVersion over-gates (liveness, not correctness).** A property write is stamped with the owner's *single latest* schema version, not the versions the written props actually need. A write to a stable `propX` gets pinned to a shortId minted by an unrelated `propY` addition, so a peer that hasn't yet received that `propY`-add **parks the write** until it does (indefinitely if that unrelated change is slow/lost). Converges once delivered. Fix: per-prop (multi-pair) DataVersion so a write depends only on the schema it touches. Self-healing, so not blocking.

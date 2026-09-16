@@ -34,11 +34,11 @@ import (
 // call per scope instead). One call = one route = one VersionId domain
 // in the returned ModifyResult.
 //
-// SetType / UnsetType write the object's one type (`any.type`, a
-// scalar LWW register); AttachCollection / DetachCollection edit its
-// collections set (`any.collections`). Membership is structural and
-// shared, so all four always route through the object's own CRDT
-// (synced).
+// SetType writes the object's one type (`any.type`, a scalar LWW
+// register — every object has exactly one, so there is no unset);
+// AttachCollection / DetachCollection edit its collections set
+// (`any.collections`). Membership is structural and shared, so all
+// three always route through the object's own CRDT (synced).
 type PropertiesAPI interface {
 	Get(ctx context.Context, objectId string) (*anyenc.Value, error)
 
@@ -55,9 +55,6 @@ type PropertiesAPI interface {
 	// datasets refuse further writes. A known collection id is refused
 	// (ErrWrongSlot).
 	SetType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
-	// UnsetType clears the object's type: it then has no parts and
-	// renders as properties.
-	UnsetType(ctx context.Context, objectId string) (ModifyResult, error)
 
 	// AttachCollection adds the object to a collection ($addToSet —
 	// idempotent). A known type id is refused (ErrWrongSlot).

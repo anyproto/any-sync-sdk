@@ -273,6 +273,11 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 		// with no declaration is not one.
 		return fmt.Errorf("spaceimpl: %w: Layout/Hidden need a type declaration (Parts / Properties / XKey)", space.ErrBundleBadRequest)
 	}
+	if req.DerivedRoot && !req.Declares() && req.RootType == "" {
+		// Every object has a type: a derived root that declares nothing
+		// takes it from RootType.
+		return fmt.Errorf("spaceimpl: %w: a derived root that declares nothing needs a RootType", space.ErrBundleBadRequest)
+	}
 	if req.Declares() && req.RootType != "" {
 		// A definition object carries its marker in the type slot; it
 		// has no type of its own.

@@ -321,6 +321,11 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 		return nil
 	}
 	adds := collectMembership(ch)
+	if adds.typeSet && adds.typeId == "" {
+		// Every object has exactly one type: a $unset, or a $set to
+		// the empty string, is refused.
+		return &ValidationError{Reason: ReasonTypeRequired, ObjectId: ch.ObjectId}
+	}
 	if err := h.checkSlots(adds); err != nil {
 		return err
 	}

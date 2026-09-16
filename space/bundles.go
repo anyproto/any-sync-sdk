@@ -108,15 +108,14 @@ type EnsureBundleRequest struct {
 	// above all the 1-1 general chat, where the convergence gate cannot
 	// work — never for anything a user may remove or for id convenience.
 	DerivedRoot bool
-	// RootType is the type of the root Ensure mints — the derived
-	// root, or the SDK-minted created root of a bare miniapp-style
-	// request — written with its name in the root's first change and,
-	// on a later Ensure, set when the row has no type yet (a type it
-	// already has is never replaced). Refused next to a declaration
-	// (Parts / Properties / XKey / Collection): a definition object
-	// carries its marker in `any.type` and has no type of its own.
-	// A caller-minted root (NewRoot) gets its type from NewRoot and
-	// refuses it here.
+	// RootType is the type of the root Ensure mints — required on a
+	// derived root that declares nothing (every object has a type),
+	// written with its name in the root's first change and, on a later
+	// Ensure, set when the row has no type yet (a type it already has
+	// is never replaced). Refused next to a declaration (Parts /
+	// Properties / XKey / Collection): a definition object carries its
+	// marker in `any.type` and has no type of its own. A caller-minted
+	// root (NewRoot) gets its type from NewRoot and refuses it here.
 	RootType string
 	// RootCollections are added to the root Ensure mints in that same
 	// change, and on every later Ensure a collection the row lacks is

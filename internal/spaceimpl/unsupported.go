@@ -31,9 +31,6 @@ func (unsupportedProperties) Set(context.Context, string, string, map[string]any
 func (unsupportedProperties) SetType(context.Context, string, string) (space.ModifyResult, error) {
 	return space.ModifyResult{}, errUnsupported("Properties().SetType")
 }
-func (unsupportedProperties) UnsetType(context.Context, string) (space.ModifyResult, error) {
-	return space.ModifyResult{}, errUnsupported("Properties().UnsetType")
-}
 func (unsupportedProperties) AttachCollection(context.Context, string, string) (space.ModifyResult, error) {
 	return space.ModifyResult{}, errUnsupported("Properties().AttachCollection")
 }

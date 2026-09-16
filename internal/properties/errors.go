@@ -24,6 +24,7 @@ const (
 	ReasonScopeMismatch      = "scope_mismatch"
 	ReasonReservedCarrier    = "reserved_carrier"
 	ReasonWrongSlot          = "wrong_slot"
+	ReasonTypeRequired       = "type_required"
 )
 
 // OwnerKind classifies a definition id for the slot rule: a type
@@ -52,6 +53,7 @@ var (
 	ErrScopeMismatch      = errors.New("property write rejected: write route does not match the property's declared scope")
 	ErrReservedCarrier    = errors.New("property write rejected: a type declaring a reserved module is carried only by its own root")
 	ErrWrongSlot          = errors.New("property write rejected: a type goes in any.type, a collection in any.collections")
+	ErrTypeRequired       = errors.New("property write rejected: an object needs a type — any.type cannot be cleared")
 )
 
 // reasonErr maps a Reason discriminant to its sentinel. Unknown reasons
@@ -74,6 +76,8 @@ func reasonErr(reason string) error {
 		return ErrReservedCarrier
 	case ReasonWrongSlot:
 		return ErrWrongSlot
+	case ReasonTypeRequired:
+		return ErrTypeRequired
 	}
 	return nil
 }
@@ -129,6 +133,8 @@ func (e *ValidationError) Error() string {
 	case ReasonWrongSlot:
 		return fmt.Sprintf("property write rejected: %s is a %s and cannot be written to any.%s",
 			e.typeLabel(), e.Kind, e.Slot)
+	case ReasonTypeRequired:
+		return "property write rejected: an object needs a type — any.type cannot be cleared"
 	case ReasonTypeUnknown:
 		return fmt.Sprintf("property write rejected: type %s has no resolvable schema on this peer; define its properties (or wait for the type to sync) before writing %s.* values",
 			e.typeLabel(), e.TypeId)

@@ -391,8 +391,11 @@ func (p *propertiesAPI) membershipWrite(ctx context.Context, objectId string, op
 // sentinel so callers classify it without reaching into the handler
 // package.
 func wrapSlotErr(err error) error {
-	if errors.Is(err, properties.ErrWrongSlot) {
+	switch {
+	case errors.Is(err, properties.ErrWrongSlot):
 		return fmt.Errorf("%w: %w", space.ErrWrongSlot, err)
+	case errors.Is(err, properties.ErrTypeRequired):
+		return fmt.Errorf("%w: %w", space.ErrTypeRequired, err)
 	}
 	return err
 }
@@ -413,17 +416,6 @@ func (p *propertiesAPI) SetType(ctx context.Context, objectId, typeId string) (s
 		Type:    crdt.OpSet,
 		Path:    []string{anytype.TypeId, anytype.FieldType},
 		Payload: arena.NewString(typeId),
-	})
-}
-
-// UnsetType clears the object's type ($unset any.type).
-func (p *propertiesAPI) UnsetType(ctx context.Context, objectId string) (space.ModifyResult, error) {
-	if objectId == "" {
-		return space.ModifyResult{}, errors.New("propertiesAPI: objectId required")
-	}
-	return p.membershipWrite(ctx, objectId, crdt.Op{
-		Type: crdt.OpUnset,
-		Path: []string{anytype.TypeId, anytype.FieldType},
 	})
 }
 

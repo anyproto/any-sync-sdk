@@ -92,6 +92,9 @@ func newObjectService(parent *spaceImpl) *objectService { return &objectService{
 // bootstrap modify (membership + InitialProperties) in one extra
 // change, and returns the new objectId.
 func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts) (string, error) {
+	if opts.Type == "" {
+		return "", fmt.Errorf("%w: CreateObjectOpts.Type", space.ErrTypeRequired)
+	}
 	obj, err := o.parent.store.Create(ctx, spaceobjects.CreateOpts{
 		ChangeType: objectChangeType,
 	})
@@ -184,32 +187,34 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 	// $set, so a collection attached concurrently is not clobbered.
 	// Derive runs on hot resolve paths ("the well-known chat/brain
 	// object of this space"), so a no-op call must not append a change.
-	if opts.Type != "" || len(opts.Collections) > 0 {
-		setType, missing, err := o.missingMembers(ctx, objectId, opts.Type, opts.Collections)
-		if err != nil {
+	setType, missing, err := o.missingMembers(ctx, objectId, opts.Type, opts.Collections)
+	if err != nil {
+		return "", err
+	}
+	if setType != "" || len(missing) > 0 {
+		if err := o.attachMembers(ctx, objectId, setType, missing); err != nil {
 			return "", err
-		}
-		if setType != "" || len(missing) > 0 {
-			if err := o.attachMembers(ctx, objectId, setType, missing); err != nil {
-				return "", err
-			}
 		}
 	}
 	return objectId, nil
 }
 
 // missingMembers compares the wanted membership against the object's
-// row: the type to set (empty when the row already has one, or none
-// is wanted) and the collections absent from the row (deduplicated,
-// input order preserved). A missing row reads as nothing, so
-// everything requested is reported on first derive.
+// row: the type to set (empty when the row already has one; a row
+// with none needs one — ErrTypeRequired) and the collections absent
+// from the row (deduplicated, input order preserved). A missing row
+// reads as nothing, so everything requested is reported on first
+// derive.
 func (o *objectService) missingMembers(ctx context.Context, objectId, wantType string, wantCollections []string) (string, []string, error) {
 	current, err := o.parent.store.ObjectMembers(ctx, objectId)
 	if err != nil {
 		return "", nil, err
 	}
 	setType := ""
-	if wantType != "" && current.Type == "" {
+	if current.Type == "" {
+		if wantType == "" {
+			return "", nil, fmt.Errorf("%w: DeriveObjectOpts.Type on an object with no type yet", space.ErrTypeRequired)
+		}
 		setType = wantType
 	}
 	have := make(map[string]struct{}, len(current.Collections)+len(wantCollections))

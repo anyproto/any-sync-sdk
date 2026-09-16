@@ -101,6 +101,9 @@ var (
 	// ErrValidationWrongSlot — the write puts a known collection id in
 	// `any.type` or a known type id in `any.collections`.
 	ErrValidationWrongSlot = properties.ErrWrongSlot
+	// ErrValidationTypeRequired — the write clears `any.type`; every
+	// object has exactly one type.
+	ErrValidationTypeRequired = properties.ErrTypeRequired
 )
 
 // ValidationReason is the machine-readable cause of a property-write
@@ -118,6 +121,7 @@ const (
 	ReasonKindMismatch       ValidationReason = properties.ReasonKindMismatch
 	ReasonReservedCarrier    ValidationReason = properties.ReasonReservedCarrier
 	ReasonWrongSlot          ValidationReason = properties.ReasonWrongSlot
+	ReasonTypeRequired       ValidationReason = properties.ReasonTypeRequired
 )
 
 // ClassifyValidation maps a property-validation rejection to its cause

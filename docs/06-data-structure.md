@@ -180,7 +180,7 @@ Inbound apply stays read-tolerant: there is **no apply-side membership guard**. 
 
 #### Querying membership
 
-`{"any.type": typeId}` returns the objects of that type; `{"any.collections": collectionId}` the members of that collection (any-store matches an array field element-wise). Neither ever returns the definition object itself, which carries a marker rather than its own id — client filters need no marker exclusion. Both fields carry a sparse index on the per-space `objects` collection.
+`{"any.type": typeId}` returns the objects of that type; `{"any.collections": collectionId}` the members of that collection (any-store matches an array field element-wise). Neither ever returns the definition object itself, which carries a marker rather than its own id — client filters need no marker exclusion. `any.type` carries a dense index on the per-space `objects` collection (every object has a type or a marker), `any.collections` a sparse one.
 
 #### Collections
 

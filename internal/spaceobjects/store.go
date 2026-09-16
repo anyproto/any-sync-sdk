@@ -1421,22 +1421,23 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
 	}
-	// Sparse indexes on the membership fields: `any.type` serves the
-	// marker scans (Types().List → `any.type == "__type__"`, the
-	// catalog) and member queries by type, `any.collections` member
-	// queries by collection. Sparse keeps them small: only rows that
-	// carry the field contribute entries. EnsureIndex is idempotent —
-	// safe to call on every fresh open.
-	for _, field := range []string{
-		anytype.TypeId + "." + anytype.FieldType,
-		anytype.TypeId + "." + anytype.FieldCollections,
-	} {
-		if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
-			Fields: []string{field},
-			Sparse: true,
-		}); err != nil {
-			return nil, fmt.Errorf("spaceobjects: ensure %s index: %w", field, err)
-		}
+	// Indexes on the membership fields. `any.type` is dense: every
+	// object carries a type (or a marker), and a dense index also
+	// serves sorts and absence checks — it backs the marker scans
+	// (Types().List → `any.type == "__type__"`, the catalog) and member
+	// queries by type. `any.collections` is sparse: only rows filed
+	// under something contribute entries, one per element. EnsureIndex
+	// is idempotent — safe to call on every fresh open.
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Fields: []string{anytype.TypeId + "." + anytype.FieldType},
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: ensure any.type index: %w", err)
+	}
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Fields: []string{anytype.TypeId + "." + anytype.FieldCollections},
+		Sparse: true,
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: ensure any.collections index: %w", err)
 	}
 	// Dense ascending index on the derived `modifiedAt` stamp — the
 	// recency ordering (`sort: ["-modifiedAt"]`) is the default object-

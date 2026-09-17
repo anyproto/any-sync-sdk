@@ -242,7 +242,7 @@ func (w *oneToOneKeysWatcher) reconcileOnce(ctx context.Context) {
 		}
 	}
 	if resolve {
-		go w.parent.resolveOneToOnePeerName(context.Background(), w.peer)
+		w.parent.goResolveOneToOnePeerName(w.peer)
 	}
 }
 

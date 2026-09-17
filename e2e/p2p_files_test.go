@@ -72,7 +72,7 @@ func TestE2E_P2PFileFetch(t *testing.T) {
 		space.AttachOpts{Name: "doc.bin", Mime: "application/octet-stream"})
 	require.NoError(t, err, "device A: Attach (must work offline)")
 	require.False(t, fileInfo.Inline, "test needs a full-tier (non-inline) file")
-	require.False(t, fileInfo.Durable, "no file node reachable, so the file is non-durable")
+	require.False(t, fileInfo.Durable, "Attach returns before any backup")
 	spaceId := spA.Id()
 
 	// Device B: empty storage, same account.

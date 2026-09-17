@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/anyproto/any-sync/commonfile/fileproto/fileprotov2"
 	"github.com/anyproto/any-sync/commonfile/fileproto/fileprotov2/fileprotov2err"
@@ -22,6 +24,10 @@ import (
 	"github.com/ipfs/go-cid"
 	"storj.io/drpc"
 )
+
+// ErrPutStalled — a presigned upload made no progress for
+// putStallTimeout and was aborted.
+var ErrPutStalled = errors.New("filebroker: presigned PUT stalled")
 
 // ErrNoFileNodes — the network configuration lists no fileV2 nodes;
 // files can be registered but never made durable.
@@ -116,9 +122,29 @@ func (c *Client) SpaceInfo(ctx context.Context, spaceIds []string) (resp *filepr
 	return resp, err
 }
 
+// putStallTimeout aborts a presigned upload that moves no byte and
+// gets no answer for this long: an upload has no overall deadline worth
+// the name (size and uplink vary by orders of magnitude), so progress is
+// what is bounded.
+var putStallTimeout = time.Minute
+
+// progressReader stamps every read so a watchdog can tell a slow
+// transfer from a dead one.
+type progressReader struct {
+	r    io.Reader
+	last atomic.Int64 // unix nanos of the last read
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.last.Store(time.Now().UnixNano())
+	return n, err
+}
+
 // Put performs the presigned upload: the exact body bytes, provider
 // fields sent verbatim as headers, Content-Length set explicitly (the
-// presign enforces the cap server-side; we fail fast locally).
+// presign enforces the cap server-side; we fail fast locally). A
+// transfer stalled for putStallTimeout is aborted.
 func (c *Client) Put(ctx context.Context, up *fileprotov2.PresignedUpload, body io.Reader, size int64) error {
 	if up == nil || up.Url == "" {
 		return errors.New("filebroker: empty presigned upload")
@@ -126,7 +152,27 @@ func (c *Client) Put(ctx context.Context, up *fileprotov2.PresignedUpload, body 
 	if up.MaxContentLength > 0 && uint64(size) > up.MaxContentLength {
 		return fmt.Errorf("filebroker: body %d bytes exceeds presign cap %d", size, up.MaxContentLength)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, up.Url, body)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	pr := &progressReader{r: body}
+	pr.last.Store(time.Now().UnixNano())
+	stall := putStallTimeout
+	go func() {
+		tick := time.NewTicker(stall / 4)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if time.Since(time.Unix(0, pr.last.Load())) > stall {
+					cancel(ErrPutStalled)
+					return
+				}
+			}
+		}
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, up.Url, pr)
 	if err != nil {
 		return err
 	}
@@ -136,6 +182,9 @@ func (c *Client) Put(ctx context.Context, up *fileprotov2.PresignedUpload, body 
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
+		if cause := context.Cause(ctx); errors.Is(cause, ErrPutStalled) {
+			return cause
+		}
 		return err
 	}
 	defer resp.Body.Close()

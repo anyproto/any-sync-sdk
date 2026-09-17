@@ -109,6 +109,15 @@ func (r *fakeRegistrar) SetNetworkSign(_ context.Context, ownerId, fileId, sign 
 	return nil
 }
 
+func (r *fakeRegistrar) FindRow(_ context.Context, fileId string) (payloads.Row, error) {
+	for _, row := range r.rows {
+		if row.Id == fileId {
+			return row, nil
+		}
+	}
+	return payloads.Row{}, fmt.Errorf("no row %s", fileId)
+}
+
 func (r *fakeRegistrar) Row(_ context.Context, ownerId, fileId string) (payloads.Row, error) {
 	row, ok := r.rows[ownerId+"/"+fileId]
 	if !ok {
@@ -222,7 +231,33 @@ func TestDriveDurableRetryBudget(t *testing.T) {
 	start := time.Now()
 	require.Error(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
 	require.Less(t, time.Since(start), 2*time.Second)
-	require.Greater(t, br.uploads, 1, "retried inside the budget")
+	require.Greater(t, br.signs, 1, "retried inside the budget")
+	require.Len(t, br.putBodies, 1, "a sign retry never moves the bytes again")
+}
+
+// TestDriveDurableSharesSiblingReceipt pins that rows bound to one root
+// share one upload, whichever job runs first.
+func TestDriveDurableSharesSiblingReceipt(t *testing.T) {
+	ctx := context.Background()
+	br := &fakeBroker{}
+	s, _ := newService(t, br)
+	reg := newFakeRegistrar()
+	content := testContent(120_000)
+
+	donor, err := s.Add(ctx, reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	bound, err := s.Add(ctx, reg, spaceId, "owner2", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	require.True(t, bound.Bound)
+
+	// The bound row's job happens to run first.
+	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner2", bound.FileId))
+	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner1", donor.FileId))
+	require.Len(t, br.putBodies, 1, "one upload for the shared root")
+	require.Equal(t, 1, br.uploads)
+	sign := reg.rows["owner2/"+bound.FileId].NetworkSign
+	require.NotEmpty(t, sign)
+	require.Equal(t, sign, reg.rows["owner1/"+donor.FileId].NetworkSign)
 }
 
 func TestAddBind(t *testing.T) {

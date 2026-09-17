@@ -11,6 +11,7 @@ import (
 	"github.com/ipfs/go-cid"
 
 	"github.com/anyproto/any-sync-sdk/internal/fanout"
+	"github.com/anyproto/any-sync-sdk/internal/files/broker"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
@@ -68,6 +69,9 @@ func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
 		err = s.files.DriveDurable(ctx, payloadsRegistrar{p: pa}, job.SpaceId, row.ObjectId, job.FileId)
 		if errors.Is(err, upload.ErrLimited) {
 			return fmt.Errorf("%w: %s", status.ErrLimited, job.FileId)
+		}
+		if errors.Is(err, broker.ErrNoFileNodes) {
+			return status.ErrNoFileNodes
 		}
 		return err
 	case status.KindPin:

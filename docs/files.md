@@ -71,10 +71,13 @@ across spaces.
 4. Enqueue a `durable` job and return. Attach never waits on the
    network: `FileInfo.Durable` is true only for an inline file or one
    bound to a durable donor.
-5. The queue worker runs the durable phase: broker `Upload` → presigned
+5. A queue worker runs the durable phase: broker `Upload` → presigned
    HTTP PUT of the CAR → `RequestSign` → verify the receipt → write
    `networkSign`. The flip reaches every member as a row update and the
    local status stream as a `durable` transition.
+
+The bytes are servable to peers from the moment Attach returns: the P2P
+file source reads the local CAR and does not look at `networkSign`.
 
 The receipt is signed by the file fleet key (`fileNetworkId` from the
 network config) over `{networkId, spaceId, rootCid, size, signedAt}`;
@@ -85,8 +88,14 @@ durable.
 Transport failures (offline, node down, object store unreachable) end
 the attempt and leave the job to the queue's backoff. Broker outcomes
 from lazy space activation, `NotResponsible` routing and the post-PUT
-visibility window retry within the attempt, inside the durable-wait
-budget. Limit and auth refusals are terminal for the attempt.
+visibility window retry the broker call alone, inside the durable-wait
+budget; the bytes move once per attempt. Limit and auth refusals are
+terminal for the attempt. A PUT that moves no byte for a minute is
+aborted; a slow one runs as long as it progresses.
+
+Rows that share a root share one upload: drives of one root are
+serialized, and a row whose sibling already holds a receipt takes that
+receipt.
 
 Crash safety: an intent marker pins the root before the row write, and
 the job is persisted before Attach returns, so a crash never leaves
@@ -99,10 +108,21 @@ One persistent queue (`internal/files/status`) with two job kinds:
 - `durable` — drive an unsigned row to a verified receipt.
 - `pin` — fetch a file's full content (`Files().Pin`).
 
-Jobs survive restarts. Failures back off from 30 s, doubling to 10 min;
-a storage-limit refusal parks the job on a 10-minute cadence.
-`Files().Retry` makes pending work due immediately (e.g. after a quota
-raise).
+Up to four jobs run at once, and the two kinds alternate when both are
+due. Deleting a file removes its jobs and cancels a running attempt.
+
+Jobs survive restarts, and a backoff does not: every job that ran in
+an earlier session without succeeding is due when the queue starts, so a file attached
+offline backs up as soon as the app next runs online. Within a session
+failures back off from 30 s, doubling to 10 min.
+
+- **Storage limit**: the job parks on a 10-minute cadence and the file
+  reports `limited`. `Files().Retry` makes it due immediately (e.g.
+  after a quota raise).
+- **No file nodes in the network config** (a local-only network):
+  nothing is attempted and no failure is counted; the job re-checks
+  every minute, so the backup starts once a config with file nodes
+  arrives. The file reports `inflight`.
 
 ## Open
 

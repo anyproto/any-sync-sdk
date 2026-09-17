@@ -59,7 +59,7 @@ func TestE2E_FilesV2_StatusAndPin(t *testing.T) {
 	big, err := spA.Files().Attach(ctx, ownerId, bytes.NewReader(content),
 		space.AttachOpts{Name: "pinned.bin", Mime: "application/octet-stream"})
 	require.NoError(t, err)
-	require.True(t, big.Durable)
+	waitFileDurable(t, ctx, spA, big.FileId)
 	small, err := spA.Files().Attach(ctx, ownerId, bytes.NewReader([]byte("inline status")),
 		space.AttachOpts{Name: "s.txt"})
 	require.NoError(t, err)

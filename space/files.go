@@ -36,11 +36,12 @@ var (
 // resolves it through the availability ladder (local cache → network).
 type Files interface {
 	// Attach ingests r as a file bound to objectId. The whole reader is
-	// consumed. Registration is durable in the CRDT immediately; for
-	// node-backed files the backup ("durable") phase runs best-effort
-	// within ctx — a false FileInfo.Durable means the file is registered
-	// and locally available but not yet backed up (retried in the
-	// background; observable via file status once SYN-29 lands).
+	// consumed. Attach is local-only and never waits on the network:
+	// registration is durable in the CRDT immediately, and for
+	// node-backed files the backup ("durable") phase runs in the
+	// background. A false FileInfo.Durable means the file is registered
+	// and locally available but not yet backed up; Status and
+	// SubscribeStatus observe the flip.
 	Attach(ctx context.Context, objectId string, r io.Reader, opts AttachOpts) (FileInfo, error)
 
 	// Open returns a random-access reader over the file's verified

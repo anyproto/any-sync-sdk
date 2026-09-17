@@ -57,7 +57,7 @@ func TestE2E_FilesV2_OffloadAndFreeUp(t *testing.T) {
 	fi, err := spA.Files().Attach(ctx, ownerId, bytes.NewReader(content),
 		space.AttachOpts{Name: "evictme.bin", Mime: "application/octet-stream"})
 	require.NoError(t, err)
-	require.True(t, fi.Durable)
+	waitFileDurable(t, ctx, spA, fi.FileId)
 	_ = spA.SyncHeads(ctx)
 
 	cdn := newBlobCDN(t, ctx, sdkA, fileV2Peers, spA.Id())

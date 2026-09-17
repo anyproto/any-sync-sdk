@@ -68,9 +68,13 @@ across spaces.
 2. Full tier: encrypt, build the DAG, finalize the local CAR.
 3. Register the row: one CRDT change. The file now exists for every
    member, whether or not backup succeeds.
-4. Enqueue a `durable` job, then run the durable phase within `ctx`:
-   broker `Upload` → presigned HTTP PUT of the CAR → `RequestSign` →
-   verify the receipt → write `networkSign`.
+4. Enqueue a `durable` job and return. Attach never waits on the
+   network: `FileInfo.Durable` is true only for an inline file or one
+   bound to a durable donor.
+5. The queue worker runs the durable phase: broker `Upload` → presigned
+   HTTP PUT of the CAR → `RequestSign` → verify the receipt → write
+   `networkSign`. The flip reaches every member as a row update and the
+   local status stream as a `durable` transition.
 
 The receipt is signed by the file fleet key (`fileNetworkId` from the
 network config) over `{networkId, spaceId, rootCid, size, signedAt}`;
@@ -78,14 +82,14 @@ every field is checked before `networkSign` is recorded. A network
 config without `fileNetworkId` leaves files registered but never
 durable.
 
-Transport failures (offline, node down, object store unreachable) return
-immediately and leave the job queued. Broker outcomes from lazy space
-activation, `NotResponsible` routing and the post-PUT visibility window
-retry inline within the durable-wait budget. Limit and auth refusals are
-terminal for the attempt.
+Transport failures (offline, node down, object store unreachable) end
+the attempt and leave the job to the queue's backoff. Broker outcomes
+from lazy space activation, `NotResponsible` routing and the post-PUT
+visibility window retry within the attempt, inside the durable-wait
+budget. Limit and auth refusals are terminal for the attempt.
 
 Crash safety: an intent marker pins the root before the row write, and
-the job is persisted before the first attempt, so a crash never leaves
+the job is persisted before Attach returns, so a crash never leaves
 an unsigned row that GC treats as garbage or the queue forgets.
 
 ## Background work

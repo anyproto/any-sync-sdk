@@ -73,7 +73,7 @@ func TestE2E_FilesV2_RealPublicRead(t *testing.T) {
 	fi, err := spA.Files().Attach(ctx, ownerId, bytes.NewReader(content),
 		space.AttachOpts{Name: "real.bin", Mime: "application/octet-stream"})
 	require.NoError(t, err)
-	require.True(t, fi.Durable)
+	waitFileDurable(t, ctx, spA, fi.FileId)
 	_ = spA.SyncHeads(ctx)
 
 	// Device B: NO Files config at all — the production configuration.

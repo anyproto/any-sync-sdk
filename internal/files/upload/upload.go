@@ -1,12 +1,13 @@
 // Package upload is the client upload path of the files subsystem
 // (SYN-27): spool → tier decision (inline / BIND dedup / full) →
 // encrypt → UnixFS DAG → local CARv2 → register the payloads row →
-// best-effort durable phase against the fileV2 broker (presigned PUT +
-// receipt-verified RequestSign).
+// enqueue the durable phase.
 //
-// Registration is unconditional; only backup is gated. A file whose
-// durable phase fails (quota, offline) stays registered with local
-// bytes — the SYN-29 drive-toward-durable queue retries it later.
+// Add never touches the network: the durable phase (presigned PUT +
+// receipt-verified RequestSign against the fileV2 broker) belongs to
+// the drive-toward-durable queue, which calls DriveDurable. A file
+// whose durable phase fails (quota, offline) stays registered with
+// local bytes and is retried by the queue.
 package upload
 
 import (
@@ -18,18 +19,14 @@ import (
 	"io"
 	"time"
 
-	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonfile/fileproto/fileprotov2"
 	"github.com/anyproto/any-sync/commonfile/fileservice"
 	"github.com/ipfs/go-cid"
-	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/files/crypt"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 )
-
-var log = logger.NewNamed("sdk.files.upload")
 
 // ErrLimited — the broker refused backup (storage limit). The file is
 // registered and locally available; it is not durable.
@@ -39,11 +36,9 @@ const (
 	// defaultMemSpool is the spool's in-memory threshold; larger inputs
 	// spill to a temp file in the store scratch dir.
 	defaultMemSpool = 8 << 20
-	// defaultDurableWait bounds the INLINE durable phase of Attach when
-	// the caller's ctx has no sooner deadline. It only covers the
-	// happy-ish online case (including a short broker activation
-	// window); anything longer is the persistent queue's job — Attach
-	// must never hold the caller hostage to the network.
+	// defaultDurableWait bounds the retries of one durable drive over
+	// the broker's lazy space-activation window; past it the queue's
+	// backoff takes over.
 	defaultDurableWait = 45 * time.Second
 	// durableRetryDelay separates durable-phase attempts.
 	durableRetryDelay = 2 * time.Second
@@ -68,13 +63,11 @@ type Registrar interface {
 	Row(ctx context.Context, ownerId, fileId string) (payloads.Row, error)
 }
 
-// Enqueuer is the SYN-29 persistent-queue seam. The durable job is
-// enqueued BEFORE the inline durable phase runs and removed on its
-// success, so a crash mid-upload leaves a persisted job instead of a
-// forgotten unsigned row. Nil = no queue (tests).
+// Enqueuer is the persistent-queue seam: every unsigned row gets a
+// durable job, and the queue's worker runs the durable phase. Nil = no
+// queue (tests).
 type Enqueuer interface {
 	Enqueue(ctx context.Context, kind, spaceId, fileId string) error
-	Remove(ctx context.Context, kind, spaceId, fileId string) error
 }
 
 // KindDurable is the drive-toward-durable job kind (mirrors the queue
@@ -140,11 +133,10 @@ func New(st *store.Store, br Broker) *Service {
 }
 
 // Add ingests r as a file bound to ownerId in spaceId: registers the
-// payloads row and, for the S3 tier, lands the CARv2 locally and runs
-// the durable phase. Durable-phase failures do not fail Add — the row
-// is registered and the bytes are local; Result.Durable reports the
-// outcome (ErrLimited and transient broker errors are logged and left
-// to the retry queue).
+// payloads row and, for the S3 tier, lands the CARv2 locally and
+// enqueues the durable phase. Add is local-only and never waits on the
+// network; Result.Durable is true only for an inline file or one bound
+// to an already durable donor.
 func (s *Service) Add(ctx context.Context, reg Registrar, spaceId, ownerId string, r io.Reader, opts AddOpts) (Result, error) {
 	sp, err := fillSpool(s.store.TmpDir(), s.memSpool, r)
 	if err != nil {
@@ -242,7 +234,7 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 }
 
 // addFull runs the S3 tier: encrypt → DAG → local CARv2 → register →
-// durable phase.
+// enqueue the durable phase.
 func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId string, sp *spool, opts AddOpts) (Result, error) {
 	key := make([]byte, fileKeySize)
 	if _, err := rand.Read(key); err != nil {
@@ -299,9 +291,7 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		return Result{}, err
 	}
 
-	res := Result{FileId: fileId, RootCid: root.String(), Size: sp.Size()}
-	// Enqueue-before-attempt: a crash anywhere in the durable phase
-	// leaves a persisted job, not a forgotten unsigned row.
+	// The persisted job owns the durable phase; Enqueue wakes the worker.
 	if s.queue != nil {
 		if err = s.queue.Enqueue(ctx, KindDurable, spaceId, fileId); err != nil {
 			return Result{}, err
@@ -311,28 +301,14 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 	if err = s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
 		return Result{}, err
 	}
-	sign, err := s.makeDurable(ctx, spaceId, root, info.Size)
-	if err != nil {
-		log.Info("durable phase deferred", zap.String("fileId", fileId),
-			zap.String("spaceId", spaceId), zap.Error(err))
-		return res, nil
-	}
-	if err = reg.SetNetworkSign(ctx, ownerId, fileId, sign); err != nil {
-		return Result{}, err
-	}
-	if s.queue != nil {
-		if err = s.queue.Remove(ctx, KindDurable, spaceId, fileId); err != nil {
-			return Result{}, err
-		}
-	}
-	res.Durable = true
-	return res, nil
+	return Result{FileId: fileId, RootCid: root.String(), Size: sp.Size()}, nil
 }
 
-// DriveDurable runs ONE durable-phase attempt for an already
-// registered row (the SYN-29 queue worker path — the queue owns the
-// backoff, so no inner retry loop). No-op when the row is already
-// durable or inline; ErrLimited on a limit refusal.
+// DriveDurable drives an already registered row to a verified receipt
+// (the queue worker path). Transport failures return at once — the
+// queue owns that backoff; only the broker's activation-window codes
+// are retried here. No-op when the row is already durable or inline;
+// ErrLimited on a limit refusal.
 func (s *Service) DriveDurable(ctx context.Context, reg Registrar, spaceId, ownerId, fileId string) error {
 	row, err := reg.Row(ctx, ownerId, fileId)
 	if err != nil {
@@ -358,7 +334,7 @@ func (s *Service) DriveDurable(ctx context.Context, reg Registrar, spaceId, owne
 	if !complete {
 		return fmt.Errorf("fileupload: drive %s: local bytes incomplete", fileId)
 	}
-	sign, _, err := s.durableAttempt(ctx, spaceId, root, size)
+	sign, err := s.makeDurable(ctx, spaceId, root, size)
 	if err != nil {
 		return err
 	}
@@ -367,45 +343,33 @@ func (s *Service) DriveDurable(ctx context.Context, reg Registrar, spaceId, owne
 
 // makeDurable drives one root through Upload → presigned PUT →
 // RequestSign → receipt verify, retrying transient per-item outcomes
-// (the broker activates a space lazily on first contact) within the
-// durable-wait budget. Returns the verified networkSign.
+// (the broker activates a space lazily on first contact) until the
+// durable-wait budget is spent. The budget bounds the retries only,
+// never the PUT — that is ctx's job. Returns the verified networkSign.
 func (s *Service) makeDurable(ctx context.Context, spaceId string, root cid.Cid, carSize int64) (string, error) {
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.durableWait)
-		defer cancel()
-	}
-	var lastErr error
-	for attempt := 0; ; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				if lastErr == nil {
-					lastErr = ctx.Err()
-				}
-				return "", lastErr
-			case <-time.After(s.retryDelay):
-			}
-		}
+	retryUntil := time.Now().Add(s.durableWait)
+	for {
 		sign, retryable, err := s.durableAttempt(ctx, spaceId, root, carSize)
 		if err == nil {
 			return sign, nil
 		}
-		if !retryable {
+		if !retryable || !time.Now().Before(retryUntil) {
 			return "", err
 		}
-		lastErr = err
+		select {
+		case <-ctx.Done():
+			return "", err
+		case <-time.After(s.retryDelay):
+		}
 	}
 }
 
 // durableAttempt is one pass of the durable phase. retryable marks
-// outcomes worth another INLINE attempt — that is only the per-item
-// business codes of the broker's lazy space activation window, i.e.
-// cases where we ARE talking to the network. Transport-level failures
-// (offline, node down, S3 unreachable) are never retried inline: the
-// app is offline-first, so they defer to the persistent queue
-// immediately instead of stalling the caller. ErrLimited and
-// verification failures are terminal.
+// outcomes worth an immediate re-attempt — only the per-item business
+// codes of the broker's lazy space activation window, i.e. cases where
+// we ARE talking to the network. Transport-level failures (offline,
+// node down, S3 unreachable) go back to the queue's backoff, as do
+// ErrLimited and verification failures.
 func (s *Service) durableAttempt(ctx context.Context, spaceId string, root cid.Cid, carSize int64) (sign string, retryable bool, err error) {
 	upResp, err := s.broker.Upload(ctx, spaceId, []*fileprotov2.UploadRequestItem{
 		{RootCid: root.Bytes(), Size: uint64(carSize)},

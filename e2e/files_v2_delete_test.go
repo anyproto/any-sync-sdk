@@ -62,7 +62,7 @@ func TestE2E_FilesV2_Delete(t *testing.T) {
 	origInfo, err := spA.Files().Attach(ctx, owner1, bytes.NewReader(original),
 		space.AttachOpts{Name: "victim.raw", Mime: "image/x-raw"})
 	require.NoError(t, err)
-	require.True(t, origInfo.Durable)
+	waitFileDurable(t, ctx, spA, origInfo.FileId)
 	thumbInfo, err := spA.Files().Attach(ctx, owner1, bytes.NewReader([]byte("thumb bytes")),
 		space.AttachOpts{Name: "victim-thumb.jpg", Variant: "thumbnail", VariantOf: origInfo.FileId})
 	require.NoError(t, err)
@@ -71,7 +71,7 @@ func TestE2E_FilesV2_Delete(t *testing.T) {
 	survivorInfo, err := spA.Files().Attach(ctx, owner1, bytes.NewReader(survivor),
 		space.AttachOpts{Name: "survivor.bin"})
 	require.NoError(t, err)
-	require.True(t, survivorInfo.Durable)
+	waitFileDurable(t, ctx, spA, survivorInfo.FileId)
 	otherInfo, err := spA.Files().Attach(ctx, owner2, bytes.NewReader([]byte("other object's file")),
 		space.AttachOpts{Name: "other.txt"})
 	require.NoError(t, err)

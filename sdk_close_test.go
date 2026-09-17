@@ -87,6 +87,11 @@ func TestClose_ClosesLoadedSpaceStores(t *testing.T) {
 	_, err = store.Get(ctx, sp.SpaceIndexObjectId())
 	require.ErrorIs(t, err, ocache.ErrClosed, "Close must close a loaded space's store")
 	require.Same(t, store, sdk.spaces.StoreFor(sp.Id()), "a late storeFor must not build a fresh store")
+
+	// A space first touched after Close gets a store born closed.
+	late := sdk.spaces.StoreFor("space-first-seen-after-close")
+	_, err = late.Get(ctx, "any-object")
+	require.ErrorIs(t, err, ocache.ErrClosed, "a store built after Close must be closed")
 }
 
 // openFilesUnder lists this process's open files below dir. Only Linux

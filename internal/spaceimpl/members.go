@@ -802,8 +802,10 @@ func (w *memberWatcher) tick() {
 	// Reconcile the on-disk collection first so any Query call that
 	// runs concurrently with a tick sees state at-least-as-fresh as
 	// the events firing now. Failures are logged-and-continued — the
-	// in-memory firehose is independent.
-	_ = w.reconcileCollection(ctx, prev, next)
+	// in-memory firehose is independent. Not cancellable: headId has
+	// advanced, so a delete dropped by a stop mid-tick is never retried
+	// (the restart seed only upserts). Local writes, so stop stays fast.
+	_ = w.reconcileCollection(context.WithoutCancel(ctx), prev, next)
 
 	// Emit add / change events for the new view. Track newcomers so we
 	// can pull their identityRepo profile right away — without this the
@@ -984,6 +986,9 @@ func (w *memberWatcher) requestProfiles(ids []string) {
 	}
 }
 
+// takeProfileRequests drains the queue. With all set the ids are moot:
+// the tick publishes its snapshot before it requests, so a full fetch
+// covers them.
 func (w *memberWatcher) takeProfileRequests() (all bool, ids []string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

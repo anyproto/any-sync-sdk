@@ -1065,7 +1065,7 @@ func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMeta
 	// profile is reflected in their snapshots without waiting for
 	// the periodic identityRepo tick (60s).
 	if a.spaces != nil {
-		a.spaces.KickProfiles(ctx)
+		a.spaces.KickProfiles()
 	}
 	return nil
 }

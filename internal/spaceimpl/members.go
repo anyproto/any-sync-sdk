@@ -616,6 +616,17 @@ type memberWatcher struct {
 	// 1 so coalesced kicks don't block the syncacl write path.
 	kickCh chan struct{}
 
+	// fetchAll / fetchIds (under mu) queue profile fetches for
+	// profileLoop, signalled through fetchCh (buffered 1, coalescing).
+	// Every identityRepo round-trip runs on that one joined goroutine.
+	fetchAll bool
+	fetchIds map[string]struct{}
+	fetchCh  chan struct{}
+
+	// ctx bounds the loops' coordinator calls and store writes; stop
+	// cancels it, so a hung round-trip can't hold stop.
+	ctx    context.Context
+	cancel context.CancelFunc
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -631,8 +642,11 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 		snapshot: make(map[string]space.Member),
 		profiles: make(map[string]space.AccountMetadata),
 		kickCh:   make(chan struct{}, 1),
+		fetchIds: make(map[string]struct{}),
+		fetchCh:  make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
 	}
+	w.ctx, w.cancel = context.WithCancel(context.Background())
 	// Seed the snapshot AND reconcile the disk collection synchronously
 	// so the first tick after start doesn't fire spurious "added"
 	// events for the existing set, and Query reads land fresh data
@@ -684,6 +698,7 @@ func (w *memberWatcher) stop() {
 		// already stopped
 	default:
 		close(w.stopCh)
+		w.cancel()
 	}
 	w.wg.Wait()
 }
@@ -721,7 +736,7 @@ func (w *memberWatcher) UpdateAcl(_ list.AclList) {
 }
 
 func (w *memberWatcher) tick() {
-	ctx := context.Background()
+	ctx := w.ctx
 	acl, err := w.api.aclList(ctx)
 	if err != nil {
 		return
@@ -828,7 +843,7 @@ func (w *memberWatcher) tick() {
 	// Fetch profiles for both newcomers and members whose symkey just
 	// became available (deduped).
 	if fetch := dedupStrings(newcomers, newKeyIds); len(fetch) > 0 {
-		go w.fetchProfilesFor(context.Background(), fetch)
+		w.requestProfiles(fetch)
 	}
 	// Emit remove events for identities that disappeared.
 	for id, old := range prev {
@@ -931,7 +946,7 @@ func (w *memberWatcher) profileLoop() {
 	defer w.wg.Done()
 	// Seed run — pick up any profile that was published before we
 	// started watching this space.
-	w.fetchProfilesOnce(context.Background())
+	w.fetchProfilesOnce(w.ctx)
 	t := time.NewTicker(identityRepoPollInterval)
 	defer t.Stop()
 	for {
@@ -939,9 +954,47 @@ func (w *memberWatcher) profileLoop() {
 		case <-w.stopCh:
 			return
 		case <-t.C:
-			w.fetchProfilesOnce(context.Background())
+			w.fetchProfilesOnce(w.ctx)
+		case <-w.fetchCh:
+			all, ids := w.takeProfileRequests()
+			if all {
+				w.fetchProfilesOnce(w.ctx)
+			} else {
+				w.fetchProfilesFor(w.ctx, ids)
+			}
 		}
 	}
+}
+
+// requestProfiles queues an identityRepo fetch on profileLoop: the
+// given identities, or every current member when ids is nil. Never
+// blocks — callers include the ACL tick and Account.UpdateMetadata.
+func (w *memberWatcher) requestProfiles(ids []string) {
+	w.mu.Lock()
+	if ids == nil {
+		w.fetchAll = true
+	}
+	for _, id := range ids {
+		w.fetchIds[id] = struct{}{}
+	}
+	w.mu.Unlock()
+	select {
+	case w.fetchCh <- struct{}{}:
+	default:
+	}
+}
+
+func (w *memberWatcher) takeProfileRequests() (all bool, ids []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	all = w.fetchAll
+	ids = make([]string, 0, len(w.fetchIds))
+	for id := range w.fetchIds {
+		ids = append(ids, id)
+	}
+	w.fetchAll = false
+	w.fetchIds = make(map[string]struct{})
+	return all, ids
 }
 
 // fetchProfilesOnce pulls every current member's identityRepo profile

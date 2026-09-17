@@ -2086,6 +2086,23 @@ func (s *Service) Close(_ context.Context) error {
 	s.joinWG.Wait()
 	s.stopJoinWaiters()
 	s.watchers.stopAll()
+	// Close every loaded space's Store: its drainer, read-state
+	// materializer and reindex sweep write the SDK db, which the caller
+	// closes next. Offload closes a store on its own; this covers the
+	// spaces still loaded at shutdown. The closed stores stay in the
+	// map so a late storeFor (a sync message during app teardown)
+	// gets one that refuses, not a fresh one on a closing db.
+	s.mu.Lock()
+	stores := make(map[string]*spaceobjects.Store, len(s.stores))
+	for id, st := range s.stores {
+		stores[id] = st
+	}
+	s.mu.Unlock()
+	for id, st := range stores {
+		if err := st.Close(); err != nil {
+			offloadLog.Warn("close store", zap.String("spaceId", id), zap.Error(err))
+		}
+	}
 	return nil
 }
 
@@ -2130,8 +2147,8 @@ func (s *Service) ResolveIdentityProfilesAsync() {
 // identityRepo profiles immediately. Called by the SDK after the
 // caller publishes their own profile via Account.UpdateMetadata so
 // the self-view propagates without waiting for the slow tick.
-func (s *Service) KickProfiles(ctx context.Context) {
-	s.watchers.kickProfiles(ctx)
+func (s *Service) KickProfiles() {
+	s.watchers.kickProfiles()
 }
 
 // SpaceRegistry implementation. Routes between the tech-space (which

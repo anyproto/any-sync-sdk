@@ -24,9 +24,9 @@ import (
 // through the public SDK API against a live local network:
 //
 //  1. Files().Attach on a multi-megabyte reader → encrypt → UnixFS DAG
-//     → local CARv2 → payloads row → broker Upload → presigned PUT →
-//     RequestSign → receipt verified → networkSign on the row, all
-//     inside one Attach call (FileInfo.Durable == true);
+//     → local CARv2 → payloads row, returning before the backup; the
+//     queue then drives broker Upload → presigned PUT → RequestSign →
+//     receipt verified → networkSign on the row;
 //  2. the stored S3 object is byte-identical to the local CARv2
 //     (RequestDownload → GET → compare — locked decision 2);
 //  3. the inline tier (< 4 KiB) never touches the broker;
@@ -76,12 +76,13 @@ func TestE2E_FilesV2_SDKAttach(t *testing.T) {
 	info, err := sp.Files().Attach(ctx, ownerId, bytes.NewReader(content),
 		space.AttachOpts{Name: "big.bin", Mime: "application/octet-stream"})
 	require.NoError(t, err, "Attach")
-	require.True(t, info.Durable, "Attach must come back durable against a live broker")
+	require.False(t, info.Durable, "Attach returns before the backup runs")
 	require.False(t, info.Inline)
 	require.NotEmpty(t, info.RootCid)
 	require.EqualValues(t, len(content), info.Size)
 	require.Equal(t, ownerId, info.ObjectId)
 
+	waitFileDurable(t, ctx, sp, info.FileId)
 	pa := payloadsSurface(t, sp)
 	row, err := pa.GetRow(ctx, ownerId, info.FileId)
 	require.NoError(t, err)
@@ -146,6 +147,16 @@ func TestE2E_FilesV2_SDKAttach(t *testing.T) {
 
 // carPathFor mirrors the store layout: <DataDir>/files/<spaceId>/<2-char
 // shard>/<rootCid>.car.
+// waitFileDurable blocks until the queue-driven backup of fileId lands
+// its receipt.
+func waitFileDurable(t *testing.T, ctx context.Context, sp space.Space, fileId string) {
+	t.Helper()
+	require.True(t, waitFor(ctx, 120*time.Second, 200*time.Millisecond, func() bool {
+		st, err := sp.Files().Status(ctx, fileId)
+		return err == nil && st.State == space.FileStateDurable
+	}), "file %s never became durable", fileId)
+}
+
 func carPathFor(dataDir, spaceId, rootCid string) string {
 	return filepath.Join(dataDir, "files", spaceId, rootCid[len(rootCid)-2:], rootCid+".car")
 }

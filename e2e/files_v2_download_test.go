@@ -74,7 +74,8 @@ func TestE2E_FilesV2_SDKDownload(t *testing.T) {
 	fileInfo, err := spA.Files().Attach(ctx, ownerId, bytes.NewReader(content),
 		space.AttachOpts{Name: "movie.bin", Mime: "application/octet-stream"})
 	require.NoError(t, err, "device A: Attach")
-	require.True(t, fileInfo.Durable, "file must be durable before B can read it publicly")
+	// B reads publicly, which serves durable files only.
+	waitFileDurable(t, ctx, spA, fileInfo.FileId)
 
 	inlineContent := []byte("inline for download e2e " + spA.Id())
 	inlineInfo, err := spA.Files().Attach(ctx, ownerId, bytes.NewReader(inlineContent),

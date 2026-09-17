@@ -495,6 +495,10 @@ func (r payloadsRegistrar) SetNetworkSign(ctx context.Context, ownerId, fileId, 
 	return r.p.SetNetworkSign(ctx, ownerId, fileId, sign)
 }
 
+func (r payloadsRegistrar) FindRow(ctx context.Context, fileId string) (payloads.Row, error) {
+	return r.p.FindRow(ctx, fileId)
+}
+
 func (r payloadsRegistrar) Row(ctx context.Context, ownerId, fileId string) (payloads.Row, error) {
 	return r.p.GetRow(ctx, ownerId, fileId)
 }

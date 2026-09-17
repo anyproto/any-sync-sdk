@@ -52,8 +52,14 @@ func (j Job) id() string { return j.Kind + "/" + j.SpaceId + "/" + j.FileId }
 // from the broker's per-item outcome).
 var ErrLimited = errors.New("filestatus: storage limit exceeded")
 
+// ErrNoFileNodes is returned by a Runner when the network lists no file
+// nodes (a local-only network): nothing was attempted, so the job waits
+// for nodes to appear without counting a failure.
+var ErrNoFileNodes = errors.New("filestatus: no file nodes in the network")
+
 // Runner executes one job. Success removes the job; ErrLimited parks
-// it on the slow cadence; any other error backs off exponentially.
+// it on the slow cadence; ErrNoFileNodes parks it uncounted; any other
+// error backs off exponentially.
 type Runner func(ctx context.Context, job Job) error
 
 // OnChange observes job transitions (enqueue, attempt failure, done).
@@ -66,8 +72,23 @@ const (
 	baseBackoff    = 30 * time.Second
 	maxBackoff     = 10 * time.Minute
 	limitedBackoff = 10 * time.Minute
-	jobTimeout     = 5 * time.Minute
+	noNodesBackoff = time.Minute
+	// pinTimeout bounds one pin attempt; fetched blocks persist, so the
+	// next attempt resumes.
+	pinTimeout = 5 * time.Minute
+	// durableTimeout bounds one backup attempt. An upload cannot
+	// resume, so the cap is generous; a stalled transfer is the
+	// uploader's to detect.
+	durableTimeout = 6 * time.Hour
+	// workers is how many jobs run at once.
+	workers = 4
+	// dueBatch is how many due jobs one scan looks at.
+	dueBatch = 64
 )
+
+// triedJobs matches every job that ran and did not succeed (failed,
+// limited or parked): those carry a lastErr.
+var triedJobs = query.Key{Path: []string{fieldLastErr}, Filter: query.NewComp(query.CompOpGt, "")}
 
 // Queue is the persistent work queue. One per SDK.
 type Queue struct {
@@ -76,9 +97,14 @@ type Queue struct {
 	onChange OnChange
 
 	kick   chan struct{}
+	slots  chan struct{}
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	mu       sync.Mutex
+	running  map[string]context.CancelFunc // job id → cancel of its attempt
+	lastKind string
 }
 
 // NewQueue opens the queue over the shared files DB. Call Run to start
@@ -94,20 +120,33 @@ func NewQueue(ctx context.Context, db anystore.DB, runner Runner, onChange OnCha
 		runner:   runner,
 		onChange: onChange,
 		kick:     make(chan struct{}, 1),
+		slots:    make(chan struct{}, workers),
+		running:  map[string]context.CancelFunc{},
 		ctx:      qctx,
 		cancel:   cancel,
 	}, nil
 }
 
-// Run starts the worker loop (persisted jobs from a previous session
-// pick up on the first scan).
+// Run starts the worker loop. Persisted jobs from a previous session
+// pick up on the first scan, and a backoff earned in that session does
+// not carry over: the network may be back, so every job that ran
+// before is due now and its backoff starts over from the base step. A
+// job that never ran keeps its schedule (takeover stagger).
 func (q *Queue) Run() {
+	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+		v.Set(fieldNext, a.NewNumberFloat64(0))
+		v.Del(fieldAtt)
+		return v, true, nil
+	})
+	if _, err := q.coll.Find(triedJobs).Update(q.ctx, mod); err != nil {
+		log.Warn("reset backoff failed", zap.Error(err))
+	}
 	q.wg.Add(1)
 	go q.loop()
 	q.Kick()
 }
 
-// Close stops the worker and waits for the in-flight job.
+// Close stops the workers and waits for the in-flight jobs.
 func (q *Queue) Close() {
 	q.cancel()
 	q.wg.Wait()
@@ -186,11 +225,16 @@ func (q *Queue) upsert(ctx context.Context, job Job, mod query.ModifyFunc) error
 	return nil
 }
 
-// Remove drops a job (its work became unnecessary — e.g. the durable
-// phase succeeded inline).
+// Remove drops a job (its work became unnecessary — e.g. the file was
+// deleted) and cancels its attempt when one is running.
 func (q *Queue) Remove(ctx context.Context, kind, spaceId, fileId string) error {
 	job := Job{Kind: kind, SpaceId: spaceId, FileId: fileId}
 	err := q.coll.DeleteId(ctx, job.id())
+	q.mu.Lock()
+	if cancel := q.running[job.id()]; cancel != nil {
+		cancel()
+	}
+	q.mu.Unlock()
 	if err != nil && !errors.Is(err, anystore.ErrDocNotFound) {
 		return err
 	}
@@ -288,12 +332,12 @@ func jobFromValue(v *anyenc.Value) Job {
 	}
 }
 
-// loop is the worker: run every due job, then sleep until the next
-// deadline (bounded by scanInterval) or a kick.
+// loop is the dispatcher: hand every due job to a worker, then sleep
+// until the next deadline (bounded by scanInterval) or a kick.
 func (q *Queue) loop() {
 	defer q.wg.Done()
 	for {
-		q.drainDue()
+		q.dispatchDue()
 		select {
 		case <-q.ctx.Done():
 			return
@@ -303,43 +347,90 @@ func (q *Queue) loop() {
 	}
 }
 
-// drainDue runs due jobs one at a time until none are due (each pass
-// re-queries so a job re-enqueued while running is observed).
-func (q *Queue) drainDue() {
+// dispatchDue starts due jobs until none is left, waiting for a free
+// worker when all are busy. Each pass re-queries, so a job re-enqueued
+// while running is observed.
+func (q *Queue) dispatchDue() {
 	for {
-		if q.ctx.Err() != nil {
-			return
-		}
 		job, ok := q.nextDue()
 		if !ok {
 			return
 		}
-		q.runOne(job)
+		select {
+		case q.slots <- struct{}{}:
+		case <-q.ctx.Done():
+			return
+		}
+		ctx, cancel := context.WithTimeout(q.ctx, jobTimeout(job.Kind))
+		q.mu.Lock()
+		q.running[job.id()] = cancel
+		q.lastKind = job.Kind
+		q.mu.Unlock()
+		q.wg.Add(1)
+		go func() {
+			defer q.wg.Done()
+			q.runOne(ctx, job)
+			cancel()
+			q.mu.Lock()
+			delete(q.running, job.id())
+			q.mu.Unlock()
+			<-q.slots
+			q.Kick()
+		}()
 	}
 }
 
+func jobTimeout(kind string) time.Duration {
+	if kind == KindDurable {
+		return durableTimeout
+	}
+	return pinTimeout
+}
+
+// nextDue picks a due job that is not running. Kinds alternate when
+// both are due, so a backlog of one never starves the other.
 func (q *Queue) nextDue() (Job, bool) {
+	// The read and the running check share one critical section: a
+	// worker leaves q.running only after its job's row is settled, so a
+	// job read as due here is either still marked running or truly due.
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	now := float64(time.Now().Unix())
 	filter := query.Key{Path: []string{fieldNext}, Filter: query.NewComp(query.CompOpLte, now)}
-	iter, err := q.coll.Find(filter).Limit(1).Iter(q.ctx)
+	iter, err := q.coll.Find(filter).Limit(dueBatch).Iter(q.ctx)
 	if err != nil {
 		return Job{}, false
 	}
-	defer iter.Close()
-	if !iter.Next() {
+	var due []Job
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			break
+		}
+		due = append(due, jobFromValue(doc.Value()))
+	}
+	_ = iter.Close()
+
+	var pick *Job
+	for i := range due {
+		if _, busy := q.running[due[i].id()]; busy {
+			continue
+		}
+		if due[i].Kind != q.lastKind {
+			return due[i], true
+		}
+		if pick == nil {
+			pick = &due[i]
+		}
+	}
+	if pick == nil {
 		return Job{}, false
 	}
-	doc, err := iter.Doc()
-	if err != nil {
-		return Job{}, false
-	}
-	return jobFromValue(doc.Value()), true
+	return *pick, true
 }
 
-func (q *Queue) runOne(job Job) {
-	ctx, cancel := context.WithTimeout(q.ctx, jobTimeout)
+func (q *Queue) runOne(ctx context.Context, job Job) {
 	err := q.runner(ctx, job)
-	cancel()
 	if err == nil {
 		if derr := q.coll.DeleteId(q.ctx, job.id()); derr != nil && !errors.Is(derr, anystore.ErrDocNotFound) {
 			log.Warn("dequeue failed", zap.String("job", job.id()), zap.Error(derr))
@@ -347,19 +438,25 @@ func (q *Queue) runOne(job Job) {
 		q.notify(job, true)
 		return
 	}
-	job.Attempts++
 	job.LastErr = err.Error()
 	job.Limited = errors.Is(err, ErrLimited)
-	delay := baseBackoff << min(job.Attempts-1, 5)
-	if delay > maxBackoff {
-		delay = maxBackoff
-	}
-	if job.Limited {
-		delay = limitedBackoff
+	var delay time.Duration
+	if errors.Is(err, ErrNoFileNodes) {
+		delay = noNodesBackoff
+		log.Debug("job parked: no file nodes", zap.String("job", job.id()))
+	} else {
+		job.Attempts++
+		delay = baseBackoff << min(job.Attempts-1, 5)
+		if delay > maxBackoff {
+			delay = maxBackoff
+		}
+		if job.Limited {
+			delay = limitedBackoff
+		}
+		log.Info("job attempt failed", zap.String("job", job.id()),
+			zap.Int("attempts", job.Attempts), zap.Bool("limited", job.Limited), zap.Error(err))
 	}
 	job.NextAt = time.Now().Add(delay)
-	log.Info("job attempt failed", zap.String("job", job.id()),
-		zap.Int("attempts", job.Attempts), zap.Bool("limited", job.Limited), zap.Error(err))
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set(fieldAtt, a.NewNumberInt(job.Attempts))
 		v.Set(fieldNext, a.NewNumberFloat64(float64(job.NextAt.Unix())))

@@ -109,6 +109,15 @@ func (r *fakeRegistrar) SetNetworkSign(_ context.Context, ownerId, fileId, sign 
 	return nil
 }
 
+func (r *fakeRegistrar) FindRow(_ context.Context, fileId string) (payloads.Row, error) {
+	for _, row := range r.rows {
+		if row.Id == fileId {
+			return row, nil
+		}
+	}
+	return payloads.Row{}, fmt.Errorf("no row %s", fileId)
+}
+
 func (r *fakeRegistrar) Row(_ context.Context, ownerId, fileId string) (payloads.Row, error) {
 	row, ok := r.rows[ownerId+"/"+fileId]
 	if !ok {
@@ -167,13 +176,17 @@ func TestAddFullDurable(t *testing.T) {
 	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{Name: "big.bin"})
 	require.NoError(t, err)
 	require.False(t, res.Inline)
-	require.True(t, res.Durable)
+	require.False(t, res.Durable, "the durable phase belongs to the queue")
 	require.NotEmpty(t, res.RootCid)
+	require.Zero(t, br.uploads, "Add never touches the broker")
 
 	row := reg.rows["owner1/"+res.FileId]
 	require.Equal(t, res.RootCid, row.RootCid)
 	require.Len(t, row.Enc.Key, 32)
-	require.NotEmpty(t, row.NetworkSign)
+	require.Empty(t, row.NetworkSign)
+
+	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
+	require.NotEmpty(t, reg.rows["owner1/"+res.FileId].NetworkSign)
 
 	// The PUT body is the local CARv2 verbatim.
 	require.Len(t, br.putBodies, 1)
@@ -190,27 +203,7 @@ func TestAddFullDurable(t *testing.T) {
 	require.Equal(t, []string{res.FileId}, info.Refs)
 }
 
-func TestAddLimitExceeded(t *testing.T) {
-	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
-	s, st := newService(t, br)
-	reg := newFakeRegistrar()
-
-	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(testContent(50_000)), AddOpts{})
-	require.NoError(t, err, "limit refusal must not fail the attach")
-	require.False(t, res.Durable)
-	require.NotEmpty(t, res.FileId)
-
-	row := reg.rows["owner1/"+res.FileId]
-	require.Empty(t, row.NetworkSign)
-	root, err := cid.Decode(res.RootCid)
-	require.NoError(t, err)
-	info, err := st.Info(context.Background(), spaceId, root)
-	require.NoError(t, err)
-	require.Equal(t, store.StateComplete, info.State, "bytes stay local for the retry queue")
-	require.Equal(t, 1, br.uploads, "limit is terminal, no retry")
-}
-
-func TestAddRetriesActivationWindow(t *testing.T) {
+func TestDriveDurableRetriesActivationWindow(t *testing.T) {
 	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{
 		fileprotov2.ErrCode_ErrUnexpected, // broker still activating the space
 		fileprotov2.ErrCode_Ok,
@@ -220,8 +213,51 @@ func TestAddRetriesActivationWindow(t *testing.T) {
 
 	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(testContent(20_000)), AddOpts{})
 	require.NoError(t, err)
-	require.True(t, res.Durable)
+	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
 	require.Equal(t, 2, br.uploads)
+	require.NotEmpty(t, reg.rows["owner1/"+res.FileId].NetworkSign)
+}
+
+// TestDriveDurableRetryBudget pins that the activation-window retries
+// stop at the durable-wait budget and hand the job back to the queue.
+func TestDriveDurableRetryBudget(t *testing.T) {
+	br := &fakeBroker{signCode: fileprotov2.ErrCode_ErrCidNotFound}
+	s, _ := newService(t, br)
+	s.durableWait = 20 * time.Millisecond
+	reg := newFakeRegistrar()
+
+	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(testContent(20_000)), AddOpts{})
+	require.NoError(t, err)
+	start := time.Now()
+	require.Error(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
+	require.Less(t, time.Since(start), 2*time.Second)
+	require.Greater(t, br.signs, 1, "retried inside the budget")
+	require.Len(t, br.putBodies, 1, "a sign retry never moves the bytes again")
+}
+
+// TestDriveDurableSharesSiblingReceipt pins that rows bound to one root
+// share one upload, whichever job runs first.
+func TestDriveDurableSharesSiblingReceipt(t *testing.T) {
+	ctx := context.Background()
+	br := &fakeBroker{}
+	s, _ := newService(t, br)
+	reg := newFakeRegistrar()
+	content := testContent(120_000)
+
+	donor, err := s.Add(ctx, reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	bound, err := s.Add(ctx, reg, spaceId, "owner2", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	require.True(t, bound.Bound)
+
+	// The bound row's job happens to run first.
+	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner2", bound.FileId))
+	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner1", donor.FileId))
+	require.Len(t, br.putBodies, 1, "one upload for the shared root")
+	require.Equal(t, 1, br.uploads)
+	sign := reg.rows["owner2/"+bound.FileId].NetworkSign
+	require.NotEmpty(t, sign)
+	require.Equal(t, sign, reg.rows["owner1/"+donor.FileId].NetworkSign)
 }
 
 func TestAddBind(t *testing.T) {
@@ -232,7 +268,7 @@ func TestAddBind(t *testing.T) {
 
 	first, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{Name: "orig.bin"})
 	require.NoError(t, err)
-	require.True(t, first.Durable)
+	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", first.FileId))
 	uploadsAfterFirst := br.uploads
 
 	second, err := s.Add(context.Background(), reg, spaceId, "owner2", bytes.NewReader(content), AddOpts{Name: "copy.bin"})
@@ -269,7 +305,6 @@ func TestAddBindDonorGoneFallsThrough(t *testing.T) {
 	second, err := s.Add(context.Background(), reg, spaceId, "owner2", bytes.NewReader(content), AddOpts{})
 	require.NoError(t, err)
 	require.False(t, second.Bound)
-	require.True(t, second.Durable)
 	// Fresh random key ⇒ fresh ciphertext ⇒ a different root.
 	require.NotEqual(t, first.RootCid, second.RootCid)
 }
@@ -287,13 +322,7 @@ func (q *fakeQueue) Enqueue(_ context.Context, kind, spaceId, fileId string) err
 	return nil
 }
 
-func (q *fakeQueue) Remove(_ context.Context, kind, spaceId, fileId string) error {
-	delete(q.entries, kind+"/"+spaceId+"/"+fileId)
-	q.log = append(q.log, "remove "+kind+"/"+fileId)
-	return nil
-}
-
-func TestAddEnqueuesBeforeDurablePhase(t *testing.T) {
+func TestAddEnqueuesDurableJob(t *testing.T) {
 	br := &fakeBroker{}
 	s, _ := newService(t, br)
 	q := newFakeQueue()
@@ -302,14 +331,26 @@ func TestAddEnqueuesBeforeDurablePhase(t *testing.T) {
 
 	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(testContent(20_000)), AddOpts{})
 	require.NoError(t, err)
-	require.True(t, res.Durable)
-	// Enqueued before the attempt, removed after the success.
-	require.Equal(t, []string{"enqueue durable/" + res.FileId, "remove durable/" + res.FileId}, q.log)
-	require.Empty(t, q.entries)
+	require.Equal(t, []string{"enqueue durable/" + res.FileId}, q.log)
+	require.True(t, q.entries["durable/"+spaceId+"/"+res.FileId])
 }
 
-func TestAddLimitLeavesJobForTheQueue(t *testing.T) {
-	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
+// stallBroker never answers: every call parks until its ctx ends.
+type stallBroker struct {
+	fakeBroker
+}
+
+func (b *stallBroker) Upload(ctx context.Context, _ string, _ []*fileprotov2.UploadRequestItem) (*fileprotov2.UploadResponse, error) {
+	b.uploads++
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestAddNeverWaitsOnTheNetwork pins the offline-first contract: Add
+// registers the file, enqueues the backup and returns without a broker
+// call, even when the network would stall forever.
+func TestAddNeverWaitsOnTheNetwork(t *testing.T) {
+	br := &stallBroker{}
 	s, _ := newService(t, br)
 	q := newFakeQueue()
 	s.SetQueue(q)
@@ -318,16 +359,11 @@ func TestAddLimitLeavesJobForTheQueue(t *testing.T) {
 	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 20_000), AddOpts{})
 	require.NoError(t, err)
 	require.False(t, res.Durable)
-	require.True(t, q.entries["durable/"+spaceId+"/"+res.FileId], "the refused upload stays queued")
+	require.Zero(t, br.uploads, "no broker call inside Add")
+	require.True(t, q.entries["durable/"+spaceId+"/"+res.FileId], "backup handed to the queue")
 
-	// Headroom appears (quota raised): one queue-driven attempt drains
-	// the job to durable.
-	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
 	row := reg.rows["owner1/"+res.FileId]
-	require.NotEmpty(t, row.NetworkSign, "DriveDurable must record the receipt")
-
-	// Now idempotent.
-	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
+	require.NotEmpty(t, row.RootCid, "registration is local-first, network-independent")
 }
 
 type offlineBroker struct {
@@ -339,41 +375,43 @@ func (b *offlineBroker) Upload(ctx context.Context, spaceId string, items []*fil
 	return nil, errors.New("dial: network unreachable")
 }
 
-// TestAddOfflineReturnsFast pins the offline-first contract: with no
-// network, Attach registers the file and returns immediately — one
-// transport failure defers straight to the persistent queue, never an
-// inline retry loop.
-func TestAddOfflineReturnsFast(t *testing.T) {
+// TestDriveDurableOfflineReturnsFast pins that a transport failure goes
+// straight back to the queue's backoff, never the activation retry loop.
+func TestDriveDurableOfflineReturnsFast(t *testing.T) {
 	br := &offlineBroker{}
 	s, _ := newService(t, br)
 	s.durableWait = time.Minute // must NOT be consumed
-	q := newFakeQueue()
-	s.SetQueue(q)
 	reg := newFakeRegistrar()
 
-	start := time.Now()
 	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 20_000), AddOpts{})
 	require.NoError(t, err)
-	require.False(t, res.Durable)
-	require.Less(t, time.Since(start), 2*time.Second, "offline attach must not block on the network")
+	start := time.Now()
+	require.Error(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
+	require.Less(t, time.Since(start), 2*time.Second)
 	require.Equal(t, 1, br.uploads, "exactly one transport attempt")
-	require.True(t, q.entries["durable/"+spaceId+"/"+res.FileId], "backup deferred to the queue")
-
-	row := reg.rows["owner1/"+res.FileId]
-	require.NotEmpty(t, row.RootCid, "registration is local-first, network-independent")
 }
 
 func TestDriveDurableLimited(t *testing.T) {
-	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{
-		fileprotov2.ErrCode_ErrLimitExceeded, // Attach attempt
-		fileprotov2.ErrCode_ErrLimitExceeded, // queue attempt
-	}}
-	s, _ := newService(t, br)
+	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
+	s, st := newService(t, br)
 	reg := newFakeRegistrar()
 	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytesReaderOf(t, 20_000), AddOpts{})
 	require.NoError(t, err)
 	err = s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId)
 	require.ErrorIs(t, err, ErrLimited, "the queue needs the typed refusal to park the job")
+	require.Equal(t, 1, br.uploads, "limit is terminal, no retry")
+	require.Empty(t, reg.rows["owner1/"+res.FileId].NetworkSign)
+
+	root, err := cid.Decode(res.RootCid)
+	require.NoError(t, err)
+	info, err := st.Info(context.Background(), spaceId, root)
+	require.NoError(t, err)
+	require.Equal(t, store.StateComplete, info.State, "bytes stay local for the next attempt")
+
+	// Headroom appears: the next drive signs the row, then is idempotent.
+	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
+	require.NotEmpty(t, reg.rows["owner1/"+res.FileId].NetworkSign)
+	require.NoError(t, s.DriveDurable(context.Background(), reg, spaceId, "owner1", res.FileId))
 }
 
 func bytesReaderOf(t *testing.T, n int) *bytes.Reader {
@@ -424,7 +462,7 @@ func TestAddIntentMarkerLifecycle(t *testing.T) {
 // not-yet-durable donor gets its own drive-toward-durable job (the
 // donor's job signs only the donor's row).
 func TestAddBindUnsignedDonorEnqueues(t *testing.T) {
-	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
+	br := &fakeBroker{}
 	s, _ := newService(t, br)
 	q := newFakeQueue()
 	s.SetQueue(q)
@@ -472,9 +510,8 @@ func TestAddSpoolSpill(t *testing.T) {
 	reg := newFakeRegistrar()
 	content := testContent(80_000)
 
-	res, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{})
+	_, err := s.Add(context.Background(), reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{})
 	require.NoError(t, err)
-	require.True(t, res.Durable)
 
 	ents, err := os.ReadDir(st.TmpDir())
 	require.NoError(t, err)
@@ -482,30 +519,27 @@ func TestAddSpoolSpill(t *testing.T) {
 }
 
 // TestDriveDurableSkipsWhenPeerMadeItDurable is the P2P durability-takeover
-// edge case: device A attaches a file while the file nodes are unreachable
+// edge case: device A attaches a file and its backup has not run yet
 // (local CAR built, NOT durable). Another device (B) then fetches it over
 // the LAN and makes it durable, and B's receipt syncs into A's row. When
 // A's still-queued durable job later fires, it must NOT re-upload — the
 // NetworkSign re-read in DriveDurable makes it a no-op.
 func TestDriveDurableSkipsWhenPeerMadeItDurable(t *testing.T) {
 	ctx := context.Background()
-	// A limit refusal defers durability without a retry loop: A's local
-	// CAR is complete but the row stays non-durable.
-	br := &fakeBroker{uploadCodes: []fileprotov2.ErrCode{fileprotov2.ErrCode_ErrLimitExceeded}}
+	br := &fakeBroker{}
 	s, _ := newService(t, br)
 	reg := newFakeRegistrar()
 
 	res, err := s.Add(ctx, reg, spaceId, "owner1", bytes.NewReader(testContent(80_000)), AddOpts{Name: "x.bin"})
 	require.NoError(t, err)
-	require.False(t, res.Durable, "no reachable node → deferred")
-	uploadsAfterAdd := br.uploads
+	require.False(t, res.Durable)
 
 	// Device B made it durable; its receipt lands in A's row via CRDT sync.
 	require.NoError(t, reg.SetNetworkSign(ctx, "owner1", res.FileId, "peerB-receipt"))
 
 	// A's queued durable job fires now — must be a no-op (no re-upload).
 	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner1", res.FileId))
-	require.Equal(t, uploadsAfterAdd, br.uploads,
+	require.Zero(t, br.uploads,
 		"A must not re-upload a file a peer already made durable")
 	require.Equal(t, "peerB-receipt", reg.rows["owner1/"+res.FileId].NetworkSign,
 		"the peer's receipt must be preserved, not overwritten")

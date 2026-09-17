@@ -323,6 +323,15 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	// above this SDK's, every synced write fails with
 	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).
 	st.SetGlobalGate(s.tsp.WriteGate)
+	if s.closing {
+		// A sync message during app teardown: hand back a closed store
+		// (callers dereference the result) with no background work
+		// started on a db that is closing.
+		_ = st.Close()
+		s.stores[spaceId] = st
+		s.mu.Unlock()
+		return st
+	}
 	// Read-only gate on every user-authored synced write
 	// (Object.LocalWrite, Store.Create). Guest-mode is fixed for the
 	// store's lifetime — a key refresh tears the runtime down — so it
@@ -2071,10 +2080,10 @@ func (s *Service) DeclineInvite(ctx context.Context, spaceId string) error {
 	return nil
 }
 
-// Close stops per-space subsystems the SDK owns directly — currently
-// just members watchers (one polling goroutine each). The any-sync
-// side of each space is owned by the App's space cache and torn down
-// separately by App.Close.
+// Close stops what the SDK owns per space: the background goroutines,
+// the inbox, the deletion and join controllers, every watcher, then
+// each loaded space's Store. The any-sync side of each space is owned
+// by the App's space cache and torn down separately by App.Close.
 func (s *Service) Close(_ context.Context) error {
 	// Stop spawning new lazy-seed goroutines, cancel any in flight, and
 	// wait for them to return before the caller tears down the store /
@@ -2104,6 +2113,30 @@ func (s *Service) Close(_ context.Context) error {
 	s.joinWG.Wait()
 	s.stopJoinWaiters()
 	s.watchers.stopAll()
+	// Close every loaded space's Store: its drainer, read-state
+	// materializer and reindex sweep write the SDK db, which the caller
+	// closes next. Offload closes a store on its own; this covers the
+	// spaces still loaded at shutdown. The closed stores stay in the
+	// map, and storeFor builds only closed ones from here on, so a
+	// sync message during app teardown starts nothing new. Concurrent:
+	// a store waits out its sweep's tree replay and in-flight applies.
+	s.mu.Lock()
+	stores := make(map[string]*spaceobjects.Store, len(s.stores))
+	for id, st := range s.stores {
+		stores[id] = st
+	}
+	s.mu.Unlock()
+	var wg sync.WaitGroup
+	for id, st := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := st.Close(); err != nil {
+				offloadLog.Warn("close store", zap.String("spaceId", id), zap.Error(err))
+			}
+		}()
+	}
+	wg.Wait()
 	return nil
 }
 
@@ -2144,12 +2177,12 @@ func (s *Service) ResolveIdentityProfilesAsync() {
 	}()
 }
 
-// KickProfiles asks every running members watcher to refetch
-// identityRepo profiles immediately. Called by the SDK after the
-// caller publishes their own profile via Account.UpdateMetadata so
-// the self-view propagates without waiting for the slow tick.
-func (s *Service) KickProfiles(ctx context.Context) {
-	s.watchers.kickProfiles(ctx)
+// KickProfiles queues an identityRepo refetch on every running members
+// watcher's profile loop. Called by the SDK after the caller publishes
+// their own profile via Account.UpdateMetadata so the self-view
+// propagates without waiting for the slow tick.
+func (s *Service) KickProfiles() {
+	s.watchers.kickProfiles()
 }
 
 // SpaceRegistry implementation. Routes between the tech-space (which

@@ -34,6 +34,12 @@ type readMaterializer struct {
 	store  *Store
 	cancel func()
 
+	// ctx bounds processObject; close cancels it so a materialize pass
+	// blocked on an object load can't hold Store.Close.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+	closeOnce sync.Once
+
 	mu    sync.Mutex
 	dirty map[string]struct{}
 
@@ -61,6 +67,7 @@ func newReadMaterializer(s *Store) *readMaterializer {
 		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
+	m.ctx, m.ctxCancel = context.WithCancel(context.Background())
 	m.cancel = s.readState.SubscribeState(func(objectId string, _ uint64) {
 		m.mu.Lock()
 		m.dirty[objectId] = struct{}{}
@@ -75,8 +82,11 @@ func newReadMaterializer(s *Store) *readMaterializer {
 }
 
 func (m *readMaterializer) close() {
-	m.cancel()
-	close(m.stop)
+	m.closeOnce.Do(func() {
+		m.cancel()
+		m.ctxCancel()
+		close(m.stop)
+	})
 	<-m.done
 }
 
@@ -100,7 +110,10 @@ func (m *readMaterializer) run() {
 		m.dirty = map[string]struct{}{}
 		m.mu.Unlock()
 		for objectId := range batch {
-			if err := m.processObject(context.Background(), objectId); err != nil {
+			if m.ctx.Err() != nil {
+				return
+			}
+			if err := m.processObject(m.ctx, objectId); err != nil && m.ctx.Err() == nil {
 				storeLog.Warn("materialize read state", zap.String("objectId", objectId), zap.Error(err))
 			}
 		}

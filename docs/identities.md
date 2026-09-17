@@ -106,7 +106,10 @@ reason.
   head, so members present at start are only processed by this seed. The
   tick handles newcomers and members whose symkey just arrived, and
   records sightings on membership changes. `fetchProfilesFor` writes
-  resolved profiles through to the directory.
+  resolved profiles through to the directory. Every fetch runs on the
+  watcher's profile loop: the tick and `KickProfiles` only queue a
+  request (`requestProfiles`), and stopping the watcher cancels the
+  round-trip in flight and joins the loop.
 - **1-1 resolver** (`resolveOneToOnePeerName`) and the **join-request
   resolver** write profiles and sightings the same way.
 - **Reads:** `recordToInfo` fills a 1-1 row's name from the directory;

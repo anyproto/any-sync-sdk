@@ -22,6 +22,8 @@ func TestPeerKeyAction(t *testing.T) {
 		{"no directory row", techspace.IdentityRecord{}, true, true},
 		{"key cached elsewhere, profile missing", techspace.IdentityRecord{SymKey: "k"}, false, true},
 		{"key cached, profile resolved", techspace.IdentityRecord{SymKey: "k", Name: "Alice"}, false, false},
+		{"key cached, name-less profile", techspace.IdentityRecord{SymKey: "k", Description: "d"}, false, false},
+		{"key cached, icon-only profile", techspace.IdentityRecord{SymKey: "k", IconCID: "cid"}, false, false},
 		{"different key", techspace.IdentityRecord{SymKey: "old", Name: "Alice"}, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

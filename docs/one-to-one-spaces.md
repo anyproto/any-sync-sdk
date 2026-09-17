@@ -276,10 +276,12 @@ channel: its read key is held by exactly the two participants.
   with a one-shot reconcile on start. Only the row keyed by the row's
   `OneToOnePeer` goes to the identities directory (`SetIdentityMetaKey`,
   no-op when equal). Each reconcile triggers `resolveOneToOnePeerName` in
-  the background while the directory holds no profile for the peer, whoever
-  cached the key: the inbox invite and the synced directory deliver the key
-  with no resolve of their own, and the resolves on `RegisterIncoming` and
-  accept can run before any key has arrived. The fetch itself is one-shot;
+  the background when the key is new or the directory holds no profile
+  (name, description and icon all empty) for the peer, whoever cached the
+  key: an inbox invite for an already active row and the synced directory
+  deliver the key with no resolve, and the resolves on `RegisterIncoming`
+  and accept can run before any key has arrived. The fetch itself is
+  one-shot and a failed one waits for the next reconcile or boot;
   a space whose member watcher runs (started by the first members query or
   subscribe) also refreshes every member's profile each
   `identityRepoPollInterval` (60s) with the same directory key. Cold devices

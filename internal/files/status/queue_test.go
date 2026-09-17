@@ -266,6 +266,41 @@ func TestQueueRestartResetsBackoff(t *testing.T) {
 	assert.Equal(t, 1, rec2.runCount("durable/sp1/f1"))
 }
 
+// TestQueueRestartRestartsBackoff pins that a restart while still
+// offline starts the backoff over: the next wait is the base step, not
+// the long one earned in the previous session.
+func TestQueueRestartRestartsBackoff(t *testing.T) {
+	ctx := context.Background()
+	down := func(Job, int) error { return errors.New("dial: network unreachable") }
+	q, db := newQueue(t, &recorder{err: down})
+	q.Run()
+	require.NoError(t, q.Enqueue(ctx, KindDurable, "sp1", "f1"))
+	// Three failures in a row: the wait has grown to 2 minutes.
+	for n := 1; n <= 3; n++ {
+		waitFor(t, func() bool {
+			job, ok, err := q.Get(ctx, KindDurable, "sp1", "f1")
+			return err == nil && ok && job.Attempts == n
+		})
+		if n < 3 {
+			_, err := q.KickJob(ctx, KindDurable, "sp1", "f1")
+			require.NoError(t, err)
+		}
+	}
+	q.Close()
+
+	q2, err := NewQueue(ctx, db, (&recorder{err: down}).run, nil)
+	require.NoError(t, err)
+	t.Cleanup(q2.Close)
+	q2.Run()
+	waitFor(t, func() bool {
+		job, ok, err := q2.Get(ctx, KindDurable, "sp1", "f1")
+		return err == nil && ok && job.Attempts == 1 && job.NextAt.After(time.Now())
+	})
+	job, _, err := q2.Get(ctx, KindDurable, "sp1", "f1")
+	require.NoError(t, err)
+	assert.True(t, job.NextAt.Before(time.Now().Add(baseBackoff+5*time.Second)), "backoff starts over at the base step")
+}
+
 // TestQueueRestartKeepsDelayedSchedule pins that a job which never ran
 // (the takeover stagger) is not pulled forward by a restart.
 func TestQueueRestartKeepsDelayedSchedule(t *testing.T) {

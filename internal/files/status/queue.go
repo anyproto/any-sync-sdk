@@ -130,11 +130,12 @@ func NewQueue(ctx context.Context, db anystore.DB, runner Runner, onChange OnCha
 // Run starts the worker loop. Persisted jobs from a previous session
 // pick up on the first scan, and a backoff earned in that session does
 // not carry over: the network may be back, so every job that ran
-// before is due now. A job that never ran keeps its schedule (takeover
-// stagger).
+// before is due now and its backoff starts over from the base step. A
+// job that never ran keeps its schedule (takeover stagger).
 func (q *Queue) Run() {
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set(fieldNext, a.NewNumberFloat64(0))
+		v.Del(fieldAtt)
 		return v, true, nil
 	})
 	if _, err := q.coll.Find(triedJobs).Update(q.ctx, mod); err != nil {

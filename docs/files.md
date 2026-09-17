@@ -112,8 +112,9 @@ Up to four jobs run at once, and the two kinds alternate when both are
 due. Deleting a file removes its jobs and cancels a running attempt.
 
 Jobs survive restarts, and a backoff does not: every job that ran in
-an earlier session without succeeding is due when the queue starts, so a file attached
-offline backs up as soon as the app next runs online. Within a session
+an earlier session without succeeding is due when the queue starts and its backoff
+starts over, so a file attached offline backs up as soon as the app next
+runs online. Within a session
 failures back off from 30 s, doubling to 10 min.
 
 - **Storage limit**: the job parks on a 10-minute cadence and the file

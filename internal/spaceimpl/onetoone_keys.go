@@ -11,6 +11,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -209,12 +210,13 @@ func (w *oneToOneKeysWatcher) loop() {
 }
 
 // reconcileOnce reads the peer's identityKeys row off the spaceIndex
-// object and caches its key in the identities directory, kicking the
-// peer-name resolution (a coordinator round-trip, so in the background
-// like every other caller) when the key is new. Only the row keyed by
-// the other participant counts: the directory is account-wide, so a
-// row under any other identity is ignored rather than cached. Silent on
-// a spaceIndex tree not present locally yet — the sub fires once it
+// object, caches its key in the identities directory when it is new,
+// and kicks the peer-name resolution (a coordinator round-trip, so in
+// the background like every other caller) when the key is new or the
+// directory holds no profile for the peer. Only the row keyed by the
+// other participant counts: the directory is account-wide, so a row
+// under any other identity is ignored rather than cached. Silent on a
+// spaceIndex tree not present locally yet — the sub fires once it
 // arrives.
 func (w *oneToOneKeysWatcher) reconcileOnce(ctx context.Context) {
 	if w.peer == "" {
@@ -231,14 +233,31 @@ func (w *oneToOneKeysWatcher) reconcileOnce(ctx context.Context) {
 	if symKey == "" {
 		return
 	}
-	if cur, ok := w.parent.tsp.GetIdentityMetaKey(ctx, w.peer); ok && cur == symKey {
-		return
+	dir, _ := w.parent.tsp.GetIdentity(ctx, w.peer)
+	cache, resolve := peerKeyAction(symKey, dir)
+	if cache {
+		if err := w.parent.tsp.SetIdentityMetaKey(ctx, w.peer, symKey); err != nil {
+			oneToOneKeysLog.Warn("cache peer identity key", zap.String("spaceId", w.spaceId), zap.Error(err))
+			return
+		}
 	}
-	if err := w.parent.tsp.SetIdentityMetaKey(ctx, w.peer, symKey); err != nil {
-		oneToOneKeysLog.Warn("cache peer identity key", zap.String("spaceId", w.spaceId), zap.Error(err))
-		return
+	if resolve {
+		w.parent.goResolveOneToOnePeerName(w.peer)
 	}
-	go w.parent.resolveOneToOnePeerName(context.Background(), w.peer)
+}
+
+// peerKeyAction is what a reconcile owes for the peer's published key
+// given the peer's directory row: cache the key when it differs, resolve
+// the profile when the key is new or no profile is cached. A cached key
+// says nothing about the profile — an inbox invite for an already
+// active row and the synced directory both deliver the key with no
+// resolve, and every other resolve kick may have run before the key
+// arrived. "No profile" is the resolver's own emptiness test, so a
+// name-less profile is not fetched again.
+func peerKeyAction(rowKey string, dir techspace.IdentityRecord) (cache, resolve bool) {
+	cache = dir.SymKey != rowKey
+	unresolved := dir.Name == "" && dir.Description == "" && dir.IconCID == ""
+	return cache, cache || unresolved
 }
 
 var _ spaceScoped = (*oneToOneKeysWatcher)(nil)

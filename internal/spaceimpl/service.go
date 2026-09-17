@@ -1437,7 +1437,7 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 		// For a still-pending row, (re)try resolving the peer's name — an
 		// earlier attempt may have run before the peer's symkey arrived.
 		if rec.LocalStatus == oneToOnePendingLocalStatus {
-			go s.resolveOneToOnePeerName(context.Background(), peerIdentity)
+			s.goResolveOneToOnePeerName(peerIdentity)
 		}
 		return nil
 	}
@@ -1458,8 +1458,26 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 	// Resolve the peer's display name from identityRepo in the background:
 	// with symkey-only invites the pending row starts identity-only, so we
 	// fetch + decrypt the peer's profile and write name/icon onto the row.
-	go s.resolveOneToOnePeerName(context.Background(), peerIdentity)
+	s.goResolveOneToOnePeerName(peerIdentity)
 	return nil
+}
+
+// goResolveOneToOnePeerName runs resolveOneToOnePeerName in the
+// background, tracked by seedWG and bound to seedCtx like goSeed: Close
+// cancels the coordinator round-trip and drains the goroutine before
+// the tech space is torn down. No-op once closing.
+func (s *Service) goResolveOneToOnePeerName(peerIdentity string) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.seedWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.seedWG.Done()
+		s.resolveOneToOnePeerName(s.seedCtx, peerIdentity)
+	}()
 }
 
 // resolveOneToOnePeerName best-effort resolves a 1-1 peer's identityRepo
@@ -1468,8 +1486,8 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 // (via recordToInfo) shows the friend by name rather than identity-only.
 // No-op when the symkey isn't cached yet, the coordinator is offline, the
 // profile is empty, or the row is no longer a non-declined 1-1.
-// Best-effort: meant to run in a goroutine; all failures are dropped (a
-// later RegisterIncoming retries once the key/coordinator are available).
+// Best-effort: runs through goResolveOneToOnePeerName; all failures are
+// dropped (a later RegisterIncoming or key-watcher reconcile retries).
 func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity string) {
 	keys := s.app.AccountKeys()
 	if keys == nil {
@@ -1548,7 +1566,7 @@ func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity st
 	s.goSeed(sp)
 	// Resolve the friend's name onto the active 1-1 row so the space list
 	// shows it (no-op until we hold their symkey; best-effort).
-	go s.resolveOneToOnePeerName(context.Background(), peerIdentity)
+	s.goResolveOneToOnePeerName(peerIdentity)
 	return sp, nil
 }
 

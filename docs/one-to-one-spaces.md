@@ -275,10 +275,14 @@ channel: its read key is held by exactly the two participants.
   1-1 spaces only): a subscription on `(spaceIndexObjectId, identityKeys)`
   with a one-shot reconcile on start. Only the row keyed by the row's
   `OneToOnePeer` goes to the identities directory (`SetIdentityMetaKey`,
-  no-op when equal) and triggers `resolveOneToOnePeerName` in the
-  background. That fetch is one-shot; the space's member watcher refreshes
-  every member's profile each `identityRepoPollInterval` (60s) with the same
-  directory key, so a missed fetch retries within a minute. Cold devices
+  no-op when equal). Each reconcile triggers `resolveOneToOnePeerName` in
+  the background while the directory holds no profile for the peer, whoever
+  cached the key: the inbox invite and the synced directory deliver the key
+  with no resolve of their own, and the resolves on `RegisterIncoming` and
+  accept can run before any key has arrived. The fetch itself is one-shot;
+  a space whose member watcher runs (started by the first members query or
+  subscribe) also refreshes every member's profile each
+  `identityRepoPollInterval` (60s) with the same directory key. Cold devices
   receive the key through the synced directory, as for any contact.
 - **The inbox invite still carries the key.** It is the only pre-accept
   channel: a pending row shows the initiator's name before the space is

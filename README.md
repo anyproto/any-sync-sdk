@@ -159,3 +159,9 @@ See [`docs/`](docs/):
 ## Compatibility note
 
 The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's allow-list: the `any` product's `any.space` / `any.techspace` / `any.onetoone` (fileproto v2 required) plus anytype's `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. The SDK mints only the `any.*` family; it can join `anytype.*` spaces but never creates them. See `docs/space.md § Space type strings`.
+
+
+## License
+
+We plan to release Any under an open-source license. The specific license
+is **TBD** and will be added once that decision is made.

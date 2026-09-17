@@ -146,6 +146,9 @@ func TestE2E_FilesV2_Delete(t *testing.T) {
 		if _, err := spB.Files().Get(ctx, survivorInfo.FileId); err != nil {
 			return false // rows not synced in yet
 		}
+		if _, err := spB.Files().Get(ctx, otherInfo.FileId); err != nil {
+			return false // the second object's rows sync separately
+		}
 		_, err := spB.Files().Get(ctx, origInfo.FileId)
 		return err != nil
 	}), "device B never converged on the deletion")

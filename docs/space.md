@@ -110,6 +110,17 @@ type AclSpaceClient interface {
   id, the invite private key minted by any-sync's `BuildInvite`, and the
   kind (member request-to-join, or guest). Not compatible with
   anytype-heart's invite blob.
+- **Member invite sharing.** `ACL.CreateInvite` reuses the active request-to-join
+  token for any active member, including readers. Only an owner/admin may
+  mint or revoke it or approve requests. Revoke before creating to rotate.
+  The SDK stores proof keys in the encrypted spaceIndex's internal
+  `inviteKeys` dataset, keyed by their public-key account ID. The handler
+  accepts only the matching private key and refuses deletion; the live ACL,
+  not custody, determines which keys `Members.Invites` can expose. Generic
+  server reads and history must withhold this dataset. Legacy issuer custody
+  is backfilled on space load; a lost legacy key still requires revocation
+  and a fresh invite. Sharing never calls the coordinator's owner-only
+  make-shareable operation.
 - **Metadata and member names.** Symkey only (`identities.md`): the
   ACL `RequestMetadata` carries each account's metadata symkey, and
   member names resolve from the encrypted identityRepo profile with that

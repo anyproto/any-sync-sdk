@@ -20,8 +20,8 @@ var ErrBadIdentity = errors.New("bad identity")
 // failures with errors.Is against this package instead of importing
 // any-sync internals.
 var (
-	// ErrDuplicateInvite is returned by CreateInvite when an active
-	// invite of the same type already exists.
+	// ErrDuplicateInvite is returned when an active invite exists but
+	// its key cannot be recovered (for example, a legacy invite).
 	ErrDuplicateInvite = list.ErrDuplicateInvites
 
 	// ErrInsufficientPermissions is returned by ACL ops the caller's
@@ -46,11 +46,12 @@ var (
 // Scope: only RequestToJoin invites are supported. AnyoneCanJoin is
 // deferred until any-sync ships v2 of that invite type.
 type ACL interface {
-	// CreateInvite mints a new RequestToJoin invite, revoking any
-	// prior invite on this space (mirrors AclSpaceClient.ReplaceInvite
-	// semantics — only one active invite at a time). The returned
-	// Invite is share-friendly (base58-encoded via Invite.Encode()
-	// equivalents on space.EncodeInvite).
+	// CreateInvite returns the existing RequestToJoin invite when its key
+	// is available. Any active member, including readers, can share it.
+	// If no invite exists, only owners/admins may mint one. Revoke first
+	// to rotate the token. The key is replicated inside the encrypted
+	// space; legacy issuer custody is backfilled when that device loads it.
+	// EncodeInvite turns the result into a share-friendly base58 token.
 	CreateInvite(ctx context.Context) (Invite, error)
 
 	// RevokeInvite revokes a single invite by record id. The record id

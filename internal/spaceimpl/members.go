@@ -9,6 +9,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/syncacl"
 	"github.com/anyproto/any-sync/identityrepo/identityrepoproto"
@@ -274,15 +275,19 @@ func (m *membersAPI) Invites(ctx context.Context) ([]space.InviteInfo, error) {
 		return nil, err
 	}
 	acl.RLock()
-	defer acl.RUnlock()
 	invites := acl.AclState().Invites()
+	active := selfAclActive(acl.AclState())
+	acl.RUnlock()
 	out := make([]space.InviteInfo, 0, len(invites))
 	for _, inv := range invites {
 		info := space.InviteInfo{
 			RecordId:   inv.Id,
 			Permission: fromAclPermissions(inv.Permissions),
 		}
-		if hasCustody && inv.Key != nil && inv.Key.Equals(custody.GetPublic()) {
+		if active && inv.Type == aclrecordproto.AclInviteType_RequestToJoin {
+			info.Key = m.s.sharedInviteKey(ctx, inv.Key)
+		}
+		if active && inv.Type == aclrecordproto.AclInviteType_RequestToJoin && info.Key == nil && hasCustody && inv.Key != nil && inv.Key.Equals(custody.GetPublic()) {
 			info.Key = custody
 		}
 		out = append(out, info)

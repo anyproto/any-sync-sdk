@@ -167,7 +167,10 @@ returns it; `CreateGuestKey`'s idempotent path reads it). Per-path merge
 keeps kinds minted on different devices apart. Revoke paths clear it,
 and read paths verify it against live ACL state, hiding custody that
 went stale. Kept apart from `guestKey` so an issuer's row never reads as
-guest mode.
+guest mode. Member keys are additionally published to the encrypted
+spaceIndex `inviteKeys` dataset so other members can share the active
+request-to-join token. Existing issuer custody is backfilled on load;
+guest keys remain account-private.
 
 **`derived`** — set-once bool stamped at row create by `Spaces().Derive`
 (re-running Derive adds it to an unflagged row). It makes derived spaces

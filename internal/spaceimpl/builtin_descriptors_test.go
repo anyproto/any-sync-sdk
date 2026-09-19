@@ -84,6 +84,7 @@ func TestBuiltInDescriptiveSlice(t *testing.T) {
 		techspace.CRDTVersionDataset: techspace.CRDTVersionSchema(),
 		techspace.InboxCursorDataset: techspace.InboxCursorSchema(),
 		spaceindex.BundlesDataset:    spaceindex.BundlesSchema(),
+		spaceindex.InviteKeysDataset: spaceindex.InviteKeysSchema(),
 		"payloads":                   payloads.Schema(),
 	} {
 		for _, f := range ds.Fields {

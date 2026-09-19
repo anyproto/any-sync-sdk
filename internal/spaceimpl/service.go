@@ -2155,6 +2155,7 @@ func (s *Service) goSeed(sp *spaceImpl) {
 		defer s.seedWG.Done()
 		sp.maybeLazySeedSpaceIndex(s.seedCtx)
 		sp.publishOneToOneKey(s.seedCtx)
+		sp.publishIssuedInvite(s.seedCtx)
 	}()
 }
 

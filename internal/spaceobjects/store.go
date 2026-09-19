@@ -77,6 +77,7 @@ var builtinDataVersions = map[string]string{
 	payloads.Dataset:               payloads.HandlerVersion,
 	spaceindex.BundlesDataset:      spaceindex.BundlesHandlerVersion,
 	spaceindex.IdentityKeysDataset: spaceindex.IdentityKeysHandlerVersion,
+	spaceindex.InviteKeysDataset:   spaceindex.InviteKeysHandlerVersion,
 }
 
 // plaintextSpecs declares the plaintext (node-readable) object
@@ -2547,6 +2548,7 @@ func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
 		// only on a 1-1's spaceIndex object; the handler admits a row
 		// only from the identity it is keyed by.
 		{Name: spaceindex.IdentityKeysDataset, Handler: spaceindex.IdentityKeysHandler{}, Schema: spaceindex.IdentityKeysSchema()},
+		{Name: spaceindex.InviteKeysDataset, Handler: spaceindex.InviteKeysHandler{}, Schema: spaceindex.InviteKeysSchema()},
 	}
 	// Per-store system datasets: same footing as payloads/bundles.
 	regs = append(regs, s.systemRegs...)

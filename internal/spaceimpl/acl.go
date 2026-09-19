@@ -37,24 +37,36 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 	return handle.Inner().AclClient(), nil
 }
 
-// CreateInvite mints a fresh RequestToJoin invite, replacing any
-// prior invite. Output is a share-friendly base58 token.
-//
-// The space must be registered with the coordinator before any ACL
-// record can be published — otherwise the node returns
-// "space not exists". CreateInvite calls SpaceMakeShareable
-// transparently. The first call after Create may race with the
-// periodic headsync that pushes the space header to the coordinator;
-// we retry with a short backoff so callers don't have to.
-//
-// The invite private key is persisted as this account's issued-key
-// custody (synced tech-space row), so every device of the minting
-// account can re-encode the same token — Members.Invites returns it
-// on the matching row. Persist failure fails the call: the ACL invite
-// stands, but an unrecoverable token defeats the contract; re-mint.
+// CreateInvite returns the active request-to-join invite to any member.
+// Only owners/admins can mint one; approval and revocation stay ACL-gated.
+// Keys are shared through the encrypted spaceIndex, with the issuer's
+// private tech-space custody retained as a recovery/migration source.
 func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
-	if err := ensureShareable(ctx, a.s); err != nil {
+	invites, err := a.s.members.Invites(ctx)
+	if err != nil {
 		return space.Invite{}, err
+	}
+	for _, inv := range invites {
+		if inv.Key != nil {
+			if a.s.canWrite(ctx) {
+				if err := a.s.publishInviteKey(ctx, inv.Key); err != nil {
+					return space.Invite{}, err
+				}
+			}
+			return space.Invite{SpaceId: a.s.id, InviteKey: inv.Key}, nil
+		}
+	}
+	me, err := a.s.members.Me(ctx)
+	if err != nil {
+		return space.Invite{}, err
+	}
+	if me.Permission != space.PermissionOwner && me.Permission != space.PermissionAdmin {
+		return space.Invite{}, space.ErrInsufficientPermissions
+	}
+	if me.Permission == space.PermissionOwner {
+		if err := ensureShareable(ctx, a.s); err != nil {
+			return space.Invite{}, err
+		}
 	}
 	cl, err := a.client(ctx)
 	if err != nil {
@@ -70,6 +82,9 @@ func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 		return space.Invite{}, fmt.Errorf("acl: publish invite: %w", err)
 	}
 	if err := a.s.persistIssuedKey(ctx, techspace.IssuedKeyMember, res.InviteKey); err != nil {
+		return space.Invite{}, err
+	}
+	if err := a.s.publishInviteKey(ctx, res.InviteKey); err != nil {
 		return space.Invite{}, err
 	}
 	return space.Invite{SpaceId: a.s.id, InviteKey: res.InviteKey}, nil

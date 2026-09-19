@@ -119,8 +119,7 @@ func TestSDK_ACL_OwnerSurface(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, invs)
 
-	// Revoke-then-mint (the replacement flow — a second CreateInvite
-	// while one is active is ErrDuplicateInvite): custody follows the
+	// Revoke-then-mint rotates the token: custody follows the
 	// fresh invite, the old token is gone for good.
 	inv2, err := sp.ACL().CreateInvite(ctx)
 	require.NoError(t, err)

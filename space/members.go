@@ -188,14 +188,11 @@ type InviteInfo struct {
 	// RequestToJoin path it is set at accept time. Always
 	// PermissionNone here in v1.
 	Permission Permission
-	// Key is the invite private key when THIS account minted the
-	// invite: recovered from the account's synced issued-key custody
-	// (the ACL record carries only the public key), so it is present
-	// on every device of the minting account and nil everywhere else —
-	// other members', even admins', devices never held it. Also nil
-	// for invites minted before custody shipped (re-mint once to make
-	// them recoverable) and for custody gone stale (invite replaced /
-	// revoked elsewhere). Non-nil Key re-encodes to the original share
-	// token via EncodeInvite(Invite{SpaceId, InviteKey: Key}).
+	// Key is the active request-to-join key recovered from the encrypted
+	// space or the issuer's private custody. Available to every active
+	// member after sync, including readers. Nil for legacy invites whose
+	// issuer has not backfilled custody, missing keys, or inactive members.
+	// Re-encodes to the original token through EncodeInvite. Revoked keys
+	// are never returned: every candidate is matched against the live ACL.
 	Key crypto.PrivKey
 }

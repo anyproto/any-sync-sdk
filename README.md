@@ -163,5 +163,4 @@ The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's 
 
 ## License
 
-We plan to release Any under an open-source license. The specific license
-is **TBD** and will be added once that decision is made.
+Released under the [MIT License](LICENSE.md).

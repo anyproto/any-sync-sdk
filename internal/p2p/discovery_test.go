@@ -202,7 +202,10 @@ func TestDiscoverySwitchEndsAndResumesSession(t *testing.T) {
 	drv := newFakeDriver()
 	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
 	d.driver = drv
-	d.retryDelay = 20 * time.Millisecond
+	// Long on purpose: Disabled must be recorded as the session ends,
+	// not after this backoff, and the switch turning on must cut it
+	// short. Neither path may be paced by it.
+	d.retryDelay = 10 * time.Second
 
 	require.NoError(t, d.Run(context.Background()))
 	defer func() { require.NoError(t, d.Close(context.Background())) }()
@@ -212,21 +215,18 @@ func TestDiscoverySwitchEndsAndResumesSession(t *testing.T) {
 
 	// Restating the current value must not tear down a healthy session.
 	d.SetEnabled(true)
-	time.Sleep(5 * d.retryDelay)
+	time.Sleep(100 * time.Millisecond)
 	require.Equal(t, 1, drv.announceCount())
 
 	// Off: the LIVE session must end. The supervisor only re-probes
 	// between sessions, and a session on a healthy LAN never ends on
 	// its own, so without the nudge the device announces indefinitely.
-	// Disabled is recorded as the session ends, not after a backoff.
-	d.retryDelay = time.Hour
 	d.SetEnabled(false)
 	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
 	require.False(t, d.Enabled())
-	d.retryDelay = 20 * time.Millisecond
 
 	// And stays ended — no new session while the switch is off.
-	time.Sleep(5 * d.retryDelay)
+	time.Sleep(100 * time.Millisecond)
 	require.Equal(t, 1, drv.announceCount())
 
 	// On again: discovery comes back with no SDK restart.

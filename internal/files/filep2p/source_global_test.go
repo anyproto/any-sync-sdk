@@ -35,6 +35,7 @@ func (s stubPeer) DoDrpc(context.Context, func(conn drpc.Conn) error) error {
 type hangingDialPool struct {
 	mu        sync.Mutex
 	gets      int
+	picks     int
 	connected map[string]peer.Peer
 }
 
@@ -47,6 +48,9 @@ func (h *hangingDialPool) Get(ctx context.Context, _ string) (peer.Peer, error) 
 }
 
 func (h *hangingDialPool) Pick(_ context.Context, id string) (peer.Peer, error) {
+	h.mu.Lock()
+	h.picks++
+	h.mu.Unlock()
 	if p, ok := h.connected[id]; ok {
 		return p, nil
 	}
@@ -68,7 +72,7 @@ func TestSourceGlobalPeersPickOnly(t *testing.T) {
 	// A disconnected global peer is not banned: it is simply not
 	// connected right now.
 	src.banMu.Lock()
-	_, banned := src.banned["g2"]
+	_, banned := src.banned[banKey{"g2", true}]
 	src.banMu.Unlock()
 	require.False(t, banned)
 }
@@ -147,7 +151,7 @@ func TestSourceLanPeerKeepsTheShortBudget(t *testing.T) {
 	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
 
 	require.False(t, ok)
-	require.Less(t, time.Since(start), perGlobalPeerTimeout,
+	require.Less(t, time.Since(start), 2*perPeerTimeout,
 		"a LAN peer must not hold the sweep for the global budget")
 }
 
@@ -173,4 +177,53 @@ func TestPeerCarReadDeadlineIsPerLayer(t *testing.T) {
 	require.Equal(t, globalReadDeadline, global.PeerReadDeadline())
 	require.Zero(t, lan.PeerReadDeadline(), "a LAN read keeps the package default")
 	var _ fetch.PeerReadDeadliner = global
+}
+
+// A LAN failure must not remove the same device's relayed path: one
+// peer id, two paths, two very different budgets.
+func TestSourceBansArePerLayer(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
+	s := NewSource(pool, lanOnlyPeers{lan: []string{"d1"}})
+	// A LAN dial that never answers bans the LAN entry.
+	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.False(t, ok)
+
+	s.banMu.Lock()
+	_, lanBanned := s.banned[banKey{"d1", false}]
+	_, globalBanned := s.banned[banKey{"d1", true}]
+	s.banMu.Unlock()
+	require.True(t, lanBanned, "the failing LAN path is banned")
+	require.False(t, globalBanned, "the relayed path to the same device must survive")
+}
+
+// The caller giving up must not be recorded against the peer: banning
+// on an aborted download would drop the one device holding the file.
+func TestSourceDoesNotBanOnCallerCancel(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
+	s := NewSource(pool, lanOnlyPeers{lan: []string{"d1"}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, ok := s.SourceFor(ctx, "space1", testCid(t))
+	require.False(t, ok)
+	s.banMu.Lock()
+	n := len(s.banned)
+	s.banMu.Unlock()
+	require.Zero(t, n, "a cancelled caller says nothing about the peer")
+}
+
+// A stale global id that is not connected must not spend a try slot,
+// or it shadows the connected peer that actually holds the file: the
+// peer store ranks global ids by last-seen, not by connectedness.
+func TestSourceUnreachableCandidatesDoNotSpendTries(t *testing.T) {
+	answered := stubPeer{id: "live"} // answers the RPC (with an error)
+	pool := &hangingDialPool{connected: map[string]peer.Peer{"live": answered}}
+	// Four stale ids ahead of the connected one — more than
+	// maxCandidates, so a counter that charges unreachable candidates
+	// would break out before reaching it.
+	s := NewSource(pool, globalOnlyPeers{global: []string{"s1", "s2", "s3", "s4", "live"}})
+
+	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.False(t, ok, "the stub reports nothing held")
+	require.Equal(t, 5, pool.picks, "every candidate must be consulted; stale ids spent the budget")
 }

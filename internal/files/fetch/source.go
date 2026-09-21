@@ -29,13 +29,15 @@ type CarSource interface {
 	ReadProbe(ctx context.Context) (head []byte, total int64, err error)
 }
 
-// PeerSource selects a LAN peer that holds a file in full. It returns a
+// PeerSource selects a peer that holds a file in full — on the local
+// network or, more slowly, across the internet. It returns a
 // CarSource that reads the file's CAR object from that peer, plus a ban
 // hook the fetcher calls when the peer serves INVALID bytes (so a bad
 // peer is not re-selected). ok=false — no peer holds the file / p2p
-// disabled — means the fetch uses the public GET only. Selection must be
-// cheap and bounded (one FileCheck round) so it never spikes latency
-// when no peer has the file.
+// disabled — means the fetch uses the public GET only. Selection is
+// bounded as a whole, not only per candidate: a relayed FileCheck is
+// orders of magnitude slower than a LAN one, so an unbounded sweep
+// would spike latency exactly when no peer has the file.
 type PeerSource interface {
 	SourceFor(ctx context.Context, spaceId string, root cid.Cid) (src CarSource, ban func(), ok bool)
 }
@@ -59,7 +61,17 @@ type PeerReadDeadliner interface {
 	PeerReadDeadline() time.Duration
 }
 
-// peerDeadline is the budget for one read from the current peer source.
+// PeerProbeDeadliner states a budget for the head probe, which is one
+// round trip rather than a transfer. Without it a probe would inherit
+// the range budget, so a silently stalled peer costs a full range
+// deadline before the ladder demotes to HTTP.
+type PeerProbeDeadliner interface {
+	// PeerProbeDeadline returns the budget for one probe read, or zero
+	// to take the read budget.
+	PeerProbeDeadline() time.Duration
+}
+
+// peerDeadline is the budget for one range read from the current peer.
 func (fs *fetchSources) peerDeadline() time.Duration {
 	if d, ok := fs.peer.(PeerReadDeadliner); ok {
 		if v := d.PeerReadDeadline(); v > 0 {
@@ -67,6 +79,16 @@ func (fs *fetchSources) peerDeadline() time.Duration {
 		}
 	}
 	return peerPreferDeadline
+}
+
+// peerProbeDeadline is the budget for the head probe.
+func (fs *fetchSources) peerProbeDeadline() time.Duration {
+	if d, ok := fs.peer.(PeerProbeDeadliner); ok {
+		if v := d.PeerProbeDeadline(); v > 0 {
+			return v
+		}
+	}
+	return fs.peerDeadline()
 }
 
 // fetchSources are the ordered CAR sources for one fetch: a LAN peer
@@ -140,7 +162,7 @@ func (fs *fetchSources) readRange(ctx context.Context, off, length int64, valida
 // peer→HTTP validation ladder as readRange.
 func (fs *fetchSources) readProbe(ctx context.Context, validate func([]byte) error) (head []byte, total int64, err error) {
 	if fs.peer != nil && !fs.peerOff {
-		pctx, cancel := context.WithTimeout(ctx, fs.peerDeadline())
+		pctx, cancel := context.WithTimeout(ctx, fs.peerProbeDeadline())
 		head, total, err = fs.peer.ReadProbe(pctx)
 		cancel()
 		switch {

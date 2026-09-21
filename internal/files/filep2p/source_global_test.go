@@ -117,10 +117,8 @@ func (s slowCheckPeer) DoDrpc(ctx context.Context, _ func(conn drpc.Conn) error)
 }
 
 // A global candidate gets a budget sized for a relayed round trip, not
-// the LAN one. At the LAN figure a peer that holds the file in full is
-// never asked, the file reads as unavailable, and nothing names the
-// cause — measured across two machines, a 1.5 MB file would not
-// transfer at all until the budget was raised.
+// the LAN one: at the LAN figure a peer holding the file in full is
+// never asked and the file reads as unavailable.
 func TestSourceGlobalPeerGetsARelaySizedBudget(t *testing.T) {
 	require.Greater(t, perGlobalPeerTimeout, perPeerTimeout,
 		"a relayed FileCheck cannot share the LAN budget")
@@ -140,11 +138,13 @@ func TestSourceGlobalPeerGetsARelaySizedBudget(t *testing.T) {
 	require.Less(t, elapsed, perGlobalPeerTimeout, "and it must still be bounded")
 }
 
-// The LAN budget is unchanged: a slow LAN peer is still cut off fast so
-// the sweep reaches the peers behind it.
+// The LAN FileCheck budget is unchanged: a LAN peer that DIALS fine
+// and then answers slowly is still cut off at the short budget, so the
+// sweep reaches the peers behind it. The dial has to succeed or this
+// measures the dial timeout instead.
 func TestSourceLanPeerKeepsTheShortBudget(t *testing.T) {
 	slow := slowCheckPeer{id: "l1", delay: time.Hour}
-	pool := &hangingDialPool{connected: map[string]peer.Peer{"l1": slow}}
+	pool := &answeringDialPool{peers: map[string]peer.Peer{"l1": slow}}
 	s := NewSource(pool, lanOnlyPeers{lan: []string{"l1"}})
 
 	start := time.Now()
@@ -152,20 +152,28 @@ func TestSourceLanPeerKeepsTheShortBudget(t *testing.T) {
 
 	require.False(t, ok)
 	require.Less(t, time.Since(start), 2*perPeerTimeout,
-		"a LAN peer must not hold the sweep for the global budget")
+		"a LAN FileCheck must not get the relayed budget")
+}
+
+// answeringDialPool dials successfully, so the FileCheck budget is
+// what bounds the candidate.
+type answeringDialPool struct{ peers map[string]peer.Peer }
+
+func (a *answeringDialPool) Get(_ context.Context, id string) (peer.Peer, error) {
+	if p, ok := a.peers[id]; ok {
+		return p, nil
+	}
+	return nil, errors.New("no such peer")
+}
+
+func (a *answeringDialPool) Pick(ctx context.Context, id string) (peer.Peer, error) {
+	return a.Get(ctx, id)
 }
 
 type lanOnlyPeers struct{ lan []string }
 
 func (l lanOnlyPeers) LocalPeerIds(string) []string  { return l.lan }
 func (l lanOnlyPeers) GlobalPeerIds(string) []string { return nil }
-
-func testCid(t *testing.T) cid.Cid {
-	t.Helper()
-	root, err := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	require.NoError(t, err)
-	return root
-}
 
 // A global peerCar states a read budget of its own; a LAN one defers to
 // the fetch package's default. A range served across a relay runs at a
@@ -197,12 +205,13 @@ func TestSourceBansArePerLayer(t *testing.T) {
 }
 
 // The caller giving up must not be recorded against the peer: banning
-// on an aborted download would drop the one device holding the file.
+// on an aborted download would hide the one device holding the file
+// for banTTL. The cancel has to land MID-DIAL — a context already dead
+// when the sweep starts never reaches the ban path at all.
 func TestSourceDoesNotBanOnCallerCancel(t *testing.T) {
-	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
-	s := NewSource(pool, lanOnlyPeers{lan: []string{"d1"}})
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	pool := &cancellingDialPool{cancel: cancel}
+	s := NewSource(pool, lanOnlyPeers{lan: []string{"d1"}})
 
 	_, _, ok := s.SourceFor(ctx, "space1", testCid(t))
 	require.False(t, ok)
@@ -212,18 +221,69 @@ func TestSourceDoesNotBanOnCallerCancel(t *testing.T) {
 	require.Zero(t, n, "a cancelled caller says nothing about the peer")
 }
 
-// A stale global id that is not connected must not spend a try slot,
-// or it shadows the connected peer that actually holds the file: the
-// peer store ranks global ids by last-seen, not by connectedness.
-func TestSourceUnreachableCandidatesDoNotSpendTries(t *testing.T) {
-	answered := stubPeer{id: "live"} // answers the RPC (with an error)
-	pool := &hangingDialPool{connected: map[string]peer.Peer{"live": answered}}
-	// Four stale ids ahead of the connected one — more than
-	// maxCandidates, so a counter that charges unreachable candidates
-	// would break out before reaching it.
-	s := NewSource(pool, globalOnlyPeers{global: []string{"s1", "s2", "s3", "s4", "live"}})
+// cancellingDialPool cancels the caller while the dial is in flight.
+type cancellingDialPool struct {
+	hangingDialPool
+	cancel context.CancelFunc
+}
+
+func (c *cancellingDialPool) Get(ctx context.Context, _ string) (peer.Peer, error) {
+	c.cancel()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A layer that exhausts its own clock must not spend the next layer's:
+// stale LAN ids used to consume a shared budget, so the relayed peer
+// holding the file was never consulted.
+func TestSourceLayersDoNotStarveEachOther(t *testing.T) {
+	live := stubPeer{id: "g1"}
+	pool := &hangingDialPool{connected: map[string]peer.Peer{"g1": live}}
+	var lan []string
+	for i := 0; i < 12; i++ {
+		lan = append(lan, "stale"+string(rune('a'+i)))
+	}
+	s := NewSource(pool, bothLayerPeers{lan: lan, global: []string{"g1"}})
 
 	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
 	require.False(t, ok, "the stub reports nothing held")
-	require.Equal(t, 5, pool.picks, "every candidate must be consulted; stale ids spent the budget")
+	require.LessOrEqual(t, pool.gets, maxCandidates, "the LAN layer must stay bounded")
+	require.Positive(t, pool.picks, "the global layer must still be reached")
+}
+
+type bothLayerPeers struct{ lan, global []string }
+
+func (b bothLayerPeers) LocalPeerIds(string) []string  { return b.lan }
+func (b bothLayerPeers) GlobalPeerIds(string) []string { return b.global }
+
+// The global layer is bounded on its own terms: at most
+// maxCandidates consulted, and its clock is not spent by the LAN one.
+func TestSourceGlobalLayerIsBoundedSeparately(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
+	var global []string
+	for i := 0; i < 20; i++ {
+		global = append(global, "g"+string(rune('a'+i)))
+	}
+	s := NewSource(pool, globalOnlyPeers{global: global})
+
+	start := time.Now()
+	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.False(t, ok)
+	require.LessOrEqual(t, pool.picks, maxCandidates, "twenty stale ids must not all be consulted")
+	require.Less(t, time.Since(start), maxGlobalSweep, "and the layer's clock bounds it")
+}
+
+// The head probe cannot be tighter than the budget selection admitted
+// the peer under: both are one relayed round trip, so a peer accepted
+// at perGlobalPeerTimeout would otherwise fail its first read.
+func TestGlobalProbeBudgetCoversSelection(t *testing.T) {
+	require.GreaterOrEqual(t, globalProbeDeadline, perGlobalPeerTimeout)
+	require.GreaterOrEqual(t, globalReadDeadline, globalProbeDeadline)
+}
+
+func testCid(t *testing.T) cid.Cid {
+	t.Helper()
+	root, err := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+	require.NoError(t, err)
+	return root
 }

@@ -6,9 +6,8 @@ import (
 	"time"
 )
 
-// slowCar blocks past the LAN budget, then answers.
+// slowCar records the budget each read was given.
 type slowCar struct {
-	delay     time.Duration
 	readFor   time.Duration
 	probeFor  time.Duration
 	lastRange time.Duration
@@ -18,24 +17,17 @@ type slowCar struct {
 func (c *slowCar) PeerReadDeadline() time.Duration  { return c.readFor }
 func (c *slowCar) PeerProbeDeadline() time.Duration { return c.probeFor }
 
+// The assertions inspect the deadline the caller set, so the stub
+// answers at once: sleeping to "prove" it would only buy timer slop on
+// a loaded runner.
 func (c *slowCar) ReadRange(ctx context.Context, _, length int64) ([]byte, error) {
 	c.lastRange = budgetOf(ctx)
-	select {
-	case <-time.After(c.delay):
-		return make([]byte, length), nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return make([]byte, length), nil
 }
 
 func (c *slowCar) ReadProbe(ctx context.Context) ([]byte, int64, error) {
 	c.lastProbe = budgetOf(ctx)
-	select {
-	case <-time.After(c.delay):
-		return []byte{1}, 1, nil
-	case <-ctx.Done():
-		return nil, 0, ctx.Err()
-	}
+	return []byte{1}, 1, nil
 }
 
 func budgetOf(ctx context.Context) time.Duration {
@@ -50,13 +42,13 @@ func budgetOf(ctx context.Context) time.Duration {
 // reverting readRange/readProbe to the LAN constant leaves every test
 // green while every relayed read silently returns to 800ms.
 func TestReadsHonourADeclaredPeerBudget(t *testing.T) {
-	car := &slowCar{delay: peerPreferDeadline * 2, readFor: 6 * time.Second, probeFor: 2 * time.Second}
+	car := &slowCar{readFor: 6 * time.Second, probeFor: 2 * time.Second}
 	fs := &fetchSources{peer: car}
 
 	if _, err := fs.readRange(context.Background(), 0, 8, nil); err != nil {
 		t.Fatalf("a read inside the declared budget must succeed: %v", err)
 	}
-	if car.lastRange < peerPreferDeadline*2 {
+	if car.lastRange <= peerPreferDeadline {
 		t.Errorf("range budget = %v, want the declared %v", car.lastRange, car.readFor)
 	}
 	if _, _, err := fs.readProbe(context.Background(), nil); err != nil {

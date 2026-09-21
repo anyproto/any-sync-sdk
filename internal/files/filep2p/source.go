@@ -27,21 +27,18 @@ const (
 	// time out and be banned. A LAN round trip is sub-millisecond, so
 	// this is already generous there.
 	perPeerTimeout = 700 * time.Millisecond
-	// perGlobalPeerTimeout is the same budget for a global candidate,
-	// whose FileCheck crosses the internet and usually a relay. The LAN
-	// figure sits right at the edge of a relayed round trip: the check
-	// times out, the file is reported unavailable, and a peer that holds
-	// it in full is never asked — so files simply do not transfer over
-	// the global layer, intermittently and with no error naming the
-	// cause. Kept under the connector's own global dial timeout, since a
-	// global candidate is picked from the pool rather than dialed.
+	// perGlobalPeerTimeout is the budget for a global candidate, whose
+	// FileCheck crosses the internet and usually a relay. The LAN
+	// figure sits at the edge of a relayed round trip, so the check
+	// times out and a peer holding the file in full is never asked.
+	// What this bounds is the FileCheck RPC: the pick itself is
+	// already capped at p2p.PickTimeout.
 	perGlobalPeerTimeout = 5 * time.Second
-	// maxSweep bounds the WHOLE selection sweep, not just each
-	// candidate. The per-candidate budgets multiply by the number of
-	// candidates, and a fetch that has an HTTP fallback must reach it
-	// in reasonable time rather than spending a minute discovering
-	// that every peer is stalled.
-	maxSweep = 8 * time.Second
+	// maxLanSweep / maxGlobalSweep bound each layer's whole sweep. Per
+	// layer, not shared: a shared clock lets stale LAN ids spend it all
+	// before any relayed peer is consulted.
+	maxLanSweep    = 3 * time.Second
+	maxGlobalSweep = 8 * time.Second
 	// globalReadDeadline is the budget for ONE range read from a global
 	// peer, replacing the fetch package's LAN default. The fetcher
 	// coalesces at most maxFetchSpan (4 MiB) per read and a relayed
@@ -49,14 +46,13 @@ const (
 	// with no durable copy to fall back on, that expiry fails the whole
 	// fetch.
 	globalReadDeadline = 10 * time.Second
-	// globalProbeDeadline is the budget for the 4 KiB head probe, which
-	// is one round trip rather than a transfer. Giving it the range
-	// budget would make a silently stalled peer cost globalReadDeadline
-	// before the ladder demotes to HTTP.
-	globalProbeDeadline = 2 * time.Second
-	// maxCandidates caps how many peers we FileCheck before giving up
-	// and using HTTP — keeps selection bounded on a busy LAN, and bounds
-	// the worst case once global candidates carry the larger budget.
+	// globalProbeDeadline covers the 4 KiB head probe — one relayed
+	// round trip, like the FileCheck that selected the peer, so it
+	// cannot be smaller than the budget that selection passed under or
+	// a peer admitted at 5s would fail its first read.
+	globalProbeDeadline = perGlobalPeerTimeout
+	// maxCandidates caps how many peers of ONE layer we consult before
+	// giving up and using HTTP.
 	maxCandidates = 3
 	// banTTL keeps a peer that failed to dial/serve out of selection.
 	banTTL = 5 * time.Minute
@@ -103,40 +99,46 @@ var (
 // that peer (called by the fetcher if it serves invalid bytes).
 // ok=false when no peer holds the file.
 //
-// The two layers get separate try budgets. They used to share one, so
-// three LAN peers that did not have the file could spend it before any
-// global peer was asked — a file no LAN peer holds and a relayed peer
-// does would never be found. The whole sweep is bounded as well as each
-// candidate: a fetch with an HTTP fallback must reach it in reasonable
-// time, and the per-candidate budgets multiply.
+// Each layer gets its own try count AND its own clock. Sharing either
+// starves the global layer: LAN ids come first and a handful of stale
+// ones exhaust a shared budget before any relayed peer is asked.
 func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (fetch.CarSource, func(), bool) {
-	sctx, cancel := context.WithTimeout(ctx, maxSweep)
-	defer cancel()
 	for _, layer := range []struct {
-		ids    []string
+		ids    func() []string
 		global bool
+		sweep  time.Duration
 	}{
-		{ids: s.filterBanned(s.peers.LocalPeerIds(spaceId), false)},
-		{ids: s.filterBanned(s.peers.GlobalPeerIds(spaceId), true), global: true},
+		{ids: func() []string { return s.filterBanned(s.peers.LocalPeerIds(spaceId), false) }, sweep: maxLanSweep},
+		// Built lazily: resolving the global set unions in every
+		// account peer and ranks them, all wasted when a LAN peer
+		// answers first.
+		{ids: func() []string { return s.filterBanned(s.peers.GlobalPeerIds(spaceId), true) }, global: true, sweep: maxGlobalSweep},
 	} {
-		tried := 0
-		for _, id := range layer.ids {
-			if tried >= maxCandidates || sctx.Err() != nil {
-				break
-			}
-			full, reached := s.holdsFull(sctx, id, layer.global, spaceId, root)
-			if reached {
-				// Only a candidate we actually reached spends a slot.
-				// Counting unreachable ones let stale global ids — the
-				// peer store ranks by last-seen, not by connectedness —
-				// shadow the connected peer that has the file.
-				tried++
-			}
-			if full {
-				peerId, global := id, layer.global
-				car := &peerCar{pool: s.pool, peerId: peerId, global: global, spaceId: spaceId, root: root}
-				return car, func() { s.ban(peerId, global) }, true
-			}
+		lctx, cancel := context.WithTimeout(ctx, layer.sweep)
+		src, ban, ok := s.sweepLayer(lctx, ctx, layer.ids(), layer.global, spaceId, root)
+		cancel()
+		if ok {
+			return src, ban, true
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, nil, false
+}
+
+// sweepLayer consults up to maxCandidates peers of one layer. lctx
+// carries this layer's clock; ctx is the caller's, used to tell "the
+// caller gave up" from "this layer ran out of budget".
+func (s *Source) sweepLayer(lctx, ctx context.Context, ids []string, global bool, spaceId string, root cid.Cid) (fetch.CarSource, func(), bool) {
+	for i, id := range ids {
+		if i >= maxCandidates || lctx.Err() != nil {
+			break
+		}
+		if s.holdsFull(lctx, ctx, id, global, spaceId, root) {
+			peerId := id
+			car := &peerCar{pool: s.pool, peerId: peerId, global: global, spaceId: spaceId, root: root}
+			return car, func() { s.ban(peerId, global) }, true
 		}
 	}
 	return nil, nil, false
@@ -147,26 +149,24 @@ func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (f
 // only picked from the pool and skipped, not banned, when it has no
 // live connection. A dial/RPC failure bans the peer — it is
 // unreachable — but a plain "not full" answer does not, and neither
-// does the CALLER's context ending: an aborted download or an expired
-// request deadline says nothing about the peer, and banning on it
-// would drop the one device holding the file for banTTL.
-//
-// reached reports whether the peer answered at all, so the caller can
-// charge a try only for a candidate that was really consulted.
-func (s *Source) holdsFull(ctx context.Context, peerId string, global bool, spaceId string, root cid.Cid) (full, reached bool) {
+// does the CALLER's context ending: an aborted download says nothing
+// about the peer, and banTTL is long enough to hide the only device
+// holding the file.
+func (s *Source) holdsFull(lctx, ctx context.Context, peerId string, global bool, spaceId string, root cid.Cid) bool {
 	budget := perPeerTimeout
 	if global {
 		budget = perGlobalPeerTimeout
 	}
-	pctx, cancel := context.WithTimeout(ctx, budget)
+	pctx, cancel := context.WithTimeout(lctx, budget)
 	defer cancel()
 	p, err := s.peer(pctx, peerId, global)
 	if err != nil {
-		if !global && !callerDone(ctx) {
+		if !global && ctx.Err() == nil {
 			s.ban(peerId, global)
 		}
-		return false, false
+		return false
 	}
+	var full bool
 	err = p.DoDrpc(pctx, func(conn drpc.Conn) error {
 		resp, derr := filep2p.NewDRPCFileP2PClient(conn).FileCheck(pctx, &filep2p.FileCheckRequest{
 			SpaceId:  spaceId,
@@ -183,17 +183,13 @@ func (s *Source) holdsFull(ctx context.Context, peerId string, global bool, spac
 		return nil
 	})
 	if err != nil {
-		if !callerDone(ctx) {
+		if ctx.Err() == nil {
 			s.ban(peerId, global)
 		}
-		return false, false
+		return false
 	}
-	return full, true
+	return full
 }
-
-// callerDone reports that the sweep's own context ended — the caller
-// gave up or ran out of budget — as opposed to this peer failing.
-func callerDone(ctx context.Context) bool { return ctx.Err() != nil }
 
 // peer resolves a candidate: dial for LAN, live connection only for
 // global.
@@ -225,14 +221,18 @@ func (s *Source) filterBanned(ids []string, global bool) []string {
 	s.banMu.Lock()
 	defer s.banMu.Unlock()
 	now := time.Now()
+	// Drop every expired ban, not only the ones whose id is in this
+	// list: a peer that left the network is never handed back, so a
+	// lazy per-id cleanup would keep its entry for the process life.
+	for k, until := range s.banned {
+		if !now.Before(until) {
+			delete(s.banned, k)
+		}
+	}
 	out := ids[:0:0]
 	for _, id := range ids {
-		k := banKey{id, global}
-		if until, ok := s.banned[k]; ok {
-			if now.Before(until) {
-				continue
-			}
-			delete(s.banned, k) // lazy cleanup of an expired ban
+		if _, banned := s.banned[banKey{id, global}]; banned {
+			continue
 		}
 		out = append(out, id)
 	}

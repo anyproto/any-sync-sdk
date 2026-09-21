@@ -238,10 +238,15 @@ func (d *Discovery) setPossibility(p sdkp2p.Possibility) {
 // the switch turning on is picked up at once through its nudge.
 func (d *Discovery) superviseLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		d.setPossibility(d.probe(ctx))
+		p := d.probe(ctx)
 		// The switch is re-read after the probe: a flip in between must
-		// not start a session; its nudge is consumed by backOff.
-		if d.Possibility() == sdkp2p.PossibilityPossible && d.enabled.Load() {
+		// neither publish Possible nor start a session; its nudge is
+		// consumed by backOff.
+		if !d.enabled.Load() {
+			p = sdkp2p.PossibilityDisabled
+		}
+		d.setPossibility(p)
+		if p == sdkp2p.PossibilityPossible {
 			d.runSession(ctx)
 		}
 		if !d.backOff(ctx) {
@@ -281,6 +286,9 @@ func (d *Discovery) runSession(ctx context.Context) {
 	go func() {
 		defer swg.Done()
 		defer cancel() // announce died → end the session
+		if !d.enabled.Load() {
+			return // switched off since the supervisor's check: no multicast
+		}
 		if err := d.driver.Announce(sctx, sdkp2p.Announcement{
 			PeerId:      d.peerId,
 			Port:        d.port,

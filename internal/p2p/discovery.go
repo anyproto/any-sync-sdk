@@ -239,8 +239,8 @@ func (d *Discovery) setPossibility(p sdkp2p.Possibility) {
 
 // superviseLoop re-runs discovery sessions until the component closes.
 // Each iteration re-probes possibility, so plugging in a cable or
-// granting the iOS permission is picked up within a retry cycle — or at
-// once, when SetEnabled nudges it.
+// granting the iOS permission is picked up within a retry cycle, and
+// the switch turning on is picked up at once through its nudge.
 func (d *Discovery) superviseLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		d.setPossibility(d.probe(ctx))
@@ -272,8 +272,8 @@ func (d *Discovery) backOff(ctx context.Context) bool {
 
 // runSession runs one announce+browse pair under a child context and
 // blocks until it ends: driver death, interface-set change (watcher
-// cancels for a clean restart), the switch turning off or the probe
-// turning negative, or component close.
+// cancels for a clean restart), the switch turning off, or component
+// close.
 func (d *Discovery) runSession(ctx context.Context) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -306,19 +306,19 @@ func (d *Discovery) runSession(ctx context.Context) {
 		cancel()
 		swg.Wait()
 	}
-	// ended re-probes in the middle of the live session and ends it on
-	// a negative answer. The supervisor otherwise re-probes only BETWEEN
-	// sessions, and a session on a healthy LAN never ends on its own —
-	// so the switch turning off, or an injected probe that starts
-	// answering Restricted, would go unheard for the life of the
-	// process. Recording the new state is the supervisor's job: it
-	// re-probes at the top of its next iteration.
+	// ended checks the switch in the middle of the live session and ends
+	// it once off. The supervisor otherwise re-probes only BETWEEN
+	// sessions, and a session on a healthy LAN never ends on its own, so
+	// a host turning discovery off would go unheard for the life of the
+	// process. Only the switch is checked here, not the platform probe:
+	// one flaky probe answer must not tear down a healthy session.
+	// Recording the new state is the supervisor's job: it re-probes at
+	// the top of its next iteration.
 	ended := func() bool {
-		p := d.probe(sctx)
-		if p == sdkp2p.PossibilityPossible {
+		if d.enabled.Load() {
 			return false
 		}
-		log.Info("discovery no longer possible, ending session", zap.Stringer("state", p))
+		log.Info("local discovery switched off, ending session")
 		endSession()
 		return true
 	}
@@ -395,23 +395,14 @@ func (d *Discovery) emit(ev discoveryEvent) {
 }
 
 // probe determines whether discovery can work right now: Disabled while
-// the switch is off; otherwise the injected platform probe if any, else
-// "is there a usable multicast interface with an IPv4 address" — and the
-// interface check also covers a probe that answers Unknown.
+// the switch is off; otherwise the injected platform probe if any (iOS),
+// else "is there a usable multicast interface with an IPv4 address".
 func (d *Discovery) probe(ctx context.Context) sdkp2p.Possibility {
 	if !d.enabled.Load() {
 		return sdkp2p.PossibilityDisabled
 	}
 	if f := sdkp2p.PossibilityProbe(); f != nil {
-		// Unknown is a host saying "I have nothing to add", not an
-		// answer: fall through to the interface check rather than
-		// reporting a state that stops discovery for a reason nobody
-		// named. It is what lets a host override only the half it
-		// knows — "the OS refuses local-network access" — without
-		// having to reimplement the interface check to say "carry on".
-		if p := f(ctx, d.port); p != sdkp2p.PossibilityUnknown {
-			return p
-		}
+		return f(ctx, d.port)
 	}
 	if len(ownIPv4s()) == 0 {
 		return sdkp2p.PossibilityNoInterfaces

@@ -118,16 +118,11 @@ func InterfaceProvider() func() ([]net.Interface, error) {
 // Network permission being denied. Pass nil to restore the default
 // (interface-based) check.
 //
-// A probe may return PossibilityUnknown to mean "nothing to add right
-// now"; the SDK then falls back to its own interface check. That is how
-// a host overrides only the half it knows — whether the OS permits
-// local-network access — without reimplementing the rest.
-//
-// The probe is re-read on every cycle and once per resweep mid-session,
-// so it may change its answer over the life of the process. It is not
-// consulted while local discovery is switched off
-// (SDK.SetLocalDiscoveryEnabled); a host that knows the answer states it
-// through the switch rather than through the probe.
+// The probe is re-read before every discovery session, not during one,
+// so a change of answer takes effect at the next session start. It is
+// not consulted while local discovery is switched off
+// (SDK.SetLocalDiscoveryEnabled); a host that knows the answer states
+// it through the switch rather than through the probe.
 func SetPossibilityProbe(f func(ctx context.Context, port int) Possibility) {
 	injectMu.Lock()
 	defer injectMu.Unlock()

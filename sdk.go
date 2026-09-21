@@ -951,9 +951,13 @@ func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 // SetLocalDiscoveryEnabled switches mDNS announce and browse on or off
 // without a restart. Off ends the running discovery session at once and
 // starts no other; on starts one immediately, subject to the usual
-// possibility check. The QUIC listener and the global (iroh) layer are
-// unaffected; already-known LAN peers stay connected. Restating the
-// current value is a no-op.
+// possibility check. Restating the current value is a no-op.
+//
+// The switch governs discovery traffic only. The QUIC listener and the
+// global (iroh) layer are unaffected, and LAN peers already known stay
+// in the peer store and dialable: a live connection to one is kept,
+// and sync status keeps reporting it. A host that must stop every
+// local-network exchange, not just the scanning, uses p2p.enabled.
 //
 // Config p2p.localDiscovery sets the state at Open. Hosts that own a
 // local-network permission flow — a desktop shell around the macOS
@@ -961,6 +965,10 @@ func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 // with it off and turn it on once the user has answered; a host whose
 // user turns LAN discovery off in settings uses the same switch.
 func (s *SDK) SetLocalDiscoveryEnabled(enabled bool) { s.app.SetLocalDiscoveryEnabled(enabled) }
+
+// LocalDiscoveryEnabled is the local-discovery switch state. Cheap:
+// hosts polling it need not build the P2PStatus snapshot.
+func (s *SDK) LocalDiscoveryEnabled() bool { return s.app.LocalDiscoveryEnabled() }
 
 // AccountAPI exposes account-level operations outside any space.
 type AccountAPI interface {

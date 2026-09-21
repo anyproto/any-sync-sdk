@@ -254,49 +254,31 @@ func TestDiscoveryStartsOffFromConfigAndSwitchCutsShortTheBackoff(t *testing.T) 
 	waitFor(t, func() bool { return drv.announceCount() == 1 })
 }
 
-func TestDiscoveryReprobesOnResweep(t *testing.T) {
+func TestDiscoveryProbeReadBetweenSessionsAndSwitchWinsOverIt(t *testing.T) {
 	var restricted atomic.Bool
+	restricted.Store(true)
 	setProbe(t, &restricted)
 
 	drv := newFakeDriver()
 	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
 	d.driver = drv
 	d.retryDelay = 20 * time.Millisecond
-	d.resweepEvery = 20 * time.Millisecond
 
 	require.NoError(t, d.Run(context.Background()))
 	defer func() { require.NoError(t, d.Close(context.Background())) }()
-	awaitSession(t, drv)
-	waitFor(t, func() bool { return drv.announceCount() == 1 })
-
-	// An injected probe that changes its mind is honoured within one
-	// resweep, without any nudge.
-	restricted.Store(true)
 	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
-	time.Sleep(5 * d.retryDelay)
-	require.Equal(t, 1, drv.announceCount())
+	require.Equal(t, 0, drv.announceCount())
 
-	// And the switch wins over the probe: off is Disabled, not Restricted.
+	// The switch wins over the probe: off is Disabled, not Restricted,
+	// and the probe is not consulted at all while off.
 	d.SetEnabled(false)
 	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
-}
 
-func TestDiscoveryProbeUnknownFallsBackToInterfaceCheck(t *testing.T) {
-	sdkp2p.SetPossibilityProbe(func(context.Context, int) sdkp2p.Possibility {
-		return sdkp2p.PossibilityUnknown
-	})
-	t.Cleanup(func() { sdkp2p.SetPossibilityProbe(nil) })
-
-	drv := newFakeDriver()
-	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
-	d.driver = drv
-	d.retryDelay = 20 * time.Millisecond
-
-	require.NoError(t, d.Run(context.Background()))
-	defer func() { require.NoError(t, d.Close(context.Background())) }()
-
-	// A host with nothing to say must not stop discovery: Unknown means
-	// "ask your own check", and this machine has interfaces.
+	// Granted after the fact: the probe is re-read before every session,
+	// so switching on with a positive probe starts one within a cycle.
+	restricted.Store(false)
+	d.SetEnabled(true)
 	awaitSession(t, drv)
-	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityPossible })
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
+	require.Equal(t, sdkp2p.PossibilityPossible, d.Possibility())
 }

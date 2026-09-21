@@ -870,10 +870,11 @@ func pickLive(pl pool.Pool, id string) bool {
 // verdicts (NotPossible on missing interfaces, Restricted on a denied
 // local-network permission) still surface while the LAN layer is on —
 // the global layer does not hide why the LAN path is down. Local
-// discovery switched off counts as the LAN layer being off. Pure so
-// it's unit-testable without the app graph.
+// discovery switched off stops finding peers but keeps the ones already
+// known dialable, so a live LAN peer still counts; with nobody live it
+// is NotPossible only when no layer can find anyone. Pure so it's
+// unit-testable without the app graph.
 func p2pStateFor(lanEnabled, globalEnabled bool, poss sdkp2p.Possibility, localPeerIds, globalPeerIds []string, pickable func(string) bool) space.P2PState {
-	lanEnabled = lanEnabled && poss != sdkp2p.PossibilityDisabled
 	if !lanEnabled && !globalEnabled {
 		return space.P2PStateNotPossible
 	}
@@ -898,6 +899,10 @@ func p2pStateFor(lanEnabled, globalEnabled bool, poss sdkp2p.Possibility, localP
 			return space.P2PStateNotPossible
 		case sdkp2p.PossibilityRestricted:
 			return space.P2PStateRestricted
+		case sdkp2p.PossibilityDisabled:
+			if !globalEnabled {
+				return space.P2PStateNotPossible
+			}
 		}
 	}
 	return space.P2PStateNotConnected
@@ -914,6 +919,9 @@ func globalPeersOrNil(store *p2p.PeerStore, enabled bool) globalPeerSource {
 
 // SetLocalDiscoveryEnabled switches mDNS announce and browse at runtime.
 func (a *App) SetLocalDiscoveryEnabled(enabled bool) { a.discovery.SetEnabled(enabled) }
+
+// LocalDiscoveryEnabled is the mDNS switch state.
+func (a *App) LocalDiscoveryEnabled() bool { return a.discovery.Enabled() }
 
 // P2PStatus is the account-wide p2p snapshot for the debug surface:
 // LAN listener state, discovery possibility, every LAN peer with its

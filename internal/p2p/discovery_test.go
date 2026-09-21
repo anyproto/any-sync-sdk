@@ -198,10 +198,7 @@ func setProbe(t *testing.T, restricted *atomic.Bool) {
 	t.Cleanup(func() { sdkp2p.SetPossibilityProbe(nil) })
 }
 
-func TestDiscoveryEndsAndResumesSessionOnProbeChange(t *testing.T) {
-	var restricted atomic.Bool
-	setProbe(t, &restricted)
-
+func TestDiscoverySwitchEndsAndResumesSession(t *testing.T) {
 	drv := newFakeDriver()
 	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
 	d.driver = drv
@@ -209,27 +206,52 @@ func TestDiscoveryEndsAndResumesSessionOnProbeChange(t *testing.T) {
 
 	require.NoError(t, d.Run(context.Background()))
 	defer func() { require.NoError(t, d.Close(context.Background())) }()
-	<-drv.ready
+	awaitSession(t, drv)
 	waitFor(t, func() bool { return drv.announceCount() == 1 })
+	require.True(t, d.Enabled())
 
-	// The host has learned the OS refuses local-network access. The LIVE
-	// session must end: the supervisor only re-probes between sessions,
-	// and a session on a healthy LAN never ends on its own, so without
-	// this the device announces into a dropped path indefinitely.
-	restricted.Store(true)
-	d.RefreshPossibility()
-	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
-
-	// And stays ended — no new session while the probe says restricted.
+	// Restating the current value must not tear down a healthy session.
+	d.SetEnabled(true)
 	time.Sleep(5 * d.retryDelay)
 	require.Equal(t, 1, drv.announceCount())
 
-	// Granted after the fact: discovery comes back with no SDK restart.
-	restricted.Store(false)
-	d.RefreshPossibility()
+	// Off: the LIVE session must end. The supervisor only re-probes
+	// between sessions, and a session on a healthy LAN never ends on
+	// its own, so without the nudge the device announces indefinitely.
+	d.SetEnabled(false)
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
+	require.False(t, d.Enabled())
+
+	// And stays ended — no new session while the switch is off.
+	time.Sleep(5 * d.retryDelay)
+	require.Equal(t, 1, drv.announceCount())
+
+	// On again: discovery comes back with no SDK restart.
+	d.SetEnabled(true)
 	awaitSession(t, drv)
 	waitFor(t, func() bool { return drv.announceCount() == 2 })
 	require.Equal(t, sdkp2p.PossibilityPossible, d.Possibility())
+}
+
+func TestDiscoveryStartsOffFromConfigAndSwitchCutsShortTheBackoff(t *testing.T) {
+	off := false
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{LocalDiscovery: &off}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	// Only the switch can get the supervisor out of this: a host that
+	// has just been granted the permission must not sit out the backoff.
+	d.retryDelay = time.Hour
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+	// Not a single multicast send before the host says so: this is what
+	// keeps the macOS Local Network prompt from firing at boot.
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
+	require.Equal(t, 0, drv.announceCount())
+
+	d.SetEnabled(true)
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
 }
 
 func TestDiscoveryReprobesOnResweep(t *testing.T) {
@@ -244,36 +266,19 @@ func TestDiscoveryReprobesOnResweep(t *testing.T) {
 
 	require.NoError(t, d.Run(context.Background()))
 	defer func() { require.NoError(t, d.Close(context.Background())) }()
-	<-drv.ready
-	waitFor(t, func() bool { return drv.announceCount() == 1 })
-
-	// No RefreshPossibility here: a host that never nudges must still
-	// converge, within one resweep.
-	restricted.Store(true)
-	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
-}
-
-func TestDiscoveryRefreshCutsShortTheRetryBackoff(t *testing.T) {
-	var restricted atomic.Bool
-	restricted.Store(true)
-	setProbe(t, &restricted)
-
-	drv := newFakeDriver()
-	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
-	d.driver = drv
-	// Only a refresh can get the supervisor out of this: a host that has
-	// just been granted the permission must not sit out the backoff.
-	d.retryDelay = time.Hour
-
-	require.NoError(t, d.Run(context.Background()))
-	defer func() { require.NoError(t, d.Close(context.Background())) }()
-	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
-	require.Equal(t, 0, drv.announceCount())
-
-	restricted.Store(false)
-	d.RefreshPossibility()
 	awaitSession(t, drv)
 	waitFor(t, func() bool { return drv.announceCount() == 1 })
+
+	// An injected probe that changes its mind is honoured within one
+	// resweep, without any nudge.
+	restricted.Store(true)
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
+	time.Sleep(5 * d.retryDelay)
+	require.Equal(t, 1, drv.announceCount())
+
+	// And the switch wins over the probe: off is Disabled, not Restricted.
+	d.SetEnabled(false)
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
 }
 
 func TestDiscoveryProbeUnknownFallsBackToInterfaceCheck(t *testing.T) {

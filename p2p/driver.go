@@ -45,6 +45,9 @@ const (
 	// PossibilityRestricted — the OS denies local-network access
 	// (e.g. iOS Local Network permission).
 	PossibilityRestricted
+	// PossibilityDisabled — the host switched local discovery off
+	// (config p2p.localDiscovery, SDK.SetLocalDiscoveryEnabled).
+	PossibilityDisabled
 )
 
 // String returns a stable lowercase token for logging / wire mapping.
@@ -56,6 +59,8 @@ func (p Possibility) String() string {
 		return "nointerfaces"
 	case PossibilityRestricted:
 		return "restricted"
+	case PossibilityDisabled:
+		return "disabled"
 	default:
 		return "unknown"
 	}
@@ -118,9 +123,11 @@ func InterfaceProvider() func() ([]net.Interface, error) {
 // a host overrides only the half it knows — whether the OS permits
 // local-network access — without reimplementing the rest.
 //
-// The probe is re-read on every cycle and mid-session, so it may change
-// its answer over the life of the process; see SDK.RefreshP2PPossibility
-// for applying a change at once.
+// The probe is re-read on every cycle and once per resweep mid-session,
+// so it may change its answer over the life of the process. It is not
+// consulted while local discovery is switched off
+// (SDK.SetLocalDiscoveryEnabled); a host that knows the answer states it
+// through the switch rather than through the probe.
 func SetPossibilityProbe(f func(ctx context.Context, port int) Possibility) {
 	injectMu.Lock()
 	defer injectMu.Unlock()

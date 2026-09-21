@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/any-sync/app"
@@ -83,6 +84,11 @@ type Discovery struct {
 	wg      sync.WaitGroup
 	port    int
 
+	// enabled is the local-discovery switch (config p2p.localDiscovery,
+	// SetEnabled). Read by probe on every cycle; off reads as
+	// PossibilityDisabled.
+	enabled atomic.Bool
+
 	// timing knobs — the constants above, overridable in tests.
 	resweepEvery time.Duration
 	retryDelay   time.Duration
@@ -97,7 +103,7 @@ func NewDiscovery(cfg config.P2P, peerId string, portFn func() (int, bool), noti
 	if serviceType == "" {
 		serviceType = DefaultServiceType
 	}
-	return &Discovery{
+	d := &Discovery{
 		cfg:          cfg,
 		serviceType:  serviceType,
 		peerId:       peerId,
@@ -108,6 +114,8 @@ func NewDiscovery(cfg config.P2P, peerId string, portFn func() (int, bool), noti
 		resweepEvery: resweepInterval,
 		retryDelay:   sessionRetryDelay,
 	}
+	d.enabled.Store(cfg.IsLocalDiscoveryEnabled())
+	return d
 }
 
 func (d *Discovery) Init(_ *app.App) error {
@@ -170,15 +178,33 @@ func (d *Discovery) Possibility() sdkp2p.Possibility {
 	return d.possibility
 }
 
-// RefreshPossibility asks discovery to re-probe now rather than at its
-// next cycle. Non-blocking and coalescing: a burst collapses into one
-// re-probe, and a call made while nothing is listening is held until it
-// is.
+// Enabled is the local-discovery switch state: config p2p.localDiscovery
+// at start, SetEnabled afterwards.
+func (d *Discovery) Enabled() bool { return d.enabled.Load() }
+
+// SetEnabled switches mDNS announce and browse on or off at runtime.
+// Off ends a live session at once and keeps the supervisor from
+// starting another; on starts a session as soon as the probe allows,
+// cutting short any retry backoff. A restatement of the current value
+// is a no-op, so a host may call it freely without tearing down a
+// healthy session.
 //
-// For hosts that LEARN the answer instead of polling for it — a desktop
-// shell that has just detected the OS granting or refusing local-network
-// access, and wants the injected probe honoured at once.
-func (d *Discovery) RefreshPossibility() {
+// For hosts that own a local-network permission flow: the macOS Local
+// Network prompt fires on the first multicast send, so such a host
+// starts with the switch off in config and turns it on once the user
+// has answered.
+func (d *Discovery) SetEnabled(enabled bool) {
+	if d.enabled.Swap(enabled) == enabled {
+		return
+	}
+	d.nudge()
+}
+
+// nudge wakes the supervisor to re-probe now rather than at its next
+// cycle. Non-blocking and coalescing: a burst collapses into one
+// re-probe, and a nudge sent while nothing is listening is held until
+// something is.
+func (d *Discovery) nudge() {
 	select {
 	case d.refresh <- struct{}{}:
 	default:
@@ -205,7 +231,7 @@ func (d *Discovery) setPossibility(p sdkp2p.Possibility) {
 	d.possibility = p
 	hooks := d.hooks
 	d.mu.Unlock()
-	log.Info("discovery possibility changed", zap.Uint8("state", uint8(p)))
+	log.Info("discovery possibility changed", zap.Stringer("state", p))
 	for _, fn := range hooks {
 		fn(p)
 	}
@@ -214,7 +240,7 @@ func (d *Discovery) setPossibility(p sdkp2p.Possibility) {
 // superviseLoop re-runs discovery sessions until the component closes.
 // Each iteration re-probes possibility, so plugging in a cable or
 // granting the iOS permission is picked up within a retry cycle — or at
-// once, when RefreshPossibility fires.
+// once, when SetEnabled nudges it.
 func (d *Discovery) superviseLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		d.setPossibility(d.probe(ctx))
@@ -228,9 +254,9 @@ func (d *Discovery) superviseLoop(ctx context.Context) {
 }
 
 // backOff paces the supervisor between sessions, cutting the wait short
-// on a refresh: a host that has just learned local-network access came
-// back should not sit out a delay it knows is pointless. Reports false
-// when the component is closing.
+// on a nudge: a host that has just switched discovery on should not sit
+// out a delay it knows is pointless. Reports false when the component
+// is closing.
 func (d *Discovery) backOff(ctx context.Context) bool {
 	timer := time.NewTimer(d.retryDelay)
 	defer timer.Stop()
@@ -244,22 +270,10 @@ func (d *Discovery) backOff(ctx context.Context) bool {
 	}
 }
 
-// stillPossible re-probes in the middle of a live session. The
-// supervisor otherwise re-probes only BETWEEN sessions, and a session on
-// a healthy LAN never ends on its own — so an injected probe that starts
-// answering Restricted (a host that has learned the OS refuses
-// local-network access) would go unheard for the life of the process.
-//
-// Recording the new state is the supervisor's job, not this one's: it
-// re-probes at the top of its next iteration, which a false answer here
-// reaches immediately.
-func (d *Discovery) stillPossible(ctx context.Context) bool {
-	return d.probe(ctx) == sdkp2p.PossibilityPossible
-}
-
 // runSession runs one announce+browse pair under a child context and
 // blocks until it ends: driver death, interface-set change (watcher
-// cancels for a clean restart), or component close.
+// cancels for a clean restart), the switch turning off or the probe
+// turning negative, or component close.
 func (d *Discovery) runSession(ctx context.Context) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -292,15 +306,29 @@ func (d *Discovery) runSession(ctx context.Context) {
 		cancel()
 		swg.Wait()
 	}
+	// ended re-probes in the middle of the live session and ends it on
+	// a negative answer. The supervisor otherwise re-probes only BETWEEN
+	// sessions, and a session on a healthy LAN never ends on its own —
+	// so the switch turning off, or an injected probe that starts
+	// answering Restricted, would go unheard for the life of the
+	// process. Recording the new state is the supervisor's job: it
+	// re-probes at the top of its next iteration.
+	ended := func() bool {
+		p := d.probe(sctx)
+		if p == sdkp2p.PossibilityPossible {
+			return false
+		}
+		log.Info("discovery no longer possible, ending session", zap.Stringer("state", p))
+		endSession()
+		return true
+	}
 	for {
 		select {
 		case <-sctx.Done():
 			swg.Wait()
 			return
 		case <-d.refresh:
-			if !d.stillPossible(sctx) {
-				log.Info("discovery no longer possible, ending session")
-				endSession()
+			if ended() {
 				return
 			}
 		case <-ticker.C:
@@ -309,9 +337,7 @@ func (d *Discovery) runSession(ctx context.Context) {
 				endSession()
 				return
 			}
-			if !d.stillPossible(sctx) {
-				log.Info("discovery no longer possible, ending session")
-				endSession()
+			if ended() {
 				return
 			}
 			d.emit(discoveryEvent{resweep: true})
@@ -368,11 +394,14 @@ func (d *Discovery) emit(ev discoveryEvent) {
 	}
 }
 
-// probe determines whether discovery can work right now: the injected
-// platform probe if any, otherwise "is there a usable multicast
-// interface with an IPv4 address" — and the interface check also covers
-// a probe that answers Unknown.
+// probe determines whether discovery can work right now: Disabled while
+// the switch is off; otherwise the injected platform probe if any, else
+// "is there a usable multicast interface with an IPv4 address" — and the
+// interface check also covers a probe that answers Unknown.
 func (d *Discovery) probe(ctx context.Context) sdkp2p.Possibility {
+	if !d.enabled.Load() {
+		return sdkp2p.PossibilityDisabled
+	}
 	if f := sdkp2p.PossibilityProbe(); f != nil {
 		// Unknown is a host saying "I have nothing to add", not an
 		// answer: fall through to the interface check rather than

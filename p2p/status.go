@@ -83,6 +83,9 @@ type Status struct {
 	PeerId string
 	// Enabled is the LAN config opt-out state.
 	Enabled bool
+	// LocalDiscovery is the mDNS switch state (config p2p.localDiscovery,
+	// SDK.SetLocalDiscoveryEnabled). False reads as PossibilityDisabled.
+	LocalDiscovery bool
 	// ListenerStarted — the inbound QUIC listener is up.
 	ListenerStarted bool
 	// Port is the QUIC listen port (zero when not started).

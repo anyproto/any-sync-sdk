@@ -948,6 +948,18 @@ func (s *SDK) Store() anystore.DB { return s.db }
 // (P2P / LocalPeers); this is the account-wide debug view.
 func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 
+// RefreshP2PPossibility asks local discovery to re-probe now instead of
+// waiting for its next cycle, ending a running session at once when the
+// answer turned negative.
+//
+// Only meaningful with a probe installed through p2p.SetPossibilityProbe:
+// the built-in check is interface-based and already covered by discovery's
+// own interface watcher. Hosts that LEARN whether local-network access is
+// available — a desktop shell detecting the macOS Local Network permission,
+// a mobile bridge seeing the iOS one — call this when the answer changes,
+// rather than making the SDK poll for it.
+func (s *SDK) RefreshP2PPossibility() { s.app.RefreshP2PPossibility() }
+
 // AccountAPI exposes account-level operations outside any space.
 type AccountAPI interface {
 	// Id returns the account's identity string (StrKey-encoded).

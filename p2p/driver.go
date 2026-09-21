@@ -112,6 +112,15 @@ func InterfaceProvider() func() ([]net.Interface, error) {
 // bridges inject a self-connection probe here to detect the Local
 // Network permission being denied. Pass nil to restore the default
 // (interface-based) check.
+//
+// A probe may return PossibilityUnknown to mean "nothing to add right
+// now"; the SDK then falls back to its own interface check. That is how
+// a host overrides only the half it knows — whether the OS permits
+// local-network access — without reimplementing the rest.
+//
+// The probe is re-read on every cycle and mid-session, so it may change
+// its answer over the life of the process; see SDK.RefreshP2PPossibility
+// for applying a change at once.
 func SetPossibilityProbe(f func(ctx context.Context, port int) Possibility) {
 	injectMu.Lock()
 	defer injectMu.Unlock()

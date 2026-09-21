@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -170,4 +171,127 @@ func TestDiscoverySessionRestartsAfterDriverDeath(t *testing.T) {
 
 	<-drv.ready
 	waitFor(t, func() bool { return drv.announceCount() == 2 })
+}
+
+// awaitSession waits for the driver's next Browse. Bounded: a bare
+// receive would turn a regression into a test-binary timeout rather
+// than a named failure.
+func awaitSession(t *testing.T, drv *fakeDriver) {
+	t.Helper()
+	select {
+	case <-drv.ready:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no discovery session started in time")
+	}
+}
+
+// setProbe installs a possibility probe whose answer the test controls,
+// and restores the process global afterwards.
+func setProbe(t *testing.T, restricted *atomic.Bool) {
+	t.Helper()
+	sdkp2p.SetPossibilityProbe(func(context.Context, int) sdkp2p.Possibility {
+		if restricted.Load() {
+			return sdkp2p.PossibilityRestricted
+		}
+		return sdkp2p.PossibilityPossible
+	})
+	t.Cleanup(func() { sdkp2p.SetPossibilityProbe(nil) })
+}
+
+func TestDiscoveryEndsAndResumesSessionOnProbeChange(t *testing.T) {
+	var restricted atomic.Bool
+	setProbe(t, &restricted)
+
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	d.retryDelay = 20 * time.Millisecond
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+	<-drv.ready
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
+
+	// The host has learned the OS refuses local-network access. The LIVE
+	// session must end: the supervisor only re-probes between sessions,
+	// and a session on a healthy LAN never ends on its own, so without
+	// this the device announces into a dropped path indefinitely.
+	restricted.Store(true)
+	d.RefreshPossibility()
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
+
+	// And stays ended — no new session while the probe says restricted.
+	time.Sleep(5 * d.retryDelay)
+	require.Equal(t, 1, drv.announceCount())
+
+	// Granted after the fact: discovery comes back with no SDK restart.
+	restricted.Store(false)
+	d.RefreshPossibility()
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return drv.announceCount() == 2 })
+	require.Equal(t, sdkp2p.PossibilityPossible, d.Possibility())
+}
+
+func TestDiscoveryReprobesOnResweep(t *testing.T) {
+	var restricted atomic.Bool
+	setProbe(t, &restricted)
+
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	d.retryDelay = 20 * time.Millisecond
+	d.resweepEvery = 20 * time.Millisecond
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+	<-drv.ready
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
+
+	// No RefreshPossibility here: a host that never nudges must still
+	// converge, within one resweep.
+	restricted.Store(true)
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
+}
+
+func TestDiscoveryRefreshCutsShortTheRetryBackoff(t *testing.T) {
+	var restricted atomic.Bool
+	restricted.Store(true)
+	setProbe(t, &restricted)
+
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	// Only a refresh can get the supervisor out of this: a host that has
+	// just been granted the permission must not sit out the backoff.
+	d.retryDelay = time.Hour
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
+	require.Equal(t, 0, drv.announceCount())
+
+	restricted.Store(false)
+	d.RefreshPossibility()
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
+}
+
+func TestDiscoveryProbeUnknownFallsBackToInterfaceCheck(t *testing.T) {
+	sdkp2p.SetPossibilityProbe(func(context.Context, int) sdkp2p.Possibility {
+		return sdkp2p.PossibilityUnknown
+	})
+	t.Cleanup(func() { sdkp2p.SetPossibilityProbe(nil) })
+
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	d.retryDelay = 20 * time.Millisecond
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+
+	// A host with nothing to say must not stop discovery: Unknown means
+	// "ask your own check", and this machine has interfaces.
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityPossible })
 }

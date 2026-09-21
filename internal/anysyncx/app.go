@@ -910,6 +910,10 @@ func globalPeersOrNil(store *p2p.PeerStore, enabled bool) globalPeerSource {
 	return store
 }
 
+// RefreshP2PPossibility asks local discovery to re-probe now instead of
+// waiting for its next cycle.
+func (a *App) RefreshP2PPossibility() { a.discovery.RefreshPossibility() }
+
 // P2PStatus is the account-wide p2p snapshot for the debug surface:
 // LAN listener state, discovery possibility, every LAN peer with its
 // live-connection flag, and the global layer.

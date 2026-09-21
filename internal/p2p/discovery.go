@@ -239,7 +239,9 @@ func (d *Discovery) setPossibility(p sdkp2p.Possibility) {
 func (d *Discovery) superviseLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		d.setPossibility(d.probe(ctx))
-		if d.Possibility() == sdkp2p.PossibilityPossible {
+		// The switch is re-read after the probe: a flip in between must
+		// not start a session; its nudge is consumed by backOff.
+		if d.Possibility() == sdkp2p.PossibilityPossible && d.enabled.Load() {
 			d.runSession(ctx)
 		}
 		if !d.backOff(ctx) {
@@ -301,14 +303,10 @@ func (d *Discovery) runSession(ctx context.Context) {
 		cancel()
 		swg.Wait()
 	}
-	// ended checks the switch in the middle of the live session and ends
-	// it once off. The supervisor otherwise re-probes only BETWEEN
-	// sessions, and a session on a healthy LAN never ends on its own, so
-	// a host turning discovery off would go unheard for the life of the
-	// process. Only the switch is checked here, not the platform probe:
-	// one flaky probe answer must not tear down a healthy session. The
-	// state is recorded here too, not after the supervisor's backoff:
-	// status and hooks see Disabled the moment the session ends.
+	// ended ends the live session once the switch is off and records
+	// Disabled at once (the supervisor only re-probes between sessions,
+	// after its backoff). The platform probe is not re-read here: one
+	// flaky answer must not kill a healthy session.
 	ended := func() bool {
 		if d.enabled.Load() {
 			return false
@@ -331,9 +329,6 @@ func (d *Discovery) runSession(ctx context.Context) {
 			if fp := interfaceFingerprint(); fp != fingerprint {
 				log.Info("network interfaces changed, restarting discovery session")
 				endSession()
-				return
-			}
-			if ended() {
 				return
 			}
 			d.emit(discoveryEvent{resweep: true})

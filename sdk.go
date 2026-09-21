@@ -949,21 +949,19 @@ func (s *SDK) Store() anystore.DB { return s.db }
 func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 
 // SetLocalDiscoveryEnabled switches mDNS announce and browse on or off
-// without a restart. Off ends the running discovery session at once and
-// starts no other; on starts one immediately, subject to the usual
-// possibility check. Restating the current value is a no-op.
+// without a restart: off ends the running session at once, on starts
+// one immediately (subject to the possibility probe), a restatement is
+// a no-op. Config p2p.localDiscovery sets the state at Open.
 //
-// The switch governs discovery traffic only. The QUIC listener and the
-// global (iroh) layer are unaffected, and LAN peers already known stay
-// in the peer store and dialable: a live connection to one is kept,
-// and sync status keeps reporting it. A host that must stop every
-// local-network exchange, not just the scanning, uses p2p.enabled.
+// Discovery traffic only: the QUIC listener, the global (iroh) layer and
+// LAN peers already known are unaffected, so a live connection is kept
+// and sync status keeps reporting it. Stopping every local-network
+// exchange is p2p.enabled's job.
 //
-// Config p2p.localDiscovery sets the state at Open. Hosts that own a
-// local-network permission flow — a desktop shell around the macOS
-// Local Network prompt, which fires on the first multicast send — start
-// with it off and turn it on once the user has answered; a host whose
-// user turns LAN discovery off in settings uses the same switch.
+// For hosts that own a local-network permission flow: the macOS Local
+// Network prompt fires on the first multicast send, so such a host
+// starts off and turns discovery on once the user has answered. A
+// user-facing "LAN discovery" setting uses the same switch.
 func (s *SDK) SetLocalDiscoveryEnabled(enabled bool) { s.app.SetLocalDiscoveryEnabled(enabled) }
 
 // LocalDiscoveryEnabled is the local-discovery switch state, false as

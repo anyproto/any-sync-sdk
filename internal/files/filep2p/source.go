@@ -21,13 +21,24 @@ const (
 	// CARv2 pragma + header + root, and the response's totalSize gives
 	// the object size for the index-tail read.
 	probeLen = 4096
-	// perPeerTimeout bounds EACH candidate's dial+FileCheck during
+	// perPeerTimeout bounds EACH LAN candidate's dial+FileCheck during
 	// selection — a per-peer budget, NOT a shared one, so a single slow
 	// peer can't exhaust the sweep and cause healthy peers behind it to
-	// time out and be banned.
+	// time out and be banned. A LAN round trip is sub-millisecond, so
+	// this is already generous there.
 	perPeerTimeout = 700 * time.Millisecond
-	// maxCandidates caps how many local peers we FileCheck before giving
-	// up and using HTTP — keeps selection bounded on a busy LAN.
+	// perGlobalPeerTimeout is the same budget for a global candidate,
+	// whose FileCheck crosses the internet and usually a relay. The LAN
+	// figure sits right at the edge of a relayed round trip: the check
+	// times out, the file is reported unavailable, and a peer that holds
+	// it in full is never asked — so files simply do not transfer over
+	// the global layer, intermittently and with no error naming the
+	// cause. Kept under the connector's own global dial timeout, since a
+	// global candidate is picked from the pool rather than dialed.
+	perGlobalPeerTimeout = 5 * time.Second
+	// maxCandidates caps how many peers we FileCheck before giving up
+	// and using HTTP — keeps selection bounded on a busy LAN, and bounds
+	// the worst case once global candidates carry the larger budget.
 	maxCandidates = 3
 	// banTTL keeps a peer that failed to dial/serve out of selection.
 	banTTL = 5 * time.Minute
@@ -106,7 +117,11 @@ func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (f
 // live connection. A dial/RPC failure bans the peer — it is
 // unreachable — but a plain "not full" answer does not.
 func (s *Source) holdsFull(ctx context.Context, peerId string, global bool, spaceId string, root cid.Cid) bool {
-	pctx, cancel := context.WithTimeout(ctx, perPeerTimeout)
+	budget := perPeerTimeout
+	if global {
+		budget = perGlobalPeerTimeout
+	}
+	pctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	p, err := s.peer(pctx, peerId, global)
 	if err != nil {

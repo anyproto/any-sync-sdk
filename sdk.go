@@ -966,8 +966,9 @@ func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 // user turns LAN discovery off in settings uses the same switch.
 func (s *SDK) SetLocalDiscoveryEnabled(enabled bool) { s.app.SetLocalDiscoveryEnabled(enabled) }
 
-// LocalDiscoveryEnabled is the local-discovery switch state. Cheap:
-// hosts polling it need not build the P2PStatus snapshot.
+// LocalDiscoveryEnabled is the local-discovery switch state, false as
+// well while p2p is disabled in config. Cheap: hosts polling it need
+// not build the P2PStatus snapshot.
 func (s *SDK) LocalDiscoveryEnabled() bool { return s.app.LocalDiscoveryEnabled() }
 
 // AccountAPI exposes account-level operations outside any space.

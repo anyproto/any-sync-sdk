@@ -179,20 +179,15 @@ func (d *Discovery) Possibility() sdkp2p.Possibility {
 }
 
 // Enabled is the local-discovery switch state: config p2p.localDiscovery
-// at start, SetEnabled afterwards.
-func (d *Discovery) Enabled() bool { return d.enabled.Load() }
+// at start, SetEnabled afterwards. Off as well while p2p is disabled in
+// config, since discovery never runs then whatever the switch says.
+func (d *Discovery) Enabled() bool { return d.cfg.IsEnabled() && d.enabled.Load() }
 
-// SetEnabled switches mDNS announce and browse on or off at runtime.
-// Off ends a live session at once and keeps the supervisor from
-// starting another; on starts a session as soon as the probe allows,
-// cutting short any retry backoff. A restatement of the current value
-// is a no-op, so a host may call it freely without tearing down a
-// healthy session.
-//
-// For hosts that own a local-network permission flow: the macOS Local
-// Network prompt fires on the first multicast send, so such a host
-// starts with the switch off in config and turns it on once the user
-// has answered.
+// SetEnabled switches mDNS announce and browse on or off at runtime
+// (SDK.SetLocalDiscoveryEnabled has the contract). Off ends a live
+// session at once and keeps the supervisor from starting another; on
+// starts a session as soon as the probe allows, cutting short any retry
+// backoff. A restatement is a no-op.
 func (d *Discovery) SetEnabled(enabled bool) {
 	if d.enabled.Swap(enabled) == enabled {
 		return
@@ -311,15 +306,16 @@ func (d *Discovery) runSession(ctx context.Context) {
 	// sessions, and a session on a healthy LAN never ends on its own, so
 	// a host turning discovery off would go unheard for the life of the
 	// process. Only the switch is checked here, not the platform probe:
-	// one flaky probe answer must not tear down a healthy session.
-	// Recording the new state is the supervisor's job: it re-probes at
-	// the top of its next iteration.
+	// one flaky probe answer must not tear down a healthy session. The
+	// state is recorded here too, not after the supervisor's backoff:
+	// status and hooks see Disabled the moment the session ends.
 	ended := func() bool {
 		if d.enabled.Load() {
 			return false
 		}
 		log.Info("local discovery switched off, ending session")
 		endSession()
+		d.setPossibility(sdkp2p.PossibilityDisabled)
 		return true
 	}
 	for {
@@ -402,7 +398,13 @@ func (d *Discovery) probe(ctx context.Context) sdkp2p.Possibility {
 		return sdkp2p.PossibilityDisabled
 	}
 	if f := sdkp2p.PossibilityProbe(); f != nil {
-		return f(ctx, d.port)
+		p := f(ctx, d.port)
+		// A platform probe may take seconds (iOS self-dials); a switch
+		// flipped off meanwhile must not be outvoted by its answer.
+		if !d.enabled.Load() {
+			return sdkp2p.PossibilityDisabled
+		}
+		return p
 	}
 	if len(ownIPv4s()) == 0 {
 		return sdkp2p.PossibilityNoInterfaces

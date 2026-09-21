@@ -218,9 +218,12 @@ func TestDiscoverySwitchEndsAndResumesSession(t *testing.T) {
 	// Off: the LIVE session must end. The supervisor only re-probes
 	// between sessions, and a session on a healthy LAN never ends on
 	// its own, so without the nudge the device announces indefinitely.
+	// Disabled is recorded as the session ends, not after a backoff.
+	d.retryDelay = time.Hour
 	d.SetEnabled(false)
 	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
 	require.False(t, d.Enabled())
+	d.retryDelay = 20 * time.Millisecond
 
 	// And stays ended — no new session while the switch is off.
 	time.Sleep(5 * d.retryDelay)
@@ -231,6 +234,14 @@ func TestDiscoverySwitchEndsAndResumesSession(t *testing.T) {
 	awaitSession(t, drv)
 	waitFor(t, func() bool { return drv.announceCount() == 2 })
 	require.Equal(t, sdkp2p.PossibilityPossible, d.Possibility())
+}
+
+func TestDiscoveryEnabledReadsOffWhileP2PDisabled(t *testing.T) {
+	off := false
+	d := NewDiscovery(config.P2P{Enabled: &off}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	require.False(t, d.Enabled())
+	d.SetEnabled(true)
+	require.False(t, d.Enabled(), "the switch cannot turn on what p2p.enabled keeps off")
 }
 
 func TestDiscoveryStartsOffFromConfigAndSwitchCutsShortTheBackoff(t *testing.T) {

@@ -35,13 +35,15 @@ func TestP2PStateFor(t *testing.T) {
 	require.Equal(t, space.P2PStateConnected,
 		p2pStateFor(true, false, sdkp2p.PossibilityUnknown, lan, nil, connected))
 	// Local discovery switched off: a LAN peer that is still live still
-	// counts (known peers stay dialable); with nobody live it is
-	// NotPossible alone and NotConnected once the global layer could
-	// still find someone.
+	// counts, and a known one that is idle is NotConnected (known peers
+	// stay dialable). NotPossible only with nobody known and no global
+	// layer to find anyone.
 	require.Equal(t, space.P2PStateConnected,
 		p2pStateFor(true, false, sdkp2p.PossibilityDisabled, lan, nil, connected))
-	require.Equal(t, space.P2PStateNotPossible,
+	require.Equal(t, space.P2PStateNotConnected,
 		p2pStateFor(true, false, sdkp2p.PossibilityDisabled, lan, nil, nobody))
+	require.Equal(t, space.P2PStateNotPossible,
+		p2pStateFor(true, false, sdkp2p.PossibilityDisabled, nil, nil, nobody))
 	require.Equal(t, space.P2PStateConnected,
 		p2pStateFor(true, true, sdkp2p.PossibilityDisabled, lan, global, only("lp1")))
 	require.Equal(t, space.P2PStateNotConnected,

@@ -871,9 +871,10 @@ func pickLive(pl pool.Pool, id string) bool {
 // local-network permission) still surface while the LAN layer is on —
 // the global layer does not hide why the LAN path is down. Local
 // discovery switched off stops finding peers but keeps the ones already
-// known dialable, so a live LAN peer still counts; with nobody live it
-// is NotPossible only when no layer can find anyone. Pure so it's
-// unit-testable without the app graph.
+// known dialable, so a live LAN peer still counts and known ones make
+// it NotConnected rather than NotPossible; NotPossible only when no
+// layer can find anyone and nobody is known. Pure so it's unit-testable
+// without the app graph.
 func p2pStateFor(lanEnabled, globalEnabled bool, poss sdkp2p.Possibility, localPeerIds, globalPeerIds []string, pickable func(string) bool) space.P2PState {
 	if !lanEnabled && !globalEnabled {
 		return space.P2PStateNotPossible
@@ -900,7 +901,7 @@ func p2pStateFor(lanEnabled, globalEnabled bool, poss sdkp2p.Possibility, localP
 		case sdkp2p.PossibilityRestricted:
 			return space.P2PStateRestricted
 		case sdkp2p.PossibilityDisabled:
-			if !globalEnabled {
+			if !globalEnabled && len(localPeerIds) == 0 {
 				return space.P2PStateNotPossible
 			}
 		}

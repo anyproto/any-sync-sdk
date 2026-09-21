@@ -143,10 +143,7 @@ type P2P struct {
 	// LocalDiscovery is an opt-out for mDNS announce and browse alone:
 	// nil (the default) means on. False keeps the QUIC listener up and
 	// LAN peers dialable, but starts no discovery session until
-	// SDK.SetLocalDiscoveryEnabled(true). For hosts that own a
-	// local-network permission flow: the macOS Local Network prompt
-	// fires on the first multicast send, so a host that must not scan
-	// before the user has been asked starts with this off.
+	// SDK.SetLocalDiscoveryEnabled(true), which has the contract.
 	LocalDiscovery *bool `yaml:"localDiscovery"`
 
 	// Global is the internet-wide device-to-device layer (iroh: QUIC

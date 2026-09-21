@@ -40,10 +40,34 @@ type PeerSource interface {
 	SourceFor(ctx context.Context, spaceId string, root cid.Cid) (src CarSource, ban func(), ok bool)
 }
 
-// peerPreferDeadline bounds each peer read. On a healthy LAN a ~1 MiB
-// range returns in a few ms; this generous cap means a stalling peer
-// costs at most one deadline before we demote it to HTTP for this fetch.
+// peerPreferDeadline bounds each read from a LAN peer. On a healthy
+// LAN a ~1 MiB range returns in a few ms; this generous cap means a
+// stalling peer costs at most one deadline before we demote it to HTTP
+// for this fetch.
 const peerPreferDeadline = 800 * time.Millisecond
+
+// PeerReadDeadliner is the optional interface a CarSource implements to
+// state a read budget other than the LAN default. A range served across
+// the internet — through a relay, at a few MB/s — takes orders of
+// magnitude longer than the same range on a LAN, and the LAN figure
+// simply expires mid-transfer. Where there is no HTTP fallback (a file
+// that never reached a durability node) that expiry is the whole fetch,
+// so a file that a peer holds in full never arrives.
+type PeerReadDeadliner interface {
+	// PeerReadDeadline returns the budget for one range read, or zero
+	// to take the LAN default.
+	PeerReadDeadline() time.Duration
+}
+
+// peerDeadline is the budget for one read from the current peer source.
+func (fs *fetchSources) peerDeadline() time.Duration {
+	if d, ok := fs.peer.(PeerReadDeadliner); ok {
+		if v := d.PeerReadDeadline(); v > 0 {
+			return v
+		}
+	}
+	return peerPreferDeadline
+}
 
 // fetchSources are the ordered CAR sources for one fetch: a LAN peer
 // (preferred — free, offline-capable) laddered over the public HTTP
@@ -63,7 +87,7 @@ type fetchSources struct {
 	peer    CarSource
 	http    CarSource // nil for a non-durable file with no public object
 	banPeer func()    // bans the peer for future selection; nil-safe
-	peerOff bool       // peer demoted/banned for the rest of this fetch
+	peerOff bool      // peer demoted/banned for the rest of this fetch
 }
 
 func (fs *fetchSources) available() bool { return fs.peer != nil || fs.http != nil }
@@ -75,7 +99,7 @@ func (fs *fetchSources) available() bool { return fs.peer != nil || fs.http != n
 // not a silent corruption).
 func (fs *fetchSources) readRange(ctx context.Context, off, length int64, validate func([]byte) error) ([]byte, error) {
 	if fs.peer != nil && !fs.peerOff {
-		pctx, cancel := context.WithTimeout(ctx, peerPreferDeadline)
+		pctx, cancel := context.WithTimeout(ctx, fs.peerDeadline())
 		data, err := fs.peer.ReadRange(pctx, off, length)
 		cancel()
 		switch {
@@ -116,7 +140,7 @@ func (fs *fetchSources) readRange(ctx context.Context, off, length int64, valida
 // peer→HTTP validation ladder as readRange.
 func (fs *fetchSources) readProbe(ctx context.Context, validate func([]byte) error) (head []byte, total int64, err error) {
 	if fs.peer != nil && !fs.peerOff {
-		pctx, cancel := context.WithTimeout(ctx, peerPreferDeadline)
+		pctx, cancel := context.WithTimeout(ctx, fs.peerDeadline())
 		head, total, err = fs.peer.ReadProbe(pctx)
 		cancel()
 		switch {

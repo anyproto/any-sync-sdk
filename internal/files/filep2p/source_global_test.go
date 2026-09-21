@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
 	"github.com/anyproto/any-sync/net/peer"
 	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/require"
@@ -160,4 +161,16 @@ func testCid(t *testing.T) cid.Cid {
 	root, err := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	require.NoError(t, err)
 	return root
+}
+
+// A global peerCar states a read budget of its own; a LAN one defers to
+// the fetch package's default. A range served across a relay runs at a
+// few MB/s, so the LAN figure expires mid-range — and with no durable
+// copy to fall back on, that expiry fails the whole fetch.
+func TestPeerCarReadDeadlineIsPerLayer(t *testing.T) {
+	global := &peerCar{global: true}
+	lan := &peerCar{global: false}
+	require.Equal(t, globalReadDeadline, global.PeerReadDeadline())
+	require.Zero(t, lan.PeerReadDeadline(), "a LAN read keeps the package default")
+	var _ fetch.PeerReadDeadliner = global
 }

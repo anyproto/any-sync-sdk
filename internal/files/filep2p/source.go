@@ -36,6 +36,12 @@ const (
 	// cause. Kept under the connector's own global dial timeout, since a
 	// global candidate is picked from the pool rather than dialed.
 	perGlobalPeerTimeout = 5 * time.Second
+	// globalReadDeadline is the budget for ONE range read from a global
+	// peer, replacing the fetch package's LAN default. A range is up to
+	// maxObjectReadLen, and a relayed path runs at a few MB/s, so the
+	// LAN figure expires mid-range; with no durable copy to fall back
+	// on, that expiry fails the whole fetch.
+	globalReadDeadline = 10 * time.Second
 	// maxCandidates caps how many peers we FileCheck before giving up
 	// and using HTTP — keeps selection bounded on a busy LAN, and bounds
 	// the worst case once global candidates carry the larger budget.
@@ -227,6 +233,15 @@ func (c *peerCar) read(ctx context.Context, off, length int64) (data []byte, tot
 		return nil, 0, err
 	}
 	return data, total, nil
+}
+
+// PeerReadDeadline implements fetch.PeerReadDeadliner: a global peer's
+// range crosses the internet, a LAN peer's does not.
+func (c *peerCar) PeerReadDeadline() time.Duration {
+	if c.global {
+		return globalReadDeadline
+	}
+	return 0 // the fetch package's LAN default
 }
 
 func (c *peerCar) ReadRange(ctx context.Context, off, length int64) ([]byte, error) {

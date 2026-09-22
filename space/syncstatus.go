@@ -44,8 +44,9 @@ type P2PState uint8
 
 const (
 	P2PStateUnknown P2PState = iota
-	// P2PStateNotPossible — p2p is disabled in config, or the device
-	// has no usable network interface.
+	// P2PStateNotPossible — p2p is disabled in config, the device has
+	// no usable network interface, or local discovery is switched off
+	// with no LAN peer known and no global layer to find one.
 	P2PStateNotPossible
 	// P2PStateNotConnected — a p2p layer is on but no direct peer
 	// sharing this space is connected.

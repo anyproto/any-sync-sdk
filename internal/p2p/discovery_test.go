@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -170,4 +171,125 @@ func TestDiscoverySessionRestartsAfterDriverDeath(t *testing.T) {
 
 	<-drv.ready
 	waitFor(t, func() bool { return drv.announceCount() == 2 })
+}
+
+// awaitSession waits for the driver's next Browse. Bounded: a bare
+// receive would turn a regression into a test-binary timeout rather
+// than a named failure.
+func awaitSession(t *testing.T, drv *fakeDriver) {
+	t.Helper()
+	select {
+	case <-drv.ready:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no discovery session started in time")
+	}
+}
+
+// setProbe installs a possibility probe whose answer the test controls,
+// and restores the process global afterwards.
+func setProbe(t *testing.T, restricted *atomic.Bool) {
+	t.Helper()
+	sdkp2p.SetPossibilityProbe(func(context.Context, int) sdkp2p.Possibility {
+		if restricted.Load() {
+			return sdkp2p.PossibilityRestricted
+		}
+		return sdkp2p.PossibilityPossible
+	})
+	t.Cleanup(func() { sdkp2p.SetPossibilityProbe(nil) })
+}
+
+func TestDiscoverySwitchEndsAndResumesSession(t *testing.T) {
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	// Long on purpose: Disabled must be recorded as the session ends,
+	// not after this backoff, and the switch turning on must cut it
+	// short. Neither path may be paced by it.
+	d.retryDelay = 10 * time.Second
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
+	require.True(t, d.Enabled())
+
+	// Restating the current value must not tear down a healthy session.
+	d.SetEnabled(true)
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, 1, drv.announceCount())
+
+	// Off: the LIVE session must end. The supervisor only re-probes
+	// between sessions, and a session on a healthy LAN never ends on
+	// its own, so without the nudge the device announces indefinitely.
+	d.SetEnabled(false)
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
+	require.False(t, d.Enabled())
+
+	// And stays ended — no new session while the switch is off.
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, 1, drv.announceCount())
+
+	// On again: discovery comes back with no SDK restart.
+	d.SetEnabled(true)
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return drv.announceCount() == 2 })
+	require.Equal(t, sdkp2p.PossibilityPossible, d.Possibility())
+}
+
+func TestDiscoveryEnabledReadsOffWhileP2PDisabled(t *testing.T) {
+	off := false
+	d := NewDiscovery(config.P2P{Enabled: &off}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	require.False(t, d.Enabled())
+	d.SetEnabled(true)
+	require.False(t, d.Enabled(), "the switch cannot turn on what p2p.enabled keeps off")
+}
+
+func TestDiscoveryStartsOffFromConfigAndSwitchCutsShortTheBackoff(t *testing.T) {
+	off := false
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{LocalDiscovery: &off}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	// Only the switch can get the supervisor out of this: a host that
+	// has just been granted the permission must not sit out the backoff.
+	d.retryDelay = time.Hour
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+	// Not a single multicast send before the host says so: this is what
+	// keeps the macOS Local Network prompt from firing at boot.
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
+	require.Equal(t, 0, drv.announceCount())
+
+	d.SetEnabled(true)
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
+}
+
+func TestDiscoveryProbeReadBetweenSessionsAndSwitchWinsOverIt(t *testing.T) {
+	var restricted atomic.Bool
+	restricted.Store(true)
+	setProbe(t, &restricted)
+
+	drv := newFakeDriver()
+	d := NewDiscovery(config.P2P{}, "self", func() (int, bool) { return 1, true }, &recordingNotifier{})
+	d.driver = drv
+	d.retryDelay = 20 * time.Millisecond
+
+	require.NoError(t, d.Run(context.Background()))
+	defer func() { require.NoError(t, d.Close(context.Background())) }()
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityRestricted })
+	require.Equal(t, 0, drv.announceCount())
+
+	// The switch wins over the probe: off is Disabled, not Restricted,
+	// and the probe is not consulted at all while off.
+	d.SetEnabled(false)
+	waitFor(t, func() bool { return d.Possibility() == sdkp2p.PossibilityDisabled })
+
+	// Granted after the fact: the probe is re-read before every session,
+	// so switching on with a positive probe starts one within a cycle.
+	restricted.Store(false)
+	d.SetEnabled(true)
+	awaitSession(t, drv)
+	waitFor(t, func() bool { return drv.announceCount() == 1 })
+	require.Equal(t, sdkp2p.PossibilityPossible, d.Possibility())
 }

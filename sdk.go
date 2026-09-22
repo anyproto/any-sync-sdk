@@ -948,6 +948,27 @@ func (s *SDK) Store() anystore.DB { return s.db }
 // (P2P / LocalPeers); this is the account-wide debug view.
 func (s *SDK) P2PStatus() p2p.Status { return s.app.P2PStatus() }
 
+// SetLocalDiscoveryEnabled switches mDNS announce and browse on or off
+// without a restart: off ends the running session at once, on starts
+// one immediately (subject to the possibility probe), a restatement is
+// a no-op. Config p2p.localDiscovery sets the state at Open.
+//
+// Discovery traffic only: the QUIC listener, the global (iroh) layer and
+// LAN peers already known are unaffected, so a live connection is kept
+// and sync status keeps reporting it. Stopping every local-network
+// exchange is p2p.enabled's job.
+//
+// For hosts that own a local-network permission flow: the macOS Local
+// Network prompt fires on the first multicast send, so such a host
+// starts off and turns discovery on once the user has answered. A
+// user-facing "LAN discovery" setting uses the same switch.
+func (s *SDK) SetLocalDiscoveryEnabled(enabled bool) { s.app.SetLocalDiscoveryEnabled(enabled) }
+
+// LocalDiscoveryEnabled is the local-discovery switch state, false as
+// well while p2p is disabled in config. Cheap: hosts polling it need
+// not build the P2PStatus snapshot.
+func (s *SDK) LocalDiscoveryEnabled() bool { return s.app.LocalDiscoveryEnabled() }
+
 // AccountAPI exposes account-level operations outside any space.
 type AccountAPI interface {
 	// Id returns the account's identity string (StrKey-encoded).

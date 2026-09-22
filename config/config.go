@@ -140,6 +140,12 @@ type P2P struct {
 	// the same LAN don't discover each other.
 	ServiceName string `yaml:"serviceName"`
 
+	// LocalDiscovery is an opt-out for mDNS announce and browse alone:
+	// nil (the default) means on. False keeps the QUIC listener up and
+	// LAN peers dialable, but starts no discovery session until
+	// SDK.SetLocalDiscoveryEnabled(true), which has the contract.
+	LocalDiscovery *bool `yaml:"localDiscovery"`
+
 	// Global is the internet-wide device-to-device layer (iroh: QUIC
 	// with relay fallback and hole punching, peers discovered through
 	// each space's key-value store). Independent of the LAN layer:
@@ -149,6 +155,11 @@ type P2P struct {
 
 // IsEnabled resolves the opt-out tristate: nil = enabled.
 func (p P2P) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+
+// IsLocalDiscoveryEnabled resolves the LocalDiscovery tristate: nil = on.
+func (p P2P) IsLocalDiscoveryEnabled() bool {
+	return p.LocalDiscovery == nil || *p.LocalDiscovery
+}
 
 // GlobalP2P configures the internet-wide p2p layer. Opt-in: nil Enabled
 // means off until a relay is deployed for the network. Zero-valued

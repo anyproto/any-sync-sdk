@@ -21,6 +21,12 @@ import (
 
 var tsLog = logger.NewNamed("anysyncx.treesyncer")
 
+// ErrTreeTypeSkipped is a tree fetch declined by selective sync before
+// any tree-storage write. The registry records a heads-only stub in its
+// place (or finds the entry already deleted), so the diff converges
+// with nothing to materialize and the syncer never parks it.
+var ErrTreeTypeSkipped = errors.New("anysyncx: tree type not selected for sync")
+
 // PeerSyncSnapshot is the latest per-peer headsync result the
 // adapter has observed. Returned by Stats() — debug surface only.
 type PeerSyncSnapshot struct {
@@ -92,13 +98,16 @@ type treeSyncerAdapter struct {
 	// Parking the id here and retrying on subsequent SyncAll calls
 	// (diffsyncer invokes SyncAll every headsync period even with an
 	// empty diff) closes that gap. Ids clear on the first successful
-	// GetTree; entries are never dropped on failure — giving up would
-	// re-create the silent divergence, and the per-round Warn keeps a
-	// stuck id visible.
+	// GetTree, or once a fetch is classified as declined by selective
+	// sync (nothing was persisted); any other failure keeps its entry —
+	// giving up would re-create the silent divergence, and the
+	// per-round Warn keeps a stuck id visible.
 	pendingMu sync.Mutex
 	// pending maps a parked id to whether it was missing locally when
 	// parked, so a recovered fetch still reports through onFetched.
 	pending map[string]bool
+
+	log logger.CtxLogger
 }
 
 // Compile-time check: the adapter implements any-sync's optional
@@ -112,6 +121,7 @@ func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCall
 		stats:    map[string]PeerSyncSnapshot{},
 		onRound:  onRound,
 		pending:  map[string]bool{},
+		log:      tsLog,
 	}
 }
 
@@ -186,6 +196,18 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 				continue
 			}
 			tree, regErr := t.registry.GetTree(peerCtx, t.spaceId, id)
+			if errors.Is(regErr, ErrTreeTypeSkipped) {
+				// Declined by selective sync before any tree-storage
+				// write; the stub it recorded converges the diff. A park
+				// would re-probe the peer every round and hold
+				// ParkedTreeCount above zero for the process lifetime.
+				if recovered, _ := t.clearPending(id); recovered {
+					t.log.Info("parked tree skipped by selective sync",
+						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+						zap.String("peerId", p.Id()))
+				}
+				continue
+			}
 			if regErr != nil {
 				// See the pending field doc: the fetch may already have
 				// landed in storage, so this id may never show up in a
@@ -198,11 +220,11 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 					// yet (access pending or revoked). Park quietly — the
 					// retry sweep runs every round, and recovery logs
 					// "parked tree recovered" once the key arrives.
-					tsLog.Debug("tree parked: no read key",
+					t.log.Debug("tree parked: no read key",
 						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
 						zap.String("peerId", p.Id()))
 				} else {
-					tsLog.Warn("tree sync failed; parked for retry",
+					t.log.Warn("tree sync failed; parked for retry",
 						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
 						zap.String("peerId", p.Id()), zap.Error(regErr))
 				}
@@ -210,7 +232,7 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 			}
 			recovered, parkedMissing := t.clearPending(id)
 			if recovered {
-				tsLog.Info("parked tree recovered",
+				t.log.Info("parked tree recovered",
 					zap.String("spaceId", t.spaceId), zap.String("treeId", id),
 					zap.String("peerId", p.Id()))
 			}

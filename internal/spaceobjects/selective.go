@@ -49,6 +49,8 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/util/cidutil"
 	"go.uber.org/zap"
+
+	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 )
 
 // skiplistDataset is the per-space skip-marker collection suffix; full
@@ -58,18 +60,10 @@ const skiplistDataset = "skiplist"
 
 const skiplistTypeKey = "type"
 
-var (
-	// ErrTreeTypeSkipped aborts a remote tree fetch whose root
-	// changeType is not in the selective set. By the time it is
-	// returned the stub + marker are recorded; nothing was persisted
-	// to tree storage.
-	ErrTreeTypeSkipped = errors.New("spaceobjects: tree type not selected for sync")
-
-	// errProbeSelectedType aborts a probe fetch that found a SELECTED
-	// type — openTree reacts with one full (non-probe) re-fetch. Never
-	// escapes openTree.
-	errProbeSelectedType = errors.New("spaceobjects: probe hit a selected tree type")
-)
+// errProbeSelectedType aborts a probe fetch that found a SELECTED
+// type — openTree reacts with one full (non-probe) re-fetch. Never
+// escapes openTree.
+var errProbeSelectedType = errors.New("spaceobjects: probe hit a selected tree type")
 
 // SelectiveMode reports whether this store filters trees by root
 // changeType (cfg.Sync.TreeTypes non-empty and this is not the tech
@@ -220,7 +214,7 @@ func (s *Store) unmarkSkipped(ctx context.Context, treeId string) error {
 // streamed response; storage creation is deferred).
 //
 //   - type not selected → record stub + marker, abort with
-//     ErrTreeTypeSkipped (at most one response batch was downloaded);
+//     anysyncx.ErrTreeTypeSkipped (at most one response batch was downloaded);
 //   - selected, probe response (no change bodies) → abort with
 //     errProbeSelectedType so openTree re-fetches in full. A non-probe
 //     stream always carries at least the root in its first batch, so
@@ -239,7 +233,10 @@ func (s *Store) selectiveTreeValidator(probe bool) objecttree.ValidatorFunc {
 			if rerr := s.recordSkippedTree(context.Background(), payload.RootRawChange.Id, root, payload.Heads); rerr != nil {
 				return nil, rerr
 			}
-			return nil, ErrTreeTypeSkipped
+			// anysyncx.ErrTreeTypeSkipped: stub + marker are recorded,
+			// nothing was persisted to tree storage, and the treesyncer
+			// leaves the id unparked.
+			return nil, anysyncx.ErrTreeTypeSkipped
 		}
 		if probe && len(payload.Changes) == 0 {
 			return nil, errProbeSelectedType

@@ -3,13 +3,18 @@ package anysyncx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // scriptedRegistry fails GetTree for the ids in fail; every call is
@@ -138,4 +143,35 @@ func TestTreeSyncerReportsFetchedTrees(t *testing.T) {
 	}
 	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "n1"}, []string{"existing"}, []string{"missing"}))
 	require.Equal(t, []string{"n1/missing/h1,h2"}, got)
+}
+
+// A tree declined by selective sync is not a failure: the stub it
+// leaves behind converges the diff, so the id must not be parked (it
+// would be re-probed every round and hold ParkedTreeCount above zero
+// for the process lifetime). A park from an earlier transient failure
+// is released once the tree is classified as skipped.
+func TestTreeSyncerSkippedTreeIsNotParked(t *testing.T) {
+	reg := &scriptedRegistry{fail: map[string]error{"t": errors.New("boom")}}
+	ts := newTreeSyncer("space1", reg, nil)
+	core, logs := observer.New(zapcore.DebugLevel)
+	ts.log = logger.CtxLogger{Logger: zap.New(core)}
+	p := fakePeer{id: "peer1"}
+
+	require.NoError(t, ts.SyncAll(context.Background(), p, nil, []string{"t"}))
+	require.Equal(t, 1, ts.Stats()[0].Pending)
+
+	reg.fail["t"] = fmt.Errorf("spaceobjects: BuildTree t: %w", ErrTreeTypeSkipped)
+	reg.calls = nil
+	require.NoError(t, ts.SyncAll(context.Background(), p, nil, nil))
+	require.Equal(t, []string{"t"}, reg.calls)
+	require.Equal(t, 0, ts.Stats()[0].Pending)
+	reg.calls = nil
+	require.NoError(t, ts.SyncAll(context.Background(), p, nil, nil))
+	require.Empty(t, reg.calls, "an unparked id is not retried")
+	require.Len(t, logs.FilterLevelExact(zapcore.WarnLevel).All(), 1, "only the transient failure warns")
+
+	// Never parked when skipped on first sight.
+	reg.fail["u"] = reg.fail["t"]
+	require.NoError(t, ts.SyncAll(context.Background(), p, nil, []string{"u"}))
+	require.Equal(t, 0, ts.Stats()[0].Pending)
 }

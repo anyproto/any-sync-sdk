@@ -75,8 +75,11 @@ func (f *File) Size() int64 { return f.size }
 // recorded on the local row (refcount for GC).
 func (s *Service) Open(ctx context.Context, spaceId string, root cid.Cid, key []byte, durable bool, ref string) (*File, error) {
 	h, err := s.store.Open(ctx, spaceId, root)
+	// seed hands back the sources it selected so a not-local file pays
+	// for peer selection once, not again for the reader.
+	var src *fetchSources
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrNoBytes) {
-		h, err = s.seed(ctx, spaceId, root, durable, ref)
+		h, src, err = s.seed(ctx, spaceId, root, durable, ref)
 	}
 	if err != nil {
 		return nil, err
@@ -84,7 +87,10 @@ func (s *Service) Open(ctx context.Context, spaceId string, root cid.Cid, key []
 
 	var fetchFn func(ctx context.Context, c cid.Cid) ([]byte, error)
 	if !h.Complete() {
-		src, srcErr := s.source(ctx, spaceId, root, durable)
+		var srcErr error
+		if src == nil {
+			src, srcErr = s.source(ctx, spaceId, root, durable)
+		}
 		if srcErr != nil {
 			// Offline-first: the locally-present ranges of a partial
 			// file stay readable with no network. Only a read that
@@ -114,8 +120,9 @@ func (s *Service) Open(ctx context.Context, spaceId string, root cid.Cid, key []
 // already complete.
 func (s *Service) Fetch(ctx context.Context, spaceId string, root cid.Cid, durable bool, ref string) error {
 	h, err := s.store.Open(ctx, spaceId, root)
+	var src *fetchSources
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrNoBytes) {
-		h, err = s.seed(ctx, spaceId, root, durable, ref)
+		h, src, err = s.seed(ctx, spaceId, root, durable, ref)
 	}
 	if err != nil {
 		return err
@@ -124,9 +131,10 @@ func (s *Service) Fetch(ctx context.Context, spaceId string, root cid.Cid, durab
 	if h.Complete() {
 		return nil
 	}
-	src, err := s.source(ctx, spaceId, root, durable)
-	if err != nil {
-		return err
+	if src == nil {
+		if src, err = s.source(ctx, spaceId, root, durable); err != nil {
+			return err
+		}
 	}
 	fetchFn := remoteFetcher(spaceId, h, src)
 	for _, c := range h.MissingBlocks() {
@@ -152,10 +160,10 @@ func (s *Service) Fetch(ctx context.Context, spaceId string, root cid.Cid, durab
 // Range (the embedded index), then CreateSparse. The skeleton's root
 // must match the requested root — a wrong object at the URL is
 // rejected before anything is recorded.
-func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durable bool, ref string) (*store.Handle, error) {
+func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durable bool, ref string) (*store.Handle, *fetchSources, error) {
 	src, err := s.source(ctx, spaceId, root, durable)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Validate the probed head's root against the requested root INSIDE
 	// the ladder: a peer (or CDN) serving a wrong/garbage object is
@@ -173,31 +181,35 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	hdr, err := carfile.ParseHeader(head)
 	if err != nil {
-		return nil, fmt.Errorf("filefetch: remote head: %w", err)
+		return nil, nil, fmt.Errorf("filefetch: remote head: %w", err)
 	}
 	idxOff := int64(hdr.IndexOffset)
 	var idx []byte
 	if int64(len(head)) >= total {
 		// The probe swallowed the whole object.
 		if idxOff > int64(len(head)) {
-			return nil, fmt.Errorf("filefetch: object claims %d total bytes but its index starts at %d", total, idxOff)
+			return nil, nil, fmt.Errorf("filefetch: object claims %d total bytes but its index starts at %d", total, idxOff)
 		}
 		head = head[:total]
 		idx = head[idxOff:]
 		head = head[:idxOff]
 	} else {
 		if idx, err = src.readRange(ctx, idxOff, total-idxOff, nil); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	if _, err = s.store.CreateSparse(ctx, spaceId, head, idx, ref); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return s.store.Open(ctx, spaceId, root)
+	h, err := s.store.Open(ctx, spaceId, root)
+	if err != nil {
+		return nil, nil, err
+	}
+	return h, src, nil
 }
 
 // source builds the CAR object reader for a fetch: a LAN peer that holds

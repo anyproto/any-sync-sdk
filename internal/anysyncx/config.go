@@ -99,16 +99,16 @@ func (c *configAdapter) GetDrpc() rpc.Config {
 
 func (c *configAdapter) GetYamux() yamux.Config {
 	return yamux.Config{
-		WriteTimeoutSec:    int(c.dialSeconds()),
-		DialTimeoutSec:     int(c.dialSeconds()),
+		WriteTimeoutSec:    c.dialSeconds(),
+		DialTimeoutSec:     c.dialSeconds(),
 		KeepAlivePeriodSec: 25,
 	}
 }
 
 func (c *configAdapter) GetQuic() quic.Config {
 	return quic.Config{
-		WriteTimeoutSec:    int(c.dialSeconds()),
-		DialTimeoutSec:     int(c.dialSeconds()),
+		WriteTimeoutSec:    c.dialSeconds(),
+		DialTimeoutSec:     c.dialSeconds(),
 		MaxStreams:         128,
 		KeepAlivePeriodSec: 25,
 	}
@@ -122,12 +122,12 @@ func (c *configAdapter) GetIroh() iroh.Config {
 	conf := iroh.Config{
 		RelayURLs:          g.RelayURLs,
 		InsecureRelay:      g.InsecureRelay,
-		WriteTimeoutSec:    int(c.dialSeconds()),
-		DialTimeoutSec:     int(g.DialTimeout / time.Second),
+		WriteTimeoutSec:    c.dialSeconds(),
+		DialTimeoutSec:     wholeSeconds(g.DialTimeout),
 		CloseTimeoutSec:    5,
 		MaxStreams:         128,
-		KeepAlivePeriodSec: int(g.KeepAlive / time.Second),
-		MaxIdleTimeoutSec:  int(3 * g.KeepAlive / time.Second),
+		KeepAlivePeriodSec: wholeSeconds(g.KeepAlive),
+		MaxIdleTimeoutSec:  wholeSeconds(3 * g.KeepAlive),
 	}
 	if g.Port != 0 {
 		// dual-stack, like go-iroh's own default bind
@@ -162,11 +162,24 @@ func (c *configAdapter) GetNodeConfStorePath() string {
 	return filepath.Join(c.sdk.Storage.DataDir, "nodeconf")
 }
 
-// dialSeconds returns Sync.DialTimeout in seconds, defaulting to 10s.
-func (c *configAdapter) dialSeconds() int64 {
+// dialSeconds returns Sync.DialTimeout in whole seconds, defaulting to
+// 10s.
+func (c *configAdapter) dialSeconds() int {
 	d := c.sdk.Sync.DialTimeout
 	if d <= 0 {
 		d = 10 * time.Second
 	}
-	return int64(d / time.Second)
+	return wholeSeconds(d)
+}
+
+// wholeSeconds converts a positive duration for the transports' *Sec
+// fields, rounding UP so a sub-second value never becomes 0: the
+// transports read 0 as "use my default" (yamux 10s, iroh 15s) or, for
+// the QUIC accept handshake and stream writes, as an already-expired
+// deadline — either way not what the caller configured.
+func wholeSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	return int((d + time.Second - 1) / time.Second)
 }

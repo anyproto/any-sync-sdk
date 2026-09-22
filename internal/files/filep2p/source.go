@@ -3,6 +3,7 @@ package filep2p
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -39,24 +40,44 @@ const (
 	// before any relayed peer is consulted.
 	maxLanSweep    = 3 * time.Second
 	maxGlobalSweep = 8 * time.Second
-	// globalReadDeadline is the budget for ONE range read from a global
-	// peer, replacing the fetch package's LAN default. The fetcher
-	// coalesces at most maxFetchSpan (4 MiB) per read and a relayed
-	// path runs at a few MB/s, so the LAN figure expires mid-range;
-	// with no durable copy to fall back on, that expiry fails the whole
-	// fetch.
-	globalReadDeadline = 10 * time.Second
-	// globalProbeDeadline covers the 4 KiB head probe — one relayed
-	// round trip, like the FileCheck that selected the peer, so it
-	// cannot be smaller than the budget that selection passed under or
-	// a peer admitted at 5s would fail its first read.
-	globalProbeDeadline = perGlobalPeerTimeout
-	// maxCandidates caps how many peers of ONE layer we consult before
-	// giving up and using HTTP.
+	// globalRoundTrip is the fixed part of a global read's budget: one
+	// relayed round trip, like the FileCheck that selected the peer, so
+	// it cannot be smaller than the budget selection passed under or a
+	// peer admitted at that figure would fail its first read.
+	globalRoundTrip = perGlobalPeerTimeout
+	// globalMinRate / lanMinRate are the transfer rates a read on each
+	// layer is expected to sustain; the budget grows by length/rate on
+	// top of the round trip, so a 4 KiB probe and a multi-MiB range are
+	// each sized for what they move. Below the rate the peer is treated
+	// as stalled, and with an HTTP fallback that bans it, so each floor
+	// sits well under what its medium delivers: a relayed path runs at
+	// a few MB/s, a congested Wi-Fi still tens of Mbit/s.
+	globalMinRate = 1 << 20
+	lanMinRate    = 2 << 20
+	// maxCandidates caps how many peers of ONE layer are ASKED (a
+	// FileCheck was attempted on a resolved peer) before giving up. A
+	// candidate that never answers a dial or has no live connection
+	// does not count: the layer clock already bounds those, and
+	// counting them lets a few offline ids ranked ahead hide the one
+	// connected holder.
 	maxCandidates = 3
 	// banTTL keeps a peer that failed to dial/serve out of selection.
 	banTTL = 5 * time.Minute
 )
+
+// budgets are the selection clocks; a field so tests run them in
+// milliseconds.
+type budgets struct {
+	lanPeer, globalPeer   time.Duration
+	lanSweep, globalSweep time.Duration
+}
+
+var defaultBudgets = budgets{
+	lanPeer:     perPeerTimeout,
+	globalPeer:  perGlobalPeerTimeout,
+	lanSweep:    maxLanSweep,
+	globalSweep: maxGlobalSweep,
+}
 
 // LocalPeers is the slice of the p2p peer store this source needs: LAN
 // peers are dialed (bounded), global peers only used while connected.
@@ -72,26 +93,28 @@ type DialPool interface {
 	Pick(ctx context.Context, id string) (peer.Peer, error)
 }
 
-// Source is the fetch.PeerSource: it finds a LAN peer that holds a file
-// in full and hands back a Car reader over the FileP2P ObjectRead RPC.
-// Selection is bounded (one FileCheck sweep) and failures ban the peer,
-// so it never stalls a fetch when no peer has the file.
+// Source is the fetch.PeerSource: it finds a peer that holds a file in
+// full — on the LAN first, then among the connected global peers — and
+// hands back a Car reader over the FileP2P ObjectRead RPC. Each layer
+// sweeps under its own clock and per-candidate budget, and failures ban
+// the peer on that layer, so selection never stalls a fetch when no
+// peer has the file.
 type Source struct {
 	pool  DialPool
 	peers LocalPeers
+	b     budgets
 
 	banMu  sync.Mutex
 	banned map[banKey]time.Time
 }
 
 func NewSource(pool DialPool, peers LocalPeers) *Source {
-	return &Source{pool: pool, peers: peers, banned: map[banKey]time.Time{}}
+	return &Source{pool: pool, peers: peers, b: defaultBudgets, banned: map[banKey]time.Time{}}
 }
 
 var (
-	_ fetch.PeerSource         = (*Source)(nil)
-	_ fetch.PeerReadDeadliner  = (*peerCar)(nil)
-	_ fetch.PeerProbeDeadliner = (*peerCar)(nil)
+	_ fetch.PeerSource       = (*Source)(nil)
+	_ fetch.PeerReadBudgeter = (*peerCar)(nil)
 )
 
 // SourceFor returns a peer-backed Car reader for (spaceId, root) when a
@@ -108,34 +131,39 @@ func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (f
 		global bool
 		sweep  time.Duration
 	}{
-		{ids: func() []string { return s.filterBanned(s.peers.LocalPeerIds(spaceId), false) }, sweep: maxLanSweep},
+		{ids: func() []string { return s.filterBanned(s.peers.LocalPeerIds(spaceId), false) }, sweep: s.b.lanSweep},
 		// Built lazily: resolving the global set unions in every
 		// account peer and ranks them, all wasted when a LAN peer
 		// answers first.
-		{ids: func() []string { return s.filterBanned(s.peers.GlobalPeerIds(spaceId), true) }, global: true, sweep: maxGlobalSweep},
+		{ids: func() []string { return s.filterBanned(s.peers.GlobalPeerIds(spaceId), true) }, global: true, sweep: s.b.globalSweep},
 	} {
 		lctx, cancel := context.WithTimeout(ctx, layer.sweep)
-		src, ban, ok := s.sweepLayer(lctx, ctx, layer.ids(), layer.global, spaceId, root)
+		src, ban, ok := s.sweepLayer(lctx, layer.ids(), layer.global, spaceId, root)
 		cancel()
 		if ok {
 			return src, ban, true
-		}
-		if ctx.Err() != nil {
-			break
 		}
 	}
 	return nil, nil, false
 }
 
-// sweepLayer consults up to maxCandidates peers of one layer. lctx
-// carries this layer's clock; ctx is the caller's, used to tell "the
-// caller gave up" from "this layer ran out of budget".
-func (s *Source) sweepLayer(lctx, ctx context.Context, ids []string, global bool, spaceId string, root cid.Cid) (fetch.CarSource, func(), bool) {
-	for i, id := range ids {
-		if i >= maxCandidates || lctx.Err() != nil {
+// sweepLayer asks up to maxCandidates peers of one layer, under lctx,
+// this layer's clock. Candidates that are never reached — a dead LAN
+// dial, a global id with no live connection — are skipped without
+// counting: the clock bounds them, and the global ranking is by last
+// seen, not connectivity, so a connected holder may sit behind several
+// offline ids.
+func (s *Source) sweepLayer(lctx context.Context, ids []string, global bool, spaceId string, root cid.Cid) (fetch.CarSource, func(), bool) {
+	asked := 0
+	for _, id := range ids {
+		if asked >= maxCandidates || lctx.Err() != nil {
 			break
 		}
-		if s.holdsFull(lctx, ctx, id, global, spaceId, root) {
+		reached, full := s.holdsFull(lctx, id, global, spaceId, root)
+		if reached {
+			asked++
+		}
+		if full {
 			peerId := id
 			car := &peerCar{pool: s.pool, peerId: peerId, global: global, spaceId: spaceId, root: root}
 			return car, func() { s.ban(peerId, global) }, true
@@ -144,29 +172,35 @@ func (s *Source) sweepLayer(lctx, ctx context.Context, ids []string, global bool
 	return nil, nil, false
 }
 
-// holdsFull reaches one peer (under its own timeout) and asks whether
-// it holds the file in full. LAN peers are dialed; a global peer is
-// only picked from the pool and skipped, not banned, when it has no
-// live connection. A dial/RPC failure bans the peer — it is
-// unreachable — but a plain "not full" answer does not, and neither
-// does the CALLER's context ending: an aborted download says nothing
-// about the peer, and banTTL is long enough to hide the only device
-// holding the file.
-func (s *Source) holdsFull(lctx, ctx context.Context, peerId string, global bool, spaceId string, root cid.Cid) bool {
-	budget := perPeerTimeout
+// holdsFull reaches one peer (under its own budget) and asks whether it
+// holds the file in full. reached reports that the peer was resolved
+// and a FileCheck attempted on it. LAN peers are dialed; a global peer
+// is only picked from the pool and skipped, not banned, when it has no
+// live connection. A dial/RPC failure bans the peer — it is unreachable
+// — but a plain "not full" answer does not, and neither does the layer
+// clock (or the caller) ending first: that cut-off says nothing about
+// the peer, and banTTL is long enough to hide the only device holding
+// the file. Nor does a dial error carrying ANOTHER caller's cancel: the
+// pool shares an in-flight dial's outcome with every waiter (retrying a
+// few times, but the last verdict can still be that cancel), so a fetch
+// aborted elsewhere must not ban a healthy LAN holder. A deadline error
+// with pctx alive is NOT inherited: it is the dial's own timeout, and
+// the peer is unreachable.
+func (s *Source) holdsFull(lctx context.Context, peerId string, global bool, spaceId string, root cid.Cid) (reached, full bool) {
+	budget := s.b.lanPeer
 	if global {
-		budget = perGlobalPeerTimeout
+		budget = s.b.globalPeer
 	}
 	pctx, cancel := context.WithTimeout(lctx, budget)
 	defer cancel()
 	p, err := s.peer(pctx, peerId, global)
 	if err != nil {
-		if !global && ctx.Err() == nil {
+		inherited := pctx.Err() == nil && errors.Is(err, context.Canceled)
+		if !global && lctx.Err() == nil && !inherited {
 			s.ban(peerId, global)
 		}
-		return false
+		return false, false
 	}
-	var full bool
 	err = p.DoDrpc(pctx, func(conn drpc.Conn) error {
 		resp, derr := filep2p.NewDRPCFileP2PClient(conn).FileCheck(pctx, &filep2p.FileCheckRequest{
 			SpaceId:  spaceId,
@@ -183,12 +217,12 @@ func (s *Source) holdsFull(lctx, ctx context.Context, peerId string, global bool
 		return nil
 	})
 	if err != nil {
-		if ctx.Err() == nil {
+		if lctx.Err() == nil {
 			s.ban(peerId, global)
 		}
-		return false
+		return true, false
 	}
-	return full
+	return true, full
 }
 
 // peer resolves a candidate: dial for LAN, live connection only for
@@ -239,9 +273,9 @@ func (s *Source) filterBanned(ids []string, global bool) []string {
 	return out
 }
 
-// peerCar reads a file's CAR object from one LAN peer via ObjectRead.
-// Implements fetch.CarSource so seed and the block fetcher use it exactly
-// like the HTTP source. It does NOT ban on its own: the fetcher decides
+// peerCar reads a file's CAR object from one peer, LAN or global, via
+// ObjectRead. Implements fetch.CarSource so seed and the block fetcher
+// use it exactly like the HTTP source. It does NOT ban on its own: the fetcher decides
 // (via the ban hook SourceFor returned) whether a failure was invalid
 // content — ban — or merely transient — demote for this fetch only.
 type peerCar struct {
@@ -283,21 +317,15 @@ func (c *peerCar) read(ctx context.Context, off, length int64) (data []byte, tot
 	return data, total, nil
 }
 
-// PeerReadDeadline implements fetch.PeerReadDeadliner: a global peer's
-// range crosses the internet, a LAN peer's does not.
-func (c *peerCar) PeerReadDeadline() time.Duration {
+// PeerReadBudget implements fetch.PeerReadBudgeter: a global peer's
+// read crosses the internet; a LAN peer's keeps the package round trip
+// but still earns time per byte, or a coalesced multi-MiB range would
+// have to land inside one LAN round trip.
+func (c *peerCar) PeerReadBudget() (time.Duration, int64) {
 	if c.global {
-		return globalReadDeadline
+		return globalRoundTrip, globalMinRate
 	}
-	return 0 // the fetch package's LAN default
-}
-
-// PeerProbeDeadline implements fetch.PeerProbeDeadliner.
-func (c *peerCar) PeerProbeDeadline() time.Duration {
-	if c.global {
-		return globalProbeDeadline
-	}
-	return 0
+	return 0, lanMinRate
 }
 
 func (c *peerCar) ReadRange(ctx context.Context, off, length int64) ([]byte, error) {

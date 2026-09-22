@@ -48,47 +48,66 @@ type PeerSource interface {
 // for this fetch.
 const peerPreferDeadline = 800 * time.Millisecond
 
-// PeerReadDeadliner is the optional interface a CarSource implements to
-// state a read budget other than the LAN default. A range served across
-// the internet — through a relay, at a few MB/s — takes orders of
-// magnitude longer than the same range on a LAN, and the LAN figure
-// simply expires mid-transfer. Where there is no HTTP fallback (a file
-// that never reached a durability node) that expiry is the whole fetch,
-// so a file that a peer holds in full never arrives.
-type PeerReadDeadliner interface {
-	// PeerReadDeadline returns the budget for one range read, or zero
-	// to take the LAN default.
-	PeerReadDeadline() time.Duration
+// MaxPeerReadLen is the largest single read a peer serves; the FileP2P
+// server rejects anything longer outright. The fetcher coalesces at
+// most maxFetchSpan (4 MiB) per read, so this is generous headroom, and
+// it bounds a peer read's budget no matter what object size the peer
+// itself reported.
+const MaxPeerReadLen = 8 << 20
+
+// PeerReadBudgeter is the optional interface a CarSource implements to
+// state a read budget other than the LAN default. A read is one round
+// trip plus a transfer, and both differ by orders of magnitude between
+// a LAN and a relayed internet path, so a single fixed figure either
+// expires mid-range on the largest reads or wastes seconds on a stalled
+// 4 KiB probe. Where there is no HTTP fallback an expiry is the whole
+// fetch, so a file that a peer holds in full never arrives.
+type PeerReadBudgeter interface {
+	// PeerReadBudget returns the round-trip allowance for one read and
+	// the transfer rate (bytes/s) the peer is expected to sustain; the
+	// read's budget is roundTrip + length/rate. A zero roundTrip takes
+	// the LAN default; a zero rate charges nothing per byte.
+	PeerReadBudget() (roundTrip time.Duration, bytesPerSecond int64)
 }
 
-// PeerProbeDeadliner states a budget for the head probe, which is one
-// round trip rather than a transfer. Without it a probe would inherit
-// the range budget, so a silently stalled peer costs a full range
-// deadline before the ladder demotes to HTTP.
-type PeerProbeDeadliner interface {
-	// PeerProbeDeadline returns the budget for one probe read, or zero
-	// to take the read budget.
-	PeerProbeDeadline() time.Duration
-}
-
-// peerDeadline is the budget for one range read from the current peer.
-func (fs *fetchSources) peerDeadline() time.Duration {
-	if d, ok := fs.peer.(PeerReadDeadliner); ok {
-		if v := d.PeerReadDeadline(); v > 0 {
-			return v
+// peerDeadline is the budget for reading length bytes from the current
+// peer. length is clamped to MaxPeerReadLen: seed sizes its index read
+// from the total the peer reported, and a stalling peer that reports an
+// absurd total must not buy itself an unbounded budget.
+func (fs *fetchSources) peerDeadline(length int64) time.Duration {
+	roundTrip, rate := peerPreferDeadline, int64(0)
+	if b, ok := fs.peer.(PeerReadBudgeter); ok {
+		rt, bps := b.PeerReadBudget()
+		if rt > 0 {
+			roundTrip = rt
 		}
+		rate = bps
 	}
-	return peerPreferDeadline
+	if rate > 0 {
+		length = min(length, MaxPeerReadLen)
+		roundTrip += time.Duration(length) * time.Second / time.Duration(rate)
+	}
+	return roundTrip
 }
 
-// peerProbeDeadline is the budget for the head probe.
-func (fs *fetchSources) peerProbeDeadline() time.Duration {
-	if d, ok := fs.peer.(PeerProbeDeadliner); ok {
-		if v := d.PeerProbeDeadline(); v > 0 {
-			return v
-		}
+// peerReadFailed applies the ladder's verdict on a failed peer read.
+// With an HTTP fallback the peer is demoted for the rest of this fetch;
+// if the read exhausted the budget this peer itself declared, it is
+// also banned, so a stalled relay costs one budget per banTTL rather
+// than one per Open (a read error only demotes; selection already
+// admitted the peer, and the next Open would admit it again). A caller
+// giving up (ctx done) says nothing about the peer. With no fallback
+// the error surfaces and the peer stays: it is the only source, and
+// the next block retries it.
+func (fs *fetchSources) peerReadFailed(ctx context.Context, expired bool, err error) error {
+	if fs.http == nil {
+		return err
 	}
-	return fs.peerDeadline()
+	fs.peerOff = true
+	if expired && ctx.Err() == nil && fs.banPeer != nil {
+		fs.banPeer()
+	}
+	return nil
 }
 
 // fetchSources are the ordered CAR sources for one fetch: a LAN peer
@@ -99,10 +118,10 @@ func (fs *fetchSources) peerProbeDeadline() time.Duration {
 //   - peer read succeeds AND validates → use it (zero HTTP egress);
 //   - peer serves INVALID bytes (validate fails) → ban the peer and fall
 //     back to HTTP (a bad peer must never make a durable file unreadable);
-//   - peer read errors (timeout / transport) → demote for the rest of
-//     this fetch when HTTP exists (no ban — could be transient/slow);
-//     with no HTTP fallback, surface the error and keep the peer for the
-//     next block (it is the only source).
+//   - peer read errors → demote for the rest of this fetch when HTTP
+//     exists; a read that exhausted the peer's own budget also bans it
+//     (see peerReadFailed). With no HTTP fallback, surface the error
+//     and keep the peer for the next block (it is the only source).
 //
 // One fetchSources per fetch; not shared across goroutines.
 type fetchSources struct {
@@ -121,8 +140,9 @@ func (fs *fetchSources) available() bool { return fs.peer != nil || fs.http != n
 // not a silent corruption).
 func (fs *fetchSources) readRange(ctx context.Context, off, length int64, validate func([]byte) error) ([]byte, error) {
 	if fs.peer != nil && !fs.peerOff {
-		pctx, cancel := context.WithTimeout(ctx, fs.peerDeadline())
+		pctx, cancel := context.WithTimeout(ctx, fs.peerDeadline(length))
 		data, err := fs.peer.ReadRange(pctx, off, length)
+		expired := pctx.Err() != nil
 		cancel()
 		switch {
 		case err == nil && (validate == nil || validate(data) == nil):
@@ -133,14 +153,10 @@ func (fs *fetchSources) readRange(ctx context.Context, off, length int64, valida
 				fs.banPeer()
 			}
 			fs.peerOff = true
-		case fs.http != nil:
-			// Transient peer error but we have a fallback: demote for the
-			// rest of this fetch (no ban — it may just be slow).
-			fs.peerOff = true
 		default:
-			// Transient error and the peer is our only source: fail this
-			// block, keep the peer for the next (matches per-block retry).
-			return nil, err
+			if err = fs.peerReadFailed(ctx, expired, err); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if fs.http == nil {
@@ -162,8 +178,9 @@ func (fs *fetchSources) readRange(ctx context.Context, off, length int64, valida
 // peer→HTTP validation ladder as readRange.
 func (fs *fetchSources) readProbe(ctx context.Context, validate func([]byte) error) (head []byte, total int64, err error) {
 	if fs.peer != nil && !fs.peerOff {
-		pctx, cancel := context.WithTimeout(ctx, fs.peerProbeDeadline())
+		pctx, cancel := context.WithTimeout(ctx, fs.peerDeadline(headProbeLen))
 		head, total, err = fs.peer.ReadProbe(pctx)
+		expired := pctx.Err() != nil
 		cancel()
 		switch {
 		case err == nil && (validate == nil || validate(head) == nil):
@@ -173,10 +190,10 @@ func (fs *fetchSources) readProbe(ctx context.Context, validate func([]byte) err
 				fs.banPeer()
 			}
 			fs.peerOff = true
-		case fs.http != nil:
-			fs.peerOff = true
 		default:
-			return nil, 0, err
+			if err = fs.peerReadFailed(ctx, expired, err); err != nil {
+				return nil, 0, err
+			}
 		}
 	}
 	if fs.http == nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/ipfs/go-cid"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
 )
 
@@ -26,9 +27,9 @@ import (
 const CName = "sdk.p2p.fileserver"
 
 // maxObjectReadLen caps one ObjectRead response so a peer can't force a
-// huge allocation. The fetcher coalesces at most maxFetchSpan (4 MiB)
-// per read, so this is generous headroom.
-const maxObjectReadLen = 8 << 20
+// huge allocation. It is the fetcher's budget clamp, so a read the
+// server would refuse never earns a budget on the client.
+const maxObjectReadLen = fetch.MaxPeerReadLen
 
 // Authorizer reports whether the peer may read the given space's files.
 // Wired to the p2p peer store's advertisement check (App.LocalPeerHasSpace)

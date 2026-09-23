@@ -1949,21 +1949,32 @@ func (s *Store) dropCollectionByName(ctx context.Context, name string) {
 	}
 }
 
+// headStorage returns the space's head storage; ok is false when the
+// space has no storage attached, which every tree probe reads as
+// "nothing here".
+func (s *Store) headStorage(ctx context.Context) (hs headstorage.HeadStorage, ok bool, err error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return nil, false, err
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return nil, false, nil
+	}
+	return st.HeadStorage(), true, nil
+}
+
 // TreeDeleted reports whether any-sync's head storage records treeId as
 // deleted — the permanent, cross-device-authoritative deletion flag
 // (set once, never cleared, no inbound path resurrects the tree). Lets
 // consumers tell a deleted object (whose local row was hard-removed)
 // apart from one that was never materialized.
 func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
+	hs, ok, err := s.headStorage(ctx)
+	if err != nil || !ok {
 		return false, err
 	}
-	st := handle.Inner().Storage()
-	if st == nil {
-		return false, nil
-	}
-	entry, err := st.HeadStorage().GetEntry(ctx, treeId)
+	entry, err := hs.GetEntry(ctx, treeId)
 	if err != nil {
 		if isDocNotFound(err) {
 			return false, nil
@@ -1981,19 +1992,16 @@ func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
 //
 // Distinguishing a derived owner from a signed one is what lets its
 // payloads child pick a derivation: a derived object cannot be a tree
-// parent (objecttree.ErrDerivedParent, refused by deriveChildGate), so a derived owner's payloads object
-// is derived unparented (see payloads.DerivedOwnerSeed) while a signed
-// owner's stays parented. Mirrors TreeDeleted's head-storage lookup.
+// parent (objecttree.ErrDerivedParent, refused by deriveChildGate), so
+// a derived owner's payloads object is derived unparented (see
+// payloads.DerivedOwnerSeed) while a signed owner's stays parented.
+// Mirrors TreeDeleted's head-storage lookup.
 func (s *Store) TreeIsDerived(ctx context.Context, treeId string) (isDerived bool, present bool, err error) {
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
+	hs, ok, err := s.headStorage(ctx)
+	if err != nil || !ok {
 		return false, false, err
 	}
-	st := handle.Inner().Storage()
-	if st == nil {
-		return false, false, nil
-	}
-	entry, err := st.HeadStorage().GetEntry(ctx, treeId)
+	entry, err := hs.GetEntry(ctx, treeId)
 	if err != nil {
 		if isDocNotFound(err) {
 			return false, false, nil
@@ -2093,15 +2101,11 @@ func (s *Store) DeriveId(ctx context.Context, opts DeriveOpts) (string, error) {
 // HasTree reports whether the tree exists in local storage (deleted
 // trees count as existing — TreeDeleted distinguishes them).
 func (s *Store) HasTree(ctx context.Context, treeId string) (bool, error) {
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
+	hs, ok, err := s.headStorage(ctx)
+	if err != nil || !ok {
 		return false, err
 	}
-	st := handle.Inner().Storage()
-	if st == nil {
-		return false, nil
-	}
-	if _, err := st.HeadStorage().GetEntry(ctx, treeId); err != nil {
+	if _, err := hs.GetEntry(ctx, treeId); err != nil {
 		if isDocNotFound(err) {
 			return false, nil
 		}
@@ -2187,6 +2191,11 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		return nil, fmt.Errorf("spaceobjects: derive root: %w", err)
 	}
 	if opts.ParentId != "" {
+		// Derive sits on hot resolve paths: a child already resident in
+		// the cache is returned without touching head storage.
+		if v, err := s.cache.Pick(ctx, root.Id); err == nil {
+			return v.(*object.Object), nil
+		}
 		if err := s.CheckDeriveParent(ctx, root.Id, opts.ParentId); err != nil {
 			return nil, err
 		}
@@ -2204,15 +2213,14 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 // creating; a caller that must refuse before Derive (Objects.Derive with
 // no type yet) runs it first so a missing parent is reported as such.
 func (s *Store) CheckDeriveParent(ctx context.Context, childId, parentId string) error {
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	hs, ok, err := s.headStorage(ctx)
 	if err != nil {
 		return fmt.Errorf("spaceobjects: get space: %w", err)
 	}
-	st := handle.Inner().Storage()
-	if st == nil {
+	if !ok {
 		return fmt.Errorf("spaceobjects: derive under %s: space storage unavailable", parentId)
 	}
-	return deriveChildGate(ctx, st.HeadStorage().GetEntry, childId, parentId)
+	return deriveChildGate(ctx, hs.GetEntry, childId, parentId)
 }
 
 // deriveChildGate decides whether a child bound to parentId may be

@@ -34,6 +34,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
@@ -2168,7 +2169,9 @@ func (s *Store) TreeIdsByChangeType(ctx context.Context, changeType string) ([]s
 // A child (opts.ParentId set) that is already stored here is loaded as
 // is, whatever its parent's local state: any-sync stores a child in any
 // arrival order, so a synced child may precede its parent. Creating a
-// child goes through deriveChildGate first.
+// child goes through deriveChildGate, which owns the parent rules here;
+// the root is built by the pure derivation so no builder-side check
+// runs ahead of the gate.
 func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, error) {
 	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
 		return nil, err
@@ -2177,27 +2180,31 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
 	}
-	// The builder, not the pure root derivation: it refuses a derived
-	// parent (objecttree.ErrDerivedParent) whose entry it can read.
-	payload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, objecttree.ObjectTreeDerivePayload{
+	root, err := objecttree.DeriveObjectTreeRoot(objecttree.ObjectTreeDerivePayload{
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
 		IsEncrypted:   !opts.Unencrypted,
 		ParentId:      opts.ParentId,
-	})
+	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("spaceobjects: DeriveTree: %w", err)
+		return nil, fmt.Errorf("spaceobjects: derive root: %w", err)
 	}
-	childId := payload.RootRawChange.Id
 	if opts.ParentId != "" {
-		if st := handle.Inner().Storage(); st != nil {
-			if err := deriveChildGate(ctx, st.HeadStorage().GetEntry, childId, opts.ParentId); err != nil {
-				return nil, err
-			}
+		st := handle.Inner().Storage()
+		if st == nil {
+			return nil, fmt.Errorf("spaceobjects: derive under %s: %w", opts.ParentId, space.ErrObjectNotFound)
+		}
+		if err := deriveChildGate(ctx, st.HeadStorage().GetEntry, root.Id, opts.ParentId); err != nil {
+			return nil, err
 		}
 	}
-	return s.Get(ctxWithLoadPayload(ctx, &payload), childId)
+	payload := treestorage.TreeStorageCreatePayload{
+		RootRawChange: root,
+		Changes:       []*treechangeproto.RawTreeChangeWithId{root},
+		Heads:         []string{root.Id},
+	}
+	return s.Get(ctxWithLoadPayload(ctx, &payload), root.Id)
 }
 
 // deriveChildGate decides whether a child bound to parentId may be
@@ -2205,27 +2212,27 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 // state. Otherwise one read of the parent's head entry settles it:
 //
 //   - absent: refused with space.ErrObjectNotFound. any-sync stores a
-//     child of an absent parent, but "a derived object cannot be a
-//     parent" is checked on the entry, so with no entry a child could be
-//     minted under a derived parent and its binding would never cascade.
-//     A synced parent lifts the refusal.
+//     child of an absent parent, but the derived-parent rule below needs
+//     the entry, so with none a child could be minted under a derived
+//     parent and its binding would never cascade. A synced parent lifts
+//     the refusal.
 //   - deleted (queued or done): refused with space.ErrObjectDeleted.
 //     any-sync would store the child pre-queued for the deleter, and a
 //     live object handed back would be reclaimed under the caller.
-//   - derived: refused with objecttree.ErrDerivedParent, the builder's
-//     rule, so the outcome does not depend on which check runs first.
+//   - derived: refused with objecttree.ErrDerivedParent. A derived
+//     object is never deleted, so the binding could never cascade.
 func deriveChildGate(ctx context.Context, getEntry func(context.Context, string) (headstorage.HeadsEntry, error), childId, parentId string) error {
 	if _, err := getEntry(ctx, childId); err == nil {
 		return nil
 	} else if !isDocNotFound(err) {
-		return err
+		return fmt.Errorf("spaceobjects: derive %s: %w", childId, err)
 	}
 	parent, err := getEntry(ctx, parentId)
 	switch {
 	case err != nil && isDocNotFound(err):
 		return fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectNotFound)
 	case err != nil:
-		return err
+		return fmt.Errorf("spaceobjects: derive under %s: %w", parentId, err)
 	case parent.DeletedStatus != headstorage.DeletedStatusNotDeleted:
 		return fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectDeleted)
 	case parent.IsDerived:

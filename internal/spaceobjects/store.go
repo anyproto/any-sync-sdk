@@ -1980,8 +1980,8 @@ func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
 // its class can't be read, so the caller can't classify it.
 //
 // Distinguishing a derived owner from a signed one is what lets its
-// payloads child pick a derivation: any-sync rejects a derived object as
-// a tree parent (ErrDerivedParent), so a derived owner's payloads object
+// payloads child pick a derivation: a derived object cannot be a tree
+// parent (objecttree.ErrDerivedParent, refused by deriveChildGate), so a derived owner's payloads object
 // is derived unparented (see payloads.DerivedOwnerSeed) while a signed
 // owner's stays parented. Mirrors TreeDeleted's head-storage lookup.
 func (s *Store) TreeIsDerived(ctx context.Context, treeId string) (isDerived bool, present bool, err error) {
@@ -2066,8 +2066,8 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 
 // DeriveId computes the deterministic objectId Derive(opts) would
 // produce, WITHOUT creating or loading anything. Pure: the root change
-// is built in memory from ChangeType, ChangePayload and ParentId, which
-// are the id. Unencrypted is not in the root; it is pinned per
+// is built in memory from SpaceId, ChangeType, ChangePayload and
+// ParentId, which are the id. Unencrypted is not in the root; it is pinned per
 // ChangeType by validateEncryptionClass. Read paths use this to resolve
 // lazily-created objects and treat a missing tree as "no rows yet".
 func (s *Store) DeriveId(ctx context.Context, opts DeriveOpts) (string, error) {
@@ -2176,10 +2176,6 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
 		return nil, err
 	}
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
-		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
-	}
 	root, err := objecttree.DeriveObjectTreeRoot(objecttree.ObjectTreeDerivePayload{
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,
@@ -2191,11 +2187,7 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		return nil, fmt.Errorf("spaceobjects: derive root: %w", err)
 	}
 	if opts.ParentId != "" {
-		st := handle.Inner().Storage()
-		if st == nil {
-			return nil, fmt.Errorf("spaceobjects: derive under %s: %w", opts.ParentId, space.ErrObjectNotFound)
-		}
-		if err := deriveChildGate(ctx, st.HeadStorage().GetEntry, root.Id, opts.ParentId); err != nil {
+		if err := s.CheckDeriveParent(ctx, root.Id, opts.ParentId); err != nil {
 			return nil, err
 		}
 	}
@@ -2207,9 +2199,26 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 	return s.Get(ctxWithLoadPayload(ctx, &payload), root.Id)
 }
 
+// CheckDeriveParent runs deriveChildGate for the child childId bound to
+// parentId against this space's head storage. Derive runs it before
+// creating; a caller that must refuse before Derive (Objects.Derive with
+// no type yet) runs it first so a missing parent is reported as such.
+func (s *Store) CheckDeriveParent(ctx context.Context, childId, parentId string) error {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: get space: %w", err)
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return fmt.Errorf("spaceobjects: derive under %s: space storage unavailable", parentId)
+	}
+	return deriveChildGate(ctx, st.HeadStorage().GetEntry, childId, parentId)
+}
+
 // deriveChildGate decides whether a child bound to parentId may be
 // created here. A child already stored passes whatever its parent's
-// state. Otherwise one read of the parent's head entry settles it:
+// state. Otherwise one read of the parent's head entry, as it stands at
+// creation time, settles it:
 //
 //   - absent: refused with space.ErrObjectNotFound. any-sync stores a
 //     child of an absent parent, but the derived-parent rule below needs

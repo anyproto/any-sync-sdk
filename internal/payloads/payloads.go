@@ -59,8 +59,8 @@ const ChangeType = "payloads"
 const WellKnownDeriveSeed = "builtin:payloads"
 
 // DerivedOwnerSeed is the ChangePayload seed of a payloads object whose
-// owner is a DERIVED object. any-sync rejects a derived object as a tree
-// parent (objecttree.ErrDerivedParent), so the payloads object can't take
+// owner is a DERIVED object. A derived object cannot be a tree parent
+// (objecttree.ErrDerivedParent), so the payloads object can't take
 // the parented WellKnownDeriveSeed shape signed owners get. It is derived
 // UNPARENTED instead, with the ownerId folded into the seed so each
 // derived owner still resolves to its own deterministic, per-owner

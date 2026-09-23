@@ -37,9 +37,9 @@ const spaceIndexTypeKey = anytype.TypeId + "." + anytype.FieldType
 func (s *Service) seedSpaceIndexOnCreate(ctx context.Context, store *spaceobjects.Store, spaceId string, req space.CreateRequest, normalizedSpaceType string) error {
 	// Derive the spaceIndex object — idempotent on the any-sync side
 	// (a second Create with the same seed returns the existing tree).
-	// ChangeType intentionally left empty: any-sync's DeriveTree
-	// hashes the full payload (including ChangeType) into the tree id,
-	// so it must match what ensureSpaceIndexWiring derives with.
+	// ChangeType intentionally left empty: the derived root hashes the
+	// full payload (including ChangeType) into the tree id, so it must
+	// match what ensureSpaceIndexWiring derives with.
 	obj, err := store.Derive(ctx, spaceobjects.DeriveOpts{
 		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
 	})

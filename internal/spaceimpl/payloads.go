@@ -59,10 +59,10 @@ type RegisterFileOpts struct {
 //
 //   - signed owner  → ParentId=ownerId, seed=WellKnownDeriveSeed: the
 //     payloads object is the owner's child, cascade-deleted with it;
-//   - derived owner → ParentId="", seed=DerivedOwnerSeed(ownerId): any-
-//     sync rejects a derived object as a parent (ErrDerivedParent), so
-//     the payloads object is unparented, with the ownerId folded into the
-//     seed for per-owner uniqueness.
+//   - derived owner → ParentId="", seed=DerivedOwnerSeed(ownerId): a
+//     derived object cannot be a parent (objecttree.ErrDerivedParent),
+//     so the payloads object is unparented, with the ownerId folded into
+//     the seed for per-owner uniqueness.
 //
 // The ParentId and seed edits are COUPLED — the derived branch must clear
 // ParentId AND fold ownerId into the seed together, or every derived

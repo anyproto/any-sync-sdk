@@ -14,8 +14,9 @@ import (
 var ErrTypeRequired = errors.New("space: an object needs a type")
 
 // ErrObjectDeleted is returned by ObjectService.Get for an object
-// whose tree any-sync records as deleted — here or on a peer. Distinct
-// from ErrNotFound: the id existed and is gone for good.
+// whose tree any-sync records as deleted — here or on a peer, and by
+// Derive for a ParentId in that state. Distinct from ErrNotFound: the
+// id existed and is gone for good.
 var ErrObjectDeleted = errors.New("space: object deleted")
 
 // ErrObjectNotFound is returned by a per-object operation that has to

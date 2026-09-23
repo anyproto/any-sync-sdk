@@ -41,8 +41,8 @@ func TestDeriveChildGate(t *testing.T) {
 		{"parent derived", []headstorage.HeadsEntry{{Id: parent, IsDerived: true}}, objecttree.ErrDerivedParent, false},
 		{"parent derived, child present", []headstorage.HeadsEntry{{Id: child}, {Id: parent, IsDerived: true}}, nil, true},
 		{"parent deleted, child present", []headstorage.HeadsEntry{{Id: child}, {Id: parent, DeletedStatus: headstorage.DeletedStatusDeleted}}, nil, true},
-		{"child queued for deletion", []headstorage.HeadsEntry{{Id: child, DeletedStatus: headstorage.DeletedStatusQueued}, {Id: parent}}, space.ErrObjectDeleted, false},
-		{"child deleted", []headstorage.HeadsEntry{{Id: child, DeletedStatus: headstorage.DeletedStatusDeleted}, {Id: parent}}, space.ErrObjectDeleted, false},
+		{"child queued for deletion", []headstorage.HeadsEntry{{Id: child, DeletedStatus: headstorage.DeletedStatusQueued}, {Id: parent}}, space.ErrObjectNotFound, false},
+		{"child deleted", []headstorage.HeadsEntry{{Id: child, DeletedStatus: headstorage.DeletedStatusDeleted}, {Id: parent}}, space.ErrObjectNotFound, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -92,9 +92,8 @@ func payloadsDeriveOpts(ownerId string, ownerDerived bool) spaceobjects.DeriveOp
 //   - the owner's head entry — full tree, selective-sync stub, or a
 //     deleted owner (the entry survives deletion) — carries IsDerived;
 //   - failing that, an existing payloads tree self-identifies its shape:
-//     only the unparented derived-owner shape can be present without its
-//     owner (any-sync hard-rejects a parented child before its parent —
-//     objecttree.ErrParentNotFound), so one existence probe decides.
+//     either shape can land before its owner (any-sync stores a child in
+//     any arrival order), so both candidate ids are probed.
 //
 // When neither is present the class is genuinely unknowable locally — a
 // signed owner that hasn't synced and a derived owner with no payloads
@@ -117,16 +116,8 @@ func (p *PayloadsAPI) ObjectId(ctx context.Context, ownerId string) (string, err
 	if present {
 		return p.s.store.DeriveId(ctx, payloadsDeriveOpts(ownerId, ownerDerived))
 	}
-	derivedShapeId, err := p.s.store.DeriveId(ctx, payloadsDeriveOpts(ownerId, true))
-	if err != nil {
-		return "", err
-	}
-	ok, err := p.s.store.HasTree(ctx, derivedShapeId)
-	if err != nil {
-		return "", err
-	}
-	if ok {
-		return derivedShapeId, nil
+	if id, ok, err := p.existingObjectId(ctx, ownerId); err != nil || ok {
+		return id, err
 	}
 	return "", fmt.Errorf("payloads: owner %s: %w", ownerId, payloads.ErrOwnerUnknown)
 }
@@ -182,11 +173,15 @@ func (p *PayloadsAPI) RegisterFiles(ctx context.Context, ownerId string, files [
 	}
 
 	// Resolve the owner's class so the payloads object is derived with
-	// the right shape (a derived owner can't be a parent). The owner tree
-	// is present here — Attach verifies it before any registration.
-	ownerDerived, _, err := p.s.store.TreeIsDerived(ctx, ownerId)
+	// the right shape (a derived owner can't be a parent). An absent
+	// owner has no class to derive from: guessing "signed" would mint a
+	// tree the owner's true class never resolves to.
+	ownerDerived, present, err := p.s.store.TreeIsDerived(ctx, ownerId)
 	if err != nil {
 		return nil, "", err
+	}
+	if !present {
+		return nil, "", fmt.Errorf("payloads: owner %s: %w", ownerId, payloads.ErrOwnerUnknown)
 	}
 	// Lazy ensure: Derive is idempotent (deterministic id, per-id
 	// load lock), so first-use creation and reuse are the same call.
@@ -455,11 +450,11 @@ func (p *PayloadsAPI) rowFromValue(ctx context.Context, v *anyenc.Value) (payloa
 // consulted: both shapes have deterministic ids, so two existence probes
 // decide. At most one shape can exist for an owner (RegisterFiles derives
 // with the owner's true, immutable class); the signed/parented shape is
-// probed first as the common case, and the derived shape is the only one
-// that can be present without its owner (see ObjectId), so a peer holding
-// the payloads tree but not a content-less derived owner still finds its
-// rows. An owner with no payloads tree of either shape — no files yet,
-// class irrelevant — reads as no-rows.
+// probed first as the common case. Either shape can be present without
+// its owner (any-sync stores a child in any arrival order), so a peer
+// holding the payloads tree but not yet the owner still finds its rows.
+// An owner with no payloads tree of either shape — no files yet, class
+// irrelevant — reads as no-rows.
 func (p *PayloadsAPI) existingObjectId(ctx context.Context, ownerId string) (string, bool, error) {
 	if ownerId == "" {
 		return "", false, errors.New("payloads: ownerId required")

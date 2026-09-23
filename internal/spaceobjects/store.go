@@ -133,9 +133,10 @@ type DeriveOpts struct {
 	// deletes it with the parent. It is also hashed into the derived id.
 	ParentId string
 	// Unencrypted derives a plaintext (node-readable) tree — see
-	// CreateOpts.Unencrypted. NOTE: the flag participates in the
-	// derived root bytes, so it changes the derived object id; every
-	// deriver of a given plaintext object must pass the same value.
+	// CreateOpts.Unencrypted. The flag is not part of the derived root,
+	// so it does not change the id: validateEncryptionClass pins it per
+	// ChangeType, and every deriver of a ChangeType must pass the same
+	// value.
 	Unencrypted bool
 }
 
@@ -2063,30 +2064,29 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 }
 
 // DeriveId computes the deterministic objectId Derive(opts) would
-// produce, WITHOUT creating or loading anything. Pure: DeriveTree
-// only builds the root change in memory (all inputs — including
-// Unencrypted and ParentId — are baked into the root bytes, so they
-// participate in the id). Read paths use this to resolve lazily-
-// created objects and treat a missing tree as "no rows yet".
+// produce, WITHOUT creating or loading anything. Pure: the root change
+// is built in memory from ChangeType, ChangePayload and ParentId, which
+// are the id. Unencrypted is not in the root; it is pinned per
+// ChangeType by validateEncryptionClass. Read paths use this to resolve
+// lazily-created objects and treat a missing tree as "no rows yet".
 func (s *Store) DeriveId(ctx context.Context, opts DeriveOpts) (string, error) {
 	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
 		return "", err
 	}
-	handle, err := s.app.GetSpace(ctx, s.spaceId)
-	if err != nil {
-		return "", fmt.Errorf("spaceobjects: get space: %w", err)
-	}
-	payload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, objecttree.ObjectTreeDerivePayload{
+	// The id is a pure function of the root; built without the space's
+	// TreeBuilder, which also enforces creation rules (a derived parent
+	// refuses) that an id lookup must not trip.
+	root, err := objecttree.DeriveObjectTreeRoot(objecttree.ObjectTreeDerivePayload{
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
 		IsEncrypted:   !opts.Unencrypted,
 		ParentId:      opts.ParentId,
-	})
+	}, nil)
 	if err != nil {
-		return "", fmt.Errorf("spaceobjects: DeriveTree: %w", err)
+		return "", fmt.Errorf("spaceobjects: derive root: %w", err)
 	}
-	return payload.RootRawChange.Id, nil
+	return root.Id, nil
 }
 
 // HasTree reports whether the tree exists in local storage (deleted
@@ -2172,6 +2172,19 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
 	}
+	if opts.ParentId != "" {
+		// Cascade-delete is the binding's promise, and only a parent held
+		// here can make it; any-sync stores a child of an absent parent.
+		ok, err := s.HasTree(ctx, opts.ParentId)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("spaceobjects: derive under %s: %w", opts.ParentId, space.ErrObjectNotFound)
+		}
+	}
+	// The builder, not the pure root derivation: it refuses a derived
+	// parent (objecttree.ErrDerivedParent).
 	payload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, objecttree.ObjectTreeDerivePayload{
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,

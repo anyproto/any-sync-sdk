@@ -121,9 +121,9 @@ func TestE2E_SelectiveSyncPayloads(t *testing.T) {
 	require.NoError(t, err)
 	paB := payloadsSurface(t, spB)
 
-	// The payloads rows converge. The child tree can transiently fail
-	// with ErrParentNotFound until the owner's heads-only stub lands
-	// (same sync round or the next), hence the tolerant wait.
+	// The payloads rows converge; the child tree lands whether or not
+	// the owner's heads-only stub is there yet, hence the tolerant wait
+	// on rows rather than on any one round.
 	var rowsB []payloads.Row
 	if !waitFor(ctx, 150*time.Second, 500*time.Millisecond, func() bool {
 		_ = spB.SyncHeads(ctx)

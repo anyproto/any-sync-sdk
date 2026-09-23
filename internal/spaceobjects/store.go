@@ -2191,13 +2191,6 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		return nil, fmt.Errorf("spaceobjects: derive root: %w", err)
 	}
 	if opts.ParentId != "" {
-		// Derive sits on hot resolve paths: a child resident in the cache
-		// skips head storage. Get, not Pick, hands it back so the entry's
-		// last use is refreshed and the TTL sweep does not close it under
-		// the caller.
-		if _, err := s.cache.Pick(ctx, root.Id); err == nil {
-			return s.Get(ctx, root.Id)
-		}
 		present, err := s.CheckDeriveParent(ctx, root.Id, opts.ParentId)
 		if err != nil {
 			return nil, err

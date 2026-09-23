@@ -130,3 +130,5 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.37.1 // indirect
 )
+
+replace github.com/brutella/dnssd => github.com/anyproto/dnssd v1.2.15-0.20260923145437-add77669e40b

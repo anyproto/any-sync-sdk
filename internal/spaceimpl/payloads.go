@@ -101,10 +101,8 @@ func payloadsDeriveOpts(ownerId string, ownerDerived bool) spaceobjects.DeriveOp
 // rather than guessing an id that would flip once the owner arrives.
 // Callers retry after sync delivers the owner (or its payloads tree).
 //
-// The WRITE path (RegisterFiles) doesn't share this resolution: at create
-// time there is no payloads tree to probe, so the owner's true class is
-// the only valid input (the owner is always present there — Attach checks
-// HasTree first).
+// The WRITE path (RegisterFiles) resolves the class the same way and
+// refuses with the same sentinel; it never guesses a shape to create.
 func (p *PayloadsAPI) ObjectId(ctx context.Context, ownerId string) (string, error) {
 	if ownerId == "" {
 		return "", errors.New("payloads: ownerId required")
@@ -173,12 +171,19 @@ func (p *PayloadsAPI) RegisterFiles(ctx context.Context, ownerId string, files [
 	}
 
 	// Resolve the owner's class so the payloads object is derived with
-	// the right shape (a derived owner can't be a parent). An absent
-	// owner has no class to derive from: guessing "signed" would mint a
-	// tree the owner's true class never resolves to.
+	// the right shape (a derived owner can't be a parent). With the
+	// owner absent, a payloads tree already here names the shape (see
+	// ObjectId); with neither, guessing "signed" would mint a tree the
+	// owner's true class never resolves to.
 	ownerDerived, present, err := p.s.store.TreeIsDerived(ctx, ownerId)
 	if err != nil {
 		return nil, "", err
+	}
+	if !present {
+		_, ownerDerived, present, err = p.existingShape(ctx, ownerId)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	if !present {
 		return nil, "", fmt.Errorf("payloads: owner %s: %w", ownerId, payloads.ErrOwnerUnknown)
@@ -456,23 +461,30 @@ func (p *PayloadsAPI) rowFromValue(ctx context.Context, v *anyenc.Value) (payloa
 // An owner with no payloads tree of either shape — no files yet, class
 // irrelevant — reads as no-rows.
 func (p *PayloadsAPI) existingObjectId(ctx context.Context, ownerId string) (string, bool, error) {
+	id, _, ok, err := p.existingShape(ctx, ownerId)
+	return id, ok, err
+}
+
+// existingShape is existingObjectId plus the owner class the found
+// tree's shape discloses (unparented → derived owner).
+func (p *PayloadsAPI) existingShape(ctx context.Context, ownerId string) (objId string, ownerDerived bool, ok bool, err error) {
 	if ownerId == "" {
-		return "", false, errors.New("payloads: ownerId required")
+		return "", false, false, errors.New("payloads: ownerId required")
 	}
 	for _, ownerDerived := range []bool{false, true} {
 		objId, err := p.s.store.DeriveId(ctx, payloadsDeriveOpts(ownerId, ownerDerived))
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		ok, err := p.s.store.HasTree(ctx, objId)
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		if ok {
-			return objId, true, nil
+			return objId, ownerDerived, true, nil
 		}
 	}
-	return "", false, nil
+	return "", false, false, nil
 }
 
 // existingObject loads the owner's payloads object if its tree exists

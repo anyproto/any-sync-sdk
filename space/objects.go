@@ -24,6 +24,9 @@ var ErrObjectDeleted = errors.New("space: object deleted")
 // deleted. One sentinel for both because the caller can act on
 // neither — the object is not addressable on this device.
 //
+// Derive with a ParentId returns it for a parent not yet held here (see
+// DeriveObjectOpts.ParentId); a retry after the parent syncs succeeds.
+//
 // Subscribe reports it for a DELETED object but not for an unknown one:
 // an id with no tree here yields an empty initial snapshot instead, so a
 // subscription registered before the object lands still receives its
@@ -90,5 +93,10 @@ type DeriveObjectOpts struct {
 	// re-derivable only with the same ParentId. Deleting the parent
 	// cascade-deletes the child's tree and excludes it from cold sync.
 	// Empty derives a top-level object.
+	//
+	// Creating the child needs the parent's tree on this device:
+	// ErrObjectNotFound until it has synced, ErrObjectDeleted once it
+	// is deleted. A child that is already here (synced ahead of its
+	// parent) re-derives regardless.
 	ParentId string
 }

@@ -76,7 +76,10 @@ space.Upsert(ctx, UpsertBatch)
 ```
 
 `Derive` with a `ParentId` binds the child to its parent: the parent id is
-hashed into the child's id, and deleting the parent deletes the child.
+hashed into the child's id, and deleting the parent deletes the child. Creating
+the child needs the parent's tree on this device (`ErrObjectNotFound` until it
+syncs, `ErrObjectDeleted` after deletion); a child that already synced here
+re-derives without it.
 
 ## Lifecycle
 

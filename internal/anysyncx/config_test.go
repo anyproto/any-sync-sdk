@@ -55,3 +55,38 @@ func TestGetIroh(t *testing.T) {
 	cfg.P2P.Global.Port = 0
 	require.Empty(t, newConfig(cfg, nodeconf.Configuration{}).GetIroh().BindAddr)
 }
+
+// Every transport takes whole seconds. A sub-second timeout rounds up
+// to one, never down to zero: the transports read zero as their own
+// default or as an expired deadline.
+func TestTimeoutsRoundUpToWholeSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		in   time.Duration
+		want int
+	}{
+		{0, 10},
+		{500 * time.Millisecond, 1},
+		{time.Second, 1},
+		{1500 * time.Millisecond, 2},
+		{10 * time.Second, 10},
+	} {
+		cfg := config.Config{Sync: config.Sync{DialTimeout: tc.in}}
+		c := newConfig(cfg, nodeconf.Configuration{})
+		require.Equal(t, tc.want, c.GetYamux().DialTimeoutSec, "yamux dial %v", tc.in)
+		require.Equal(t, tc.want, c.GetYamux().WriteTimeoutSec, "yamux write %v", tc.in)
+		require.Equal(t, tc.want, c.GetQuic().DialTimeoutSec, "quic dial %v", tc.in)
+		require.Equal(t, tc.want, c.GetQuic().WriteTimeoutSec, "quic write %v", tc.in)
+		require.Equal(t, tc.want, c.GetIroh().WriteTimeoutSec, "iroh write %v", tc.in)
+	}
+
+	on := true
+	cfg := config.Config{P2P: config.P2P{Global: config.GlobalP2P{
+		Enabled:     &on,
+		DialTimeout: 500 * time.Millisecond,
+		KeepAlive:   700 * time.Millisecond,
+	}}}
+	conf := newConfig(cfg, nodeconf.Configuration{}).GetIroh()
+	require.Equal(t, 1, conf.DialTimeoutSec)
+	require.Equal(t, 1, conf.KeepAlivePeriodSec)
+	require.Equal(t, 3, conf.MaxIdleTimeoutSec, "three keep-alives, rounded up")
+}

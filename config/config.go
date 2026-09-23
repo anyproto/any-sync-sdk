@@ -212,10 +212,12 @@ type GlobalP2P struct {
 	// DialTimeout bounds one global dial (relay round trip included).
 	// A relay dial either completes in about a round trip or dies at
 	// QUIC's own handshake timeout of 5 s, so this only decides how long
-	// the connector's single dial slot stays busy on a dead peer.
+	// the connector's single dial slot stays busy on a dead peer. The
+	// transport counts whole seconds, so it is rounded up.
 	DialTimeout time.Duration `yaml:"dialTimeout"`
 
-	// KeepAlive is the QUIC keep-alive period of global connections.
+	// KeepAlive is the QUIC keep-alive period of global connections,
+	// rounded up to whole seconds.
 	KeepAlive time.Duration `yaml:"keepAlive"`
 
 	// StaleAfter / DormantAfter / DisableAfter are the liveness tiers:
@@ -347,6 +349,9 @@ type Network struct {
 // Sync tunes sync timeouts and retries. All zero-valued fields fall
 // back to SDK defaults.
 type Sync struct {
+	// DialTimeout bounds one dial and one write on the sync transports
+	// (default 10 s). The transports count whole seconds, so it is
+	// rounded up.
 	DialTimeout     time.Duration
 	ChangeBatchSize int
 

@@ -195,6 +195,14 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 			return "", err
 		}
 		if members.Type == "" {
+			// A child not here yet is refused for its parent's state
+			// first: on a device the parent hasn't reached, the caller
+			// needs the retry-after-sync sentinel, not a type.
+			if opts.ParentId != "" {
+				if _, err := o.parent.store.CheckDeriveParent(ctx, id, opts.ParentId); err != nil {
+					return "", err
+				}
+			}
 			return "", fmt.Errorf("%w: DeriveObjectOpts.Type on an object with no type yet", space.ErrTypeRequired)
 		}
 	}

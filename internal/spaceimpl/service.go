@@ -453,11 +453,13 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 		SpaceId:       spaceId,
 		IsEncrypted:   true,
 	}
-	storagePayload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, derivePayload)
+	// An id lookup, not a creation: the builder's creation rules do not
+	// apply, the pure root derivation does.
+	root, err := objecttree.DeriveObjectTreeRoot(derivePayload, nil)
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: derive spaceIndex tree id: %w", err)
 	}
-	objectId := storagePayload.RootRawChange.Id
+	objectId := root.Id
 
 	s.mu.Lock()
 	if existing, ok := s.spaceIndexIds[spaceId]; ok {

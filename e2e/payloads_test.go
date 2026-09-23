@@ -67,10 +67,8 @@ func TestE2E_Payloads(t *testing.T) {
 	// The owner carries a type binding so its tree has content. A
 	// root-only (never-written) tree is excluded from the headsync
 	// diff (any-sync DiffManager treats empty roots as old-diff-only),
-	// so a bare owner never reaches the node — and the node then
-	// refuses the payloads CHILD tree forever with ErrParentNotFound
-	// (objecttree.CreateStorage hard-requires the parent). Flagged as
-	// an any-sync gap; real owners always have content.
+	// so a bare owner never reaches the node. Flagged as an any-sync
+	// gap; real owners always have content.
 	typeId, _ := setupMovieType(t, ctx, sp)
 	ownerId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
@@ -183,9 +181,9 @@ func TestE2E_Payloads(t *testing.T) {
 	paB := payloadsSurface(t, spB)
 
 	// The payloads id depends on the owner's class (signed → parented
-	// shape), which B can't know before the owner tree syncs — ObjectId
+	// shape). Until either the owner or the payloads tree has synced, B
 	// must refuse with the sentinel rather than guess an id that would
-	// flip, and must agree with A as soon as anything discloses the class.
+	// flip; as soon as one of them is here it must agree with A.
 	objIdB, err := paB.ObjectId(ctx, ownerId)
 	if err != nil {
 		require.ErrorIs(t, err, payloads.ErrOwnerUnknown,

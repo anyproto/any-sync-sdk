@@ -28,23 +28,26 @@ func TestDeriveChildGate(t *testing.T) {
 		}
 	}
 	cases := []struct {
-		name    string
-		entries []headstorage.HeadsEntry
-		want    error
+		name        string
+		entries     []headstorage.HeadsEntry
+		want        error
+		wantPresent bool
 	}{
-		{"parent absent, child absent", nil, space.ErrObjectNotFound},
-		{"parent absent, child present", []headstorage.HeadsEntry{{Id: child}}, nil},
-		{"parent signed", []headstorage.HeadsEntry{{Id: parent}}, nil},
-		{"parent queued for deletion", []headstorage.HeadsEntry{{Id: parent, DeletedStatus: headstorage.DeletedStatusQueued}}, space.ErrObjectDeleted},
-		{"parent deleted", []headstorage.HeadsEntry{{Id: parent, DeletedStatus: headstorage.DeletedStatusDeleted}}, space.ErrObjectDeleted},
-		{"parent derived", []headstorage.HeadsEntry{{Id: parent, IsDerived: true}}, objecttree.ErrDerivedParent},
-		{"parent deleted, child present", []headstorage.HeadsEntry{{Id: child}, {Id: parent, DeletedStatus: headstorage.DeletedStatusDeleted}}, nil},
+		{"parent absent, child absent", nil, space.ErrObjectNotFound, false},
+		{"parent absent, child present", []headstorage.HeadsEntry{{Id: child}}, nil, true},
+		{"parent signed", []headstorage.HeadsEntry{{Id: parent}}, nil, false},
+		{"parent queued for deletion", []headstorage.HeadsEntry{{Id: parent, DeletedStatus: headstorage.DeletedStatusQueued}}, space.ErrObjectDeleted, false},
+		{"parent deleted", []headstorage.HeadsEntry{{Id: parent, DeletedStatus: headstorage.DeletedStatusDeleted}}, space.ErrObjectDeleted, false},
+		{"parent derived", []headstorage.HeadsEntry{{Id: parent, IsDerived: true}}, objecttree.ErrDerivedParent, false},
+		{"parent derived, child present", []headstorage.HeadsEntry{{Id: child}, {Id: parent, IsDerived: true}}, nil, true},
+		{"parent deleted, child present", []headstorage.HeadsEntry{{Id: child}, {Id: parent, DeletedStatus: headstorage.DeletedStatusDeleted}}, nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := deriveChildGate(context.Background(), entries(tc.entries...), child, parent)
+			present, err := deriveChildGate(context.Background(), entries(tc.entries...), child, parent)
 			if tc.want == nil {
 				require.NoError(t, err)
+				require.Equal(t, tc.wantPresent, present)
 				return
 			}
 			require.ErrorIs(t, err, tc.want)
@@ -54,6 +57,7 @@ func TestDeriveChildGate(t *testing.T) {
 	t.Run("storage error propagates", func(t *testing.T) {
 		boom := errors.New("boom")
 		getEntry := func(context.Context, string) (headstorage.HeadsEntry, error) { return headstorage.HeadsEntry{}, boom }
-		require.ErrorIs(t, deriveChildGate(context.Background(), getEntry, child, parent), boom)
+		_, err := deriveChildGate(context.Background(), getEntry, child, parent)
+		require.ErrorIs(t, err, boom)
 	})
 }

@@ -2191,13 +2191,22 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		return nil, fmt.Errorf("spaceobjects: derive root: %w", err)
 	}
 	if opts.ParentId != "" {
-		// Derive sits on hot resolve paths: a child already resident in
-		// the cache is returned without touching head storage.
-		if v, err := s.cache.Pick(ctx, root.Id); err == nil {
-			return v.(*object.Object), nil
+		// Derive sits on hot resolve paths: a child resident in the cache
+		// skips head storage. Get, not Pick, hands it back so the entry's
+		// last use is refreshed and the TTL sweep does not close it under
+		// the caller.
+		if _, err := s.cache.Pick(ctx, root.Id); err == nil {
+			return s.Get(ctx, root.Id)
 		}
-		if err := s.CheckDeriveParent(ctx, root.Id, opts.ParentId); err != nil {
+		present, err := s.CheckDeriveParent(ctx, root.Id, opts.ParentId)
+		if err != nil {
 			return nil, err
+		}
+		if present {
+			// The gate saw the child's entry: load it as is, with no
+			// create payload, so PutTree's write transaction is not
+			// opened just to report ErrTreeExists.
+			return s.Get(ctx, root.Id)
 		}
 	}
 	payload := treestorage.TreeStorageCreatePayload{
@@ -2209,24 +2218,25 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 }
 
 // CheckDeriveParent runs deriveChildGate for the child childId bound to
-// parentId against this space's head storage. Derive runs it before
-// creating; a caller that must refuse before Derive (Objects.Derive with
-// no type yet) runs it first so a missing parent is reported as such.
-func (s *Store) CheckDeriveParent(ctx context.Context, childId, parentId string) error {
+// parentId against this space's head storage; childPresent reports a
+// child already stored here. Derive runs it before creating; a caller
+// that must refuse before Derive (Objects.Derive with no type yet) runs
+// it first so a missing parent is reported as such.
+func (s *Store) CheckDeriveParent(ctx context.Context, childId, parentId string) (childPresent bool, err error) {
 	hs, ok, err := s.headStorage(ctx)
 	if err != nil {
-		return fmt.Errorf("spaceobjects: get space: %w", err)
+		return false, fmt.Errorf("spaceobjects: get space: %w", err)
 	}
 	if !ok {
-		return fmt.Errorf("spaceobjects: derive under %s: space storage unavailable", parentId)
+		return false, fmt.Errorf("spaceobjects: derive under %s: space storage unavailable", parentId)
 	}
 	return deriveChildGate(ctx, hs.GetEntry, childId, parentId)
 }
 
 // deriveChildGate decides whether a child bound to parentId may be
-// created here. A child already stored passes whatever its parent's
-// state. Otherwise one read of the parent's head entry, as it stands at
-// creation time, settles it:
+// created here. A child already stored passes (childPresent true)
+// whatever its parent's state. Otherwise one read of the parent's head
+// entry, as it stands at creation time, settles it:
 //
 //   - absent: refused with space.ErrObjectNotFound. any-sync stores a
 //     child of an absent parent, but the derived-parent rule below needs
@@ -2238,24 +2248,24 @@ func (s *Store) CheckDeriveParent(ctx context.Context, childId, parentId string)
 //     live object handed back would be reclaimed under the caller.
 //   - derived: refused with objecttree.ErrDerivedParent. A derived
 //     object is never deleted, so the binding could never cascade.
-func deriveChildGate(ctx context.Context, getEntry func(context.Context, string) (headstorage.HeadsEntry, error), childId, parentId string) error {
+func deriveChildGate(ctx context.Context, getEntry func(context.Context, string) (headstorage.HeadsEntry, error), childId, parentId string) (childPresent bool, err error) {
 	if _, err := getEntry(ctx, childId); err == nil {
-		return nil
+		return true, nil
 	} else if !isDocNotFound(err) {
-		return fmt.Errorf("spaceobjects: derive %s: %w", childId, err)
+		return false, fmt.Errorf("spaceobjects: derive %s: %w", childId, err)
 	}
 	parent, err := getEntry(ctx, parentId)
 	switch {
 	case err != nil && isDocNotFound(err):
-		return fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectNotFound)
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectNotFound)
 	case err != nil:
-		return fmt.Errorf("spaceobjects: derive under %s: %w", parentId, err)
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, err)
 	case parent.DeletedStatus != headstorage.DeletedStatusNotDeleted:
-		return fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectDeleted)
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectDeleted)
 	case parent.IsDerived:
-		return fmt.Errorf("spaceobjects: derive under %s: %w", parentId, objecttree.ErrDerivedParent)
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, objecttree.ErrDerivedParent)
 	}
-	return nil
+	return false, nil
 }
 
 // loadObject is the ocache.LoadFunc. Builds Controller + Object +

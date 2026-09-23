@@ -2,6 +2,7 @@ package anysyncx
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -181,5 +182,5 @@ func wholeSeconds(d time.Duration) int {
 	if d <= 0 {
 		return 0
 	}
-	return int((d + time.Second - 1) / time.Second)
+	return int(math.Ceil(d.Seconds()))
 }

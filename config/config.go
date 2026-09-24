@@ -191,8 +191,12 @@ type GlobalP2P struct {
 	// tests only.
 	InsecurePkarr bool `yaml:"insecurePkarr"`
 
-	// Port fixes the UDP port of the iroh endpoint. Zero binds an
-	// ephemeral port.
+	// Port fixes the UDP port of the iroh endpoint: one attempt, no
+	// fallback. Zero — the default — reuses the port persisted under
+	// DataDir from the previous run, falling back to an ephemeral one
+	// when it is taken (and persists what was bound). While the LAN layer
+	// is on, a persisted port equal to its port is not reused: the LAN
+	// keeps it.
 	Port int `yaml:"port"`
 
 	// MaxConnections caps the global connections this device maintains

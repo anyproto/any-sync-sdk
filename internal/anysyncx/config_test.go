@@ -38,7 +38,7 @@ nodes:
 // keep-alive stays below the idle timeout, the relay flags pass through.
 func TestGetIroh(t *testing.T) {
 	on := true
-	cfg := config.Config{P2P: config.P2P{Global: config.GlobalP2P{
+	cfg := config.Config{Storage: config.Storage{DataDir: t.TempDir()}, P2P: config.P2P{Global: config.GlobalP2P{
 		Enabled:       &on,
 		RelayURLs:     []string{"http://127.0.0.1:3340"},
 		InsecureRelay: true,

@@ -5,14 +5,10 @@ package anysyncx
 import (
 	"context"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/anyproto/any-sync/app"
-	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/net/transport/quic"
 	"github.com/anyproto/any-sync/net/transport/yamux"
 	"go.uber.org/zap"
@@ -21,13 +17,6 @@ import (
 )
 
 const p2pServerCName = "sdk.p2p.server"
-
-var p2pLog = logger.NewNamed("anysyncx.p2p")
-
-// portFileName sits directly under DataDir, next to the anysync/ and
-// files/ subdirs. Plain decimal text — same low-ceremony persistence as
-// the nodeconf store path.
-const portFileName = "p2p_port"
 
 // quicListener is the slice of quic.Quic the server needs; an interface
 // so tests can fake the transport without booting secureservice.
@@ -76,7 +65,7 @@ type p2pServer struct {
 }
 
 func newP2PServer(cfg config.P2P, dataDir string) *p2pServer {
-	return &p2pServer{cfg: cfg, portFile: filepath.Join(dataDir, portFileName)}
+	return &p2pServer{cfg: cfg, portFile: portFilePath(dataDir, portFileName)}
 }
 
 func (s *p2pServer) Init(a *app.App) error {
@@ -121,7 +110,7 @@ func (s *p2pServer) start(ctx context.Context) error {
 	want := s.cfg.Port
 	forced := want != 0
 	if !forced {
-		want = s.readSavedPort()
+		want = readPortFile(s.portFile)
 	}
 	// A forced port is config-owned: one attempt, no fallback. Sticky /
 	// ephemeral ports retry fresh pairs when either side is occupied
@@ -143,8 +132,8 @@ func (s *p2pServer) start(ctx context.Context) error {
 		s.port = port
 		s.started = true
 		s.mu.Unlock()
-		if !forced && port != s.readSavedPort() {
-			s.savePort(port)
+		if !forced {
+			savePortFile(s.portFile, port)
 		}
 		return nil
 	}
@@ -172,24 +161,6 @@ func (s *p2pServer) bindPair(ctx context.Context, want int) (int, error) {
 	}
 	s.yamux.AddListener(tcp)
 	return port, nil
-}
-
-func (s *p2pServer) readSavedPort() int {
-	raw, err := os.ReadFile(s.portFile)
-	if err != nil {
-		return 0
-	}
-	port, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || port <= 0 || port > 65535 {
-		return 0
-	}
-	return port
-}
-
-func (s *p2pServer) savePort(port int) {
-	if err := os.WriteFile(s.portFile, []byte(strconv.Itoa(port)), 0o600); err != nil {
-		p2pLog.Warn("persist p2p port", zap.Error(err))
-	}
 }
 
 func parseAddrPort(addr string) (int, error) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -117,9 +118,12 @@ func (c *configAdapter) GetQuic() quic.Config {
 
 // GetIroh maps the global p2p budget onto the iroh transport. The idle
 // timeout is three keep-alive periods so a quiet relay path survives a
-// missed probe; a dead peer is noticed within that window.
+// missed probe; a dead peer is noticed within that window. Without a
+// configured port the endpoint prefers the one persisted by the previous
+// run (keepIrohPort) and falls back to an ephemeral one when it is taken.
 func (c *configAdapter) GetIroh() iroh.Config {
-	g := c.sdk.ResolveP2P().Global
+	p2pCfg := c.sdk.ResolveP2P()
+	g := p2pCfg.Global
 	conf := iroh.Config{
 		RelayURLs:          g.RelayURLs,
 		InsecureRelay:      g.InsecureRelay,
@@ -130,9 +134,24 @@ func (c *configAdapter) GetIroh() iroh.Config {
 		KeepAlivePeriodSec: wholeSeconds(g.KeepAlive),
 		MaxIdleTimeoutSec:  wholeSeconds(3 * g.KeepAlive),
 	}
-	if g.Port != 0 {
+	port := g.Port
+	if port == 0 {
+		port = readPortFile(c.irohPortFile())
+		// The iroh endpoint binds before the LAN listener: a remembered
+		// port equal to the LAN one would take it, and the LAN listener
+		// has a single attempt at a configured port.
+		lanPort := p2pCfg.Port
+		if lanPort == 0 {
+			lanPort = readPortFile(portFilePath(c.sdk.Storage.DataDir, portFileName))
+		}
+		if p2pCfg.IsEnabled() && port == lanPort {
+			port = 0
+		}
+		conf.BindFallback = port != 0
+	}
+	if port != 0 {
 		// dual-stack, like go-iroh's own default bind
-		conf.BindAddr = net.JoinHostPort("::", strconv.Itoa(g.Port))
+		conf.BindAddr = net.JoinHostPort("::", strconv.Itoa(port))
 	}
 	return conf
 }
@@ -157,6 +176,21 @@ func (c *configAdapter) GetStreamConfig() streampool.StreamConfig {
 		DialQueueWorkers: 4,
 		DialQueueSize:    outgoingQueueSize,
 	}
+}
+
+// keepIrohPort persists the port the iroh endpoint bound so the next
+// start prefers it (GetIroh). A configured port is never written.
+func (c *configAdapter) keepIrohPort(ep interface{ LocalAddr() netip.AddrPort }) {
+	if c.sdk.ResolveP2P().Global.Port != 0 {
+		return
+	}
+	if port := int(ep.LocalAddr().Port()); port != 0 {
+		savePortFile(c.irohPortFile(), port)
+	}
+}
+
+func (c *configAdapter) irohPortFile() string {
+	return portFilePath(c.sdk.Storage.DataDir, irohPortFileName)
 }
 
 func (c *configAdapter) GetNodeConfStorePath() string {

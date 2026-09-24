@@ -29,6 +29,8 @@ import (
 	"github.com/anyproto/any-sync/net/rpc/server"
 	"github.com/anyproto/any-sync/net/secureservice"
 	"github.com/anyproto/any-sync/net/streampool"
+	"github.com/anyproto/any-sync/net/transport"
+	"github.com/anyproto/any-sync/net/transport/iroh"
 	"github.com/anyproto/any-sync/node/nodeclient"
 	"github.com/anyproto/any-sync/nodeconf"
 	"github.com/anyproto/any-sync/nodeconf/nodeconfstore"
@@ -398,6 +400,9 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 
 	if err := a.Start(ctx); err != nil {
 		return nil, fmt.Errorf("anysyncx: app start: %w", err)
+	}
+	if globalEnabled {
+		cfgAdapter.keepIrohPort(a.MustComponent(transport.IrohCName).(iroh.Iroh))
 	}
 
 	out.coord = a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)

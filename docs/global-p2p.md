@@ -56,7 +56,7 @@ key-value store, plus the account record for the account's own devices
 
 ## Liveness tiers
 
-Every peer has a persisted record (`p2p_peers.json` under DataDir):
+Every peer has a persisted record (`anysync/p2p_peers.json` under DataDir):
 `lastSeen`, `lastAttempt`, `failures`. `lastSeen` is the newest of: the
 key-value row timestamps (publisher clock, clamped to now), a successful
 dial, an accepted connection, or the 10 s sweep over peers still connected.
@@ -156,9 +156,15 @@ Off by default. `RelayURLs` is required when enabled; `Open` refuses an
 enabled layer without one, because a relay-less endpoint would publish its IP
 addresses into every space's records. Independent of the LAN layer
 (`P2P.Enabled`). `InsecureRelay` admits `http://` relays for development.
-`Port` pins the UDP port (dual-stack). `PkarrRelayURLs` turns on the account
-layer ([19-account-discovery](account-discovery.md)). The remaining fields
-are the budget above.
+`Port` pins the UDP port (dual-stack; one attempt, no fallback). Unset, the
+endpoint prefers the port it bound last time (`anysync/iroh_port` under
+DataDir) and binds an ephemeral one when that is taken; the port it ends up
+on is persisted for the next start. While the LAN layer is on, a remembered
+port equal to its port, configured or remembered, is not reused: the LAN
+keeps it.
+`PkarrRelayURLs` turns on the account layer
+([19-account-discovery](account-discovery.md)). The remaining fields are the
+budget above.
 
 ## Status
 

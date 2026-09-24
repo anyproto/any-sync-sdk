@@ -380,15 +380,21 @@ type Service interface {
 	// Query(SpaceIndexObjectId(), "devices").
 	SetDevice(ctx context.Context, up DeviceUpsert) error
 
-	// ClaimActive marks THIS device as the active instance of app: it
-	// writes an activeClaims.<app> = {seq, at} claim on the own row
-	// (seq = max existing + 1). Conflict-resolution semantics live in
+	// ClaimActive marks a device as the active instance of app: it
+	// writes an activeClaims.<app> = {seq, at} claim (seq = max
+	// existing + 1) on peerId's row, or on the own row when peerId is
+	// "" or the local peer id. Conflict-resolution semantics live in
 	// the reader — resolve the winner with ActiveDevice, never by
 	// comparing claims ad hoc. There is no un-claim: only a higher
-	// claim from another device or a row deletion moves the winner.
+	// claim or a row deletion moves the winner.
+	//
+	// A self claim also marks the app installed on the own row;
 	// ErrDevicePruned when this device's row was deleted (see
-	// SetDevice).
-	ClaimActive(ctx context.Context, app string) error
+	// SetDevice). A claim for another device writes only the claim:
+	// ErrDeviceUnknown when peerId has no live row,
+	// ErrDeviceAppNotInstalled when the row doesn't carry the app,
+	// ErrDevicePruned when the row is pruned before the write lands.
+	ClaimActive(ctx context.Context, app, peerId string) error
 
 	// DeleteDevice prunes peerId's row — the "device doesn't exist"
 	// signal that moves the active election away from it. The tombstone

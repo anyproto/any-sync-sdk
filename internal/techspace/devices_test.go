@@ -238,3 +238,95 @@ func TestDevices_ClaimRoundTrip(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, peer, winner)
 }
+
+func claimOpsRow(t *testing.T, ctrl *crdt.Controller, peer string, apps ...string) space.Device {
+	t.Helper()
+	info := map[string]map[string]any{}
+	for _, a := range apps {
+		info[a] = map[string]any{}
+	}
+	ops, err := techspace.DeviceUpsertOps(&anyenc.Arena{}, space.DeviceUpsert{Name: peer, Apps: info})
+	require.NoError(t, err)
+	require.NoError(t, ctrl.ApplyChange(context.Background(), devicesChange(crdt.VersionId("v-"+peer), peer, true, ops...)))
+	return techspace.DecodeDeviceRecord(ctrl.Get(context.Background(), techspace.DevicesDataset, peer))
+}
+
+// A claim for another device lands on that row only — just the claim,
+// never apps — and wins the election over the claimer's older claim.
+func TestDevices_ClaimOpsRemote(t *testing.T) {
+	ctrl := newDevicesController(t)
+	ctx := context.Background()
+	const self, target = "12D3KooWSelf", "12D3KooWTarget"
+
+	selfRow := claimOpsRow(t, ctrl, self, "bao")
+	selfRow.ActiveClaims = map[string]space.DeviceClaim{"bao": {Seq: 4, At: 1770000000}}
+	targetRow := claimOpsRow(t, ctrl, target, "bao")
+
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, []space.Device{selfRow, targetRow}, self, target, "bao", 1770000100)
+	require.NoError(t, err)
+	assert.Equal(t, target, rec.Id)
+	assert.False(t, rec.Upsert, "a remote claim must never mint a row")
+	require.Len(t, rec.Ops, 1)
+	assert.Equal(t, []string{techspace.FieldDeviceActiveClaims, "bao"}, rec.Ops[0].Path)
+
+	require.NoError(t, ctrl.ApplyChange(ctx, devicesChange("v-claim", rec.Id, rec.Upsert, rec.Ops...)))
+	got := techspace.DecodeDeviceRecord(ctrl.Get(ctx, techspace.DevicesDataset, target))
+	assert.Equal(t, space.DeviceClaim{Seq: 5, At: 1770000100}, got.ActiveClaims["bao"])
+
+	winner, ok := space.ActiveDevice([]space.Device{selfRow, got}, "bao")
+	require.True(t, ok)
+	assert.Equal(t, target, winner)
+}
+
+func TestDevices_ClaimOpsRemoteRefusals(t *testing.T) {
+	ctrl := newDevicesController(t)
+	const self, target = "12D3KooWSelf", "12D3KooWTarget"
+	devices := []space.Device{claimOpsRow(t, ctrl, self, "bao"), claimOpsRow(t, ctrl, target, "other")}
+
+	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, "12D3KooWNobody", "bao", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceUnknown)
+
+	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, target, "bao", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceAppNotInstalled)
+
+	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, target, "a.b", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceBadApp)
+}
+
+// A self claim — "" or the own peer id — upserts the own row and marks
+// the app installed when it isn't yet.
+func TestDevices_ClaimOpsSelf(t *testing.T) {
+	const self = "12D3KooWSelf"
+	for _, target := range []string{"", self} {
+		rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, self, target, "bao", 1770000000)
+		require.NoError(t, err)
+		assert.Equal(t, self, rec.Id)
+		assert.True(t, rec.Upsert)
+		require.Len(t, rec.Ops, 2)
+		assert.Equal(t, []string{techspace.FieldDeviceApps, "bao"}, rec.Ops[0].Path)
+		assert.Equal(t, []string{techspace.FieldDeviceActiveClaims, "bao"}, rec.Ops[1].Path)
+	}
+
+	withApp := []space.Device{{PeerId: self, Apps: map[string]map[string]any{"bao": {}}}}
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, withApp, self, "", "bao", 1770000000)
+	require.NoError(t, err)
+	require.Len(t, rec.Ops, 1)
+}
+
+// A remote claim on a row pruned after the snapshot is absorbed by the
+// tombstone: it is not an upsert, so the row never resurrects.
+func TestDevices_ClaimOpsRemoteOnPrunedRow(t *testing.T) {
+	ctrl := newDevicesController(t)
+	ctx := context.Background()
+	const self, target = "12D3KooWSelf", "12D3KooWTarget"
+	devices := []space.Device{claimOpsRow(t, ctrl, self, "bao"), claimOpsRow(t, ctrl, target, "bao")}
+
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, target, "bao", 1)
+	require.NoError(t, err)
+	require.NoError(t, ctrl.ApplyChange(ctx, devicesChange("v-del", target, false, crdt.Op{Type: crdt.OpDelete})))
+
+	_ = ctrl.ApplyChange(ctx, devicesChange("v-claim", rec.Id, rec.Upsert, rec.Ops...))
+	for _, v := range ctrl.Records(ctx, techspace.DevicesDataset) {
+		assert.NotEqual(t, target, techspace.DecodeDeviceRecord(v).PeerId)
+	}
+}

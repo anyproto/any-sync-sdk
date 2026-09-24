@@ -23,14 +23,19 @@ var (
 	// ErrDeviceEmptyUpsert rejects a SetDevice call with nothing to
 	// write.
 	ErrDeviceEmptyUpsert = errors.New("device upsert is empty")
-	// ErrDeviceUnknown is returned by DeleteDevice when peerId has no
-	// live row.
+	// ErrDeviceUnknown is returned by DeleteDevice and a remote
+	// ClaimActive when peerId has no live row.
 	ErrDeviceUnknown = errors.New("unknown device")
 	// ErrDevicePruned reports a write absorbed by the own row's sticky
 	// tombstone: this device was pruned (DeleteDevice) and its peer id
 	// can never re-register. Without this error the absorbed write
 	// would be indistinguishable from success.
 	ErrDevicePruned = errors.New("device row is pruned")
+	// ErrDeviceAppNotInstalled rejects a ClaimActive for another
+	// device whose row doesn't carry apps.<slug>: the election skips
+	// such a claim, and the claimer can't mark an app installed on a
+	// device it isn't.
+	ErrDeviceAppNotInstalled = errors.New("app not installed on device")
 	// ErrDeviceSelfDelete rejects DeleteDevice on the local device's
 	// own row — the tombstone is sticky, so self-pruning would
 	// permanently lock this installation out of the registry. Prune a
@@ -43,7 +48,8 @@ var (
 // outside the account). Online status deliberately does not live here.
 type Device struct {
 	// PeerId is the device's libp2p peer id — the row id. Stable per
-	// device installation; every device writes only its own row.
+	// device installation. A device writes only its own row, except a
+	// ClaimActive for another device (its activeClaims.<slug> only).
 	PeerId string
 
 	// Name is the device's display name (hostname or user-set).

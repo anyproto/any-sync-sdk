@@ -202,7 +202,12 @@ here.
 Reads go through the generic dataset surface
 (`Spaces().Query(SpaceIndexObjectId(), "devices")`, `ListDevices`).
 Writes go only through `SetDevice` (always the local peer id's row),
-`ClaimActive` and `DeleteDevice`.
+`ClaimActive` and `DeleteDevice`. `ClaimActive` claims for the local
+device by default; given another peer id it writes only that row's
+`activeClaims.<app>`, and only when the row is live
+(`ErrDeviceUnknown`) and already carries the app
+(`ErrDeviceAppNotInstalled`). A self claim also marks the app
+installed on the own row.
 
 **Active-app election** is resolved by readers with one rule,
 `space.ActiveDevice`: among live rows with the app installed, highest

@@ -50,6 +50,10 @@ type Service struct {
 	avMu  sync.Mutex
 	avIds map[string]string
 
+	// claimMu serializes ClaimActive's read-registry-then-write, so
+	// overlapping claims from this device mint increasing seqs.
+	claimMu sync.Mutex
+
 	// store is a regular spaceobjects Store (type/properties model,
 	// runtime dataset catalog, schema gate) with the tech datasets
 	// registered as system built-ins — see SystemDatasets. The index

@@ -52,8 +52,9 @@ const (
 	// Presence of the slug = installed; written / removed per-slug
 	// (apps.<slug>) so devices touching different slugs merge.
 	FieldDeviceApps = "apps"
-	// FieldDeviceActiveClaims holds the per-app active claims, keyed by
-	// app slug: {seq, at} written by Service.ClaimActive. The claim is
+	// FieldDeviceActiveClaims holds the per-app claims this device
+	// made, keyed by app slug: {seq, at, target?} written by
+	// Service.ClaimActive, always on the claimer's own row. The claim is
 	// writer-supplied data — NOT a CRDT version id, which is
 	// peer-locally allocated and therefore not comparable across
 	// devices. The winner is computed by every reader with the same
@@ -71,6 +72,9 @@ const (
 	// DeviceClaimAt is the claim wall-clock time in unix seconds —
 	// first tiebreak on equal seq (advisory, writer-supplied).
 	DeviceClaimAt = "at"
+	// DeviceClaimTarget is the peer id of the device the claim hands
+	// the app to. Absent for a self claim.
+	DeviceClaimTarget = "target"
 )
 
 // DevicesSchema declares the devices dataset. All fields synced — the
@@ -93,7 +97,7 @@ func DevicesSchema() schema.Dataset {
 		{Id: FieldDeviceApps, Name: "Apps", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced,
 			Description: "Installed apps by slug; presence means installed."},
 		{Id: FieldDeviceActiveClaims, Name: "Active claims", Schema: schema.Leaf(schema.KindObject), Scope: schema.ScopeSynced,
-			Description: "Per-slug {seq, at} claims the active-app election reads."},
+			Description: "Per-slug {seq, at, target?} claims this device made; the active-app election reads them."},
 	}}
 }
 
@@ -102,10 +106,10 @@ func DevicesSchema() schema.Dataset {
 // device row is the "device doesn't exist" signal the election rule
 // keys off. Self-row-only writing is NOT enforceable here (a CRDT
 // handler can't know which peer authored a change's row id); it is a
-// write-path convention — Service.SetDevice only ever targets the
-// local peer id, and a ClaimActive for another device writes only its
-// activeClaims.<slug> — and the restricted HTTP surface enforces it
-// at the API boundary.
+// write-path convention — SetDevice and ClaimActive only ever target
+// the local peer id (a claim for another device names it in the
+// claim's target) — and the restricted HTTP surface enforces it at
+// the API boundary.
 type DevicesHandler struct{}
 
 func (DevicesHandler) Init(_ context.Context) error { return nil }
@@ -185,7 +189,9 @@ func DecodeDeviceRecord(v *anyenc.Value) space.Device {
 					return
 				}
 				at, _ := claimNum(val, DeviceClaimAt) // advisory tiebreak; bad reads as 0
-				d.ActiveClaims[string(k)] = space.DeviceClaim{Seq: seq, At: at}
+				// A non-string target reads as "" — a self claim.
+				target := val.GetString(DeviceClaimTarget)
+				d.ActiveClaims[string(k)] = space.DeviceClaim{Seq: seq, At: at, Target: target}
 			})
 		}
 	}
@@ -341,13 +347,15 @@ func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) (object.
 }
 
 // ClaimActive marks a device as the active instance of app: it writes
-// activeClaims.<app> = {seq, at} on the target row, with seq =
-// max(existing seqs for the slug across all live rows) + 1 and at =
-// now (unix seconds). peerId names the target row; "" (or the local
-// peer id) claims for THIS device. The read-then-write is not atomic —
-// two devices claiming concurrently can mint the same seq — but the
-// reader-side rule (space.ActiveDevice: highest seq, then at, then
-// peer id) makes that survivable by design.
+// activeClaims.<app> = {seq, at, target?} on THIS device's row, with
+// seq = max(existing seqs for the slug across all live rows) + 1 and
+// at = now (unix seconds). peerId names the device the claim hands the
+// app to; "" (or the local peer id) claims for this device and writes
+// no target. claimMu serializes the read-then-write, so overlapping
+// claims from this device mint increasing seqs; claims from different
+// devices can still collide on seq, and the reader-side rule
+// (space.ActiveDevice: highest seq, then at, then claimer peer id)
+// makes that survivable by design.
 //
 // Known limit (v1): seq is minted from THIS replica's view — on a
 // device that hasn't synced the latest claims yet, a fresh claim can
@@ -369,6 +377,8 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 	if err != nil {
 		return object.WriteResult{}, err
 	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
 	rows := obj.Controller().Records(ctx, DevicesDataset)
 	devices := make([]space.Device, 0, len(rows))
 	for _, v := range rows {
@@ -387,24 +397,25 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 	if err != nil {
 		return res, err
 	}
-	return res, surfaceDeviceRejections(res, rec.Id)
+	return res, surfaceDeviceRejections(res, self)
 }
 
 // ClaimActiveOps plans the record change for a ClaimActive: devices is
-// the live registry snapshot, self the local peer id, target the row
-// to claim for ("" = self), now the claim time in unix seconds.
+// the live registry snapshot, self the local peer id, target the
+// device to claim for ("" = self), now the claim time in unix seconds.
+// The change always upserts the own row.
 //
-// A self claim upserts the own row and also marks the app installed
-// (apps.<app> = {}) when the row doesn't carry it yet, so a claim can
-// never dangle on a row the election filter would skip.
+// A self claim writes no target and also marks the app installed
+// (apps.<app> = {}) when the row doesn't carry it yet, so the claim
+// can never point at a row the election filter would skip.
 //
-// A remote claim touches only activeClaims.<app> on another device's
-// row: the claimer can't know what is installed there, so it never
-// writes apps. The row must be live (space.ErrDeviceUnknown otherwise
-// — an upsert would mint a row for a mistyped id) and must already
-// carry apps.<app> (space.ErrDeviceAppNotInstalled — the election
-// would skip the claim). The change is not an upsert, so a row pruned
-// concurrently absorbs it as a rejection instead of resurrecting.
+// A remote claim writes target and never touches apps: the claimer
+// can't know what is installed elsewhere, and needs no app itself.
+// The target must be a live row (space.ErrDeviceUnknown) that already
+// carries apps.<app> (space.ErrDeviceAppNotInstalled). These are
+// write-time courtesy checks; space.ActiveDevice applies the same
+// rule on converged data, so a target pruned or uninstalled later
+// simply stops winning.
 func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app string, now int64) (crdt.RecordChange, error) {
 	if err := validDeviceApp(app); err != nil {
 		return crdt.RecordChange{}, err
@@ -413,26 +424,25 @@ func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app s
 		target = self
 	}
 	var maxSeq int64
-	var row *space.Device
+	var selfRow, targetRow *space.Device
 	for i := range devices {
 		d := &devices[i]
 		if c, ok := d.ActiveClaims[app]; ok && c.Seq > maxSeq {
 			maxSeq = c.Seq
 		}
-		if d.PeerId == target {
-			row = d
+		if d.PeerId == self {
+			selfRow = d
 		}
-	}
-	var hasApp bool
-	if row != nil {
-		_, hasApp = row.Apps[app]
+		if d.PeerId == target {
+			targetRow = d
+		}
 	}
 	remote := target != self
 	if remote {
-		if row == nil {
+		if targetRow == nil {
 			return crdt.RecordChange{}, fmt.Errorf("techspace: %w: %q", space.ErrDeviceUnknown, target)
 		}
-		if !hasApp {
+		if _, ok := targetRow.Apps[app]; !ok {
 			return crdt.RecordChange{}, fmt.Errorf("techspace: %w: %q on %q", space.ErrDeviceAppNotInstalled, app, target)
 		}
 	}
@@ -441,11 +451,18 @@ func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app s
 	// Float64 constructors — anyenc numbers are float64 on the wire.
 	claim.Set(DeviceClaimSeq, a.NewNumberFloat64(float64(maxSeq+1)))
 	claim.Set(DeviceClaimAt, a.NewNumberFloat64(float64(now)))
+	if remote {
+		claim.Set(DeviceClaimTarget, a.NewString(target))
+	}
 	ops := []crdt.Op{{Type: crdt.OpSet, Path: []string{FieldDeviceActiveClaims, app}, Payload: claim}}
-	if !remote && !hasApp {
+	var selfHasApp bool
+	if selfRow != nil {
+		_, selfHasApp = selfRow.Apps[app]
+	}
+	if !remote && !selfHasApp {
 		ops = append([]crdt.Op{{Type: crdt.OpSet, Path: []string{FieldDeviceApps, app}, Payload: a.NewObject()}}, ops...)
 	}
-	return crdt.RecordChange{Id: target, Upsert: !remote, Ops: ops}, nil
+	return crdt.RecordChange{Id: self, Upsert: true, Ops: ops}, nil
 }
 
 // DeleteDevice prunes peerId's row — the "device doesn't exist"

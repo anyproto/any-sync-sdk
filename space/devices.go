@@ -116,6 +116,13 @@ type DeviceUpsert struct {
 // claimer itself needs no app installed. Deterministic on converged
 // data for every reader. ok=false when no claim qualifies.
 //
+// No un-claim exists: the winner changes when a better claim appears,
+// or when a claim starts or stops qualifying — its claimer or target
+// is pruned, or its target uninstalls or reinstalls the app. A device
+// holds one claim per app, so a hand-off replaces the claimer's own
+// claim: if the hand-off later stops qualifying, the fallback does not
+// return to the claimer.
+//
 // A claim with Seq <= 0 is treated as absent: ClaimActive mints seqs
 // from 1, so a zero can only come from a malformed bag (unknown
 // future writer, corrupt data) that decoded to the zero value — it

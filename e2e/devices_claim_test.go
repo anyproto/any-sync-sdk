@@ -13,17 +13,17 @@ import (
 )
 
 // TestE2E_Devices_ConcurrentClaimsMintDistinctSeqs fires overlapping
-// ClaimActive calls on one device (the runtime's automatic self claim
-// racing a UI click). Each claim reads the registry and mints max+1, so
-// they must be serialized: n claims leave seq == n, and the last one
-// written is the one the election sees.
+// ClaimActive calls on one device. Each claim reads the registry and
+// mints max+1 on the device's one claim slot, so they must be
+// serialized: n claims leave seq == n. Unserialized, they mint the same
+// seq, or a later write lands a lower one and the slot's seq goes
+// backwards. Runs offline on the tracked local nodeconf.
 func TestE2E_Devices_ConcurrentClaimsMintDistinctSeqs(t *testing.T) {
 	t.Parallel()
-	yaml, confPath, err := loadAnySyncNetwork()
+	yaml, err := loadLocalNetwork()
 	if err != nil {
-		t.Skipf("no any-sync network config available: %v", err)
+		t.Fatalf("local network config: %v", err)
 	}
-	t.Logf("using any-sync network config from %s", confPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

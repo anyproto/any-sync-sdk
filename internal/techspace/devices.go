@@ -189,8 +189,18 @@ func DecodeDeviceRecord(v *anyenc.Value) space.Device {
 					return
 				}
 				at, _ := claimNum(val, DeviceClaimAt) // advisory tiebreak; bad reads as 0
-				// A non-string target reads as "" — a self claim.
-				target := val.GetString(DeviceClaimTarget)
+				// A target that is present but not a non-empty string
+				// is malformed too: reading it as a self claim would
+				// hand the app back to the device that gave it away.
+				var target string
+				if tv := val.Get(DeviceClaimTarget); tv != nil {
+					if tv.Type() != anyenc.TypeString {
+						return
+					}
+					if target = string(tv.GetStringBytes()); target == "" {
+						return
+					}
+				}
 				d.ActiveClaims[string(k)] = space.DeviceClaim{Seq: seq, At: at, Target: target}
 			})
 		}
@@ -350,12 +360,15 @@ func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) (object.
 // activeClaims.<app> = {seq, at, target?} on THIS device's row, with
 // seq = max(existing seqs for the slug across all live rows) + 1 and
 // at = now (unix seconds). peerId names the device the claim hands the
-// app to; "" (or the local peer id) claims for this device and writes
-// no target. claimMu serializes the read-then-write, so overlapping
-// claims from this device mint increasing seqs; claims from different
-// devices can still collide on seq, and the reader-side rule
-// (space.ActiveDevice: highest seq, then at, then claimer peer id)
-// makes that survivable by design.
+// app to; "" claims for this device. claimMu serializes the
+// read-then-write, so this device's own claim seq never goes
+// backwards; claims from different devices can still collide on seq,
+// and the reader-side rule (space.ActiveDevice: highest seq, then at,
+// then claimer peer id) makes that survivable by design.
+//
+// A pruned device is refused (ErrDevicePruned) before anything is
+// planned or written: its row's tombstone would absorb the claim, and
+// the absorbed change would still be signed into the shared history.
 //
 // Known limit (v1): seq is minted from THIS replica's view — on a
 // device that hasn't synced the latest claims yet, a fresh claim can
@@ -366,6 +379,9 @@ func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) (object.
 //
 // See ClaimActiveOps for the self / remote split.
 func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.WriteResult, error) {
+	if err := validDeviceApp(app); err != nil {
+		return object.WriteResult{}, err
+	}
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
@@ -379,12 +395,10 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 	}
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
-	rows := obj.Controller().Records(ctx, DevicesDataset)
-	devices := make([]space.Device, 0, len(rows))
-	for _, v := range rows {
-		devices = append(devices, DecodeDeviceRecord(v))
+	if err := ctx.Err(); err != nil {
+		return object.WriteResult{}, err
 	}
-	rec, err := ClaimActiveOps(&anyenc.Arena{}, devices, self, peerId, app, time.Now().Unix())
+	rec, err := PlanClaimActive(ctx, obj.Controller(), self, peerId, app, time.Now().Unix())
 	if err != nil {
 		return object.WriteResult{}, err
 	}
@@ -400,27 +414,48 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 	return res, surfaceDeviceRejections(res, self)
 }
 
+// PlanClaimActive reads the registry from ctrl and plans a ClaimActive
+// with ClaimActiveOps. A pruned own row is refused first
+// (space.ErrDevicePruned): Records skips tombstones, so without the
+// check a pruned device would read as one that never registered, and
+// a failed target check would hide that it was pruned.
+func PlanClaimActive(ctx context.Context, ctrl *crdt.Controller, self, target, app string, now int64) (crdt.RecordChange, error) {
+	if own := ctrl.Get(ctx, DevicesDataset, self); own != nil && !liveDeviceRow(own) {
+		return crdt.RecordChange{}, fmt.Errorf("techspace: %w: %q", space.ErrDevicePruned, self)
+	}
+	rows := ctrl.Records(ctx, DevicesDataset)
+	devices := make([]space.Device, 0, len(rows))
+	for _, v := range rows {
+		devices = append(devices, DecodeDeviceRecord(v))
+	}
+	return ClaimActiveOps(&anyenc.Arena{}, devices, self, target, app, now)
+}
+
 // ClaimActiveOps plans the record change for a ClaimActive: devices is
 // the live registry snapshot, self the local peer id, target the
 // device to claim for ("" = self), now the claim time in unix seconds.
 // The change always upserts the own row.
 //
-// A self claim writes no target and also marks the app installed
-// (apps.<app> = {}) when the row doesn't carry it yet, so the claim
-// can never point at a row the election filter would skip.
+// A claim with an empty target is the runtime's self claim: it writes
+// no target and also marks the app installed (apps.<app> = {}) when
+// the own row doesn't carry it yet, so the claim can never point at a
+// row the election would skip.
 //
-// A remote claim writes target and never touches apps: the claimer
-// can't know what is installed elsewhere, and needs no app itself.
-// The target must be a live row (space.ErrDeviceUnknown) that already
-// carries apps.<app> (space.ErrDeviceAppNotInstalled). These are
-// write-time courtesy checks; space.ActiveDevice applies the same
-// rule on converged data, so a target pruned or uninstalled later
-// simply stops winning.
+// A claim that names a device — another one, or this one by its peer
+// id — never touches apps: the target must be a row in the snapshot
+// (space.ErrDeviceUnknown) that already carries apps.<app>
+// (space.ErrDeviceAppNotInstalled). Naming another device writes it as
+// the claim's target; naming this one writes no target.
+//
+// The planned claim is then run through space.ActiveDevice against the
+// snapshot, and refused unless the election would name the target —
+// the election rule stays the single definition of which claims count.
 func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app string, now int64) (crdt.RecordChange, error) {
 	if err := validDeviceApp(app); err != nil {
 		return crdt.RecordChange{}, err
 	}
-	if target == "" {
+	selfClaim := target == ""
+	if selfClaim {
 		target = self
 	}
 	var maxSeq int64
@@ -437,8 +472,11 @@ func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app s
 			targetRow = d
 		}
 	}
-	remote := target != self
-	if remote {
+	var selfHasApp bool
+	if selfRow != nil {
+		_, selfHasApp = selfRow.Apps[app]
+	}
+	if !selfClaim {
 		if targetRow == nil {
 			return crdt.RecordChange{}, fmt.Errorf("techspace: %w: %q", space.ErrDeviceUnknown, target)
 		}
@@ -447,22 +485,65 @@ func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app s
 		}
 	}
 
+	c := space.DeviceClaim{Seq: maxSeq + 1, At: now}
+	if target != self {
+		c.Target = target
+	}
+	markInstalled := selfClaim && !selfHasApp
+	if winner, ok := space.ActiveDevice(withClaim(devices, self, app, c, markInstalled), app); !ok || winner != target {
+		return crdt.RecordChange{}, fmt.Errorf("techspace: a claim for %q would not elect it for %q", target, app)
+	}
+
 	claim := a.NewObject()
 	// Float64 constructors — anyenc numbers are float64 on the wire.
-	claim.Set(DeviceClaimSeq, a.NewNumberFloat64(float64(maxSeq+1)))
-	claim.Set(DeviceClaimAt, a.NewNumberFloat64(float64(now)))
-	if remote {
-		claim.Set(DeviceClaimTarget, a.NewString(target))
+	claim.Set(DeviceClaimSeq, a.NewNumberFloat64(float64(c.Seq)))
+	claim.Set(DeviceClaimAt, a.NewNumberFloat64(float64(c.At)))
+	if c.Target != "" {
+		claim.Set(DeviceClaimTarget, a.NewString(c.Target))
 	}
 	ops := []crdt.Op{{Type: crdt.OpSet, Path: []string{FieldDeviceActiveClaims, app}, Payload: claim}}
-	var selfHasApp bool
-	if selfRow != nil {
-		_, selfHasApp = selfRow.Apps[app]
-	}
-	if !remote && !selfHasApp {
+	if markInstalled {
 		ops = append([]crdt.Op{{Type: crdt.OpSet, Path: []string{FieldDeviceApps, app}, Payload: a.NewObject()}}, ops...)
 	}
 	return crdt.RecordChange{Id: self, Upsert: true, Ops: ops}, nil
+}
+
+// withClaim returns a copy of devices as it reads once self's claim for
+// app is c (and, with markInstalled, apps.<app> is present on self's
+// row) — the snapshot the planned claim is checked against. The input
+// is left untouched.
+func withClaim(devices []space.Device, self, app string, c space.DeviceClaim, markInstalled bool) []space.Device {
+	out := make([]space.Device, 0, len(devices)+1)
+	found := false
+	for _, d := range devices {
+		if d.PeerId == self {
+			found = true
+			d = withOwnClaim(d, app, c, markInstalled)
+		}
+		out = append(out, d)
+	}
+	if !found {
+		out = append(out, withOwnClaim(space.Device{PeerId: self}, app, c, markInstalled))
+	}
+	return out
+}
+
+func withOwnClaim(d space.Device, app string, c space.DeviceClaim, markInstalled bool) space.Device {
+	claims := maps.Clone(d.ActiveClaims)
+	if claims == nil {
+		claims = map[string]space.DeviceClaim{}
+	}
+	claims[app] = c
+	d.ActiveClaims = claims
+	if markInstalled {
+		apps := maps.Clone(d.Apps)
+		if apps == nil {
+			apps = map[string]map[string]any{}
+		}
+		apps[app] = map[string]any{}
+		d.Apps = apps
+	}
+	return d
 }
 
 // DeleteDevice prunes peerId's row — the "device doesn't exist"

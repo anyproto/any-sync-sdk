@@ -203,13 +203,15 @@ here.
 Reads go through the generic dataset surface
 (`Spaces().Query(SpaceIndexObjectId(), "devices")`, `ListDevices`).
 Writes go only through `SetDevice`, `ClaimActive` and `DeleteDevice`.
-`SetDevice` and `ClaimActive` write only the local peer id's row, so
-every row has a single writer. `ClaimActive` claims for the local
-device by default and then also marks the app installed. Given another
-peer id, it writes that id as the claim's `target`, and only when the
-target's row is in this replica's registry (`ErrDeviceUnknown`) and
-carries the app (`ErrDeviceAppNotInstalled`). Claims from one device
-are serialized, so they mint increasing `seq`s.
+`SetDevice` and `ClaimActive` write only the local peer id's row;
+`DeleteDevice` is the one write to another device's row. With no peer
+id, `ClaimActive` claims for the local device and also marks the app
+installed. Given a peer id, it requires that row in this replica's
+registry (`ErrDeviceUnknown`) carrying the app
+(`ErrDeviceAppNotInstalled`) and never writes `apps`; another device's
+id becomes the claim's `target`. A pruned device's claim is refused
+before anything is written (`ErrDevicePruned`). Claims from one device
+are serialized, so the device's own claim `seq` never goes backwards.
 
 **Active-app election** is resolved by readers with one rule,
 `space.ActiveDevice`: the claims of all live rows rank by highest `seq`,
@@ -218,15 +220,23 @@ target (the claimer when `target` is absent) of the best claim whose
 target is a live row with the app installed; the claimer needs no app.
 A claim is writer-supplied `{seq: max+1, at: now}`, not a CRDT version
 id (those are peer-local and not comparable across devices). There is
-no un-claim; only a higher claim, or deleting the claimer's or the
-target's row, moves the winner.
+no un-claim: the winner changes when a better claim appears, or when a
+claim starts or stops qualifying — its claimer or target is deleted,
+or its target uninstalls or reinstalls the app.
+
+A device holds one claim per app, so handing an app away replaces the
+device's own claim. Two consequences, both repaired by claiming again:
+deleting the device that made the winning hand-off moves the app back
+to the best remaining claim, and when a hand-off's target stops
+qualifying, the fallback skips the device that handed it away.
 
 - `DeleteDevice` tombstones are sticky, so a pruned peer id can never
   re-register. Deleting the local device's own row is refused
   (`ErrDeviceSelfDelete`); a pruned device's later `SetDevice` /
   `ClaimActive` returns `ErrDevicePruned`.
-- Claims decode strictly (integer `seq >= 1`, at most 2^53); a malformed
-  claim reads as absent on every architecture.
+- Claims decode strictly (integer `seq >= 1`, at most 2^53; a `target`,
+  when present, a non-empty string); a malformed claim reads as absent
+  on every architecture.
 - Known limit: `seq` comes from the claiming replica's view, so a claim
   made on a stale device can lose to an older unseen claim once heads
   converge. Re-claim after sync.

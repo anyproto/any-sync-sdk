@@ -27,6 +27,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/crypt"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // ErrLimited — the broker refused backup (storage limit). The file is
@@ -217,6 +218,11 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 		},
 	})
 	if err != nil {
+		if ownerRefused(err) {
+			// No row was written; the donor keeps its CAR, but this
+			// marker would pin it past every sweep.
+			_ = s.store.DeleteKV(ctx, store.IntentKey(spaceId, ref.Root))
+		}
 		return Result{}, false, err
 	}
 	if err = s.store.AddRefs(ctx, spaceId, ref.Root, fileId); err != nil {
@@ -291,6 +297,11 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		},
 	})
 	if err != nil {
+		if ownerRefused(err) {
+			// No row was written, so nothing will ever reference this
+			// CAR; the intent marker would pin it past every sweep.
+			s.dropUnregistered(ctx, spaceId, root)
+		}
 		return Result{}, err
 	}
 	if err = s.store.AddRefs(ctx, spaceId, root, fileId); err != nil {
@@ -311,6 +322,26 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		return Result{}, err
 	}
 	return Result{FileId: fileId, RootCid: root.String(), Size: sp.Size()}, nil
+}
+
+// ownerRefused reports whether RegisterFile refused the owner before
+// writing anything: the owner is deleted, gone, or not resolvable yet.
+// Any other error may come from the row write itself, and then the CAR
+// must stay pinned for the sweep to heal.
+func ownerRefused(err error) bool {
+	return errors.Is(err, space.ErrObjectDeleted) ||
+		errors.Is(err, space.ErrObjectNotFound) ||
+		errors.Is(err, payloads.ErrOwnerUnknown)
+}
+
+// dropUnregistered removes a finalized CAR that no row will reference,
+// and its intent marker. Best effort: a failure leaves what the sweep
+// would have left anyway.
+func (s *Service) dropUnregistered(ctx context.Context, spaceId string, root cid.Cid) {
+	if err := s.store.Delete(ctx, spaceId, root); err != nil {
+		return
+	}
+	_ = s.store.DeleteKV(ctx, store.IntentKey(spaceId, root))
 }
 
 // DriveDurable drives an already registered row to a verified receipt

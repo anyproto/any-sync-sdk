@@ -64,6 +64,9 @@ across spaces.
 
 ## Attach and backup
 
+0. Check the owner before touching the reader: `ErrNotFound` when it
+   isn't on this device, `ErrObjectDeleted` when it is deleted or
+   queued for deletion (a child cascaded from its parent included).
 1. Spool the reader, compute SHA-256, choose the tier.
 2. Full tier: encrypt, build the DAG, finalize the local CAR.
 3. Register the row: one CRDT change. The file now exists for every
@@ -99,7 +102,10 @@ receipt.
 
 Crash safety: an intent marker pins the root before the row write, and
 the job is persisted before Attach returns, so a crash never leaves
-an unsigned row that GC treats as garbage or the queue forgets.
+an unsigned row that GC treats as garbage or the queue forgets. When
+registration refuses the owner (deleted meanwhile, gone, or not
+resolvable), no row was written: the new CAR and its marker are
+dropped, and a bound upload drops only its marker.
 
 ## Background work
 

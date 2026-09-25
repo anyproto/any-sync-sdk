@@ -20,6 +20,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/carfile"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 const spaceId = "space.test"
@@ -76,6 +77,7 @@ type fakeRegistrar struct {
 	n            int
 	rows         map[string]payloads.Row
 	failRegister bool
+	registerErr  error // returned by RegisterFile when set
 }
 
 func newFakeRegistrar() *fakeRegistrar {
@@ -83,6 +85,9 @@ func newFakeRegistrar() *fakeRegistrar {
 }
 
 func (r *fakeRegistrar) RegisterFile(_ context.Context, ownerId string, opts RegisterOpts) (string, error) {
+	if r.registerErr != nil {
+		return "", r.registerErr
+	}
 	if r.failRegister {
 		return "", errors.New("register failed")
 	}
@@ -543,4 +548,55 @@ func TestDriveDurableSkipsWhenPeerMadeItDurable(t *testing.T) {
 		"A must not re-upload a file a peer already made durable")
 	require.Equal(t, "peerB-receipt", reg.rows["owner1/"+res.FileId].NetworkSign,
 		"the peer's receipt must be preserved, not overwritten")
+}
+
+// A refused owner (deleted, gone, unresolvable) means no row was
+// written: the finalized CAR and its intent marker are dropped instead
+// of being pinned past every sweep.
+func TestAddOwnerRefusedDropsCar(t *testing.T) {
+	for _, refusal := range []error{space.ErrObjectDeleted, space.ErrObjectNotFound, payloads.ErrOwnerUnknown} {
+		t.Run(refusal.Error(), func(t *testing.T) {
+			ctx := context.Background()
+			s, st := newService(t, &fakeBroker{})
+			s.SetQueue(newFakeQueue())
+			reg := newFakeRegistrar()
+			reg.registerErr = fmt.Errorf("payloads: derive payloads object: %w", refusal)
+
+			_, err := s.Add(ctx, reg, spaceId, "gone", bytesReaderOf(t, 21_000), AddOpts{})
+			require.ErrorIs(t, err, refusal)
+			require.NoError(t, st.IterateAll(ctx, func(info store.Info) (bool, error) {
+				t.Errorf("CAR %s left behind", info.Root)
+				_, marked, kvErr := st.GetKV(ctx, store.IntentKey(spaceId, info.Root))
+				require.NoError(t, kvErr)
+				require.False(t, marked)
+				return true, nil
+			}))
+		})
+	}
+}
+
+// On the bind path a refused owner drops only its intent marker: the
+// donor keeps its CAR and refs.
+func TestAddBindOwnerRefusedKeepsDonor(t *testing.T) {
+	ctx := context.Background()
+	s, st := newService(t, &fakeBroker{})
+	reg := newFakeRegistrar()
+	content := testContent(60_000)
+
+	first, err := s.Add(ctx, reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner1", first.FileId))
+
+	reg.registerErr = fmt.Errorf("payloads: derive payloads object: %w", space.ErrObjectDeleted)
+	_, err = s.Add(ctx, reg, spaceId, "gone", bytes.NewReader(content), AddOpts{})
+	require.ErrorIs(t, err, space.ErrObjectDeleted)
+
+	root, err := cid.Decode(first.RootCid)
+	require.NoError(t, err)
+	info, err := st.Info(ctx, spaceId, root)
+	require.NoError(t, err)
+	require.Equal(t, []string{first.FileId}, info.Refs, "the donor's CAR and ref stay")
+	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
+	require.NoError(t, err)
+	require.False(t, marked, "no marker pins the donor's root")
 }

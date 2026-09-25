@@ -87,3 +87,52 @@ func TestActiveDevice_PerApp(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "b", winner)
 }
+
+// remote builds a row whose claim hands app to target; the claimer
+// has no app installed.
+func remote(peerId, target, app string, seq, at int64) Device {
+	return Device{PeerId: peerId, ActiveClaims: map[string]DeviceClaim{app: {Seq: seq, At: at, Target: target}}}
+}
+
+// A claim with a target elects the target, not the claimer — and the
+// claimer needs no app installed.
+func TestActiveDevice_RemoteTargetWins(t *testing.T) {
+	devices := []Device{dev("a", "bao", 1, 1), dev("b", "bao", 0, 0), remote("phone", "b", "bao", 2, 2)}
+	winner, ok := ActiveDevice(devices, "bao")
+	require.True(t, ok)
+	assert.Equal(t, "b", winner)
+}
+
+// A claim whose target is not a live row with the app falls through to
+// the next-best claim.
+func TestActiveDevice_UnqualifiedTargetFallsBack(t *testing.T) {
+	cases := []struct {
+		name    string
+		devices []Device
+	}{
+		{"target unknown", []Device{dev("a", "bao", 1, 1), remote("c", "gone", "bao", 5, 5)}},
+		{"target lacks app", []Device{dev("a", "bao", 1, 1), dev("b", "other", 0, 0), remote("c", "b", "bao", 5, 5)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			winner, ok := ActiveDevice(tc.devices, "bao")
+			require.True(t, ok)
+			assert.Equal(t, "a", winner)
+		})
+	}
+}
+
+// The tiebreak on equal (seq, at) is the claimer's peer id, not the
+// target's: two claimers handing to different targets resolve the same
+// way on every reader.
+func TestActiveDevice_TiebreakOnClaimer(t *testing.T) {
+	devices := []Device{
+		dev("a", "bao", 0, 0), dev("z", "bao", 0, 0),
+		remote("c1", "z", "bao", 3, 3), remote("c2", "a", "bao", 3, 3),
+	}
+	for _, order := range [][]Device{devices, {devices[3], devices[2], devices[1], devices[0]}} {
+		winner, ok := ActiveDevice(order, "bao")
+		require.True(t, ok)
+		assert.Equal(t, "a", winner, "c2 > c1 wins; its target is a")
+	}
+}

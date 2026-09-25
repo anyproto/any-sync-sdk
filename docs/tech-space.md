@@ -196,25 +196,30 @@ on boot. `inboxCursor` is the synced 1-1 inbox read position
 One row per device of the account, keyed by libp2p peer id
 (`SDK.PeerId()`). All fields synced: `name`, `os`, `version`, `apps`
 (object keyed by app slug; presence = installed; slugs are an open set)
-and `activeClaims` (per-slug `{seq, at}`). Online status is not stored
+and `activeClaims` (per-slug `{seq, at, target?}`, the claims this
+device made). Online status is not stored
 here.
 
 Reads go through the generic dataset surface
 (`Spaces().Query(SpaceIndexObjectId(), "devices")`, `ListDevices`).
-Writes go only through `SetDevice` (always the local peer id's row),
-`ClaimActive` and `DeleteDevice`. `ClaimActive` claims for the local
-device by default; given another peer id it writes only that row's
-`activeClaims.<app>`, and only when the row is live
-(`ErrDeviceUnknown`) and already carries the app
-(`ErrDeviceAppNotInstalled`). A self claim also marks the app
-installed on the own row.
+Writes go only through `SetDevice`, `ClaimActive` and `DeleteDevice`.
+`SetDevice` and `ClaimActive` write only the local peer id's row, so
+every row has a single writer. `ClaimActive` claims for the local
+device by default and then also marks the app installed. Given another
+peer id, it writes that id as the claim's `target`, and only when the
+target's row is in this replica's registry (`ErrDeviceUnknown`) and
+carries the app (`ErrDeviceAppNotInstalled`). Claims from one device
+are serialized, so they mint increasing `seq`s.
 
 **Active-app election** is resolved by readers with one rule,
-`space.ActiveDevice`: among live rows with the app installed, highest
-`seq` wins, then highest `at`, then largest peer id. A claim is
-writer-supplied `{seq: max+1, at: now}`, not a CRDT version id (those are
-peer-local and not comparable across devices). There is no un-claim;
-only a higher claim or a row deletion moves the winner.
+`space.ActiveDevice`: the claims of all live rows rank by highest `seq`,
+then highest `at`, then largest claimer peer id. The winner is the
+target (the claimer when `target` is absent) of the best claim whose
+target is a live row with the app installed; the claimer needs no app.
+A claim is writer-supplied `{seq: max+1, at: now}`, not a CRDT version
+id (those are peer-local and not comparable across devices). There is
+no un-claim; only a higher claim, or deleting the claimer's or the
+target's row, moves the winner.
 
 - `DeleteDevice` tombstones are sticky, so a pruned peer id can never
   re-register. Deleting the local device's own row is refused

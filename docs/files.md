@@ -16,7 +16,9 @@ a derived child of the object the file is bound to, created on the
 first `Attach`.
 
 - Signed owner: seed `builtin:payloads` with `ParentId = ownerId`.
-  any-sync cascade-deletes it with the owner.
+  any-sync cascade-deletes it with the owner. From the delete on, its
+  rows neither list nor resolve by fileId, even while the object is
+  still loaded.
 - Derived owner: unparented seed `builtin:payloads/<ownerId>`. any-sync
   rejects a derived object as a parent, so the owner id goes into the
   seed to keep the child id unique per owner.
@@ -103,9 +105,11 @@ receipt.
 Crash safety: an intent marker pins the root before the row write, and
 the job is persisted before Attach returns, so a crash never leaves
 an unsigned row that GC treats as garbage or the queue forgets. When
-registration refuses the owner (deleted meanwhile, gone, or not
-resolvable), no row was written: the new CAR and its marker are
-dropped, and a bound upload drops only its marker.
+registration refuses the owner (deleted during the upload, gone, or
+not resolvable), no row was written: the new CAR and its marker are
+dropped, and a bound upload drops only its marker. A marker whose
+payloads object was deleted since resolves to no row, so the sweep
+drops its CAR.
 
 ## Background work
 

@@ -42,23 +42,16 @@ func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opt
 	if err := f.s.writeGate(ctx); err != nil {
 		return space.FileInfo{}, err
 	}
-	ok, err := f.s.store.HasTree(ctx, objectId)
+	owner, err := f.s.store.TreeEntry(ctx, objectId)
 	if err != nil {
 		return space.FileInfo{}, err
 	}
-	if !ok {
+	if !owner.Present {
 		return space.FileInfo{}, fmt.Errorf("files: attach to %s: %w", objectId, space.ErrNotFound)
 	}
-	// HasTree counts a deleted tree as present. Refuse it here, before
-	// a byte of the body is read: past this point the refusal would
-	// only come from registering the row, after the whole upload was
-	// spooled and encrypted — and a derived owner's payloads object
-	// has no parent gate to refuse it at all.
-	deleted, err := f.s.store.TreeDeleted(ctx, objectId)
-	if err != nil {
-		return space.FileInfo{}, err
-	}
-	if deleted {
+	// Refuse a deleted owner before a byte of the body is read.
+	// Registration checks again for an owner deleted during the upload.
+	if owner.Deleted {
 		return space.FileInfo{}, fmt.Errorf("files: attach to %s: %w", objectId, space.ErrObjectDeleted)
 	}
 	if err = f.validateVariant(ctx, objectId, opts); err != nil {

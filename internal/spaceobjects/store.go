@@ -1970,18 +1970,8 @@ func (s *Store) headStorage(ctx context.Context) (hs headstorage.HeadStorage, ok
 // consumers tell a deleted object (whose local row was hard-removed)
 // apart from one that was never materialized.
 func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
-	hs, ok, err := s.headStorage(ctx)
-	if err != nil || !ok {
-		return false, err
-	}
-	entry, err := hs.GetEntry(ctx, treeId)
-	if err != nil {
-		if isDocNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return entry.DeletedStatus != headstorage.DeletedStatusNotDeleted, nil
+	e, err := s.TreeEntry(ctx, treeId)
+	return e.Deleted, err
 }
 
 // TreeIsDerived reports whether treeId is a DERIVED object — the root's
@@ -1997,18 +1987,40 @@ func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
 // payloads.DerivedOwnerSeed) while a signed owner's stays parented.
 // Mirrors TreeDeleted's head-storage lookup.
 func (s *Store) TreeIsDerived(ctx context.Context, treeId string) (isDerived bool, present bool, err error) {
+	e, err := s.TreeEntry(ctx, treeId)
+	return e.Derived, e.Present, err
+}
+
+// TreeEntry is what head storage records for one tree.
+type TreeEntry struct {
+	// Present: the tree is stored here. A deleted tree keeps its entry,
+	// so it stays present.
+	Present bool
+	// Deleted: deleted or queued for deletion (see TreeDeleted).
+	Deleted bool
+	// Derived: the root is derived (see TreeIsDerived).
+	Derived bool
+}
+
+// TreeEntry reads treeId's head entry once: HasTree, TreeDeleted and
+// TreeIsDerived in one lookup. A tree absent here is the zero value.
+func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error) {
 	hs, ok, err := s.headStorage(ctx)
 	if err != nil || !ok {
-		return false, false, err
+		return TreeEntry{}, err
 	}
 	entry, err := hs.GetEntry(ctx, treeId)
 	if err != nil {
 		if isDocNotFound(err) {
-			return false, false, nil
+			return TreeEntry{}, nil
 		}
-		return false, false, err
+		return TreeEntry{}, err
 	}
-	return entry.IsDerived, true, nil
+	return TreeEntry{
+		Present: true,
+		Deleted: entry.DeletedStatus != headstorage.DeletedStatusNotDeleted,
+		Derived: entry.IsDerived,
+	}, nil
 }
 
 // isDocNotFound matches any-store's document-not-found across BOTH
@@ -2101,17 +2113,8 @@ func (s *Store) DeriveId(ctx context.Context, opts DeriveOpts) (string, error) {
 // HasTree reports whether the tree exists in local storage (deleted
 // trees count as existing — TreeDeleted distinguishes them).
 func (s *Store) HasTree(ctx context.Context, treeId string) (bool, error) {
-	hs, ok, err := s.headStorage(ctx)
-	if err != nil || !ok {
-		return false, err
-	}
-	if _, err := hs.GetEntry(ctx, treeId); err != nil {
-		if isDocNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	e, err := s.TreeEntry(ctx, treeId)
+	return e.Present, err
 }
 
 // TreeIdsByChangeType returns the ids of every materialized tree in

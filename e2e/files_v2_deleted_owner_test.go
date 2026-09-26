@@ -10,6 +10,8 @@ import (
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/config"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
+	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -25,7 +27,9 @@ func (r untouchedReader) Read([]byte) (int, error) {
 // refused with ErrObjectDeleted before the body is read — whether the
 // object never had files, had some, or is a derived child cascade-
 // deleted with its created parent (whose payloads object has no parent
-// gate of its own).
+// gate of its own). Registration refuses the same way, for an owner
+// deleted while its upload was spooling, and the deleted owner's files
+// stop resolving at once.
 func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -55,7 +59,7 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	require.NoError(t, err)
 	withFiles, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
-	_, err = sp.Files().Attach(ctx, withFiles, bytes.NewReader([]byte("before the delete")), space.AttachOpts{Name: "a.txt"})
+	attached, err := sp.Files().Attach(ctx, withFiles, bytes.NewReader([]byte("before the delete")), space.AttachOpts{Name: "a.txt"})
 	require.NoError(t, err)
 	root, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
@@ -66,8 +70,18 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	require.NoError(t, sp.Objects().Delete(ctx, withFiles))
 	require.NoError(t, sp.Objects().Delete(ctx, root))
 
+	pa := payloadsSurface(t, sp)
+	late := []byte("spooled before the delete")
 	for name, id := range map[string]string{"never had files": bare, "had files": withFiles, "cascade-deleted child": child} {
 		_, err := sp.Files().Attach(ctx, id, untouchedReader{t}, space.AttachOpts{Name: "late.bin"})
 		require.ErrorIs(t, err, space.ErrObjectDeleted, name)
+		_, _, err = pa.RegisterFile(ctx, id, spaceimpl.RegisterFileOpts{Size: int64(len(late)), Enc: payloads.EncPayload{Inline: late}})
+		require.ErrorIs(t, err, space.ErrObjectDeleted, name)
 	}
+
+	files, err := sp.Files().List(ctx, space.FileListOpts{ObjectId: withFiles})
+	require.NoError(t, err)
+	require.Empty(t, files, "a deleted owner lists no files")
+	_, err = sp.Files().Get(ctx, attached.FileId)
+	require.ErrorIs(t, err, space.ErrNotFound, "a deleted owner's file no longer resolves")
 }

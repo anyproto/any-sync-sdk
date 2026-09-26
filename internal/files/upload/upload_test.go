@@ -74,10 +74,10 @@ func (b *fakeBroker) VerifyReceipt(_ *fileprotov2.NetworkSignReceipt, _ string, 
 }
 
 type fakeRegistrar struct {
-	n            int
-	rows         map[string]payloads.Row
-	failRegister bool
-	registerErr  error // returned by RegisterFile when set
+	n           int
+	rows        map[string]payloads.Row
+	registerErr error  // returned by RegisterFile when set
+	refusedRoot string // RootCid of the last refused registration
 }
 
 func newFakeRegistrar() *fakeRegistrar {
@@ -86,10 +86,8 @@ func newFakeRegistrar() *fakeRegistrar {
 
 func (r *fakeRegistrar) RegisterFile(_ context.Context, ownerId string, opts RegisterOpts) (string, error) {
 	if r.registerErr != nil {
+		r.refusedRoot = opts.RootCid
 		return "", r.registerErr
-	}
-	if r.failRegister {
-		return "", errors.New("register failed")
 	}
 	r.n++
 	id := fmt.Sprintf("file-%d", r.n)
@@ -445,7 +443,7 @@ func TestAddIntentMarkerLifecycle(t *testing.T) {
 
 	// Registration failure (standing in for a crash after the marker):
 	// the finalized CAR stays marked so GC pins and heals it.
-	reg.failRegister = true
+	reg.registerErr = errors.New("register failed")
 	_, err = s.Add(ctx, reg, spaceId, "owner2", bytesReaderOf(t, 21_000), AddOpts{})
 	require.Error(t, err)
 	var orphanRoot cid.Cid
@@ -564,13 +562,13 @@ func TestAddOwnerRefusedDropsCar(t *testing.T) {
 
 			_, err := s.Add(ctx, reg, spaceId, "gone", bytesReaderOf(t, 21_000), AddOpts{})
 			require.ErrorIs(t, err, refusal)
-			require.NoError(t, st.IterateAll(ctx, func(info store.Info) (bool, error) {
-				t.Errorf("CAR %s left behind", info.Root)
-				_, marked, kvErr := st.GetKV(ctx, store.IntentKey(spaceId, info.Root))
-				require.NoError(t, kvErr)
-				require.False(t, marked)
-				return true, nil
-			}))
+			root, err := cid.Decode(reg.refusedRoot)
+			require.NoError(t, err)
+			_, err = st.Info(ctx, spaceId, root)
+			require.ErrorIs(t, err, store.ErrNotFound, "the refused CAR is dropped")
+			_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
+			require.NoError(t, err)
+			require.False(t, marked, "the refused CAR's marker is dropped")
 		})
 	}
 }

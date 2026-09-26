@@ -175,10 +175,17 @@ func (p *PayloadsAPI) RegisterFiles(ctx context.Context, ownerId string, files [
 	// owner absent, a payloads tree already here names the shape (see
 	// ObjectId); with neither, guessing "signed" would mint a tree the
 	// owner's true class never resolves to.
-	ownerDerived, present, err := p.s.store.TreeIsDerived(ctx, ownerId)
+	owner, err := p.s.store.TreeEntry(ctx, ownerId)
 	if err != nil {
 		return nil, "", err
 	}
+	// The owner may have been deleted while the caller spooled the
+	// upload. A derived owner's payloads object is unparented, so no
+	// derive gate would refuse it.
+	if owner.Deleted {
+		return nil, "", fmt.Errorf("payloads: owner %s: %w", ownerId, space.ErrObjectDeleted)
+	}
+	ownerDerived, present := owner.Derived, owner.Present
 	if !present {
 		_, ownerDerived, present, err = p.existingShape(ctx, ownerId)
 		if err != nil {
@@ -318,7 +325,7 @@ func (p *PayloadsAPI) DeleteRows(ctx context.Context, ownerId string, fileIds []
 
 // GetRow returns one typed row, unsealed when the caller holds the
 // space key (Sealed stays true otherwise). space.ErrNotFound when the
-// owner has no payloads object, no such row, or a tombstoned row.
+// owner has no live payloads object, no such row, or a tombstoned row.
 func (p *PayloadsAPI) GetRow(ctx context.Context, ownerId, fileId string) (payloads.Row, error) {
 	objId, ok, err := p.existingObjectId(ctx, ownerId)
 	if err != nil {
@@ -332,8 +339,16 @@ func (p *PayloadsAPI) GetRow(ctx context.Context, ownerId, fileId string) (paylo
 
 // getRowIn reads one row directly from a payloads object (already
 // resolved — the bare-fileId lookup path scans objects without knowing
-// the owner). space.ErrNotFound for a missing or tombstoned row.
+// the owner). space.ErrNotFound for a missing or tombstoned row, and
+// for every row of a deleted object, even while it is still resident.
 func (p *PayloadsAPI) getRowIn(ctx context.Context, payloadsObjId, fileId string) (payloads.Row, error) {
+	e, err := p.s.store.TreeEntry(ctx, payloadsObjId)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	if e.Deleted {
+		return payloads.Row{}, space.ErrNotFound
+	}
 	coll, err := resolveCollection(ctx, p.s.store, payloadsObjId, payloads.Dataset)
 	if err != nil {
 		return payloads.Row{}, err
@@ -406,7 +421,8 @@ func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row,
 }
 
 // ListRows returns every live row of the owner's payloads object,
-// unsealed when possible. Empty (nil) when the object doesn't exist.
+// unsealed when possible. Empty (nil) when the object doesn't exist or
+// is deleted.
 func (p *PayloadsAPI) ListRows(ctx context.Context, ownerId string) ([]payloads.Row, error) {
 	objId, ok, err := p.existingObjectId(ctx, ownerId)
 	if err != nil {
@@ -459,7 +475,7 @@ func (p *PayloadsAPI) rowFromValue(ctx context.Context, v *anyenc.Value) (payloa
 // its owner (any-sync stores a child in any arrival order), so a peer
 // holding the payloads tree but not yet the owner still finds its rows.
 // An owner with no payloads tree of either shape — no files yet, class
-// irrelevant — reads as no-rows.
+// irrelevant — reads as no-rows, and so does a deleted payloads tree.
 func (p *PayloadsAPI) existingObjectId(ctx context.Context, ownerId string) (string, bool, error) {
 	id, _, ok, err := p.existingShape(ctx, ownerId)
 	return id, ok, err
@@ -476,11 +492,15 @@ func (p *PayloadsAPI) existingShape(ctx context.Context, ownerId string) (objId 
 		if err != nil {
 			return "", false, false, err
 		}
-		ok, err := p.s.store.HasTree(ctx, objId)
+		e, err := p.s.store.TreeEntry(ctx, objId)
 		if err != nil {
 			return "", false, false, err
 		}
-		if ok {
+		if e.Deleted {
+			// Deleted with its owner: no rows to read or write.
+			return "", false, false, nil
+		}
+		if e.Present {
 			return objId, ownerDerived, true, nil
 		}
 	}

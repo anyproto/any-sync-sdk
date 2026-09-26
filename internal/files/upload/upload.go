@@ -327,7 +327,7 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 // ownerRefused reports whether RegisterFile refused the owner before
 // writing anything: the owner is deleted, gone, or not resolvable yet.
 // Any other error may come from the row write itself, and then the CAR
-// must stay pinned for the sweep to heal.
+// stays pinned; the sweep heals it once the owner's rows resolve.
 func ownerRefused(err error) bool {
 	return errors.Is(err, space.ErrObjectDeleted) ||
 		errors.Is(err, space.ErrObjectNotFound) ||
@@ -335,13 +335,14 @@ func ownerRefused(err error) bool {
 }
 
 // dropUnregistered removes a finalized CAR that no row will reference,
-// and its intent marker. Best effort: a failure leaves what the sweep
-// would have left anyway.
+// and its intent marker. The marker goes first: a CAR left without one
+// is unreferenced, and the sweep deletes it after the grace period.
 func (s *Service) dropUnregistered(ctx context.Context, spaceId string, root cid.Cid) {
-	if err := s.store.Delete(ctx, spaceId, root); err != nil {
+	ctx = context.WithoutCancel(ctx)
+	if err := s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
 		return
 	}
-	_ = s.store.DeleteKV(ctx, store.IntentKey(spaceId, root))
+	_ = s.store.Delete(ctx, spaceId, root)
 }
 
 // DriveDurable drives an already registered row to a verified receipt

@@ -40,7 +40,12 @@ var ErrOwnerUnknown = errors.New("payloads: owner class unknown; payloads id not
 // for it.
 type NotWrittenError struct{ Err error }
 
-func (e *NotWrittenError) Error() string { return e.Err.Error() }
+func (e *NotWrittenError) Error() string {
+	if e.Err == nil {
+		return "payloads: row not written"
+	}
+	return e.Err.Error()
+}
 func (e *NotWrittenError) Unwrap() error { return e.Err }
 
 // NotWritten reports whether err says registration wrote no row.

@@ -502,7 +502,7 @@ func (p *PayloadsAPI) readRowsIn(ctx context.Context, payloadsObjId string, owne
 	}
 	rows := make([]payloads.Row, 0, len(vals))
 	for _, v := range vals {
-		row, err := p.rowFromValue(ctx, v)
+		row, err := payloads.RowFromValue(v)
 		if err != nil {
 			return nil, err
 		}
@@ -514,6 +514,9 @@ func (p *PayloadsAPI) readRowsIn(ctx context.Context, payloadsObjId string, owne
 			if gone {
 				continue
 			}
+		}
+		if err := row.Unseal(ctx, p.keys); err != nil {
+			return nil, err
 		}
 		rows = append(rows, row)
 	}
@@ -542,8 +545,7 @@ func (p *PayloadsAPI) ownerDeleted(ctx context.Context, ownerId string) (bool, e
 	if ownerId == "" {
 		return false, nil
 	}
-	e, err := p.s.store.TreeEntry(ctx, ownerId)
-	return e.Deleted, err
+	return p.s.store.TreeDeleted(ctx, ownerId)
 }
 
 // deletedOwners memoizes owner deletion over one listing.
@@ -556,15 +558,15 @@ func (d *deletedOwners) deleted(ctx context.Context, ownerId string) (bool, erro
 	if gone, ok := d.seen[ownerId]; ok || ownerId == "" {
 		return gone, nil
 	}
-	e, err := d.store.TreeEntry(ctx, ownerId)
+	gone, err := d.store.TreeDeleted(ctx, ownerId)
 	if err != nil {
 		return false, err
 	}
 	if d.seen == nil {
 		d.seen = map[string]bool{}
 	}
-	d.seen[ownerId] = e.Deleted
-	return e.Deleted, nil
+	d.seen[ownerId] = gone
+	return gone, nil
 }
 
 // existingObjectId resolves the owner's payloads object id and whether its

@@ -39,34 +39,16 @@ func (v *payloadsView) ListRows(ctx context.Context, payloadsObjectId string) ([
 	if payloadsObjectId == "" {
 		return nil, errors.New("spaceimpl: payloads view: payloadsObjectId required")
 	}
-	e, err := v.s.store.TreeEntry(ctx, payloadsObjectId)
+	deleted, err := v.s.store.TreeDeleted(ctx, payloadsObjectId)
+	if err != nil || deleted {
+		return nil, err
+	}
+	rows, err := (&PayloadsAPI{s: v.s, keys: v.keys}).listRowsIn(ctx, payloadsObjectId)
 	if err != nil {
 		return nil, err
 	}
-	if e.Deleted {
-		return nil, nil
-	}
-	owners := &deletedOwners{store: v.s.store}
-	vals, err := newQuery(v.s.store, payloadsObjectId, payloads.Dataset).All(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]space.PayloadRow, 0, len(vals))
-	for _, val := range vals {
-		row, err := payloads.RowFromValue(val)
-		if err != nil {
-			return nil, err
-		}
-		gone, err := owners.deleted(ctx, row.ObjectId)
-		if err != nil {
-			return nil, err
-		}
-		if gone {
-			continue
-		}
-		if err := row.Unseal(ctx, v.keys); err != nil {
-			return nil, err
-		}
+	out := make([]space.PayloadRow, 0, len(rows))
+	for _, row := range rows {
 		out = append(out, space.PayloadRow{
 			FileId:      row.Id,
 			RootCid:     row.RootCid,

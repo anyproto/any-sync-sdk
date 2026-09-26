@@ -109,11 +109,13 @@ receipt.
 Crash safety: an intent marker pins the root before the row write, and
 the job is persisted before Attach returns, so a crash never leaves
 an unsigned row that GC treats as garbage or the queue forgets. When
-registration fails before the row write (the owner was deleted during
-the upload, or is not resolvable), the new CAR and its marker are
+registration fails before the row write, for any reason (the owner was
+deleted during the upload, the space key is unavailable, the context
+ended), no row references the new CAR, so it and its marker are
 dropped; a bound upload leaves the marker, which every attach of that
-content shares, to the sweep. A marker whose owner was deleted since
-resolves to no row, so the sweep drops its CAR.
+content shares, to the sweep. A failure in the write itself keeps both
+for the sweep. A marker whose owner was deleted since resolves to no
+row, so the sweep drops its CAR.
 
 ## Background work
 

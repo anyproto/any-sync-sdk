@@ -63,7 +63,8 @@ type Registrar interface {
 	RegisterFile(ctx context.Context, ownerId string, opts RegisterOpts) (fileId string, err error)
 	SetNetworkSign(ctx context.Context, ownerId, fileId, sign string) error
 	Row(ctx context.Context, ownerId, fileId string) (payloads.Row, error)
-	// FindRow resolves a row by fileId alone (space-wide).
+	// FindRow resolves a row by fileId alone (space-wide), a deleted
+	// derived owner's row included: its receipt still covers the root.
 	FindRow(ctx context.Context, fileId string) (payloads.Row, error)
 }
 

@@ -376,9 +376,9 @@ func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) (object.
 // and the reader-side rule (space.ActiveDevice: highest seq, then at,
 // then claimer peer id) makes that survivable by design.
 //
-// A pruned device is refused (ErrDevicePruned) before anything is
-// planned or written: its row's tombstone would absorb the claim, and
-// the absorbed change would still be signed into the shared history.
+// A device already known to be pruned is refused (ErrDevicePruned)
+// without writing: its row's tombstone would absorb the claim, and the
+// absorbed change would still be signed into the shared history.
 //
 // Known limit (v1): seq is minted from THIS replica's view — on a
 // device that hasn't synced the latest claims yet, a fresh claim can
@@ -399,17 +399,13 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 	if self == "" {
 		return object.WriteResult{}, errors.New("techspace: ClaimActive: no peer key")
 	}
-	obj, err := s.indexObj(ctx)
+	unlock, err := s.lockClaims(ctx)
 	if err != nil {
 		return object.WriteResult{}, err
 	}
-	select {
-	case s.claimSem <- struct{}{}:
-	case <-ctx.Done():
-		return object.WriteResult{}, ctx.Err()
-	}
-	defer func() { <-s.claimSem }()
-	if err := ctx.Err(); err != nil {
+	defer unlock()
+	obj, err := s.indexObj(ctx)
+	if err != nil {
 		return object.WriteResult{}, err
 	}
 	rec, err := PlanClaimActive(ctx, obj.Controller(), self, peerId, app, time.Now().Unix())
@@ -426,6 +422,21 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 		return res, err
 	}
 	return res, surfaceDeviceRejections(res, self)
+}
+
+// lockClaims takes the claim slot, or returns ctx.Err() when ctx ends
+// first — including a ctx already done when the slot is free.
+func (s *Service) lockClaims(ctx context.Context) (unlock func(), err error) {
+	select {
+	case s.claimSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		<-s.claimSem
+		return nil, err
+	}
+	return func() { <-s.claimSem }, nil
 }
 
 // PlanClaimActive reads the registry from ctrl and plans a ClaimActive
@@ -476,6 +487,9 @@ func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app s
 		if d.PeerId == target {
 			targetRow = d
 		}
+	}
+	if maxSeq >= maxClaimNum {
+		return crdt.RecordChange{}, fmt.Errorf("techspace: claim seq for %q is at its ceiling; a new claim cannot outrank it", app)
 	}
 	var selfHasApp bool
 	if selfRow != nil {

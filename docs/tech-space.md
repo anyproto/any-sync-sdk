@@ -209,8 +209,8 @@ id, `ClaimActive` claims for the local device and also marks the app
 installed. Given a peer id, it requires that row in this replica's
 registry (`ErrDeviceUnknown`) carrying the app
 (`ErrDeviceAppNotInstalled`) and never writes `apps`; another device's
-id becomes the claim's `target`. A pruned device's claim is refused
-before anything is written (`ErrDevicePruned`). Claims from one device
+id becomes the claim's `target`. A device already known to be pruned
+is refused without writing (`ErrDevicePruned`). Claims from one device
 are serialized, so the device's own claim `seq` never goes backwards.
 
 **Active-app election** is resolved by readers with one rule,

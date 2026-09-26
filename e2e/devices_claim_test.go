@@ -133,7 +133,8 @@ func TestE2E_Devices_SwitchToAnotherDevice(t *testing.T) {
 	require.ErrorIs(t, svcA.ClaimActive(ctx, "chess", b), space.ErrDeviceAppNotInstalled)
 
 	require.NoError(t, svcA.ClaimActive(ctx, "bao", b), "device A: switch to B")
-	claimA, _ := row(svcA, a)
+	claimA, ok := row(svcA, a)
+	require.True(t, ok, "device A: own row")
 	assert.Equal(t, b, claimA.ActiveClaims["bao"].Target, "the switch lives on A's row")
 	waitWinner("after A switched to B", b)
 

@@ -23,16 +23,17 @@ var (
 	// ErrDeviceEmptyUpsert rejects a SetDevice call with nothing to
 	// write.
 	ErrDeviceEmptyUpsert = errors.New("device upsert is empty")
-	// ErrDeviceUnknown is returned by DeleteDevice and a remote
-	// ClaimActive when peerId has no live row in this replica's
-	// registry (a device that registered elsewhere may not have synced
+	// ErrDeviceUnknown is returned by DeleteDevice, and by a
+	// ClaimActive naming a device (this one included), when peerId has
+	// no live row in this replica's registry (a device that registered elsewhere may not have synced
 	// here yet).
 	ErrDeviceUnknown = errors.New("unknown device")
 	// ErrDevicePruned reports that this device was pruned
 	// (DeleteDevice) and its peer id can never re-register. SetDevice's
 	// write is absorbed by the own row's sticky tombstone, and without
-	// this error would be indistinguishable from success; ClaimActive
-	// is refused before anything is written.
+	// this error would be indistinguishable from success. ClaimActive
+	// from a device already known to be pruned is refused without
+	// writing.
 	ErrDevicePruned = errors.New("device row is pruned")
 	// ErrDeviceAppNotInstalled rejects a ClaimActive naming a device
 	// (another one, or this one by its peer id) whose row doesn't carry
@@ -51,7 +52,8 @@ var (
 // outside the account). Online status deliberately does not live here.
 type Device struct {
 	// PeerId is the device's libp2p peer id — the row id. Stable per
-	// device installation. A device writes only its own row.
+	// device installation. SetDevice and ClaimActive write only the
+	// device's own row; DeleteDevice is the one write to another's.
 	PeerId string
 
 	// Name is the device's display name (hostname or user-set).

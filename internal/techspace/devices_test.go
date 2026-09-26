@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -437,7 +438,7 @@ func TestDevices_ClaimOpsExplicitSelf(t *testing.T) {
 	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, self, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "no own row yet")
 
-	devices := []space.Device{claimOpsRow(t, newDevicesController(t), self, "ui")}
+	devices := []space.Device{{PeerId: self, Apps: map[string]map[string]any{"ui": {}}}}
 	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceAppNotInstalled)
 
@@ -466,4 +467,52 @@ func TestDevices_PlanClaimActivePrunedFirst(t *testing.T) {
 	}
 	_, err := techspace.PlanClaimActive(ctx, ctrl, other, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "a live device naming the pruned one")
+}
+
+// A claim at the seq ceiling can't be outranked: seq+1 would round back
+// to the same float64 on the wire and tie instead of winning, so the
+// claim is refused rather than written as a silent no-op.
+func TestDevices_ClaimOpsSeqCeiling(t *testing.T) {
+	const self, other = "12D3KooWSelf", "12D3KooWOther"
+	row := func(seq int64) []space.Device {
+		return []space.Device{{
+			PeerId:       other,
+			Apps:         map[string]map[string]any{"bao": {}},
+			ActiveClaims: map[string]space.DeviceClaim{"bao": {Seq: seq}},
+		}}
+	}
+	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, row(1<<53), self, "", "bao", 1)
+	assert.Error(t, err)
+
+	ctrl := newDevicesController(t)
+	claimOpsRow(t, ctrl, self, "bao")
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, row(1<<53-1), self, "", "bao", 1)
+	require.NoError(t, err)
+	devices := applyClaim(t, ctrl, "v1-self", rec)
+	assert.Equal(t, int64(1<<53), deviceById(devices, self).ActiveClaims["bao"].Seq)
+}
+
+// A claim waiting for the slot leaves as soon as its ctx ends, and a
+// ctx already done never takes a free slot.
+func TestDevices_LockClaimsHonorsCtx(t *testing.T) {
+	s := techspace.New(nil, nil)
+	unlock, err := s.LockClaimsForTest(context.Background())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = s.LockClaimsForTest(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second)
+	unlock()
+
+	done, cancelDone := context.WithCancel(context.Background())
+	cancelDone()
+	_, err = s.LockClaimsForTest(done)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	unlock, err = s.LockClaimsForTest(context.Background())
+	require.NoError(t, err, "a refused waiter must not keep the slot")
+	unlock()
 }

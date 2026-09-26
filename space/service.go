@@ -394,7 +394,9 @@ type Service interface {
 	// requires that row in this replica's registry (ErrDeviceUnknown)
 	// carrying the app (ErrDeviceAppNotInstalled), and never writes
 	// apps. ErrDevicePruned when this device's row was deleted (see
-	// SetDevice), whatever peerId names.
+	// SetDevice), whatever peerId names. Claims from this device run
+	// one at a time; a call whose ctx ends while waiting for another
+	// returns ctx.Err().
 	ClaimActive(ctx context.Context, app, peerId string) error
 
 	// DeleteDevice prunes peerId's row — the "device doesn't exist"

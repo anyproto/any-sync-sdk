@@ -42,6 +42,10 @@ type Files interface {
 	// background. A false FileInfo.Durable means the file is registered
 	// and locally available but not yet backed up; Status and
 	// SubscribeStatus observe the flip.
+	//
+	// The owner is checked before the reader is touched: ErrNotFound
+	// when objectId isn't on this device, ErrObjectDeleted when it is
+	// deleted (or queued for deletion, e.g. cascaded from its parent).
 	Attach(ctx context.Context, objectId string, r io.Reader, opts AttachOpts) (FileInfo, error)
 
 	// Open returns a random-access reader over the file's verified

@@ -42,12 +42,17 @@ func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opt
 	if err := f.s.writeGate(ctx); err != nil {
 		return space.FileInfo{}, err
 	}
-	ok, err := f.s.store.HasTree(ctx, objectId)
+	owner, err := f.s.store.TreeEntry(ctx, objectId)
 	if err != nil {
 		return space.FileInfo{}, err
 	}
-	if !ok {
+	if !owner.Present {
 		return space.FileInfo{}, fmt.Errorf("files: attach to %s: %w", objectId, space.ErrNotFound)
+	}
+	// Refuse a deleted owner before a byte of the body is read.
+	// Registration checks again for an owner deleted during the upload.
+	if owner.Deleted {
+		return space.FileInfo{}, fmt.Errorf("files: attach to %s: %w", objectId, space.ErrObjectDeleted)
 	}
 	if err = f.validateVariant(ctx, objectId, opts); err != nil {
 		return space.FileInfo{}, err
@@ -246,7 +251,15 @@ func (f *filesAPI) List(ctx context.Context, opts space.FileListOpts) ([]space.F
 // rows. See space.Files.
 func (f *filesAPI) Query(objectId string) (space.Query, error) {
 	ctx := context.Background() // local reads only (derive + existence)
-	objId, ok, err := f.s.PayloadsInternal().existingObjectId(ctx, objectId)
+	pa := f.s.PayloadsInternal()
+	gone, err := pa.ownerDeleted(ctx, objectId)
+	if err != nil {
+		return nil, err
+	}
+	if gone {
+		return nil, fmt.Errorf("files: %s is deleted: %w", objectId, space.ErrNotFound)
+	}
+	objId, ok, err := pa.existingObjectId(ctx, objectId)
 	if err != nil {
 		return nil, err
 	}

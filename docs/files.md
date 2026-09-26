@@ -19,7 +19,13 @@ first `Attach`.
   any-sync cascade-deletes it with the owner.
 - Derived owner: unparented seed `builtin:payloads/<ownerId>`. any-sync
   rejects a derived object as a parent, so the owner id goes into the
-  seed to keep the child id unique per owner.
+  seed to keep the child id unique per owner. Being derived itself, it
+  is never deleted and outlives its owner.
+
+A deleted owner's files are gone from the delete on, for both shapes:
+reads check the owner, so its rows neither list, resolve by fileId nor
+count in stats, even while the payloads object is loaded. GC reclaims
+their CARs and the queue drops their pending uploads.
 
 A payloads object's tree changes are **plaintext** at the any-sync
 level, so nodes can read rows for refcount, GC, quota and durability
@@ -64,6 +70,9 @@ across spaces.
 
 ## Attach and backup
 
+0. Check the owner before touching the reader: `ErrNotFound` when it
+   isn't on this device, `ErrObjectDeleted` when it is deleted or
+   queued for deletion (a child cascaded from its parent included).
 1. Spool the reader, compute SHA-256, choose the tier.
 2. Full tier: encrypt, build the DAG, finalize the local CAR.
 3. Register the row: one CRDT change. The file now exists for every
@@ -99,7 +108,12 @@ receipt.
 
 Crash safety: an intent marker pins the root before the row write, and
 the job is persisted before Attach returns, so a crash never leaves
-an unsigned row that GC treats as garbage or the queue forgets.
+an unsigned row that GC treats as garbage or the queue forgets. When
+registration fails before the row write (the owner was deleted during
+the upload, or is not resolvable), the new CAR and its marker are
+dropped; a bound upload leaves the marker, which every attach of that
+content shares, to the sweep. A marker whose owner was deleted since
+resolves to no row, so the sweep drops its CAR.
 
 ## Background work
 

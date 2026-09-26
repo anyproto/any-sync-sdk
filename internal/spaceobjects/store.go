@@ -1985,7 +1985,6 @@ func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
 // parent (objecttree.ErrDerivedParent, refused by deriveChildGate), so
 // a derived owner's payloads object is derived unparented (see
 // payloads.DerivedOwnerSeed) while a signed owner's stays parented.
-// Mirrors TreeDeleted's head-storage lookup.
 func (s *Store) TreeIsDerived(ctx context.Context, treeId string) (isDerived bool, present bool, err error) {
 	e, err := s.TreeEntry(ctx, treeId)
 	return e.Derived, e.Present, err
@@ -1993,8 +1992,9 @@ func (s *Store) TreeIsDerived(ctx context.Context, treeId string) (isDerived boo
 
 // TreeEntry is what head storage records for one tree.
 type TreeEntry struct {
-	// Present: the tree is stored here. A deleted tree keeps its entry,
-	// so it stays present.
+	// Present: head storage has an entry for the tree — a full tree, a
+	// heads-only stub (selective sync), or a deleted tree, which keeps
+	// its entry.
 	Present bool
 	// Deleted: deleted or queued for deletion (see TreeDeleted).
 	Deleted bool

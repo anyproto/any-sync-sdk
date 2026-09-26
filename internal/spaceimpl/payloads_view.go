@@ -33,11 +33,20 @@ func (v *payloadsView) ListObjects(ctx context.Context) ([]string, error) {
 // ListRows reads every live row of one payloads object and maps it to
 // the public cleartext shape. Unsealing is attempted best-effort purely
 // to report Sealed truthfully (a keyless reader stays Sealed — the
-// broker view); the opened secrets are never surfaced.
+// broker view); the opened secrets are never surfaced. A deleted
+// object, and a deleted owner's rows, list nothing.
 func (v *payloadsView) ListRows(ctx context.Context, payloadsObjectId string) ([]space.PayloadRow, error) {
 	if payloadsObjectId == "" {
 		return nil, errors.New("spaceimpl: payloads view: payloadsObjectId required")
 	}
+	e, err := v.s.store.TreeEntry(ctx, payloadsObjectId)
+	if err != nil {
+		return nil, err
+	}
+	if e.Deleted {
+		return nil, nil
+	}
+	owners := &deletedOwners{store: v.s.store}
 	vals, err := newQuery(v.s.store, payloadsObjectId, payloads.Dataset).All(ctx)
 	if err != nil {
 		return nil, err
@@ -47,6 +56,13 @@ func (v *payloadsView) ListRows(ctx context.Context, payloadsObjectId string) ([
 		row, err := payloads.RowFromValue(val)
 		if err != nil {
 			return nil, err
+		}
+		gone, err := owners.deleted(ctx, row.ObjectId)
+		if err != nil {
+			return nil, err
+		}
+		if gone {
+			continue
 		}
 		if err := row.Unseal(ctx, v.keys); err != nil {
 			return nil, err

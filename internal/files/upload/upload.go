@@ -27,7 +27,6 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/crypt"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
-	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // ErrLimited — the broker refused backup (storage limit). The file is
@@ -58,7 +57,8 @@ type Broker interface {
 }
 
 // Registrar is the per-space payloads write surface (implemented over
-// spaceimpl.PayloadsAPI; faked in tests).
+// spaceimpl.PayloadsAPI; faked in tests). RegisterFile returns a
+// *payloads.NotWrittenError when it wrote no row.
 type Registrar interface {
 	RegisterFile(ctx context.Context, ownerId string, opts RegisterOpts) (fileId string, err error)
 	SetNetworkSign(ctx context.Context, ownerId, fileId, sign string) error
@@ -218,11 +218,9 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 		},
 	})
 	if err != nil {
-		if ownerRefused(err) {
-			// No row was written; the donor keeps its CAR, but this
-			// marker would pin it past every sweep.
-			_ = s.store.DeleteKV(ctx, store.IntentKey(spaceId, ref.Root))
-		}
+		// The marker stays even when no row was written: every attach of
+		// this content shares it. It pins nothing while the donor holds
+		// its ref, and the sweep heals it once the donor is gone.
 		return Result{}, false, err
 	}
 	if err = s.store.AddRefs(ctx, spaceId, ref.Root, fileId); err != nil {
@@ -297,9 +295,9 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		},
 	})
 	if err != nil {
-		if ownerRefused(err) {
+		if payloads.NotWritten(err) {
 			// No row was written, so nothing will ever reference this
-			// CAR; the intent marker would pin it past every sweep.
+			// CAR: drop it now rather than after the sweep's grace.
 			s.dropUnregistered(ctx, spaceId, root)
 		}
 		return Result{}, err
@@ -322,16 +320,6 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		return Result{}, err
 	}
 	return Result{FileId: fileId, RootCid: root.String(), Size: sp.Size()}, nil
-}
-
-// ownerRefused reports whether RegisterFile refused the owner before
-// writing anything: the owner is deleted, gone, or not resolvable yet.
-// Any other error may come from the row write itself, and then the CAR
-// stays pinned; the sweep heals it once the owner's rows resolve.
-func ownerRefused(err error) bool {
-	return errors.Is(err, space.ErrObjectDeleted) ||
-		errors.Is(err, space.ErrObjectNotFound) ||
-		errors.Is(err, payloads.ErrOwnerUnknown)
 }
 
 // dropUnregistered removes a finalized CAR that no row will reference,

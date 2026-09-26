@@ -35,6 +35,20 @@ import (
 // Resolvable after sync delivers the owner (or its payloads tree).
 var ErrOwnerUnknown = errors.New("payloads: owner class unknown; payloads id not resolvable yet")
 
+// NotWrittenError wraps a registration failure from before the row
+// write: no row exists, so nothing references what the caller staged
+// for it.
+type NotWrittenError struct{ Err error }
+
+func (e *NotWrittenError) Error() string { return e.Err.Error() }
+func (e *NotWrittenError) Unwrap() error { return e.Err }
+
+// NotWritten reports whether err says registration wrote no row.
+func NotWritten(err error) bool {
+	var nw *NotWrittenError
+	return errors.As(err, &nw)
+}
+
 // Dataset is the CRDT dataset name; on disk the collection is
 // `<payloadsObjectId>_payloads`.
 const Dataset = "payloads"

@@ -28,8 +28,9 @@ func (r untouchedReader) Read([]byte) (int, error) {
 // object never had files, had some, or is a derived child cascade-
 // deleted with its created parent (whose payloads object has no parent
 // gate of its own). Registration refuses the same way, for an owner
-// deleted while its upload was spooling, and the deleted owner's files
-// stop resolving at once.
+// deleted while its upload was spooling, and the deleted owners' files
+// stop listing, resolving and counting at once — the derived child's
+// too, though its payloads object outlives it.
 func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -65,6 +66,10 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	require.NoError(t, err)
 	child, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: []byte("child"), Type: typeId, ParentId: root})
 	require.NoError(t, err)
+	childFile, err := sp.Files().Attach(ctx, child, bytes.NewReader([]byte("child's file")), space.AttachOpts{Name: "c.txt"})
+	require.NoError(t, err)
+	childPayloads, err := payloadsSurface(t, sp).ObjectId(ctx, child)
+	require.NoError(t, err)
 
 	require.NoError(t, sp.Objects().Delete(ctx, bare))
 	require.NoError(t, sp.Objects().Delete(ctx, withFiles))
@@ -79,9 +84,20 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 		require.ErrorIs(t, err, space.ErrObjectDeleted, name)
 	}
 
-	files, err := sp.Files().List(ctx, space.FileListOpts{ObjectId: withFiles})
+	for name, f := range map[string]space.FileInfo{"had files": attached, "cascade-deleted child": childFile} {
+		files, err := sp.Files().List(ctx, space.FileListOpts{ObjectId: f.ObjectId})
+		require.NoError(t, err)
+		require.Empty(t, files, "%s: a deleted owner lists no files", name)
+		_, err = sp.Files().Get(ctx, f.FileId)
+		require.ErrorIs(t, err, space.ErrNotFound, "%s: a deleted owner's file no longer resolves", name)
+	}
+	all, err := sp.Files().List(ctx, space.FileListOpts{})
 	require.NoError(t, err)
-	require.Empty(t, files, "a deleted owner lists no files")
-	_, err = sp.Files().Get(ctx, attached.FileId)
-	require.ErrorIs(t, err, space.ErrNotFound, "a deleted owner's file no longer resolves")
+	require.Empty(t, all, "the space lists no files of deleted owners")
+	rows, err := sp.Payloads().ListRows(ctx, childPayloads)
+	require.NoError(t, err)
+	require.Empty(t, rows, "the payloads view skips a deleted owner's rows")
+	stats, err := sp.Files().Stats(ctx)
+	require.NoError(t, err)
+	require.Zero(t, stats.Total, "stats count no files of deleted owners")
 }

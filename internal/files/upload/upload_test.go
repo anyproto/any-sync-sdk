@@ -548,34 +548,30 @@ func TestDriveDurableSkipsWhenPeerMadeItDurable(t *testing.T) {
 		"the peer's receipt must be preserved, not overwritten")
 }
 
-// A refused owner (deleted, gone, unresolvable) means no row was
-// written: the finalized CAR and its intent marker are dropped instead
-// of being pinned past every sweep.
-func TestAddOwnerRefusedDropsCar(t *testing.T) {
-	for _, refusal := range []error{space.ErrObjectDeleted, space.ErrObjectNotFound, payloads.ErrOwnerUnknown} {
-		t.Run(refusal.Error(), func(t *testing.T) {
-			ctx := context.Background()
-			s, st := newService(t, &fakeBroker{})
-			s.SetQueue(newFakeQueue())
-			reg := newFakeRegistrar()
-			reg.registerErr = fmt.Errorf("payloads: derive payloads object: %w", refusal)
+// A registration that wrote no row (a deleted or unresolvable owner)
+// drops the finalized CAR and its intent marker instead of leaving them
+// for the sweep.
+func TestAddNotWrittenDropsCar(t *testing.T) {
+	ctx := context.Background()
+	s, st := newService(t, &fakeBroker{})
+	s.SetQueue(newFakeQueue())
+	reg := newFakeRegistrar()
+	reg.registerErr = &payloads.NotWrittenError{Err: fmt.Errorf("payloads: owner gone: %w", space.ErrObjectDeleted)}
 
-			_, err := s.Add(ctx, reg, spaceId, "gone", bytesReaderOf(t, 21_000), AddOpts{})
-			require.ErrorIs(t, err, refusal)
-			root, err := cid.Decode(reg.refusedRoot)
-			require.NoError(t, err)
-			_, err = st.Info(ctx, spaceId, root)
-			require.ErrorIs(t, err, store.ErrNotFound, "the refused CAR is dropped")
-			_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
-			require.NoError(t, err)
-			require.False(t, marked, "the refused CAR's marker is dropped")
-		})
-	}
+	_, err := s.Add(ctx, reg, spaceId, "gone", bytesReaderOf(t, 21_000), AddOpts{})
+	require.ErrorIs(t, err, space.ErrObjectDeleted)
+	root, err := cid.Decode(reg.refusedRoot)
+	require.NoError(t, err)
+	_, err = st.Info(ctx, spaceId, root)
+	require.ErrorIs(t, err, store.ErrNotFound, "the refused CAR is dropped")
+	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
+	require.NoError(t, err)
+	require.False(t, marked, "the refused CAR's marker is dropped")
 }
 
-// On the bind path a refused owner drops only its intent marker: the
-// donor keeps its CAR and refs.
-func TestAddBindOwnerRefusedKeepsDonor(t *testing.T) {
+// On the bind path a registration that wrote no row leaves the donor's
+// CAR and refs alone.
+func TestAddBindNotWrittenKeepsDonor(t *testing.T) {
 	ctx := context.Background()
 	s, st := newService(t, &fakeBroker{})
 	reg := newFakeRegistrar()
@@ -585,7 +581,7 @@ func TestAddBindOwnerRefusedKeepsDonor(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner1", first.FileId))
 
-	reg.registerErr = fmt.Errorf("payloads: derive payloads object: %w", space.ErrObjectDeleted)
+	reg.registerErr = &payloads.NotWrittenError{Err: space.ErrObjectDeleted}
 	_, err = s.Add(ctx, reg, spaceId, "gone", bytes.NewReader(content), AddOpts{})
 	require.ErrorIs(t, err, space.ErrObjectDeleted)
 
@@ -594,7 +590,4 @@ func TestAddBindOwnerRefusedKeepsDonor(t *testing.T) {
 	info, err := st.Info(ctx, spaceId, root)
 	require.NoError(t, err)
 	require.Equal(t, []string{first.FileId}, info.Refs, "the donor's CAR and ref stay")
-	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
-	require.NoError(t, err)
-	require.False(t, marked, "no marker pins the donor's root")
 }

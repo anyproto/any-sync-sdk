@@ -235,7 +235,8 @@ qualifying, the fallback skips the device that handed it away.
   re-register. Deleting the local device's own row is refused
   (`ErrDeviceSelfDelete`); a pruned device's later `SetDevice` /
   `ClaimActive` returns `ErrDevicePruned`.
-- Claims decode strictly (integer `seq >= 1`, at most 2^53; a `target`,
+- Claims decode strictly (integer `seq >= 1`, at most 2^53, where new
+  claims stop raising `seq` and tie on it, so `at` decides; a `target`,
   when present, a non-empty string); a malformed claim reads as absent
   on every architecture.
 - Known limit: `seq` comes from the claiming replica's view, so a claim

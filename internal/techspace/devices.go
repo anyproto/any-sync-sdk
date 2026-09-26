@@ -425,18 +425,17 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 }
 
 // lockClaims takes the claim slot, or returns ctx.Err() when ctx ends
-// first — including a ctx already done when the slot is free.
+// first; a ctx already done never takes it.
 func (s *Service) lockClaims(ctx context.Context) (unlock func(), err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case s.claimSem <- struct{}{}:
+		return func() { <-s.claimSem }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
-		<-s.claimSem
-		return nil, err
-	}
-	return func() { <-s.claimSem }, nil
 }
 
 // PlanClaimActive reads the registry from ctrl and plans a ClaimActive
@@ -488,9 +487,6 @@ func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app s
 			targetRow = d
 		}
 	}
-	if maxSeq >= maxClaimNum {
-		return crdt.RecordChange{}, fmt.Errorf("techspace: claim seq for %q is at its ceiling; a new claim cannot outrank it", app)
-	}
 	var selfHasApp bool
 	if selfRow != nil {
 		_, selfHasApp = selfRow.Apps[app]
@@ -504,7 +500,9 @@ func ClaimActiveOps(a *anyenc.Arena, devices []space.Device, self, target, app s
 		}
 	}
 
-	c := space.DeviceClaim{Seq: maxSeq + 1, At: now}
+	// At the ceiling seq can't grow (maxClaimNum+1 has no float64 of its
+	// own), so the claim ties on seq and at decides.
+	c := space.DeviceClaim{Seq: min(maxSeq+1, maxClaimNum), At: now}
 	if target != self {
 		c.Target = target
 	}

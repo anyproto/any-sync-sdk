@@ -469,27 +469,28 @@ func TestDevices_PlanClaimActivePrunedFirst(t *testing.T) {
 	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "a live device naming the pruned one")
 }
 
-// A claim at the seq ceiling can't be outranked: seq+1 would round back
-// to the same float64 on the wire and tie instead of winning, so the
-// claim is refused rather than written as a silent no-op.
+// At the seq ceiling a new claim can't raise seq (2^53+1 has no
+// float64 of its own), so it ties the stored claim on seq and wins on
+// at instead of minting a value that reads back as the same seq.
 func TestDevices_ClaimOpsSeqCeiling(t *testing.T) {
 	const self, other = "12D3KooWSelf", "12D3KooWOther"
-	row := func(seq int64) []space.Device {
-		return []space.Device{{
-			PeerId:       other,
-			Apps:         map[string]map[string]any{"bao": {}},
-			ActiveClaims: map[string]space.DeviceClaim{"bao": {Seq: seq}},
-		}}
-	}
-	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, row(1<<53), self, "", "bao", 1)
-	assert.Error(t, err)
-
 	ctrl := newDevicesController(t)
 	claimOpsRow(t, ctrl, self, "bao")
-	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, row(1<<53-1), self, "", "bao", 1)
+	claimOpsRow(t, ctrl, other, "bao")
+	a := &anyenc.Arena{}
+	claim := a.NewObject()
+	claim.Set(techspace.DeviceClaimSeq, a.NewNumberFloat64(1<<53))
+	claim.Set(techspace.DeviceClaimAt, a.NewNumberFloat64(1000))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), devicesChange("v2-ceiling", other, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "bao"}, Payload: claim})))
+
+	rec, err := techspace.PlanClaimActive(context.Background(), ctrl, self, "", "bao", 2000)
 	require.NoError(t, err)
-	devices := applyClaim(t, ctrl, "v1-self", rec)
-	assert.Equal(t, int64(1<<53), deviceById(devices, self).ActiveClaims["bao"].Seq)
+	devices := applyClaim(t, ctrl, "v3-self", rec)
+	assert.Equal(t, space.DeviceClaim{Seq: 1 << 53, At: 2000}, deviceById(devices, self).ActiveClaims["bao"])
+	winner, ok := space.ActiveDevice(devices, "bao")
+	require.True(t, ok)
+	assert.Equal(t, self, winner)
 }
 
 // A claim waiting for the slot leaves as soon as its ctx ends, and a

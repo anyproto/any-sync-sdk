@@ -25,8 +25,9 @@ var (
 	ErrDeviceEmptyUpsert = errors.New("device upsert is empty")
 	// ErrDeviceUnknown is returned by DeleteDevice, and by a
 	// ClaimActive naming a device (this one included), when peerId has
-	// no live row in this replica's registry (a device that registered elsewhere may not have synced
-	// here yet).
+	// no live row in this replica's registry (a device that registered
+	// elsewhere may not have synced here yet). A pruned own row gets
+	// ErrDevicePruned instead.
 	ErrDeviceUnknown = errors.New("unknown device")
 	// ErrDevicePruned reports that this device was pruned
 	// (DeleteDevice) and its peer id can never re-register. SetDevice's

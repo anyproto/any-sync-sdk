@@ -412,6 +412,11 @@ func (s *Service) ClaimActive(ctx context.Context, app, peerId string) (object.W
 	if err != nil {
 		return object.WriteResult{}, err
 	}
+	// Registry reads stop early on a done ctx, so a plan made under one
+	// may rest on a partial registry and mint a stale seq.
+	if err := ctx.Err(); err != nil {
+		return object.WriteResult{}, err
+	}
 	change := crdt.Change{
 		Dataset:     DevicesDataset,
 		DataVersion: DevicesHandlerVersion,

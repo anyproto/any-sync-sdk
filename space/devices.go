@@ -26,8 +26,8 @@ var (
 	// ErrDeviceUnknown is returned by DeleteDevice, and by a
 	// ClaimActive naming a device (this one included), when peerId has
 	// no live row in this replica's registry (a device that registered
-	// elsewhere may not have synced here yet). A pruned own row gets
-	// ErrDevicePruned instead.
+	// elsewhere may not have synced here yet). ClaimActive from a
+	// pruned device gets ErrDevicePruned instead.
 	ErrDeviceUnknown = errors.New("unknown device")
 	// ErrDevicePruned reports that this device was pruned
 	// (DeleteDevice) and its peer id can never re-register. SetDevice's

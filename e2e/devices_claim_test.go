@@ -12,13 +12,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// deviceRow returns peer's row in svc's registry; false when it is
-// missing or the registry can't be read.
-func deviceRow(ctx context.Context, svc space.Service, peer string) (space.Device, bool) {
-	devices, err := svc.ListDevices(ctx)
-	if err != nil {
-		return space.Device{}, false
-	}
+// findDevice returns peer's row in devices.
+func findDevice(devices []space.Device, peer string) (space.Device, bool) {
 	for _, d := range devices {
 		if d.PeerId == peer {
 			return d, true
@@ -62,11 +57,11 @@ func TestE2E_Devices_ConcurrentClaimsMintDistinctSeqs(t *testing.T) {
 		require.NoError(t, err, "claim %d", i)
 	}
 
-	mine, ok := deviceRow(ctx, svc, self)
-	require.True(t, ok, "own row")
-	assert.Equal(t, int64(n), mine.ActiveClaims["bao"].Seq)
 	devices, err := svc.ListDevices(ctx)
 	require.NoError(t, err)
+	mine, ok := findDevice(devices, self)
+	require.True(t, ok, "own row")
+	assert.Equal(t, int64(n), mine.ActiveClaims["bao"].Seq)
 	winner, ok := space.ActiveDevice(devices, "bao")
 	require.True(t, ok)
 	assert.Equal(t, self, winner)
@@ -103,7 +98,11 @@ func TestE2E_Devices_SwitchToAnotherDevice(t *testing.T) {
 	}), "device B: install bao")
 
 	hasBao := func(svc space.Service, peer string) bool {
-		d, ok := deviceRow(ctx, svc, peer)
+		devices, err := svc.ListDevices(ctx)
+		if err != nil {
+			return false
+		}
+		d, ok := findDevice(devices, peer)
 		_, installed := d.Apps["bao"]
 		return ok && installed
 	}
@@ -132,7 +131,9 @@ func TestE2E_Devices_SwitchToAnotherDevice(t *testing.T) {
 	require.ErrorIs(t, svcA.ClaimActive(ctx, "chess", b), space.ErrDeviceAppNotInstalled)
 
 	require.NoError(t, svcA.ClaimActive(ctx, "bao", b), "device A: switch to B")
-	claimA, ok := deviceRow(ctx, svcA, a)
+	devicesA, err := svcA.ListDevices(ctx)
+	require.NoError(t, err)
+	claimA, ok := findDevice(devicesA, a)
 	require.True(t, ok, "device A: own row")
 	assert.Equal(t, b, claimA.ActiveClaims["bao"].Target, "the switch lives on A's row")
 	waitWinner("after A switched to B", b)

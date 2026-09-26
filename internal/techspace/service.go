@@ -50,6 +50,11 @@ type Service struct {
 	avMu  sync.Mutex
 	avIds map[string]string
 
+	// claimSem (one slot) serializes ClaimActive's
+	// read-registry-then-write, so overlapping claims from this device
+	// mint increasing seqs; a waiter leaves when its ctx is done.
+	claimSem chan struct{}
+
 	// store is a regular spaceobjects Store (type/properties model,
 	// runtime dataset catalog, schema gate) with the tech datasets
 	// registered as system built-ins — see SystemDatasets. The index
@@ -88,7 +93,7 @@ func deriveCfg(signKey crypto.PrivKey) spacepayloads.SpaceDerivePayload {
 
 // New returns a Service ready for Open.
 func New(app *anysyncx.App, db anystore.DB) *Service {
-	return &Service{app: app, db: db}
+	return &Service{app: app, db: db, claimSem: make(chan struct{}, 1)}
 }
 
 // SyncHeads forces an immediate head-sync round on the tech space, so

@@ -260,11 +260,7 @@ func applyClaim(t *testing.T, ctrl *crdt.Controller, v crdt.VersionId, rec crdt.
 	res, err := ctrl.ApplyChangeWithResult(ctx, devicesChange(v, rec.Id, rec.Upsert, rec.Ops...))
 	require.NoError(t, err)
 	require.Empty(t, res.Rejections)
-	var out []space.Device
-	for _, row := range ctrl.Records(ctx, techspace.DevicesDataset) {
-		out = append(out, techspace.DecodeDeviceRecord(row))
-	}
-	return out
+	return techspace.DecodeDevices(ctrl.Records(ctx, techspace.DevicesDataset))
 }
 
 func deviceById(devices []space.Device, peer string) space.Device {
@@ -388,11 +384,7 @@ func TestDevices_ClaimOpsPruneMovesWinner(t *testing.T) {
 	}
 	prune := func(t *testing.T, ctrl *crdt.Controller, peer string) []space.Device {
 		require.NoError(t, ctrl.ApplyChange(ctx, devicesChange(crdt.VersionId("v3-del-"+peer), peer, false, crdt.Op{Type: crdt.OpDelete})))
-		var out []space.Device
-		for _, row := range ctrl.Records(ctx, techspace.DevicesDataset) {
-			out = append(out, techspace.DecodeDeviceRecord(row))
-		}
-		return out
+		return techspace.DecodeDevices(ctrl.Records(ctx, techspace.DevicesDataset))
 	}
 
 	t.Run("target pruned", func(t *testing.T) {
@@ -445,11 +437,11 @@ func TestDevices_ClaimOpsExplicitSelf(t *testing.T) {
 	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, self, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "no own row yet")
 
-	ctrl := newDevicesController(t)
-	devices := []space.Device{claimOpsRow(t, ctrl, self, "ui")}
+	devices := []space.Device{claimOpsRow(t, newDevicesController(t), self, "ui")}
 	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceAppNotInstalled)
 
+	ctrl := newDevicesController(t)
 	devices = []space.Device{claimOpsRow(t, ctrl, self, "bao")}
 	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, self, "bao", 1770000000)
 	require.NoError(t, err)

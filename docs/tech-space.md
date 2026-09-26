@@ -217,7 +217,8 @@ are serialized, so the device's own claim `seq` never goes backwards.
 `space.ActiveDevice`: the claims of all live rows rank by highest `seq`,
 then highest `at`, then largest claimer peer id. The winner is the
 target (the claimer when `target` is absent) of the best claim whose
-target is a live row with the app installed; the claimer needs no app.
+target is a live row with the app installed; the claimer needs no app,
+so the rule reads the whole registry, never a list filtered by app.
 A claim is writer-supplied `{seq: max+1, at: now}`, not a CRDT version
 id (those are peer-local and not comparable across devices). There is
 no un-claim: the winner changes when a better claim appears, or when a

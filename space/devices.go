@@ -23,20 +23,23 @@ var (
 	// ErrDeviceEmptyUpsert rejects a SetDevice call with nothing to
 	// write.
 	ErrDeviceEmptyUpsert = errors.New("device upsert is empty")
-	// ErrDeviceUnknown is returned by DeleteDevice and a remote
-	// ClaimActive when peerId has no live row in this replica's
-	// registry (a device that registered elsewhere may not have synced
-	// here yet).
+	// ErrDeviceUnknown is returned by DeleteDevice, and by a
+	// ClaimActive naming a device (this one included), when peerId has
+	// no live row in this replica's registry (a device that registered
+	// elsewhere may not have synced here yet). ClaimActive from a
+	// pruned device gets ErrDevicePruned instead.
 	ErrDeviceUnknown = errors.New("unknown device")
-	// ErrDevicePruned reports a write absorbed by the own row's sticky
-	// tombstone: this device was pruned (DeleteDevice) and its peer id
-	// can never re-register. Without this error the absorbed write
-	// would be indistinguishable from success.
+	// ErrDevicePruned reports that this device was pruned
+	// (DeleteDevice) and its peer id can never re-register. SetDevice's
+	// write is absorbed by the own row's sticky tombstone, and without
+	// this error would be indistinguishable from success. ClaimActive
+	// from a device already known to be pruned is refused without
+	// writing.
 	ErrDevicePruned = errors.New("device row is pruned")
-	// ErrDeviceAppNotInstalled rejects a ClaimActive for another
-	// device whose row doesn't carry apps.<slug>: the election skips
-	// a claim whose target lacks the app, and the claimer can't mark
-	// an app installed on another device's row.
+	// ErrDeviceAppNotInstalled rejects a ClaimActive naming a device
+	// (another one, or this one by its peer id) whose row doesn't carry
+	// apps.<slug>: the election skips a claim whose target lacks the
+	// app, and a named claim never marks an app installed.
 	ErrDeviceAppNotInstalled = errors.New("app not installed on device")
 	// ErrDeviceSelfDelete rejects DeleteDevice on the local device's
 	// own row — the tombstone is sticky, so self-pruning would
@@ -50,7 +53,8 @@ var (
 // outside the account). Online status deliberately does not live here.
 type Device struct {
 	// PeerId is the device's libp2p peer id — the row id. Stable per
-	// device installation. A device writes only its own row.
+	// device installation. SetDevice and ClaimActive write only the
+	// device's own row; DeleteDevice is the one write to another's.
 	PeerId string
 
 	// Name is the device's display name (hostname or user-set).
@@ -113,8 +117,10 @@ type DeviceUpsert struct {
 // with the app installed (Apps[app] present). A claim for a device
 // that uninstalled the app or was pruned never wins and the next
 // claim is tried; a pruned claimer's claims vanish with its row. The
-// claimer itself needs no app installed. Deterministic on converged
-// data for every reader. ok=false when no claim qualifies.
+// claimer itself needs no app installed, so pass the whole registry
+// (ListDevices): a list filtered to devices with the app drops the
+// claims of devices without it. Deterministic on converged data for
+// every reader. ok=false when no claim qualifies.
 //
 // No un-claim exists: the winner changes when a better claim appears,
 // or when a claim starts or stops qualifying — its claimer or target

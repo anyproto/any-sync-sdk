@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -260,11 +261,7 @@ func applyClaim(t *testing.T, ctrl *crdt.Controller, v crdt.VersionId, rec crdt.
 	res, err := ctrl.ApplyChangeWithResult(ctx, devicesChange(v, rec.Id, rec.Upsert, rec.Ops...))
 	require.NoError(t, err)
 	require.Empty(t, res.Rejections)
-	var out []space.Device
-	for _, row := range ctrl.Records(ctx, techspace.DevicesDataset) {
-		out = append(out, techspace.DecodeDeviceRecord(row))
-	}
-	return out
+	return techspace.DecodeDevices(ctrl.Records(ctx, techspace.DevicesDataset))
 }
 
 func deviceById(devices []space.Device, peer string) space.Device {
@@ -388,11 +385,7 @@ func TestDevices_ClaimOpsPruneMovesWinner(t *testing.T) {
 	}
 	prune := func(t *testing.T, ctrl *crdt.Controller, peer string) []space.Device {
 		require.NoError(t, ctrl.ApplyChange(ctx, devicesChange(crdt.VersionId("v3-del-"+peer), peer, false, crdt.Op{Type: crdt.OpDelete})))
-		var out []space.Device
-		for _, row := range ctrl.Records(ctx, techspace.DevicesDataset) {
-			out = append(out, techspace.DecodeDeviceRecord(row))
-		}
-		return out
+		return techspace.DecodeDevices(ctrl.Records(ctx, techspace.DevicesDataset))
 	}
 
 	t.Run("target pruned", func(t *testing.T) {
@@ -445,11 +438,11 @@ func TestDevices_ClaimOpsExplicitSelf(t *testing.T) {
 	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, self, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "no own row yet")
 
-	ctrl := newDevicesController(t)
-	devices := []space.Device{claimOpsRow(t, ctrl, self, "ui")}
+	devices := []space.Device{{PeerId: self, Apps: map[string]map[string]any{"ui": {}}}}
 	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceAppNotInstalled)
 
+	ctrl := newDevicesController(t)
 	devices = []space.Device{claimOpsRow(t, ctrl, self, "bao")}
 	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, self, "bao", 1770000000)
 	require.NoError(t, err)
@@ -474,4 +467,53 @@ func TestDevices_PlanClaimActivePrunedFirst(t *testing.T) {
 	}
 	_, err := techspace.PlanClaimActive(ctx, ctrl, other, self, "bao", 1)
 	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "a live device naming the pruned one")
+}
+
+// At the seq ceiling a new claim can't raise seq (2^53+1 has no
+// float64 of its own), so it ties the stored claim on seq and wins on
+// at instead of minting a value that reads back as the same seq.
+func TestDevices_ClaimOpsSeqCeiling(t *testing.T) {
+	const self, other = "12D3KooWSelf", "12D3KooWOther"
+	ctrl := newDevicesController(t)
+	claimOpsRow(t, ctrl, self, "bao")
+	claimOpsRow(t, ctrl, other, "bao")
+	a := &anyenc.Arena{}
+	claim := a.NewObject()
+	claim.Set(techspace.DeviceClaimSeq, a.NewNumberFloat64(1<<53))
+	claim.Set(techspace.DeviceClaimAt, a.NewNumberFloat64(1000))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), devicesChange("v2-ceiling", other, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "bao"}, Payload: claim})))
+
+	rec, err := techspace.PlanClaimActive(context.Background(), ctrl, self, "", "bao", 2000)
+	require.NoError(t, err)
+	devices := applyClaim(t, ctrl, "v3-self", rec)
+	assert.Equal(t, space.DeviceClaim{Seq: 1 << 53, At: 2000}, deviceById(devices, self).ActiveClaims["bao"])
+	winner, ok := space.ActiveDevice(devices, "bao")
+	require.True(t, ok)
+	assert.Equal(t, self, winner)
+}
+
+// A claim waiting for the slot leaves as soon as its ctx ends, and a
+// ctx already done never takes a free slot.
+func TestDevices_LockClaimsHonorsCtx(t *testing.T) {
+	s := techspace.New(nil, nil)
+	unlock, err := s.LockClaimsForTest(context.Background())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = s.LockClaimsForTest(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second)
+	unlock()
+
+	done, cancelDone := context.WithCancel(context.Background())
+	cancelDone()
+	_, err = s.LockClaimsForTest(done)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	unlock, err = s.LockClaimsForTest(context.Background())
+	require.NoError(t, err, "a refused waiter must not keep the slot")
+	unlock()
 }

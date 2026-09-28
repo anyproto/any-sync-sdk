@@ -209,15 +209,16 @@ id, `ClaimActive` claims for the local device and also marks the app
 installed. Given a peer id, it requires that row in this replica's
 registry (`ErrDeviceUnknown`) carrying the app
 (`ErrDeviceAppNotInstalled`) and never writes `apps`; another device's
-id becomes the claim's `target`. A pruned device's claim is refused
-before anything is written (`ErrDevicePruned`). Claims from one device
+id becomes the claim's `target`. A device already known to be pruned
+is refused without writing (`ErrDevicePruned`). Claims from one device
 are serialized, so the device's own claim `seq` never goes backwards.
 
 **Active-app election** is resolved by readers with one rule,
 `space.ActiveDevice`: the claims of all live rows rank by highest `seq`,
 then highest `at`, then largest claimer peer id. The winner is the
 target (the claimer when `target` is absent) of the best claim whose
-target is a live row with the app installed; the claimer needs no app.
+target is a live row with the app installed; the claimer needs no app,
+so the rule reads the whole registry, never a list filtered by app.
 A claim is writer-supplied `{seq: max+1, at: now}`, not a CRDT version
 id (those are peer-local and not comparable across devices). There is
 no un-claim: the winner changes when a better claim appears, or when a
@@ -234,7 +235,10 @@ qualifying, the fallback skips the device that handed it away.
   re-register. Deleting the local device's own row is refused
   (`ErrDeviceSelfDelete`); a pruned device's later `SetDevice` /
   `ClaimActive` returns `ErrDevicePruned`.
-- Claims decode strictly (integer `seq >= 1`, at most 2^53; a `target`,
+- Claims decode strictly (integer `seq >= 1`, at most 2^53; there new
+  claims stop raising `seq` and tie on it, so `at`, then the claimer
+  peer id, decides, and a stored claim stamped later than now keeps
+  winning; a `target`,
   when present, a non-empty string); a malformed claim reads as absent
   on every architecture.
 - Known limit: `seq` comes from the claiming replica's view, so a claim

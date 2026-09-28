@@ -215,6 +215,26 @@ func (c *Controller) PersistVersions(ctx context.Context) error {
 	})
 }
 
+// TreeOrphanSeq returns the highest AddSeq among the changes the tree
+// storage set aside that the materialized rows are known to be free of.
+func (c *Controller) TreeOrphanSeq() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.treeOrphanSeq
+}
+
+// PersistTreeOrphanSeq records that the materialized rows hold nothing
+// from the set-aside changes up to seq. Called once the load has
+// finished whatever rebuild they asked for: it stamps the current
+// handler versions along with the mark.
+func (c *Controller) PersistTreeOrphanSeq(ctx context.Context, seq uint64) error {
+	c.treeOrphanSeq = seq
+	return persistMeta(ctx, c.metaColl, c.objectId, c.maxAddSeq, c.maxApplySeq, c.HandlerVersions(), c.spaceId, func(a *anyenc.Arena, v *anyenc.Value) {
+		v.Set(metaTreeOrphanSeqKey, a.NewNumberInt(int(seq)))
+	})
+}
+
 // LocalFields returns the dataset's declared local-scope top-level field
 // names. Local values are written by Object.LocalSet and never enter the
 // DAG, so a replay cannot reproduce them — the re-index path snapshots

@@ -59,6 +59,13 @@ const (
 	// object's rebuild is in flight and the next load resumes it.
 	metaReindexLocalKey = "rl"
 
+	// metaTreeOrphanSeqKey is the highest AddSeq among the changes the
+	// tree storage set aside (they can never attach: a parent never
+	// reached the storage) that the materialized rows are known to be
+	// free of. An orphan above it and at or under the watermark was
+	// applied here, so the next load rebuilds the object (reindex.go).
+	metaTreeOrphanSeqKey = "to"
+
 	// spaceMetaKeyPrefix namespaces space-scoped rows inside the same
 	// _meta collection. Colon is not a valid char in any-sync's
 	// content-addressable object IDs, so "space:<id>" rows can't
@@ -370,6 +377,7 @@ func (c *Controller) LoadAndSeedMeta(ctx context.Context, metaColl anystore.Coll
 		c.reindexPending = true
 		c.reindexLocal = rl.MarshalTo(nil)
 	}
+	c.treeOrphanSeq = uint64(v.GetInt(metaTreeOrphanSeqKey))
 	return handlerVersions, nil
 }
 

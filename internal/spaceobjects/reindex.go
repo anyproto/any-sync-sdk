@@ -9,6 +9,7 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -84,10 +85,11 @@ type localLeaf = crdt.LocalLeaf
 // A rebuild that was already in flight (the previous attempt persisted
 // its leaves and did not finish) re-uses them instead of capturing: the
 // rows are gone or half-rebuilt, so a fresh capture would read nothing.
-func (s *Store) reindexPrepare(ctx context.Context, objectId string, ctrl *crdt.Controller, stale []string) ([]localLeaf, error) {
+func (s *Store) reindexPrepare(ctx context.Context, objectId string, ctrl *crdt.Controller, stale []string, orphansApplied bool) ([]localLeaf, error) {
 	storeLog.Info("reindex: rebuilding object",
 		zap.String("objectId", objectId),
-		zap.Strings("datasets", stale))
+		zap.Strings("datasets", stale),
+		zap.Bool("treeOrphansApplied", orphansApplied))
 	var leaves []localLeaf
 	if ctrl.ReindexPending() {
 		leaves = ctrl.ReindexLocalLeaves()
@@ -509,6 +511,25 @@ func (s *Store) reindexSweep() {
 	}
 	storeLog.Info("reindex sweep: done",
 		zap.String("spaceId", s.spaceId), zap.Int("rebuilt", done), zap.Int("total", len(ids)))
+}
+
+// treeOrphans reads the changes the tree storage set aside: they were
+// stored under a parent that never reached the storage, so they can never
+// attach and no peer has them. Returns the highest AddSeq among them and
+// whether any was applied here — above the recorded mark and at or under
+// the watermark. Applied ones left their values and versions in the
+// materialized rows, where they would silently outrank the writes that
+// reuse their order ids; the rebuild drops them.
+func treeOrphans(ctx context.Context, tree objecttree.ObjectTree, ctrl *crdt.Controller) (maxSeq uint64, applied bool, err error) {
+	mark, watermark := ctrl.TreeOrphanSeq(), ctrl.MaxAddSeq()
+	err = tree.Storage().GetOrphans(ctx, func(_ context.Context, ch objecttree.StorageChange) (bool, error) {
+		maxSeq = max(maxSeq, ch.AddSeq)
+		if ch.AddSeq > mark && ch.AddSeq <= watermark {
+			applied = true
+		}
+		return true, nil
+	})
+	return maxSeq, applied, err
 }
 
 // handlerVersions is the dataset→handler version map the stale check

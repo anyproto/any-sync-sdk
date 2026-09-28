@@ -2347,9 +2347,23 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	// failed open (offline, tree removed, selective-mode reject) with the
 	// rows gone, nothing to replay them back, and the captured local
 	// values dropped on the error path.
+	//
+	// Opening the tree is also what moves changes that can never attach
+	// out of its storage. Those applied here are still in the rows: the
+	// object rebuilds for them the same way.
+	orphanSeq, orphansApplied, err := treeOrphans(ctx, obj.Tree(), ctrl)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: tree orphans %s: %w", objectId, err)
+	}
+	orphansApplied = orphansApplied && !resume
+	if orphansApplied && !rebuilding {
+		rebuilding = true
+		s.readSeedPending.Store(objectId, struct{}{})
+		defer s.readSeedPending.Delete(objectId)
+	}
 	var reindexLeaves []localLeaf
-	if len(stale) > 0 {
-		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale); err != nil {
+	if len(stale) > 0 || orphansApplied {
+		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale, orphansApplied); err != nil {
 			return nil, err
 		}
 	} else if resume {
@@ -2384,6 +2398,13 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	}
 	if rebuilding {
 		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
+	}
+	if orphanSeq > ctrl.TreeOrphanSeq() {
+		// Last: a crash before it costs one more rebuild on the next load.
+		if err := ctrl.PersistTreeOrphanSeq(ctx, orphanSeq); err != nil {
+			storeLog.Warn("reindex: persist tree orphan mark",
+				zap.String("objectId", objectId), zap.Error(err))
+		}
 	}
 	if seedPending {
 		if len(publishedSets) > 0 {

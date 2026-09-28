@@ -152,7 +152,7 @@ func TestReindex_PrepareKeepsLeavesOnDisk(t *testing.T) {
 		v.Set("unread", a.NewTrue())
 	})
 
-	leaves, err := s.reindexPrepare(ctx, "obj1", ctrl, []string{reindexNotes})
+	leaves, err := s.reindexPrepare(ctx, "obj1", ctrl, []string{reindexNotes}, false)
 	require.NoError(t, err)
 	require.Len(t, leaves, 1)
 	_, err = s.db.OpenCollection(ctx, "obj1_"+reindexNotes)
@@ -174,7 +174,7 @@ func TestReindex_PrepareKeepsLeavesOnDisk(t *testing.T) {
 
 	// Preparing again (the stale verdict still armed, rows gone) keeps
 	// the persisted leaves instead of capturing an empty set.
-	leaves2, err := s.reindexPrepare(ctx, "obj1", again, []string{reindexNotes})
+	leaves2, err := s.reindexPrepare(ctx, "obj1", again, []string{reindexNotes}, false)
 	require.NoError(t, err)
 	assert.Equal(t, leaves, leaves2)
 
@@ -306,7 +306,7 @@ func TestReindex_WipeFailureAbortsRebuild(t *testing.T) {
 	err := s.wipeMaterialized(ctx, "obj1", ctrl)
 	require.Error(t, err, "a failed wipe must surface")
 
-	_, err = s.reindexPrepare(ctx, "obj1", ctrl, []string{reindexNotes})
+	_, err = s.reindexPrepare(ctx, "obj1", ctrl, []string{reindexNotes}, false)
 	require.Error(t, err, "prepare propagates it, so loadObject never stamps versions")
 }
 

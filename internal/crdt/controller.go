@@ -148,6 +148,8 @@ type Controller struct {
 	// that finds it set resumes the rebuild. See reindex.go.
 	reindexPending bool
 	reindexLocal   []byte
+	// treeOrphanSeq mirrors the _meta row's mark (metaTreeOrphanSeqKey).
+	treeOrphanSeq uint64
 
 	// collMu guards collections. Per-object collections are opened
 	// lazily — on first write via db.Collection (creates), on read via

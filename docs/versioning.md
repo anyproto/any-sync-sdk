@@ -129,6 +129,25 @@ A load that finds the in-flight mark with versions already current skips
 4–6 and runs 7–8 from the persisted watermark.
 ```
 
+## Tree orphans
+
+A change stored under a parent that never reached the tree storage can
+never attach: it is not part of the tree and no peer has it. any-sync moves
+such changes out of the tree storage when it builds the tree
+(`objecttree.Storage.MoveToOrphans`; `GetOrphans` lists them). They were
+applied here when they were written, so their values and versions are still
+in the rows, where a version outranks every later write that reuses its
+order id.
+
+`loadObject` reads the orphans once the tree is open. One whose AddSeq is
+above the object's mark (`_meta` key `to`) and at or under the watermark was
+applied, and the object rebuilds exactly as for a handler version bump. The
+mark is then set to the highest orphan AddSeq, last, so an interrupted load
+rebuilds again. An object that never applied them only gets the mark.
+
+The rebuild drops what the orphans wrote. Rows only they created disappear
+without a Removed event, as in every rebuild.
+
 ## Runtime dataset schemas
 
 Runtime-defined datasets (docs/user-datasets.md) change without a replay:

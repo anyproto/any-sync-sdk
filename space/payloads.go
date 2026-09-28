@@ -21,7 +21,8 @@ type PayloadsView interface {
 
 	// ListRows returns every live row of one payloads object. The
 	// object must be materialized locally (an id from ListObjects);
-	// rows come back in collection order.
+	// rows come back in collection order. A deleted object, and the
+	// rows of a deleted owner, list nothing.
 	ListRows(ctx context.Context, payloadsObjectId string) ([]PayloadRow, error)
 }
 

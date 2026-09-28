@@ -57,12 +57,14 @@ type Broker interface {
 }
 
 // Registrar is the per-space payloads write surface (implemented over
-// spaceimpl.PayloadsAPI; faked in tests).
+// spaceimpl.PayloadsAPI; faked in tests). RegisterFile returns a
+// *payloads.NotWrittenError when it wrote no row.
 type Registrar interface {
 	RegisterFile(ctx context.Context, ownerId string, opts RegisterOpts) (fileId string, err error)
 	SetNetworkSign(ctx context.Context, ownerId, fileId, sign string) error
 	Row(ctx context.Context, ownerId, fileId string) (payloads.Row, error)
-	// FindRow resolves a row by fileId alone (space-wide).
+	// FindRow resolves a row by fileId alone (space-wide), a deleted
+	// derived owner's row included: its receipt still covers the root.
 	FindRow(ctx context.Context, fileId string) (payloads.Row, error)
 }
 
@@ -217,6 +219,9 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 		},
 	})
 	if err != nil {
+		// The marker stays even when no row was written: every attach of
+		// this content shares it. It pins nothing while the donor holds
+		// its ref, and the sweep heals it once the donor is gone.
 		return Result{}, false, err
 	}
 	if err = s.store.AddRefs(ctx, spaceId, ref.Root, fileId); err != nil {
@@ -291,6 +296,11 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		},
 	})
 	if err != nil {
+		if payloads.NotWritten(err) {
+			// No row was written, so nothing will ever reference this
+			// CAR: drop it now rather than after the sweep's grace.
+			s.dropUnregistered(ctx, spaceId, root)
+		}
 		return Result{}, err
 	}
 	if err = s.store.AddRefs(ctx, spaceId, root, fileId); err != nil {
@@ -311,6 +321,17 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		return Result{}, err
 	}
 	return Result{FileId: fileId, RootCid: root.String(), Size: sp.Size()}, nil
+}
+
+// dropUnregistered removes a finalized CAR that no row will reference,
+// and its intent marker. The marker goes first: a CAR left without one
+// is unreferenced, and the sweep deletes it after the grace period.
+func (s *Service) dropUnregistered(ctx context.Context, spaceId string, root cid.Cid) {
+	ctx = context.WithoutCancel(ctx)
+	if err := s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
+		return
+	}
+	_ = s.store.Delete(ctx, spaceId, root)
 }
 
 // DriveDurable drives an already registered row to a verified receipt

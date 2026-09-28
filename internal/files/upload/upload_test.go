@@ -20,6 +20,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/files/carfile"
 	"github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 const spaceId = "space.test"
@@ -73,9 +74,10 @@ func (b *fakeBroker) VerifyReceipt(_ *fileprotov2.NetworkSignReceipt, _ string, 
 }
 
 type fakeRegistrar struct {
-	n            int
-	rows         map[string]payloads.Row
-	failRegister bool
+	n           int
+	rows        map[string]payloads.Row
+	registerErr error  // returned by RegisterFile when set
+	refusedRoot string // RootCid of the last refused registration
 }
 
 func newFakeRegistrar() *fakeRegistrar {
@@ -83,8 +85,9 @@ func newFakeRegistrar() *fakeRegistrar {
 }
 
 func (r *fakeRegistrar) RegisterFile(_ context.Context, ownerId string, opts RegisterOpts) (string, error) {
-	if r.failRegister {
-		return "", errors.New("register failed")
+	if r.registerErr != nil {
+		r.refusedRoot = opts.RootCid
+		return "", r.registerErr
 	}
 	r.n++
 	id := fmt.Sprintf("file-%d", r.n)
@@ -440,7 +443,7 @@ func TestAddIntentMarkerLifecycle(t *testing.T) {
 
 	// Registration failure (standing in for a crash after the marker):
 	// the finalized CAR stays marked so GC pins and heals it.
-	reg.failRegister = true
+	reg.registerErr = errors.New("register failed")
 	_, err = s.Add(ctx, reg, spaceId, "owner2", bytesReaderOf(t, 21_000), AddOpts{})
 	require.Error(t, err)
 	var orphanRoot cid.Cid
@@ -543,4 +546,48 @@ func TestDriveDurableSkipsWhenPeerMadeItDurable(t *testing.T) {
 		"A must not re-upload a file a peer already made durable")
 	require.Equal(t, "peerB-receipt", reg.rows["owner1/"+res.FileId].NetworkSign,
 		"the peer's receipt must be preserved, not overwritten")
+}
+
+// A registration that wrote no row (a deleted or unresolvable owner)
+// drops the finalized CAR and its intent marker instead of leaving them
+// for the sweep.
+func TestAddNotWrittenDropsCar(t *testing.T) {
+	ctx := context.Background()
+	s, st := newService(t, &fakeBroker{})
+	s.SetQueue(newFakeQueue())
+	reg := newFakeRegistrar()
+	reg.registerErr = &payloads.NotWrittenError{Err: fmt.Errorf("payloads: owner gone: %w", space.ErrObjectDeleted)}
+
+	_, err := s.Add(ctx, reg, spaceId, "gone", bytesReaderOf(t, 21_000), AddOpts{})
+	require.ErrorIs(t, err, space.ErrObjectDeleted)
+	root, err := cid.Decode(reg.refusedRoot)
+	require.NoError(t, err)
+	_, err = st.Info(ctx, spaceId, root)
+	require.ErrorIs(t, err, store.ErrNotFound, "the refused CAR is dropped")
+	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
+	require.NoError(t, err)
+	require.False(t, marked, "the refused CAR's marker is dropped")
+}
+
+// On the bind path a registration that wrote no row leaves the donor's
+// CAR and refs alone.
+func TestAddBindNotWrittenKeepsDonor(t *testing.T) {
+	ctx := context.Background()
+	s, st := newService(t, &fakeBroker{})
+	reg := newFakeRegistrar()
+	content := testContent(60_000)
+
+	first, err := s.Add(ctx, reg, spaceId, "owner1", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	require.NoError(t, s.DriveDurable(ctx, reg, spaceId, "owner1", first.FileId))
+
+	reg.registerErr = &payloads.NotWrittenError{Err: space.ErrObjectDeleted}
+	_, err = s.Add(ctx, reg, spaceId, "gone", bytes.NewReader(content), AddOpts{})
+	require.ErrorIs(t, err, space.ErrObjectDeleted)
+
+	root, err := cid.Decode(first.RootCid)
+	require.NoError(t, err)
+	info, err := st.Info(ctx, spaceId, root)
+	require.NoError(t, err)
+	require.Equal(t, []string{first.FileId}, info.Refs, "the donor's CAR and ref stay")
 }

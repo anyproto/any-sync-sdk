@@ -23,14 +23,24 @@ var (
 	// ErrDeviceEmptyUpsert rejects a SetDevice call with nothing to
 	// write.
 	ErrDeviceEmptyUpsert = errors.New("device upsert is empty")
-	// ErrDeviceUnknown is returned by DeleteDevice when peerId has no
-	// live row.
+	// ErrDeviceUnknown is returned by DeleteDevice, and by a
+	// ClaimActive naming a device (this one included), when peerId has
+	// no live row in this replica's registry (a device that registered
+	// elsewhere may not have synced here yet). ClaimActive from a
+	// pruned device gets ErrDevicePruned instead.
 	ErrDeviceUnknown = errors.New("unknown device")
-	// ErrDevicePruned reports a write absorbed by the own row's sticky
-	// tombstone: this device was pruned (DeleteDevice) and its peer id
-	// can never re-register. Without this error the absorbed write
-	// would be indistinguishable from success.
+	// ErrDevicePruned reports that this device was pruned
+	// (DeleteDevice) and its peer id can never re-register. SetDevice's
+	// write is absorbed by the own row's sticky tombstone, and without
+	// this error would be indistinguishable from success. ClaimActive
+	// from a device already known to be pruned is refused without
+	// writing.
 	ErrDevicePruned = errors.New("device row is pruned")
+	// ErrDeviceAppNotInstalled rejects a ClaimActive naming a device
+	// (another one, or this one by its peer id) whose row doesn't carry
+	// apps.<slug>: the election skips a claim whose target lacks the
+	// app, and a named claim never marks an app installed.
+	ErrDeviceAppNotInstalled = errors.New("app not installed on device")
 	// ErrDeviceSelfDelete rejects DeleteDevice on the local device's
 	// own row — the tombstone is sticky, so self-pruning would
 	// permanently lock this installation out of the registry. Prune a
@@ -43,7 +53,8 @@ var (
 // outside the account). Online status deliberately does not live here.
 type Device struct {
 	// PeerId is the device's libp2p peer id — the row id. Stable per
-	// device installation; every device writes only its own row.
+	// device installation. SetDevice and ClaimActive write only the
+	// device's own row; DeleteDevice is the one write to another's.
 	PeerId string
 
 	// Name is the device's display name (hostname or user-set).
@@ -62,9 +73,10 @@ type Device struct {
 	// Nil when the device never registered an app.
 	Apps map[string]map[string]any
 
-	// ActiveClaims holds the device's active claim per app slug,
-	// written by Service.ClaimActive. Resolve the winner with
-	// ActiveDevice — never by comparing claims ad hoc.
+	// ActiveClaims holds the claim this device made per app slug,
+	// written by Service.ClaimActive — for itself or, via Target, for
+	// another device. Resolve the winner with ActiveDevice — never by
+	// comparing claims ad hoc.
 	ActiveClaims map[string]DeviceClaim
 }
 
@@ -78,6 +90,9 @@ type DeviceClaim struct {
 	// At is the claim wall-clock time in unix seconds — tiebreak on
 	// equal Seq.
 	At int64
+	// Target is the peer id of the device the claim hands the app to;
+	// "" means the claiming device itself.
+	Target string
 }
 
 // DeviceUpsert is the input to Service.SetDevice. Only non-empty
@@ -96,12 +111,23 @@ type DeviceUpsert struct {
 // is two consumers deciding differently; UI, runtime, and the `any`
 // server must all call this, never re-derive it).
 //
-// Deterministic on converged data for every reader: among live rows
-// that carry the app installed (Apps[app] present — a dangling claim
-// on a device that uninstalled the app never wins; a pruned device
-// has no row at all), the claim with the highest Seq wins, ties
-// broken by highest At, then by lexicographically largest peer id.
-// ok=false when no device qualifies.
+// Every live row's claim for app is ranked by highest Seq, then
+// highest At, then lexicographically largest claimer peer id; the
+// winner is the target of the best claim whose target is a live row
+// with the app installed (Apps[app] present). A claim for a device
+// that uninstalled the app or was pruned never wins and the next
+// claim is tried; a pruned claimer's claims vanish with its row. The
+// claimer itself needs no app installed, so pass the whole registry
+// (ListDevices): a list filtered to devices with the app drops the
+// claims of devices without it. Deterministic on converged data for
+// every reader. ok=false when no claim qualifies.
+//
+// No un-claim exists: the winner changes when a better claim appears,
+// or when a claim starts or stops qualifying — its claimer or target
+// is pruned, or its target uninstalls or reinstalls the app. A device
+// holds one claim per app, so a hand-off replaces the claimer's own
+// claim: if the hand-off later stops qualifying, the fallback does not
+// return to the claimer.
 //
 // A claim with Seq <= 0 is treated as absent: ClaimActive mints seqs
 // from 1, so a zero can only come from a malformed bag (unknown
@@ -114,20 +140,31 @@ type DeviceUpsert struct {
 // user's newest intent losing to an older one. Claims are cheap:
 // re-claim after sync.
 func ActiveDevice(devices []Device, app string) (peerId string, ok bool) {
-	var win DeviceClaim
+	installed := make(map[string]bool, len(devices))
 	for _, d := range devices {
-		if _, installed := d.Apps[app]; !installed {
-			continue
+		if _, has := d.Apps[app]; has {
+			installed[d.PeerId] = true
 		}
+	}
+	var win DeviceClaim
+	var winClaimer string
+	for _, d := range devices {
 		c, claimed := d.ActiveClaims[app]
 		if !claimed || c.Seq <= 0 {
 			continue
 		}
+		target := c.Target
+		if target == "" {
+			target = d.PeerId
+		}
+		if !installed[target] {
+			continue
+		}
 		better := c.Seq > win.Seq ||
 			(c.Seq == win.Seq && c.At > win.At) ||
-			(c.Seq == win.Seq && c.At == win.At && d.PeerId > peerId)
+			(c.Seq == win.Seq && c.At == win.At && d.PeerId > winClaimer)
 		if !ok || better {
-			win, peerId, ok = c, d.PeerId, true
+			win, winClaimer, peerId, ok = c, d.PeerId, target, true
 		}
 	}
 	return peerId, ok

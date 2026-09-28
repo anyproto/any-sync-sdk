@@ -970,10 +970,11 @@ func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) error {
 	return err
 }
 
-// ClaimActive claims the active role for app on this device (see
-// space.Service.ClaimActive for the contract).
-func (s *Service) ClaimActive(ctx context.Context, app string) error {
-	_, err := s.tsp.ClaimActive(ctx, app)
+// ClaimActive claims the active role for app on peerId's device, or on
+// this device when peerId is "" (see space.Service.ClaimActive for the
+// contract).
+func (s *Service) ClaimActive(ctx context.Context, app, peerId string) error {
+	_, err := s.tsp.ClaimActive(ctx, app, peerId)
 	return err
 }
 

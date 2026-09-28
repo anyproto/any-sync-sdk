@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -213,9 +214,10 @@ func TestDevices_DecodeSkipsMalformedClaims(t *testing.T) {
 	assert.Equal(t, map[string]space.DeviceClaim{"good": {Seq: 2, At: 1770000000}}, d.ActiveClaims)
 }
 
-// The claim payload ClaimActive writes, applied via the synced route
-// and decoded back — the {seq, at} wire shape is the cross-repo
-// contract the `any` server and the runtime read.
+// A self claim's payload, applied via the synced route and decoded
+// back — the {seq, at} shape without a target (TestDevices_ClaimOpsRemote
+// covers the target) is the cross-repo contract the `any` server and
+// the runtime read.
 func TestDevices_ClaimRoundTrip(t *testing.T) {
 	ctrl := newDevicesController(t)
 	ctx := context.Background()
@@ -237,4 +239,281 @@ func TestDevices_ClaimRoundTrip(t *testing.T) {
 	winner, ok := space.ActiveDevice([]space.Device{d}, "bao")
 	require.True(t, ok)
 	assert.Equal(t, peer, winner)
+}
+
+func claimOpsRow(t *testing.T, ctrl *crdt.Controller, peer string, apps ...string) space.Device {
+	t.Helper()
+	info := map[string]map[string]any{}
+	for _, a := range apps {
+		info[a] = map[string]any{}
+	}
+	ops, err := techspace.DeviceUpsertOps(&anyenc.Arena{}, space.DeviceUpsert{Name: peer, Apps: info})
+	require.NoError(t, err)
+	require.NoError(t, ctrl.ApplyChange(context.Background(), devicesChange(crdt.VersionId("v-"+peer), peer, true, ops...)))
+	return techspace.DecodeDeviceRecord(ctrl.Get(context.Background(), techspace.DevicesDataset, peer))
+}
+
+// applyClaim applies a planned claim through the synced route and
+// returns the registry as every reader sees it.
+func applyClaim(t *testing.T, ctrl *crdt.Controller, v crdt.VersionId, rec crdt.RecordChange) []space.Device {
+	t.Helper()
+	ctx := context.Background()
+	res, err := ctrl.ApplyChangeWithResult(ctx, devicesChange(v, rec.Id, rec.Upsert, rec.Ops...))
+	require.NoError(t, err)
+	require.Empty(t, res.Rejections)
+	return techspace.DecodeDevices(ctrl.Records(ctx, techspace.DevicesDataset))
+}
+
+func deviceById(devices []space.Device, peer string) space.Device {
+	for _, d := range devices {
+		if d.PeerId == peer {
+			return d
+		}
+	}
+	return space.Device{}
+}
+
+// A claim for another device lands on the claimer's own row, naming
+// the target — the target row is never written. It replaces the
+// claimer's own self claim (one claim per app per row) and hands the
+// election to the target.
+func TestDevices_ClaimOpsRemote(t *testing.T) {
+	ctrl := newDevicesController(t)
+	const self, target = "12D3KooWSelf", "12D3KooWTarget"
+	claimOpsRow(t, ctrl, self, "bao")
+	claimOpsRow(t, ctrl, target, "bao")
+
+	selfClaim, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, self, "", "bao", 1770000000)
+	require.NoError(t, err)
+	devices := applyClaim(t, ctrl, "v1-self", selfClaim)
+	before := deviceById(devices, target)
+
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, target, "bao", 1770000100)
+	require.NoError(t, err)
+	assert.Equal(t, self, rec.Id)
+	require.Len(t, rec.Ops, 1)
+	assert.Equal(t, []string{techspace.FieldDeviceActiveClaims, "bao"}, rec.Ops[0].Path)
+
+	devices = applyClaim(t, ctrl, "v2-remote", rec)
+	assert.Equal(t, space.DeviceClaim{Seq: 2, At: 1770000100, Target: target}, deviceById(devices, self).ActiveClaims["bao"])
+	assert.Equal(t, before, deviceById(devices, target), "the target row is untouched")
+
+	winner, ok := space.ActiveDevice(devices, "bao")
+	require.True(t, ok)
+	assert.Equal(t, target, winner)
+}
+
+// The claimer needs no app of its own: a device without bao (a phone
+// running only the UI) can hand bao to one that has it.
+func TestDevices_ClaimOpsRemoteFromDeviceWithoutApp(t *testing.T) {
+	ctrl := newDevicesController(t)
+	const self, target = "12D3KooWPhone", "12D3KooWBox"
+	devices := []space.Device{claimOpsRow(t, ctrl, self, "ui"), claimOpsRow(t, ctrl, target, "bao")}
+
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, target, "bao", 1)
+	require.NoError(t, err)
+	require.Len(t, rec.Ops, 1, "a claim that names a device never writes apps")
+	devices = applyClaim(t, ctrl, "v2-remote", rec)
+	assert.NotContains(t, deviceById(devices, self).Apps, "bao")
+
+	winner, ok := space.ActiveDevice(devices, "bao")
+	require.True(t, ok)
+	assert.Equal(t, target, winner)
+}
+
+func TestDevices_ClaimOpsRemoteRefusals(t *testing.T) {
+	ctrl := newDevicesController(t)
+	const self, target = "12D3KooWSelf", "12D3KooWTarget"
+	devices := []space.Device{claimOpsRow(t, ctrl, self, "bao"), claimOpsRow(t, ctrl, target, "other")}
+
+	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, "12D3KooWNobody", "bao", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceUnknown)
+
+	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, target, "bao", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceAppNotInstalled)
+
+	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, target, "a.b", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceBadApp)
+}
+
+// The runtime's self claim ("") writes no target, marks the app
+// installed when the row doesn't carry it yet (including a row that
+// doesn't exist), and wins once applied.
+func TestDevices_ClaimOpsSelf(t *testing.T) {
+	const self = "12D3KooWSelf"
+	ctrl := newDevicesController(t)
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, self, "", "bao", 1770000000)
+	require.NoError(t, err)
+	assert.Equal(t, self, rec.Id)
+	assert.True(t, rec.Upsert)
+
+	devices := applyClaim(t, ctrl, "v1-self", rec)
+	got := deviceById(devices, self)
+	assert.Contains(t, got.Apps, "bao")
+	assert.Equal(t, space.DeviceClaim{Seq: 1, At: 1770000000}, got.ActiveClaims["bao"])
+	winner, ok := space.ActiveDevice(devices, "bao")
+	require.True(t, ok)
+	assert.Equal(t, self, winner)
+
+	again, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, "", "bao", 1770000001)
+	require.NoError(t, err)
+	require.Len(t, again.Ops, 1, "the app is installed already")
+	devices = applyClaim(t, ctrl, "v2-again", again)
+	assert.Equal(t, int64(2), deviceById(devices, self).ActiveClaims["bao"].Seq)
+}
+
+// Pruning the target after a remote claim moves the election back to
+// the best remaining claim; pruning the claimer drops its claim.
+func TestDevices_ClaimOpsPruneMovesWinner(t *testing.T) {
+	ctx := context.Background()
+	const a, b, c = "12D3KooWA", "12D3KooWB", "12D3KooWC"
+	setup := func(t *testing.T) (*crdt.Controller, []space.Device) {
+		ctrl := newDevicesController(t)
+		claimOpsRow(t, ctrl, a, "bao")
+		claimOpsRow(t, ctrl, b, "bao")
+		claimOpsRow(t, ctrl, c, "bao")
+		selfA, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, a, "", "bao", 1)
+		require.NoError(t, err)
+		devices := applyClaim(t, ctrl, "v-a", selfA)
+		cForB, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, c, b, "bao", 2)
+		require.NoError(t, err)
+		devices = applyClaim(t, ctrl, "v-c", cForB)
+		winner, ok := space.ActiveDevice(devices, "bao")
+		require.True(t, ok)
+		require.Equal(t, b, winner)
+		return ctrl, devices
+	}
+	prune := func(t *testing.T, ctrl *crdt.Controller, peer string) []space.Device {
+		require.NoError(t, ctrl.ApplyChange(ctx, devicesChange(crdt.VersionId("v3-del-"+peer), peer, false, crdt.Op{Type: crdt.OpDelete})))
+		return techspace.DecodeDevices(ctrl.Records(ctx, techspace.DevicesDataset))
+	}
+
+	t.Run("target pruned", func(t *testing.T) {
+		ctrl, _ := setup(t)
+		winner, ok := space.ActiveDevice(prune(t, ctrl, b), "bao")
+		require.True(t, ok)
+		assert.Equal(t, a, winner)
+	})
+	t.Run("claimer pruned", func(t *testing.T) {
+		ctrl, _ := setup(t)
+		winner, ok := space.ActiveDevice(prune(t, ctrl, c), "bao")
+		require.True(t, ok)
+		assert.Equal(t, a, winner)
+	})
+}
+
+// The target round-trips through the synced route; a target that is
+// present but not a non-empty string drops the claim, like a
+// malformed seq — reading it as a self claim would hand the app back
+// to the device that gave it away.
+func TestDevices_ClaimTargetDecode(t *testing.T) {
+	ctrl := newDevicesController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+
+	const peer = "12D3KooWDevA"
+	claim := func(target *anyenc.Value) *anyenc.Value {
+		c := arena.NewObject()
+		c.Set(techspace.DeviceClaimSeq, arena.NewNumberFloat64(1))
+		c.Set(techspace.DeviceClaimTarget, target)
+		return c
+	}
+	require.NoError(t, ctrl.ApplyChange(ctx, devicesChange("v1", peer, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "str"}, Payload: claim(arena.NewString("12D3KooWDevB"))},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "num"}, Payload: claim(arena.NewNumberFloat64(7))},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "obj"}, Payload: claim(arena.NewObject())},
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "empty"}, Payload: claim(arena.NewString(""))},
+	)))
+
+	d := techspace.DecodeDeviceRecord(ctrl.Get(ctx, techspace.DevicesDataset, peer))
+	assert.Equal(t, map[string]space.DeviceClaim{"str": {Seq: 1, Target: "12D3KooWDevB"}}, d.ActiveClaims)
+}
+
+// Naming this device by its peer id is not the runtime's self claim:
+// it gets the same checks as any named target and never marks the app
+// installed, so a device without the app can't elect itself this way.
+func TestDevices_ClaimOpsExplicitSelf(t *testing.T) {
+	const self = "12D3KooWSelf"
+
+	_, err := techspace.ClaimActiveOps(&anyenc.Arena{}, nil, self, self, "bao", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "no own row yet")
+
+	devices := []space.Device{{PeerId: self, Apps: map[string]map[string]any{"ui": {}}}}
+	_, err = techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, self, "bao", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceAppNotInstalled)
+
+	ctrl := newDevicesController(t)
+	devices = []space.Device{claimOpsRow(t, ctrl, self, "bao")}
+	rec, err := techspace.ClaimActiveOps(&anyenc.Arena{}, devices, self, self, "bao", 1770000000)
+	require.NoError(t, err)
+	require.Len(t, rec.Ops, 1)
+	devices = applyClaim(t, ctrl, "v1-self", rec)
+	assert.Equal(t, space.DeviceClaim{Seq: 1, At: 1770000000}, deviceById(devices, self).ActiveClaims["bao"])
+}
+
+// A pruned device is refused before any planning, whatever it names —
+// a failed target check must not hide that it was pruned.
+func TestDevices_PlanClaimActivePrunedFirst(t *testing.T) {
+	ctx := context.Background()
+	ctrl := newDevicesController(t)
+	const self, other = "12D3KooWSelf", "12D3KooWOther"
+	claimOpsRow(t, ctrl, self, "bao")
+	claimOpsRow(t, ctrl, other, "bao")
+	require.NoError(t, ctrl.ApplyChange(ctx, devicesChange("v9-del", self, false, crdt.Op{Type: crdt.OpDelete})))
+
+	for _, target := range []string{"", self, other, "12D3KooWNobody"} {
+		_, err := techspace.PlanClaimActive(ctx, ctrl, self, target, "bao", 1)
+		assert.ErrorIs(t, err, space.ErrDevicePruned, "target %q", target)
+	}
+	_, err := techspace.PlanClaimActive(ctx, ctrl, other, self, "bao", 1)
+	assert.ErrorIs(t, err, space.ErrDeviceUnknown, "a live device naming the pruned one")
+}
+
+// At the seq ceiling a new claim can't raise seq (2^53+1 has no
+// float64 of its own), so it ties the stored claim on seq and wins on
+// at instead of minting a value that reads back as the same seq.
+func TestDevices_ClaimOpsSeqCeiling(t *testing.T) {
+	const self, other = "12D3KooWSelf", "12D3KooWOther"
+	ctrl := newDevicesController(t)
+	claimOpsRow(t, ctrl, self, "bao")
+	claimOpsRow(t, ctrl, other, "bao")
+	a := &anyenc.Arena{}
+	claim := a.NewObject()
+	claim.Set(techspace.DeviceClaimSeq, a.NewNumberFloat64(1<<53))
+	claim.Set(techspace.DeviceClaimAt, a.NewNumberFloat64(1000))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), devicesChange("v2-ceiling", other, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDeviceActiveClaims, "bao"}, Payload: claim})))
+
+	rec, err := techspace.PlanClaimActive(context.Background(), ctrl, self, "", "bao", 2000)
+	require.NoError(t, err)
+	devices := applyClaim(t, ctrl, "v3-self", rec)
+	assert.Equal(t, space.DeviceClaim{Seq: 1 << 53, At: 2000}, deviceById(devices, self).ActiveClaims["bao"])
+	winner, ok := space.ActiveDevice(devices, "bao")
+	require.True(t, ok)
+	assert.Equal(t, self, winner)
+}
+
+// A claim waiting for the slot leaves as soon as its ctx ends, and a
+// ctx already done never takes a free slot.
+func TestDevices_LockClaimsHonorsCtx(t *testing.T) {
+	s := techspace.New(nil, nil)
+	unlock, err := s.LockClaimsForTest(context.Background())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = s.LockClaimsForTest(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second)
+	unlock()
+
+	done, cancelDone := context.WithCancel(context.Background())
+	cancelDone()
+	_, err = s.LockClaimsForTest(done)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	unlock, err = s.LockClaimsForTest(context.Background())
+	require.NoError(t, err, "a refused waiter must not keep the slot")
+	unlock()
 }

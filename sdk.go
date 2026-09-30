@@ -207,10 +207,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	sdkDBPath := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "sdk.db")
-	// 64 MB process-global page-buffer pool (mirrors the sqlite-side
-	// preallocation for the v1 space stores). Idempotent; the page size
-	// must match the store's (v2 default, 4 KiB).
-	anystore.InitPageBuffer(4096, (1<<26)/4096)
+	InitPageBuffer()
 	db, err := anystore.Open(ctx, sdkDBPath, &anystore.Config{
 		UseGlobalPageBuffer: true,
 		// One shared DB serves every space's reads; keep the engine's
@@ -1149,4 +1146,16 @@ func (a *accountImpl) pushToIdentityRepo(ctx context.Context, meta space.Account
 		Data:      payload,
 		Signature: signature,
 	}})
+}
+
+// InitPageBuffer sizes the process-global any-store v2 page pool: 128 MiB
+// of 4 KiB pages (the v2 default page size), twice the sqlite-side
+// preallocation for the v1 space stores because the pool is shared by
+// sdk.db and the host's index store, and a bulk re-index must not push
+// sdk.db under slab pressure. Every v2 store opened with
+// UseGlobalPageBuffer draws from it, so a host that opens such a store
+// before the SDK boots calls this first to get the same pool.
+// Idempotent: the first call wins.
+func InitPageBuffer() {
+	anystore.InitPageBuffer(4096, (1<<27)/4096)
 }

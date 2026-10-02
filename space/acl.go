@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 )
 
 // ErrNoActiveGuestKey is returned by RevokeGuestKey when the space has
@@ -16,9 +17,9 @@ var ErrNoActiveGuestKey = errors.New("no active guest key")
 // a decodable account address.
 var ErrBadIdentity = errors.New("bad identity")
 
-// Re-exported any-sync ACL sentinels, so consumers classify ACL
-// failures with errors.Is against this package instead of importing
-// any-sync internals.
+// Re-exported any-sync ACL and coordinator sentinels, so consumers
+// classify ACL failures with errors.Is against this package instead
+// of importing any-sync internals.
 var (
 	// ErrDuplicateInvite is returned by CreateInvite when an active
 	// invite of the same type already exists.
@@ -31,6 +32,16 @@ var (
 	// ErrAclRecordNotFound is returned by ACL ops addressing a record
 	// (or pending request) the ACL does not hold.
 	ErrAclRecordNotFound = list.ErrNoSuchRecord
+
+	// ErrInviteNotFound is returned by Join when the space's ACL holds
+	// no such invite (revoked, replaced, or never minted), and by
+	// RevokeInvite for an unknown invite record.
+	ErrInviteNotFound = list.ErrNoSuchInvite
+
+	// ErrCoordinatorForbidden is the coordinator refusing an operation
+	// for this account. CreateInvite, CreateGuestKey and AddAccounts
+	// return it from make-shareable, which is owner-only.
+	ErrCoordinatorForbidden = coordinatorproto.ErrForbidden
 )
 
 // ACL is the owner/admin-side ACL surface: invite lifecycle, join

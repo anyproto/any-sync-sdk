@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 )
 
 // TestSentinelMessages pins the message phrases downstream consumers
@@ -32,6 +33,7 @@ func TestSentinelMessages(t *testing.T) {
 		{ErrNotAType, "names a collection, not a type"},
 		{ErrNotACollection, "names a type, not a collection"},
 		{ErrWrongSlot, "a type goes in any.type, a collection in any.collections"},
+		{ErrMetaType, "not an object's type"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(c.err.Error(), c.phrase) {
@@ -52,5 +54,11 @@ func TestAclSentinelAliases(t *testing.T) {
 	}
 	if ErrAclRecordNotFound != list.ErrNoSuchRecord { //nolint:errorlint
 		t.Error("ErrAclRecordNotFound is not list.ErrNoSuchRecord")
+	}
+	if ErrInviteNotFound != list.ErrNoSuchInvite { //nolint:errorlint
+		t.Error("ErrInviteNotFound is not list.ErrNoSuchInvite")
+	}
+	if ErrCoordinatorForbidden != coordinatorproto.ErrForbidden { //nolint:errorlint
+		t.Error("ErrCoordinatorForbidden is not coordinatorproto.ErrForbidden")
 	}
 }

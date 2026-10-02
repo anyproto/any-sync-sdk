@@ -158,6 +158,10 @@ type Store struct {
 	spaceId string
 	reg     *types.LiveRegistry
 
+	// spaceIndexObjId is the space's derived spaceIndex object, the one
+	// row the objects handler admits with `spaceIndex` as its type.
+	spaceIndexObjId string
+
 	// extTypes are the caller-supplied type catalog entries; their
 	// handlers are carried onto every per-object Controller
 	// alongside the built-ins. dataVersions overlays the built-in
@@ -483,6 +487,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		rowEvents:      fanout.New[RowEvent](),
 		disableHistory: cfg.DisableHistory,
 	}
+	s.spaceIndexObjId = s.deriveSpaceIndexId()
 	if len(cfg.SelectiveTypes) > 0 {
 		s.selective = make(map[string]struct{}, len(cfg.SelectiveTypes))
 		for _, t := range cfg.SelectiveTypes {
@@ -1209,7 +1214,19 @@ func (s *Store) objectsHandler() *properties.SystemPropertiesHandler {
 	h := properties.NewWithGrants(s.reg, s.ModuleGrants)
 	h.ReservedCarrier = s.ReservedCarrier
 	h.Classify = s.Classify
+	h.SpaceIndexId = s.spaceIndexObjId
 	return h
+}
+
+// deriveSpaceIndexId is the space's derived spaceIndex object id, a
+// pure function of the space id: the root seedSpaceIndexOnCreate
+// derives. Empty when the derivation fails.
+func (s *Store) deriveSpaceIndexId() string {
+	id, err := s.DeriveId(context.Background(), DeriveOpts{ChangePayload: []byte(spaceindex.WellKnownDeriveSeed)})
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 // ReservedCarrier reports whether typeId is a user type declaring a

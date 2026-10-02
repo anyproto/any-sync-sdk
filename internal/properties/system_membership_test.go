@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
@@ -249,6 +250,54 @@ func TestPreValidate_WrongSlotUnknownIdsPass(t *testing.T) {
 	bare := properties.New(membersRegistry())
 	require.NoError(t, bare.PreValidate(singlePathChange(
 		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(shelfC)), nil))
+}
+
+// TestPreValidate_MetaType pins that a meta id is never an object's
+// type, in every shape a change can set it. The one row admitted with
+// `spaceIndex` is the space's own spaceIndex object.
+func TestPreValidate_MetaType(t *testing.T) {
+	h := properties.New(membersRegistry())
+	h.Classify = classifier
+	a := &anyenc.Arena{}
+
+	for _, meta := range []string{anytype.TypeId, typetype.TypeId, collectiontype.TypeId, spaceindex.TypeId} {
+		err := h.PreValidate(singlePathChange(
+			crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(meta)), nil)
+		require.ErrorIs(t, err, properties.ErrMetaType, meta)
+		var ve *properties.ValidationError
+		require.ErrorAs(t, err, &ve, meta)
+		assert.Equal(t, properties.ReasonMetaType, ve.Reason, meta)
+		assert.Equal(t, meta, ve.TypeId, meta)
+		assert.Equal(t, testObjectId, ve.ObjectId, meta)
+
+		payload := a.NewObject()
+		payload.Set(typeAny+"."+anytype.FieldType, a.NewString(meta))
+		require.ErrorIs(t, h.PreValidate(multiFieldChange(payload), beforeWithMembers(a, movieT)),
+			properties.ErrMetaType, meta)
+	}
+
+	h.SpaceIndexId = testObjectId
+	require.NoError(t, h.PreValidate(singlePathChange(
+		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(spaceindex.TypeId)), nil))
+	for _, meta := range []string{anytype.TypeId, typetype.TypeId, collectiontype.TypeId} {
+		require.ErrorIs(t, h.PreValidate(singlePathChange(
+			crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(meta)), nil),
+			properties.ErrMetaType, meta)
+	}
+	h.SpaceIndexId = "other-object"
+	require.ErrorIs(t, h.PreValidate(singlePathChange(
+		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(spaceindex.TypeId)), nil),
+		properties.ErrMetaType)
+
+	// A row that already carries a meta type (an inbound copy, or one
+	// written before the rule) keeps writing it back unchanged; moving
+	// it to another meta id is still refused.
+	legacy := beforeWithMembers(a, anytype.TypeId)
+	require.NoError(t, h.PreValidate(singlePathChange(
+		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(anytype.TypeId)), legacy))
+	require.ErrorIs(t, h.PreValidate(singlePathChange(
+		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(collectiontype.TypeId)), legacy),
+		properties.ErrMetaType)
 }
 
 // TestPreValidate_TypeRequired pins the one-type rule on the local

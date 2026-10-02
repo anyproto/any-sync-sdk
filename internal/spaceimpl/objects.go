@@ -99,6 +99,9 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 	if opts.Type == "" {
 		return "", fmt.Errorf("%w: CreateObjectOpts.Type", space.ErrTypeRequired)
 	}
+	if properties.IsMetaType(opts.Type) {
+		return "", fmt.Errorf("%w: CreateObjectOpts.Type %q", space.ErrMetaType, opts.Type)
+	}
 	obj, err := o.parent.store.Create(ctx, spaceobjects.CreateOpts{
 		ChangeType: objectChangeType,
 	})
@@ -181,6 +184,22 @@ func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts)
 		ChangeType:    objectChangeType,
 		ChangePayload: opts.Seed,
 		ParentId:      opts.ParentId,
+	}
+	// A derived tree cannot be deleted, so a meta type is refused before
+	// anything is minted, and only when it would be set: an object that
+	// already has a type keeps it (missingMembers).
+	if properties.IsMetaType(opts.Type) {
+		id, err := o.parent.store.DeriveId(ctx, derive)
+		if err != nil {
+			return "", err
+		}
+		members, err := o.parent.store.ObjectMembers(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		if members.Type == "" {
+			return "", fmt.Errorf("%w: DeriveObjectOpts.Type %q", space.ErrMetaType, opts.Type)
+		}
 	}
 	if opts.Type == "" {
 		// The rule is checked before anything is minted, like Create:

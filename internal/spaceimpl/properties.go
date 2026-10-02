@@ -387,8 +387,8 @@ func (p *propertiesAPI) membershipWrite(ctx context.Context, objectId string, op
 	return modifyResultFromWrite(res), nil
 }
 
-// wrapSlotErr maps the handler's wrong_slot rejection onto the public
-// sentinel so callers classify it without reaching into the handler
+// wrapSlotErr maps the handler's membership rejections onto the public
+// sentinels so callers classify them without reaching into the handler
 // package.
 func wrapSlotErr(err error) error {
 	switch {
@@ -396,6 +396,8 @@ func wrapSlotErr(err error) error {
 		return fmt.Errorf("%w: %w", space.ErrWrongSlot, err)
 	case errors.Is(err, properties.ErrTypeRequired):
 		return fmt.Errorf("%w: %w", space.ErrTypeRequired, err)
+	case errors.Is(err, properties.ErrMetaType):
+		return fmt.Errorf("%w: %w", space.ErrMetaType, err)
 	}
 	return err
 }

@@ -115,7 +115,8 @@ type EnsureBundleRequest struct {
 	// is never replaced). Refused next to a declaration (Parts /
 	// Properties / XKey / Collection): a definition object carries its
 	// marker in `any.type` and has no type of its own. A caller-minted
-	// root (NewRoot) gets its type from NewRoot and refuses it here.
+	// root (NewRoot) gets its type from NewRoot and refuses it here. A
+	// meta id is refused (ErrMetaType).
 	RootType string
 	// RootCollections are added to the root Ensure mints in that same
 	// change, and on every later Ensure a collection the row lacks is

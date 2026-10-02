@@ -67,7 +67,8 @@ type ObjectService interface {
 // CreateObjectOpts is the input to ObjectService.Create.
 type CreateObjectOpts struct {
 	// Type is the object's one type (`any.type`). Required: every
-	// object has exactly one type (ErrTypeRequired otherwise).
+	// object has exactly one type (ErrTypeRequired otherwise). A meta
+	// id is refused (ErrMetaType).
 	Type string
 	// Collections are the collections the object is filed under at
 	// birth (`any.collections`). Optional.
@@ -84,7 +85,8 @@ type DeriveObjectOpts struct {
 	Seed []byte
 	// Type is set on first materialization; a type the object already
 	// has is never replaced. Required unless the object already has one
-	// (ErrTypeRequired). Collections it lacks are added on every call
+	// (ErrTypeRequired). A meta id is refused when it would be set
+	// (ErrMetaType). Collections it lacks are added on every call
 	// ($addToSet, idempotent); optional.
 	Type        string
 	Collections []string

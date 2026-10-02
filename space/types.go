@@ -44,6 +44,13 @@ var (
 // id this device cannot resolve passes. A client error → 4xx.
 var ErrWrongSlot = errors.New("space: a type goes in any.type, a collection in any.collections")
 
+// ErrMetaType is returned by the same writes when `any.type` is set to
+// a meta id: `any`, `type`, `collection` or `spaceIndex`. Types().List
+// lists them, but none is a type an object carries. Create, Derive and
+// Bundles().Ensure refuse before minting anything. A client error →
+// 4xx.
+var ErrMetaType = errors.New("space: any, type, collection and spaceIndex are not an object's type")
+
 // ErrModuleOwned is returned by the field-level dataset methods
 // (AddDatasetField / RemoveDatasetField / PatchDatasetField) when the
 // dataset is served by a module: the module owns the schema, so a

@@ -17,6 +17,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 )
 
@@ -112,6 +113,10 @@ type SystemPropertiesHandler struct {
 	// part is the consumer's compiled-in declaration, attachable by
 	// design. Nil reserves nothing.
 	ReservedCarrier func(typeId string) bool
+
+	// SpaceIndexId is the space's derived spaceIndex object: the one
+	// row whose type may be `spaceIndex`. Empty admits it on no row.
+	SpaceIndexId string
 }
 
 // New constructs a SystemPropertiesHandler bound to a Registry. Pass
@@ -323,6 +328,9 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 		// the empty string, is refused.
 		return &ValidationError{Reason: ReasonTypeRequired, ObjectId: ch.ObjectId}
 	}
+	if verr := h.checkMetaType(ch, before, adds); verr != nil {
+		return verr
+	}
 	if err := h.checkSlots(adds); err != nil {
 		return err
 	}
@@ -469,6 +477,36 @@ func (h *SystemPropertiesHandler) checkSlots(adds membershipAdds) error {
 		}
 	}
 	return nil
+}
+
+// checkMetaType refuses a meta id set as `any.type`. `any`, `type`,
+// `collection` and `spaceIndex` own namespaces and list as types, but
+// none gives an object a format, parts or datasets. The one exception
+// is the space's own spaceIndex object. The markers stay admitted: a
+// definition object carries one. Like checkReservedCarriers, only a
+// type this change sets is checked: a row already carrying one keeps
+// writing.
+func (h *SystemPropertiesHandler) checkMetaType(ch *crdt.Change, before *anyenc.Value, adds membershipAdds) *ValidationError {
+	if !adds.typeSet || !IsMetaType(adds.typeId) {
+		return nil
+	}
+	if before != nil && before.GetString(anytype.TypeId, anytype.FieldType) == adds.typeId {
+		return nil
+	}
+	if adds.typeId == spaceindex.TypeId && h.SpaceIndexId != "" && ch.ObjectId == h.SpaceIndexId {
+		return nil
+	}
+	return &ValidationError{Reason: ReasonMetaType, TypeId: adds.typeId, ObjectId: ch.ObjectId}
+}
+
+// IsMetaType reports whether id is one of the meta ids that own a
+// namespace and list as types but are never an object's type.
+func IsMetaType(id string) bool {
+	switch id {
+	case anytype.TypeId, typetype.TypeId, collectiontype.TypeId, spaceindex.TypeId:
+		return true
+	}
+	return false
 }
 
 // isMarker reports whether id is one of the definition markers or the

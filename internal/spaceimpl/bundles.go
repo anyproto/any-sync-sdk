@@ -286,6 +286,9 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 	if req.RootType == typetype.MetaTypeMarker || req.RootType == collectiontype.MetaMarker {
 		return fmt.Errorf("spaceimpl: %w: RootType names a marker — declare instead", space.ErrBundleBadRequest)
 	}
+	if properties.IsMetaType(req.RootType) {
+		return fmt.Errorf("spaceimpl: %w: RootType %q", space.ErrMetaType, req.RootType)
+	}
 	for _, c := range req.RootCollections {
 		if c == "" {
 			return fmt.Errorf("spaceimpl: %w: RootCollections: empty id", space.ErrBundleBadRequest)

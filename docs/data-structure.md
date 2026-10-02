@@ -240,7 +240,10 @@ Slots are strict. A known collection id written to `any.type`, or a
 known type id or marker added to `any.collections`, is refused with
 `wrong_slot` (`space.ErrWrongSlot`). An id this device cannot resolve
 (a definition not synced yet) passes: offline-first outranks slot
-hygiene. The check runs in the handler pre-flight, so a raw `$set`
+hygiene. The meta ids `any`, `type`, `collection` and `spaceIndex` are
+never an object's type and are refused in `any.type` with `meta_type`
+(`space.ErrMetaType`); the one exception is the space's own spaceIndex
+object. The checks run in the handler pre-flight, so a raw `$set`
 through `Modify` is covered too.
 
 Inbound apply has **no membership guard**. `any.type` and

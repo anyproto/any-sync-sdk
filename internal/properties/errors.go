@@ -25,6 +25,7 @@ const (
 	ReasonReservedCarrier    = "reserved_carrier"
 	ReasonWrongSlot          = "wrong_slot"
 	ReasonTypeRequired       = "type_required"
+	ReasonMetaType           = "meta_type"
 )
 
 // OwnerKind classifies a definition id for the slot rule: a type
@@ -54,6 +55,7 @@ var (
 	ErrReservedCarrier    = errors.New("property write rejected: a type declaring a reserved module is carried only by its own root")
 	ErrWrongSlot          = errors.New("property write rejected: a type goes in any.type, a collection in any.collections")
 	ErrTypeRequired       = errors.New("property write rejected: an object needs a type — any.type cannot be cleared")
+	ErrMetaType           = errors.New("property write rejected: any, type, collection and spaceIndex are not an object's type")
 )
 
 // reasonErr maps a Reason discriminant to its sentinel. Unknown reasons
@@ -78,6 +80,8 @@ func reasonErr(reason string) error {
 		return ErrWrongSlot
 	case ReasonTypeRequired:
 		return ErrTypeRequired
+	case ReasonMetaType:
+		return ErrMetaType
 	}
 	return nil
 }
@@ -117,7 +121,8 @@ type ValidationError struct {
 	Slot string
 	Kind OwnerKind
 
-	// ObjectId is the row the write targets (reserved_carrier).
+	// ObjectId is the row the write targets (reserved_carrier,
+	// type_required, meta_type).
 	ObjectId string
 }
 
@@ -135,6 +140,9 @@ func (e *ValidationError) Error() string {
 			e.typeLabel(), e.Kind, e.Slot)
 	case ReasonTypeRequired:
 		return "property write rejected: an object needs a type — any.type cannot be cleared"
+	case ReasonMetaType:
+		return fmt.Sprintf("property write rejected: %s is a meta id, not a type an object carries; set a type of this space as any.type",
+			e.typeLabel())
 	case ReasonTypeUnknown:
 		return fmt.Sprintf("property write rejected: type %s has no resolvable schema on this peer; define its properties (or wait for the type to sync) before writing %s.* values",
 			e.typeLabel(), e.TypeId)

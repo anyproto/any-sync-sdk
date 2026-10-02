@@ -1209,7 +1209,19 @@ func (s *Store) objectsHandler() *properties.SystemPropertiesHandler {
 	h := properties.NewWithGrants(s.reg, s.ModuleGrants)
 	h.ReservedCarrier = s.ReservedCarrier
 	h.Classify = s.Classify
+	h.SpaceIndexId = s.spaceIndexId()
 	return h
+}
+
+// spaceIndexId is the space's derived spaceIndex object id, a pure
+// function of the space id (the same root Service derives). Empty when
+// the derivation fails.
+func (s *Store) spaceIndexId() string {
+	id, err := s.DeriveId(context.Background(), DeriveOpts{ChangePayload: []byte(spaceindex.WellKnownDeriveSeed)})
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 // ReservedCarrier reports whether typeId is a user type declaring a

@@ -373,6 +373,55 @@ func TestE2E_Collections(t *testing.T) {
 		assert.ElementsMatch(t, []string{"bafyunknowncollection"}, gotColls)
 	})
 
+	// The meta ids list as types but are never an object's type: Create
+	// refuses them and mints nothing, SetType and a raw Modify refuse
+	// them too. The space's own spaceIndex object keeps its type.
+	t.Run("MetaType", func(t *testing.T) {
+		typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Plain"})
+		require.NoError(t, err)
+		objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
+		require.NoError(t, err)
+		allIds := func() []string {
+			rows, err := sp.QueryObjects().All(ctx)
+			require.NoError(t, err)
+			return collRowIds(rows)
+		}
+		before := allIds()
+		for _, meta := range []string{"any", "type", "collection", "spaceIndex"} {
+			id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: meta})
+			assert.ErrorIs(t, err, space.ErrMetaType, meta)
+			assert.Empty(t, id, meta)
+
+			_, err = sp.Properties().SetType(ctx, objId, meta)
+			assert.ErrorIs(t, err, space.ErrMetaType, meta)
+
+			_, err = sp.Modify(ctx, space.ModifyBatch{
+				ObjectId: objId, Dataset: "objects",
+				Records: []space.RecordModify{{
+					Id: objId, Upsert: true,
+					Ops: []space.Op{{Type: space.OpSet, Path: "any.type", Value: meta}},
+				}},
+			})
+			assert.ErrorIs(t, err, space.ErrMetaType, "raw Modify, %s: %v", meta, err)
+
+			// A derived tree cannot be deleted, so the derived paths
+			// refuse before minting.
+			_, err = sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: []byte("meta-" + meta), Type: meta})
+			assert.ErrorIs(t, err, space.ErrMetaType, "Derive, %s", meta)
+			_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+				Id: "meta-" + meta + "/v1", DerivedRoot: true, RootType: meta,
+			})
+			assert.ErrorIs(t, err, space.ErrMetaType, "Ensure, %s", meta)
+		}
+		assert.ElementsMatch(t, before, allIds(), "a refused Create leaves no object behind")
+		gotType, _ := collMembers(t, ctx, sp, objId)
+		assert.Equal(t, typeId, gotType)
+
+		indexRow, err := sp.Objects().Get(ctx, sp.SpaceIndexObjectId())
+		require.NoError(t, err)
+		assert.Equal(t, "spaceIndex", indexRow.GetString("any", "type"))
+	})
+
 	// Queries: the two membership fields select disjoint sets, and
 	// neither ever returns the definition object.
 	t.Run("Queries", func(t *testing.T) {

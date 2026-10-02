@@ -26,6 +26,7 @@ func TestClassifyValidation_PerReason(t *testing.T) {
 		{properties.ReasonUnknownProperty, handler.ReasonUnknownProperty, handler.ErrValidationUnknownProperty},
 		{properties.ReasonKindMismatch, handler.ReasonKindMismatch, handler.ErrValidationKindMismatch},
 		{properties.ReasonReservedCarrier, handler.ReasonReservedCarrier, handler.ErrValidationReservedCarrier},
+		{properties.ReasonMetaType, handler.ReasonMetaType, handler.ErrValidationMetaType},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.want), func(t *testing.T) {

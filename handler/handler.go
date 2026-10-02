@@ -104,6 +104,9 @@ var (
 	// ErrValidationTypeRequired — the write clears `any.type`; every
 	// object has exactly one type.
 	ErrValidationTypeRequired = properties.ErrTypeRequired
+	// ErrValidationMetaType — the write sets a meta id (`any`, `type`,
+	// `collection`, `spaceIndex`) as `any.type`.
+	ErrValidationMetaType = properties.ErrMetaType
 )
 
 // ValidationReason is the machine-readable cause of a property-write
@@ -122,6 +125,7 @@ const (
 	ReasonReservedCarrier    ValidationReason = properties.ReasonReservedCarrier
 	ReasonWrongSlot          ValidationReason = properties.ReasonWrongSlot
 	ReasonTypeRequired       ValidationReason = properties.ReasonTypeRequired
+	ReasonMetaType           ValidationReason = properties.ReasonMetaType
 )
 
 // ClassifyValidation maps a property-validation rejection to its cause

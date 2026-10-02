@@ -48,9 +48,10 @@ builder), `commonspace/object/tree/treechangeproto`,
   `Objects().Derive`. A write to an unknown object fails with
   `ErrObjectNotFound`; it never creates one.
 - **One object, many datasets.** Every object has exactly one type
-  (`any.type`, required: `ErrTypeRequired`), which contributes the handlers
-  (schema and rules) for the datasets it declares, and any number of
-  collections (`any.collections`), which contribute properties only. See
+  (`any.type`, required: `ErrTypeRequired`; never a meta id:
+  `ErrMetaType`), which contributes the handlers (schema and rules) for
+  the datasets it declares, and any number of collections
+  (`any.collections`), which contribute properties only. See
   docs/data-structure.md § Type and collections.
 - **The per-space `objects` dataset** holds each object's row: membership
   and property values. It is the object index (docs/data-structure.md).

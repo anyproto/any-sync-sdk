@@ -417,6 +417,14 @@ func TestE2E_Collections(t *testing.T) {
 		gotType, _ := collMembers(t, ctx, sp, objId)
 		assert.Equal(t, typeId, gotType)
 
+		// Derive never replaces a type the object already has, so a
+		// meta id there is ignored rather than refused.
+		derived, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: []byte("meta-typed"), Type: typeId})
+		require.NoError(t, err)
+		again, err := sp.Objects().Derive(ctx, space.DeriveObjectOpts{Seed: []byte("meta-typed"), Type: "any"})
+		require.NoError(t, err)
+		assert.Equal(t, derived, again)
+
 		indexRow, err := sp.Objects().Get(ctx, sp.SpaceIndexObjectId())
 		require.NoError(t, err)
 		assert.Equal(t, "spaceIndex", indexRow.GetString("any", "type"))

@@ -288,6 +288,16 @@ func TestPreValidate_MetaType(t *testing.T) {
 	require.ErrorIs(t, h.PreValidate(singlePathChange(
 		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(spaceindex.TypeId)), nil),
 		properties.ErrMetaType)
+
+	// A row that already carries a meta type (an inbound copy, or one
+	// written before the rule) keeps writing it back unchanged; moving
+	// it to another meta id is still refused.
+	legacy := beforeWithMembers(a, anytype.TypeId)
+	require.NoError(t, h.PreValidate(singlePathChange(
+		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(anytype.TypeId)), legacy))
+	require.ErrorIs(t, h.PreValidate(singlePathChange(
+		crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(collectiontype.TypeId)), legacy),
+		properties.ErrMetaType)
 }
 
 // TestPreValidate_TypeRequired pins the one-type rule on the local

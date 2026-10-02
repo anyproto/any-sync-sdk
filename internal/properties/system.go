@@ -328,7 +328,7 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 		// the empty string, is refused.
 		return &ValidationError{Reason: ReasonTypeRequired, ObjectId: ch.ObjectId}
 	}
-	if verr := h.checkMetaType(ch, adds); verr != nil {
+	if verr := h.checkMetaType(ch, before, adds); verr != nil {
 		return verr
 	}
 	if err := h.checkSlots(adds); err != nil {
@@ -483,9 +483,14 @@ func (h *SystemPropertiesHandler) checkSlots(adds membershipAdds) error {
 // `collection` and `spaceIndex` own namespaces and list as types, but
 // none gives an object a format, parts or datasets. The one exception
 // is the space's own spaceIndex object. The markers stay admitted: a
-// definition object carries one.
-func (h *SystemPropertiesHandler) checkMetaType(ch *crdt.Change, adds membershipAdds) *ValidationError {
+// definition object carries one. Like checkReservedCarriers, only a
+// type this change sets is checked: a row already carrying one keeps
+// writing.
+func (h *SystemPropertiesHandler) checkMetaType(ch *crdt.Change, before *anyenc.Value, adds membershipAdds) *ValidationError {
 	if !adds.typeSet || !IsMetaType(adds.typeId) {
+		return nil
+	}
+	if before != nil && before.GetString(anytype.TypeId, anytype.FieldType) == adds.typeId {
 		return nil
 	}
 	if adds.typeId == spaceindex.TypeId && h.SpaceIndexId != "" && ch.ObjectId == h.SpaceIndexId {

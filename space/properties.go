@@ -53,7 +53,7 @@ type PropertiesAPI interface {
 	// SetType replaces the object's type. The previous type's values
 	// and dataset records become orphan data, read-tolerant; its
 	// datasets refuse further writes. A known collection id is refused
-	// (ErrWrongSlot).
+	// (ErrWrongSlot), and so is a meta id (ErrMetaType).
 	SetType(ctx context.Context, objectId, typeId string) (ModifyResult, error)
 
 	// AttachCollection adds the object to a collection ($addToSet —

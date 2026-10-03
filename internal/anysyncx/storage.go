@@ -170,11 +170,14 @@ func (s *storageProvider) tmpDir() string {
 // device runs many space DBs at once, so per-DB read connections are
 // capped instead of scaling with NumCPU. Commit-time fsync is relaxed
 // to checkpoint-time (synchronous=normal): losing the last local
-// commits on power loss is acceptable because space state re-syncs,
-// and the sentinel triggers a quick-check on unclean shutdown. The
-// commit-path autocheckpoint threshold is raised and the real
-// checkpoint work happens on idle — without the idle flush, busy
-// stores never checkpoint and all data accumulates in the WAL.
+// commits on power loss is acceptable because space state re-syncs.
+// No sentinel: every mobile exit is a kill, so a dirty sentinel would
+// make each open run `PRAGMA quick_check` over the whole store — ~6 s
+// for a 160 MB space on a phone — for damage a process kill cannot
+// cause (WAL mode keeps the file consistent). The commit-path
+// autocheckpoint threshold is raised and the real checkpoint work
+// happens on idle — without the idle flush, busy stores never
+// checkpoint and all data accumulates in the WAL.
 func (s *storageProvider) anyStoreConfig() *anystorev1.Config {
 	return &anystorev1.Config{
 		ReadConnections: 8,
@@ -192,7 +195,7 @@ func (s *storageProvider) anyStoreConfig() *anystorev1.Config {
 			AutoFlush: true,
 			IdleAfter: 20 * time.Second,
 			FlushMode: anystorev1.FlushModeCheckpointPassive,
-			Sentinel:  true,
+			Sentinel:  false,
 		},
 	}
 }

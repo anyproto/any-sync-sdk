@@ -57,12 +57,14 @@ type ModifyBatch struct {
 	// the ModifyResult.ApplySeq of the caller's own previous write.
 	// Snapshot and Subscribe skip tombstones, so a value taken from them
 	// stays below a later delete's stamp and every write is refused. Any
-	// apply that stamps a record counts as a change, device-local writes
-	// (read-tracking flags) included. The value holds within one store
-	// generation (Changes().Generation): a rebuilt store renumbers
-	// _applySeq, so compare generations before reusing an older value.
+	// apply that stamps a record counts as a change: device-local writes
+	// (read-tracking flags) and a tree rebuild's replay included. The
+	// value holds within one store generation (Changes().Generation): a
+	// rebuilt store renumbers _applySeq, so compare generations before
+	// reusing an older value.
 	//
-	// Synced scope only; not for ModifyMany or shared datasets.
+	// Synced scope only; not for ModifyMany or the objects dataset, whose
+	// row every change to the object stamps.
 	IfUnchangedSince *uint64
 }
 
@@ -72,7 +74,9 @@ type ModifyBatch struct {
 // as the batch's other records, so a batch creates, updates and deletes
 // in one change; per-op handler rejections (ModifyResult.Rejections)
 // still apply to it, as to any op. A delete needs an explicit Id that no
-// other record of the batch writes, and no Upsert, Path or Value.
+// other record of the batch writes, and no Upsert, Path or Value. The
+// objects dataset takes no deletes: every record there is the object's
+// one row.
 //
 // Id: when empty, the CRDT layer derives one from the change's
 // ChangeId (base58(xxh3-64(ChangeId))); subsequent empty-id records

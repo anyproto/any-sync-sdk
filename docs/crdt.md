@@ -89,12 +89,14 @@ is the `_applySeq` the write stamped, the value for the next conditional
 write against its result. Otherwise take the value from a read that includes
 tombstones (`ProjectionOpts{IncludeDeleted: true}`): `Snapshot` and
 `Subscribe` skip them, so a value read there stays below a later delete's
-stamp. Any apply that stamps a record counts, device-local writes included,
-and a value holds within one store generation (`Changes().Generation`). The per-object `_applySeq` watermark answers
+stamp. Any apply that stamps a record counts, device-local writes and
+rebuild replays included, and a value holds within one store generation
+(`Changes().Generation`). The per-object `_applySeq` watermark answers
 without a scan when nothing in the object moved past the value, except
 while a reindex is pending; otherwise one filtered read of the dataset's
 collection decides. Synced scope only, `Modify` only (each `ModifyMany`
-batch is its own change), and not on shared datasets.
+batch is its own change), and not on the `objects` dataset, whose row
+every change to the object stamps; that dataset takes no `OpDelete` either.
 
 ## Trace IDs
 

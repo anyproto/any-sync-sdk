@@ -553,16 +553,6 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 		return WriteResult{}, ErrClosed
 	}
 
-	if ifUnchangedSince != nil {
-		changed, err := o.ctrl.ChangedSince(ctx, ch.Dataset, *ifUnchangedSince)
-		if err != nil {
-			return WriteResult{}, fmt.Errorf("object: precondition: %w", err)
-		}
-		if changed {
-			return WriteResult{}, crdt.ErrPreconditionFailed
-		}
-	}
-
 	// Plaintext-class objects ship their changes UNencrypted, so only
 	// the class's allowlisted datasets may enter the DAG — a write to
 	// any other dataset (`objects` properties, an app dataset) would
@@ -582,6 +572,18 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	// whose handler doesn't implement LocalPreValidator.
 	if err := o.ctrl.PreValidateLocal(ctx, &ch); err != nil {
 		return WriteResult{}, err
+	}
+
+	// The precondition runs after the checks that can refuse the write,
+	// so a refused write never opens the dataset's collection.
+	if ifUnchangedSince != nil {
+		changed, err := o.ctrl.ChangedSince(ctx, ch.Dataset, *ifUnchangedSince)
+		if err != nil {
+			return WriteResult{}, fmt.Errorf("object: precondition: %w", err)
+		}
+		if changed {
+			return WriteResult{}, crdt.ErrPreconditionFailed
+		}
 	}
 
 	// Encode under tree.Lock — the codec's arena is shared with the
@@ -735,6 +737,7 @@ func (o *Object) InjectedSet(ctx context.Context, ch crdt.Change) (WriteResult, 
 		VersionId:  ch.VersionId,
 		RecordIds:  recordIds,
 		Rejections: res.Rejections,
+		ApplySeq:   res.ApplySeq,
 	}, nil
 }
 

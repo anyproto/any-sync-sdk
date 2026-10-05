@@ -24,8 +24,10 @@ var applySeqPath = []string{ApplySeqField}
 // apply also advances the per-object watermark past the stamps it
 // writes, so a watermark at or below seq answers without a scan; a
 // reindex restarts the watermark below the rows it rebuilds, so the
-// shortcut is off while one is pending. Shared datasets hold every
-// object's rows and are refused.
+// shortcut is off while one is pending. A shared dataset (on main, the
+// per-space objects collection) holds every object's rows, which this
+// per-object scan cannot scope, so it is refused; Modify refuses a
+// precondition on objects before the object loads.
 func (c *Controller) ChangedSince(ctx context.Context, dataset string, seq uint64) (bool, error) {
 	if c.IsShared(dataset) {
 		return false, fmt.Errorf("crdt: ChangedSince: %q is a shared dataset", dataset)

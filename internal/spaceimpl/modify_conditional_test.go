@@ -37,7 +37,7 @@ func TestBuildChange_DeleteRecords(t *testing.T) {
 }
 
 // The guards fire before any store access, so a zero spaceImpl
-// exercises them (as in modify_scope_test.go).
+// exercises them (as in modify_scope_test.go). Each is a caller error.
 func TestModify_ConditionalGuards(t *testing.T) {
 	ctx := context.Background()
 	s := &spaceImpl{}
@@ -47,7 +47,7 @@ func TestModify_ConditionalGuards(t *testing.T) {
 		b := scopedBatch(space.ScopeLocal)
 		b.IfUnchangedSince = &seq
 		_, err := s.Modify(ctx, b)
-		require.Error(t, err)
+		require.ErrorIs(t, err, crdt.ErrValidation)
 		assert.Contains(t, err.Error(), "IfUnchangedSince")
 	})
 
@@ -55,7 +55,7 @@ func TestModify_ConditionalGuards(t *testing.T) {
 		b := scopedBatch(space.ScopeLocal)
 		b.Records[0].Ops = []space.Op{{Type: space.OpDelete}}
 		_, err := s.Modify(ctx, b)
-		require.Error(t, err)
+		require.ErrorIs(t, err, crdt.ErrValidation)
 		assert.Contains(t, err.Error(), "cannot delete")
 	})
 
@@ -63,7 +63,25 @@ func TestModify_ConditionalGuards(t *testing.T) {
 		b := scopedBatch(space.ScopeSynced)
 		b.IfUnchangedSince = &seq
 		_, err := s.ModifyMany(ctx, []space.ModifyBatch{b})
-		require.Error(t, err)
+		require.ErrorIs(t, err, crdt.ErrValidation)
 		assert.Contains(t, err.Error(), "Modify only")
+	})
+
+	// Every record of the objects dataset is the object's one row.
+	t.Run("objects: precondition rejected", func(t *testing.T) {
+		b := scopedBatch(space.ScopeSynced)
+		b.Dataset = "objects"
+		b.IfUnchangedSince = &seq
+		_, err := s.Modify(ctx, b)
+		require.ErrorIs(t, err, crdt.ErrValidation)
+	})
+
+	t.Run("objects: delete rejected", func(t *testing.T) {
+		b := scopedBatch(space.ScopeSynced)
+		b.Dataset = "objects"
+		b.Records = append(b.Records, space.RecordModify{Id: "x", Ops: []space.Op{{Type: space.OpDelete}}})
+		_, err := s.Modify(ctx, b)
+		require.ErrorIs(t, err, crdt.ErrValidation)
+		assert.Contains(t, err.Error(), "takes no deletes")
 	})
 }

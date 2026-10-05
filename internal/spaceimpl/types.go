@@ -635,10 +635,6 @@ func markerOf(rec *anyenc.Value) string {
 	return ""
 }
 
-func (t *typesAPI) Delete(_ context.Context, _ string) error {
-	return errors.New("typesAPI: Delete not implemented")
-}
-
 // builtInMetaCollectionProperties translates collectiontype.Properties
 // into the public PropertyDef shape.
 func builtInMetaCollectionProperties() []space.PropertyDef {

@@ -157,10 +157,6 @@ type TypesAPI interface {
 	// type object's id.
 	Create(ctx context.Context, params TypeCreateParams) (typeId string, err error)
 
-	// Delete a type. Objects naming it in `any.type` keep the
-	// reference (orphan), per docs §"read tolerance".
-	Delete(ctx context.Context, typeId string) error
-
 	// Patch edits a user type's display and rendering metadata: name,
 	// description, icon, layout, hidden, meta. Absent fields keep
 	// their value. Registered built-ins refuse (ErrTypeRegistered); a
@@ -552,10 +548,6 @@ type CollectionsAPI interface {
 	// Create a new user-defined collection. Returns the new object's
 	// id.
 	Create(ctx context.Context, params CollectionCreateParams) (collectionId string, err error)
-
-	// Delete a collection. Objects listing it keep the reference
-	// (orphan), per docs §"read tolerance".
-	Delete(ctx context.Context, collectionId string) error
 
 	// Patch edits a user collection's display and listing metadata.
 	// Registered built-ins refuse (ErrTypeRegistered); a type id

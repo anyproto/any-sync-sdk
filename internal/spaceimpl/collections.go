@@ -177,10 +177,6 @@ func (c *collectionsAPI) Get(ctx context.Context, id string) (space.CollectionIn
 	return space.CollectionInfo{}, space.ErrNotFound
 }
 
-func (c *collectionsAPI) Delete(_ context.Context, _ string) error {
-	return errors.New("collectionsAPI: Delete not implemented")
-}
-
 // Patch rewrites a user collection's display and listing metadata in
 // one change on its objects row. Absent fields keep their value; an
 // empty string clears a text field; a nil Meta value unsets the key.

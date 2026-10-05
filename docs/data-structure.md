@@ -252,6 +252,13 @@ applies on them would make the outcome apply-order-dependent. A value
 written concurrently with a retype or detach lands as an orphan on
 every peer and converges (§ Orphan values).
 
+A definition is deleted like any object, through `Objects().Delete`,
+and the delete does not cascade: every object naming it keeps the id
+in `any.type` or `any.collections`, so `{"any.collections": id}` still
+matches it, and keeps its values as orphans. A cascade could not be
+complete anyway: a peer's offline filing applies after the delete,
+unguarded as above.
+
 #### Querying membership
 
 `{"any.type": typeId}` returns the objects of a type;
@@ -268,7 +275,6 @@ List(ctx) ([]CollectionInfo, error)                 // meta `collection` + regis
 Get(ctx, collectionId) (CollectionInfo, error)      // a type id → ErrNotACollection
 Create(ctx, CollectionCreateParams) (id, error)     // Name, Description, IconCID, XKey, Hidden, Meta
 Patch(ctx, collectionId, CollectionPatch) error     // registered → ErrTypeRegistered; a type id → ErrNotACollection
-Delete(ctx, collectionId) error                     // not implemented, like Types().Delete
 ```
 
 `Create` writes `any.{name,description,icon}`,

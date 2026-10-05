@@ -88,7 +88,6 @@ func TestTechWrappers_RefuseLifecycle(t *testing.T) {
 	ty := techTypes{}
 	_, err = ty.Create(ctx, space.TypeCreateParams{})
 	assert.ErrorIs(t, err, space.ErrUnsupported)
-	assert.ErrorIs(t, ty.Delete(ctx, "t"), space.ErrUnsupported)
 	assert.ErrorIs(t, ty.Patch(ctx, "t", space.TypePatch{}), space.ErrUnsupported)
 	// AddProperty / RemoveProperty / PatchProperty are conditional like
 	// the part and dataset mutators — refused off bundle roots, allowed
@@ -99,7 +98,6 @@ func TestTechWrappers_RefuseLifecycle(t *testing.T) {
 	c := techCollections{}
 	_, err = c.Create(ctx, space.CollectionCreateParams{})
 	assert.ErrorIs(t, err, space.ErrUnsupported)
-	assert.ErrorIs(t, c.Delete(ctx, "c"), space.ErrUnsupported)
 	assert.ErrorIs(t, c.Patch(ctx, "c", space.CollectionPatch{}), space.ErrUnsupported)
 
 	assert.ErrorIs(t, errUnsupported("x"), space.ErrUnsupported)

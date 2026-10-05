@@ -57,9 +57,6 @@ func (x techCollections) Get(ctx context.Context, id string) (space.CollectionIn
 func (techCollections) Create(context.Context, space.CollectionCreateParams) (string, error) {
 	return "", errUnsupported("Collections().Create")
 }
-func (techCollections) Delete(context.Context, string) error {
-	return errUnsupported("Collections().Delete")
-}
 func (techCollections) Patch(context.Context, string, space.CollectionPatch) error {
 	return errUnsupported("Collections().Patch")
 }
@@ -387,7 +384,6 @@ func (x techTypes) PatchDatasetField(ctx context.Context, typeId, fieldDefId str
 func (techTypes) Create(context.Context, space.TypeCreateParams) (string, error) {
 	return "", errUnsupported("Types().Create")
 }
-func (techTypes) Delete(context.Context, string) error { return errUnsupported("Types().Delete") }
 func (techTypes) Patch(context.Context, string, space.TypePatch) error {
 	return errUnsupported("Types().Patch")
 }

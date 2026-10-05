@@ -63,8 +63,8 @@ Supported:
   (same as `WaitListSynced`).
 
 Everything else returns `space.ErrUnsupported`: `Objects().Create` /
-`Derive`, `Types().Create` / `Delete`, `Collections().Create` /
-`Delete` / `Patch`, property definitions outside bundle roots,
+`Derive`, `Types().Create`, `Collections().Create` / `Patch`,
+property definitions outside bundle roots,
 `Properties()`, `Members()`, `ACL()`, `Files()`, `History()`,
 `ReadState()`, `PubSub()`, `Changes()`, `SetMetadata`. `Subscribe`-style
 methods with no error return (`Members`, `Files`, `ReadState`,

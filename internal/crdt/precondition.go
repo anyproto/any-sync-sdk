@@ -33,9 +33,12 @@ func (c *Controller) ChangedSince(ctx context.Context, dataset string, seq uint6
 	if !c.reindexPending && c.maxApplySeq <= seq {
 		return false, nil
 	}
-	coll := c.collectionForRead(ctx, dataset)
-	if coll == nil {
-		return false, nil
+	// collectionForRead answers nil on any open error; a precondition
+	// must not read that as "unchanged". The write is about to create
+	// the collection anyway.
+	coll, err := c.collectionForWrite(ctx, dataset)
+	if err != nil {
+		return false, fmt.Errorf("crdt: ChangedSince: %w", err)
 	}
 	it, err := coll.Find(query.Key{Path: applySeqPath, Filter: query.NewComp(query.CompOpGt, seq)}).Limit(1).Iter(ctx)
 	if err != nil {

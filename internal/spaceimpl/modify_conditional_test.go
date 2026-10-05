@@ -22,13 +22,17 @@ func TestBuildChange_DeleteRecords(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, crdt.OpDelete, ch.Records[1].Ops[0].Type, "a delete record rides the same change")
 
-	for name, rec := range map[string]space.RecordModify{
-		"delete beside another op": {Id: "r", Ops: []space.Op{del, set}},
-		"delete without an id":     {Ops: []space.Op{del}},
-		"delete as an upsert":      {Id: "r", Upsert: true, Ops: []space.Op{del}},
+	for name, records := range map[string][]space.RecordModify{
+		"delete beside another op":          {{Id: "r", Ops: []space.Op{del, set}}},
+		"delete with a path":                {{Id: "r", Ops: []space.Op{{Type: space.OpDelete, Path: "text"}}}},
+		"delete with a value":               {{Id: "r", Ops: []space.Op{{Type: space.OpDelete, Value: "x"}}}},
+		"delete without an id":              {{Ops: []space.Op{del}}},
+		"delete as an upsert":               {{Id: "r", Upsert: true, Ops: []space.Op{del}}},
+		"deleted id written by the batch":   {{Id: "r", Ops: []space.Op{del}}, {Id: "r", Ops: []space.Op{set}}},
+		"written id deleted later in batch": {{Id: "r", Upsert: true, Ops: []space.Op{set}}, {Id: "r", Ops: []space.Op{del}}},
 	} {
-		_, err := buildChange(space.ModifyBatch{Dataset: "notes", Records: []space.RecordModify{rec}}, "v1")
-		assert.Error(t, err, name)
+		_, err := buildChange(space.ModifyBatch{Dataset: "notes", Records: records}, "v1")
+		assert.ErrorIs(t, err, crdt.ErrValidation, name)
 	}
 }
 

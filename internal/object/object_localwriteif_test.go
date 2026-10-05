@@ -80,12 +80,12 @@ func TestLocalWriteIf(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, first.ApplySeq)
 
-	second, err := o.LocalWriteIf(ctx, nameChange(t, "blocks", "a", "v2"), first.ApplySeq)
+	second, err := o.LocalWriteIf(ctx, nameChange(t, "blocks", "a", "v2"), &first.ApplySeq)
 	require.NoError(t, err, "unchanged since the read: the write lands")
 	assert.Greater(t, second.ApplySeq, first.ApplySeq)
 
 	adds := tree.adds
-	_, err = o.LocalWriteIf(ctx, nameChange(t, "blocks", "a", "stale"), first.ApplySeq)
+	_, err = o.LocalWriteIf(ctx, nameChange(t, "blocks", "a", "stale"), &first.ApplySeq)
 	require.ErrorIs(t, err, crdt.ErrPreconditionFailed)
 	assert.Equal(t, adds, tree.adds, "a refused write adds no change")
 	assert.Equal(t, "v2", o.ctrl.Get(ctx, "blocks", "a").GetString("name"))
@@ -94,7 +94,7 @@ func TestLocalWriteIf(t *testing.T) {
 	// still as read, so the write lands.
 	_, err = o.LocalWrite(ctx, nameChange(t, "other", "x", "elsewhere"))
 	require.NoError(t, err)
-	third, err := o.LocalWriteIf(ctx, nameChange(t, "blocks", "b", "v1"), second.ApplySeq)
+	third, err := o.LocalWriteIf(ctx, nameChange(t, "blocks", "b", "v1"), &second.ApplySeq)
 	require.NoError(t, err, "a write to another dataset does not fail the precondition")
 
 	// A delete is a change to the dataset too.
@@ -104,7 +104,7 @@ func TestLocalWriteIf(t *testing.T) {
 		Records:     []crdt.RecordChange{{Id: "a", Ops: []crdt.Op{{Type: crdt.OpDelete}}}},
 	})
 	require.NoError(t, err)
-	_, err = o.LocalWriteIf(ctx, nameChange(t, "blocks", "b", "v2"), third.ApplySeq)
+	_, err = o.LocalWriteIf(ctx, nameChange(t, "blocks", "b", "v2"), &third.ApplySeq)
 	require.ErrorIs(t, err, crdt.ErrPreconditionFailed, "a tombstone stamped after the read fails the precondition")
 }
 
@@ -132,7 +132,7 @@ func TestLocalWriteIf_UpdateAndDeleteInOneChange(t *testing.T) {
 			{Id: "fresh", Upsert: true, Ops: []crdt.Op{recordOp(t, "name", "added")}},
 			{Id: "drop", Ops: []crdt.Op{{Type: crdt.OpDelete}}},
 		},
-	}, seed.ApplySeq)
+	}, &seed.ApplySeq)
 	require.NoError(t, err)
 	assert.Empty(t, res.Rejections)
 

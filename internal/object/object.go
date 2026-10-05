@@ -517,19 +517,16 @@ type WriteResult struct {
 // requires the caller to hold tree.Lock — without it, any-sync
 // logs "use tree when unlocked" at ERROR.
 func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, error) {
-	return o.localWrite(ctx, ch, nil)
+	return o.LocalWriteIf(ctx, ch, nil)
 }
 
-// LocalWriteIf is LocalWrite conditional on the change's dataset being
-// unchanged since ifUnchangedSince (crdt.Controller.ChangedSince). The
-// check runs under tree.Lock, which every apply takes, so nothing lands
-// between it and the write; a dataset that changed is
-// crdt.ErrPreconditionFailed with nothing written.
-func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSince uint64) (WriteResult, error) {
-	return o.localWrite(ctx, ch, &ifUnchangedSince)
-}
-
-func (o *Object) localWrite(ctx context.Context, ch crdt.Change, ifUnchangedSince *uint64) (WriteResult, error) {
+// LocalWriteIf is LocalWrite conditional, when ifUnchangedSince is
+// non-nil, on the change's dataset being unchanged since that apply
+// sequence (crdt.Controller.ChangedSince). The check runs under
+// tree.Lock, which every apply takes, so nothing lands between it and
+// the write; a dataset that changed is crdt.ErrPreconditionFailed with
+// nothing written.
+func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSince *uint64) (WriteResult, error) {
 	if o.tree == nil {
 		return WriteResult{}, ErrTreeNotSet
 	}
@@ -694,6 +691,7 @@ func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, err
 		VersionId:  ch.VersionId,
 		RecordIds:  recordIds,
 		Rejections: res.Rejections,
+		ApplySeq:   res.ApplySeq,
 	}, nil
 }
 

@@ -86,7 +86,11 @@ under the object's write lock, which every local write and every synced
 apply takes, so nothing lands between it and the write. A dataset that
 changed is `ErrPreconditionFailed` with nothing written. `ModifyResult.ApplySeq`
 is the `_applySeq` the write stamped, the value for the next conditional
-write against its result. The per-object `_applySeq` watermark answers
+write against its result. Otherwise take the value from a read that includes
+tombstones (`ProjectionOpts{IncludeDeleted: true}`): `Snapshot` and
+`Subscribe` skip them, so a value read there stays below a later delete's
+stamp. Any apply that stamps a record counts, device-local writes included,
+and a value holds within one store generation (`Changes().Generation`). The per-object `_applySeq` watermark answers
 without a scan when nothing in the object moved past the value, except
 while a reindex is pending; otherwise one filtered read of the dataset's
 collection decides. Synced scope only, `Modify` only (each `ModifyMany`

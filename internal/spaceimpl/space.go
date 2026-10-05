@@ -325,13 +325,7 @@ func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, obj
 // localWriteRetryIf is localWriteRetry with an optional precondition
 // (ModifyBatch.IfUnchangedSince).
 func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change, ifUnchangedSince *uint64) (object.WriteResult, error) {
-	write := func(obj *object.Object) (object.WriteResult, error) {
-		if ifUnchangedSince != nil {
-			return obj.LocalWriteIf(ctx, ch, *ifUnchangedSince)
-		}
-		return obj.LocalWrite(ctx, ch)
-	}
-	res, err := write(obj)
+	res, err := obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
 	if !errors.Is(err, object.ErrClosed) {
 		return res, wrapSlotErr(err)
 	}
@@ -339,7 +333,7 @@ func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, o
 	if gerr != nil {
 		return object.WriteResult{}, gerr
 	}
-	res, err = write(obj)
+	res, err = obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
 	return res, wrapSlotErr(err)
 }
 
@@ -391,6 +385,11 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	obj, err := s.store.Get(ctx, batch.ObjectId)
 	if err != nil {
 		return space.ModifyResult{}, err
+	}
+
+	if batch.IfUnchangedSince != nil && obj.Controller().IsShared(batch.Dataset) {
+		return space.ModifyResult{}, errors.Join(crdt.ErrValidation,
+			fmt.Errorf("spaceimpl: Modify: IfUnchangedSince is not supported on the shared dataset %q", batch.Dataset))
 	}
 
 	change, err := buildChange(batch, dataVersion)
@@ -608,6 +607,9 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 // land on a fresh anyenc arena owned by the change — the encoder
 // runs inside LocalWrite before the arena goes out of scope.
 func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, error) {
+	if err := checkDeletedIdsUnshared(batch.Records); err != nil {
+		return crdt.Change{}, err
+	}
 	arena := &anyenc.Arena{}
 	records := make([]crdt.RecordChange, len(batch.Records))
 	for i := range batch.Records {
@@ -625,6 +627,28 @@ func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, erro
 	}, nil
 }
 
+// checkDeletedIdsUnshared refuses a batch that deletes a record and
+// writes it in another RecordModify: the outcome would depend on their
+// order.
+func checkDeletedIdsUnshared(records []space.RecordModify) error {
+	deleted := map[string]bool{}
+	for i := range records {
+		if isDelete(&records[i]) {
+			deleted[records[i].Id] = true
+		}
+	}
+	for i := range records {
+		if !isDelete(&records[i]) && records[i].Id != "" && deleted[records[i].Id] {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("record %d: %q is deleted by the same batch", i, records[i].Id))
+		}
+	}
+	return nil
+}
+
+func isDelete(rec *space.RecordModify) bool {
+	return slices.ContainsFunc(rec.Ops, func(op space.Op) bool { return op.Type == space.OpDelete })
+}
+
 func buildRecord(a *anyenc.Arena, rec *space.RecordModify) (crdt.RecordChange, error) {
 	for _, op := range rec.Ops {
 		if op.Type != space.OpDelete {
@@ -632,11 +656,13 @@ func buildRecord(a *anyenc.Arena, rec *space.RecordModify) (crdt.RecordChange, e
 		}
 		switch {
 		case len(rec.Ops) != 1:
-			return crdt.RecordChange{}, errors.New("delete must be the record's only op")
+			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete must be the record's only op"))
+		case op.Path != "" || op.Value != nil:
+			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete tombstones the whole record: it takes no path or value"))
 		case rec.Id == "":
-			return crdt.RecordChange{}, errors.New("delete needs an explicit record id")
+			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete needs an explicit record id"))
 		case rec.Upsert:
-			return crdt.RecordChange{}, errors.New("delete cannot be an upsert")
+			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete cannot be an upsert"))
 		}
 	}
 	ops := make([]crdt.Op, len(rec.Ops))

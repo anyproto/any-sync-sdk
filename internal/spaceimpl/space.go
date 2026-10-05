@@ -319,7 +319,19 @@ func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, datase
 // resident handles, and an in-flight caller must not surface that
 // transient as a user error.
 func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
-	res, err := obj.LocalWrite(ctx, ch)
+	return s.localWriteRetryIf(ctx, obj, objectId, ch, nil)
+}
+
+// localWriteRetryIf is localWriteRetry with an optional precondition
+// (ModifyBatch.IfUnchangedSince).
+func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change, ifUnchangedSince *uint64) (object.WriteResult, error) {
+	write := func(obj *object.Object) (object.WriteResult, error) {
+		if ifUnchangedSince != nil {
+			return obj.LocalWriteIf(ctx, ch, *ifUnchangedSince)
+		}
+		return obj.LocalWrite(ctx, ch)
+	}
+	res, err := write(obj)
 	if !errors.Is(err, object.ErrClosed) {
 		return res, wrapSlotErr(err)
 	}
@@ -327,7 +339,7 @@ func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, obj
 	if gerr != nil {
 		return object.WriteResult{}, gerr
 	}
-	res, err = obj.LocalWrite(ctx, ch)
+	res, err = write(obj)
 	return res, wrapSlotErr(err)
 }
 
@@ -386,7 +398,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 		return space.ModifyResult{}, err
 	}
 
-	res, err := s.localWriteRetry(ctx, obj, batch.ObjectId, change)
+	res, err := s.localWriteRetryIf(ctx, obj, batch.ObjectId, change, batch.IfUnchangedSince)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -422,7 +434,15 @@ func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (s
 	if len(batch.TraceIds) > 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: Modify: TraceIds ride the any-sync change and are not supported on the local scope")
 	}
+	if batch.IfUnchangedSince != nil {
+		return space.ModifyResult{}, errors.New("spaceimpl: Modify: IfUnchangedSince is supported on the synced scope only")
+	}
 	for i := range batch.Records {
+		for _, op := range batch.Records[i].Ops {
+			if op.Type == space.OpDelete {
+				return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes cannot delete records", i)
+			}
+		}
 		if batch.Records[i].Id == "" {
 			return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes require explicit record ids", i)
 		}
@@ -481,6 +501,11 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		if batches[i].Scope != 0 && batches[i].Scope != space.ScopeSynced {
 			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: scope %s not supported (synced only) — issue scoped batches through Modify",
 				i, batches[i].Scope)
+		}
+		// Each batch is its own change, so a precondition could not hold
+		// across them.
+		if batches[i].IfUnchangedSince != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: IfUnchangedSince is supported by Modify only", i)
 		}
 	}
 
@@ -601,6 +626,19 @@ func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, erro
 }
 
 func buildRecord(a *anyenc.Arena, rec *space.RecordModify) (crdt.RecordChange, error) {
+	for _, op := range rec.Ops {
+		if op.Type != space.OpDelete {
+			continue
+		}
+		switch {
+		case len(rec.Ops) != 1:
+			return crdt.RecordChange{}, errors.New("delete must be the record's only op")
+		case rec.Id == "":
+			return crdt.RecordChange{}, errors.New("delete needs an explicit record id")
+		case rec.Upsert:
+			return crdt.RecordChange{}, errors.New("delete cannot be an upsert")
+		}
+	}
 	ops := make([]crdt.Op, len(rec.Ops))
 	for i := range rec.Ops {
 		op, err := buildOp(a, &rec.Ops[i])

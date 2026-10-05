@@ -492,6 +492,9 @@ type WriteResult struct {
 	ChangeId   string
 	RecordIds  []string
 	Rejections []crdt.OpRejection
+	// ApplySeq is the per-space apply sequence the change stamped on the
+	// records it wrote (their _applySeq).
+	ApplySeq uint64
 }
 
 // LocalWrite applies a CRDT batch as a new tree change. Encodes the
@@ -514,6 +517,19 @@ type WriteResult struct {
 // requires the caller to hold tree.Lock — without it, any-sync
 // logs "use tree when unlocked" at ERROR.
 func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, error) {
+	return o.localWrite(ctx, ch, nil)
+}
+
+// LocalWriteIf is LocalWrite conditional on the change's dataset being
+// unchanged since ifUnchangedSince (crdt.Controller.ChangedSince). The
+// check runs under tree.Lock, which every apply takes, so nothing lands
+// between it and the write; a dataset that changed is
+// crdt.ErrPreconditionFailed with nothing written.
+func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSince uint64) (WriteResult, error) {
+	return o.localWrite(ctx, ch, &ifUnchangedSince)
+}
+
+func (o *Object) localWrite(ctx context.Context, ch crdt.Change, ifUnchangedSince *uint64) (WriteResult, error) {
 	if o.tree == nil {
 		return WriteResult{}, ErrTreeNotSet
 	}
@@ -538,6 +554,16 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	defer o.tree.Unlock()
 	if o.closed {
 		return WriteResult{}, ErrClosed
+	}
+
+	if ifUnchangedSince != nil {
+		changed, err := o.ctrl.ChangedSince(ctx, ch.Dataset, *ifUnchangedSince)
+		if err != nil {
+			return WriteResult{}, fmt.Errorf("object: precondition: %w", err)
+		}
+		if changed {
+			return WriteResult{}, crdt.ErrPreconditionFailed
+		}
 	}
 
 	// Plaintext-class objects ship their changes UNencrypted, so only
@@ -628,6 +654,7 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 		ChangeId:   ch.ChangeId,
 		RecordIds:  recordIds,
 		Rejections: applyRes.Rejections,
+		ApplySeq:   applyRes.ApplySeq,
 	}, nil
 }
 

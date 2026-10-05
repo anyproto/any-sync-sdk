@@ -72,8 +72,25 @@ Client workflow:
    Sub}`; live deltas arrive on `Sub.Events()`. `Snapshot(ctx, opts)` returns
    the same shape once.
 2. `Modify(ctx, ModifyBatch)` → `ModifyResult{VersionId, ChangeId, RecordIds,
-   Rejections}`: one batch of ops, one versionId.
+   Rejections, ApplySeq}`: one batch of ops, one versionId. A record whose
+   only op is `OpDelete` is tombstoned by the same change, so one batch can
+   create, update and delete atomically.
 3. `Delete(ctx, DeleteBatch)` writes sticky tombstones.
+
+### Conditional writes
+
+`ModifyBatch.IfUnchangedSince` makes a batch apply only while no record of
+its `(ObjectId, Dataset)`, tombstones included, carries an `_applySeq` above
+the given value — the highest `_applySeq` the caller read. The check runs
+under the object's write lock, which every local write and every synced
+apply takes, so nothing lands between it and the write. A dataset that
+changed is `ErrPreconditionFailed` with nothing written. `ModifyResult.ApplySeq`
+is the `_applySeq` the write stamped, the value for the next conditional
+write against its result. The per-object `_applySeq` watermark answers
+without a scan when nothing in the object moved past the value, except
+while a reindex is pending; otherwise one filtered read of the dataset's
+collection decides. Synced scope only, `Modify` only (each `ModifyMany`
+batch is its own change), and not on shared datasets.
 
 ## Trace IDs
 

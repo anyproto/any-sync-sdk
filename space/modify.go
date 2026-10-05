@@ -50,8 +50,18 @@ type ModifyBatch struct {
 	// check and the write are one step under the object's write lock,
 	// which every local write and every synced apply takes, so nothing
 	// lands in between. A dataset that changed is ErrPreconditionFailed
-	// with nothing written. ModifyResult.ApplySeq of a successful write
-	// is the value for the next conditional write against the result.
+	// with nothing written.
+	//
+	// Take the value from a read that includes tombstones — a Query with
+	// ProjectionOpts{IncludeDeleted: true}, keeping _applySeq — or from
+	// the ModifyResult.ApplySeq of the caller's own previous write.
+	// Snapshot and Subscribe skip tombstones, so a value taken from them
+	// stays below a later delete's stamp and every write is refused. Any
+	// apply that stamps a record counts as a change, device-local writes
+	// (read-tracking flags) included. The value holds within one store
+	// generation (Changes().Generation): a rebuilt store renumbers
+	// _applySeq, so compare generations before reusing an older value.
+	//
 	// Synced scope only; not for ModifyMany or shared datasets.
 	IfUnchangedSince *uint64
 }
@@ -59,8 +69,10 @@ type ModifyBatch struct {
 // RecordModify groups ops applied to one record id.
 //
 // A record whose only op is OpDelete is tombstoned by the same change
-// as the batch's other records, so a batch can create, update and
-// delete in one atomic write. It needs an explicit Id and no Upsert.
+// as the batch's other records, so a batch creates, updates and deletes
+// in one change; per-op handler rejections (ModifyResult.Rejections)
+// still apply to it, as to any op. A delete needs an explicit Id that no
+// other record of the batch writes, and no Upsert, Path or Value.
 //
 // Id: when empty, the CRDT layer derives one from the change's
 // ChangeId (base58(xxh3-64(ChangeId))); subsequent empty-id records

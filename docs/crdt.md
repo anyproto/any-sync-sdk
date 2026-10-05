@@ -90,8 +90,10 @@ write against its result. Otherwise take the value from a read that includes
 tombstones (`ProjectionOpts{IncludeDeleted: true}`): `Snapshot` and
 `Subscribe` skip them, so a value read there stays below a later delete's
 stamp. Any apply that stamps a record counts, device-local writes and
-rebuild replays included, and a value holds within one store generation
-(`Changes().Generation`). The per-object `_applySeq` watermark answers
+rebuild replays included. A value holds within one process run and one
+store generation (`Changes().Generation`): the allocator re-seeds from
+persisted watermarks on every start, so after a restart re-read the
+dataset instead of reusing a value from before it. The per-object `_applySeq` watermark answers
 without a scan when nothing in the object moved past the value, except
 while a reindex is pending; otherwise one filtered read of the dataset's
 collection decides. Synced scope only, `Modify` only (each `ModifyMany`

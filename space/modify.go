@@ -59,9 +59,11 @@ type ModifyBatch struct {
 	// stays below a later delete's stamp and every write is refused. Any
 	// apply that stamps a record counts as a change: device-local writes
 	// (read-tracking flags) and a tree rebuild's replay included. The
-	// value holds within one store generation (Changes().Generation): a
-	// rebuilt store renumbers _applySeq, so compare generations before
-	// reusing an older value.
+	// value holds within one process run and one store generation
+	// (Changes().Generation): the allocator re-seeds from persisted
+	// watermarks on every start, and a rebuilt store renumbers
+	// _applySeq, so after a restart re-read the dataset instead of
+	// reusing a value from before it.
 	//
 	// Synced scope only; not for ModifyMany or the objects dataset, whose
 	// row every change to the object stamps.

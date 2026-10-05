@@ -563,6 +563,19 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 		return WriteResult{}, err
 	}
 
+	// The precondition runs before the state-dependent pre-flight: a
+	// write built on a stale read is a precondition failure (re-read
+	// and retry), not a validation error against state it never saw.
+	if ifUnchangedSince != nil {
+		changed, err := o.ctrl.ChangedSince(ctx, ch.Dataset, *ifUnchangedSince)
+		if err != nil {
+			return WriteResult{}, fmt.Errorf("object: precondition: %w", err)
+		}
+		if changed {
+			return WriteResult{}, crdt.ErrPreconditionFailed
+		}
+	}
+
 	// Writer-side schema pre-flight: strict validation against the
 	// current record state, BEFORE the change enters the DAG. A failure
 	// here returns an agent-readable error and keeps the malformed
@@ -572,18 +585,6 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	// whose handler doesn't implement LocalPreValidator.
 	if err := o.ctrl.PreValidateLocal(ctx, &ch); err != nil {
 		return WriteResult{}, err
-	}
-
-	// The precondition runs after the checks that can refuse the write,
-	// so a refused write never opens the dataset's collection.
-	if ifUnchangedSince != nil {
-		changed, err := o.ctrl.ChangedSince(ctx, ch.Dataset, *ifUnchangedSince)
-		if err != nil {
-			return WriteResult{}, fmt.Errorf("object: precondition: %w", err)
-		}
-		if changed {
-			return WriteResult{}, crdt.ErrPreconditionFailed
-		}
 	}
 
 	// Encode under tree.Lock — the codec's arena is shared with the

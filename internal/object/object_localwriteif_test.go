@@ -33,16 +33,21 @@ func (s *sequencedTree) AddContent(ctx context.Context, content objecttree.Signa
 
 func newLocalWriteIfFixture(t *testing.T) (*Object, *sequencedTree) {
 	t.Helper()
+	return newLocalWriteIfFixtureWith(t,
+		crdt.HandlerReg{Name: "blocks", Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
+		crdt.HandlerReg{Name: "other", Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
+	)
+}
+
+func newLocalWriteIfFixtureWith(t *testing.T, regs ...crdt.HandlerReg) (*Object, *sequencedTree) {
+	t.Helper()
 	ctx := context.Background()
 
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "lwif.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	ctrl, err := crdt.NewController(ctx, "obj-lwif", db,
-		crdt.HandlerReg{Name: "blocks", Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
-		crdt.HandlerReg{Name: "other", Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
-	)
+	ctrl, err := crdt.NewController(ctx, "obj-lwif", db, regs...)
 	require.NoError(t, err)
 	ctrl.SetApplySeqAllocator(crdt.NewApplySeqAllocator(func(context.Context) (uint64, error) { return 0, nil }))
 
@@ -139,4 +144,28 @@ func TestLocalWriteIf_UpdateAndDeleteInOneChange(t *testing.T) {
 	assert.Equal(t, "new", o.ctrl.Get(ctx, "blocks", "keep").GetString("name"))
 	assert.Equal(t, "added", o.ctrl.Get(ctx, "blocks", "fresh").GetString("name"))
 	assert.NotNil(t, o.ctrl.Get(ctx, "blocks", "drop").Get(crdt.DeletedAtField), "the deleted record is a tombstone")
+}
+
+// TestLocalWriteIf_StaleWriteFailsThePrecondition pins the order of the
+// checks: a write built on a read that predates a change is a
+// precondition failure (re-read and retry), not a validation error
+// against state the caller never saw — here a write-once field another
+// write already set.
+func TestLocalWriteIf_StaleWriteFailsThePrecondition(t *testing.T) {
+	ctx := context.Background()
+	ds := schema.Dataset{
+		Fields: []schema.Field{{Id: "name", Schema: schema.Leaf(schema.KindString)}},
+		IdRule: schema.IdUser,
+	}
+	h, err := crdt.NewSchemaHandler(ds)
+	require.NoError(t, err)
+	o, _ := newLocalWriteIfFixtureWith(t, crdt.HandlerReg{Name: "docs", Handler: h, Schema: ds})
+
+	before := uint64(0) // the caller read the dataset while it was empty
+	_, err = o.LocalWrite(ctx, nameChange(t, "docs", "a", "first"))
+	require.NoError(t, err)
+
+	_, err = o.LocalWriteIf(ctx, nameChange(t, "docs", "a", "stale"), &before)
+	require.ErrorIs(t, err, crdt.ErrPreconditionFailed)
+	assert.NotErrorIs(t, err, crdt.ErrValidation)
 }

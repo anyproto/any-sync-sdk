@@ -11,7 +11,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-func TestBuildChange_DeleteRecords(t *testing.T) {
+func TestDeleteRecords(t *testing.T) {
 	del := space.Op{Type: space.OpDelete}
 	set := space.Op{Type: space.OpSet, Path: "text", Value: "x"}
 
@@ -31,8 +31,7 @@ func TestBuildChange_DeleteRecords(t *testing.T) {
 		"deleted id written by the batch":   {{Id: "r", Ops: []space.Op{del}}, {Id: "r", Ops: []space.Op{set}}},
 		"written id deleted later in batch": {{Id: "r", Upsert: true, Ops: []space.Op{set}}, {Id: "r", Ops: []space.Op{del}}},
 	} {
-		_, err := buildChange(space.ModifyBatch{Dataset: "notes", Records: records}, "v1")
-		assert.ErrorIs(t, err, crdt.ErrValidation, name)
+		assert.ErrorIs(t, checkRecordShapes(records), crdt.ErrValidation, name)
 	}
 }
 
@@ -73,6 +72,18 @@ func TestModify_ConditionalGuards(t *testing.T) {
 		b.Dataset = "objects"
 		b.IfUnchangedSince = &seq
 		_, err := s.Modify(ctx, b)
+		require.ErrorIs(t, err, crdt.ErrValidation)
+	})
+
+	t.Run("objects: Delete rejected", func(t *testing.T) {
+		_, err := s.Delete(ctx, space.DeleteBatch{ObjectId: "obj", Dataset: "objects", RecordIds: []string{"x"}})
+		require.ErrorIs(t, err, crdt.ErrValidation)
+	})
+
+	t.Run("ModifyMany: malformed delete rejected before loading", func(t *testing.T) {
+		b := scopedBatch(space.ScopeSynced)
+		b.Records = append(b.Records, space.RecordModify{Ops: []space.Op{{Type: space.OpDelete}}})
+		_, err := s.ModifyMany(ctx, []space.ModifyBatch{b})
 		require.ErrorIs(t, err, crdt.ErrValidation)
 	})
 

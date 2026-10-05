@@ -368,6 +368,9 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	if err := checkObjectsRowBatch(batch); err != nil {
 		return space.ModifyResult{}, err
 	}
+	if err := checkRecordShapes(batch.Records); err != nil {
+		return space.ModifyResult{}, err
+	}
 	switch batch.Scope {
 	case 0, space.ScopeSynced:
 		// The DAG route below.
@@ -502,6 +505,12 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		if batches[i].IfUnchangedSince != nil {
 			return nil, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: ModifyMany: batch %d: IfUnchangedSince is supported by Modify only", i))
 		}
+		if err := checkObjectsRowBatch(batches[i]); err != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: %w", i, err)
+		}
+		if err := checkRecordShapes(batches[i].Records); err != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: %w", i, err)
+		}
 	}
 
 	for i := range batches {
@@ -519,10 +528,6 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	var validationErrs []error
 	for i, b := range batches {
 		if err := checkPublicDataset(b.Dataset); err != nil {
-			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
-			continue
-		}
-		if err := checkObjectsRowBatch(b); err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
 		}
@@ -572,6 +577,9 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 	if err := checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
+	if batch.Dataset == properties.Dataset {
+		return space.ModifyResult{}, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Delete: the %s dataset takes no deletes: every record there is the object's one row", properties.Dataset))
+	}
 	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
 	if err != nil {
 		return space.ModifyResult{}, err
@@ -607,9 +615,6 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 // land on a fresh anyenc arena owned by the change — the encoder
 // runs inside LocalWrite before the arena goes out of scope.
 func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, error) {
-	if err := checkDeletedIdsUnshared(batch.Records); err != nil {
-		return crdt.Change{}, err
-	}
 	arena := &anyenc.Arena{}
 	records := make([]crdt.RecordChange, len(batch.Records))
 	for i := range batch.Records {
@@ -627,15 +632,33 @@ func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, erro
 	}, nil
 }
 
-// checkDeletedIdsUnshared refuses a batch that deletes a record and
-// writes it in another RecordModify: the outcome would depend on their
-// order.
-func checkDeletedIdsUnshared(records []space.RecordModify) error {
+// checkRecordShapes refuses malformed delete records before anything
+// loads: a delete is its record's only op, takes no path or value,
+// names an explicit id and is no upsert; and no other record of the
+// batch writes an id the batch deletes, since the outcome would depend
+// on their order.
+func checkRecordShapes(records []space.RecordModify) error {
 	deleted := map[string]bool{}
 	for i := range records {
-		if isDelete(&records[i]) {
-			deleted[records[i].Id] = true
+		rec := &records[i]
+		if !isDelete(rec) {
+			continue
 		}
+		var err error
+		switch {
+		case len(rec.Ops) != 1:
+			err = errors.New("delete must be the record's only op")
+		case rec.Ops[0].Path != "" || rec.Ops[0].Value != nil:
+			err = errors.New("delete tombstones the whole record: it takes no path or value")
+		case rec.Id == "":
+			err = errors.New("delete needs an explicit record id")
+		case rec.Upsert:
+			err = errors.New("delete cannot be an upsert")
+		}
+		if err != nil {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("record %d: %w", i, err))
+		}
+		deleted[rec.Id] = true
 	}
 	for i := range records {
 		if !isDelete(&records[i]) && records[i].Id != "" && deleted[records[i].Id] {
@@ -670,18 +693,6 @@ func isDelete(rec *space.RecordModify) bool {
 }
 
 func buildRecord(a *anyenc.Arena, rec *space.RecordModify) (crdt.RecordChange, error) {
-	if isDelete(rec) {
-		switch {
-		case len(rec.Ops) != 1:
-			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete must be the record's only op"))
-		case rec.Ops[0].Path != "" || rec.Ops[0].Value != nil:
-			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete tombstones the whole record: it takes no path or value"))
-		case rec.Id == "":
-			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete needs an explicit record id"))
-		case rec.Upsert:
-			return crdt.RecordChange{}, errors.Join(crdt.ErrValidation, errors.New("delete cannot be an upsert"))
-		}
-	}
 	ops := make([]crdt.Op, len(rec.Ops))
 	for i := range rec.Ops {
 		op, err := buildOp(a, &rec.Ops[i])

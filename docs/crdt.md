@@ -98,7 +98,8 @@ without a scan when nothing in the object moved past the value, except
 while a reindex is pending; otherwise one filtered read of the dataset's
 collection decides. Synced scope only, `Modify` only (each `ModifyMany`
 batch is its own change), and not on the `objects` dataset, whose row
-every change to the object stamps; that dataset takes no `OpDelete` either.
+every change to the object stamps; that dataset takes no `OpDelete` and
+no `Delete` either.
 
 ## Trace IDs
 

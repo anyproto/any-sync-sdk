@@ -35,12 +35,14 @@ func (c *Controller) ChangedSince(ctx context.Context, dataset string, seq uint6
 	if !c.reindexPending && c.maxApplySeq <= seq {
 		return false, nil
 	}
-	// collectionForRead answers nil on any open error; a precondition
-	// must not read that as "unchanged". The write is about to create
-	// the collection anyway.
-	coll, err := c.collectionForWrite(ctx, dataset)
+	// A read-only open: a failed open is an error, not "no rows", and
+	// an absent collection is not created.
+	coll, err := c.openForRead(ctx, dataset)
 	if err != nil {
 		return false, fmt.Errorf("crdt: ChangedSince: %w", err)
+	}
+	if coll == nil {
+		return false, nil
 	}
 	it, err := coll.Find(query.Key{Path: applySeqPath, Filter: query.NewComp(query.CompOpGt, seq)}).Limit(1).Iter(ctx)
 	if err != nil {

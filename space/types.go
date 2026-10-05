@@ -71,6 +71,14 @@ var ErrModuleReserved = errors.New("space: module is reserved for the consumer's
 // 4xx.
 var ErrDatasetNotDeclared = errors.New("space: dataset is declared by none of the object's types")
 
+// ErrRecordIdOfAnotherObject is returned by a write to a shared
+// dataset whose record id does not belong to the target object: it
+// carries another object's prefix, or contains "/" without being one of
+// this object's ids. A record id written to a shared dataset is the
+// plain id or `<objectId>/<recordId>` for the batch's own object. A
+// client error → 4xx.
+var ErrRecordIdOfAnotherObject = errors.New("space: record id does not belong to the object")
+
 // Scope is the unified write/sync class shared by property definitions
 // and dataset schema fields — how a value is written, which version
 // domain stamps its `_ver` entries, and how far it syncs. A property
@@ -333,6 +341,12 @@ type DatasetDraft struct {
 	// Module is the serving module — "records" (the default when
 	// empty), or a registered module such as "editor" / "chat".
 	Module string
+	// Shared stores the dataset's records from every object in one
+	// collection per space, so they are read across objects as well as
+	// per object. A record keeps belonging to the object it was
+	// written on, and its id on reads is `<objectId>/<recordId>`.
+	// Records datasets only; pinned.
+	Shared bool
 
 	DisplayName string
 	Description string
@@ -403,6 +417,9 @@ type DatasetDef struct {
 	Key        string
 	Collection string
 	Module     string
+	// Shared: the records of every object live in one collection per
+	// space (DatasetDraft.Shared).
+	Shared bool
 	// PartId is the owning part's id.
 	PartId      string
 	DisplayName string

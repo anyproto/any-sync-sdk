@@ -106,6 +106,14 @@ func (a *aggImpl) combined() *anyenc.Value {
 	exists.Set("$exists", a.arena.NewFalse())
 	match := a.arena.NewObject()
 	match.Set(crdt.DeletedAtField, exists)
+	if a.store.IsKeyedDataset(a.dataset) {
+		// A shared dataset's collection holds every object's rows.
+		lo, hi := crdt.KeyedBounds(a.objectId)
+		idRange := a.arena.NewObject()
+		idRange.Set("$gte", a.arena.NewString(lo))
+		idRange.Set("$lt", a.arena.NewString(hi))
+		match.Set(crdt.IdField, idRange)
+	}
 	skipStage := a.arena.NewObject()
 	skipStage.Set("$match", match)
 

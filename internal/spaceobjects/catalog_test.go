@@ -61,6 +61,23 @@ func seedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, 
 // `title` field).
 func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, canonical bool, verPrefix string) {
 	t.Helper()
+	var markers []string
+	if canonical {
+		markers = append(markers, typetype.DefFieldCanonical)
+	}
+	seedDefs(t, ctx, db, typeId, dsKey, module, markers, verPrefix)
+}
+
+// seedSharedDatasetDefs declares a shared records dataset keyed dsKey.
+func seedSharedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, verPrefix string) {
+	t.Helper()
+	seedDefs(t, ctx, db, typeId, dsKey, types.RecordsModule, []string{typetype.DefFieldPerSpace}, verPrefix)
+}
+
+// seedDefs is seedModuleDefs with the head's boolean markers spelled
+// out.
+func seedDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, markers []string, verPrefix string) {
+	t.Helper()
 	ctrl, err := crdt.NewController(ctx, typeId, db,
 		crdt.HandlerReg{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}},
 		crdt.HandlerReg{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
@@ -82,8 +99,8 @@ func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, d
 	head.Set(typetype.FieldKey, a.NewString(dsKey))
 	head.Set(typetype.DefFieldModule, a.NewString(module))
 	head.Set(typetype.DefFieldPart, a.NewString(partId))
-	if canonical {
-		head.Set(typetype.DefFieldCanonical, a.NewTrue())
+	for _, marker := range markers {
+		head.Set(marker, a.NewTrue())
 	}
 	if module == types.RecordsModule {
 		head.Set(typetype.DefFieldIdRule, a.NewString("user"))

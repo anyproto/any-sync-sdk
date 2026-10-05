@@ -60,7 +60,7 @@ Delivery order doesn't matter, and there is no multi-head or conflict state.
 - `id` is required and immutable.
 - `_ver.id` is the record's creation version (§3.5).
 - `_ver` ships with query results so clients can reconcile per-field state.
-- Reserved names are `id` and every top-level name starting with `_`: `_ver`, `_deletedAt`, `_traces`, `_addSeq`, `_applySeq`. Input ops can't write them (§5.0).
+- Reserved names are `id` and every top-level name starting with `_`: `_ver`, `_deletedAt`, `_traces`, `_addSeq`, `_applySeq`, `_objectId`. Input ops can't write them (§5.0).
 - All other fields belong to the dataset (schema and handler, §8).
 
 `_ver` is a tree. Each entry is either:
@@ -118,6 +118,8 @@ Resolution, per change, before validation:
 5. Handlers see the resolved id.
 
 On a shared dataset (the per-space `objects` row) every record resolves to the change's `objectId`.
+
+On a keyed dataset (`HandlerReg.Keyed`: a runtime dataset declared `Shared`, [user-datasets.md](user-datasets.md) § Shared datasets) the resolved id is stored as `<objectId>/<recordId>` in a per-space collection, and the row is stamped `_objectId`. Handlers see the record id; apply results, hooks and events carry the stored one.
 
 ### 3.4 Soft Delete
 

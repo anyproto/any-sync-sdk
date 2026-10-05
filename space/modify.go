@@ -51,6 +51,11 @@ type ModifyBatch struct {
 // in the same batch get a ":<index>" suffix. Empty id requires
 // Upsert=true.
 //
+// On a shared dataset (DatasetDraft.Shared) a record is read back as
+// `<objectId>/<recordId>`. Id takes that form for the batch's own
+// object, or the plain record id; a "/" anywhere else is
+// ErrRecordIdOfAnotherObject.
+//
 // Upsert: false (default) = strict update-if-exists — modifies on an
 // absent record are silent no-ops. true = create-or-update; the
 // record is auto-created if absent. Tombstones stay sticky in both
@@ -125,7 +130,9 @@ type DeleteBatch struct {
 //     empty Id, the resolved value is `base58(xxh3-64(ChangeId))`
 //     (with `:<index>` suffix for the second-and-later empty ids in
 //     a batch). This is the propId / shortId convention; callers
-//     creating types or properties read it from RecordIds[0].
+//     creating types or properties read it from RecordIds[0]. On a
+//     shared dataset each id is the one the record is read back
+//     under, `<objectId>/<recordId>`; a rejection's RecordId too.
 //   - Rejections lists per-op handler rejections — ops that the
 //     change carries but the handler refused (kind mismatch,
 //     terminal status, immutable field, unknown property…). The

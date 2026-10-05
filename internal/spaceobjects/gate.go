@@ -107,6 +107,10 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// when it does we still feed the drainer a generic wakeup to
 		// avoid stuck parked changes.
 		ids, idsErr := crdt.ResolveRecordIds(*ch)
+		if idsErr == nil {
+			// Events carry the id a record is stored and read under.
+			obj.Controller().StoreIds(ch.Dataset, ids)
+		}
 
 		if s.engine != nil && s.engine.HasSubscribers() {
 			rowIds, postValue := s.postValueFor(ctx, obj, ch, ids)

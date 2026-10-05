@@ -199,13 +199,9 @@ func BuildView(ctx context.Context, p ViewParams) (*View, error) {
 // hook: scratch rows carry no _applySeq and feed no read-tracking —
 // replay artifacts stay out.
 func scratchController(ctx context.Context, db anystore.DB, p ViewParams) (*crdt.Controller, []string, error) {
-	shared := crdt.SharedCollections{}
-	for _, name := range p.SharedDatasets {
-		coll, err := db.Collection(ctx, name)
-		if err != nil {
-			return nil, nil, fmt.Errorf("history: open scratch shared collection %s: %w", name, err)
-		}
-		shared[name] = coll
+	shared, err := scratchCollections(ctx, db, p.SharedDatasets, p.Regs)
+	if err != nil {
+		return nil, nil, err
 	}
 	ctrl, err := crdt.NewControllerWithShared(ctx, p.ObjectId, db, shared, p.Regs...)
 	if err != nil {
@@ -217,6 +213,24 @@ func scratchController(ctx context.Context, db anystore.DB, p ViewParams) (*crdt
 	}
 	slices.Sort(datasets)
 	return ctrl, datasets, nil
+}
+
+// scratchCollections opens, in the scratch store, a collection for
+// every dataset the live side keeps in a per-space collection: the
+// ObjectId-keyed shared ones and the keyed ones among regs. A scratch
+// row then has the id its live row has.
+func scratchCollections(ctx context.Context, db anystore.DB, sharedDatasets []string, regs []crdt.HandlerReg) (crdt.SharedCollections, error) {
+	shared := crdt.SharedCollections{}
+	for _, names := range [][]string{sharedDatasets, crdt.KeyedNames(regs)} {
+		for _, name := range names {
+			coll, err := db.Collection(ctx, name)
+			if err != nil {
+				return nil, fmt.Errorf("history: open scratch shared collection %s: %w", name, err)
+			}
+			shared[name] = coll
+		}
+	}
+	return shared, nil
 }
 
 func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.HistoryTree, p ViewParams) (*View, error) {

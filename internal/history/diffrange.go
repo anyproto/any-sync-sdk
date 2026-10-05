@@ -167,6 +167,8 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 			return true
 		}
 		if recordIds, idErr := crdt.ResolveRecordIds(*decoded); idErr == nil {
+			// Rows are read back by the id they are stored under.
+			ctrl.StoreIds(decoded.Dataset, recordIds)
 			for _, rec := range recordIds {
 				if wantRecord(rec) {
 					touched[recKey{decoded.Dataset, rec}] = struct{}{}

@@ -100,7 +100,34 @@ const (
 	// collide. Backs the consumer-side change-index "records changed
 	// since N" scans.
 	AddSeqField = "_addSeq"
+
+	// ObjectIdField names the object a record of a keyed dataset
+	// (HandlerReg.Keyed) belongs to. Stamped by the Controller on every
+	// row it creates there, tombstones included.
+	ObjectIdField = "_objectId"
 )
+
+// keySeparator joins the object id and the record id into the document
+// id of a keyed dataset. An object id never contains it, so the first
+// one always splits.
+const keySeparator = "/"
+
+// KeyedId is the document id of recordId on objectId in a keyed
+// dataset. An id already carrying the object's prefix is returned as
+// is, so callers may pass either form.
+func KeyedId(objectId, recordId string) string {
+	prefix := objectId + keySeparator
+	if strings.HasPrefix(recordId, prefix) {
+		return recordId
+	}
+	return prefix + recordId
+}
+
+// KeyedBounds is the document-id range holding every row of objectId in
+// a keyed dataset: lo inclusive, hi exclusive.
+func KeyedBounds(objectId string) (lo, hi string) {
+	return objectId + keySeparator, objectId + string(rune(keySeparator[0]+1))
+}
 
 // Controller is the CRDT entrypoint for one any-sync object tree. It
 // applies version-gated changes to an any-store database, one collection
@@ -169,6 +196,10 @@ type Controller struct {
 	// RecordChange.Id), so all objects in the space project into one
 	// row each. Used for the per-space `objects` values collection.
 	shared map[string]struct{}
+	// keyed marks the supplied collections that hold one row per record
+	// of every object (HandlerReg.Keyed): the row id is
+	// `<objectId>/<recordId>`. A keyed dataset is in shared too.
+	keyed map[string]struct{}
 	// scopeByKey marks datasets whose undeclared field heads carry
 	// per-key scopes (HandlerReg.DynamicScopeByKey).
 	scopeByKey map[string]bool
@@ -346,8 +377,17 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 		}
 		c.scopeByKey[name] = true
 	}
+	if reg.Keyed {
+		if _, supplied := c.shared[name]; !supplied {
+			return fmt.Errorf("crdt: keyed dataset %q registered without its collection", name)
+		}
+		if c.keyed == nil {
+			c.keyed = make(map[string]struct{})
+		}
+		c.keyed[name] = struct{}{}
+	}
 	if st, ok := reg.Handler.(ObjectStamper); ok {
-		if _, isShared := c.shared[name]; isShared {
+		if c.IsShared(name) {
 			c.objectStampers = append(c.objectStampers, objectStamper{dataset: name, stamper: st})
 		}
 	}
@@ -569,7 +609,7 @@ func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value 
 	if coll == nil {
 		return nil
 	}
-	doc, err := coll.FindId(ctx, id)
+	doc, err := coll.FindId(ctx, c.StoreId(dataset, id))
 	if err != nil {
 		return nil
 	}
@@ -601,15 +641,98 @@ func (c *Controller) NextLocalVersion(ctx context.Context, ch *Change) VersionId
 }
 
 // IsShared reports whether the dataset uses a per-space shared
-// collection (write-side rule: row id = ObjectId, not RecordChange.Id).
-// Subscribers projecting changes back to a path-based wire need this
-// to look up the right post-apply row.
+// collection holding one row per object (write-side rule: row id =
+// ObjectId, not RecordChange.Id). Subscribers projecting changes back
+// to a path-based wire need this to look up the right post-apply row.
+// A keyed dataset is not shared in this sense.
 func (c *Controller) IsShared(dataset string) bool {
 	if c == nil {
 		return false
 	}
-	_, ok := c.shared[dataset]
+	if _, ok := c.shared[dataset]; !ok {
+		return false
+	}
+	_, keyed := c.keyed[dataset]
+	return !keyed
+}
+
+// IsKeyed reports whether the dataset's records live in a per-space
+// collection under `<objectId>/<recordId>` (HandlerReg.Keyed). The
+// collection Collection returns for it holds every object's rows:
+// bound a read with KeyedBounds.
+func (c *Controller) IsKeyed(dataset string) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := c.keyed[dataset]
 	return ok
+}
+
+// StoreId is the document id recordId is stored under in dataset: the
+// keyed id for a keyed dataset, recordId itself otherwise.
+func (c *Controller) StoreId(dataset, recordId string) string {
+	if c == nil {
+		return recordId
+	}
+	if _, keyed := c.keyed[dataset]; keyed {
+		return KeyedId(c.objectId, recordId)
+	}
+	return recordId
+}
+
+// StoreIds rewrites record ids to the document ids they are stored
+// under in dataset, in place. A no-op unless the dataset is keyed.
+func (c *Controller) StoreIds(dataset string, ids []string) {
+	if c == nil {
+		return
+	}
+	if _, keyed := c.keyed[dataset]; !keyed {
+		return
+	}
+	for i := range ids {
+		ids[i] = KeyedId(c.objectId, ids[i])
+	}
+}
+
+// keyedObject is the object id rows of dataset are stamped with: this
+// controller's when the dataset is keyed, "" otherwise.
+func (c *Controller) keyedObject(dataset string) string {
+	if _, keyed := c.keyed[dataset]; keyed {
+		return c.objectId
+	}
+	return ""
+}
+
+// objectRows is the filter selecting this object's rows in a keyed
+// dataset's collection.
+func (c *Controller) objectRows() query.Filter { return KeyedRows(c.objectId) }
+
+// KeyedRows is the filter selecting objectId's rows in a keyed
+// dataset's collection — a range on the primary key.
+func KeyedRows(objectId string) query.Filter {
+	lo, hi := KeyedBounds(objectId)
+	return query.And{
+		query.Key{Path: []string{IdField}, Filter: query.NewComp(query.CompOpGte, lo)},
+		query.Key{Path: []string{IdField}, Filter: query.NewComp(query.CompOpLt, hi)},
+	}
+}
+
+// KeyedRecordId is the record id inside the keyed document id id: what
+// follows the object's prefix. An id without that prefix is returned
+// as is.
+func KeyedRecordId(objectId, id string) string {
+	return strings.TrimPrefix(id, objectId+keySeparator)
+}
+
+// KeyedNames lists the keyed datasets among regs, in order.
+func KeyedNames(regs []HandlerReg) []string {
+	var names []string
+	for i := range regs {
+		if regs[i].Keyed {
+			names = append(names, regs[i].Name)
+		}
+	}
+	return names
 }
 
 // Records returns all live (non-tombstone) records in the dataset.
@@ -624,7 +747,11 @@ func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Valu
 	if coll == nil {
 		return nil
 	}
-	iter, err := coll.Find(nil).Iter(ctx)
+	var filter any
+	if c.IsKeyed(dataset) {
+		filter = c.objectRows()
+	}
+	iter, err := coll.Find(filter).Iter(ctx)
 	if err != nil {
 		return nil
 	}
@@ -799,11 +926,14 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	if err != nil {
 		return res, err
 	}
-	if _, isShared := c.shared[ch.Dataset]; isShared && ch.ObjectId != "" {
+	if c.IsShared(ch.Dataset) && ch.ObjectId != "" {
 		for i := range resolvedIds {
 			resolvedIds[i] = ch.ObjectId
 		}
 	}
+	// A keyed dataset stores each record under the object's prefix;
+	// handlers keep seeing the record id the change carries.
+	c.StoreIds(ch.Dataset, resolvedIds)
 
 	// Field-class enforcement (the dataset schema is the source of truth):
 	//   - Derived fields are handler-only — no input op may write one;
@@ -1114,6 +1244,7 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 	sink := c.sinkPool.Get().(*Sink)
 	mod := c.modifierPool.Get().(*recordModifier)
 	mod.set(handler, ch, id, rc, sink, getter)
+	mod.keyedObject = c.keyedObject(ch.Dataset)
 
 	defer func() {
 		mod.clear()
@@ -1179,11 +1310,14 @@ func (c *Controller) applySiblings(ctx context.Context, ch *Change, siblings []S
 		}
 		mod := c.modifierPool.Get().(*recordModifier)
 		mod.setSibling(ch, sib)
+		id := c.StoreId(sib.Dataset, sib.Record.Id)
+		mod.id = id
+		mod.keyedObject = c.keyedObject(sib.Dataset)
 		op := sib.Record
 		if hasDelete(op.Ops) || op.Upsert {
-			_, err = coll.UpsertId(ctx, sib.Record.Id, mod)
+			_, err = coll.UpsertId(ctx, id, mod)
 		} else {
-			_, err = coll.UpdateId(ctx, sib.Record.Id, mod)
+			_, err = coll.UpdateId(ctx, id, mod)
 			if errors.Is(err, anystore.ErrDocNotFound) {
 				err = nil
 			}
@@ -1339,6 +1473,10 @@ type recordModifier struct {
 	rec     *RecordChange
 	sink    *Sink
 
+	// keyedObject is the object a row of a keyed dataset is stamped
+	// with (ObjectIdField); empty for every other dataset.
+	keyedObject string
+
 	// getter backs ChangeCtx.Get for the handler hooks; nil in sibling
 	// mode (siblings run no hooks).
 	getter func(dataset, id string) *anyenc.Value
@@ -1390,6 +1528,7 @@ func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange,
 	m.rec = rc
 	m.sink = sink
 	m.getter = getter
+	m.keyedObject = ""
 	m.siblingMode = false
 	m.siblingRec = nil
 	m.recordedErr = nil
@@ -1400,6 +1539,13 @@ func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange,
 	m.took = m.took[:0]
 }
 
+// stampObject records the owning object on a row of a keyed dataset.
+func (m *recordModifier) stampObject(a *anyenc.Arena, doc *anyenc.Value) {
+	if m.keyedObject != "" {
+		doc.Set(ObjectIdField, a.NewString(m.keyedObject))
+	}
+}
+
 func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
 	m.handler = nil
 	m.ch = ch
@@ -1407,6 +1553,7 @@ func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
 	m.rec = nil
 	m.sink = nil
 	m.getter = nil
+	m.keyedObject = ""
 	m.siblingMode = true
 	m.siblingRec = &sib.Record
 	m.recordedErr = nil
@@ -1424,6 +1571,7 @@ func (m *recordModifier) clear() {
 	m.rec = nil
 	m.sink = nil
 	m.getter = nil
+	m.keyedObject = ""
 	m.siblingRec = nil
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
@@ -1508,6 +1656,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			return existing, false, nil // drop record, batch keeps going
 		}
 		tomb := newTombstone(a, m.id, *ch, existing)
+		m.stampObject(a, tomb)
 		updateTraces(a, tomb, *ch)
 		m.wrote = true
 		return tomb, true, nil
@@ -1522,6 +1671,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		ver := a.NewObject()
 		ver.Set(IdField, a.NewString(string(ch.VersionId)))
 		existing.Set(VersionsKey, ver)
+		m.stampObject(a, existing)
 		// Mirror the stamp as a synthetic derived op so the dispatcher
 		// includes _ver.id in the create event. Allocates on the
 		// modifier's own arena — a's lifetime ends with this Modify
@@ -1665,6 +1815,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 			return existing, false, nil
 		}
 		tomb := newTombstone(a, m.id, *ch, existing)
+		m.stampObject(a, tomb)
 		updateTraces(a, tomb, *ch)
 		m.wrote = true
 		return tomb, true, nil
@@ -1674,6 +1825,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		ver := a.NewObject()
 		ver.Set(IdField, a.NewString(string(ch.VersionId)))
 		existing.Set(VersionsKey, ver)
+		m.stampObject(a, existing)
 	} else if isTombstone(existing) {
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 			stampAddSeq(a, existing, ch.AddSeq)

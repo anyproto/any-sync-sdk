@@ -659,6 +659,15 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 		// The canonical name as the key of an unmarked head: namespaced.
 		{"h-unmarked", "notes_body", "notes", "part-a", false},
 	}
+	// A shared records dataset, and the same marker on a module dataset.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("s1", "cs1", "h-samples", true,
+		headPayload(arena, "samples", map[string]any{
+			typetype.DefFieldPart: "part-a", typetype.DefFieldPerSpace: true,
+		}))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("s2", "cs2", "h-shared-editor", true,
+		headPayload(arena, "draft", map[string]any{
+			typetype.DefFieldModule: "editor", typetype.DefFieldPart: "part-a", typetype.DefFieldPerSpace: true,
+		}))))
 	for i, h := range heads {
 		extra := map[string]any{typetype.DefFieldModule: h.module, typetype.DefFieldPart: h.part}
 		if h.canonical {
@@ -709,6 +718,13 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	assert.Equal(t, "chat_messages", byKey["chat_messages"].Name)
 	assert.True(t, byKey["chat_messages"].Canonical)
 
+	samples := byKey["samples"]
+	assert.False(t, samples.Invalid)
+	assert.True(t, samples.Shared)
+	assert.Equal(t, testObjectId+"_samples", samples.Name, "a shared dataset keeps its namespaced name")
+	assert.False(t, byKey["segments"].Shared)
+	assert.True(t, byKey["draft"].Invalid, "only a records dataset is shared")
+
 	unmarked := byKey["notes_body"]
 	assert.False(t, unmarked.Invalid)
 	assert.False(t, unmarked.Canonical)
@@ -726,7 +742,7 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	for _, ds := range body.Datasets {
 		bodyKeys = append(bodyKeys, ds.Key)
 	}
-	assert.Equal(t, []string{"editor_blocks", "notes", "notes_body", "segments", "summary", "x"}, bodyKeys)
+	assert.Equal(t, []string{"draft", "editor_blocks", "notes", "notes_body", "samples", "segments", "summary", "x"}, bodyKeys)
 
 	// The marker is a pinned leaf: two heads of one key that disagree
 	// on it fold invalid, and so does the same key under another part.

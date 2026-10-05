@@ -297,7 +297,11 @@ func (ix *Index) PurgeObject(ctx context.Context, objectId string) error {
 // final one (proposal §4.4). The caller provides a tree that is safe
 // to iterate (a history tree, or the live tree under its lock).
 // Synchronous; see the note above DefaultBackfillBatch.
-func (ix *Index) Backfill(ctx context.Context, tree objecttree.ReadableObjectTree, objectId string, batchSize int) error {
+//
+// keyed reports the datasets whose records are stored under
+// `<objectId>/<recordId>`; their rows index that id, as the apply hook
+// does. Nil means none.
+func (ix *Index) Backfill(ctx context.Context, tree objecttree.ReadableObjectTree, objectId string, keyed func(dataset string) bool, batchSize int) error {
 	if batchSize <= 0 {
 		batchSize = DefaultBackfillBatch
 	}
@@ -319,6 +323,11 @@ func (ix *Index) Backfill(ctx context.Context, tree objecttree.ReadableObjectTre
 			recordIds, idErr := crdt.ResolveRecordIds(batch[i])
 			if idErr != nil {
 				continue // malformed change: not listable, keep going
+			}
+			if keyed != nil && keyed(batch[i].Dataset) {
+				for j := range recordIds {
+					recordIds[j] = crdt.KeyedId(objectId, recordIds[j])
+				}
 			}
 			if err := ix.IndexChange(tx.Context(), &batch[i], recordIds); err != nil {
 				_ = tx.Rollback()

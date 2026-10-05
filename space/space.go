@@ -100,7 +100,9 @@ type Space interface {
 
 	// Query builds a read query against (objectId, dataset). Used for
 	// per-object datasets that exist on the object's own controller —
-	// e.g. a type object's `properties` (definitions) dataset.
+	// e.g. a type object's `properties` (definitions) dataset. On a
+	// shared dataset it reads that object's records, each with the id
+	// `<objectId>/<recordId>` and the object in `_objectId`.
 	Query(objectId, dataset string) Query
 
 	// QueryObjects builds a read query against the per-space `objects`

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
@@ -144,45 +145,59 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 	isCreate := make(map[string]bool, len(page))
 	idxById := make(map[string]int, len(page))
 	seen := make(map[string]struct{}, len(page))
+	keyed := s.store.IsKeyedDataset(batch.Dataset)
 	for i := range page {
 		rec := &page[i]
 		idx := start + i
-		if rec.Id == "" {
-			res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id,
+		// The batch is keyed by the plain record id. A shared dataset's
+		// reads return `<objectId>/<recordId>`; that form names the
+		// same record, and any other "/" names no record of this
+		// object.
+		id := rec.Id
+		if keyed && id != "" {
+			id = crdt.KeyedRecordId(batch.ObjectId, id)
+			if strings.Contains(id, "/") {
+				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id,
+					Err: fmt.Errorf("upsert: %w: %q", space.ErrRecordIdOfAnotherObject, rec.Id)})
+				continue
+			}
+		}
+		if id == "" {
+			res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: id,
 				Err: errors.New("upsert: record id required")})
 			continue
 		}
-		if _, dup := seen[rec.Id]; dup {
-			res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id,
-				Err: fmt.Errorf("upsert: duplicate id %q in page", rec.Id)})
+		if _, dup := seen[id]; dup {
+			res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: id,
+				Err: fmt.Errorf("upsert: duplicate id %q in page", id)})
 			continue
 		}
-		seen[rec.Id] = struct{}{}
+		seen[id] = struct{}{}
 
 		desired, cerr := upsertFields(arena, rec.Fields)
 		if cerr != nil {
-			res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id, Err: cerr})
+			res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: id, Err: cerr})
 			continue
 		}
-		before := stored[rec.Id]
+		before := stored[id]
 		switch {
 		case before == nil:
-			if serr := up.screenCreate(rec.Id, desired); serr != nil {
-				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id, Err: serr})
+			if serr := up.screenCreate(id, desired); serr != nil {
+				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: id, Err: serr})
 				continue
 			}
-			recs = append(recs, upsertCreate(arena, rec.Id, desired))
+			recs = append(recs, upsertCreate(arena, id, desired))
 			created++
-			isCreate[rec.Id] = true
-			idxById[rec.Id] = idx
+			isCreate[id] = true
+			idxById[id] = idx
 		default:
 			if before.Get(crdt.DeletedAtField) != nil {
-				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id, Err: space.ErrRecordDeleted})
+				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: id, Err: space.ErrRecordDeleted})
 				continue
 			}
-			mod, derr := up.diffRecord(rec.Id, desired, before)
+			mod, derr := up.diffRecord(id, desired, before)
 			if derr != nil {
-				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id, Err: derr})
+				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: id, Err: derr})
 				continue
 			}
 			if mod == nil {
@@ -191,7 +206,7 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 			}
 			recs = append(recs, *mod)
 			updated++
-			idxById[rec.Id] = idx
+			idxById[id] = idx
 		}
 	}
 	if len(recs) == 0 {
@@ -218,19 +233,25 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 		if err == nil {
 			err = fmt.Errorf("upsert: %s", rej.Reason)
 		}
+		// A rejection names the stored id; the batch is keyed by the
+		// caller's.
+		recId := rej.RecordId
+		if keyed {
+			recId = crdt.KeyedRecordId(batch.ObjectId, recId)
+		}
 		res.Rejections = append(res.Rejections, space.UpsertRejection{
-			Index: idxById[rej.RecordId], Id: rej.RecordId, Err: err,
+			Index: idxById[recId], Id: recId, Err: err,
 		})
 		if rej.OpIndex != -1 {
 			continue
 		}
-		if _, dup := dropped[rej.RecordId]; dup {
+		if _, dup := dropped[recId]; dup {
 			continue
 		}
-		dropped[rej.RecordId] = struct{}{}
-		if isCreate[rej.RecordId] {
+		dropped[recId] = struct{}{}
+		if isCreate[recId] {
 			created--
-		} else if _, tracked := idxById[rej.RecordId]; tracked {
+		} else if _, tracked := idxById[recId]; tracked {
 			updated--
 		}
 	}
@@ -249,7 +270,8 @@ func (s *spaceImpl) upsertReadPage(ctx context.Context, objectId, dataset string
 	if err != nil {
 		return nil, err
 	}
-	coll := obj.Controller().Collection(ctx, dataset)
+	ctrl := obj.Controller()
+	coll := ctrl.Collection(ctx, dataset)
 	if coll == nil {
 		return nil, nil
 	}
@@ -257,7 +279,9 @@ func (s *spaceImpl) upsertReadPage(ctx context.Context, objectId, dataset string
 	vals := make([]*anyenc.Value, 0, len(page))
 	for i := range page {
 		if page[i].Id != "" {
-			vals = append(vals, arena.NewString(page[i].Id))
+			// The row is stored under the object's key in a shared
+			// dataset; the result stays keyed by the caller's id.
+			vals = append(vals, arena.NewString(ctrl.StoreId(dataset, page[i].Id)))
 		}
 	}
 	if len(vals) == 0 {
@@ -275,10 +299,19 @@ func (s *spaceImpl) upsertReadPage(ctx context.Context, objectId, dataset string
 			return nil, derr
 		}
 		if v := doc.Value(); v != nil {
-			out[v.GetString(crdt.IdField)] = anyencx.Clone(v)
+			out[upsertRecordId(ctrl, objectId, dataset, v.GetString(crdt.IdField))] = anyencx.Clone(v)
 		}
 	}
 	return out, iter.Err()
+}
+
+// upsertRecordId maps the id a row is stored under back to the record
+// id the caller upserts by.
+func upsertRecordId(ctrl *crdt.Controller, objectId, dataset, storedId string) string {
+	if ctrl.IsKeyed(dataset) {
+		return crdt.KeyedRecordId(objectId, storedId)
+	}
+	return storedId
 }
 
 // upsertFields converts the caller field map, rejecting reserved keys

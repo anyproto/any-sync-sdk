@@ -92,3 +92,26 @@ func TestPartRecords_CanonicalKeyAndMarker(t *testing.T) {
 	_, err = normalizeDatasetDraft(modules, "type", &space.DatasetDraft{})
 	require.Error(t, err, "records has no canonical collection and needs a key")
 }
+
+// A shared records dataset stores its marker on the head record; a
+// module dataset cannot be shared.
+func TestPartRecords_SharedMarker(t *testing.T) {
+	modules := types.NewModules(types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"})
+	shared := space.DatasetDraft{Key: "samples", Shared: true}
+	coll, err := normalizeDatasetDraft(modules, "type", &shared)
+	require.NoError(t, err)
+	assert.Equal(t, "type_samples", coll)
+	_, recs, err := datasetDefRecords(&anyenc.Arena{}, modules, "part", &shared)
+	require.NoError(t, err)
+	assert.True(t, recs[0].Ops[0].Payload.GetBool(typetype.DefFieldPerSpace))
+
+	plain := space.DatasetDraft{Key: "segments"}
+	_, err = normalizeDatasetDraft(modules, "type", &plain)
+	require.NoError(t, err)
+	_, recs, err = datasetDefRecords(&anyenc.Arena{}, modules, "part", &plain)
+	require.NoError(t, err)
+	assert.Nil(t, recs[0].Ops[0].Payload.Get(typetype.DefFieldPerSpace))
+
+	_, err = normalizeDatasetDraft(modules, "type", &space.DatasetDraft{Module: "editor", Shared: true})
+	require.ErrorIs(t, err, schema.ErrDecl)
+}

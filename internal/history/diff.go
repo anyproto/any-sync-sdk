@@ -85,6 +85,7 @@ var excludedFields = map[string]struct{}{
 	crdt.TracesKey:     {},
 	crdt.ApplySeqField: {},
 	crdt.AddSeqField:   {},
+	crdt.ObjectIdField: {},
 }
 
 // DiffRecords deep-compares two record values (either may be nil =

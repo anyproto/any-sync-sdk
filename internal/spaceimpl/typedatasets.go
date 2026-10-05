@@ -110,6 +110,9 @@ func normalizeDatasetDraft(modules types.Modules, typeId string, draft *space.Da
 	if draft.Key == "" {
 		draft.Key = modules.CanonicalKey(draft.Module)
 	}
+	if draft.Shared && draft.Module != space.RecordsModule {
+		return "", fmt.Errorf("%w: dataset %q: only a records dataset is shared", schema.ErrDecl, draft.Key)
+	}
 	name, _, err := modules.DraftCollection(typeId, draft.Key, draft.Module)
 	return name, err
 }
@@ -239,6 +242,9 @@ func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetD
 	}
 	if draft.DeleteBy == space.DeleteByAuthor {
 		payload.Set(typetype.DefFieldDeleteBy, arena.NewString(draft.DeleteBy.String()))
+	}
+	if draft.Shared {
+		payload.Set(typetype.DefFieldPerSpace, arena.NewTrue())
 	}
 	if draft.SkipHistory {
 		payload.Set(typetype.DefFieldSkipHistory, arena.NewTrue())
@@ -1098,6 +1104,7 @@ func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 		Key:           c.Key,
 		Collection:    c.Name,
 		Module:        c.Module,
+		Shared:        c.Shared,
 		PartId:        c.PartId,
 		DisplayName:   c.DisplayName,
 		Description:   c.Description,

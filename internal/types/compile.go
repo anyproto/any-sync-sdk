@@ -30,6 +30,9 @@ type CompiledDataset struct {
 	// Canonical is the head's stored marker: the dataset is its
 	// module's canonical collection instead of a namespaced one.
 	Canonical bool
+	// Shared marks a records dataset whose records from every object
+	// live in one collection per space.
+	Shared bool
 	// PartId is the owning part record's id.
 	PartId string
 	// DefId is the head record's id — the definition's stable identity.
@@ -243,12 +246,14 @@ type headRec struct {
 	module  string
 	// canonical is the stored marker (DefFieldCanonical).
 	canonical bool
-	partId    string
-	ds        schema.Dataset
-	skip      bool
-	search    *schema.SearchFields
-	display   string
-	descr     string
+	// shared is the per-space marker (DefFieldPerSpace).
+	shared  bool
+	partId  string
+	ds      schema.Dataset
+	skip    bool
+	search  *schema.SearchFields
+	display string
+	descr   string
 }
 
 type fieldRec struct {
@@ -273,8 +278,8 @@ type partRec struct {
 // pinnedLeaves are the head fields two concurrent declarations of one
 // key must agree on; a disagreement marks the definition invalid.
 func (h *headRec) pinnedLeaves() string {
-	return fmt.Sprintf("%s|%t|%s|%t|%s|%s|%d|%s|%t",
-		h.module, h.canonical, h.partId, h.ds.Dynamic, h.ds.IdRule, h.ds.IdPattern, h.ds.IdMaxLen, h.ds.DeleteBy, h.skip)
+	return fmt.Sprintf("%s|%t|%s|%t|%s|%s|%d|%s|%t|%t",
+		h.module, h.canonical, h.partId, h.ds.Dynamic, h.ds.IdRule, h.ds.IdPattern, h.ds.IdMaxLen, h.ds.DeleteBy, h.skip, h.shared)
 }
 
 // CompileTypeParts folds a type object's `datasets` records into parts
@@ -386,6 +391,7 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 			}
 			h.ds.Dynamic = v.GetBool("dynamic")
 			h.skip = v.GetBool("skipHistory")
+			h.shared = v.GetBool("perSpace")
 			if rule, ok := schema.ParseIdRule(v.GetString("idRule")); ok {
 				h.ds.IdRule = rule
 			}
@@ -531,6 +537,7 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 			DefId:       w.id,
 			TypeId:      typeId,
 			SkipHistory: w.skip,
+			Shared:      w.shared,
 			Search:      w.search,
 			DisplayName: w.display,
 			Description: w.descr,
@@ -558,6 +565,9 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 		if w.canonical && canonicalKeep[w.module] != key && !compiled.Invalid {
 			invalid(fmt.Sprintf("type already declares the canonical %q dataset (%q)", w.module, canonicalKeep[w.module]))
 		}
+		if w.shared && w.module != RecordsModule && !compiled.Invalid {
+			invalid(fmt.Sprintf("dataset %q: only a records dataset is shared", key))
+		}
 
 		if w.module == RecordsModule {
 			ds := w.ds
@@ -584,6 +594,12 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 				compiled.Schema = norm
 				if !compiled.Invalid {
 					compiled.SchemaRev = schemaRev(norm)
+					if w.shared {
+						// Where the records live is part of the
+						// registration: a controller built for the
+						// other mode is stale.
+						compiled.SchemaRev += "+space"
+					}
 				}
 			}
 		} else if !compiled.Invalid {

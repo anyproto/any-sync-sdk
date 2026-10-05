@@ -1186,7 +1186,7 @@ func toDatasetSchemas(named []spaceobjects.NamedSchema) []space.DatasetSchema {
 		if err != nil {
 			continue
 		}
-		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw, Owners: ns.Owners, Module: ns.Module})
+		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw, Owners: ns.Owners, Module: ns.Module, Shared: ns.Shared})
 	}
 	return out
 }

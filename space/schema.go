@@ -40,4 +40,8 @@ type DatasetSchema struct {
 	// schema-enforced kind, "editor" / "chat" for registered modules);
 	// empty for built-ins and registered-type datasets.
 	Module string
+	// Shared marks a shared dataset (DatasetDraft.Shared): the records
+	// of every object live in one collection per space, and a record's
+	// id on reads is `<objectId>/<recordId>`.
+	Shared bool
 }

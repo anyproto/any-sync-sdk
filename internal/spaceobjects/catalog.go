@@ -281,6 +281,9 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 			SchemaRev:   ds.SchemaRev,
 			SkipHistory: ds.SkipHistory,
 			Version:     crdt.SchemaHandlerVersion,
+			// A shared dataset's records live in one collection per
+			// space (Store.keyedCollection).
+			Keyed: ds.Shared,
 		}, nil
 	}
 	m, ok := s.modules[ds.Module]

@@ -219,6 +219,13 @@ type HandlerReg struct {
 	// the per-type `objects` namespace) set Schema.Dynamic.
 	Schema schema.Dataset
 
+	// Keyed marks a dataset whose records from every object of a space
+	// live in one collection, supplied pre-opened through
+	// SharedCollections. A record is stored under the document id
+	// `<objectId>/<recordId>` and stamped with ObjectIdField; handlers
+	// keep seeing the record id the change carries.
+	Keyed bool
+
 	// SchemaRev is an opaque fingerprint of the registered schema for
 	// runtime-defined datasets. The store compares a resident
 	// controller's rev against the current catalog rev to detect stale

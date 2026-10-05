@@ -47,7 +47,13 @@ type queryImpl struct {
 }
 
 func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
-	return &queryImpl{store: store, objectId: objectId, dataset: dataset}
+	q := &queryImpl{store: store, objectId: objectId, dataset: dataset}
+	if store.IsKeyedDataset(dataset) {
+		// A shared dataset's collection holds every object's rows;
+		// every later Filter narrows this object's range.
+		q.filter = crdt.KeyedRows(objectId)
+	}
+	return q
 }
 
 // sharedObjectsDataset is the sentinel dataset name that makes the

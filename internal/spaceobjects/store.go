@@ -228,6 +228,9 @@ type Store struct {
 	mu         sync.Mutex
 	sharedColl anystore.Collection // per-space `objects` collection, lazy-opened
 	detached   anystore.Collection // per-space `_detached` collection, lazy-opened
+	// keyedColls are the per-space collections of shared datasets, by
+	// dataset name, lazy-opened and handed to every controller.
+	keyedColls map[string]anystore.Collection
 
 	// drainMu serializes Drain passes — see Store.Drain.
 	drainMu sync.Mutex
@@ -1050,6 +1053,9 @@ type NamedSchema struct {
 	// Module is the serving module (records for the generic kind);
 	// empty for built-ins and registered-type datasets.
 	Module string
+	// Shared marks a shared dataset: every object's records in one
+	// collection per space.
+	Shared bool
 }
 
 // Schemas returns the declared schema of every dataset this store hosts —
@@ -1087,7 +1093,7 @@ func (s *Store) Schemas() []NamedSchema {
 	}
 	for _, name := range sortedCatalogNames(snap) {
 		ds := snap.byName[name]
-		out = append(out, NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module})
+		out = append(out, NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module, Shared: ds.Shared})
 	}
 	return out
 }
@@ -1421,6 +1427,34 @@ func (s *Store) OpenObjectCollection(ctx context.Context, objectId, dataset stri
 	return s.db.OpenCollection(ctx, objectId+"_"+dataset)
 }
 
+// keyedCollection returns the per-space collection of a shared dataset
+// — `<spaceId>_<dataset>` — opening it on first call. Every object's
+// records of the dataset live there, under `<objectId>/<recordId>`;
+// the controllers ensure its indexes.
+func (s *Store) keyedCollection(ctx context.Context, dataset string) (anystore.Collection, error) {
+	s.mu.Lock()
+	if coll, ok := s.keyedColls[dataset]; ok {
+		s.mu.Unlock()
+		return coll, nil
+	}
+	s.mu.Unlock()
+	collName := s.spaceId + "_" + dataset
+	coll, err := s.db.Collection(ctx, collName)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.keyedColls[dataset]; ok {
+		return existing, nil
+	}
+	if s.keyedColls == nil {
+		s.keyedColls = make(map[string]anystore.Collection)
+	}
+	s.keyedColls[dataset] = coll
+	return coll, nil
+}
+
 // SharedObjects returns the per-space `objects` collection, opening
 // it on first call. Callers can hit it directly for cross-object
 // queries (find all rows where any.name = X, etc.). First open also
@@ -1526,6 +1560,18 @@ func (s *Store) DataVersionFor(ctx context.Context, dataset string) (string, err
 // collection name — one atomic snapshot load.
 func (s *Store) RuntimeDataset(dataset string) (types.CompiledDataset, bool) {
 	return s.catalog.lookup(dataset)
+}
+
+// IsKeyedDataset reports whether dataset is a shared dataset: its
+// records from every object live in one per-space collection under
+// `<objectId>/<recordId>`, so a read for one object bounds the
+// collection with crdt.KeyedRows.
+func (s *Store) IsKeyedDataset(dataset string) bool {
+	if s == nil {
+		return false
+	}
+	ds, ok := s.catalog.lookup(dataset)
+	return ok && ds.Shared
 }
 
 // DatasetDecl resolves any known dataset's schema declaration:
@@ -1751,6 +1797,7 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	// includes the per-object history collections; the space-level history
 	// leftovers (trace rows, stale-flag row) need their own purge.
 	s.dropObjectCollections(ctx, objectId)
+	s.purgeKeyedRows(ctx, objectId)
 	s.purgeHistoryRows(ctx, objectId)
 	_ = s.unmarkSkipped(ctx, objectId)
 	// A deleted TYPE object must leave the runtime catalog, or its
@@ -1883,6 +1930,7 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 			// refresh below would re-add the deleted type's names.
 			s.dropObjectCollections(ctx, p.id)
 		}
+		s.purgeKeyedRows(ctx, p.id)
 		s.purgeHistoryRows(ctx, p.id)
 		s.Drop(p.id)
 		// See purgeObject: a deleted type object leaves the catalog.
@@ -1899,6 +1947,55 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		}
 	}
 	return nil
+}
+
+// keyedPurgeChunk bounds one delete transaction of purgeKeyedRows.
+const keyedPurgeChunk = 5000
+
+// keyedDatasets lists the shared datasets of the current catalog,
+// sorted.
+func (s *Store) keyedDatasets() []string {
+	snap := s.catalog.snapshot()
+	var names []string
+	for name, ds := range snap.byName {
+		if ds.Shared {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// purgeKeyedRows deletes objectId's rows from the per-space collection
+// of every shared dataset the catalog knows. Best-effort like the
+// collection drops: a failure is logged, and the deletion reconcile
+// purges the object again.
+func (s *Store) purgeKeyedRows(ctx context.Context, objectId string) {
+	for _, dataset := range s.keyedDatasets() {
+		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
+			storeLog.Warn("purge: shared dataset rows",
+				zap.String("treeId", objectId), zap.String("dataset", dataset), zap.Error(err))
+		}
+	}
+}
+
+// deleteKeyedRows removes objectId's rows from one shared dataset's
+// collection — a range of its primary key — in bounded transactions.
+func (s *Store) deleteKeyedRows(ctx context.Context, dataset, objectId string) error {
+	coll, err := s.keyedCollection(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	filter := crdt.KeyedRows(objectId)
+	for {
+		res, err := coll.Find(filter).Limit(keyedPurgeChunk).Delete(ctx)
+		if err != nil {
+			return err
+		}
+		if res.Matched == 0 && res.Modified == 0 {
+			return nil
+		}
+	}
 }
 
 // dropObjectCollections drops every `<objectId>_<dataset>` collection
@@ -2587,6 +2684,13 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	shared := crdt.SharedCollections{}
 	for _, name := range sharedNames {
 		coll, cerr := s.SharedObjects(ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		shared[name] = coll
+	}
+	for _, name := range crdt.KeyedNames(regs) {
+		coll, cerr := s.keyedCollection(ctx, name)
 		if cerr != nil {
 			return nil, cerr
 		}

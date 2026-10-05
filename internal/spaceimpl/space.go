@@ -385,6 +385,9 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
+	if err := s.changeRecordIds(batch.ObjectId, batch.Dataset, change.Records); err != nil {
+		return space.ModifyResult{}, err
+	}
 
 	res, err := s.localWriteRetry(ctx, obj, batch.ObjectId, change)
 	if err != nil {
@@ -446,6 +449,9 @@ func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (s
 
 	change, err := buildChange(batch, dataVersion)
 	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := s.changeRecordIds(batch.ObjectId, batch.Dataset, change.Records); err != nil {
 		return space.ModifyResult{}, err
 	}
 
@@ -512,6 +518,10 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: build: %w", i, err))
 			continue
 		}
+		if err := s.changeRecordIds(objectId, b.Dataset, ch.Records); err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
+			continue
+		}
 		if err := s.checkDatasetMembership(ctx, objectId, b.Dataset); err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
@@ -565,6 +575,9 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 			Ops: []crdt.Op{{Type: crdt.OpDelete}},
 		}
 	}
+	if err := s.changeRecordIds(batch.ObjectId, batch.Dataset, records); err != nil {
+		return space.ModifyResult{}, err
+	}
 	change := crdt.Change{
 		Dataset:     batch.Dataset,
 		DataVersion: dataVersion,
@@ -576,6 +589,26 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 		return space.ModifyResult{}, err
 	}
 	return modifyResultFromWrite(res), nil
+}
+
+// changeRecordIds puts the record ids of a write to a shared dataset
+// in the form a change carries: the plain record id. Reads return such
+// a record as `<objectId>/<recordId>` and a caller may write it back
+// that way; the object's own prefix is dropped here. An id that still
+// holds a "/" names another object's record, or is no id of this
+// dataset at all. A no-op for every other dataset.
+func (s *spaceImpl) changeRecordIds(objectId, dataset string, records []crdt.RecordChange) error {
+	if !s.store.IsKeyedDataset(dataset) {
+		return nil
+	}
+	for i := range records {
+		id := crdt.KeyedRecordId(objectId, records[i].Id)
+		if strings.Contains(id, "/") {
+			return fmt.Errorf("spaceimpl: record %d: %w: %q", i, space.ErrRecordIdOfAnotherObject, records[i].Id)
+		}
+		records[i].Id = id
+	}
+	return nil
 }
 
 // buildChange converts a public space.ModifyBatch into the internal

@@ -177,6 +177,7 @@ Per dataset:
 | `IdRule` | `auto` (zero: ids derived from the change, the empty-id sugar) / `user` (caller ids, pattern + max length constrained) |
 | `DeleteBy` | record-delete gate: `anyone` (zero) / `author` |
 | `SkipHistory` | keep out of the version-history index |
+| `Shared` | every object's records in one collection per space (§ Shared datasets); pinned |
 | `Search` | `{title, text}` field mapping plus an optional `scope` slug (which index scope the entries land under), surfaced as `x-search` for external indexers; SDK-opaque. `text` names one or more field keys, which the indexer joins into one body; on the wire a single key is a bare string, several are an array (a single-element array marshals as the string) |
 
 Declaration well-formedness (`schema.ValidateDatasetDecl`, shared by
@@ -258,7 +259,8 @@ type's parts are CRDT records there:
   mutable.
 - **Head record** (one per dataset; id minted client-side, unique):
   `def:"dataset"`, `key` (slug), `module`, `shared` (the canonical
-  marker), `part` (the owning part record id), `dynamic`, `idRule`/`idPattern`/`idMaxLen`,
+  marker), `perSpace` (a shared dataset), `part` (the owning part
+  record id), `dynamic`, `idRule`/`idPattern`/`idMaxLen`,
   `deleteBy`, `skipHistory`, all pinned first-write; `displayName`,
   `description`, and the `search.title`/`search.text`/`search.scope`
   leaves stay mutable (leaves mutate, a broad `search` replace is
@@ -452,7 +454,55 @@ descriptor).
 management views: definition ids, invalid state, display fields, the
 computed `Collection`, the full value shape, the descriptor.
 
+## Shared datasets
+
+A `records` dataset declared `Shared` keeps the records of every object
+that holds it in one any-store collection per space,
+`<spaceId>_<typeId>_<key>`, where a per-object dataset uses one
+collection per object. Nothing else moves: a record is written on an
+object, through that object's tree, and belongs to that object alone.
+Version ids order changes within one tree, so no record is ever
+written by two objects.
+
+```
+<spaceId>_<typeId>_<key>
+  id         "<objectId>/<recordId>"   primary key
+  _objectId  "<objectId>"              stamped by the Controller
+  <fields…>, _ver, _traces?, _deletedAt?, _addSeq, _applySeq
+```
+
+- **The record id** inside a change is the plain id the dataset's
+  `IdRule` produces, so a peer on an SDK without shared datasets
+  applies the same changes to a per-object collection. The stored
+  document id adds the object's prefix; an object id holds no `/`, so
+  the first one splits.
+- **Reads** return the stored id: `Space.Query(objectId, dataset)`
+  reads the object's rows — a range of the primary key — each with
+  `id = <objectId>/<recordId>` and `_objectId`. Subscription events,
+  `ModifyResult.RecordIds`, rejections and version history carry the
+  same id.
+- **Writes** take the plain record id, or the stored id of the batch's
+  own object. A `/` anywhere else is `ErrRecordIdOfAnotherObject` — a
+  failed call on `Modify` and `Delete`, a per-record rejection on
+  `Upsert`. `Upsert` is keyed by the plain id and reports it.
+- **Handlers** see the record id the change carries.
+- **Object deletion and re-index** delete the object's key range from
+  the collection; deleting the space drops the collection.
+- **`_objectId`** is reserved like every `_` field: input ops cannot
+  write it.
+
+The marker is stored on the head record as `perSpace`. An SDK that
+predates it ignores the leaf and materializes the dataset per object.
+
 ## Limitations
+
+- **A shared dataset is declared shared.** The flag is pinned. Removing
+  a dataset and declaring its key again in the other mode leaves the
+  records a device already materialized where they were.
+- **Rows of a shared dataset are purged through the catalog.** An
+  object's rows are deleted from the shared datasets the catalog knows
+  at that moment; rows of a dataset whose definition was removed stay,
+  as record data does after `RemoveDataset`.
 
 - **No computed fields.** Apply hooks must be replica-deterministic; a
   user-facing expression form is a versioned-determinism problem.

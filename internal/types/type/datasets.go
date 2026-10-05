@@ -81,6 +81,10 @@ const (
 	DefFieldIdMaxLen    = "idMaxLen"    // number (head), pinned
 	DefFieldDeleteBy    = "deleteBy"    // "anyone"/"author" (head), pinned
 	DefFieldSkipHistory = "skipHistory" // bool (head), pinned
+	// DefFieldPerSpace — bool (head), pinned — marks a shared dataset:
+	// its records from every object live in one collection per space.
+	// Records datasets only.
+	DefFieldPerSpace    = "perSpace"
 	DefFieldSearch      = "search"      // {title,text,scope} (head); leaves mutable, text string-or-array
 	DefFieldDisplayName = "displayName" // human label (head), mutable
 	DefFieldDataset     = "dataset"     // owning head record id (field), pinned

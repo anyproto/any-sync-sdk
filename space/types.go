@@ -79,6 +79,11 @@ var ErrDatasetNotDeclared = errors.New("space: dataset is declared by none of th
 // client error → 4xx.
 var ErrRecordIdOfAnotherObject = errors.New("space: record id does not belong to the object")
 
+// ErrDatasetNotShared is returned by a read across objects
+// (QueryDataset / AggregateDataset) of a dataset that is not declared
+// Shared, or that the space does not hold. A client error → 4xx.
+var ErrDatasetNotShared = errors.New("space: dataset is not a shared dataset")
+
 // Scope is the unified write/sync class shared by property definitions
 // and dataset schema fields — how a value is written, which version
 // domain stamps its `_ver` entries, and how far it syncs. A property

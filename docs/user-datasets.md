@@ -486,10 +486,31 @@ written by two objects.
   failed call on `Modify` and `Delete`, a per-record rejection on
   `Upsert`. `Upsert` is keyed by the plain id and reports it.
 - **Handlers** see the record id the change carries.
+- **`space.SharedRecordId` / `space.PlainRecordId`** convert between
+  the two forms.
 - **Object deletion and re-index** delete the object's key range from
   the collection; deleting the space drops the collection.
 - **`_objectId`** is reserved like every `_` field: input ops cannot
   write it.
+
+### Reads across objects
+
+`Space.QueryDataset(dataset)` and `Space.AggregateDataset(dataset,
+pipeline)` read the whole collection: every object's records, with the
+same builders and terminals as `Query` and `Aggregate`.
+
+- **No object is loaded.** The read sees the space's materialized
+  state, as `QueryObjects` does. `Query(objectId, dataset)` loads its
+  object first and stays the read for one known object.
+- **`Subscribe`** delivers the changes of every object's records.
+  Deleting an object arrives as removals of its rows, with no
+  `VersionId`. A subscription without a filter or a sorted limit holds
+  the whole collection in memory.
+- **A dataset that is not shared**, or that the space does not hold,
+  fails the terminal call with `ErrDatasetNotShared`.
+- **Version ids order one object's changes.** Rows of different objects
+  are not ordered by `_ver`; `_applySeq` orders them as this device
+  applied them.
 
 The marker is stored on the head record as `perSpace`. An SDK that
 predates it ignores the leaf and materializes the dataset per object.
@@ -503,7 +524,6 @@ predates it ignores the leaf and materializes the dataset per object.
   object's rows are deleted from the shared datasets the catalog knows
   at that moment; rows of a dataset whose definition was removed stay,
   as record data does after `RemoveDataset`.
-
 - **No computed fields.** Apply hooks must be replica-deterministic; a
   user-facing expression form is a versioned-determinism problem.
   Stamps cover the security-relevant derivations; other derivation
@@ -552,4 +572,6 @@ Bundles().Ensure(ctx, req, space.SystemInstall())   // the consumer's own instal
 
 // data (space.Space), next to Modify/Query
 Upsert(ctx, UpsertBatch) (UpsertResult, error)
+QueryDataset(dataset) Query                 // a shared dataset, every object's records
+AggregateDataset(dataset, pipeline) Agg
 ```

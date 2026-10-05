@@ -240,6 +240,18 @@ func (s *spaceImpl) Query(objectId, dataset string) space.Query {
 	return newQuery(s.store, objectId, dataset)
 }
 
+// QueryDataset builds a chainable query over a shared dataset across
+// every object that holds it.
+func (s *spaceImpl) QueryDataset(dataset string) space.Query {
+	return newDatasetQuery(s.store, dataset)
+}
+
+// AggregateDataset builds an aggregation pipeline over a shared dataset
+// across every object that holds it.
+func (s *spaceImpl) AggregateDataset(dataset string, pipeline any) space.Agg {
+	return newDatasetAgg(s.store, dataset, pipeline)
+}
+
 // QueryObjects builds a chainable query against the per-space
 // `objects` collection — one row per regular object's property
 // values, keyed by objectId.

@@ -622,6 +622,7 @@ Callers use it to:
 ```go
 space.Query(objectId, dataset)   // one object's dataset
 space.QueryObjects()             // the per-space objects collection
+space.QueryDataset(dataset)      // a shared dataset, every object's records
 
 q.Filter(f).Sort(keys...).Limit(n).Offset(n).Projection(opts)
 ```
@@ -635,7 +636,7 @@ Terminals:
 - `Snapshot(ctx, opts)` — `*QueryResult` with an optional total (§13).
 - `Subscribe(ctx, opts)` — the snapshot plus a live `Sub` (§13).
 
-`Filter` accepts whatever `query.ParseCondition` accepts: a built `query.Filter`, a JSON string, or a map with Mongo-style operators. `Sort` accepts `query.ParseSort` input: `"name"`, `"-_ver.id"` for descending, or a built `query.Sort`. Parse errors surface on the first terminal call. `Aggregate` and `AggregateObjects` run aggregation pipelines over the same collections, snapshot only.
+`Filter` accepts whatever `query.ParseCondition` accepts: a built `query.Filter`, a JSON string, or a map with Mongo-style operators. `Sort` accepts `query.ParseSort` input: `"name"`, `"-_ver.id"` for descending, or a built `query.Sort`. Parse errors surface on the first terminal call. `Aggregate`, `AggregateObjects` and `AggregateDataset` run aggregation pipelines over the same collections, snapshot only.
 
 ### 11.1 Projections
 
@@ -703,6 +704,7 @@ Live queries are windowed:
 ```go
 Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
 QueryObjects().Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
+QueryDataset(dataset).Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
 ```
 
 `Subscribe` returns `*QueryResult{Initial, Total, HasNext, Sub}`, where `Sub` is the live `QuerySubscription`. `Snapshot(ctx, opts)` returns the same shape without `Sub`. `QueryOpts.IncludeTotal` requests a one-time count.

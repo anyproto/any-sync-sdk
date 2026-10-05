@@ -500,8 +500,9 @@ at their write boundary.
 
 ### Query API
 
-`Space.Query(objectId, dataset)` and `Space.QueryObjects()` return a
-`space.Query` builder over any-store:
+`Space.Query(objectId, dataset)`, `Space.QueryObjects()` and
+`Space.QueryDataset(dataset)` — a shared dataset across its objects —
+return a `space.Query` builder over any-store:
 
 - `Filter(any)` — a built `query.Filter`, a JSON string or a map with
   Mongo-style operators, parsed eagerly; errors surface on the terminal
@@ -525,8 +526,9 @@ an open question.
 - **Mailbox**: `github.com/cheggaaa/mb/v3` per subscription, capacity
   `MailboxCapacity` (default 256, minimum 16). Consumers read with
   `sub.Events().Wait(ctx)` or `WaitOne(ctx)`.
-- **Scope**: the shared `objects` dataset (`QueryObjects`) or one
-  `(objectId, dataset)`. Members queries do not support `Subscribe`
+- **Scope**: the per-space `objects` dataset (`QueryObjects`), one
+  `(objectId, dataset)`, or a shared dataset across its objects
+  (`QueryDataset`). Members queries do not support `Subscribe`
   (`ErrSubscribeUnsupported`).
 - **Events**: `SubscriptionEvent{VersionId, Added, Updated, Removed}`.
   `Added` / `Updated` are `[]SubRecord{Id, Doc, Ops}`: the full

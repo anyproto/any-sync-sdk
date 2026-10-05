@@ -105,6 +105,15 @@ type Space interface {
 	// `<objectId>/<recordId>` and the object in `_objectId`.
 	Query(objectId, dataset string) Query
 
+	// QueryDataset builds a read query over a shared dataset
+	// (DatasetDraft.Shared) across every object that holds it: one
+	// collection per space, each record with the id
+	// `<objectId>/<recordId>` and its object in `_objectId`. Reads the
+	// space's materialized state without loading any object, like
+	// QueryObjects. A dataset that is not shared fails the terminal
+	// call with ErrDatasetNotShared.
+	QueryDataset(dataset string) Query
+
 	// QueryObjects builds a read query against the per-space `objects`
 	// collection — one row per regular object in the space, holding
 	// computed property values. Use this for cross-object queries
@@ -120,6 +129,11 @@ type Space interface {
 	// key order matters ($sort over several keys) is given as JSON
 	// text or *fastjson.Value. Snapshot-only. See Agg.
 	Aggregate(objectId, dataset string, pipeline any) Agg
+
+	// AggregateDataset builds an aggregation pipeline over a shared
+	// dataset across every object that holds it — the Aggregate of
+	// QueryDataset. See Agg.
+	AggregateDataset(dataset string, pipeline any) Agg
 
 	// AggregateObjects builds an aggregation pipeline against the
 	// per-space `objects` collection — the aggregation sibling of

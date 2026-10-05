@@ -317,7 +317,7 @@ func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crd
 		if !ctrl.IsKeyed(dataset) {
 			continue
 		}
-		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
+		if err := s.deleteKeyedRows(ctx, dataset, objectId, false); err != nil {
 			return fmt.Errorf("spaceobjects: reindex clear %s rows of %s: %w", dataset, objectId, err)
 		}
 	}

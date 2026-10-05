@@ -32,6 +32,9 @@ type aggImpl struct {
 	store    *spaceobjects.Store
 	objectId string
 	dataset  string
+	// allObjects runs over a shared dataset across every object that
+	// holds it (Space.AggregateDataset); objectId is unused.
+	allObjects bool
 
 	// pipeline is the normalized user pipeline (an anyenc array; nil
 	// for an absent/empty pipeline). arena owns the values aggImpl
@@ -54,6 +57,22 @@ func newAgg(store *spaceobjects.Store, objectId, dataset string, pipeline any) *
 	a := &aggImpl{store: store, objectId: objectId, dataset: dataset, arena: &anyenc.Arena{}}
 	a.pipeline, a.parseErr = a.normalizePipeline(pipeline)
 	return a
+}
+
+// newDatasetAgg builds an aggImpl over the per-space collection of a
+// shared dataset — every object's records.
+func newDatasetAgg(store *spaceobjects.Store, dataset string, pipeline any) *aggImpl {
+	a := newAgg(store, "", dataset, pipeline)
+	a.allObjects = true
+	return a
+}
+
+// collection resolves the collection the pipeline runs over.
+func (a *aggImpl) collection(ctx context.Context) (anystore.Collection, error) {
+	if a.allObjects {
+		return resolveDatasetCollection(ctx, a.store, a.dataset)
+	}
+	return resolveCollection(ctx, a.store, a.objectId, a.dataset)
 }
 
 // newSharedAgg builds an aggImpl over the per-space `objects`
@@ -106,7 +125,7 @@ func (a *aggImpl) combined() *anyenc.Value {
 	exists.Set("$exists", a.arena.NewFalse())
 	match := a.arena.NewObject()
 	match.Set(crdt.DeletedAtField, exists)
-	if a.store.IsKeyedDataset(a.dataset) {
+	if !a.allObjects && a.store.IsKeyedDataset(a.dataset) {
 		// A shared dataset's collection holds every object's rows.
 		lo, hi := crdt.KeyedBounds(a.objectId)
 		idRange := a.arena.NewObject()
@@ -181,7 +200,7 @@ func (a *aggImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if a.parseErr != nil {
 		return nil, a.parseErr
 	}
-	coll, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	coll, err := a.collection(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +240,7 @@ func (a *aggImpl) Count(ctx context.Context) (int, error) {
 	if a.parseErr != nil {
 		return 0, a.parseErr
 	}
-	coll, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	coll, err := a.collection(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -238,7 +257,7 @@ func (a *aggImpl) Explain(ctx context.Context) (string, error) {
 	if a.parseErr != nil {
 		return "", a.parseErr
 	}
-	coll, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	coll, err := a.collection(ctx)
 	if err != nil {
 		return "", err
 	}

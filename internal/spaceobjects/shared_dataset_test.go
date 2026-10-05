@@ -4,13 +4,16 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 )
 
@@ -131,6 +134,79 @@ func TestSharedDataset_PurgeDeletesTheObjectsRows(t *testing.T) {
 	// The batch purge takes the same path, and a second purge is a no-op.
 	require.NoError(t, store.PurgeObjects(ctx, []string{"obj2", "obj1"}))
 	assert.Equal(t, []string{"obj10/r1", "obj10/r2"}, collectionIds(t, ctx, coll))
+}
+
+// A purge tells live queries which rows went: the reader across objects
+// and the purged object's own, not another object's.
+func TestSharedDataset_PurgeNotifiesSubscribers(t *testing.T) {
+	ctx, store, samples, _ := sharedDatasetStore(t)
+	for _, objectId := range []string{"obj1", "obj2"} {
+		ctrl, err := store.newController(ctx, objectId)
+		require.NoError(t, err)
+		writeTitle(t, ctx, ctrl, objectId, samples, "r1", "v1", objectId)
+		writeTitle(t, ctx, ctrl, objectId, samples, "r2", "v2", objectId)
+	}
+	coll, ok, err := store.KeyedCollection(ctx, samples)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	subscribeRows := func(scope subscribe.Scope, rows query.Filter) *subscribe.Sub {
+		sub, err := store.engine.Subscribe(subscribe.SubConfig{Scope: scope}, func(yield func(string, *anyenc.Value)) error {
+			iter, err := coll.Find(rows).Iter(ctx)
+			if err != nil {
+				return err
+			}
+			defer iter.Close()
+			for iter.Next() {
+				doc, err := iter.Doc()
+				if err != nil {
+					return err
+				}
+				yield(doc.Value().GetString(crdt.IdField), doc.Value())
+			}
+			return iter.Err()
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sub.Close() })
+		return sub
+	}
+	all := subscribeRows(subscribe.Scope{AllObjects: true, Dataset: samples}, nil)
+	own := subscribeRows(subscribe.Scope{ObjectId: "obj1", Dataset: samples}, crdt.KeyedRows("obj1"))
+	other := subscribeRows(subscribe.Scope{ObjectId: "obj2", Dataset: samples}, crdt.KeyedRows("obj2"))
+
+	require.NoError(t, store.purgeObject(ctx, "obj1"))
+
+	for _, sub := range []*subscribe.Sub{all, own} {
+		waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+		ev, err := sub.Events().WaitOne(waitCtx)
+		cancel()
+		require.NoError(t, err)
+		var removed []string
+		for _, r := range ev.Removed {
+			removed = append(removed, r.Id)
+		}
+		assert.ElementsMatch(t, []string{"obj1/r1", "obj1/r2"}, removed)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err = other.Events().WaitOne(waitCtx)
+	require.Error(t, err, "another object's reader hears nothing")
+}
+
+// KeyedCollection serves a shared dataset only.
+func TestSharedDataset_KeyedCollection(t *testing.T) {
+	ctx, store, samples, notes := sharedDatasetStore(t)
+	coll, ok, err := store.KeyedCollection(ctx, samples)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "spaceA_"+samples, coll.Name())
+
+	for _, dataset := range []string{notes, "unknown", "objects"} {
+		coll, ok, err := store.KeyedCollection(ctx, dataset)
+		require.NoError(t, err, dataset)
+		assert.False(t, ok, dataset)
+		assert.Nil(t, coll, dataset)
+	}
 }
 
 // A re-index wipe clears the object's rows in the shared dataset's

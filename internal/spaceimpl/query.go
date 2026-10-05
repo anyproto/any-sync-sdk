@@ -33,6 +33,9 @@ type queryImpl struct {
 	store    *spaceobjects.Store
 	objectId string
 	dataset  string
+	// allObjects reads a shared dataset across every object that holds
+	// it (Space.QueryDataset); objectId is unused.
+	allObjects bool
 
 	// filter / sort hold the parsed query.Filter / query.Sort. Parse
 	// errors are stashed in parseErr and surfaced on the first
@@ -54,6 +57,26 @@ func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
 		q.filter = crdt.KeyedRows(objectId)
 	}
 	return q
+}
+
+// newDatasetQuery builds a queryImpl over the per-space collection of a
+// shared dataset — every object's records, no object named.
+func newDatasetQuery(store *spaceobjects.Store, dataset string) *queryImpl {
+	return &queryImpl{store: store, dataset: dataset, allObjects: true}
+}
+
+// resolveDatasetCollection resolves the per-space collection of a
+// shared dataset. No object is loaded: the read sees the space's
+// materialized state, as a QueryObjects read does.
+func resolveDatasetCollection(ctx context.Context, store *spaceobjects.Store, dataset string) (anystore.Collection, error) {
+	coll, ok, err := store.KeyedCollection(ctx, dataset)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("query: %w: %q", space.ErrDatasetNotShared, dataset)
+	}
+	return coll, nil
 }
 
 // sharedObjectsDataset is the sentinel dataset name that makes the
@@ -294,9 +317,12 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 
 	// Resolve scope from the original builder shape.
 	var scope subscribe.Scope
-	if q.dataset == sharedObjectsDataset {
+	switch {
+	case q.dataset == sharedObjectsDataset:
 		scope = subscribe.Scope{Shared: true}
-	} else {
+	case q.allObjects:
+		scope = subscribe.Scope{AllObjects: true, Dataset: q.dataset}
+	default:
 		scope = subscribe.Scope{Shared: false, ObjectId: q.objectId, Dataset: q.dataset}
 	}
 
@@ -315,6 +341,10 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	)
 	if scope.Shared {
 		if sharedColl, err = q.store.SharedObjects(ctx); err != nil {
+			return nil, err
+		}
+	} else if scope.AllObjects {
+		if sharedColl, err = resolveDatasetCollection(ctx, q.store, q.dataset); err != nil {
 			return nil, err
 		}
 	} else {
@@ -338,7 +368,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	// resident owner; nil means nothing materialised yet. Safe under
 	// engine.mu: no object load, no DAG apply.
 	collection := func(ctx context.Context) anystore.Collection {
-		if scope.Shared {
+		if scope.Shared || scope.AllObjects {
 			return sharedColl
 		}
 		if obj == nil {
@@ -513,6 +543,9 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 // accessor and isn't worth it — querying a typo dataset name already
 // silently returns empty in any-store too.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
+	if q.allObjects {
+		return resolveDatasetCollection(ctx, q.store, q.dataset)
+	}
 	return resolveCollection(ctx, q.store, q.objectId, q.dataset)
 }
 

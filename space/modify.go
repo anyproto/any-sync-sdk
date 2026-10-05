@@ -2,6 +2,20 @@ package space
 
 import "github.com/anyproto/any-sync-sdk/internal/crdt"
 
+// SharedRecordId is the id a record of a shared dataset
+// (DatasetDraft.Shared) is stored and read under:
+// `<objectId>/<recordId>`.
+func SharedRecordId(objectId, recordId string) string {
+	return crdt.KeyedId(objectId, recordId)
+}
+
+// PlainRecordId is the record id inside id, the stored id of one of
+// objectId's records in a shared dataset: what follows the object's
+// prefix. An id without that prefix is returned as is.
+func PlainRecordId(objectId, id string) string {
+	return crdt.KeyedRecordId(objectId, id)
+}
+
 // ModifyBatch is the caller-facing write batch: one or more record
 // changes in a single dataset of a single object. Applied atomically
 // and returns one VersionId for the whole batch.

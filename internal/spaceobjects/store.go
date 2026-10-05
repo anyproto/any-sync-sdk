@@ -29,6 +29,7 @@ import (
 	anystorev1 "github.com/anyproto/any-store"
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
@@ -1967,30 +1968,71 @@ func (s *Store) keyedDatasets() []string {
 }
 
 // purgeKeyedRows deletes objectId's rows from the per-space collection
-// of every shared dataset the catalog knows. Best-effort like the
-// collection drops: a failure is logged, and the deletion reconcile
-// purges the object again.
+// of every shared dataset and tells live queries which rows went.
+// Best-effort like the rest of the purge: a failure is logged and the
+// rows stay until a later reconcile purges the object again.
 func (s *Store) purgeKeyedRows(ctx context.Context, objectId string) {
 	for _, dataset := range s.keyedDatasets() {
-		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
+		if err := s.deleteKeyedRows(ctx, dataset, objectId, true); err != nil {
 			storeLog.Warn("purge: shared dataset rows",
 				zap.String("treeId", objectId), zap.String("dataset", dataset), zap.Error(err))
 		}
 	}
 }
 
+// keyedChunkIds reads the document ids of the next chunk a
+// deleteKeyedRows transaction removes.
+func keyedChunkIds(ctx context.Context, coll anystore.Collection, rows query.Filter) ([]string, error) {
+	iter, err := coll.Find(rows).Limit(keyedPurgeChunk).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var ids []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, doc.Value().GetString(crdt.IdField))
+	}
+	return ids, iter.Err()
+}
+
+// KeyedCollection returns the per-space collection of the shared
+// dataset: every object's records, each under `<objectId>/<recordId>`.
+// ok is false when dataset is not a shared dataset of this space.
+func (s *Store) KeyedCollection(ctx context.Context, dataset string) (coll anystore.Collection, ok bool, err error) {
+	if !s.IsKeyedDataset(dataset) {
+		return nil, false, nil
+	}
+	coll, err = s.keyedCollection(ctx, dataset)
+	return coll, err == nil, err
+}
+
 // deleteKeyedRows removes objectId's rows from one shared dataset's
 // collection — a range of its primary key — in bounded transactions.
-func (s *Store) deleteKeyedRows(ctx context.Context, dataset, objectId string) error {
+// With notify set, live queries get each chunk's ids as removals once
+// the chunk is gone.
+func (s *Store) deleteKeyedRows(ctx context.Context, dataset, objectId string, notify bool) error {
 	coll, err := s.keyedCollection(ctx, dataset)
 	if err != nil {
 		return err
 	}
 	filter := crdt.KeyedRows(objectId)
 	for {
+		var ids []string
+		if notify && s.engine != nil && s.engine.HasSubscribers() {
+			if ids, err = keyedChunkIds(ctx, coll, filter); err != nil {
+				return err
+			}
+		}
 		res, err := coll.Find(filter).Limit(keyedPurgeChunk).Delete(ctx)
 		if err != nil {
 			return err
+		}
+		if len(ids) > 0 {
+			s.engine.NotifyRecordsDeleted(s.spaceId, dataset, objectId, ids)
 		}
 		if res.Matched == 0 && res.Modified == 0 {
 			return nil

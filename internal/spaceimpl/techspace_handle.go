@@ -142,6 +142,12 @@ func (q failQuery) Subscribe(context.Context, space.QueryOpts) (*space.QueryResu
 	return nil, q.err
 }
 func (t *techSpace) QueryObjects() space.Query { return t.inner.QueryObjects() }
+func (t *techSpace) QueryDataset(dataset string) space.Query {
+	return t.inner.QueryDataset(dataset)
+}
+func (t *techSpace) AggregateDataset(dataset string, pipeline any) space.Agg {
+	return t.inner.AggregateDataset(dataset, pipeline)
+}
 func (t *techSpace) Aggregate(objectId, dataset string, pipeline any) space.Agg {
 	return t.inner.Aggregate(objectId, dataset, pipeline)
 }

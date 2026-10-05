@@ -112,8 +112,9 @@ key = <module canonical>   →  <module canonical>     editor_blocks
 any other key              →  <typeId>_<key>         bafyrei…_segments
 ```
 
-- A draft with no key takes its module's canonical name. `records` has
-  no canonical collection and requires a key.
+- A draft with no key takes its module's canonical name. A module
+  without a canonical collection, `records` among them, requires a key.
+- A `CanonicalOnly` module admits no key but its canonical name.
 - The canonical collection is one name per module per space: every type
   that declares it addresses the same collection, so retyping an object
   between two such types keeps its records. A namespaced dataset
@@ -121,6 +122,10 @@ any other key              →  <typeId>_<key>         bafyrei…_segments
   give two collections; nothing merges.
 - Keys are unique within a type, so a type declares a module's
   canonical dataset at most once.
+- The head record stores the outcome as a pinned marker (`shared`), set
+  exactly when the key is the module's canonical name. The compile
+  resolves the collection from the marker: a stored head keyed by the
+  canonical name without it is namespaced, `<typeId>_<key>`.
 - Namespaced names cannot collide: type ids are content-addressed CIDs
   without `_`, so `<typeId>_<key>` splits at the first `_` and no two
   types can produce the same collection. The catalog needs no
@@ -252,17 +257,15 @@ type's parts are CRDT records there:
   `ui` (an object, created whole) and `uses` (an array of dataset keys)
   mutable.
 - **Head record** (one per dataset; id minted client-side, unique):
-  `def:"dataset"`, `key` (slug), `module`, `part` (the owning
-  part record id), `dynamic`, `idRule`/`idPattern`/`idMaxLen`,
+  `def:"dataset"`, `key` (slug), `module`, `shared` (the canonical
+  marker), `part` (the owning part record id), `dynamic`, `idRule`/`idPattern`/`idMaxLen`,
   `deleteBy`, `skipHistory`, all pinned first-write; `displayName`,
   `description`, and the `search.title`/`search.text`/`search.scope`
   leaves stay mutable (leaves mutate, a broad `search` replace is
   pinned). `title`/`scope` are scalar strings; `text` is a bare field
   key or a non-empty array of unique keys. The head carries
   no `collection`: the collection is computed at compile from the
-  collection rule. A head keyed by its module's canonical name also
-  carries a `shared: true` leaf, which peers on an older SDK read in
-  place of the key.
+  collection rule.
 - **Field record** (one per field of a `records` dataset; id derived
   from the change): `def:"field"`, `dataset` (owning head id), `key`,
   `kind`, `scope`, `stamp`, `required`, `mutableBy`, `items`/`properties`
@@ -315,8 +318,10 @@ flat dataset view of the same fold):
   per key), and a disagreement on a pinned leaf marks the definition
   invalid. This is sound within one tree: orderId values are peer-local
   but their relative order converges;
-- the collection rule decides the collection from the key; an unknown
-  module or a rule violation marks the definition invalid;
+- the collection rule decides the collection from the head's canonical
+  marker; an unknown module or a rule violation marks the definition
+  invalid; a type holding two canonical datasets of one module keeps
+  the smallest `_ver.id` and marks the rest invalid;
 - a module-served dataset carries no fields: field records under it
   are orphans;
 - a `records` fold that fails `ValidateDatasetDecl` is emitted
@@ -330,7 +335,7 @@ evolution is additive-only with pinned behavior:
 
 - Add parts, datasets and fields freely at runtime; edits sync and
   apply like any space data.
-- A part's key; a dataset's key, module and part; a
+- A part's key; a dataset's key, module, canonical marker and part; a
   field's `kind`, `scope`, `stamp`, `required`, `mutableBy`; the id
   rule and the delete gate are pinned for the life of the definition;
   remove and re-add under a new key to change them. A dataset never
@@ -424,7 +429,7 @@ writer per dataset (see the IdRule contract above).
 
 `Space.Datasets()` lists every collection the store hosts. Each
 `DatasetSchema` carries `Owners`, the declaring types: one for a
-registered-type or namespaced dataset, every type sharing the module
+registered-type or namespaced dataset, every type declaring it
 for a canonical collection (empty while nothing declares it), none for
 space-level built-ins; plus `Module`. Consumer indexers
 gate on `Owners` (an object may hold the dataset when it carries one

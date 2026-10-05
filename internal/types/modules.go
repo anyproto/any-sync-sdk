@@ -58,29 +58,47 @@ func CollectionName(typeId, key string) string { return typeId + "_" + key }
 // module has none or is unknown.
 func (m Modules) CanonicalKey(module string) string { return m[module].Canonical }
 
-// Collection applies the collection rule to one declaration. The key
-// decides: a dataset keyed by its module's canonical name is that
+// IsCanonicalKey reports whether key names module's canonical
+// collection — the rule a declaration follows: the key decides.
+func (m Modules) IsCanonicalKey(module, key string) bool {
+	c := m[module].Canonical
+	return c != "" && c == key
+}
+
+// DraftCollection applies the collection rule to a declaration being
+// made: a dataset keyed by its module's canonical name is that
 // collection, any other key is namespaced under the declaring type.
-// The error names the rule the declaration violates.
-func (m Modules) Collection(typeId, key, module string) (string, error) {
+// canonical is what the stored head records.
+func (m Modules) DraftCollection(typeId, key, module string) (name string, canonical bool, err error) {
+	canonical = m.IsCanonicalKey(module, key)
+	name, err = m.Collection(typeId, key, module, canonical)
+	return name, canonical, err
+}
+
+// Collection resolves the collection of one stored declaration.
+// canonical is the head's stored marker: set, the dataset is the
+// module's canonical collection and its key must be that name; unset,
+// it is namespaced under the declaring type, whatever its key. The
+// error names the rule the declaration violates.
+func (m Modules) Collection(typeId, key, module string, canonical bool) (string, error) {
 	mi, ok := m[module]
 	if !ok {
 		return "", fmt.Errorf("%w %q", ErrUnknownModule, module)
 	}
-	if mi.Canonical != "" && key == mi.Canonical {
+	if canonical {
+		if mi.Canonical == "" {
+			return "", fmt.Errorf("%w: module %q has no canonical collection", schema.ErrDecl, module)
+		}
+		if key != mi.Canonical {
+			return "", fmt.Errorf("%w: the canonical %q dataset is keyed %q, got %q", schema.ErrDecl, module, mi.Canonical, key)
+		}
 		return mi.Canonical, nil
 	}
 	if mi.CanonicalOnly {
-		return "", fmt.Errorf("%w: a %q dataset is keyed %q, got %q", schema.ErrDecl, module, mi.Canonical, key)
+		return "", fmt.Errorf("%w: module %q admits only its canonical dataset %q, got key %q", schema.ErrDecl, module, mi.Canonical, key)
 	}
 	if err := schema.ValidateSlug("dataset", key); err != nil {
 		return "", err
 	}
 	return CollectionName(typeId, key), nil
-}
-
-// IsCanonical reports whether collection is module's canonical one.
-func (m Modules) IsCanonical(module, collection string) bool {
-	c := m[module].Canonical
-	return c != "" && c == collection
 }

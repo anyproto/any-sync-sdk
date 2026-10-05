@@ -52,37 +52,43 @@ func TestDraftFieldDecl_CarriesDescriptorSlice(t *testing.T) {
 	assert.Equal(t, schema.KindString, f.Schema.Items.Kind)
 }
 
-// A draft with no key takes its module's canonical name, and the head
-// record of a canonical dataset carries the legacy leaf a peer on an
-// older SDK resolves the collection from. A namespaced head carries
-// none.
-func TestDatasetDraft_CanonicalKeyAndLegacyLeaf(t *testing.T) {
+// A declaration follows its key: with none it takes its module's
+// canonical name. The head record a part writes carries the canonical
+// marker exactly when the key is that name — the compile resolves the
+// collection from the marker.
+func TestPartRecords_CanonicalKeyAndMarker(t *testing.T) {
 	modules := types.NewModules(types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"})
-	arena := &anyenc.Arena{}
-	head := func(draft space.DatasetDraft) (string, *anyenc.Value) {
-		coll, err := normalizeDatasetDraft(modules, "type", &draft)
+	draft := space.PartDraft{Key: "body", Datasets: []space.DatasetDraft{
+		{Module: "editor"},
+		{Module: "editor", Key: "summary"},
+		{Key: "segments"},
+	}}
+	wantColl := []string{"editor_blocks", "type_summary", "type_segments"}
+	for i := range draft.Datasets {
+		coll, err := normalizeDatasetDraft(modules, "type", &draft.Datasets[i])
 		require.NoError(t, err)
-		return coll, encodeDatasetHead(arena, "part", &draft, modules.IsCanonical(draft.Module, draft.Key))
+		assert.Equal(t, wantColl[i], coll)
 	}
 
-	coll, rec := head(space.DatasetDraft{Module: "editor"})
-	assert.Equal(t, "editor_blocks", coll)
-	assert.Equal(t, "editor_blocks", rec.GetString(typetype.FieldKey))
-	assert.True(t, rec.GetBool(typetype.DefFieldLegacyShared))
+	_, recs, err := partRecords(&anyenc.Arena{}, modules, &draft)
+	require.NoError(t, err)
+	marked := map[string]bool{}
+	for _, rec := range recs {
+		head := rec.Ops[0].Payload
+		if head.GetString(typetype.DefFieldDef) != typetype.DefKindDataset {
+			continue
+		}
+		marked[head.GetString(typetype.FieldKey)] = head.GetBool(typetype.DefFieldCanonical)
+	}
+	assert.Equal(t, map[string]bool{"editor_blocks": true, "summary": false, "segments": false}, marked)
 
-	coll, rec = head(space.DatasetDraft{Module: "editor", Key: "editor_blocks"})
-	assert.Equal(t, "editor_blocks", coll)
-	assert.True(t, rec.GetBool(typetype.DefFieldLegacyShared))
+	spelled := space.DatasetDraft{Module: "editor", Key: "editor_blocks"}
+	_, err = normalizeDatasetDraft(modules, "type", &spelled)
+	require.NoError(t, err)
+	_, recs, err = datasetDefRecords(&anyenc.Arena{}, modules, "part", &spelled)
+	require.NoError(t, err)
+	assert.True(t, recs[0].Ops[0].Payload.GetBool(typetype.DefFieldCanonical), "the canonical name spelled out is the canonical dataset")
 
-	coll, rec = head(space.DatasetDraft{Module: "editor", Key: "summary"})
-	assert.Equal(t, "type_summary", coll)
-	assert.Nil(t, rec.Get(typetype.DefFieldLegacyShared))
-
-	coll, rec = head(space.DatasetDraft{Key: "segments"})
-	assert.Equal(t, "type_segments", coll)
-	assert.Equal(t, space.RecordsModule, rec.GetString(typetype.DefFieldModule))
-	assert.Nil(t, rec.Get(typetype.DefFieldLegacyShared))
-
-	_, err := normalizeDatasetDraft(modules, "type", &space.DatasetDraft{})
+	_, err = normalizeDatasetDraft(modules, "type", &space.DatasetDraft{})
 	require.Error(t, err, "records has no canonical collection and needs a key")
 }

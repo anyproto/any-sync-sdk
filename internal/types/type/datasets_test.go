@@ -185,7 +185,7 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		{Type: crdt.OpSet, Path: []string{typetype.FieldKey}, Payload: arena.NewString("renamed")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldDef}, Payload: arena.NewString("field")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldModule}, Payload: arena.NewString("editor")},
-		{Type: crdt.OpSet, Path: []string{typetype.DefFieldLegacyShared}, Payload: arena.NewTrue()},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldCanonical}, Payload: arena.NewTrue()},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldPart}, Payload: arena.NewString("part-2")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldIdRule}, Payload: arena.NewString("user")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldDeleteBy}, Payload: arena.NewString("anyone")},
@@ -619,9 +619,9 @@ func TestCompileDatasetDefs_TombstonesDrop(t *testing.T) {
 
 // Parts fold by key (display from the earlier creation, datasets and
 // uses unioned) and the collection rule places every dataset by its
-// key: the module's canonical name on the canonical collection, any
-// other key under the type; module-served datasets carry no fields;
-// violations of the rule compile invalid.
+// stored canonical marker: a marked head on the module's canonical
+// collection, an unmarked one under the type; module-served datasets
+// carry no fields; violations of the rule compile invalid.
 func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
@@ -629,6 +629,7 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	modules := types.NewModules(
 		types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"},
 		types.ModuleInfo{Name: "chat", Canonical: "chat_messages", CanonicalOnly: true},
+		types.ModuleInfo{Name: "notes", Canonical: "notes_body"},
 	)
 
 	usesA := arena.NewArray()
@@ -644,24 +645,24 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("p3", "cp3", "part-c", true,
 		partPayload(arena, "chat", map[string]any{typetype.FieldName: "Chat"}))))
 
-	// legacyLeaf is the stored leaf a canonical head carries for peers
-	// on an older SDK; the key alone decides the collection.
 	heads := []struct {
 		id, key, module, part string
-		legacyLeaf            bool
+		canonical             bool
 	}{
 		{"h-canonical", "editor_blocks", "editor", "part-a", true},
 		{"h-summary", "summary", "editor", "part-b", false},
-		{"h-badkey", "notes", "editor", "part-a", true}, // the leaf on a non-canonical key
+		{"h-badkey", "notes", "editor", "part-a", true}, // a canonical dataset is keyed by the canonical name
 		{"h-thread", "thread", "chat", "part-c", false}, // chat admits its canonical only
-		{"h-chat", "chat_messages", "chat", "part-c", false},
+		{"h-chat", "chat_messages", "chat", "part-c", true},
 		{"h-unknown", "x", "sketch", "part-a", false}, // no such module
 		{"h-records", "segments", types.RecordsModule, "part-a", false},
+		// The canonical name as the key of an unmarked head: namespaced.
+		{"h-unmarked", "notes_body", "notes", "part-a", false},
 	}
 	for i, h := range heads {
 		extra := map[string]any{typetype.DefFieldModule: h.module, typetype.DefFieldPart: h.part}
-		if h.legacyLeaf {
-			extra[typetype.DefFieldLegacyShared] = true
+		if h.canonical {
+			extra[typetype.DefFieldCanonical] = true
 		}
 		require.NoError(t, ctrl.ApplyChange(ctx, defsChange(crdt.VersionId("h"+string(rune('a'+i))), "ch"+h.id, h.id, true,
 			headPayload(arena, h.key, extra))))
@@ -688,7 +689,7 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 		byKey[ds.Key] = ds
 	}
 	canonical := byKey["editor_blocks"]
-	assert.Equal(t, "editor_blocks", canonical.Name, "the canonical key is the canonical collection")
+	assert.Equal(t, "editor_blocks", canonical.Name, "a marked head is the canonical collection")
 	assert.True(t, canonical.Canonical)
 	assert.False(t, canonical.Invalid)
 	assert.NotEmpty(t, canonical.SchemaRev)
@@ -702,11 +703,16 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	assert.False(t, summary.Canonical)
 	assert.Equal(t, "part-a", summary.PartId, "a head under the losing duplicate attaches to the winner")
 
-	assert.True(t, byKey["notes"].Invalid, "the legacy leaf on a non-canonical key")
+	assert.True(t, byKey["notes"].Invalid, "a marked editor head keyed other than the canonical")
 	assert.True(t, byKey["thread"].Invalid, "namespaced chat is refused")
 	assert.False(t, byKey["chat_messages"].Invalid)
-	assert.Equal(t, "chat_messages", byKey["chat_messages"].Name, "the key decides without the legacy leaf")
+	assert.Equal(t, "chat_messages", byKey["chat_messages"].Name)
 	assert.True(t, byKey["chat_messages"].Canonical)
+
+	unmarked := byKey["notes_body"]
+	assert.False(t, unmarked.Invalid)
+	assert.False(t, unmarked.Canonical)
+	assert.Equal(t, testObjectId+"_notes_body", unmarked.Name, "the marker decides, not the key")
 	assert.True(t, byKey["x"].Invalid)
 	assert.Contains(t, byKey["x"].InvalidReason, "unknown module")
 
@@ -720,17 +726,17 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	for _, ds := range body.Datasets {
 		bodyKeys = append(bodyKeys, ds.Key)
 	}
-	assert.Equal(t, []string{"editor_blocks", "notes", "segments", "summary", "x"}, bodyKeys)
+	assert.Equal(t, []string{"editor_blocks", "notes", "notes_body", "segments", "summary", "x"}, bodyKeys)
 
-	// Two heads of one canonical key that differ only in the legacy
-	// leaf fold valid; the same key under another part folds invalid.
+	// The marker is a pinned leaf: two heads of one key that disagree
+	// on it fold invalid, and so does the same key under another part.
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("h8", "ch8", "h-chat-2", true,
 		headPayload(arena, "chat_messages", map[string]any{
-			typetype.DefFieldModule: "chat", typetype.DefFieldPart: "part-c", typetype.DefFieldLegacyShared: true,
+			typetype.DefFieldModule: "chat", typetype.DefFieldPart: "part-c",
 		}))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("h9", "ch9", "h-canonical-2", true,
 		headPayload(arena, "editor_blocks", map[string]any{
-			typetype.DefFieldModule: "editor", typetype.DefFieldPart: "part-c", typetype.DefFieldLegacyShared: true,
+			typetype.DefFieldModule: "editor", typetype.DefFieldPart: "part-c", typetype.DefFieldCanonical: true,
 		}))))
 	ct, err = types.CompileTypeParts(ctx, db, testObjectId, modules)
 	require.NoError(t, err)
@@ -738,7 +744,7 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	for _, ds := range ct.Datasets {
 		byKey[ds.Key] = ds
 	}
-	assert.False(t, byKey["chat_messages"].Invalid, "the legacy leaf is not a pinned leaf")
+	assert.True(t, byKey["chat_messages"].Invalid, "two heads of one key disagreeing on the marker fold invalid")
 	assert.True(t, byKey["editor_blocks"].Invalid, "two heads of one key disagreeing on the part fold invalid")
 }
 

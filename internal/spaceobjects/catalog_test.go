@@ -53,13 +53,13 @@ func seedDefinitionObject(t *testing.T, ctx context.Context, db anystore.DB, spa
 // never share orderIds). The dataset is a records one keyed dsKey.
 func seedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, verPrefix string) {
 	t.Helper()
-	seedModuleDefs(t, ctx, db, typeId, dsKey, types.RecordsModule, verPrefix)
+	seedModuleDefs(t, ctx, db, typeId, dsKey, types.RecordsModule, false, verPrefix)
 }
 
 // seedModuleDefs declares one part keyed dsKey carrying one dataset
 // keyed dsKey of the given module (a records dataset also gets a
 // `title` field).
-func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, verPrefix string) {
+func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, canonical bool, verPrefix string) {
 	t.Helper()
 	ctrl, err := crdt.NewController(ctx, typeId, db,
 		crdt.HandlerReg{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}},
@@ -82,6 +82,9 @@ func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, d
 	head.Set(typetype.FieldKey, a.NewString(dsKey))
 	head.Set(typetype.DefFieldModule, a.NewString(module))
 	head.Set(typetype.DefFieldPart, a.NewString(partId))
+	if canonical {
+		head.Set(typetype.DefFieldCanonical, a.NewTrue())
+	}
 	if module == types.RecordsModule {
 		head.Set(typetype.DefFieldIdRule, a.NewString("user"))
 	}
@@ -438,8 +441,8 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 	// instance.
 	seedTypeObject(t, ctx, db, "spaceA", "type-a")
 	seedTypeObject(t, ctx, db, "spaceA", "type-b")
-	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", "a")
-	seedModuleDefs(t, ctx, db, "type-b", "notes", "blocks", "b")
+	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", true, "a")
+	seedModuleDefs(t, ctx, db, "type-b", "notes", "blocks", false, "b")
 	store.refreshType(ctx, "type-a")
 	store.refreshType(ctx, "type-b")
 

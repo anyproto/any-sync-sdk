@@ -51,8 +51,8 @@ const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 // v3: field records carry an opaque `x-format` (an object, created
 // whole, mutable); head records carry none.
 // v4: parts. A head is keyed (`key`, pinned) and bound to a part and a
-// module (`part`, `module`, pinned); the `collection` field is gone —
-// the collection is computed at compile from the key.
+// module (`part`, `module`, `shared`, pinned); the `collection` field
+// is gone — the collection is computed at compile.
 const DatasetDefsLocalVersion = 4
 
 // Discriminator values of the pinned `def` field.
@@ -70,23 +70,23 @@ const (
 const (
 	DefFieldDef    = "def"    // discriminator, pinned
 	DefFieldModule = "module" // module slug (head), pinned
-	// DefFieldLegacyShared is written on a head whose key names its
-	// module's canonical collection. The key decides the collection;
-	// the leaf serves peers on an older SDK, which read it instead.
-	DefFieldLegacyShared = "shared"
-	DefFieldPart         = "part"        // owning part record id (head), pinned
-	DefFieldDynamic      = "dynamic"     // bool (head), pinned
-	DefFieldIdRule       = "idRule"      // "auto"/"user" (head), pinned ("id" is a reserved head)
-	DefFieldIdPattern    = "idPattern"   // RE2 (head), pinned
-	DefFieldIdMaxLen     = "idMaxLen"    // number (head), pinned
-	DefFieldDeleteBy     = "deleteBy"    // "anyone"/"author" (head), pinned
-	DefFieldSkipHistory  = "skipHistory" // bool (head), pinned
-	DefFieldSearch       = "search"      // {title,text,scope} (head); leaves mutable, text string-or-array
-	DefFieldDisplayName  = "displayName" // human label (head), mutable
-	DefFieldDataset      = "dataset"     // owning head record id (field), pinned
-	DefFieldStamp        = "stamp"       // "creator"/"createTime"/"modifyTime" (field), pinned
-	DefFieldRequired     = "required"    // bool (field), pinned
-	DefFieldMutableBy    = "mutableBy"   // "never"/"author"/"any" (field), pinned
+	// DefFieldCanonical — bool (head), pinned — marks the dataset as its
+	// module's canonical collection. Stored as `shared`. A declaration
+	// sets it exactly when its key is the module's canonical name.
+	DefFieldCanonical   = "shared"
+	DefFieldPart        = "part"        // owning part record id (head), pinned
+	DefFieldDynamic     = "dynamic"     // bool (head), pinned
+	DefFieldIdRule      = "idRule"      // "auto"/"user" (head), pinned ("id" is a reserved head)
+	DefFieldIdPattern   = "idPattern"   // RE2 (head), pinned
+	DefFieldIdMaxLen    = "idMaxLen"    // number (head), pinned
+	DefFieldDeleteBy    = "deleteBy"    // "anyone"/"author" (head), pinned
+	DefFieldSkipHistory = "skipHistory" // bool (head), pinned
+	DefFieldSearch      = "search"      // {title,text,scope} (head); leaves mutable, text string-or-array
+	DefFieldDisplayName = "displayName" // human label (head), mutable
+	DefFieldDataset     = "dataset"     // owning head record id (field), pinned
+	DefFieldStamp       = "stamp"       // "creator"/"createTime"/"modifyTime" (field), pinned
+	DefFieldRequired    = "required"    // bool (field), pinned
+	DefFieldMutableBy   = "mutableBy"   // "never"/"author"/"any" (field), pinned
 )
 
 // Part record fields — the display slice a client renders. All mutable;
@@ -272,12 +272,12 @@ func validatePartCreate(ops []crdt.Op) error {
 }
 
 // validateHeadCreate checks a dataset head record: a slug key (a
-// module's canonical collection name is a slug too), the module and
-// part references, parseable behavioral labels, and no `x-format` — the
-// descriptor is a field-record member. Module existence and the
-// collection rule are compile-time facts (the handler cannot see the
-// module catalog, and a peer without the module still stores the
-// declaration).
+// canonical dataset's key is its module's canonical name, which is a
+// slug too), the module and part references, parseable behavioral
+// labels, and no `x-format` — the descriptor is a field-record member.
+// Module existence and the collection rule are compile-time facts (the
+// handler cannot see the module catalog, and a peer without the module
+// still stores the declaration).
 func validateHeadCreate(ops []crdt.Op) error {
 	key, _ := extractField(ops, FieldKey)
 	if err := ValidateKey("dataset", key); err != nil {

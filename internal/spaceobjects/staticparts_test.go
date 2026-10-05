@@ -14,9 +14,9 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types"
 )
 
-// docType is a registered type with static parts: a shared module
-// body, a namespaced module instance and a static records dataset
-// under a hidden part.
+// docType is a registered type with static parts: the module's
+// canonical body, a namespaced module instance and a static records
+// dataset under a hidden part.
 func docType() handler.Type {
 	return handler.Type{
 		Id:     "doc",
@@ -105,13 +105,19 @@ func TestValidateExternalModules_StaticPartsAndReserved(t *testing.T) {
 		{"unkeyed without canonical", []handler.Type{{Id: "t", Parts: []handler.Part{{Key: "p",
 			Datasets: []handler.PartDataset{{Module: "plain"}}}}}}, []handler.Module{noCanonical}, "key must be non-empty"},
 		{"canonical-only with another key", []handler.Type{{Id: "t", Parts: []handler.Part{{Key: "p",
-			Datasets: []handler.PartDataset{{Module: "secret", Key: "thread"}}}}}}, []handler.Module{reserved}, `is keyed "secret_shared"`},
+			Datasets: []handler.PartDataset{{Module: "secret", Key: "thread"}}}}}}, []handler.Module{reserved}, `admits only its canonical dataset "secret_shared"`},
 		{"instance without data version", []handler.Type{{Id: "t", Parts: []handler.Part{{Key: "p",
 			Datasets: []handler.PartDataset{{Module: "plain", Key: "notes"}}}}}}, []handler.Module{noCanonical}, "needs a DataVersion"},
 		{"instance collides with a registered dataset", []handler.Type{
 			{Id: "t", Parts: []handler.Part{{Key: "p", Datasets: []handler.PartDataset{{Module: "blocks", Key: "notes"}}}}},
 			{Id: "u", Datasets: []handler.Dataset{{Name: "t_notes", DataVersion: "v", Handler: crdt.DefaultHandler{}}}},
 		}, []handler.Module{testModule()}, "already registered"},
+		// The key decides, not the minted name: a namespaced instance
+		// whose name spells the module's canonical collection collides
+		// with it.
+		{"instance name spells the canonical", []handler.Type{
+			{Id: "blocks", Parts: []handler.Part{{Key: "p", Datasets: []handler.PartDataset{{Module: "body", Key: "shared"}}}}},
+		}, []handler.Module{canonicalNamed("body", "blocks_shared")}, "already registered"},
 		// The canonical dataset declared twice collides on its key,
 		// spelled or defaulted — the same verdict a runtime declaration
 		// gets.
@@ -154,7 +160,7 @@ func TestCatalog_StaticParts(t *testing.T) {
 	// Ownership before any runtime type exists.
 	owners, gated := store.DatasetOwners("blocks_shared")
 	require.True(t, gated)
-	assert.Equal(t, []string{"doc"}, owners, "a static shared declaration owns the canonical collection")
+	assert.Equal(t, []string{"doc"}, owners, "a static canonical declaration owns the canonical collection")
 	owners, gated = store.DatasetOwners("doc_summary")
 	require.True(t, gated)
 	assert.Equal(t, []string{"doc"}, owners)
@@ -200,7 +206,7 @@ func TestCatalog_StaticParts(t *testing.T) {
 	// A runtime type declaring the canonical dataset joins the static
 	// owner; a refresh never drops the static one.
 	seedTypeObject(t, ctx, db, "spaceA", "type-a")
-	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", "a")
+	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", true, "a")
 	store.refreshType(ctx, "type-a")
 	owners, _ = store.DatasetOwners("blocks_shared")
 	assert.Equal(t, []string{"doc", "type-a"}, owners)
@@ -273,4 +279,13 @@ func TestStaticTypeParts_ImplicitParts(t *testing.T) {
 	assert.Equal(t, "credits", ct.Parts[1].Key)
 	assert.Equal(t, types.RecordsModule, ct.Parts[1].Datasets[0].Module)
 	assert.True(t, ct.Parts[1].Datasets[0].Schema.Dynamic)
+}
+
+// canonicalNamed is testModule under another name and canonical
+// collection.
+func canonicalNamed(name, canonical string) handler.Module {
+	m := testModule()
+	m.Name = name
+	m.Canonical = canonical
+	return m
 }

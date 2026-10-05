@@ -19,15 +19,16 @@ import (
 // object's `datasets` records.
 type CompiledDataset struct {
 	// Name is the dataset's collection name — the module's canonical
-	// collection when the key names it, `<typeId>_<key>` otherwise.
+	// collection for a canonical dataset, `<typeId>_<key>` otherwise.
 	Name string
-	// Key is the dataset's slug inside its type.
+	// Key is the dataset's slug inside its type; for a canonical
+	// dataset it equals the canonical collection name.
 	Key string
 	// Module is the module serving the dataset (`records` for the
 	// generic schema-enforced kind).
 	Module string
-	// Canonical marks a dataset whose collection is its module's
-	// canonical one.
+	// Canonical is the head's stored marker: the dataset is its
+	// module's canonical collection instead of a namespaced one.
 	Canonical bool
 	// PartId is the owning part record's id.
 	PartId string
@@ -240,15 +241,14 @@ type headRec struct {
 	created string // creation _ver.id, the dedup tiebreak
 	key     string
 	module  string
-	// legacyShared is the stored `shared` leaf peers on an older SDK
-	// read; it must agree with the key.
-	legacyShared bool
-	partId       string
-	ds           schema.Dataset
-	skip         bool
-	search       *schema.SearchFields
-	display      string
-	descr        string
+	// canonical is the stored marker (DefFieldCanonical).
+	canonical bool
+	partId    string
+	ds        schema.Dataset
+	skip      bool
+	search    *schema.SearchFields
+	display   string
+	descr     string
 }
 
 type fieldRec struct {
@@ -273,8 +273,8 @@ type partRec struct {
 // pinnedLeaves are the head fields two concurrent declarations of one
 // key must agree on; a disagreement marks the definition invalid.
 func (h *headRec) pinnedLeaves() string {
-	return fmt.Sprintf("%s|%s|%t|%s|%s|%d|%s|%t",
-		h.module, h.partId, h.ds.Dynamic, h.ds.IdRule, h.ds.IdPattern, h.ds.IdMaxLen, h.ds.DeleteBy, h.skip)
+	return fmt.Sprintf("%s|%t|%s|%t|%s|%s|%d|%s|%t",
+		h.module, h.canonical, h.partId, h.ds.Dynamic, h.ds.IdRule, h.ds.IdPattern, h.ds.IdMaxLen, h.ds.DeleteBy, h.skip)
 }
 
 // CompileTypeParts folds a type object's `datasets` records into parts
@@ -295,8 +295,10 @@ func (h *headRec) pinnedLeaves() string {
 //     peer-local but their relative order converges, so every replica
 //     picks the same winner;
 //   - the collection rule (Modules.Collection) decides the collection
-//     from the key; an unknown module or a rule violation marks the
-//     definition invalid;
+//     from the head's stored canonical marker; an unknown module or a
+//     rule violation marks the definition invalid; a type holding two
+//     canonical datasets of one module keeps the smallest `_ver.id` and
+//     marks the rest invalid;
 //   - a module-served dataset carries no fields (the module owns the
 //     schema): field records under it are orphans;
 //   - a `records` dataset whose folded declaration fails
@@ -373,14 +375,15 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 				created: created,
 				key:     key,
 				module:  v.GetString("module"),
-				partId:  v.GetString("part"),
-				display: v.GetString("displayName"),
-				descr:   v.GetString("description"),
+				// The canonical marker is stored under `shared`.
+				canonical: v.GetBool("shared"),
+				partId:    v.GetString("part"),
+				display:   v.GetString("displayName"),
+				descr:     v.GetString("description"),
 			}
 			if h.module == "" {
 				h.module = RecordsModule
 			}
-			h.legacyShared = v.GetBool("shared")
 			h.ds.Dynamic = v.GetBool("dynamic")
 			h.skip = v.GetBool("skipHistory")
 			if rule, ok := schema.ParseIdRule(v.GetString("idRule")); ok {
@@ -496,10 +499,22 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 		}
 	}
 
+	// One canonical dataset per module per type: the group with the
+	// smallest winner creation keeps it.
+	canonicalKeep := make(map[string]string) // module → dataset key
+	canonicalCreated := make(map[string]string)
 	keys := make([]string, 0, len(groups))
 	for key, hs := range groups {
 		keys = append(keys, key)
 		sort.Slice(hs, func(i, j int) bool { return hs[i].created < hs[j].created })
+		w := hs[0]
+		if !w.canonical {
+			continue
+		}
+		if prev, taken := canonicalKeep[w.module]; !taken || w.created < canonicalCreated[w.module] || (w.created == canonicalCreated[w.module] && key < prev) {
+			canonicalKeep[w.module] = key
+			canonicalCreated[w.module] = w.created
+		}
 	}
 	sort.Strings(keys)
 
@@ -511,6 +526,7 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 		compiled := CompiledDataset{
 			Key:         key,
 			Module:      w.module,
+			Canonical:   w.canonical,
 			PartId:      w.partId,
 			DefId:       w.id,
 			TypeId:      typeId,
@@ -530,25 +546,17 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 				break
 			}
 		}
-		name, cerr := modules.Collection(typeId, key, w.module)
+		name, cerr := modules.Collection(typeId, key, w.module, w.canonical)
 		if cerr != nil && !compiled.Invalid {
 			invalid(cerr.Error())
 		}
 		if cerr == nil {
 			compiled.Name = name
-			compiled.Canonical = modules.IsCanonical(w.module, name)
 		} else {
 			compiled.Name = CollectionName(typeId, key)
 		}
-		// A peer on an older SDK takes the collection from the stored
-		// leaf, so a leaf on a non-canonical key must stay invalid here.
-		if !compiled.Canonical && !compiled.Invalid {
-			for _, h := range hs {
-				if h.legacyShared {
-					invalid(fmt.Sprintf("dataset %q carries the legacy shared leaf on a non-canonical key", key))
-					break
-				}
-			}
+		if w.canonical && canonicalKeep[w.module] != key && !compiled.Invalid {
+			invalid(fmt.Sprintf("type already declares the canonical %q dataset (%q)", w.module, canonicalKeep[w.module]))
 		}
 
 		if w.module == RecordsModule {

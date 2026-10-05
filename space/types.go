@@ -327,8 +327,8 @@ type DatasetDraft struct {
 	// name is that collection, the one every type declaring it
 	// addresses, so retyping an object keeps its records. Any other
 	// key is the collection `<typeId>_<key>`, this type's own. Empty
-	// defaults to the module's canonical name; records has none and
-	// requires a key.
+	// defaults to the module's canonical name; a module without one,
+	// records among them, requires a key.
 	Key string
 	// Module is the serving module — "records" (the default when
 	// empty), or a registered module such as "editor" / "chat".

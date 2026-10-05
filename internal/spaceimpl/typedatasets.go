@@ -110,7 +110,8 @@ func normalizeDatasetDraft(modules types.Modules, typeId string, draft *space.Da
 	if draft.Key == "" {
 		draft.Key = modules.CanonicalKey(draft.Module)
 	}
-	return modules.Collection(typeId, draft.Key, draft.Module)
+	name, _, err := modules.DraftCollection(typeId, draft.Key, draft.Module)
+	return name, err
 }
 
 // checkReservedModule refuses a runtime draft naming a reserved module
@@ -213,8 +214,8 @@ func encodePart(arena *anyenc.Arena, draft *space.PartDraft) (*anyenc.Value, err
 }
 
 // encodeDatasetHead builds the head record payload from a draft.
-// canonical writes the legacy `shared` leaf: a peer on an older SDK
-// takes the collection from it, not from the key.
+// canonical sets the stored marker the compile resolves the collection
+// from.
 func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetDraft, canonical bool) *anyenc.Value {
 	payload := arena.NewObject()
 	payload.Set(typetype.DefFieldDef, arena.NewString(typetype.DefKindDataset))
@@ -222,7 +223,7 @@ func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetD
 	payload.Set(typetype.DefFieldModule, arena.NewString(draft.Module))
 	payload.Set(typetype.DefFieldPart, arena.NewString(partId))
 	if canonical {
-		payload.Set(typetype.DefFieldLegacyShared, arena.NewTrue())
+		payload.Set(typetype.DefFieldCanonical, arena.NewTrue())
 	}
 	if draft.Dynamic {
 		payload.Set(typetype.DefFieldDynamic, arena.NewTrue())
@@ -440,7 +441,7 @@ func datasetDefRecords(arena *anyenc.Arena, modules types.Modules, partId string
 	recs = append(recs, crdt.RecordChange{
 		Id:     headId,
 		Upsert: true,
-		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, partId, draft, modules.IsCanonical(draft.Module, draft.Key))}},
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, partId, draft, modules.IsCanonicalKey(draft.Module, draft.Key))}},
 	})
 	for i := range decl.Fields {
 		payload, err := encodeDatasetField(arena, headId, &decl.Fields[i])

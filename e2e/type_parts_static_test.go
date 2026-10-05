@@ -93,7 +93,7 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 		return err
 	}
 	err = openWithPart(handler.Part{Key: "extra", Datasets: []handler.PartDataset{{Module: "secret", Key: "other"}}})
-	require.ErrorContains(t, err, `a "secret" dataset is keyed "secret_inbox", got "other"`,
+	require.ErrorContains(t, err, `module "secret" admits only its canonical dataset "secret_inbox", got key "other"`,
 		"a canonical-only module refuses a non-canonical key in a static part")
 	err = openWithPart(handler.Part{Key: "extra", Datasets: []handler.PartDataset{{Module: "notes", Key: "notes_body"}}})
 	require.ErrorContains(t, err, `duplicate dataset key "notes_body"`,
@@ -217,14 +217,14 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	// collection rule, on a runtime part and on the consumer's own
 	// install, where the reservation does not apply.
 	_, err = sp.Types().AddPart(ctx, userType, space.PartDraft{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret", Key: "other"}}})
-	require.ErrorContains(t, err, `a "secret" dataset is keyed "secret_inbox", got "other"`,
+	require.ErrorContains(t, err, `module "secret" admits only its canonical dataset "secret_inbox", got key "other"`,
 		"a canonical-only module refuses a non-canonical key in a runtime declaration")
 	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "room/v1", DerivedRoot: true, Hidden: true,
 		Parts: []space.PartDraft{{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret", Key: "other"}}}},
 	}, space.SystemInstall())
 	require.ErrorIs(t, err, space.ErrBundleBadRequest)
-	require.ErrorContains(t, err, `a "secret" dataset is keyed "secret_inbox", got "other"`,
+	require.ErrorContains(t, err, `module "secret" admits only its canonical dataset "secret_inbox", got key "other"`,
 		"the consumer's own install of a canonical-only module still needs the canonical key")
 	_, err = sp.Bundles().Get(ctx, "room/v1")
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "a refused install leaves nothing behind")

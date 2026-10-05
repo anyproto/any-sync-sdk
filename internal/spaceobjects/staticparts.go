@@ -107,7 +107,7 @@ func staticModuleDatasets(t handler.Type, modules types.Modules) ([]staticModule
 			if key == "" {
 				key = modules.CanonicalKey(d.Module)
 			}
-			coll, err := modules.Collection(t.Id, key, d.Module)
+			coll, canonical, err := modules.DraftCollection(t.Id, key, d.Module)
 			if err != nil {
 				return nil, fmt.Errorf("type %q part %q: %w", t.Id, p.Key, err)
 			}
@@ -116,7 +116,7 @@ func staticModuleDatasets(t handler.Type, modules types.Modules) ([]staticModule
 			}
 			keys[key] = struct{}{}
 			out = append(out, staticModuleDataset{
-				typeId: t.Id, partKey: p.Key, module: d.Module, canonical: modules.IsCanonical(d.Module, coll), key: key, collection: coll,
+				typeId: t.Id, partKey: p.Key, module: d.Module, canonical: canonical, key: key, collection: coll,
 			})
 		}
 	}

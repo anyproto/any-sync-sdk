@@ -3,10 +3,13 @@ package spaceimpl
 import (
 	"testing"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/schema"
+	"github.com/anyproto/any-sync-sdk/internal/types"
+	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -47,4 +50,39 @@ func TestDraftFieldDecl_CarriesDescriptorSlice(t *testing.T) {
 	assert.Equal(t, "choice", f.XFormat["type"])
 	require.NotNil(t, f.Schema.Items)
 	assert.Equal(t, schema.KindString, f.Schema.Items.Kind)
+}
+
+// A draft with no key takes its module's canonical name, and the head
+// record of a canonical dataset carries the legacy leaf a peer on an
+// older SDK resolves the collection from. A namespaced head carries
+// none.
+func TestDatasetDraft_CanonicalKeyAndLegacyLeaf(t *testing.T) {
+	modules := types.NewModules(types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"})
+	arena := &anyenc.Arena{}
+	head := func(draft space.DatasetDraft) (string, *anyenc.Value) {
+		coll, err := normalizeDatasetDraft(modules, "type", &draft)
+		require.NoError(t, err)
+		return coll, encodeDatasetHead(arena, "part", &draft, modules.IsCanonical(draft.Module, draft.Key))
+	}
+
+	coll, rec := head(space.DatasetDraft{Module: "editor"})
+	assert.Equal(t, "editor_blocks", coll)
+	assert.Equal(t, "editor_blocks", rec.GetString(typetype.FieldKey))
+	assert.True(t, rec.GetBool(typetype.DefFieldLegacyShared))
+
+	coll, rec = head(space.DatasetDraft{Module: "editor", Key: "editor_blocks"})
+	assert.Equal(t, "editor_blocks", coll)
+	assert.True(t, rec.GetBool(typetype.DefFieldLegacyShared))
+
+	coll, rec = head(space.DatasetDraft{Module: "editor", Key: "summary"})
+	assert.Equal(t, "type_summary", coll)
+	assert.Nil(t, rec.Get(typetype.DefFieldLegacyShared))
+
+	coll, rec = head(space.DatasetDraft{Key: "segments"})
+	assert.Equal(t, "type_segments", coll)
+	assert.Equal(t, space.RecordsModule, rec.GetString(typetype.DefFieldModule))
+	assert.Nil(t, rec.Get(typetype.DefFieldLegacyShared))
+
+	_, err := normalizeDatasetDraft(modules, "type", &space.DatasetDraft{})
+	require.Error(t, err, "records has no canonical collection and needs a key")
 }

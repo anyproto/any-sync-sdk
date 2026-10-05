@@ -185,8 +185,8 @@ type TypesAPI interface {
 	// RemovePart tombstones a part and every dataset declared under it.
 	// Record data is NOT cleaned up (the RemoveProperty stance);
 	// subsequent writes to the datasets drop once peers apply the
-	// removal, and a shared dataset's removal only withdraws this
-	// type's ownership of the canonical collection.
+	// removal, and removing a module's canonical dataset only withdraws
+	// this type's ownership of that collection.
 	RemovePart(ctx context.Context, typeId, partId string) error
 
 	// Datasets returns the type's dataset definitions across every part
@@ -197,8 +197,8 @@ type TypesAPI interface {
 	// syncs like any space data; peers register the dataset (the
 	// generic schema handler for records, the module's handler
 	// otherwise) as it applies. Returns the definition's stable id.
-	// Behavioral parts of the declaration (key, module, shared, id
-	// rule, delete gate, field kinds/flags) are pinned — remove and
+	// Behavioral parts of the declaration (key, module, id rule,
+	// delete gate, field kinds/flags) are pinned — remove and
 	// re-add to change them; display parts patch via PatchDataset.
 	AddDataset(ctx context.Context, typeId, partId string, draft DatasetDraft) (datasetDefId string, err error)
 
@@ -316,26 +316,23 @@ const (
 )
 
 // RecordsModule is the built-in generic module: a schema-enforced
-// dataset with no shared collection, always namespaced.
+// dataset with no canonical collection, always namespaced.
 const RecordsModule = "records"
 
 // DatasetDraft is the input to TypesAPI.AddDataset (and PartDraft's
 // Datasets).
 type DatasetDraft struct {
-	// Key is the dataset's slug inside its type — pinned. Namespaced
-	// datasets live in the collection `<typeId>_<key>`; a shared
-	// dataset's key is its module's canonical collection name and may
-	// be left empty to default to it.
+	// Key is the dataset's slug inside its type — pinned — and decides
+	// the collection. A key equal to the module's canonical collection
+	// name is that collection, the one every type declaring it
+	// addresses, so retyping an object keeps its records. Any other
+	// key is the collection `<typeId>_<key>`, this type's own. Empty
+	// defaults to the module's canonical name; records has none and
+	// requires a key.
 	Key string
 	// Module is the serving module — "records" (the default when
 	// empty), or a registered module such as "editor" / "chat".
 	Module string
-	// Shared makes the type participate in the module's canonical
-	// collection instead of a namespaced one: two types sharing the
-	// editor give an object carrying both a single body. Legal only
-	// for modules with a canonical collection; at most one shared
-	// dataset per module per type. Never for records.
-	Shared bool
 
 	DisplayName string
 	Description string
@@ -400,12 +397,12 @@ type DatasetFieldDraft struct {
 type DatasetDef struct {
 	Id string // head record id, immutable
 	// Key is the slug inside the type; Collection the name reads and
-	// writes address (the module's canonical collection when Shared,
-	// `<typeId>_<key>` otherwise) — server-computed, never client-set.
+	// writes address (the module's canonical collection when the key
+	// names it, `<typeId>_<key>` otherwise) — server-computed, never
+	// client-set.
 	Key        string
 	Collection string
 	Module     string
-	Shared     bool
 	// PartId is the owning part's id.
 	PartId      string
 	DisplayName string

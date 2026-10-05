@@ -181,8 +181,8 @@ type Store struct {
 
 	// modules are the caller-registered dataset modules by name;
 	// moduleInfos is the compile-time catalog (records included).
-	// canonicalRegs are the shared canonical collections' registrations
-	// — identical on every controller, built once; canonicalModule maps
+	// canonicalRegs are the canonical collections' registrations —
+	// identical on every controller, built once; canonicalModule maps
 	// each canonical collection back to its module. modulesTracked
 	// reports that some module instance opts into read tracking, which
 	// is what constructs the read-state engine when no static dataset
@@ -193,14 +193,14 @@ type Store struct {
 	canonicalModule map[string]string
 	modulesTracked  bool
 
-	// Static parts (handler.Type.Parts): a registered type's shared
+	// Static parts (handler.Type.Parts): a registered type's canonical
 	// module datasets seed the canonical collections' owner sets
-	// (staticSharedOwners) and the module namespaces (staticModuleOwners)
+	// (staticCanonicalOwners) and the module namespaces (staticModuleOwners)
 	// of every catalog snapshot; its namespaced module datasets are
 	// registrations built once here (staticInstanceRegs, module by
 	// collection in staticInstanceModule), owned through datasetOwners.
-	staticSharedOwners map[string]map[string]struct{}
-	staticModuleOwners map[string]map[string]struct{}
+	staticCanonicalOwners map[string]map[string]struct{}
+	staticModuleOwners    map[string]map[string]struct{}
 	// reservedModules are the configured modules with Reserved set —
 	// the one-branch fast path of ReservedCarrier when there are none.
 	reservedModules      []string
@@ -521,9 +521,9 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	infos := make([]types.ModuleInfo, 0, len(cfg.Modules))
 	for _, m := range cfg.Modules {
 		s.modules[m.Name] = m
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly, Reserved: m.Reserved})
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
 		if m.Canonical != "" {
-			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Shared: true})
+			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true})
 			if err != nil {
 				// ValidateExternalModules probes the same construction;
 				// a failure here is a programming error, not a runtime
@@ -538,7 +538,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 				s.modulesTracked = true
 			}
 		}
-		if !m.SharedOnly {
+		if !m.CanonicalOnly {
 			probe := m.New(handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"})
 			if probe.ReadTracking != nil {
 				s.modulesTracked = true
@@ -552,10 +552,10 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	// Static parts: a registered type's module datasets are ownership
-	// (shared) or registrations (namespaced), settled once here — the
+	// (canonical) or registrations (namespaced), settled once here — the
 	// same footing a runtime declaration reaches through the catalog.
 	// ValidateExternalModules has already refused what cannot resolve.
-	s.staticSharedOwners = map[string]map[string]struct{}{}
+	s.staticCanonicalOwners = map[string]map[string]struct{}{}
 	s.staticModuleOwners = map[string]map[string]struct{}{}
 	s.staticInstanceModule = map[string]string{}
 	own := func(set map[string]map[string]struct{}, key, typeId string) {
@@ -574,8 +574,8 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 		for _, md := range mods {
 			own(s.staticModuleOwners, md.module, t.Id)
-			if md.shared {
-				own(s.staticSharedOwners, md.collection, t.Id)
+			if md.canonical {
+				own(s.staticCanonicalOwners, md.collection, t.Id)
 				continue
 			}
 			m := s.modules[md.module]
@@ -927,14 +927,14 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 		if m.New == nil {
 			return fmt.Errorf("spaceobjects: module[%d] (%q): New is required", i, m.Name)
 		}
-		if m.SharedOnly && m.Canonical == "" {
-			return fmt.Errorf("spaceobjects: module[%d] (%q): SharedOnly requires Canonical", i, m.Name)
+		if m.CanonicalOnly && m.Canonical == "" {
+			return fmt.Errorf("spaceobjects: module[%d] (%q): CanonicalOnly requires Canonical", i, m.Name)
 		}
-		if m.Reserved && !m.SharedOnly {
+		if m.Reserved && !m.CanonicalOnly {
 			// A namespaced instance of a reserved module would be a
 			// per-type collection nobody but the consumer may declare —
 			// reservation exists for the one canonical install.
-			return fmt.Errorf("spaceobjects: module[%d] (%q): Reserved requires SharedOnly", i, m.Name)
+			return fmt.Errorf("spaceobjects: module[%d] (%q): Reserved requires CanonicalOnly", i, m.Name)
 		}
 		if m.Canonical != "" {
 			if err := schema.ValidateSlug("canonical collection", m.Canonical); err != nil {
@@ -950,11 +950,11 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 			if m.DataVersion == "" {
 				return fmt.Errorf("spaceobjects: module[%d] (%q): empty DataVersion", i, m.Name)
 			}
-			if _, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Shared: true}); err != nil {
+			if _, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true}); err != nil {
 				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical instance: %w", i, m.Name, err)
 			}
 		}
-		if !m.SharedOnly {
+		if !m.CanonicalOnly {
 			if _, err := moduleReg(m, handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"}); err != nil {
 				return fmt.Errorf("spaceobjects: module[%d] (%q): namespaced instance: %w", i, m.Name, err)
 			}
@@ -984,7 +984,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 	infos := make([]types.ModuleInfo, 0, len(modules))
 	byName := make(map[string]handler.Module, len(modules))
 	for _, m := range modules {
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly, Reserved: m.Reserved})
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
 		byName[m.Name] = m
 	}
 	catalog := types.NewModules(infos...)
@@ -994,7 +994,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
 		}
 		for _, md := range mods {
-			if md.shared {
+			if md.canonical {
 				continue
 			}
 			if m, ok := byName[md.module]; ok && m.DataVersion == "" {
@@ -1043,15 +1043,13 @@ type NamedSchema struct {
 	Name   string
 	Schema schema.Dataset
 	// Owners are the types that declare the dataset: one for a
-	// registered or namespaced dataset, every type declaring a shared
-	// dataset of the module for a canonical collection; empty for
-	// space-level built-ins. External indexers key their gating on it.
+	// registered or namespaced dataset, every type declaring it for a
+	// module's canonical collection; empty for space-level built-ins.
+	// External indexers key their gating on it.
 	Owners []string
 	// Module is the serving module (records for the generic kind);
-	// empty for built-ins and registered-type datasets. Shared marks a
-	// module's canonical collection.
+	// empty for built-ins and registered-type datasets.
 	Module string
-	Shared bool
 }
 
 // Schemas returns the declared schema of every dataset this store hosts —
@@ -1076,8 +1074,8 @@ func (s *Store) Schemas() []NamedSchema {
 	for _, reg := range s.canonicalRegs {
 		out = append(out, NamedSchema{
 			Name: reg.Name, Schema: reg.Schema,
-			Owners: sortedOwners(snap.sharedOwners[reg.Name]),
-			Module: s.canonicalModule[reg.Name], Shared: true,
+			Owners: sortedOwners(snap.canonicalOwners[reg.Name]),
+			Module: s.canonicalModule[reg.Name],
 		})
 	}
 	for _, reg := range s.staticInstanceRegs {
@@ -1199,7 +1197,7 @@ func (s *Store) DatasetOwners(dataset string) ([]string, bool) {
 		return []string{owner}, true
 	}
 	if _, canonical := s.canonicalModule[dataset]; canonical {
-		return sortedOwners(s.catalog.snapshot().sharedOwners[dataset]), true
+		return sortedOwners(s.catalog.snapshot().canonicalOwners[dataset]), true
 	}
 	if ds, ok := s.catalog.lookup(dataset); ok {
 		return []string{ds.TypeId}, true

@@ -98,21 +98,19 @@ func draftFieldDecl(draft *space.DatasetFieldDraft) (schema.Field, error) {
 }
 
 // normalizeDatasetDraft fills the draft's defaults — records when no
-// module is named, the canonical collection as the key of a shared
-// dataset — and applies the collection rule, returning the collection
-// the declaration will address. The same rule the compiler applies, so
-// a draft accepted here compiles valid on every peer that carries the
-// module.
+// module is named, the module's canonical collection as the key when
+// none is given — and applies the collection rule, returning the
+// collection the declaration will address. The same rule the compiler
+// applies, so a draft accepted here compiles valid on every peer that
+// carries the module.
 func normalizeDatasetDraft(modules types.Modules, typeId string, draft *space.DatasetDraft) (string, error) {
 	if draft.Module == "" {
 		draft.Module = space.RecordsModule
 	}
-	if draft.Shared && draft.Key == "" {
-		if mi, ok := modules[draft.Module]; ok {
-			draft.Key = mi.Canonical
-		}
+	if draft.Key == "" {
+		draft.Key = modules.CanonicalKey(draft.Module)
 	}
-	return modules.Collection(typeId, draft.Key, draft.Module, draft.Shared)
+	return modules.Collection(typeId, draft.Key, draft.Module)
 }
 
 // checkReservedModule refuses a runtime draft naming a reserved module
@@ -215,14 +213,16 @@ func encodePart(arena *anyenc.Arena, draft *space.PartDraft) (*anyenc.Value, err
 }
 
 // encodeDatasetHead builds the head record payload from a draft.
-func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetDraft) *anyenc.Value {
+// canonical writes the legacy `shared` leaf: a peer on an older SDK
+// takes the collection from it, not from the key.
+func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetDraft, canonical bool) *anyenc.Value {
 	payload := arena.NewObject()
 	payload.Set(typetype.DefFieldDef, arena.NewString(typetype.DefKindDataset))
 	payload.Set(typetype.FieldKey, arena.NewString(draft.Key))
 	payload.Set(typetype.DefFieldModule, arena.NewString(draft.Module))
 	payload.Set(typetype.DefFieldPart, arena.NewString(partId))
-	if draft.Shared {
-		payload.Set(typetype.DefFieldShared, arena.NewTrue())
+	if canonical {
+		payload.Set(typetype.DefFieldLegacyShared, arena.NewTrue())
 	}
 	if draft.Dynamic {
 		payload.Set(typetype.DefFieldDynamic, arena.NewTrue())
@@ -349,8 +349,7 @@ func (t *typesAPI) compiled(ctx context.Context, typeId string) (*types.Compiled
 
 // preflightDataset normalizes and validates one dataset draft against
 // the module catalog and the type's current declarations: the key is
-// free (or the caller is re-declaring under a new part — refused), and
-// at most one shared dataset per module per type.
+// free (or the caller is re-declaring under a new part — refused).
 func (t *typesAPI) preflightDataset(typeId string, draft *space.DatasetDraft, existing *types.CompiledType, sibling map[string]struct{}) error {
 	if _, err := normalizeDatasetDraft(t.parent.store.Modules(), typeId, draft); err != nil {
 		return fmt.Errorf("typesAPI: dataset %q: %w", draft.Key, err)
@@ -372,9 +371,6 @@ func (t *typesAPI) preflightDataset(typeId string, draft *space.DatasetDraft, ex
 		if ds.Key == draft.Key {
 			return fmt.Errorf("typesAPI: dataset %q is already declared on type %q", draft.Key, typeId)
 		}
-		if draft.Shared && ds.Shared && ds.Module == draft.Module && !ds.Invalid {
-			return fmt.Errorf("typesAPI: type %q already declares a shared %q dataset (%q)", typeId, draft.Module, ds.Key)
-		}
 	}
 	return nil
 }
@@ -393,17 +389,9 @@ func (t *typesAPI) preflightPart(typeId string, draft *space.PartDraft, existing
 		}
 	}
 	sibling := map[string]struct{}{}
-	shared := map[string]struct{}{}
 	for i := range draft.Datasets {
-		d := &draft.Datasets[i]
-		if err := t.preflightDataset(typeId, d, existing, sibling); err != nil {
+		if err := t.preflightDataset(typeId, &draft.Datasets[i], existing, sibling); err != nil {
 			return err
-		}
-		if d.Shared {
-			if _, dup := shared[d.Module]; dup {
-				return fmt.Errorf("typesAPI: part %q declares two shared %q datasets", draft.Key, d.Module)
-			}
-			shared[d.Module] = struct{}{}
 		}
 	}
 	return nil
@@ -412,7 +400,7 @@ func (t *typesAPI) preflightPart(typeId string, draft *space.PartDraft, existing
 // partRecords builds the records of one part: the part record plus
 // every dataset's head and fields, all referencing ids minted here so
 // they ride one change. Returns the part id with the records.
-func partRecords(arena *anyenc.Arena, draft *space.PartDraft) (string, []crdt.RecordChange, error) {
+func partRecords(arena *anyenc.Arena, modules types.Modules, draft *space.PartDraft) (string, []crdt.RecordChange, error) {
 	partId, err := newDefId("prt")
 	if err != nil {
 		return "", nil, err
@@ -427,7 +415,7 @@ func partRecords(arena *anyenc.Arena, draft *space.PartDraft) (string, []crdt.Re
 		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
 	}}
 	for i := range draft.Datasets {
-		_, r, err := datasetDefRecords(arena, partId, &draft.Datasets[i])
+		_, r, err := datasetDefRecords(arena, modules, partId, &draft.Datasets[i])
 		if err != nil {
 			return "", nil, err
 		}
@@ -439,7 +427,7 @@ func partRecords(arena *anyenc.Arena, draft *space.PartDraft) (string, []crdt.Re
 // datasetDefRecords validates the draft and builds its head + field
 // records (one head under partId, fields referencing it). Returns the
 // minted head id with the records.
-func datasetDefRecords(arena *anyenc.Arena, partId string, draft *space.DatasetDraft) (string, []crdt.RecordChange, error) {
+func datasetDefRecords(arena *anyenc.Arena, modules types.Modules, partId string, draft *space.DatasetDraft) (string, []crdt.RecordChange, error) {
 	decl, err := draftToDecl(draft)
 	if err != nil {
 		return "", nil, err
@@ -452,7 +440,7 @@ func datasetDefRecords(arena *anyenc.Arena, partId string, draft *space.DatasetD
 	recs = append(recs, crdt.RecordChange{
 		Id:     headId,
 		Upsert: true,
-		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, partId, draft)}},
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetHead(arena, partId, draft, modules.IsCanonical(draft.Module, draft.Key))}},
 	})
 	for i := range decl.Fields {
 		payload, err := encodeDatasetField(arena, headId, &decl.Fields[i])
@@ -502,7 +490,7 @@ func (t *typesAPI) AddPart(ctx context.Context, typeId string, draft space.PartD
 	if err := t.preflightPart(typeId, &draft, existing); err != nil {
 		return "", err
 	}
-	partId, recs, err := partRecords(&anyenc.Arena{}, &draft)
+	partId, recs, err := partRecords(&anyenc.Arena{}, t.parent.store.Modules(), &draft)
 	if err != nil {
 		return "", err
 	}
@@ -690,7 +678,7 @@ func (t *typesAPI) AddDataset(ctx context.Context, typeId, partId string, draft 
 	if err := t.preflightDataset(typeId, &draft, existing, map[string]struct{}{}); err != nil {
 		return "", err
 	}
-	headId, recs, err := datasetDefRecords(&anyenc.Arena{}, partId, &draft)
+	headId, recs, err := datasetDefRecords(&anyenc.Arena{}, t.parent.store.Modules(), partId, &draft)
 	if err != nil {
 		return "", err
 	}
@@ -1109,7 +1097,6 @@ func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 		Key:           c.Key,
 		Collection:    c.Name,
 		Module:        c.Module,
-		Shared:        c.Shared,
 		PartId:        c.PartId,
 		DisplayName:   c.DisplayName,
 		Description:   c.Description,

@@ -112,7 +112,6 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.Equal(t, "articles", def.Key)
 	assert.Equal(t, typeId+"_articles", coll, "a records dataset is namespaced under its type")
 	assert.Equal(t, space.RecordsModule, def.Module)
-	assert.False(t, def.Shared)
 	assert.Equal(t, partId, def.PartId)
 	assert.Equal(t, space.IdUser, def.IdRule)
 	assert.Equal(t, space.DeleteByAuthor, def.DeleteBy)
@@ -370,13 +369,19 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	assert.Equal(t, 1, res.Updated)
 	assert.Empty(t, res.Rejections)
 
-	// A second dataset joins the same part; a duplicate key is refused.
+	// A second dataset joins the same part; a duplicate key is refused,
+	// and so is a records dataset with no key — records has no
+	// canonical collection to default to.
 	_, err = sp.Types().AddDataset(ctx, typeId, partId, space.DatasetDraft{
 		Key: "notes", Fields: []space.DatasetFieldDraft{{Key: "text", Kind: space.PropertyKindString, MutableBy: space.MutableByAnyone}},
 	})
 	require.NoError(t, err)
 	_, err = sp.Types().AddDataset(ctx, typeId, partId, space.DatasetDraft{Key: "notes"})
 	require.Error(t, err, "duplicate key within the type")
+	_, err = sp.Types().AddDataset(ctx, typeId, partId, space.DatasetDraft{
+		Fields: []space.DatasetFieldDraft{{Key: "text", Kind: space.PropertyKindString, MutableBy: space.MutableByAnyone}},
+	})
+	require.Error(t, err, "a records dataset requires a key")
 	_, err = sp.Types().AddDataset(ctx, typeId, "no-such-part", space.DatasetDraft{Key: "more"})
 	require.ErrorIs(t, err, space.ErrNotFound)
 	parts, err = sp.Types().Parts(ctx, typeId)

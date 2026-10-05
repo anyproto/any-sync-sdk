@@ -39,8 +39,8 @@ func TestValidateEnsureRequest(t *testing.T) {
 	newRoot := func(context.Context) (string, error) { return "root", nil }
 	badKey := entriesDraft()
 	badKey.Key = "_private"
-	shared := entriesDraft()
-	shared.Shared = true
+	noKey := entriesDraft()
+	noKey.Key = ""
 	cases := []struct {
 		name string
 		req  space.EnsureBundleRequest
@@ -86,7 +86,7 @@ func TestValidateEnsureRequest(t *testing.T) {
 		{name: "invalid part key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: []space.PartDraft{{Key: "Bad Key"}}}, bad: true},
 		{name: "duplicate dataset key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(entriesDraft(), entriesDraft())}, bad: true},
 		{name: "duplicate part key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: []space.PartDraft{{Key: "a"}, {Key: "a"}}}, bad: true},
-		{name: "shared records", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(shared)}, bad: true},
+		{name: "records without a key", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart(noKey)}, bad: true},
 		{name: "tech derived with parts", req: space.EnsureBundleRequest{Id: "b", DerivedRoot: true, Parts: entriesPart()}, tech: true},
 		{name: "tech caller-created root", req: space.EnsureBundleRequest{Id: "b", NewRoot: newRoot, Parts: entriesPart()}, tech: true, bad: true},
 		{name: "tech sdk-minted created root", req: space.EnsureBundleRequest{Id: "b", Parts: entriesPart()}, tech: true},

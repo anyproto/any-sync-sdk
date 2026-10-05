@@ -14,9 +14,9 @@ package spaceobjects
 // Two kinds of entry come out of a compile. A NAMESPACED dataset
 // (`<typeId>_<key>`) gets its own registration — the generic schema
 // handler for `records`, the module's factory for anything else — and
-// is owned by exactly one type. A SHARED dataset names the module's
-// canonical collection, which every controller registers statically;
-// the catalog only records which types own it.
+// is owned by exactly one type. A CANONICAL dataset is keyed by its
+// module's canonical collection, which every controller registers
+// statically; the catalog only records which types own it.
 
 import (
 	"context"
@@ -70,11 +70,11 @@ type catalogSnapshot struct {
 	// Handlers are read-only after construction, so sharing them across
 	// controllers is safe.
 	regs map[string]crdt.HandlerReg
-	// sharedOwners maps a module's canonical collection to the types
-	// declaring a shared dataset of it; moduleOwners maps a module name
-	// to the types declaring any dataset of it (shared or namespaced).
-	sharedOwners map[string]map[string]struct{}
-	moduleOwners map[string]map[string]struct{}
+	// canonicalOwners maps a module's canonical collection to the types
+	// declaring it; moduleOwners maps a module name to the types
+	// declaring any dataset of it (canonical or namespaced).
+	canonicalOwners map[string]map[string]struct{}
+	moduleOwners    map[string]map[string]struct{}
 	// moduleOf maps a namespaced collection to its module.
 	moduleOf map[string]string
 }
@@ -191,18 +191,18 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 }
 
 // resolveCatalog folds per-type compiles into the resolved snapshot:
-// invalid definitions never register; a shared dataset only adds its
-// type to the canonical collection's owner set; a namespaced dataset
+// invalid definitions never register; a canonical dataset only adds
+// its type to that collection's owner set; a namespaced dataset
 // gets its registration built from the module (or the generic schema
 // handler for records).
 func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSnapshot {
 	snap := &catalogSnapshot{
-		byName:       map[string]types.CompiledDataset{},
-		byType:       byType,
-		regs:         map[string]crdt.HandlerReg{},
-		sharedOwners: map[string]map[string]struct{}{},
-		moduleOwners: map[string]map[string]struct{}{},
-		moduleOf:     map[string]string{},
+		byName:          map[string]types.CompiledDataset{},
+		byType:          byType,
+		regs:            map[string]crdt.HandlerReg{},
+		canonicalOwners: map[string]map[string]struct{}{},
+		moduleOwners:    map[string]map[string]struct{}{},
+		moduleOf:        map[string]string{},
 	}
 	own := func(set map[string]map[string]struct{}, key, typeId string) {
 		m := set[key]
@@ -215,9 +215,9 @@ func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSn
 	// Registered types' static module declarations are owners on every
 	// snapshot. Copied in, never aliased: a runtime fold mutates the
 	// per-key sets.
-	for coll, set := range s.staticSharedOwners {
+	for coll, set := range s.staticCanonicalOwners {
 		for typeId := range set {
-			own(snap.sharedOwners, coll, typeId)
+			own(snap.canonicalOwners, coll, typeId)
 		}
 	}
 	for module, set := range s.staticModuleOwners {
@@ -230,16 +230,15 @@ func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSn
 			if ds.Invalid {
 				continue
 			}
-			if ds.Shared {
+			if ds.Canonical {
 				if _, static := s.dataVersions[ds.Name]; !static {
-					// The compile already refused a shared dataset of a
-					// module without a canonical; a canonical the store
-					// does not register is a module the config lacks.
-					storeLog.Warn("catalog: shared dataset of an unregistered module",
+					// A canonical the store does not register is a module
+					// the config lacks.
+					storeLog.Warn("catalog: canonical dataset of an unregistered module",
 						zap.String("collection", ds.Name), zap.String("typeId", ds.TypeId))
 					continue
 				}
-				own(snap.sharedOwners, ds.Name, ds.TypeId)
+				own(snap.canonicalOwners, ds.Name, ds.TypeId)
 				own(snap.moduleOwners, ds.Module, ds.TypeId)
 				continue
 			}

@@ -30,7 +30,7 @@ func docType() handler.Type {
 		}},
 		Parts: []handler.Part{
 			{Key: "body", Name: "Body", Pos: "a0", UI: map[string]any{"type": "document"},
-				Datasets: []handler.PartDataset{{Module: "blocks", Shared: true}, {Module: "blocks", Key: "summary"}}},
+				Datasets: []handler.PartDataset{{Module: "blocks"}, {Module: "blocks", Key: "summary"}}},
 			{Key: "meta", Hidden: true, Uses: []string{"summary"},
 				Datasets: []handler.PartDataset{{Name: "doc_meta"}}},
 		},
@@ -60,7 +60,7 @@ func TestValidateExternalTypes_StaticParts(t *testing.T) {
 		}), "already owned by part"},
 		{"both forms", bad(func(d *handler.Type) { d.Parts[1].Datasets[0].Module = "blocks" }), "exclusive"},
 		{"neither form", bad(func(d *handler.Type) { d.Parts[1].Datasets[0] = handler.PartDataset{} }), "Name or Module required"},
-		{"shared on a static name", bad(func(d *handler.Type) { d.Parts[1].Datasets[0].Shared = true }), "module datasets only"},
+		{"key on a static name", bad(func(d *handler.Type) { d.Parts[1].Datasets[0].Key = "meta" }), "module datasets only"},
 		{"records module", bad(func(d *handler.Type) { d.Parts[0].Datasets[1].Module = "records" }), "static records dataset"},
 	}
 	for _, tc := range cases {
@@ -79,16 +79,18 @@ func TestValidateExternalModules_StaticPartsAndReserved(t *testing.T) {
 	reserved.Name = "secret"
 	reserved.Canonical = "secret_shared"
 	reserved.Reserved = true
-	reserved.SharedOnly = true
+	reserved.CanonicalOnly = true
 	require.NoError(t, ValidateExternalModules(nil, []handler.Module{reserved}))
-	reserved.SharedOnly = false
+	reserved.CanonicalOnly = false
 	err := ValidateExternalModules(nil, []handler.Module{reserved})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Reserved requires SharedOnly")
+	assert.Contains(t, err.Error(), "Reserved requires CanonicalOnly")
+	reserved.CanonicalOnly = true
 
-	// A static part naming a module the config lacks, a shared dataset
-	// of a module without a canonical, a namespaced instance of a
-	// module without a DataVersion, a collision on the minted name.
+	// A static part naming a module the config lacks, an unkeyed
+	// dataset of a module without a canonical, another key on a
+	// canonical-only module, a namespaced instance of a module without
+	// a DataVersion, a collision on the minted name.
 	noCanonical := testModule()
 	noCanonical.Name = "plain"
 	noCanonical.Canonical = ""
@@ -100,19 +102,22 @@ func TestValidateExternalModules_StaticPartsAndReserved(t *testing.T) {
 		err   string
 	}{
 		{"unknown module", []handler.Type{docType()}, nil, "unknown module"},
-		{"shared without canonical", []handler.Type{{Id: "t", Parts: []handler.Part{{Key: "p",
-			Datasets: []handler.PartDataset{{Module: "plain", Shared: true}}}}}}, []handler.Module{noCanonical}, "no shared collection"},
+		{"unkeyed without canonical", []handler.Type{{Id: "t", Parts: []handler.Part{{Key: "p",
+			Datasets: []handler.PartDataset{{Module: "plain"}}}}}}, []handler.Module{noCanonical}, "key must be non-empty"},
+		{"canonical-only with another key", []handler.Type{{Id: "t", Parts: []handler.Part{{Key: "p",
+			Datasets: []handler.PartDataset{{Module: "secret", Key: "thread"}}}}}}, []handler.Module{reserved}, `is keyed "secret_shared"`},
 		{"instance without data version", []handler.Type{{Id: "t", Parts: []handler.Part{{Key: "p",
 			Datasets: []handler.PartDataset{{Module: "plain", Key: "notes"}}}}}}, []handler.Module{noCanonical}, "needs a DataVersion"},
 		{"instance collides with a registered dataset", []handler.Type{
 			{Id: "t", Parts: []handler.Part{{Key: "p", Datasets: []handler.PartDataset{{Module: "blocks", Key: "notes"}}}}},
 			{Id: "u", Datasets: []handler.Dataset{{Name: "t_notes", DataVersion: "v", Handler: crdt.DefaultHandler{}}}},
 		}, []handler.Module{testModule()}, "already registered"},
-		// A second shared dataset of one module collides on the
-		// canonical key — the same verdict a runtime declaration gets.
-		{"two shared of one module", []handler.Type{{Id: "t", Parts: []handler.Part{
-			{Key: "p", Datasets: []handler.PartDataset{{Module: "blocks", Shared: true}}},
-			{Key: "q", Datasets: []handler.PartDataset{{Module: "blocks", Shared: true}}},
+		// The canonical dataset declared twice collides on its key,
+		// spelled or defaulted — the same verdict a runtime declaration
+		// gets.
+		{"canonical declared twice", []handler.Type{{Id: "t", Parts: []handler.Part{
+			{Key: "p", Datasets: []handler.PartDataset{{Module: "blocks"}}},
+			{Key: "q", Datasets: []handler.PartDataset{{Module: "blocks", Key: "blocks_shared"}}},
 		}}}, []handler.Module{testModule()}, "duplicate dataset key"},
 		// Keys are one namespace per type: a module key cannot reuse a
 		// static dataset's name.
@@ -188,15 +193,14 @@ func TestCatalog_StaticParts(t *testing.T) {
 			sawInst = true
 			assert.Equal(t, []string{"doc"}, ns.Owners)
 			assert.Equal(t, "blocks", ns.Module)
-			assert.False(t, ns.Shared)
 		}
 	}
 	assert.True(t, sawCanonical && sawInst)
 
-	// A runtime type sharing the module joins the static owner; a
-	// refresh never drops the static one.
+	// A runtime type declaring the canonical dataset joins the static
+	// owner; a refresh never drops the static one.
 	seedTypeObject(t, ctx, db, "spaceA", "type-a")
-	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", true, "a")
+	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", "a")
 	store.refreshType(ctx, "type-a")
 	owners, _ = store.DatasetOwners("blocks_shared")
 	assert.Equal(t, []string{"doc", "type-a"}, owners)
@@ -217,7 +221,7 @@ func TestCatalog_StaticParts(t *testing.T) {
 	assert.Equal(t, map[string]any{"type": "document"}, body.UI)
 	require.Len(t, body.Datasets, 2)
 	assert.Equal(t, "blocks_shared", body.Datasets[0].Name)
-	assert.True(t, body.Datasets[0].Shared)
+	assert.True(t, body.Datasets[0].Canonical)
 	assert.Equal(t, "doc_summary", body.Datasets[1].Name)
 	assert.Equal(t, "summary", body.Datasets[1].Key)
 	assert.Equal(t, "blocks", body.Datasets[1].Module)

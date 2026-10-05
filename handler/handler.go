@@ -387,7 +387,7 @@ type Type struct {
 	// Parts are the type's display units, declared statically — the
 	// shape a user type declares at runtime through
 	// space.TypesAPI.AddPart. Each part names one or more datasets:
-	// entries of Datasets by Name, or module datasets (a shared
+	// entries of Datasets by Name, or module datasets (the module's
 	// canonical collection, or a namespaced `<typeId>_<key>` instance)
 	// the SDK instantiates exactly as it does for a runtime declaration
 	// — the write gate, discovery ownership and the module namespace on
@@ -459,43 +459,41 @@ type Part struct {
 //   - Name: one of the owning Type's Datasets, by name. The dataset's
 //     collection is its Name; its module reads as `records` when it
 //     runs on the generic schema handler (nil Handler), none when
-//     bespoke. Shared and Key stay empty.
+//     bespoke. Key stays empty.
 //   - Module: a dataset of a registered module, declared as a runtime
-//     part would — Shared for the module's canonical collection (Key
-//     defaults to the canonical name), a namespaced `<typeId>_<Key>`
-//     instance otherwise (the module needs a DataVersion for that).
-//     The `records` module has no place here: a static records dataset
-//     is a Type.Datasets entry with a Schema.
+//     part would — the module's canonical collection when Key is empty
+//     or names it, a namespaced `<typeId>_<Key>` instance otherwise
+//     (the module needs a DataVersion for that). The `records` module
+//     has no place here: a static records dataset is a Type.Datasets
+//     entry with a Schema.
 //
 // Keys are one namespace per type: a module Key must not equal a
 // static dataset's Name.
 type PartDataset struct {
 	Name   string
 	Module string
-	Shared bool
 	Key    string
 }
 
 // ModuleInstance identifies one collection a module serves: the type
 // declaring it, the dataset key inside that type, the collection name
-// the instance reads and writes, and whether it is the module's shared
+// the instance reads and writes, and whether it is the module's
 // canonical collection — TypeId and Key are empty for that one, since
-// every type declaring a shared dataset of the module participates in
-// it.
+// every type declaring it addresses the same collection.
 type ModuleInstance struct {
 	TypeId     string
 	Key        string
 	Collection string
-	Shared     bool
+	Canonical  bool
 }
 
 // Module is a compiled-in dataset behaviour a type declares at runtime
 // inside one of its parts: the block editor, the chat message stream.
 // Where a Type binds fixed dataset names, a Module is a factory the SDK
-// instantiates per collection — once for the shared Canonical
-// collection and once per namespaced `<typeId>_<key>` instance a type
-// declares — so derivation, authorisation, read tracking and indexes
-// behave identically on every instance. Callers register modules via
+// instantiates per collection — once for the Canonical collection and
+// once per namespaced `<typeId>_<key>` instance a type declares — so
+// derivation, authorisation, read tracking and indexes behave
+// identically on every instance. Callers register modules via
 // config.Config.Modules; `records` (the generic schema-enforced
 // dataset) is built in.
 type Module struct {
@@ -503,17 +501,17 @@ type Module struct {
 	// ("editor", "chat"). Required; "records" is reserved.
 	Name string
 
-	// Canonical is the shared collection name ("editor_blocks"): a type
-	// declaring `shared: true` for this module participates in it.
-	// Empty means the module has no shared collection and every
-	// instance is namespaced.
+	// Canonical is the module's own collection name ("editor_blocks"):
+	// a dataset keyed by it — or left unkeyed — is that collection on
+	// every type declaring it. Empty means the module has none and
+	// every instance is namespaced.
 	Canonical string
 
-	// SharedOnly refuses namespaced instances, so an object carries at
-	// most one collection of the module — the invariant behind a single
-	// read frontier and a single push group per object. Requires
+	// CanonicalOnly refuses namespaced instances, so an object carries
+	// at most one collection of the module — the invariant behind a
+	// single read frontier and a single push group per object. Requires
 	// Canonical.
-	SharedOnly bool
+	CanonicalOnly bool
 
 	// Reserved keeps the module out of runtime declarations: a part or
 	// dataset draft naming it — through TypesAPI.AddPart / AddDataset or
@@ -522,7 +520,7 @@ type Module struct {
 	// consumer's own catalog install). Registered types may still
 	// declare it statically, and a declaration that reached the DAG
 	// stays valid on apply (a peer that admitted it was the consumer's
-	// own install). Requires SharedOnly. The install root is also the
+	// own install). Requires CanonicalOnly. The install root is also the
 	// module's only carrier: a local write attaching a user type that
 	// declares a reserved module to any other row is refused
 	// (ErrValidationReservedCarrier) — no SystemInstall escape, the

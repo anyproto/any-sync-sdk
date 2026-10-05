@@ -14,25 +14,27 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// secretModule is a reserved module: shared-only, declarable at runtime
-// only by the consumer's own install (the space.SystemInstall option).
+// secretModule is a reserved module: canonical-only, declarable at
+// runtime only by the consumer's own install (the space.SystemInstall
+// option).
 func secretModule() handler.Module {
 	return handler.Module{
-		Name:        "secret",
-		Canonical:   "secret_shared",
-		SharedOnly:  true,
-		Reserved:    true,
-		DataVersion: "secret-v1",
+		Name:          "secret",
+		Canonical:     "secret_inbox",
+		CanonicalOnly: true,
+		Reserved:      true,
+		DataVersion:   "secret-v1",
 		New: func(handler.ModuleInstance) handler.Dataset {
 			return handler.Dataset{Schema: handler.Schema{Dynamic: true}}
 		},
 	}
 }
 
-// docType is a registered, hidden type with static parts: a body that
-// shares the notes module and carries a namespaced notes instance, and
-// a hidden part owning a static records dataset and a static
-// declaration of the reserved module.
+// docType is a registered, hidden type with static parts: a body
+// declaring the notes module's canonical dataset (no key) and a
+// namespaced notes instance, and a hidden part owning a static records
+// dataset and the reserved module's canonical dataset (its name spelled
+// out as the key).
 func docType() handler.Type {
 	return handler.Type{
 		Id: "doc", Name: "Document", Hidden: true,
@@ -44,8 +46,8 @@ func docType() handler.Type {
 		}},
 		Parts: []handler.Part{
 			{Key: "body", Name: "Body", Pos: "a0", UI: map[string]any{"type": "document"},
-				Datasets: []handler.PartDataset{{Module: "notes", Shared: true}, {Module: "notes", Key: "summary"}}},
-			{Key: "meta", Hidden: true, Datasets: []handler.PartDataset{{Name: "doc_meta"}, {Module: "secret", Shared: true}}},
+				Datasets: []handler.PartDataset{{Module: "notes"}, {Module: "notes", Key: "summary"}}},
+			{Key: "meta", Hidden: true, Datasets: []handler.PartDataset{{Name: "doc_meta"}, {Module: "secret", Key: "secret_inbox"}}},
 		},
 	}
 }
@@ -54,9 +56,10 @@ func docType() handler.Type {
 // side of parts on one device: a registered type's parts read back
 // compiled, its module declarations own collections exactly like a
 // runtime declaration (write gate, discovery, namespace), the type is
-// hidden and immutable, and a reserved module is refused to runtime
-// declarations and bundles alike — unless the bundle is the consumer's
-// own install.
+// hidden and immutable, Open refuses a static part the collection rule
+// rejects, a canonical-only module refuses any other key, and a
+// reserved module is refused to runtime declarations and bundles alike
+// — unless the bundle is the consumer's own install.
 func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -68,12 +71,35 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	sdk, err := anysyncsdk.Open(ctx, config.Config{
-		Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
-		Network: config.Network{NodeConfYAML: yaml},
-		Types:   []handler.Type{docType()},
-		Modules: []handler.Module{notesModule(), secretModule()},
-	}, newFixedSeedProvider(t))
+	open := func(typ handler.Type) (*anysyncsdk.SDK, error) {
+		return anysyncsdk.Open(ctx, config.Config{
+			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Network: config.Network{NodeConfYAML: yaml},
+			Types:   []handler.Type{typ},
+			Modules: []handler.Module{notesModule(), secretModule()},
+		}, newFixedSeedProvider(t))
+	}
+
+	// Open validates static parts against the module catalog: the
+	// canonical-only module under another key, and the canonical
+	// dataset declared a second time, are refused.
+	openWithPart := func(extra handler.Part) error {
+		typ := docType()
+		typ.Parts = append(typ.Parts, extra)
+		s, err := open(typ)
+		if s != nil {
+			_ = s.Close()
+		}
+		return err
+	}
+	err = openWithPart(handler.Part{Key: "extra", Datasets: []handler.PartDataset{{Module: "secret", Key: "other"}}})
+	require.ErrorContains(t, err, `a "secret" dataset is keyed "secret_inbox", got "other"`,
+		"a canonical-only module refuses a non-canonical key in a static part")
+	err = openWithPart(handler.Part{Key: "extra", Datasets: []handler.PartDataset{{Module: "notes", Key: "notes_body"}}})
+	require.ErrorContains(t, err, `duplicate dataset key "notes_body"`,
+		"a second static declaration of the canonical dataset is a duplicate key")
+
+	sdk, err := open(docType())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk.Close() })
 
@@ -97,13 +123,15 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	assert.Equal(t, "body", parts[0].Id)
 	assert.Equal(t, map[string]any{"type": "document"}, parts[0].UI)
 	require.Len(t, parts[0].Datasets, 2)
-	assert.Equal(t, "notes_shared", parts[0].Datasets[0].Collection)
-	assert.True(t, parts[0].Datasets[0].Shared)
-	assert.Equal(t, "doc_summary", parts[0].Datasets[1].Collection)
+	assert.Equal(t, "notes_body", parts[0].Datasets[0].Key, "an unkeyed static module dataset takes the canonical name as its key")
+	assert.Equal(t, "notes_body", parts[0].Datasets[0].Collection, "an unkeyed static module dataset is the canonical collection")
+	assert.Equal(t, "notes", parts[0].Datasets[0].Module)
+	assert.Equal(t, "doc_summary", parts[0].Datasets[1].Collection, "a static module dataset with another key is namespaced under the type")
 	assert.Equal(t, "notes", parts[0].Datasets[1].Module)
 	assert.True(t, parts[1].Hidden)
 	require.Len(t, parts[1].Datasets, 2)
-	assert.Equal(t, "secret_shared", parts[1].Datasets[1].Collection)
+	assert.Equal(t, "secret_inbox", parts[1].Datasets[1].Collection, "a static module dataset keyed by the canonical name is the canonical collection")
+	assert.Equal(t, "secret", parts[1].Datasets[1].Module)
 	assert.Equal(t, "doc_meta", parts[1].Datasets[0].Collection)
 	assert.Equal(t, space.RecordsModule, parts[1].Datasets[0].Module)
 	require.Len(t, parts[1].Datasets[0].Fields, 1)
@@ -127,7 +155,8 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	for _, ds := range sp.Datasets() {
 		seen[ds.Name] = ds
 	}
-	assert.Equal(t, []string{"doc"}, seen["notes_shared"].Owners)
+	assert.Equal(t, []string{"doc"}, seen["notes_body"].Owners)
+	assert.Equal(t, []string{"doc"}, seen["secret_inbox"].Owners)
 	assert.Equal(t, []string{"doc"}, seen["doc_summary"].Owners)
 	assert.Equal(t, "notes", seen["doc_summary"].Module)
 	assert.Equal(t, []string{"doc"}, seen["doc_meta"].Owners)
@@ -150,7 +179,7 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 		}
 		return nil
 	}
-	require.NoError(t, write(obj, "notes_shared", "text", "body"))
+	require.NoError(t, write(obj, "notes_body", "text", "body"))
 	require.NoError(t, write(obj, "doc_summary", "text", "tl;dr"))
 	require.NoError(t, write(obj, "doc_meta", "label", "draft"))
 	rows, err := sp.Query(obj, "doc_summary").All(ctx)
@@ -162,7 +191,7 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 		Type: markerTypeId(t, ctx, sp, "Bare"),
 	})
 	require.NoError(t, err)
-	require.ErrorIs(t, write(bare, "notes_shared", "text", "nope"), space.ErrDatasetNotDeclared)
+	require.ErrorIs(t, write(bare, "notes_body", "text", "nope"), space.ErrDatasetNotDeclared)
 	require.ErrorIs(t, write(bare, "doc_summary", "text", "nope"), space.ErrDatasetNotDeclared)
 	require.ErrorIs(t, write(bare, "doc_meta", "label", "nope"), space.ErrDatasetNotDeclared)
 
@@ -171,18 +200,35 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	// is the consumer's own install.
 	userType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Room"})
 	require.NoError(t, err)
-	_, err = sp.Types().AddPart(ctx, userType, space.PartDraft{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret", Shared: true}}})
+	_, err = sp.Types().AddPart(ctx, userType, space.PartDraft{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret"}}})
 	require.ErrorIs(t, err, space.ErrModuleReserved)
-	partId, err := sp.Types().AddPart(ctx, userType, space.PartDraft{Key: "notes", Datasets: []space.DatasetDraft{{Module: "notes", Shared: true}}})
+	partId, err := sp.Types().AddPart(ctx, userType, space.PartDraft{Key: "notes", Datasets: []space.DatasetDraft{{Module: "notes"}}})
 	require.NoError(t, err)
-	_, err = sp.Types().AddDataset(ctx, userType, partId, space.DatasetDraft{Module: "secret", Shared: true})
+	_, err = sp.Types().AddDataset(ctx, userType, partId, space.DatasetDraft{Module: "secret"})
 	require.ErrorIs(t, err, space.ErrModuleReserved)
-	secretPart := []space.PartDraft{{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret", Shared: true}}}}
+	secretPart := []space.PartDraft{{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret"}}}}
 	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{Id: "room/v1", DerivedRoot: true, Parts: secretPart})
 	require.ErrorIs(t, err, space.ErrModuleReserved)
 	require.ErrorIs(t, err, space.ErrBundleBadRequest)
 	_, err = sp.Bundles().Get(ctx, "room/v1")
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "a refused install leaves nothing behind")
+
+	// Canonical-only: any key but the canonical name is refused by the
+	// collection rule, on a runtime part and on the consumer's own
+	// install, where the reservation does not apply.
+	_, err = sp.Types().AddPart(ctx, userType, space.PartDraft{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret", Key: "other"}}})
+	require.ErrorContains(t, err, `a "secret" dataset is keyed "secret_inbox", got "other"`,
+		"a canonical-only module refuses a non-canonical key in a runtime declaration")
+	_, _, err = sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
+		Id: "room/v1", DerivedRoot: true, Hidden: true,
+		Parts: []space.PartDraft{{Key: "chat", Datasets: []space.DatasetDraft{{Module: "secret", Key: "other"}}}},
+	}, space.SystemInstall())
+	require.ErrorIs(t, err, space.ErrBundleBadRequest)
+	require.ErrorContains(t, err, `a "secret" dataset is keyed "secret_inbox", got "other"`,
+		"the consumer's own install of a canonical-only module still needs the canonical key")
+	_, err = sp.Bundles().Get(ctx, "room/v1")
+	require.ErrorIs(t, err, space.ErrBundleUnknown, "a refused install leaves nothing behind")
+
 	inst, installed, err := sp.Bundles().Ensure(ctx, space.EnsureBundleRequest{
 		Id: "room/v1", DerivedRoot: true, Parts: secretPart, Hidden: true,
 	}, space.SystemInstall())
@@ -192,8 +238,9 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 	for _, ds := range sp.Datasets() {
 		seen[ds.Name] = ds
 	}
-	assert.ElementsMatch(t, []string{"doc", inst.RootId}, seen["secret_shared"].Owners)
-	require.NoError(t, write(inst.RootId, "secret_shared", "text", "hush"))
+	assert.ElementsMatch(t, []string{"doc", inst.RootId}, seen["secret_inbox"].Owners,
+		"the static and the installed declaration both own the canonical collection")
+	require.NoError(t, write(inst.RootId, "secret_inbox", "text", "hush"))
 	root, err := sp.Types().Get(ctx, inst.RootId)
 	require.NoError(t, err)
 	assert.True(t, root.Hidden)
@@ -217,9 +264,9 @@ func TestE2E_TypeParts_RegisteredStaticAndReserved(t *testing.T) {
 		Records: []space.RecordModify{{Id: inst.RootId, Upsert: true, Ops: []space.Op{{Type: space.OpSet, Path: "any.type", Value: inst.RootId}}}},
 	})
 	require.ErrorIs(t, err, handler.ErrValidationReservedCarrier)
-	require.ErrorIs(t, write(bare, "secret_shared", "text", "nope"), space.ErrDatasetNotDeclared)
+	require.ErrorIs(t, write(bare, "secret_inbox", "text", "nope"), space.ErrDatasetNotDeclared)
 	_, err = sp.Properties().SetType(ctx, bare, "doc")
 	require.NoError(t, err, "a registered type's static declaration of the module is attachable")
-	require.NoError(t, write(bare, "notes_shared", "text", "ok"))
-	require.NoError(t, write(bare, "secret_shared", "text", "through the static declaration"))
+	require.NoError(t, write(bare, "notes_body", "text", "ok"))
+	require.NoError(t, write(bare, "secret_inbox", "text", "through the static declaration"))
 }

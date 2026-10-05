@@ -26,7 +26,7 @@ Type
  ├─ layout                (rendering metadata, docs/data-structure.md)
  └─ parts[]               display units, keyed
      ├─ name/icon/pos/hidden/ui/uses
-     └─ datasets[]        keyed; module + shared; the declaration
+     └─ datasets[]        keyed; module; the declaration
 ```
 
 - A **part** is what a client renders: a key (slug, pinned), the
@@ -35,22 +35,22 @@ Type
   the SDK) and `uses`, keys of other datasets of the same type the
   part renders without owning.
 - A **dataset** is keyed inside its type (slug, pinned) and names a
-  `module` (pinned) and whether it is `shared` (pinned). A `records`
-  dataset carries the behavioural declaration below; a module-served
+  `module` (pinned). The key decides its collection (§ The collection
+  rule). A `records` dataset carries the behavioural declaration below; a module-served
   dataset carries none: the module owns the schema, and field
   declarations on it are refused (`ErrModuleOwned`).
 - A **module** (`handler.Module`, registered via `config.Config.Modules`)
   is a factory: `New(ModuleInstance) handler.Dataset` returns the
   handler, schema, indexes, read-tracking and history flags for one
-  collection. A module may own a shared **canonical collection**
-  (`Canonical`); `SharedOnly` refuses namespaced instances so an object
-  carries at most one collection of the module. A module may also
+  collection. A module may own a **canonical collection**
+  (`Canonical`); `CanonicalOnly` refuses namespaced instances so an
+  object carries at most one collection of the module. A module may also
   declare a namespace on the objects row (`Properties`); see
   docs/data-structure.md § Module namespaces.
 
 ### Reserved modules
 
-A **reserved** module (`Reserved`, requires `SharedOnly`) cannot be
+A **reserved** module (`Reserved`, requires `CanonicalOnly`) cannot be
 declared at runtime: `AddPart`, `AddDataset` and a bundle's `Parts`
 naming it fail with `space.ErrModuleReserved`. Only a bundle install
 made with the `space.SystemInstall()` ensure option, or a registered
@@ -82,10 +82,10 @@ A registered type (`config.Config.Types`) declares its parts at boot
 names entries of the type's `Datasets` (`PartDataset.Name`: the
 collection is the dataset's name; the module reads as `records` on the
 generic schema handler, none for a bespoke handler) or module datasets
-(`PartDataset.Module` + `Shared` / `Key`, per the collection rule below).
+(`PartDataset.Module` + `Key`, per the collection rule below).
 
 - Module datasets enter the catalog as if a type object had declared
-  them: a shared one adds the type to the canonical collection's owner
+  them: a canonical one adds the type to that collection's owner
   set; a namespaced one registers `<typeId>_<key>` on every controller
   with the module's `DataVersion` (registered types mint no schema state
   to gate on). The module namespace on the objects row follows
@@ -105,19 +105,22 @@ generic schema handler, none for a bespoke handler) or module datasets
 
 ### The collection rule
 
+The key decides:
+
 ```
-shared: true   →  <module canonical>            editor_blocks
-shared: false  →  <typeId>_<key>                bafyrei…_segments
+key = <module canonical>   →  <module canonical>     editor_blocks
+any other key              →  <typeId>_<key>         bafyrei…_segments
 ```
 
-- `shared` is legal only for a module with a canonical collection, and
-  a shared dataset's key IS the canonical name (it defaults to it when
-  left empty). A type declares at most one shared dataset per module.
-  `records` is never shared.
-- A shared dataset is the canonical collection itself, one per module
-  per space: two types that both share `editor` give an object carrying
-  both a single body, and retyping keeps it. Two types with namespaced
-  editor datasets give two collections; nothing merges.
+- A draft with no key takes its module's canonical name. `records` has
+  no canonical collection and requires a key.
+- The canonical collection is one name per module per space: every type
+  that declares it addresses the same collection, so retyping an object
+  between two such types keeps its records. A namespaced dataset
+  belongs to its type alone: two types with namespaced editor datasets
+  give two collections; nothing merges.
+- Keys are unique within a type, so a type declares a module's
+  canonical dataset at most once.
 - Namespaced names cannot collide: type ids are content-addressed CIDs
   without `_`, so `<typeId>_<key>` splits at the first `_` and no two
   types can produce the same collection. The catalog needs no
@@ -142,8 +145,8 @@ canonical collections register statically on every controller
 (a peer applies an inbound `editor_blocks` change without the
 declaring type's definitions), namespaced instances go through the
 catalog and park until the declaring type's schema state arrives
-(below). Removing a shared dataset withdraws that type's ownership of
-the canonical collection and nothing else.
+(below). Removing a canonical dataset withdraws that type's ownership
+of the collection and nothing else.
 
 ## Declaration vocabulary (records datasets)
 
@@ -249,7 +252,7 @@ type's parts are CRDT records there:
   `ui` (an object, created whole) and `uses` (an array of dataset keys)
   mutable.
 - **Head record** (one per dataset; id minted client-side, unique):
-  `def:"dataset"`, `key` (slug), `module`, `shared`, `part` (the owning
+  `def:"dataset"`, `key` (slug), `module`, `part` (the owning
   part record id), `dynamic`, `idRule`/`idPattern`/`idMaxLen`,
   `deleteBy`, `skipHistory`, all pinned first-write; `displayName`,
   `description`, and the `search.title`/`search.text`/`search.scope`
@@ -257,7 +260,9 @@ type's parts are CRDT records there:
   pinned). `title`/`scope` are scalar strings; `text` is a bare field
   key or a non-empty array of unique keys. The head carries
   no `collection`: the collection is computed at compile from the
-  collection rule.
+  collection rule. A head keyed by its module's canonical name also
+  carries a `shared: true` leaf, which peers on an older SDK read in
+  place of the key.
 - **Field record** (one per field of a `records` dataset; id derived
   from the change): `def:"field"`, `dataset` (owning head id), `key`,
   `kind`, `scope`, `stamp`, `required`, `mutableBy`, `items`/`properties`
@@ -310,10 +315,8 @@ flat dataset view of the same fold):
   per key), and a disagreement on a pinned leaf marks the definition
   invalid. This is sound within one tree: orderId values are peer-local
   but their relative order converges;
-- the collection rule decides the collection; an unknown module or a
-  shared violation marks the definition invalid; a type declaring two
-  shared datasets of one module keeps the smallest `_ver.id` and marks
-  the rest invalid;
+- the collection rule decides the collection from the key; an unknown
+  module or a rule violation marks the definition invalid;
 - a module-served dataset carries no fields: field records under it
   are orphans;
 - a `records` fold that fails `ValidateDatasetDecl` is emitted
@@ -327,7 +330,7 @@ evolution is additive-only with pinned behavior:
 
 - Add parts, datasets and fields freely at runtime; edits sync and
   apply like any space data.
-- A part's key; a dataset's key, module, shared flag and part; a
+- A part's key; a dataset's key, module and part; a
   field's `kind`, `scope`, `stamp`, `required`, `mutableBy`; the id
   rule and the delete gate are pinned for the life of the definition;
   remove and re-add under a new key to change them. A dataset never
@@ -341,7 +344,7 @@ evolution is additive-only with pinned behavior:
   an author-gated dataset). Already-invalid definitions stay removable.
 - `RemoveDataset` / `RemovePart` do not clean up record data (as with
   `RemoveProperty`); subsequent writes drop once peers apply the
-  removal, and a shared dataset's removal only withdraws this type's
+  removal, and a canonical dataset's removal only withdraws this type's
   ownership.
 
 ## Runtime registration
@@ -358,8 +361,8 @@ declarations reach them through a store-level **catalog**:
   A namespaced dataset gets one registration: the generic schema
   handler over its declaration for `records`, the module's
   `New(instance)` output otherwise, with the module's `HandlerVersion`
-  composed in. A shared dataset adds its type to the canonical
-  collection's owner set and registers nothing; the canonical
+  composed in. A canonical dataset adds its type to that collection's
+  owner set and registers nothing; the canonical
   collection is on every controller from store open, with the module's
   `DataVersion`.
 - **Eviction is lazy.** Schema apply evicts nothing. Each registration carries a `SchemaRev` fingerprint of
@@ -423,7 +426,7 @@ writer per dataset (see the IdRule contract above).
 `DatasetSchema` carries `Owners`, the declaring types: one for a
 registered-type or namespaced dataset, every type sharing the module
 for a canonical collection (empty while nothing declares it), none for
-space-level built-ins; plus `Module` and `Shared`. Consumer indexers
+space-level built-ins; plus `Module`. Consumer indexers
 gate on `Owners` (an object may hold the dataset when it carries one
 of them).
 
@@ -459,7 +462,7 @@ computed `Collection`, the full value shape, the descriptor.
   rebuilds stored rows. Rows rebuild only when a registration's handler
   version changes (the generic schema handler's version or a module's
   `HandlerVersion`), through the lazy per-object re-index on load.
-- A module's `SharedOnly` is the only per-object cardinality rule: a
+- A module's `CanonicalOnly` is the only per-object cardinality rule: a
   type declaring two namespaced datasets of one module gives its
   objects two storage collections of it.
 
@@ -481,11 +484,11 @@ PatchDatasetField(ctx, typeId, fieldDefId, DatasetDefPatch) error
 Datasets(ctx, typeId) ([]DatasetDef, error)               // flat, with Collection
 
 // modules (config.Config.Modules)
-handler.Module{Name, Canonical, SharedOnly, Reserved, DataVersion, HandlerVersion, Properties, New}
+handler.Module{Name, Canonical, CanonicalOnly, Reserved, DataVersion, HandlerVersion, Properties, New}
 
 // static parts (config.Config.Types)
 handler.Type{…, Parts: []handler.Part{{Key, Name, Icon, Pos, Hidden, UI, Uses,
-    Datasets: []handler.PartDataset{{Name} | {Module, Shared, Key}}}}, Hidden}
+    Datasets: []handler.PartDataset{{Name} | {Module, Key}}}}, Hidden}
 
 // bundles declaring a definition (space.EnsureBundleRequest)
 EnsureBundleRequest{…, XKey, Parts, Properties /* XKey required, deterministic ids */, Layout, Hidden}

@@ -262,12 +262,20 @@ type Store struct {
 
 	// indexBuilds reports builds of shared datasets' declared indexes
 	// (indexes.go); the index* fields are that worker's state.
-	indexBuilds *fanout.Registry[IndexBuild]
-	indexMu     sync.Mutex
-	indexKick   chan struct{}
-	indexDone   chan struct{}
-	indexCancel context.CancelFunc
-	indexClosed bool
+	indexBuilds  *fanout.Registry[IndexBuild]
+	indexMu      sync.Mutex
+	indexKick    chan struct{}
+	indexDone    chan struct{}
+	indexCancel  context.CancelFunc
+	indexClosed  bool
+	indexStarted bool
+	// indexHeld: type objects mid-replay, whose datasets the worker
+	// leaves alone.
+	indexHeld map[string]struct{}
+	// buildMu orders build reports against a subscription being added;
+	// building is the dataset whose build is in flight.
+	buildMu  sync.Mutex
+	building string
 
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
@@ -1991,12 +1999,33 @@ func (s *Store) keyedDatasets() []string {
 // Best-effort like the rest of the purge: a failure is logged and the
 // rows stay until a later reconcile purges the object again.
 func (s *Store) purgeKeyedRows(ctx context.Context, objectId string) {
-	for _, dataset := range s.keyedDatasets() {
-		if err := s.deleteKeyedRows(ctx, dataset, objectId, true); err != nil {
+	for _, dataset := range s.purgeDatasets() {
+		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
 			storeLog.Warn("purge: shared dataset rows",
 				zap.String("treeId", objectId), zap.String("dataset", dataset), zap.Error(err))
 		}
 	}
+}
+
+// purgeDatasets lists the shared datasets a purge clears: the
+// catalog's, and every one whose collection this store opened — a
+// definition removed, or absent while its type object replays, still
+// holds the object's rows.
+func (s *Store) purgeDatasets() []string {
+	names := s.keyedDatasets()
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		seen[name] = struct{}{}
+	}
+	s.mu.Lock()
+	for name := range s.keyedColls {
+		if _, ok := seen[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(names)
+	return names
 }
 
 // keyedChunkIds reads the document ids of the next chunk a
@@ -2030,27 +2059,30 @@ func (s *Store) KeyedCollection(ctx context.Context, dataset string) (coll anyst
 }
 
 // deleteKeyedRows removes objectId's rows from one shared dataset's
-// collection — a range of its primary key — in bounded transactions.
-// With notify set, live queries get each chunk's ids as removals once
-// the chunk is gone.
-func (s *Store) deleteKeyedRows(ctx context.Context, dataset, objectId string, notify bool) error {
+// collection — a range of its primary key — in bounded transactions,
+// and tells live queries which rows went once each chunk is gone. The
+// ids are read whether or not anyone listens: a query that subscribes
+// while a delete runs saw the rows. An object with no rows costs one
+// read and no write.
+func (s *Store) deleteKeyedRows(ctx context.Context, dataset, objectId string) error {
 	coll, err := s.keyedCollection(ctx, dataset)
 	if err != nil {
 		return err
 	}
 	filter := crdt.KeyedRows(objectId)
 	for {
-		var ids []string
-		if notify && s.engine != nil && s.engine.HasSubscribers() {
-			if ids, err = keyedChunkIds(ctx, coll, filter); err != nil {
-				return err
-			}
+		ids, err := keyedChunkIds(ctx, coll, filter)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
 		}
 		res, err := coll.Find(filter).Limit(keyedPurgeChunk).Delete(ctx)
 		if err != nil {
 			return err
 		}
-		if len(ids) > 0 {
+		if s.engine != nil {
 			s.engine.NotifyRecordsDeleted(s.spaceId, dataset, objectId, ids)
 		}
 		if res.Matched == 0 && res.Modified == 0 {

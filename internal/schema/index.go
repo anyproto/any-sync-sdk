@@ -31,6 +31,10 @@ const (
 	// index, apart from the handler and built-in ones.
 	IndexStorePrefix = "dx_"
 
+	// MaxIndexFieldLen bounds the key of an indexed field, so the store
+	// name of the widest index stays a valid any-store name.
+	MaxIndexFieldLen = 48
+
 	// IndexPathCreated orders records by creation within one object.
 	IndexPathCreated = "_ver.id"
 	// IndexPathObject is the owning object of a shared dataset's record.
@@ -73,9 +77,8 @@ func ValidateIndexShape(idx Index) error {
 
 // ValidateIndexDecl checks an index against the dataset it belongs to:
 // its shape, and that every path is a declared field of a scalar kind
-// (string, number, boolean, datetime) or a protocol path the dataset
-// carries. Declared shapes are enforced at apply, so an indexed field
-// holds one scalar type on every record. shared says the dataset keeps
+// (string, number, boolean, datetime) with an indexable key, or a
+// protocol path the dataset carries. shared says the dataset keeps
 // every object's records in one collection, which is where
 // IndexPathObject exists.
 func ValidateIndexDecl(ds Dataset, idx Index, shared bool) error {
@@ -93,6 +96,10 @@ func ValidateIndexDecl(ds Dataset, idx Index, shared bool) error {
 			}
 			continue
 		}
+		if !indexableKey(path) {
+			return fmt.Errorf("%w: index %q: field %q: an indexed field's key is letters, digits and \"_\", starts with a letter and is at most %d bytes",
+				ErrDecl, idx.Key, path, MaxIndexFieldLen)
+		}
 		var field *Field
 		for i := range ds.Fields {
 			if ds.Fields[i].Id == path {
@@ -108,6 +115,26 @@ func ValidateIndexDecl(ds Dataset, idx Index, shared bool) error {
 		}
 	}
 	return nil
+}
+
+// indexableKey admits the field keys an index may name. The store name
+// joins the paths with "," and marks direction and sparseness with "-"
+// and "~": keys free of those, and of any-store's reserved "$", keep
+// every name valid and distinct per shape.
+func indexableKey(key string) bool {
+	if key == "" || len(key) > MaxIndexFieldLen {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '_'):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func indexableKind(k Kind) bool {

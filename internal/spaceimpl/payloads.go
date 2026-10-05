@@ -372,7 +372,7 @@ func (p *PayloadsAPI) GetRow(ctx context.Context, ownerId, fileId string) (paylo
 // resolved — the bare-fileId lookup path scans objects without knowing
 // the owner). space.ErrNotFound for a missing or tombstoned row.
 func (p *PayloadsAPI) getRowIn(ctx context.Context, payloadsObjId, fileId string) (payloads.Row, error) {
-	coll, err := resolveCollection(ctx, p.s.store, payloadsObjId, payloads.Dataset)
+	coll, _, err := resolveCollection(ctx, p.s.store, payloadsObjId, payloads.Dataset)
 	if err != nil {
 		return payloads.Row{}, err
 	}

@@ -104,6 +104,7 @@ func TestPartRecords_SharedMarker(t *testing.T) {
 	_, recs, err := datasetDefRecords(&anyenc.Arena{}, modules, "part", &shared)
 	require.NoError(t, err)
 	assert.True(t, recs[0].Ops[0].Payload.GetBool(typetype.DefFieldPerSpace))
+	assert.Nil(t, recs[0].Ops[0].Payload.Get(typetype.DefFieldCanonical), "a shared dataset is not the canonical one")
 
 	plain := space.DatasetDraft{Key: "segments"}
 	_, err = normalizeDatasetDraft(modules, "type", &plain)

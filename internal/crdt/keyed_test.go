@@ -3,6 +3,7 @@ package crdt
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -102,12 +103,19 @@ func TestKeyed_RowsPerObject(t *testing.T) {
 	assert.Equal(t, "one", row.GetString("v"))
 	assert.Equal(t, "two", c2.Get(ctx, keyedSamples, "r1").GetString("v"))
 
-	// Either form of the id reads the row; another object's does not.
-	assert.NotNil(t, c1.Get(ctx, keyedSamples, "obj1/r1"))
+	// Get takes the id a change carries: the stored id names another
+	// record, which does not exist.
+	assert.Nil(t, c1.Get(ctx, keyedSamples, "obj1/r1"))
 	assert.Nil(t, c1.Get(ctx, keyedSamples, "r2"))
 	assert.Equal(t, "obj1/r1", c1.StoreId(keyedSamples, "r1"))
-	assert.Equal(t, "obj1/r1", c1.StoreId(keyedSamples, "obj1/r1"))
+	assert.Equal(t, "obj1/obj1/r1", c1.StoreId(keyedSamples, "obj1/r1"), "the prefix is added whatever the id holds")
+	ids := []string{"r1", "obj1/r1"}
+	c1.StoreIds(keyedSamples, ids)
+	assert.Equal(t, []string{"obj1/r1", "obj1/obj1/r1"}, ids)
 	assert.Equal(t, "r1", c1.StoreId(stampNotes, "r1"), "a per-object dataset keeps the record id")
+	// A caller may name a record by either form.
+	assert.Equal(t, "obj1/r1", KeyedId("obj1", "r1"))
+	assert.Equal(t, "obj1/r1", KeyedId("obj1", "obj1/r1"))
 
 	// A strict update lands on the writer's row only.
 	require.NoError(t, c1.ApplyChange(ctx, keyedChange("obj1", "v2",
@@ -123,6 +131,141 @@ func TestKeyed_RowsPerObject(t *testing.T) {
 	assert.True(t, c1.IsKeyed(keyedSamples))
 	assert.False(t, c1.IsShared(keyedSamples), "keyed is not the one-row-per-object mode")
 	assert.False(t, c1.IsKeyed(stampNotes))
+}
+
+// The record id a change carries is stored under the object's prefix
+// whatever it holds: `x` and `obj1/x` on obj1 are two records, each
+// with its own fields and tombstone.
+func TestKeyed_PrefixedRecordIdIsAnotherRecord(t *testing.T) {
+	f := newKeyedFixture(t)
+	a := &anyenc.Arena{}
+	c := f.controller(t, "obj1", DefaultHandler{})
+	res, err := c.ApplyChangeWithResult(ctx, keyedChange("obj1", "v1",
+		RecordChange{Id: "x", Upsert: true, Ops: []Op{setOp(a, "v", "plain")}},
+		RecordChange{Id: "obj1/x", Upsert: true, Ops: []Op{setOp(a, "v", "prefixed")}}))
+	require.NoError(t, err)
+	assert.Empty(t, res.Rejections)
+	assert.Equal(t, []string{"obj1/obj1/x", "obj1/x"}, f.ids(t))
+	assert.Equal(t, "plain", c.Get(ctx, keyedSamples, "x").GetString("v"))
+	assert.Equal(t, "prefixed", c.Get(ctx, keyedSamples, "obj1/x").GetString("v"))
+	assert.Equal(t, "obj1", c.Get(ctx, keyedSamples, "obj1/x").GetString(ObjectIdField))
+
+	// An update of one leaves the other.
+	require.NoError(t, c.ApplyChange(ctx, keyedChange("obj1", "v2",
+		RecordChange{Id: "obj1/x", Ops: []Op{setOp(a, "w", "only-prefixed")}})))
+	assert.Nil(t, c.Get(ctx, keyedSamples, "x").Get("w"))
+	assert.Equal(t, "only-prefixed", c.Get(ctx, keyedSamples, "obj1/x").GetString("w"))
+
+	// So does a delete.
+	require.NoError(t, c.ApplyChange(ctx, keyedChange("obj1", "v3",
+		RecordChange{Id: "x", Ops: []Op{{Type: OpDelete}}})))
+	assert.NotNil(t, c.Get(ctx, keyedSamples, "x").Get(DeletedAtField))
+	live := c.Get(ctx, keyedSamples, "obj1/x")
+	assert.Nil(t, live.Get(DeletedAtField))
+	assert.Equal(t, "prefixed", live.GetString("v"))
+	recs := c.Records(ctx, keyedSamples)
+	require.Len(t, recs, 1)
+	assert.Equal(t, "obj1/obj1/x", recs[0].GetString(IdField))
+
+	require.NoError(t, c.ApplyChange(ctx, keyedChange("obj1", "v4",
+		RecordChange{Id: "obj1/x", Ops: []Op{{Type: OpDelete}}})))
+	assert.Empty(t, c.Records(ctx, keyedSamples))
+	assert.Equal(t, []string{"obj1/obj1/x", "obj1/x"}, f.ids(t), "each tombstone keeps its own row")
+}
+
+// derivedOp finds the op at path among a record's derived ops.
+func derivedOp(ops []Op, path ...string) *Op {
+	for i := range ops {
+		if slices.Equal(ops[i].Path, path) {
+			return &ops[i]
+		}
+	}
+	return nil
+}
+
+// Creating a record derives its object stamp next to the creation
+// version, so an event rebuilds the row whole; an update derives
+// neither, and a per-object dataset derives no stamp.
+func TestKeyed_CreateDerivesTheObjectStamp(t *testing.T) {
+	f := newKeyedFixture(t)
+	a := &anyenc.Arena{}
+	c := f.controller(t, "obj1", DefaultHandler{})
+
+	res, err := c.ApplyChangeWithResult(ctx, keyedChange("obj1", "v1",
+		RecordChange{Id: "r1", Upsert: true, Ops: []Op{setOp(a, "v", "x")}}))
+	require.NoError(t, err)
+	require.Len(t, res.DerivedOps, 1)
+	stamp := derivedOp(res.DerivedOps[0], ObjectIdField)
+	require.NotNil(t, stamp, "the create derives _objectId")
+	assert.Equal(t, OpSet, stamp.Type)
+	assert.Equal(t, "obj1", string(stamp.Payload.GetStringBytes()))
+	ver := derivedOp(res.DerivedOps[0], VersionsKey, IdField)
+	require.NotNil(t, ver)
+	assert.Equal(t, "v1", string(ver.Payload.GetStringBytes()))
+
+	res, err = c.ApplyChangeWithResult(ctx, keyedChange("obj1", "v2",
+		RecordChange{Id: "r1", Ops: []Op{setOp(a, "v", "y")}}))
+	require.NoError(t, err)
+	for _, ops := range res.DerivedOps {
+		assert.Nil(t, derivedOp(ops, ObjectIdField), "an update derives no stamp")
+	}
+
+	res, err = c.ApplyChangeWithResult(ctx, Change{
+		ObjectId: "obj1", Dataset: stampNotes, ChangeId: "ch-notes", VersionId: "v3",
+		Timestamp: 1, DataVersion: "dv",
+		Records: []RecordChange{{Id: "n1", Upsert: true, Ops: []Op{setOp(a, "v", "x")}}},
+	})
+	require.NoError(t, err)
+	require.Len(t, res.DerivedOps, 1)
+	assert.Nil(t, derivedOp(res.DerivedOps[0], ObjectIdField), "a per-object record carries no stamp")
+	assert.NotNil(t, derivedOp(res.DerivedOps[0], VersionsKey, IdField))
+}
+
+// A controller whose collections were released opens a collection by
+// name for each call; it leaves the declared indexes under its prune
+// prefix as its successor set them, neither creating nor dropping one.
+func TestController_ReleasedLeavesDeclaredIndexes(t *testing.T) {
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "test.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	a := &anyenc.Arena{}
+	open := func(indexes ...anystore.IndexInfo) *Controller {
+		c, err := NewController(ctx, "obj1", db, HandlerReg{
+			Name: stampNotes, Handler: DefaultHandler{}, Schema: dynSchema,
+			Indexes: indexes, PruneIndexPrefix: "dx_",
+		})
+		require.NoError(t, err)
+		return c
+	}
+	write := func(c *Controller, ver VersionId) {
+		require.NoError(t, c.ApplyChange(ctx, Change{
+			ObjectId: "obj1", Dataset: stampNotes, ChangeId: "ch-" + string(ver), VersionId: ver,
+			Timestamp: 1, DataVersion: "dv",
+			Records: []RecordChange{{Id: "r-" + string(ver), Upsert: true, Ops: []Op{setOp(a, "v", "x")}}},
+		}))
+	}
+	collNames := func() []string {
+		coll, err := db.OpenCollection(ctx, "obj1_"+stampNotes)
+		require.NoError(t, err)
+		return collIndexNames(coll)
+	}
+
+	stale := open(anystore.IndexInfo{Name: "dx_old", Fields: []string{"old"}})
+	write(stale, "v1")
+	assert.Equal(t, []string{"dx_old", "idx__addSeq"}, collNames())
+	require.NoError(t, stale.CloseOwnedCollections())
+
+	// The successor registers another set and reconciles the collection.
+	next := open(anystore.IndexInfo{Name: "dx_new", Fields: []string{"new"}})
+	write(next, "v2")
+	assert.Equal(t, []string{"dx_new", "idx__addSeq"}, collNames())
+
+	// The released one reads and writes without touching that set.
+	require.NotNil(t, stale.Get(ctx, stampNotes, "r-v1"), "a read reopens the collection")
+	assert.Equal(t, []string{"dx_new", "idx__addSeq"}, collNames())
+	write(stale, "v3")
+	assert.Equal(t, []string{"dx_new", "idx__addSeq"}, collNames())
+	assert.NotNil(t, next.Get(ctx, stampNotes, "r-v3"))
 }
 
 // An empty record id resolves from the change id, then takes the
@@ -208,6 +351,7 @@ func TestKeyed_CollectionIsSupplied(t *testing.T) {
 	_, err := NewController(ctx, "obj1", f.db,
 		HandlerReg{Name: keyedSamples, Handler: DefaultHandler{}, Schema: dynSchema, Keyed: true})
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), `keyed dataset "samples" registered without its collection`)
 
 	a := &anyenc.Arena{}
 	c1 := f.controller(t, "obj1", DefaultHandler{})

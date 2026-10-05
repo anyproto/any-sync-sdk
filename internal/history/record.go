@@ -194,7 +194,7 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 	}
 
 	// Get clones off any-store's buffer, so the value survives db.Close.
-	return ctrl.Get(ctx, p.Dataset, p.RecordId), nil
+	return ctrl.GetStored(ctx, p.Dataset, p.RecordId), nil
 }
 
 // changeRecordId is p.RecordId in the form a change of p.Dataset

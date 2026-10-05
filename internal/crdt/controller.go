@@ -112,15 +112,23 @@ const (
 // one always splits.
 const keySeparator = "/"
 
-// KeyedId is the document id of recordId on objectId in a keyed
-// dataset. An id already carrying the object's prefix is returned as
-// is, so callers may pass either form.
+// KeyedId is the document id a caller names a record of objectId by in
+// a keyed dataset: an id already carrying the object's prefix is
+// returned as is, so a caller may pass either form. For the record id
+// a change carries use KeyedStoreId.
 func KeyedId(objectId, recordId string) string {
 	prefix := objectId + keySeparator
 	if strings.HasPrefix(recordId, prefix) {
 		return recordId
 	}
 	return prefix + recordId
+}
+
+// KeyedStoreId is the document id the record id of a change is stored
+// under on objectId. Always the object's prefix plus the id: two record
+// ids of one object never share a document, whatever they hold.
+func KeyedStoreId(objectId, recordId string) string {
+	return objectId + keySeparator + recordId
 }
 
 // KeyedBounds is the document-id range holding every row of objectId in
@@ -448,6 +456,27 @@ func ensureHandlerIndexes(ctx context.Context, indexes []anystore.IndexInfo, col
 	return nil
 }
 
+// reconcileIndexes brings a per-object collection's indexes in line
+// with the dataset's registration when the collection is opened. A
+// controller whose collections were released was replaced by a newer
+// one: its registration may be the older, so it leaves the set under a
+// prune prefix to its successor.
+func (c *Controller) reconcileIndexes(ctx context.Context, dataset string, coll anystore.Collection) error {
+	prefix := c.prunePrefixes[dataset]
+	if prefix == "" || !c.collsReleased.Load() {
+		if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
+			return err
+		}
+	}
+	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
+		return err
+	}
+	if c.collsReleased.Load() {
+		return nil
+	}
+	return DropStaleIndexes(ctx, coll, c.indexes[dataset], prefix)
+}
+
 // StaleIndexes lists the collection's indexes named under prefix that
 // are not among want. An empty prefix lists none.
 func StaleIndexes(coll anystore.Collection, want []anystore.IndexInfo, prefix string) []string {
@@ -529,14 +558,8 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 	if err != nil {
 		return nil, fmt.Errorf("crdt: open collection %q: %w", collName, err)
 	}
-	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
-		return nil, fmt.Errorf("crdt: ensure indexes for %q: %w", dataset, err)
-	}
-	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
-		return nil, fmt.Errorf("crdt: ensure builtin indexes for %q: %w", dataset, err)
-	}
-	if err := DropStaleIndexes(ctx, coll, c.indexes[dataset], c.prunePrefixes[dataset]); err != nil {
-		return nil, fmt.Errorf("crdt: drop stale indexes for %q: %w", dataset, err)
+	if err := c.reconcileIndexes(ctx, dataset, coll); err != nil {
+		return nil, fmt.Errorf("crdt: indexes for %q: %w", dataset, err)
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
@@ -573,13 +596,7 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 	if err != nil {
 		return nil
 	}
-	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
-		return nil
-	}
-	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
-		return nil
-	}
-	if err := DropStaleIndexes(ctx, coll, c.indexes[dataset], c.prunePrefixes[dataset]); err != nil {
+	if err := c.reconcileIndexes(ctx, dataset, coll); err != nil {
 		return nil
 	}
 	c.collMu.Lock()
@@ -673,12 +690,22 @@ func (c *Controller) RecordGetter(ctx context.Context) func(dataset, id string) 
 // the value would alias a buffer that's released back to the pool
 // before this function returns (any-store's FindId releases via
 // defer).
+//
+// id is the record id a change carries. For the id a row is stored and
+// read under — what StoreIds, events and reads return — use GetStored.
 func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value {
+	return c.GetStored(ctx, dataset, c.StoreId(dataset, id))
+}
+
+// GetStored returns the record stored under storeId in the dataset, or
+// nil if absent: the document id as it is, with no object prefix added.
+// Cloned like Get.
+func (c *Controller) GetStored(ctx context.Context, dataset, storeId string) *anyenc.Value {
 	coll := c.collectionForRead(ctx, dataset)
 	if coll == nil {
 		return nil
 	}
-	doc, err := coll.FindId(ctx, c.StoreId(dataset, id))
+	doc, err := coll.FindId(ctx, storeId)
 	if err != nil {
 		return nil
 	}
@@ -737,14 +764,15 @@ func (c *Controller) IsKeyed(dataset string) bool {
 	return ok
 }
 
-// StoreId is the document id recordId is stored under in dataset: the
-// keyed id for a keyed dataset, recordId itself otherwise.
+// StoreId is the document id recordId — the id a change carries — is
+// stored under in dataset: the keyed id for a keyed dataset, recordId
+// itself otherwise.
 func (c *Controller) StoreId(dataset, recordId string) string {
 	if c == nil {
 		return recordId
 	}
 	if _, keyed := c.keyed[dataset]; keyed {
-		return KeyedId(c.objectId, recordId)
+		return KeyedStoreId(c.objectId, recordId)
 	}
 	return recordId
 }
@@ -759,7 +787,7 @@ func (c *Controller) StoreIds(dataset string, ids []string) {
 		return
 	}
 	for i := range ids {
-		ids[i] = KeyedId(c.objectId, ids[i])
+		ids[i] = KeyedStoreId(c.objectId, ids[i])
 	}
 }
 
@@ -1751,6 +1779,13 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			Path:    []string{VersionsKey, IdField},
 			Payload: m.derivedArena().NewString(string(ch.VersionId)),
 		})
+		if m.keyedObject != "" {
+			m.appliedDerived = append(m.appliedDerived, Op{
+				Type:    OpSet,
+				Path:    []string{ObjectIdField},
+				Payload: m.derivedArena().NewString(m.keyedObject),
+			})
+		}
 
 		// Local and Injected materializations are handler-exclusive —
 		// their validation is writer-side (Properties.Set / the mirror).

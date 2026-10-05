@@ -324,8 +324,14 @@ func (v *View) Datasets() []string {
 // Record returns one record (nil if absent), tombstones included —
 // callers that need liveness filtering check _deletedAt. _applySeq is
 // never present (scratch controllers run without an allocator).
+//
+// recordId is the id a caller names the record by: for a shared
+// dataset the stored `<objectId>/<recordId>` or the plain record id.
 func (v *View) Record(ctx context.Context, dataset, recordId string) *anyenc.Value {
-	return v.ctrl.Get(ctx, dataset, recordId)
+	if v.ctrl.IsKeyed(dataset) {
+		recordId = crdt.KeyedId(v.ctrl.ObjectId(), recordId)
+	}
+	return v.ctrl.GetStored(ctx, dataset, recordId)
 }
 
 // Records returns all live (non-tombstone) records of a dataset.

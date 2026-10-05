@@ -156,7 +156,7 @@ func (s *spaceImpl) upsertPage(ctx context.Context, batch *space.UpsertBatch, up
 		id := rec.Id
 		if keyed && id != "" {
 			id = crdt.KeyedRecordId(batch.ObjectId, id)
-			if strings.Contains(id, "/") {
+			if strings.Contains(id, "/") || id == "" {
 				res.Rejections = append(res.Rejections, space.UpsertRejection{Index: idx, Id: rec.Id,
 					Err: fmt.Errorf("upsert: %w: %q", space.ErrRecordIdOfAnotherObject, rec.Id)})
 				continue
@@ -280,8 +280,8 @@ func (s *spaceImpl) upsertReadPage(ctx context.Context, objectId, dataset string
 	for i := range page {
 		if page[i].Id != "" {
 			// The row is stored under the object's key in a shared
-			// dataset; the result stays keyed by the caller's id.
-			vals = append(vals, arena.NewString(ctrl.StoreId(dataset, page[i].Id)))
+			// dataset; the caller may name it either way.
+			vals = append(vals, arena.NewString(ctrl.StoreId(dataset, upsertRecordId(ctrl, objectId, dataset, page[i].Id))))
 		}
 	}
 	if len(vals) == 0 {

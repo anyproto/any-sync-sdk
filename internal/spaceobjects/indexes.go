@@ -34,11 +34,46 @@ type IndexBuild struct {
 	Err     error
 }
 
-// SubscribeIndexBuilds registers cb on the index-build feed. cb runs on
-// the index worker — keep it small or hand off. The returned cancel is
-// idempotent.
+// SubscribeIndexBuilds registers cb on the index-build feed. A build in
+// flight is reported to cb at once as Started, so its terminal report
+// never arrives alone. cb runs on the index worker, or here for that
+// first report — keep it small or hand off, and do not subscribe from
+// it. The returned cancel is idempotent.
 func (s *Store) SubscribeIndexBuilds(cb func(IndexBuild)) (cancel func()) {
-	return s.indexBuilds.Add(cb)
+	if cb == nil {
+		return func() {}
+	}
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+	cancel = s.indexBuilds.Add(cb)
+	if s.building != "" {
+		cb(IndexBuild{Dataset: s.building, Phase: IndexBuildStarted})
+	}
+	return cancel
+}
+
+// reportBuild dispatches one build report. buildMu orders it against a
+// subscription being added.
+func (s *Store) reportBuild(ev IndexBuild) {
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+	if ev.Phase == IndexBuildStarted {
+		s.building = ev.Dataset
+	} else {
+		s.building = ""
+	}
+	s.indexBuilds.Dispatch(ev)
+}
+
+// StartIndexSync lets the index worker run and asks for a first pass,
+// which builds what a previous run left missing. Until it is called a
+// store indexes nothing: one handed back closed during teardown never
+// starts background work.
+func (s *Store) StartIndexSync() {
+	s.indexMu.Lock()
+	s.indexStarted = true
+	s.indexMu.Unlock()
+	s.kickIndexSync()
 }
 
 // kickIndexSync asks the index worker for a pass over the space's
@@ -50,7 +85,7 @@ func (s *Store) kickIndexSync() {
 	}
 	s.indexMu.Lock()
 	defer s.indexMu.Unlock()
-	if s.indexClosed {
+	if s.indexClosed || !s.indexStarted {
 		return
 	}
 	if s.indexKick == nil {
@@ -64,6 +99,37 @@ func (s *Store) kickIndexSync() {
 	case s.indexKick <- struct{}{}:
 	default:
 	}
+}
+
+// holdIndexSync keeps the worker off a type's datasets while the type
+// object replays: each replayed definition change refreshes the
+// catalog, and a dataset whose index records have not replayed yet
+// would lose its indexes to a pass in between. releaseIndexSync ends
+// the hold and asks for the pass.
+func (s *Store) holdIndexSync(typeId string) {
+	s.indexMu.Lock()
+	if s.indexHeld == nil {
+		s.indexHeld = make(map[string]struct{})
+	}
+	s.indexHeld[typeId] = struct{}{}
+	s.indexMu.Unlock()
+}
+
+func (s *Store) releaseIndexSync(typeId string) {
+	s.indexMu.Lock()
+	_, held := s.indexHeld[typeId]
+	delete(s.indexHeld, typeId)
+	s.indexMu.Unlock()
+	if held {
+		s.kickIndexSync()
+	}
+}
+
+func (s *Store) indexSyncHeld(typeId string) bool {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	_, held := s.indexHeld[typeId]
+	return held
 }
 
 // stopIndexSync stops the index worker and waits for a build in flight:
@@ -104,7 +170,7 @@ func (s *Store) indexLoop(ctx context.Context) {
 // names any more, builds the missing ones.
 func (s *Store) syncKeyedIndexes(ctx context.Context, dataset string) error {
 	ds, ok := s.catalog.lookup(dataset)
-	if !ok || !ds.Shared {
+	if !ok || !ds.Shared || s.indexSyncHeld(ds.TypeId) {
 		return nil
 	}
 	coll, err := s.keyedCollection(ctx, dataset)
@@ -119,12 +185,12 @@ func (s *Store) syncKeyedIndexes(ctx context.Context, dataset string) error {
 	if len(missing) == 0 {
 		return nil
 	}
-	s.indexBuilds.Dispatch(IndexBuild{Dataset: dataset, Phase: IndexBuildStarted})
+	s.reportBuild(IndexBuild{Dataset: dataset, Phase: IndexBuildStarted})
 	if err := coll.EnsureIndex(ctx, missing...); err != nil {
-		s.indexBuilds.Dispatch(IndexBuild{Dataset: dataset, Phase: IndexBuildFailed, Err: err})
+		s.reportBuild(IndexBuild{Dataset: dataset, Phase: IndexBuildFailed, Err: err})
 		return err
 	}
-	s.indexBuilds.Dispatch(IndexBuild{Dataset: dataset, Phase: IndexBuildDone})
+	s.reportBuild(IndexBuild{Dataset: dataset, Phase: IndexBuildDone})
 	return nil
 }
 

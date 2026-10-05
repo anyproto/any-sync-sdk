@@ -15,6 +15,7 @@ import (
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/config"
 	"github.com/anyproto/any-sync-sdk/handler"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -580,17 +581,15 @@ func TestE2E_SharedDatasets_ReadsAndWrites(t *testing.T) {
 		a, b := lab.newObject(t, ctx), lab.newObject(t, ctx)
 		lab.put(t, ctx, a, lab.samples, "r1", map[string]any{"label": "a1", "score": 1, "kind": "x"})
 
-		// `_objectId` is not writable: an attempt fails the call or is
-		// rejected, and the row keeps naming its object.
+		// `_objectId` is not writable: an attempt fails the call as a
+		// validation error, and the row keeps naming its object.
 		for _, rec := range []space.RecordModify{
 			{Id: "r1", Ops: []space.Op{{Type: space.OpSet, Path: "_objectId", Value: b}}},
 			{Id: "r1", Ops: []space.Op{{Type: space.OpUnset, Path: "_objectId"}}},
 			{Id: "r2", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"_objectId": b, "label": "a2", "kind": "x"}}}},
 		} {
-			res, err := sp.Modify(ctx, space.ModifyBatch{ObjectId: a, Dataset: lab.samples, Records: []space.RecordModify{rec}})
-			if err == nil {
-				assert.NotEmpty(t, res.Rejections, "a write of _objectId (%s on %s) is refused", rec.Ops[0].Type, rec.Id)
-			}
+			_, err := sp.Modify(ctx, space.ModifyBatch{ObjectId: a, Dataset: lab.samples, Records: []space.RecordModify{rec}})
+			assert.ErrorIs(t, err, crdt.ErrValidation, "a write of _objectId (%s on %s) is refused", rec.Ops[0].Type, rec.Id)
 		}
 		ures, err := sp.Upsert(ctx, space.UpsertBatch{ObjectId: a, Dataset: lab.samples, Records: []space.UpsertRecord{
 			{Id: "r3", Fields: map[string]any{"_objectId": b, "label": "a3", "kind": "x"}},
@@ -599,9 +598,7 @@ func TestE2E_SharedDatasets_ReadsAndWrites(t *testing.T) {
 		require.Len(t, ures.Rejections, 1, "Upsert refuses the reserved field")
 		assert.Equal(t, "r3", ures.Rejections[0].Id)
 
-		for id, row := range lab.rows(t, ctx, a, lab.samples) {
-			assert.Equal(t, a, row.GetString("_objectId"), "row %s still names A", id)
-		}
+		assertOwnedRows(t, lab.rows(t, ctx, a, lab.samples), a, "r1")
 		assert.Empty(t, lab.rows(t, ctx, b, lab.samples), "nothing moved to B")
 	})
 
@@ -734,9 +731,9 @@ func TestE2E_SharedDatasets_ReadsAndWrites(t *testing.T) {
 		assert.Empty(t, res.Rejections)
 	})
 
-	// An Upsert naming another object's record, or any other id holding
-	// "/", is refused as ErrRecordIdOfAnotherObject — as the call's
-	// error or as the record's rejection — and writes nothing.
+	// An Upsert naming another object's record, any other id holding
+	// "/", or the object's bare prefix, is a per-record rejection as
+	// ErrRecordIdOfAnotherObject, and writes nothing.
 	t.Run("UpsertForeignIdRefused", func(t *testing.T) {
 		a, b := lab.newObject(t, ctx), lab.newObject(t, ctx)
 		fields := map[string]any{"label": "one", "score": 1, "kind": "x"}
@@ -746,16 +743,18 @@ func TestE2E_SharedDatasets_ReadsAndWrites(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 1, res.Created)
 		}
-		for _, id := range []string{b + "/u1", "x/y"} {
+		for _, id := range []string{b + "/u1", "x/y", a + "/x/y", a + "/"} {
 			res, err := sp.Upsert(ctx, space.UpsertBatch{ObjectId: a, Dataset: lab.samples, Records: []space.UpsertRecord{
 				{Id: id, Fields: map[string]any{"label": "hijack", "score": 1, "kind": "x"}},
 			}})
-			refusal := err
-			if refusal == nil && len(res.Rejections) == 1 {
-				refusal = res.Rejections[0].Err
+			require.NoError(t, err, "Upsert of %q on A", id)
+			if assert.Len(t, res.Rejections, 1, "Upsert of %q on A", id) {
+				assert.Equal(t, 0, res.Rejections[0].Index)
+				assert.Equal(t, id, res.Rejections[0].Id, "the rejection names the id as written")
+				assert.ErrorIs(t, res.Rejections[0].Err, space.ErrRecordIdOfAnotherObject, "Upsert of %q on A", id)
 			}
-			assert.ErrorIs(t, refusal, space.ErrRecordIdOfAnotherObject, "Upsert of %q on A", id)
-			assert.Zero(t, res.Created+res.Updated, "Upsert of %q wrote nothing", id)
+			assert.Zero(t, res.Created+res.Updated+res.Skipped, "Upsert of %q wrote nothing", id)
+			assert.Empty(t, res.Pages, "Upsert of %q wrote no change", id)
 		}
 		assertOwnedRows(t, lab.rows(t, ctx, a, lab.samples), a, "u1")
 		rowsB := lab.rows(t, ctx, b, lab.samples)
@@ -766,10 +765,9 @@ func TestE2E_SharedDatasets_ReadsAndWrites(t *testing.T) {
 	})
 
 	// With an id pattern admitting "/", the read-back id of an existing
-	// record reaches the write path. Re-running an Upsert keyed by it
-	// stays a no-op — the record is either addressed (skipped) or the
-	// id refused — and never reports the existing record created or
-	// writes a change per run.
+	// record reaches the write path, and addresses that record: an
+	// Upsert keyed by it finds the record unchanged and skips it, on
+	// every run, writing no change.
 	t.Run("UpsertReadBackIdRerun", func(t *testing.T) {
 		_, err := sp.Types().AddDataset(ctx, lab.typeId, lab.partId, space.DatasetDraft{
 			Key: "paths", Shared: true, IdRule: space.IdUser, IdPattern: `[A-Za-z0-9._:/-]+`,
@@ -787,16 +785,78 @@ func TestE2E_SharedDatasets_ReadsAndWrites(t *testing.T) {
 		require.Equal(t, 1, res.Created)
 
 		for run := 1; run <= 2; run++ {
-			// A refusal (a non-nil error) leaves the counters at zero too.
-			res, _ = sp.Upsert(ctx, space.UpsertBatch{ObjectId: a, Dataset: paths,
+			res, err = sp.Upsert(ctx, space.UpsertBatch{ObjectId: a, Dataset: paths,
 				Records: []space.UpsertRecord{{Id: a + "/p1", Fields: fields}}})
-			assert.Zero(t, res.Created, "run %d: %s/p1 exists, nothing is created", run, a)
+			require.NoError(t, err, "run %d", run)
+			assert.Empty(t, res.Rejections, "run %d", run)
+			assert.Equal(t, 1, res.Skipped, "run %d: %s/p1 is the unchanged record p1", run, a)
+			assert.Zero(t, res.Created+res.Updated, "run %d: nothing is created or updated", run)
 			assert.Empty(t, res.Pages, "run %d: an unchanged record writes no change", run)
 		}
 		assertOwnedRows(t, lab.rows(t, ctx, a, paths), a, "p1")
 		list, err := sp.History().ListChanges(ctx, a, space.HistoryFilter{Dataset: paths}, 0, "")
 		require.NoError(t, err)
 		assert.Len(t, list.Changes, 1, "the record's history holds its create only")
+	})
+
+	// The plain id and the object's stored id name one record: a page
+	// holding both rejects the second as a duplicate, under the plain
+	// id, and writes the first.
+	t.Run("UpsertBothIdForms", func(t *testing.T) {
+		a := lab.newObject(t, ctx)
+		res, err := sp.Upsert(ctx, space.UpsertBatch{ObjectId: a, Dataset: lab.samples, Records: []space.UpsertRecord{
+			{Id: "u1", Fields: map[string]any{"label": "plain", "score": 1, "kind": "x"}},
+			{Id: a + "/u1", Fields: map[string]any{"label": "stored", "score": 2, "kind": "x"}},
+		}})
+		require.NoError(t, err)
+		assert.Equal(t, 1, res.Created)
+		if assert.Len(t, res.Rejections, 1) {
+			assert.Equal(t, 1, res.Rejections[0].Index)
+			assert.Equal(t, "u1", res.Rejections[0].Id)
+			assert.ErrorContains(t, res.Rejections[0].Err, "duplicate id")
+		}
+		require.Len(t, res.Pages, 1)
+		assert.Equal(t, []string{a + "/u1"}, res.Pages[0].RecordIds)
+		rows := lab.rows(t, ctx, a, lab.samples)
+		assertOwnedRows(t, rows, a, "u1")
+		if row := rows[a+"/u1"]; assert.NotNil(t, row) {
+			assert.Equal(t, "plain", row.GetString("label"))
+		}
+	})
+
+	// The object's bare prefix names no record: a write naming it fails
+	// rather than creating a record under a derived id.
+	t.Run("BarePrefixRefused", func(t *testing.T) {
+		a := lab.newObject(t, ctx)
+		lab.put(t, ctx, a, lab.events, "", map[string]any{"label": "auto"})
+		bare := a + "/"
+		for _, tc := range []struct {
+			dataset string
+			rec     space.RecordModify
+		}{
+			{lab.samples, space.RecordModify{Id: bare, Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"label": "bare", "kind": "x"}}}}},
+			{lab.samples, space.RecordModify{Id: bare, Ops: []space.Op{{Type: space.OpSet, Path: "label", Value: "bare"}}}},
+			{lab.events, space.RecordModify{Id: bare, Upsert: true, Ops: []space.Op{{Type: space.OpSet, Path: "label", Value: "bare"}}}},
+		} {
+			_, err := sp.Modify(ctx, space.ModifyBatch{ObjectId: a, Dataset: tc.dataset, Records: []space.RecordModify{tc.rec}})
+			assert.ErrorIs(t, err, space.ErrRecordIdOfAnotherObject, "Modify of the bare prefix on %s (upsert %t)", tc.dataset, tc.rec.Upsert)
+		}
+		_, err := sp.Delete(ctx, space.DeleteBatch{ObjectId: a, Dataset: lab.samples, RecordIds: []string{bare}})
+		assert.ErrorIs(t, err, space.ErrRecordIdOfAnotherObject, "Delete of the bare prefix")
+		res, err := sp.Upsert(ctx, space.UpsertBatch{ObjectId: a, Dataset: lab.samples, Records: []space.UpsertRecord{
+			{Id: bare, Fields: map[string]any{"label": "bare", "kind": "x"}},
+		}})
+		require.NoError(t, err)
+		if assert.Len(t, res.Rejections, 1) {
+			assert.ErrorIs(t, res.Rejections[0].Err, space.ErrRecordIdOfAnotherObject)
+		}
+		assert.Zero(t, res.Created)
+
+		assert.Empty(t, lab.rows(t, ctx, a, lab.samples), "nothing was written to samples")
+		assert.Len(t, lab.rows(t, ctx, a, lab.events), 1, "events holds its one derived record")
+		n, err := sp.Query(a, lab.samples).Projection(space.ProjectionOpts{IncludeDeleted: true}).Count(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, n, "no tombstone either")
 	})
 
 	t.Run("Aggregate", func(t *testing.T) {
@@ -1121,6 +1181,132 @@ func TestE2E_SharedDatasets_Subscribe(t *testing.T) {
 	assert.Equal(t, "b9-edited", rec.Doc.GetString("label"))
 }
 
+// TestE2E_SharedDatasets_CreateEventCarriesObjectStamp: a create in a
+// shared dataset reaches a live query with its `_objectId` among the
+// record's ops, next to its fields, so a client rebuilds the row from
+// the ops alone.
+func TestE2E_SharedDatasets_CreateEventCarriesObjectStamp(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	lab := openSharedLab(t, ctx, "SharedCreateStamp")
+	sp := lab.sp
+	a := lab.newObject(t, ctx)
+
+	spaceSub, err := sp.QueryDataset(lab.samples).Subscribe(ctx, space.QueryOpts{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = spaceSub.Sub.Close() })
+	objectSub, err := sp.Query(a, lab.samples).Subscribe(ctx, space.QueryOpts{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = objectSub.Sub.Close() })
+
+	lab.put(t, ctx, a, lab.samples, "r1", map[string]any{"label": "a1", "score": 1, "kind": "x"})
+	for name, sub := range map[string]space.QuerySubscription{"space": spaceSub.Sub, "object": objectSub.Sub} {
+		ev := receiveOne(t, sub, 2*time.Second)
+		rec, where := subRecordFor(ev, a+"/r1")
+		require.NotNil(t, rec, "%s: event ids %v", name, eventIds(ev))
+		assert.Equal(t, "added", where, name)
+		stamps := 0
+		for _, op := range rec.Ops {
+			if len(op.Path) == 1 && op.Path[0] == "_objectId" {
+				stamps++
+				assert.Equal(t, crdt.OpSet, op.Type, name)
+				if assert.NotNil(t, op.Payload, name) {
+					assert.Equal(t, a, string(op.Payload.GetStringBytes()), name)
+				}
+			}
+		}
+		assert.Equal(t, 1, stamps, "%s: the create carries one _objectId op", name)
+	}
+
+	// An update does not carry it again.
+	lab.set(t, ctx, a, lab.samples, "r1", "label", "a1-edited")
+	ev := receiveOne(t, spaceSub.Sub, 2*time.Second)
+	rec, where := subRecordFor(ev, a+"/r1")
+	require.NotNil(t, rec, "event ids %v", eventIds(ev))
+	assert.Equal(t, "updated", where)
+	for _, op := range rec.Ops {
+		assert.NotEqual(t, []string{"_objectId"}, op.Path, "an update carries no _objectId op")
+	}
+}
+
+// TestE2E_SharedDatasets_RemovedDefinition: after a shared dataset's
+// definition is removed, an object still resident reads the per-space
+// collection through its controller, and every per-object read stays
+// inside that object's rows; the space-wide read is refused; deleting
+// an object still takes its rows out of the collection.
+func TestE2E_SharedDatasets_RemovedDefinition(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	lab := openSharedLab(t, ctx, "SharedRemovedDef")
+	sp := lab.sp
+
+	a, b := lab.newObject(t, ctx), lab.newObject(t, ctx)
+	lab.putRows(t, ctx,
+		sample(a, "r1", "x", 1), sample(a, "r2", "y", 2),
+		sample(b, "r1", "x", 10), sample(b, "r2", "y", 20), sample(b, "r3", "x", 30))
+	own := map[string][]string{a: {a + "/r1", a + "/r2"}, b: {b + "/r1", b + "/r2", b + "/r3"}}
+	others := map[string]string{a: b, b: a}
+	// Both objects load, and stay resident through the test.
+	assertOwnedRows(t, lab.rows(t, ctx, a, lab.samples), a, "r1", "r2")
+	assertOwnedRows(t, lab.rows(t, ctx, b, lab.samples), b, "r1", "r2", "r3")
+
+	require.NoError(t, sp.Types().RemoveDataset(ctx, lab.typeId, datasetDefs(t, ctx, sp, lab.typeId)["samples"].Id))
+	_, ok := datasetDefs(t, ctx, sp, lab.typeId)["samples"]
+	require.False(t, ok, "the definition is gone")
+
+	_, err := sp.QueryDataset(lab.samples).All(ctx)
+	assert.ErrorIs(t, err, space.ErrDatasetNotShared)
+	_, err = sp.AggregateDataset(lab.samples, `[{"$count": "n"}]`).All(ctx)
+	assert.ErrorIs(t, err, space.ErrDatasetNotShared)
+
+	for _, obj := range []string{a, b} {
+		want := own[obj]
+		rows, err := sp.Query(obj, lab.samples).All(ctx)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, want, idsOfInitial(rows), "All reads %s's rows only", obj)
+		for _, row := range rows {
+			assert.Equal(t, obj, row.GetString("_objectId"))
+		}
+		n, err := sp.Query(obj, lab.samples).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, len(want), n, "Count of %s", obj)
+		n, err = sp.Query(obj, lab.samples).Filter(map[string]any{"_objectId": others[obj]}).Count(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, n, "no row of the other object is visible through %s", obj)
+		_, err = sp.Query(obj, lab.samples).Filter(map[string]any{"id": others[obj] + "/r1"}).One(ctx)
+		assert.ErrorIs(t, err, space.ErrNotFound)
+
+		snap, err := sp.Query(obj, lab.samples).Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
+		require.NoError(t, err)
+		assert.Equal(t, len(want), snap.Total, "Snapshot total of %s", obj)
+		assert.ElementsMatch(t, want, idsOfInitial(snap.Initial))
+
+		sub, err := sp.Query(obj, lab.samples).Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
+		require.NoError(t, err)
+		assert.ElementsMatch(t, want, idsOfInitial(sub.Initial), "Subscribe starts from %s's rows", obj)
+		assert.Equal(t, len(want), sub.Total)
+		_ = sub.Sub.Close()
+
+		agg, err := sp.Aggregate(obj, lab.samples, `[{"$group": {"_id": "$_objectId", "n": {"$count": {}}}}]`).All(ctx)
+		require.NoError(t, err)
+		if assert.Len(t, agg, 1, "one owning object in %s's pipeline", obj) {
+			assert.Equal(t, obj, agg[0].GetString("id"))
+			assert.Equal(t, len(want), agg[0].GetInt("n"))
+		}
+		n, err = sp.Aggregate(obj, lab.samples, `[{"$match": {"_objectId": "`+others[obj]+`"}}]`).Count(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, n, "the other object's rows never enter %s's pipeline", obj)
+	}
+
+	// The collection stays open: deleting an object purges its rows.
+	require.Equal(t, 2, lab.storedRows(t, ctx, lab.samples, a))
+	require.NoError(t, sp.Objects().Delete(ctx, a))
+	assert.Zero(t, lab.storedRows(t, ctx, lab.samples, a), "A's rows are purged")
+	assert.Equal(t, 3, lab.storedRows(t, ctx, lab.samples, b), "B's rows stay")
+}
+
 // TestE2E_SharedDatasets_ObjectDelete: deleting an object removes its
 // rows from the per-space collection of every shared dataset and
 // leaves the other objects' rows, read back unchanged.
@@ -1180,9 +1366,13 @@ func TestE2E_SharedDatasets_ObjectDelete(t *testing.T) {
 	assert.Equal(t, 2, lab.storedRows(t, ctx, lab.samples, b))
 	assert.Equal(t, 1, lab.storedRows(t, ctx, lab.events, b))
 
-	// Nothing of A reads back, deleted rows included.
-	if rows, qerr := sp.Query(a, lab.samples).Projection(space.ProjectionOpts{IncludeDeleted: true}).All(ctx); qerr == nil {
-		assert.Empty(t, rows, "a deleted object reads no records")
+	// Nothing of A reads back, deleted rows included: the deleted object
+	// has no tree to open, and the space-wide read holds none of its
+	// rows.
+	_, err = sp.Query(a, lab.samples).Projection(space.ProjectionOpts{IncludeDeleted: true}).All(ctx)
+	assert.ErrorIs(t, err, space.ErrObjectNotFound)
+	for id, row := range lab.spaceRows(t, ctx, lab.samples) {
+		assert.Equal(t, b, row.GetString("_objectId"), "row %s", id)
 	}
 
 	// B keeps taking writes.

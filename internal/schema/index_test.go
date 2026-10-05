@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,6 +66,32 @@ func TestValidateIndexDecl(t *testing.T) {
 			require.ErrorIs(t, ValidateIndexDecl(ds, tc.idx, tc.shared), ErrDecl)
 		})
 	}
+}
+
+// An indexed field's key is letters, digits and "_", starts with a
+// letter and is at most MaxIndexFieldLen bytes; the rule holds whether
+// or not the field is declared.
+func TestValidateIndexDecl_FieldKeyRule(t *testing.T) {
+	longest := "a" + strings.Repeat("b", MaxIndexFieldLen-1)
+	accepted := []string{"a", "A1_b", longest}
+	refused := []string{"1a", "_a", "a-b", "a,b", "$a", "a~sparse", "a b", "a.b", "naïve", longest + "c"}
+	field := func(key string) Field { return Field{Id: key, Schema: &Schema{Kind: KindString}} }
+	for _, key := range accepted {
+		t.Run(key, func(t *testing.T) {
+			ds := Dataset{Fields: []Field{field(key)}}
+			require.NoError(t, ValidateIndexDecl(ds, Index{Key: "x", Fields: []string{key}}, false))
+			require.NoError(t, ValidateIndexDecl(ds, Index{Key: "x", Fields: []string{"-" + key}}, false), "descending")
+		})
+	}
+	for _, key := range refused {
+		t.Run(key, func(t *testing.T) {
+			ds := Dataset{Fields: []Field{field(key)}}
+			err := ValidateIndexDecl(ds, Index{Key: "x", Fields: []string{key}}, false)
+			require.ErrorIs(t, err, ErrDecl)
+			assert.Contains(t, err.Error(), "an indexed field's key is letters, digits")
+		})
+	}
+	assert.Len(t, longest, MaxIndexFieldLen)
 }
 
 // The store name follows what is indexed, not the key.

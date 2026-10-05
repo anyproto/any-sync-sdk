@@ -166,6 +166,11 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// drainer wakes, so Drain sees the new snapshot when it decides
 		// which parked rows are replayable.
 		if ch.Dataset == typetype.DatasetDefs {
+			if obj != nil && obj.Replaying() {
+				// The catalog passes through every replayed state:
+				// index the type's shared datasets once it settles.
+				s.holdIndexSync(ch.ObjectId)
+			}
 			s.refreshType(ctx, ch.ObjectId)
 		}
 		if idsErr != nil {
@@ -269,6 +274,7 @@ func (s *Store) afterReplayFor() object.AfterReplay {
 			return
 		}
 		s.flushObjectStamps(ctx, obj.Controller(), obj.Controller().ObjectId())
+		s.releaseIndexSync(obj.Controller().ObjectId())
 	}
 }
 
@@ -311,7 +317,7 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 		if rowId == "" {
 			return nil
 		}
-		return ctrl.Get(ctx, ch.Dataset, rowId)
+		return ctrl.GetStored(ctx, ch.Dataset, rowId)
 	}
 }
 

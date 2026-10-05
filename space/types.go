@@ -246,14 +246,18 @@ type TypesAPI interface {
 	// (ErrModuleOwned).
 	AddDatasetIndex(ctx context.Context, typeId, datasetDefId string, draft IndexDraft) (indexDefId string, err error)
 
-	// RemoveDatasetIndex drops one index definition; the index goes
-	// from each collection as its device applies the removal.
+	// RemoveDatasetIndex drops one index definition, with every
+	// concurrent declaration of its key. A shared dataset's collection
+	// loses the index once its device applies the removal, a per-object
+	// one at its next open; an index another definition of the same
+	// shape still names stays.
 	RemoveDatasetIndex(ctx context.Context, typeId, indexDefId string) error
 
 	// SubscribeIndexBuilds registers cb for the builds of shared
-	// datasets' declared indexes in this space. cb runs on the build
-	// worker — keep it small or hand off. The returned cancel is
-	// idempotent.
+	// datasets' declared indexes in this space. A build in flight is
+	// reported to cb at once as Started. cb runs on the build worker —
+	// keep it small or hand off, and do not subscribe from it. The
+	// returned cancel is idempotent.
 	SubscribeIndexBuilds(cb func(IndexBuild)) (cancel func())
 
 	// PatchDataset edits a definition's mutable leaves: displayName,
@@ -498,6 +502,8 @@ type IndexDraft struct {
 	// "-" prefix keeps that path descending. Each names a declared
 	// field of kind string, number, boolean or datetime, or
 	// IndexPathCreated; a shared dataset also takes IndexPathObject.
+	// An indexed field's key is letters, digits and "_", starts with a
+	// letter and is at most 48 bytes.
 	Fields []string
 	// Sparse leaves a record out of the index unless it carries every
 	// indexed field.

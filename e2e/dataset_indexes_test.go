@@ -984,6 +984,15 @@ func TestE2E_DatasetIndexes_Refusals(t *testing.T) {
 	require.NoError(t, err)
 	defs := datasetDefs(t, ctx, sp, lab.typeId)
 	samplesId, plainId, eventsId := defs["samples"].Id, defs["plain"].Id, defs["events"].Id
+	// Field keys a declaration admits and an index does not: "-", "$",
+	// a leading digit, one byte past the 48-byte limit.
+	longKey := "k" + strings.Repeat("x", 48)
+	for _, key := range []string{"a-b", "$price", "1st", longKey} {
+		_, err := sp.Types().AddDatasetField(ctx, lab.typeId, samplesId, space.DatasetFieldDraft{
+			Key: key, Kind: space.PropertyKindString, MutableBy: space.MutableByAnyone,
+		})
+		require.NoError(t, err, "field %q declares", key)
+	}
 
 	// expect is the listing every refusal must leave as it is.
 	expect := mustListing(t, ctx, sp, lab.typeId)
@@ -1022,7 +1031,13 @@ func TestE2E_DatasetIndexes_Refusals(t *testing.T) {
 			msg   string
 		}{
 			{"UndeclaredField", samplesId, space.IndexDraft{Key: "by_nope", Fields: []string{"nope"}}, "is not a declared field"},
-			{"PathIntoObject", samplesId, space.IndexDraft{Key: "by_meta_x", Fields: []string{"meta.x"}}, "is not a declared field"},
+			{"PathIntoObject", samplesId, space.IndexDraft{Key: "by_meta_x", Fields: []string{"meta.x"}}, "an indexed field's key is letters, digits"},
+			{"DashedFieldKey", samplesId, space.IndexDraft{Key: "by_ab", Fields: []string{"a-b"}}, "an indexed field's key is letters, digits"},
+			{"DashedFieldKeyDescending", samplesId, space.IndexDraft{Key: "by_ab", Fields: []string{"score", "-a-b"}}, "an indexed field's key is letters, digits"},
+			{"DollarFieldKey", samplesId, space.IndexDraft{Key: "by_price", Fields: []string{"$price"}}, "an indexed field's key is letters, digits"},
+			{"DigitFirstFieldKey", samplesId, space.IndexDraft{Key: "by_first", Fields: []string{"1st"}}, "an indexed field's key is letters, digits"},
+			{"LongFieldKey", samplesId, space.IndexDraft{Key: "by_long", Fields: []string{longKey}}, "at most 48 bytes"},
+			{"DashedFieldKeyWithObject", samplesId, space.IndexDraft{Key: "by_ab_obj", Fields: []string{"a-b", space.IndexPathObject}}, "an indexed field's key is letters, digits"},
 			{"ArrayField", samplesId, space.IndexDraft{Key: "by_tags", Fields: []string{"tags"}}, "is not a string, number, boolean or datetime"},
 			{"ObjectField", samplesId, space.IndexDraft{Key: "by_meta", Fields: []string{"meta"}}, "is not a string, number, boolean or datetime"},
 			{"ArrayFieldPerObject", plainId, space.IndexDraft{Key: "by_tags", Fields: []string{"score", "tags"}}, "is not a string, number, boolean or datetime"},

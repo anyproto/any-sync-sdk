@@ -213,7 +213,7 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 	// survive further applies).
 	before := make(map[recKey]*anyenc.Value, len(touched))
 	for key := range touched {
-		before[key] = ctrl.Get(txCtx, key.dataset, key.record)
+		before[key] = ctrl.GetStored(txCtx, key.dataset, key.record)
 	}
 
 	// Apply the delta on top of the materialized base, restoring each
@@ -268,7 +268,7 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 		return cmp.Or(cmp.Compare(a.dataset, b.dataset), cmp.Compare(a.record, b.record))
 	})
 	for _, key := range keys {
-		after := ctrl.Get(ctx, key.dataset, key.record)
+		after := ctrl.GetStored(ctx, key.dataset, key.record)
 		if rd := DiffRecords(key.record, before[key], after); rd != nil {
 			byDataset[key.dataset] = append(byDataset[key.dataset], *rd)
 		}

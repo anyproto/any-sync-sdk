@@ -3,6 +3,7 @@ package typetype_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -150,6 +151,11 @@ func TestDatasetDefs_IndexIsPinned(t *testing.T) {
 	rec := ctrl.Get(ctx, typetype.DatasetDefs, "idx-1")
 	assert.Equal(t, "by_ts", rec.GetString(typetype.FieldKey))
 	assert.Nil(t, rec.Get(typetype.DefFieldIndexSparse))
+	var fields []string
+	for _, f := range rec.GetArray(typetype.DefFieldIndexFields) {
+		fields = append(fields, string(f.GetStringBytes()))
+	}
+	assert.Equal(t, []string{"ts"}, fields)
 }
 
 // Index records fold under their dataset: by key, validated against the
@@ -214,6 +220,111 @@ func TestCompile_Indexes(t *testing.T) {
 	for _, x := range ds.Indexes {
 		assert.NotEqual(t, "wide", x.Key)
 		assert.True(t, x.Invalid, x.Key)
+	}
+}
+
+// Every live record declaring an index key on a dataset is listed with
+// the winner, across concurrent heads of the dataset, so a removal can
+// take them all; a removed winner hands the key to the next.
+func TestCompile_DuplicateIndexKeysListEveryRecord(t *testing.T) {
+	ctrl, db := newDefsController(t)
+	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
+	s := &defsSeq{t: t, ctrl: ctrl}
+
+	s.put("head-1", headPayload(arena, "samples", nil))
+	s.put("head-2", headPayload(arena, "samples", nil))
+	s.put("f-ts", fieldPayload(arena, "head-1", "ts", "datetime", nil))
+	s.put("f-value", fieldPayload(arena, "head-1", "value", "number", nil))
+	s.put("x-b", indexPayload(arena, "head-1", "by_ts", false, "ts"))
+	s.put("x-a", indexPayload(arena, "head-1", "by_ts", false, "value"))
+	s.put("x-c", indexPayload(arena, "head-2", "by_ts", false, "-ts"))
+	s.put("x-other", indexPayload(arena, "head-1", "other", false, "value"))
+
+	byKey := func() map[string]types.CompiledIndex {
+		ds := compileOne(t, db, "samples")
+		require.False(t, ds.Invalid, ds.InvalidReason)
+		out := map[string]types.CompiledIndex{}
+		for _, x := range ds.Indexes {
+			out[x.Key] = x
+		}
+		return out
+	}
+	got := byKey()
+	require.Len(t, got, 2)
+	assert.Equal(t, "x-b", got["by_ts"].DefId, "the earlier declaration wins")
+	assert.Equal(t, []string{"ts"}, got["by_ts"].Fields)
+	assert.Equal(t, []string{"x-a", "x-b", "x-c"}, got["by_ts"].DefIds, "every declaration of the key, sorted")
+	assert.Equal(t, []string{"x-other"}, got["other"].DefIds)
+
+	s.del("x-b")
+	got = byKey()
+	assert.Equal(t, "x-a", got["by_ts"].DefId, "a hidden duplicate takes the key")
+	assert.Equal(t, []string{"value"}, got["by_ts"].Fields)
+	assert.Equal(t, []string{"x-a", "x-c"}, got["by_ts"].DefIds)
+}
+
+// An index over a declared field whose key is not indexable is listed
+// invalid and built nowhere.
+func TestCompile_IndexOverAnUnindexableKey(t *testing.T) {
+	ctrl, db := newDefsController(t)
+	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
+	s := &defsSeq{t: t, ctrl: ctrl}
+
+	long := strings.Repeat("k", schema.MaxIndexFieldLen+1)
+	s.put("head-1", headPayload(arena, "samples", nil))
+	s.put("f-ok", fieldPayload(arena, "head-1", "price", "number", nil))
+	s.put("f-dollar", fieldPayload(arena, "head-1", "$price", "number", nil))
+	s.put("f-comma", fieldPayload(arena, "head-1", "a,b", "string", nil))
+	s.put("f-long", fieldPayload(arena, "head-1", long, "string", nil))
+	s.put("x-ok", indexPayload(arena, "head-1", "by_price", false, "price"))
+	s.put("x-dollar", indexPayload(arena, "head-1", "by_dollar", false, "$price"))
+	s.put("x-comma", indexPayload(arena, "head-1", "by_comma", false, "a,b"))
+	s.put("x-long", indexPayload(arena, "head-1", "by_long", false, long))
+
+	ds := compileOne(t, db, "samples")
+	require.False(t, ds.Invalid, "the fields themselves are valid: %s", ds.InvalidReason)
+	require.Len(t, ds.Schema.Fields, 4)
+	invalid := map[string]bool{}
+	for _, x := range ds.Indexes {
+		invalid[x.Key] = x.Invalid
+		if x.Invalid {
+			assert.Contains(t, x.InvalidReason, "an indexed field's key is letters, digits", x.Key)
+		}
+	}
+	assert.Equal(t, map[string]bool{"by_price": false, "by_dollar": true, "by_comma": true, "by_long": true}, invalid)
+	assert.Equal(t, []anystore.IndexInfo{{Name: "dx_price", Fields: []string{"price"}}}, ds.StoreIndexes())
+}
+
+// Two concurrent heads of one key that disagree on the shared marker
+// leave the definition valid: the earlier head's marker decides.
+func TestCompile_SharedMarkerFollowsTheEarlierHead(t *testing.T) {
+	shared := map[string]any{typetype.DefFieldPerSpace: true}
+	for _, tc := range []struct {
+		name          string
+		first, second map[string]any
+		want          bool
+	}{
+		{"shared first", shared, nil, true},
+		{"per-object first", nil, shared, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl, db := newDefsController(t)
+			arena := &anyenc.Arena{}
+			seedPart(t, ctrl, arena)
+			s := &defsSeq{t: t, ctrl: ctrl}
+			s.put("head-1", headPayload(arena, "samples", tc.first))
+			s.put("head-2", headPayload(arena, "samples", tc.second))
+			s.put("f-ts", fieldPayload(arena, "head-2", "ts", "datetime", nil))
+
+			ds := compileOne(t, db, "samples")
+			assert.False(t, ds.Invalid, ds.InvalidReason)
+			assert.Equal(t, "head-1", ds.DefId)
+			assert.Equal(t, tc.want, ds.Shared)
+			assert.NotEmpty(t, ds.SchemaRev)
+			require.Len(t, ds.Schema.Fields, 1, "fields union across both heads")
+		})
 	}
 }
 

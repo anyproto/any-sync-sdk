@@ -892,11 +892,15 @@ func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 					return fmt.Errorf("typesAPI: removing field %q would invalidate dataset %q: %w", def.Fields[j].Key, def.Key, verr)
 				}
 			}
-			// An index over the field would stop being built on every
-			// device: the index goes first.
+			// A valid index over the field would stop being built on
+			// every device: the index goes first. An already-invalid
+			// definition stays removable.
 			for _, x := range def.Indexes {
+				if def.Invalid || x.Invalid {
+					continue
+				}
 				for _, entry := range x.Fields {
-					if path, _ := schema.IndexFieldPath(entry); path == def.Fields[j].Key && !x.Invalid {
+					if path, _ := schema.IndexFieldPath(entry); path == def.Fields[j].Key {
 						return fmt.Errorf("typesAPI: %w: field %q is indexed by %q — remove the index first", schema.ErrDecl, def.Fields[j].Key, x.Key)
 					}
 				}
@@ -952,15 +956,25 @@ func (t *typesAPI) RemoveDatasetIndex(ctx context.Context, typeId, indexDefId st
 	if t.staticType(typeId) {
 		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
-	defs, err := t.Datasets(ctx, typeId)
+	compiled, err := t.parent.store.DatasetDefs(ctx, typeId)
 	if err != nil {
 		return err
 	}
-	for i := range defs {
-		for _, x := range defs[i].Indexes {
-			if x.Id == indexDefId {
-				return t.removeDatasetDefRecord(ctx, typeId, indexDefId)
+	for i := range compiled {
+		for _, x := range compiled[i].Indexes {
+			if x.DefId != indexDefId {
+				continue
 			}
+			// With every concurrent duplicate of the key: a hidden
+			// one would otherwise become the index.
+			recs := make([]crdt.RecordChange, 0, len(x.DefIds))
+			for _, id := range x.DefIds {
+				recs = append(recs, crdt.RecordChange{Id: id, Ops: []crdt.Op{{Type: crdt.OpDelete}}})
+			}
+			if _, err := t.writeDatasetDefs(ctx, typeId, recs...); err != nil {
+				return fmt.Errorf("typesAPI: remove index definition: %w", err)
+			}
+			return nil
 		}
 	}
 	return fmt.Errorf("typesAPI: index definition %q not found on type %q", indexDefId, typeId)

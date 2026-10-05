@@ -163,6 +163,7 @@ func (s *Service) Open(ctx context.Context) error {
 	// Gate is on: rows parked for a dataset that registers later (a
 	// bundle root's declarations) drain on first touch after restart.
 	s.store.NotifyDrainer(types.DataVersionPair{})
+	s.store.StartIndexSync()
 
 	// Derive the single index object through the Store. Store.Derive
 	// computes the deterministic id, then runs PutTree (first boot) /

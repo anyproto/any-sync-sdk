@@ -145,7 +145,13 @@ func (s *Store) captureLocalLeaves(ctx context.Context, objectId string, ctrl *c
 			if coll == nil {
 				continue
 			}
+			n := len(out)
 			out, err = captureRecordFields(ctx, coll, dataset, fields, crdt.KeyedRows(objectId), out)
+			// A leaf is restored through a local write, which takes
+			// the record id a change carries.
+			for i := n; i < len(out); i++ {
+				out[i].RecordId = crdt.KeyedRecordId(objectId, out[i].RecordId)
+			}
 		} else {
 			fields := ctrl.LocalFields(dataset)
 			if len(fields) == 0 {
@@ -296,9 +302,12 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 // once the replay lands the defs; only local writes see a transient
 // type_unknown rejection.
 //
-// Live subscriptions are not notified of the wipe (nothing here reaches
-// the subscribe engine): a window keeps its rows and sees the replay as
-// one update per change in the tree, converging when it ends.
+// Live subscriptions are not notified of the wipe of the object's own
+// collections: a window keeps its rows and sees the replay as one
+// update per change in the tree, converging when it ends. The object's
+// rows in a shared dataset's collection are the exception — a reader
+// across objects holds them without having loaded the object, so it is
+// told they left, and the replay adds back the ones it rebuilds.
 func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crdt.Controller) error {
 	for _, dataset := range ctrl.RegisteredDatasets() {
 		if !ctrl.IsShared(dataset) {
@@ -317,7 +326,10 @@ func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crd
 		if !ctrl.IsKeyed(dataset) {
 			continue
 		}
-		if err := s.deleteKeyedRows(ctx, dataset, objectId, false); err != nil {
+		// Told to live queries: a reader across objects holds these
+		// rows without having loaded the object, and the replay re-adds
+		// the ones it rebuilds.
+		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
 			return fmt.Errorf("spaceobjects: reindex clear %s rows of %s: %w", dataset, objectId, err)
 		}
 	}

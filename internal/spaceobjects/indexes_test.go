@@ -57,11 +57,41 @@ func seedIndexDef(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsK
 
 func removeIndexDef(t *testing.T, ctx context.Context, db anystore.DB, typeId, indexKey, ver string) {
 	t.Helper()
+	removeDef(t, ctx, db, typeId, "index-"+indexKey, ver)
+}
+
+// removeDef tombstones one definition record of typeId.
+func removeDef(t *testing.T, ctx context.Context, db anystore.DB, typeId, recId, ver string) {
+	t.Helper()
 	ctrl := defsController(t, ctx, db, typeId)
 	require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{
-		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-unindex-" + typeId + indexKey + ver,
+		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-remove-" + typeId + recId + ver,
 		VersionId: crdt.VersionId(ver), DataVersion: typetype.DatasetDefsHandlerVersion,
-		Records: []crdt.RecordChange{{Id: "index-" + indexKey, Ops: []crdt.Op{{Type: crdt.OpDelete}}}},
+		Records: []crdt.RecordChange{{Id: recId, Ops: []crdt.Op{{Type: crdt.OpDelete}}}},
+	}))
+	require.NoError(t, ctrl.CloseOwnedCollections())
+}
+
+// seedFieldDef declares field key of kind (and scope, when set) on the
+// dataset seedDefs created for (typeId, dsKey); the record id is
+// "field-<key>".
+func seedFieldDef(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, key, kind, scope, ver string) {
+	t.Helper()
+	ctrl := defsController(t, ctx, db, typeId)
+	a := &anyenc.Arena{}
+	rec := a.NewObject()
+	rec.Set(typetype.DefFieldDef, a.NewString(typetype.DefKindField))
+	rec.Set(typetype.DefFieldDataset, a.NewString(typeId+"-head-"+dsKey))
+	rec.Set(typetype.FieldKey, a.NewString(key))
+	rec.Set(typetype.FieldKind, a.NewString(kind))
+	if scope != "" {
+		rec.Set(typetype.FieldScope, a.NewString(scope))
+	}
+	require.NoError(t, ctrl.ApplyChange(ctx, crdt.Change{
+		ObjectId: typeId, Dataset: typetype.DatasetDefs, ChangeId: "cd-field-" + typeId + key + ver,
+		VersionId: crdt.VersionId(ver), DataVersion: typetype.DatasetDefsHandlerVersion,
+		Records: []crdt.RecordChange{{Id: "field-" + key, Upsert: true,
+			Ops: []crdt.Op{{Type: crdt.OpSet, Payload: rec}}}},
 	}))
 	require.NoError(t, ctrl.CloseOwnedCollections())
 }
@@ -154,12 +184,26 @@ func TestIndexes_PerObjectDatasetFollowsItsRegistration(t *testing.T) {
 	assert.Empty(t, declaredIndexNames(coll))
 }
 
+// indexLen counts the entries of the collection's index named name.
+func indexLen(t *testing.T, ctx context.Context, coll anystore.Collection, name string) int {
+	t.Helper()
+	for _, idx := range coll.GetIndexes() {
+		if idx.Info().Name == name {
+			n, err := idx.Len(ctx)
+			require.NoError(t, err)
+			return n
+		}
+	}
+	t.Fatalf("index %q not found", name)
+	return 0
+}
+
 // A shared dataset's collection is indexed by the store: a definition
-// that applies builds the index in the background and reports it, a
-// removed one drops it, and a store opening over definitions builds
-// what is missing.
+// that applies builds the index in the background and reports it, rows
+// written later enter it, and a removed definition drops it.
 func TestIndexes_SharedDatasetFollowsTheCatalog(t *testing.T) {
 	ctx, store, samples, _ := sharedDatasetStore(t)
+	store.StartIndexSync()
 	for _, objectId := range []string{"obj1", "obj2"} {
 		ctrl, err := store.newController(ctx, objectId)
 		require.NoError(t, err)
@@ -184,32 +228,180 @@ func TestIndexes_SharedDatasetFollowsTheCatalog(t *testing.T) {
 	// The registration is not what indexes a shared collection.
 	assert.Empty(t, store.catalog.snapshot().regs[samples].Indexes)
 
-	// Rows written after the build are read through it.
+	// The build indexed the rows already there; a row written after it
+	// enters the index.
+	assert.Equal(t, 2, indexLen(t, ctx, coll, name))
 	ctrl, err := store.newController(ctx, "obj3")
 	require.NoError(t, err)
 	writeTitle(t, ctx, ctrl, "obj3", samples, "r1", "v1", "obj3")
-	n, err := coll.Find(`{"title":"obj3"}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	assert.Equal(t, 3, indexLen(t, ctx, coll, name))
 
-	// Another pass with nothing missing builds and reports nothing.
-	store.refreshType(ctx, catTypeId)
-	time.Sleep(50 * time.Millisecond)
+	// A pass with nothing missing builds and reports nothing.
+	require.NoError(t, store.syncKeyedIndexes(ctx, samples))
 	assert.Len(t, log.phases(samples), 2)
 
 	removeIndexDef(t, ctx, store.db, catTypeId, "by_title", "c2")
 	store.refreshType(ctx, catTypeId)
 	require.Eventually(t, func() bool { return !store.KeyedIndexReady(ctx, samples, name) }, 5*time.Second, 5*time.Millisecond)
 	assert.Len(t, log.phases(samples), 2, "a drop is not a build")
+	assert.False(t, store.KeyedIndexReady(ctx, "unknown", name), "an unknown dataset holds no index")
+}
 
-	// A store that opens over a definition builds the missing index.
-	seedIndexDef(t, ctx, store.db, catTypeId, "samples", "by_title2", "c3", "title")
+// A store that opens over a definition builds the missing index once
+// its worker is started; Close waits for a build in flight and leaves
+// no worker a later kick could reach.
+func TestIndexes_StartAndClose(t *testing.T) {
+	ctx, store, samples, _ := sharedDatasetStore(t)
+	ctrl, err := store.newController(ctx, "obj1")
+	require.NoError(t, err)
+	writeTitle(t, ctx, ctrl, "obj1", samples, "r1", "v1", "one")
+	seedIndexDef(t, ctx, store.db, catTypeId, "samples", "by_title", "c1", "title")
+
 	reopened := NewStore(nil, store.db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = reopened.Close() })
-	require.Eventually(t, func() bool { return reopened.KeyedIndexReady(ctx, samples, "dx_title") }, 5*time.Second, 5*time.Millisecond)
-
-	// Close waits for the worker and is safe to repeat.
-	require.NoError(t, reopened.Close())
+	// Not started: a refresh kicks nothing, and nothing builds.
+	reopened.refreshType(ctx, catTypeId)
 	reopened.kickIndexSync()
-	assert.False(t, store.KeyedIndexReady(ctx, "unknown", name))
+	reopened.indexMu.Lock()
+	assert.Nil(t, reopened.indexKick, "no worker before StartIndexSync")
+	reopened.indexMu.Unlock()
+	assert.False(t, reopened.KeyedIndexReady(ctx, samples, "dx_title"))
+
+	// A build blocks in its Started report until released.
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	cancel := reopened.SubscribeIndexBuilds(func(ev IndexBuild) {
+		if ev.Dataset == samples && ev.Phase == IndexBuildStarted {
+			once.Do(func() { close(started) })
+			<-release
+		}
+	})
+	defer cancel()
+	reopened.StartIndexSync()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the started worker builds the missing index")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- reopened.Close() }()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a build is in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close returns once the build ends")
+	}
+
+	// The worker is gone, and a kick after Close starts none.
+	reopened.indexMu.Lock()
+	done := reopened.indexDone
+	reopened.indexMu.Unlock()
+	select {
+	case <-done:
+	default:
+		t.Fatal("the worker exited before Close returned")
+	}
+	reopened.kickIndexSync()
+	reopened.StartIndexSync()
+	reopened.indexMu.Lock()
+	assert.Empty(t, reopened.indexKick, "a kick after Close is not queued")
+	assert.Equal(t, done, reopened.indexDone, "no second worker starts")
+	reopened.indexMu.Unlock()
+	assert.NotPanics(t, func() { _ = reopened.Close() }, "Close is safe to repeat")
+}
+
+// While a type object replays, the worker leaves its datasets alone: a
+// half-replayed catalog that misses an index the collection holds does
+// not drop it. The end of the replay asks for the pass that reconciles.
+func TestIndexes_HeldTypeIsSkipped(t *testing.T) {
+	ctx, store, samples, _ := sharedDatasetStore(t)
+	ctrl, err := store.newController(ctx, "obj1")
+	require.NoError(t, err)
+	writeTitle(t, ctx, ctrl, "obj1", samples, "r1", "v1", "one")
+	seedIndexDef(t, ctx, store.db, catTypeId, "samples", "by_title", "c1", "title")
+	store.refreshType(ctx, catTypeId)
+	require.NoError(t, store.syncKeyedIndexes(ctx, samples))
+	require.True(t, store.KeyedIndexReady(ctx, samples, "dx_title"))
+
+	store.holdIndexSync(catTypeId)
+	store.StartIndexSync()
+	removeIndexDef(t, ctx, store.db, catTypeId, "by_title", "c2")
+	store.refreshType(ctx, catTypeId)
+	require.NoError(t, store.syncKeyedIndexes(ctx, samples))
+	assert.True(t, store.KeyedIndexReady(ctx, samples, "dx_title"), "a held type's index stays")
+
+	store.releaseIndexSync(catTypeId)
+	require.Eventually(t, func() bool { return !store.KeyedIndexReady(ctx, samples, "dx_title") },
+		5*time.Second, 5*time.Millisecond, "the release reconciles the collection")
+
+	// A release without a hold is a no-op.
+	store.releaseIndexSync(catTypeId)
+	assert.False(t, store.indexSyncHeld(catTypeId))
+}
+
+// A subscriber that joins while a build is in flight hears Started at
+// once and then the build's end; one that joins after the end hears
+// nothing of it.
+func TestIndexes_SubscribeDuringABuild(t *testing.T) {
+	_, store, samples, _ := sharedDatasetStore(t)
+	assert.NotPanics(t, func() { store.SubscribeIndexBuilds(nil)() })
+
+	store.reportBuild(IndexBuild{Dataset: samples, Phase: IndexBuildStarted})
+	during := &buildLog{}
+	cancel := store.SubscribeIndexBuilds(during.add)
+	defer cancel()
+	assert.Equal(t, []IndexBuildPhase{IndexBuildStarted}, during.phases(samples))
+	store.reportBuild(IndexBuild{Dataset: samples, Phase: IndexBuildDone})
+	assert.Equal(t, []IndexBuildPhase{IndexBuildStarted, IndexBuildDone}, during.phases(samples))
+
+	after := &buildLog{}
+	cancelAfter := store.SubscribeIndexBuilds(after.add)
+	defer cancelAfter()
+	assert.Empty(t, after.phases(samples), "nothing is in flight after Done")
+
+	// A failed build ends it too.
+	store.reportBuild(IndexBuild{Dataset: samples, Phase: IndexBuildStarted})
+	store.reportBuild(IndexBuild{Dataset: samples, Phase: IndexBuildFailed})
+	late := &buildLog{}
+	cancelLate := store.SubscribeIndexBuilds(late.add)
+	defer cancelLate()
+	assert.Empty(t, late.phases(samples), "nothing is in flight after Failed")
+	assert.Equal(t, []IndexBuildPhase{IndexBuildStarted, IndexBuildFailed}, after.phases(samples))
+}
+
+// An index whose field is removed turns invalid: discovery stops
+// listing it and the store drops it from the shared collection.
+func TestIndexes_InvalidIndexIsDropped(t *testing.T) {
+	ctx, store, samples, _ := sharedDatasetStore(t)
+	store.StartIndexSync()
+	seedFieldDef(t, ctx, store.db, catTypeId, "samples", "score", "number", "", "d1")
+	seedIndexDef(t, ctx, store.db, catTypeId, "samples", "by_score", "d2", "score")
+	store.refreshType(ctx, catTypeId)
+	require.Eventually(t, func() bool { return store.KeyedIndexReady(ctx, samples, "dx_score") }, 5*time.Second, 5*time.Millisecond)
+	listed := func() []schema.Index {
+		for _, ns := range store.Schemas() {
+			if ns.Name == samples {
+				return ns.Indexes
+			}
+		}
+		t.Fatalf("%s not listed", samples)
+		return nil
+	}
+	assert.Equal(t, []schema.Index{{Key: "by_score", Fields: []string{"score"}}}, listed())
+
+	removeDef(t, ctx, store.db, catTypeId, "field-score", "d3")
+	store.refreshType(ctx, catTypeId)
+	ds, ok := store.RuntimeDataset(samples)
+	require.True(t, ok, "the dataset stays valid")
+	require.Len(t, ds.Indexes, 1)
+	assert.True(t, ds.Indexes[0].Invalid)
+	assert.Empty(t, listed(), "an invalid index is not listed")
+	require.Eventually(t, func() bool { return !store.KeyedIndexReady(ctx, samples, "dx_score") }, 5*time.Second, 5*time.Millisecond)
 }

@@ -143,9 +143,8 @@ func (s *Store) initCatalog(ctx context.Context) {
 		}
 	}
 	s.catalog.mu.Lock()
+	defer s.catalog.mu.Unlock()
 	s.catalog.snap.Store(s.resolveCatalog(byType))
-	s.catalog.mu.Unlock()
-	s.kickIndexSync()
 }
 
 // catalogHasType reports whether the runtime catalog currently carries
@@ -190,7 +189,8 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 	}
 	s.catalog.snap.Store(s.resolveCatalog(byType))
 	s.catalog.mu.Unlock()
-	// A shared dataset's declared indexes follow the catalog.
+	// A shared dataset's declared indexes follow the catalog. A no-op
+	// for a type whose replay holds the worker (holdIndexSync).
 	s.kickIndexSync()
 }
 
@@ -289,7 +289,13 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 			// space (Store.keyedCollection).
 			Keyed: ds.Shared,
 		}
-		if !ds.Shared {
+		if ds.Shared {
+			// Rows materialized per object — by an SDK that predates
+			// shared datasets, which ignores the marker — are in the
+			// wrong collection: a version of its own makes the objects
+			// holding them stale, and their re-index moves the rows.
+			reg.Version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, sharedLayoutVersion)
+		} else {
 			// A per-object collection carries the declared indexes
 			// from its open; the store indexes a shared one.
 			reg.Indexes = ds.StoreIndexes()
@@ -310,6 +316,11 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 	reg.SchemaRev = ds.SchemaRev
 	return reg, nil
 }
+
+// sharedLayoutVersion is the consumer half of a shared dataset's
+// registration version: it tells rows in the per-space collection from
+// rows the same schema handler materialized per object.
+const sharedLayoutVersion = 1
 
 // moduleReg instantiates a module for one collection and turns the
 // returned dataset into a controller registration. A nil Handler gets

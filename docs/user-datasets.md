@@ -359,9 +359,11 @@ evolution is additive-only with pinned behavior:
 - **`RemoveDatasetField` re-validates the remaining declaration** and
   refuses removals that would invalidate it (e.g. the creator stamp of
   an author-gated dataset). Already-invalid definitions stay removable.
-  A field a declared index names is refused until the index is removed.
+  A field a valid declared index names is refused until the index is
+  removed.
 - **An index is replaced, never edited**: `RemoveDatasetIndex`, then
-  `AddDatasetIndex`.
+  `AddDatasetIndex`. A removal takes every concurrent declaration of
+  the key with it.
 - `RemoveDataset` / `RemovePart` do not clean up record data (as with
   `RemoveProperty`); subsequent writes drop once peers apply the
   removal, and a canonical dataset's removal only withdraws this type's
@@ -489,8 +491,8 @@ written by two objects.
 - **The record id** inside a change is the plain id the dataset's
   `IdRule` produces, so a peer on an SDK without shared datasets
   applies the same changes to a per-object collection. The stored
-  document id adds the object's prefix; an object id holds no `/`, so
-  the first one splits.
+  document id is the object's prefix plus that id, whatever the id
+  holds; an object id holds no `/`, so the first one splits.
 - **Reads** return the stored id: `Space.Query(objectId, dataset)`
   reads the object's rows — a range of the primary key — each with
   `id = <objectId>/<recordId>` and `_objectId`. Subscription events,
@@ -548,8 +550,13 @@ IndexDraft{Key: "top",      Fields: []string{"-score"}, Sparse: true}
 - **Paths**: one to `MaxIndexFields` (4), each a declared field of kind
   string, number, boolean or datetime, or `_ver.id` (creation order
   within one object); a shared dataset also takes `_objectId`. A `-`
-  prefix keeps a path descending. Declared shapes are enforced at
-  apply, so an indexed field holds one scalar type on every record.
+  prefix keeps a path descending. An indexed field's key is letters,
+  digits and `_`, starts with a letter and is at most 48 bytes, so
+  every index has a valid store name of its own.
+- **Values of another type still index.** A synced write is checked
+  against the declared shape; a local-scope value, and a value a
+  dynamic dataset held before the field was declared, are not.
+  any-store orders keys by type, so reads stay correct.
 - **`Sparse`** leaves a record out unless it carries every indexed
   field.
 - **Limits**: `MaxDatasetIndexes` (8) per dataset; every index is
@@ -566,12 +573,14 @@ IndexDraft{Key: "top",      Fields: []string{"-score"}, Sparse: true}
 - **A shared dataset** has one collection per space, which the store
   indexes: when a definition applies, and at open when an index is
   missing, a background worker builds it; a removed definition drops
-  it. A build scans the collection in one write transaction, so every
+  it. While a type object replays, its datasets wait for the replay to
+  end. A build scans the collection in one write transaction, so every
   write to the account's database waits for it. It never runs on the
-  apply path. `Types().SubscribeIndexBuilds` reports each build
-  (`Started`, then `Done` or `Failed`); a definition whose index the
-  collection already holds builds nothing. Until a build ends, reads
-  scan.
+  apply path, and `Close` waits for one in flight.
+  `Types().SubscribeIndexBuilds` reports each build (`Started`, then
+  `Done` or `Failed`), a build in flight to a new subscriber too; a
+  definition whose index the collection already holds builds nothing.
+  Until a build ends, reads scan.
 - **An invalid index** — a path that names no declared scalar field —
   is listed by `Types().Datasets` with its reason and built nowhere.
 
@@ -580,10 +589,14 @@ IndexDraft{Key: "top",      Fields: []string{"-score"}, Sparse: true}
 - **A shared dataset is declared shared.** The flag is pinned. Removing
   a dataset and declaring its key again in the other mode leaves the
   records a device already materialized where they were.
-- **Rows of a shared dataset are purged through the catalog.** An
-  object's rows are deleted from the shared datasets the catalog knows
-  at that moment; rows of a dataset whose definition was removed stay,
-  as record data does after `RemoveDataset`.
+- **Rows of a shared dataset are purged best-effort.** An object's
+  rows are deleted from the shared datasets the catalog knows and the
+  ones the store has opened. Rows of a dataset whose definition was
+  removed before the store opened stay, as record data does after
+  `RemoveDataset`; so do rows of a purge that failed part way, until
+  the space's deletions are reconciled again.
+- **A shared dataset declared concurrently in both modes** follows the
+  earlier declaration. An SDK that predates the marker reads neither.
 - **No computed fields.** Apply hooks must be replica-deterministic; a
   user-facing expression form is a versioned-determinism problem.
   Stamps cover the security-relevant derivations; other derivation

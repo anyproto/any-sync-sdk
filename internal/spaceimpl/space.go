@@ -615,7 +615,9 @@ func (s *spaceImpl) changeRecordIds(objectId, dataset string, records []crdt.Rec
 	}
 	for i := range records {
 		id := crdt.KeyedRecordId(objectId, records[i].Id)
-		if strings.Contains(id, "/") {
+		// The bare prefix names no record: left alone it would read as
+		// an empty id, which a create derives.
+		if strings.Contains(id, "/") || (id == "" && records[i].Id != "") {
 			return fmt.Errorf("spaceimpl: record %d: %w: %q", i, space.ErrRecordIdOfAnotherObject, records[i].Id)
 		}
 		records[i].Id = id

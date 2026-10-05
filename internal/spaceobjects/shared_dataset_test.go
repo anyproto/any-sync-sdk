@@ -2,17 +2,22 @@ package spaceobjects
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 )
@@ -150,29 +155,9 @@ func TestSharedDataset_PurgeNotifiesSubscribers(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	subscribeRows := func(scope subscribe.Scope, rows query.Filter) *subscribe.Sub {
-		sub, err := store.engine.Subscribe(subscribe.SubConfig{Scope: scope}, func(yield func(string, *anyenc.Value)) error {
-			iter, err := coll.Find(rows).Iter(ctx)
-			if err != nil {
-				return err
-			}
-			defer iter.Close()
-			for iter.Next() {
-				doc, err := iter.Doc()
-				if err != nil {
-					return err
-				}
-				yield(doc.Value().GetString(crdt.IdField), doc.Value())
-			}
-			return iter.Err()
-		})
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = sub.Close() })
-		return sub
-	}
-	all := subscribeRows(subscribe.Scope{AllObjects: true, Dataset: samples}, nil)
-	own := subscribeRows(subscribe.Scope{ObjectId: "obj1", Dataset: samples}, crdt.KeyedRows("obj1"))
-	other := subscribeRows(subscribe.Scope{ObjectId: "obj2", Dataset: samples}, crdt.KeyedRows("obj2"))
+	all := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{AllObjects: true, Dataset: samples}, nil)
+	own := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{ObjectId: "obj1", Dataset: samples}, crdt.KeyedRows("obj1"))
+	other := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{ObjectId: "obj2", Dataset: samples}, crdt.KeyedRows("obj2"))
 
 	require.NoError(t, store.purgeObject(ctx, "obj1"))
 
@@ -232,4 +217,242 @@ func TestSharedDataset_ReindexWipeClearsOnlyThisObject(t *testing.T) {
 	// The replay writes through the same handle.
 	writeTitle(t, ctx, c1, "obj1", samples, "r1", "v1", "one")
 	assert.Equal(t, []string{"obj1/r1", "obj2/r1"}, collectionIds(t, ctx, coll))
+}
+
+// subscribeKeyedRows registers a live query on the store's engine whose
+// snapshot is the rows of coll matching rows (all of them for nil).
+func subscribeKeyedRows(t *testing.T, ctx context.Context, store *Store, coll anystore.Collection, scope subscribe.Scope, rows query.Filter) *subscribe.Sub {
+	t.Helper()
+	sub, err := store.engine.Subscribe(subscribe.SubConfig{Scope: scope}, func(yield func(string, *anyenc.Value)) error {
+		iter, err := coll.Find(rows).Iter(ctx)
+		if err != nil {
+			return err
+		}
+		defer iter.Close()
+		for iter.Next() {
+			doc, err := iter.Doc()
+			if err != nil {
+				return err
+			}
+			yield(doc.Value().GetString(crdt.IdField), doc.Value())
+		}
+		return iter.Err()
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sub.Close() })
+	return sub
+}
+
+// removedIds reads sub's events until it has heard want removals.
+func removedIds(t *testing.T, ctx context.Context, sub *subscribe.Sub, want int) []string {
+	t.Helper()
+	var out []string
+	for len(out) < want {
+		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ev, err := sub.Events().WaitOne(waitCtx)
+		cancel()
+		require.NoError(t, err, "heard %d of %d removals", len(out), want)
+		for _, r := range ev.Removed {
+			out = append(out, r.Id)
+		}
+	}
+	return out
+}
+
+// assertQuiet checks that sub hears nothing for a short while.
+func assertQuiet(t *testing.T, ctx context.Context, sub *subscribe.Sub) {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err := sub.Events().WaitOne(waitCtx)
+	require.Error(t, err, "the subscription hears nothing")
+}
+
+// A purge clears the rows of a shared dataset whose definition left the
+// catalog after the store opened its collection. A store that never
+// opened it leaves them, as documented.
+func TestSharedDataset_PurgeCoversARemovedDefinition(t *testing.T) {
+	ctx, store, samples, _ := sharedDatasetStore(t)
+	for _, objectId := range []string{"obj1", "obj2"} {
+		ctrl, err := store.newController(ctx, objectId)
+		require.NoError(t, err)
+		writeTitle(t, ctx, ctrl, objectId, samples, "r1", "v1", objectId)
+	}
+	coll, err := store.keyedCollection(ctx, samples)
+	require.NoError(t, err)
+
+	removeDef(t, ctx, store.db, catTypeId, catTypeId+"-head-samples", "z1")
+	store.refreshType(ctx, catTypeId)
+	require.False(t, store.IsKeyedDataset(samples), "the definition is gone")
+	require.NotContains(t, store.keyedDatasets(), samples)
+
+	require.NoError(t, store.purgeObject(ctx, "obj1"))
+	assert.Equal(t, []string{"obj2/r1"}, collectionIds(t, ctx, coll))
+
+	fresh := NewStore(nil, store.db, nil, "spaceA", nil, nil, nil, nil)
+	t.Cleanup(func() { _ = fresh.Close() })
+	require.NoError(t, fresh.purgeObject(ctx, "obj2"))
+	assert.Equal(t, []string{"obj2/r1"}, collectionIds(t, ctx, coll))
+}
+
+// A purge deletes the object's rows in bounded chunks and tells live
+// queries about every one of them; an object with no rows tells
+// nothing.
+func TestSharedDataset_PurgeInChunks(t *testing.T) {
+	ctx, store, samples, _ := sharedDatasetStore(t)
+	coll, err := store.keyedCollection(ctx, samples)
+	require.NoError(t, err)
+
+	// Rows straight into the collection: a purge reads the key range.
+	n := keyedPurgeChunk + 1
+	want := make([]string, 0, n)
+	tx, err := store.db.WriteTx(ctx)
+	require.NoError(t, err)
+	a := &anyenc.Arena{}
+	insert := func(objectId, id string) {
+		a.Reset()
+		doc := a.NewObject()
+		doc.Set(crdt.IdField, a.NewString(id))
+		doc.Set(crdt.ObjectIdField, a.NewString(objectId))
+		require.NoError(t, coll.Insert(tx.Context(), doc))
+	}
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("obj1/r%05d", i)
+		insert("obj1", id)
+		want = append(want, id)
+	}
+	insert("obj2", "obj2/r1")
+	require.NoError(t, tx.Commit())
+
+	all := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{AllObjects: true, Dataset: samples}, nil)
+	other := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{ObjectId: "obj2", Dataset: samples}, crdt.KeyedRows("obj2"))
+
+	require.NoError(t, store.purgeObject(ctx, "obj1"))
+	assert.Equal(t, []string{"obj2/r1"}, collectionIds(t, ctx, coll))
+	got := removedIds(t, ctx, all, n)
+	assert.ElementsMatch(t, want, got, "every purged row is told once")
+	assertQuiet(t, ctx, other)
+
+	// Nothing left of obj1: no write, nothing told.
+	require.NoError(t, store.deleteKeyedRows(ctx, samples, "obj1"))
+	assertQuiet(t, ctx, all)
+}
+
+// A re-index wipe tells live queries which of the object's rows went: a
+// reader across objects holds them without the object loaded.
+func TestSharedDataset_ReindexWipeNotifiesSubscribers(t *testing.T) {
+	ctx, store, samples, _ := sharedDatasetStore(t)
+	c1, err := store.newController(ctx, "obj1")
+	require.NoError(t, err)
+	c2, err := store.newController(ctx, "obj2")
+	require.NoError(t, err)
+	writeTitle(t, ctx, c1, "obj1", samples, "r1", "v1", "one")
+	writeTitle(t, ctx, c1, "obj1", samples, "r2", "v2", "two")
+	writeTitle(t, ctx, c2, "obj2", samples, "r1", "v1", "other")
+	coll, err := store.keyedCollection(ctx, samples)
+	require.NoError(t, err)
+
+	all := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{AllObjects: true, Dataset: samples}, nil)
+	other := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{ObjectId: "obj2", Dataset: samples}, crdt.KeyedRows("obj2"))
+
+	require.NoError(t, store.wipeMaterialized(ctx, "obj1", c1))
+	assert.ElementsMatch(t, []string{"obj1/r1", "obj1/r2"}, removedIds(t, ctx, all, 2))
+	assertQuiet(t, ctx, other)
+	assert.Equal(t, []string{"obj2/r1"}, collectionIds(t, ctx, coll))
+}
+
+// stubTree is the part of an object tree a device-local write touches.
+type stubTree struct {
+	objecttree.ObjectTree
+	mu sync.Mutex
+	id string
+}
+
+func (s *stubTree) Lock()                    { s.mu.Lock() }
+func (s *stubTree) Unlock()                  { s.mu.Unlock() }
+func (s *stubTree) Id() string               { return s.id }
+func (s *stubTree) Root() *objecttree.Change { return nil }
+
+// A re-index keeps the device-local values of the object's rows in a
+// shared dataset, and leaves another object's rows as they were.
+func TestSharedDataset_ReindexKeepsLocalValues(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "shared.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
+	seedSharedDatasetDefs(t, ctx, db, catTypeId, "samples", "a")
+	seedFieldDef(t, ctx, db, catTypeId, "samples", "seen", "boolean", "local", "a9")
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	t.Cleanup(func() { _ = store.Close() })
+	samples := types.CollectionName(catTypeId, "samples")
+
+	setSeen := func(ctrl *crdt.Controller, objectId string) {
+		a := &anyenc.Arena{}
+		ch := crdt.Change{
+			ObjectId: objectId, Dataset: samples, DataVersion: "dv", Timestamp: 1, Local: true,
+			Records: []crdt.RecordChange{{Id: "r1", Ops: []crdt.Op{{Type: crdt.OpSet, Path: []string{"seen"}, Payload: a.NewTrue()}}}},
+		}
+		ch.VersionId = ctrl.NextLocalVersion(ctx, &ch)
+		res, err := ctrl.ApplyChangeWithResult(ctx, ch)
+		require.NoError(t, err)
+		require.Empty(t, res.Rejections)
+	}
+	ctrls := map[string]*crdt.Controller{}
+	for _, objectId := range []string{"obj1", "obj2"} {
+		ctrl, err := store.newController(ctx, objectId)
+		require.NoError(t, err)
+		require.Equal(t, []string{"seen"}, ctrl.LocalFields(samples))
+		writeTitle(t, ctx, ctrl, objectId, samples, "r1", "v1", objectId)
+		setSeen(ctrl, objectId)
+		ctrls[objectId] = ctrl
+	}
+	c1 := ctrls["obj1"]
+	obj, err := object.New(object.Config{SpaceId: "spaceA", Controller: c1},
+		func(updatelistener.UpdateListener) (objecttree.ObjectTree, error) { return &stubTree{id: "obj1"}, nil })
+	require.NoError(t, err)
+	coll, err := store.keyedCollection(ctx, samples)
+	require.NoError(t, err)
+
+	leaves, err := store.reindexPrepare(ctx, "obj1", c1, []string{samples})
+	require.NoError(t, err)
+	require.Len(t, leaves, 1)
+	assert.Equal(t, []string{"obj2/r1"}, collectionIds(t, ctx, coll), "the wipe takes obj1's rows only")
+
+	// The replay rebuilds the synced state, then the leaves come back.
+	writeTitle(t, ctx, c1, "obj1", samples, "r1", "v1", "obj1")
+	store.reindexFinish(ctx, obj, c1, leaves)
+
+	assert.Equal(t, []string{"obj1/r1", "obj2/r1"}, collectionIds(t, ctx, coll), "no row beside the record's own")
+	for _, objectId := range []string{"obj1", "obj2"} {
+		row := ctrls[objectId].Get(ctx, samples, "r1")
+		require.NotNil(t, row, objectId)
+		assert.Equal(t, objectId, row.GetString("title"), objectId)
+		assert.True(t, row.GetBool("seen"), "%s keeps its local value", objectId)
+	}
+}
+
+// A shared dataset registers with a version of its own: an object whose
+// rows a per-object registration of the same dataset materialized is
+// stale, and its re-index moves them.
+func TestSharedDataset_RegistrationVersion(t *testing.T) {
+	ctx, store, samples, notes := sharedDatasetStore(t)
+	regs := store.catalog.snapshot().regs
+	assert.Equal(t, crdt.ComposeVersion(crdt.SchemaHandlerVersion, sharedLayoutVersion), regs[samples].Version)
+	assert.Equal(t, crdt.SchemaHandlerVersion, regs[notes].Version)
+	assert.NotEqual(t, regs[samples].Version, regs[notes].Version)
+
+	meta, err := store.db.Collection(ctx, crdt.MetaCollectionName)
+	require.NoError(t, err)
+	require.NoError(t, crdt.PersistMeta(ctx, meta, "obj1", 1, 0,
+		map[string]int{samples: crdt.SchemaHandlerVersion, notes: crdt.SchemaHandlerVersion}, "spaceA"))
+	require.NoError(t, crdt.PersistMeta(ctx, meta, "obj2", 1, 0,
+		map[string]int{samples: regs[samples].Version, notes: crdt.SchemaHandlerVersion}, "spaceA"))
+
+	c1, err := store.newController(ctx, "obj1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{samples}, c1.StaleDatasets(), "per-object rows of a shared dataset are stale")
+	c2, err := store.newController(ctx, "obj2")
+	require.NoError(t, err)
+	assert.Empty(t, c2.StaleDatasets())
 }

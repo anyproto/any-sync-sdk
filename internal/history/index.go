@@ -326,7 +326,7 @@ func (ix *Index) Backfill(ctx context.Context, tree objecttree.ReadableObjectTre
 			}
 			if keyed != nil && keyed(batch[i].Dataset) {
 				for j := range recordIds {
-					recordIds[j] = crdt.KeyedId(objectId, recordIds[j])
+					recordIds[j] = crdt.KeyedStoreId(objectId, recordIds[j])
 				}
 			}
 			if err := ix.IndexChange(tx.Context(), &batch[i], recordIds); err != nil {

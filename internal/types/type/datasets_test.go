@@ -723,7 +723,10 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	assert.True(t, samples.Shared)
 	assert.Equal(t, testObjectId+"_samples", samples.Name, "a shared dataset keeps its namespaced name")
 	assert.False(t, byKey["segments"].Shared)
-	assert.True(t, byKey["draft"].Invalid, "only a records dataset is shared")
+	draft := byKey["draft"]
+	assert.False(t, draft.Invalid, "a module head carrying the shared marker is valid: %s", draft.InvalidReason)
+	assert.False(t, draft.Shared, "only a records dataset is shared")
+	assert.Equal(t, testObjectId+"_draft", draft.Name)
 
 	unmarked := byKey["notes_body"]
 	assert.False(t, unmarked.Invalid)

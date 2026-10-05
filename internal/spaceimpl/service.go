@@ -365,6 +365,8 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	// for every object to be opened (spaceobjects/reindex.go). No-op when
 	// no handler version changed.
 	st.StartReindexSweep()
+	// Shared datasets' declared indexes missing from a previous run.
+	st.StartIndexSync()
 	// Kick the drainer once so prior-session parked rows whose
 	// dependencies have since landed get picked up on first touch.
 	st.NotifyDrainer(types.DataVersionPair{})

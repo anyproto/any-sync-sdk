@@ -44,8 +44,7 @@ type DatasetSchema struct {
 	// of every object live in one collection per space, and a record's
 	// id on reads is `<objectId>/<recordId>`.
 	Shared bool
-	// Indexes are the dataset's declared indexes that collections
-	// build (an invalid definition is listed by TypesAPI.Datasets
-	// only).
+	// Indexes are the dataset's valid declared indexes (an invalid
+	// definition is listed by TypesAPI.Datasets only).
 	Indexes []IndexDraft
 }

@@ -499,7 +499,8 @@ written by two objects.
 - **Writes** take the plain record id, or the stored id of the batch's
   own object. A `/` anywhere else is `ErrRecordIdOfAnotherObject` — a
   failed call on `Modify` and `Delete`, a per-record rejection on
-  `Upsert`. `Upsert` is keyed by the plain id and reports it.
+  `Upsert`. `Upsert` is keyed by the plain id: a rejection names it,
+  and each page's `RecordIds` are stored ids like any write result's.
 - **Handlers** see the record id the change carries.
 - **`space.SharedRecordId` / `space.PlainRecordId`** convert between
   the two forms.

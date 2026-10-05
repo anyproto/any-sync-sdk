@@ -1068,7 +1068,7 @@ type NamedSchema struct {
 	// Shared marks a shared dataset: every object's records in one
 	// collection per space.
 	Shared bool
-	// Indexes are the dataset's declared indexes that are built.
+	// Indexes are the dataset's valid declared indexes.
 	Indexes []schema.Index
 }
 

@@ -155,6 +155,9 @@ type Controller struct {
 	// collection is first opened.
 	versions map[string]int
 	indexes  map[string][]anystore.IndexInfo
+	// prunePrefixes: dataset → name prefix under which indexes is the
+	// whole set (HandlerReg.PruneIndexPrefix).
+	prunePrefixes map[string]string
 	// schemas is the per-dataset field declaration (field classes +
 	// Dynamic). Source of truth for synced/derived/local enforcement.
 	schemas map[string]schema.Dataset
@@ -362,6 +365,12 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 	c.handlers[name] = reg.Handler
 	c.versions[name] = NormalizedVersion(reg.Version)
 	c.indexes[name] = reg.Indexes
+	if reg.PruneIndexPrefix != "" {
+		if c.prunePrefixes == nil {
+			c.prunePrefixes = make(map[string]string)
+		}
+		c.prunePrefixes[name] = reg.PruneIndexPrefix
+	}
 	// Zero-value scopes are resolved once here (stamps → derived, rest →
 	// synced) so field-class enforcement never sees an unset scope.
 	c.schemas[name] = reg.Schema.Normalized()
@@ -439,6 +448,60 @@ func ensureHandlerIndexes(ctx context.Context, indexes []anystore.IndexInfo, col
 	return nil
 }
 
+// StaleIndexes lists the collection's indexes named under prefix that
+// are not among want. An empty prefix lists none.
+func StaleIndexes(coll anystore.Collection, want []anystore.IndexInfo, prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	keep := make(map[string]struct{}, len(want))
+	for _, idx := range want {
+		keep[idx.Name] = struct{}{}
+	}
+	var stale []string
+	for _, idx := range coll.GetIndexes() {
+		name := idx.Info().Name
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if _, ok := keep[name]; !ok {
+			stale = append(stale, name)
+		}
+	}
+	return stale
+}
+
+// MissingIndexes lists the indexes of want the collection does not
+// hold yet, by name.
+func MissingIndexes(coll anystore.Collection, want []anystore.IndexInfo) []anystore.IndexInfo {
+	if len(want) == 0 {
+		return nil
+	}
+	have := make(map[string]struct{})
+	for _, idx := range coll.GetIndexes() {
+		have[idx.Info().Name] = struct{}{}
+	}
+	var missing []anystore.IndexInfo
+	for _, idx := range want {
+		if _, ok := have[idx.Name]; !ok {
+			missing = append(missing, idx)
+		}
+	}
+	return missing
+}
+
+// DropStaleIndexes drops the collection's indexes named under prefix
+// that are not among want, so the set under a prefix follows its
+// registration. No-op for an empty prefix.
+func DropStaleIndexes(ctx context.Context, coll anystore.Collection, want []anystore.IndexInfo, prefix string) error {
+	for _, name := range StaleIndexes(coll, want, prefix) {
+		if err := coll.DropIndex(ctx, name); err != nil && !errors.Is(err, anystore.ErrIndexNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
 // builtinIndexes are ensured on every data collection (per-object and
 // shared) on top of the handler's own indexes. The ascending _addSeq
 // index backs the "records changed since N" scans the change-index feed
@@ -471,6 +534,9 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 	}
 	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
 		return nil, fmt.Errorf("crdt: ensure builtin indexes for %q: %w", dataset, err)
+	}
+	if err := DropStaleIndexes(ctx, coll, c.indexes[dataset], c.prunePrefixes[dataset]); err != nil {
+		return nil, fmt.Errorf("crdt: drop stale indexes for %q: %w", dataset, err)
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
@@ -511,6 +577,9 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 		return nil
 	}
 	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
+		return nil
+	}
+	if err := DropStaleIndexes(ctx, coll, c.indexes[dataset], c.prunePrefixes[dataset]); err != nil {
 		return nil
 	}
 	c.collMu.Lock()

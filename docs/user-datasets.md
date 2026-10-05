@@ -276,6 +276,10 @@ type's parts are CRDT records there:
   carries, docs/data-structure.md § "The `x-format` descriptor") mutable via
   `PatchDatasetField`. The descriptive slice never enters the schema
   revision: editing it re-registers nothing.
+- **Index record** (one per declared index of a `records` dataset; id
+  derived from the change): `def:"index"`, `dataset` (owning head id),
+  `key` (slug), `fields` (an array of paths), `sparse`, all pinned.
+  See § Declared indexes.
 
 A bundle root that declares `Parts` is a type object (`any.type =
 "__type__"`, `typeId == objectId`) and hosts these records itself under
@@ -293,15 +297,17 @@ records would take arrival-order-dependent verdicts, and a handler
 cannot see the module catalog (a peer without a module still stores
 the declaration).
 
-`AddPart` writes the part, its heads and their fields in one change
-(the ids are minted client-side so records can reference each other),
-so a crash can never strand an orphan. `AddDataset` on an existing part
-writes the head and its fields the same way.
+`AddPart` writes the part, its heads, their fields and their indexes in
+one change (the ids are minted client-side so records can reference
+each other), so a crash can never strand an orphan. `AddDataset` on an
+existing part writes the head, its fields and its indexes the same way.
 
-Every definition create/delete projects a shortId row into the type's
-`<typeId>_shortIds` collection (with a `src: "datasets"` discriminator),
-so the DataVersion gate covers dataset-schema state with no extra
-lookups.
+Every part, head and field create, and every definition delete,
+projects a shortId row into the type's `<typeId>_shortIds` collection
+(with a `src: "datasets"` discriminator), so the DataVersion gate
+covers dataset-schema state with no extra lookups. An index record's
+creation projects none: an index changes no apply verdict, so no data
+change waits for one.
 
 ### Compile: records → parts and declarations
 
@@ -324,8 +330,12 @@ flat dataset view of the same fold):
   marker; an unknown module or a rule violation marks the definition
   invalid; a type holding two canonical datasets of one module keeps
   the smallest `_ver.id` and marks the rest invalid;
-- a module-served dataset carries no fields: field records under it
-  are orphans;
+- a module-served dataset carries no fields: field and index records
+  under it are orphans;
+- index records attach to their head like fields and dedup by index
+  key (smallest `_ver.id`); one whose paths are not declared scalar
+  fields of the folded declaration, or that is past the per-dataset
+  limit in creation order, is emitted invalid and never built;
 - a `records` fold that fails `ValidateDatasetDecl` is emitted
   invalid, visible through `Types().Datasets` (with the reason)
   so it can be repaired or removed, but never registered.
@@ -349,6 +359,9 @@ evolution is additive-only with pinned behavior:
 - **`RemoveDatasetField` re-validates the remaining declaration** and
   refuses removals that would invalidate it (e.g. the creator stamp of
   an author-gated dataset). Already-invalid definitions stay removable.
+  A field a declared index names is refused until the index is removed.
+- **An index is replaced, never edited**: `RemoveDatasetIndex`, then
+  `AddDatasetIndex`.
 - `RemoveDataset` / `RemovePart` do not clean up record data (as with
   `RemoveProperty`); subsequent writes drop once peers apply the
   removal, and a canonical dataset's removal only withdraws this type's
@@ -374,9 +387,10 @@ declarations reach them through a store-level **catalog**:
   `DataVersion`.
 - **Eviction is lazy.** Schema apply evicts nothing. Each registration carries a `SchemaRev` fingerprint of
   its compiled declaration (for a module instance: the module and key,
-  since the schema is the module's); a resident controller whose rev
+  since the schema is the module's; for a per-object records dataset:
+  its declared indexes too); a resident controller whose rev
   differs from the catalog's (dataset added, field added/removed,
-  definition removed) is stale. Local touch (`Modify`/`Upsert`/`Query`)
+  index added/removed, definition removed) is stale. Local touch (`Modify`/`Upsert`/`Query`)
   drops and reloads it; user-facing write paths retry once on the
   resulting `object.ErrClosed`, so the eviction never surfaces as a
   caller error.
@@ -433,7 +447,8 @@ writer per dataset (see the IdRule contract above).
 `DatasetSchema` carries `Owners`, the declaring types: one for a
 registered-type or namespaced dataset, every type declaring it
 for a canonical collection (empty while nothing declares it), none for
-space-level built-ins; plus `Module`. Consumer indexers
+space-level built-ins; plus `Module`, `Shared` and the declared
+`Indexes` that are built. Consumer indexers
 gate on `Owners` (an object may hold the dataset when it carries one
 of them).
 
@@ -501,7 +516,9 @@ same builders and terminals as `Query` and `Aggregate`.
 
 - **No object is loaded.** The read sees the space's materialized
   state, as `QueryObjects` does. `Query(objectId, dataset)` loads its
-  object first and stays the read for one known object.
+  object first and stays the read for one known object: it reads the
+  object's key range, where a filter on `_objectId` here scans the
+  collection unless a declared index leads with it.
 - **`Subscribe`** delivers the changes of every object's records.
   Deleting an object arrives as removals of its rows, with no
   `VersionId`. A subscription without a filter or a sorted limit holds
@@ -514,6 +531,48 @@ same builders and terminals as `Query` and `Aggregate`.
 
 The marker is stored on the head record as `perSpace`. An SDK that
 predates it ignores the leaf and materializes the dataset per object.
+
+## Declared indexes
+
+A `records` dataset declares secondary indexes: `DatasetDraft.Indexes`
+at creation, `Types().AddDatasetIndex` later — also on a dataset that
+holds records. An index is an ordered list of paths any-store keeps
+sorted, so a filter or sort on a leading run of them is a range read.
+
+```go
+IndexDraft{Key: "by_start", Fields: []string{"start", "_objectId"}}
+IndexDraft{Key: "top",      Fields: []string{"-score"}, Sparse: true}
+```
+
+- **Paths**: one to `MaxIndexFields` (4), each a declared field of kind
+  string, number, boolean or datetime, or `_ver.id` (creation order
+  within one object); a shared dataset also takes `_objectId`. A `-`
+  prefix keeps a path descending. Declared shapes are enforced at
+  apply, so an indexed field holds one scalar type on every record.
+- **`Sparse`** leaves a record out unless it carries every indexed
+  field.
+- **Limits**: `MaxDatasetIndexes` (8) per dataset; every index is
+  written on every record write. No unique index — replicas cannot
+  enforce one convergently — and no full-text or vector index.
+- **Definitions sync**, so every device holds the same set. They stay
+  out of the DataVersion gate.
+- **The any-store index** is named from what it indexes
+  (`dx_start,_objectId`), not from the key: two definitions of one
+  shape are one index, and a replaced definition is another index.
+- **A per-object dataset** carries its indexes on its registration: an
+  object's collection gets them when it is next opened, and loses a
+  removed one the same way.
+- **A shared dataset** has one collection per space, which the store
+  indexes: when a definition applies, and at open when an index is
+  missing, a background worker builds it; a removed definition drops
+  it. A build scans the collection in one write transaction, so every
+  write to the account's database waits for it. It never runs on the
+  apply path. `Types().SubscribeIndexBuilds` reports each build
+  (`Started`, then `Done` or `Failed`); a definition whose index the
+  collection already holds builds nothing. Until a build ends, reads
+  scan.
+- **An invalid index** — a path that names no declared scalar field —
+  is listed by `Types().Datasets` with its reason and built nowhere.
 
 ## Limitations
 
@@ -547,13 +606,16 @@ predates it ignores the leaf and materializes the dataset per object.
 // definitions (space.TypesAPI)
 Patch(ctx, typeId, TypePatch) error                       // name/description/icon/layout/hidden/meta
 Parts(ctx, typeId) ([]PartDef, error)
-AddPart(ctx, typeId, PartDraft) (partId, error)           // part + datasets + fields, one change
+AddPart(ctx, typeId, PartDraft) (partId, error)           // part + datasets + fields + indexes, one change
 PatchPart(ctx, typeId, partId, DatasetDefPatch) error     // display slice, ui (whole), uses
 RemovePart(ctx, typeId, partId) error                     // part + its datasets
 AddDataset(ctx, typeId, partId, DatasetDraft) (datasetDefId, error)
 AddDatasetField(ctx, typeId, datasetDefId, DatasetFieldDraft) (fieldDefId, error) // records only
 RemoveDataset(ctx, typeId, datasetDefId) error
 RemoveDatasetField(ctx, typeId, fieldDefId) error
+AddDatasetIndex(ctx, typeId, datasetDefId, IndexDraft) (indexDefId, error)        // records only
+RemoveDatasetIndex(ctx, typeId, indexDefId) error
+SubscribeIndexBuilds(cb func(IndexBuild)) (cancel func())                          // shared datasets
 PatchDataset(ctx, typeId, defId, DatasetDefPatch) error   // mutable leaves
 PatchDatasetField(ctx, typeId, fieldDefId, DatasetDefPatch) error
 Datasets(ctx, typeId) ([]DatasetDef, error)               // flat, with Collection

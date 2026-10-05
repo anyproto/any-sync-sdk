@@ -32,6 +32,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
@@ -142,8 +143,9 @@ func (s *Store) initCatalog(ctx context.Context) {
 		}
 	}
 	s.catalog.mu.Lock()
-	defer s.catalog.mu.Unlock()
 	s.catalog.snap.Store(s.resolveCatalog(byType))
+	s.catalog.mu.Unlock()
+	s.kickIndexSync()
 }
 
 // catalogHasType reports whether the runtime catalog currently carries
@@ -176,7 +178,6 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 		return
 	}
 	s.catalog.mu.Lock()
-	defer s.catalog.mu.Unlock()
 	prev := s.catalog.snap.Load()
 	byType := make(map[string]*types.CompiledType, len(prev.byType)+1)
 	for k, v := range prev.byType {
@@ -188,6 +189,9 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 		byType[typeId] = compiled
 	}
 	s.catalog.snap.Store(s.resolveCatalog(byType))
+	s.catalog.mu.Unlock()
+	// A shared dataset's declared indexes follow the catalog.
+	s.kickIndexSync()
 }
 
 // resolveCatalog folds per-type compiles into the resolved snapshot:
@@ -274,7 +278,7 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 		if err != nil {
 			return crdt.HandlerReg{}, err
 		}
-		return crdt.HandlerReg{
+		reg := crdt.HandlerReg{
 			Name:        ds.Name,
 			Handler:     sh,
 			Schema:      ds.Schema,
@@ -284,7 +288,14 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 			// A shared dataset's records live in one collection per
 			// space (Store.keyedCollection).
 			Keyed: ds.Shared,
-		}, nil
+		}
+		if !ds.Shared {
+			// A per-object collection carries the declared indexes
+			// from its open; the store indexes a shared one.
+			reg.Indexes = ds.StoreIndexes()
+			reg.PruneIndexPrefix = schema.IndexStorePrefix
+		}
+		return reg, nil
 	}
 	m, ok := s.modules[ds.Module]
 	if !ok {

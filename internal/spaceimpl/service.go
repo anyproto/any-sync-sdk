@@ -1186,7 +1186,11 @@ func toDatasetSchemas(named []spaceobjects.NamedSchema) []space.DatasetSchema {
 		if err != nil {
 			continue
 		}
-		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw, Owners: ns.Owners, Module: ns.Module, Shared: ns.Shared})
+		ds := space.DatasetSchema{Name: ns.Name, JSONSchema: raw, Owners: ns.Owners, Module: ns.Module, Shared: ns.Shared}
+		for _, idx := range ns.Indexes {
+			ds.Indexes = append(ds.Indexes, space.IndexDraft{Key: idx.Key, Fields: idx.Fields, Sparse: idx.Sparse})
+		}
+		out = append(out, ds)
 	}
 	return out
 }

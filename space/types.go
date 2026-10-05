@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/anyproto/any-sync-sdk/handler"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // ErrPinnedField is returned by PatchProperty / PatchDataset /
@@ -233,6 +234,28 @@ type TypesAPI interface {
 	// undeclared (non-dynamic datasets).
 	RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error
 
+	// AddDatasetIndex declares a secondary index on an existing records
+	// dataset; one may be added to a dataset that holds records.
+	// Returns the index definition's id. The definition syncs, so every
+	// device keeps the same set. A per-object dataset builds the index
+	// when an object's collection is next opened; a shared dataset
+	// builds it once per space in the background — every write to the
+	// account's data waits for that build. SubscribeIndexBuilds reports
+	// a build; an index of a shape the collection already holds builds
+	// nothing and reports nothing. A module-served dataset refuses
+	// (ErrModuleOwned).
+	AddDatasetIndex(ctx context.Context, typeId, datasetDefId string, draft IndexDraft) (indexDefId string, err error)
+
+	// RemoveDatasetIndex drops one index definition; the index goes
+	// from each collection as its device applies the removal.
+	RemoveDatasetIndex(ctx context.Context, typeId, indexDefId string) error
+
+	// SubscribeIndexBuilds registers cb for the builds of shared
+	// datasets' declared indexes in this space. cb runs on the build
+	// worker — keep it small or hand off. The returned cancel is
+	// idempotent.
+	SubscribeIndexBuilds(cb func(IndexBuild)) (cancel func())
+
 	// PatchDataset edits a definition's mutable leaves: displayName,
 	// description, name (field records' display label), search.title,
 	// search.text (a field key string or a non-empty array of unique
@@ -376,6 +399,8 @@ type DatasetDraft struct {
 	// Search is the optional search-extraction annotation (x-search).
 	Search *SearchFields
 
+	// Indexes are the initial declared indexes. Records datasets only.
+	Indexes []IndexDraft
 	// Fields are the initial field definitions. Records datasets only —
 	// a module owns its schema and refuses fields.
 	Fields []DatasetFieldDraft
@@ -437,6 +462,9 @@ type DatasetDef struct {
 	SkipHistory bool
 	Search      *SearchFields
 	Fields      []DatasetFieldDef
+	// Indexes are the declared indexes in creation order, invalid ones
+	// included.
+	Indexes []IndexDef
 
 	// Invalid marks a definition whose folded declaration fails
 	// validation (InvalidReason says why). Invalid definitions never
@@ -444,6 +472,71 @@ type DatasetDef struct {
 	// (AddDatasetField) or removed.
 	Invalid       bool
 	InvalidReason string
+}
+
+// Index limits and the protocol paths an index may name next to
+// declared fields.
+const (
+	// MaxIndexFields bounds the paths of one index.
+	MaxIndexFields = schema.MaxIndexFields
+	// MaxDatasetIndexes bounds the indexes of one dataset.
+	MaxDatasetIndexes = schema.MaxDatasetIndexes
+	// IndexPathCreated orders records by creation within one object.
+	IndexPathCreated = schema.IndexPathCreated
+	// IndexPathObject is the object of a shared dataset's record.
+	IndexPathObject = schema.IndexPathObject
+)
+
+// IndexDraft declares a secondary index of a records dataset — input to
+// AddDataset / AddDatasetIndex. A filter or sort on a leading run of
+// its fields is a range read. Every part is pinned: change an index by
+// removing it and adding another.
+type IndexDraft struct {
+	// Key is the index's slug, unique within the dataset.
+	Key string
+	// Fields are the indexed paths in order, at most MaxIndexFields; a
+	// "-" prefix keeps that path descending. Each names a declared
+	// field of kind string, number, boolean or datetime, or
+	// IndexPathCreated; a shared dataset also takes IndexPathObject.
+	Fields []string
+	// Sparse leaves a record out of the index unless it carries every
+	// indexed field.
+	Sparse bool
+}
+
+// IndexDef is the compiled view of one declared index.
+type IndexDef struct {
+	// Id is the definition record's id — what RemoveDatasetIndex takes.
+	Id     string
+	Key    string
+	Fields []string
+	Sparse bool
+	// Invalid marks an index no collection builds (InvalidReason says
+	// why): a field it names is not a declared scalar field, or the
+	// dataset already holds MaxDatasetIndexes. It stays listed so it
+	// can be removed.
+	Invalid       bool
+	InvalidReason string
+}
+
+// IndexBuildPhase is the state an IndexBuild reports.
+type IndexBuildPhase int
+
+const (
+	IndexBuildStarted IndexBuildPhase = iota
+	IndexBuildDone
+	IndexBuildFailed
+)
+
+// IndexBuild reports the build of a shared dataset's missing declared
+// indexes on this device: Started before the collection is scanned,
+// then Done or Failed. Every write waits while a build runs.
+type IndexBuild struct {
+	// Dataset is the shared dataset's storage collection name.
+	Dataset string
+	Phase   IndexBuildPhase
+	// Err is set on IndexBuildFailed.
+	Err error
 }
 
 // DatasetFieldDef is the compiled view of one dataset field.

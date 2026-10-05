@@ -19,6 +19,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -147,6 +148,9 @@ func draftToDecl(draft *space.DatasetDraft) (schema.Dataset, error) {
 		if len(draft.Fields) > 0 {
 			return ds, fmt.Errorf("%w: dataset %q: a %q dataset declares no fields", space.ErrModuleOwned, draft.Key, draft.Module)
 		}
+		if len(draft.Indexes) > 0 {
+			return ds, fmt.Errorf("%w: dataset %q: a %q dataset declares no indexes", space.ErrModuleOwned, draft.Key, draft.Module)
+		}
 		return ds, nil
 	}
 	for i := range draft.Fields {
@@ -159,7 +163,63 @@ func draftToDecl(draft *space.DatasetDraft) (schema.Dataset, error) {
 	if err := schema.ValidateDatasetDecl(ds); err != nil {
 		return ds, err
 	}
+	if err := validateIndexDrafts(ds, draft.Indexes, nil, draft.Shared); err != nil {
+		return ds, fmt.Errorf("dataset %q: %w", draft.Key, err)
+	}
 	return ds, nil
+}
+
+// draftIndexDecl is the schema form of an index draft.
+func draftIndexDecl(draft *space.IndexDraft) schema.Index {
+	return schema.Index{Key: draft.Key, Fields: draft.Fields, Sparse: draft.Sparse}
+}
+
+// validateIndexDrafts checks index drafts against the declaration they
+// join and the indexes it already holds: each one's shape and paths,
+// keys unique, the per-dataset limit.
+func validateIndexDrafts(ds schema.Dataset, drafts []space.IndexDraft, existing []space.IndexDef, shared bool) error {
+	if len(drafts) == 0 {
+		return nil
+	}
+	keys := make(map[string]struct{}, len(existing)+len(drafts))
+	held := 0
+	for _, x := range existing {
+		keys[x.Key] = struct{}{}
+		if !x.Invalid {
+			held++
+		}
+	}
+	for i := range drafts {
+		idx := draftIndexDecl(&drafts[i])
+		if err := schema.ValidateIndexDecl(ds, idx, shared); err != nil {
+			return err
+		}
+		if _, dup := keys[idx.Key]; dup {
+			return fmt.Errorf("%w: index %q is already declared", schema.ErrDecl, idx.Key)
+		}
+		keys[idx.Key] = struct{}{}
+		if held++; held > schema.MaxDatasetIndexes {
+			return fmt.Errorf("%w: a dataset holds at most %d indexes", schema.ErrDecl, schema.MaxDatasetIndexes)
+		}
+	}
+	return nil
+}
+
+// encodeDatasetIndex builds an index record payload.
+func encodeDatasetIndex(arena *anyenc.Arena, headId string, idx schema.Index) *anyenc.Value {
+	payload := arena.NewObject()
+	payload.Set(typetype.DefFieldDef, arena.NewString(typetype.DefKindIndex))
+	payload.Set(typetype.DefFieldDataset, arena.NewString(headId))
+	payload.Set(typetype.FieldKey, arena.NewString(idx.Key))
+	fields := arena.NewArray()
+	for i, f := range idx.Fields {
+		fields.SetArrayItem(i, arena.NewString(f))
+	}
+	payload.Set(typetype.DefFieldIndexFields, fields)
+	if idx.Sparse {
+		payload.Set(typetype.DefFieldIndexSparse, arena.NewTrue())
+	}
+	return payload
 }
 
 // encodeShapeInto writes a value shape's kind/items/properties onto a
@@ -457,6 +517,12 @@ func datasetDefRecords(arena *anyenc.Arena, modules types.Modules, partId string
 		recs = append(recs, crdt.RecordChange{
 			Upsert: true, // empty Id → fieldDefId derived from ChangeId
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+		})
+	}
+	for i := range draft.Indexes {
+		recs = append(recs, crdt.RecordChange{
+			Upsert: true, // empty Id → indexDefId derived from ChangeId
+			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetIndex(arena, headId, draftIndexDecl(&draft.Indexes[i]))}},
 		})
 	}
 	return headId, recs, nil
@@ -826,10 +892,88 @@ func (t *typesAPI) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 					return fmt.Errorf("typesAPI: removing field %q would invalidate dataset %q: %w", def.Fields[j].Key, def.Key, verr)
 				}
 			}
+			// An index over the field would stop being built on every
+			// device: the index goes first.
+			for _, x := range def.Indexes {
+				for _, entry := range x.Fields {
+					if path, _ := schema.IndexFieldPath(entry); path == def.Fields[j].Key && !x.Invalid {
+						return fmt.Errorf("typesAPI: %w: field %q is indexed by %q — remove the index first", schema.ErrDecl, def.Fields[j].Key, x.Key)
+					}
+				}
+			}
 			return t.removeDatasetDefRecord(ctx, typeId, fieldDefId)
 		}
 	}
 	return fmt.Errorf("typesAPI: field definition %q not found on type %q", fieldDefId, typeId)
+}
+
+// AddDatasetIndex declares one index on an existing records dataset.
+// The draft is validated against the dataset's current declaration and
+// indexes, so a definition no collection would build never syncs.
+func (t *typesAPI) AddDatasetIndex(ctx context.Context, typeId, datasetDefId string, draft space.IndexDraft) (string, error) {
+	if err := t.requireType(ctx, typeId); err != nil {
+		return "", err
+	}
+	if t.staticType(typeId) {
+		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	def, err := t.findDatasetDef(ctx, typeId, datasetDefId)
+	if err != nil {
+		return "", err
+	}
+	if def.Module != space.RecordsModule {
+		return "", fmt.Errorf("%w: dataset %q is served by %q", space.ErrModuleOwned, def.Key, def.Module)
+	}
+	if def.Invalid {
+		return "", fmt.Errorf("typesAPI: %w: dataset %q is invalid: %s", schema.ErrDecl, def.Key, def.InvalidReason)
+	}
+	if err := validateIndexDrafts(defToDecl(&def), []space.IndexDraft{draft}, def.Indexes, def.Shared); err != nil {
+		return "", fmt.Errorf("typesAPI: dataset %q: %w", def.Key, err)
+	}
+	arena := &anyenc.Arena{}
+	res, err := t.writeDatasetDefs(ctx, typeId, crdt.RecordChange{
+		Upsert: true,
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: encodeDatasetIndex(arena, datasetDefId, draftIndexDecl(&draft))}},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(res.RecordIds) == 0 {
+		return "", errors.New("typesAPI: dataset index write returned no record id")
+	}
+	return res.RecordIds[0], nil
+}
+
+// RemoveDatasetIndex tombstones one index definition.
+func (t *typesAPI) RemoveDatasetIndex(ctx context.Context, typeId, indexDefId string) error {
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	defs, err := t.Datasets(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	for i := range defs {
+		for _, x := range defs[i].Indexes {
+			if x.Id == indexDefId {
+				return t.removeDatasetDefRecord(ctx, typeId, indexDefId)
+			}
+		}
+	}
+	return fmt.Errorf("typesAPI: index definition %q not found on type %q", indexDefId, typeId)
+}
+
+// SubscribeIndexBuilds forwards the store's index-build feed.
+func (t *typesAPI) SubscribeIndexBuilds(cb func(space.IndexBuild)) (cancel func()) {
+	if cb == nil {
+		return func() {}
+	}
+	return t.parent.store.SubscribeIndexBuilds(func(ev spaceobjects.IndexBuild) {
+		cb(space.IndexBuild{Dataset: ev.Dataset, Phase: space.IndexBuildPhase(ev.Phase), Err: ev.Err})
+	})
 }
 
 func (t *typesAPI) removeDatasetDefRecord(ctx context.Context, typeId, defId string) error {
@@ -1137,6 +1281,12 @@ func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 			fd.Kind = schemaKindToPropertyKind(f.Schema.Kind)
 		}
 		def.Fields = append(def.Fields, fd)
+	}
+	for _, x := range c.Indexes {
+		def.Indexes = append(def.Indexes, space.IndexDef{
+			Id: x.DefId, Key: x.Key, Fields: x.Fields, Sparse: x.Sparse,
+			Invalid: x.Invalid, InvalidReason: x.InvalidReason,
+		})
 	}
 	return def
 }

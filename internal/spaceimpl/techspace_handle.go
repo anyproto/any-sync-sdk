@@ -378,6 +378,21 @@ func (x techTypes) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 	}
 	return x.inner.RemoveDatasetField(ctx, typeId, fieldDefId)
 }
+func (x techTypes) AddDatasetIndex(ctx context.Context, typeId, defId string, draft space.IndexDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddDatasetIndex(ctx, typeId, defId, draft)
+}
+func (x techTypes) RemoveDatasetIndex(ctx context.Context, typeId, indexDefId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveDatasetIndex(ctx, typeId, indexDefId)
+}
+func (x techTypes) SubscribeIndexBuilds(cb func(space.IndexBuild)) (cancel func()) {
+	return x.inner.SubscribeIndexBuilds(cb)
+}
 func (x techTypes) PatchDataset(ctx context.Context, typeId, defId string, patch space.DatasetDefPatch) error {
 	if err := x.root(ctx, typeId); err != nil {
 		return err

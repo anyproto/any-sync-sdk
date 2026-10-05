@@ -211,6 +211,11 @@ type HandlerReg struct {
 	Version int
 	Handler Handler
 	Indexes []anystore.IndexInfo
+	// PruneIndexPrefix, when set, makes Indexes the whole set under
+	// that name prefix: opening the dataset's per-object collection
+	// drops any other index named under it. For a dataset whose indexes
+	// are declared at runtime and can be removed.
+	PruneIndexPrefix string
 	// Schema is the dataset's required, JSON-Schema-compatible field
 	// declaration. Each field carries a class (Scope: synced/derived/
 	// local/account) the apply path enforces: derived fields are

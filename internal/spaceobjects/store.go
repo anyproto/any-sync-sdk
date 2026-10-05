@@ -260,6 +260,15 @@ type Store struct {
 	applySeqBackfill    sync.Once
 	applySeqBackfillErr error
 
+	// indexBuilds reports builds of shared datasets' declared indexes
+	// (indexes.go); the index* fields are that worker's state.
+	indexBuilds *fanout.Registry[IndexBuild]
+	indexMu     sync.Mutex
+	indexKick   chan struct{}
+	indexDone   chan struct{}
+	indexCancel context.CancelFunc
+	indexClosed bool
+
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *fanout.Registry[RowEvent]
@@ -489,6 +498,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		engine:         subscribe.New(cfg.SpaceId),
 		changeSubs:     fanout.New[ObjectChange](),
 		rowEvents:      fanout.New[RowEvent](),
+		indexBuilds:    fanout.New[IndexBuild](),
 		disableHistory: cfg.DisableHistory,
 	}
 	s.spaceIndexObjId = s.deriveSpaceIndexId()
@@ -1024,6 +1034,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
 	s.stopSweep()
+	s.stopIndexSync()
 	if s.readMat != nil {
 		s.readMat.close()
 	}
@@ -1057,6 +1068,8 @@ type NamedSchema struct {
 	// Shared marks a shared dataset: every object's records in one
 	// collection per space.
 	Shared bool
+	// Indexes are the dataset's declared indexes that are built.
+	Indexes []schema.Index
 }
 
 // Schemas returns the declared schema of every dataset this store hosts —
@@ -1094,7 +1107,13 @@ func (s *Store) Schemas() []NamedSchema {
 	}
 	for _, name := range sortedCatalogNames(snap) {
 		ds := snap.byName[name]
-		out = append(out, NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module, Shared: ds.Shared})
+		ns := NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module, Shared: ds.Shared}
+		for _, idx := range ds.Indexes {
+			if !idx.Invalid {
+				ns.Indexes = append(ns.Indexes, idx.Index)
+			}
+		}
+		out = append(out, ns)
 	}
 	return out
 }

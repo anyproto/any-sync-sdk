@@ -115,3 +115,93 @@ func TestPartRecords_SharedMarker(t *testing.T) {
 	_, err = normalizeDatasetDraft(modules, "type", &space.DatasetDraft{Module: "editor", Shared: true})
 	require.ErrorIs(t, err, schema.ErrDecl)
 }
+
+// A draft's indexes ride the dataset's change as index records under
+// its head, and a draft naming one no collection would build is
+// refused before anything is written.
+func TestDatasetDefRecords_Indexes(t *testing.T) {
+	modules := types.NewModules(types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"})
+	fields := []space.DatasetFieldDraft{
+		{Key: "ts", Kind: space.PropertyKindDatetime},
+		{Key: "value", Kind: space.PropertyKindNumber},
+		{Key: "tags", Kind: space.PropertyKindArray},
+	}
+	draft := space.DatasetDraft{Key: "samples", Shared: true, Fields: fields, Indexes: []space.IndexDraft{
+		{Key: "by_ts", Fields: []string{"ts", space.IndexPathObject}},
+		{Key: "top", Fields: []string{"-value"}, Sparse: true},
+	}}
+	_, err := normalizeDatasetDraft(modules, "type", &draft)
+	require.NoError(t, err)
+	headId, recs, err := datasetDefRecords(&anyenc.Arena{}, modules, "part", &draft)
+	require.NoError(t, err)
+
+	type indexRec struct {
+		fields []string
+		sparse bool
+	}
+	got := map[string]indexRec{}
+	for _, rec := range recs {
+		payload := rec.Ops[0].Payload
+		if payload.GetString(typetype.DefFieldDef) != typetype.DefKindIndex {
+			continue
+		}
+		assert.Equal(t, headId, payload.GetString(typetype.DefFieldDataset))
+		assert.True(t, rec.Upsert)
+		var paths []string
+		for _, f := range payload.GetArray(typetype.DefFieldIndexFields) {
+			paths = append(paths, string(f.GetStringBytes()))
+		}
+		got[payload.GetString(typetype.FieldKey)] = indexRec{fields: paths, sparse: payload.GetBool(typetype.DefFieldIndexSparse)}
+	}
+	assert.Equal(t, map[string]indexRec{
+		"by_ts": {fields: []string{"ts", "_objectId"}},
+		"top":   {fields: []string{"-value"}, sparse: true},
+	}, got)
+
+	refused := []struct {
+		name  string
+		draft space.DatasetDraft
+	}{
+		{"undeclared field", space.DatasetDraft{Key: "s", Fields: fields, Indexes: []space.IndexDraft{{Key: "x", Fields: []string{"missing"}}}}},
+		{"array field", space.DatasetDraft{Key: "s", Fields: fields, Indexes: []space.IndexDraft{{Key: "x", Fields: []string{"tags"}}}}},
+		{"object path on a per-object dataset", space.DatasetDraft{Key: "s", Fields: fields, Indexes: []space.IndexDraft{{Key: "x", Fields: []string{space.IndexPathObject}}}}},
+		{"one key twice", space.DatasetDraft{Key: "s", Fields: fields, Indexes: []space.IndexDraft{
+			{Key: "x", Fields: []string{"ts"}}, {Key: "x", Fields: []string{"value"}},
+		}}},
+		{"no fields", space.DatasetDraft{Key: "s", Fields: fields, Indexes: []space.IndexDraft{{Key: "x"}}}},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := datasetDefRecords(&anyenc.Arena{}, modules, "part", &tc.draft)
+			require.ErrorIs(t, err, schema.ErrDecl)
+		})
+	}
+
+	_, _, err = datasetDefRecords(&anyenc.Arena{}, modules, "part", &space.DatasetDraft{
+		Module: "editor", Key: "summary", Indexes: []space.IndexDraft{{Key: "x", Fields: []string{"ts"}}},
+	})
+	require.ErrorIs(t, err, space.ErrModuleOwned)
+}
+
+// An added index is checked against the indexes the dataset holds: its
+// key is free and the dataset stays within its limit.
+func TestValidateIndexDrafts_AgainstExisting(t *testing.T) {
+	ds := schema.Dataset{Fields: []schema.Field{
+		{Id: "a", Schema: schema.Leaf(schema.KindString)},
+		{Id: "b", Schema: schema.Leaf(schema.KindString)},
+	}}
+	existing := []space.IndexDef{{Key: "by_a", Fields: []string{"a"}}}
+	require.NoError(t, validateIndexDrafts(ds, []space.IndexDraft{{Key: "by_b", Fields: []string{"b"}}}, existing, false))
+	require.ErrorIs(t, validateIndexDrafts(ds, []space.IndexDraft{{Key: "by_a", Fields: []string{"b"}}}, existing, false), schema.ErrDecl)
+
+	// Invalid definitions hold no slot of the limit, and keep their key.
+	full := []space.IndexDef{{Key: "broken", Fields: []string{"gone"}, Invalid: true}}
+	for i := 0; i < schema.MaxDatasetIndexes-1; i++ {
+		full = append(full, space.IndexDef{Key: "k" + string(rune('a'+i)), Fields: []string{"a"}})
+	}
+	require.NoError(t, validateIndexDrafts(ds, []space.IndexDraft{{Key: "last", Fields: []string{"b"}}}, full, false))
+	require.ErrorIs(t, validateIndexDrafts(ds, []space.IndexDraft{
+		{Key: "last", Fields: []string{"b"}}, {Key: "over", Fields: []string{"a", "b"}},
+	}, full, false), schema.ErrDecl)
+	require.ErrorIs(t, validateIndexDrafts(ds, []space.IndexDraft{{Key: "broken", Fields: []string{"b"}}}, full, false), schema.ErrDecl)
+}

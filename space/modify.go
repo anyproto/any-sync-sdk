@@ -141,8 +141,6 @@ const (
 // Ignores RecordModify.Upsert semantics — tombstones always win and
 // are always created, including for records that never existed
 // locally (seeds a tombstone to preserve "delete wins absolutely").
-// The objects dataset is refused: every record there is the object's
-// one row.
 type DeleteBatch struct {
 	ObjectId  string
 	Dataset   string

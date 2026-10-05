@@ -577,9 +577,6 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 	if err := checkPublicDataset(batch.Dataset); err != nil {
 		return space.ModifyResult{}, err
 	}
-	if batch.Dataset == properties.Dataset {
-		return space.ModifyResult{}, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Delete: the %s dataset takes no deletes: every record there is the object's one row", properties.Dataset))
-	}
 	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
 	if err != nil {
 		return space.ModifyResult{}, err

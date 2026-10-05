@@ -75,11 +75,6 @@ func TestModify_ConditionalGuards(t *testing.T) {
 		require.ErrorIs(t, err, crdt.ErrValidation)
 	})
 
-	t.Run("objects: Delete rejected", func(t *testing.T) {
-		_, err := s.Delete(ctx, space.DeleteBatch{ObjectId: "obj", Dataset: "objects", RecordIds: []string{"x"}})
-		require.ErrorIs(t, err, crdt.ErrValidation)
-	})
-
 	t.Run("ModifyMany: malformed delete rejected before loading", func(t *testing.T) {
 		b := scopedBatch(space.ScopeSynced)
 		b.Records = append(b.Records, space.RecordModify{Ops: []space.Op{{Type: space.OpDelete}}})

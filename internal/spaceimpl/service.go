@@ -27,6 +27,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
@@ -2283,20 +2284,91 @@ func (s *Service) ShouldPullTree(ctx context.Context, spaceId, treeId string, ro
 	return s.storeFor(spaceId).ShouldPullTree(ctx, treeId, root, heads)
 }
 
-// PullFirst lists the trees a sync round handles before the rest: a
-// regular space's spaceIndex, so the space name reaches a joiner
-// before the rest of the space. The tech space has none. Derived from
-// the space id alone — a round can run while the space is being
-// offloaded, and resolving through storeFor would rebuild its store.
-func (s *Service) PullFirst(spaceId string) []string {
+// PullFirst lists the trees a sync round handles before the rest, in a
+// regular space: the spaceIndex, so the space name reaches a joiner
+// before the rest of the space, and then the definitions this device
+// already knows of —
+//
+//   - the bundle roots the spaceIndex lists: a bundle that declares a
+//     type or a collection does it on its root, whose changeType is a
+//     plain object's, so PullFirstTypes cannot find it;
+//   - the type and collection objects that are local: a device that
+//     holds the space pushes its trees to a peer that lacks them, and
+//     this puts the definitions at the front of that push. A joiner
+//     has none of them yet and finds them by probing (PullFirstTypes).
+//
+// The tech space has none.
+//
+// Reads rows only, from collections that exist: the spaceIndex id is
+// derived from the space id, and nothing here builds a store, loads an
+// object or creates a collection. A round can run while the space is
+// being offloaded, and resolving through storeFor would rebuild the
+// store the offload just closed.
+func (s *Service) PullFirst(ctx context.Context, spaceId string) []string {
 	if spaceId == s.tsp.SpaceId() {
 		return nil
 	}
-	id, err := spaceIndexTreeId(spaceId)
+	indexId, err := spaceIndexTreeId(spaceId)
 	if err != nil {
 		return nil
 	}
-	return []string{id}
+	ids := []string{indexId}
+	if s.db == nil {
+		return ids
+	}
+	ids = append(ids, s.rowStrings(ctx, indexId+"_"+spaceindex.BundlesDataset, nil, spaceindex.FieldBundleRootId)...)
+	objects := spaceId + "_" + spaceobjects.SpaceObjectsCollection
+	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveTypeRowsFilter, "id")...)
+	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveCollectionRowsFilter, "id")...)
+	return ids
+}
+
+// rowStrings returns field of every live row of an existing collection
+// that matches filter; nothing when the collection does not exist.
+func (s *Service) rowStrings(ctx context.Context, collection string, filter any, field string) []string {
+	coll, err := s.db.OpenCollection(ctx, collection)
+	if err != nil {
+		return nil
+	}
+	iter, err := coll.Find(filter).Iter(ctx)
+	if err != nil {
+		return nil
+	}
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			continue
+		}
+		v := doc.Value()
+		if v == nil || v.Get(crdt.DeletedAtField) != nil {
+			continue
+		}
+		if str := v.GetString(field); str != "" {
+			out = append(out, str)
+		}
+	}
+	return out
+}
+
+// pullFirstTypes are the root changeTypes of definition objects: a
+// type (typesAPI.Create) and a collection (collectionsAPI.Create).
+var pullFirstTypes = []string{typeChangeType, collectionChangeType}
+
+// PullFirstTypes lists the root changeTypes a sync round fetches ahead
+// of its other missing trees: types and collections, so the objects
+// that follow apply at once instead of parking until their definition
+// arrives. None for the tech space, and none under selective sync,
+// which already probes every tree it fetches.
+func (s *Service) PullFirstTypes(spaceId string) []string {
+	if spaceId == s.tsp.SpaceId() {
+		return nil
+	}
+	if s.app != nil && len(s.app.SelectiveTreeTypes()) > 0 {
+		return nil
+	}
+	return pullFirstTypes
 }
 
 // Compile-time check that we satisfy the registry contract.

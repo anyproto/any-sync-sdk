@@ -41,6 +41,11 @@ type typesAPI struct {
 
 func newTypesAPI(parent *spaceImpl) *typesAPI { return &typesAPI{parent: parent} }
 
+// typeChangeType is the root changeType of a type object's tree. A
+// joiner's sync reads it off the root to fetch types first
+// (Service.PullFirstTypes).
+const typeChangeType = "type"
+
 // Create mints a new type object: a fresh any-sync tree whose
 // `properties` dataset record carries the type's display metadata
 // (any.name / any.description / any.icon), its programmatic handle
@@ -56,7 +61,7 @@ func newTypesAPI(parent *spaceImpl) *typesAPI { return &typesAPI{parent: parent}
 // as the namespace prefix in property paths on instance objects.
 func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (string, error) {
 	obj, err := t.parent.store.Create(ctx, spaceobjects.CreateOpts{
-		ChangeType: "type",
+		ChangeType: typeChangeType,
 	})
 	if err != nil {
 		return "", err

@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -19,18 +23,28 @@ import (
 
 // scriptedRegistry fails GetTree for the ids in fail; every call is
 // recorded so tests can assert retry behavior. first is what PullFirst
-// reports.
+// reports; a fetched id adds its grow entry to it, the way a fetched
+// spaceIndex makes its bundle roots known. firstTypes is what
+// PullFirstTypes reports.
 type scriptedRegistry struct {
-	fail  map[string]error
-	trees map[string]objecttree.ObjectTree
-	first []string
+	fail       map[string]error
+	trees      map[string]objecttree.ObjectTree
+	first      []string
+	grow       map[string][]string
+	firstTypes []string
+
+	// mu guards what overlapping rounds write.
+	mu    sync.Mutex
 	calls []string
 	// firstCalls counts PullFirst lookups.
 	firstCalls int
 }
 
 func (r *scriptedRegistry) GetTree(_ context.Context, _, treeId string) (objecttree.ObjectTree, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.calls = append(r.calls, treeId)
+	r.first = append(r.first, r.grow[treeId]...)
 	if err, ok := r.fail[treeId]; ok {
 		return nil, err
 	}
@@ -55,10 +69,13 @@ func (r *scriptedRegistry) DeleteTree(context.Context, string, string) error    
 func (r *scriptedRegistry) ShouldPullTree(context.Context, string, string, *treechangeproto.RawTreeChangeWithId, []string) bool {
 	return true
 }
-func (r *scriptedRegistry) PullFirst(string) []string {
+func (r *scriptedRegistry) PullFirst(context.Context, string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.firstCalls++
-	return r.first
+	return slices.Clone(r.first)
 }
+func (r *scriptedRegistry) PullFirstTypes(string) []string { return r.firstTypes }
 
 // A round handles the registry's pull-first trees before its other
 // ids, wherever the round found them: missing, changed or parked. The
@@ -94,6 +111,14 @@ func TestTreeSyncerHandlesPullFirstTreesFirst(t *testing.T) {
 		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "m2"}))
 		require.Equal(t, []string{"index", "m1", "m2", "e1"}, reg.calls)
 		require.Equal(t, 0, ts.Stats()[0].Pending)
+	})
+
+	t.Run("named by a tree handled first", func(t *testing.T) {
+		// The index names root1 only once it is local.
+		reg := &scriptedRegistry{first: []string{"index"}, grow: map[string][]string{"index": {"root1"}}}
+		ts := newTreeSyncer("space1", reg, nil)
+		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "root1", "index", "m2"}))
+		require.Equal(t, []string{"index", "root1", "m1", "m2", "e1"}, reg.calls)
 	})
 
 	t.Run("not in the round", func(t *testing.T) {
@@ -235,4 +260,42 @@ func TestTreeSyncerSkippedTreeIsNotParked(t *testing.T) {
 	reg.fail["u"] = reg.fail["t"]
 	require.NoError(t, ts.SyncAll(context.Background(), p, nil, []string{"u"}))
 	require.Equal(t, 0, ts.Stats()[0].Pending)
+}
+
+// A peer that turns a fetch away as busy is asked again within the
+// round: the tree is not parked for a refusal that passes on its own.
+func TestTreeSyncerRetriesABusyPeer(t *testing.T) {
+	prevBackoff := getTreeBackoff
+	getTreeBackoff = time.Millisecond
+	t.Cleanup(func() { getTreeBackoff = prevBackoff })
+
+	reg := &busyRegistry{busy: map[string]int{"t1": 2, "t2": getTreeRetries + 1}}
+	ts := newTreeSyncer("space1", reg, nil)
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, []string{"t1", "t2"}))
+	require.Equal(t, 3, reg.gets["t1"], "refused twice, fetched on the third ask")
+	require.Equal(t, getTreeRetries+1, reg.gets["t2"])
+	require.Equal(t, 1, ts.Stats()[0].Pending, "only the tree the peer kept refusing is parked")
+}
+
+// busyRegistry refuses the first busy[id] fetches of a tree the way a
+// peer over its request cap does.
+type busyRegistry struct {
+	scriptedRegistry
+	busy map[string]int
+
+	getsMu sync.Mutex
+	gets   map[string]int
+}
+
+func (r *busyRegistry) GetTree(_ context.Context, _, treeId string) (objecttree.ObjectTree, error) {
+	r.getsMu.Lock()
+	defer r.getsMu.Unlock()
+	if r.gets == nil {
+		r.gets = map[string]int{}
+	}
+	r.gets[treeId]++
+	if r.gets[treeId] <= r.busy[treeId] {
+		return nil, fmt.Errorf("spaceobjects: BuildTree %s: %w", treeId, spacesyncproto.ErrTooManyRequestsFromPeer)
+	}
+	return nil, nil
 }

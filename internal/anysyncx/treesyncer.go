@@ -7,14 +7,17 @@ import (
 	"sync"
 	"time"
 
+	anystore "github.com/anyproto/any-store"
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/treesyncer"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
 	"github.com/anyproto/any-sync/commonspace/spacestate"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/net/peer"
 	"go.uber.org/zap"
 )
@@ -107,6 +110,33 @@ type treeSyncerAdapter struct {
 	// parked, so a recovered fetch still reports through onFetched.
 	pending map[string]bool
 
+	// limits is the request budget this adapter's probes take from,
+	// per peer and shared with every other space's adapter.
+	limits *peerLimits
+
+	// prober fetches a missing tree's root without its changes; the
+	// space's tree builder. See treeprobe.go.
+	prober rootProber
+	// hasTree reports whether a tree is in the space's local storage.
+	// Read from the space's own head storage: a probe must not reach
+	// the registry's store, which a round racing the space's teardown
+	// would rebuild.
+	hasTree func(ctx context.Context, treeId string) (bool, error)
+	// probeMu guards the probe state below.
+	probeMu sync.Mutex
+	// probed holds what is known of every probed root whose tree a
+	// recent round's diff still offered; probeRound counts the rounds.
+	probed     map[string]probeAnswer
+	probeRound uint64
+	// probing holds the trees a probe is in flight for: overlapping
+	// rounds see much the same diff, and a peer refuses a second
+	// request for a tree it is already serving.
+	probing map[string]struct{}
+	// noProbe holds the peers that answer a probe with change bodies:
+	// they ignore the flag, and probing them would download every tree
+	// twice.
+	noProbe map[string]struct{}
+
 	log logger.CtxLogger
 }
 
@@ -121,6 +151,10 @@ func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCall
 		stats:    map[string]PeerSyncSnapshot{},
 		onRound:  onRound,
 		pending:  map[string]bool{},
+		limits:   newPeerLimits(),
+		probed:   map[string]probeAnswer{},
+		probing:  map[string]struct{}{},
+		noProbe:  map[string]struct{}{},
 		log:      tsLog,
 	}
 }
@@ -135,6 +169,15 @@ func (t *treeSyncerAdapter) Init(a *app.App) error {
 		t.spaceId = got
 	}
 	t.treeBuilder = a.MustComponent(objecttreebuilder.CName).(objecttreebuilder.TreeBuilder)
+	t.prober = t.treeBuilder
+	storage := a.MustComponent(spacestorage.CName).(spacestorage.SpaceStorage)
+	t.hasTree = func(ctx context.Context, treeId string) (bool, error) {
+		_, err := storage.HeadStorage().GetEntry(ctx, treeId)
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return false, nil
+		}
+		return err == nil, err
+	}
 	return nil
 }
 
@@ -182,7 +225,7 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 	}
 	pending := t.pendingIds()
 	seen := make(map[string]struct{}, len(missing)+len(existing))
-	for _, ids := range [][]string{t.roundFirst(missing, existing, pending), missing, existing, pending} {
+	handle := func(ids []string) {
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
 				continue
@@ -196,7 +239,7 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 				t.markPending(id, wasMissing)
 				continue
 			}
-			tree, regErr := t.registry.GetTree(peerCtx, t.spaceId, id)
+			tree, regErr := t.getTree(ctx, peerCtx, id)
 			if errors.Is(regErr, ErrTreeTypeSkipped) {
 				// Declined by selective sync before any tree-storage
 				// write; the stub it recorded converges the diff. A park
@@ -224,6 +267,12 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 					t.log.Debug("tree parked: no read key",
 						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
 						zap.String("peerId", p.Id()))
+				} else if peerBusy(regErr) {
+					// The peer is still turning requests away after the
+					// retries; nothing is wrong with the tree.
+					t.log.Debug("tree parked: peer busy",
+						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+						zap.String("peerId", p.Id()), zap.Error(regErr))
 				} else {
 					t.log.Warn("tree sync failed; parked for retry",
 						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
@@ -249,18 +298,64 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 			// Don't close — async exchange may still need it.
 		}
 	}
+	// Ahead of the diff order: the trees the registry names — asked
+	// again after an answer was handled, because handling the first
+	// (the spaceIndex) can add to the second (the bundle roots it
+	// lists) — then the missing
+	// trees whose probed root is of a pull-first changeType (types and
+	// collections). The dedup skips all of them at their own position.
+	for i := 0; i < 2; i++ {
+		first := t.roundFirst(ctx, seen, missing, existing, pending)
+		if len(first) == 0 {
+			break
+		}
+		handle(first)
+	}
+	handle(t.probeFirst(ctx, p, missing, seen))
+	handle(missing)
+	handle(existing)
+	handle(pending)
 	return nil
 }
 
-// roundFirst picks, from the ids a round works on, the ones the
-// registry wants handled before the rest; SyncAll's dedup then skips
-// them at their own position. The diff orders ids by hash and a round
-// handles them one at a time, so on a large space a tree needed early
-// (the spaceIndex, which carries the space name) would otherwise wait
-// behind an arbitrary share of the whole space — whether it is missing,
-// changed or parked. An id outside the round's lists is left out: the
-// order changes, the work does not.
-func (t *treeSyncerAdapter) roundFirst(lists ...[]string) []string {
+// getTreeRetries is how often a round asks again for a tree the peer
+// turned away as busy, and getTreeBackoff the first wait, doubled per
+// attempt. Vars so tests don't wait on them.
+var (
+	getTreeRetries = 4
+	getTreeBackoff = 50 * time.Millisecond
+)
+
+// getTree resolves a tree through the registry, which fetches it when
+// it is missing locally. A peer that turns the request away without
+// looking at the tree — over its request cap, or already serving this
+// tree to us, as a probe of an overlapping round makes it — is asked
+// again after a short wait.
+func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, id string) (objecttree.ObjectTree, error) {
+	backoff := getTreeBackoff
+	for attempt := 0; ; attempt++ {
+		tree, err := t.registry.GetTree(peerCtx, t.spaceId, id)
+		if !peerBusy(err) || attempt >= getTreeRetries {
+			return tree, err
+		}
+		select {
+		case <-time.After(backoff):
+			backoff *= 2
+		case <-ctx.Done():
+			return nil, err
+		}
+	}
+}
+
+// roundFirst picks, from the ids a round works on and has not handled
+// yet, the ones the registry wants handled before the rest; SyncAll's
+// dedup then skips them at their own position. The diff orders ids by
+// hash and a round handles them one at a time, so on a large space a
+// tree needed early (the spaceIndex, which carries the space name)
+// would otherwise wait behind an arbitrary share of the whole space —
+// whether it is missing, changed or parked. An id outside the round's
+// lists is left out: the order changes, the work does not.
+func (t *treeSyncerAdapter) roundFirst(ctx context.Context, seen map[string]struct{}, lists ...[]string) []string {
 	total := 0
 	for _, ids := range lists {
 		total += len(ids)
@@ -269,7 +364,10 @@ func (t *treeSyncerAdapter) roundFirst(lists ...[]string) []string {
 		return nil
 	}
 	var out []string
-	for _, id := range t.registry.PullFirst(t.spaceId) {
+	for _, id := range t.registry.PullFirst(ctx, t.spaceId) {
+		if _, done := seen[id]; done {
+			continue
+		}
 		for _, ids := range lists {
 			if slices.Contains(ids, id) {
 				out = append(out, id)

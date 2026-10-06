@@ -349,11 +349,34 @@ dialed on a sync path; see `global-p2p.md`.
 - **Sync order.** A headsync round handles its trees one at a time:
   the missing ones in the diff's hash order, then the changed ones,
   then the retries of earlier failures. A round is time-boxed, so on a
-  large space the backlog spans many rounds. The spaceIndex goes first
-  whenever a round has it to fetch, sync or retry
-  (`SpaceRegistry.PullFirst`), so the space name and description reach
-  a joiner, or a device catching up on a rename, ahead of the rest of
-  the space.
+  large space the backlog spans many rounds. Ahead of that order go,
+  when the round has them to fetch, sync or retry:
+  - the spaceIndex — the space name and description, the bundles
+    registry — so they reach a joiner, or a device catching up on a
+    rename, before the rest of the space;
+  - the definitions this device already knows of: the bundle roots
+    the spaceIndex lists (a bundle declares its type or collection on
+    its root) and the type and collection objects that are local. A
+    device that holds the space pushes its trees to a peer that lacks
+    them, definitions first;
+  - the types and collections among the missing trees. The diff names a
+    missing tree by id alone, but a tree's root carries its changeType
+    in plain text, so a round with a backlog first probes the roots of
+    its missing trees (root and heads, no changes; several at a time)
+    and fetches the `type` and `collection` trees first. An object that
+    follows its type applies at once; ahead of it, its changes park and
+    replay when the type lands (`crdt.md` § Datasets).
+
+  The order is an optimisation: a tree the round could not classify —
+  a peer that ignores probes, a small backlog, selective sync — syncs
+  at its diff position (`SpaceRegistry.PullFirst`, `PullFirstTypes`).
+- **Request budget.** A peer caps the tree requests one client holds
+  open on it, across all the client's spaces, and refuses the excess;
+  it also refuses a second request for a tree it is already serving
+  that client. The rounds of every space share one budget per peer for
+  their probes, narrowed by a refusal and widened again by answered
+  requests, and a fetch the peer turns away as busy is asked again
+  within the round instead of being parked.
 - **Replication key.** One per account, read from the tech space id. The
   tech space is derived from the account key, so the key is known before
   any space loads, including on a new device.

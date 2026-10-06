@@ -101,6 +101,10 @@ type App struct {
 	// brief ocache evictions when the same id loads again).
 	syncersMu sync.Mutex
 	syncers   map[string]*treeSyncerAdapter
+	// treeLimits is the per-peer request budget every space's tree
+	// syncer takes from: a peer caps a client's requests across all
+	// its spaces.
+	treeLimits *peerLimits
 
 	keys *accountdata.AccountKeys
 
@@ -357,6 +361,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		headCache:          newHeadCache(),
 		syncStatus:         syncstatus.NewService(),
 		syncers:            map[string]*treeSyncerAdapter{},
+		treeLimits:         newPeerLimits(),
 		keys:               keys,
 		inbox:              inbox,
 		selectiveTreeTypes: cfg.Sync.TreeTypes,
@@ -815,6 +820,7 @@ func (a *App) newTreeSyncerForSpace(spaceId string) *treeSyncerAdapter {
 		a.syncStatus.For(spaceId).BulkSyncedFromPeer(peerId)
 	}
 	ts := newTreeSyncer(spaceId, a.tree.registry, onRound)
+	ts.limits = a.treeLimits
 	// A tree fetched whole from a responsible peer (node, LAN or global)
 	// is in sync with it: without this a space that converges through
 	// peer pulls alone would sit in Syncing until a fully empty round.

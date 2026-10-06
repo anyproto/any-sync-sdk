@@ -10,6 +10,7 @@ import (
 	anystore "github.com/anyproto/any-store"
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
@@ -130,8 +131,10 @@ type treeSyncerAdapter struct {
 	probeRound uint64
 	// probing holds the trees a probe is in flight for: overlapping
 	// rounds see much the same diff, and a peer refuses a second
-	// request for a tree it is already serving.
-	probing map[string]struct{}
+	// request for a tree it is already serving. probeIdle is closed,
+	// and replaced, whenever a probe ends.
+	probing   map[string]struct{}
+	probeIdle chan struct{}
 	// noProbe holds the peers that answer a probe with change bodies:
 	// they ignore the flag, and probing them would download every tree
 	// twice.
@@ -146,16 +149,17 @@ var _ treesyncer.PullFilter = (*treeSyncerAdapter)(nil)
 
 func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCallback) *treeSyncerAdapter {
 	return &treeSyncerAdapter{
-		spaceId:  spaceId,
-		registry: registry,
-		stats:    map[string]PeerSyncSnapshot{},
-		onRound:  onRound,
-		pending:  map[string]bool{},
-		limits:   newPeerLimits(),
-		probed:   map[string]probeAnswer{},
-		probing:  map[string]struct{}{},
-		noProbe:  map[string]struct{}{},
-		log:      tsLog,
+		spaceId:   spaceId,
+		registry:  registry,
+		stats:     map[string]PeerSyncSnapshot{},
+		onRound:   onRound,
+		pending:   map[string]bool{},
+		limits:    newPeerLimits(),
+		probed:    map[string]probeAnswer{},
+		probing:   map[string]struct{}{},
+		probeIdle: make(chan struct{}),
+		noProbe:   map[string]struct{}{},
+		log:       tsLog,
 	}
 }
 
@@ -172,13 +176,25 @@ func (t *treeSyncerAdapter) Init(a *app.App) error {
 	t.prober = t.treeBuilder
 	storage := a.MustComponent(spacestorage.CName).(spacestorage.SpaceStorage)
 	t.hasTree = func(ctx context.Context, treeId string) (bool, error) {
-		_, err := storage.HeadStorage().GetEntry(ctx, treeId)
-		if errors.Is(err, anystore.ErrDocNotFound) {
-			return false, nil
-		}
-		return err == nil, err
+		return hasHeadEntry(ctx, storage.HeadStorage(), treeId)
 	}
 	return nil
+}
+
+// headEntries is the slice of a space's head storage hasHeadEntry
+// reads.
+type headEntries interface {
+	GetEntry(ctx context.Context, id string) (headstorage.HeadsEntry, error)
+}
+
+// hasHeadEntry reports whether the space's storage knows treeId: any
+// entry counts, a deleted tree's and a selective-sync stub's included.
+func hasHeadEntry(ctx context.Context, hs headEntries, treeId string) (bool, error) {
+	_, err := hs.GetEntry(ctx, treeId)
+	if errors.Is(err, anystore.ErrDocNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (t *treeSyncerAdapter) Name() string { return treesyncer.CName }
@@ -344,6 +360,10 @@ func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, id string) (ob
 		case <-ctx.Done():
 			return nil, err
 		}
+		// Both may have been ready: a finished round asks nothing more.
+		if ctx.Err() != nil {
+			return nil, err
+		}
 	}
 }
 
@@ -363,16 +383,25 @@ func (t *treeSyncerAdapter) roundFirst(ctx context.Context, seen map[string]stru
 	if total < 2 {
 		return nil
 	}
+	first := t.registry.PullFirst(ctx, t.spaceId)
+	if len(first) == 0 {
+		return nil
+	}
+	// A device that holds the space names every definition it has; the
+	// lists it is matched against can be the whole space.
+	inRound := make(map[string]struct{}, total)
+	for _, ids := range lists {
+		for _, id := range ids {
+			inRound[id] = struct{}{}
+		}
+	}
 	var out []string
-	for _, id := range t.registry.PullFirst(ctx, t.spaceId) {
+	for _, id := range first {
 		if _, done := seen[id]; done {
 			continue
 		}
-		for _, ids := range lists {
-			if slices.Contains(ids, id) {
-				out = append(out, id)
-				break
-			}
+		if _, ok := inRound[id]; ok {
+			out = append(out, id)
 		}
 	}
 	return out

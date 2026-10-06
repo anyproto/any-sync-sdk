@@ -16,22 +16,29 @@ import (
 // context.
 func TestPeerLimitBoundsRequestsInFlight(t *testing.T) {
 	l := newPeerLimits().of("peer1")
-	for i := 0; i < peerLimitMax; i++ {
-		require.NoError(t, l.acquire(context.Background()))
+	slots := make([]peerSlot, peerLimitMax)
+	for i := range slots {
+		slot, err := l.acquire(context.Background())
+		require.NoError(t, err)
+		slots[i] = slot
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	require.ErrorIs(t, l.acquire(ctx), context.DeadlineExceeded)
+	_, err := l.acquire(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	got := make(chan error, 1)
-	go func() { got <- l.acquire(context.Background()) }()
+	go func() {
+		_, err := l.acquire(context.Background())
+		got <- err
+	}()
 	select {
 	case <-got:
 		t.Fatal("acquired over the budget")
 	case <-time.After(20 * time.Millisecond):
 	}
-	l.release(false)
+	l.release(slots[0], false)
 	require.NoError(t, <-got)
 }
 
@@ -41,8 +48,9 @@ func TestPeerLimitBoundsRequestsInFlight(t *testing.T) {
 func TestPeerLimitAdaptsToRefusals(t *testing.T) {
 	l := newPeerLimits().of("peer1")
 	cycle := func(tooMany bool) {
-		require.NoError(t, l.acquire(context.Background()))
-		l.release(tooMany)
+		slot, err := l.acquire(context.Background())
+		require.NoError(t, err)
+		l.release(slot, tooMany)
 	}
 	cycle(true)
 	require.Equal(t, peerLimitMax/2, l.width)
@@ -59,6 +67,28 @@ func TestPeerLimitAdaptsToRefusals(t *testing.T) {
 		cycle(false)
 	}
 	require.Equal(t, peerLimitMax, l.width)
+}
+
+// Requests in flight together are refused together. Such a burst
+// narrows the budget once, not once per refusal.
+func TestPeerLimitNarrowsOncePerBurst(t *testing.T) {
+	l := newPeerLimits().of("peer1")
+	slots := make([]peerSlot, peerLimitMax)
+	for i := range slots {
+		slot, err := l.acquire(context.Background())
+		require.NoError(t, err)
+		slots[i] = slot
+	}
+	for _, slot := range slots {
+		l.release(slot, true)
+	}
+	require.Equal(t, peerLimitMax/2, l.width)
+
+	// A refusal of a request sent after that narrows it again.
+	slot, err := l.acquire(context.Background())
+	require.NoError(t, err)
+	l.release(slot, true)
+	require.Equal(t, peerLimitMax/4, l.width)
 }
 
 // Budgets are per peer, and one peer's is the same for every caller.

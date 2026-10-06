@@ -2289,9 +2289,10 @@ func (s *Service) ShouldPullTree(ctx context.Context, spaceId, treeId string, ro
 // before the rest of the space, and then the definitions this device
 // already knows of —
 //
-//   - the bundle roots the spaceIndex lists: a bundle that declares a
-//     type or a collection does it on its root, whose changeType is a
-//     plain object's, so PullFirstTypes cannot find it;
+//   - the bundle roots the spaceIndex lists, the register and every
+//     root claimed: a bundle that declares a type or a collection does
+//     it on its root, whose changeType is a plain object's, so
+//     PullFirstTypes cannot find it;
 //   - the type and collection objects that are local: a device that
 //     holds the space pushes its trees to a peer that lacks them, and
 //     this puts the definitions at the front of that push. A joiner
@@ -2316,16 +2317,33 @@ func (s *Service) PullFirst(ctx context.Context, spaceId string) []string {
 	if s.db == nil {
 		return ids
 	}
-	ids = append(ids, s.rowStrings(ctx, indexId+"_"+spaceindex.BundlesDataset, nil, spaceindex.FieldBundleRootId)...)
+	ids = append(ids, s.rowStrings(ctx, indexId+"_"+spaceindex.BundlesDataset, nil, bundleRowRoots)...)
 	objects := spaceId + "_" + spaceobjects.SpaceObjectsCollection
-	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveTypeRowsFilter, "id")...)
-	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveCollectionRowsFilter, "id")...)
+	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveTypeRowsFilter, rowId)...)
+	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveCollectionRowsFilter, rowId)...)
 	return ids
 }
 
-// rowStrings returns field of every live row of an existing collection
-// that matches filter; nothing when the collection does not exist.
-func (s *Service) rowStrings(ctx context.Context, collection string, filter any, field string) []string {
+func rowId(row *anyenc.Value) []string { return []string{row.GetString("id")} }
+
+// bundleRowRoots returns every root a bundle row names: the register
+// and each root ever claimed. Which of them wins is the read path's
+// decision (a claimed canonical root beats the register); naming them
+// all needs none.
+func bundleRowRoots(row *anyenc.Value) []string {
+	out := []string{row.GetString(spaceindex.FieldBundleRootId)}
+	for _, v := range row.GetArray(spaceindex.FieldBundleRoots) {
+		if b, err := v.StringBytes(); err == nil {
+			out = append(out, string(b))
+		}
+	}
+	return out
+}
+
+// rowStrings returns what pick takes from every live row of an existing
+// collection that matches filter; nothing when the collection does not
+// exist.
+func (s *Service) rowStrings(ctx context.Context, collection string, filter any, pick func(row *anyenc.Value) []string) []string {
 	coll, err := s.db.OpenCollection(ctx, collection)
 	if err != nil {
 		return nil
@@ -2345,8 +2363,10 @@ func (s *Service) rowStrings(ctx context.Context, collection string, filter any,
 		if v == nil || v.Get(crdt.DeletedAtField) != nil {
 			continue
 		}
-		if str := v.GetString(field); str != "" {
-			out = append(out, str)
+		for _, str := range pick(v) {
+			if str != "" {
+				out = append(out, str)
+			}
 		}
 	}
 	return out

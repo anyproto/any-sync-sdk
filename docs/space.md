@@ -355,8 +355,9 @@ dialed on a sync path; see `global-p2p.md`.
     registry — so they reach a joiner, or a device catching up on a
     rename, before the rest of the space;
   - the definitions this device already knows of: the bundle roots
-    the spaceIndex lists (a bundle declares its type or collection on
-    its root) and the type and collection objects that are local. A
+    the spaceIndex lists, claimed ones included (a bundle declares its
+    type or collection on its root), and the type and collection
+    objects that are local. A
     device that holds the space pushes its trees to a peer that lacks
     them, definitions first;
   - the types and collections among the missing trees. The diff names a
@@ -368,8 +369,11 @@ dialed on a sync path; see `global-p2p.md`.
     replay when the type lands (`crdt.md` § Datasets).
 
   The order is an optimisation: a tree the round could not classify —
-  a peer that ignores probes, a small backlog, selective sync — syncs
-  at its diff position (`SpaceRegistry.PullFirst`, `PullFirstTypes`).
+  a peer that ignores probes or fails them, a small backlog, selective
+  sync — syncs at its diff position (`SpaceRegistry.PullFirst`,
+  `PullFirstTypes`). A failed probe is repeated after a wait that
+  doubles per failure; rounds of one space overlap, and a round waits
+  for the probes another has in flight on its trees.
 - **Request budget.** A peer caps the tree requests one client holds
   open on it, across all the client's spaces, and refuses the excess;
   it also refuses a second request for a tree it is already serving

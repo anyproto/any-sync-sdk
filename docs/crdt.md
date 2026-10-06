@@ -72,8 +72,34 @@ Client workflow:
    Sub}`; live deltas arrive on `Sub.Events()`. `Snapshot(ctx, opts)` returns
    the same shape once.
 2. `Modify(ctx, ModifyBatch)` → `ModifyResult{VersionId, ChangeId, RecordIds,
-   Rejections}`: one batch of ops, one versionId.
+   Rejections, ApplySeq}`: one batch of ops, one versionId. A record whose
+   only op is `OpDelete` is tombstoned by the same change, so one batch can
+   create, update and delete atomically.
 3. `Delete(ctx, DeleteBatch)` writes sticky tombstones.
+
+### Conditional writes
+
+`ModifyBatch.IfUnchangedSince` makes a batch apply only while no record of
+its `(ObjectId, Dataset)`, tombstones included, carries an `_applySeq` above
+the given value — the highest `_applySeq` the caller read. The check runs
+under the object's write lock, which every local write and every synced
+apply takes, so nothing lands between it and the write. A dataset that
+changed is `ErrPreconditionFailed` with nothing written. `ModifyResult.ApplySeq`
+is the `_applySeq` the write stamped, the value for the next conditional
+write against its result. Otherwise take the value from a read that includes
+tombstones (`ProjectionOpts{IncludeDeleted: true}`): `Snapshot` and
+`Subscribe` skip them, so a value read there stays below a later delete's
+stamp. Any apply that stamps a record counts, device-local writes and
+rebuild replays included. A value holds within one process run and one
+store generation (`Changes().Generation`): the allocator re-seeds from
+persisted watermarks on every start, so after a restart re-read the
+dataset instead of reusing a value from before it. The per-object `_applySeq` watermark answers
+without a scan when nothing in the object moved past the value, except
+while a reindex is pending; otherwise one filtered read of the dataset's
+collection decides. Synced scope only, `Modify` only (each `ModifyMany`
+batch is its own change), and not on the `objects` dataset, whose row
+every change to the object stamps; that dataset takes no `OpDelete` in
+a batch either.
 
 ## Trace IDs
 

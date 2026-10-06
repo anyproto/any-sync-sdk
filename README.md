@@ -105,7 +105,7 @@ cfg.Types = []handler.Type{
 ## Status
 
 Implemented:
-- CRDT apply (`$set`/`$unset`/`$inc`/`$incGated`/`$addToSet`/`$pull`, sticky tombstones, per-field `_ver` gating); per-op rejections surface as `ModifyResult.Rejections`
+- CRDT apply (`$set`/`$unset`/`$inc`/`$incGated`/`$addToSet`/`$pull`, sticky tombstones, per-field `_ver` gating); per-op rejections surface as `ModifyResult.Rejections`; one batch can create, update and delete (`OpDelete`) and can be conditional on the dataset being unchanged since an `_applySeq` (`ModifyBatch.IfUnchangedSince`)
 - Local writes and inbound sync replay through one apply path; cold restore, watermarked replay, parked changes drained once their schema arrives
 - Derived fields stamped from the tree: `id`, `author`, `createdAt`, `spaceId` from the immutable header; `modifiedAt` / `modifiedBy` from the object's latest synced change on any dataset
 - Types (one per object), collections, property definitions with scopes, runtime datasets and parts, bundles

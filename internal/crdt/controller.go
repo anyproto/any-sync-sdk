@@ -454,24 +454,34 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 // a snapshot, never persist it as a negative fact (none do today; keep
 // it that way).
 func (c *Controller) collectionForRead(ctx context.Context, dataset string) anystore.Collection {
+	coll, _ := c.openForRead(ctx, dataset)
+	return coll
+}
+
+// openForRead is collectionForRead reporting why an open failed: a nil
+// collection with a nil error means the collection does not exist.
+func (c *Controller) openForRead(ctx context.Context, dataset string) (anystore.Collection, error) {
 	c.collMu.Lock()
 	if coll, ok := c.collections[dataset]; ok {
 		c.collMu.Unlock()
-		return coll
+		return coll, nil
 	}
 	c.collMu.Unlock()
 	if _, ok := c.handlers[dataset]; !ok {
-		return nil
+		return nil, nil
 	}
 	coll, err := c.db.OpenCollection(ctx, c.objectId+"_"+dataset)
+	if errors.Is(err, anystore.ErrCollectionNotFound) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
-		return nil
+		return nil, err
 	}
 	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
-		return nil
+		return nil, err
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
@@ -480,7 +490,7 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 		c.collections[dataset] = coll
 	}
 	c.collMu.Unlock()
-	return coll
+	return coll, nil
 }
 
 // CloseOwnedCollections closes and forgets every cached PER-OBJECT

@@ -42,9 +42,43 @@ type ModifyBatch struct {
 	// not wired yet — the account mirror handles objects rows only
 	// (docs/scoped-properties-proposal.md § Account transport).
 	Scope Scope
+
+	// IfUnchangedSince makes the batch conditional: it applies only if
+	// no record of (ObjectId, Dataset), tombstones included, carries an
+	// _applySeq above this value — the dataset is still as the caller
+	// read it, when the highest _applySeq it read was this value. The
+	// check and the write are one step under the object's write lock,
+	// which every local write and every synced apply takes, so nothing
+	// lands in between. A dataset that changed is ErrPreconditionFailed
+	// with nothing written.
+	//
+	// Take the value from a read that includes tombstones — a Query with
+	// ProjectionOpts{IncludeDeleted: true}, keeping _applySeq — or from
+	// the ModifyResult.ApplySeq of the caller's own previous write.
+	// Snapshot and Subscribe skip tombstones, so a value taken from them
+	// stays below a later delete's stamp and every write is refused. Any
+	// apply that stamps a record counts as a change: device-local writes
+	// (read-tracking flags) and a tree rebuild's replay included. The
+	// value holds within one process run and one store generation
+	// (Changes().Generation): the allocator re-seeds from persisted
+	// watermarks on every start, and a rebuilt store renumbers
+	// _applySeq, so after a restart re-read the dataset instead of
+	// reusing a value from before it.
+	//
+	// Synced scope only; not for ModifyMany or the objects dataset, whose
+	// row every change to the object stamps.
+	IfUnchangedSince *uint64
 }
 
 // RecordModify groups ops applied to one record id.
+//
+// A record whose only op is OpDelete is tombstoned by the same change
+// as the batch's other records, so a batch creates, updates and deletes
+// in one change; per-op handler rejections (ModifyResult.Rejections)
+// still apply to it, as to any op. A delete needs an explicit Id that no
+// other record of the batch writes, and no Upsert, Path or Value. The
+// objects dataset takes no deletes: every record there is the object's
+// one row.
 //
 // Id: when empty, the CRDT layer derives one from the change's
 // ChangeId (base58(xxh3-64(ChangeId))); subsequent empty-id records
@@ -98,6 +132,9 @@ const (
 	OpPull     OpType = "$pull"
 	OpInc      OpType = "$inc"
 	OpIncGated OpType = "$incGated"
+	// OpDelete tombstones the record (DeleteBatch semantics). It must
+	// be its RecordModify's only op.
+	OpDelete OpType = "delete"
 )
 
 // DeleteBatch produces sticky tombstones for the listed record ids.
@@ -132,11 +169,16 @@ type DeleteBatch struct {
 //     change still committed with a fresh VersionId, but those ops
 //     did not land. HTTP layers can surface this as a partial
 //     success or a hard error per their policy.
+//   - ApplySeq is the per-space apply sequence the change stamped on
+//     the records it wrote (their _applySeq): peer-local, monotonic.
+//     Pass it as ModifyBatch.IfUnchangedSince to write conditionally
+//     against the state this write produced.
 type ModifyResult struct {
 	VersionId  VersionId
 	ChangeId   string
 	RecordIds  []string
 	Rejections []OpRejection
+	ApplySeq   uint64
 }
 
 // OpRejection describes one op the handler refused to apply. The
@@ -167,3 +209,8 @@ type OpRejection struct {
 // indistinguishable from a successful create. Deleting an
 // already-deleted record stays silent (idempotent).
 var ErrRecordDeleted = crdt.ErrRecordDeleted
+
+// ErrPreconditionFailed is a conditional Modify's refusal
+// (ModifyBatch.IfUnchangedSince): the dataset changed after the given
+// apply sequence. Nothing was written.
+var ErrPreconditionFailed = crdt.ErrPreconditionFailed

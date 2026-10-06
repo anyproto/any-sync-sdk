@@ -53,6 +53,14 @@ const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 // v4: parts. A head is keyed (`key`, pinned) and bound to a part and a
 // module (`part`, `module`, `shared`, pinned); the `collection` field
 // is gone — the collection is computed at compile.
+//
+// Index records (`def: index`) moved no version: a build that predates
+// them drops them at apply, and recovering them on such a device after
+// its upgrade would cost a rebuild of every object on every device — the
+// `datasets` handler is registered on every controller, so its version
+// is stored on every object's _meta row. Such a device holds no index
+// until its type object is next rebuilt; an index changes no apply
+// verdict, so nothing else differs.
 const DatasetDefsLocalVersion = 4
 
 // Discriminator values of the pinned `def` field.
@@ -60,17 +68,22 @@ const (
 	DefKindPart    = "part"    // part record: one per part of the type
 	DefKindDataset = "dataset" // head record: one per dataset of a part
 	DefKindField   = "field"   // field record: one per field of a records dataset
+	DefKindIndex   = "index"   // index record: one per declared index of a records dataset
 )
 
 // Dataset-def record field names. Part records use the Part* set plus
 // FieldKey / FieldName; head records the Def* set plus FieldKey; field
 // records reuse FieldKey/FieldKind/FieldName/FieldDescription/FieldItems/
 // FieldProperties from the property-record vocabulary plus the Field*
-// behavioral set below.
+// behavioral set below; index records use FieldKey, DefFieldDataset and
+// the DefFieldIndex* pair.
 const (
-	DefFieldDef         = "def"         // discriminator, pinned
-	DefFieldModule      = "module"      // module slug (head), pinned
-	DefFieldShared      = "shared"      // bool (head), pinned — the module's canonical collection
+	DefFieldDef    = "def"    // discriminator, pinned
+	DefFieldModule = "module" // module slug (head), pinned
+	// DefFieldCanonical — bool (head), pinned — marks the dataset as its
+	// module's canonical collection. Stored as `shared`. A declaration
+	// sets it exactly when its key is the module's canonical name.
+	DefFieldCanonical   = "shared"
 	DefFieldPart        = "part"        // owning part record id (head), pinned
 	DefFieldDynamic     = "dynamic"     // bool (head), pinned
 	DefFieldIdRule      = "idRule"      // "auto"/"user" (head), pinned ("id" is a reserved head)
@@ -78,12 +91,20 @@ const (
 	DefFieldIdMaxLen    = "idMaxLen"    // number (head), pinned
 	DefFieldDeleteBy    = "deleteBy"    // "anyone"/"author" (head), pinned
 	DefFieldSkipHistory = "skipHistory" // bool (head), pinned
+	// DefFieldPerSpace — bool (head), pinned — marks a shared dataset:
+	// its records from every object live in one collection per space.
+	// Records datasets only.
+	DefFieldPerSpace    = "perSpace"
 	DefFieldSearch      = "search"      // {title,text,scope} (head); leaves mutable, text string-or-array
 	DefFieldDisplayName = "displayName" // human label (head), mutable
 	DefFieldDataset     = "dataset"     // owning head record id (field), pinned
 	DefFieldStamp       = "stamp"       // "creator"/"createTime"/"modifyTime" (field), pinned
 	DefFieldRequired    = "required"    // bool (field), pinned
 	DefFieldMutableBy   = "mutableBy"   // "never"/"author"/"any" (field), pinned
+	// DefFieldIndexFields — array of field paths (index), pinned — the
+	// indexed paths in order, "-" prefix for descending.
+	DefFieldIndexFields = "fields"
+	DefFieldIndexSparse = "sparse" // bool (index), pinned
 )
 
 // Part record fields — the display slice a client renders. All mutable;
@@ -209,7 +230,11 @@ func IsDatasetFieldPinnedPath(path []string) bool {
 // DatasetDefsHandler validates ops on a type object's `datasets`
 // dataset and projects shortId rows on every important change (def
 // added / removed), so the existing DataVersion gate parks data changes
-// written against schema state this replica hasn't applied yet.
+// written against schema state this replica hasn't applied yet. An
+// index record's creation is not one: an index changes no apply
+// verdict, and a replica that predates index records drops the record
+// and so never projects for it. Its removal projects like any other: a
+// delete carries no kind, and that replica projects for it too.
 //
 // All validation is record-local and stateless (see PropertyHandler for
 // the convergence rationale): cross-record consistency — orphan field
@@ -239,6 +264,9 @@ func (DatasetDefsHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChan
 		if err := validateFieldCreate(rec.Ops); err != nil {
 			return err
 		}
+	case DefKindIndex:
+		// No shortId row: see the type comment.
+		return validateIndexCreate(rec.Ops)
 	default:
 		return fmt.Errorf("%w: %w: unknown `def` %q", crdt.ErrValidation, ErrBadDatasetDef, defKind)
 	}
@@ -268,13 +296,13 @@ func validatePartCreate(ops []crdt.Op) error {
 	return nil
 }
 
-// validateHeadCreate checks a dataset head record: a slug key (a shared
-// dataset's key is its module's canonical name, which is a slug too),
-// the module and part references, parseable behavioral labels, and no
-// `x-format` — the descriptor is a field-record member. Module
-// existence and the shared rule are compile-time facts (the handler
-// cannot see the module catalog, and a peer without the module still
-// stores the declaration).
+// validateHeadCreate checks a dataset head record: a slug key (a
+// canonical dataset's key is its module's canonical name, which is a
+// slug too), the module and part references, parseable behavioral
+// labels, and no `x-format` — the descriptor is a field-record member.
+// Module existence and the collection rule are compile-time facts (the
+// handler cannot see the module catalog, and a peer without the module
+// still stores the declaration).
 func validateHeadCreate(ops []crdt.Op) error {
 	key, _ := extractField(ops, FieldKey)
 	if err := ValidateKey("dataset", key); err != nil {
@@ -363,6 +391,54 @@ func validateFieldCreate(ops []crdt.Op) error {
 		}
 	}
 	return validateXFormatCreate(ops)
+}
+
+// validateIndexCreate checks an index record: its owning head ref and
+// the definition's own shape (schema.ValidateIndexShape). Whether the
+// paths name declared scalar fields is a cross-record fact resolved at
+// compile.
+func validateIndexCreate(ops []crdt.Op) error {
+	if headId, ok := extractField(ops, DefFieldDataset); !ok || headId == "" {
+		return fmt.Errorf("%w: %w: index record requires its owning `dataset` id", crdt.ErrValidation, ErrBadDatasetDef)
+	}
+	key, _ := extractField(ops, FieldKey)
+	idx := schema.Index{Key: key, Fields: extractStrings(ops, DefFieldIndexFields)}
+	if err := schema.ValidateIndexShape(idx); err != nil {
+		return fmt.Errorf("%w: %w: %w", crdt.ErrValidation, ErrBadDatasetDef, err)
+	}
+	return nil
+}
+
+// extractStrings reads a creation-shape array of strings for `field`:
+// a key of the multi-field $set payload, or a single-field $set at
+// Path = [field]. Nil when absent or not an array of strings.
+func extractStrings(ops []crdt.Op, field string) []string {
+	for i := range ops {
+		op := &ops[i]
+		if op.Type != crdt.OpSet || op.Payload == nil {
+			continue
+		}
+		var v *anyenc.Value
+		switch {
+		case len(op.Path) == 0 && op.Payload.Type() == anyenc.TypeObject:
+			v = op.Payload.Get(field)
+		case len(op.Path) == 1 && op.Path[0] == field:
+			v = op.Payload
+		}
+		if v == nil || v.Type() != anyenc.TypeArray {
+			continue
+		}
+		items := v.GetArray()
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			if item == nil || item.Type() != anyenc.TypeString {
+				return nil
+			}
+			out = append(out, string(item.GetStringBytes()))
+		}
+		return out
+	}
+	return nil
 }
 
 // BeforeModify rejects edits to pinned dataset-def state; the mutable

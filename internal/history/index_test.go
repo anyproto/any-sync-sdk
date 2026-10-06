@@ -282,7 +282,7 @@ func TestStaleLifecycleAndBackfill(t *testing.T) {
 	b.add("notes", upsert(t, "n2", `{"title":"b"}`))
 	b.add("tasks", upsert(t, "t1", `{"done":true}`))
 
-	require.NoError(t, ix.Backfill(ctx, b.tree, testObjectId, 2)) // batch smaller than total
+	require.NoError(t, ix.Backfill(ctx, b.tree, testObjectId, nil, 2)) // batch smaller than total
 
 	stale, err = ix.IsStale(ctx, testObjectId)
 	require.NoError(t, err)
@@ -294,6 +294,29 @@ func TestStaleLifecycleAndBackfill(t *testing.T) {
 	assert.Equal(t, "cid-003", out[0].Version)
 	require.Len(t, out[0].Touched, 1)
 	assert.Equal(t, "t1", out[0].Touched[0].RecordId)
+}
+
+// A backfill indexes the records of a keyed dataset under the id they
+// are stored and read by, the id the apply hook indexes.
+func TestBackfillIndexesKeyedIds(t *testing.T) {
+	ctx := context.Background()
+	ix := newTestIndex(t)
+	b := newTreeBuilder(t)
+	b.add("samples", upsert(t, "r1", `{"v":1}`))
+	b.add("notes", upsert(t, "n1", `{"title":"a"}`))
+
+	keyed := func(dataset string) bool { return dataset == "samples" }
+	require.NoError(t, ix.Backfill(ctx, b.tree, testObjectId, keyed, 0))
+
+	out, _, err := ix.ListChanges(ctx, Filter{ObjectId: testObjectId, Dataset: "samples", RecordId: testObjectId + "/r1"}, 10, "")
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Len(t, out[0].Touched, 1)
+	assert.Equal(t, testObjectId+"/r1", out[0].Touched[0].RecordId)
+
+	out, _, err = ix.ListChanges(ctx, Filter{ObjectId: testObjectId, Dataset: "notes", RecordId: "n1"}, 10, "")
+	require.NoError(t, err)
+	require.Len(t, out, 1, "a per-object dataset keeps its record ids")
 }
 
 func TestListLimitClamps(t *testing.T) {

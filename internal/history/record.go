@@ -105,13 +105,9 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 	}
 	defer db.Close()
 
-	shared := crdt.SharedCollections{}
-	for _, name := range p.SharedDatasets {
-		coll, cerr := db.Collection(ctx, name)
-		if cerr != nil {
-			return nil, fmt.Errorf("history: open scratch shared collection %s: %w", name, cerr)
-		}
-		shared[name] = coll
+	shared, err := scratchCollections(ctx, db, p.SharedDatasets, p.Regs)
+	if err != nil {
+		return nil, err
 	}
 	ctrl, err := crdt.NewControllerWithShared(ctx, p.ObjectId, db, shared, p.Regs...)
 	if err != nil {
@@ -160,7 +156,9 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 		// Fallback mode: apply only changes whose payload names the
 		// record. (Index-fed changes already passed this test at index
 		// time; re-checking is harmless and guards a stale index row.)
-		if !touchesRecord(decoded, p.RecordId) {
+		// A change names a record of a keyed dataset by its plain id;
+		// p.RecordId may be the keyed one.
+		if !touchesRecord(decoded, changeRecordId(ctrl, p)) {
 			return nil, nil
 		}
 		return decoded, nil
@@ -196,7 +194,16 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 	}
 
 	// Get clones off any-store's buffer, so the value survives db.Close.
-	return ctrl.Get(ctx, p.Dataset, p.RecordId), nil
+	return ctrl.GetStored(ctx, p.Dataset, p.RecordId), nil
+}
+
+// changeRecordId is p.RecordId in the form a change of p.Dataset
+// carries it.
+func changeRecordId(ctrl *crdt.Controller, p RecordAtParams) string {
+	if ctrl.IsKeyed(p.Dataset) {
+		return crdt.KeyedRecordId(p.ObjectId, p.RecordId)
+	}
+	return p.RecordId
 }
 
 // touchesRecord reports whether the decoded change carries ops for the

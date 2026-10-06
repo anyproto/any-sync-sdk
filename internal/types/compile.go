@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"sort"
 	"strconv"
+	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -19,16 +20,19 @@ import (
 // object's `datasets` records.
 type CompiledDataset struct {
 	// Name is the dataset's collection name — the module's canonical
-	// collection for a shared dataset, `<typeId>_<key>` otherwise.
+	// collection for a canonical dataset, `<typeId>_<key>` otherwise.
 	Name string
-	// Key is the dataset's slug inside its type; for a shared dataset
-	// it equals the canonical collection name.
+	// Key is the dataset's slug inside its type; for a canonical
+	// dataset it equals the canonical collection name.
 	Key string
 	// Module is the module serving the dataset (`records` for the
 	// generic schema-enforced kind).
 	Module string
-	// Shared marks a dataset that participates in the module's
-	// canonical collection instead of a namespaced one.
+	// Canonical is the head's stored marker: the dataset is its
+	// module's canonical collection instead of a namespaced one.
+	Canonical bool
+	// Shared marks a records dataset whose records from every object
+	// live in one collection per space.
 	Shared bool
 	// PartId is the owning part record's id.
 	PartId string
@@ -63,6 +67,46 @@ type CompiledDataset struct {
 	// FieldDefIds are the field records' ids, aligned with
 	// Schema.Fields — the identities RemoveDatasetField targets.
 	FieldDefIds []string
+	// Indexes are the dataset's declared indexes in creation order,
+	// invalid ones included (flagged). Records datasets only.
+	Indexes []CompiledIndex
+}
+
+// CompiledIndex is one declared index folded out of a type object's
+// index records.
+type CompiledIndex struct {
+	// DefId is the index record's id — what RemoveDatasetIndex targets.
+	DefId string
+	// DefIds are the ids of every live record declaring the key on the
+	// dataset: DefId and the concurrent duplicates the fold hides. A
+	// removal takes them all, or a hidden one would take its place.
+	DefIds []string
+	schema.Index
+	// Invalid marks an index that is never built: a path that names no
+	// declared scalar field (a field removed since), or one past the
+	// per-dataset limit. It stays visible so it can be removed.
+	Invalid       bool
+	InvalidReason string
+}
+
+// StoreIndexes lists the any-store indexes the dataset's valid declared
+// indexes need, one per distinct shape.
+func (c *CompiledDataset) StoreIndexes() []anystore.IndexInfo {
+	var out []anystore.IndexInfo
+	seen := make(map[string]struct{}, len(c.Indexes))
+	for i := range c.Indexes {
+		idx := &c.Indexes[i]
+		if idx.Invalid {
+			continue
+		}
+		name := idx.StoreName()
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, anystore.IndexInfo{Name: name, Fields: idx.Fields, Sparse: idx.Sparse})
+	}
+	return out
 }
 
 // CompiledPart is one part folded out of a type object's records: the
@@ -120,6 +164,56 @@ func hashRev(raw []byte) string {
 	h := fnv.New64a()
 	_, _ = h.Write(raw)
 	return strconv.FormatUint(h.Sum64(), 36)
+}
+
+// compileIndexes orders a dataset's index winners by creation and
+// validates each against the folded declaration.
+func compileIndexes(ds schema.Dataset, byKey map[string]*indexRec, ids map[string][]string, shared bool) []CompiledIndex {
+	if len(byKey) == 0 {
+		return nil
+	}
+	ordered := make([]*indexRec, 0, len(byKey))
+	for _, x := range byKey {
+		ordered = append(ordered, x)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].created != ordered[j].created {
+			return ordered[i].created < ordered[j].created
+		}
+		return ordered[i].index.Key < ordered[j].index.Key
+	})
+	out := make([]CompiledIndex, 0, len(ordered))
+	valid := 0
+	for _, x := range ordered {
+		all := append([]string(nil), ids[x.index.Key]...)
+		sort.Strings(all)
+		ci := CompiledIndex{DefId: x.id, DefIds: all, Index: x.index}
+		switch err := schema.ValidateIndexDecl(ds, x.index, shared); {
+		case err != nil:
+			ci.Invalid, ci.InvalidReason = true, err.Error()
+		case valid >= schema.MaxDatasetIndexes:
+			ci.Invalid = true
+			ci.InvalidReason = fmt.Sprintf("a dataset holds at most %d indexes", schema.MaxDatasetIndexes)
+		default:
+			valid++
+		}
+		out = append(out, ci)
+	}
+	return out
+}
+
+// indexRev fingerprints a set of any-store indexes, order-free. Empty
+// for no indexes.
+func indexRev(infos []anystore.IndexInfo) string {
+	if len(infos) == 0 {
+		return ""
+	}
+	names := make([]string, len(infos))
+	for i, info := range infos {
+		names[i] = info.Name
+	}
+	sort.Strings(names)
+	return hashRev([]byte(strings.Join(names, "|")))
 }
 
 // DatasetHeadKey resolves a live head record's dataset key by its
@@ -241,6 +335,9 @@ type headRec struct {
 	created string // creation _ver.id, the dedup tiebreak
 	key     string
 	module  string
+	// canonical is the stored marker (DefFieldCanonical).
+	canonical bool
+	// shared is the per-space marker (DefFieldPerSpace).
 	shared  bool
 	partId  string
 	ds      schema.Dataset
@@ -257,6 +354,13 @@ type fieldRec struct {
 	field   schema.Field
 }
 
+type indexRec struct {
+	id      string
+	headId  string
+	created string
+	index   schema.Index
+}
+
 type partRec struct {
 	id      string
 	created string
@@ -270,10 +374,13 @@ type partRec struct {
 }
 
 // pinnedLeaves are the head fields two concurrent declarations of one
-// key must agree on; a disagreement marks the definition invalid.
+// key must agree on; a disagreement marks the definition invalid. The
+// shared marker is not one of them: an SDK that predates it folds the
+// same heads without reading it, so a disagreement must leave the
+// definition valid here too. The winning head's marker decides.
 func (h *headRec) pinnedLeaves() string {
 	return fmt.Sprintf("%s|%t|%s|%t|%s|%s|%d|%s|%t",
-		h.module, h.shared, h.partId, h.ds.Dynamic, h.ds.IdRule, h.ds.IdPattern, h.ds.IdMaxLen, h.ds.DeleteBy, h.skip)
+		h.module, h.canonical, h.partId, h.ds.Dynamic, h.ds.IdRule, h.ds.IdPattern, h.ds.IdMaxLen, h.ds.DeleteBy, h.skip)
 }
 
 // CompileTypeParts folds a type object's `datasets` records into parts
@@ -293,12 +400,17 @@ func (h *headRec) pinnedLeaves() string {
 //   - `_ver.id` comparison is sound within one tree: orderId VALUES are
 //     peer-local but their relative order converges, so every replica
 //     picks the same winner;
-//   - the collection rule (Modules.Collection) decides the collection;
-//     an unknown module or a shared violation marks the definition
-//     invalid; a type declaring two shared datasets of one module keeps
-//     the smallest `_ver.id` and marks the rest invalid;
+//   - the collection rule (Modules.Collection) decides the collection
+//     from the head's stored canonical marker; an unknown module or a
+//     rule violation marks the definition invalid; a type holding two
+//     canonical datasets of one module keeps the smallest `_ver.id` and
+//     marks the rest invalid;
 //   - a module-served dataset carries no fields (the module owns the
-//     schema): field records under it are orphans;
+//     schema): field and index records under it are orphans;
+//   - index records attach like fields and dedup by index key (smallest
+//     `_ver.id`); one that fails ValidateIndexDecl against the folded
+//     declaration, or is past MaxDatasetIndexes in creation order, is
+//     flagged Invalid and never built;
 //   - a `records` dataset whose folded declaration fails
 //     ValidateDatasetDecl is emitted with Invalid set: visible for
 //     repair/removal, never registered.
@@ -327,6 +439,7 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 	var parts []*partRec
 	var heads []*headRec
 	var fields []*fieldRec
+	var indexes []*indexRec
 
 	for iter.Next() {
 		doc, derr := iter.Doc()
@@ -373,16 +486,18 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 				created: created,
 				key:     key,
 				module:  v.GetString("module"),
-				shared:  v.GetBool("shared"),
-				partId:  v.GetString("part"),
-				display: v.GetString("displayName"),
-				descr:   v.GetString("description"),
+				// The canonical marker is stored under `shared`.
+				canonical: v.GetBool("shared"),
+				partId:    v.GetString("part"),
+				display:   v.GetString("displayName"),
+				descr:     v.GetString("description"),
 			}
 			if h.module == "" {
 				h.module = RecordsModule
 			}
 			h.ds.Dynamic = v.GetBool("dynamic")
 			h.skip = v.GetBool("skipHistory")
+			h.shared = v.GetBool("perSpace")
 			if rule, ok := schema.ParseIdRule(v.GetString("idRule")); ok {
 				h.ds.IdRule = rule
 			}
@@ -433,6 +548,19 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 			}
 			f.Required = v.GetBool("required")
 			fields = append(fields, &fieldRec{id: v.GetString("id"), headId: headId, created: created, field: f})
+		case "index":
+			headId := v.GetString("dataset")
+			key := v.GetString("key")
+			if headId == "" || key == "" {
+				continue
+			}
+			idx := schema.Index{Key: key, Sparse: v.GetBool("sparse")}
+			for _, f := range v.GetArray("fields") {
+				if f != nil && f.Type() == anyenc.TypeString {
+					idx.Fields = append(idx.Fields, string(f.GetStringBytes()))
+				}
+			}
+			indexes = append(indexes, &indexRec{id: v.GetString("id"), headId: headId, created: created, index: idx})
 		}
 	}
 	if iter.Err() != nil {
@@ -496,21 +624,41 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 		}
 	}
 
-	// One shared dataset per module per type: the group with the
+	// Indexes: attach like fields, dedup per group by index key.
+	indexWinners := make(map[string]map[string]*indexRec, len(groups)) // dataset key → index key → winner
+	indexIds := make(map[string]map[string][]string, len(groups))      // dataset key → index key → every record id
+	for _, x := range indexes {
+		h, ok := headById[x.headId]
+		if !ok {
+			continue // orphan index
+		}
+		byKey := indexWinners[h.key]
+		if byKey == nil {
+			byKey = make(map[string]*indexRec)
+			indexWinners[h.key] = byKey
+			indexIds[h.key] = make(map[string][]string)
+		}
+		indexIds[h.key][x.index.Key] = append(indexIds[h.key][x.index.Key], x.id)
+		if w, dup := byKey[x.index.Key]; !dup || x.created < w.created {
+			byKey[x.index.Key] = x
+		}
+	}
+
+	// One canonical dataset per module per type: the group with the
 	// smallest winner creation keeps it.
-	sharedKeep := make(map[string]string) // module → dataset key
-	sharedCreated := make(map[string]string)
+	canonicalKeep := make(map[string]string) // module → dataset key
+	canonicalCreated := make(map[string]string)
 	keys := make([]string, 0, len(groups))
 	for key, hs := range groups {
 		keys = append(keys, key)
 		sort.Slice(hs, func(i, j int) bool { return hs[i].created < hs[j].created })
 		w := hs[0]
-		if !w.shared {
+		if !w.canonical {
 			continue
 		}
-		if prev, taken := sharedKeep[w.module]; !taken || w.created < sharedCreated[w.module] || (w.created == sharedCreated[w.module] && key < prev) {
-			sharedKeep[w.module] = key
-			sharedCreated[w.module] = w.created
+		if prev, taken := canonicalKeep[w.module]; !taken || w.created < canonicalCreated[w.module] || (w.created == canonicalCreated[w.module] && key < prev) {
+			canonicalKeep[w.module] = key
+			canonicalCreated[w.module] = w.created
 		}
 	}
 	sort.Strings(keys)
@@ -523,11 +671,14 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 		compiled := CompiledDataset{
 			Key:         key,
 			Module:      w.module,
-			Shared:      w.shared,
+			Canonical:   w.canonical,
 			PartId:      w.partId,
 			DefId:       w.id,
 			TypeId:      typeId,
 			SkipHistory: w.skip,
+			// Records only: a module head carrying the marker is
+			// served as an SDK that predates it serves it.
+			Shared:      w.shared && w.module == RecordsModule,
 			Search:      w.search,
 			DisplayName: w.display,
 			Description: w.descr,
@@ -543,7 +694,7 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 				break
 			}
 		}
-		name, cerr := modules.Collection(typeId, key, w.module, w.shared)
+		name, cerr := modules.Collection(typeId, key, w.module, w.canonical)
 		if cerr != nil && !compiled.Invalid {
 			invalid(cerr.Error())
 		}
@@ -552,8 +703,8 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 		} else {
 			compiled.Name = CollectionName(typeId, key)
 		}
-		if w.shared && sharedKeep[w.module] != key && !compiled.Invalid {
-			invalid(fmt.Sprintf("type already declares a shared %q dataset (%q)", w.module, sharedKeep[w.module]))
+		if w.canonical && canonicalKeep[w.module] != key && !compiled.Invalid {
+			invalid(fmt.Sprintf("type already declares the canonical %q dataset (%q)", w.module, canonicalKeep[w.module]))
 		}
 
 		if w.module == RecordsModule {
@@ -579,8 +730,20 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 			} else {
 				norm := ds.Normalized()
 				compiled.Schema = norm
+				compiled.Indexes = compileIndexes(norm, indexWinners[key], indexIds[key], compiled.Shared)
 				if !compiled.Invalid {
 					compiled.SchemaRev = schemaRev(norm)
+					if compiled.Shared {
+						// Where the records live is part of the
+						// registration: a controller built for the
+						// other mode is stale.
+						compiled.SchemaRev += "+space"
+					} else if rev := indexRev(compiled.StoreIndexes()); rev != "" {
+						// A per-object collection gets its indexes
+						// from the registration, at open. A shared
+						// one is indexed by the store.
+						compiled.SchemaRev += "+" + rev
+					}
 				}
 			}
 		} else if !compiled.Invalid {

@@ -41,7 +41,8 @@ refuse it with `ErrIsTechSpace`.
 
 Supported:
 
-- Reads: `Query`, `QueryObjects`, `Aggregate`, `Datasets`,
+- Reads: `Query`, `QueryObjects`, `QueryDataset`, `Aggregate`,
+  `AggregateDataset`, `Datasets`,
   `Objects().Get`, `Types()` / `Collections()` reads. `Query` on the
   index object's `identities` dataset returns `ErrUnsupported` (rows
   carry the profile-decryption `symKey`); use `SDK.Identities()`.

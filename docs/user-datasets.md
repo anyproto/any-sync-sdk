@@ -26,7 +26,7 @@ Type
  ├─ layout                (rendering metadata, docs/data-structure.md)
  └─ parts[]               display units, keyed
      ├─ name/icon/pos/hidden/ui/uses
-     └─ datasets[]        keyed; module + shared; the declaration
+     └─ datasets[]        keyed; module; the declaration
 ```
 
 - A **part** is what a client renders: a key (slug, pinned), the
@@ -35,22 +35,22 @@ Type
   the SDK) and `uses`, keys of other datasets of the same type the
   part renders without owning.
 - A **dataset** is keyed inside its type (slug, pinned) and names a
-  `module` (pinned) and whether it is `shared` (pinned). A `records`
-  dataset carries the behavioural declaration below; a module-served
+  `module` (pinned). The key decides its collection (§ The collection
+  rule). A `records` dataset carries the behavioural declaration below; a module-served
   dataset carries none: the module owns the schema, and field
   declarations on it are refused (`ErrModuleOwned`).
 - A **module** (`handler.Module`, registered via `config.Config.Modules`)
   is a factory: `New(ModuleInstance) handler.Dataset` returns the
   handler, schema, indexes, read-tracking and history flags for one
-  collection. A module may own a shared **canonical collection**
-  (`Canonical`); `SharedOnly` refuses namespaced instances so an object
-  carries at most one collection of the module. A module may also
+  collection. A module may own a **canonical collection**
+  (`Canonical`); `CanonicalOnly` refuses namespaced instances so an
+  object carries at most one collection of the module. A module may also
   declare a namespace on the objects row (`Properties`); see
   docs/data-structure.md § Module namespaces.
 
 ### Reserved modules
 
-A **reserved** module (`Reserved`, requires `SharedOnly`) cannot be
+A **reserved** module (`Reserved`, requires `CanonicalOnly`) cannot be
 declared at runtime: `AddPart`, `AddDataset` and a bundle's `Parts`
 naming it fail with `space.ErrModuleReserved`. Only a bundle install
 made with the `space.SystemInstall()` ensure option, or a registered
@@ -82,10 +82,10 @@ A registered type (`config.Config.Types`) declares its parts at boot
 names entries of the type's `Datasets` (`PartDataset.Name`: the
 collection is the dataset's name; the module reads as `records` on the
 generic schema handler, none for a bespoke handler) or module datasets
-(`PartDataset.Module` + `Shared` / `Key`, per the collection rule below).
+(`PartDataset.Module` + `Key`, per the collection rule below).
 
 - Module datasets enter the catalog as if a type object had declared
-  them: a shared one adds the type to the canonical collection's owner
+  them: a canonical one adds the type to that collection's owner
   set; a namespaced one registers `<typeId>_<key>` on every controller
   with the module's `DataVersion` (registered types mint no schema state
   to gate on). The module namespace on the objects row follows
@@ -105,19 +105,27 @@ generic schema handler, none for a bespoke handler) or module datasets
 
 ### The collection rule
 
+The key decides:
+
 ```
-shared: true   →  <module canonical>            editor_blocks
-shared: false  →  <typeId>_<key>                bafyrei…_segments
+key = <module canonical>   →  <module canonical>     editor_blocks
+any other key              →  <typeId>_<key>         bafyrei…_segments
 ```
 
-- `shared` is legal only for a module with a canonical collection, and
-  a shared dataset's key IS the canonical name (it defaults to it when
-  left empty). A type declares at most one shared dataset per module.
-  `records` is never shared.
-- A shared dataset is the canonical collection itself, one per module
-  per space: two types that both share `editor` give an object carrying
-  both a single body, and retyping keeps it. Two types with namespaced
-  editor datasets give two collections; nothing merges.
+- A draft with no key takes its module's canonical name. A module
+  without a canonical collection, `records` among them, requires a key.
+- A `CanonicalOnly` module admits no key but its canonical name.
+- The canonical collection is one name per module per space: every type
+  that declares it addresses the same collection, so retyping an object
+  between two such types keeps its records. A namespaced dataset
+  belongs to its type alone: two types with namespaced editor datasets
+  give two collections; nothing merges.
+- Keys are unique within a type, so a type declares a module's
+  canonical dataset at most once.
+- The head record stores the outcome as a pinned marker (`shared`), set
+  exactly when the key is the module's canonical name. The compile
+  resolves the collection from the marker: a stored head keyed by the
+  canonical name without it is namespaced, `<typeId>_<key>`.
 - Namespaced names cannot collide: type ids are content-addressed CIDs
   without `_`, so `<typeId>_<key>` splits at the first `_` and no two
   types can produce the same collection. The catalog needs no
@@ -142,8 +150,8 @@ canonical collections register statically on every controller
 (a peer applies an inbound `editor_blocks` change without the
 declaring type's definitions), namespaced instances go through the
 catalog and park until the declaring type's schema state arrives
-(below). Removing a shared dataset withdraws that type's ownership of
-the canonical collection and nothing else.
+(below). Removing a canonical dataset withdraws that type's ownership
+of the collection and nothing else.
 
 ## Declaration vocabulary (records datasets)
 
@@ -169,6 +177,7 @@ Per dataset:
 | `IdRule` | `auto` (zero: ids derived from the change, the empty-id sugar) / `user` (caller ids, pattern + max length constrained) |
 | `DeleteBy` | record-delete gate: `anyone` (zero) / `author` |
 | `SkipHistory` | keep out of the version-history index |
+| `Shared` | every object's records in one collection per space (§ Shared datasets); pinned |
 | `Search` | `{title, text}` field mapping plus an optional `scope` slug (which index scope the entries land under), surfaced as `x-search` for external indexers; SDK-opaque. `text` names one or more field keys, which the indexer joins into one body; on the wire a single key is a bare string, several are an array (a single-element array marshals as the string) |
 
 Declaration well-formedness (`schema.ValidateDatasetDecl`, shared by
@@ -249,8 +258,9 @@ type's parts are CRDT records there:
   `ui` (an object, created whole) and `uses` (an array of dataset keys)
   mutable.
 - **Head record** (one per dataset; id minted client-side, unique):
-  `def:"dataset"`, `key` (slug), `module`, `shared`, `part` (the owning
-  part record id), `dynamic`, `idRule`/`idPattern`/`idMaxLen`,
+  `def:"dataset"`, `key` (slug), `module`, `shared` (the canonical
+  marker), `perSpace` (a shared dataset), `part` (the owning part
+  record id), `dynamic`, `idRule`/`idPattern`/`idMaxLen`,
   `deleteBy`, `skipHistory`, all pinned first-write; `displayName`,
   `description`, and the `search.title`/`search.text`/`search.scope`
   leaves stay mutable (leaves mutate, a broad `search` replace is
@@ -266,6 +276,10 @@ type's parts are CRDT records there:
   carries, docs/data-structure.md § "The `x-format` descriptor") mutable via
   `PatchDatasetField`. The descriptive slice never enters the schema
   revision: editing it re-registers nothing.
+- **Index record** (one per declared index of a `records` dataset; id
+  derived from the change): `def:"index"`, `dataset` (owning head id),
+  `key` (slug), `fields` (an array of paths), `sparse`, all pinned.
+  See § Declared indexes.
 
 A bundle root that declares `Parts` is a type object (`any.type =
 "__type__"`, `typeId == objectId`) and hosts these records itself under
@@ -283,15 +297,19 @@ records would take arrival-order-dependent verdicts, and a handler
 cannot see the module catalog (a peer without a module still stores
 the declaration).
 
-`AddPart` writes the part, its heads and their fields in one change
-(the ids are minted client-side so records can reference each other),
-so a crash can never strand an orphan. `AddDataset` on an existing part
-writes the head and its fields the same way.
+`AddPart` writes the part, its heads, their fields and their indexes in
+one change (the ids are minted client-side so records can reference
+each other), so a crash can never strand an orphan. `AddDataset` on an
+existing part writes the head, its fields and its indexes the same way.
 
-Every definition create/delete projects a shortId row into the type's
-`<typeId>_shortIds` collection (with a `src: "datasets"` discriminator),
-so the DataVersion gate covers dataset-schema state with no extra
-lookups.
+Every part, head and field create, and every definition delete,
+projects a shortId row into the type's `<typeId>_shortIds` collection
+(with a `src: "datasets"` discriminator), so the DataVersion gate
+covers dataset-schema state with no extra lookups. An index record's
+creation projects none: an index changes no apply verdict, so no data
+change waits for one. An SDK that predates index records drops them at
+apply and holds no index until its type object is next rebuilt; its
+reads stay correct.
 
 ### Compile: records → parts and declarations
 
@@ -310,12 +328,16 @@ flat dataset view of the same fold):
   per key), and a disagreement on a pinned leaf marks the definition
   invalid. This is sound within one tree: orderId values are peer-local
   but their relative order converges;
-- the collection rule decides the collection; an unknown module or a
-  shared violation marks the definition invalid; a type declaring two
-  shared datasets of one module keeps the smallest `_ver.id` and marks
-  the rest invalid;
-- a module-served dataset carries no fields: field records under it
-  are orphans;
+- the collection rule decides the collection from the head's canonical
+  marker; an unknown module or a rule violation marks the definition
+  invalid; a type holding two canonical datasets of one module keeps
+  the smallest `_ver.id` and marks the rest invalid;
+- a module-served dataset carries no fields: field and index records
+  under it are orphans;
+- index records attach to their head like fields and dedup by index
+  key (smallest `_ver.id`); one whose paths are not declared scalar
+  fields of the folded declaration, or that is past the per-dataset
+  limit in creation order, is emitted invalid and never built;
 - a `records` fold that fails `ValidateDatasetDecl` is emitted
   invalid, visible through `Types().Datasets` (with the reason)
   so it can be repaired or removed, but never registered.
@@ -327,7 +349,7 @@ evolution is additive-only with pinned behavior:
 
 - Add parts, datasets and fields freely at runtime; edits sync and
   apply like any space data.
-- A part's key; a dataset's key, module, shared flag and part; a
+- A part's key; a dataset's key, module, canonical marker and part; a
   field's `kind`, `scope`, `stamp`, `required`, `mutableBy`; the id
   rule and the delete gate are pinned for the life of the definition;
   remove and re-add under a new key to change them. A dataset never
@@ -339,9 +361,14 @@ evolution is additive-only with pinned behavior:
 - **`RemoveDatasetField` re-validates the remaining declaration** and
   refuses removals that would invalidate it (e.g. the creator stamp of
   an author-gated dataset). Already-invalid definitions stay removable.
+  A field a valid declared index names is refused until the index is
+  removed.
+- **An index is replaced, never edited**: `RemoveDatasetIndex`, then
+  `AddDatasetIndex`. A removal takes every concurrent declaration of
+  the key with it.
 - `RemoveDataset` / `RemovePart` do not clean up record data (as with
   `RemoveProperty`); subsequent writes drop once peers apply the
-  removal, and a shared dataset's removal only withdraws this type's
+  removal, and a canonical dataset's removal only withdraws this type's
   ownership.
 
 ## Runtime registration
@@ -358,15 +385,16 @@ declarations reach them through a store-level **catalog**:
   A namespaced dataset gets one registration: the generic schema
   handler over its declaration for `records`, the module's
   `New(instance)` output otherwise, with the module's `HandlerVersion`
-  composed in. A shared dataset adds its type to the canonical
-  collection's owner set and registers nothing; the canonical
+  composed in. A canonical dataset adds its type to that collection's
+  owner set and registers nothing; the canonical
   collection is on every controller from store open, with the module's
   `DataVersion`.
 - **Eviction is lazy.** Schema apply evicts nothing. Each registration carries a `SchemaRev` fingerprint of
   its compiled declaration (for a module instance: the module and key,
-  since the schema is the module's); a resident controller whose rev
+  since the schema is the module's; for a per-object records dataset:
+  its declared indexes too); a resident controller whose rev
   differs from the catalog's (dataset added, field added/removed,
-  definition removed) is stale. Local touch (`Modify`/`Upsert`/`Query`)
+  index added/removed, definition removed) is stale. Local touch (`Modify`/`Upsert`/`Query`)
   drops and reloads it; user-facing write paths retry once on the
   resulting `object.ErrClosed`, so the eviction never surfaces as a
   caller error.
@@ -421,9 +449,10 @@ writer per dataset (see the IdRule contract above).
 
 `Space.Datasets()` lists every collection the store hosts. Each
 `DatasetSchema` carries `Owners`, the declaring types: one for a
-registered-type or namespaced dataset, every type sharing the module
+registered-type or namespaced dataset, every type declaring it
 for a canonical collection (empty while nothing declares it), none for
-space-level built-ins; plus `Module` and `Shared`. Consumer indexers
+space-level built-ins; plus `Module`, `Shared` and the declared
+`Indexes` that are built. Consumer indexers
 gate on `Owners` (an object may hold the dataset when it carries one
 of them).
 
@@ -444,8 +473,132 @@ descriptor).
 management views: definition ids, invalid state, display fields, the
 computed `Collection`, the full value shape, the descriptor.
 
+## Shared datasets
+
+A `records` dataset declared `Shared` keeps the records of every object
+that holds it in one any-store collection per space,
+`<spaceId>_<typeId>_<key>`, where a per-object dataset uses one
+collection per object. Nothing else moves: a record is written on an
+object, through that object's tree, and belongs to that object alone.
+Version ids order changes within one tree, so no record is ever
+written by two objects.
+
+```
+<spaceId>_<typeId>_<key>
+  id         "<objectId>/<recordId>"   primary key
+  _objectId  "<objectId>"              stamped by the Controller
+  <fields…>, _ver, _traces?, _deletedAt?, _addSeq, _applySeq
+```
+
+- **The record id** inside a change is the plain id the dataset's
+  `IdRule` produces, so a peer on an SDK without shared datasets
+  applies the same changes to a per-object collection. The stored
+  document id is the object's prefix plus that id, whatever the id
+  holds; an object id holds no `/`, so the first one splits.
+- **Reads** return the stored id: `Space.Query(objectId, dataset)`
+  reads the object's rows — a range of the primary key — each with
+  `id = <objectId>/<recordId>` and `_objectId`. Subscription events,
+  `ModifyResult.RecordIds`, rejections and version history carry the
+  same id.
+- **Writes** take the plain record id, or the stored id of the batch's
+  own object. A `/` anywhere else is `ErrRecordIdOfAnotherObject` — a
+  failed call on `Modify` and `Delete`, a per-record rejection on
+  `Upsert`. `Upsert` is keyed by the plain id: a rejection names it,
+  and each page's `RecordIds` are stored ids like any write result's.
+- **Handlers** see the record id the change carries.
+- **`space.SharedRecordId` / `space.PlainRecordId`** convert between
+  the two forms.
+- **Object deletion and re-index** delete the object's key range from
+  the collection; deleting the space drops the collection.
+- **`_objectId`** is reserved like every `_` field: input ops cannot
+  write it.
+
+### Reads across objects
+
+`Space.QueryDataset(dataset)` and `Space.AggregateDataset(dataset,
+pipeline)` read the whole collection: every object's records, with the
+same builders and terminals as `Query` and `Aggregate`.
+
+- **No object is loaded.** The read sees the space's materialized
+  state, as `QueryObjects` does. `Query(objectId, dataset)` loads its
+  object first and stays the read for one known object: it reads the
+  object's key range, where a filter on `_objectId` here scans the
+  collection unless a declared index leads with it.
+- **`Subscribe`** delivers the changes of every object's records.
+  Deleting an object arrives as removals of its rows, with no
+  `VersionId`. A subscription without a filter or a sorted limit holds
+  the whole collection in memory.
+- **A dataset that is not shared**, or that the space does not hold,
+  fails the terminal call with `ErrDatasetNotShared`.
+- **Version ids order one object's changes.** Rows of different objects
+  are not ordered by `_ver`; `_applySeq` orders them as this device
+  applied them.
+
+The marker is stored on the head record as `perSpace`. An SDK that
+predates it ignores the leaf and materializes the dataset per object.
+
+## Declared indexes
+
+A `records` dataset declares secondary indexes: `DatasetDraft.Indexes`
+at creation, `Types().AddDatasetIndex` later — also on a dataset that
+holds records. An index is an ordered list of paths any-store keeps
+sorted, so a filter or sort on a leading run of them is a range read.
+
+```go
+IndexDraft{Key: "by_start", Fields: []string{"start", "_objectId"}}
+IndexDraft{Key: "top",      Fields: []string{"-score"}, Sparse: true}
+```
+
+- **Paths**: one to `MaxIndexFields` (4), each a declared field of kind
+  string, number, boolean or datetime, or `_ver.id` (creation order
+  within one object); a shared dataset also takes `_objectId`. A `-`
+  prefix keeps a path descending. An indexed field's key is letters,
+  digits and `_`, starts with a letter and is at most 48 bytes, so
+  every index has a valid store name of its own.
+- **Values of another type still index.** A synced write is checked
+  against the declared shape; a local-scope value, and a value a
+  dynamic dataset held before the field was declared, are not.
+  any-store orders keys by type, so reads stay correct.
+- **`Sparse`** leaves a record out unless it carries every indexed
+  field.
+- **Limits**: `MaxDatasetIndexes` (8) per dataset; every index is
+  written on every record write. No unique index — replicas cannot
+  enforce one convergently — and no full-text or vector index.
+- **Definitions sync**, so every device holds the same set. They stay
+  out of the DataVersion gate.
+- **The any-store index** is named from what it indexes
+  (`dx_start,_objectId`), not from the key: two definitions of one
+  shape are one index, and a replaced definition is another index.
+- **A per-object dataset** carries its indexes on its registration: an
+  object's collection gets them when it is next opened, and loses a
+  removed one the same way.
+- **A shared dataset** has one collection per space, which the store
+  indexes: when a definition applies, and at open when an index is
+  missing, a background worker builds it; a removed definition drops
+  it. While a type object replays, its datasets wait for the replay to
+  end. A build scans the collection in one write transaction, so every
+  write to the account's database waits for it. It never runs on the
+  apply path, and `Close` waits for one in flight.
+  `Types().SubscribeIndexBuilds` reports each build (`Started`, then
+  `Done` or `Failed`), a build in flight to a new subscriber too; a
+  definition whose index the collection already holds builds nothing.
+  Until a build ends, reads scan.
+- **An invalid index** — a path that names no declared scalar field —
+  is listed by `Types().Datasets` with its reason and built nowhere.
+
 ## Limitations
 
+- **A shared dataset is declared shared.** The flag is pinned. Removing
+  a dataset and declaring its key again in the other mode leaves the
+  records a device already materialized where they were.
+- **Rows of a shared dataset are purged best-effort.** An object's
+  rows are deleted from the shared datasets the catalog knows and the
+  ones the store has opened. Rows of a dataset whose definition was
+  removed before the store opened stay, as record data does after
+  `RemoveDataset`; so do rows of a purge that failed part way, until
+  the space's deletions are reconciled again.
+- **A shared dataset declared concurrently in both modes** follows the
+  earlier declaration. An SDK that predates the marker reads neither.
 - **No computed fields.** Apply hooks must be replica-deterministic; a
   user-facing expression form is a versioned-determinism problem.
   Stamps cover the security-relevant derivations; other derivation
@@ -459,7 +612,7 @@ computed `Collection`, the full value shape, the descriptor.
   rebuilds stored rows. Rows rebuild only when a registration's handler
   version changes (the generic schema handler's version or a module's
   `HandlerVersion`), through the lazy per-object re-index on load.
-- A module's `SharedOnly` is the only per-object cardinality rule: a
+- A module's `CanonicalOnly` is the only per-object cardinality rule: a
   type declaring two namespaced datasets of one module gives its
   objects two storage collections of it.
 
@@ -469,23 +622,26 @@ computed `Collection`, the full value shape, the descriptor.
 // definitions (space.TypesAPI)
 Patch(ctx, typeId, TypePatch) error                       // name/description/icon/layout/hidden/meta
 Parts(ctx, typeId) ([]PartDef, error)
-AddPart(ctx, typeId, PartDraft) (partId, error)           // part + datasets + fields, one change
+AddPart(ctx, typeId, PartDraft) (partId, error)           // part + datasets + fields + indexes, one change
 PatchPart(ctx, typeId, partId, DatasetDefPatch) error     // display slice, ui (whole), uses
 RemovePart(ctx, typeId, partId) error                     // part + its datasets
 AddDataset(ctx, typeId, partId, DatasetDraft) (datasetDefId, error)
 AddDatasetField(ctx, typeId, datasetDefId, DatasetFieldDraft) (fieldDefId, error) // records only
 RemoveDataset(ctx, typeId, datasetDefId) error
 RemoveDatasetField(ctx, typeId, fieldDefId) error
+AddDatasetIndex(ctx, typeId, datasetDefId, IndexDraft) (indexDefId, error)        // records only
+RemoveDatasetIndex(ctx, typeId, indexDefId) error
+SubscribeIndexBuilds(cb func(IndexBuild)) (cancel func())                          // shared datasets
 PatchDataset(ctx, typeId, defId, DatasetDefPatch) error   // mutable leaves
 PatchDatasetField(ctx, typeId, fieldDefId, DatasetDefPatch) error
 Datasets(ctx, typeId) ([]DatasetDef, error)               // flat, with Collection
 
 // modules (config.Config.Modules)
-handler.Module{Name, Canonical, SharedOnly, Reserved, DataVersion, HandlerVersion, Properties, New}
+handler.Module{Name, Canonical, CanonicalOnly, Reserved, DataVersion, HandlerVersion, Properties, New}
 
 // static parts (config.Config.Types)
 handler.Type{…, Parts: []handler.Part{{Key, Name, Icon, Pos, Hidden, UI, Uses,
-    Datasets: []handler.PartDataset{{Name} | {Module, Shared, Key}}}}, Hidden}
+    Datasets: []handler.PartDataset{{Name} | {Module, Key}}}}, Hidden}
 
 // bundles declaring a definition (space.EnsureBundleRequest)
 EnsureBundleRequest{…, XKey, Parts, Properties /* XKey required, deterministic ids */, Layout, Hidden}
@@ -494,4 +650,6 @@ Bundles().Ensure(ctx, req, space.SystemInstall())   // the consumer's own instal
 
 // data (space.Space), next to Modify/Query
 Upsert(ctx, UpsertBatch) (UpsertResult, error)
+QueryDataset(dataset) Query                 // a shared dataset, every object's records
+AggregateDataset(dataset, pipeline) Agg
 ```

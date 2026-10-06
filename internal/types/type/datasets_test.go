@@ -185,7 +185,7 @@ func TestDatasetDefs_PinningMatrix(t *testing.T) {
 		{Type: crdt.OpSet, Path: []string{typetype.FieldKey}, Payload: arena.NewString("renamed")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldDef}, Payload: arena.NewString("field")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldModule}, Payload: arena.NewString("editor")},
-		{Type: crdt.OpSet, Path: []string{typetype.DefFieldShared}, Payload: arena.NewTrue()},
+		{Type: crdt.OpSet, Path: []string{typetype.DefFieldCanonical}, Payload: arena.NewTrue()},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldPart}, Payload: arena.NewString("part-2")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldIdRule}, Payload: arena.NewString("user")},
 		{Type: crdt.OpSet, Path: []string{typetype.DefFieldDeleteBy}, Payload: arena.NewString("anyone")},
@@ -618,17 +618,18 @@ func TestCompileDatasetDefs_TombstonesDrop(t *testing.T) {
 }
 
 // Parts fold by key (display from the earlier creation, datasets and
-// uses unioned) and the collection rule places every dataset: a shared
-// dataset on the module's canonical collection, a namespaced one under
-// the type; module-served datasets carry no fields; violations of the
-// rule compile invalid.
+// uses unioned) and the collection rule places every dataset by its
+// stored canonical marker: a marked head on the module's canonical
+// collection, an unmarked one under the type; module-served datasets
+// carry no fields; violations of the rule compile invalid.
 func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	ctrl, db := newDefsController(t)
 	ctx := context.Background()
 	arena := &anyenc.Arena{}
 	modules := types.NewModules(
 		types.ModuleInfo{Name: "editor", Canonical: "editor_blocks"},
-		types.ModuleInfo{Name: "chat", Canonical: "chat_messages", SharedOnly: true},
+		types.ModuleInfo{Name: "chat", Canonical: "chat_messages", CanonicalOnly: true},
+		types.ModuleInfo{Name: "notes", Canonical: "notes_body"},
 	)
 
 	usesA := arena.NewArray()
@@ -646,20 +647,31 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 
 	heads := []struct {
 		id, key, module, part string
-		shared                bool
+		canonical             bool
 	}{
-		{"h-shared", "editor_blocks", "editor", "part-a", true},
+		{"h-canonical", "editor_blocks", "editor", "part-a", true},
 		{"h-summary", "summary", "editor", "part-b", false},
-		{"h-badkey", "notes", "editor", "part-a", true}, // shared key must be the canonical
-		{"h-thread", "thread", "chat", "part-c", false}, // chat admits shared only
+		{"h-badkey", "notes", "editor", "part-a", true}, // a canonical dataset is keyed by the canonical name
+		{"h-thread", "thread", "chat", "part-c", false}, // chat admits its canonical only
 		{"h-chat", "chat_messages", "chat", "part-c", true},
 		{"h-unknown", "x", "sketch", "part-a", false}, // no such module
 		{"h-records", "segments", types.RecordsModule, "part-a", false},
+		// The canonical name as the key of an unmarked head: namespaced.
+		{"h-unmarked", "notes_body", "notes", "part-a", false},
 	}
+	// A shared records dataset, and the same marker on a module dataset.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("s1", "cs1", "h-samples", true,
+		headPayload(arena, "samples", map[string]any{
+			typetype.DefFieldPart: "part-a", typetype.DefFieldPerSpace: true,
+		}))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("s2", "cs2", "h-shared-editor", true,
+		headPayload(arena, "draft", map[string]any{
+			typetype.DefFieldModule: "editor", typetype.DefFieldPart: "part-a", typetype.DefFieldPerSpace: true,
+		}))))
 	for i, h := range heads {
 		extra := map[string]any{typetype.DefFieldModule: h.module, typetype.DefFieldPart: h.part}
-		if h.shared {
-			extra[typetype.DefFieldShared] = true
+		if h.canonical {
+			extra[typetype.DefFieldCanonical] = true
 		}
 		require.NoError(t, ctrl.ApplyChange(ctx, defsChange(crdt.VersionId("h"+string(rune('a'+i))), "ch"+h.id, h.id, true,
 			headPayload(arena, h.key, extra))))
@@ -667,7 +679,7 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	// A field on a module-served dataset is an orphan: the module owns
 	// the schema.
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("f1", "cf1", "f-editor", true,
-		fieldPayload(arena, "h-shared", "text", "string", nil))))
+		fieldPayload(arena, "h-canonical", "text", "string", nil))))
 	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("f2", "cf2", "f-seg", true,
 		fieldPayload(arena, "h-records", "speaker", "string", nil))))
 
@@ -685,24 +697,41 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	for _, ds := range ct.Datasets {
 		byKey[ds.Key] = ds
 	}
-	shared := byKey["editor_blocks"]
-	assert.Equal(t, "editor_blocks", shared.Name, "a shared dataset is the canonical collection")
-	assert.True(t, shared.Shared)
-	assert.False(t, shared.Invalid)
-	assert.NotEmpty(t, shared.SchemaRev)
-	assert.Empty(t, shared.Schema.Fields, "module-served: no fields")
-	assert.Equal(t, "part-a", shared.PartId)
+	canonical := byKey["editor_blocks"]
+	assert.Equal(t, "editor_blocks", canonical.Name, "a marked head is the canonical collection")
+	assert.True(t, canonical.Canonical)
+	assert.False(t, canonical.Invalid)
+	assert.NotEmpty(t, canonical.SchemaRev)
+	assert.Empty(t, canonical.Schema.Fields, "module-served: no fields")
+	assert.Equal(t, "part-a", canonical.PartId)
 
 	summary := byKey["summary"]
 	assert.Equal(t, testObjectId+"_summary", summary.Name)
 	assert.Equal(t, "editor", summary.Module)
 	assert.False(t, summary.Invalid)
+	assert.False(t, summary.Canonical)
 	assert.Equal(t, "part-a", summary.PartId, "a head under the losing duplicate attaches to the winner")
 
-	assert.True(t, byKey["notes"].Invalid, "shared editor keyed other than the canonical")
+	assert.True(t, byKey["notes"].Invalid, "a marked editor head keyed other than the canonical")
 	assert.True(t, byKey["thread"].Invalid, "namespaced chat is refused")
 	assert.False(t, byKey["chat_messages"].Invalid)
 	assert.Equal(t, "chat_messages", byKey["chat_messages"].Name)
+	assert.True(t, byKey["chat_messages"].Canonical)
+
+	samples := byKey["samples"]
+	assert.False(t, samples.Invalid)
+	assert.True(t, samples.Shared)
+	assert.Equal(t, testObjectId+"_samples", samples.Name, "a shared dataset keeps its namespaced name")
+	assert.False(t, byKey["segments"].Shared)
+	draft := byKey["draft"]
+	assert.False(t, draft.Invalid, "a module head carrying the shared marker is valid: %s", draft.InvalidReason)
+	assert.False(t, draft.Shared, "only a records dataset is shared")
+	assert.Equal(t, testObjectId+"_draft", draft.Name)
+
+	unmarked := byKey["notes_body"]
+	assert.False(t, unmarked.Invalid)
+	assert.False(t, unmarked.Canonical)
+	assert.Equal(t, testObjectId+"_notes_body", unmarked.Name, "the marker decides, not the key")
 	assert.True(t, byKey["x"].Invalid)
 	assert.Contains(t, byKey["x"].InvalidReason, "unknown module")
 
@@ -716,14 +745,17 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	for _, ds := range body.Datasets {
 		bodyKeys = append(bodyKeys, ds.Key)
 	}
-	assert.Equal(t, []string{"editor_blocks", "notes", "segments", "summary", "x"}, bodyKeys)
+	assert.Equal(t, []string{"draft", "editor_blocks", "notes", "notes_body", "samples", "segments", "summary", "x"}, bodyKeys)
 
-	// A second shared editor dataset (a different key cannot be the
-	// canonical, so re-declare the canonical under another part): the
-	// earlier creation keeps it.
-	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("h9", "ch9", "h-shared-2", true,
+	// The marker is a pinned leaf: two heads of one key that disagree
+	// on it fold invalid, and so does the same key under another part.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("h8", "ch8", "h-chat-2", true,
+		headPayload(arena, "chat_messages", map[string]any{
+			typetype.DefFieldModule: "chat", typetype.DefFieldPart: "part-c",
+		}))))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("h9", "ch9", "h-canonical-2", true,
 		headPayload(arena, "editor_blocks", map[string]any{
-			typetype.DefFieldModule: "editor", typetype.DefFieldPart: "part-c", typetype.DefFieldShared: true,
+			typetype.DefFieldModule: "editor", typetype.DefFieldPart: "part-c", typetype.DefFieldCanonical: true,
 		}))))
 	ct, err = types.CompileTypeParts(ctx, db, testObjectId, modules)
 	require.NoError(t, err)
@@ -731,6 +763,7 @@ func TestCompileTypeParts_ModulesAndCollections(t *testing.T) {
 	for _, ds := range ct.Datasets {
 		byKey[ds.Key] = ds
 	}
+	assert.True(t, byKey["chat_messages"].Invalid, "two heads of one key disagreeing on the marker fold invalid")
 	assert.True(t, byKey["editor_blocks"].Invalid, "two heads of one key disagreeing on the part fold invalid")
 }
 

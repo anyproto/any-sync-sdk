@@ -333,9 +333,8 @@ func (b *bundlesAPI) validateEnsureRequest(req space.EnsureBundleRequest, system
 // the root's own id. The root's own values are seeded through its
 // declaration (Properties with deterministic ids), never by naming
 // the root as an owner. Collection names cannot collide — a namespaced
-// dataset lives under the root's own id and a shared one is the
-// module's canonical collection — so there is no name ownership to
-// settle.
+// dataset lives under the root's own id and a canonical one is its
+// module's own collection — so there is no name ownership to settle.
 func (b *bundlesAPI) preflightType(ctx context.Context, req space.EnsureBundleRequest) error {
 	if !req.Declares() {
 		return nil
@@ -473,12 +472,11 @@ func (b *bundlesAPI) declareProperties(ctx context.Context, rootId string, draft
 // validateBundleParts rejects an invalid part or dataset draft, or a
 // duplicate key, up front — the same validation declareParts applies,
 // so nothing half-registers. Drafts are normalized in place (module
-// default, a shared dataset's canonical key). A reserved module is
+// default, the canonical key when none is given). A reserved module is
 // refused unless the request is the consumer's own install.
 func (b *bundlesAPI) validateBundleParts(drafts []space.PartDraft, systemInstall bool) error {
 	seen := make(map[string]struct{}, len(drafts))
 	keys := make(map[string]struct{})
-	shared := make(map[string]struct{})
 	for i := range drafts {
 		p := &drafts[i]
 		if err := typetype.ValidateKey("part", p.Key); err != nil {
@@ -505,12 +503,6 @@ func (b *bundlesAPI) validateBundleParts(drafts []space.PartDraft, systemInstall
 				return fmt.Errorf("spaceimpl: %w: dataset %q declared twice", space.ErrBundleBadRequest, d.Key)
 			}
 			keys[d.Key] = struct{}{}
-			if d.Shared {
-				if _, dup := shared[d.Module]; dup {
-					return fmt.Errorf("spaceimpl: %w: two shared %q datasets", space.ErrBundleBadRequest, d.Module)
-				}
-				shared[d.Module] = struct{}{}
-			}
 		}
 	}
 	return nil
@@ -543,7 +535,7 @@ func (b *bundlesAPI) declareParts(ctx context.Context, rootId string, drafts []s
 				return fmt.Errorf("spaceimpl: %w: dataset %q: %w", space.ErrBundleBadRequest, drafts[i].Datasets[j].Key, err)
 			}
 		}
-		_, r, err := partRecords(arena, &drafts[i])
+		_, r, err := partRecords(arena, b.parent.store.Modules(), &drafts[i])
 		if err != nil {
 			return fmt.Errorf("spaceimpl: bundles: declare part %q on root %q: %w", drafts[i].Key, rootId, err)
 		}

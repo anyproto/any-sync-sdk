@@ -69,6 +69,7 @@ space.Objects().Delete(ctx, objectId)
 // Records: reads and live updates through the query builder.
 space.Query(objectId, dataset).Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe
 space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe
+space.QueryDataset(dataset).Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe // a shared dataset
 
 // Writes.
 space.Modify(ctx, ModifyBatch)  // → ModifyResult{VersionId, ChangeId, RecordIds, Rejections, ApplySeq}; IfUnchangedSince makes it conditional

@@ -2,10 +2,10 @@ package spaceobjects
 
 // Static parts: the parts a registered handler.Type declares at boot,
 // compiled into the same view a runtime declaration produces. Module
-// datasets among them enter the catalog as ownership (a shared one adds
-// the type to the canonical collection's owner set, a namespaced one
-// gets its own registration), so the write gate, discovery and the
-// module namespace treat them exactly like a user declaration.
+// datasets among them enter the catalog as ownership (a canonical one
+// adds the type to that collection's owner set, a namespaced one gets
+// its own registration), so the write gate, discovery and the module
+// namespace treat them exactly like a user declaration.
 
 import (
 	"fmt"
@@ -22,7 +22,7 @@ type staticModuleDataset struct {
 	typeId     string
 	partKey    string
 	module     string
-	shared     bool
+	canonical  bool
 	key        string
 	collection string
 }
@@ -61,8 +61,8 @@ func validateStaticParts(t handler.Type) error {
 			case d.Name == "" && d.Module == "":
 				return fmt.Errorf("type %q part %q dataset[%d]: Name or Module required", t.Id, p.Key, j)
 			case d.Name != "":
-				if d.Shared || d.Key != "" {
-					return fmt.Errorf("type %q part %q dataset %q: Shared/Key apply to module datasets only", t.Id, p.Key, d.Name)
+				if d.Key != "" {
+					return fmt.Errorf("type %q part %q dataset %q: Key applies to module datasets only", t.Id, p.Key, d.Name)
 				}
 				if _, ok := static[d.Name]; !ok {
 					return fmt.Errorf("type %q part %q: dataset %q is not among the type's Datasets", t.Id, p.Key, d.Name)
@@ -90,27 +90,24 @@ func validateStaticParts(t handler.Type) error {
 
 // staticModuleDatasets resolves the module datasets a registered type
 // declares in its parts against the module catalog: the collection
-// rule, at most one shared dataset per module per type, unique keys —
-// across the static datasets too, since both are keys of one type.
+// rule and unique keys — across the static datasets too, since both are
+// keys of one type.
 func staticModuleDatasets(t handler.Type, modules types.Modules) ([]staticModuleDataset, error) {
 	var out []staticModuleDataset
 	keys := make(map[string]struct{}, len(t.Datasets))
 	for _, d := range t.Datasets {
 		keys[d.Name] = struct{}{}
 	}
-	shared := make(map[string]struct{})
 	for _, p := range t.Parts {
 		for _, d := range p.Datasets {
 			if d.Module == "" {
 				continue
 			}
 			key := d.Key
-			if d.Shared && key == "" {
-				if mi, ok := modules[d.Module]; ok {
-					key = mi.Canonical
-				}
+			if key == "" {
+				key = modules.CanonicalKey(d.Module)
 			}
-			coll, err := modules.Collection(t.Id, key, d.Module, d.Shared)
+			coll, canonical, err := modules.DraftCollection(t.Id, key, d.Module)
 			if err != nil {
 				return nil, fmt.Errorf("type %q part %q: %w", t.Id, p.Key, err)
 			}
@@ -118,14 +115,8 @@ func staticModuleDatasets(t handler.Type, modules types.Modules) ([]staticModule
 				return nil, fmt.Errorf("type %q part %q: duplicate dataset key %q", t.Id, p.Key, key)
 			}
 			keys[key] = struct{}{}
-			if d.Shared {
-				if _, dup := shared[d.Module]; dup {
-					return nil, fmt.Errorf("type %q: two shared %q datasets", t.Id, d.Module)
-				}
-				shared[d.Module] = struct{}{}
-			}
 			out = append(out, staticModuleDataset{
-				typeId: t.Id, partKey: p.Key, module: d.Module, shared: d.Shared, key: key, collection: coll,
+				typeId: t.Id, partKey: p.Key, module: d.Module, canonical: canonical, key: key, collection: coll,
 			})
 		}
 	}
@@ -210,7 +201,7 @@ func StaticTypeParts(t handler.Type, modules types.Modules) (*types.CompiledType
 		}
 		for _, m := range modByPart[p.Key] {
 			cp.Datasets = append(cp.Datasets, types.CompiledDataset{
-				Name: m.collection, Key: m.key, Module: m.module, Shared: m.shared,
+				Name: m.collection, Key: m.key, Module: m.module, Canonical: m.canonical,
 				PartId: p.Key, DefId: m.key, TypeId: t.Id,
 			})
 		}

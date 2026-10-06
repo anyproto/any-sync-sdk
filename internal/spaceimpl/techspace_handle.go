@@ -142,6 +142,12 @@ func (q failQuery) Subscribe(context.Context, space.QueryOpts) (*space.QueryResu
 	return nil, q.err
 }
 func (t *techSpace) QueryObjects() space.Query { return t.inner.QueryObjects() }
+func (t *techSpace) QueryDataset(dataset string) space.Query {
+	return t.inner.QueryDataset(dataset)
+}
+func (t *techSpace) AggregateDataset(dataset string, pipeline any) space.Agg {
+	return t.inner.AggregateDataset(dataset, pipeline)
+}
 func (t *techSpace) Aggregate(objectId, dataset string, pipeline any) space.Agg {
 	return t.inner.Aggregate(objectId, dataset, pipeline)
 }
@@ -371,6 +377,21 @@ func (x techTypes) RemoveDatasetField(ctx context.Context, typeId, fieldDefId st
 		return err
 	}
 	return x.inner.RemoveDatasetField(ctx, typeId, fieldDefId)
+}
+func (x techTypes) AddDatasetIndex(ctx context.Context, typeId, defId string, draft space.IndexDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddDatasetIndex(ctx, typeId, defId, draft)
+}
+func (x techTypes) RemoveDatasetIndex(ctx context.Context, typeId, indexDefId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveDatasetIndex(ctx, typeId, indexDefId)
+}
+func (x techTypes) SubscribeIndexBuilds(cb func(space.IndexBuild)) (cancel func()) {
+	return x.inner.SubscribeIndexBuilds(cb)
 }
 func (x techTypes) PatchDataset(ctx context.Context, typeId, defId string, patch space.DatasetDefPatch) error {
 	if err := x.root(ctx, typeId); err != nil {

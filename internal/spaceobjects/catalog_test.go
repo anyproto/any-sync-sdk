@@ -59,7 +59,24 @@ func seedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, 
 // seedModuleDefs declares one part keyed dsKey carrying one dataset
 // keyed dsKey of the given module (a records dataset also gets a
 // `title` field).
-func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, shared bool, verPrefix string) {
+func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, canonical bool, verPrefix string) {
+	t.Helper()
+	var markers []string
+	if canonical {
+		markers = append(markers, typetype.DefFieldCanonical)
+	}
+	seedDefs(t, ctx, db, typeId, dsKey, module, markers, verPrefix)
+}
+
+// seedSharedDatasetDefs declares a shared records dataset keyed dsKey.
+func seedSharedDatasetDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, verPrefix string) {
+	t.Helper()
+	seedDefs(t, ctx, db, typeId, dsKey, types.RecordsModule, []string{typetype.DefFieldPerSpace}, verPrefix)
+}
+
+// seedDefs is seedModuleDefs with the head's boolean markers spelled
+// out.
+func seedDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, dsKey, module string, markers []string, verPrefix string) {
 	t.Helper()
 	ctrl, err := crdt.NewController(ctx, typeId, db,
 		crdt.HandlerReg{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}},
@@ -82,8 +99,8 @@ func seedModuleDefs(t *testing.T, ctx context.Context, db anystore.DB, typeId, d
 	head.Set(typetype.FieldKey, a.NewString(dsKey))
 	head.Set(typetype.DefFieldModule, a.NewString(module))
 	head.Set(typetype.DefFieldPart, a.NewString(partId))
-	if shared {
-		head.Set(typetype.DefFieldShared, a.NewTrue())
+	for _, marker := range markers {
+		head.Set(marker, a.NewTrue())
 	}
 	if module == types.RecordsModule {
 		head.Set(typetype.DefFieldIdRule, a.NewString("user"))
@@ -159,7 +176,6 @@ func TestCatalog_BootScanAndBuildRegs(t *testing.T) {
 			listed = true
 			assert.Equal(t, []string{catTypeId}, ns.Owners)
 			assert.Equal(t, types.RecordsModule, ns.Module)
-			assert.False(t, ns.Shared)
 		}
 	}
 	assert.True(t, listed)
@@ -427,7 +443,7 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 	require.NotNil(t, canonical, "the canonical collection registers statically")
 	bh, ok := canonical.Handler.(blocksHandler)
 	require.True(t, ok)
-	assert.True(t, bh.inst.Shared)
+	assert.True(t, bh.inst.Canonical)
 	assert.Equal(t, "blocks_shared", bh.inst.Collection)
 	dv, err := store.DataVersionFor(ctx, "blocks_shared")
 	require.NoError(t, err)
@@ -438,7 +454,8 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 	assert.Empty(t, owners, "nothing declares it yet")
 	assert.Empty(t, store.ModuleGrants(map[string]struct{}{"type-a": {}}))
 
-	// Type A shares the module; type B declares a namespaced instance.
+	// Type A declares the canonical dataset; type B a namespaced
+	// instance.
 	seedTypeObject(t, ctx, db, "spaceA", "type-a")
 	seedTypeObject(t, ctx, db, "spaceA", "type-b")
 	seedModuleDefs(t, ctx, db, "type-a", "blocks_shared", "blocks", true, "a")
@@ -466,7 +483,7 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 	require.True(t, ok, "served by the module, not the schema handler")
 	assert.Equal(t, "type-b", bh.inst.TypeId)
 	assert.Equal(t, "notes", bh.inst.Key)
-	assert.False(t, bh.inst.Shared)
+	assert.False(t, bh.inst.Canonical)
 	assert.NotEmpty(t, instReg.SchemaRev)
 
 	// The module namespace is granted off either declaration kind.
@@ -489,17 +506,15 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 			sawCanonical = true
 			assert.Equal(t, []string{"type-a"}, ns.Owners)
 			assert.Equal(t, "blocks", ns.Module)
-			assert.True(t, ns.Shared)
 		case inst:
 			sawInst = true
 			assert.Equal(t, []string{"type-b"}, ns.Owners)
 			assert.Equal(t, "blocks", ns.Module)
-			assert.False(t, ns.Shared)
 		}
 	}
 	assert.True(t, sawCanonical && sawInst)
 
-	// A withdrawn shared declaration drops the owner; the canonical
+	// A withdrawn canonical declaration drops the owner; the
 	// registration stays.
 	headColl, err := db.Collection(ctx, "type-a_datasets")
 	require.NoError(t, err)
@@ -512,15 +527,15 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 
 func TestValidateExternalModules(t *testing.T) {
 	good := testModule()
-	sharedOnly := testModule()
-	sharedOnly.Name = "chatty"
-	sharedOnly.Canonical = "chatty_shared"
-	sharedOnly.SharedOnly = true
+	canonicalOnly := testModule()
+	canonicalOnly.Name = "chatty"
+	canonicalOnly.Canonical = "chatty_shared"
+	canonicalOnly.CanonicalOnly = true
 	noCanonical := testModule()
 	noCanonical.Name = "plain"
 	noCanonical.Canonical = ""
 	noCanonical.DataVersion = ""
-	require.NoError(t, ValidateExternalModules(nil, []handler.Module{good, sharedOnly, noCanonical}))
+	require.NoError(t, ValidateExternalModules(nil, []handler.Module{good, canonicalOnly, noCanonical}))
 
 	bad := func(mut func(m *handler.Module)) handler.Module {
 		m := testModule()
@@ -539,7 +554,7 @@ func TestValidateExternalModules(t *testing.T) {
 		{"type id collision", []handler.Type{{Id: "blocks"}}, []handler.Module{good}},
 		{"duplicate", nil, []handler.Module{good, good}},
 		{"nil New", nil, []handler.Module{bad(func(m *handler.Module) { m.New = nil })}},
-		{"shared-only without canonical", nil, []handler.Module{bad(func(m *handler.Module) { m.Canonical = ""; m.SharedOnly = true })}},
+		{"canonical-only without canonical", nil, []handler.Module{bad(func(m *handler.Module) { m.Canonical = ""; m.CanonicalOnly = true })}},
 		{"canonical reserved", nil, []handler.Module{bad(func(m *handler.Module) { m.Canonical = "objects" })}},
 		{"canonical collides with a type dataset", []handler.Type{{Id: "t", Datasets: []handler.Dataset{{Name: "blocks_shared", DataVersion: "v", Handler: crdt.DefaultHandler{}}}}}, []handler.Module{good}},
 		{"empty data version", nil, []handler.Module{bad(func(m *handler.Module) { m.DataVersion = "" })}},

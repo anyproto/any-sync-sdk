@@ -507,6 +507,74 @@ func TestScope_SharedAndExplicitDoNotCrossFire(t *testing.T) {
 	waitNone(t, explicit) // explicit on obj1 — no event for obj2
 }
 
+// An AllObjects sub sees its dataset from every object; a per-object
+// sub of the same dataset sees its own object only.
+func TestScope_AllObjectsRoutesByDataset(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+
+	all := subscribeSorted(t, eng, Scope{AllObjects: true, Dataset: "samples"}, nil, 0, nil)
+	own := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "samples"}, nil, 0, nil)
+
+	arena := newArena()
+	r1 := makeRow(arena, "obj1/a", 1, nil)
+	fireEvent(eng, "obj1", "samples", "obj1/a", r1.d, false, nil)
+	ev, err := waitOne(t, all)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1/a"}, idsOf(ev.Added))
+	ev, err = waitOne(t, own)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1/a"}, idsOf(ev.Added))
+
+	r2 := makeRow(arena, "obj2/a", 2, nil)
+	fireEvent(eng, "obj2", "samples", "obj2/a", r2.d, false, nil)
+	ev, err = waitOne(t, all)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj2/a"}, idsOf(ev.Added))
+	waitNone(t, own)
+
+	// Another dataset of the same object reaches neither.
+	r3 := makeRow(arena, "b", 3, nil)
+	fireEvent(eng, "obj1", "notes", "b", r3.d, false, nil)
+	waitNone(t, all)
+	waitNone(t, own)
+
+	// A closed sub leaves its bucket.
+	require.NoError(t, all.Close())
+	assert.Empty(t, eng.scope.perDataset)
+}
+
+// NotifyRecordsDeleted removes the named rows from every window that
+// holds them.
+func TestNotifyRecordsDeleted(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+
+	arena := newArena()
+	initial := []row{
+		makeRow(arena, "obj1/a", 1, nil),
+		makeRow(arena, "obj1/b", 2, nil),
+		makeRow(arena, "obj2/a", 3, nil),
+	}
+	all := subscribeSorted(t, eng, Scope{AllObjects: true, Dataset: "samples"}, nil, 0, initial)
+	own := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "samples"}, nil, 0, initial[:2])
+	other := subscribeSorted(t, eng, Scope{ObjectId: "obj2", Dataset: "samples"}, nil, 0, initial[2:])
+
+	eng.NotifyRecordsDeleted("test", "samples", "obj1", []string{"obj1/a", "obj1/b"})
+
+	for _, sub := range []*Sub{all, own} {
+		ev, err := waitOne(t, sub)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []string{"obj1/a", "obj1/b"}, removedIdsOf(ev.Removed))
+		assert.Empty(t, ev.Added)
+		assert.Empty(t, ev.Updated)
+	}
+	waitNone(t, other)
+
+	eng.NotifyRecordsDeleted("test", "samples", "obj1", nil)
+	waitNone(t, all)
+}
+
 // Engine.Close cascades — every live sub gets its mailbox closed.
 func TestEngineClose_CascadesToSubs(t *testing.T) {
 	eng := New("test")

@@ -641,6 +641,8 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	if idErr != nil {
 		return WriteResult{}, fmt.Errorf("object: resolve record ids: %w", idErr)
 	}
+	// The caller reads records back by the id they are stored under.
+	o.ctrl.StoreIds(ch.Dataset, recordIds)
 
 	// Apply through the same per-change primitive the drain path uses
 	// — no gate (we own this change), no re-decode (we have it in
@@ -690,6 +692,7 @@ func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, err
 		return WriteResult{}, fmt.Errorf("object: local set: %w", err)
 	}
 	recordIds, _ := crdt.ResolveRecordIds(ch)
+	o.ctrl.StoreIds(ch.Dataset, recordIds)
 	return WriteResult{
 		VersionId:  ch.VersionId,
 		RecordIds:  recordIds,
@@ -734,6 +737,7 @@ func (o *Object) InjectedSet(ctx context.Context, ch crdt.Change) (WriteResult, 
 		return WriteResult{}, fmt.Errorf("object: injected set: %w", err)
 	}
 	recordIds, _ := crdt.ResolveRecordIds(ch)
+	o.ctrl.StoreIds(ch.Dataset, recordIds)
 	return WriteResult{
 		VersionId:  ch.VersionId,
 		RecordIds:  recordIds,

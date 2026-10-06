@@ -219,14 +219,14 @@ duplicate draft, or a seed that cannot be encoded, fails with
 scan finds the root; the ownership check (the object's type declares the
 dataset, or the object is the declaring type) passes on every carrier
 and on the root itself; a namespaced dataset lives in `<rootId>_<key>` with the
-`<rootId>:<shortId>` gate stamp; a shared one uses the module's canonical
-collection; `Types().Parts(rootId)` / `Datasets(rootId)` and
+`<rootId>:<shortId>` gate stamp; one keyed by its module's canonical name
+uses that collection; `Types().Parts(rootId)` / `Datasets(rootId)` and
 `Space.Datasets()` list the declarations with `Owners = [rootId]`; records
 go through `Upsert` / `Modify` / `Query`. A bundle's setup state lives in
 records on its root, not in child objects.
 
 Collections cannot collide: a namespaced dataset is `<rootId>_<key>` and
-a shared one belongs to its module, so two bundles in one space may use
+a canonical one belongs to its module, so two bundles in one space may use
 the same keys.
 
 A part naming a **reserved** module (`handler.Module.Reserved`) is

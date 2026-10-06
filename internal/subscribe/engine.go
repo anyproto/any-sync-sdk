@@ -204,6 +204,25 @@ func (e *Engine) NotifyDeleted(spaceId, dataset, objectId string) {
 	}, func(int) *anyenc.Value { return nil })
 }
 
+// NotifyRecordsDeleted emits a synthetic delete for records ids of
+// (objectId, dataset): the rows a purge removed from a shared dataset's
+// collection. Like NotifyDeleted, the event carries no VersionId.
+func (e *Engine) NotifyRecordsDeleted(spaceId, dataset, objectId string, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	records := make([]EventRecord, len(ids))
+	for i, id := range ids {
+		records[i] = EventRecord{Id: id, Deleted: true}
+	}
+	e.OnApply(Event{
+		SpaceId:  spaceId,
+		Dataset:  dataset,
+		ObjectId: objectId,
+		Records:  records,
+	}, func(int) *anyenc.Value { return nil })
+}
+
 // closeSub removes a sub from the engine. Called via Sub.Close.
 func (e *Engine) closeSub(s *querySub) {
 	e.mu.Lock()

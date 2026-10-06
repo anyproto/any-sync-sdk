@@ -211,6 +211,11 @@ type HandlerReg struct {
 	Version int
 	Handler Handler
 	Indexes []anystore.IndexInfo
+	// PruneIndexPrefix, when set, makes Indexes the whole set under
+	// that name prefix: opening the dataset's per-object collection
+	// drops any other index named under it. For a dataset whose indexes
+	// are declared at runtime and can be removed.
+	PruneIndexPrefix string
 	// Schema is the dataset's required, JSON-Schema-compatible field
 	// declaration. Each field carries a class (Scope: synced/derived/
 	// local/account) the apply path enforces: derived fields are
@@ -218,6 +223,13 @@ type HandlerReg struct {
 	// Dynamic rejects undeclared fields. Free-form datasets (shortIds,
 	// the per-type `objects` namespace) set Schema.Dynamic.
 	Schema schema.Dataset
+
+	// Keyed marks a dataset whose records from every object of a space
+	// live in one collection, supplied pre-opened through
+	// SharedCollections. A record is stored under the document id
+	// `<objectId>/<recordId>` and stamped with ObjectIdField; handlers
+	// keep seeing the record id the change carries.
+	Keyed bool
 
 	// SchemaRev is an opaque fingerprint of the registered schema for
 	// runtime-defined datasets. The store compares a resident

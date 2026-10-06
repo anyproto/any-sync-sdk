@@ -8,6 +8,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/history"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -23,6 +24,16 @@ type historyAPI struct {
 }
 
 func newHistoryAPI(s *spaceImpl) *historyAPI { return &historyAPI{parent: s} }
+
+// storedRecordId is recordId in the form history indexes and returns it:
+// `<objectId>/<recordId>` for a shared dataset, whichever form the
+// caller passed; recordId itself otherwise.
+func (h *historyAPI) storedRecordId(objectId, dataset, recordId string) string {
+	if recordId == "" || !h.parent.store.IsKeyedDataset(dataset) {
+		return recordId
+	}
+	return crdt.KeyedId(objectId, recordId)
+}
 
 // viewParams assembles ViewParams for one object from the live tree
 // and the store's current handler set.
@@ -103,7 +114,7 @@ func (h *historyAPI) ensureFresh(ctx context.Context, ix *history.Index, obj *ob
 	if err != nil {
 		return mapHistoryErr(err)
 	}
-	return ix.Backfill(ctx, histTree, objectId, 0)
+	return ix.Backfill(ctx, histTree, objectId, h.parent.store.IsKeyedDataset, 0)
 }
 
 func (h *historyAPI) ListChanges(ctx context.Context, objectId string, f space.HistoryFilter, limit int, cursor string) (space.ChangeList, error) {
@@ -128,7 +139,7 @@ func (h *historyAPI) ListChanges(ctx context.Context, objectId string, f space.H
 	filter := history.Filter{
 		ObjectId: objectId,
 		Dataset:  f.Dataset,
-		RecordId: f.RecordId,
+		RecordId: h.storedRecordId(objectId, f.Dataset, f.RecordId),
 		TraceId:  f.TraceId,
 		Author:   f.Author,
 	}
@@ -196,6 +207,7 @@ func (h *historyAPI) RecordAt(ctx context.Context, objectId, dataset, recordId s
 	if version == "" {
 		return nil, errors.New("history: version required")
 	}
+	recordId = h.storedRecordId(objectId, dataset, recordId)
 	obj, params, err := h.viewParams(ctx, objectId)
 	if err != nil {
 		return nil, err
@@ -273,7 +285,11 @@ func (h *historyAPI) Diff(ctx context.Context, objectId string, base, version sp
 	}
 
 	params.Dataset = f.Dataset
-	filter := history.DiffFilter{Dataset: f.Dataset, RecordIds: f.RecordIds}
+	recordIds := make([]string, len(f.RecordIds))
+	for i, id := range f.RecordIds {
+		recordIds[i] = h.storedRecordId(objectId, f.Dataset, id)
+	}
+	filter := history.DiffFilter{Dataset: f.Dataset, RecordIds: recordIds}
 
 	// Single-replay fast path (proposal §5): base is an ancestor of
 	// version in the common "what changed since" case and always for

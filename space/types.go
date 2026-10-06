@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/anyproto/any-sync-sdk/handler"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // ErrPinnedField is returned by PatchProperty / PatchDataset /
@@ -70,6 +71,19 @@ var ErrModuleReserved = errors.New("space: module is reserved for the consumer's
 // attached on write; the caller attaches one first. A client error →
 // 4xx.
 var ErrDatasetNotDeclared = errors.New("space: dataset is declared by none of the object's types")
+
+// ErrRecordIdOfAnotherObject is returned by a write to a shared
+// dataset whose record id does not belong to the target object: it
+// carries another object's prefix, or contains "/" without being one of
+// this object's ids. A record id written to a shared dataset is the
+// plain id or `<objectId>/<recordId>` for the batch's own object. A
+// client error → 4xx.
+var ErrRecordIdOfAnotherObject = errors.New("space: record id does not belong to the object")
+
+// ErrDatasetNotShared is returned by a read across objects
+// (QueryDataset / AggregateDataset) of a dataset that is not declared
+// Shared, or that the space does not hold. A client error → 4xx.
+var ErrDatasetNotShared = errors.New("space: dataset is not a shared dataset")
 
 // Scope is the unified write/sync class shared by property definitions
 // and dataset schema fields — how a value is written, which version
@@ -185,8 +199,8 @@ type TypesAPI interface {
 	// RemovePart tombstones a part and every dataset declared under it.
 	// Record data is NOT cleaned up (the RemoveProperty stance);
 	// subsequent writes to the datasets drop once peers apply the
-	// removal, and a shared dataset's removal only withdraws this
-	// type's ownership of the canonical collection.
+	// removal, and removing a module's canonical dataset only withdraws
+	// this type's ownership of that collection.
 	RemovePart(ctx context.Context, typeId, partId string) error
 
 	// Datasets returns the type's dataset definitions across every part
@@ -197,8 +211,8 @@ type TypesAPI interface {
 	// syncs like any space data; peers register the dataset (the
 	// generic schema handler for records, the module's handler
 	// otherwise) as it applies. Returns the definition's stable id.
-	// Behavioral parts of the declaration (key, module, shared, id
-	// rule, delete gate, field kinds/flags) are pinned — remove and
+	// Behavioral parts of the declaration (key, module, id rule,
+	// delete gate, field kinds/flags) are pinned — remove and
 	// re-add to change them; display parts patch via PatchDataset.
 	AddDataset(ctx context.Context, typeId, partId string, draft DatasetDraft) (datasetDefId string, err error)
 
@@ -219,6 +233,32 @@ type TypesAPI interface {
 	// stay stored; subsequent writes to the field are rejected as
 	// undeclared (non-dynamic datasets).
 	RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error
+
+	// AddDatasetIndex declares a secondary index on an existing records
+	// dataset; one may be added to a dataset that holds records.
+	// Returns the index definition's id. The definition syncs, so every
+	// device keeps the same set. A per-object dataset builds the index
+	// when an object's collection is next opened; a shared dataset
+	// builds it once per space in the background — every write to the
+	// account's data waits for that build. SubscribeIndexBuilds reports
+	// a build; an index of a shape the collection already holds builds
+	// nothing and reports nothing. A module-served dataset refuses
+	// (ErrModuleOwned).
+	AddDatasetIndex(ctx context.Context, typeId, datasetDefId string, draft IndexDraft) (indexDefId string, err error)
+
+	// RemoveDatasetIndex drops one index definition, with every
+	// concurrent declaration of its key. A shared dataset's collection
+	// loses the index once its device applies the removal, a per-object
+	// one at its next open; an index another definition of the same
+	// shape still names stays.
+	RemoveDatasetIndex(ctx context.Context, typeId, indexDefId string) error
+
+	// SubscribeIndexBuilds registers cb for the builds of shared
+	// datasets' declared indexes in this space. A build in flight is
+	// reported to cb at once as Started. cb runs on the build worker —
+	// keep it small or hand off, and do not subscribe from it. The
+	// returned cancel is idempotent.
+	SubscribeIndexBuilds(cb func(IndexBuild)) (cancel func())
 
 	// PatchDataset edits a definition's mutable leaves: displayName,
 	// description, name (field records' display label), search.title,
@@ -316,25 +356,28 @@ const (
 )
 
 // RecordsModule is the built-in generic module: a schema-enforced
-// dataset with no shared collection, always namespaced.
+// dataset with no canonical collection, always namespaced.
 const RecordsModule = "records"
 
 // DatasetDraft is the input to TypesAPI.AddDataset (and PartDraft's
 // Datasets).
 type DatasetDraft struct {
-	// Key is the dataset's slug inside its type — pinned. Namespaced
-	// datasets live in the collection `<typeId>_<key>`; a shared
-	// dataset's key is its module's canonical collection name and may
-	// be left empty to default to it.
+	// Key is the dataset's slug inside its type — pinned — and decides
+	// the collection. A key equal to the module's canonical collection
+	// name is that collection, the one every type declaring it
+	// addresses, so retyping an object keeps its records. Any other
+	// key is the collection `<typeId>_<key>`, this type's own. Empty
+	// defaults to the module's canonical name; a module without one,
+	// records among them, requires a key.
 	Key string
 	// Module is the serving module — "records" (the default when
 	// empty), or a registered module such as "editor" / "chat".
 	Module string
-	// Shared makes the type participate in the module's canonical
-	// collection instead of a namespaced one: two types sharing the
-	// editor give an object carrying both a single body. Legal only
-	// for modules with a canonical collection; at most one shared
-	// dataset per module per type. Never for records.
+	// Shared stores the dataset's records from every object in one
+	// collection per space, so they are read across objects as well as
+	// per object. A record keeps belonging to the object it was
+	// written on, and its id on reads is `<objectId>/<recordId>`.
+	// Records datasets only; pinned.
 	Shared bool
 
 	DisplayName string
@@ -360,6 +403,8 @@ type DatasetDraft struct {
 	// Search is the optional search-extraction annotation (x-search).
 	Search *SearchFields
 
+	// Indexes are the initial declared indexes. Records datasets only.
+	Indexes []IndexDraft
 	// Fields are the initial field definitions. Records datasets only —
 	// a module owns its schema and refuses fields.
 	Fields []DatasetFieldDraft
@@ -400,12 +445,15 @@ type DatasetFieldDraft struct {
 type DatasetDef struct {
 	Id string // head record id, immutable
 	// Key is the slug inside the type; Collection the name reads and
-	// writes address (the module's canonical collection when Shared,
-	// `<typeId>_<key>` otherwise) — server-computed, never client-set.
+	// writes address (the module's canonical collection when the key
+	// names it, `<typeId>_<key>` otherwise) — server-computed, never
+	// client-set.
 	Key        string
 	Collection string
 	Module     string
-	Shared     bool
+	// Shared: the records of every object live in one collection per
+	// space (DatasetDraft.Shared).
+	Shared bool
 	// PartId is the owning part's id.
 	PartId      string
 	DisplayName string
@@ -418,6 +466,9 @@ type DatasetDef struct {
 	SkipHistory bool
 	Search      *SearchFields
 	Fields      []DatasetFieldDef
+	// Indexes are the declared indexes in creation order, invalid ones
+	// included.
+	Indexes []IndexDef
 
 	// Invalid marks a definition whose folded declaration fails
 	// validation (InvalidReason says why). Invalid definitions never
@@ -425,6 +476,73 @@ type DatasetDef struct {
 	// (AddDatasetField) or removed.
 	Invalid       bool
 	InvalidReason string
+}
+
+// Index limits and the protocol paths an index may name next to
+// declared fields.
+const (
+	// MaxIndexFields bounds the paths of one index.
+	MaxIndexFields = schema.MaxIndexFields
+	// MaxDatasetIndexes bounds the indexes of one dataset.
+	MaxDatasetIndexes = schema.MaxDatasetIndexes
+	// IndexPathCreated orders records by creation within one object.
+	IndexPathCreated = schema.IndexPathCreated
+	// IndexPathObject is the object of a shared dataset's record.
+	IndexPathObject = schema.IndexPathObject
+)
+
+// IndexDraft declares a secondary index of a records dataset — input to
+// AddDataset / AddDatasetIndex. A filter or sort on a leading run of
+// its fields is a range read. Every part is pinned: change an index by
+// removing it and adding another.
+type IndexDraft struct {
+	// Key is the index's slug, unique within the dataset.
+	Key string
+	// Fields are the indexed paths in order, at most MaxIndexFields; a
+	// "-" prefix keeps that path descending. Each names a declared
+	// field of kind string, number, boolean or datetime, or
+	// IndexPathCreated; a shared dataset also takes IndexPathObject.
+	// An indexed field's key is letters, digits and "_", starts with a
+	// letter and is at most 48 bytes.
+	Fields []string
+	// Sparse leaves a record out of the index unless it carries every
+	// indexed field.
+	Sparse bool
+}
+
+// IndexDef is the compiled view of one declared index.
+type IndexDef struct {
+	// Id is the definition record's id — what RemoveDatasetIndex takes.
+	Id     string
+	Key    string
+	Fields []string
+	Sparse bool
+	// Invalid marks an index no collection builds (InvalidReason says
+	// why): a field it names is not a declared scalar field, or the
+	// dataset already holds MaxDatasetIndexes. It stays listed so it
+	// can be removed.
+	Invalid       bool
+	InvalidReason string
+}
+
+// IndexBuildPhase is the state an IndexBuild reports.
+type IndexBuildPhase int
+
+const (
+	IndexBuildStarted IndexBuildPhase = iota
+	IndexBuildDone
+	IndexBuildFailed
+)
+
+// IndexBuild reports the build of a shared dataset's missing declared
+// indexes on this device: Started before the collection is scanned,
+// then Done or Failed. Every write waits while a build runs.
+type IndexBuild struct {
+	// Dataset is the shared dataset's storage collection name.
+	Dataset string
+	Phase   IndexBuildPhase
+	// Err is set on IndexBuildFailed.
+	Err error
 }
 
 // DatasetFieldDef is the compiled view of one dataset field.

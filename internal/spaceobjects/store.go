@@ -29,6 +29,7 @@ import (
 	anystorev1 "github.com/anyproto/any-store"
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
@@ -181,8 +182,8 @@ type Store struct {
 
 	// modules are the caller-registered dataset modules by name;
 	// moduleInfos is the compile-time catalog (records included).
-	// canonicalRegs are the shared canonical collections' registrations
-	// — identical on every controller, built once; canonicalModule maps
+	// canonicalRegs are the canonical collections' registrations —
+	// identical on every controller, built once; canonicalModule maps
 	// each canonical collection back to its module. modulesTracked
 	// reports that some module instance opts into read tracking, which
 	// is what constructs the read-state engine when no static dataset
@@ -193,14 +194,14 @@ type Store struct {
 	canonicalModule map[string]string
 	modulesTracked  bool
 
-	// Static parts (handler.Type.Parts): a registered type's shared
+	// Static parts (handler.Type.Parts): a registered type's canonical
 	// module datasets seed the canonical collections' owner sets
-	// (staticSharedOwners) and the module namespaces (staticModuleOwners)
+	// (staticCanonicalOwners) and the module namespaces (staticModuleOwners)
 	// of every catalog snapshot; its namespaced module datasets are
 	// registrations built once here (staticInstanceRegs, module by
 	// collection in staticInstanceModule), owned through datasetOwners.
-	staticSharedOwners map[string]map[string]struct{}
-	staticModuleOwners map[string]map[string]struct{}
+	staticCanonicalOwners map[string]map[string]struct{}
+	staticModuleOwners    map[string]map[string]struct{}
 	// reservedModules are the configured modules with Reserved set —
 	// the one-branch fast path of ReservedCarrier when there are none.
 	reservedModules      []string
@@ -228,6 +229,9 @@ type Store struct {
 	mu         sync.Mutex
 	sharedColl anystore.Collection // per-space `objects` collection, lazy-opened
 	detached   anystore.Collection // per-space `_detached` collection, lazy-opened
+	// keyedColls are the per-space collections of shared datasets, by
+	// dataset name, lazy-opened and handed to every controller.
+	keyedColls map[string]anystore.Collection
 
 	// drainMu serializes Drain passes — see Store.Drain.
 	drainMu sync.Mutex
@@ -255,6 +259,23 @@ type Store struct {
 	applySeqs           *crdt.ApplySeqAllocator
 	applySeqBackfill    sync.Once
 	applySeqBackfillErr error
+
+	// indexBuilds reports builds of shared datasets' declared indexes
+	// (indexes.go); the index* fields are that worker's state.
+	indexBuilds  *fanout.Registry[IndexBuild]
+	indexMu      sync.Mutex
+	indexKick    chan struct{}
+	indexDone    chan struct{}
+	indexCancel  context.CancelFunc
+	indexClosed  bool
+	indexStarted bool
+	// indexHeld: type objects mid-replay, whose datasets the worker
+	// leaves alone.
+	indexHeld map[string]struct{}
+	// buildMu orders build reports against a subscription being added;
+	// building is the dataset whose build is in flight.
+	buildMu  sync.Mutex
+	building string
 
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
@@ -485,6 +506,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		engine:         subscribe.New(cfg.SpaceId),
 		changeSubs:     fanout.New[ObjectChange](),
 		rowEvents:      fanout.New[RowEvent](),
+		indexBuilds:    fanout.New[IndexBuild](),
 		disableHistory: cfg.DisableHistory,
 	}
 	s.spaceIndexObjId = s.deriveSpaceIndexId()
@@ -521,9 +543,9 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	infos := make([]types.ModuleInfo, 0, len(cfg.Modules))
 	for _, m := range cfg.Modules {
 		s.modules[m.Name] = m
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly, Reserved: m.Reserved})
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
 		if m.Canonical != "" {
-			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Shared: true})
+			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true})
 			if err != nil {
 				// ValidateExternalModules probes the same construction;
 				// a failure here is a programming error, not a runtime
@@ -538,7 +560,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 				s.modulesTracked = true
 			}
 		}
-		if !m.SharedOnly {
+		if !m.CanonicalOnly {
 			probe := m.New(handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"})
 			if probe.ReadTracking != nil {
 				s.modulesTracked = true
@@ -552,10 +574,10 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	// Static parts: a registered type's module datasets are ownership
-	// (shared) or registrations (namespaced), settled once here — the
+	// (canonical) or registrations (namespaced), settled once here — the
 	// same footing a runtime declaration reaches through the catalog.
 	// ValidateExternalModules has already refused what cannot resolve.
-	s.staticSharedOwners = map[string]map[string]struct{}{}
+	s.staticCanonicalOwners = map[string]map[string]struct{}{}
 	s.staticModuleOwners = map[string]map[string]struct{}{}
 	s.staticInstanceModule = map[string]string{}
 	own := func(set map[string]map[string]struct{}, key, typeId string) {
@@ -574,8 +596,8 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 		for _, md := range mods {
 			own(s.staticModuleOwners, md.module, t.Id)
-			if md.shared {
-				own(s.staticSharedOwners, md.collection, t.Id)
+			if md.canonical {
+				own(s.staticCanonicalOwners, md.collection, t.Id)
 				continue
 			}
 			m := s.modules[md.module]
@@ -927,14 +949,14 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 		if m.New == nil {
 			return fmt.Errorf("spaceobjects: module[%d] (%q): New is required", i, m.Name)
 		}
-		if m.SharedOnly && m.Canonical == "" {
-			return fmt.Errorf("spaceobjects: module[%d] (%q): SharedOnly requires Canonical", i, m.Name)
+		if m.CanonicalOnly && m.Canonical == "" {
+			return fmt.Errorf("spaceobjects: module[%d] (%q): CanonicalOnly requires Canonical", i, m.Name)
 		}
-		if m.Reserved && !m.SharedOnly {
+		if m.Reserved && !m.CanonicalOnly {
 			// A namespaced instance of a reserved module would be a
 			// per-type collection nobody but the consumer may declare —
 			// reservation exists for the one canonical install.
-			return fmt.Errorf("spaceobjects: module[%d] (%q): Reserved requires SharedOnly", i, m.Name)
+			return fmt.Errorf("spaceobjects: module[%d] (%q): Reserved requires CanonicalOnly", i, m.Name)
 		}
 		if m.Canonical != "" {
 			if err := schema.ValidateSlug("canonical collection", m.Canonical); err != nil {
@@ -950,11 +972,11 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 			if m.DataVersion == "" {
 				return fmt.Errorf("spaceobjects: module[%d] (%q): empty DataVersion", i, m.Name)
 			}
-			if _, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Shared: true}); err != nil {
+			if _, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true}); err != nil {
 				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical instance: %w", i, m.Name, err)
 			}
 		}
-		if !m.SharedOnly {
+		if !m.CanonicalOnly {
 			if _, err := moduleReg(m, handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"}); err != nil {
 				return fmt.Errorf("spaceobjects: module[%d] (%q): namespaced instance: %w", i, m.Name, err)
 			}
@@ -984,7 +1006,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 	infos := make([]types.ModuleInfo, 0, len(modules))
 	byName := make(map[string]handler.Module, len(modules))
 	for _, m := range modules {
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, SharedOnly: m.SharedOnly, Reserved: m.Reserved})
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
 		byName[m.Name] = m
 	}
 	catalog := types.NewModules(infos...)
@@ -994,7 +1016,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
 		}
 		for _, md := range mods {
-			if md.shared {
+			if md.canonical {
 				continue
 			}
 			if m, ok := byName[md.module]; ok && m.DataVersion == "" {
@@ -1020,6 +1042,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
 	s.stopSweep()
+	s.stopIndexSync()
 	if s.readMat != nil {
 		s.readMat.close()
 	}
@@ -1043,15 +1066,18 @@ type NamedSchema struct {
 	Name   string
 	Schema schema.Dataset
 	// Owners are the types that declare the dataset: one for a
-	// registered or namespaced dataset, every type declaring a shared
-	// dataset of the module for a canonical collection; empty for
-	// space-level built-ins. External indexers key their gating on it.
+	// registered or namespaced dataset, every type declaring it for a
+	// module's canonical collection; empty for space-level built-ins.
+	// External indexers key their gating on it.
 	Owners []string
 	// Module is the serving module (records for the generic kind);
-	// empty for built-ins and registered-type datasets. Shared marks a
-	// module's canonical collection.
+	// empty for built-ins and registered-type datasets.
 	Module string
+	// Shared marks a shared dataset: every object's records in one
+	// collection per space.
 	Shared bool
+	// Indexes are the dataset's valid declared indexes.
+	Indexes []schema.Index
 }
 
 // Schemas returns the declared schema of every dataset this store hosts —
@@ -1076,8 +1102,8 @@ func (s *Store) Schemas() []NamedSchema {
 	for _, reg := range s.canonicalRegs {
 		out = append(out, NamedSchema{
 			Name: reg.Name, Schema: reg.Schema,
-			Owners: sortedOwners(snap.sharedOwners[reg.Name]),
-			Module: s.canonicalModule[reg.Name], Shared: true,
+			Owners: sortedOwners(snap.canonicalOwners[reg.Name]),
+			Module: s.canonicalModule[reg.Name],
 		})
 	}
 	for _, reg := range s.staticInstanceRegs {
@@ -1089,7 +1115,13 @@ func (s *Store) Schemas() []NamedSchema {
 	}
 	for _, name := range sortedCatalogNames(snap) {
 		ds := snap.byName[name]
-		out = append(out, NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module})
+		ns := NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module, Shared: ds.Shared}
+		for _, idx := range ds.Indexes {
+			if !idx.Invalid {
+				ns.Indexes = append(ns.Indexes, idx.Index)
+			}
+		}
+		out = append(out, ns)
 	}
 	return out
 }
@@ -1199,7 +1231,7 @@ func (s *Store) DatasetOwners(dataset string) ([]string, bool) {
 		return []string{owner}, true
 	}
 	if _, canonical := s.canonicalModule[dataset]; canonical {
-		return sortedOwners(s.catalog.snapshot().sharedOwners[dataset]), true
+		return sortedOwners(s.catalog.snapshot().canonicalOwners[dataset]), true
 	}
 	if ds, ok := s.catalog.lookup(dataset); ok {
 		return []string{ds.TypeId}, true
@@ -1423,6 +1455,34 @@ func (s *Store) OpenObjectCollection(ctx context.Context, objectId, dataset stri
 	return s.db.OpenCollection(ctx, objectId+"_"+dataset)
 }
 
+// keyedCollection returns the per-space collection of a shared dataset
+// — `<spaceId>_<dataset>` — opening it on first call. Every object's
+// records of the dataset live there, under `<objectId>/<recordId>`;
+// the controllers ensure its indexes.
+func (s *Store) keyedCollection(ctx context.Context, dataset string) (anystore.Collection, error) {
+	s.mu.Lock()
+	if coll, ok := s.keyedColls[dataset]; ok {
+		s.mu.Unlock()
+		return coll, nil
+	}
+	s.mu.Unlock()
+	collName := s.spaceId + "_" + dataset
+	coll, err := s.db.Collection(ctx, collName)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.keyedColls[dataset]; ok {
+		return existing, nil
+	}
+	if s.keyedColls == nil {
+		s.keyedColls = make(map[string]anystore.Collection)
+	}
+	s.keyedColls[dataset] = coll
+	return coll, nil
+}
+
 // SharedObjects returns the per-space `objects` collection, opening
 // it on first call. Callers can hit it directly for cross-object
 // queries (find all rows where any.name = X, etc.). First open also
@@ -1528,6 +1588,18 @@ func (s *Store) DataVersionFor(ctx context.Context, dataset string) (string, err
 // collection name — one atomic snapshot load.
 func (s *Store) RuntimeDataset(dataset string) (types.CompiledDataset, bool) {
 	return s.catalog.lookup(dataset)
+}
+
+// IsKeyedDataset reports whether dataset is a shared dataset: its
+// records from every object live in one per-space collection under
+// `<objectId>/<recordId>`, so a read for one object bounds the
+// collection with crdt.KeyedRows.
+func (s *Store) IsKeyedDataset(dataset string) bool {
+	if s == nil {
+		return false
+	}
+	ds, ok := s.catalog.lookup(dataset)
+	return ok && ds.Shared
 }
 
 // DatasetDecl resolves any known dataset's schema declaration:
@@ -1753,6 +1825,7 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	// includes the per-object history collections; the space-level history
 	// leftovers (trace rows, stale-flag row) need their own purge.
 	s.dropObjectCollections(ctx, objectId)
+	s.purgeKeyedRows(ctx, objectId)
 	s.purgeHistoryRows(ctx, objectId)
 	_ = s.unmarkSkipped(ctx, objectId)
 	// A deleted TYPE object must leave the runtime catalog, or its
@@ -1885,6 +1958,7 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 			// refresh below would re-add the deleted type's names.
 			s.dropObjectCollections(ctx, p.id)
 		}
+		s.purgeKeyedRows(ctx, p.id)
 		s.purgeHistoryRows(ctx, p.id)
 		s.Drop(p.id)
 		// See purgeObject: a deleted type object leaves the catalog.
@@ -1901,6 +1975,120 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		}
 	}
 	return nil
+}
+
+// keyedPurgeChunk bounds one delete transaction of purgeKeyedRows.
+const keyedPurgeChunk = 5000
+
+// keyedDatasets lists the shared datasets of the current catalog,
+// sorted.
+func (s *Store) keyedDatasets() []string {
+	snap := s.catalog.snapshot()
+	var names []string
+	for name, ds := range snap.byName {
+		if ds.Shared {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// purgeKeyedRows deletes objectId's rows from the per-space collection
+// of every shared dataset and tells live queries which rows went.
+// Best-effort like the rest of the purge: a failure is logged and the
+// rows stay until a later reconcile purges the object again.
+func (s *Store) purgeKeyedRows(ctx context.Context, objectId string) {
+	for _, dataset := range s.purgeDatasets() {
+		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
+			storeLog.Warn("purge: shared dataset rows",
+				zap.String("treeId", objectId), zap.String("dataset", dataset), zap.Error(err))
+		}
+	}
+}
+
+// purgeDatasets lists the shared datasets a purge clears: the
+// catalog's, and every one whose collection this store opened — a
+// definition removed, or absent while its type object replays, still
+// holds the object's rows.
+func (s *Store) purgeDatasets() []string {
+	names := s.keyedDatasets()
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		seen[name] = struct{}{}
+	}
+	s.mu.Lock()
+	for name := range s.keyedColls {
+		if _, ok := seen[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(names)
+	return names
+}
+
+// keyedChunkIds reads the document ids of the next chunk a
+// deleteKeyedRows transaction removes.
+func keyedChunkIds(ctx context.Context, coll anystore.Collection, rows query.Filter) ([]string, error) {
+	iter, err := coll.Find(rows).Limit(keyedPurgeChunk).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var ids []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, doc.Value().GetString(crdt.IdField))
+	}
+	return ids, iter.Err()
+}
+
+// KeyedCollection returns the per-space collection of the shared
+// dataset: every object's records, each under `<objectId>/<recordId>`.
+// ok is false when dataset is not a shared dataset of this space.
+func (s *Store) KeyedCollection(ctx context.Context, dataset string) (coll anystore.Collection, ok bool, err error) {
+	if !s.IsKeyedDataset(dataset) {
+		return nil, false, nil
+	}
+	coll, err = s.keyedCollection(ctx, dataset)
+	return coll, err == nil, err
+}
+
+// deleteKeyedRows removes objectId's rows from one shared dataset's
+// collection — a range of its primary key — in bounded transactions,
+// and tells live queries which rows went once each chunk is gone. The
+// ids are read whether or not anyone listens: a query that subscribes
+// while a delete runs saw the rows. An object with no rows costs one
+// read and no write.
+func (s *Store) deleteKeyedRows(ctx context.Context, dataset, objectId string) error {
+	coll, err := s.keyedCollection(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	filter := crdt.KeyedRows(objectId)
+	for {
+		ids, err := keyedChunkIds(ctx, coll, filter)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		res, err := coll.Find(filter).Limit(keyedPurgeChunk).Delete(ctx)
+		if err != nil {
+			return err
+		}
+		if s.engine != nil {
+			s.engine.NotifyRecordsDeleted(s.spaceId, dataset, objectId, ids)
+		}
+		if res.Matched == 0 && res.Modified == 0 {
+			return nil
+		}
+	}
 }
 
 // dropObjectCollections drops every `<objectId>_<dataset>` collection
@@ -2589,6 +2777,13 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	shared := crdt.SharedCollections{}
 	for _, name := range sharedNames {
 		coll, cerr := s.SharedObjects(ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		shared[name] = coll
+	}
+	for _, name := range crdt.KeyedNames(regs) {
+		coll, cerr := s.keyedCollection(ctx, name)
 		if cerr != nil {
 			return nil, cerr
 		}

@@ -15,13 +15,13 @@ import (
 )
 
 // notesModule is a stand-in for a compiled-in dataset module (the
-// editor, the chat): a shared canonical collection plus namespaced
-// instances, one free-form record shape, a per-object counter in the
-// module's namespace.
+// editor, the chat): a canonical collection plus namespaced instances,
+// one free-form record shape, a per-object counter in the module's
+// namespace.
 func notesModule() handler.Module {
 	return handler.Module{
 		Name:        "notes",
-		Canonical:   "notes_shared",
+		Canonical:   "notes_body",
 		DataVersion: "notes-v1",
 		Properties: []handler.PropertyDecl{
 			{Id: "pinned", Name: "Pinned", Kind: handler.PropertyKindBoolean},
@@ -36,14 +36,15 @@ func notesModule() handler.Module {
 	}
 }
 
-// TestE2E_TypeParts_ModulesSharedAndNamespaced covers the module
-// surface on one device: two types sharing the module's canonical
-// collection give an object carrying either a single body, a
-// namespaced instance is its own collection served by the module, a
-// write to a collection none of the object's types declare is refused
-// without attaching anything, and the module's namespace on the
-// objects row opens with the declaration.
-func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
+// TestE2E_TypeParts_ModulesCanonicalAndNamespaced covers the module
+// surface on one device. The key decides the collection: no key or the
+// canonical name is the module's canonical collection, so two types
+// declaring it give an object carrying either a single body; any other
+// key is a namespaced instance served by the module. A write to a
+// collection none of the object's types declare is refused without
+// attaching anything, and the module's namespace on the objects row
+// opens with the declaration.
+func TestE2E_TypeParts_ModulesCanonicalAndNamespaced(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
@@ -74,33 +75,39 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	// declares it, with no owners.
 	var canonical *space.DatasetSchema
 	for _, ds := range sp.Datasets() {
-		if ds.Name == "notes_shared" {
+		if ds.Name == "notes_body" {
 			c := ds
 			canonical = &c
 		}
 	}
 	require.NotNil(t, canonical, "the module's canonical collection registers statically")
 	assert.Equal(t, "notes", canonical.Module)
-	assert.True(t, canonical.Shared)
 	assert.Empty(t, canonical.Owners)
 
-	// Page and Meeting both share the module; Meeting adds a namespaced
-	// summary instance under a second part.
+	// Page declares the module with no key, Meeting with the canonical
+	// name spelled out: both are the canonical collection. Meeting adds
+	// a namespaced summary instance under a second part.
 	pageId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Page"})
 	require.NoError(t, err)
 	_, err = sp.Types().AddPart(ctx, pageId, space.PartDraft{
-		Key: "body", Datasets: []space.DatasetDraft{{Module: "notes", Shared: true}},
+		Key: "body", Datasets: []space.DatasetDraft{{Module: "notes"}},
 	})
-	require.NoError(t, err, "a shared dataset defaults its key to the canonical")
+	require.NoError(t, err)
+	pageDefs, err := sp.Types().Datasets(ctx, pageId)
+	require.NoError(t, err)
+	require.Len(t, pageDefs, 1)
+	assert.Equal(t, "notes_body", pageDefs[0].Key, "a module dataset with no key takes the canonical name as its key")
+	assert.Equal(t, "notes_body", pageDefs[0].Collection, "a module dataset with no key is the canonical collection")
+	assert.Equal(t, "notes", pageDefs[0].Module)
 	meetingId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Meeting"})
 	require.NoError(t, err)
 	bodyPart, err := sp.Types().AddPart(ctx, meetingId, space.PartDraft{
 		Key: "description", Name: "Description",
-		Datasets: []space.DatasetDraft{{Key: "notes_shared", Module: "notes", Shared: true}},
+		Datasets: []space.DatasetDraft{{Key: "notes_body", Module: "notes"}},
 	})
 	require.NoError(t, err)
 	summaryPart, err := sp.Types().AddPart(ctx, meetingId, space.PartDraft{
-		Key: "summary", Name: "Summary", Uses: []string{"notes_shared"},
+		Key: "summary", Name: "Summary", Uses: []string{"notes_body"},
 		Datasets: []space.DatasetDraft{{Key: "summary", Module: "notes"}},
 	})
 	require.NoError(t, err)
@@ -112,22 +119,29 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	for _, d := range defs {
 		byKey[d.Key] = d
 	}
-	assert.Equal(t, "notes_shared", byKey["notes_shared"].Collection)
-	assert.True(t, byKey["notes_shared"].Shared)
-	assert.Equal(t, bodyPart, byKey["notes_shared"].PartId)
-	assert.Equal(t, meetingId+"_summary", byKey["summary"].Collection)
+	assert.Equal(t, "notes_body", byKey["notes_body"].Collection, "a module dataset keyed by the canonical name is the canonical collection")
+	assert.Equal(t, "notes", byKey["notes_body"].Module)
+	assert.Equal(t, bodyPart, byKey["notes_body"].PartId)
+	assert.Equal(t, meetingId+"_summary", byKey["summary"].Collection, "a module dataset with any other key is namespaced under its type")
 	assert.Equal(t, "notes", byKey["summary"].Module)
 	assert.Equal(t, summaryPart, byKey["summary"].PartId)
 	parts, err := sp.Types().Parts(ctx, meetingId)
 	require.NoError(t, err)
 	require.Len(t, parts, 2)
-	assert.Equal(t, []string{"notes_shared"}, parts[1].Uses)
+	assert.Equal(t, []string{"notes_body"}, parts[1].Uses)
 
-	// Rule violations are refused at declaration time.
+	// Rule violations are refused at declaration time. The canonical
+	// dataset is one key on its type: declaring it again, keyed or not,
+	// is a duplicate.
 	_, err = sp.Types().AddPart(ctx, meetingId, space.PartDraft{
-		Key: "second", Datasets: []space.DatasetDraft{{Module: "notes", Shared: true}},
+		Key: "second", Datasets: []space.DatasetDraft{{Module: "notes"}},
 	})
-	require.Error(t, err, "at most one shared dataset per module per type")
+	require.ErrorContains(t, err, "is already declared on type", "a second part declaring the canonical dataset is a duplicate key")
+	_, err = sp.Types().AddDataset(ctx, meetingId, summaryPart, space.DatasetDraft{Key: "notes_body", Module: "notes"})
+	require.ErrorContains(t, err, "is already declared on type", "AddDataset of the canonical dataset again is a duplicate key")
+	defs, err = sp.Types().Datasets(ctx, meetingId)
+	require.NoError(t, err)
+	require.Len(t, defs, 2, "a refused declaration writes nothing")
 	_, err = sp.Types().AddPart(ctx, meetingId, space.PartDraft{
 		Key: "fields", Datasets: []space.DatasetDraft{{Key: "extra", Module: "notes",
 			Fields: []space.DatasetFieldDraft{{Key: "x", Kind: space.PropertyKindString}}}},
@@ -142,19 +156,23 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	})
 	require.ErrorIs(t, err, space.ErrModuleOwned)
 
-	// Discovery: the canonical carries both owners now.
+	// Discovery: one canonical entry listing both declaring types, and
+	// the namespaced instance owned by Meeting alone. Neither spelling
+	// of the canonical key mints a per-type collection.
+	seen := map[string]space.DatasetSchema{}
 	for _, ds := range sp.Datasets() {
-		if ds.Name == "notes_shared" {
-			assert.ElementsMatch(t, []string{pageId, meetingId}, ds.Owners)
-		}
-		if ds.Name == meetingId+"_summary" {
-			assert.Equal(t, []string{meetingId}, ds.Owners)
-			assert.Equal(t, "notes", ds.Module)
-			assert.False(t, ds.Shared)
-		}
+		seen[ds.Name] = ds
 	}
+	require.Contains(t, seen, "notes_body")
+	assert.ElementsMatch(t, []string{pageId, meetingId}, seen["notes_body"].Owners, "every type declaring the canonical dataset owns the canonical collection")
+	assert.Equal(t, "notes", seen["notes_body"].Module)
+	require.Contains(t, seen, meetingId+"_summary")
+	assert.Equal(t, []string{meetingId}, seen[meetingId+"_summary"].Owners)
+	assert.Equal(t, "notes", seen[meetingId+"_summary"].Module)
+	assert.NotContains(t, seen, pageId+"_notes_body", "an unkeyed canonical declaration is not namespaced")
+	assert.NotContains(t, seen, meetingId+"_notes_body", "the canonical key spelled out is not namespaced")
 
-	// An object carrying only Page writes the shared body.
+	// An object carrying only Page writes the canonical body.
 	obj, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: pageId})
 	require.NoError(t, err)
 	write := func(dataset, text string) (space.ModifyResult, error) {
@@ -163,7 +181,7 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 			Records: []space.RecordModify{{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Path: "text", Value: text}}}},
 		})
 	}
-	res, err := write("notes_shared", "hello")
+	res, err := write("notes_body", "hello")
 	require.NoError(t, err)
 	require.Empty(t, res.Rejections)
 	require.Len(t, res.RecordIds, 1)
@@ -219,7 +237,7 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	// collection) and opens the summary.
 	_, err = sp.Properties().SetType(ctx, obj, meetingId)
 	require.NoError(t, err)
-	rows, err := sp.Query(obj, "notes_shared").All(ctx)
+	rows, err := sp.Query(obj, "notes_body").All(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "hello", string(rows[0].GetStringBytes("text")))
@@ -231,15 +249,16 @@ func TestE2E_TypeParts_ModulesSharedAndNamespaced(t *testing.T) {
 	require.Len(t, rows, 1)
 	assert.Equal(t, "tl;dr", string(rows[0].GetStringBytes("text")))
 
-	// Removing Meeting's shared part withdraws only its ownership: the
-	// canonical collection stays registered, Page still owns it.
+	// Removing Meeting's canonical part withdraws only its ownership:
+	// the canonical collection stays registered, Page still owns it.
 	require.NoError(t, sp.Types().RemovePart(ctx, meetingId, bodyPart))
+	seen = map[string]space.DatasetSchema{}
 	for _, ds := range sp.Datasets() {
-		if ds.Name == "notes_shared" {
-			assert.Equal(t, []string{pageId}, ds.Owners)
-		}
+		seen[ds.Name] = ds
 	}
-	_, err = write("notes_shared", "again")
+	require.Contains(t, seen, "notes_body", "the canonical collection stays registered")
+	assert.Equal(t, []string{pageId}, seen["notes_body"].Owners)
+	_, err = write("notes_body", "again")
 	require.ErrorIs(t, err, space.ErrDatasetNotDeclared, "the object now carries only Meeting, which no longer declares the body")
 	_, err = write(meetingId+"_summary", "still mine")
 	require.NoError(t, err)

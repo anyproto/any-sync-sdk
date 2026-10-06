@@ -30,16 +30,21 @@ type DatasetSchema struct {
 	Name       string
 	JSONSchema json.RawMessage
 	// Owners are the types that declare the dataset: exactly one for a
-	// registered-type or namespaced dataset, every type declaring a
-	// shared dataset of the module for a canonical collection (empty
-	// while nothing declares it), none for space-level built-ins.
+	// registered-type or namespaced dataset, every type declaring it
+	// for a module's canonical collection (empty while nothing declares
+	// it), none for space-level built-ins.
 	// Consumers gate indexing/eviction on it — an object may hold the
 	// dataset when it carries one of the owners.
 	Owners []string
 	// Module is the serving module ("records" for the generic
 	// schema-enforced kind, "editor" / "chat" for registered modules);
-	// empty for built-ins and registered-type datasets. Shared marks a
-	// module's canonical collection.
+	// empty for built-ins and registered-type datasets.
 	Module string
+	// Shared marks a shared dataset (DatasetDraft.Shared): the records
+	// of every object live in one collection per space, and a record's
+	// id on reads is `<objectId>/<recordId>`.
 	Shared bool
+	// Indexes are the dataset's valid declared indexes (an invalid
+	// definition is listed by TypesAPI.Datasets only).
+	Indexes []IndexDraft
 }

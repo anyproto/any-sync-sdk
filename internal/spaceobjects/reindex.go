@@ -133,6 +133,25 @@ func (s *Store) captureLocalLeaves(ctx context.Context, objectId string, ctrl *c
 				continue // never materialized
 			}
 			out, err = s.captureSharedRow(ctx, coll, objectId, dataset, ctrl, out)
+		} else if ctrl.IsKeyed(dataset) {
+			// The object's rows in a shared dataset's per-space
+			// collection: the handle is the store's and outlives the
+			// wipe, which deletes rows, not the collection.
+			fields := ctrl.LocalFields(dataset)
+			if len(fields) == 0 {
+				continue
+			}
+			coll := ctrl.Collection(ctx, dataset)
+			if coll == nil {
+				continue
+			}
+			n := len(out)
+			out, err = captureRecordFields(ctx, coll, dataset, fields, crdt.KeyedRows(objectId), out)
+			// A leaf is restored through a local write, which takes
+			// the record id a change carries.
+			for i := n; i < len(out); i++ {
+				out[i].RecordId = crdt.KeyedRecordId(objectId, out[i].RecordId)
+			}
 		} else {
 			fields := ctrl.LocalFields(dataset)
 			if len(fields) == 0 {
@@ -149,7 +168,7 @@ func (s *Store) captureLocalLeaves(ctx context.Context, objectId string, ctrl *c
 			if oerr != nil {
 				continue // never materialized
 			}
-			out, err = captureRecordFields(ctx, coll, dataset, fields, out)
+			out, err = captureRecordFields(ctx, coll, dataset, fields, nil, out)
 		}
 		if err != nil {
 			storeLog.Warn("reindex: capture local values",
@@ -216,10 +235,15 @@ func (s *Store) captureSharedRow(ctx context.Context, coll anystore.Collection, 
 }
 
 // captureRecordFields captures one declared local field across every
-// record of a per-object dataset that carries it.
-func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset string, fields []string, out []localLeaf) ([]localLeaf, error) {
+// record of a dataset that carries it. rows narrows the scan to the
+// object's own rows where the collection holds several objects'; nil
+// for a per-object collection.
+func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset string, fields []string, rows query.Filter, out []localLeaf) ([]localLeaf, error) {
 	for _, field := range fields {
-		filter := query.Key{Path: []string{field}, Filter: query.Exists{}}
+		var filter query.Filter = query.Key{Path: []string{field}, Filter: query.Exists{}}
+		if rows != nil {
+			filter = query.And{rows, filter}
+		}
 		iter, err := coll.Find(filter).Iter(ctx)
 		if err != nil {
 			return out, err
@@ -278,9 +302,12 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 // once the replay lands the defs; only local writes see a transient
 // type_unknown rejection.
 //
-// Live subscriptions are not notified of the wipe (nothing here reaches
-// the subscribe engine): a window keeps its rows and sees the replay as
-// one update per change in the tree, converging when it ends.
+// Live subscriptions are not notified of the wipe of the object's own
+// collections: a window keeps its rows and sees the replay as one
+// update per change in the tree, converging when it ends. The object's
+// rows in a shared dataset's collection are the exception — a reader
+// across objects holds them without having loaded the object, so it is
+// told they left, and the replay adds back the ones it rebuilds.
 func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crdt.Controller) error {
 	for _, dataset := range ctrl.RegisteredDatasets() {
 		if !ctrl.IsShared(dataset) {
@@ -292,6 +319,18 @@ func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crd
 		}
 		if err := coll.DeleteId(ctx, objectId); err != nil && !errors.Is(err, anystore.ErrDocNotFound) {
 			return fmt.Errorf("spaceobjects: reindex clear %s row %s: %w", dataset, objectId, err)
+		}
+	}
+	// The object's rows in each shared dataset's per-space collection.
+	for _, dataset := range ctrl.RegisteredDatasets() {
+		if !ctrl.IsKeyed(dataset) {
+			continue
+		}
+		// Told to live queries: a reader across objects holds these
+		// rows without having loaded the object, and the replay re-adds
+		// the ones it rebuilds.
+		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
+			return fmt.Errorf("spaceobjects: reindex clear %s rows of %s: %w", dataset, objectId, err)
 		}
 	}
 	if err := s.dropObjectCollectionsChecked(ctx, objectId); err != nil {

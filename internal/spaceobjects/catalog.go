@@ -14,9 +14,9 @@ package spaceobjects
 // Two kinds of entry come out of a compile. A NAMESPACED dataset
 // (`<typeId>_<key>`) gets its own registration — the generic schema
 // handler for `records`, the module's factory for anything else — and
-// is owned by exactly one type. A SHARED dataset names the module's
-// canonical collection, which every controller registers statically;
-// the catalog only records which types own it.
+// is owned by exactly one type. A CANONICAL dataset is keyed by its
+// module's canonical collection, which every controller registers
+// statically; the catalog only records which types own it.
 
 import (
 	"context"
@@ -32,6 +32,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
@@ -70,11 +71,11 @@ type catalogSnapshot struct {
 	// Handlers are read-only after construction, so sharing them across
 	// controllers is safe.
 	regs map[string]crdt.HandlerReg
-	// sharedOwners maps a module's canonical collection to the types
-	// declaring a shared dataset of it; moduleOwners maps a module name
-	// to the types declaring any dataset of it (shared or namespaced).
-	sharedOwners map[string]map[string]struct{}
-	moduleOwners map[string]map[string]struct{}
+	// canonicalOwners maps a module's canonical collection to the types
+	// declaring it; moduleOwners maps a module name to the types
+	// declaring any dataset of it (canonical or namespaced).
+	canonicalOwners map[string]map[string]struct{}
+	moduleOwners    map[string]map[string]struct{}
 	// moduleOf maps a namespaced collection to its module.
 	moduleOf map[string]string
 }
@@ -176,7 +177,6 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 		return
 	}
 	s.catalog.mu.Lock()
-	defer s.catalog.mu.Unlock()
 	prev := s.catalog.snap.Load()
 	byType := make(map[string]*types.CompiledType, len(prev.byType)+1)
 	for k, v := range prev.byType {
@@ -188,21 +188,25 @@ func (s *Store) refreshType(ctx context.Context, typeId string) {
 		byType[typeId] = compiled
 	}
 	s.catalog.snap.Store(s.resolveCatalog(byType))
+	s.catalog.mu.Unlock()
+	// A shared dataset's declared indexes follow the catalog. A no-op
+	// for a type whose replay holds the worker (holdIndexSync).
+	s.kickIndexSync()
 }
 
 // resolveCatalog folds per-type compiles into the resolved snapshot:
-// invalid definitions never register; a shared dataset only adds its
-// type to the canonical collection's owner set; a namespaced dataset
+// invalid definitions never register; a canonical dataset only adds
+// its type to that collection's owner set; a namespaced dataset
 // gets its registration built from the module (or the generic schema
 // handler for records).
 func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSnapshot {
 	snap := &catalogSnapshot{
-		byName:       map[string]types.CompiledDataset{},
-		byType:       byType,
-		regs:         map[string]crdt.HandlerReg{},
-		sharedOwners: map[string]map[string]struct{}{},
-		moduleOwners: map[string]map[string]struct{}{},
-		moduleOf:     map[string]string{},
+		byName:          map[string]types.CompiledDataset{},
+		byType:          byType,
+		regs:            map[string]crdt.HandlerReg{},
+		canonicalOwners: map[string]map[string]struct{}{},
+		moduleOwners:    map[string]map[string]struct{}{},
+		moduleOf:        map[string]string{},
 	}
 	own := func(set map[string]map[string]struct{}, key, typeId string) {
 		m := set[key]
@@ -215,9 +219,9 @@ func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSn
 	// Registered types' static module declarations are owners on every
 	// snapshot. Copied in, never aliased: a runtime fold mutates the
 	// per-key sets.
-	for coll, set := range s.staticSharedOwners {
+	for coll, set := range s.staticCanonicalOwners {
 		for typeId := range set {
-			own(snap.sharedOwners, coll, typeId)
+			own(snap.canonicalOwners, coll, typeId)
 		}
 	}
 	for module, set := range s.staticModuleOwners {
@@ -230,16 +234,15 @@ func (s *Store) resolveCatalog(byType map[string]*types.CompiledType) *catalogSn
 			if ds.Invalid {
 				continue
 			}
-			if ds.Shared {
+			if ds.Canonical {
 				if _, static := s.dataVersions[ds.Name]; !static {
-					// The compile already refused a shared dataset of a
-					// module without a canonical; a canonical the store
-					// does not register is a module the config lacks.
-					storeLog.Warn("catalog: shared dataset of an unregistered module",
+					// A canonical the store does not register is a module
+					// the config lacks.
+					storeLog.Warn("catalog: canonical dataset of an unregistered module",
 						zap.String("collection", ds.Name), zap.String("typeId", ds.TypeId))
 					continue
 				}
-				own(snap.sharedOwners, ds.Name, ds.TypeId)
+				own(snap.canonicalOwners, ds.Name, ds.TypeId)
 				own(snap.moduleOwners, ds.Module, ds.TypeId)
 				continue
 			}
@@ -275,14 +278,30 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 		if err != nil {
 			return crdt.HandlerReg{}, err
 		}
-		return crdt.HandlerReg{
+		reg := crdt.HandlerReg{
 			Name:        ds.Name,
 			Handler:     sh,
 			Schema:      ds.Schema,
 			SchemaRev:   ds.SchemaRev,
 			SkipHistory: ds.SkipHistory,
 			Version:     crdt.SchemaHandlerVersion,
-		}, nil
+			// A shared dataset's records live in one collection per
+			// space (Store.keyedCollection).
+			Keyed: ds.Shared,
+		}
+		if ds.Shared {
+			// Rows materialized per object — by an SDK that predates
+			// shared datasets, which ignores the marker — are in the
+			// wrong collection: a version of its own makes the objects
+			// holding them stale, and their re-index moves the rows.
+			reg.Version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, sharedLayoutVersion)
+		} else {
+			// A per-object collection carries the declared indexes
+			// from its open; the store indexes a shared one.
+			reg.Indexes = ds.StoreIndexes()
+			reg.PruneIndexPrefix = schema.IndexStorePrefix
+		}
+		return reg, nil
 	}
 	m, ok := s.modules[ds.Module]
 	if !ok {
@@ -297,6 +316,11 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 	reg.SchemaRev = ds.SchemaRev
 	return reg, nil
 }
+
+// sharedLayoutVersion is the consumer half of a shared dataset's
+// registration version: it tells rows in the per-space collection from
+// rows the same schema handler materialized per object.
+const sharedLayoutVersion = 1
 
 // moduleReg instantiates a module for one collection and turns the
 // returned dataset into a controller registration. A nil Handler gets

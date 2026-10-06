@@ -33,6 +33,14 @@ type queryImpl struct {
 	store    *spaceobjects.Store
 	objectId string
 	dataset  string
+	// allObjects reads a shared dataset across every object that holds
+	// it (Space.QueryDataset); objectId is unused.
+	allObjects bool
+	// rows bounds a per-object read to the object's key range. Set when
+	// the collection is resolved, from the controller that supplies it:
+	// the catalog may no longer call the dataset shared while a resident
+	// controller still reads the per-space collection.
+	rows query.Filter
 
 	// filter / sort hold the parsed query.Filter / query.Sort. Parse
 	// errors are stashed in parseErr and surfaced on the first
@@ -48,6 +56,38 @@ type queryImpl struct {
 
 func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
 	return &queryImpl{store: store, objectId: objectId, dataset: dataset}
+}
+
+// scoped is the filter a read runs: the caller's, narrowed to the
+// object's rows when the collection holds every object's (q.rows).
+func (q *queryImpl) scoped() query.Filter {
+	switch {
+	case q.rows == nil:
+		return q.filter
+	case q.filter == nil:
+		return q.rows
+	}
+	return query.And{q.rows, q.filter}
+}
+
+// newDatasetQuery builds a queryImpl over the per-space collection of a
+// shared dataset — every object's records, no object named.
+func newDatasetQuery(store *spaceobjects.Store, dataset string) *queryImpl {
+	return &queryImpl{store: store, dataset: dataset, allObjects: true}
+}
+
+// resolveDatasetCollection resolves the per-space collection of a
+// shared dataset. No object is loaded: the read sees the space's
+// materialized state, as a QueryObjects read does.
+func resolveDatasetCollection(ctx context.Context, store *spaceobjects.Store, dataset string) (anystore.Collection, error) {
+	coll, ok, err := store.KeyedCollection(ctx, dataset)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("query: %w: %q", space.ErrDatasetNotShared, dataset)
+	}
+	return coll, nil
 }
 
 // sharedObjectsDataset is the sentinel dataset name that makes the
@@ -192,7 +232,7 @@ func (q *queryImpl) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.
 		return &space.QueryResult{Initial: nil, Total: total}, nil
 	}
 
-	combined, err := combineWithTombstoneSkip(q.filter)
+	combined, err := combineWithTombstoneSkip(q.scoped())
 	if err != nil {
 		return nil, err
 	}
@@ -288,27 +328,26 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 
 	// Resolve scope from the original builder shape.
 	var scope subscribe.Scope
-	if q.dataset == sharedObjectsDataset {
+	switch {
+	case q.dataset == sharedObjectsDataset:
 		scope = subscribe.Scope{Shared: true}
-	} else {
+	case q.allObjects:
+		scope = subscribe.Scope{AllObjects: true, Dataset: q.dataset}
+	default:
 		scope = subscribe.Scope{Shared: false, ObjectId: q.objectId, Dataset: q.dataset}
-	}
-
-	// Combine user filter with the tombstone-skip clause so the engine
-	// matches what the snapshot path returns (queryIterator.Next drops
-	// _deletedAt rows post-iteration; we push it into the filter for
-	// the live path).
-	combined, err := combineWithTombstoneSkip(q.filter)
-	if err != nil {
-		return nil, err
 	}
 
 	var (
 		sharedColl anystore.Collection
 		obj        *object.Object
+		err        error
 	)
 	if scope.Shared {
 		if sharedColl, err = q.store.SharedObjects(ctx); err != nil {
+			return nil, err
+		}
+	} else if scope.AllObjects {
+		if sharedColl, err = resolveDatasetCollection(ctx, q.store, q.dataset); err != nil {
 			return nil, err
 		}
 	} else {
@@ -326,13 +365,24 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			// not run under engine.mu. Under the fence the lookup is
 			// then a map hit; nil stays nil until a first row lands.
 			obj.Controller().Collection(ctx, q.dataset)
+			if obj.Controller().IsKeyed(q.dataset) {
+				q.rows = crdt.KeyedRows(q.objectId)
+			}
 		}
+	}
+	// Combine user filter with the tombstone-skip clause so the engine
+	// matches what the snapshot path returns (queryIterator.Next drops
+	// _deletedAt rows post-iteration; we push it into the filter for
+	// the live path).
+	combined, err := combineWithTombstoneSkip(q.scoped())
+	if err != nil {
+		return nil, err
 	}
 	// collection resolves the dataset's collection from the already
 	// resident owner; nil means nothing materialised yet. Safe under
 	// engine.mu: no object load, no DAG apply.
 	collection := func(ctx context.Context) anystore.Collection {
-		if scope.Shared {
+		if scope.Shared || scope.AllObjects {
 			return sharedColl
 		}
 		if obj == nil {
@@ -468,7 +518,7 @@ func (q *queryImpl) Count(ctx context.Context) (int, error) {
 	if coll == nil {
 		return 0, nil
 	}
-	filter := q.filter
+	filter := q.scoped()
 	if !q.opts.IncludeDeleted {
 		filter, err = combineWithTombstoneSkip(filter)
 		if err != nil {
@@ -507,7 +557,14 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 // accessor and isn't worth it — querying a typo dataset name already
 // silently returns empty in any-store too.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
-	return resolveCollection(ctx, q.store, q.objectId, q.dataset)
+	if q.allObjects {
+		return resolveDatasetCollection(ctx, q.store, q.dataset)
+	}
+	coll, keyed, err := resolveCollection(ctx, q.store, q.objectId, q.dataset)
+	if keyed {
+		q.rows = crdt.KeyedRows(q.objectId)
+	}
+	return coll, err
 }
 
 // resolveCollection is the dataset → any-store collection lookup
@@ -515,9 +572,10 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 // "<shared:objects>" selects the per-space objects collection;
 // anything else goes through the object's controller. See
 // queryImpl.collection for the (nil, nil) empty-dataset contract.
-func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (anystore.Collection, error) {
+func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (coll anystore.Collection, keyed bool, err error) {
 	if dataset == sharedObjectsDataset {
-		return store.SharedObjects(ctx)
+		coll, err = store.SharedObjects(ctx)
+		return coll, false, err
 	}
 	// A resident controller built before a runtime dataset was defined
 	// doesn't know its collection; reload it so a just-defined dataset
@@ -525,9 +583,10 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	store.EnsureDatasetRegistered(ctx, objectId, dataset)
 	obj, err := store.Get(ctx, objectId)
 	if err != nil {
-		return nil, fmt.Errorf("query: %w", err)
+		return nil, false, fmt.Errorf("query: %w", err)
 	}
-	return obj.Controller().Collection(ctx, dataset), nil
+	// keyed comes from the controller that supplies the collection.
+	return obj.Controller().Collection(ctx, dataset), obj.Controller().IsKeyed(dataset), nil
 }
 
 // emptyIterator is the Iter() result when the dataset has no
@@ -550,8 +609,8 @@ func (q *queryImpl) build(coll anystore.Collection) (anystore.Query, error) {
 		return nil, q.parseErr
 	}
 	var out anystore.Query
-	if q.filter != nil {
-		out = coll.Find(q.filter)
+	if filter := q.scoped(); filter != nil {
+		out = coll.Find(filter)
 	} else {
 		out = coll.Find(nil)
 	}

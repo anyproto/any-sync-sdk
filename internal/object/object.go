@@ -492,6 +492,9 @@ type WriteResult struct {
 	ChangeId   string
 	RecordIds  []string
 	Rejections []crdt.OpRejection
+	// ApplySeq is the per-space apply sequence the change stamped on the
+	// records it wrote (their _applySeq).
+	ApplySeq uint64
 }
 
 // LocalWrite applies a CRDT batch as a new tree change. Encodes the
@@ -514,6 +517,16 @@ type WriteResult struct {
 // requires the caller to hold tree.Lock — without it, any-sync
 // logs "use tree when unlocked" at ERROR.
 func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, error) {
+	return o.LocalWriteIf(ctx, ch, nil)
+}
+
+// LocalWriteIf is LocalWrite conditional, when ifUnchangedSince is
+// non-nil, on the change's dataset being unchanged since that apply
+// sequence (crdt.Controller.ChangedSince). The check runs under
+// tree.Lock, which every apply takes, so nothing lands between it and
+// the write; a dataset that changed is crdt.ErrPreconditionFailed with
+// nothing written.
+func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSince *uint64) (WriteResult, error) {
 	if o.tree == nil {
 		return WriteResult{}, ErrTreeNotSet
 	}
@@ -548,6 +561,19 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 	spec := o.plaintextSpecFor(o.tree)
 	if err := checkPlaintextDataset(spec, ch.Dataset); err != nil {
 		return WriteResult{}, err
+	}
+
+	// The precondition runs before the state-dependent pre-flight: a
+	// write built on a stale read is a precondition failure (re-read
+	// and retry), not a validation error against state it never saw.
+	if ifUnchangedSince != nil {
+		changed, err := o.ctrl.ChangedSince(ctx, ch.Dataset, *ifUnchangedSince)
+		if err != nil {
+			return WriteResult{}, fmt.Errorf("object: precondition: %w", err)
+		}
+		if changed {
+			return WriteResult{}, crdt.ErrPreconditionFailed
+		}
 	}
 
 	// Writer-side schema pre-flight: strict validation against the
@@ -630,6 +656,7 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 		ChangeId:   ch.ChangeId,
 		RecordIds:  recordIds,
 		Rejections: applyRes.Rejections,
+		ApplySeq:   applyRes.ApplySeq,
 	}, nil
 }
 
@@ -670,6 +697,7 @@ func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, err
 		VersionId:  ch.VersionId,
 		RecordIds:  recordIds,
 		Rejections: res.Rejections,
+		ApplySeq:   res.ApplySeq,
 	}, nil
 }
 
@@ -714,6 +742,7 @@ func (o *Object) InjectedSet(ctx context.Context, ch crdt.Change) (WriteResult, 
 		VersionId:  ch.VersionId,
 		RecordIds:  recordIds,
 		Rejections: res.Rejections,
+		ApplySeq:   res.ApplySeq,
 	}, nil
 }
 

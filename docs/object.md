@@ -72,7 +72,7 @@ space.QueryObjects().Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|
 space.QueryDataset(dataset).Filter(...).Sort(...).Limit(n).Iter|All|One|Count|Snapshot|Subscribe // a shared dataset
 
 // Writes.
-space.Modify(ctx, ModifyBatch)  // → ModifyResult{VersionId, ChangeId, RecordIds, Rejections}
+space.Modify(ctx, ModifyBatch)  // → ModifyResult{VersionId, ChangeId, RecordIds, Rejections, ApplySeq}; IfUnchangedSince makes it conditional
 space.Delete(ctx, DeleteBatch)
 space.Upsert(ctx, UpsertBatch)
 ```

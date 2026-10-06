@@ -331,7 +331,13 @@ func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, datase
 // resident handles, and an in-flight caller must not surface that
 // transient as a user error.
 func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
-	res, err := obj.LocalWrite(ctx, ch)
+	return s.localWriteRetryIf(ctx, obj, objectId, ch, nil)
+}
+
+// localWriteRetryIf is localWriteRetry with an optional precondition
+// (ModifyBatch.IfUnchangedSince).
+func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change, ifUnchangedSince *uint64) (object.WriteResult, error) {
+	res, err := obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
 	if !errors.Is(err, object.ErrClosed) {
 		return res, wrapSlotErr(err)
 	}
@@ -339,7 +345,7 @@ func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, obj
 	if gerr != nil {
 		return object.WriteResult{}, gerr
 	}
-	res, err = obj.LocalWrite(ctx, ch)
+	res, err = obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
 	return res, wrapSlotErr(err)
 }
 
@@ -369,6 +375,12 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 		return space.ModifyResult{}, errors.New("spaceimpl: Dataset required")
 	}
 	if err := checkPublicDataset(batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := checkObjectsRowBatch(batch); err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := checkRecordShapes(batch.Records); err != nil {
 		return space.ModifyResult{}, err
 	}
 	switch batch.Scope {
@@ -401,7 +413,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 		return space.ModifyResult{}, err
 	}
 
-	res, err := s.localWriteRetry(ctx, obj, batch.ObjectId, change)
+	res, err := s.localWriteRetryIf(ctx, obj, batch.ObjectId, change, batch.IfUnchangedSince)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -437,7 +449,13 @@ func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (s
 	if len(batch.TraceIds) > 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: Modify: TraceIds ride the any-sync change and are not supported on the local scope")
 	}
+	if batch.IfUnchangedSince != nil {
+		return space.ModifyResult{}, errors.Join(crdt.ErrValidation, errors.New("spaceimpl: Modify: IfUnchangedSince is supported on the synced scope only"))
+	}
 	for i := range batch.Records {
+		if isDelete(&batch.Records[i]) {
+			return space.ModifyResult{}, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes cannot delete records", i))
+		}
 		if batch.Records[i].Id == "" {
 			return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes require explicit record ids", i)
 		}
@@ -499,6 +517,17 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		if batches[i].Scope != 0 && batches[i].Scope != space.ScopeSynced {
 			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: scope %s not supported (synced only) — issue scoped batches through Modify",
 				i, batches[i].Scope)
+		}
+		// Each batch is its own change, so a precondition could not hold
+		// across them.
+		if batches[i].IfUnchangedSince != nil {
+			return nil, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: ModifyMany: batch %d: IfUnchangedSince is supported by Modify only", i))
+		}
+		if err := checkObjectsRowBatch(batches[i]); err != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: %w", i, err)
+		}
+		if err := checkRecordShapes(batches[i].Records); err != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: %w", i, err)
 		}
 	}
 
@@ -645,6 +674,66 @@ func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, erro
 		TraceIds:    batch.TraceIds,
 		Records:     records,
 	}, nil
+}
+
+// checkRecordShapes refuses malformed delete records before anything
+// loads: a delete is its record's only op, takes no path or value,
+// names an explicit id and is no upsert; and no other record of the
+// batch writes an id the batch deletes, since the outcome would depend
+// on their order.
+func checkRecordShapes(records []space.RecordModify) error {
+	deleted := map[string]bool{}
+	for i := range records {
+		rec := &records[i]
+		if !isDelete(rec) {
+			continue
+		}
+		var err error
+		switch {
+		case len(rec.Ops) != 1:
+			err = errors.New("delete must be the record's only op")
+		case rec.Ops[0].Path != "" || rec.Ops[0].Value != nil:
+			err = errors.New("delete tombstones the whole record: it takes no path or value")
+		case rec.Id == "":
+			err = errors.New("delete needs an explicit record id")
+		case rec.Upsert:
+			err = errors.New("delete cannot be an upsert")
+		}
+		if err != nil {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("record %d: %w", i, err))
+		}
+		deleted[rec.Id] = true
+	}
+	for i := range records {
+		if !isDelete(&records[i]) && records[i].Id != "" && deleted[records[i].Id] {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("record %d: %q is deleted by the same batch", i, records[i].Id))
+		}
+	}
+	return nil
+}
+
+// checkObjectsRowBatch refuses what the objects dataset cannot take
+// through Modify: every record there lands on the object's one row, so
+// a delete in a batch tombstones that row for good whatever record id
+// it names, and the row is stamped by every change to the object, so a
+// precondition on it would mean "nothing in the object changed".
+func checkObjectsRowBatch(batch space.ModifyBatch) error {
+	if batch.Dataset != properties.Dataset {
+		return nil
+	}
+	if batch.IfUnchangedSince != nil {
+		return errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Modify: IfUnchangedSince is not supported on the %s dataset", properties.Dataset))
+	}
+	for i := range batch.Records {
+		if isDelete(&batch.Records[i]) {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Modify: record %d: the %s dataset takes no deletes", i, properties.Dataset))
+		}
+	}
+	return nil
+}
+
+func isDelete(rec *space.RecordModify) bool {
+	return slices.ContainsFunc(rec.Ops, func(op space.Op) bool { return op.Type == space.OpDelete })
 }
 
 func buildRecord(a *anyenc.Arena, rec *space.RecordModify) (crdt.RecordChange, error) {

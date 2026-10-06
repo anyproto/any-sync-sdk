@@ -33,8 +33,8 @@ func TestPullFirstIsSpaceIndexAndBuildsNoStore(t *testing.T) {
 }
 
 // After the spaceIndex, PullFirst names the definitions the local rows
-// know of: the winning root of every bundle in the spaceIndex's
-// registry, then the live type and collection objects. It reads rows
+// know of: every root the spaceIndex's bundle rows name, then the live
+// type and collection objects. It reads rows
 // only — a space with no rows yet, a joiner's, gets the spaceIndex
 // alone, and no collection is created for the asking.
 func TestPullFirstNamesLocalDefinitions(t *testing.T) {
@@ -77,7 +77,13 @@ func TestPullFirstNamesLocalDefinitions(t *testing.T) {
 
 	bundles := mustColl(t, ctx, db, indexId+"_"+spaceindex.BundlesDataset)
 	row(bundles, "wiki/v1", func(a *anyenc.Arena, doc *anyenc.Value) {
+		// The register names one root; the claimed set also holds the
+		// one the read path may prefer.
 		doc.Set(spaceindex.FieldBundleRootId, a.NewString("root-wiki"))
+		roots := a.NewArray()
+		roots.SetArrayItem(0, a.NewString("root-wiki"))
+		roots.SetArrayItem(1, a.NewString("root-wiki-canonical"))
+		doc.Set(spaceindex.FieldBundleRoots, roots)
 	})
 	row(bundles, "empty/v1", func(*anyenc.Arena, *anyenc.Value) {})
 	row(bundles, "gone/v1", deleted(func(a *anyenc.Arena, doc *anyenc.Value) {
@@ -93,7 +99,7 @@ func TestPullFirstNamesLocalDefinitions(t *testing.T) {
 	// Another space's rows stay its own.
 	row(mustColl(t, ctx, db, "space2_"+spaceobjects.SpaceObjectsCollection), "type-b", anyType("__type__"))
 
-	require.Equal(t, []string{indexId, "root-wiki", "type-a", "coll-a"}, s.PullFirst(ctx, spaceId))
+	require.Equal(t, []string{indexId, "root-wiki", "root-wiki", "root-wiki-canonical", "type-a", "coll-a"}, s.PullFirst(ctx, spaceId))
 	require.Empty(t, s.stores)
 }
 

@@ -19,10 +19,10 @@ import (
 // (ErrDuplicateRequest). Neither says anything about the tree: the
 // request passes once the peer has room.
 //
-// peerLimits keeps the requests of all spaces' rounds under that cap,
-// leaving room for the request queue any-sync runs beside the rounds
-// (ten workers per peer). The width adapts: a refusal halves it, a run
-// of answered requests widens it again.
+// peerLimits keeps the probes and the fetches of all spaces' rounds
+// under that cap, leaving room for the request queue any-sync runs
+// beside the rounds (ten workers per peer). The width adapts: a
+// refusal halves it, a run of answered requests widens it again.
 
 const (
 	// peerLimitMax is the widest a peer's budget gets.
@@ -60,41 +60,55 @@ type peerLimit struct {
 	width, inUse int
 	// streak counts the answered requests since width last changed.
 	streak int
+	// epoch counts the times width was narrowed. Requests in flight
+	// together are refused together; only the first refusal of such a
+	// burst narrows the budget.
+	epoch uint64
 	// changed is closed, and replaced, whenever a slot may have opened.
 	changed chan struct{}
 }
 
+// peerSlot is one acquired slot of a peer's budget.
+type peerSlot struct{ epoch uint64 }
+
 // acquire takes a slot, waiting for one while the budget is spent.
-func (l *peerLimit) acquire(ctx context.Context) error {
+func (l *peerLimit) acquire(ctx context.Context) (peerSlot, error) {
 	for {
 		l.mu.Lock()
 		if l.inUse < l.width {
 			l.inUse++
+			slot := peerSlot{epoch: l.epoch}
 			l.mu.Unlock()
-			return nil
+			return slot, nil
 		}
 		changed := l.changed
 		l.mu.Unlock()
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return ctx.Err()
+			return peerSlot{}, ctx.Err()
 		}
 	}
 }
 
 // release returns a slot. tooMany reports that the peer refused the
 // request as one over its cap.
-func (l *peerLimit) release(tooMany bool) {
+func (l *peerLimit) release(slot peerSlot, tooMany bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.inUse--
-	if tooMany {
+	switch {
+	case tooMany && slot.epoch == l.epoch:
 		l.width = max(1, l.width/2)
 		l.streak = 0
-	} else if l.streak++; l.width < peerLimitMax && l.streak >= l.width*peerLimitGrow {
-		l.width++
-		l.streak = 0
+		l.epoch++
+	case tooMany:
+		// Refused with the burst that already narrowed the budget.
+	default:
+		if l.streak++; l.width < peerLimitMax && l.streak >= l.width*peerLimitGrow {
+			l.width++
+			l.streak = 0
+		}
 	}
 	close(l.changed)
 	l.changed = make(chan struct{})

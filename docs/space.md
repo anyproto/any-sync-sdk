@@ -356,8 +356,9 @@ dialed on a sync path; see `global-p2p.md`.
     registry — so they reach a joiner, or a device catching up on a
     rename, before the rest of the space;
   - the definitions this device already knows of: the bundle roots
-    the spaceIndex lists (a bundle declares its type or collection on
-    its root) and the type and collection objects that are local. A
+    the spaceIndex lists, claimed ones included (a bundle declares its
+    type or collection on its root), and the type and collection
+    objects that are local. A
     device that holds the space pushes its trees to a peer that lacks
     them, definitions first;
   - the types and collections among the missing trees. The diff names a
@@ -368,16 +369,25 @@ dialed on a sync path; see `global-p2p.md`.
     follows its type applies at once; ahead of it, its changes park and
     replay when the type lands (`crdt.md` § Datasets).
 
-  Then the missing trees whose probed root says they define nothing,
-  several at a time: a fetch is a round trip to the peer, and one at a
-  time the round is paced by latency alone. Only those. A definition is
-  never replayed next to a tree that may look it up — any-store shows a
-  collection to readers before the transaction creating it commits, and
-  a reader that gets there first fails with a read error — so
-  definitions, the trees a probe did not classify (a small backlog, a
-  peer that ignores probes, selective sync), the changed trees and the
-  retries sync one tree at a time (`SpaceRegistry.PullFirst`,
-  `PullFirstTypes`).
+  Then the missing trees whose probed root is not a type or a
+  collection, several at a time: a fetch is a round trip to the peer,
+  and one at a time the round is paced by latency alone. Only those.
+  any-store shows a collection to readers before the transaction
+  creating it commits, and a reader that gets there first fails with a
+  read error, so a definition is kept from being replayed next to a
+  tree that may look it up wherever the round can tell: definitions,
+  the trees a probe did not classify (a small backlog, a peer that
+  ignores probes or fails them, selective sync), the changed trees and
+  the retries sync one tree at a time (`SpaceRegistry.PullFirst`,
+  `PullFirstTypes`). It cannot always tell — a bundle root the local
+  spaceIndex does not list yet reads as a plain object, and overlapping
+  rounds and pushes replay trees on their own — and there the object's
+  change waits: a gate lookup that fails parks the change, and it
+  drains when the definition commits (`crdt.md` § Datasets).
+
+  A failed probe is repeated after a wait that doubles per failure;
+  rounds of one space overlap, and a round waits for the probes another
+  has in flight on its trees.
 - **Request budget.** A peer caps the tree requests one client holds
   open on it, across all the client's spaces, and refuses the excess;
   it also refuses a second request for a tree it is already serving

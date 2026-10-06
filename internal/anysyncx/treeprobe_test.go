@@ -204,11 +204,12 @@ func TestTreeSyncerProbeSkips(t *testing.T) {
 	})
 }
 
-// A tree whose probe fails on the tree itself is unclassified: it syncs
-// after the trees whose root was read. It is probed again, a few times:
-// a failure can be passing, but a tree the peer cannot serve must not
-// cost a probe every round.
-func TestTreeSyncerFailedProbeLeavesTheTreeUnclassified(t *testing.T) {
+// A tree whose probe fails is unclassified: it syncs after the trees
+// whose root was read, one at a time. It is probed again, after a wait
+// that doubles per failure: a tree the peer cannot serve must not cost
+// a probe every round, and no failure settles a tree — the probe that
+// gets through still classifies it.
+func TestTreeSyncerFailedProbeIsRetriedWithBackoff(t *testing.T) {
 	reg := &scriptedRegistry{firstTypes: []string{"type"}, fail: map[string]error{}}
 	for _, id := range backlog(6) {
 		reg.fail[id] = errors.New("boom") // nothing is fetched: the diffs keep offering
@@ -219,24 +220,62 @@ func TestTreeSyncerFailedProbeLeavesTheTreeUnclassified(t *testing.T) {
 	}
 	ts := probeSyncer(t, reg, prober)
 	p := fakePeer{id: "peer1"}
+	probesOf := func(id string) (n int) {
+		for _, probed := range prober.probed() {
+			if probed == id {
+				n++
+			}
+		}
+		return n
+	}
 
 	require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))
 	require.Equal(t, []string{"m01", "m00", "m02", "m03", "m05", "m04"}, reg.calls)
 
-	for i := 0; i < 5; i++ {
+	// Rounds 2..9: the failing tree is probed in rounds 3 and 7 only.
+	for i := 0; i < 8; i++ {
 		require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))
 	}
-	require.Len(t, prober.probed(), 6+int(probeMaxFails)-1, "the failing tree is probed probeMaxFails times in all")
+	require.Equal(t, 3, probesOf("m04"))
+	require.Len(t, prober.probed(), 6+2, "the trees whose root was read are not probed again")
 
-	// The failure was passing after all: a tree settled as unclassified
-	// stays so, but one still being retried takes the answer.
-	prober2 := &scriptedProber{types: map[string]string{"m04": "type"}, fail: map[string]error{"m04": errors.New("refused")}}
-	ts2 := probeSyncer(t, reg, prober2)
-	require.NoError(t, ts2.SyncAll(context.Background(), p, nil, backlog(6)))
-	delete(prober2.fail, "m04")
+	// The failure passes: the next probe that is due classifies the tree.
+	delete(prober.fail, "m04")
+	for i := 0; i < int(probeMaxBackoff); i++ {
+		require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))
+	}
 	reg.calls = nil
-	require.NoError(t, ts2.SyncAll(context.Background(), p, nil, backlog(6)))
-	require.Equal(t, "m04", reg.calls[0])
+	require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))
+	require.Equal(t, []string{"m01", "m04"}, reg.calls[:2])
+}
+
+// When probe after probe fails and none is answered, the link or the
+// peer is failing, not the trees: the round stops probing that peer,
+// and a later round, with the peer back, classifies the backlog.
+func TestTreeSyncerStopsProbingAFailingPeer(t *testing.T) {
+	prevWorkers, prevGiveUp := probeWorkers, probeGiveUp
+	probeWorkers, probeGiveUp = 1, 3
+	t.Cleanup(func() { probeWorkers, probeGiveUp = prevWorkers, prevGiveUp })
+
+	reg := &scriptedRegistry{firstTypes: []string{"type"}, fail: map[string]error{}}
+	prober := &scriptedProber{types: map[string]string{"m10": "type"}, fail: map[string]error{}}
+	for _, id := range backlog(12) {
+		reg.fail[id] = errors.New("boom")
+		prober.fail[id] = errors.New("connection closed")
+	}
+	ts := probeSyncer(t, reg, prober)
+	p := fakePeer{id: "peer1"}
+
+	require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(12)))
+	require.Less(t, len(prober.probed()), 12, "the round gave up on the peer")
+
+	prober.fail = nil
+	for i := 0; i < int(probeMaxBackoff)+1; i++ {
+		require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(12)))
+	}
+	reg.calls = nil
+	require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(12)))
+	require.Equal(t, "m10", reg.calls[0], "nothing was settled by the failures")
 }
 
 // A peer that turns a probe away as busy — over its request cap, or
@@ -258,10 +297,11 @@ func TestTreeSyncerBusyPeerIsProbedAgain(t *testing.T) {
 	ts := probeSyncer(t, reg, prober)
 	p := fakePeer{id: "peer1"}
 
-	for i := 0; i < int(probeMaxFails)+2; i++ {
+	const rounds = 5
+	for i := 0; i < rounds; i++ {
 		require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))
 	}
-	require.Len(t, prober.probed(), 4+2*(int(probeMaxFails)+2), "the two refused trees are probed every round")
+	require.Len(t, prober.probed(), 4+2*rounds, "the two refused trees are probed every round")
 	require.Less(t, ts.limits.of("peer1").width, peerLimitMax, "refusals over the cap narrow the budget")
 
 	prober.fail = nil
@@ -279,38 +319,46 @@ func TestTreeSyncerProbeFailureKeepsAnAnswer(t *testing.T) {
 	ts.probeRecord("t1", probeIsOther)
 	require.True(t, ts.probed["t1"].first)
 	require.True(t, ts.probed["t1"].done)
+	require.Zero(t, ts.probed["t1"].fails)
 }
 
-// A probe is in flight for a tree at most once: an overlapping round
-// leaves the tree to the round that is probing it.
-func TestTreeSyncerOverlappingRoundsProbeATreeOnce(t *testing.T) {
+// A probe is in flight for a tree at most once, and a round does not
+// go on to its fetches while an overlapping round is still probing a
+// tree of its diff: the definition that round finds is fetched first
+// here too.
+func TestTreeSyncerWaitsForAnOverlappingRoundsProbes(t *testing.T) {
 	reg := &scriptedRegistry{firstTypes: []string{"type"}}
 	release := make(chan struct{})
 	started := make(chan struct{}, 64)
-	prober := &scriptedProber{types: map[string]string{"m01": "type"}}
+	prober := &scriptedProber{types: map[string]string{"m02": "type"}}
 	prober.onProbe = func(string) {
 		started <- struct{}{}
 		<-release
 	}
 	ts := probeSyncer(t, reg, prober)
 
-	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, backlog(4))
-		}()
-	}
+	done := make(chan error, 2)
+	go func() { done <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, backlog(4)) }()
 	for i := 0; i < 4; i++ {
-		<-started
+		<-started // the first round holds a probe of every tree
 	}
-	// Both rounds are in their probe phase or past dispatch; give the
-	// second one time to try the same ids.
-	time.Sleep(50 * time.Millisecond)
+	go func() { done <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, backlog(4)) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("a round finished while probes of its diff were in flight: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	reg.mu.Lock()
+	require.Empty(t, reg.calls, "nothing is fetched before the probes answer")
+	reg.mu.Unlock()
+
 	close(release)
-	wg.Wait()
+	require.NoError(t, <-done)
+	require.NoError(t, <-done)
 	require.ElementsMatch(t, backlog(4), prober.probed(), "each root probed once across both rounds")
+	require.Equal(t, "m02", reg.calls[0], "the definition the other round found goes first")
+	require.Len(t, reg.calls, 8)
 }
 
 // A probe cut short by the round leaves its tree unclassified, to be

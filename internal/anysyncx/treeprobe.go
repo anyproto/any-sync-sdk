@@ -23,16 +23,18 @@ import (
 // diff names a missing tree by id and head alone. A probe request asks
 // the peer for a tree's root and heads without its changes, so a round
 // with a backlog probes the roots of its missing trees — several at a
-// time, they are small and build nothing — and fetches the ones of a
+// time: an answer is a root and its heads, and nothing is built here
+// (the responder loads the tree to answer, as it will for the fetch) —
+// and fetches the ones of a
 // pull-first changeType (SpaceRegistry.PullFirstTypes: types and
 // collections) ahead of the rest. Objects that arrive after their type
 // apply at once; arriving before it, their changes park until the type
 // lands and replay then.
 //
 // The answer orders the fetches, and tells which of them may run side
-// by side (SyncAll): the trees whose root says they define nothing. A
-// tree that was not probed, or whose probe failed, syncs after those,
-// one at a time.
+// by side (SyncAll): the trees whose root is neither a type nor a
+// collection. A tree that was not probed, or whose probe failed, syncs
+// after those, one at a time.
 
 // Vars, not consts, so tests don't depend on them.
 var (
@@ -53,10 +55,16 @@ var (
 	// own diff, so an answer is dropped by age, not by one round's
 	// missing list.
 	probeKeepRounds uint64 = 16
-	// probeMaxFails is how many failed probes settle a tree as
-	// unclassified, so a tree the peer cannot serve is not probed
-	// every round. A peer that was only busy does not count.
-	probeMaxFails uint8 = 3
+	// probeMaxBackoff caps, in rounds, how long a tree whose probe
+	// failed waits for the next one. The wait doubles per failure: a
+	// tree the peer cannot serve must not cost a probe every round, and
+	// a failure of the link or the peer, which hits every tree at once,
+	// must not settle anything.
+	probeMaxBackoff uint64 = 8
+	// probeGiveUp is how many probes in a row may fail, with none
+	// answered, before a round stops probing the peer: the link or the
+	// peer is failing, not the trees.
+	probeGiveUp int64 = 8
 )
 
 // errProbed ends a probe fetch once its root is read; nothing is built
@@ -67,10 +75,13 @@ var errProbed = errors.New("anysyncx: root probed")
 type probeAnswer struct {
 	// done: the tree is not probed again. first: its root was read and
 	// its changeType is a pull-first one. other: its root was read and
-	// its changeType is not. Neither: the tree could not be classified.
+	// its changeType is not. Neither: the tree arrived before a probe
+	// could read its root.
 	done, first, other bool
-	// fails counts the probes that failed on the tree itself.
-	fails uint8
+	// fails counts the failed probes; retryAt is the round from which
+	// the tree is probed again.
+	fails   uint8
+	retryAt uint64
 	// round is the last round whose diff offered the tree.
 	round uint64
 }
@@ -94,6 +105,9 @@ func (t *treeSyncerAdapter) probeFirst(ctx context.Context, p peer.Peer, missing
 	if todo := t.probeTodo(p.Id(), missing, seen); len(todo) > 0 {
 		t.probeRoots(ctx, p.Id(), todo, types)
 	}
+	// An overlapping round may still be probing trees of this diff: a
+	// definition among them must not be overtaken by its objects.
+	t.probeWait(ctx, missing)
 	t.probeMu.Lock()
 	defer t.probeMu.Unlock()
 	var out []string
@@ -106,7 +120,7 @@ func (t *treeSyncerAdapter) probeFirst(ctx context.Context, p peer.Peer, missing
 }
 
 // probedOther returns the missing trees, in diff order, whose root was
-// read and is not of a pull-first changeType: the ones a round may sync
+// read and is not of a pull-first changeType: the ones a round syncs
 // side by side (see SyncAll).
 func (t *treeSyncerAdapter) probedOther(missing []string, seen map[string]struct{}) []string {
 	t.probeMu.Lock()
@@ -158,7 +172,10 @@ func (t *treeSyncerAdapter) probeTodo(peerId string, missing []string, seen map[
 	}
 	var todo []string
 	for _, id := range missing {
-		if _, handled := seen[id]; !handled && !t.probed[id].done {
+		if _, handled := seen[id]; handled {
+			continue
+		}
+		if a := t.probed[id]; !a.done && t.probeRound >= a.retryAt {
 			todo = append(todo, id)
 		}
 	}
@@ -175,9 +192,10 @@ func (t *treeSyncerAdapter) probeRoots(ctx context.Context, peerId string, ids, 
 	limit := t.limits.of(peerId)
 	work := make(chan string)
 	var (
-		wg           sync.WaitGroup
-		found, busy  atomic.Int64
-		probed, sent int
+		wg                      sync.WaitGroup
+		probed, found, busy     atomic.Int64
+		failedInARow            atomic.Int64
+		answered, peerIsFailing atomic.Bool
 	)
 	for w := 0; w < min(probeWorkers, len(ids)); w++ {
 		wg.Add(1)
@@ -188,39 +206,93 @@ func (t *treeSyncerAdapter) probeRoots(ctx context.Context, peerId string, ids, 
 					continue // an overlapping round is on it
 				}
 				res := probeUnanswered
-				if limit.acquire(ctx) == nil {
+				if slot, err := limit.acquire(ctx); err == nil {
 					res = t.probeRoot(ctx, peerId, id, types)
-					limit.release(res == probeTooMany)
+					limit.release(slot, res == probeTooMany)
 				}
-				t.probeRelease(id)
 				switch res {
-				case probeIsFirst:
-					found.Add(1)
+				case probeIsFirst, probeIsOther:
+					probed.Add(1)
+					answered.Store(true)
+					failedInARow.Store(0)
+					if res == probeIsFirst {
+						found.Add(1)
+					}
 				case probeBusy, probeTooMany:
 					busy.Add(1)
+				case probeFailed:
+					if failedInARow.Add(1) >= probeGiveUp && !answered.Load() {
+						peerIsFailing.Store(true)
+					}
 				}
+				// Recorded before the claim goes: a round waiting on the
+				// claim reads the answer.
 				t.probeRecord(id, res)
+				t.probeRelease(id)
 			}
 		}()
 	}
 	for _, id := range ids {
-		if ctx.Err() != nil || t.probeOff(peerId) {
+		if ctx.Err() != nil || peerIsFailing.Load() || t.probeOff(peerId) {
 			break
 		}
 		select {
 		case work <- id:
-			sent++
 		case <-ctx.Done():
 		}
 	}
 	close(work)
 	wg.Wait()
-	probed = sent - int(busy.Load())
 	t.log.Debug("probed missing tree roots",
 		zap.String("spaceId", t.spaceId), zap.String("peerId", peerId),
-		zap.Int("missing", len(ids)), zap.Int("probed", probed),
+		zap.Int("missing", len(ids)), zap.Int64("probed", probed.Load()),
 		zap.Int64("first", found.Load()), zap.Int64("peerBusy", busy.Load()),
+		zap.Bool("peerFailing", peerIsFailing.Load()),
 		zap.Duration("dur", time.Since(start)))
+}
+
+// probeWait returns once no probe is in flight for a tree of missing,
+// or the probing budget is spent.
+func (t *treeSyncerAdapter) probeWait(ctx context.Context, missing []string) {
+	var (
+		inDiff map[string]struct{}
+		expire <-chan time.Time
+	)
+	for {
+		t.probeMu.Lock()
+		waiting := false
+		if len(t.probing) > 0 {
+			if inDiff == nil {
+				inDiff = make(map[string]struct{}, len(missing))
+				for _, id := range missing {
+					inDiff[id] = struct{}{}
+				}
+			}
+			for id := range t.probing {
+				if _, ok := inDiff[id]; ok {
+					waiting = true
+					break
+				}
+			}
+		}
+		idle := t.probeIdle
+		t.probeMu.Unlock()
+		if !waiting {
+			return
+		}
+		if expire == nil {
+			timer := time.NewTimer(probeBudget)
+			defer timer.Stop()
+			expire = timer.C
+		}
+		select {
+		case <-idle:
+		case <-expire:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // probeResult is the outcome of one probe.
@@ -233,7 +305,8 @@ const (
 	// looking at the tree — probe again.
 	probeBusy
 	probeTooMany
-	// probeFailed: the tree could not be probed (deleted, refused).
+	// probeFailed: the probe failed — the tree's own fault (deleted,
+	// refused) or the link's; probe again after a wait.
 	probeFailed
 	// probeGone: nothing to probe — the tree arrived meanwhile.
 	probeGone
@@ -264,8 +337,10 @@ func (t *treeSyncerAdapter) probeRecord(id string, res probeResult) {
 	case probeGone:
 		a.done = true
 	case probeFailed:
-		a.fails++
-		a.done = a.fails >= probeMaxFails
+		if a.fails < 16 {
+			a.fails++
+		}
+		a.retryAt = t.probeRound + min(uint64(1)<<a.fails, probeMaxBackoff)
 	}
 	t.probed[id] = a
 }
@@ -306,7 +381,9 @@ func (t *treeSyncerAdapter) probeRoot(ctx context.Context, peerId, id string, ty
 		},
 	})
 	if tree != nil {
-		// The tree landed between the check above and the request.
+		// The tree landed between the check above and the request, and
+		// BuildTree opened it. Closing this second handle drops what is
+		// queued for the tree; the next round's diff brings it back.
 		_ = tree.Close()
 		return probeGone
 	}
@@ -353,6 +430,8 @@ func (t *treeSyncerAdapter) probeClaim(id string) bool {
 func (t *treeSyncerAdapter) probeRelease(id string) {
 	t.probeMu.Lock()
 	delete(t.probing, id)
+	close(t.probeIdle)
+	t.probeIdle = make(chan struct{})
 	t.probeMu.Unlock()
 }
 
@@ -364,8 +443,9 @@ func (t *treeSyncerAdapter) probeOff(peerId string) bool {
 }
 
 // rootChangeType reads the changeType off a raw root change. The cid is
-// not checked: a mislabelled root changes the order of the fetches, and
-// the fetch itself validates the tree.
+// not checked: a mislabelled root changes the order of the fetches and
+// which of them run side by side, and the fetch itself validates the
+// tree.
 func rootChangeType(raw *treechangeproto.RawTreeChangeWithId) (string, error) {
 	if raw == nil || len(raw.GetRawChange()) == 0 {
 		return "", errors.New("anysyncx: probe answer carries no root")

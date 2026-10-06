@@ -11,6 +11,7 @@ import (
 	anystore "github.com/anyproto/any-store"
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
@@ -145,8 +146,10 @@ type treeSyncerAdapter struct {
 	probeRound uint64
 	// probing holds the trees a probe is in flight for: overlapping
 	// rounds see much the same diff, and a peer refuses a second
-	// request for a tree it is already serving.
-	probing map[string]struct{}
+	// request for a tree it is already serving. probeIdle is closed,
+	// and replaced, whenever a probe ends.
+	probing   map[string]struct{}
+	probeIdle chan struct{}
 	// noProbe holds the peers that answer a probe with change bodies:
 	// they ignore the flag, and probing them would download every tree
 	// twice.
@@ -161,16 +164,17 @@ var _ treesyncer.PullFilter = (*treeSyncerAdapter)(nil)
 
 func newTreeSyncer(spaceId string, registry SpaceRegistry, onRound PeerRoundCallback) *treeSyncerAdapter {
 	return &treeSyncerAdapter{
-		spaceId:  spaceId,
-		registry: registry,
-		stats:    map[string]PeerSyncSnapshot{},
-		onRound:  onRound,
-		pending:  map[string]bool{},
-		limits:   newPeerLimits(),
-		probed:   map[string]probeAnswer{},
-		probing:  map[string]struct{}{},
-		noProbe:  map[string]struct{}{},
-		log:      tsLog,
+		spaceId:   spaceId,
+		registry:  registry,
+		stats:     map[string]PeerSyncSnapshot{},
+		onRound:   onRound,
+		pending:   map[string]bool{},
+		limits:    newPeerLimits(),
+		probed:    map[string]probeAnswer{},
+		probing:   map[string]struct{}{},
+		probeIdle: make(chan struct{}),
+		noProbe:   map[string]struct{}{},
+		log:       tsLog,
 	}
 }
 
@@ -187,13 +191,25 @@ func (t *treeSyncerAdapter) Init(a *app.App) error {
 	t.prober = t.treeBuilder
 	storage := a.MustComponent(spacestorage.CName).(spacestorage.SpaceStorage)
 	t.hasTree = func(ctx context.Context, treeId string) (bool, error) {
-		_, err := storage.HeadStorage().GetEntry(ctx, treeId)
-		if errors.Is(err, anystore.ErrDocNotFound) {
-			return false, nil
-		}
-		return err == nil, err
+		return hasHeadEntry(ctx, storage.HeadStorage(), treeId)
 	}
 	return nil
+}
+
+// headEntries is the slice of a space's head storage hasHeadEntry
+// reads.
+type headEntries interface {
+	GetEntry(ctx context.Context, id string) (headstorage.HeadsEntry, error)
+}
+
+// hasHeadEntry reports whether the space's storage knows treeId: any
+// entry counts, a deleted tree's and a selective-sync stub's included.
+func hasHeadEntry(ctx context.Context, hs headEntries, treeId string) (bool, error) {
+	_, err := hs.GetEntry(ctx, treeId)
+	if errors.Is(err, anystore.ErrDocNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (t *treeSyncerAdapter) Name() string { return treesyncer.CName }
@@ -275,16 +291,20 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 		handle(first, false)
 	}
 	handle(t.probeFirst(ctx, p, missing, seen), false)
-	// Only the missing trees whose root says they define nothing sync
-	// several at a time, and only now that the round's definitions are
-	// in. A definition must not be replayed next to a tree that may
-	// look it up: any-store shows a collection to readers before the
-	// transaction creating it commits, and a reader that gets there
-	// first fails with a read error. Readers of collections that
-	// already exist are unaffected, which is what makes the rest safe.
-	// Everything a probe did not classify — a small backlog, a peer
-	// that ignores probes, the changed trees, the retries — syncs one
-	// tree at a time.
+	// Only the missing trees whose probed root is not a type or a
+	// collection sync several at a time, and only now that the round's
+	// definitions are in. any-store shows a collection to readers
+	// before the transaction creating it commits, and a reader that
+	// gets there first fails with a read error; readers of collections
+	// that already exist are unaffected, which is what makes the rest
+	// safe. So wherever the round can tell, a definition is not
+	// replayed next to a tree that may look it up: everything a probe
+	// did not classify — a small backlog, a peer that ignores probes,
+	// the changed trees, the retries — syncs one tree at a time. It
+	// cannot always tell (a bundle root the local spaceIndex does not
+	// list yet reads as a plain object; overlapping rounds and pushes
+	// replay on their own); there the apply gate parks the object's
+	// change until the definition commits.
 	handle(t.probedOther(missing, seen), true)
 	handle(missing, false)
 	handle(existing, false)
@@ -404,9 +424,11 @@ var (
 )
 
 // getTree resolves a tree through the registry, which fetches it when
-// it is missing locally. A fetch holds a slot of the peer's request
-// budget, shared with the rounds of every other space; a tree that is
-// local needs none. A peer that turns the request away without looking
+// it is missing locally. A tree the round's diff or the parked set
+// names as missing holds a slot of the peer's request budget, shared
+// with the rounds of every other space, until it is fetched and
+// replayed (the registry does both in one step); a tree known to be
+// local takes none. A peer that turns the request away without looking
 // at the tree — over its request cap, or already serving this tree to
 // us, as a probe of an overlapping round makes it — is asked again
 // after a short wait, the slot returned meanwhile.
@@ -417,11 +439,12 @@ func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, peerId, id str
 	limit := t.limits.of(peerId)
 	backoff := getTreeBackoff
 	for attempt := 0; ; attempt++ {
-		if err := limit.acquire(ctx); err != nil {
+		slot, err := limit.acquire(ctx)
+		if err != nil {
 			return nil, err
 		}
 		tree, err := t.registry.GetTree(peerCtx, t.spaceId, id)
-		limit.release(peerTooMany(err))
+		limit.release(slot, peerTooMany(err))
 		if !peerBusy(err) || attempt >= getTreeRetries {
 			return tree, err
 		}
@@ -429,6 +452,10 @@ func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, peerId, id str
 		case <-time.After(backoff):
 			backoff *= 2
 		case <-ctx.Done():
+			return nil, err
+		}
+		// Both may have been ready: a finished round asks nothing more.
+		if ctx.Err() != nil {
 			return nil, err
 		}
 	}
@@ -451,16 +478,25 @@ func (t *treeSyncerAdapter) roundFirst(ctx context.Context, seen map[string]stru
 	if total < 2 {
 		return nil
 	}
+	first := t.registry.PullFirst(ctx, t.spaceId)
+	if len(first) == 0 {
+		return nil
+	}
+	// A device that holds the space names every definition it has; the
+	// lists it is matched against can be the whole space.
+	inRound := make(map[string]struct{}, total)
+	for _, ids := range lists {
+		for _, id := range ids {
+			inRound[id] = struct{}{}
+		}
+	}
 	var out []string
-	for _, id := range t.registry.PullFirst(ctx, t.spaceId) {
+	for _, id := range first {
 		if _, done := seen[id]; done {
 			continue
 		}
-		for _, ids := range lists {
-			if slices.Contains(ids, id) {
-				out = append(out, id)
-				break
-			}
+		if _, ok := inRound[id]; ok {
+			out = append(out, id)
 		}
 	}
 	return out

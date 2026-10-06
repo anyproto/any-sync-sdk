@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	anystore "github.com/anyproto/any-store"
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
@@ -288,17 +290,62 @@ func TestTreeSyncerRetriesABusyPeer(t *testing.T) {
 	require.Less(t, ts.limits.of("peer1").width, peerLimitMax, "refusals over the cap narrow the peer's budget")
 }
 
+// A round that ends while it waits to ask a busy peer again asks
+// nothing more.
+func TestTreeSyncerBusyRetryStopsWithTheRound(t *testing.T) {
+	prevBackoff := getTreeBackoff
+	getTreeBackoff = 30 * time.Millisecond
+	t.Cleanup(func() { getTreeBackoff = prevBackoff })
+
+	reg := &busyRegistry{busy: map[string]int{"t1": 100}}
+	ts := newTreeSyncer("space1", reg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	reg.onGet = func() { cancel() } // the round ends during the first refusal
+	require.NoError(t, ts.SyncAll(ctx, fakePeer{id: "peer1"}, nil, []string{"t1", "t2"}))
+	require.Equal(t, 1, reg.gets["t1"])
+	require.Zero(t, reg.gets["t2"], "a finished round fetches nothing")
+}
+
+// A tree is local when the space's head storage has any entry for it;
+// only a missing document means it is not.
+func TestHasHeadEntry(t *testing.T) {
+	ctx := context.Background()
+	has, err := hasHeadEntry(ctx, headEntriesFunc(func(string) error { return nil }), "t1")
+	require.NoError(t, err)
+	require.True(t, has)
+
+	has, err = hasHeadEntry(ctx, headEntriesFunc(func(string) error {
+		return fmt.Errorf("get entry: %w", anystore.ErrDocNotFound)
+	}), "t1")
+	require.NoError(t, err)
+	require.False(t, has)
+
+	_, err = hasHeadEntry(ctx, headEntriesFunc(func(string) error { return errors.New("storage closed") }), "t1")
+	require.Error(t, err)
+}
+
+type headEntriesFunc func(id string) error
+
+func (f headEntriesFunc) GetEntry(_ context.Context, id string) (headstorage.HeadsEntry, error) {
+	return headstorage.HeadsEntry{Id: id}, f(id)
+}
+
 // busyRegistry refuses the first busy[id] fetches of a tree the way a
 // peer over its request cap does.
 type busyRegistry struct {
 	scriptedRegistry
 	busy map[string]int
+	// onGet runs inside every fetch.
+	onGet func()
 
 	getsMu sync.Mutex
 	gets   map[string]int
 }
 
 func (r *busyRegistry) GetTree(_ context.Context, _, treeId string) (objecttree.ObjectTree, error) {
+	if r.onGet != nil {
+		r.onGet()
+	}
 	r.getsMu.Lock()
 	defer r.getsMu.Unlock()
 	if r.gets == nil {
@@ -457,7 +504,8 @@ func TestTreeSyncerFetchesStayWithinThePeerBudget(t *testing.T) {
 		ts := newTreeSyncer("space1", reg, nil)
 		limit := ts.limits.of("peer1")
 		for i := 0; i < peerLimitMax; i++ {
-			require.NoError(t, limit.acquire(context.Background()))
+			_, err := limit.acquire(context.Background())
+			require.NoError(t, err)
 		}
 		done := make(chan error, 1)
 		go func() { done <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, backlog(4), nil) }()

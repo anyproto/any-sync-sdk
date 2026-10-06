@@ -6,6 +6,8 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 
+	"go.uber.org/zap"
+
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
@@ -38,7 +40,22 @@ func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate
 			for _, p := range pairs {
 				known, kerr := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId)
 				if kerr != nil {
-					return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
+					if ctx.Err() != nil {
+						return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
+					}
+					// A lookup that fails does not show the definition
+					// is known, so the change waits like any change
+					// whose definition is not: failing the replay
+					// instead would hold the whole tree back for a
+					// round. any-store shows a collection to readers
+					// before the transaction creating it commits, and a
+					// lookup that gets there first fails — which is a
+					// type being applied next to an object that names
+					// it. The definition's commit drains the change.
+					storeLog.Warn("gate: definition lookup failed; change parked",
+						zap.String("objectId", objectId), zap.String("typeId", p.TypeId),
+						zap.String("shortId", p.ShortId), zap.Error(kerr))
+					known = false
 				}
 				if !known {
 					missing = append(missing, p)
@@ -84,7 +101,15 @@ func (s *Store) parkGated(ctx context.Context, row DetachedRow) error {
 	if err := s.Park(ctx, row); err != nil {
 		return err
 	}
+	if s.parkedHook != nil {
+		s.parkedHook()
+	}
+	// The row is in. The lookup that decides whether it gets its drain
+	// must not be lost to the caller's deadline.
+	ctx = context.WithoutCancel(ctx)
 	for _, p := range row.Pending {
+		// A lookup that fails here is a definition still being
+		// committed: its own wake-up follows.
 		if known, err := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId); err != nil || !known {
 			return nil
 		}

@@ -307,7 +307,9 @@ projects a shortId row into the type's `<typeId>_shortIds` collection
 (with a `src: "datasets"` discriminator), so the DataVersion gate
 covers dataset-schema state with no extra lookups. An index record's
 creation projects none: an index changes no apply verdict, so no data
-change waits for one.
+change waits for one. An SDK that predates index records drops them at
+apply and holds no index until its type object is next rebuilt; its
+reads stay correct.
 
 ### Compile: records → parts and declarations
 

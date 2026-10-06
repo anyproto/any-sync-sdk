@@ -53,8 +53,15 @@ const DatasetDefsHandlerVersion = "typeDatasetHandler-v1"
 // v4: parts. A head is keyed (`key`, pinned) and bound to a part and a
 // module (`part`, `module`, `shared`, pinned); the `collection` field
 // is gone — the collection is computed at compile.
-// v5: index records (`def: index`).
-const DatasetDefsLocalVersion = 5
+//
+// Index records (`def: index`) moved no version: a build that predates
+// them drops them at apply, and recovering them on such a device after
+// its upgrade would cost a rebuild of every object on every device — the
+// `datasets` handler is registered on every controller, so its version
+// is stored on every object's _meta row. Such a device holds no index
+// until its type object is next rebuilt; an index changes no apply
+// verdict, so nothing else differs.
+const DatasetDefsLocalVersion = 4
 
 // Discriminator values of the pinned `def` field.
 const (

@@ -175,6 +175,7 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 	if t.registry == nil {
 		return ErrSpaceRegistryUnset
 	}
+	missing = pullFirst(missing, t.registry.PullFirst(t.spaceId))
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
 	fetched := make(map[string]struct{}, len(missing))
 	for _, id := range missing {
@@ -249,6 +250,32 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 		}
 	}
 	return nil
+}
+
+// pullFirst moves the ids in first to the front of missing and keeps
+// the rest in diff order. The diff orders ids by hash and a round
+// fetches them one at a time, so on a large space a tree the joiner
+// needs early (the spaceIndex, which carries the space name) would
+// otherwise wait behind an arbitrary share of the whole space.
+func pullFirst(missing, first []string) []string {
+	if len(first) == 0 || len(missing) < 2 {
+		return missing
+	}
+	out := make([]string, 0, len(missing))
+	for _, id := range missing {
+		if slices.Contains(first, id) {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return missing
+	}
+	for _, id := range missing {
+		if !slices.Contains(first, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // pendingIds snapshots the parked-tree set for a retry sweep.

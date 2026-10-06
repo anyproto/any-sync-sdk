@@ -1261,6 +1261,16 @@ func (s *Store) deriveSpaceIndexId() string {
 	return id
 }
 
+// PullFirst lists the trees a sync round fetches before the rest of
+// the space: the spaceIndex, so a joiner sees the space name without
+// waiting for the whole space to sync.
+func (s *Store) PullFirst() []string {
+	if s.spaceIndexObjId == "" {
+		return nil
+	}
+	return []string{s.spaceIndexObjId}
+}
+
 // ReservedCarrier reports whether typeId is a user type declaring a
 // dataset of a reserved module (handler.Module.Reserved): the
 // consumer's own install root, carried by nothing else. Registered

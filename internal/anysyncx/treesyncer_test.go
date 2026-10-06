@@ -18,10 +18,12 @@ import (
 )
 
 // scriptedRegistry fails GetTree for the ids in fail; every call is
-// recorded so tests can assert retry behavior.
+// recorded so tests can assert retry behavior. first is what PullFirst
+// reports.
 type scriptedRegistry struct {
 	fail  map[string]error
 	trees map[string]objecttree.ObjectTree
+	first []string
 	calls []string
 }
 
@@ -50,6 +52,24 @@ func (r *scriptedRegistry) MarkTreeDeleted(context.Context, string, string) erro
 func (r *scriptedRegistry) DeleteTree(context.Context, string, string) error      { return nil }
 func (r *scriptedRegistry) ShouldPullTree(context.Context, string, string, *treechangeproto.RawTreeChangeWithId, []string) bool {
 	return true
+}
+func (r *scriptedRegistry) PullFirst(string) []string { return r.first }
+
+// A round fetches the registry's pull-first trees before the rest of
+// the missing ids, which keep their diff order. Existing ids and ids
+// absent from the diff are not reordered or added.
+func TestTreeSyncerPullsFirstTreesFirst(t *testing.T) {
+	reg := &scriptedRegistry{first: []string{"index", "absent"}}
+	ts := newTreeSyncer("space1", reg, nil)
+	p := fakePeer{id: "peer1"}
+
+	require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "m2", "index", "m3"}))
+	require.Equal(t, []string{"index", "m1", "m2", "m3", "e1"}, reg.calls)
+
+	// Nothing to move: the diff order stands.
+	reg.calls = nil
+	require.NoError(t, ts.SyncAll(context.Background(), p, []string{"index"}, []string{"m2", "m1"}))
+	require.Equal(t, []string{"m2", "m1", "index"}, reg.calls)
 }
 
 // TestTreeSyncerRetriesFailedGetTree pins the parked-tree repair loop:

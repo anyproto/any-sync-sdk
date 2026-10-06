@@ -36,6 +36,7 @@ func (r *pushRegistry) DeleteTree(context.Context, string, string) error      { 
 func (r *pushRegistry) ShouldPullTree(context.Context, string, string, *treechangeproto.RawTreeChangeWithId, []string) bool {
 	return true
 }
+func (r *pushRegistry) PullFirst(string) []string { return nil }
 
 var ErrSpaceRegistryUnknown = context.Canceled
 

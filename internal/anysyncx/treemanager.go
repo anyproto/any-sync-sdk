@@ -51,6 +51,10 @@ type SpaceRegistry interface {
 	// without the tree's change bodies. Full-sync deployments always
 	// return true.
 	ShouldPullTree(ctx context.Context, spaceId, treeId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool
+
+	// PullFirst lists the trees of spaceId that a sync round fetches
+	// before its other missing trees. nil when none.
+	PullFirst(spaceId string) []string
 }
 
 // treeManagerAdapter implements treemanager.TreeManager by routing

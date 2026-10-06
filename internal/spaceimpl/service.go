@@ -2276,6 +2276,15 @@ func (s *Service) ShouldPullTree(ctx context.Context, spaceId, treeId string, ro
 	return s.storeFor(spaceId).ShouldPullTree(ctx, treeId, root, heads)
 }
 
+// PullFirst lists the trees a sync round fetches before the rest. The
+// tech space has none; a regular space delegates to its Store.
+func (s *Service) PullFirst(spaceId string) []string {
+	if spaceId == s.tsp.SpaceId() {
+		return nil
+	}
+	return s.storeFor(spaceId).PullFirst()
+}
+
 // Compile-time check that we satisfy the registry contract.
 var _ anysyncx.SpaceRegistry = (*Service)(nil)
 

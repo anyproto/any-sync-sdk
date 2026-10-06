@@ -122,3 +122,51 @@ func TestGate_Decision(t *testing.T) {
 		assert.Equal(t, types.DataVersionPair{TypeId: "typeU", ShortId: "sMissing"}, rows[0].Pending[0])
 	})
 }
+
+// A change is parked for a definition that is not known when the gate
+// looks. If the definition lands before the park commits, the wake-up
+// of that landing has already found nothing to drain; the park itself
+// must then ask for a drain, or the change waits for an unrelated
+// definition, or a restart.
+func TestGate_ParkAsksForADrainWhenItsDefinitionsLanded(t *testing.T) {
+	pending := func(pairs ...types.DataVersionPair) DetachedRow {
+		return DetachedRow{ChangeId: "ch1", SpaceId: "spaceA", ObjectId: "obj-X", Payload: []byte("p"), Pending: pairs}
+	}
+	tA := types.DataVersionPair{TypeId: "typeT", ShortId: "sA"}
+	tB := types.DataVersionPair{TypeId: "typeU", ShortId: "sB"}
+	// The store's drainer consumes its queue as it fills; a drainer that
+	// was never started keeps the requests countable.
+	gateStore := func(t *testing.T) (context.Context, *Store) {
+		ctx, store := gateStore(t)
+		store.drainer.Close()
+		store.drainer = newDrainer(store)
+		return ctx, store
+	}
+
+	t.Run("still unknown: the definition's apply will wake the drainer", func(t *testing.T) {
+		ctx, store := gateStore(t)
+		require.NoError(t, store.parkGated(ctx, pending(tA)))
+		assert.Zero(t, store.drainer.queue.Len())
+		assert.Len(t, countDetached(t, ctx, store), 1)
+	})
+
+	t.Run("landed between the lookup and the park", func(t *testing.T) {
+		ctx, store := gateStore(t)
+		landShortId(t, ctx, store, tA.TypeId, tA.ShortId)
+		require.NoError(t, store.parkGated(ctx, pending(tA)))
+		assert.Equal(t, 1, store.drainer.queue.Len())
+	})
+
+	t.Run("one of two still unknown", func(t *testing.T) {
+		ctx, store := gateStore(t)
+		landShortId(t, ctx, store, tA.TypeId, tA.ShortId)
+		require.NoError(t, store.parkGated(ctx, pending(tA, tB)))
+		assert.Zero(t, store.drainer.queue.Len())
+	})
+
+	t.Run("waiting on nothing: a stale controller", func(t *testing.T) {
+		ctx, store := gateStore(t)
+		require.NoError(t, store.parkGated(ctx, pending()))
+		assert.Equal(t, 1, store.drainer.queue.Len())
+	})
+}

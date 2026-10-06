@@ -59,19 +59,38 @@ func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate
 			Pending:   missing,
 			Dataset:   ch.Dataset,
 		}
-		if perr := s.Park(ctx, row); perr != nil {
+		if perr := s.parkGated(ctx, row); perr != nil {
 			return false, fmt.Errorf("gate: park: %w", perr)
-		}
-		if len(missing) == 0 {
-			// Parked only because this controller's registration is
-			// missing/stale — the schema may already be fully applied,
-			// so no future defs apply is guaranteed to wake the
-			// drainer. Nudge it now: Drain evicts the stale controller
-			// and replays the row.
-			s.drainer.Notify(types.DataVersionPair{})
 		}
 		return false, nil
 	}
+}
+
+// parkGated parks a change the gate held back and makes sure a drain
+// follows when nothing else will bring one.
+//
+// A change waiting on definitions is woken by their apply — unless
+// they applied between the gate's lookup and this park's commit: that
+// wake-up found no row, and no other is coming. So the lookup is
+// repeated once the row is in. Trees of one space apply side by side
+// (several per sync round, plus the pushes), so a type and an object
+// that names it do interleave this way.
+//
+// A change parked only because its controller's registration is missing
+// or stale waits on nothing — the schema may already be fully applied —
+// so it is nudged too: Drain evicts the stale controller and replays
+// the row.
+func (s *Store) parkGated(ctx context.Context, row DetachedRow) error {
+	if err := s.Park(ctx, row); err != nil {
+		return err
+	}
+	for _, p := range row.Pending {
+		if known, err := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId); err != nil || !known {
+			return nil
+		}
+	}
+	s.drainer.Notify(types.DataVersionPair{})
+	return nil
 }
 
 // afterApplyFor is the post-apply hook. Two independent fan-outs

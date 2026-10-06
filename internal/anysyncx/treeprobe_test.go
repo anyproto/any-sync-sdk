@@ -199,14 +199,16 @@ func TestTreeSyncerProbeSkips(t *testing.T) {
 		ts.hasTree = func(_ context.Context, id string) (bool, error) { return id == "m03", nil }
 		require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))
 		require.NotContains(t, prober.probed(), "m03")
-		require.Equal(t, backlog(6), reg.calls)
+		// Unclassified, it follows the trees whose root was read.
+		require.Equal(t, []string{"m00", "m01", "m02", "m04", "m05", "m03"}, reg.calls)
 	})
 }
 
-// A probe that fails on the tree itself leaves it at its diff position.
-// It is tried again, a few times: a failure can be passing, but a tree
-// the peer cannot serve must not cost a probe every round.
-func TestTreeSyncerFailedProbeKeepsDiffOrder(t *testing.T) {
+// A tree whose probe fails on the tree itself is unclassified: it syncs
+// after the trees whose root was read. It is probed again, a few times:
+// a failure can be passing, but a tree the peer cannot serve must not
+// cost a probe every round.
+func TestTreeSyncerFailedProbeLeavesTheTreeUnclassified(t *testing.T) {
 	reg := &scriptedRegistry{firstTypes: []string{"type"}, fail: map[string]error{}}
 	for _, id := range backlog(6) {
 		reg.fail[id] = errors.New("boom") // nothing is fetched: the diffs keep offering
@@ -219,7 +221,7 @@ func TestTreeSyncerFailedProbeKeepsDiffOrder(t *testing.T) {
 	p := fakePeer{id: "peer1"}
 
 	require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))
-	require.Equal(t, []string{"m01", "m00", "m02", "m03", "m04", "m05"}, reg.calls)
+	require.Equal(t, []string{"m01", "m00", "m02", "m03", "m05", "m04"}, reg.calls)
 
 	for i := 0; i < 5; i++ {
 		require.NoError(t, ts.SyncAll(context.Background(), p, nil, backlog(6)))

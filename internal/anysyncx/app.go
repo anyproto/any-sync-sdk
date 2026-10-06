@@ -863,6 +863,21 @@ func (a *App) ParkedTreeCount(spaceId string) int {
 	return ts.pendingCount()
 }
 
+// SyncingTreeCount returns the number of trees a sync round of spaceId
+// is fetching or replaying right now. 0 when the space was never loaded
+// this session. Consumed, with ParkedTreeCount, by the SDK's close-time
+// watermark gate: a tree cut mid-replay by Close is in storage but not
+// in the projection, and only the boot replay brings it back.
+func (a *App) SyncingTreeCount(spaceId string) int {
+	a.syncersMu.Lock()
+	ts := a.syncers[spaceId]
+	a.syncersMu.Unlock()
+	if ts == nil {
+		return 0
+	}
+	return ts.syncingCount()
+}
+
 // pickLive reports a live pool connection to the peer within
 // p2p.PickTimeout; it never dials and never waits out somebody else's
 // dial.

@@ -346,11 +346,12 @@ dialed on a sync path; see `global-p2p.md`.
     join key propagation; the park-retry set is in memory, so the boot
     replay is their only cross-restart recovery).
   - The write never regresses the watermark.
-- **Sync order.** A headsync round handles its trees one at a time:
-  the missing ones in the diff's hash order, then the changed ones,
+- **Sync order.** A headsync round handles its trees in groups, each
+  done before the next starts: the missing ones, then the changed ones,
   then the retries of earlier failures. A round is time-boxed, so on a
   large space the backlog spans many rounds. Ahead of that order go,
-  when the round has them to fetch, sync or retry:
+  each as a group of its own, when the round has them to fetch, sync or
+  retry:
   - the spaceIndex — the space name and description, the bundles
     registry — so they reach a joiner, or a device catching up on a
     rename, before the rest of the space;
@@ -367,16 +368,23 @@ dialed on a sync path; see `global-p2p.md`.
     follows its type applies at once; ahead of it, its changes park and
     replay when the type lands (`crdt.md` § Datasets).
 
-  The order is an optimisation: a tree the round could not classify —
-  a peer that ignores probes, a small backlog, selective sync — syncs
-  at its diff position (`SpaceRegistry.PullFirst`, `PullFirstTypes`).
+  Then the missing trees whose probed root says they define nothing,
+  several at a time: a fetch is a round trip to the peer, and one at a
+  time the round is paced by latency alone. Only those. A definition is
+  never replayed next to a tree that may look it up — any-store shows a
+  collection to readers before the transaction creating it commits, and
+  a reader that gets there first fails with a read error — so
+  definitions, the trees a probe did not classify (a small backlog, a
+  peer that ignores probes, selective sync), the changed trees and the
+  retries sync one tree at a time (`SpaceRegistry.PullFirst`,
+  `PullFirstTypes`).
 - **Request budget.** A peer caps the tree requests one client holds
   open on it, across all the client's spaces, and refuses the excess;
   it also refuses a second request for a tree it is already serving
   that client. The rounds of every space share one budget per peer for
-  their probes, narrowed by a refusal and widened again by answered
-  requests, and a fetch the peer turns away as busy is asked again
-  within the round instead of being parked.
+  their probes and fetches, narrowed by a refusal and widened again by
+  answered requests, and a fetch the peer turns away as busy is asked
+  again within the round instead of being parked.
 - **Replication key.** One per account, read from the tech space id. The
   tech space is derived from the account key, so the key is known before
   any space loads, including on a new device.

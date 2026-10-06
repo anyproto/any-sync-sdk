@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	anystore "github.com/anyproto/any-store"
@@ -23,6 +24,16 @@ import (
 )
 
 var tsLog = logger.NewNamed("anysyncx.treesyncer")
+
+// treeSyncWorkers bounds the trees one round syncs at once, where it
+// syncs several (SyncAll says which). A missing tree costs a round trip
+// to the peer, and a round that waits for each one in turn is paced by
+// latency alone, whatever the device and the link could carry. Kept
+// under the read connections of a space's
+// storage (eight), each replay holding one, so other readers of the
+// space are not starved; the requests themselves are bounded per peer,
+// across spaces, by peerLimits. A var so tests can pin the order.
+var treeSyncWorkers = 6
 
 // ErrTreeTypeSkipped is a tree fetch declined by selective sync before
 // any tree-storage write. The registry records a heads-only stub in its
@@ -48,8 +59,9 @@ type PeerSyncSnapshot struct {
 
 // treeSyncerAdapter is registered by anysyncx as the per-space
 // commonspace.Deps.TreeSyncer. On SyncAll it builds (fetches) missing
-// trees and pushes existing ones via SyncWithPeer. Trees are not closed
-// here — they stay in ocache for the async exchange to land.
+// trees and pushes existing ones via SyncWithPeer; the bulk of a
+// backlog several trees at a time. Trees are not closed here — they
+// stay in ocache for the async exchange to land.
 //
 // SyncAll routes through SpaceRegistry.GetTree (NOT through the
 // per-space TreeBuilder directly): the registry's per-space
@@ -109,6 +121,9 @@ type treeSyncerAdapter struct {
 	// pending maps a parked id to whether it was missing locally when
 	// parked, so a recovered fetch still reports through onFetched.
 	pending map[string]bool
+	// syncing counts the trees a round is syncing right now; see
+	// syncingCount.
+	syncing atomic.Int64
 
 	// limits is the request budget this adapter's probes take from,
 	// per peer and shared with every other space's adapter.
@@ -225,97 +240,159 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 	}
 	pending := t.pendingIds()
 	seen := make(map[string]struct{}, len(missing)+len(existing))
-	handle := func(ids []string) {
+	// handle syncs the ids the round has not handled yet and returns
+	// when all of them are done: a later group never starts ahead of an
+	// earlier one. atOnce lets the group sync several trees at a time.
+	handle := func(ids []string, atOnce bool) {
+		todo := make([]string, 0, len(ids))
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
 				continue
 			}
 			seen[id] = struct{}{}
-			_, wasMissing := fetched[id]
-			if ctx.Err() != nil {
-				// Round budget exhausted: park everything unresolved for
-				// the next round instead of burning through the rest
-				// with guaranteed failures.
-				t.markPending(id, wasMissing)
-				continue
-			}
-			tree, regErr := t.getTree(ctx, peerCtx, id)
-			if errors.Is(regErr, ErrTreeTypeSkipped) {
-				// Declined by selective sync before any tree-storage
-				// write; the stub it recorded converges the diff. A park
-				// would re-probe the peer every round and hold
-				// ParkedTreeCount above zero for the process lifetime.
-				if recovered, _ := t.clearPending(id); recovered {
-					t.log.Info("parked tree skipped by selective sync",
-						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
-						zap.String("peerId", p.Id()))
-				}
-				continue
-			}
-			if regErr != nil {
-				// See the pending field doc: the fetch may already have
-				// landed in storage, so this id may never show up in a
-				// diff again — park it or the controller replay is lost
-				// for the process lifetime.
-				t.markPending(id, wasMissing)
-				if errors.Is(regErr, list.ErrNoReadKey) {
-					// Expected long-lived state, not a failure: the tree's
-					// changes are stored but this account holds no read key
-					// yet (access pending or revoked). Park quietly — the
-					// retry sweep runs every round, and recovery logs
-					// "parked tree recovered" once the key arrives.
-					t.log.Debug("tree parked: no read key",
-						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
-						zap.String("peerId", p.Id()))
-				} else if peerBusy(regErr) {
-					// The peer is still turning requests away after the
-					// retries; nothing is wrong with the tree.
-					t.log.Debug("tree parked: peer busy",
-						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
-						zap.String("peerId", p.Id()), zap.Error(regErr))
-				} else {
-					t.log.Warn("tree sync failed; parked for retry",
-						zap.String("spaceId", t.spaceId), zap.String("treeId", id),
-						zap.String("peerId", p.Id()), zap.Error(regErr))
-				}
-				continue
-			}
-			recovered, parkedMissing := t.clearPending(id)
-			if recovered {
-				t.log.Info("parked tree recovered",
-					zap.String("spaceId", t.spaceId), zap.String("treeId", id),
-					zap.String("peerId", p.Id()))
-			}
-			if (wasMissing || parkedMissing) && t.onFetched != nil && tree != nil {
-				tree.Lock()
-				heads := slices.Clone(tree.Heads())
-				tree.Unlock()
-				t.onFetched(p.Id(), id, heads)
-			}
-			if st, ok := tree.(synctree.SyncTree); ok {
-				_ = st.SyncWithPeer(ctx, p)
-			}
-			// Don't close — async exchange may still need it.
+			todo = append(todo, id)
 		}
+		workers := 1
+		if atOnce {
+			workers = treeSyncWorkers
+		}
+		eachTree(todo, workers, func(id string) {
+			_, wasMissing := fetched[id]
+			t.syncTree(ctx, peerCtx, p, id, wasMissing)
+		})
 	}
 	// Ahead of the diff order: the trees the registry names — asked
 	// again after an answer was handled, because handling the first
 	// (the spaceIndex) can add to the second (the bundle roots it
-	// lists) — then the missing
-	// trees whose probed root is of a pull-first changeType (types and
-	// collections). The dedup skips all of them at their own position.
+	// lists) — then the missing trees whose probed root is of a
+	// pull-first changeType (types and collections). The dedup skips
+	// all of them at their own position.
 	for i := 0; i < 2; i++ {
 		first := t.roundFirst(ctx, seen, missing, existing, pending)
 		if len(first) == 0 {
 			break
 		}
-		handle(first)
+		handle(first, false)
 	}
-	handle(t.probeFirst(ctx, p, missing, seen))
-	handle(missing)
-	handle(existing)
-	handle(pending)
+	handle(t.probeFirst(ctx, p, missing, seen), false)
+	// Only the missing trees whose root says they define nothing sync
+	// several at a time, and only now that the round's definitions are
+	// in. A definition must not be replayed next to a tree that may
+	// look it up: any-store shows a collection to readers before the
+	// transaction creating it commits, and a reader that gets there
+	// first fails with a read error. Readers of collections that
+	// already exist are unaffected, which is what makes the rest safe.
+	// Everything a probe did not classify — a small backlog, a peer
+	// that ignores probes, the changed trees, the retries — syncs one
+	// tree at a time.
+	handle(t.probedOther(missing, seen), true)
+	handle(missing, false)
+	handle(existing, false)
+	handle(pending, false)
 	return nil
+}
+
+// syncTree resolves one tree of a round through the registry — which
+// fetches it when it is missing locally — and pings the peer with it.
+// A failure parks the id for the next round. Safe to run for several
+// trees at once.
+func (t *treeSyncerAdapter) syncTree(ctx, peerCtx context.Context, p peer.Peer, id string, wasMissing bool) {
+	t.syncing.Add(1)
+	defer t.syncing.Add(-1)
+	if ctx.Err() != nil {
+		// Round budget exhausted: park everything unresolved for
+		// the next round instead of burning through the rest
+		// with guaranteed failures.
+		t.markPending(id, wasMissing)
+		return
+	}
+	tree, regErr := t.getTree(ctx, peerCtx, p.Id(), id, wasMissing || t.parkedMissing(id))
+	if errors.Is(regErr, ErrTreeTypeSkipped) {
+		// Declined by selective sync before any tree-storage
+		// write; the stub it recorded converges the diff. A park
+		// would re-probe the peer every round and hold
+		// ParkedTreeCount above zero for the process lifetime.
+		if recovered, _ := t.clearPending(id); recovered {
+			t.log.Info("parked tree skipped by selective sync",
+				zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+				zap.String("peerId", p.Id()))
+		}
+		return
+	}
+	if regErr != nil {
+		// See the pending field doc: the fetch may already have
+		// landed in storage, so this id may never show up in a
+		// diff again — park it or the controller replay is lost
+		// for the process lifetime.
+		t.markPending(id, wasMissing)
+		if errors.Is(regErr, list.ErrNoReadKey) {
+			// Expected long-lived state, not a failure: the tree's
+			// changes are stored but this account holds no read key
+			// yet (access pending or revoked). Park quietly — the
+			// retry sweep runs every round, and recovery logs
+			// "parked tree recovered" once the key arrives.
+			t.log.Debug("tree parked: no read key",
+				zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+				zap.String("peerId", p.Id()))
+		} else if peerBusy(regErr) {
+			// The peer is still turning requests away after the
+			// retries; nothing is wrong with the tree.
+			t.log.Debug("tree parked: peer busy",
+				zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+				zap.String("peerId", p.Id()), zap.Error(regErr))
+		} else {
+			t.log.Warn("tree sync failed; parked for retry",
+				zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+				zap.String("peerId", p.Id()), zap.Error(regErr))
+		}
+		return
+	}
+	recovered, parkedMissing := t.clearPending(id)
+	if recovered {
+		t.log.Info("parked tree recovered",
+			zap.String("spaceId", t.spaceId), zap.String("treeId", id),
+			zap.String("peerId", p.Id()))
+	}
+	if (wasMissing || parkedMissing) && t.onFetched != nil && tree != nil {
+		tree.Lock()
+		heads := slices.Clone(tree.Heads())
+		tree.Unlock()
+		t.onFetched(p.Id(), id, heads)
+	}
+	if st, ok := tree.(synctree.SyncTree); ok {
+		_ = st.SyncWithPeer(ctx, p)
+	}
+	// Don't close — async exchange may still need it.
+}
+
+// eachTree runs fn over ids, in order, on up to workers goroutines,
+// and returns when every call has returned.
+func eachTree(ids []string, workers int, fn func(id string)) {
+	workers = min(workers, len(ids))
+	if workers <= 1 {
+		for _, id := range ids {
+			fn(id)
+		}
+		return
+	}
+	var (
+		wg   sync.WaitGroup
+		next atomic.Int64
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(ids) {
+					return
+				}
+				fn(ids[i])
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // getTreeRetries is how often a round asks again for a tree the peer
@@ -327,14 +404,24 @@ var (
 )
 
 // getTree resolves a tree through the registry, which fetches it when
-// it is missing locally. A peer that turns the request away without
-// looking at the tree — over its request cap, or already serving this
-// tree to us, as a probe of an overlapping round makes it — is asked
-// again after a short wait.
-func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, id string) (objecttree.ObjectTree, error) {
+// it is missing locally. A fetch holds a slot of the peer's request
+// budget, shared with the rounds of every other space; a tree that is
+// local needs none. A peer that turns the request away without looking
+// at the tree — over its request cap, or already serving this tree to
+// us, as a probe of an overlapping round makes it — is asked again
+// after a short wait, the slot returned meanwhile.
+func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, peerId, id string, mayFetch bool) (objecttree.ObjectTree, error) {
+	if !mayFetch {
+		return t.registry.GetTree(peerCtx, t.spaceId, id)
+	}
+	limit := t.limits.of(peerId)
 	backoff := getTreeBackoff
 	for attempt := 0; ; attempt++ {
+		if err := limit.acquire(ctx); err != nil {
+			return nil, err
+		}
 		tree, err := t.registry.GetTree(peerCtx, t.spaceId, id)
+		limit.release(peerTooMany(err))
 		if !peerBusy(err) || attempt >= getTreeRetries {
 			return tree, err
 		}
@@ -350,9 +437,10 @@ func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, id string) (ob
 // roundFirst picks, from the ids a round works on and has not handled
 // yet, the ones the registry wants handled before the rest; SyncAll's
 // dedup then skips them at their own position. The diff orders ids by
-// hash and a round handles them one at a time, so on a large space a
-// tree needed early (the spaceIndex, which carries the space name)
-// would otherwise wait behind an arbitrary share of the whole space —
+// hash and a round works through them a few at a time, so on a large
+// space a tree needed early (the spaceIndex, which carries the space
+// name) would otherwise wait behind an arbitrary share of the whole
+// space —
 // whether it is missing, changed or parked. An id outside the round's
 // lists is left out: the order changes, the work does not.
 func (t *treeSyncerAdapter) roundFirst(ctx context.Context, seen map[string]struct{}, lists ...[]string) []string {
@@ -393,14 +481,29 @@ func (t *treeSyncerAdapter) pendingIds() []string {
 }
 
 // pendingCount reports the parked-set size. Exposed via
-// App.ParkedTreeCount for the SDK's close-time watermark gate: a
-// nonzero count means storage holds trees the projection never
-// materialized, so the space watermark must NOT be snapshotted (the
-// boot replay is the only cross-restart recovery for them).
+// App.ParkedTreeCount for the gates that need every tree a finished
+// round discovered to be applied: a nonzero count means storage holds
+// trees the projection never materialized.
 func (t *treeSyncerAdapter) pendingCount() int {
 	t.pendingMu.Lock()
 	defer t.pendingMu.Unlock()
 	return len(t.pending)
+}
+
+// syncingCount reports the trees a round is syncing right now. Exposed
+// via App.SyncingTreeCount for the close-time watermark gate: a fetched
+// tree is in storage before its replay ends, so until then it is as
+// unmaterialized as a parked one.
+func (t *treeSyncerAdapter) syncingCount() int {
+	return int(t.syncing.Load())
+}
+
+// parkedMissing reports whether id is parked as missing locally: its
+// retry may fetch.
+func (t *treeSyncerAdapter) parkedMissing(id string) bool {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	return t.pending[id]
 }
 
 // markPending parks id; a parked id already marked missing stays so.

@@ -29,8 +29,10 @@ import (
 // apply at once; arriving before it, their changes park until the type
 // lands and replay then.
 //
-// The answer only orders the fetches. A tree that was not probed, or
-// whose probe failed, syncs at its diff position.
+// The answer orders the fetches, and tells which of them may run side
+// by side (SyncAll): the trees whose root says they define nothing. A
+// tree that was not probed, or whose probe failed, syncs after those,
+// one at a time.
 
 // Vars, not consts, so tests don't depend on them.
 var (
@@ -63,9 +65,10 @@ var errProbed = errors.New("anysyncx: root probed")
 
 // probeAnswer is what is known of a probed root.
 type probeAnswer struct {
-	// done: the tree is classified and is not probed again. first: its
-	// root's changeType is a pull-first one.
-	done, first bool
+	// done: the tree is not probed again. first: its root was read and
+	// its changeType is a pull-first one. other: its root was read and
+	// its changeType is not. Neither: the tree could not be classified.
+	done, first, other bool
 	// fails counts the probes that failed on the tree itself.
 	fails uint8
 	// round is the last round whose diff offered the tree.
@@ -96,6 +99,24 @@ func (t *treeSyncerAdapter) probeFirst(ctx context.Context, p peer.Peer, missing
 	var out []string
 	for _, id := range missing {
 		if _, handled := seen[id]; !handled && t.probed[id].first {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// probedOther returns the missing trees, in diff order, whose root was
+// read and is not of a pull-first changeType: the ones a round may sync
+// side by side (see SyncAll).
+func (t *treeSyncerAdapter) probedOther(missing []string, seen map[string]struct{}) []string {
+	t.probeMu.Lock()
+	defer t.probeMu.Unlock()
+	if len(t.probed) == 0 {
+		return nil
+	}
+	var out []string
+	for _, id := range missing {
+		if _, handled := seen[id]; !handled && t.probed[id].other {
 			out = append(out, id)
 		}
 	}
@@ -214,6 +235,8 @@ const (
 	probeTooMany
 	// probeFailed: the tree could not be probed (deleted, refused).
 	probeFailed
+	// probeGone: nothing to probe — the tree arrived meanwhile.
+	probeGone
 	// probeIsFirst, probeIsOther: the root was read.
 	probeIsFirst
 	probeIsOther
@@ -237,6 +260,8 @@ func (t *treeSyncerAdapter) probeRecord(id string, res probeResult) {
 	case probeIsFirst:
 		a.done, a.first = true, true
 	case probeIsOther:
+		a.done, a.other = true, true
+	case probeGone:
 		a.done = true
 	case probeFailed:
 		a.fails++
@@ -259,7 +284,7 @@ func (t *treeSyncerAdapter) probeRoot(ctx context.Context, peerId, id string, ty
 			return probeUnanswered
 		}
 		if has {
-			return probeIsOther
+			return probeGone
 		}
 	}
 	var (
@@ -283,7 +308,7 @@ func (t *treeSyncerAdapter) probeRoot(ctx context.Context, peerId, id string, ty
 	if tree != nil {
 		// The tree landed between the check above and the request.
 		_ = tree.Close()
-		return probeIsOther
+		return probeGone
 	}
 	if full {
 		t.probeMu.Lock()

@@ -52,8 +52,10 @@ type SpaceRegistry interface {
 	// return true.
 	ShouldPullTree(ctx context.Context, spaceId, treeId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool
 
-	// PullFirst lists the trees of spaceId that a sync round fetches
-	// before its other missing trees. nil when none.
+	// PullFirst lists the trees of spaceId that a sync round handles
+	// before its other trees, when the round has them to fetch, sync
+	// or retry. nil when none. Called from sync rounds, which can race
+	// a space's teardown: implementations stay free of side effects.
 	PullFirst(spaceId string) []string
 }
 

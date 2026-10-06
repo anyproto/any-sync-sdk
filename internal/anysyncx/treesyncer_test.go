@@ -25,6 +25,8 @@ type scriptedRegistry struct {
 	trees map[string]objecttree.ObjectTree
 	first []string
 	calls []string
+	// firstCalls counts PullFirst lookups.
+	firstCalls int
 }
 
 func (r *scriptedRegistry) GetTree(_ context.Context, _, treeId string) (objecttree.ObjectTree, error) {
@@ -53,23 +55,62 @@ func (r *scriptedRegistry) DeleteTree(context.Context, string, string) error    
 func (r *scriptedRegistry) ShouldPullTree(context.Context, string, string, *treechangeproto.RawTreeChangeWithId, []string) bool {
 	return true
 }
-func (r *scriptedRegistry) PullFirst(string) []string { return r.first }
+func (r *scriptedRegistry) PullFirst(string) []string {
+	r.firstCalls++
+	return r.first
+}
 
-// A round fetches the registry's pull-first trees before the rest of
-// the missing ids, which keep their diff order. Existing ids and ids
-// absent from the diff are not reordered or added.
-func TestTreeSyncerPullsFirstTreesFirst(t *testing.T) {
-	reg := &scriptedRegistry{first: []string{"index", "absent"}}
-	ts := newTreeSyncer("space1", reg, nil)
+// A round handles the registry's pull-first trees before its other
+// ids, wherever the round found them: missing, changed or parked. The
+// rest keep their order, and a pull-first id the round does not work
+// on adds no work.
+func TestTreeSyncerHandlesPullFirstTreesFirst(t *testing.T) {
 	p := fakePeer{id: "peer1"}
 
-	require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "m2", "index", "m3"}))
-	require.Equal(t, []string{"index", "m1", "m2", "m3", "e1"}, reg.calls)
+	t.Run("missing", func(t *testing.T) {
+		reg := &scriptedRegistry{first: []string{"index", "absent"}}
+		ts := newTreeSyncer("space1", reg, nil)
+		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "m2", "index", "m3"}))
+		require.Equal(t, []string{"index", "m1", "m2", "m3", "e1"}, reg.calls)
+	})
 
-	// Nothing to move: the diff order stands.
-	reg.calls = nil
-	require.NoError(t, ts.SyncAll(context.Background(), p, []string{"index"}, []string{"m2", "m1"}))
-	require.Equal(t, []string{"m2", "m1", "index"}, reg.calls)
+	t.Run("changed", func(t *testing.T) {
+		reg := &scriptedRegistry{first: []string{"index"}}
+		ts := newTreeSyncer("space1", reg, nil)
+		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1", "index"}, []string{"m1", "m2"}))
+		require.Equal(t, []string{"index", "m1", "m2", "e1"}, reg.calls)
+	})
+
+	t.Run("parked", func(t *testing.T) {
+		reg := &scriptedRegistry{first: []string{"index"}, fail: map[string]error{"index": errors.New("boom")}}
+		ts := newTreeSyncer("space1", reg, nil)
+		require.NoError(t, ts.SyncAll(context.Background(), p, nil, []string{"index"}))
+		require.Equal(t, 1, ts.Stats()[0].Pending)
+
+		// The diff no longer offers the parked id; the retry still runs
+		// ahead of the round's backlog.
+		delete(reg.fail, "index")
+		reg.calls = nil
+		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "m2"}))
+		require.Equal(t, []string{"index", "m1", "m2", "e1"}, reg.calls)
+		require.Equal(t, 0, ts.Stats()[0].Pending)
+	})
+
+	t.Run("not in the round", func(t *testing.T) {
+		reg := &scriptedRegistry{first: []string{"index"}}
+		ts := newTreeSyncer("space1", reg, nil)
+		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m2", "m1"}))
+		require.Equal(t, []string{"m2", "m1", "e1"}, reg.calls)
+	})
+
+	t.Run("nothing to order", func(t *testing.T) {
+		reg := &scriptedRegistry{first: []string{"index"}}
+		ts := newTreeSyncer("space1", reg, nil)
+		require.NoError(t, ts.SyncAll(context.Background(), p, nil, nil))
+		require.NoError(t, ts.SyncAll(context.Background(), p, nil, []string{"index"}))
+		require.Equal(t, []string{"index"}, reg.calls)
+		require.Zero(t, reg.firstCalls, "a round with fewer than two ids does not ask the registry")
+	})
 }
 
 // TestTreeSyncerRetriesFailedGetTree pins the parked-tree repair loop:

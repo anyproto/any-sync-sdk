@@ -175,14 +175,14 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 	if t.registry == nil {
 		return ErrSpaceRegistryUnset
 	}
-	missing = pullFirst(missing, t.registry.PullFirst(t.spaceId))
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
 	fetched := make(map[string]struct{}, len(missing))
 	for _, id := range missing {
 		fetched[id] = struct{}{}
 	}
+	pending := t.pendingIds()
 	seen := make(map[string]struct{}, len(missing)+len(existing))
-	for _, ids := range [][]string{missing, existing, t.pendingIds()} {
+	for _, ids := range [][]string{t.roundFirst(missing, existing, pending), missing, existing, pending} {
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
 				continue
@@ -252,27 +252,29 @@ func (t *treeSyncerAdapter) SyncAll(ctx context.Context, p peer.Peer, existing, 
 	return nil
 }
 
-// pullFirst moves the ids in first to the front of missing and keeps
-// the rest in diff order. The diff orders ids by hash and a round
-// fetches them one at a time, so on a large space a tree the joiner
-// needs early (the spaceIndex, which carries the space name) would
-// otherwise wait behind an arbitrary share of the whole space.
-func pullFirst(missing, first []string) []string {
-	if len(first) == 0 || len(missing) < 2 {
-		return missing
+// roundFirst picks, from the ids a round works on, the ones the
+// registry wants handled before the rest; SyncAll's dedup then skips
+// them at their own position. The diff orders ids by hash and a round
+// handles them one at a time, so on a large space a tree needed early
+// (the spaceIndex, which carries the space name) would otherwise wait
+// behind an arbitrary share of the whole space — whether it is missing,
+// changed or parked. An id outside the round's lists is left out: the
+// order changes, the work does not.
+func (t *treeSyncerAdapter) roundFirst(lists ...[]string) []string {
+	total := 0
+	for _, ids := range lists {
+		total += len(ids)
 	}
-	out := make([]string, 0, len(missing))
-	for _, id := range missing {
-		if slices.Contains(first, id) {
-			out = append(out, id)
-		}
+	if total < 2 {
+		return nil
 	}
-	if len(out) == 0 {
-		return missing
-	}
-	for _, id := range missing {
-		if !slices.Contains(first, id) {
-			out = append(out, id)
+	var out []string
+	for _, id := range t.registry.PullFirst(t.spaceId) {
+		for _, ids := range lists {
+			if slices.Contains(ids, id) {
+				out = append(out, id)
+				break
+			}
 		}
 	}
 	return out

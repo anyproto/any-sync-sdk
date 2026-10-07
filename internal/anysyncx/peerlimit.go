@@ -30,6 +30,11 @@ const (
 	// peerLimitGrow is how many full windows of answered requests
 	// widen the budget by one.
 	peerLimitGrow = 4
+	// peerLimitReserve is the slots beyond the width that only a
+	// first request may take: the trees a space names first (its
+	// spaceIndex) are fetched while other spaces' fetch stages hold the
+	// budget.
+	peerLimitReserve = 1
 )
 
 // peerLimits holds one budget per peer, shared by every space's tree
@@ -71,11 +76,16 @@ type peerLimit struct {
 // peerSlot is one acquired slot of a peer's budget.
 type peerSlot struct{ epoch uint64 }
 
-// acquire takes a slot, waiting for one while the budget is spent.
-func (l *peerLimit) acquire(ctx context.Context) (peerSlot, error) {
+// acquire takes a slot, waiting for one while the budget is spent; a
+// first request may take a reserved slot beyond the width.
+func (l *peerLimit) acquire(ctx context.Context, first bool) (peerSlot, error) {
 	for {
 		l.mu.Lock()
-		if l.inUse < l.width {
+		width := l.width
+		if first {
+			width += peerLimitReserve
+		}
+		if l.inUse < width {
 			l.inUse++
 			slot := peerSlot{epoch: l.epoch}
 			l.mu.Unlock()

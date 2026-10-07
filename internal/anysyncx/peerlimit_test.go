@@ -18,19 +18,19 @@ func TestPeerLimitBoundsRequestsInFlight(t *testing.T) {
 	l := newPeerLimits().of("peer1")
 	slots := make([]peerSlot, peerLimitMax)
 	for i := range slots {
-		slot, err := l.acquire(context.Background())
+		slot, err := l.acquire(context.Background(), false)
 		require.NoError(t, err)
 		slots[i] = slot
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, err := l.acquire(ctx)
+	_, err := l.acquire(ctx, false)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	got := make(chan error, 1)
 	go func() {
-		_, err := l.acquire(context.Background())
+		_, err := l.acquire(context.Background(), false)
 		got <- err
 	}()
 	select {
@@ -48,7 +48,7 @@ func TestPeerLimitBoundsRequestsInFlight(t *testing.T) {
 func TestPeerLimitAdaptsToRefusals(t *testing.T) {
 	l := newPeerLimits().of("peer1")
 	cycle := func(tooMany bool) {
-		slot, err := l.acquire(context.Background())
+		slot, err := l.acquire(context.Background(), false)
 		require.NoError(t, err)
 		l.release(slot, tooMany)
 	}
@@ -75,7 +75,7 @@ func TestPeerLimitNarrowsOncePerBurst(t *testing.T) {
 	l := newPeerLimits().of("peer1")
 	slots := make([]peerSlot, peerLimitMax)
 	for i := range slots {
-		slot, err := l.acquire(context.Background())
+		slot, err := l.acquire(context.Background(), false)
 		require.NoError(t, err)
 		slots[i] = slot
 	}
@@ -85,7 +85,7 @@ func TestPeerLimitNarrowsOncePerBurst(t *testing.T) {
 	require.Equal(t, peerLimitMax/2, l.width)
 
 	// A refusal of a request sent after that narrows it again.
-	slot, err := l.acquire(context.Background())
+	slot, err := l.acquire(context.Background(), false)
 	require.NoError(t, err)
 	l.release(slot, true)
 	require.Equal(t, peerLimitMax/4, l.width)
@@ -109,4 +109,24 @@ func TestPeerBusyMatchesValueAndWireCode(t *testing.T) {
 	require.True(t, peerTooMany(fmt.Errorf("fetch: %w", wire)))
 	require.False(t, peerBusy(fmt.Errorf("boom")))
 	require.False(t, peerBusy(nil))
+}
+
+// A first request takes the reserved slot while the budget is spent;
+// any other request waits.
+func TestPeerLimitReservesASlotForFirstRequests(t *testing.T) {
+	l := newPeerLimits().of("peer1")
+	l.width = 2
+	for i := 0; i < 2; i++ {
+		_, err := l.acquire(context.Background(), false)
+		require.NoError(t, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := l.acquire(ctx, false)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the budget is spent")
+	slot, err := l.acquire(context.Background(), true)
+	require.NoError(t, err, "a first request has the reserved slot")
+	_, err = l.acquire(ctx, true)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "one reserved slot")
+	l.release(slot, false)
 }

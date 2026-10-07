@@ -374,7 +374,10 @@ dialed on a sync path; see `global-p2p.md`.
     changeType in plain text, and the fetch reads it on the way in;
   - the fetched `type` and `collection` trees (`PullFirstTypes`),
     materialized one at a time;
-  - the other fetched trees, materialized several at a time;
+  - the other fetched trees, materialized one at a time as well: a
+    replay is a write transaction on the projection store, whose single
+    writer serializes them, so a wider replay only queues on that lock
+    (measured: the same wall time at one and at six workers);
   - the changed trees, loaded and pinged with a full-sync request (a
     tree fetched from the peer is in sync with it already and is not
     pinged);
@@ -407,7 +410,10 @@ dialed on a sync path; see `global-p2p.md`.
   that client. The jobs of every space share one budget per peer for
   their fetches, narrowed by a refusal and widened again by answered
   requests, and a fetch the peer turns away as busy is asked again
-  after a short wait, a few times, before it is parked.
+  after a short wait, a few times, before it is parked. One slot beyond
+  the width is reserved for the trees a space names first, so a small
+  space's spaceIndex is fetched while a large space's fetch stage holds
+  the budget.
 - **Replication key.** One per account, read from the tech space id. The
   tech space is derived from the account key, so the key is known before
   any space loads, including on a new device.

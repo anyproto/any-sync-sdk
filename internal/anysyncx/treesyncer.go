@@ -26,10 +26,13 @@ import (
 var tsLog = logger.NewNamed("anysyncx.treesyncer")
 
 // treeSyncWorkers bounds the fetched trees one pass materializes at
-// once (syncjob.go). Kept under the read connections of a space's
-// storage (eight), each replay holding one, so other readers of the
-// space are not starved. A var so tests can pin the order.
-var treeSyncWorkers = 6
+// once (syncjob.go). One: a replay is a write transaction on the
+// space's projection store, which has a single writer, so wider replay
+// queues on that lock and only adds CPU — measured the same wall time
+// at one and at six workers, on a desktop and on a phone with two large
+// spaces replaying side by side. A var so a store with another writer
+// model can widen it, and so tests can pin the order.
+var treeSyncWorkers = 1
 
 // ErrTreeTypeSkipped is a tree fetch declined by selective sync before
 // any tree-storage write. The registry records a heads-only stub in its
@@ -236,7 +239,7 @@ func (t *treeSyncerAdapter) syncInline(ctx context.Context, p peer.Peer, existin
 	}
 	pending := t.pendingIds()
 	seen := make(map[string]struct{}, len(missing)+len(existing)+len(pending))
-	handle := func(ids []string) {
+	handle := func(ids []string, first bool) {
 		for _, id := range ids {
 			if _, dup := seen[id]; dup {
 				continue
@@ -251,7 +254,7 @@ func (t *treeSyncerAdapter) syncInline(ctx context.Context, p peer.Peer, existin
 				continue
 			}
 			t.syncing.Add(1)
-			tree, fetched, handled := t.syncOne(ctx, p, id, wasMissing || t.parkedMissing(id))
+			tree, fetched, handled := t.syncOne(ctx, p, id, wasMissing || t.parkedMissing(id), first)
 			if !handled {
 				t.markPending(id, wasMissing)
 			} else if tree != nil {
@@ -267,21 +270,23 @@ func (t *treeSyncerAdapter) syncInline(ctx context.Context, p peer.Peer, existin
 		if len(first) == 0 {
 			break
 		}
-		handle(first)
+		handle(first, true)
 	}
-	handle(missing)
-	handle(existing)
-	handle(pending)
+	handle(missing, false)
+	handle(existing, false)
+	handle(pending, false)
 }
 
 // syncOne resolves one tree through the registry, which fetches it
-// when mayFetch says it is missing locally, and reports the tree and
-// whether it was fetched from the peer (nil when there is nothing to
-// settle: the tree was skipped, deleted or parked). A failure parks
-// the id for the next round. handled is false when ctx ended before
-// the tree was handled either way. Safe to run for several trees at
-// once.
-func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string, mayFetch bool) (tree objecttree.ObjectTree, fetched, handled bool) {
+// when mayFetch says it is missing locally — on the budget's reserved
+// slot when first: a tree the registry names first (the spaceIndex of
+// a small space) must not wait behind the fetch stage of a large one —
+// and reports the tree and whether it was fetched from the peer (nil
+// when there is nothing to settle: the tree was skipped, deleted or
+// parked). A failure parks the id for the next round. handled is false
+// when ctx ended before the tree was handled either way. Safe to run
+// for several trees at once.
+func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string, mayFetch, first bool) (tree objecttree.ObjectTree, fetched, handled bool) {
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
 	// The diff names as missing a tree this device holds as its root
 	// alone; the peer may hold changes to it.
@@ -292,7 +297,7 @@ func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string,
 		}
 	}
 	var err error
-	tree, err = t.getTree(ctx, peerCtx, p.Id(), id, mayFetch)
+	tree, err = t.getTree(ctx, peerCtx, p.Id(), id, mayFetch, first)
 	switch {
 	case errors.Is(err, ErrTreeTypeSkipped):
 		// Declined by selective sync before any tree-storage
@@ -449,15 +454,16 @@ var (
 )
 
 // askPeer runs ask under a slot of peerId's request budget, shared with
-// the rounds of every other space. A peer that turns the request away
-// without looking at the tree — over its request cap, or already
-// serving this tree to us — is asked again after a short wait, the slot
-// returned meanwhile.
-func (t *treeSyncerAdapter) askPeer(ctx context.Context, peerId string, ask func() error) error {
+// the rounds of every other space; first takes the budget's reserved
+// slot when the rest are in use (peerLimit.acquire). A peer that turns
+// the request away without looking at the tree — over its request cap,
+// or already serving this tree to us — is asked again after a short
+// wait, the slot returned meanwhile.
+func (t *treeSyncerAdapter) askPeer(ctx context.Context, peerId string, first bool, ask func() error) error {
 	limit := t.limits.of(peerId)
 	backoff := getTreeBackoff
 	for attempt := 0; ; attempt++ {
-		slot, err := limit.acquire(ctx)
+		slot, err := limit.acquire(ctx, first)
 		if err != nil {
 			return err
 		}
@@ -482,12 +488,13 @@ func (t *treeSyncerAdapter) askPeer(ctx context.Context, peerId string, ask func
 // getTree resolves a tree through the registry, which fetches it when
 // it is missing locally. A tree that may be fetched holds a slot of the
 // peer's request budget until it is fetched and replayed (the registry
-// does both in one step); a tree known to be local takes none.
-func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, peerId, id string, mayFetch bool) (tree objecttree.ObjectTree, err error) {
+// does both in one step), the reserved slot when first; a tree known
+// to be local takes none.
+func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, peerId, id string, mayFetch, first bool) (tree objecttree.ObjectTree, err error) {
 	if !mayFetch {
 		return t.registry.GetTree(peerCtx, t.spaceId, id)
 	}
-	err = t.askPeer(ctx, peerId, func() error {
+	err = t.askPeer(ctx, peerId, first, func() error {
 		tree, err = t.registry.GetTree(peerCtx, t.spaceId, id)
 		return err
 	})
@@ -498,7 +505,7 @@ func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, peerId, id str
 // request budget and reports its root changeType, and whether it was
 // in storage already.
 func (t *treeSyncerAdapter) fetchTree(ctx context.Context, peerId, id string) (changeType string, local bool, err error) {
-	err = t.askPeer(ctx, peerId, func() error {
+	err = t.askPeer(ctx, peerId, false, func() error {
 		fctx, cancel := context.WithTimeout(ctx, fetchTimeout)
 		defer cancel()
 		changeType, local, err = t.fetcher.fetch(fctx, peerId, id)

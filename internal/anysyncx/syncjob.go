@@ -33,7 +33,9 @@ import (
 //     the way in says what each tree is.
 //  3. the fetched trees whose root is a type or a collection
 //     (SpaceRegistry.PullFirstTypes), materialized one at a time.
-//  4. the other fetched trees, materialized treeSyncWorkers at a time.
+//  4. the other fetched trees, materialized treeSyncWorkers (one) at a
+//     time: a replay is a write transaction on the projection store,
+//     whose single writer serializes them anyway.
 //  5. the changed trees, loaded and pinged with a full-sync request.
 //  6. the retries of trees parked by earlier failures.
 //
@@ -80,8 +82,8 @@ type syncItem struct {
 	peers []peer.Peer
 	// seq orders the items the way rounds queued them.
 	seq uint64
-	// busy: a worker is on it.
-	busy bool
+	// busy: a worker is on it. first: the registry named it first.
+	busy, first bool
 	// fetched: the tree is in storage, not yet materialized; changeType
 	// is its root's. local: it was in storage before the pass looked —
 	// a tree the diff names as missing that this device holds as its
@@ -311,6 +313,7 @@ func (j *syncJob) takeFirst() []*syncItem {
 		}
 		seen[id] = struct{}{}
 		if it, ok := j.items[id]; ok {
+			it.first = true
 			out = append(out, it)
 		}
 	}
@@ -347,7 +350,7 @@ func (j *syncJob) finish(it *syncItem) {
 // handle syncs one tree in one step, the way a round did on its own:
 // fetched when missing, loaded and pinged otherwise.
 func (j *syncJob) handle(it *syncItem) {
-	tree, fetched, handled := j.t.syncOne(j.ctx, it.peer, it.id, it.kind == syncMissing || j.t.parkedMissing(it.id))
+	tree, fetched, handled := j.t.syncOne(j.ctx, it.peer, it.id, it.kind == syncMissing || j.t.parkedMissing(it.id), it.first)
 	if !handled {
 		return
 	}

@@ -199,6 +199,35 @@ func TestSyncJobFetchesStayWithinThePeerBudget(t *testing.T) {
 	require.Equal(t, int64(2), fetches.peak.Load())
 }
 
+// The trees the registry names first are fetched on the budget's
+// reserved slot: a small space's spaceIndex does not wait behind a
+// large space's fetch stage holding the whole budget.
+func TestSyncJobFirstTreesBypassASpentBudget(t *testing.T) {
+	reg := &scriptedRegistry{first: []string{"index"}}
+	f := &scriptedFetcher{}
+	ts := jobSyncer(t, reg, f)
+	limit := ts.limits.of("peer1")
+	var held []peerSlot
+	for i := 0; i < peerLimitMax; i++ {
+		slot, err := limit.acquire(context.Background(), false)
+		require.NoError(t, err)
+		held = append(held, slot)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, []string{"m1", "index", "m2"})
+	}()
+	require.Eventually(t, func() bool { return slices.Equal(reg.got(), []string{"index"}) }, 5*time.Second, time.Millisecond,
+		"the index is fetched on the reserved slot")
+	time.Sleep(50 * time.Millisecond)
+	require.Empty(t, f.got(), "the other trees wait for the budget")
+	for _, slot := range held {
+		limit.release(slot, false)
+	}
+	require.NoError(t, <-done)
+	require.ElementsMatch(t, []string{"m1", "m2"}, f.got())
+}
+
 // A round returns with its caller's error once the caller's context
 // ends, and the job goes on: nothing is parked, the fetch in flight
 // completes and the tree is materialized.

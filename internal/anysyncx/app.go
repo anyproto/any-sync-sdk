@@ -863,6 +863,33 @@ func (a *App) ParkedTreeCount(spaceId string) int {
 	return ts.pendingCount()
 }
 
+// CloseSyncJob ends spaceId's sync job and waits for its workers. The
+// SDK calls it before it closes the space's store: a job that outlives
+// the store would park every tree it still holds, and a load through
+// the registry would rebuild the store the teardown just closed. The
+// trees the job still holds stay counted (SyncingTreeCount).
+func (a *App) CloseSyncJob(spaceId string) {
+	a.syncersMu.Lock()
+	ts := a.syncers[spaceId]
+	a.syncersMu.Unlock()
+	if ts != nil {
+		ts.job.close()
+	}
+}
+
+// CloseSyncJobs ends every space's sync job; see CloseSyncJob.
+func (a *App) CloseSyncJobs() {
+	a.syncersMu.Lock()
+	all := make([]*treeSyncerAdapter, 0, len(a.syncers))
+	for _, ts := range a.syncers {
+		all = append(all, ts)
+	}
+	a.syncersMu.Unlock()
+	for _, ts := range all {
+		ts.job.close()
+	}
+}
+
 // SyncingTreeCount returns the number of trees spaceId's sync job holds
 // — queued, being fetched or being replayed — plus the ones a round
 // syncs inline right now. 0 when the space was never loaded this

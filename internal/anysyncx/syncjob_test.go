@@ -3,6 +3,7 @@ package anysyncx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -187,7 +189,7 @@ func TestSyncJobGroupsRunAtTheirWidth(t *testing.T) {
 // workers the pass has.
 func TestSyncJobFetchesStayWithinThePeerBudget(t *testing.T) {
 	withWorkers(t, 6, 1)
-	fetches := newFlight(6, 30*time.Millisecond) // six never overlap: the budget is two
+	fetches := newFlight(6, 300*time.Millisecond) // six never overlap: the budget is two
 	reg := &scriptedRegistry{}
 	ts := jobSyncer(t, reg, &scriptedFetcher{onFetch: fetches.hold})
 	ts.limits.of("peer1").width = 2
@@ -224,6 +226,88 @@ func TestSyncJobOutlivesTheRound(t *testing.T) {
 	require.Eventually(t, func() bool { return ts.syncingCount() == 0 }, 5*time.Second, time.Millisecond)
 	require.Equal(t, []string{"m1"}, reg.got())
 	require.Zero(t, ts.pendingCount())
+}
+
+// A round waits for the whole queue, not only for the trees its own
+// diff named: a round with an empty diff that arrives while fetched
+// trees await their replay returns only once they are in.
+func TestSyncJobRoundWaitsForTheWholeQueue(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reg := &scriptedRegistry{}
+	reg.onGet = func(context.Context, string) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-release
+	}
+	ts := jobSyncer(t, reg, &scriptedFetcher{})
+	first := make(chan error, 1)
+	go func() { first <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, backlog(3)) }()
+	<-started // the trees are fetched; the first replay is held
+
+	empty := make(chan error, 1)
+	go func() { empty <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, nil) }()
+	select {
+	case err := <-empty:
+		t.Fatalf("an empty-diff round returned (%v) while fetched trees await their replay", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	require.NoError(t, <-first)
+	require.NoError(t, <-empty)
+	require.Equal(t, backlog(3), reg.got())
+}
+
+// A tree is reported fetched from the peer it was fetched from, however
+// many rounds named it since; a local tree is pinged on every peer
+// whose round named it.
+func TestSyncJobKeepsTheFetchingPeerAndPingsEveryNamingPeer(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	changed := &pingTree{}
+	reg := &scriptedRegistry{trees: map[string]objecttree.ObjectTree{"m1": headsTree{heads: []string{"h"}}, "c1": changed}, has: map[string]bool{"c1": true}}
+	f := &scriptedFetcher{onFetch: func(context.Context, string) {
+		close(started)
+		<-release
+	}}
+	ts := jobSyncer(t, reg, f)
+	var reported []string
+	ts.onFetched = func(peerId, treeId string, _ []string) { reported = append(reported, peerId+"/"+treeId) }
+
+	done := make(chan error, 2)
+	go func() {
+		done <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, []string{"c1"}, []string{"m1"})
+	}()
+	<-started // m1 is being fetched from peer1
+	go func() {
+		done <- ts.SyncAll(context.Background(), fakePeer{id: "peer2"}, []string{"c1"}, []string{"m1"})
+	}()
+	require.Eventually(t, func() bool {
+		ts.job.mu.Lock()
+		defer ts.job.mu.Unlock()
+		return len(ts.job.items["c1"].peers) == 2
+	}, 5*time.Second, time.Millisecond)
+	close(release)
+	require.NoError(t, <-done)
+	require.NoError(t, <-done)
+	require.Equal(t, []string{"peer1/m1"}, reported)
+	require.Equal(t, int64(2), changed.pings.Load())
+}
+
+// A tree deleted while it was queued is finished without a park,
+// whether the fetch or the replay finds it gone.
+func TestSyncJobDeletedTreeIsNotParked(t *testing.T) {
+	gone := spacestorage.ErrTreeStorageAlreadyDeleted
+	reg := &scriptedRegistry{fail: map[string]error{"m2": fmt.Errorf("spaceobjects: BuildTree m2: %w", gone)}}
+	f := &scriptedFetcher{fail: map[string]error{"m1": gone}}
+	ts := jobSyncer(t, reg, f)
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, backlog(3)))
+	require.Equal(t, []string{"m02", "m03"}, reg.got()[len(reg.got())-2:])
+	require.Zero(t, ts.pendingCount())
+	require.Zero(t, ts.syncingCount())
 }
 
 // Rounds that overlap queue the same trees once and both wait for them.
@@ -289,6 +373,25 @@ func TestSyncJobReplayFailureParks(t *testing.T) {
 	require.Equal(t, []string{"m02"}, reg.got())
 	require.Equal(t, backlog(3), f.got(), "a tree in storage is not fetched again")
 	require.Zero(t, ts.pendingCount())
+}
+
+// Close during a replay: the replay's context ends, the tree is not
+// parked, and the round waiting returns.
+func TestSyncJobCloseDuringReplay(t *testing.T) {
+	started := make(chan struct{})
+	reg := &scriptedRegistry{fail: map[string]error{"m01": context.Canceled}}
+	reg.onGet = func(ctx context.Context, _ string) {
+		close(started)
+		<-ctx.Done()
+	}
+	ts := jobSyncer(t, reg, &scriptedFetcher{})
+	done := make(chan error, 1)
+	go func() { done <- ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, backlog(2)) }()
+	<-started
+	require.NoError(t, ts.Close(context.Background()))
+	require.NoError(t, <-done)
+	require.Zero(t, ts.pendingCount())
+	require.Equal(t, 2, ts.syncingCount(), "both trees are in storage and not in the projection")
 }
 
 // Close ends the job: the fetch in flight is cut, nothing more runs,

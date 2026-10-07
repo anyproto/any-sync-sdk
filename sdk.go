@@ -783,6 +783,11 @@ func (s *SDK) Close() error {
 	// touches readSync, spaces, tsp, db and app, all of which are
 	// closed below — including the case of a cold GetSpace hanging on
 	// an unreachable sync-node, which the cancel unblocks.
+	if s.app != nil {
+		// The sync jobs stop before anything they write to closes; what
+		// they still hold stays counted for the watermark gate below.
+		s.app.CloseSyncJobs()
+	}
 	if s.bootstrapDone != nil {
 		s.bootstrapCancel()
 		<-s.bootstrapDone

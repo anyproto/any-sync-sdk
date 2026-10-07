@@ -37,11 +37,13 @@ import (
 //  5. the changed trees, loaded and pinged with a full-sync request.
 //  6. the retries of trees parked by earlier failures.
 //
-// Within a pass no object replays ahead of a definition the diff
-// offered, and no definition replays next to a tree that may look it
-// up: that is what keeps the apply gate's parking (crdt.md § Datasets)
-// for the cases the job cannot see — a tree a peer's head update pulls
-// on its own, a definition arriving in a later pass.
+// Within a pass no object the pass fetched replays ahead of a type or
+// collection it fetched, and no such definition replays next to a tree
+// that may look it up: that is what keeps the apply gate's parking
+// (crdt.md § Datasets) for the cases the job cannot see — a tree a
+// peer's head update pulls on its own, a definition arriving in a
+// later pass, a bundle root (an object that declares a type) handled
+// in group 1 or, when the spaceIndex does not list it yet, in group 4.
 
 // treeFetchWorkers bounds the trees one pass fetches at once. A fetch is
 // a round trip to the peer and a storage write, nothing else, so the
@@ -50,8 +52,8 @@ import (
 var treeFetchWorkers = 8
 
 // fetchTimeout bounds one tree request. A tree cut short keeps what
-// arrived: its storage was created on the first answer, so the next
-// diff offers it as changed and a full-sync request completes it.
+// arrived: its storage was created on the first answer, so a later
+// pass finds it local and the ping completes it.
 var fetchTimeout = 2 * time.Minute
 
 // syncKind is why a round queued a tree.
@@ -71,7 +73,11 @@ const (
 type syncItem struct {
 	id   string
 	kind syncKind
-	peer peer.Peer
+	// peer is the one the tree is fetched from: the latest round's,
+	// until the fetch starts. peers are every round's, the ones a local
+	// tree is pinged with.
+	peer  peer.Peer
+	peers []peer.Peer
 	// seq orders the items the way rounds queued them.
 	seq uint64
 	// busy: a worker is on it.
@@ -119,12 +125,16 @@ func newSyncJob(t *treeSyncerAdapter) *syncJob {
 
 // add queues a round's trees — in the order given, missing and changed
 // ids first, then the parked ones, an id once — and returns the items
-// the round waits for. A tree already queued is shared; a queued retry
-// the diff now offers becomes a fetch or a ping.
+// the round waits for: the whole queue, in queue order. A tree in
+// storage but not yet in the projection is one the diff no longer
+// names, so a round that waited for its own trees alone would report
+// a space synced while the job still holds its trees. A tree already
+// queued is shared; a queued retry the diff now offers becomes a fetch
+// or a ping, and a tree not yet being fetched is fetched from the
+// latest round's peer.
 func (j *syncJob) add(p peer.Peer, existing, missing, parked []string) []*syncItem {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	var out []*syncItem
 	seen := make(map[string]struct{}, len(existing)+len(missing)+len(parked))
 	queue := func(ids []string, kind syncKind) {
 		for _, id := range ids {
@@ -135,20 +145,29 @@ func (j *syncJob) add(p peer.Peer, existing, missing, parked []string) []*syncIt
 			it, ok := j.items[id]
 			if !ok {
 				j.seq++
-				it = &syncItem{id: id, kind: kind, peer: p, seq: j.seq, done: make(chan struct{})}
+				it = &syncItem{id: id, kind: kind, peer: p, peers: []peer.Peer{p}, seq: j.seq, done: make(chan struct{})}
 				j.items[id] = it
-			} else if !it.busy {
+				continue
+			}
+			if !slices.ContainsFunc(it.peers, func(q peer.Peer) bool { return q.Id() == p.Id() }) {
+				it.peers = append(it.peers, p)
+			}
+			if !it.busy && !it.fetched {
 				it.peer = p
 				if it.kind == syncRetry {
 					it.kind = kind
 				}
 			}
-			out = append(out, it)
 		}
 	}
 	queue(missing, syncMissing)
 	queue(existing, syncChanged)
 	queue(parked, syncRetry)
+	out := make([]*syncItem, 0, len(j.items))
+	for _, it := range j.items {
+		out = append(out, it)
+	}
+	slices.SortFunc(out, func(a, b *syncItem) int { return int(a.seq - b.seq) })
 	if len(out) == 0 || j.closed {
 		return out
 	}
@@ -328,13 +347,19 @@ func (j *syncJob) finish(it *syncItem) {
 // handle syncs one tree in one step, the way a round did on its own:
 // fetched when missing, loaded and pinged otherwise.
 func (j *syncJob) handle(it *syncItem) {
-	if j.t.syncOne(j.ctx, it.peer, it.id, it.kind == syncMissing || j.t.parkedMissing(it.id)) {
-		j.finish(it)
+	tree, fetched, handled := j.t.syncOne(j.ctx, it.peer, it.id, it.kind == syncMissing || j.t.parkedMissing(it.id))
+	if !handled {
+		return
 	}
+	if tree != nil {
+		j.t.synced(j.ctx, it.peer, it.peers, it.id, tree, fetched)
+	}
+	j.finish(it)
 }
 
 // fetch brings one missing tree into storage. A failure parks the tree
-// for a retry; success leaves the item queued as fetched.
+// for a retry; a tree deleted meanwhile has nothing to sync; success
+// leaves the item queued as fetched.
 func (j *syncJob) fetch(it *syncItem) {
 	t := j.t
 	changeType, local, err := t.fetchTree(j.ctx, it.peer.Id(), it.id)
@@ -342,8 +367,12 @@ func (j *syncJob) fetch(it *syncItem) {
 		if j.ctx.Err() != nil {
 			return
 		}
-		t.markPending(it.id, true)
-		t.logParked(it.peer.Id(), it.id, err)
+		if treeGone(err) {
+			t.gone(it.peer.Id(), it.id)
+		} else {
+			t.markPending(it.id, true)
+			t.logParked(it.peer.Id(), it.id, err)
+		}
 		j.finish(it)
 		return
 	}
@@ -365,12 +394,16 @@ func (j *syncJob) materialize(it *syncItem) {
 		if j.ctx.Err() != nil {
 			return
 		}
-		t.markPending(it.id, false)
-		t.logParked(it.peer.Id(), it.id, err)
+		if treeGone(err) {
+			t.gone(it.peer.Id(), it.id)
+		} else {
+			t.markPending(it.id, false)
+			t.logParked(it.peer.Id(), it.id, err)
+		}
 		j.finish(it)
 		return
 	}
 	t.recovered(it.peer.Id(), it.id)
-	t.synced(j.ctx, it.peer, it.id, tree, !it.local)
+	t.synced(j.ctx, it.peer, it.peers, it.id, tree, !it.local)
 	j.finish(it)
 }

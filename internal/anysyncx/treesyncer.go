@@ -177,7 +177,9 @@ func (t *treeSyncerAdapter) Name() string { return treesyncer.CName }
 func (t *treeSyncerAdapter) Run(_ context.Context) error { return nil }
 
 // Close ends the space's sync job and waits for its workers: nothing
-// fetches or replays once the space's components close.
+// fetches or replays once the space's components close. The SDK closes
+// the job earlier, before it closes the space's store (App.CloseSyncJob,
+// CloseSyncJobs); a second close is a no-op.
 func (t *treeSyncerAdapter) Close(_ context.Context) error {
 	t.job.close()
 	return nil
@@ -241,12 +243,21 @@ func (t *treeSyncerAdapter) syncInline(ctx context.Context, p peer.Peer, existin
 			}
 			seen[id] = struct{}{}
 			_, wasMissing := isMissing[id]
-			if ctx.Err() != nil || !t.syncOne(ctx, p, id, wasMissing || t.parkedMissing(id)) {
+			if ctx.Err() != nil {
 				// Round budget exhausted: park everything unresolved for
 				// the next round instead of burning through the rest
 				// with guaranteed failures.
 				t.markPending(id, wasMissing)
+				continue
 			}
+			t.syncing.Add(1)
+			tree, fetched, handled := t.syncOne(ctx, p, id, wasMissing || t.parkedMissing(id))
+			if !handled {
+				t.markPending(id, wasMissing)
+			} else if tree != nil {
+				t.synced(ctx, p, []peer.Peer{p}, id, tree, fetched)
+			}
+			t.syncing.Add(-1)
 		}
 	}
 	// Asked again after an answer was handled: handling the first (the
@@ -263,15 +274,14 @@ func (t *treeSyncerAdapter) syncInline(ctx context.Context, p peer.Peer, existin
 	handle(pending)
 }
 
-// syncOne resolves one tree through the registry — which fetches it
-// when mayFetch says it is missing locally — and, when it was local,
-// pings the peer with it: a tree fetched from the peer is in sync with
-// it already. A failure parks the id for the next round. It reports
-// false when ctx ended before the tree was handled either way. Safe to
-// run for several trees at once.
-func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string, mayFetch bool) (handled bool) {
-	t.syncing.Add(1)
-	defer t.syncing.Add(-1)
+// syncOne resolves one tree through the registry, which fetches it
+// when mayFetch says it is missing locally, and reports the tree and
+// whether it was fetched from the peer (nil when there is nothing to
+// settle: the tree was skipped, deleted or parked). A failure parks
+// the id for the next round. handled is false when ctx ended before
+// the tree was handled either way. Safe to run for several trees at
+// once.
+func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string, mayFetch bool) (tree objecttree.ObjectTree, fetched, handled bool) {
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
 	// The diff names as missing a tree this device holds as its root
 	// alone; the peer may hold changes to it.
@@ -281,8 +291,10 @@ func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string,
 			local = has
 		}
 	}
-	tree, err := t.getTree(ctx, peerCtx, p.Id(), id, mayFetch)
-	if errors.Is(err, ErrTreeTypeSkipped) {
+	var err error
+	tree, err = t.getTree(ctx, peerCtx, p.Id(), id, mayFetch)
+	switch {
+	case errors.Is(err, ErrTreeTypeSkipped):
 		// Declined by selective sync before any tree-storage
 		// write; the stub it recorded converges the diff. A park
 		// would re-probe the peer every round and hold
@@ -292,11 +304,13 @@ func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string,
 				zap.String("spaceId", t.spaceId), zap.String("treeId", id),
 				zap.String("peerId", p.Id()))
 		}
-		return true
-	}
-	if err != nil {
+		return nil, false, true
+	case treeGone(err):
+		t.gone(p.Id(), id)
+		return nil, false, true
+	case err != nil:
 		if ctx.Err() != nil {
-			return false
+			return nil, false, false
 		}
 		// See the pending field doc: the fetch may already have
 		// landed in storage, so this id may never show up in a
@@ -304,27 +318,44 @@ func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string,
 		// for the process lifetime.
 		t.markPending(id, mayFetch)
 		t.logParked(p.Id(), id, err)
-		return true
+		return nil, false, true
 	}
 	t.recovered(p.Id(), id)
-	t.synced(ctx, p, id, tree, mayFetch && !local)
-	return true
+	return tree, mayFetch && !local, true
 }
 
-// synced settles a tree the round resolved: one fetched from the peer
-// is reported as in sync with it; one that was local is pinged with a
-// full-sync request, whose answer the peer routes to the tree's own
-// handler — the space settings tree's included, which is how a device
-// that holds it as its root alone learns of deletions. The tree is not
-// closed: the async exchange may still need it.
-func (t *treeSyncerAdapter) synced(ctx context.Context, p peer.Peer, id string, tree objecttree.ObjectTree, fetched bool) {
+// synced settles a tree a round resolved: one fetched from p is
+// reported as in sync with it; one that was local is pinged with a
+// full-sync request on every peer whose round named it — the answer is
+// routed by the peer to the tree's own handler, the space settings
+// tree's included, which is how a device that holds it as its root
+// alone learns of deletions. The tree is not closed: the async exchange
+// may still need it.
+func (t *treeSyncerAdapter) synced(ctx context.Context, p peer.Peer, peers []peer.Peer, id string, tree objecttree.ObjectTree, fetched bool) {
 	if fetched {
 		t.reportFetched(p.Id(), id, tree)
 		return
 	}
-	if st, ok := tree.(synctree.SyncTree); ok {
-		_ = st.SyncWithPeer(ctx, p)
+	st, ok := tree.(synctree.SyncTree)
+	if !ok {
+		return
 	}
+	for _, q := range peers {
+		_ = st.SyncWithPeer(ctx, q)
+	}
+}
+
+// treeGone reports a tree deleted on this device: nothing to sync.
+func treeGone(err error) bool {
+	return errors.Is(err, spacestorage.ErrTreeStorageAlreadyDeleted)
+}
+
+// gone settles a tree deleted while it was queued: a park would retry
+// it every round for nothing.
+func (t *treeSyncerAdapter) gone(peerId, id string) {
+	t.clearPending(id)
+	t.log.Debug("tree deleted meanwhile; nothing to sync",
+		zap.String("spaceId", t.spaceId), zap.String("treeId", id), zap.String("peerId", peerId))
 }
 
 // logParked logs a tree parked for retry at the level its failure

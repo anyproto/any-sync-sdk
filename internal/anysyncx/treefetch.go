@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	anystore "github.com/anyproto/any-store"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
@@ -50,6 +52,8 @@ type storageFetcher struct {
 }
 
 func (f *storageFetcher) fetch(ctx context.Context, peerId, treeId string) (string, bool, error) {
+	// Checked right before the request, as any-sync's own fetch does: a
+	// tree can be deleted while it waits in the queue.
 	if ct, stored, err := f.stored(ctx, treeId); stored || err != nil {
 		return ct, stored, err
 	}
@@ -69,14 +73,23 @@ func (f *storageFetcher) fetch(ctx context.Context, peerId, treeId string) (stri
 	return coll.changeType, false, nil
 }
 
-// stored reports the root changeType of a tree in the space's storage.
-// The storage handle is not closed: it shares the space's changes
-// collection, as every open tree does.
+// stored reports the root changeType of a tree in the space's storage,
+// or spacestorage.ErrTreeStorageAlreadyDeleted for a tree deleted here
+// (its changes are gone and its head entry says so; fetching it would
+// bring a deleted object back). The storage handle is not closed: it
+// shares the space's changes collection, as every open tree does.
 func (f *storageFetcher) stored(ctx context.Context, treeId string) (changeType string, stored bool, err error) {
-	st, err := f.storage.TreeStorage(ctx, treeId)
-	if errors.Is(err, treestorage.ErrUnknownTreeId) {
+	entry, err := f.storage.HeadStorage().GetEntry(ctx, treeId)
+	if errors.Is(err, anystore.ErrDocNotFound) {
 		return "", false, nil
 	}
+	if err != nil {
+		return "", false, err
+	}
+	if entry.DeletedStatus != headstorage.DeletedStatusNotDeleted {
+		return "", false, spacestorage.ErrTreeStorageAlreadyDeleted
+	}
+	st, err := f.storage.TreeStorage(ctx, treeId)
 	if err != nil {
 		return "", false, err
 	}

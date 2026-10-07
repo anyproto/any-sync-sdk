@@ -380,14 +380,23 @@ dialed on a sync path; see `global-p2p.md`.
     pinged);
   - the retries of trees parked by earlier failures.
 
-  So within a pass no object replays ahead of a definition, and no
-  definition replays next to a tree that may look it up (any-store shows
-  a collection to readers before the transaction creating it commits,
-  and a reader that gets there first fails with a read error). What the
-  job cannot see — a tree a peer's head update pulls on its own, a
-  definition arriving in a later pass — the apply gate covers: a gate
-  lookup that fails parks the object's change, and it drains when the
+  So within a pass no object the pass fetched replays ahead of a type
+  or collection it fetched, and no such definition replays next to a
+  tree that may look it up (any-store shows a collection to readers
+  before the transaction creating it commits, and a reader that gets
+  there first fails with a read error). What the job cannot see — a
+  tree a peer's head update pulls on its own, a definition arriving in
+  a later pass, a bundle root (an object that declares a type) the
+  spaceIndex does not list yet — the apply gate covers: a gate lookup
+  that fails parks the object's change, and it drains when the
   definition commits (`crdt.md` § Datasets).
+
+  A round waits for the whole queue, not only for the trees its own
+  diff named: a tree fetched into storage is one the diff no longer
+  names, and a round that returned before it replayed would report the
+  space synced too early. The job stops before the space's store
+  closes (shutdown, offload); what it still holds stays counted for the
+  close-time watermark gate.
 
   The tech space and a space under selective sync sync within the round
   instead, one tree at a time in the same group order, so a caller that
@@ -398,7 +407,7 @@ dialed on a sync path; see `global-p2p.md`.
   that client. The jobs of every space share one budget per peer for
   their fetches, narrowed by a refusal and widened again by answered
   requests, and a fetch the peer turns away as busy is asked again
-  after a short wait instead of being parked.
+  after a short wait, a few times, before it is parked.
 - **Replication key.** One per account, read from the tech space id. The
   tech space is derived from the account key, so the key is known before
   any space loads, including on a new device.

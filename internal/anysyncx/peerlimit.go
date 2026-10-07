@@ -19,10 +19,10 @@ import (
 // (ErrDuplicateRequest). Neither says anything about the tree: the
 // request passes once the peer has room.
 //
-// peerLimits keeps the probes and the fetches of all spaces' rounds
-// under that cap, leaving room for the request queue any-sync runs
-// beside the rounds (ten workers per peer). The width adapts: a
-// refusal halves it, a run of answered requests widens it again.
+// peerLimits keeps the fetches of all spaces' sync jobs under that
+// cap, leaving room for the request queue any-sync runs beside them
+// (ten workers per peer). The width adapts: a refusal halves it, a run
+// of answered requests widens it again.
 
 const (
 	// peerLimitMax is the widest a peer's budget gets.

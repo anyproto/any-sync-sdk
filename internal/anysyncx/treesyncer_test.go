@@ -4,13 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/net/peer"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -19,18 +27,36 @@ import (
 
 // scriptedRegistry fails GetTree for the ids in fail; every call is
 // recorded so tests can assert retry behavior. first is what PullFirst
-// reports.
+// reports; a fetched id adds its grow entry to it, the way a fetched
+// spaceIndex makes its bundle roots known. firstTypes is what
+// PullFirstTypes reports: nil syncs inline, set uses the sync job.
 type scriptedRegistry struct {
-	fail  map[string]error
-	trees map[string]objecttree.ObjectTree
-	first []string
+	fail       map[string]error
+	trees      map[string]objecttree.ObjectTree
+	first      []string
+	grow       map[string][]string
+	firstTypes []string
+	// onGet runs inside every GetTree, outside the lock: a test's hook
+	// to hold a load or watch the ones in flight.
+	onGet func(ctx context.Context, treeId string)
+
+	// mu guards what a round's workers and overlapping rounds write.
+	mu    sync.Mutex
 	calls []string
 	// firstCalls counts PullFirst lookups.
 	firstCalls int
 }
 
-func (r *scriptedRegistry) GetTree(_ context.Context, _, treeId string) (objecttree.ObjectTree, error) {
+func (r *scriptedRegistry) GetTree(ctx context.Context, _, treeId string) (objecttree.ObjectTree, error) {
+	r.mu.Lock()
 	r.calls = append(r.calls, treeId)
+	r.mu.Unlock()
+	if r.onGet != nil {
+		r.onGet(ctx, treeId)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.first = append(r.first, r.grow[treeId]...)
 	if err, ok := r.fail[treeId]; ok {
 		return nil, err
 	}
@@ -40,6 +66,19 @@ func (r *scriptedRegistry) GetTree(_ context.Context, _, treeId string) (objectt
 	// nil tree is fine for SyncAll: the synctree.SyncTree assertion
 	// just comes back false and the ping is skipped.
 	return nil, nil
+}
+
+func (r *scriptedRegistry) got() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+func (r *scriptedRegistry) reset(fail map[string]error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = nil
+	r.fail = fail
 }
 
 func (r *scriptedRegistry) HasTree(_ context.Context, _, treeId string) (bool, error) {
@@ -55,10 +94,13 @@ func (r *scriptedRegistry) DeleteTree(context.Context, string, string) error    
 func (r *scriptedRegistry) ShouldPullTree(context.Context, string, string, *treechangeproto.RawTreeChangeWithId, []string) bool {
 	return true
 }
-func (r *scriptedRegistry) PullFirst(string) []string {
+func (r *scriptedRegistry) PullFirst(context.Context, string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.firstCalls++
-	return r.first
+	return slices.Clone(r.first)
 }
+func (r *scriptedRegistry) PullFirstTypes(string) []string { return r.firstTypes }
 
 // A round handles the registry's pull-first trees before its other
 // ids, wherever the round found them: missing, changed or parked. The
@@ -94,6 +136,14 @@ func TestTreeSyncerHandlesPullFirstTreesFirst(t *testing.T) {
 		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "m2"}))
 		require.Equal(t, []string{"index", "m1", "m2", "e1"}, reg.calls)
 		require.Equal(t, 0, ts.Stats()[0].Pending)
+	})
+
+	t.Run("named by a tree handled first", func(t *testing.T) {
+		// The index names root1 only once it is local.
+		reg := &scriptedRegistry{first: []string{"index"}, grow: map[string][]string{"index": {"root1"}}}
+		ts := newTreeSyncer("space1", reg, nil)
+		require.NoError(t, ts.SyncAll(context.Background(), p, []string{"e1"}, []string{"m1", "root1", "index", "m2"}))
+		require.Equal(t, []string{"index", "root1", "m1", "m2", "e1"}, reg.calls)
 	})
 
 	t.Run("not in the round", func(t *testing.T) {
@@ -164,6 +214,18 @@ func TestTreeSyncerParksOnDeadCtx(t *testing.T) {
 	require.Equal(t, 0, ts.Stats()[0].Pending)
 }
 
+// A round whose context ends during a fetch parks the tree in flight
+// and the ones after it, so the next round picks them up.
+func TestTreeSyncerParksWhenTheRoundEndsMidFetch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reg := &scriptedRegistry{fail: map[string]error{"t1": context.Canceled}}
+	reg.onGet = func(context.Context, string) { cancel() }
+	ts := newTreeSyncer("space1", reg, nil)
+	require.NoError(t, ts.SyncAll(ctx, fakePeer{id: "peer1"}, nil, []string{"t1", "t2"}))
+	require.Equal(t, []string{"t1"}, reg.calls)
+	require.Equal(t, 2, ts.pendingCount())
+}
+
 // TestTreeSyncerDedupsPendingAgainstDiff: an id present in both the
 // round's diff and the parked set is resolved once per round.
 func TestTreeSyncerDedupsPendingAgainstDiff(t *testing.T) {
@@ -190,6 +252,20 @@ func (h headsTree) Lock()           {}
 func (h headsTree) Unlock()         {}
 func (h headsTree) Heads() []string { return h.heads }
 
+// pingTree counts the full-sync requests SyncAll queues for it.
+type pingTree struct {
+	synctree.SyncTree
+	pings atomic.Int64
+}
+
+func (p *pingTree) Lock()           {}
+func (p *pingTree) Unlock()         {}
+func (p *pingTree) Heads() []string { return []string{"h"} }
+func (p *pingTree) SyncWithPeer(context.Context, peer.Peer) error {
+	p.pings.Add(1)
+	return nil
+}
+
 // A tree fetched whole from the peer is reported with its heads; a
 // tree that already existed is not.
 func TestTreeSyncerReportsFetchedTrees(t *testing.T) {
@@ -204,6 +280,17 @@ func TestTreeSyncerReportsFetchedTrees(t *testing.T) {
 	}
 	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "n1"}, []string{"existing"}, []string{"missing"}))
 	require.Equal(t, []string{"n1/missing/h1,h2"}, got)
+}
+
+// A changed tree is pinged with a full-sync request; a tree fetched
+// from the peer is in sync with it already and is not.
+func TestTreeSyncerPingsChangedTreesOnly(t *testing.T) {
+	missing, changed := &pingTree{}, &pingTree{}
+	reg := &scriptedRegistry{trees: map[string]objecttree.ObjectTree{"missing": missing, "changed": changed}}
+	ts := newTreeSyncer("space1", reg, nil)
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "n1"}, []string{"changed"}, []string{"missing"}))
+	require.Equal(t, int64(1), changed.pings.Load())
+	require.Zero(t, missing.pings.Load())
 }
 
 // A tree declined by selective sync is not a failure: the stub it
@@ -235,4 +322,121 @@ func TestTreeSyncerSkippedTreeIsNotParked(t *testing.T) {
 	reg.fail["u"] = reg.fail["t"]
 	require.NoError(t, ts.SyncAll(context.Background(), p, nil, []string{"u"}))
 	require.Equal(t, 0, ts.Stats()[0].Pending)
+}
+
+// A peer that turns a fetch away as busy is asked again within the
+// round: the tree is not parked for a refusal that passes on its own.
+func TestTreeSyncerRetriesABusyPeer(t *testing.T) {
+	prevBackoff := getTreeBackoff
+	getTreeBackoff = time.Millisecond
+	t.Cleanup(func() { getTreeBackoff = prevBackoff })
+
+	reg := &busyRegistry{busy: map[string]int{"t1": 2, "t2": getTreeRetries + 1}}
+	ts := newTreeSyncer("space1", reg, nil)
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, []string{"t1", "t2"}))
+	require.Equal(t, 3, reg.gets["t1"], "refused twice, fetched on the third ask")
+	require.Equal(t, getTreeRetries+1, reg.gets["t2"])
+	require.Equal(t, 1, ts.Stats()[0].Pending, "only the tree the peer kept refusing is parked")
+	require.Less(t, ts.limits.of("peer1").width, peerLimitMax, "refusals over the cap narrow the peer's budget")
+}
+
+// A round that ends while it waits to ask a busy peer again asks
+// nothing more.
+func TestTreeSyncerBusyRetryStopsWithTheRound(t *testing.T) {
+	prevBackoff := getTreeBackoff
+	getTreeBackoff = 30 * time.Millisecond
+	t.Cleanup(func() { getTreeBackoff = prevBackoff })
+
+	reg := &busyRegistry{busy: map[string]int{"t1": 100}}
+	ts := newTreeSyncer("space1", reg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	reg.onGet = func() { cancel() } // the round ends during the first refusal
+	require.NoError(t, ts.SyncAll(ctx, fakePeer{id: "peer1"}, nil, []string{"t1", "t2"}))
+	require.Equal(t, 1, reg.gets["t1"])
+	require.Zero(t, reg.gets["t2"], "a finished round fetches nothing")
+}
+
+// busyRegistry refuses the first busy[id] fetches of a tree the way a
+// peer over its request cap does.
+type busyRegistry struct {
+	scriptedRegistry
+	busy map[string]int
+	// onGet runs inside every fetch.
+	onGet func()
+
+	getsMu sync.Mutex
+	gets   map[string]int
+}
+
+func (r *busyRegistry) GetTree(_ context.Context, _, treeId string) (objecttree.ObjectTree, error) {
+	if r.onGet != nil {
+		r.onGet()
+	}
+	r.getsMu.Lock()
+	defer r.getsMu.Unlock()
+	if r.gets == nil {
+		r.gets = map[string]int{}
+	}
+	r.gets[treeId]++
+	if r.gets[treeId] <= r.busy[treeId] {
+		return nil, fmt.Errorf("spaceobjects: BuildTree %s: %w", treeId, spacesyncproto.ErrTooManyRequestsFromPeer)
+	}
+	return nil, nil
+}
+
+// The tests of this package assert the order trees are handled in, so
+// they run one tree at a time; a test of the parallel groups sets the
+// worker counts itself.
+func TestMain(m *testing.M) {
+	treeSyncWorkers = 1
+	treeFetchWorkers = 1
+	os.Exit(m.Run())
+}
+
+func withWorkers(t *testing.T, fetch, sync int) {
+	t.Helper()
+	prevFetch, prevSync := treeFetchWorkers, treeSyncWorkers
+	treeFetchWorkers, treeSyncWorkers = fetch, sync
+	t.Cleanup(func() { treeFetchWorkers, treeSyncWorkers = prevFetch, prevSync })
+}
+
+// flight watches the calls in flight: every call waits until want of
+// them overlap (or a timeout), so a group that runs one at a time
+// stalls and never reaches the peak.
+type flight struct {
+	want           int64
+	wait           time.Duration
+	inFlight, peak atomic.Int64
+	full           chan struct{}
+	once           sync.Once
+}
+
+func newFlight(want int, wait time.Duration) *flight {
+	return &flight{want: int64(want), wait: wait, full: make(chan struct{})}
+}
+
+func (f *flight) hold(context.Context, string) {
+	n := f.inFlight.Add(1)
+	defer f.inFlight.Add(-1)
+	for {
+		if p := f.peak.Load(); n <= p || f.peak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	if n >= f.want {
+		f.once.Do(func() { close(f.full) })
+	}
+	select {
+	case <-f.full:
+	case <-time.After(f.wait):
+	}
+}
+
+// backlog returns n tree ids, m01..mNN.
+func backlog(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("m%02d", i+1)
+	}
+	return out
 }

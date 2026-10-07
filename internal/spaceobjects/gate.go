@@ -46,8 +46,8 @@ func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate
 					// A lookup that fails does not show the definition
 					// is known, so the change waits like any change
 					// whose definition is not: failing the replay
-					// instead would hold the whole tree back for a
-					// round. any-store shows a collection to readers
+					// instead would hold the whole tree back until a
+					// retry. any-store shows a collection to readers
 					// before the transaction creating it commits, and a
 					// lookup that gets there first fails — which is a
 					// type being applied next to an object that names
@@ -90,7 +90,7 @@ func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate
 // they applied between the gate's lookup and this park's commit: that
 // wake-up found no row, and no other is coming. So the lookup is
 // repeated once the row is in. Trees of one space apply side by side
-// (several per sync round, plus the pushes), so a type and an object
+// (several per sync pass, plus the pushes), so a type and an object
 // that names it do interleave this way.
 //
 // A change parked only because its controller's registration is missing

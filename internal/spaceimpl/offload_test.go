@@ -285,12 +285,15 @@ func TestRemotelyGone(t *testing.T) {
 		coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
 		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted,
 		coordinatorproto.SpaceStatus_SpaceStatusDeleted,
-		coordinatorproto.SpaceStatus_SpaceStatusNotExists,
 	}
 	for _, st := range gone {
 		assert.True(t, remotelyGone(st), "status %v should be gone", st)
 	}
 	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusCreated))
+	// Not registered on the coordinator yet (first push pending), not deleted.
+	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusNotExists))
+	// Unknown future statuses must never offload.
+	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus(99)))
 }
 
 // TestDecideReconcile exhaustively covers the reconcile decision: who
@@ -305,6 +308,7 @@ func TestDecideReconcile(t *testing.T) {
 	}
 	C := coordinatorproto.SpaceStatus_SpaceStatusCreated
 	P := coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
+	S := coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted
 	D := coordinatorproto.SpaceStatus_SpaceStatusDeleted
 	NX := coordinatorproto.SpaceStatus_SpaceStatusNotExists
 
@@ -320,8 +324,11 @@ func TestDecideReconcile(t *testing.T) {
 		{"member deleted locally, active -> none (cannot delete)", true, st(C, reader), actionNone},
 		{"active not-deleted owner -> none", false, st(C, owner), actionNone},
 		{"inbound pending, not deleted -> offload", false, st(P, owner), actionOffload},
+		{"inbound deletion started, not deleted -> offload", false, st(S, reader), actionOffload},
 		{"inbound deleted, not deleted -> offload", false, st(D, reader), actionOffload},
-		{"inbound not-exists, not deleted -> offload", false, st(NX, owner), actionOffload},
+		{"unknown status, not deleted -> none", false, st(coordinatorproto.SpaceStatus(99), owner), actionNone},
+		{"not-exists (unpushed), not deleted -> none", false, st(NX, owner), actionNone},
+		{"not-exists (unpushed), deleted locally -> none (nothing to drive)", true, st(NX, owner), actionNone},
 		{"nil status -> none", true, nil, actionNone},
 	}
 	for _, c := range cases {

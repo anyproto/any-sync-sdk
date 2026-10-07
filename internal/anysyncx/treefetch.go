@@ -27,10 +27,12 @@ import (
 // the rest (syncjob.go).
 
 // treeFetcher fetches a missing tree into the space's storage and
-// reports its root changeType. A tree already in storage is reported
-// from the stored root without a request.
+// reports its root changeType. A tree already in storage — the diff
+// can name one as missing: a tree this device holds as its root alone
+// is not in the diff — is reported from the stored root without a
+// request, with local set.
 type treeFetcher interface {
-	fetch(ctx context.Context, peerId, treeId string) (changeType string, err error)
+	fetch(ctx context.Context, peerId, treeId string) (changeType string, local bool, err error)
 }
 
 // errFetchedNothing is a peer that answered a tree request without a
@@ -47,9 +49,9 @@ type storageFetcher struct {
 	acl        list.AclList
 }
 
-func (f *storageFetcher) fetch(ctx context.Context, peerId, treeId string) (string, error) {
+func (f *storageFetcher) fetch(ctx context.Context, peerId, treeId string) (string, bool, error) {
 	if ct, stored, err := f.stored(ctx, treeId); stored || err != nil {
-		return ct, err
+		return ct, stored, err
 	}
 	coll := &fetchCollector{storage: f.storage, acl: f.acl}
 	req := f.syncClient.CreateNewTreeRequest(peerId, treeId)
@@ -57,14 +59,14 @@ func (f *storageFetcher) fetch(ctx context.Context, peerId, treeId string) (stri
 		// A pull the peer's head update started may have stored the tree
 		// meanwhile; then this request failed for nothing.
 		if ct, stored, serr := f.stored(ctx, treeId); stored && serr == nil {
-			return ct, nil
+			return ct, true, nil
 		}
-		return "", err
+		return "", false, err
 	}
 	if coll.tree == nil {
-		return "", errFetchedNothing
+		return "", false, errFetchedNothing
 	}
-	return coll.changeType, nil
+	return coll.changeType, false, nil
 }
 
 // stored reports the root changeType of a tree in the space's storage.

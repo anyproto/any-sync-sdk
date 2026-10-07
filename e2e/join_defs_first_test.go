@@ -221,27 +221,38 @@ func TestE2E_JoinerGetsDefinitionsFirst(t *testing.T) {
 		return n
 	}
 
-	// Each sample checks the definitions before the objects, so the
-	// object count recorded when the last definition is seen is an
-	// upper bound on the objects applied at that moment.
+	// A sample reads every row, so objects applied while it runs are
+	// seen in it and a definition applied meanwhile is not: the counts
+	// recorded per definition are approximate. The order check is
+	// exact: a definition read as not applied right after an object
+	// was read as applied came after that object (applied is
+	// monotonic), and only that is a violation.
 	localDefs := map[string]int{}
 	localObjs := map[string]struct{}{}
 	objectsAtDefs := -1
 	var defsAfter time.Duration
+	var late []string
 	if !waitFor(ctx, 3*time.Minute, 5*time.Millisecond, func() bool {
-		var arrived []string
 		for _, id := range defIds {
 			if _, ok := localDefs[id]; !ok && isApplied(id) {
-				arrived = append(arrived, id)
+				localDefs[id] = len(localObjs)
 			}
 		}
 		for _, id := range ids {
-			if _, ok := localObjs[id]; !ok && isApplied(id) {
-				localObjs[id] = struct{}{}
+			if _, ok := localObjs[id]; ok || !isApplied(id) {
+				continue
 			}
-		}
-		for _, id := range arrived {
-			localDefs[id] = len(localObjs)
+			localObjs[id] = struct{}{}
+			if len(localDefs) == len(defIds) {
+				continue
+			}
+			for _, d := range defIds {
+				if _, ok := localDefs[d]; ok || isApplied(d) {
+					continue
+				}
+				localDefs[d] = -1 // seen late once; counted no more
+				late = append(late, fmt.Sprintf("%s applied after object %s", d, id))
+			}
 		}
 		if objectsAtDefs < 0 && len(localDefs) == len(defIds) {
 			objectsAtDefs = len(localObjs)
@@ -304,10 +315,11 @@ func TestE2E_JoinerGetsDefinitionsFirst(t *testing.T) {
 	}
 	t.Logf("bob: definitions applied after %s, all %d objects after %s, converged after %s",
 		defsAfter.Round(time.Millisecond), objects, allAfter.Round(time.Millisecond), time.Since(accepted).Round(time.Millisecond))
-	t.Logf("bob: objects applied as each definition arrived (types, bundle type, collections): %v", positions)
+	t.Logf("bob: objects seen applied as each definition was (types, bundle type, collections; sampled): %v", positions)
+	t.Logf("bob: %d of %d objects seen applied when the last definition was (sampled)", objectsAtDefs, objects)
 	t.Logf("bob: %d changes parked through the sync, at most %d at once", len(everParked), peakParked)
 
-	require.Zero(t, objectsAtDefs,
+	require.Empty(t, late,
 		"every type and collection is applied before the first object")
 	require.Zero(t, len(everParked),
 		"objects synced after their definitions must apply without parking")

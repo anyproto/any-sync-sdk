@@ -25,14 +25,16 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// scriptedRegistry fails GetTree for the ids in fail; every call is
-// recorded so tests can assert retry behavior. first is what PullFirst
+// scriptedRegistry fails GetTree for the ids in fail and returns the
+// trees in trees; every call is recorded so tests can assert retry
+// behavior. has is what HasTree reports. first is what PullFirst
 // reports; a fetched id adds its grow entry to it, the way a fetched
 // spaceIndex makes its bundle roots known. firstTypes is what
 // PullFirstTypes reports: nil syncs inline, set uses the sync job.
 type scriptedRegistry struct {
 	fail       map[string]error
 	trees      map[string]objecttree.ObjectTree
+	has        map[string]bool
 	first      []string
 	grow       map[string][]string
 	firstTypes []string
@@ -82,8 +84,7 @@ func (r *scriptedRegistry) reset(fail map[string]error) {
 }
 
 func (r *scriptedRegistry) HasTree(_ context.Context, _, treeId string) (bool, error) {
-	_, ok := r.trees[treeId]
-	return ok, nil
+	return r.has[treeId], nil
 }
 
 func (r *scriptedRegistry) PutTree(context.Context, string, treestorage.TreeStorageCreatePayload) error {
@@ -282,15 +283,24 @@ func TestTreeSyncerReportsFetchedTrees(t *testing.T) {
 	require.Equal(t, []string{"n1/missing/h1,h2"}, got)
 }
 
-// A changed tree is pinged with a full-sync request; a tree fetched
-// from the peer is in sync with it already and is not.
-func TestTreeSyncerPingsChangedTreesOnly(t *testing.T) {
-	missing, changed := &pingTree{}, &pingTree{}
-	reg := &scriptedRegistry{trees: map[string]objecttree.ObjectTree{"missing": missing, "changed": changed}}
+// A changed tree is pinged with a full-sync request, and so is a tree
+// the diff names as missing that is in storage already (held as its
+// root alone); a tree fetched from the peer is in sync with it already
+// and is not.
+func TestTreeSyncerPingsLocalTreesOnly(t *testing.T) {
+	missing, rootOnly, changed := &pingTree{}, &pingTree{}, &pingTree{}
+	reg := &scriptedRegistry{
+		trees: map[string]objecttree.ObjectTree{"missing": missing, "rootOnly": rootOnly, "changed": changed},
+		has:   map[string]bool{"rootOnly": true, "changed": true},
+	}
 	ts := newTreeSyncer("space1", reg, nil)
-	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "n1"}, []string{"changed"}, []string{"missing"}))
+	var reported []string
+	ts.onFetched = func(_, treeId string, _ []string) { reported = append(reported, treeId) }
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "n1"}, []string{"changed"}, []string{"missing", "rootOnly"}))
 	require.Equal(t, int64(1), changed.pings.Load())
+	require.Equal(t, int64(1), rootOnly.pings.Load())
 	require.Zero(t, missing.pings.Load())
+	require.Equal(t, []string{"missing"}, reported)
 }
 
 // A tree declined by selective sync is not a failure: the stub it

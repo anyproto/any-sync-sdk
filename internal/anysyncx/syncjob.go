@@ -77,12 +77,15 @@ type syncItem struct {
 	// busy: a worker is on it.
 	busy bool
 	// fetched: the tree is in storage, not yet materialized; changeType
-	// is its root's.
-	fetched    bool
-	changeType string
+	// is its root's. local: it was in storage before the pass looked —
+	// a tree the diff names as missing that this device holds as its
+	// root alone — so the peer may hold changes to pull.
+	fetched, local bool
+	changeType     string
 	// done is closed when the item is handled: materialized, parked or
-	// skipped.
-	done chan struct{}
+	// skipped. finished says so.
+	done     chan struct{}
+	finished bool
 }
 
 type syncJob struct {
@@ -268,7 +271,9 @@ func (j *syncJob) take(pick func(*syncItem) bool) []*syncItem {
 }
 
 // takeFirst picks the queued items the registry names first, in its
-// order. A queue of one has nothing to order and asks nothing.
+// order, each once (a bundle root can be named as the register's and
+// as a claimed one). A queue of one has nothing to order and asks
+// nothing.
 func (j *syncJob) takeFirst() []*syncItem {
 	if j.count() < 2 {
 		return nil
@@ -280,7 +285,12 @@ func (j *syncJob) takeFirst() []*syncItem {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	var out []*syncItem
+	seen := make(map[string]struct{}, len(first))
 	for _, id := range first {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
 		if it, ok := j.items[id]; ok {
 			out = append(out, it)
 		}
@@ -306,8 +316,12 @@ func (j *syncJob) each(items []*syncItem, workers int, fn func(*syncItem)) {
 // for it.
 func (j *syncJob) finish(it *syncItem) {
 	j.mu.Lock()
+	defer j.mu.Unlock()
+	if it.finished {
+		return
+	}
+	it.finished = true
 	delete(j.items, it.id)
-	j.mu.Unlock()
 	close(it.done)
 }
 
@@ -323,7 +337,7 @@ func (j *syncJob) handle(it *syncItem) {
 // for a retry; success leaves the item queued as fetched.
 func (j *syncJob) fetch(it *syncItem) {
 	t := j.t
-	changeType, err := t.fetchTree(j.ctx, it.peer.Id(), it.id)
+	changeType, local, err := t.fetchTree(j.ctx, it.peer.Id(), it.id)
 	if err != nil {
 		if j.ctx.Err() != nil {
 			return
@@ -334,14 +348,16 @@ func (j *syncJob) fetch(it *syncItem) {
 		return
 	}
 	j.mu.Lock()
-	it.fetched, it.changeType, it.busy = true, changeType, false
+	it.fetched, it.local, it.changeType, it.busy = true, local, changeType, false
 	j.mu.Unlock()
 }
 
 // materialize replays one fetched tree into the projection. The load
 // takes no request slot and names no peer: the tree is local, and one
 // that is not any more (deleted meanwhile) fails and parks rather than
-// fetch outside the budget.
+// fetch outside the budget. A tree that was local before the pass is
+// pinged like a changed one; a fetched tree is in sync with the peer
+// by construction and is reported as such.
 func (j *syncJob) materialize(it *syncItem) {
 	t := j.t
 	tree, err := t.registry.GetTree(j.ctx, t.spaceId, it.id)
@@ -355,6 +371,6 @@ func (j *syncJob) materialize(it *syncItem) {
 		return
 	}
 	t.recovered(it.peer.Id(), it.id)
-	t.reportFetched(it.peer.Id(), it.id, tree)
+	t.synced(j.ctx, it.peer, it.id, tree, !it.local)
 	j.finish(it)
 }

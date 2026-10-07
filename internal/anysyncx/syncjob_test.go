@@ -9,15 +9,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/stretchr/testify/require"
 )
 
 // scriptedFetcher answers a fetch with the tree's changeType from types
-// ("object" when unnamed), or the error in fail. Every call is
-// recorded.
+// ("object" when unnamed), or the error in fail; the ids in local are
+// reported as in storage already. Every call is recorded.
 type scriptedFetcher struct {
 	types map[string]string
 	fail  map[string]error
+	local map[string]bool
 	// onFetch runs inside every fetch, outside the lock.
 	onFetch func(ctx context.Context, treeId string)
 
@@ -25,7 +27,7 @@ type scriptedFetcher struct {
 	calls []string
 }
 
-func (f *scriptedFetcher) fetch(ctx context.Context, _, treeId string) (string, error) {
+func (f *scriptedFetcher) fetch(ctx context.Context, _, treeId string) (string, bool, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, treeId)
 	f.mu.Unlock()
@@ -35,12 +37,13 @@ func (f *scriptedFetcher) fetch(ctx context.Context, _, treeId string) (string, 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err, ok := f.fail[treeId]; ok {
-		return "", err
+		return "", false, err
 	}
-	if ct, ok := f.types[treeId]; ok {
-		return ct, nil
+	ct := "object"
+	if named, ok := f.types[treeId]; ok {
+		ct = named
 	}
-	return "object", nil
+	return ct, f.local[treeId], nil
 }
 
 func (f *scriptedFetcher) got() []string {
@@ -140,6 +143,16 @@ func TestSyncJobAsksPullFirstAgain(t *testing.T) {
 	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, []string{"m1", "root1", "index", "m2"}))
 	require.Equal(t, []string{"index", "root1", "m1", "m2"}, reg.got())
 	require.Equal(t, []string{"m1", "m2"}, f.got())
+}
+
+// A tree the registry names first more than once — a bundle root as
+// the register's and as a claimed one — is handled once.
+func TestSyncJobHandlesATreeNamedTwiceOnce(t *testing.T) {
+	reg := &scriptedRegistry{first: []string{"root1", "index", "root1"}}
+	f := &scriptedFetcher{}
+	ts := jobSyncer(t, reg, f)
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, []string{"m1", "root1", "index"}))
+	require.Equal(t, []string{"root1", "index", "m1"}, reg.got())
 }
 
 // Each group runs at its own width: the fetches treeFetchWorkers at a
@@ -300,6 +313,23 @@ func TestSyncJobCloseStopsTheWork(t *testing.T) {
 	require.Empty(t, reg.got())
 	require.Zero(t, ts.pendingCount(), "a closing job parks nothing")
 	require.Equal(t, 3, ts.syncingCount())
+}
+
+// A tree the diff names as missing that is in storage already — held
+// as its root alone — is pinged with a full-sync request once it is
+// materialized, like a changed tree; a fetched tree is reported as in
+// sync instead.
+func TestSyncJobPingsTreesThatWereLocal(t *testing.T) {
+	fetched, local := &pingTree{}, &pingTree{}
+	reg := &scriptedRegistry{trees: map[string]objecttree.ObjectTree{"m1": fetched, "m2": local}}
+	f := &scriptedFetcher{local: map[string]bool{"m2": true}}
+	ts := jobSyncer(t, reg, f)
+	var reported []string
+	ts.onFetched = func(_, treeId string, _ []string) { reported = append(reported, treeId) }
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, nil, []string{"m1", "m2"}))
+	require.Zero(t, fetched.pings.Load())
+	require.Equal(t, int64(1), local.pings.Load())
+	require.Equal(t, []string{"m1"}, reported)
 }
 
 // A space the registry names no pull-first types for syncs within the

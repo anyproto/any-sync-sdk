@@ -273,6 +273,14 @@ func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string,
 	t.syncing.Add(1)
 	defer t.syncing.Add(-1)
 	peerCtx := peer.CtxWithPeerId(ctx, p.Id())
+	// The diff names as missing a tree this device holds as its root
+	// alone; the peer may hold changes to it.
+	local := false
+	if mayFetch {
+		if has, err := t.registry.HasTree(ctx, t.spaceId, id); err == nil {
+			local = has
+		}
+	}
 	tree, err := t.getTree(ctx, peerCtx, p.Id(), id, mayFetch)
 	if errors.Is(err, ErrTreeTypeSkipped) {
 		// Declined by selective sync before any tree-storage
@@ -299,13 +307,24 @@ func (t *treeSyncerAdapter) syncOne(ctx context.Context, p peer.Peer, id string,
 		return true
 	}
 	t.recovered(p.Id(), id)
-	if mayFetch {
+	t.synced(ctx, p, id, tree, mayFetch && !local)
+	return true
+}
+
+// synced settles a tree the round resolved: one fetched from the peer
+// is reported as in sync with it; one that was local is pinged with a
+// full-sync request, whose answer the peer routes to the tree's own
+// handler — the space settings tree's included, which is how a device
+// that holds it as its root alone learns of deletions. The tree is not
+// closed: the async exchange may still need it.
+func (t *treeSyncerAdapter) synced(ctx context.Context, p peer.Peer, id string, tree objecttree.ObjectTree, fetched bool) {
+	if fetched {
 		t.reportFetched(p.Id(), id, tree)
-	} else if st, ok := tree.(synctree.SyncTree); ok {
+		return
+	}
+	if st, ok := tree.(synctree.SyncTree); ok {
 		_ = st.SyncWithPeer(ctx, p)
 	}
-	// Don't close — async exchange may still need it.
-	return true
 }
 
 // logParked logs a tree parked for retry at the level its failure
@@ -445,15 +464,16 @@ func (t *treeSyncerAdapter) getTree(ctx, peerCtx context.Context, peerId, id str
 }
 
 // fetchTree fetches a missing tree into storage under the peer's
-// request budget and reports its root changeType.
-func (t *treeSyncerAdapter) fetchTree(ctx context.Context, peerId, id string) (changeType string, err error) {
+// request budget and reports its root changeType, and whether it was
+// in storage already.
+func (t *treeSyncerAdapter) fetchTree(ctx context.Context, peerId, id string) (changeType string, local bool, err error) {
 	err = t.askPeer(ctx, peerId, func() error {
 		fctx, cancel := context.WithTimeout(ctx, fetchTimeout)
 		defer cancel()
-		changeType, err = t.fetcher.fetch(fctx, peerId, id)
+		changeType, local, err = t.fetcher.fetch(fctx, peerId, id)
 		return err
 	})
-	return changeType, err
+	return changeType, local, err
 }
 
 // roundFirst picks, from the ids a round works on and has not handled

@@ -346,14 +346,74 @@ dialed on a sync path; see `global-p2p.md`.
     join key propagation; the park-retry set is in memory, so the boot
     replay is their only cross-restart recovery).
   - The write never regresses the watermark.
-- **Sync order.** A headsync round handles its trees one at a time:
-  the missing ones in the diff's hash order, then the changed ones,
-  then the retries of earlier failures. A round is time-boxed, so on a
-  large space the backlog spans many rounds. The spaceIndex goes first
-  whenever a round has it to fetch, sync or retry
-  (`SpaceRegistry.PullFirst`), so the space name and description reach
-  a joiner, or a device catching up on a rename, ahead of the rest of
-  the space.
+- **Sync job.** A headsync round finds the trees missing or changed
+  against a peer and hands them to the space's sync job, one loop per
+  space that runs under the space's lifetime, not the round's. The
+  round waits for its trees as long as its caller lets it and returns
+  the caller's error when that ends; the job goes on until its queue is
+  empty, so a backlog of thousands syncs in one go instead of across
+  time-boxed rounds with an idle diff between each, and a round a
+  caller kicked with a short context parks nothing. Rounds that overlap
+  queue the same trees once.
+
+  A pass over the queue handles it in groups, each done before the next
+  starts:
+  - the trees the registry names first (`SpaceRegistry.PullFirst`), one
+    at a time, each fetched and materialized in one step: the spaceIndex
+    — the space name and description, the bundles registry — so they
+    reach a joiner, or a device catching up on a rename, before the rest
+    of the space; then the definitions this device already knows of: the
+    bundle roots the spaceIndex lists, claimed ones included (a bundle
+    declares its type or collection on its root), and the type and
+    collection objects that are local. Asked twice, as handling the
+    spaceIndex adds to the answer. A device that holds the space pushes
+    its trees to a peer that lacks them, definitions first;
+  - the other missing trees, fetched into storage several at a time and
+    not materialized — a fetch is a round trip to the peer, and one at a
+    time it is paced by latency alone. A tree's root carries its
+    changeType in plain text, and the fetch reads it on the way in;
+  - the fetched `type` and `collection` trees (`PullFirstTypes`),
+    materialized one at a time;
+  - the other fetched trees, materialized one at a time as well: a
+    replay is a write transaction on the projection store, whose single
+    writer serializes them, so a wider replay only queues on that lock
+    (measured: the same wall time at one and at six workers);
+  - the changed trees, loaded and pinged with a full-sync request (a
+    tree fetched from the peer is in sync with it already and is not
+    pinged);
+  - the retries of trees parked by earlier failures.
+
+  So within a pass no object the pass fetched replays ahead of a type
+  or collection it fetched, and no such definition replays next to a
+  tree that may look it up (any-store shows a collection to readers
+  before the transaction creating it commits, and a reader that gets
+  there first fails with a read error). What the job cannot see — a
+  tree a peer's head update pulls on its own, a definition arriving in
+  a later pass, a bundle root (an object that declares a type) the
+  spaceIndex does not list yet — the apply gate covers: a gate lookup
+  that fails parks the object's change, and it drains when the
+  definition commits (`crdt.md` § Datasets).
+
+  A round waits for the whole queue, not only for the trees its own
+  diff named: a tree fetched into storage is one the diff no longer
+  names, and a round that returned before it replayed would report the
+  space synced too early. The job stops before the space's store
+  closes (shutdown, offload); what it still holds stays counted for the
+  close-time watermark gate.
+
+  The tech space and a space under selective sync sync within the round
+  instead, one tree at a time in the same group order, so a caller that
+  reads the space right after its round reads what the round found.
+- **Request budget.** A peer caps the tree requests one client holds
+  open on it, across all the client's spaces, and refuses the excess;
+  it also refuses a second request for a tree it is already serving
+  that client. The jobs of every space share one budget per peer for
+  their fetches, narrowed by a refusal and widened again by answered
+  requests, and a fetch the peer turns away as busy is asked again
+  after a short wait, a few times, before it is parked. One slot beyond
+  the width is reserved for the trees a space names first, so a small
+  space's spaceIndex is fetched while a large space's fetch stage holds
+  the budget.
 - **Replication key.** One per account, read from the tech space id. The
   tech space is derived from the account key, so the key is known before
   any space loads, including on a new device.

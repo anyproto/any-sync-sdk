@@ -240,6 +240,10 @@ type Store struct {
 	// afterApply hooks push pairs in, the drainer consumes them and
 	// coalesces bursts into single Drain passes. See drainer.go.
 	drainer *drainer
+	// parkedHook runs between a gated park's commit and the lookup that
+	// follows it — a seam for tests of that order. Always nil in
+	// production.
+	parkedHook func()
 
 	// engine drives windowed live queries (Query.Subscribe). The
 	// afterApply hook gates on engine.HasSubscribers so the cold-

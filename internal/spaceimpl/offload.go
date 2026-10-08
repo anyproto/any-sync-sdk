@@ -129,6 +129,8 @@ func (s *Service) Evict(ctx context.Context, spaceId string) error {
 // are logged, not propagated.
 func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	s.watchers.stopForSpace(spaceId)
+	// The sync job stops before the store it replays into closes.
+	s.app.CloseSyncJob(spaceId)
 
 	// Drop pubsub subscriptions + remote interest before the space
 	// evicts. Deliberately here — the deliberate teardown funnel — and

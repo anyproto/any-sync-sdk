@@ -101,6 +101,10 @@ type App struct {
 	// brief ocache evictions when the same id loads again).
 	syncersMu sync.Mutex
 	syncers   map[string]*treeSyncerAdapter
+	// treeLimits is the per-peer request budget every space's tree
+	// syncer takes from: a peer caps a client's requests across all
+	// its spaces.
+	treeLimits *peerLimits
 
 	keys *accountdata.AccountKeys
 
@@ -357,6 +361,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		headCache:          newHeadCache(),
 		syncStatus:         syncstatus.NewService(),
 		syncers:            map[string]*treeSyncerAdapter{},
+		treeLimits:         newPeerLimits(),
 		keys:               keys,
 		inbox:              inbox,
 		selectiveTreeTypes: cfg.Sync.TreeTypes,
@@ -815,6 +820,7 @@ func (a *App) newTreeSyncerForSpace(spaceId string) *treeSyncerAdapter {
 		a.syncStatus.For(spaceId).BulkSyncedFromPeer(peerId)
 	}
 	ts := newTreeSyncer(spaceId, a.tree.registry, onRound)
+	ts.limits = a.treeLimits
 	// A tree fetched whole from a responsible peer (node, LAN or global)
 	// is in sync with it: without this a space that converges through
 	// peer pulls alone would sit in Syncing until a fully empty round.
@@ -855,6 +861,50 @@ func (a *App) ParkedTreeCount(spaceId string) int {
 		return 0
 	}
 	return ts.pendingCount()
+}
+
+// CloseSyncJob ends spaceId's sync job and waits for its workers. The
+// SDK calls it before it closes the space's store: a job that outlives
+// the store would park every tree it still holds, and a load through
+// the registry would rebuild the store the teardown just closed. The
+// trees the job still holds stay counted (SyncingTreeCount).
+func (a *App) CloseSyncJob(spaceId string) {
+	a.syncersMu.Lock()
+	ts := a.syncers[spaceId]
+	a.syncersMu.Unlock()
+	if ts != nil {
+		ts.job.close()
+	}
+}
+
+// CloseSyncJobs ends every space's sync job; see CloseSyncJob.
+func (a *App) CloseSyncJobs() {
+	a.syncersMu.Lock()
+	all := make([]*treeSyncerAdapter, 0, len(a.syncers))
+	for _, ts := range a.syncers {
+		all = append(all, ts)
+	}
+	a.syncersMu.Unlock()
+	for _, ts := range all {
+		ts.job.close()
+	}
+}
+
+// SyncingTreeCount returns the number of trees spaceId's sync job holds
+// — queued, being fetched or being replayed — plus the ones a round
+// syncs inline right now. 0 when the space was never loaded this
+// session. Consumed, with ParkedTreeCount, by the SDK's close-time
+// watermark gate: a tree fetched and not yet replayed when Close comes
+// is in storage but not in the projection, and only the boot replay
+// brings it back.
+func (a *App) SyncingTreeCount(spaceId string) int {
+	a.syncersMu.Lock()
+	ts := a.syncers[spaceId]
+	a.syncersMu.Unlock()
+	if ts == nil {
+		return 0
+	}
+	return ts.syncingCount()
 }
 
 // pickLive reports a live pool connection to the peer within

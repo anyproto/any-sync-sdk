@@ -49,12 +49,16 @@ func (c *collectionsAPI) PatchProperty(ctx context.Context, ownerId, propId stri
 	return c.defs.PatchProperty(ctx, ownerId, propId, patch)
 }
 
+// collectionChangeType is the root changeType of a collection object's
+// tree; see typeChangeType.
+const collectionChangeType = "collection"
+
 // Create mints a new collection object: a fresh any-sync tree whose
 // objects row carries the display metadata under `any`, the handle
 // and flags under `collection`, and `any.type = "__collection__"` —
 // set in the same change so the local pre-flight grants the namespace.
 func (c *collectionsAPI) Create(ctx context.Context, params space.CollectionCreateParams) (string, error) {
-	obj, err := c.parent.store.Create(ctx, spaceobjects.CreateOpts{ChangeType: "collection"})
+	obj, err := c.parent.store.Create(ctx, spaceobjects.CreateOpts{ChangeType: collectionChangeType})
 	if err != nil {
 		return "", err
 	}

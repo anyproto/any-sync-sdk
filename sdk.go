@@ -783,6 +783,11 @@ func (s *SDK) Close() error {
 	// touches readSync, spaces, tsp, db and app, all of which are
 	// closed below — including the case of a cold GetSpace hanging on
 	// an unreachable sync-node, which the cancel unblocks.
+	if s.app != nil {
+		// The sync jobs stop before anything they write to closes; what
+		// they still hold stays counted for the watermark gate below.
+		s.app.CloseSyncJobs()
+	}
 	if s.bootstrapDone != nil {
 		s.bootstrapCancel()
 		<-s.bootstrapDone
@@ -826,16 +831,18 @@ func (s *SDK) Close() error {
 // (measured: ~0.8s for a session that wrote 2×3000 objects; mobile
 // hosts restart the SDK on every foregrounding). A crash — or any
 // space absent from the allowlist — keeps the boot replay. Two guards
-// on top: a non-empty treesyncer parked set skips the space (parked
-// trees are storage-committed but never materialized; the in-memory
-// retry set doesn't survive a restart, so the boot replay is their
-// only recovery), and the write itself never regresses. PickSpace
+// on top: a space with trees parked in its treesyncer, or still held
+// by its sync job, is skipped (such trees can be storage-committed
+// but not materialized; the in-memory retry set doesn't survive a
+// restart, so the boot replay is their only recovery), and the write
+// itself never regresses. PickSpace
 // never loads, so offloaded/deleted spaces are naturally skipped.
 // Anything the head store accepts after the per-space read lands above
 // the snapshot and replays next boot; there is deliberately no
 // periodic persist (no natural tick to ride) and no quiescence barrier
-// (the residue window between a tree's storage commit and its
-// park-mark is sub-millisecond and any-sync has no stop-intake hook).
+// (any-sync has no stop-intake hook): a tree a peer pushes while Close
+// runs is stored before its replay ends and is covered by neither
+// guard.
 func (s *SDK) snapshotWatermarks(ctx context.Context) {
 	for _, id := range s.caughtUpIds() {
 		if n := s.parkedTreeCount(id); n > 0 {
@@ -858,11 +865,14 @@ func (s *SDK) snapshotWatermarks(ctx context.Context) {
 // production.
 var parkedCountHook func(spaceId string) int
 
+// parkedTreeCount is the number of trees of spaceId that may be in
+// storage without being in the projection: parked in its treesyncer,
+// or still held by its sync job.
 func (s *SDK) parkedTreeCount(spaceId string) int {
 	if h := parkedCountHook; h != nil {
 		return h(spaceId)
 	}
-	return s.app.ParkedTreeCount(spaceId)
+	return s.app.ParkedTreeCount(spaceId) + s.app.SyncingTreeCount(spaceId)
 }
 
 // Spaces returns the space-level entrypoint.

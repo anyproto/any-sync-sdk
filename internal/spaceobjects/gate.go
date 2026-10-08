@@ -6,6 +6,8 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 
+	"go.uber.org/zap"
+
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
@@ -38,7 +40,22 @@ func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate
 			for _, p := range pairs {
 				known, kerr := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId)
 				if kerr != nil {
-					return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
+					if ctx.Err() != nil {
+						return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
+					}
+					// A lookup that fails does not show the definition
+					// is known, so the change waits like any change
+					// whose definition is not: failing the replay
+					// instead would hold the whole tree back until a
+					// retry. any-store shows a collection to readers
+					// before the transaction creating it commits, and a
+					// lookup that gets there first fails — which is a
+					// type being applied next to an object that names
+					// it. The definition's commit drains the change.
+					storeLog.Warn("gate: definition lookup failed; change parked",
+						zap.String("objectId", objectId), zap.String("typeId", p.TypeId),
+						zap.String("shortId", p.ShortId), zap.Error(kerr))
+					known = false
 				}
 				if !known {
 					missing = append(missing, p)
@@ -59,19 +76,46 @@ func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate
 			Pending:   missing,
 			Dataset:   ch.Dataset,
 		}
-		if perr := s.Park(ctx, row); perr != nil {
+		if perr := s.parkGated(ctx, row); perr != nil {
 			return false, fmt.Errorf("gate: park: %w", perr)
-		}
-		if len(missing) == 0 {
-			// Parked only because this controller's registration is
-			// missing/stale — the schema may already be fully applied,
-			// so no future defs apply is guaranteed to wake the
-			// drainer. Nudge it now: Drain evicts the stale controller
-			// and replays the row.
-			s.drainer.Notify(types.DataVersionPair{})
 		}
 		return false, nil
 	}
+}
+
+// parkGated parks a change the gate held back and makes sure a drain
+// follows when nothing else will bring one.
+//
+// A change waiting on definitions is woken by their apply — unless
+// they applied between the gate's lookup and this park's commit: that
+// wake-up found no row, and no other is coming. So the lookup is
+// repeated once the row is in. Trees of one space apply side by side
+// (several per sync pass, plus the pushes), so a type and an object
+// that names it do interleave this way.
+//
+// A change parked only because its controller's registration is missing
+// or stale waits on nothing — the schema may already be fully applied —
+// so it is nudged too: Drain evicts the stale controller and replays
+// the row.
+func (s *Store) parkGated(ctx context.Context, row DetachedRow) error {
+	if err := s.Park(ctx, row); err != nil {
+		return err
+	}
+	if s.parkedHook != nil {
+		s.parkedHook()
+	}
+	// The row is in. The lookup that decides whether it gets its drain
+	// must not be lost to the caller's deadline.
+	ctx = context.WithoutCancel(ctx)
+	for _, p := range row.Pending {
+		// A lookup that fails here is a definition still being
+		// committed: its own wake-up follows.
+		if known, err := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId); err != nil || !known {
+			return nil
+		}
+	}
+	s.drainer.Notify(types.DataVersionPair{})
+	return nil
 }
 
 // afterApplyFor is the post-apply hook. Two independent fan-outs

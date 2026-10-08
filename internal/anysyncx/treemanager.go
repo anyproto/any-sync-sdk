@@ -54,9 +54,19 @@ type SpaceRegistry interface {
 
 	// PullFirst lists the trees of spaceId that a sync round handles
 	// before its other trees, when the round has them to fetch, sync
-	// or retry. nil when none. Called from sync rounds, which can race
-	// a space's teardown: implementations stay free of side effects.
-	PullFirst(spaceId string) []string
+	// or retry. nil when none. A round asks twice: what handling the
+	// first answer brought in can add to the second. Called from sync
+	// rounds, which can race a space's teardown: implementations read
+	// what is local and stay free of side effects — no store built, no
+	// tree fetched (ctx carries no peer).
+	PullFirst(ctx context.Context, spaceId string) []string
+
+	// PullFirstTypes lists the root changeTypes whose trees the space's
+	// sync job materializes ahead of the other trees it fetched: types
+	// and collections. nil = the space is synced one tree at a time,
+	// within the round that found the trees, in diff order (the tech
+	// space, selective sync).
+	PullFirstTypes(spaceId string) []string
 }
 
 // treeManagerAdapter implements treemanager.TreeManager by routing

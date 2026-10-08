@@ -346,6 +346,14 @@ dialed on a sync path; see `global-p2p.md`.
     join key propagation; the park-retry set is in memory, so the boot
     replay is their only cross-restart recovery).
   - The write never regresses the watermark.
+- **Sync order.** A headsync round handles its trees one at a time:
+  the missing ones in the diff's hash order, then the changed ones,
+  then the retries of earlier failures. A round is time-boxed, so on a
+  large space the backlog spans many rounds. The spaceIndex goes first
+  whenever a round has it to fetch, sync or retry
+  (`SpaceRegistry.PullFirst`), so the space name and description reach
+  a joiner, or a device catching up on a rename, ahead of the rest of
+  the space.
 - **Replication key.** One per account, read from the tech space id. The
   tech space is derived from the account key, so the key is known before
   any space loads, including on a new device.

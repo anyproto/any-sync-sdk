@@ -450,18 +450,10 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: ensureSpaceIndexWiring: %w", err)
 	}
-	derivePayload := objecttree.ObjectTreeDerivePayload{
-		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
-		SpaceId:       spaceId,
-		IsEncrypted:   true,
-	}
-	// An id lookup, not a creation: the builder's creation rules do not
-	// apply, the pure root derivation does.
-	root, err := objecttree.DeriveObjectTreeRoot(derivePayload, nil)
+	objectId, err := spaceIndexTreeId(spaceId)
 	if err != nil {
-		return "", fmt.Errorf("spaceimpl: derive spaceIndex tree id: %w", err)
+		return "", err
 	}
-	objectId := root.Id
 
 	s.mu.Lock()
 	if existing, ok := s.spaceIndexIds[spaceId]; ok {
@@ -594,6 +586,21 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 		}
 	}
 	return objectId, nil
+}
+
+// spaceIndexTreeId is the id of spaceId's derived spaceIndex tree, a
+// pure function of the space id. An id lookup, not a creation: the
+// builder's creation rules do not apply, the pure root derivation does.
+func spaceIndexTreeId(spaceId string) (string, error) {
+	root, err := objecttree.DeriveObjectTreeRoot(objecttree.ObjectTreeDerivePayload{
+		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
+		SpaceId:       spaceId,
+		IsEncrypted:   true,
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: derive spaceIndex tree id: %w", err)
+	}
+	return root.Id, nil
 }
 
 // spaceIndexObjectIdFor returns the cached spaceIndex object id for
@@ -2274,6 +2281,22 @@ func (s *Service) ShouldPullTree(ctx context.Context, spaceId, treeId string, ro
 		return true
 	}
 	return s.storeFor(spaceId).ShouldPullTree(ctx, treeId, root, heads)
+}
+
+// PullFirst lists the trees a sync round handles before the rest: a
+// regular space's spaceIndex, so the space name reaches a joiner
+// before the rest of the space. The tech space has none. Derived from
+// the space id alone — a round can run while the space is being
+// offloaded, and resolving through storeFor would rebuild its store.
+func (s *Service) PullFirst(spaceId string) []string {
+	if spaceId == s.tsp.SpaceId() {
+		return nil
+	}
+	id, err := spaceIndexTreeId(spaceId)
+	if err != nil {
+		return nil
+	}
+	return []string{id}
 }
 
 // Compile-time check that we satisfy the registry contract.

@@ -3,6 +3,8 @@ package subscribe
 import (
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -303,10 +305,58 @@ func TestSentinel_PromoteOnVisibleDelete(t *testing.T) {
 	ev, err := waitOne(t, sub)
 	require.NoError(t, err)
 	// Visibility transitions: a was visible → gone (Removed). c was
-	// sentinel (not visible) → promoted to visible (Added).
+	// sentinel (not visible) → promoted to visible (Added), shipping
+	// the doc the window held for it — postValue covers a only.
 	assert.ElementsMatch(t, []string{"c"}, idsOf(ev.Added))
+	require.NotNil(t, ev.Added[0].Doc)
+	assert.Equal(t, 3, ev.Added[0].Doc.GetInt("n"))
 	assert.Empty(t, ev.Updated)
 	assert.ElementsMatch(t, []space.RemovedRecord{{Id: "a", Reason: space.RemoveDeleted}}, ev.Removed)
+}
+
+// An unbounded sub (Limit 0) has no sentinel, so nothing is ever
+// shipped from the held set: it tracks membership only — no doc and no
+// tuple per entry, sorted or not — while its events still carry the
+// post docs.
+func TestUnbounded_TracksMembershipOnly(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	initial := []row{
+		makeRow(arena, "a", 1, nil),
+		makeRow(arena, "b", 2, nil),
+	}
+	sub := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "chat"}, nil, 0, initial)
+	membershipOnly := func() {
+		t.Helper()
+		for id, e := range sub.entries {
+			assert.Nil(t, e.doc, id)
+			assert.Nil(t, e.tuple, id)
+		}
+	}
+	membershipOnly()
+
+	fireEvent(eng, "obj1", "chat", "b", makeRow(arena, "b", 5, nil).d, false, nil)
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	require.Len(t, ev.Updated, 1)
+	require.NotNil(t, ev.Updated[0].Doc)
+	assert.Equal(t, 5, ev.Updated[0].Doc.GetInt("n"))
+
+	fireEvent(eng, "obj1", "chat", "c", makeRow(arena, "c", 3, nil).d, false, nil)
+	ev, err = waitOne(t, sub)
+	require.NoError(t, err)
+	require.Len(t, ev.Added, 1)
+	require.NotNil(t, ev.Added[0].Doc)
+	assert.Equal(t, 3, ev.Added[0].Doc.GetInt("n"))
+
+	fireEvent(eng, "obj1", "chat", "a", nil, true, nil)
+	ev, err = waitOne(t, sub)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []space.RemovedRecord{{Id: "a", Reason: space.RemoveDeleted}}, ev.Removed)
+
+	assert.ElementsMatch(t, []string{"b", "c"}, slices.Collect(maps.Keys(sub.entries)))
+	membershipOnly()
 }
 
 // The three RemoveReason causes are reported distinctly: a tombstone is

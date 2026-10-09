@@ -48,24 +48,44 @@ func newSub(cfg SubConfig) *querySub {
 }
 
 // appendInitial is called by Engine.Subscribe once per snapshot row.
-// Computes the sort tuple, deep-clones the doc, inserts the entry.
-// Snapshot rows arrive in sort order (ascending tuple), so the last
-// row appended is maxRef and the first is minRef when the loop
-// completes.
+// Inserts the entry with what the sub keeps per row. Snapshot rows
+// arrive in sort order (ascending tuple), so the last row appended is
+// maxRef and the first is minRef when the loop completes.
 func (s *querySub) appendInitial(id string, doc *anyenc.Value) {
 	if doc == nil || id == "" {
 		return
 	}
-	tuple := s.tupleFor(doc)
-	cloned := anyencx.Clone(doc)
-	s.insertEntry(id, tuple, cloned)
+	var kept *anyenc.Value
+	if s.windowed() {
+		kept = anyencx.Clone(doc)
+	}
+	s.insertEntry(id, s.tupleFor(doc), kept)
 }
 
-// tupleFor builds the sort tuple for doc. With cfg.Sort==nil (only
-// allowed when Limit==0), the tuple is empty — we don't need
-// ordering when there's no boundary.
+// windowed reports whether the sub has a boundary (Limit > 0). A
+// windowed sub keeps each held row's tuple and doc: the sentinel is
+// compared against arrivals and ships its doc when an unrelated event
+// promotes it into view. An unbounded sub has no sentinel and tracks
+// membership only — one entry per row, no doc and no tuple — so a
+// subscription over a whole collection costs its id set, not a parsed
+// copy of every row for its lifetime.
+func (s *querySub) windowed() bool {
+	return s.cfg.Limit > 0
+}
+
+// held returns what the entry keeps of a freshly cloned post doc: the
+// clone itself for a windowed sub, nothing otherwise.
+func (s *querySub) held(doc *anyenc.Value) *anyenc.Value {
+	if s.windowed() {
+		return doc
+	}
+	return nil
+}
+
+// tupleFor builds the sort tuple for doc; nil for an unbounded sub,
+// which has no boundary to compare against (and may have no Sort).
 func (s *querySub) tupleFor(doc *anyenc.Value) anyenc.Tuple {
-	if s.cfg.Sort == nil {
+	if !s.windowed() {
 		return nil
 	}
 	return s.cfg.Sort.AppendKey(nil, doc)
@@ -108,6 +128,7 @@ type subPending struct {
 
 type pendingRec struct {
 	e   *entry
+	doc *anyenc.Value   // the event's clone of the post doc, or the held doc for an implicit transition
 	ops []space.EventOp // nil for implicit transitions
 }
 
@@ -138,13 +159,13 @@ func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	if len(p.added) > 0 {
 		subev.Added = make([]space.SubRecord, 0, len(p.added))
 		for _, pr := range p.added {
-			subev.Added = append(subev.Added, space.SubRecord{Id: pr.e.id, Doc: pr.e.doc, Ops: pr.ops})
+			subev.Added = append(subev.Added, space.SubRecord{Id: pr.e.id, Doc: pr.doc, Ops: pr.ops})
 		}
 	}
 	if len(p.updated) > 0 {
 		subev.Updated = make([]space.SubRecord, 0, len(p.updated))
 		for _, pr := range p.updated {
-			subev.Updated = append(subev.Updated, space.SubRecord{Id: pr.e.id, Doc: pr.e.doc, Ops: pr.ops})
+			subev.Updated = append(subev.Updated, space.SubRecord{Id: pr.e.id, Doc: pr.doc, Ops: pr.ops})
 		}
 	}
 	if len(p.removed) > 0 {
@@ -202,10 +223,13 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		}
 	}
 
-	// Apply transition to held set.
+	// Apply transition to held set. The event ships its own clone of
+	// the post doc; a windowed sub keeps that clone on the entry too.
+	var eventDoc *anyenc.Value
 	switch {
 	case wasHeld && matches:
-		s.updateEntry(oldEntry, postKey, anyencx.Clone(postDoc))
+		eventDoc = anyencx.Clone(postDoc)
+		s.updateEntry(oldEntry, postKey, s.held(eventDoc))
 	case wasHeld && !matches:
 		s.removeEntry(oldEntry)
 		s.lost++
@@ -217,7 +241,8 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 				// Not a "loss" — steady-state add.
 			}
 		}
-		s.insertEntry(rc.Id, postKey, anyencx.Clone(postDoc))
+		eventDoc = anyencx.Clone(postDoc)
+		s.insertEntry(rc.Id, postKey, s.held(eventDoc))
 	default:
 		return
 	}
@@ -229,9 +254,9 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 
 	switch {
 	case !wasVisible && isVisible:
-		p.added = append(p.added, pendingRec{e: newEntry, ops: rc.Ops})
+		p.added = append(p.added, pendingRec{e: newEntry, doc: eventDoc, ops: rc.Ops})
 	case wasVisible && isVisible:
-		p.updated = append(p.updated, pendingRec{e: newEntry, ops: rc.Ops})
+		p.updated = append(p.updated, pendingRec{e: newEntry, doc: eventDoc, ops: rc.Ops})
 	case wasVisible && !isVisible:
 		// isHeld ⇒ the record updated and became the sentinel via its
 		// own sort move: still matches, just slid out of view.
@@ -255,7 +280,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if prevSentinelId != "" && prevSentinelId != rc.Id {
 			if _, alreadySeen := p.seen[prevSentinelId]; !alreadySeen {
 				if e := s.entries[prevSentinelId]; e != nil && e != s.sentinel() {
-					p.added = append(p.added, pendingRec{e: e}) // implicit: no ops
+					p.added = append(p.added, pendingRec{e: e, doc: e.doc}) // implicit: no ops, the held doc
 					p.seen[prevSentinelId] = struct{}{}
 				}
 			}

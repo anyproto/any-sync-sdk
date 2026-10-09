@@ -320,8 +320,10 @@ func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, c
 // collection that appears in between.
 //
 // Initial in the returned QueryResult is the user-visible window
-// (limit rows excluding the sentinel; or all rows when limit == 0).
-// Subsequent live updates flow through QueryResult.Sub.
+// (limit rows excluding the sentinel; or all rows when limit == 0),
+// the caller's to drop once rendered: the subscription keeps no
+// reference to it. Subsequent live updates flow through
+// QueryResult.Sub.
 func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
 	if q.parseErr != nil {
 		return nil, q.parseErr
@@ -398,10 +400,9 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		return obj.Controller().Collection(ctx, q.dataset), nil
 	}
 
-	// Hold the snapshot rows for both the engine's initial population
-	// AND the user-visible Initial slice. Same iteration, two outputs.
+	// One iteration feeds both the engine's initial population and the
+	// user-visible Initial slice.
 	var snapshotRows []*anyenc.Value
-	var snapshotIds []string
 	totalCount := -1
 
 	cfg := subscribe.SubConfig{
@@ -451,10 +452,12 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			if id == "" {
 				continue
 			}
-			// Capture for Initial — clone now so the slice survives past
-			// the iterator (which reuses its buffer).
-			snapshotRows = append(snapshotRows, anyencx.Clone(v))
-			snapshotIds = append(snapshotIds, id)
+			// Initial's copy of the visible rows, cloned off the
+			// iterator's reused buffer. The sentinel is the engine's
+			// alone, and an unbounded sub keeps no copy of its own.
+			if q.limit == 0 || len(snapshotRows) < int(q.limit) {
+				snapshotRows = append(snapshotRows, anyencx.Clone(v))
+			}
 			yield(id, v)
 		}
 		return it.Err()
@@ -478,21 +481,11 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		}
 	}
 
-	// Initial = first limit rows (excluding the sentinel). When limit==0
-	// (unbounded), all rows are visible.
-	var initial []*anyenc.Value
-	if q.limit > 0 && len(snapshotRows) > int(q.limit) {
-		initial = snapshotRows[:q.limit]
-	} else {
-		initial = snapshotRows
-	}
-	_ = snapshotIds // currently unused, but kept for symmetry / future debugging hooks
-
 	hasNext := false
 	if opts.IncludeTotal {
-		hasNext = int(q.offset)+len(initial) < totalCount
+		hasNext = int(q.offset)+len(snapshotRows) < totalCount
 	}
-	return &space.QueryResult{Initial: initial, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
+	return &space.QueryResult{Initial: snapshotRows, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
 }
 
 // tombstoneSkip matches live rows only: a tombstone keeps _deletedAt

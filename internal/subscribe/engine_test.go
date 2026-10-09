@@ -615,3 +615,45 @@ func itoa(i int) string {
 	}
 	return string(out)
 }
+
+// CloseObject ends every per-object sub of the object — all datasets —
+// with the given reason, after the Removed a NotifyDeleted queued, and
+// leaves shared, per-dataset and other objects' subs alone.
+func TestCloseObject_ClosesPerObjectSubs(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+
+	arena := newArena()
+	initial := []row{makeRow(arena, "obj1", 1, nil)}
+	shared := subscribeSorted(t, eng, Scope{Shared: true}, nil, 0, initial)
+	perDataset := subscribeSorted(t, eng, Scope{AllObjects: true, Dataset: "samples"}, nil, 0, nil)
+	chat := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "chat"}, nil, 0, nil)
+	samples := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "samples"}, nil, 0, nil)
+	other := subscribeSorted(t, eng, Scope{ObjectId: "obj2", Dataset: "chat"}, nil, 0, nil)
+
+	eng.NotifyDeleted("test", ObjectsDataset, "obj1")
+	eng.CloseObject("obj1", space.ErrObjectDeleted)
+
+	// The shared sub saw the row leave and stays open.
+	ev, err := waitOne(t, shared)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1"}, removedIdsOf(ev.Removed))
+	assert.NoError(t, shared.Err())
+
+	for _, sub := range []*Sub{chat, samples} {
+		_, err := waitOne(t, sub)
+		assert.True(t, errors.Is(err, mb.ErrClosed), "per-object sub must be closed; got %v", err)
+		assert.True(t, errors.Is(sub.Err(), space.ErrObjectDeleted), "close reason; got %v", sub.Err())
+	}
+	for _, sub := range []*Sub{perDataset, other} {
+		waitNone(t, sub)
+		assert.NoError(t, sub.Err())
+	}
+
+	// The consumer's Close still releases a closed sub; a second
+	// CloseObject on an unknown object is a no-op.
+	require.NoError(t, chat.Close())
+	eng.CloseObject("obj1", space.ErrObjectDeleted)
+	eng.CloseObject("nope", space.ErrObjectDeleted)
+	assert.True(t, eng.HasSubscribers())
+}

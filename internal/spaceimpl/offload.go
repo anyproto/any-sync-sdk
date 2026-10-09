@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 )
 
@@ -178,12 +179,17 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 // cold-restore replay: synced trees, zero rows. Dropping the space's
 // `space:<id>` row also rotates the change-feed generation, so
 // consumers full-reindex instead of trusting a renumbered applySeq axis.
+// The shared read-state collections are purged per-row for the same
+// reason (readstate.PurgeSpace): a surviving row keeps its seeded flag
+// and frontier, so a re-materialized space would skip first-sight
+// seeding for every object that still has one.
 //
 // The sweep commits in CHUNKS of offloadDropChunk drops, each its own
-// WriteTx, in a fixed order: meta purge FIRST (own chunk), then the
-// per-object drops, then `<spaceId>_objects` last. It returns the
-// first chunk error (meta purge, failed drop or commit, enumeration),
-// leaving the rest of the sweep for the next attempt.
+// WriteTx, in a fixed order: meta purge FIRST (own chunk), the
+// read-state purge (own chunks), then the per-object drops, then
+// `<spaceId>_objects` last. It returns the first chunk error (meta or
+// read-state purge, failed drop or commit, enumeration), leaving the
+// rest of the sweep for the next attempt.
 func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) error {
 	objectIds, enumErr := s.spaceObjectIds(ctx, spaceId)
 	if enumErr != nil {
@@ -215,6 +221,9 @@ func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) erro
 	// re-flags the owner on the next attempt and converges. Own chunk,
 	// so its progress persists independently of later failures.
 	if pErr := s.purgeMetaChunk(ctx, spaceId, objectIds); pErr != nil {
+		return pErr
+	}
+	if pErr := s.purgeReadStateChunk(ctx, spaceId); pErr != nil {
 		return pErr
 	}
 
@@ -315,6 +324,20 @@ func (s *Service) purgeMetaChunk(ctx context.Context, spaceId string, objectIds 
 	}
 	if sweepChunkCommitted != nil {
 		sweepChunkCommitted(len(ids) + 1)
+	}
+	return nil
+}
+
+// purgeReadStateChunk removes the space's read-state rows in their own
+// bounded transactions (see readstate.PurgeSpace). Any error is
+// returned: a stale frontier is state offload must not commit to.
+func (s *Service) purgeReadStateChunk(ctx context.Context, spaceId string) error {
+	n, err := readstate.PurgeSpace(ctx, s.db, spaceId)
+	if err != nil {
+		return err
+	}
+	if n > 0 && sweepChunkCommitted != nil {
+		sweepChunkCommitted(n)
 	}
 	return nil
 }

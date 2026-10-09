@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 var log = logger.NewNamed("sdk.object")
@@ -28,6 +29,11 @@ var ErrTreeNotSet = errors.New("object: tree not set")
 // resolved the Object before an eviction (e.g. the lazy schema-refresh
 // Drop) retry with a fresh Store.Get.
 var ErrClosed = errors.New("object: closed")
+
+// ErrDeleted rejects writes on an Object whose tree is being deleted
+// (see MarkDeleted). Wraps space.ErrObjectDeleted so API callers match
+// the public sentinel.
+var ErrDeleted = fmt.Errorf("object: %w", space.ErrObjectDeleted)
 
 // Object binds one any-sync object tree to one crdt.Controller.
 //
@@ -137,6 +143,10 @@ type Object struct {
 	// synchandler-driven Update) must NOT try to re-lock.
 	tree   objecttree.ObjectTree
 	closed bool
+	// deleted is set by MarkDeleted under tree.Lock before the store
+	// purges the object's projection. Every write entry point checks
+	// it, so no apply can land between the purge and the eviction.
+	deleted bool
 }
 
 // Config carries the dependencies object.New wires onto a new
@@ -294,6 +304,23 @@ func (o *Object) TryClose(_ time.Duration) (bool, error) {
 	return true, o.tree.Close()
 }
 
+// MarkDeleted flags the Object as deleted. Taken under tree.Lock, so
+// an in-flight apply (inbound replay, drain, local write) finishes
+// first and none can start after: every write entry point returns
+// ErrDeleted (replay callbacks no-op) once the flag is set. The store
+// calls it before purging the object's projection, so a parked change
+// drained between the purge and the cache eviction cannot resurrect
+// rows. Idempotent.
+func (o *Object) MarkDeleted() {
+	if o.tree == nil {
+		o.deleted = true
+		return
+	}
+	o.tree.Lock()
+	o.deleted = true
+	o.tree.Unlock()
+}
+
 // releaseResources drops the per-object any-store state the Object's
 // residency pins: the controller's cached `<objectId>_<dataset>`
 // collection handles, then the store's OnClose extras. Runs exactly
@@ -337,6 +364,9 @@ func (o *Object) ApplyDecoded(ctx context.Context, ch crdt.Change) error {
 	defer o.tree.Unlock()
 	if o.closed {
 		return ErrClosed
+	}
+	if o.deleted {
+		return ErrDeleted
 	}
 	// Defense-in-depth for the drain path: replayLocked already skips
 	// non-allowlisted datasets on plaintext objects before parking, so
@@ -552,6 +582,9 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	if o.closed {
 		return WriteResult{}, ErrClosed
 	}
+	if o.deleted {
+		return WriteResult{}, ErrDeleted
+	}
 
 	// Plaintext-class objects ship their changes UNencrypted, so only
 	// the class's allowlisted datasets may enter the DAG — a write to
@@ -681,6 +714,9 @@ func (o *Object) LocalSet(ctx context.Context, ch crdt.Change) (WriteResult, err
 	if o.closed {
 		return WriteResult{}, ErrClosed
 	}
+	if o.deleted {
+		return WriteResult{}, ErrDeleted
+	}
 	ch.Local = true
 	ch.SpaceId = o.spaceId
 	ch.ObjectId = o.tree.Id()
@@ -726,6 +762,9 @@ func (o *Object) InjectedSet(ctx context.Context, ch crdt.Change) (WriteResult, 
 	defer o.tree.Unlock()
 	if o.closed {
 		return WriteResult{}, ErrClosed
+	}
+	if o.deleted {
+		return WriteResult{}, ErrDeleted
 	}
 	ch.Injected = true
 	ch.SpaceId = o.spaceId
@@ -799,9 +838,10 @@ func (o *Object) ColdRestore(ctx context.Context) error {
 // bytes; we hand off the parsed Change to the iterate callback via
 // Change.Model.
 func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) error {
-	if o.closed {
-		// Stale callback after Close (listener detach race) — no-op.
-		// The freshly-loaded peer Object owns subsequent applies.
+	if o.closed || o.deleted {
+		// Stale callback after Close (listener detach race) or a
+		// callback racing a deletion — no-op. The freshly-loaded peer
+		// Object owns subsequent applies; a deleted tree has none.
 		return nil
 	}
 

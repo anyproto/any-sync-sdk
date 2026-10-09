@@ -341,6 +341,11 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	if rec, ok := s.tsp.Get(context.Background(), spaceId); ok && rec.GuestKey != "" {
 		st.SetWriteGateErr(space.ErrReadOnlySpace)
 	}
+	// A purged object's file leftovers (index entries, live file
+	// queries) clear with it.
+	st.SetPurgeHook(func(ctx context.Context, objectId string) {
+		s.purgeFileLeftovers(ctx, spaceId, st, objectId)
+	})
 	// Resolve the read-sync service lazily: stores can be created
 	// before sdk.Open injects it, and untracked spaces never call it.
 	st.SetSeedHeadsProvider(func(ctx context.Context, objectId string) ([][]string, error) {

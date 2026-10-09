@@ -27,20 +27,26 @@ type EventOp struct {
 // (added/updated/removed within a windowed view) instead of the raw
 // per-change Event.
 //
-// The mailbox closes for one of three reasons:
+// The mailbox closes for one of four reasons:
 //   - Caller invoked Close: Err() returns nil.
 //   - Mailbox overflowed: Err() returns ErrSubscriptionOverflow.
 //   - Held window drifted past its budget: Err() returns
 //     ErrSubscriptionDrifted.
+//   - The object a per-object query reads was deleted: Err() returns
+//     ErrObjectDeleted, after a Removed for its row where one applies.
+//     Nothing will reach the query again; there is nothing to
+//     resubscribe to.
 //
-// In both error cases the client should resubscribe to recover.
+// In the overflow and drift cases the client should resubscribe to
+// recover.
 type QuerySubscription interface {
 	// Events returns the underlying mb/v3 mailbox. Use Wait for
 	// batched delivery or WaitOne for single events.
 	Events() *mb.MB[SubscriptionEvent]
 
 	// Err returns the close reason after the mailbox closes. nil
-	// while the subscription is live or after a user-initiated Close.
+	// while the subscription is live or after a user-initiated Close;
+	// see the type's doc for the reasons.
 	Err() error
 
 	// Close releases the subscription. Idempotent.

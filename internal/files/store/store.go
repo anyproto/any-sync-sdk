@@ -388,6 +388,12 @@ func (s *Store) DeleteSpace(ctx context.Context, spaceId string) error {
 			}
 		}
 	}
+	// The space's KV entries: the file index and attach-intent markers.
+	for _, prefix := range []string{fileIndexPrefix(spaceId), intentPrefix(spaceId)} {
+		if err := s.DeleteKVPrefix(ctx, prefix); err != nil {
+			return err
+		}
+	}
 	return os.RemoveAll(filepath.Join(s.root, spaceId))
 }
 
@@ -458,6 +464,44 @@ func (s *Store) DeleteKV(ctx context.Context, key string) error {
 	return err
 }
 
+// deleteKVsChunk bounds the keys one DeleteKVs statement names.
+const deleteKVsChunk = 500
+
+// DeleteKVs removes the given values in bounded statements; missing
+// keys are a no-op.
+func (s *Store) DeleteKVs(ctx context.Context, keys []string) error {
+	for len(keys) > 0 {
+		n := min(len(keys), deleteKVsChunk)
+		a := &anyenc.Arena{}
+		vals := make([]*anyenc.Value, n)
+		for i, k := range keys[:n] {
+			vals[i] = a.NewString(k)
+		}
+		filter := query.Key{Path: []string{idField}, Filter: query.NewInValue(vals...)}
+		if _, err := s.kv.Find(filter).Delete(ctx); err != nil {
+			return err
+		}
+		keys = keys[n:]
+	}
+	return nil
+}
+
+// DeleteKVPrefix removes every value whose key starts with prefix — a
+// range on the primary key.
+func (s *Store) DeleteKVPrefix(ctx context.Context, prefix string) error {
+	if prefix == "" {
+		return errors.New("filestore: DeleteKVPrefix requires a prefix")
+	}
+	last := prefix[len(prefix)-1]
+	hi := prefix[:len(prefix)-1] + string(rune(last+1))
+	filter := query.And{
+		query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpGte, prefix)},
+		query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpLt, hi)},
+	}
+	_, err := s.kv.Find(filter).Delete(ctx)
+	return err
+}
+
 // IntentKey is the KV key of an attach-intent marker: written (with
 // the owning objectId as value) BEFORE a file's row is registered and
 // cleared once the CAR ref + retry job landed. GC treats a marked
@@ -466,8 +510,16 @@ func (s *Store) DeleteKV(ctx context.Context, key string) error {
 // ref write would leave the only copy of a never-uploaded file
 // unreferenced and GC would delete it.
 func IntentKey(spaceId string, root cid.Cid) string {
-	return "intent/" + spaceId + "/" + root.String()
+	return intentPrefix(spaceId) + root.String()
 }
+
+func intentPrefix(spaceId string) string { return "intent/" + spaceId + "/" }
+
+// FileIndexKey is the KV key of the local fileId → payloads-object
+// entry the space layer keeps per attached file.
+func FileIndexKey(spaceId, fileId string) string { return fileIndexPrefix(spaceId) + fileId }
+
+func fileIndexPrefix(spaceId string) string { return "fidx/" + spaceId + "/" }
 
 // GetKV reads one value; ok is false when the key was never set.
 func (s *Store) GetKV(ctx context.Context, key string) (value string, ok bool, err error) {

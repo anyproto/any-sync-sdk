@@ -16,6 +16,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/fanout"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 )
 
 // purgeStore builds a Store wired with exactly what the purge path needs: a
@@ -165,4 +166,84 @@ func TestPurgeObjects_Batch(t *testing.T) {
 		ids[c.ObjectId] = true
 	}
 	assert.Equal(t, map[string]bool{"live": true, "base": true}, ids)
+}
+
+// trackRead records one unread change for objectId through a read-state
+// engine on the store's DB, as the apply path would.
+func trackRead(t *testing.T, ctx context.Context, s *Store, objectId, changeId string) *readstate.Engine {
+	t.Helper()
+	eng := readstate.New(s.db, s.spaceId, s.applySeqs.Next, nil)
+	require.NoError(t, eng.TrackChange(ctx, readstate.Track{
+		ObjectId: objectId, ChangeId: changeId, VersionId: "v" + changeId,
+		AddSeq: 1, ApplySeq: 1, RecordIds: []string{"r1"}, Tags: []string{"msg"}, Tracked: true,
+	}))
+	return eng
+}
+
+func unreadOf(t *testing.T, ctx context.Context, eng *readstate.Engine, objectId string) int {
+	t.Helper()
+	entries, _, err := eng.UnreadEntries(ctx, objectId)
+	require.NoError(t, err)
+	return len(entries)
+}
+
+func parkedOf(t *testing.T, ctx context.Context, s *Store, objectId string) int {
+	t.Helper()
+	n := 0
+	require.NoError(t, s.IterDetached(ctx, func(row DetachedRow) bool {
+		if row.ObjectId == objectId {
+			n++
+		}
+		return true
+	}))
+	return n
+}
+
+// A purge clears the object's read state in the purge transaction and
+// its parked changes in the tail, and runs the purge hook while the
+// object's collections are still there. Other objects keep theirs.
+func TestPurgeObject_ClearsReadStateParkedAndRunsHook(t *testing.T) {
+	ctx, s := purgeStore(t)
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	writeObjectRow(t, ctx, s, "o1")
+	writeObjectRow(t, ctx, s, "o2")
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "o1", 5, 5, nil, "spaceA"))
+	require.NoError(t, s.EnsureApplySeq(ctx))
+	eng := trackRead(t, ctx, s, "o1", "c1")
+	trackRead(t, ctx, s, "o2", "c2")
+	for _, id := range []string{"o1", "o2"} {
+		require.NoError(t, s.Park(ctx, DetachedRow{ChangeId: "ch-" + id, SpaceId: "spaceA", ObjectId: id, Payload: []byte("x")}))
+	}
+	for _, id := range []string{"o1", "o2"} {
+		_, err = s.db.Collection(ctx, id+"_blocks")
+		require.NoError(t, err)
+	}
+
+	var hooked []string
+	s.SetPurgeHook(func(ctx context.Context, objectId string) {
+		_, err := s.db.OpenCollection(ctx, objectId+"_blocks")
+		assert.NoError(t, err, "the hook runs before the object's collections drop")
+		assert.False(t, objectRowExists(t, ctx, s, objectId), "the hook runs after the purge committed")
+		hooked = append(hooked, objectId)
+	})
+
+	require.NoError(t, s.purgeObject(ctx, "o1"))
+
+	assert.Equal(t, []string{"o1"}, hooked)
+	assert.Zero(t, unreadOf(t, ctx, eng, "o1"))
+	seeded, err := eng.Seeded(ctx, "o1")
+	require.NoError(t, err)
+	assert.False(t, seeded)
+	assert.Equal(t, 1, unreadOf(t, ctx, eng, "o2"))
+	assert.Zero(t, parkedOf(t, ctx, s, "o1"))
+	assert.Equal(t, 1, parkedOf(t, ctx, s, "o2"))
+	_, err = s.db.OpenCollection(ctx, "o1_blocks")
+	assert.True(t, errors.Is(err, anystore.ErrCollectionNotFound))
+
+	// The batch path does the same per id.
+	require.NoError(t, s.PurgeObjects(ctx, []string{"o2"}))
+	assert.Equal(t, []string{"o1", "o2"}, hooked)
+	assert.Zero(t, unreadOf(t, ctx, eng, "o2"))
+	assert.Zero(t, parkedOf(t, ctx, s, "o2"))
 }

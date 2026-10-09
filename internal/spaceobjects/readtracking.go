@@ -94,7 +94,11 @@ func (s *Store) readResolver() readstate.Resolver {
 		// the engine parks it as a pending head. Not for a deleted
 		// tree (its changes are gone and none will arrive): parking
 		// would re-create the state row the purge removed.
-		if e, eerr := s.TreeEntry(ctx, objectId); eerr == nil && e.Deleted {
+		e, err := s.TreeEntry(ctx, objectId)
+		if err != nil {
+			return nil, "", false, err
+		}
+		if e.Deleted {
 			return nil, "", false, readstate.ErrObjectDeleted
 		}
 		return nil, "", false, nil

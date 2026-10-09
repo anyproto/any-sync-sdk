@@ -22,12 +22,13 @@ import (
 //     entries of its rows (nothing else removes them — FindRow only
 //     answers ErrNotFound through a stale entry) and their pending
 //     file jobs, which would otherwise retry the lookup forever;
-//   - a purged owner: its payloads object of either shape, when present.
-//     The signed shape is cascade-deleted by any-sync and cleans itself
-//     up through its own purge; the derived shape is unparented and
-//     outlives the owner, so its index entries and live subscriptions
-//     (Files().Query(owner).Subscribe) end here — the owner's files are
-//     gone with it (see PayloadsAPI.ownerDeleted).
+//   - a purged owner: live subscriptions on its payloads object of
+//     either shape end (Files().Query(owner).Subscribe) — the owner's
+//     files are gone with it (see PayloadsAPI.ownerDeleted). The signed
+//     shape is cascade-deleted by any-sync and clears its own entries
+//     and jobs through its own purge; the derived shape is unparented
+//     and outlives the owner with its rows, whose entries stay valid
+//     (an entry lives as long as its row, see FindRow).
 //
 // Reads collections by name; never loads an object.
 func (s *Service) purgeFileLeftovers(ctx context.Context, spaceId string, st *spaceobjects.Store, objectId string) {
@@ -45,7 +46,6 @@ func (s *Service) purgeFileLeftovers(ctx context.Context, spaceId string, st *sp
 			continue
 		}
 		st.SubEngine().CloseObject(payloadsId, space.ErrObjectDeleted)
-		s.dropFileIndex(ctx, spaceId, payloadsId)
 	}
 }
 

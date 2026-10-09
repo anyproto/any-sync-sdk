@@ -234,6 +234,15 @@ func TestE2E_Payloads(t *testing.T) {
 	}
 	gotBig, ok := byId[fileBig]
 	require.True(t, ok)
+	// A bare-fileId lookup on B goes through the scan and backfills the
+	// index with the payloads object, not the owner.
+	rowB, err := paB.FindRow(ctx, fileBig)
+	require.NoError(t, err)
+	require.Equal(t, fileBig, rowB.Id)
+	indexedB, found, err := paB.IndexedPayloadsObject(ctx, fileBig)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, objIdB, indexedB)
 	assert.False(t, gotBig.Sealed, "device B holds the key and must unseal")
 	assert.Equal(t, encBig, gotBig.Enc)
 	assert.Equal(t, "net1/sig-of-bafyphotoroot", gotBig.NetworkSign)

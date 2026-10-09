@@ -338,6 +338,25 @@ func TestSubscribe_CountsBeforeSnapshot(t *testing.T) {
 	assert.Equal(t, int64(1), eng.counter.Load())
 }
 
+// A closed sub releases its held set and leaves the engine's fan-out
+// scratch, so the handle a consumer still holds keeps the mailbox only.
+func TestCloseSub_ReleasesHeldSet(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	initial := []row{makeRow(arena, "a", 1, nil), makeRow(arena, "b", 2, nil)}
+	sub := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "chat"}, nil, 2, initial)
+	fireEvent(eng, "obj1", "chat", "c", makeRow(arena, "c", 3, nil).d, false, nil)
+	require.Len(t, sub.entries, 3)
+
+	require.NoError(t, sub.Close())
+	assert.Nil(t, sub.entries)
+	assert.Nil(t, sub.maxRef)
+	for _, s := range eng.scratch[:cap(eng.scratch)] {
+		assert.Nil(t, s)
+	}
+}
+
 // An unbounded sub (Limit 0) has no sentinel, so nothing is ever
 // shipped from the held set: it tracks membership only — no doc and no
 // tuple per entry, sorted or not — while its events still carry the

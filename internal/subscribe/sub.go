@@ -47,6 +47,13 @@ func newSub(cfg SubConfig) *querySub {
 	}
 }
 
+// release drops the held set of a closed sub. apply returns on closed
+// before touching it, so nothing reads the window afterwards.
+func (s *querySub) release() {
+	s.entries = nil
+	s.minRef, s.maxRef = nil, nil
+}
+
 // appendInitial is called by Engine.Subscribe once per snapshot row.
 // Inserts the entry with what the sub keeps per row. Snapshot rows
 // arrive in sort order (ascending tuple), so the last row appended is

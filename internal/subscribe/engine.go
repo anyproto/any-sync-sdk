@@ -182,6 +182,9 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 		}
 		sub.apply(ev, postValue)
 	}
+	// A sub closed later must not stay reachable through the scratch
+	// until a fan-out of the same size overwrites its slot.
+	clear(e.scratch)
 }
 
 // NotifyDeleted emits a synthetic delete event for objectId in the
@@ -227,7 +230,9 @@ func (e *Engine) NotifyRecordsDeleted(spaceId, dataset, objectId string, ids []s
 	}, func(int) *anyenc.Value { return nil })
 }
 
-// closeSub removes a sub from the engine. Called via Sub.Close.
+// closeSub removes a sub from the engine and releases its held set;
+// the consumer's Sub handle keeps only the mailbox. Called via
+// Sub.Close.
 func (e *Engine) closeSub(s *querySub) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -238,6 +243,7 @@ func (e *Engine) closeSub(s *querySub) {
 		s.closed = true
 		_ = s.mb.Close()
 	}
+	s.release()
 	delete(e.subs, s.id)
 	e.scope.remove(s)
 	e.counter.Add(-1)
@@ -255,6 +261,7 @@ func (e *Engine) Close() error {
 			s.closed = true
 			_ = s.mb.Close()
 		}
+		s.release()
 	}
 	e.subs = map[uint64]*querySub{}
 	e.scope = newScopeIndex()

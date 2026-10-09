@@ -3,9 +3,11 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/cheggaaa/mb/v3"
 	"github.com/stretchr/testify/require"
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
@@ -30,7 +32,9 @@ func (r untouchedReader) Read([]byte) (int, error) {
 // gate of its own). Registration refuses the same way, for an owner
 // deleted while its upload was spooling, and the deleted owners' files
 // stop listing, resolving and counting at once — the derived child's
-// too, though its payloads object outlives it.
+// too, though its payloads object outlives it. Live file queries on
+// the deleted owners close with ErrObjectDeleted, and their file index
+// entries go with them.
 func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -70,12 +74,47 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	require.NoError(t, err)
 	childPayloads, err := payloadsSurface(t, sp).ObjectId(ctx, child)
 	require.NoError(t, err)
+	pa := payloadsSurface(t, sp)
+
+	// Live file queries and index entries, to be ended by the deletes.
+	subs := map[string]space.QuerySubscription{}
+	for name, id := range map[string]string{"had files": withFiles, "cascade-deleted child": child} {
+		q, err := sp.Files().Query(id)
+		require.NoError(t, err, name)
+		res, err := q.Subscribe(ctx, space.QueryOpts{})
+		require.NoError(t, err, name)
+		require.Len(t, res.Initial, 1, name)
+		subs[name] = res.Sub
+	}
+	for name, f := range map[string]space.FileInfo{"had files": attached, "cascade-deleted child": childFile} {
+		_, ok, err := pa.IndexedPayloadsObject(ctx, f.FileId)
+		require.NoError(t, err)
+		require.True(t, ok, "%s: the attach indexed the file", name)
+	}
 
 	require.NoError(t, sp.Objects().Delete(ctx, bare))
 	require.NoError(t, sp.Objects().Delete(ctx, withFiles))
 	require.NoError(t, sp.Objects().Delete(ctx, root))
 
-	pa := payloadsSurface(t, sp)
+	for name, sub := range subs {
+		waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+		for {
+			_, err := sub.Events().WaitOne(waitCtx)
+			if err != nil {
+				require.True(t, errors.Is(err, mb.ErrClosed), "%s: the subscription must close, got %v", name, err)
+				break
+			}
+		}
+		cancelWait()
+		require.ErrorIs(t, sub.Err(), space.ErrObjectDeleted, "%s: close reason", name)
+		require.NoError(t, sub.Close())
+	}
+	for name, f := range map[string]space.FileInfo{"had files": attached, "cascade-deleted child": childFile} {
+		require.Eventually(t, func() bool {
+			_, ok, err := pa.IndexedPayloadsObject(ctx, f.FileId)
+			return err == nil && !ok
+		}, 30*time.Second, 100*time.Millisecond, "%s: the file index entry must go with the owner", name)
+	}
 	late := []byte("spooled before the delete")
 	for name, id := range map[string]string{"never had files": bare, "had files": withFiles, "cascade-deleted child": child} {
 		_, err := sp.Files().Attach(ctx, id, untouchedReader{t}, space.AttachOpts{Name: "late.bin"})

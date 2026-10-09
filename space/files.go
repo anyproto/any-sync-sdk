@@ -129,7 +129,8 @@ type Files interface {
 	//
 	// ErrNotFound until the object's first file is attached (the
 	// backing dataset materializes with the first Attach) — fall back
-	// to List/Changes until then.
+	// to List/Changes until then. A live Subscribe on the query closes
+	// with ErrObjectDeleted once the object is deleted here.
 	Query(objectId string) (Query, error)
 }
 

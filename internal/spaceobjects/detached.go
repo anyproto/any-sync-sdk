@@ -7,6 +7,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 
 	"github.com/anyproto/any-sync-sdk/internal/types"
 )
@@ -119,6 +120,19 @@ func (s *Store) Unpark(ctx context.Context, changeId string) error {
 		return err
 	}
 	return nil
+}
+
+// UnparkObject removes every parked change of objectId. A purge calls
+// it: a deleted object's parked changes can never apply, and a row left
+// behind would make every drain pass reload a dead object.
+func (s *Store) UnparkObject(ctx context.Context, objectId string) error {
+	coll, err := s.Detached(ctx)
+	if err != nil {
+		return err
+	}
+	filter := query.Key{Path: []string{"objectId"}, Filter: query.NewComp(query.CompOpEq, objectId)}
+	_, err = coll.Find(filter).Delete(ctx)
+	return err
 }
 
 // IterDetached calls fn for every parked change. The visitor reads

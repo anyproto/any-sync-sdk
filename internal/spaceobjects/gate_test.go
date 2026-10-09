@@ -2,6 +2,11 @@ package spaceobjects
 
 import (
 	"context"
+	"errors"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync/app/ocache"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -88,4 +93,46 @@ func TestGate_ParkAndDrain(t *testing.T) {
 	known, err := store.reg.KnownShortId(ctx, "typeT", "shortS")
 	require.NoError(t, err)
 	assert.True(t, known, "shortS should now be known")
+}
+
+// A parked change whose object is deleted is unparked by the drain:
+// its tree cannot be opened (head storage records it deleted), so the
+// change can never apply and the row would otherwise be retried on
+// every pass. A row whose object fails to load for another reason
+// stays parked.
+func TestDrain_UnparksDeletedObject(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, t.TempDir()+"/test.db", nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	_ = store.cache.Close()
+	store.cache = ocache.New(func(_ context.Context, id string) (ocache.Object, error) {
+		if id == "obj-deleted" {
+			return nil, treeOpenError("BuildTree", id, spacestorage.ErrTreeStorageAlreadyDeleted)
+		}
+		return nil, errors.New("offline")
+	})
+	defer store.cache.Close()
+
+	payload, err := object.NewCodec().Encode(&crdt.Change{
+		Dataset: "blocks", DataVersion: "test-v1",
+		Records: []crdt.RecordChange{{Id: "r1", Upsert: true, Ops: []crdt.Op{{Type: crdt.OpSet, Path: []string{"a"}, Payload: (&anyenc.Arena{}).NewString("x")}}}},
+	})
+	require.NoError(t, err)
+	for _, id := range []string{"obj-deleted", "obj-offline"} {
+		require.NoError(t, store.Park(ctx, DetachedRow{
+			ChangeId: "ch-" + id, SpaceId: "spaceA", ObjectId: id, AddSeq: 3, OrderId: "a1", Payload: payload,
+		}))
+	}
+
+	require.NoError(t, store.Drain(ctx))
+
+	var left []string
+	require.NoError(t, store.IterDetached(ctx, func(r DetachedRow) bool {
+		left = append(left, r.ObjectId)
+		return true
+	}))
+	assert.Equal(t, []string{"obj-offline"}, left)
 }

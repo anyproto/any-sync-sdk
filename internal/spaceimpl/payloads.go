@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -395,16 +396,29 @@ func (p *PayloadsAPI) getRowIn(ctx context.Context, payloadsObjId, fileId string
 
 // fileIndexKey is the local-only fileId → payloads-object mapping in
 // the files-store KV (the network keeps no such index; locally every row
-// is seen). Written on Attach, backfilled on scan hits.
+// is seen). Written on Attach, backfilled on scan hits, removed with the
+// file, its payloads object, its owner and its space.
 func fileIndexKey(spaceId, fileId string) string {
-	return "fidx/" + spaceId + "/" + fileId
+	return filestore.FileIndexKey(spaceId, fileId)
+}
+
+// IndexedPayloadsObject reads the file index entry of fileId: the
+// payloads object it points at, and whether there is one. Test seam
+// for the entry's lifecycle; reads resolve through FindRow.
+func (p *PayloadsAPI) IndexedPayloadsObject(ctx context.Context, fileId string) (string, bool, error) {
+	kv := p.s.parent.filesStore()
+	if kv == nil {
+		return "", false, nil
+	}
+	return kv.GetKV(ctx, fileIndexKey(p.s.id, fileId))
 }
 
 // FindRow resolves a bare fileId to its row: the local index first
 // (one KV read + one row read), falling back to a scan of the space's
 // payloads objects for rows that arrived via sync, and backfilling the
 // index on the hit. space.ErrNotFound for a row whose owner or payloads
-// object is deleted.
+// object is deleted; the index entry goes with that answer, so a
+// lookup the purge did not reach does not keep it forever.
 func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row, error) {
 	row, err := p.findRow(ctx, fileId)
 	if err != nil {
@@ -415,9 +429,20 @@ func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row,
 		return payloads.Row{}, err
 	}
 	if gone {
+		p.dropIndexEntry(ctx, fileId)
 		return payloads.Row{}, space.ErrNotFound
 	}
 	return row, nil
+}
+
+// dropIndexEntry removes fileId's index entry, if the files store is
+// up. The scan path backfills an entry on every hit, so a lookup of a
+// deleted owner's file may write and drop one; the purge hook clears
+// the common case eagerly (purgeFileLeftovers).
+func (p *PayloadsAPI) dropIndexEntry(ctx context.Context, fileId string) {
+	if kv := p.s.parent.filesStore(); kv != nil {
+		_ = kv.DeleteKV(ctx, fileIndexKey(p.s.id, fileId))
+	}
 }
 
 func (p *PayloadsAPI) findRow(ctx context.Context, fileId string) (payloads.Row, error) {
@@ -428,12 +453,14 @@ func (p *PayloadsAPI) findRow(ctx context.Context, fileId string) (payloads.Row,
 	if kv != nil {
 		if objId, ok, err := kv.GetKV(ctx, fileIndexKey(p.s.id, fileId)); err == nil && ok {
 			// A fileId lives in one payloads object, and deletion is
-			// final: keep the entry and skip the scan.
+			// final: the entry has no further use, and the scan is
+			// skipped.
 			e, err := p.s.store.TreeEntry(ctx, objId)
 			if err != nil {
 				return payloads.Row{}, err
 			}
 			if e.Deleted {
+				_ = kv.DeleteKV(ctx, fileIndexKey(p.s.id, fileId))
 				return payloads.Row{}, space.ErrNotFound
 			}
 			row, err := p.getRowIn(ctx, objId, fileId)

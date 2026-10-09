@@ -21,7 +21,9 @@ import "encoding/json"
 // allowed and treated as synced.
 //
 // Behavioral declarations ride further x-keywords: per-field
-// `x-mutable-by` / `x-stamp`, dataset-level `required`, `x-delete-by`,
+// `x-mutable-by` / `x-stamp` / `x-additive` (a field not declared with
+// its dataset; on a dynamic dataset its shape is not guaranteed on
+// stored rows), dataset-level `required`, `x-delete-by`,
 // `x-id` (+ `x-id-pattern` / `x-id-max-length`), and `x-search`
 // ({title,text} field mapping for external indexers; `text` is a bare
 // field key or an array of keys — a single key marshals as the bare

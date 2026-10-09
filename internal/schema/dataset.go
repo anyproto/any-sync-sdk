@@ -311,6 +311,26 @@ type Field struct {
 	// Stamp: apply-time derived value. Non-zero forces ScopeDerived.
 	Stamp Stamp
 
+	// Additive marks a field that was not declared with its dataset:
+	// declared by a later change (AddDatasetField), by only some of the
+	// dataset's concurrent declarations, or differently by them. Rows
+	// may hold the key from before the declaration, and a change
+	// written then is valid under the schema its writer had, so the
+	// compiler drops Required on an additive field and, on a Dynamic
+	// dataset, makes it synced, unstamped and mutable by anyone: the
+	// apply path keeps treating the key as free keyspace (no shape
+	// check, no modifyTime bump) and the local pre-flight alone
+	// enforces the shape, on this device's writes. Every replica then
+	// takes the same verdict whether the declaration or the change
+	// arrived first. A non-Dynamic dataset rejects undeclared keys at
+	// write time, so its additive fields keep their shape, scope, stamp
+	// and mutability. The compiler sets it for runtime datasets; a
+	// compiled-in declaration may set it with the same meaning, and
+	// changing it on a shipped dataset changes apply verdicts like a
+	// handler version bump does. Enters the schema revision; rendered
+	// by discovery as `x-additive`.
+	Additive bool
+
 	// Description and XFormat are the field's descriptive slice: a
 	// display description and the opaque descriptor bag (semantic slug,
 	// icon, options, …). Neither is enforced by any handler and neither
@@ -415,7 +435,7 @@ func (d Dataset) ScopeOf(id string) (Scope, bool) {
 //
 // The per-field class rides as the `x-scope` extension keyword (precedent:
 // the docs' x-refType); behavioral declarations ride as `x-mutable-by`,
-// `x-stamp`, and the dataset-level `x-delete-by` / `x-id` /
+// `x-stamp`, `x-additive`, and the dataset-level `x-delete-by` / `x-id` /
 // `x-id-pattern` / `x-id-max-length` / `x-search` keywords. Defaults are
 // omitted. Cold path — discovery only; allocates freely.
 func (d Dataset) MarshalJSON() ([]byte, error) {
@@ -438,6 +458,9 @@ func (d Dataset) MarshalJSON() ([]byte, error) {
 		}
 		if f.Stamp != StampNone {
 			node["x-stamp"] = f.Stamp.String()
+		}
+		if f.Additive {
+			node["x-additive"] = true
 		}
 		if f.Required {
 			required = append(required, f.Id)

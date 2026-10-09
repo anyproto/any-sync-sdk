@@ -6,6 +6,7 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 )
 
 // ObjectChange is the payload of the change-index live feed: an object
@@ -80,6 +81,28 @@ func (s *Store) applySeqMeta(ctx context.Context) (anystore.Collection, error) {
 		return nil, s.applySeqBackfillErr
 	}
 	return coll, nil
+}
+
+// seedApplySeq is the per-space allocator's seed: the highest apply
+// sequence persisted anywhere in this space. Applies and purges persist
+// theirs as the object's _meta watermark; read marks persist theirs as
+// the object's read-state stateSeq and nowhere else, so both tables are
+// read — a seed below a persisted stateSeq would stamp later changes
+// under a consumer's read-state cursor.
+func (s *Store) seedApplySeq(ctx context.Context) (uint64, error) {
+	coll, err := s.applySeqMeta(ctx)
+	if err != nil {
+		return 0, err
+	}
+	seed, err := crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
+	if err != nil {
+		return 0, err
+	}
+	stateSeq, err := readstate.MaxStateSeq(ctx, s.db, s.spaceId)
+	if err != nil {
+		return 0, err
+	}
+	return max(seed, stateSeq), nil
 }
 
 // EnsureApplySeq forces the one-off applySeq backfill eagerly. The

@@ -208,7 +208,7 @@ Replaying an already-applied change is a no-op (gating and sticky tombstones), s
 
 ### ApplySeq (consumer-feed watermark)
 
-`applySeq` is SDK-owned and per space. It is allocated inside the apply WriteTx for every apply that writes records: DAG changes, the account mirror's applies, and device-local writes. It is stamped on written records as `_applySeq` and persisted per object as `maxApplySeq` in the same WriteTx. Re-seeding reads the highest persisted value, so the allocator needs no counter row.
+`applySeq` is SDK-owned and per space. It is allocated inside the apply WriteTx for every apply that writes records: DAG changes, the account mirror's applies, and device-local writes. It is stamped on written records as `_applySeq` and persisted per object as `maxApplySeq` in the same WriteTx. Read marks allocate from the same sequence and persist it as the object's read-state `stateSeq`. Re-seeding reads the highest value persisted in either table, so the allocator needs no counter row; a persisted watermark never rewinds (a reindex restarts only the AddSeq one).
 
 AddSeq answers "is any-store caught up with any-sync" and exists only for DAG changes. ApplySeq answers "is a consumer caught up with any-store": the change feed `Space.Changes()` is keyed on it, so non-DAG writes reach indexers.
 
@@ -562,7 +562,7 @@ A change for a dataset with no registered handler is already accepted into the a
 
 ### 8.3 Validation
 
-Handler hooks are the second of the two apply-time gates in §7.2; content and scope validation runs first, at the controller. The common single-field rules (required fields, write-once or author-gated mutability, apply-time stamps, id rules, delete gates) need no custom handler: declare them on the dataset `Schema` and the generic schema handler enforces them ([user-datasets.md](user-datasets.md)). Custom handlers cover what a declaration can't express:
+Handler hooks are the second of the two apply-time gates in §7.2; content and scope validation runs first, at the controller. The common single-field rules (required fields, write-once or author-gated mutability, apply-time stamps, id rules, delete gates) need no custom handler: declare them on the dataset `Schema` and the generic schema handler enforces them ([user-datasets.md](user-datasets.md)); an additive field of a Dynamic dataset is the exception — free keyspace at apply, its shape enforced by the local pre-flight only (user-datasets.md § Evolution rules). Custom handlers cover what a declaration can't express:
 
 - Cross-field and shape rules beyond the schema: size limits, allowed op paths, "field A requires field B".
 - Per-record permissions beyond the declared gates. The pattern: compare `ctx.Change.Creator` with a derived creation stamp on `ctx.Before`.

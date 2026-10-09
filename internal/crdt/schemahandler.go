@@ -15,8 +15,10 @@ import (
 // version (HandlerReg.Version). Every dataset the SDK applies through
 // this handler carries it, so a change here rebuilds their rows from the
 // DAG (docs/versioning.md). v2: the createTime / modifyTime stamps
-// are TypeDateTime instants, not epoch numbers.
-const SchemaHandlerVersion = 2
+// are TypeDateTime instants, not epoch numbers. v3: an additive field
+// of a Dynamic dataset is free keyspace at apply (schema.Field.Additive);
+// rows that the earlier verdicts dropped or stamped rebuild.
+const SchemaHandlerVersion = 3
 
 // SchemaHandler is the generic dataset handler: it enforces a
 // schema.Dataset's behavioral declaration (required fields, write-once /
@@ -32,7 +34,11 @@ const SchemaHandlerVersion = 2
 // creator stamp, a derived-at-create immutable fact; author-gated
 // deletes of never-created records are rejected, which converges because
 // an author's own create→delete is self-causally ordered, so a delete
-// arriving before its record's create can only be a non-author's.
+// arriving before its record's create can only be a non-author's. A
+// field declared after its Dynamic dataset (schema.Field.Additive) is
+// free keyspace at apply time: a change written under the earlier
+// schema is valid, and every replica keeps it whether the declaration
+// or the change arrived first.
 //
 // The declaration is compiled once at construction into a flat rule
 // table; the accept path of BeforeModify is one map lookup with zero
@@ -40,8 +46,13 @@ const SchemaHandlerVersion = 2
 // modifyTime bump via DeriveOnce), so the controller's multi-field
 // per-key salvage may safely re-probe it.
 type SchemaHandler struct {
-	rules       map[string]*fieldRule
-	requiredIds []string
+	// apply holds the rules every replica enforces at apply time; local
+	// adds the additive fields of a Dynamic dataset, whose shape only
+	// the local pre-flight enforces (schema.Field.Additive): at apply
+	// those keys stay free keyspace, so a change written before the
+	// declaration is kept wherever it lands.
+	apply ruleSet
+	local ruleSet
 
 	creatorField    string
 	createTimeField string
@@ -51,7 +62,6 @@ type SchemaHandler struct {
 	idRe     *regexp.Regexp
 	idMaxLen int
 	deleteBy schema.DeletePolicy
-	dynamic  bool
 }
 
 type fieldRule struct {
@@ -60,6 +70,20 @@ type fieldRule struct {
 	mutableBy schema.Mutability
 	stamp     schema.Stamp
 	shape     *schema.Schema // nil = unconstrained
+}
+
+// ruleSet is one rule table: the per-field rules and the ids a create
+// must carry.
+type ruleSet struct {
+	rules       map[string]*fieldRule
+	requiredIds []string
+}
+
+func (rs *ruleSet) add(id string, rule *fieldRule) {
+	rs.rules[id] = rule
+	if rule.required {
+		rs.requiredIds = append(rs.requiredIds, id)
+	}
 }
 
 // NewSchemaHandler compiles a dataset declaration into a generic
@@ -71,10 +95,10 @@ func NewSchemaHandler(ds schema.Dataset) (*SchemaHandler, error) {
 	}
 	ds = ds.Normalized()
 	h := &SchemaHandler{
-		rules:    make(map[string]*fieldRule, len(ds.Fields)),
+		apply:    ruleSet{rules: make(map[string]*fieldRule, len(ds.Fields))},
+		local:    ruleSet{rules: make(map[string]*fieldRule, len(ds.Fields))},
 		idRule:   ds.IdRule,
 		deleteBy: ds.DeleteBy,
-		dynamic:  ds.Dynamic,
 	}
 	if ds.IdRule == schema.IdUser {
 		re, maxLen, err := schema.CompileIdPattern(ds)
@@ -85,15 +109,16 @@ func NewSchemaHandler(ds schema.Dataset) (*SchemaHandler, error) {
 	}
 	for i := range ds.Fields {
 		f := &ds.Fields[i]
-		h.rules[f.Id] = &fieldRule{
+		rule := &fieldRule{
 			scope:     f.Scope,
 			required:  f.Required,
 			mutableBy: f.MutableBy,
 			stamp:     f.Stamp,
 			shape:     f.Schema,
 		}
-		if f.Required {
-			h.requiredIds = append(h.requiredIds, f.Id)
+		h.local.add(f.Id, rule)
+		if !ds.Dynamic || !f.Additive {
+			h.apply.add(f.Id, rule)
 		}
 		switch f.Stamp {
 		case schema.StampCreator:
@@ -116,7 +141,7 @@ func (h *SchemaHandler) BeforeCreate(ctx *ChangeCtx, rec *RecordChange, sink *Si
 	if err := h.checkRecordId(rec); err != nil {
 		return err
 	}
-	if err := h.checkCreatePayload(rec); err != nil {
+	if err := h.checkCreatePayload(&h.apply, rec); err != nil {
 		return err
 	}
 	if ctx == nil || ctx.Change == nil || sink == nil {
@@ -146,19 +171,20 @@ func (h *SchemaHandler) checkRecordId(rec *RecordChange) error {
 }
 
 // checkCreatePayload enforces required-field presence and declared value
-// shapes over the creating ops. Presence is established by content-adding
-// ops ($set / $addToSet / $inc / $incGated) on the field's head.
-func (h *SchemaHandler) checkCreatePayload(rec *RecordChange) error {
+// shapes over the creating ops, under the given rule table. Presence is
+// established by content-adding ops ($set / $addToSet / $inc /
+// $incGated) on the field's head.
+func (h *SchemaHandler) checkCreatePayload(rs *ruleSet, rec *RecordChange) error {
 	var present map[string]struct{}
-	if len(h.requiredIds) > 0 {
-		present = make(map[string]struct{}, len(h.requiredIds))
+	if len(rs.requiredIds) > 0 {
+		present = make(map[string]struct{}, len(rs.requiredIds))
 	}
 	for i := range rec.Ops {
 		op := &rec.Ops[i]
 		switch op.Type {
 		case OpSet:
 			if len(op.Path) == 0 {
-				if err := h.visitMultiField(op, present); err != nil {
+				if err := h.visitMultiField(rs, op, present); err != nil {
 					return err
 				}
 				continue
@@ -168,19 +194,19 @@ func (h *SchemaHandler) checkCreatePayload(rec *RecordChange) error {
 			if len(op.Path) == 1 && present != nil {
 				present[op.Path[0]] = struct{}{}
 			}
-			if err := h.checkOpShape(op); err != nil {
+			if err := h.checkOpShape(rs, op); err != nil {
 				return err
 			}
 		case OpAddToSet, OpInc, OpIncGated:
 			if len(op.Path) == 1 && present != nil {
 				present[op.Path[0]] = struct{}{}
 			}
-			if err := h.checkOpShape(op); err != nil {
+			if err := h.checkOpShape(rs, op); err != nil {
 				return err
 			}
 		}
 	}
-	for _, id := range h.requiredIds {
+	for _, id := range rs.requiredIds {
 		if present == nil {
 			return fmt.Errorf("%w: required field %q missing from create", ErrValidation, id)
 		}
@@ -193,7 +219,7 @@ func (h *SchemaHandler) checkCreatePayload(rec *RecordChange) error {
 
 // visitMultiField validates a multi-field $set payload's keys and marks
 // their heads present.
-func (h *SchemaHandler) visitMultiField(op *Op, present map[string]struct{}) error {
+func (h *SchemaHandler) visitMultiField(rs *ruleSet, op *Op, present map[string]struct{}) error {
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return fmt.Errorf("%w: multi-field $set payload must be an object", ErrValidation)
 	}
@@ -210,7 +236,7 @@ func (h *SchemaHandler) visitMultiField(op *Op, present map[string]struct{}) err
 			// put a valid value at `title`.
 			present[head] = struct{}{}
 		}
-		rule, ok := h.rules[head]
+		rule, ok := rs.rules[head]
 		if !ok || rule.shape == nil {
 			return
 		}
@@ -265,11 +291,12 @@ func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, _ *RecordChange, op *Op, si
 	if len(op.Path) == 0 {
 		return h.beforeModifyMulti(ctx, op, sink)
 	}
-	rule, ok := h.rules[op.Path[0]]
+	rule, ok := h.apply.rules[op.Path[0]]
 	if !ok {
-		// Undeclared head: non-Dynamic datasets never get here (the
-		// controller's field-class check rejects first); Dynamic free
-		// keyspace carries no behavioral semantics.
+		// Undeclared head, or an additive field of a Dynamic dataset:
+		// non-Dynamic datasets never get here (the controller's
+		// field-class check rejects first); Dynamic free keyspace
+		// carries no behavioral semantics.
 		return nil
 	}
 	if err := h.checkMutable(ctx, op.Path[0], rule); err != nil {
@@ -279,7 +306,7 @@ func (h *SchemaHandler) BeforeModify(ctx *ChangeCtx, _ *RecordChange, op *Op, si
 		h.bumpModifyTime(ctx, sink)
 		return nil
 	}
-	if err := h.checkOpShape(op); err != nil {
+	if err := h.checkOpShape(&h.apply, op); err != nil {
 		return err
 	}
 	h.bumpModifyTime(ctx, sink)
@@ -301,7 +328,7 @@ func (h *SchemaHandler) beforeModifyMulti(ctx *ChangeCtx, op *Op, sink *Sink) er
 			return
 		}
 		head, rest, dotted := strings.Cut(string(k), ".")
-		rule, ok := h.rules[head]
+		rule, ok := h.apply.rules[head]
 		if !ok {
 			return
 		}
@@ -365,13 +392,14 @@ func (h *SchemaHandler) checkMutable(ctx *ChangeCtx, field string, rule *fieldRu
 }
 
 // checkOpShape validates a single-path op payload against the declared
-// value shape. Deep paths validate against the resolvable sub-shape and
-// pass when the shape doesn't constrain that depth.
-func (h *SchemaHandler) checkOpShape(op *Op) error {
+// value shape under the given rule table. Deep paths validate against
+// the resolvable sub-shape and pass when the shape doesn't constrain
+// that depth.
+func (h *SchemaHandler) checkOpShape(rs *ruleSet, op *Op) error {
 	if len(op.Path) == 0 {
 		return nil
 	}
-	rule, ok := h.rules[op.Path[0]]
+	rule, ok := rs.rules[op.Path[0]]
 	if !ok || rule.shape == nil {
 		return nil
 	}
@@ -450,7 +478,8 @@ func (h *SchemaHandler) BeforeDelete(ctx *ChangeCtx, _ *RecordChange, _ *Sink) e
 // PreValidateMulti is the strict local gate: it re-runs the structural
 // checks (id rules, required fields, value shapes, write-once /
 // unknown-field rules) with agent-readable errors before the change
-// enters the DAG. Author-identity gates are left to apply time — the
+// enters the DAG, over every declared field — the additive fields of a
+// Dynamic dataset included. Author-identity gates are left to apply time — the
 // local change's Creator isn't stamped yet at pre-validation, and local
 // apply is synchronous, surfacing those rejections in the ModifyResult.
 func (h *SchemaHandler) PreValidateMulti(ch *Change, get RecordGetter) error {
@@ -473,7 +502,7 @@ func (h *SchemaHandler) PreValidateMulti(ch *Change, get RecordGetter) error {
 			if err := h.checkRecordId(rec); err != nil {
 				return fmt.Errorf("record %q: %w", rec.Id, err)
 			}
-			if err := h.checkCreatePayload(rec); err != nil {
+			if err := h.checkCreatePayload(&h.local, rec); err != nil {
 				return fmt.Errorf("record %q: %w", rec.Id, err)
 			}
 			continue
@@ -505,7 +534,7 @@ func (h *SchemaHandler) preValidateExistingOp(op *Op) error {
 				return
 			}
 			head, rest, dotted := strings.Cut(string(k), ".")
-			rule, ok := h.rules[head]
+			rule, ok := h.local.rules[head]
 			if !ok {
 				return
 			}
@@ -534,14 +563,14 @@ func (h *SchemaHandler) preValidateExistingOp(op *Op) error {
 		})
 		return firstErr
 	}
-	rule, ok := h.rules[op.Path[0]]
+	rule, ok := h.local.rules[op.Path[0]]
 	if !ok {
 		return nil
 	}
 	if rule.mutableBy == schema.MutableNever {
 		return fmt.Errorf("%w: field %q is write-once (set at create only)", ErrValidation, op.Path[0])
 	}
-	return h.checkOpShape(op)
+	return h.checkOpShape(&h.local, op)
 }
 
 // subShape descends a value shape along a dotted path remainder.

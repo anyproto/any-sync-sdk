@@ -640,13 +640,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	}
 	s.catalog = newRuntimeCatalog()
 	s.initCatalog(context.Background())
-	s.applySeqs = crdt.NewApplySeqAllocator(func(ctx context.Context) (uint64, error) {
-		coll, err := s.applySeqMeta(ctx)
-		if err != nil {
-			return 0, err
-		}
-		return crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
-	})
+	s.applySeqs = crdt.NewApplySeqAllocator(s.seedApplySeq)
 	if s.signKey != nil {
 		s.selfIdentity = s.signKey.GetPublic().Account()
 	}

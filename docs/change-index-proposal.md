@@ -44,8 +44,10 @@ cursoring on it would miss non-DAG mutations.
   a seq that commits late. Gaps (rolled-back transactions) are normal.
 - Stamped on each written record as `_applySeq`, and persisted as the
   object's watermark on its `_meta` row in the same transaction. The
-  allocator re-seeds from the highest persisted watermark, so it needs
-  no counter row and never regresses.
+  allocator re-seeds from the highest persisted watermark — the
+  objects' `_meta` rows and the read-state rows, whose stateSeq read
+  marks mint from the same sequence — so it needs no counter row and
+  never regresses.
 - Peer-local: persist and compare it as a cursor on this device; never
   send it to another peer.
 

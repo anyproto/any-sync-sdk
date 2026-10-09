@@ -311,7 +311,13 @@ func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, c
 // which takes the same lock: a load started (or joined) from inside the
 // snapshot callback deadlocks the engine, and with it every apply in
 // the space. Under the fence only the collection lookup, the snapshot
-// read and the registration run.
+// read and the registration run — and the lookup peeks
+// (Controller.PeekCollection): the first open of a dataset collection
+// ensures its indexes in a write transaction, and that transaction
+// waiting on any-store's writer under the fence would stall every
+// apply in the space for as long as the writer is busy. The warm-up
+// before the lock takes the open outside the fence; the peek covers a
+// collection that appears in between.
 //
 // Initial in the returned QueryResult is the user-visible window
 // (limit rows excluding the sentinel; or all rows when limit == 0).
@@ -358,10 +364,11 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			return nil, fmt.Errorf("query: %w", err)
 		}
 		if obj != nil {
-			// Warm the controller's handle: the first open of a dataset
-			// collection ensures its indexes in a write tx, which must
-			// not run under engine.mu. Under the fence the lookup is
-			// then a map hit; nil stays nil until a first row lands.
+			// Warm the controller's handle outside the fence: the first
+			// open of a dataset collection ensures its indexes in a
+			// write tx. Under the fence the lookup is then a map hit; a
+			// collection that appears in between is peeked without
+			// that write.
 			obj.Controller().Collection(ctx, q.dataset)
 			if obj.Controller().IsKeyed(q.dataset) {
 				q.rows = crdt.KeyedRows(q.objectId)
@@ -373,16 +380,22 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	// the snapshot read does.
 	combined := withoutTombstones(q.scoped())
 	// collection resolves the dataset's collection from the already
-	// resident owner; nil means nothing materialised yet. Safe under
-	// engine.mu: no object load, no DAG apply.
-	collection := func(ctx context.Context) anystore.Collection {
+	// resident owner; nil means nothing materialised yet. peek selects
+	// Controller.PeekCollection for the read under engine.mu, where
+	// every apply in the space waits: a collection that appeared since
+	// the warm-up is opened without the write transaction that ensures
+	// its indexes. No object load and no DAG apply there either.
+	collection := func(ctx context.Context, peek bool) (anystore.Collection, error) {
 		if scope.Shared || scope.AllObjects {
-			return sharedColl
+			return sharedColl, nil
 		}
 		if obj == nil {
-			return nil
+			return nil, nil
 		}
-		return obj.Controller().Collection(ctx, q.dataset)
+		if peek {
+			return obj.Controller().PeekCollection(ctx, q.dataset)
+		}
+		return obj.Controller().Collection(ctx, q.dataset), nil
 	}
 
 	// Hold the snapshot rows for both the engine's initial population
@@ -401,7 +414,10 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	}
 
 	sub, err := q.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
-		coll := collection(ctx)
+		coll, err := collection(ctx, true)
+		if err != nil {
+			return err
+		}
 		if coll == nil {
 			return nil // dataset has no materialised collection yet → empty
 		}
@@ -452,13 +468,13 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		// already released). Slightly stale relative to events that fired
 		// after we released, but documented as snapshot-only semantics.
 		totalCount = 0
-		if coll := collection(ctx); coll != nil {
-			n, cerr := coll.Find(combined).Count(ctx)
-			if cerr != nil {
-				_ = sub.Close()
-				return nil, cerr
-			}
-			totalCount = n
+		coll, err := collection(ctx, false)
+		if err == nil && coll != nil {
+			totalCount, err = coll.Find(combined).Count(ctx)
+		}
+		if err != nil {
+			_ = sub.Close()
+			return nil, err
 		}
 	}
 

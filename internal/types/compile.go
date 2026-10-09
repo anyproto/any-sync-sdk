@@ -166,6 +166,46 @@ func hashRev(raw []byte) string {
 	return strconv.FormatUint(h.Sum64(), 36)
 }
 
+// fieldFingerprint is the behavioral slice of a field declaration: what
+// two concurrent declarations of one key must agree on for the field to
+// count as declared with the dataset. Normalized first, so an implied
+// default and its explicit spelling fingerprint the same.
+func fieldFingerprint(f schema.Field) string {
+	f = schema.Dataset{Fields: []schema.Field{f}}.Normalized().Fields[0]
+	raw, err := json.Marshal(struct {
+		Schema    *schema.Schema
+		Scope     schema.Scope
+		Required  bool
+		MutableBy schema.Mutability
+		Stamp     schema.Stamp
+	}{f.Schema, f.Scope, f.Required, f.MutableBy, f.Stamp})
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// declaredWithEveryHead reports whether byHead (head id → fingerprint)
+// holds one agreeing declaration for each live head of the key.
+func declaredWithEveryHead(byHead map[string]string, hs []*headRec) bool {
+	if len(byHead) < len(hs) {
+		return false
+	}
+	first := ""
+	for i, h := range hs {
+		fp, ok := byHead[h.id]
+		if !ok {
+			return false
+		}
+		if i == 0 {
+			first = fp
+		} else if fp != first {
+			return false
+		}
+	}
+	return true
+}
+
 // compileIndexes orders a dataset's index winners by creation and
 // validates each against the folded declaration.
 func compileIndexes(ds schema.Dataset, byKey map[string]*indexRec, ids map[string][]string, shared bool) []CompiledIndex {
@@ -397,6 +437,10 @@ func (h *headRec) pinnedLeaves() string {
 //     definition's identity and display, fields union by key across
 //     every head (smallest `_ver.id` per key), and a disagreement on a
 //     pinned leaf marks the definition invalid;
+//   - a field is declared with the dataset when every live head of the
+//     key declared it in the head's own change, identically; any other
+//     field is additive (schema.Field.Additive): never required, and on
+//     a Dynamic dataset synced, unstamped and mutable by anyone;
 //   - `_ver.id` comparison is sound within one tree: orderId VALUES are
 //     peer-local but their relative order converges, so every replica
 //     picks the same winner;
@@ -624,6 +668,29 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 		}
 	}
 
+	// declaredWith: dataset key → field key → head id → fingerprint of
+	// the field record that rode that head's own change. A field is
+	// declared with the dataset when every live head of the key carries
+	// one such record and they agree; otherwise it is additive.
+	declaredWith := make(map[string]map[string]map[string]string, len(groups))
+	for _, f := range fields {
+		h, ok := headById[f.headId]
+		if !ok || f.created != h.created {
+			continue
+		}
+		byField := declaredWith[h.key]
+		if byField == nil {
+			byField = make(map[string]map[string]string)
+			declaredWith[h.key] = byField
+		}
+		byHead := byField[f.field.Id]
+		if byHead == nil {
+			byHead = make(map[string]string)
+			byField[f.field.Id] = byHead
+		}
+		byHead[h.id] = fieldFingerprint(f.field)
+	}
+
 	// Indexes: attach like fields, dedup per group by index key.
 	indexWinners := make(map[string]map[string]*indexRec, len(groups)) // dataset key → index key → winner
 	indexIds := make(map[string]map[string][]string, len(groups))      // dataset key → index key → every record id
@@ -715,9 +782,31 @@ func CompileTypeParts(ctx context.Context, db anystore.DB, typeId string, module
 				for _, f := range byKey {
 					ordered = append(ordered, f)
 				}
-				sort.Slice(ordered, func(i, j int) bool { return ordered[i].created < ordered[j].created })
+				// Creation order, then key: fields declared in one
+				// change share a creation id.
+				sort.Slice(ordered, func(i, j int) bool {
+					if ordered[i].created != ordered[j].created {
+						return ordered[i].created < ordered[j].created
+					}
+					return ordered[i].field.Id < ordered[j].field.Id
+				})
 				for _, f := range ordered {
-					ds.Fields = append(ds.Fields, f.field)
+					field := f.field
+					field.Additive = !declaredWithEveryHead(declaredWith[key][field.Id], hs)
+					if field.Additive {
+						// Rows may predate the declaration (see
+						// schema.Field.Additive): required fields exist
+						// only from the dataset's own declaration, and
+						// on a Dynamic dataset the key stays free
+						// keyspace at apply.
+						field.Required = false
+						if ds.Dynamic {
+							field.Scope = schema.ScopeSynced
+							field.Stamp = schema.StampNone
+							field.MutableBy = schema.MutableByAnyone
+						}
+					}
+					ds.Fields = append(ds.Fields, field)
 					fieldIds = append(fieldIds, f.id)
 				}
 			}

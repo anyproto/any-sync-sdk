@@ -181,3 +181,35 @@ func TestDataset_ScopeOf(t *testing.T) {
 	_, ok = ds.ScopeOf("nope")
 	assert.False(t, ok)
 }
+
+// An additive field renders x-additive; the others omit it.
+func TestDataset_MarshalJSONAdditive(t *testing.T) {
+	ds := Dataset{Dynamic: true, Fields: []Field{
+		{Id: "a", Schema: Leaf(KindNumber), Additive: true},
+		{Id: "b", Schema: Leaf(KindNumber)},
+	}}
+	raw, err := json.Marshal(ds)
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(raw, &doc))
+	props := doc["properties"].(map[string]any)
+	assert.Equal(t, true, props["a"].(map[string]any)["x-additive"])
+	_, has := props["b"].(map[string]any)["x-additive"]
+	assert.False(t, has)
+}
+
+func TestDataset_MarshalJSONRequiredSorted(t *testing.T) {
+	ds := Dataset{Fields: []Field{
+		{Id: "zeta", Schema: Leaf(KindString), Required: true},
+		{Id: "mid", Schema: Leaf(KindString)},
+		{Id: "alpha", Schema: Leaf(KindString), Required: true},
+	}}
+	raw, err := json.Marshal(ds)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"required":["alpha","zeta"]`)
+
+	ds.Fields[0], ds.Fields[2] = ds.Fields[2], ds.Fields[0]
+	again, err := json.Marshal(ds)
+	require.NoError(t, err)
+	assert.Equal(t, string(raw), string(again), "field order never changes the rendered document")
+}

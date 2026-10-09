@@ -487,3 +487,33 @@ func TestMarkSeeded_KeepsEntriesAndFrontier(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, entries, 1)
 }
+
+// A read mark mints its stateSeq from the space's apply-sequence
+// allocator and persists it only in the read-state table; the
+// allocator's seed reads it back from here.
+func TestMaxStateSeq_CoversReadMarks(t *testing.T) {
+	f := newFixture(t)
+	seq, err := MaxStateSeq(ctx, f.db, "space1")
+	require.NoError(t, err)
+	assert.Zero(t, seq, "no read-state rows yet")
+
+	for i, obj := range []string{"obj1", "obj2", "obj3"} {
+		tr := mkTrack(obj, fmt.Sprintf("c%d", i), fmt.Sprintf("v%02d", i), nil, "message")
+		tr.ApplySeq = uint64(30 - 10*i) // 30, 20, 10: the max is not the last row
+		f.track(t, tr)
+	}
+	seq, err = MaxStateSeq(ctx, f.db, "space1")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(30), seq)
+
+	_, err = f.MarkReadUpTo(ctx, "obj2", "")
+	require.NoError(t, err)
+	seq, err = MaxStateSeq(ctx, f.db, "space1")
+	require.NoError(t, err)
+	assert.Equal(t, f.seq, seq, "the mark's freshly minted stateSeq")
+	assert.Greater(t, seq, uint64(1000))
+
+	other, err := MaxStateSeq(ctx, f.db, "space2")
+	require.NoError(t, err)
+	assert.Zero(t, other, "scoped to the space")
+}

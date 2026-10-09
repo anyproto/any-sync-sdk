@@ -785,6 +785,20 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 	if def.Module != space.RecordsModule {
 		return "", fmt.Errorf("%w: dataset %q is served by %q", space.ErrModuleOwned, def.Key, def.Module)
 	}
+	if def.Dynamic {
+		// An additive field of a Dynamic dataset is free keyspace at
+		// apply (rows may hold the key already): the compiler makes it
+		// synced, unstamped and mutable by anyone, so a draft asking for
+		// more is refused rather than silently narrowed.
+		switch {
+		case decl.MutableBy == schema.MutableByAuthor:
+			return "", fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field cannot be author-mutable — declare it at AddDataset", def.Key)
+		case decl.Stamp != schema.StampNone:
+			return "", fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field cannot carry a stamp — declare it at AddDataset", def.Key)
+		case decl.Scope != 0 && decl.Scope != schema.ScopeSynced:
+			return "", fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field is synced — declare a %s field at AddDataset", def.Key, decl.Scope)
+		}
+	}
 	for _, f := range def.Fields {
 		if f.Key == decl.Id {
 			return "", fmt.Errorf("typesAPI: dataset %q already declares field %q", def.Key, decl.Id)
@@ -1286,6 +1300,7 @@ func compiledToDatasetDef(c *types.CompiledDataset) space.DatasetDef {
 			Required:    f.Required,
 			MutableBy:   f.MutableBy,
 			Stamp:       f.Stamp,
+			Additive:    f.Additive,
 			XFormat:     f.XFormat,
 		}
 		if i < len(c.FieldDefIds) {

@@ -472,3 +472,87 @@ func BenchmarkSchemaHandler_BeforeModifyAccept(b *testing.B) {
 		b.Fatalf("accept path allocates: %v allocs/op", allocs)
 	}
 }
+
+// A field declared after its Dynamic dataset (schema.Field.Additive) is
+// free keyspace at apply time: a change written before the declaration
+// is kept whole on every replica, whichever arrived first. The local
+// pre-flight still enforces the declaration, and a non-Dynamic dataset
+// enforces its additive fields everywhere.
+func TestSchemaHandler_AdditiveFieldOnDynamicDataset(t *testing.T) {
+	decl := schema.Dataset{
+		Dynamic: true,
+		Fields: []schema.Field{
+			{Id: "title", Schema: schema.Leaf(schema.KindString), MutableBy: schema.MutableByAnyone},
+			{Id: "score", Schema: schema.Leaf(schema.KindNumber), MutableBy: schema.MutableByAnyone, Additive: true},
+			{Id: "owner", Schema: schema.Leaf(schema.KindString), Additive: true},
+			{Id: "modifiedAt", Stamp: schema.StampModifyTime, Scope: schema.ScopeDerived},
+		},
+		IdRule: schema.IdUser,
+	}
+	st := newSchemaHandlerController(t, decl)
+	a := &anyenc.Arena{}
+
+	// A create carrying the additive keys with another kind: kept whole.
+	payload := a.NewObject()
+	payload.Set("title", a.NewString("t"))
+	payload.Set("score", a.NewString("abc"))
+	payload.Set("owner", a.NewString("alice"))
+	res, err := st.ApplyChangeWithResult(ctx, shChange("v1", shAuthorA, 100, RecordChange{
+		Id: "row-1", Upsert: true, Ops: []Op{{Type: OpSet, Payload: payload}},
+	}))
+	require.NoError(t, err)
+	require.Empty(t, res.Rejections)
+	rec := st.Get(ctx, shTestDS, "row-1")
+	require.NotNil(t, rec)
+	assert.Equal(t, "abc", string(rec.GetStringBytes("score")))
+
+	// A modify of the write-once additive key, with another kind: kept,
+	// and the key bumps nothing, like free keyspace.
+	res, err = st.ApplyChangeWithResult(ctx, shChange("v2", shAuthorB, 200, RecordChange{
+		Id: "row-1", Ops: []Op{{Type: OpSet, Path: []string{"owner"}, Payload: a.NewNumberInt(7)}},
+	}))
+	require.NoError(t, err)
+	require.Empty(t, res.Rejections)
+	rec = st.Get(ctx, shTestDS, "row-1")
+	assert.Equal(t, 7, rec.GetInt("owner"))
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"))
+
+	// A combined op over an additive key and a declared one: only the
+	// declared key is checked.
+	combined := a.NewObject()
+	combined.Set("score", a.NewString("zzz"))
+	combined.Set("title", a.NewNumberInt(1))
+	res, err = st.ApplyChangeWithResult(ctx, shChange("v3", shAuthorB, 300, RecordChange{
+		Id: "row-1", Ops: []Op{{Type: OpSet, Payload: combined}},
+	}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	rec = st.Get(ctx, shTestDS, "row-1")
+	assert.Equal(t, "zzz", string(rec.GetStringBytes("score")))
+	assert.Equal(t, "t", string(rec.GetStringBytes("title")))
+
+	// The local pre-flight enforces the additive declaration.
+	h, err := NewSchemaHandler(decl)
+	require.NoError(t, err)
+	get := func(id string) *anyenc.Value { return st.Get(ctx, shTestDS, id) }
+	badKind := shChange("v4", shAuthorA, 400, RecordChange{Id: "row-1", Ops: []Op{{Type: OpSet, Path: []string{"score"}, Payload: a.NewString("zzz")}}})
+	assert.ErrorIs(t, h.PreValidateMulti(&badKind, get), ErrValidation)
+	writeOnce := shChange("v5", shAuthorA, 500, RecordChange{Id: "row-1", Ops: []Op{{Type: OpSet, Path: []string{"owner"}, Payload: a.NewString("bob")}}})
+	assert.ErrorIs(t, h.PreValidateMulti(&writeOnce, get), ErrValidation)
+	badCreate := shChange("v6", shAuthorA, 600, RecordChange{Id: "row-2", Upsert: true, Ops: []Op{{Type: OpSet, Path: []string{"score"}, Payload: a.NewString("zzz")}}})
+	assert.ErrorIs(t, h.PreValidateMulti(&badCreate, get), ErrValidation)
+	good := shChange("v7", shAuthorA, 700, RecordChange{Id: "row-1", Ops: []Op{{Type: OpSet, Path: []string{"score"}, Payload: a.NewNumberInt(3)}}})
+	assert.NoError(t, h.PreValidateMulti(&good, get))
+
+	// A non-Dynamic dataset rejects undeclared keys at write time, so its
+	// additive fields are enforced at apply like any other.
+	strict := decl
+	strict.Dynamic = false
+	st2 := newSchemaHandlerController(t, strict)
+	res, err = st2.ApplyChangeWithResult(ctx, shChange("v1", shAuthorA, 100, RecordChange{
+		Id: "row-1", Upsert: true, Ops: []Op{{Type: OpSet, Payload: payload}},
+	}))
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Rejections)
+	assert.Nil(t, st2.Get(ctx, shTestDS, "row-1"))
+}

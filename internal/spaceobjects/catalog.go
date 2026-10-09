@@ -289,13 +289,19 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 			// space (Store.keyedCollection).
 			Keyed: ds.Shared,
 		}
+		layout := 0
 		if ds.Shared {
-			// Rows materialized per object — by an SDK that predates
-			// shared datasets, which ignores the marker — are in the
-			// wrong collection: a version of its own makes the objects
-			// holding them stale, and their re-index moves the rows.
-			reg.Version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, sharedLayoutVersion)
-		} else {
+			// Rows materialized per object are in the wrong
+			// collection; the re-index moves them.
+			layout |= sharedLayoutVersion
+		}
+		if ds.Schema.Dynamic {
+			layout |= dynamicAdditiveVersion
+		}
+		if layout != 0 {
+			reg.Version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, layout)
+		}
+		if !ds.Shared {
 			// A per-object collection carries the declared indexes
 			// from its open; the store indexes a shared one.
 			reg.Indexes = ds.StoreIndexes()
@@ -317,10 +323,23 @@ func (s *Store) instanceReg(ds types.CompiledDataset) (crdt.HandlerReg, error) {
 	return reg, nil
 }
 
-// sharedLayoutVersion is the consumer half of a shared dataset's
-// registration version: it tells rows in the per-space collection from
-// rows the same schema handler materialized per object.
-const sharedLayoutVersion = 1
+// The consumer half of a runtime records dataset's registration
+// version, composed with the generic handler's version. Each bit names
+// a change in how the dataset's rows are materialized; an object whose
+// stored version lacks it is stale and rebuilds. Compiled-in and module
+// datasets carry neither: a shared one never had a per-object layout,
+// and a static declaration has no additive fields.
+const (
+	// sharedLayoutVersion tells rows in the per-space collection from
+	// rows the same schema handler materialized per object (an SDK that
+	// predates shared datasets ignored the marker).
+	sharedLayoutVersion = 1
+	// dynamicAdditiveVersion tells rows built with a Dynamic dataset's
+	// additive fields as free keyspace (schema.Field.Additive) from rows
+	// built by the verdicts before it, which dropped records and ops on
+	// such keys and stamped modifyTime on them.
+	dynamicAdditiveVersion = 2
+)
 
 // moduleReg instantiates a module for one collection and turns the
 // returned dataset into a controller registration. A nil Handler gets

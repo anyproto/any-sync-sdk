@@ -122,17 +122,72 @@ func (s *Store) Unpark(ctx context.Context, changeId string) error {
 	return nil
 }
 
+// detachedIfExists is Detached without the create: nil when the space
+// never parked a change. The purge paths use it so a purge creates no
+// collection (an offload may be dropping it at the same time).
+func (s *Store) detachedIfExists(ctx context.Context) (anystore.Collection, error) {
+	s.mu.Lock()
+	coll := s.detached
+	s.mu.Unlock()
+	if coll != nil {
+		return coll, nil
+	}
+	coll, err := s.db.OpenCollection(ctx, s.spaceId+"_"+DetachedCollection)
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.detached == nil {
+		s.detached = coll
+	} else {
+		coll = s.detached
+	}
+	s.mu.Unlock()
+	return coll, nil
+}
+
 // UnparkObject removes every parked change of objectId. A purge calls
 // it: a deleted object's parked changes can never apply, and a row left
-// behind would make every drain pass reload a dead object.
+// behind would make every drain pass reload a dead object. One scan of
+// the (normally tiny) collection; a batch purge narrows it with
+// ParkedObjects first.
 func (s *Store) UnparkObject(ctx context.Context, objectId string) error {
-	coll, err := s.Detached(ctx)
-	if err != nil {
+	coll, err := s.detachedIfExists(ctx)
+	if err != nil || coll == nil {
 		return err
 	}
 	filter := query.Key{Path: []string{"objectId"}, Filter: query.NewComp(query.CompOpEq, objectId)}
 	_, err = coll.Find(filter).Delete(ctx)
 	return err
+}
+
+// ParkedObjects returns the ids of the objects with a parked change —
+// one scan, for a batch purge to unpark only where there is something
+// to unpark. Empty when nothing is parked.
+func (s *Store) ParkedObjects(ctx context.Context) (map[string]struct{}, error) {
+	coll, err := s.detachedIfExists(ctx)
+	if err != nil || coll == nil {
+		return nil, err
+	}
+	iter, err := coll.Find(nil).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	ids := map[string]struct{}{}
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return nil, err
+		}
+		if id := doc.Value().GetString("objectId"); id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+	return ids, iter.Err()
 }
 
 // IterDetached calls fn for every parked change. The visitor reads

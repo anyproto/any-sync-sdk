@@ -2,6 +2,8 @@ package readstate
 
 import (
 	"context"
+	"errors"
+	"github.com/anyproto/any-sync-sdk/space"
 	"path/filepath"
 	"testing"
 
@@ -113,4 +115,35 @@ func TestPurgeSpace_DropsSpaceRowsInChunks(t *testing.T) {
 	n, err = PurgeSpace(ctx, db, "space1")
 	require.NoError(t, err)
 	assert.Zero(t, n, "second pass finds nothing")
+}
+
+// A mark or merge on a deleted object stops at the resolver's answer
+// and persists nothing: the published frontiers of a purged object
+// keep arriving, and parking their heads would re-create the row the
+// purge removed.
+func TestMergeHeads_DeletedObjectPersistsNothing(t *testing.T) {
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "readstate.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	seq := uint64(1000)
+	e := New(db, "space1", func(context.Context) (uint64, error) { seq++; return seq, nil },
+		func(_ context.Context, objectId, _ string) ([]string, string, bool, error) {
+			if objectId == "gone" {
+				return nil, "", false, ErrObjectDeleted
+			}
+			return nil, "", false, nil
+		})
+
+	_, err = e.MergeHeads(ctx, "gone", []string{"h1"})
+	assert.True(t, errors.Is(err, ErrObjectDeleted))
+	assert.True(t, errors.Is(err, space.ErrObjectDeleted))
+	_, err = e.MarkRead(ctx, "gone", []string{"h1"})
+	assert.True(t, errors.Is(err, ErrObjectDeleted))
+	assert.Zero(t, stateRows(t, db), "no state row for a deleted object")
+
+	// A not-yet-arrived head on a live object still parks as pending.
+	res, err := e.MergeHeads(ctx, "live", []string{"h1"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"h1"}, res.Pending)
+	assert.Equal(t, 1, stateRows(t, db))
 }

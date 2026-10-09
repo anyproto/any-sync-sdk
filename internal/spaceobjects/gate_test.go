@@ -5,7 +5,10 @@ import (
 	"errors"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync/app/ocache"
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"testing"
 
@@ -96,7 +99,8 @@ func TestGate_ParkAndDrain(t *testing.T) {
 }
 
 // A parked change whose object is deleted is unparked by the drain:
-// its tree cannot be opened (head storage records it deleted), so the
+// its tree cannot be opened (head storage records it deleted), or the
+// cached object is flagged deleted and refuses the apply, so the
 // change can never apply and the row would otherwise be retried on
 // every pass. A row whose object fails to load for another reason
 // stays parked.
@@ -107,10 +111,21 @@ func TestDrain_UnparksDeletedObject(t *testing.T) {
 	defer db.Close()
 
 	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	ctrl, err := crdt.NewController(ctx, "obj-marked", db, crdt.HandlerReg{Name: "blocks", Handler: &crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}})
+	require.NoError(t, err)
+	marked, err := object.New(object.Config{SpaceId: "spaceA", Controller: ctrl},
+		func(updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
+			return &closableStubTree{stubTree{id: "obj-marked"}}, nil
+		})
+	require.NoError(t, err)
+	marked.MarkDeleted()
 	_ = store.cache.Close()
 	store.cache = ocache.New(func(_ context.Context, id string) (ocache.Object, error) {
-		if id == "obj-deleted" {
+		switch id {
+		case "obj-deleted":
 			return nil, treeOpenError("BuildTree", id, spacestorage.ErrTreeStorageAlreadyDeleted)
+		case "obj-marked":
+			return marked, nil
 		}
 		return nil, errors.New("offline")
 	})
@@ -121,7 +136,7 @@ func TestDrain_UnparksDeletedObject(t *testing.T) {
 		Records: []crdt.RecordChange{{Id: "r1", Upsert: true, Ops: []crdt.Op{{Type: crdt.OpSet, Path: []string{"a"}, Payload: (&anyenc.Arena{}).NewString("x")}}}},
 	})
 	require.NoError(t, err)
-	for _, id := range []string{"obj-deleted", "obj-offline"} {
+	for _, id := range []string{"obj-deleted", "obj-marked", "obj-offline"} {
 		require.NoError(t, store.Park(ctx, DetachedRow{
 			ChangeId: "ch-" + id, SpaceId: "spaceA", ObjectId: id, AddSeq: 3, OrderId: "a1", Payload: payload,
 		}))
@@ -136,3 +151,9 @@ func TestDrain_UnparksDeletedObject(t *testing.T) {
 	}))
 	assert.Equal(t, []string{"obj-offline"}, left)
 }
+
+// closableStubTree is a stubTree the object cache can close.
+type closableStubTree struct{ stubTree }
+
+func (s *closableStubTree) TryLock() bool { return s.mu.TryLock() }
+func (s *closableStubTree) Close() error  { return nil }

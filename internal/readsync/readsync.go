@@ -337,6 +337,12 @@ func (s *Service) merge(ctx context.Context, job mergeJob) {
 		return mergeErr
 	})
 	if err != nil {
+		if errors.Is(err, readstate.ErrObjectDeleted) {
+			// A purged object's published frontiers keep arriving;
+			// there is nothing left to merge them into.
+			log.Debug("merge frontier: object deleted", zap.String("objectId", job.objectId))
+			return
+		}
 		log.Warn("merge frontier", zap.String("objectId", job.objectId), zap.Error(err))
 		return
 	}

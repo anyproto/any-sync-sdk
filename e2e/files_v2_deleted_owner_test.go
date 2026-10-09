@@ -76,8 +76,10 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	require.NoError(t, err)
 	pa := payloadsSurface(t, sp)
 
-	// Live file queries and index entries, to be ended by the deletes.
+	// Live file queries and index entries, to be ended by the deletes;
+	// a Query held across the delete, to be refused by it.
 	subs := map[string]space.QuerySubscription{}
+	held := map[string]space.Query{}
 	for name, id := range map[string]string{"had files": withFiles, "cascade-deleted child": child} {
 		q, err := sp.Files().Query(id)
 		require.NoError(t, err, name)
@@ -85,6 +87,7 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 		require.NoError(t, err, name)
 		require.Len(t, res.Initial, 1, name)
 		subs[name] = res.Sub
+		held[name] = q
 	}
 	for name, f := range map[string]space.FileInfo{"had files": attached, "cascade-deleted child": childFile} {
 		_, ok, err := pa.IndexedPayloadsObject(ctx, f.FileId)
@@ -115,6 +118,12 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 			return err == nil && !ok
 		}, 30*time.Second, 100*time.Millisecond, "%s: the file index entry must go with the owner", name)
 	}
+	for name, q := range held {
+		_, err := q.All(ctx)
+		require.ErrorIs(t, err, space.ErrNotFound, "%s: a held query reads nothing after the delete", name)
+		_, err = q.Subscribe(ctx, space.QueryOpts{})
+		require.ErrorIs(t, err, space.ErrNotFound, "%s: a held query subscribes to nothing after the delete", name)
+	}
 	late := []byte("spooled before the delete")
 	for name, id := range map[string]string{"never had files": bare, "had files": withFiles, "cascade-deleted child": child} {
 		_, err := sp.Files().Attach(ctx, id, untouchedReader{t}, space.AttachOpts{Name: "late.bin"})
@@ -133,6 +142,11 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	all, err := sp.Files().List(ctx, space.FileListOpts{})
 	require.NoError(t, err)
 	require.Empty(t, all, "the space lists no files of deleted owners")
+	for name, f := range map[string]space.FileInfo{"had files": attached, "cascade-deleted child": childFile} {
+		_, ok, err := pa.IndexedPayloadsObject(ctx, f.FileId)
+		require.NoError(t, err)
+		require.False(t, ok, "%s: a lookup of a deleted owner's file writes no index entry", name)
+	}
 	rows, err := sp.Payloads().ListRows(ctx, childPayloads)
 	require.NoError(t, err)
 	require.Empty(t, rows, "the payloads view skips a deleted owner's rows")

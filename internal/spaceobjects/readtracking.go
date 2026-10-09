@@ -85,17 +85,19 @@ func (s *Store) readResolver() readstate.Resolver {
 		if st == nil {
 			return nil, "", false, nil
 		}
-		ts, err := st.TreeStorage(ctx, objectId)
-		if err != nil {
-			// Unknown tree — nothing synced yet on this device.
-			return nil, "", false, nil
+		if ts, err := st.TreeStorage(ctx, objectId); err == nil {
+			if sc, err := ts.Get(ctx, changeId); err == nil {
+				return sc.PrevIds, sc.OrderId, true, nil
+			}
 		}
-		sc, err := ts.Get(ctx, changeId)
-		if err != nil {
-			// Not arrived; the engine parks it as a pending head.
-			return nil, "", false, nil
+		// Unknown tree or change — not arrived on this device yet, so
+		// the engine parks it as a pending head. Not for a deleted
+		// tree (its changes are gone and none will arrive): parking
+		// would re-create the state row the purge removed.
+		if e, eerr := s.TreeEntry(ctx, objectId); eerr == nil && e.Deleted {
+			return nil, "", false, readstate.ErrObjectDeleted
 		}
-		return sc.PrevIds, sc.OrderId, true, nil
+		return nil, "", false, nil
 	}
 }
 

@@ -1737,8 +1737,10 @@ func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.Tree
 //
 // Ordering is deliberate: tree.Delete() runs FIRST, so any-sync marks
 // the tree deleted (a permanent, cross-device-authoritative flag) and
-// then rejects every further apply to it — the purge below therefore
-// cannot race a concurrent materialization of the same object.
+// then rejects every further apply to it; the cached Object is then
+// flagged deleted (Object.MarkDeleted), so a drained parked change
+// cannot apply either — the purge below therefore cannot race a
+// concurrent materialization of the same object.
 //
 // A purge failure is PROPAGATED, not swallowed: any-sync advances the
 // tree from Queued to Deleted only after this callback returns success,
@@ -1750,13 +1752,9 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	if err != nil {
 		return fmt.Errorf("spaceobjects: load %s: %w", treeId, err)
 	}
-	// The cached Object refuses every write from here on (waiting for
-	// an in-flight apply under the tree lock), so a parked change
-	// drained between the purge below and the eviction cannot
-	// resurrect rows.
-	obj.MarkDeleted()
 	tree := obj.Tree()
 	if tree == nil {
+		obj.MarkDeleted()
 		if err := s.purgeObject(ctx, treeId); err != nil {
 			return err
 		}
@@ -1766,6 +1764,12 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	if err := tree.Delete(); err != nil {
 		return fmt.Errorf("spaceobjects: tree.Delete %s: %w", treeId, err)
 	}
+	// Deleted in any-sync; now the cached Object refuses every write
+	// (waiting for an in-flight apply under the tree lock), so a parked
+	// change drained between the purge below and the eviction cannot
+	// resurrect rows. After tree.Delete, so a failed delete leaves the
+	// object unmarked over its live tree.
+	obj.MarkDeleted()
 	if err := s.purgeObject(ctx, treeId); err != nil {
 		return err
 	}
@@ -1967,13 +1971,16 @@ func (s *Store) unparkObject(ctx context.Context, objectId string) {
 }
 
 // PurgeObjects hard-removes the local projection for a batch of objectIds in
-// ONE WriteTx (row removal + del-stamp per materialized id), then reclaims
-// per-object collections listing collection names ONCE, drops the cache, and
-// emits one deletion feed entry per stamped id. Used by the startup
-// deletion-reconcile to purge many stale rows off the SDK.Open path without
-// the O(N x all-collections) cost of per-id purgeObject. Ids with neither a
-// live `objects` row nor a scoped `_meta` row (never materialized here) are
-// skipped. Idempotent.
+// ONE WriteTx (row removal + read-state purge + del-stamp per materialized
+// id), then reclaims per-object collections listing collection names ONCE,
+// drops the cache, and emits one deletion feed entry per stamped id. Used by
+// the startup deletion-reconcile to purge many stale rows off the SDK.Open
+// path without the O(N x all-collections) cost of per-id purgeObject. Ids
+// with neither a live `objects` row nor a scoped `_meta` row (never
+// materialized here) skip the collection reclaim; the purge hook, the
+// parked-change and subscription cleanup run for every id, since those
+// hold state for an object that never had a row (a payloads object whose
+// owner was skipped, a subscription waiting for the object). Idempotent.
 func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 	if len(objectIds) == 0 {
 		return nil
@@ -2016,31 +2023,45 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		return fmt.Errorf("spaceobjects: batch purge commit: %w", err)
 	}
 
-	// Best-effort tail — list collection names ONCE for the whole batch.
+	// Best-effort tail — list collection names ONCE for the whole batch,
+	// and scan the parked changes ONCE.
 	names, nerr := s.db.GetCollectionNames(ctx)
 	if nerr != nil {
 		storeLog.Warn("batch purge: list collections", zap.Error(nerr))
 	}
+	parked, perr := s.ParkedObjects(ctx)
+	if perr != nil {
+		storeLog.Warn("batch purge: list parked changes", zap.Error(perr))
+	}
+	purgedById := make(map[string]purgedRow, len(purged))
 	for _, p := range purged {
-		s.runPurgeHook(ctx, p.id)
-		if nerr == nil {
-			s.dropObjectCollectionsNamed(ctx, p.id, names)
+		purgedById[p.id] = p
+	}
+	for _, id := range objectIds {
+		p, materialized := purgedById[id]
+		s.runPurgeHook(ctx, id)
+		if materialized {
+			if nerr == nil {
+				s.dropObjectCollectionsNamed(ctx, id, names)
+			}
+			if nerr != nil {
+				// The batch listing failed — drop per object so the defs
+				// collection is gone before the catalog recompile, or the
+				// refresh below would re-add the deleted type's names.
+				s.dropObjectCollections(ctx, id)
+			}
+			s.purgeKeyedRows(ctx, id)
+			s.purgeHistoryRows(ctx, id)
 		}
-		if nerr != nil {
-			// The batch listing failed — drop per object so the defs
-			// collection is gone before the catalog recompile, or the
-			// refresh below would re-add the deleted type's names.
-			s.dropObjectCollections(ctx, p.id)
+		if _, ok := parked[id]; ok || perr != nil {
+			s.unparkObject(ctx, id)
 		}
-		s.purgeKeyedRows(ctx, p.id)
-		s.purgeHistoryRows(ctx, p.id)
-		s.unparkObject(ctx, p.id)
-		s.Drop(p.id)
+		s.Drop(id)
 		// See purgeObject: a deleted type object leaves the catalog.
-		if s.catalogHasType(p.id) {
-			s.refreshType(ctx, p.id)
+		if materialized && s.catalogHasType(id) {
+			s.refreshType(ctx, id)
 		}
-		s.fireDeletionEvents(p.id, p.removed, p.stamped, p.seq)
+		s.fireDeletionEvents(id, p.removed, p.stamped, p.seq)
 	}
 	if s.SelectiveMode() {
 		// Skip markers exist for ids that never materialized, so sweep

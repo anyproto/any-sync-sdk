@@ -264,7 +264,8 @@ func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) erro
 const offloadDropChunk = 256
 
 // sweepChunkCommitted, when set, observes every committed sweep chunk
-// (n = ops in the chunk). Test seam.
+// (n = ops in the chunk); the read-state purge reports once with its
+// row total. Test seam.
 var sweepChunkCommitted func(n int)
 
 // dropChunk drops one chunk of collections under a single WriteTx.
@@ -331,6 +332,7 @@ func (s *Service) purgeMetaChunk(ctx context.Context, spaceId string, objectIds 
 // purgeReadStateChunk removes the space's read-state rows in their own
 // bounded transactions (see readstate.PurgeSpace). Any error is
 // returned: a stale frontier is state offload must not commit to.
+// Reported to the seam once, with the row total, when anything went.
 func (s *Service) purgeReadStateChunk(ctx context.Context, spaceId string) error {
 	n, err := readstate.PurgeSpace(ctx, s.db, spaceId)
 	if err != nil {

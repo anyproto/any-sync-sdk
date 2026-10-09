@@ -7,7 +7,17 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/query"
+
+	"github.com/anyproto/any-sync-sdk/space"
 )
+
+// ErrObjectDeleted is what a Resolver returns for an object whose tree
+// is deleted on this device. A mark or merge that meets it stops
+// before persisting anything: the published frontiers of a purged
+// object keep arriving (every device's reconcile replays them), and
+// parking their heads as pending would re-create the state row the
+// purge removed. Wraps space.ErrObjectDeleted for API callers.
+var ErrObjectDeleted = fmt.Errorf("readstate: %w", space.ErrObjectDeleted)
 
 // purgeSpaceChunk bounds the objects one PurgeSpace transaction clears.
 var purgeSpaceChunk = 5000
@@ -58,7 +68,9 @@ func purgeObjectIn(ctx context.Context, unread, state anystore.Collection, objec
 // created and rows that are already gone are not errors. Without this
 // a purged object's row would outlive it: `sd` stays set, so a later
 // materialization of the same id would skip first-sight seeding and
-// keep the stale frontier.
+// keep the stale frontier. The object leaves the dirty feed with its
+// row (ChangedSince reads state rows); the change-index deletion entry
+// is the consumer's eviction signal.
 func PurgeObject(ctx context.Context, db anystore.DB, objectId string) error {
 	unread, state, err := purgeCollections(ctx, db)
 	if err != nil {

@@ -298,7 +298,9 @@ func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 
 // Err returns the close reason — nil while live or after user Close,
 // space.ErrSubscriptionOverflow on mailbox overflow,
-// space.ErrSubscriptionDrifted on drift-budget exceeded.
+// space.ErrSubscriptionDrifted on drift-budget exceeded,
+// space.ErrObjectDeleted when the object a per-object sub reads was
+// purged (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {
 		return v

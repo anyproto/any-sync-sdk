@@ -7,6 +7,7 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -19,7 +20,8 @@ import (
 //
 //   - a purged payloads object: the `fidx/<spaceId>/<fileId>` index
 //     entries of its rows (nothing else removes them — FindRow only
-//     answers ErrNotFound through a stale entry);
+//     answers ErrNotFound through a stale entry) and their pending
+//     file jobs, which would otherwise retry the lookup forever;
 //   - a purged owner: its payloads object of either shape, when present.
 //     The signed shape is cascade-deleted by any-sync and cleans itself
 //     up through its own purge; the derived shape is unparented and
@@ -47,11 +49,11 @@ func (s *Service) purgeFileLeftovers(ctx context.Context, spaceId string, st *sp
 	}
 }
 
-// dropFileIndex deletes the index entries of every row in objectId's
-// payloads collection. Reports whether objectId has that collection —
-// a missing one means objectId is not a payloads object with rows.
+// dropFileIndex deletes the index entries and pending jobs of every
+// row in objectId's payloads collection. Reports whether objectId has
+// that collection — a missing one means objectId is not a payloads
+// object with rows.
 func (s *Service) dropFileIndex(ctx context.Context, spaceId, objectId string) bool {
-	kv := s.filesStore()
 	coll, err := s.db.OpenCollection(ctx, objectId+"_"+payloads.Dataset)
 	if err != nil {
 		if !errors.Is(err, anystore.ErrCollectionNotFound) {
@@ -59,27 +61,44 @@ func (s *Service) dropFileIndex(ctx context.Context, spaceId, objectId string) b
 		}
 		return false
 	}
-	if kv == nil {
-		return true
-	}
 	iter, err := coll.Find(nil).Iter(ctx)
 	if err != nil {
 		filesLog.Warn("purge: scan payloads rows", zap.String("objectId", objectId), zap.Error(err))
 		return true
 	}
-	var keys []string
+	var fileIds []string
 	for iter.Next() {
 		doc, err := iter.Doc()
 		if err != nil {
 			continue
 		}
 		if id := doc.Value().GetString("id"); id != "" {
-			keys = append(keys, fileIndexKey(spaceId, id))
+			fileIds = append(fileIds, id)
 		}
 	}
+	scanErr := iter.Err()
 	_ = iter.Close()
-	if err := kv.DeleteKVs(ctx, keys); err != nil {
-		filesLog.Warn("purge: clear file index", zap.String("objectId", objectId), zap.Error(err))
+	if scanErr != nil {
+		// A partial list is cleared; the rest heals on lookup.
+		filesLog.Warn("purge: scan payloads rows", zap.String("objectId", objectId), zap.Error(scanErr))
+	}
+	if kv := s.filesStore(); kv != nil {
+		keys := make([]string, len(fileIds))
+		for i, id := range fileIds {
+			keys[i] = fileIndexKey(spaceId, id)
+		}
+		if err := kv.DeleteKVs(ctx, keys); err != nil {
+			filesLog.Warn("purge: clear file index", zap.String("objectId", objectId), zap.Error(err))
+		}
+	}
+	if q := s.fqueue; q != nil {
+		for _, id := range fileIds {
+			for _, kind := range []string{status.KindDurable, status.KindPin} {
+				if err := q.Remove(ctx, kind, spaceId, id); err != nil {
+					filesLog.Warn("purge: remove file job", zap.String("fileId", id), zap.String("kind", kind), zap.Error(err))
+				}
+			}
+		}
 	}
 	return true
 }

@@ -492,14 +492,28 @@ func (s *Store) DeleteKVPrefix(ctx context.Context, prefix string) error {
 	if prefix == "" {
 		return errors.New("filestore: DeleteKVPrefix requires a prefix")
 	}
-	last := prefix[len(prefix)-1]
-	hi := prefix[:len(prefix)-1] + string(rune(last+1))
 	filter := query.And{
 		query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpGte, prefix)},
-		query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpLt, hi)},
+	}
+	if hi, ok := prefixUpperBound(prefix); ok {
+		filter = append(filter, query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpLt, hi)})
 	}
 	_, err := s.kv.Find(filter).Delete(ctx)
 	return err
+}
+
+// prefixUpperBound is the smallest string above every string with the
+// prefix: the prefix with its last non-0xFF byte incremented and the
+// rest cut. ok is false when every byte is 0xFF (no upper bound).
+func prefixUpperBound(prefix string) (string, bool) {
+	b := []byte(prefix)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] != 0xFF {
+			b[i]++
+			return string(b[:i+1]), true
+		}
+	}
+	return "", false
 }
 
 // IntentKey is the KV key of an attach-intent marker: written (with

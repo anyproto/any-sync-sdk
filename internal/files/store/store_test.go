@@ -441,6 +441,35 @@ func TestDeleteKVsAndPrefix(t *testing.T) {
 	require.Error(t, s.DeleteKVPrefix(ctx, ""))
 }
 
+func TestPrefixUpperBound(t *testing.T) {
+	for _, tc := range []struct {
+		prefix, hi string
+		ok         bool
+	}{
+		{"fidx/sp/", "fidx/sp0", true},
+		{"a\x7f", "a\x80", true},
+		{"a\xfe", "a\xff", true},
+		{"a\xff", "b", true},
+		{"\xff\xff", "", false},
+	} {
+		hi, ok := prefixUpperBound(tc.prefix)
+		require.Equal(t, tc.ok, ok, "%q", tc.prefix)
+		require.Equal(t, tc.hi, hi, "%q", tc.prefix)
+	}
+	// Keys under a prefix ending in a high byte are bounded, siblings kept.
+	ctx := context.Background()
+	s := newStore(t)
+	for _, k := range []string{"p\xff/a", "p\xff/b", "p\xff", "q"} {
+		require.NoError(t, s.SetKV(ctx, k, "o"))
+	}
+	require.NoError(t, s.DeleteKVPrefix(ctx, "p\xff/"))
+	for k, want := range map[string]bool{"p\xff/a": false, "p\xff/b": false, "p\xff": true, "q": true} {
+		_, ok, err := s.GetKV(ctx, k)
+		require.NoError(t, err)
+		require.Equal(t, want, ok, "%q", k)
+	}
+}
+
 func TestListSpace(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)

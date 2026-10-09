@@ -212,7 +212,11 @@ func TestPurgeObject_ClearsReadStateParkedAndRunsHook(t *testing.T) {
 	require.NoError(t, s.EnsureApplySeq(ctx))
 	eng := trackRead(t, ctx, s, "o1", "c1")
 	trackRead(t, ctx, s, "o2", "c2")
-	for _, id := range []string{"o1", "o2"} {
+	ran, err := eng.SeedFrontier(ctx, "o1", []string{"c1"})
+	require.NoError(t, err)
+	require.True(t, ran)
+	// A never-materialized id (no row, no meta) with a parked change.
+	for _, id := range []string{"o1", "o2", "ghost"} {
 		require.NoError(t, s.Park(ctx, DetachedRow{ChangeId: "ch-" + id, SpaceId: "spaceA", ObjectId: id, Payload: []byte("x")}))
 	}
 	for _, id := range []string{"o1", "o2"} {
@@ -222,28 +226,43 @@ func TestPurgeObject_ClearsReadStateParkedAndRunsHook(t *testing.T) {
 
 	var hooked []string
 	s.SetPurgeHook(func(ctx context.Context, objectId string) {
-		_, err := s.db.OpenCollection(ctx, objectId+"_blocks")
-		assert.NoError(t, err, "the hook runs before the object's collections drop")
+		if objectId != "ghost" {
+			_, err := s.db.OpenCollection(ctx, objectId+"_blocks")
+			assert.NoError(t, err, "the hook runs before the object's collections drop")
+		}
 		assert.False(t, objectRowExists(t, ctx, s, objectId), "the hook runs after the purge committed")
 		hooked = append(hooked, objectId)
 	})
+	stateColl, err := s.db.OpenCollection(ctx, readstate.StateCollectionName)
+	require.NoError(t, err)
 
 	require.NoError(t, s.purgeObject(ctx, "o1"))
 
 	assert.Equal(t, []string{"o1"}, hooked)
 	assert.Zero(t, unreadOf(t, ctx, eng, "o1"))
+	_, err = stateColl.FindId(ctx, "o1")
+	assert.True(t, errors.Is(err, anystore.ErrDocNotFound), "the state row is gone")
 	seeded, err := eng.Seeded(ctx, "o1")
 	require.NoError(t, err)
-	assert.False(t, seeded)
+	assert.False(t, seeded, "a re-materialized id seeds again")
 	assert.Equal(t, 1, unreadOf(t, ctx, eng, "o2"))
 	assert.Zero(t, parkedOf(t, ctx, s, "o1"))
 	assert.Equal(t, 1, parkedOf(t, ctx, s, "o2"))
 	_, err = s.db.OpenCollection(ctx, "o1_blocks")
 	assert.True(t, errors.Is(err, anystore.ErrCollectionNotFound))
 
-	// The batch path does the same per id.
-	require.NoError(t, s.PurgeObjects(ctx, []string{"o2"}))
-	assert.Equal(t, []string{"o1", "o2"}, hooked)
+	// The batch path does the same per id; the hook and the unpark run
+	// for a never-materialized id too.
+	require.NoError(t, s.PurgeObjects(ctx, []string{"o2", "ghost"}))
+	assert.Equal(t, []string{"o1", "o2", "ghost"}, hooked)
 	assert.Zero(t, unreadOf(t, ctx, eng, "o2"))
 	assert.Zero(t, parkedOf(t, ctx, s, "o2"))
+	assert.Zero(t, parkedOf(t, ctx, s, "ghost"))
+	changed, err := s.ChangedObjects(ctx, 0, 0)
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, c := range changed {
+		ids[c.ObjectId] = true
+	}
+	assert.Equal(t, map[string]bool{"o1": true, "o2": true}, ids, "only materialized ids announce a deletion")
 }

@@ -417,32 +417,11 @@ func (p *PayloadsAPI) IndexedPayloadsObject(ctx context.Context, fileId string) 
 // (one KV read + one row read), falling back to a scan of the space's
 // payloads objects for rows that arrived via sync, and backfilling the
 // index on the hit. space.ErrNotFound for a row whose owner or payloads
-// object is deleted; the index entry goes with that answer, so a
-// lookup the purge did not reach does not keep it forever.
+// object is deleted; an index entry goes with that answer and is never
+// written for one, so a deleted file costs what an unknown id costs —
+// the scan — and leaves nothing behind.
 func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row, error) {
-	row, err := p.findRow(ctx, fileId)
-	if err != nil {
-		return payloads.Row{}, err
-	}
-	gone, err := p.ownerDeleted(ctx, row.ObjectId)
-	if err != nil {
-		return payloads.Row{}, err
-	}
-	if gone {
-		p.dropIndexEntry(ctx, fileId)
-		return payloads.Row{}, space.ErrNotFound
-	}
-	return row, nil
-}
-
-// dropIndexEntry removes fileId's index entry, if the files store is
-// up. The scan path backfills an entry on every hit, so a lookup of a
-// deleted owner's file may write and drop one; the purge hook clears
-// the common case eagerly (purgeFileLeftovers).
-func (p *PayloadsAPI) dropIndexEntry(ctx context.Context, fileId string) {
-	if kv := p.s.parent.filesStore(); kv != nil {
-		_ = kv.DeleteKV(ctx, fileIndexKey(p.s.id, fileId))
-	}
+	return p.findRow(ctx, fileId)
 }
 
 func (p *PayloadsAPI) findRow(ctx context.Context, fileId string) (payloads.Row, error) {
@@ -465,7 +444,7 @@ func (p *PayloadsAPI) findRow(ctx context.Context, fileId string) (payloads.Row,
 			}
 			row, err := p.getRowIn(ctx, objId, fileId)
 			if err == nil {
-				return row, nil
+				return p.liveOwnerRow(ctx, fileId, row, true)
 			}
 			if !errors.Is(err, space.ErrNotFound) {
 				return payloads.Row{}, err
@@ -483,16 +462,37 @@ func (p *PayloadsAPI) findRow(ctx context.Context, fileId string) (payloads.Row,
 	for _, objId := range objIds {
 		row, err := p.getRowIn(ctx, objId, fileId)
 		if err == nil {
-			if kv != nil {
-				_ = kv.SetKV(ctx, fileIndexKey(p.s.id, fileId), objId)
-			}
-			return row, nil
+			return p.liveOwnerRow(ctx, fileId, row, false)
 		}
 		if !errors.Is(err, space.ErrNotFound) {
 			return payloads.Row{}, err
 		}
 	}
 	return payloads.Row{}, space.ErrNotFound
+}
+
+// liveOwnerRow answers a lookup that found row: the row when its owner
+// is live, backfilling the index entry after a scan hit; ErrNotFound
+// when the owner is deleted, dropping the entry the hit came through
+// and writing none — a scan hit on a deleted owner's row (its derived
+// payloads object outlives it) must not re-create what the purge
+// removed, on this path or the upload dedup lookup that shares it.
+func (p *PayloadsAPI) liveOwnerRow(ctx context.Context, fileId string, row payloads.Row, indexed bool) (payloads.Row, error) {
+	gone, err := p.ownerDeleted(ctx, row.ObjectId)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	kv := p.s.parent.filesStore()
+	if gone {
+		if indexed && kv != nil {
+			_ = kv.DeleteKV(ctx, fileIndexKey(p.s.id, fileId))
+		}
+		return payloads.Row{}, space.ErrNotFound
+	}
+	if !indexed && kv != nil {
+		_ = kv.SetKV(ctx, fileIndexKey(p.s.id, fileId), row.ObjectId)
+	}
+	return row, nil
 }
 
 // ListRows returns every live row of the owner's payloads object,

@@ -314,6 +314,30 @@ func TestSentinel_PromoteOnVisibleDelete(t *testing.T) {
 	assert.ElementsMatch(t, []space.RemovedRecord{{Id: "a", Reason: space.RemoveDeleted}}, ev.Removed)
 }
 
+// The apply path gates on HasSubscribers without the lock, so a sub
+// counts from before its snapshot: an apply that commits during the
+// read queues on the fence instead of skipping the engine. A failed
+// snapshot leaves no count behind.
+func TestSubscribe_CountsBeforeSnapshot(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	cfg := SubConfig{Scope: Scope{ObjectId: "obj1", Dataset: "chat"}}
+
+	var duringSnapshot bool
+	sub, err := eng.Subscribe(cfg, func(func(string, *anyenc.Value)) error {
+		duringSnapshot = eng.HasSubscribers()
+		return nil
+	})
+	require.NoError(t, err)
+	defer sub.Close()
+	assert.True(t, duringSnapshot)
+	assert.Equal(t, int64(1), eng.counter.Load())
+
+	_, err = eng.Subscribe(cfg, func(func(string, *anyenc.Value)) error { return errors.New("boom") })
+	require.Error(t, err)
+	assert.Equal(t, int64(1), eng.counter.Load())
+}
+
 // An unbounded sub (Limit 0) has no sentinel, so nothing is ever
 // shipped from the held set: it tracks membership only — no doc and no
 // tuple per entry, sorted or not — while its events still carry the

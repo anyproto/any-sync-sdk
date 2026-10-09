@@ -98,7 +98,10 @@ func (e *Engine) HasSubscribers() bool {
 // Subscribe registers a new querySub. The snapshot callback runs
 // under engine.mu so the apply path is fenced between the snapshot
 // read and the sub's registration — no events are missed and no
-// events fire against an unregistered sub.
+// events fire against an unregistered sub. The sub counts from before
+// its snapshot: the apply path gates on HasSubscribers without the
+// lock, and an apply that commits during the read must build its
+// event and queue on the fence rather than skip the engine.
 //
 // Returns space.ErrSubscribeUnsupported when the engine is closed.
 // Returns ErrLimitWithoutSort when cfg.Limit > 0 and cfg.Sort is nil.
@@ -123,10 +126,12 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 		return nil, ErrEngineClosed
 	}
 
+	e.counter.Add(1)
 	sub := newSub(cfg)
 	if err := snapshot(func(id string, doc *anyenc.Value) {
 		sub.appendInitial(id, doc)
 	}); err != nil {
+		e.counter.Add(-1)
 		return nil, err
 	}
 	sub.initialHeld = len(sub.entries)
@@ -141,7 +146,6 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 	sub.engine = e
 	e.subs[sub.id] = sub
 	e.scope.add(sub)
-	e.counter.Add(1)
 	return &Sub{querySub: sub}, nil
 }
 

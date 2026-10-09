@@ -6,14 +6,13 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
-// entry is one held record in a querySub's window. The tuple is a
-// freshly-allocated []byte produced by query.Sort.AppendKey — owned
-// by this struct, safe to retain. doc is the deep-cloned post-apply
-// value; owned (cloned onto a fresh arena via anyencutil.FillCopy
-// elsewhere). We need doc here so implicit transitions (a record
-// promoted from sentinel into visibility by an unrelated event) can
-// still ship a SubRecord with the record's current state — postValue
-// only covers ids in the triggering ch.Records.
+// entry is one held record in a querySub's window. tuple is the sort
+// key (query.Sort.AppendKey, owned) and doc the record's last post
+// value (cloned, owned); a windowed sub keeps both — an implicit
+// transition (a record promoted from sentinel into visibility by an
+// unrelated event) ships doc, since postValue covers only the ids of
+// the triggering change. An unbounded sub tracks membership only
+// (querySub.windowed): id alone, tuple and doc nil.
 type entry struct {
 	id    string
 	tuple anyenc.Tuple

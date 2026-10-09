@@ -192,9 +192,9 @@ func (q *membersQuery) build(coll anystore.Collection) (anystore.Query, error) {
 	return out, nil
 }
 
-// membersIterator adapts any-store's Iterator. Simpler than
-// queryIterator (objects) — no tombstone filter; the watcher
-// physically deletes rows that should disappear.
+// membersIterator adapts any-store's Iterator; a nil inner is the
+// empty result. No tombstone filter: the watcher physically deletes
+// rows that should disappear.
 type membersIterator struct {
 	inner anystore.Iterator
 }

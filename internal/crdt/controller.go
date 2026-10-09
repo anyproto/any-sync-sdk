@@ -678,6 +678,40 @@ func (c *Controller) Collection(ctx context.Context, dataset string) anystore.Co
 	return c.collectionForRead(ctx, dataset)
 }
 
+// PeekCollection returns the dataset's collection for a read that must
+// not wait on any-store's writer: the resident handle, else the handle
+// opened by name with no index reconciliation and nothing cached. A
+// nil collection with a nil error means the dataset has no handler or
+// no collection on disk; an open that fails is an error, so the caller
+// does not mistake it for an empty dataset.
+//
+// Collection and the write path ensure the dataset's indexes in a
+// write transaction on first open. Under a lock the apply path waits
+// on (the subscribe engine's fence) that transaction would stall every
+// apply in the space for as long as the writer is busy — a declared
+// index build, for one. A read through a peeked handle may run before
+// the handler's indexes exist; the next Collection or write call
+// reconciles them.
+func (c *Controller) PeekCollection(ctx context.Context, dataset string) (anystore.Collection, error) {
+	c.collMu.Lock()
+	coll, ok := c.collections[dataset]
+	c.collMu.Unlock()
+	if ok {
+		return coll, nil
+	}
+	if _, ok := c.handlers[dataset]; !ok {
+		return nil, nil
+	}
+	coll, err := c.db.OpenCollection(ctx, c.objectId+"_"+dataset)
+	if errors.Is(err, anystore.ErrCollectionNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return coll, nil
+}
+
 // RecordGetter returns a ChangeCtx.Get implementation bound to ctx —
 // the one wrapper both the handler-hook and read-tracking classify
 // seams share. When ctx carries a WriteTx (the apply path), reads

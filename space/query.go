@@ -102,7 +102,10 @@ type QueryOpts struct {
 
 // QueryResult is what Snapshot and Subscribe return. Sub is nil for
 // Snapshot, non-nil for Subscribe. Initial is always the materialised
-// point-in-time view bounded by the chained limit/offset.
+// point-in-time view bounded by the chained limit/offset. It belongs
+// to the caller: Sub keeps no reference to it, so a consumer that holds
+// the result for the subscription's lifetime drops Initial once it is
+// rendered — with limit 0 it is the whole result set.
 type QueryResult struct {
 	Initial []*anyenc.Value
 	Total   int               // -1 unless QueryOpts.IncludeTotal=true

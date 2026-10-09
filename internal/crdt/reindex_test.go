@@ -233,3 +233,55 @@ func TestComposeVersion(t *testing.T) {
 	// pair produces.
 	assert.NotEqual(t, NormalizedVersion(0), ComposeVersion(1, 0))
 }
+
+// A reindex rewinds only the AddSeq watermark. The applySeq watermark
+// seeds the per-space allocator on the next load and stays at or above
+// every stamp on disk.
+func TestReindex_ResetKeepsApplySeqWatermark(t *testing.T) {
+	db := reindexDB(t, 1)
+	ctrl := reindexCtrl(t, db, 2)
+	require.NoError(t, ctrl.ResetForReindex(ctx, nil))
+
+	coll, err := db.Collection(ctx, MetaCollectionName)
+	require.NoError(t, err)
+	_, applySeq, _, err := LoadMeta(ctx, coll, "obj1")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(55), applySeq, "the stored applySeq watermark survives the rewind")
+	seed, err := MaxObjectApplySeq(ctx, coll, "spaceA")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(55), seed, "the allocator seeds at or above every stamp on disk")
+
+	// The crash-restart case: the reloaded controller carries it too, so
+	// a precondition at the watermark still answers "unchanged".
+	next := reindexCtrl(t, db, 2)
+	require.True(t, next.ReindexPending())
+	changed, err := next.ChangedSince(ctx, "blocks", 55)
+	require.NoError(t, err)
+	assert.False(t, changed)
+
+	// A replay that re-applied nothing ends with the watermark intact.
+	require.NoError(t, next.PersistVersions(ctx))
+	_, applySeq, _, err = LoadMeta(ctx, coll, "obj1")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(55), applySeq)
+}
+
+// A purge stamps the row from outside the controller; a rebuild that
+// loaded the row before that stamp must not write its older value back.
+func TestReindex_ResetNeverLowersApplySeqWatermark(t *testing.T) {
+	db := reindexDB(t, 1)
+	ctrl := reindexCtrl(t, db, 2)
+	coll, err := db.Collection(ctx, MetaCollectionName)
+	require.NoError(t, err)
+	require.NoError(t, PersistDeletionMark(ctx, coll, "obj1", "spaceA", 99))
+
+	require.NoError(t, ctrl.ResetForReindex(ctx, nil))
+	_, applySeq, _, err := LoadMeta(ctx, coll, "obj1")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(99), applySeq)
+
+	require.NoError(t, ctrl.PersistVersions(ctx))
+	_, applySeq, _, err = LoadMeta(ctx, coll, "obj1")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(99), applySeq)
+}

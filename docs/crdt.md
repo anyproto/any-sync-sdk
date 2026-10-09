@@ -94,9 +94,8 @@ rebuild replays included. A value holds within one process run and one
 store generation (`Changes().Generation`): the allocator re-seeds from
 persisted watermarks on every start, so after a restart re-read the
 dataset instead of reusing a value from before it. The per-object `_applySeq` watermark answers
-without a scan when nothing in the object moved past the value, except
-while a reindex is pending; otherwise one filtered read of the dataset's
-collection decides. Synced scope only, `Modify` only (each `ModifyMany`
+without a scan when nothing in the object moved past the value;
+otherwise one filtered read of the dataset's collection decides. Synced scope only, `Modify` only (each `ModifyMany`
 batch is its own change), and not on the `objects` dataset, whose row
 every change to the object stamps; that dataset takes no `OpDelete` in
 a batch either.

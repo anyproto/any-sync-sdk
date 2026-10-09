@@ -21,18 +21,18 @@ var applySeqPath = []string{ApplySeqField}
 //
 // The caller holds the object's write lock (tree.Lock), which every
 // apply takes, so the answer holds until the caller's own apply. Every
-// apply also advances the per-object watermark past the stamps it
-// writes, so a watermark at or below seq answers without a scan; a
-// reindex restarts the watermark below the rows it rebuilds, so the
-// shortcut is off while one is pending. A shared dataset (on main, the
-// per-space objects collection) holds every object's rows, which this
-// per-object scan cannot scope, so it is refused; Modify refuses a
-// precondition on objects before the object loads.
+// apply advances the per-object watermark past the stamps it writes and
+// nothing rewinds it (a reindex rebuilds rows with fresh stamps above
+// it), so a watermark at or below seq answers without a scan. A keyed
+// dataset's collection holds every object's rows; the scan is bounded
+// to this object's. A shared dataset (on main, the per-space objects
+// collection) is refused: its rows carry no object prefix, and Modify
+// refuses a precondition on objects before the object loads.
 func (c *Controller) ChangedSince(ctx context.Context, dataset string, seq uint64) (bool, error) {
 	if c.IsShared(dataset) {
 		return false, fmt.Errorf("crdt: ChangedSince: %q is a shared dataset", dataset)
 	}
-	if !c.reindexPending && c.maxApplySeq <= seq {
+	if c.maxApplySeq <= seq {
 		return false, nil
 	}
 	// A read-only open: a failed open is an error, not "no rows", and
@@ -44,7 +44,11 @@ func (c *Controller) ChangedSince(ctx context.Context, dataset string, seq uint6
 	if coll == nil {
 		return false, nil
 	}
-	it, err := coll.Find(query.Key{Path: applySeqPath, Filter: query.NewComp(query.CompOpGt, seq)}).Limit(1).Iter(ctx)
+	var filter query.Filter = query.Key{Path: applySeqPath, Filter: query.NewComp(query.CompOpGt, seq)}
+	if c.IsKeyed(dataset) {
+		filter = query.And{KeyedRows(c.objectId), filter}
+	}
+	it, err := coll.Find(filter).Limit(1).Iter(ctx)
 	if err != nil {
 		return false, fmt.Errorf("crdt: ChangedSince: %w", err)
 	}

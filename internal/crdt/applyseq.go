@@ -31,10 +31,14 @@ const ApplySeqField = "_applySeq"
 // pre-existing consumer cursors stay valid on one continuous axis).
 //
 // Crash safety needs no separate counter row: every allocated seq that
-// matters is persisted via some object's _meta row in the same WriteTx
-// as the record stamp, and re-seeding reads the max of those — the
-// counter can never regress below a persisted stamp. Callers must
-// allocate AFTER acquiring the WriteTx (any-store's single writer then
+// matters is persisted in the same WriteTx as the stamp it covers — as
+// an object's _meta watermark (applies, purges) or a read-state row's
+// stateSeq (read marks) — and seedFn reads the max over every such
+// table, so the counter can never regress below a persisted stamp. A
+// path that persists a seq elsewhere must join the seed, and nothing
+// may rewind a persisted watermark (a reindex keeps the applySeq
+// watermark; only the AddSeq one restarts). Callers must allocate
+// AFTER acquiring the WriteTx (any-store's single writer then
 // serializes allocation order = commit order, so an ascending-cursor
 // consumer can't skip a seq that commits late).
 type ApplySeqAllocator struct {

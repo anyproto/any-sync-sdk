@@ -142,10 +142,14 @@ func PersistMeta(ctx context.Context, coll anystore.Collection, objectId string,
 // persistMeta is PersistMeta with an optional extra mutation applied to
 // the row in the same upsert — the re-index path uses it to write and
 // clear its captured local leaves atomically with the watermark.
+//
+// The applySeq watermark only moves up: a purge stamps the row from
+// outside the controller (PersistDeletionMark), and a rebuild that
+// started from an older value must not take that stamp back.
 func persistMeta(ctx context.Context, coll anystore.Collection, objectId string, maxAddSeq, maxApplySeq uint64, handlerVersions map[string]int, spaceId string, extra func(a *anyenc.Arena, v *anyenc.Value)) error {
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set(metaAddSeqKey, a.NewNumberInt(int(maxAddSeq)))
-		if maxApplySeq > 0 {
+		if maxApplySeq > uint64(v.GetInt(metaApplySeqKey)) {
 			v.Set(metaApplySeqKey, a.NewNumberInt(int(maxApplySeq)))
 		}
 		if spaceId != "" {

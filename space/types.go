@@ -217,11 +217,12 @@ type TypesAPI interface {
 	AddDataset(ctx context.Context, typeId, partId string, draft DatasetDraft) (datasetDefId string, err error)
 
 	// AddDatasetField appends a field to an existing records dataset
-	// (additive evolution). Returns the field definition's id. Additive
-	// fields cannot be Required — validation always runs against the
-	// current schema, so a required field added later would reject the
-	// dataset's own history on fresh devices. Declare required fields
-	// at AddDataset. A module-served dataset refuses (ErrModuleOwned).
+	// (additive evolution). Returns the field definition's id. Rows may
+	// predate the field, so it cannot be Required, and on a Dynamic
+	// dataset it is synced, unstamped and mutable by anyone, its shape
+	// enforced on this device's writes only (DatasetFieldDef.Additive);
+	// a draft asking for more there is refused. Declare such fields at
+	// AddDataset. A module-served dataset refuses (ErrModuleOwned).
 	AddDatasetField(ctx context.Context, typeId, datasetDefId string, draft DatasetFieldDraft) (fieldDefId string, err error)
 
 	// RemoveDataset drops a dataset definition. Existing record data is
@@ -465,7 +466,9 @@ type DatasetDef struct {
 	DeleteBy    DeletePolicy
 	SkipHistory bool
 	Search      *SearchFields
-	Fields      []DatasetFieldDef
+	// Fields are the declared fields in creation order; fields declared
+	// in one change come in key order.
+	Fields []DatasetFieldDef
 	// Indexes are the declared indexes in creation order, invalid ones
 	// included.
 	Indexes []IndexDef
@@ -561,6 +564,12 @@ type DatasetFieldDef struct {
 	Required  bool
 	MutableBy Mutability
 	Stamp     Stamp
+	// Additive marks a field not declared with its dataset
+	// (AddDatasetField, or only some of, or differing, concurrent
+	// declarations). Never Required; on a Dynamic dataset synced,
+	// unstamped and mutable by anyone, its shape enforced on this
+	// device's writes only. See handler.Field.Additive.
+	Additive bool
 	// XFormat is the opaque descriptor declared on the field, nil when
 	// unset. See DatasetFieldDraft.XFormat.
 	XFormat map[string]any

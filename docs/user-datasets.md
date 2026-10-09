@@ -168,6 +168,7 @@ Per field:
 | `Required` | must be present in the create payload; create-only check |
 | `MutableBy` | post-create write rule: `never` (zero) / `author` / `any` |
 | `Stamp` | apply-time derived value: `creator` / `createTime` / `modifyTime`; forces derived scope, and the time stamps force kind `datetime` (the value is handler-produced, so a declared kind would only be a way to get it wrong) |
+| `Additive` | compiler-set: not declared with the dataset (added by `AddDatasetField`, or by only some of, or differently by, concurrent declarations). Never required; on a Dynamic dataset synced, unstamped and mutable by anyone, its shape enforced by the local pre-flight only; see § Evolution rules |
 
 Per dataset:
 
@@ -237,6 +238,9 @@ contract of spec §8):
   its record's create can only be a non-author's, which both orderings
   reject.
 - **Stamps come from the change envelope**, never from replica state.
+- **An additive field of a Dynamic dataset is free keyspace at apply
+  time** (§ Evolution rules): a declaration that arrives after a
+  change's writes cannot change their verdict.
 
 ### The IdRule: user contract
 
@@ -344,8 +348,9 @@ flat dataset view of the same fold):
 
 ### Evolution rules
 
-Validation always runs against the current compiled schema, so
-evolution is additive-only with pinned behavior:
+Validation runs against the current compiled schema, so evolution is
+additive-only with pinned behavior, and a declaration that rows may
+predate is enforced on this device's writes only:
 
 - Add parts, datasets and fields freely at runtime; edits sync and
   apply like any space data.
@@ -363,6 +368,23 @@ evolution is additive-only with pinned behavior:
   an author-gated dataset). Already-invalid definitions stay removable.
   A field a valid declared index names is refused until the index is
   removed.
+- **A field not declared with its dataset is additive** — added by
+  `AddDatasetField`, or declared by only some of the dataset's
+  concurrent declarations, or differently by them. Rows may already
+  hold the key, and a change written before the declaration is valid
+  under the schema its writer had, so an additive field is never
+  required, and on a Dynamic dataset it is synced, unstamped and
+  mutable by anyone whatever its draft says (`AddDatasetField` refuses
+  a draft asking for more there): the apply path keeps treating the key
+  as free keyspace (no shape check, no `modifyTime` bump), every
+  replica keeps such a change whether the declaration or the change
+  arrived first, and the local pre-flight enforces the shape on this
+  device's writes. Discovery renders the field with `x-additive`. A
+  non-Dynamic dataset rejects undeclared keys at write time, so its
+  additive fields keep their shape, scope, stamp and mutability; two
+  concurrent declarations of one of its fields that disagree are
+  converged by the earlier one, and records written under the other
+  may be rejected.
 - **An index is replaced, never edited**: `RemoveDatasetIndex`, then
   `AddDatasetIndex`. A removal takes every concurrent declaration of
   the key with it.
@@ -457,7 +479,7 @@ gate on `Owners` (an object may hold the dataset when it carries one
 of them).
 
 The JSON Schema document carries the behavioral keywords:
-standard `required`, per-field `x-mutable-by` / `x-stamp`,
+standard `required`, per-field `x-mutable-by` / `x-stamp` / `x-additive`,
 dataset-level `x-delete-by`, `x-id` / `x-id-pattern` / `x-id-max-length`,
 and `x-search {title, text, scope}` (`text`: a field key or an array of
 keys; a single key marshals as the bare string). Defaults are omitted.
@@ -556,8 +578,9 @@ IndexDraft{Key: "top",      Fields: []string{"-score"}, Sparse: true}
   digits and `_`, starts with a letter and is at most 48 bytes, so
   every index has a valid store name of its own.
 - **Values of another type still index.** A synced write is checked
-  against the declared shape; a local-scope value, and a value a
-  dynamic dataset held before the field was declared, are not.
+  against the declared shape; a local-scope value, a value a dynamic
+  dataset held before the field was declared, and any value of a
+  dynamic dataset's additive field, are not.
   any-store orders keys by type, so reads stay correct.
 - **`Sparse`** leaves a record out unless it carries every indexed
   field.
@@ -590,7 +613,10 @@ IndexDraft{Key: "top",      Fields: []string{"-score"}, Sparse: true}
 
 - **A shared dataset is declared shared.** The flag is pinned. Removing
   a dataset and declaring its key again in the other mode leaves the
-  records a device already materialized where they were.
+  records a device already materialized where they were. Declaring a
+  removed key again is a new declaration: the earlier one's records
+  stay, and its changes that reach a device only afterwards are checked
+  against the new one.
 - **Rows of a shared dataset are purged best-effort.** An object's
   rows are deleted from the shared datasets the catalog knows and the
   ones the store has opened. Rows of a dataset whose definition was

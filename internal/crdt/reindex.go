@@ -190,13 +190,17 @@ func (c *Controller) ReindexLocalLeaves() []LocalLeaf {
 // re-applies a change, at which point its PersistMeta stamps the current
 // versions. The leaves outlive that stamp: only PersistVersions clears
 // them.
+//
+// Only the AddSeq watermark rewinds. The applySeq watermark is the
+// per-space allocator's seed on the next load and must stay at or above
+// every stamp on disk: the rows the replay rebuilds get fresh stamps
+// above it, and the ones it has not wiped keep theirs.
 func (c *Controller) ResetForReindex(ctx context.Context, leaves []LocalLeaf) error {
 	c.maxAddSeq = 0
-	c.maxApplySeq = 0
 	c.staleDatasets = nil
 	c.reindexPending = true
 	c.reindexLocal = nil
-	return persistMeta(ctx, c.metaColl, c.objectId, 0, 0, nil, c.spaceId, func(a *anyenc.Arena, v *anyenc.Value) {
+	return persistMeta(ctx, c.metaColl, c.objectId, 0, c.maxApplySeq, nil, c.spaceId, func(a *anyenc.Arena, v *anyenc.Value) {
 		v.Set(metaReindexLocalKey, encodeLocalLeaves(a, leaves))
 	})
 }

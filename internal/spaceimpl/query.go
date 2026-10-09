@@ -20,10 +20,12 @@ import (
 
 // queryImpl implements space.Query backed by an any-store collection.
 //
-// Tombstones are filtered with an AND-of(<caller-filter>, _deletedAt
-// missing) so callers writing free-form filters never see deleted
-// rows by accident. Variants/meta projection is a no-op in MVP — the
-// raw record comes back as-is.
+// Every terminal reads AND-of(<caller-filter>, _deletedAt missing), so
+// callers writing free-form filters never see deleted rows by accident
+// and a limit/offset window is cut over live rows; only the find path
+// asked for tombstones (ProjectionOpts.IncludeDeleted) drops the
+// clause. Variants/meta projection is a no-op in MVP — the raw record
+// comes back as-is.
 //
 // The chained setters mutate the underlying receiver and return it;
 // the public contract is immutable-looking, but a concrete *queryImpl
@@ -160,9 +162,8 @@ func (q *queryImpl) Offset(n int) space.Query {
 
 // Projection records the requested options. Variant collapse and
 // meta-stripping are still no-ops (tracked tasks; every record returns
-// raw for those). IncludeDeleted is honored by the find path —
-// Iter / All / One gate the post-iteration tombstone skip on it, and
-// Count gates the pushed-down skip filter consistently.
+// raw for those). IncludeDeleted is honored by the find path: Iter /
+// All / One / Count run without the tombstone-skip clause.
 func (q *queryImpl) Projection(opts space.ProjectionOpts) space.Query {
 	q.opts = opts
 	return q
@@ -232,10 +233,7 @@ func (q *queryImpl) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.
 		return &space.QueryResult{Initial: nil, Total: total}, nil
 	}
 
-	combined, err := combineWithTombstoneSkip(q.scoped())
-	if err != nil {
-		return nil, err
-	}
+	combined := withoutTombstones(q.scoped())
 
 	tx, err := coll.ReadTx(ctx)
 	if err != nil {
@@ -370,14 +368,10 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			}
 		}
 	}
-	// Combine user filter with the tombstone-skip clause so the engine
-	// matches what the snapshot path returns (queryIterator.Next drops
-	// _deletedAt rows post-iteration; we push it into the filter for
-	// the live path).
-	combined, err := combineWithTombstoneSkip(q.scoped())
-	if err != nil {
-		return nil, err
-	}
+	// The tombstone-skip clause is part of the filter, so the engine's
+	// live-path evaluation rejects tombstoned post-states the same way
+	// the snapshot read does.
+	combined := withoutTombstones(q.scoped())
 	// collection resolves the dataset's collection from the already
 	// resident owner; nil means nothing materialised yet. Safe under
 	// engine.mu: no object load, no DAG apply.
@@ -485,28 +479,32 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	return &space.QueryResult{Initial: initial, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
 }
 
-// combineWithTombstoneSkip returns the user filter ANDed with a
-// `_deletedAt missing` clause. The engine's live-path filter eval
-// must reject tombstoned post-states the same way the snapshot-time
-// filter does — pushing the skip into the filter keeps the two paths
-// in lock-step.
-func combineWithTombstoneSkip(userFilter query.Filter) (query.Filter, error) {
-	skip, err := query.ParseCondition(map[string]any{
-		crdt.DeletedAtField: map[string]any{"$exists": false},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("subscribe: build tombstone-skip filter: %w", err)
-	}
+// tombstoneSkip matches live rows only: a tombstone keeps _deletedAt
+// and no user field. Pushed into every read's filter so the
+// limit/offset window, the count and the live-path evaluation see one
+// row set — a tombstone would otherwise sort first under a user-field
+// sort and take a slot of the window.
+var tombstoneSkip = query.Key{Path: []string{crdt.DeletedAtField}, Filter: query.Not{Filter: query.Exists{}}}
+
+// withoutTombstones returns userFilter ANDed with tombstoneSkip.
+func withoutTombstones(userFilter query.Filter) query.Filter {
 	if userFilter == nil {
-		return skip, nil
+		return tombstoneSkip
 	}
-	return query.And{userFilter, skip}, nil
+	return query.And{userFilter, tombstoneSkip}
 }
 
-// Count returns the match count. The find path gates tombstones on
-// ProjectionOpts.IncludeDeleted the same way Iter does: by default the
-// _deletedAt-missing clause is pushed into the filter so deleted rows
-// don't count; with IncludeDeleted set, tombstones are counted too.
+// findFilter is the filter the find terminals (Iter / All / One /
+// Count) run: the scoped filter, tombstones excluded unless
+// ProjectionOpts.IncludeDeleted asks for them.
+func (q *queryImpl) findFilter() query.Filter {
+	if q.opts.IncludeDeleted {
+		return q.scoped()
+	}
+	return withoutTombstones(q.scoped())
+}
+
+// Count returns the match count over the find filter.
 func (q *queryImpl) Count(ctx context.Context) (int, error) {
 	if q.parseErr != nil {
 		return 0, q.parseErr
@@ -518,14 +516,7 @@ func (q *queryImpl) Count(ctx context.Context) (int, error) {
 	if coll == nil {
 		return 0, nil
 	}
-	filter := q.scoped()
-	if !q.opts.IncludeDeleted {
-		filter, err = combineWithTombstoneSkip(filter)
-		if err != nil {
-			return 0, err
-		}
-	}
-	return coll.Find(filter).Count(ctx)
+	return coll.Find(q.findFilter()).Count(ctx)
 }
 
 // Iter opens a streaming iterator over the matching records.
@@ -545,7 +536,7 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &queryIterator{inner: asIter, includeDeleted: q.opts.IncludeDeleted}, nil
+	return &queryIterator{inner: asIter}, nil
 }
 
 // collection resolves the dataset's any-store collection. Returns
@@ -599,21 +590,14 @@ func (emptyIterator) Doc() (*anyenc.Value, error) { return nil, nil }
 func (emptyIterator) Err() error                  { return nil }
 func (emptyIterator) Close() error                { return nil }
 
-// build folds the parsed filter / sort / limit / offset into an
-// any-store Query. Filter and Sort are already typed query.Filter /
-// query.Sort values (parsed by Filter() / Sort() at chain time);
-// any-store accepts both directly. Tombstones are filtered post-
-// iteration in queryIterator.Next.
+// build folds the find filter / sort / limit / offset into an
+// any-store Query. The tombstone skip is part of the filter, so the
+// limit/offset window is cut over live rows.
 func (q *queryImpl) build(coll anystore.Collection) (anystore.Query, error) {
 	if q.parseErr != nil {
 		return nil, q.parseErr
 	}
-	var out anystore.Query
-	if filter := q.scoped(); filter != nil {
-		out = coll.Find(filter)
-	} else {
-		out = coll.Find(nil)
-	}
+	out := coll.Find(q.findFilter())
 	if q.sort != nil {
 		out = out.Sort(q.sort)
 	}
@@ -626,53 +610,16 @@ func (q *queryImpl) build(coll anystore.Collection) (anystore.Query, error) {
 	return out, nil
 }
 
-// queryIterator adapts any-store's Iterator to space.Iterator. The
-// underlying any-store iter holds buffers we don't want exposed —
-// Doc() copies the value out via FastJson roundtrip-free path:
-// the value is already on the iterator's arena, valid until the
-// next Next() call. Caller-side races with Next() between Doc() and
-// use are the caller's problem (same contract as any-store).
+// queryIterator adapts any-store's Iterator to space.Iterator. Doc
+// returns the value on the iterator's arena, valid until the next Next
+// call; callers clone what they retain (All and One do).
 type queryIterator struct {
-	inner          anystore.Iterator
-	includeDeleted bool
-	cur            *anyenc.Value
-	lastErr        error
+	inner anystore.Iterator
 }
 
-// Next advances past tombstones automatically — checks each doc and
-// skips ones with `_deletedAt` set. Any-store iterators don't expose
-// peek, so we have to consume to filter; that's fine, the cost is
-// proportional to deleted-row density. When includeDeleted is set
-// (ProjectionOpts.IncludeDeleted) the skip is disabled and tombstone
-// rows surface to the caller — used by consumer-side indexers to stream
-// deletions.
-func (i *queryIterator) Next() bool {
-	if i.inner == nil {
-		return false
-	}
-	for i.inner.Next() {
-		doc, err := i.inner.Doc()
-		if err != nil {
-			i.lastErr = err
-			return true
-		}
-		v := doc.Value()
-		if !i.includeDeleted && v != nil && v.Get(crdt.DeletedAtField) != nil {
-			continue // tombstone
-		}
-		i.cur = v
-		return true
-	}
-	return false
-}
+func (i *queryIterator) Next() bool { return i.inner.Next() }
 
 func (i *queryIterator) Doc() (*anyenc.Value, error) {
-	if i.lastErr != nil {
-		return nil, i.lastErr
-	}
-	if i.cur != nil {
-		return i.cur, nil
-	}
 	doc, err := i.inner.Doc()
 	if err != nil {
 		return nil, err
@@ -680,19 +627,9 @@ func (i *queryIterator) Doc() (*anyenc.Value, error) {
 	return doc.Value(), nil
 }
 
-func (i *queryIterator) Err() error {
-	if i.inner == nil {
-		return nil
-	}
-	return i.inner.Err()
-}
+func (i *queryIterator) Err() error { return i.inner.Err() }
 
-func (i *queryIterator) Close() error {
-	if i.inner == nil {
-		return nil
-	}
-	return i.inner.Close()
-}
+func (i *queryIterator) Close() error { return i.inner.Close() }
 
 // Compile-time interface check.
 var _ space.Query = (*queryImpl)(nil)

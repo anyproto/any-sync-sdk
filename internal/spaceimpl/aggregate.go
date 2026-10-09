@@ -216,7 +216,7 @@ func (a *aggImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if err != nil {
 		return nil, classifyAggErr(err)
 	}
-	return &aggIterator{inner: it}, nil
+	return &queryIterator{inner: it}, nil
 }
 
 // All materializes every result document, cloned off the iterator's
@@ -275,26 +275,6 @@ func (a *aggImpl) Explain(ctx context.Context) (string, error) {
 	}
 	return ex.Plan, nil
 }
-
-// aggIterator adapts any-store's Iterator to space.Iterator. Unlike
-// queryIterator there is no tombstone skip (handled in the pipeline
-// prefix) — it's a plain passthrough.
-type aggIterator struct {
-	inner anystore.Iterator
-}
-
-func (i *aggIterator) Next() bool { return i.inner.Next() }
-
-func (i *aggIterator) Doc() (*anyenc.Value, error) {
-	doc, err := i.inner.Doc()
-	if err != nil {
-		return nil, err
-	}
-	return doc.Value(), nil
-}
-
-func (i *aggIterator) Err() error   { return i.inner.Err() }
-func (i *aggIterator) Close() error { return i.inner.Close() }
 
 // Compile-time interface check.
 var _ space.Agg = (*aggImpl)(nil)

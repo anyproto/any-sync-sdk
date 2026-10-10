@@ -38,6 +38,7 @@ func (r *pushRegistry) ShouldPullTree(context.Context, string, string, *treechan
 }
 func (r *pushRegistry) PullFirst(context.Context, string) []string { return nil }
 func (r *pushRegistry) PullFirstTypes(string) []string             { return nil }
+func (r *pushRegistry) ReleaseTree(string, string)                 {}
 
 var ErrSpaceRegistryUnknown = context.Canceled
 

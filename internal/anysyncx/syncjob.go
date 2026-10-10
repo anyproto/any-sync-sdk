@@ -388,8 +388,9 @@ func (j *syncJob) fetch(it *syncItem) {
 // takes no request slot and names no peer: the tree is local, and one
 // that is not any more (deleted meanwhile) fails and parks rather than
 // fetch outside the budget. A tree that was local before the pass is
-// pinged like a changed one; a fetched tree is in sync with the peer
-// by construction and is reported as such.
+// pinged like a changed one and stays loaded for the answer; a fetched
+// tree is in sync with the peer by construction, is reported as such
+// and released: the replay was all the job loaded it for.
 func (j *syncJob) materialize(it *syncItem) {
 	t := j.t
 	tree, err := t.registry.GetTree(j.ctx, t.spaceId, it.id)
@@ -408,5 +409,8 @@ func (j *syncJob) materialize(it *syncItem) {
 	}
 	t.recovered(it.peer.Id(), it.id)
 	t.synced(j.ctx, it.peer, it.peers, it.id, tree, !it.local)
+	if !it.local {
+		t.registry.ReleaseTree(t.spaceId, it.id)
+	}
 	j.finish(it)
 }

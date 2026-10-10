@@ -2393,6 +2393,23 @@ func (s *Service) PullFirstTypes(spaceId string) []string {
 	return pullFirstTypes
 }
 
+// ReleaseTree closes the cached object of a tree the sync job
+// materialized (Store.Release). A space with no store holds nothing to
+// release, and none is built for it. Tech-space trees stay: the space
+// holds a handful, and its index object is in use for the account's
+// life.
+func (s *Service) ReleaseTree(spaceId, treeId string) {
+	if spaceId == s.tsp.SpaceId() {
+		return
+	}
+	s.mu.Lock()
+	st := s.stores[spaceId]
+	s.mu.Unlock()
+	if st != nil {
+		st.Release(treeId)
+	}
+}
+
 // Compile-time check that we satisfy the registry contract.
 var _ anysyncx.SpaceRegistry = (*Service)(nil)
 

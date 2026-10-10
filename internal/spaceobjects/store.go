@@ -1705,6 +1705,16 @@ func (s *Store) Drop(objectId string) {
 	_, _ = s.cache.Remove(context.Background(), objectId)
 }
 
+// Release closes the cached Object for objectId now instead of at the
+// cache's TTL, for a caller that loaded it for a one-off replay (the
+// sync job's materialization). Unlike Drop it does not wait: an Object
+// whose tree an in-flight handler holds locked declines and stays
+// until the TTL. A holder of the closed Object gets ErrClosed and
+// re-Gets, as after a GC eviction.
+func (s *Store) Release(objectId string) {
+	_, _ = s.cache.TryRemove(objectId)
+}
+
 // PutTreeFromPayload binds a tree delivered by a remote peer.
 // Used by the SpaceRegistry's PutTree route — any-sync's space-sync
 // delivers a TreeStorageCreatePayload for a tree we don't have

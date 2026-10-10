@@ -31,6 +31,7 @@ import (
 // reports; a fetched id adds its grow entry to it, the way a fetched
 // spaceIndex makes its bundle roots known. firstTypes is what
 // PullFirstTypes reports: nil syncs inline, set uses the sync job.
+// ReleaseTree calls are recorded in released.
 type scriptedRegistry struct {
 	fail       map[string]error
 	trees      map[string]objecttree.ObjectTree
@@ -47,6 +48,7 @@ type scriptedRegistry struct {
 	calls []string
 	// firstCalls counts PullFirst lookups.
 	firstCalls int
+	released   []string
 }
 
 func (r *scriptedRegistry) GetTree(ctx context.Context, _, treeId string) (objecttree.ObjectTree, error) {
@@ -102,6 +104,17 @@ func (r *scriptedRegistry) PullFirst(context.Context, string) []string {
 	return slices.Clone(r.first)
 }
 func (r *scriptedRegistry) PullFirstTypes(string) []string { return r.firstTypes }
+func (r *scriptedRegistry) ReleaseTree(_, treeId string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.released = append(r.released, treeId)
+}
+
+func (r *scriptedRegistry) releasedIds() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.released)
+}
 
 // A round handles the registry's pull-first trees before its other
 // ids, wherever the round found them: missing, changed or parked. The

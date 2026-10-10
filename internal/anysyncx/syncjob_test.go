@@ -464,6 +464,20 @@ func TestSyncJobPingsTreesThatWereLocal(t *testing.T) {
 	require.Equal(t, []string{"m1"}, reported)
 }
 
+// A fetched tree is released once it is materialized, definitions and
+// objects alike: the replay was all the job loaded it for. A tree that
+// was local is pinged and stays loaded for the answer; so do the trees
+// handled in one step (pull-first, changed) and a tree whose replay
+// failed.
+func TestSyncJobReleasesMaterializedTrees(t *testing.T) {
+	reg := &scriptedRegistry{first: []string{"index"}, fail: map[string]error{"m3": errors.New("boom")}}
+	f := &scriptedFetcher{types: map[string]string{"d1": "type"}, local: map[string]bool{"m2": true}}
+	ts := jobSyncer(t, reg, f)
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, []string{"e1"}, []string{"index", "d1", "m1", "m2", "m3"}))
+	require.Equal(t, []string{"index", "d1", "m1", "m2", "m3", "e1"}, reg.got())
+	require.Equal(t, []string{"d1", "m1"}, reg.releasedIds())
+}
+
 // A space the registry names no pull-first types for syncs within the
 // round, one tree at a time, fetcher or not.
 func TestSyncJobIsNotUsedWithoutPullFirstTypes(t *testing.T) {

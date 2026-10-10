@@ -1,12 +1,17 @@
 package spaceobjects
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 )
 
@@ -45,4 +50,37 @@ func TestFlagFlipRecords(t *testing.T) {
 	assert.NotContains(t, byId, "b")              // unchanged
 
 	assert.Empty(t, flagFlipRecords("unread", desired, desired))
+}
+
+// A pass that meets its Object closed runs once more; any other error,
+// or a second close, ends it.
+func TestProcessRetry(t *testing.T) {
+	boom := errors.New("boom")
+	for _, tc := range []struct {
+		name  string
+		errs  []error
+		calls int
+		want  error
+	}{
+		{"closed object", []error{fmt.Errorf("set: %w", object.ErrClosed), nil}, 2, nil},
+		{"closed collection", []error{anystore.ErrCollectionClosed, nil}, 2, nil},
+		{"closed twice", []error{object.ErrClosed, object.ErrClosed}, 2, object.ErrClosed},
+		{"other error", []error{boom}, 1, boom},
+		{"no error", []error{nil}, 1, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			err := processRetry(t.Context(), "o1", func(_ context.Context, id string) error {
+				require.Equal(t, "o1", id)
+				calls++
+				return tc.errs[calls-1]
+			})
+			require.Equal(t, tc.calls, calls)
+			if tc.want == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tc.want)
+			}
+		})
+	}
 }

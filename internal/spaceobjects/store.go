@@ -226,6 +226,16 @@ type Store struct {
 	// the same id never see partial state.
 	cache ocache.OCache
 
+	// released holds the ids the sync job released; the release loop
+	// closes each Object once it has gone releaseIdle without a Get.
+	// See release.go.
+	releaseMu      sync.Mutex
+	released       map[string]releasedObject
+	releaseRunning bool
+	releaseClosed  bool
+	releaseStop    chan struct{}
+	releaseWG      sync.WaitGroup
+
 	mu         sync.Mutex
 	sharedColl anystore.Collection // per-space `objects` collection, lazy-opened
 	detached   anystore.Collection // per-space `_detached` collection, lazy-opened
@@ -1041,10 +1051,11 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 	return nil
 }
 
-// Close shuts down per-Store background workers (drainer +
+// Close shuts down per-Store background workers (release loop, drainer,
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
+	s.stopRelease()
 	s.stopSweep()
 	s.stopIndexSync()
 	if s.readMat != nil {
@@ -2250,6 +2261,7 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 	if err != nil {
 		return nil, err
 	}
+	s.touchReleased(objectId)
 	return v.(*object.Object), nil
 }
 

@@ -2,10 +2,11 @@ package spaceobjects
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/anyproto/any-store/v2/anyenc"
-
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -395,6 +396,12 @@ func (s *Store) Drain(ctx context.Context) error {
 	}
 	for _, row := range ready {
 		if err := s.replayParked(ctx, row); err != nil {
+			if parkedObjectDeleted(err) {
+				// The object is gone for good; the change can never
+				// apply. The purge removes these rows too — this
+				// covers a row it did not reach.
+				_ = s.Unpark(ctx, row.ChangeId)
+			}
 			// Don't surface — keep draining the rest. A stuck row
 			// will be retried on the next drain pass.
 			continue
@@ -402,6 +409,14 @@ func (s *Store) Drain(ctx context.Context) error {
 		_ = s.Unpark(ctx, row.ChangeId)
 	}
 	return nil
+}
+
+// parkedObjectDeleted reports whether a replay failed because the
+// parked change's object is deleted: the cached Object refused the
+// apply (MarkDeleted), or its tree is recorded deleted in head storage
+// and could not be opened.
+func parkedObjectDeleted(err error) bool {
+	return errors.Is(err, object.ErrDeleted) || errors.Is(err, spacestorage.ErrTreeStorageAlreadyDeleted)
 }
 
 // allPendingKnown reports whether every (typeId, shortId) in pending

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"io"
 
 	"github.com/anyproto/any-sync/app/logger"
@@ -268,7 +269,93 @@ func (f *filesAPI) Query(objectId string) (space.Query, error) {
 		// is no collection to query (or subscribe to) before that.
 		return nil, fmt.Errorf("files: %s has no files yet: %w", objectId, space.ErrNotFound)
 	}
-	return f.s.Query(objId, payloads.Dataset), nil
+	gate := func(ctx context.Context) error {
+		gone, err := pa.ownerDeleted(ctx, objectId)
+		if err != nil {
+			return err
+		}
+		if gone {
+			return fmt.Errorf("files: %s is deleted: %w", objectId, space.ErrNotFound)
+		}
+		return nil
+	}
+	return ownerGatedQuery{Query: f.s.Query(objId, payloads.Dataset), gate: gate}, nil
+}
+
+// ownerGatedQuery is the files Query: a query over the owner's payloads
+// object that re-checks the owner on every terminal. The payloads
+// object of a derived owner outlives it, so a Query held across the
+// owner's deletion would otherwise keep reading its rows, and a
+// Subscribe landing after the purge closed the object's subscriptions
+// would stay open for good.
+type ownerGatedQuery struct {
+	space.Query
+	gate func(ctx context.Context) error
+}
+
+func (q ownerGatedQuery) wrap(inner space.Query) space.Query {
+	return ownerGatedQuery{Query: inner, gate: q.gate}
+}
+
+func (q ownerGatedQuery) Filter(filter any) space.Query { return q.wrap(q.Query.Filter(filter)) }
+func (q ownerGatedQuery) Sort(sorts ...any) space.Query { return q.wrap(q.Query.Sort(sorts...)) }
+func (q ownerGatedQuery) Limit(n int) space.Query       { return q.wrap(q.Query.Limit(n)) }
+func (q ownerGatedQuery) Offset(n int) space.Query      { return q.wrap(q.Query.Offset(n)) }
+func (q ownerGatedQuery) Projection(opts space.ProjectionOpts) space.Query {
+	return q.wrap(q.Query.Projection(opts))
+}
+
+func (q ownerGatedQuery) Iter(ctx context.Context) (space.Iterator, error) {
+	if err := q.gate(ctx); err != nil {
+		return nil, err
+	}
+	return q.Query.Iter(ctx)
+}
+
+func (q ownerGatedQuery) All(ctx context.Context) ([]*anyenc.Value, error) {
+	if err := q.gate(ctx); err != nil {
+		return nil, err
+	}
+	return q.Query.All(ctx)
+}
+
+func (q ownerGatedQuery) One(ctx context.Context) (*anyenc.Value, error) {
+	if err := q.gate(ctx); err != nil {
+		return nil, err
+	}
+	return q.Query.One(ctx)
+}
+
+func (q ownerGatedQuery) Count(ctx context.Context) (int, error) {
+	if err := q.gate(ctx); err != nil {
+		return 0, err
+	}
+	return q.Query.Count(ctx)
+}
+
+func (q ownerGatedQuery) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
+	if err := q.gate(ctx); err != nil {
+		return nil, err
+	}
+	return q.Query.Snapshot(ctx, opts)
+}
+
+// Subscribe gates twice: before, and again after the subscription is
+// registered — a deletion between the two closed the object's
+// subscriptions before this one existed, so it would never close.
+func (q ownerGatedQuery) Subscribe(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
+	if err := q.gate(ctx); err != nil {
+		return nil, err
+	}
+	res, err := q.Query.Subscribe(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := q.gate(ctx); err != nil {
+		_ = res.Sub.Close()
+		return nil, err
+	}
+	return res, nil
 }
 
 // Status derives the file's durability state on read. See space.Files.

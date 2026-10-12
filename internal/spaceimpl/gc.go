@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 )
 
@@ -146,6 +147,15 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 			if perr := crdt.PurgeSpaceMeta(ctx, metaColl, spaceId, nil); perr != nil {
 				gcLog.Warn("purge space meta", zap.String("spaceId", spaceId), zap.Error(perr))
 			}
+		}
+	}
+	// Read-state rows of dead spaces go the same way, unconditionally:
+	// an offload interrupted after its read-state chunk leaves rows
+	// nothing else revisits, and a re-materialized space would take
+	// their stale frontiers for the all-read seed.
+	for spaceId := range deadSpaces {
+		if _, perr := readstate.PurgeSpace(ctx, s.db, spaceId); perr != nil {
+			gcLog.Warn("purge space read state", zap.String("spaceId", spaceId), zap.Error(perr))
 		}
 	}
 

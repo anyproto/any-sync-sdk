@@ -741,6 +741,27 @@ func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value 
 	return c.GetStored(ctx, dataset, c.StoreId(dataset, id))
 }
 
+// Lookup is Get for callers that must tell an absent record from a
+// read that failed: (nil, nil) when the dataset or the record does not
+// exist, the store's error otherwise. Cloned like Get.
+func (c *Controller) Lookup(ctx context.Context, dataset, id string) (*anyenc.Value, error) {
+	coll, err := c.openForRead(ctx, dataset)
+	if err != nil {
+		return nil, err
+	}
+	if coll == nil {
+		return nil, nil
+	}
+	doc, err := coll.FindId(ctx, c.StoreId(dataset, id))
+	if errors.Is(err, anystore.ErrDocNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return anyencx.Clone(doc.Value()), nil
+}
+
 // GetStored returns the record stored under storeId in the dataset, or
 // nil if absent: the document id as it is, with no object prefix added.
 // Cloned like Get.

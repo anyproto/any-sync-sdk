@@ -1166,7 +1166,12 @@ func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMeta
 			a.pushMu.Unlock()
 			return fmt.Errorf("anysyncsdk: persist profile: %w", err)
 		}
-		rec, _ = a.tsp.GetProfile(ctx)
+		var err error
+		if rec, _, err = a.tsp.GetProfileState(ctx); err != nil {
+			// Stored; the mirror pushes the row on its event.
+			a.pushMu.Unlock()
+			return fmt.Errorf("anysyncsdk: read profile: %w", err)
+		}
 	}
 	err := a.pushProfile(ctx, rec, false)
 	a.pushMu.Unlock()
@@ -1191,7 +1196,12 @@ func (a *accountImpl) SetIcon(ctx context.Context, r io.Reader, opts space.IconO
 		return space.AccountMetadata{}, fmt.Errorf("anysyncsdk: SetIcon: %w", err)
 	}
 	a.pushMu.Lock()
-	rec, _ := a.tsp.GetProfile(ctx)
+	rec, _, err := a.tsp.GetProfileState(ctx)
+	if err != nil {
+		a.pushMu.Unlock()
+		_ = a.spaces.DeleteTechFile(ctx, info.FileId)
+		return space.AccountMetadata{}, fmt.Errorf("anysyncsdk: read profile: %w", err)
+	}
 	prev := rec.IconFileId
 	if err := a.tsp.SetProfileIcon(ctx, info.RootCid, info.FileId); err != nil {
 		a.pushMu.Unlock()
@@ -1226,8 +1236,12 @@ func (a *accountImpl) DeleteIcon(ctx context.Context) error {
 		return errors.New("anysyncsdk: DeleteIcon: account not open")
 	}
 	a.pushMu.Lock()
-	rec, ok := a.tsp.GetProfile(ctx)
-	if !ok || (rec.IconFileId == "" && rec.IconCID == "") {
+	rec, present, err := a.tsp.GetProfileState(ctx)
+	if err != nil {
+		a.pushMu.Unlock()
+		return fmt.Errorf("anysyncsdk: read profile: %w", err)
+	}
+	if !present || (rec.IconFileId == "" && rec.IconCID == "") {
 		a.pushMu.Unlock()
 		return nil
 	}
@@ -1237,7 +1251,7 @@ func (a *accountImpl) DeleteIcon(ctx context.Context) error {
 		return fmt.Errorf("anysyncsdk: persist profile: %w", err)
 	}
 	rec.IconCID, rec.IconFileId, rec.IconPublishedFileId = "", "", ""
-	err := a.pushProfile(ctx, rec, false)
+	err = a.pushProfile(ctx, rec, false)
 	a.pushMu.Unlock()
 	if prev != "" {
 		if derr := a.spaces.DeleteTechFile(ctx, prev); derr != nil && !errors.Is(derr, space.ErrNotFound) {
@@ -1606,8 +1620,8 @@ func (a *accountImpl) sleep(d time.Duration) bool {
 // overwritten the record meanwhile, and a put is cheap. It reports
 // true when nothing is left to do — the record is out, or the row
 // waits on a pending avatar another device is uploading (the watch is
-// armed for that) — and false when the put failed and should be
-// retried.
+// armed for that) — and false when the row could not be read or the
+// put failed, both retried.
 func (a *accountImpl) syncPush() bool {
 	if a.closed() {
 		return true

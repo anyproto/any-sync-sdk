@@ -580,7 +580,10 @@ func (s *Service) GetProfileState(ctx context.Context) (rec ProfileRecord, prese
 	if err != nil {
 		return ProfileRecord{}, false, err
 	}
-	v := obj.Controller().Get(ctx, ProfileDataset, ProfileSelfId)
+	v, err := obj.Controller().Lookup(ctx, ProfileDataset, ProfileSelfId)
+	if err != nil {
+		return ProfileRecord{}, false, err
+	}
 	if v == nil {
 		return ProfileRecord{}, false, nil
 	}

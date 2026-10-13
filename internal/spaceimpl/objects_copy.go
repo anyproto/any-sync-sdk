@@ -96,6 +96,10 @@ func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObject
 		}
 		add(id)
 	}
+	// The owners whose values travel: the source's own, before the
+	// request's collections join — a copy refiled under a marker takes
+	// the marker's values from the request, never from the source.
+	owners := append([]string{srcType}, collections...)
 	for _, id := range opts.Collections {
 		add(id)
 	}
@@ -125,7 +129,6 @@ func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObject
 	// owner the registry cannot resolve, or a value under a property
 	// it no longer declares, is orphan data and stays behind.
 	reg := o.parent.store.Registry()
-	owners := append([]string{srcType}, opts.Collections...)
 	for _, owner := range owners {
 		group := row.GetObject(owner)
 		if group == nil {
@@ -248,9 +251,18 @@ func (o *objectService) copyDatasets(ctx context.Context, src *copySource, objec
 			}
 			if len(res.Rejections) > 0 {
 				rj := res.Rejections[0]
+				if rj.ReasonErr != nil {
+					return fmt.Errorf("%w: %s from %s: record %q: %w", space.ErrFromRecordRefused, ds.Name, src.id, rj.RecordId, rj.ReasonErr)
+				}
 				return fmt.Errorf("%w: %s from %s: record %q: %s", space.ErrFromRecordRefused, ds.Name, src.id, rj.RecordId, rj.Reason)
 			}
 		}
+	}
+	// A source deleted while its datasets were being read leaves the
+	// later ones unreadable — an absent collection reads as empty — so
+	// the copy is whole only while the source still is.
+	if deleted, err := o.parent.store.TreeDeleted(ctx, src.id); err == nil && deleted {
+		return fmt.Errorf("spaceimpl: copy from %s: %w", src.id, space.ErrObjectDeleted)
 	}
 	return nil
 }

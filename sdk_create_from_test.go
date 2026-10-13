@@ -290,15 +290,43 @@ func TestCreateFrom_MarkersStayBehind(t *testing.T) {
 	assert.Empty(t, row.GetArray("any", "collections"))
 	assert.Nil(t, row.Get(cfMarker))
 
-	pinned, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		From: src, Collections: []string{cfMarker},
-		InitialProperties: map[string]map[string]any{cfMarker: {"pos": "b0"}},
-	})
+	// Refiled under the marker by the request: the marker's values come
+	// from the request, never from the source.
+	pinned, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: src, Collections: []string{cfMarker}})
 	require.NoError(t, err)
 	row, err = sp.Objects().Get(ctx, pinned)
 	require.NoError(t, err)
 	require.Len(t, row.GetArray("any", "collections"), 1)
+	assert.Nil(t, row.Get(cfMarker, "pos"), "the source's marker value did not travel")
+	placed, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		From: src, Collections: []string{cfMarker},
+		InitialProperties: map[string]map[string]any{cfMarker: {"pos": "b0"}},
+	})
+	require.NoError(t, err)
+	row, err = sp.Objects().Get(ctx, placed)
+	require.NoError(t, err)
 	assert.Equal(t, "b0", string(row.GetStringBytes(cfMarker, "pos")))
+}
+
+// Membership has one source: a `type` or `collections` value under
+// InitialProperties["any"] is ignored, so the pre-flight and the apply
+// never disagree on what the row carries.
+func TestCreate_MembershipFromOptsOnly(t *testing.T) {
+	ctx, sp := cfOpen(t)
+	id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type:        cfType,
+		Collections: []string{cfMarker},
+		InitialProperties: map[string]map[string]any{
+			"any": {"name": "n", "type": "wm-blocks-type", "collections": []string{"nowhere"}},
+		},
+	})
+	require.NoError(t, err)
+	row, err := sp.Objects().Get(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, cfType, string(row.GetStringBytes("any", "type")))
+	require.Len(t, row.GetArray("any", "collections"), 1)
+	assert.Equal(t, cfMarker, string(row.GetArray("any", "collections")[0].GetStringBytes()))
+	assert.Equal(t, "n", string(row.GetStringBytes("any", "name")))
 }
 
 func TestCreateFrom_Refusals(t *testing.T) {
@@ -332,6 +360,15 @@ func TestCreateFrom_TemplateIdReserved(t *testing.T) {
 	require.Error(t, err)
 	cfg = wmConfig(t, dataDir)
 	cfg.Types = append(cfg.Types, handler.Type{Id: space.TemplateCollectionId, Name: "Mine"})
+	_, err = Open(ctx, cfg, wmProvider(t, dataDir))
+	require.Error(t, err)
+	cfg = wmConfig(t, dataDir)
+	cfg.Modules = []handler.Module{{
+		Name: space.TemplateCollectionId, Canonical: "template_body", DataVersion: "t-v1",
+		New: func(handler.ModuleInstance) handler.Dataset {
+			return handler.Dataset{Schema: handler.Schema{Dynamic: true}}
+		},
+	}}
 	_, err = Open(ctx, cfg, wmProvider(t, dataDir))
 	require.Error(t, err)
 }

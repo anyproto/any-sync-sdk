@@ -431,6 +431,12 @@ func (o *objectService) bootstrap(ctx context.Context, objectId string, opts spa
 		var stamp *anyenc.Value
 		n := 0
 		for propId, val := range kv {
+			if typeId == anytype.TypeId && (propId == anytype.FieldType || propId == anytype.FieldCollections) {
+				// Membership has one source, Type / Collections: a value
+				// here would make the pre-flight check one type and the
+				// apply write another.
+				continue
+			}
 			v, err := goToAnyenc(arena, val)
 			if err != nil {
 				return space.ModifyResult{}, fmt.Errorf("InitialProperties[%s.%s]: %w", typeId, propId, err)

@@ -2,8 +2,11 @@ package spaceimpl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -58,6 +61,26 @@ func (s *Service) TechFileRow(ctx context.Context, fileId string) (payloads.Row,
 // OpenTechFile returns a reader over one tech-space file's plaintext.
 func (s *Service) OpenTechFile(ctx context.Context, fileId string) (space.FileReader, error) {
 	return s.techFiles().Open(ctx, fileId, space.VariantOriginal)
+}
+
+// OpenOwnIcon opens the account's avatar file named by the profile
+// row. The profile row and the file row sync separately, so a file
+// row the profile names but this device does not hold yet is "not
+// available", not "none"; so is any failure past the row, since the
+// bytes exist. The caller's own context error is returned as is.
+func (s *Service) OpenOwnIcon(ctx context.Context, fileId string) (space.FileReader, error) {
+	f, err := s.OpenTechFile(ctx, fileId)
+	if err == nil {
+		return f, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if errors.Is(err, space.ErrFileNotAvailable) {
+		return nil, err
+	}
+	filesLog.Debug("own avatar open", zap.String("fileId", fileId), zap.Error(err))
+	return nil, fmt.Errorf("files: avatar not available on this device yet: %w", space.ErrFileNotAvailable)
 }
 
 // DeleteTechFile removes one tech-space file (row, queue jobs, local ref).

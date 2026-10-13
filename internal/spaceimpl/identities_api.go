@@ -39,7 +39,7 @@ func (a *identitiesAPI) OpenIcon(ctx context.Context, identity string) (space.Fi
 		if !ok || rec.IconFileId == "" {
 			return nil, fmt.Errorf("identities: no avatar: %w", space.ErrNotFound)
 		}
-		return a.parent.OpenTechFile(ctx, rec.IconFileId)
+		return a.parent.OpenOwnIcon(ctx, rec.IconFileId)
 	}
 	r, ok := a.tsp.GetIdentity(ctx, identity)
 	if !ok {

@@ -536,3 +536,24 @@ func TestNonDurableNoPeerGraceful(t *testing.T) {
 	_, err := svc.Open(ctx, spaceId, root, key, false, "file1")
 	require.ErrorIs(t, err, space.ErrFileNotAvailable)
 }
+
+// A capped open refuses an oversized remote object at the probe: one
+// range request, no index read, and no row left in the store.
+func TestOpenLimitedRefusesOversized(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, _ := buildSource(t, 3_200_000)
+	base, requests := serveCar(t, root, car)
+
+	st := newStore(t)
+	svc := New(st, staticBase(base))
+	_, err := svc.OpenLimited(ctx, spaceId, root, key, true, "icon", 1<<20)
+	require.ErrorIs(t, err, ErrObjectTooLarge)
+	require.EqualValues(t, 1, requests.Load(), "only the probe is fetched")
+	_, err = st.Info(ctx, spaceId, root)
+	require.ErrorIs(t, err, store.ErrNotFound, "a refused object leaves no row")
+
+	// Under the cap the same object opens.
+	f, err := svc.OpenLimited(ctx, spaceId, root, key, true, "icon", int64(len(car))+1)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+}

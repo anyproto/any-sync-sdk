@@ -175,6 +175,31 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 	require.NoError(t, err)
 	device2Keys := &fixedSeedProvider{account: ownerKeys.account, device: device2}
 	device2Dir := t.TempDir()
+	// From here on the contact must never lose the avatar: not while
+	// the second device syncs the row (its mirror must wait for the
+	// file row rather than publish without the icon) and not across its
+	// restart. The directory refreshes on a 60 s tick, so the monitor
+	// samples what the joiner shows rather than every put.
+	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	dropped := make(chan space.IdentityInfo, 1)
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-monitorCtx.Done():
+				return
+			case <-t.C:
+			}
+			info, ok, _ := joiner.Identities().Get(monitorCtx, ownerId)
+			if ok && info.IconCID != meta.IconCID {
+				select {
+				case dropped <- info:
+				default:
+				}
+			}
+		}
+	}()
 	owner2 := mkSDK("owner-2", device2Dir, device2Keys, config.Files{PublicReadBaseUrl: cdn.URL})
 	require.Eventually(t, func() bool {
 		m, present, err := owner2.Account().Metadata(ctx)
@@ -195,12 +220,12 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 	closed[owner2] = true
 	require.NoError(t, owner2.Close())
 	owner2 = mkSDK("owner-2 again", device2Dir, device2Keys, config.Files{PublicReadBaseUrl: cdn.URL})
-	deadline := time.Now().Add(75 * time.Second)
-	for time.Now().Before(deadline) {
-		info, ok, _ := joiner.Identities().Get(ctx, ownerId)
-		require.True(t, ok && info.IconCID == meta.IconCID, "a second device's boot must not drop the published avatar; got %+v", info)
-		time.Sleep(3 * time.Second)
+	select {
+	case info := <-dropped:
+		t.Fatalf("the contact lost the avatar while the second device came up or restarted: %+v", info)
+	case <-time.After(75 * time.Second):
 	}
+	stopMonitor()
 	rd, err = owner2.Account().OpenIcon(ctx)
 	require.NoError(t, err)
 	_ = rd.Close()

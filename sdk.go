@@ -1,7 +1,6 @@
 package anysyncsdk
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -564,8 +563,10 @@ func (s *SDK) bootstrap(ctx context.Context) {
 	// UpdateMetadata in this process — which never happens for a
 	// freshly-started client that's only re-loading existing state.
 	//
-	// Best-effort: a failed push doesn't prevent SDK use. The next
-	// successful push (next UpdateMetadata or next boot) heals it.
+	// Best-effort: a failed push doesn't prevent SDK use. The profile
+	// mirror started below retries it and follows later changes of the
+	// row; while an avatar another device is uploading is pending, the
+	// mirror waits for it rather than publish a profile without it.
 	warn("republish profile", s.account.republishStoredProfile(ctx))
 	s.account.startProfileSync()
 
@@ -1048,9 +1049,6 @@ type accountImpl struct {
 	// watch is armed and stopped under it too, so the watched file is
 	// always the one the profile row names.
 	pushMu sync.Mutex
-	// lastPushed is the plaintext of the last record this device put
-	// successfully; a sync-driven push that would repeat it is skipped.
-	lastPushed []byte
 
 	// The avatar watch: one goroutine at a time waiting for the
 	// pending avatar file's custody receipt, to republish the profile
@@ -1318,28 +1316,36 @@ func (a *accountImpl) profileFor(ctx context.Context, rec techspace.ProfileRecor
 }
 
 // pushProfile signs and uploads the profile bytes to the coordinator's
-// identityRepo. The avatar reference rides along only when profileFor
-// reports it ready — the public read path serves nothing else. While
-// an avatar is pending (uploading, or its row or mark not synced here
-// yet) the watch is armed so the flip republishes, and a push that
-// mirrors the row (fromSync: boot or sync-driven) is skipped — this
+// identityRepo. See pushPrepared for the rules. Runs under pushMu.
+func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileRecord, fromSync bool) error {
+	profile, ready := a.profileFor(ctx, rec)
+	return a.pushPrepared(ctx, rec, profile, ready, fromSync)
+}
+
+// pushPrepared puts profile, built from rec by profileFor. The avatar
+// reference rides along only when ready — the public read path serves
+// nothing else. While an avatar is pending (uploading, or its row or
+// mark not synced here yet) the watch is armed so the flip
+// republishes. A push that mirrors the row (fromSync: boot or
+// sync-driven) goes out without the icon only when the pending file is
+// this device's own upload — nobody else can publish it first, and the
+// watch adds it once durable; otherwise it is skipped, because this
 // device cannot tell whether another device already published the
 // reference, and pushing without it would drop it for every contact.
-// A caller's own write (UpdateMetadata, SetIcon, DeleteIcon) goes out
-// without the icon. The watch, if any, is stopped only after a
-// successful put. Returns the raw error from the RPC so callers can
-// decide whether to surface it. Runs under pushMu.
-func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileRecord, fromSync bool) error {
+// A caller's own write (UpdateMetadata, SetIcon, DeleteIcon) always
+// goes out. The watch, if any, is stopped only after a successful put.
+// Returns the raw error from the RPC so callers can decide whether to
+// surface it. Runs under pushMu.
+func (a *accountImpl) pushPrepared(ctx context.Context, rec techspace.ProfileRecord, profile space.Profile, ready, fromSync bool) error {
 	keys := a.app.AccountKeys()
 	symKey, err := space.DeriveAccountMetadataSymKey(keys.SignKey)
 	if err != nil {
 		return fmt.Errorf("anysyncsdk: derive metadata key: %w", err)
 	}
-	profile, ready := a.profileFor(ctx, rec)
 	pending := rec.IconFileId != "" && !ready
 	if pending {
 		a.armIconWatch(rec.IconFileId)
-		if fromSync {
+		if fromSync && !a.spaces.TechFileLocal(ctx, rec.IconFileId) {
 			return nil
 		}
 	}
@@ -1368,7 +1374,6 @@ func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileReco
 	}}); err != nil {
 		return err
 	}
-	a.lastPushed = plain
 	if !pending {
 		a.stopIconWatch()
 	}
@@ -1479,10 +1484,11 @@ func (a *accountImpl) tryPublishIcon(fileId string) bool {
 	if !ok || rec.IconFileId != fileId {
 		return true
 	}
-	if _, ready := a.profileFor(ctx, rec); !ready {
+	profile, ready := a.profileFor(ctx, rec)
+	if !ready {
 		return false
 	}
-	if err := a.pushProfile(ctx, rec, false); err != nil {
+	if err := a.pushPrepared(ctx, rec, profile, true, true); err != nil {
 		log.Warn("republish profile after avatar backup", zap.String("fileId", fileId), zap.Error(err))
 		return false
 	}
@@ -1528,17 +1534,21 @@ func (a *accountImpl) runProfileSync() {
 		pushed := a.syncPush()
 		events := sub.Events()
 		// One waiter per subscription; it ends with the mailbox or the
-		// close context. Events only wake the loop, so a wake lost while
-		// a push ran is harmless: the push reads the row as it stands.
-		woke := make(chan error, 1)
+		// close context, never blocks on its channels, and is joined by
+		// close(). Events only wake the loop, so a wake dropped while a
+		// push ran is harmless: the push reads the row as it stands.
+		woke := make(chan struct{}, 1)
+		ended := make(chan error, 1)
+		a.wg.Add(1)
 		go func() {
+			defer a.wg.Done()
 			for {
 				if _, err := events.Wait(a.closeCtx); err != nil {
-					woke <- err
+					ended <- err
 					return
 				}
 				select {
-				case woke <- nil:
+				case woke <- struct{}{}:
 				default:
 				}
 			}
@@ -1550,11 +1560,10 @@ func (a *accountImpl) runProfileSync() {
 				wait = time.After(retry)
 			}
 			select {
-			case err := <-woke:
-				if err != nil {
-					reopen = true // the engine closed the mailbox (overflow)
-					continue
-				}
+			case <-ended:
+				reopen = true // the engine closed the mailbox (overflow)
+				continue
+			case <-woke:
 				if !a.sleep(profileSyncDebounce) {
 					_ = sub.Close()
 					return
@@ -1588,9 +1597,11 @@ func (a *accountImpl) sleep(d time.Duration) bool {
 	}
 }
 
-// syncPush mirrors the profile row as it now stands. It reports true
-// when nothing is left to do — the record is out, identical to this
-// device's last put, or waiting on a pending avatar (the watch is
+// syncPush mirrors the profile row as it now stands: every change of
+// the row, local or synced, is put again — another device may have
+// overwritten the record meanwhile, and a put is cheap. It reports
+// true when nothing is left to do — the record is out, or the row
+// waits on a pending avatar another device is uploading (the watch is
 // armed for that) — and false when the put failed and should be
 // retried.
 func (a *accountImpl) syncPush() bool {
@@ -1609,14 +1620,11 @@ func (a *accountImpl) syncPush() bool {
 		return true
 	}
 	profile, ready := a.profileFor(ctx, rec)
-	if rec.IconFileId != "" && !ready {
+	if rec.IconFileId != "" && !ready && !a.spaces.TechFileLocal(ctx, rec.IconFileId) {
 		a.armIconWatch(rec.IconFileId)
 		return true
 	}
-	if bytes.Equal(space.EncodeProfile(profile), a.lastPushed) {
-		return true
-	}
-	if err := a.pushProfile(ctx, rec, true); err != nil {
+	if err := a.pushPrepared(ctx, rec, profile, ready, true); err != nil {
 		log.Warn("profile sync: push", zap.Error(err))
 		return false
 	}

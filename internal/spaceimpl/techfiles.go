@@ -58,6 +58,14 @@ func (s *Service) TechFileRow(ctx context.Context, fileId string) (payloads.Row,
 	return s.techHandle().inner.PayloadsInternal().FindRow(ctx, fileId)
 }
 
+// TechFileLocal reports whether this device holds the complete bytes
+// of a tech-space file: it is the device that attached it (or pinned
+// it), so nothing else can make it durable first.
+func (s *Service) TechFileLocal(ctx context.Context, fileId string) bool {
+	info, err := s.techFiles().Get(ctx, fileId)
+	return err == nil && info.Cached && !info.Inline
+}
+
 // OpenTechFile returns a reader over one tech-space file's plaintext.
 func (s *Service) OpenTechFile(ctx context.Context, fileId string) (space.FileReader, error) {
 	return s.techFiles().Open(ctx, fileId, space.VariantOriginal)

@@ -564,18 +564,27 @@ func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
 // when a profile has ever been written; false on a fresh device that
 // hasn't seen UpdateMetadata yet.
 func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
+	rec, present, err := s.GetProfileState(ctx)
+	return rec, err == nil && present
+}
+
+// GetProfileState is GetProfile for callers that must tell a row that
+// is absent from a read that failed (a closed service, an index object
+// that could not be loaded): the former is final, the latter is
+// retried.
+func (s *Service) GetProfileState(ctx context.Context) (rec ProfileRecord, present bool, err error) {
 	if !s.open.Load() {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, err
 	}
 	v := obj.Controller().Get(ctx, ProfileDataset, ProfileSelfId)
 	if v == nil {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, nil
 	}
-	return DecodeProfileRecord(v), true
+	return DecodeProfileRecord(v), true, nil
 }
 
 // SetProfileMetadata writes the name and description of the profile

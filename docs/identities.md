@@ -143,15 +143,18 @@ the only writer.
   synced here yet — a caller's own write (`SetIcon`, `UpdateMetadata`,
   `DeleteIcon`) goes out without the avatar (contacts see none until
   the flip). A push that mirrors the row (boot or sync-driven) goes
-  out without it only when the pending file is this device's own
-  upload — its bytes are here, nobody else can publish it first, and
-  the watch adds it once durable; otherwise the mirror push is
-  skipped, because this device cannot tell whether another device
-  already published the reference, and pushing without it would drop
-  it for every contact. So an avatar another device never finishes
-  uploading (quota, a device lost with the bytes) holds this device's
-  mirror pushes until `SetIcon` or `DeleteIcon` replaces it; the
-  device's own writes still go out. Every pending observation arms the
+  out without it only when this device is the one uploading the
+  pending file — its queue holds the file's durable job, which a
+  sibling that merely read the bytes over LAN p2p does not — so nobody
+  else can publish it first, and the watch adds it once durable;
+  otherwise the mirror push is skipped, because this device cannot
+  tell whether another device already published the reference, and
+  pushing without it would drop it for every contact. So an avatar
+  another device never finishes uploading (quota, a device lost with
+  the bytes) holds this device's mirror pushes — a boot republish, a
+  synced change, the retry of a write of its own that failed offline —
+  until `SetIcon` or `DeleteIcon` replaces it; a write made online
+  still goes out at once. Every pending observation arms the
   avatar watch (`runIconWatch`): one goroutine that re-reads the row
   on every durable status event for the file (the uploading device's
   queue), every `iconWatchPoll` (the receipt reaches the account's
@@ -160,9 +163,10 @@ the only writer.
   close-cancelled context, with the readiness it checked; the watch is
   stopped only after a successful put, so a failed one is retried on
   the next tick. It ends when published, when the profile row is gone
-  or names another avatar, or on `SDK.Close`, which cancels and joins
-  it (a push queued behind a caller holding `pushMu` waits for that
-  caller's own RPC).
+  or names another avatar (a read of the row that fails is retried,
+  not taken as gone), or on `SDK.Close`, which cancels and joins it (a
+  push queued behind a caller holding `pushMu` waits for that caller's
+  own RPC).
 - **The row is mirrored.** The profile row is the source of truth, and
   it syncs between the account's devices. After the boot republish the
   SDK subscribes to the row (`startProfileSync`), reconciles once (the
@@ -173,7 +177,7 @@ the only writer.
   before (another device may have overwritten it meanwhile; a put is
   cheap), retrying a failed push with backoff, and reopening a
   subscription the engine closed. A pending avatar seen here arms the
-  watch instead of pushing, unless it is this device's own upload. So
+  watch instead of pushing, unless this device is uploading it. So
   a device never needs the event it missed: the row it holds is what
   it publishes, as soon as the row is complete.
 - **Read.** `Identities().OpenIcon(ctx, identity)` opens the avatar a

@@ -8,6 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -58,12 +59,18 @@ func (s *Service) TechFileRow(ctx context.Context, fileId string) (payloads.Row,
 	return s.techHandle().inner.PayloadsInternal().FindRow(ctx, fileId)
 }
 
-// TechFileLocal reports whether this device holds the complete bytes
-// of a tech-space file: it is the device that attached it (or pinned
-// it), so nothing else can make it durable first.
-func (s *Service) TechFileLocal(ctx context.Context, fileId string) bool {
-	info, err := s.techFiles().Get(ctx, fileId)
-	return err == nil && info.Cached && !info.Inline
+// TechFileUploading reports whether this device is driving the backup
+// of a tech-space file: its queue holds the file's durable job, which
+// only the device that attached the file (or took its upload over)
+// has. Holding the bytes is not enough — a sibling that read the file
+// over LAN p2p holds them too, and it is not the one that will make
+// the file durable.
+func (s *Service) TechFileUploading(ctx context.Context, fileId string) bool {
+	if s.fqueue == nil {
+		return false
+	}
+	_, ok, err := s.fqueue.Get(ctx, status.KindDurable, s.tsp.SpaceId(), fileId)
+	return err == nil && ok
 }
 
 // OpenTechFile returns a reader over one tech-space file's plaintext.

@@ -180,16 +180,18 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 	// file row rather than publish without the icon) and not across its
 	// restart. The directory refreshes on a 60 s tick, so the monitor
 	// samples what the joiner shows rather than every put.
-	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	monitorCtx, cancelMonitor := context.WithCancel(ctx)
+	monitorDone := make(chan struct{})
 	dropped := make(chan space.IdentityInfo, 1)
 	go func() {
-		t := time.NewTicker(2 * time.Second)
-		defer t.Stop()
+		defer close(monitorDone)
+		tick := time.NewTicker(2 * time.Second)
+		defer tick.Stop()
 		for {
 			select {
 			case <-monitorCtx.Done():
 				return
-			case <-t.C:
+			case <-tick.C:
 			}
 			info, ok, _ := joiner.Identities().Get(monitorCtx, ownerId)
 			if ok && info.IconCID != meta.IconCID {
@@ -200,6 +202,11 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 			}
 		}
 	}()
+	stopMonitor := func() {
+		cancelMonitor()
+		<-monitorDone
+	}
+	t.Cleanup(stopMonitor) // a failed require must not leave it reading a closing joiner
 	owner2 := mkSDK("owner-2", device2Dir, device2Keys, config.Files{PublicReadBaseUrl: cdn.URL})
 	require.Eventually(t, func() bool {
 		m, present, err := owner2.Account().Metadata(ctx)
@@ -226,6 +233,11 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 	case <-time.After(75 * time.Second):
 	}
 	stopMonitor()
+	select {
+	case info := <-dropped:
+		t.Fatalf("the contact lost the avatar right before the window closed: %+v", info)
+	default:
+	}
 	rd, err = owner2.Account().OpenIcon(ctx)
 	require.NoError(t, err)
 	_ = rd.Close()

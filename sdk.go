@@ -1327,11 +1327,12 @@ func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileReco
 // nothing else. While an avatar is pending (uploading, or its row or
 // mark not synced here yet) the watch is armed so the flip
 // republishes. A push that mirrors the row (fromSync: boot or
-// sync-driven) goes out without the icon only when the pending file is
-// this device's own upload — nobody else can publish it first, and the
-// watch adds it once durable; otherwise it is skipped, because this
-// device cannot tell whether another device already published the
-// reference, and pushing without it would drop it for every contact.
+// sync-driven) goes out without the icon only when this device is the
+// one uploading the pending file (its queue holds the job) — nobody
+// else can publish it first, and the watch adds it once durable;
+// otherwise it is skipped, because this device cannot tell whether
+// another device already published the reference, and pushing without
+// it would drop it for every contact.
 // A caller's own write (UpdateMetadata, SetIcon, DeleteIcon) always
 // goes out. The watch, if any, is stopped only after a successful put.
 // Returns the raw error from the RPC so callers can decide whether to
@@ -1345,7 +1346,7 @@ func (a *accountImpl) pushPrepared(ctx context.Context, rec techspace.ProfileRec
 	pending := rec.IconFileId != "" && !ready
 	if pending {
 		a.armIconWatch(rec.IconFileId)
-		if fromSync && !a.spaces.TechFileLocal(ctx, rec.IconFileId) {
+		if fromSync && !a.spaces.TechFileUploading(ctx, rec.IconFileId) {
 			return nil
 		}
 	}
@@ -1480,8 +1481,11 @@ func (a *accountImpl) tryPublishIcon(fileId string) bool {
 	}
 	ctx, cancel := context.WithTimeout(a.closeCtx, iconPushTimeout)
 	defer cancel()
-	rec, ok := a.tsp.GetProfile(ctx)
-	if !ok || rec.IconFileId != fileId {
+	rec, present, err := a.tsp.GetProfileState(ctx)
+	if err != nil {
+		return false // a failed read is retried, not an ended watch
+	}
+	if !present || rec.IconFileId != fileId {
 		return true
 	}
 	profile, ready := a.profileFor(ctx, rec)
@@ -1615,12 +1619,16 @@ func (a *accountImpl) syncPush() bool {
 	}
 	ctx, cancel := context.WithTimeout(a.closeCtx, iconPushTimeout)
 	defer cancel()
-	rec, ok := a.tsp.GetProfile(ctx)
-	if !ok || rec.IsEmpty() {
+	rec, present, err := a.tsp.GetProfileState(ctx)
+	if err != nil {
+		log.Warn("profile sync: read row", zap.Error(err))
+		return false
+	}
+	if !present || rec.IsEmpty() {
 		return true
 	}
 	profile, ready := a.profileFor(ctx, rec)
-	if rec.IconFileId != "" && !ready && !a.spaces.TechFileLocal(ctx, rec.IconFileId) {
+	if rec.IconFileId != "" && !ready && !a.spaces.TechFileUploading(ctx, rec.IconFileId) {
 		a.armIconWatch(rec.IconFileId)
 		return true
 	}

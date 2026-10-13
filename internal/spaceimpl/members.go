@@ -203,7 +203,7 @@ func (m *membersAPI) resolveJoinRequestProfiles(ctx context.Context, reqs []spac
 		id := reqs[i].Identity
 		if w != nil {
 			if p, ok := w.cachedProfile(id); ok {
-				applyJoinProfile(&reqs[i], p)
+				applyJoinProfile(&reqs[i], p.AccountMetadata)
 				continue
 			}
 		}
@@ -219,12 +219,12 @@ func (m *membersAPI) resolveJoinRequestProfiles(ctx context.Context, reqs []spac
 		if !ok {
 			continue
 		}
-		applyJoinProfile(&reqs[i], prof)
+		applyJoinProfile(&reqs[i], prof.AccountMetadata)
 		if w != nil {
 			w.cacheProfile(id, prof)
 		}
 		// Write through to the identities directory.
-		_ = s.tsp.SetIdentityProfile(ctx, id, prof.Name, prof.Description, prof.IconCID)
+		s.setIdentityProfile(ctx, id, prof)
 	}
 }
 
@@ -336,12 +336,12 @@ func (m *membersAPI) applyProfile(member *space.Member) {
 	if !ok {
 		return
 	}
-	applyProfile(member, p)
+	applyProfile(member, p.AccountMetadata)
 }
 
 // cachedProfile returns the watcher's cached identityRepo profile for an
 // identity, if one has been fetched. Safe under the watcher lock.
-func (w *memberWatcher) cachedProfile(identity string) (space.AccountMetadata, bool) {
+func (w *memberWatcher) cachedProfile(identity string) (space.Profile, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	p, ok := w.profiles[identity]
@@ -351,7 +351,7 @@ func (w *memberWatcher) cachedProfile(identity string) (space.AccountMetadata, b
 // cacheProfile stores a freshly fetched profile in the watcher cache so
 // later reads (member views and JoinRequests) reuse it instead of
 // re-fetching. Marks the snapshot dirty so the next tick applies it.
-func (w *memberWatcher) cacheProfile(identity string, p space.AccountMetadata) {
+func (w *memberWatcher) cacheProfile(identity string, p space.Profile) {
 	w.mu.Lock()
 	w.profiles[identity] = p
 	w.profilesDirty = true
@@ -373,7 +373,7 @@ func (m *membersAPI) applyProfiles(members []space.Member) {
 	defer w.mu.Unlock()
 	for i := range members {
 		if p, ok := w.profiles[members[i].Identity]; ok {
-			applyProfile(&members[i], p)
+			applyProfile(&members[i], p.AccountMetadata)
 		}
 	}
 }
@@ -604,7 +604,7 @@ type memberWatcher struct {
 	// keyed by identity (strkey account-address form). Applied as overrides when
 	// rebuilding the snapshot from AclList state. Updated by the
 	// identityRepo fetcher loop. Empty fields don't override.
-	profiles map[string]space.AccountMetadata
+	profiles map[string]space.Profile
 	// profilesDirty is set by the fetcher when profiles change so the
 	// next regular tick rebuilds the snapshot even when the ACL head
 	// hasn't moved.
@@ -640,7 +640,7 @@ func newMemberWatcher(ctx context.Context, api *membersAPI) (*memberWatcher, err
 		api:      api,
 		coll:     coll,
 		snapshot: make(map[string]space.Member),
-		profiles: make(map[string]space.AccountMetadata),
+		profiles: make(map[string]space.Profile),
 		kickCh:   make(chan struct{}, 1),
 		fetchIds: make(map[string]struct{}),
 		fetchCh:  make(chan struct{}, 1),
@@ -791,7 +791,7 @@ func (w *memberWatcher) tick() {
 	prev := w.snapshot
 	next := make(map[string]space.Member, len(current))
 	for _, m := range current {
-		applyProfile(&m, w.profiles[m.Identity])
+		applyProfile(&m, w.profiles[m.Identity].AccountMetadata)
 		next[m.Identity] = m
 	}
 	w.headId = head
@@ -1060,7 +1060,7 @@ func (w *memberWatcher) fetchProfilesFor(ctx context.Context, identities []strin
 
 	w.mu.Lock()
 	changed := false
-	resolved := make(map[string]space.AccountMetadata)
+	resolved := make(map[string]space.Profile)
 	for _, dwi := range res {
 		pk, ok := pubKeys[dwi.Identity]
 		if !ok {
@@ -1086,7 +1086,7 @@ func (w *memberWatcher) fetchProfilesFor(ctx context.Context, identities []strin
 	// directory (device-local) so the public Identities API and 1-1 list
 	// rows see them too. Outside the lock — these are tech-space writes.
 	for id, p := range resolved {
-		_ = w.api.s.tsp.SetIdentityProfile(ctx, id, p.Name, p.Description, p.IconCID)
+		w.api.s.parent.setIdentityProfile(ctx, id, p)
 	}
 }
 
@@ -1094,18 +1094,18 @@ func (w *memberWatcher) fetchProfilesFor(ctx context.Context, identities []strin
 // its signature against pk (over the ciphertext), and decrypts the bytes
 // with key. Returns (zero, false) on missing record, bad signature, a nil
 // key (we don't hold this contact's symkey yet), or decrypt failure.
-func decodeIdentityRepoProfile(data []*identityrepoproto.Data, pk crypto.PubKey, key crypto.SymKey) (space.AccountMetadata, bool) {
+func decodeIdentityRepoProfile(data []*identityrepoproto.Data, pk crypto.PubKey, key crypto.SymKey) (space.Profile, bool) {
 	for _, d := range data {
 		if d == nil || d.Kind != space.IdentityProfileKind {
 			continue
 		}
 		ok, err := pk.Verify(d.Data, d.Signature)
 		if err != nil || !ok {
-			return space.AccountMetadata{}, false
+			return space.Profile{}, false
 		}
 		return space.DecryptProfile(d.Data, key)
 	}
-	return space.AccountMetadata{}, false
+	return space.Profile{}, false
 }
 
 // metadataSymKeyFor resolves the symkey that decrypts identity's
@@ -1139,17 +1139,17 @@ func (s *Service) metadataSymKeyFor(ctx context.Context, identity string) crypto
 // (zero, false) when the coordinator is absent/offline, the record is
 // missing, or we don't hold the decryption key. Shared by the per-space
 // member fetcher and the pending-1-1 name resolver.
-func (s *Service) fetchIdentityProfile(ctx context.Context, identity string, key crypto.SymKey) (space.AccountMetadata, bool) {
+func (s *Service) fetchIdentityProfile(ctx context.Context, identity string, key crypto.SymKey) (space.Profile, bool) {
 	if s.app == nil || s.app.Coordinator() == nil || key == nil {
-		return space.AccountMetadata{}, false
+		return space.Profile{}, false
 	}
 	pk, err := crypto.DecodeAccountAddress(identity)
 	if err != nil {
-		return space.AccountMetadata{}, false
+		return space.Profile{}, false
 	}
 	res, err := s.app.Coordinator().IdentityRepoGet(ctx, []string{identity}, []string{space.IdentityProfileKind})
 	if err != nil {
-		return space.AccountMetadata{}, false
+		return space.Profile{}, false
 	}
 	for _, dwi := range res {
 		if dwi.Identity != identity {
@@ -1157,7 +1157,7 @@ func (s *Service) fetchIdentityProfile(ctx context.Context, identity string, key
 		}
 		return decodeIdentityRepoProfile(dwi.Data, pk, key)
 	}
-	return space.AccountMetadata{}, false
+	return space.Profile{}, false
 }
 
 // identityRepoMaxBatch is the coordinator's per-request identity cap for
@@ -1227,9 +1227,9 @@ func (s *Service) ResolveIdentityProfiles(ctx context.Context) {
 			continue
 		}
 		prof, ok := decodeIdentityRepoProfile(dwi.Data, p.pk, p.key)
-		if !ok || (prof.Name == "" && prof.Description == "" && prof.IconCID == "") {
+		if !ok || prof.IsEmpty() {
 			continue
 		}
-		_ = s.tsp.SetIdentityProfile(ctx, dwi.Identity, prof.Name, prof.Description, prof.IconCID)
+		s.setIdentityProfile(ctx, dwi.Identity, prof)
 	}
 }

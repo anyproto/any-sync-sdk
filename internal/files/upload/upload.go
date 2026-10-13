@@ -97,6 +97,11 @@ type AddOpts struct {
 	// (spaceimpl) — this layer just seals them.
 	Variant   string
 	VariantOf string
+	// NoInline forces the content-addressed tier for content under the
+	// inline cutoff. A file that must be fetchable by its rootCid — an
+	// avatar read by accounts outside the space — cannot ride inside
+	// the sealed row.
+	NoInline bool
 }
 
 // Result reports one completed Add.
@@ -155,7 +160,7 @@ func (s *Service) Add(ctx context.Context, reg Registrar, spaceId, ownerId strin
 	}
 	defer sp.Close()
 
-	if sp.Size() < payloads.InlineMaxSize {
+	if sp.Size() < payloads.InlineMaxSize && !opts.NoInline {
 		return s.addInline(ctx, reg, ownerId, sp, opts)
 	}
 	if res, ok, err := s.addBound(ctx, reg, spaceId, ownerId, sp, opts); err != nil {

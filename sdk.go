@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -880,7 +881,7 @@ func (s *SDK) Spaces() space.Service { return s.spaces }
 
 // Identities returns the account-global directory of identities this
 // account has encountered (profiles + the spaces where each was seen).
-func (s *SDK) Identities() space.IdentitiesAPI { return spaceimpl.NewIdentitiesAPI(s.tsp) }
+func (s *SDK) Identities() space.IdentitiesAPI { return spaceimpl.NewIdentitiesAPI(s.tsp, s.spaces) }
 
 // Account returns the account-level API.
 func (s *SDK) Account() AccountAPI { return s.account }
@@ -993,9 +994,24 @@ type AccountAPI interface {
 	// the SDK exposes via tsp.GetProfile.
 	Metadata(ctx context.Context) (meta space.AccountMetadata, present bool, err error)
 
-	// UpdateMetadata updates the account's public metadata
-	// (identityRepo-backed). Applies across all spaces.
+	// UpdateMetadata publishes the account's display metadata — name
+	// and description — to identityRepo. Applies across all spaces. The
+	// icon is a file: an IconCID in meta fails with
+	// space.ErrProfileIconReadOnly, and the stored avatar is kept.
 	UpdateMetadata(ctx context.Context, meta space.AccountMetadata) error
+
+	// SetIcon stores r as the account's avatar: a files-v2 object in
+	// the tech space, replacing the previous one. The returned metadata
+	// carries the new IconCID (the file's content address). The avatar
+	// reaches contacts once its network backup is confirmed: the
+	// profile is republished with the icon reference on that flip, so a
+	// reader never holds a reference it cannot fetch. r is capped at
+	// space.MaxIconSize (space.ErrIconTooLarge beyond it).
+	SetIcon(ctx context.Context, r io.Reader, opts space.IconOpts) (space.AccountMetadata, error)
+
+	// DeleteIcon removes the avatar and republishes the profile without
+	// it. No-op when none is set.
+	DeleteIcon(ctx context.Context) error
 }
 
 // accountImpl exposes the account-level surface. Id() returns the
@@ -1015,6 +1031,14 @@ type accountImpl struct {
 	// identityRepo stale until the next boot (the local copy stays
 	// fresh, so the divergence is invisible on this device).
 	pushMu sync.Mutex
+
+	// iconWatch is the subscription waiting for the avatar file's
+	// durable flip, one at a time: a new avatar replaces the watch, and
+	// iconWatchGen tells a watcher's own goroutine whether it still owns
+	// the slot.
+	iconMu       sync.Mutex
+	iconWatch    func()
+	iconWatchGen uint64
 }
 
 func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl.Service) *accountImpl {
@@ -1041,31 +1065,34 @@ func (a *accountImpl) Metadata(ctx context.Context) (space.AccountMetadata, bool
 	if !ok {
 		return space.AccountMetadata{}, false, nil
 	}
+	return recordMetadata(rec), true, nil
+}
+
+func recordMetadata(rec techspace.ProfileRecord) space.AccountMetadata {
 	return space.AccountMetadata{
 		Name:        rec.Name,
 		Description: rec.Description,
 		IconCID:     rec.IconCID,
-	}, true, nil
+	}
 }
 
-// UpdateMetadata publishes the account's profile (name / description /
-// icon CID) to identityRepo. The bytes are signed with the account
-// signing key so other peers can verify authenticity at fetch time.
+// UpdateMetadata publishes the account's name and description to
+// identityRepo. The bytes are signed with the account signing key so
+// other peers can verify authenticity at fetch time.
 //
-// Kind is "anysync-sdk.profile" — namespaced separately from
+// Kind is "anysync-sdk-profile" — namespaced separately from
 // anytype-heart's "profile" record because the on-the-wire format
 // differs (this SDK uses a flat NUL-separated layout; heart uses an
 // encrypted protobuf). Switching consumers between the two would
 // require explicit format negotiation, which is out of scope.
-//
-// Any-store the encoded plaintext locally? Not yet — the fetcher
-// reads its own profile back from identityRepo on next poll, same as
-// any other member. Skipping the local cache keeps the code small.
 func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMetadata) error {
 	if a.app.AccountKeys() == nil {
 		return errors.New("anysyncsdk: UpdateMetadata: no account keys")
 	}
-	if space.EncodeAccountMetadata(meta) == nil {
+	if meta.IconCID != "" {
+		return fmt.Errorf("anysyncsdk: UpdateMetadata: %w", space.ErrProfileIconReadOnly)
+	}
+	if meta.Name == "" && meta.Description == "" {
 		return errors.New("anysyncsdk: UpdateMetadata: empty metadata")
 	}
 	// Persist locally first so a future boot can republish without
@@ -1073,35 +1100,180 @@ func (a *accountImpl) UpdateMetadata(ctx context.Context, meta space.AccountMeta
 	// owner-only and cheap (single CRDT row). The local write and the
 	// repo push happen under pushMu as one unit so the repo converges
 	// to the LAST local write even when a boot republish is in flight.
+	// The stored avatar fields ride along untouched.
 	a.pushMu.Lock()
+	var rec techspace.ProfileRecord
 	if a.tsp != nil {
-		if err := a.tsp.SetProfile(ctx, techspace.ProfileRecord{
-			Name:        meta.Name,
-			Description: meta.Description,
-			IconCID:     meta.IconCID,
-		}); err != nil {
+		rec, _ = a.tsp.GetProfile(ctx)
+	}
+	rec.Name, rec.Description = meta.Name, meta.Description
+	if a.tsp != nil {
+		if err := a.tsp.SetProfile(ctx, rec); err != nil {
 			a.pushMu.Unlock()
 			return fmt.Errorf("anysyncsdk: persist profile: %w", err)
 		}
 	}
-	err := a.pushToIdentityRepo(ctx, meta)
+	err := a.pushProfile(ctx, rec)
 	a.pushMu.Unlock()
 	if err != nil {
 		return err
 	}
-	// Kick every running members watcher so the just-published
-	// profile is reflected in their snapshots without waiting for
-	// the periodic identityRepo tick (60s).
+	a.kickProfiles()
+	return nil
+}
+
+// SetIcon stores the avatar as a tech-space file and records it on the
+// profile row. See AccountAPI.SetIcon.
+func (a *accountImpl) SetIcon(ctx context.Context, r io.Reader, opts space.IconOpts) (space.AccountMetadata, error) {
+	if a.app.AccountKeys() == nil {
+		return space.AccountMetadata{}, errors.New("anysyncsdk: SetIcon: no account keys")
+	}
+	if a.tsp == nil || a.spaces == nil {
+		return space.AccountMetadata{}, errors.New("anysyncsdk: SetIcon: account not open")
+	}
+	info, err := a.spaces.AttachTechFile(ctx, space.LimitIcon(r), space.AttachOpts{Name: opts.Name, Mime: opts.Mime})
+	if err != nil {
+		return space.AccountMetadata{}, fmt.Errorf("anysyncsdk: SetIcon: %w", err)
+	}
+	a.pushMu.Lock()
+	rec, _ := a.tsp.GetProfile(ctx)
+	prev := rec.IconFileId
+	rec.IconCID, rec.IconFileId = info.RootCid, info.FileId
+	if err := a.tsp.SetProfile(ctx, rec); err != nil {
+		a.pushMu.Unlock()
+		_ = a.spaces.DeleteTechFile(ctx, info.FileId)
+		return space.AccountMetadata{}, fmt.Errorf("anysyncsdk: persist profile: %w", err)
+	}
+	err = a.pushProfile(ctx, rec)
+	a.pushMu.Unlock()
+	if prev != "" && prev != info.FileId {
+		if derr := a.spaces.DeleteTechFile(ctx, prev); derr != nil && !errors.Is(derr, space.ErrNotFound) {
+			log.Warn("delete replaced avatar", zap.String("fileId", prev), zap.Error(derr))
+		}
+	}
+	// A dedup hit on already-durable content publishes at once;
+	// otherwise the receipt lands in the background and the watcher
+	// republishes.
+	if info.Durable {
+		a.stopIconWatch()
+	} else {
+		a.watchIconDurable(info.FileId)
+	}
+	if err != nil {
+		return recordMetadata(rec), err
+	}
+	a.kickProfiles()
+	return recordMetadata(rec), nil
+}
+
+// DeleteIcon removes the avatar file and republishes the profile
+// without it. See AccountAPI.DeleteIcon.
+func (a *accountImpl) DeleteIcon(ctx context.Context) error {
+	if a.app.AccountKeys() == nil {
+		return errors.New("anysyncsdk: DeleteIcon: no account keys")
+	}
+	if a.tsp == nil || a.spaces == nil {
+		return errors.New("anysyncsdk: DeleteIcon: account not open")
+	}
+	a.pushMu.Lock()
+	rec, ok := a.tsp.GetProfile(ctx)
+	if !ok || rec.IconFileId == "" {
+		a.pushMu.Unlock()
+		return nil
+	}
+	prev := rec.IconFileId
+	rec.IconCID, rec.IconFileId = "", ""
+	if err := a.tsp.SetProfile(ctx, rec); err != nil {
+		a.pushMu.Unlock()
+		return fmt.Errorf("anysyncsdk: persist profile: %w", err)
+	}
+	err := a.pushProfile(ctx, rec)
+	a.pushMu.Unlock()
+	a.stopIconWatch()
+	if derr := a.spaces.DeleteTechFile(ctx, prev); derr != nil && !errors.Is(derr, space.ErrNotFound) {
+		log.Warn("delete avatar", zap.String("fileId", prev), zap.Error(derr))
+	}
+	if err != nil {
+		return err
+	}
+	a.kickProfiles()
+	return nil
+}
+
+// kickProfiles wakes every running members watcher so a just-published
+// profile is reflected in their snapshots without waiting for the
+// periodic identityRepo tick (60s).
+func (a *accountImpl) kickProfiles() {
 	if a.spaces != nil {
 		a.spaces.KickProfiles()
 	}
-	return nil
+}
+
+// watchIconDurable republishes the profile once fileId's custody receipt
+// lands, then stops watching. One watch at a time: a newer avatar
+// replaces an older, still-pending one.
+func (a *accountImpl) watchIconDurable(fileId string) {
+	a.iconMu.Lock()
+	if a.iconWatch != nil {
+		a.iconWatch()
+		a.iconWatch = nil
+	}
+	a.iconWatchGen++
+	gen := a.iconWatchGen
+	a.iconMu.Unlock()
+
+	var (
+		once  sync.Once
+		unsub func()
+		ready = make(chan struct{}) // unsub assigned
+	)
+	unsub = a.spaces.SubscribeTechFileStatus(func(st space.FileStatus) {
+		if st.FileId != fileId || st.State != space.FileStateDurable {
+			return
+		}
+		once.Do(func() {
+			// Off the dispatcher: the republish takes pushMu and the
+			// unsubscribe re-enters the fanout registry.
+			go func() {
+				if err := a.republishStoredProfile(context.Background()); err != nil {
+					log.Warn("republish profile after avatar backup", zap.Error(err))
+				}
+				<-ready
+				unsub()
+				a.iconMu.Lock()
+				if a.iconWatchGen == gen {
+					a.iconWatch = nil
+				}
+				a.iconMu.Unlock()
+			}()
+		})
+	})
+	close(ready)
+	a.iconMu.Lock()
+	if a.iconWatchGen == gen {
+		a.iconWatch = unsub
+	} else {
+		// Replaced while subscribing: a newer avatar owns the slot.
+		unsub()
+	}
+	a.iconMu.Unlock()
+}
+
+func (a *accountImpl) stopIconWatch() {
+	a.iconMu.Lock()
+	if a.iconWatch != nil {
+		a.iconWatch()
+		a.iconWatch = nil
+	}
+	a.iconMu.Unlock()
 }
 
 // republishStoredProfile reads the locally-stored profile (if any) and
 // pushes it to identityRepo. Called on SDK boot to mirror heart's
 // ownProfileSubscription.Run path. No-op when no profile has been
-// written yet (fresh device, never called UpdateMetadata).
+// written yet (fresh device, never called UpdateMetadata). An avatar
+// still waiting for its backup (a restart mid-upload) re-arms the
+// durable watch.
 func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
 	if a.tsp == nil {
 		return nil
@@ -1115,33 +1287,44 @@ func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
 	if !ok || rec.IsEmpty() {
 		return nil
 	}
-	return a.pushToIdentityRepo(ctx, space.AccountMetadata{
-		Name:        rec.Name,
-		Description: rec.Description,
-		IconCID:     rec.IconCID,
-	})
+	return a.pushProfile(ctx, rec)
 }
 
-// pushToIdentityRepo signs and uploads the profile bytes to the
-// coordinator's identityRepo. Returns the raw error from the RPC so
-// callers can decide whether to surface it.
-func (a *accountImpl) pushToIdentityRepo(ctx context.Context, meta space.AccountMetadata) error {
+// pushProfile signs and uploads the profile bytes to the coordinator's
+// identityRepo. The avatar reference rides along only once its file is
+// durable — the public read path serves nothing else — and the durable
+// watch is armed otherwise, so the flip republishes. Returns the raw
+// error from the RPC so callers can decide whether to surface it.
+// Runs under pushMu.
+func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileRecord) error {
 	keys := a.app.AccountKeys()
 	symKey, err := space.DeriveAccountMetadataSymKey(keys.SignKey)
 	if err != nil {
 		return fmt.Errorf("anysyncsdk: derive metadata key: %w", err)
+	}
+	profile := space.Profile{AccountMetadata: space.AccountMetadata{Name: rec.Name, Description: rec.Description}}
+	if rec.IconFileId != "" && a.spaces != nil {
+		row, rerr := a.spaces.TechFileRow(ctx, rec.IconFileId)
+		switch {
+		case rerr != nil:
+			// The file row is gone (deleted on another device while
+			// this one still points at it): publish without the icon.
+		case row.NetworkSign != "" && row.RootCid != "" && len(row.Enc.Key) > 0:
+			profile.IconCID = row.RootCid
+			profile.IconSpaceId = a.spaces.TechSpaceId()
+			profile.IconKey = space.EncodeIconKey(row.Enc.Key)
+		default:
+			a.watchIconDurable(rec.IconFileId)
+		}
 	}
 	// Encrypt the profile with our account metadata symkey before upload —
 	// only contacts who have received the key (via a shared space's ACL or
 	// a 1-1 invite) can read it. The signature is over the CIPHERTEXT so
 	// the fetch path verifies before it decrypts (matches
 	// decodeIdentityRepoProfile).
-	payload, err := space.EncryptProfile(meta, symKey)
+	payload, err := space.EncryptProfile(profile, symKey)
 	if err != nil {
 		return fmt.Errorf("anysyncsdk: encrypt profile: %w", err)
-	}
-	if len(payload) == 0 {
-		return nil
 	}
 	signature, err := keys.SignKey.Sign(payload)
 	if err != nil {

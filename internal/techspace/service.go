@@ -689,15 +689,14 @@ func (s *Service) SetIdentityMetaKey(ctx context.Context, identity, symKey strin
 // SetIdentityProfile caches a contact's resolved identityRepo profile.
 // DEVICE-LOCAL (LocalSet → never synced): each device re-resolves from
 // the synced symkey + identityRepo. No-op when unchanged.
-func (s *Service) SetIdentityProfile(ctx context.Context, identity, name, description, iconCID string) error {
+func (s *Service) SetIdentityProfile(ctx context.Context, identity string, p IdentityProfile) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
 	if identity == "" {
 		return nil
 	}
-	if rec, ok := s.GetIdentity(ctx, identity); ok &&
-		rec.Name == name && rec.Description == description && rec.IconCID == iconCID {
+	if rec, ok := s.GetIdentity(ctx, identity); ok && rec.IdentityProfile == p {
 		return nil
 	}
 	obj, err := s.indexObj(ctx)
@@ -706,9 +705,11 @@ func (s *Service) SetIdentityProfile(ctx context.Context, identity, name, descri
 	}
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
-	payload.Set(FieldIdentityName, arena.NewString(name))
-	payload.Set(FieldIdentityDescription, arena.NewString(description))
-	payload.Set(FieldIdentityIcon, arena.NewString(iconCID))
+	payload.Set(FieldIdentityName, arena.NewString(p.Name))
+	payload.Set(FieldIdentityDescription, arena.NewString(p.Description))
+	payload.Set(FieldIdentityIcon, arena.NewString(p.IconCID))
+	payload.Set(FieldIdentityIconSpaceId, arena.NewString(p.IconSpaceId))
+	payload.Set(FieldIdentityIconKey, arena.NewString(p.IconKey))
 	change := crdt.Change{
 		Dataset:     IdentitiesDataset,
 		DataVersion: IdentitiesHandlerVersion,

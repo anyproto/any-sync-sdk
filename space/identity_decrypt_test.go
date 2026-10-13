@@ -19,11 +19,11 @@ func TestDecryptProfileLegacyPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	short := EncodeAccountMetadata(AccountMetadata{Name: "kaye"})
+	short := EncodeProfile(Profile{AccountMetadata: AccountMetadata{Name: "kaye"}})
 	if len(short) != 6 {
 		t.Fatalf("expected 6-byte legacy blob, got %d", len(short))
 	}
-	long := EncodeAccountMetadata(AccountMetadata{Name: "a-much-longer-legacy-name"})
+	long := EncodeProfile(Profile{AccountMetadata: AccountMetadata{Name: "a-much-longer-legacy-name"}})
 
 	for _, data := range [][]byte{nil, short, long, make([]byte, minProfileCiphertext-1)} {
 		if _, ok := DecryptProfile(data, key); ok {
@@ -32,7 +32,7 @@ func TestDecryptProfileLegacyPlaintext(t *testing.T) {
 	}
 
 	// sanity: a real encrypted profile still round-trips
-	meta := AccountMetadata{Name: "kaye"}
+	meta := Profile{AccountMetadata: AccountMetadata{Name: "kaye"}}
 	enc, err := EncryptProfile(meta, key)
 	if err != nil {
 		t.Fatal(err)

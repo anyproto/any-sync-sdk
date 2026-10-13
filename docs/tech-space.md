@@ -182,13 +182,18 @@ tracked and 1-1 rows; surfaced as `SpaceInfo.Derived`.
 Account-global directory of every identity seen across spaces, 1-1s and
 inbox invites; backs `sdk.Identities()`. One row per identity with mixed
 scopes: `symKey` is synced (needed to decrypt that identity's
-identityRepo profile); `name`, `description`, `iconCID` and the
-`spaceIds` sighting set are device-local. See `identities.md`.
+identityRepo profile); `name`, `description`, the avatar reference
+(`iconCID`, `iconSpaceId`, `iconKey`) and the `spaceIds` sighting set
+are device-local. See `identities.md`.
 
 ### Profile and inbox cursor
 
 `profile` holds the account's own profile, republished to identityRepo
-on boot. `inboxCursor` is the synced 1-1 inbox read position
+on boot: name, description, and the avatar as `iconCID` (its content
+address) plus `iconFileId`, the tech-space file row holding the bytes
+and the file key. The avatar file is bound to the tech index object
+and is the one files-v2 object the tech space carries
+(`identities.md` § Avatars). `inboxCursor` is the synced 1-1 inbox read position
 (`one-to-one-spaces.md`).
 
 ### Devices registry (`devices` dataset)

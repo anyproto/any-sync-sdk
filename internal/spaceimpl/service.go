@@ -1544,10 +1544,10 @@ func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity stri
 		return
 	}
 	prof, ok := s.fetchIdentityProfile(ctx, peerIdentity, key)
-	if !ok || (prof.Name == "" && prof.Description == "" && prof.IconCID == "") {
+	if !ok || prof.IsEmpty() {
 		return
 	}
-	_ = s.tsp.SetIdentityProfile(ctx, peerIdentity, prof.Name, prof.Description, prof.IconCID)
+	s.setIdentityProfile(ctx, peerIdentity, prof)
 }
 
 // activateOneToOne loads (creating storage from the armed ctx when

@@ -51,7 +51,10 @@ rejected on both routes.
 
 ## Storage tiers
 
-`Attach` picks the tier from the content; callers never choose.
+`Attach` picks the tier from the content; callers never choose. The one
+exception is the account avatar (`identities.md` § Avatars), which the
+SDK itself pins to the full tier so non-members can fetch it by
+`rootCid`.
 
 - **Inline** — size < 4096 bytes. The bytes ride inside `enc`. No
   `rootCid`, no upload, durable by construction.

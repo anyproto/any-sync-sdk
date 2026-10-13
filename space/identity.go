@@ -1,6 +1,13 @@
 package space
 
-import "github.com/anyproto/any-sync/util/crypto"
+import (
+	"encoding/base64"
+	"errors"
+	"io"
+	"strings"
+
+	"github.com/anyproto/any-sync/util/crypto"
+)
 
 // accountMetadataSymKeyPath is the SLIP-0021 derivation path for an
 // account's metadata symmetric key — the key that encrypts the account's
@@ -44,10 +51,10 @@ func UnmarshalSymKey(s string) (crypto.SymKey, error) {
 
 // IdentityProfileKind is the identityRepo `Kind` string the SDK uses for
 // the account profile record. The SDK's record is its own format — a
-// NUL-separated layout (name\x00description\x00iconCID) encrypted with the
-// account metadata symkey and signed by the account key — namespaced
-// apart from other clients' profile kinds, whose encrypted-protobuf format
-// it can't decode without explicit negotiation.
+// NUL-separated layout (see EncodeProfile) encrypted with the account
+// metadata symkey and signed by the account key — namespaced apart from
+// other clients' profile kinds, whose encrypted-protobuf format it can't
+// decode without explicit negotiation.
 //
 // The kind string MUST NOT contain a dot — the coordinator stores
 // records as MongoDB sub-documents keyed by Kind (`data.<kind>`), so
@@ -55,63 +62,120 @@ func UnmarshalSymKey(s string) (crypto.SymKey, error) {
 // re-shapes the record on disk.
 const IdentityProfileKind = "anysync-sdk-profile"
 
-// EncodeAccountMetadata serialises an AccountMetadata into the
-// canonical bytes the SDK pushes to identityRepo. Same NUL-separated
-// layout as the join-time metadata blob (see internal/spaceimpl
-// encodeMetadata) so the same decoder works on both sides — keeps
-// the parsing surface small.
-//
-// Returns nil for an empty input; caller is expected to refuse-to-push
-// on nil to avoid clobbering an existing profile with empty values.
-func EncodeAccountMetadata(m AccountMetadata) []byte {
-	if m.Name == "" && m.Description == "" && m.IconCID == "" {
-		return nil
-	}
-	out := make([]byte, 0, len(m.Name)+len(m.Description)+len(m.IconCID)+2)
-	out = append(out, m.Name...)
-	out = append(out, 0)
-	out = append(out, m.Description...)
-	out = append(out, 0)
-	out = append(out, m.IconCID...)
-	return out
+// Profile is the account's identityRepo record: the display metadata
+// plus the avatar reference. IconCID is the avatar's content address
+// (the rootCid of a durable files-v2 object); IconSpaceId names the
+// space holding it (the owner's tech space) and IconKey unlocks it.
+// Readers fetch the ciphertext by (IconSpaceId, IconCID) through the
+// public read path and decrypt it with IconKey — they never join or
+// sync the owner's space. The whole record is sealed under the metadata
+// symkey, so the key reaches exactly the contacts who can read the name.
+type Profile struct {
+	AccountMetadata
+	// IconSpaceId is the space holding the avatar file.
+	IconSpaceId string
+	// IconKey is the avatar's AES-256 file key, standard base64.
+	IconKey string
 }
 
-// DecodeAccountMetadata is the inverse — used by the per-space
-// fetcher to interpret the bytes pulled from identityRepo. Returns
-// the zero value on a malformed input rather than an error: receivers
-// fall through to the join-time metadata snapshot in that case.
-func DecodeAccountMetadata(b []byte) AccountMetadata {
+// HasIcon reports whether the profile references a fetchable avatar.
+func (p Profile) HasIcon() bool {
+	return p.IconCID != "" && p.IconSpaceId != "" && p.IconKey != ""
+}
+
+// IsEmpty reports whether the profile has nothing worth pushing.
+func (p Profile) IsEmpty() bool {
+	return p.Name == "" && p.Description == "" && p.IconCID == ""
+}
+
+// IconKeyBytes decodes IconKey; ok is false when it is absent or not a
+// 32-byte key.
+func (p Profile) IconKeyBytes() (key []byte, ok bool) {
+	if p.IconKey == "" {
+		return nil, false
+	}
+	key, err := base64.StdEncoding.DecodeString(p.IconKey)
+	if err != nil || len(key) != iconKeySize {
+		return nil, false
+	}
+	return key, true
+}
+
+// EncodeIconKey is the inverse of Profile.IconKeyBytes.
+func EncodeIconKey(key []byte) string { return base64.StdEncoding.EncodeToString(key) }
+
+// iconKeySize is the files byte-layer AES-256 key length.
+const iconKeySize = 32
+
+// MaxIconSize caps the plaintext an avatar may carry. Avatars are
+// fetched by every contact that renders the account, so the cap keeps
+// one profile from costing every reader a large download.
+const MaxIconSize = 1 << 20
+
+var (
+	// ErrIconTooLarge — SetIcon read more than MaxIconSize bytes.
+	ErrIconTooLarge = errors.New("space: profile icon exceeds the size cap")
+	// ErrProfileIconReadOnly — UpdateMetadata was handed an IconCID.
+	// The icon is a file: SetIcon stores the bytes and derives the cid.
+	ErrProfileIconReadOnly = errors.New("space: the profile icon is set through SetIcon")
+)
+
+// IconOpts is the caller metadata of an avatar upload; both fields are
+// member-only (they ride the sealed part of the tech-space file row).
+type IconOpts struct {
+	Name string
+	Mime string
+}
+
+// profileFieldSep separates the fields of the encoded profile.
+const profileFieldSep = "\x00"
+
+// EncodeProfile serialises a Profile into the canonical bytes the SDK
+// pushes to identityRepo: NUL-separated name, description, iconCID, and
+// — only for a profile with an avatar — iconSpaceId and iconKey. A
+// profile without an avatar therefore encodes exactly as it did before
+// the icon fields existed. An empty profile encodes to its separators:
+// a push that clears every field must still reach the repo.
+func EncodeProfile(p Profile) []byte {
+	fields := []string{p.Name, p.Description, p.IconCID}
+	if p.IconSpaceId != "" || p.IconKey != "" {
+		fields = append(fields, p.IconSpaceId, p.IconKey)
+	}
+	return []byte(strings.Join(fields, profileFieldSep))
+}
+
+// DecodeProfile is the inverse — used by the fetchers to interpret the
+// bytes pulled from identityRepo. Fields past the third are optional
+// (a record written before avatars existed carries three). A malformed
+// input decodes to the zero value rather than an error: receivers fall
+// through to the join-time metadata snapshot in that case.
+func DecodeProfile(b []byte) Profile {
 	if len(b) == 0 {
-		return AccountMetadata{}
+		return Profile{}
 	}
-	name, rest, ok := splitNul(b)
-	if !ok {
-		return AccountMetadata{}
+	fields := strings.Split(string(b), profileFieldSep)
+	switch len(fields) {
+	case 1:
+		return Profile{}
+	case 2:
+		return Profile{AccountMetadata: AccountMetadata{Name: fields[0]}}
 	}
-	desc, icon, ok := splitNul(rest)
-	if !ok {
-		return AccountMetadata{Name: name}
+	p := Profile{AccountMetadata: AccountMetadata{
+		Name:        fields[0],
+		Description: fields[1],
+		IconCID:     fields[2],
+	}}
+	if len(fields) >= 5 {
+		p.IconSpaceId, p.IconKey = fields[3], fields[4]
 	}
-	return AccountMetadata{
-		Name:        name,
-		Description: desc,
-		IconCID:     string(icon),
-	}
+	return p
 }
 
-// EncryptProfile serialises an AccountMetadata and encrypts it with the
-// account's metadata symkey for upload to identityRepo. Returns nil for
-// empty input (caller should refuse-to-push on nil rather than clobber an
-// existing profile). The plaintext layout is the same NUL-separated blob
-// as the (now-deprecated plaintext) identityRepo format — only the
-// transport is encrypted, so DecodeAccountMetadata still parses the
-// decrypted bytes.
-func EncryptProfile(meta AccountMetadata, key crypto.SymKey) ([]byte, error) {
-	payload := EncodeAccountMetadata(meta)
-	if len(payload) == 0 {
-		return nil, nil
-	}
-	return key.Encrypt(payload)
+// EncryptProfile serialises a Profile and encrypts it with the account's
+// metadata symkey for upload to identityRepo. Only the transport is
+// encrypted, so DecodeProfile parses the decrypted bytes.
+func EncryptProfile(p Profile, key crypto.SymKey) ([]byte, error) {
+	return key.Encrypt(EncodeProfile(p))
 }
 
 // minProfileCiphertext is the smallest well-formed AES-GCM profile blob:
@@ -130,24 +194,37 @@ const minProfileCiphertext = crypto.NonceBytes + 16
 // contact's symkey simply can't resolve the profile yet; it surfaces from
 // identity alone until the key arrives (see docs/one-to-one-spaces.md, the identityMetaKeys
 // cache).
-func DecryptProfile(data []byte, key crypto.SymKey) (AccountMetadata, bool) {
+func DecryptProfile(data []byte, key crypto.SymKey) (Profile, bool) {
 	if key == nil || len(data) < minProfileCiphertext {
-		return AccountMetadata{}, false
+		return Profile{}, false
 	}
 	plain, err := key.Decrypt(data)
 	if err != nil {
-		return AccountMetadata{}, false
+		return Profile{}, false
 	}
-	return DecodeAccountMetadata(plain), true
+	return DecodeProfile(plain), true
 }
 
-// splitNul splits on the first 0x00 byte. Returns (head, tail, true)
-// on success; (whole, nil, false) if no separator.
-func splitNul(b []byte) (string, []byte, bool) {
-	for i, c := range b {
-		if c == 0 {
-			return string(b[:i]), b[i+1:], true
+// LimitIcon bounds an avatar upload: the returned reader yields at most
+// MaxIconSize bytes and fails with ErrIconTooLarge when r has more.
+func LimitIcon(r io.Reader) io.Reader {
+	return &iconLimiter{r: io.LimitReader(r, MaxIconSize+1)}
+}
+
+type iconLimiter struct {
+	r io.Reader
+	n int64
+}
+
+func (l *iconLimiter) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	l.n += int64(n)
+	if l.n > MaxIconSize {
+		over := int(l.n - MaxIconSize)
+		if over > n {
+			over = n
 		}
+		return n - over, ErrIconTooLarge
 	}
-	return string(b), nil, false
+	return n, err
 }

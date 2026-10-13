@@ -33,6 +33,13 @@ func (s *spaceImpl) Files() space.Files {
 
 // Attach ingests r as a file bound to objectId. See space.Files.
 func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opts space.AttachOpts) (space.FileInfo, error) {
+	return f.attach(ctx, objectId, r, opts, false)
+}
+
+// attach is Attach with the tier choice exposed: noInline forces the
+// content-addressed tier (the account avatar, which non-members fetch
+// by rootCid). Public callers never choose.
+func (f *filesAPI) attach(ctx context.Context, objectId string, r io.Reader, opts space.AttachOpts, noInline bool) (space.FileInfo, error) {
 	files := f.s.parent.files
 	if files == nil {
 		return space.FileInfo{}, errors.New("files: not configured")
@@ -64,6 +71,7 @@ func (f *filesAPI) Attach(ctx context.Context, objectId string, r io.Reader, opt
 		Mime:      opts.Mime,
 		Variant:   string(opts.Variant),
 		VariantOf: opts.VariantOf,
+		NoInline:  noInline,
 	})
 	if err != nil {
 		return space.FileInfo{}, err

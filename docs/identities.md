@@ -29,11 +29,13 @@ trade-off as anytype-heart's account symkey). Every channel carries the
 same bytes for an identity, so the directory's `symKey` needs no merge
 rule.
 
-**Push.** `Account.UpdateMetadata` and the boot republish encrypt the
-profile with the symkey (`space.EncryptProfile`) and push it to
-identityRepo under `Kind = "anysync-sdk-profile"`, signing the
-ciphertext so readers verify before decrypting (`sdk.go`
-`pushToIdentityRepo`).
+**Push.** `Account.UpdateMetadata`, `Account.SetIcon` and the boot
+republish encrypt the profile with the symkey (`space.EncryptProfile`)
+and push it to identityRepo under `Kind = "anysync-sdk-profile"`,
+signing the ciphertext so readers verify before decrypting (`sdk.go`
+`pushProfile`). The record is `space.Profile`: name, description, the
+avatar's content address (`IconCID`) and, when an avatar is set, the
+space holding its file and the file key (§ Avatars).
 
 **Distribution.** The symkey travels only over channels already
 encrypted to the right audience; names and icons never travel in the
@@ -61,7 +63,7 @@ classes on one row (`internal/techspace/identities.go`):
 | Field | Scope | Why |
 |---|---|---|
 | `symKey` | synced (`LocalWrite`) | every device of the account needs it to decrypt |
-| `name` / `description` / `iconCID` | local (`LocalSet`) | derived from symkey + identityRepo per device |
+| `name` / `description` / `iconCID` / `iconSpaceId` / `iconKey` | local (`LocalSet`) | derived from symkey + identityRepo per device |
 | `spaceIds` | local array | spaces where the identity is currently seen |
 
 `spaceIds` is indexed (`IdentitiesIndexes`) for by-space queries and
@@ -82,6 +84,7 @@ type IdentitiesAPI interface {
     List(ctx) ([]IdentityInfo, error)
     Get(ctx, identity string) (IdentityInfo, bool, error)
     Subscribe(cb func(IdentityListEvent)) (cancel func())
+    OpenIcon(ctx, identity string) (FileReader, error)
 }
 
 type IdentityInfo struct {
@@ -93,10 +96,59 @@ type IdentityInfo struct {
 }
 ```
 
-Consumers never see the symkey. `Subscribe` runs on the tech-space
-`SubEngine`, like `Spaces().Subscribe`. On the tech-space handle, a
-generic `Query` of `identities` returns `ErrUnsupported` for the same
-reason.
+Consumers never see the symkey or an avatar's file key. `Subscribe`
+runs on the tech-space `SubEngine`, like `Spaces().Subscribe`. On the
+tech-space handle, a generic `Query` of `identities` returns
+`ErrUnsupported` for the same reason.
+
+## Avatars
+
+An avatar is a files-v2 object in the owner's tech space, bound to the
+tech index object (`spaceimpl.AttachTechFile`): it rides the owner's
+quota and syncs to the owner's devices like any tech-space row. The
+restricted tech handle still withholds `Files()`; the account API is
+the only writer.
+
+- **Set.** `Account.SetIcon(ctx, r, IconOpts)` stores the bytes (at
+  most `space.MaxIconSize`, `ErrIconTooLarge` beyond), always on the
+  content-addressed tier — a file under the inline cutoff would ride
+  inside the sealed row with no `rootCid` for a non-member to fetch —
+  records `{iconCID, iconFileId}` on the `profile` row, deletes the
+  replaced file and pushes the profile. `UpdateMetadata` carries name
+  and description only; an `IconCID` there fails with
+  `ErrProfileIconReadOnly`. `DeleteIcon` clears and republishes.
+- **Publish only once durable.** The profile carries the avatar
+  reference (`IconSpaceId`, `IconKey`) only after the file's custody
+  receipt is on its row: the public read path serves durable objects
+  alone, so a reader never holds a reference it cannot fetch. Until
+  then the pushed profile names no avatar; a status watch on the tech
+  space republishes on the durable flip (and the boot republish re-arms
+  it after a restart mid-upload).
+- **Read.** `Identities().OpenIcon(ctx, identity)` opens the avatar a
+  cached profile names: `fetch.Open(iconSpaceId, iconCID, iconKey)` —
+  local cache, LAN peer, then the public read URL
+  `{base}/blob/{spaceId}/{rootCid}` — decrypted with the key from the
+  profile. The reader never joins or syncs the owner's space and
+  nothing on the network checks membership on that path, which is the
+  same path every file download already takes. The own avatar opens
+  through the tech-space file. `ErrNotFound` when the identity or its
+  avatar is unknown; `ErrFileNotAvailable` when the bytes cannot be
+  fetched (no public read base on this network).
+- **Cache.** A contact's avatar is cached under the ref
+  `identity/<identity>`. The safety sweep retains rows of a space it
+  cannot resolve, so the directory write-through
+  (`spaceimpl.setIdentityProfile`) is the reclaim path: when a profile
+  moves to another avatar, or to none, the old ref is released and the
+  CAR deleted when nothing else holds it.
+- **Key hygiene.** The file key stays the random per-file key the
+  byte layer always uses (zero-IV CFB; one key per file). It is sealed
+  inside the profile under the metadata symkey, so it reaches exactly
+  the contacts who can read the name — never derived from the symkey
+  itself, which would reuse one key across avatar versions.
+- **What a contact learns.** The owner's tech space id, sealed in the
+  profile. It unlocks nothing: sync nodes serve a space to ACL members
+  only, and the public object store serves durable blobs by exact
+  `rootCid`.
 
 ## Population and pruning
 

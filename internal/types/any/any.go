@@ -44,6 +44,12 @@ const (
 const (
 	FieldType        = "type"
 	FieldCollections = "collections"
+	// FieldTemplate names the template an object was copied from —
+	// {TemplateStampId, TemplateStampVersion} — stamped by a create
+	// whose From is filed under the built-in `template` collection.
+	FieldTemplate        = "template"
+	TemplateStampId      = "id"
+	TemplateStampVersion = "version"
 )
 
 // BuiltInProperty is one hardcoded property definition for the `any`
@@ -111,4 +117,10 @@ var Properties = []BuiltInProperty{
 	// Synced: tags are shared object metadata, like name/description.
 	{Id: "tags", Name: "Tags", Kind: schema.KindArray, Scope: schema.ScopeSynced,
 		Description: "Free-form user labels."},
+	// `template` records what the object was copied from: the template
+	// object's id and its `template.version` at copy time. Written by
+	// the copy; a consumer rewrites it after bringing the object up to
+	// date. Absent on an object not made from a template.
+	{Id: FieldTemplate, Name: "Template", Kind: schema.KindObject, Scope: schema.ScopeSynced,
+		Description: "The template the object was copied from: {id, version}; absent otherwise."},
 }

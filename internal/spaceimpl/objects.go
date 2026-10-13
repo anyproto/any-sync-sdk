@@ -96,6 +96,13 @@ func newObjectService(parent *spaceImpl) *objectService { return &objectService{
 // bootstrap modify (membership + InitialProperties) in one extra
 // change, and returns the new objectId.
 func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts) (string, error) {
+	var src *copySource
+	if opts.From != "" {
+		var err error
+		if src, opts, err = o.resolveCopy(ctx, opts); err != nil {
+			return "", err
+		}
+	}
 	if opts.Type == "" {
 		return "", fmt.Errorf("%w: CreateObjectOpts.Type", space.ErrTypeRequired)
 	}
@@ -118,6 +125,16 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 			// reclaims it without a settings-tree deletion record.
 			if derr := o.parent.store.DeleteTree(ctx, objectId); derr != nil {
 				objectLog.Warn("orphaned tree after a refused bootstrap", zap.String("objectId", objectId), zap.Error(derr))
+			}
+			return "", err
+		}
+	}
+	if src != nil {
+		if err := o.copyDatasets(ctx, src, objectId); err != nil {
+			// The row is already written: a half copy is reclaimed the
+			// way a user delete is, best effort.
+			if derr := o.Delete(ctx, objectId); derr != nil {
+				logCopyAbort(objectId, derr)
 			}
 			return "", err
 		}

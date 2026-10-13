@@ -14,7 +14,7 @@ in the local DB:
 Every object has one row in its space's `objects` collection,
 `id` = any-sync objectId. The row holds the derived fields (`id`,
 `author`, `spaceId`, `createdAt`, `modifiedAt`, `modifiedBy`), the
-universal `any` properties (name, description, icon, tags, `type`,
+universal `any` properties (name, description, icon, tags, `template`, `type`,
 `collections`) and the values of every property its type and
 collections define.
 
@@ -293,6 +293,14 @@ IconCID, Properties []PropertyDecl, Hidden}` and validated at
 appears in `Collections().List` / `Get` with `BuiltIn` set, validates
 writes like a registered type, and never changes at runtime
 (`ErrTypeRegistered`).
+
+The SDK registers one collection of its own ahead of the consumer's:
+**`template`** (`space.TemplateCollectionId`, hidden; `title` string,
+`version` number), the marker of an object that is a template of its
+type. `Objects().Create` with `From` copies such an object without the
+marker and stamps `any.template = {id, version}` on the new row
+(docs/object.md § Object API). A consumer declaration under this id,
+as a type or a collection, is refused at `sdk.Open`.
 
 #### Module namespaces
 

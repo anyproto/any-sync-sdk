@@ -5,6 +5,8 @@ import (
 	"errors"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+
+	"github.com/anyproto/any-sync-sdk/internal/types/template"
 )
 
 // ErrTypeRequired is returned by Objects().Create without a Type, by
@@ -78,7 +80,33 @@ type CreateObjectOpts struct {
 	// owner (the type or a collection) → propId → value. An owner the
 	// object does not have is rejected — name it in Type / Collections.
 	InitialProperties map[string]map[string]any
+
+	// From names an object to copy. The new object takes the source's
+	// type (Type is then optional and must equal it:
+	// ErrFromTypeMismatch), its collections, its synced `any.*` values,
+	// the synced values of every owner the new object has, and the live
+	// records of every dataset the source's type declares through its
+	// parts — a reserved module's excepted. Collections are added to
+	// the copied ones and InitialProperties are written over the copied
+	// values. A source filed under the built-in TemplateCollectionId is
+	// a template: the marker is not carried over and the row is stamped
+	// `any.template` {id, version} with the source's `template.version`
+	// (0 when unset). Any other source is a plain duplicate. An unknown
+	// or deleted source is ErrObjectNotFound / ErrObjectDeleted; a
+	// definition's own row is ErrMetaType.
+	From string
 }
+
+// ErrFromTypeMismatch is returned by Objects().Create when Type names a
+// type other than the one CreateObjectOpts.From carries: a copy keeps
+// the source's type. A client error → 4xx.
+var ErrFromTypeMismatch = errors.New("space: type differs from the copied object's type")
+
+// TemplateCollectionId is the built-in collection the SDK registers in
+// every space as the template marker (hidden, builtIn, two properties:
+// `title` and `version`). An object filed under it is a template of
+// its type; CreateObjectOpts.From copies it.
+const TemplateCollectionId = template.CollectionId
 
 // DeriveObjectOpts is the input to ObjectService.Derive.
 type DeriveObjectOpts struct {

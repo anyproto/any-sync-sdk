@@ -61,7 +61,7 @@ builder), `commonspace/object/tree/treechangeproto`,
 ## Object API
 
 ```go
-space.Objects().Create(ctx, CreateObjectOpts{Type, Collections, InitialProperties}) // → objectId
+space.Objects().Create(ctx, CreateObjectOpts{Type, Collections, InitialProperties, From}) // → objectId
 space.Objects().Derive(ctx, DeriveObjectOpts{Seed, Type, Collections, ParentId})    // → objectId, idempotent
 space.Objects().Get(ctx, objectId)    // the objects row; ErrNotFound / ErrObjectDeleted
 space.Objects().Delete(ctx, objectId)
@@ -76,6 +76,20 @@ space.Modify(ctx, ModifyBatch)  // → ModifyResult{VersionId, ChangeId, RecordI
 space.Delete(ctx, DeleteBatch)
 space.Upsert(ctx, UpsertBatch)
 ```
+
+`Create` with a `From` copies an object: the new one takes the source's
+type (`Type` is then optional and must equal it, `ErrFromTypeMismatch`),
+its collections, its synced `any.*` values, the synced values of every
+owner the new object has and the live records of every dataset the
+source's type declares through its parts (a reserved module's excepted),
+one change per dataset after the bootstrap. `Collections` are added to
+the copied ones and `InitialProperties` are written over the copied
+values. A source filed under the built-in `template` collection
+(`space.TemplateCollectionId`) is a template: the marker is not carried
+over and the row is stamped `any.template = {id, version}` with the
+source's `template.version`. Any other source is a plain duplicate.
+Record ids are kept, so a per-object dataset's references between
+records survive; an `IdAuto` records dataset derives fresh ones.
 
 `Derive` with a `ParentId` binds the child to its parent: the parent id is
 hashed into the child's id, and deleting the parent deletes the child. Creating

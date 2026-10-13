@@ -83,17 +83,25 @@ type CreateObjectOpts struct {
 
 	// From names an object to copy. The new object takes the source's
 	// type (Type is then optional and must equal it:
-	// ErrFromTypeMismatch), its collections, its synced `any.*` values,
-	// the synced values of every owner the new object has, and the live
-	// records of every dataset the source's type declares through its
-	// parts — a reserved module's excepted. Collections are added to
-	// the copied ones and InitialProperties are written over the copied
-	// values. A source filed under the built-in TemplateCollectionId is
-	// a template: the marker is not carried over and the row is stamped
+	// ErrFromTypeMismatch), its collections minus every registered
+	// marker (a consumer's registered collections and the template
+	// marker are states of the source, never content), its synced
+	// `any.*` values, the declared synced values of every owner the new
+	// object has, and the live records of every dataset the source's
+	// type declares through its parts — a reserved module's excepted —
+	// in changes of at most a thousand records after the bootstrap.
+	// Record ids are kept except where the generic schema handler
+	// derives them (IdAuto); on a dataset that is not Dynamic only the
+	// declared fields travel. Collections are added to the copied ones
+	// and InitialProperties are written over the copied values (a
+	// value is replaced, never cleared). A source filed under the
+	// built-in TemplateCollectionId is a template: the row is stamped
 	// `any.template` {id, version} with the source's `template.version`
-	// (0 when unset). Any other source is a plain duplicate. An unknown
-	// or deleted source is ErrObjectNotFound / ErrObjectDeleted; a
-	// definition's own row is ErrMetaType.
+	// (0 when unset); any other source keeps the stamp it has. An
+	// unknown source, or one whose row has not synced here yet, is
+	// ErrObjectNotFound; a deleted one ErrObjectDeleted; a definition's
+	// own row ErrMetaType; a record the dataset's create rules refuse
+	// today ErrFromRecordRefused, and the half copy is deleted.
 	From string
 }
 
@@ -101,6 +109,13 @@ type CreateObjectOpts struct {
 // type other than the one CreateObjectOpts.From carries: a copy keeps
 // the source's type. A client error → 4xx.
 var ErrFromTypeMismatch = errors.New("space: type differs from the copied object's type")
+
+// ErrFromRecordRefused is returned by Objects().Create with From when a
+// record of the source no longer passes its dataset's create rules, or
+// a handler rejects it at apply: a required field unset since, a
+// bespoke create check. The copy is abandoned and the new object
+// deleted. The source, not the request, is what needs repair.
+var ErrFromRecordRefused = errors.New("space: a record of the copied object is refused by its dataset")
 
 // TemplateCollectionId is the built-in collection the SDK registers in
 // every space as the template marker (hidden, builtIn, two properties:

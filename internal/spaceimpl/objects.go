@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -84,6 +85,9 @@ var objectLog = logger.NewNamed("sdk.objects")
 // every deriver of the same object must pass the same value.
 const objectChangeType = "object"
 
+// copyCleanupTimeout bounds the delete that reclaims a half copy.
+const copyCleanupTimeout = 30 * time.Second
+
 // objectService implements space.ObjectService backed by the
 // per-space spaceobjects.Store.
 type objectService struct {
@@ -132,8 +136,12 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 	if src != nil {
 		if err := o.copyDatasets(ctx, src, objectId); err != nil {
 			// The row is already written: a half copy is reclaimed the
-			// way a user delete is, best effort.
-			if derr := o.Delete(ctx, objectId); derr != nil {
+			// way a user delete is, best effort, on a context the
+			// failure's own cancellation cannot take down.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), copyCleanupTimeout)
+			derr := o.Delete(cleanupCtx, objectId)
+			cancel()
+			if derr != nil {
 				logCopyAbort(objectId, derr)
 			}
 			return "", err
@@ -390,29 +398,57 @@ func needsBootstrap(opts space.CreateObjectOpts) bool {
 
 // bootstrap writes the post-create initial state (membership +
 // per-owner property values) into the object's `properties` dataset.
-// One Modify call regardless of how many owners / properties are
-// being seeded — keeps the DAG clean.
+// One change regardless of how many owners / properties are being
+// seeded — keeps the DAG clean — carrying one multi-field op for the
+// membership and one per owner's values, with the template stamp on
+// its own: a peer that does not know an owner or a field drops the
+// op that carries it and keeps the rest of the row (a create has no
+// per-key salvage), so an object stays typed and named everywhere.
 func (o *objectService) bootstrap(ctx context.Context, objectId string, opts space.CreateObjectOpts) (space.ModifyResult, error) {
 	arena := &anyenc.Arena{}
-	multi := arena.NewObject()
+	var ops []crdt.Op
 
+	membership := arena.NewObject()
 	if opts.Type != "" {
-		multi.Set(anytype.TypeId+"."+anytype.FieldType, arena.NewString(opts.Type))
+		membership.Set(anytype.TypeId+"."+anytype.FieldType, arena.NewString(opts.Type))
 	}
 	if len(opts.Collections) > 0 {
 		arr := arena.NewArray()
 		for i, t := range opts.Collections {
 			arr.SetArrayItem(i, arena.NewString(t))
 		}
-		multi.Set(anytype.TypeId+"."+anytype.FieldCollections, arr)
+		membership.Set(anytype.TypeId+"."+anytype.FieldCollections, arr)
 	}
-	for typeId, kv := range opts.InitialProperties {
+	if opts.Type != "" || len(opts.Collections) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: membership})
+	}
+	for _, typeId := range uniqueOwners(opts) {
+		kv := opts.InitialProperties[typeId]
+		if len(kv) == 0 {
+			continue
+		}
+		group := arena.NewObject()
+		var stamp *anyenc.Value
+		n := 0
 		for propId, val := range kv {
 			v, err := goToAnyenc(arena, val)
 			if err != nil {
 				return space.ModifyResult{}, fmt.Errorf("InitialProperties[%s.%s]: %w", typeId, propId, err)
 			}
-			multi.Set(typeId+"."+propId, v)
+			if typeId == anytype.TypeId && propId == anytype.FieldTemplate {
+				stamp = v
+				continue
+			}
+			group.Set(typeId+"."+propId, v)
+			n++
+		}
+		if n > 0 {
+			ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: group})
+		}
+		if stamp != nil {
+			only := arena.NewObject()
+			only.Set(anytype.TypeId+"."+anytype.FieldTemplate, stamp)
+			ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: only})
 		}
 	}
 
@@ -435,7 +471,7 @@ func (o *objectService) bootstrap(ctx context.Context, objectId string, opts spa
 			{
 				Id:     objectId,
 				Upsert: true,
-				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
+				Ops:    ops,
 			},
 		},
 	})

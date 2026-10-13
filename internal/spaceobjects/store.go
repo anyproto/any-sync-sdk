@@ -980,6 +980,11 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 		if _, reserved := ReservedTypeIds[m.Name]; reserved {
 			return fmt.Errorf("spaceobjects: module[%d]: name %q is reserved for a built-in type", i, m.Name)
 		}
+		if isBuiltInCollectionId(m.Name) {
+			// Modules own an objects-row namespace under their name;
+			// the built-in collection's would shadow it.
+			return fmt.Errorf("spaceobjects: module[%d]: name %q is a built-in collection", i, m.Name)
+		}
 		for _, t := range extTypes {
 			if t.Id == m.Name {
 				return fmt.Errorf("spaceobjects: module[%d]: name %q collides with a registered type id", i, m.Name)

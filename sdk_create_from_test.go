@@ -22,8 +22,10 @@ import (
 const (
 	cfType    = "cf-doc"
 	cfDataset = "cf_blocks"
+	cfNotes   = "cf_notes"
 	cfStatus  = "status"
 	cfSecret  = "secret"
+	cfMarker  = "cf-pin"
 )
 
 func cfConfig(t *testing.T, dataDir string) config.Config {
@@ -36,11 +38,28 @@ func cfConfig(t *testing.T, dataDir string) config.Config {
 			{Id: cfStatus, Name: "Status", Kind: handler.PropertyKindString},
 			{Id: cfSecret, Name: "Secret", Kind: handler.PropertyKindString, Scope: handler.ScopeLocal},
 		},
-		Datasets: []handler.Dataset{{
-			Name:        cfDataset,
-			DataVersion: "cf-v1",
-			Handler:     handler.DefaultHandler{},
-		}},
+		Datasets: []handler.Dataset{
+			{
+				Name:        cfDataset,
+				DataVersion: "cf-v1",
+				Handler:     handler.DefaultHandler{},
+			},
+			// The generic schema handler: derived ids, a creator stamp,
+			// a required field, undeclared fields refused.
+			{
+				Name:        cfNotes,
+				DataVersion: "cf-v1",
+				Schema: handler.Schema{Fields: []handler.Field{
+					{Id: "text", Schema: handler.Leaf(handler.PropertyKindString), Required: true},
+					{Id: "by", Stamp: handler.StampCreator},
+				}},
+			},
+		},
+	})
+	// A consumer marker, the bin's shape: never carried into a copy.
+	cfg.Collections = append(cfg.Collections, handler.Collection{
+		Id: cfMarker, Name: "Pin", Hidden: true,
+		Properties: []handler.PropertyDecl{{Id: "pos", Name: "Pos", Kind: handler.PropertyKindString}},
 	})
 	return cfg
 }
@@ -61,8 +80,12 @@ func cfOpen(t *testing.T) (context.Context, space.Space) {
 // cfRecords reads the dataset's live records keyed by id, system fields
 // dropped.
 func cfRecords(t *testing.T, ctx context.Context, sp space.Space, objectId string) map[string]map[string]any {
+	return cfRecordsOf(t, ctx, sp, objectId, cfDataset)
+}
+
+func cfRecordsOf(t *testing.T, ctx context.Context, sp space.Space, objectId, dataset string) map[string]map[string]any {
 	t.Helper()
-	docs, err := sp.Query(objectId, cfDataset).All(ctx)
+	docs, err := sp.Query(objectId, dataset).All(ctx)
 	require.NoError(t, err)
 	out := make(map[string]map[string]any, len(docs))
 	for _, d := range docs {
@@ -107,6 +130,12 @@ func cfSeed(t *testing.T, ctx context.Context, sp space.Space, collections []str
 	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: id, Dataset: cfDataset, Records: []space.RecordModify{
 		{Id: "b1", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "Heading", "nav": map[string]any{"parentId": "", "pos": "a0"}}}}},
 		{Id: "b2", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "Child", "nav": map[string]any{"parentId": "b1", "pos": "a0"}}}}},
+		{Id: "b3", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{}}}},
+	}})
+	require.NoError(t, err)
+	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: id, Dataset: cfNotes, Records: []space.RecordModify{
+		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "note one"}}}},
+		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "note two"}}}},
 	}})
 	require.NoError(t, err)
 	// A local-scope value on the source never travels.
@@ -166,6 +195,20 @@ func TestCreateFrom_Template(t *testing.T) {
 	want := cfRecords(t, ctx, sp, src)
 	assert.Equal(t, want, got, "records copied with their ids and fields")
 	require.Contains(t, got, "b2")
+	assert.Contains(t, got, "b3", "a record with nothing but its id is recreated")
+
+	// A schema dataset: fresh derived ids, the stamp re-derived.
+	notes := cfRecordsOf(t, ctx, sp, id, cfNotes)
+	srcNotes := cfRecordsOf(t, ctx, sp, src, cfNotes)
+	require.Len(t, notes, 2)
+	texts := map[string]bool{}
+	for rid, fields := range notes {
+		_, same := srcNotes[rid]
+		assert.False(t, same, "a derived id is not reused")
+		texts[fields["text"].(string)] = true
+		assert.NotEmpty(t, fields["by"], "the creator stamp is re-derived")
+	}
+	assert.Equal(t, map[string]bool{"note one": true, "note two": true}, texts)
 
 	// A later edit of the template leaves the copy alone.
 	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: src, Dataset: cfDataset, Records: []space.RecordModify{
@@ -224,6 +267,38 @@ func TestCreateFrom_DuplicateAndSaveAsTemplate(t *testing.T) {
 	assert.Empty(t, row.GetArray("any", "collections"))
 	assert.Equal(t, tpl, string(row.GetStringBytes("any", "template", "id")))
 	assert.Equal(t, float64(1), row.GetFloat64("any", "template", "version"))
+
+	// A duplicate of a stamped object keeps its lineage.
+	again, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: made})
+	require.NoError(t, err)
+	row, err = sp.Objects().Get(ctx, again)
+	require.NoError(t, err)
+	assert.Equal(t, tpl, string(row.GetStringBytes("any", "template", "id")))
+}
+
+// A consumer's registered collection is a marker of the source — like
+// the bin or the sidebar — and never travels, values included; the
+// request may still file the copy under one.
+func TestCreateFrom_MarkersStayBehind(t *testing.T) {
+	ctx, sp := cfOpen(t)
+	src := cfSeed(t, ctx, sp, []string{cfMarker}, map[string]map[string]any{cfMarker: {"pos": "a0"}})
+
+	dup, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: src})
+	require.NoError(t, err)
+	row, err := sp.Objects().Get(ctx, dup)
+	require.NoError(t, err)
+	assert.Empty(t, row.GetArray("any", "collections"))
+	assert.Nil(t, row.Get(cfMarker))
+
+	pinned, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		From: src, Collections: []string{cfMarker},
+		InitialProperties: map[string]map[string]any{cfMarker: {"pos": "b0"}},
+	})
+	require.NoError(t, err)
+	row, err = sp.Objects().Get(ctx, pinned)
+	require.NoError(t, err)
+	require.Len(t, row.GetArray("any", "collections"), 1)
+	assert.Equal(t, "b0", string(row.GetStringBytes(cfMarker, "pos")))
 }
 
 func TestCreateFrom_Refusals(t *testing.T) {

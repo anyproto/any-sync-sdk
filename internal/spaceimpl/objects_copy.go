@@ -9,6 +9,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -19,6 +20,10 @@ import (
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+// copyBatch bounds the records one change carries when a dataset is
+// copied, so a large body becomes several DAG changes instead of one.
+const copyBatch = 1000
 
 // copySource is the object CreateObjectOpts.From names, resolved
 // before the new tree is minted: its id, its type and the datasets
@@ -31,11 +36,11 @@ type copySource struct {
 
 // resolveCopy reads the source row once and folds it into opts: the
 // source's type (opts.Type must be absent or equal), its collections
-// minus the template marker ahead of the request's, its synced `any.*`
-// values and the synced values of every owner the new object has,
-// then the request's InitialProperties over them. A source filed under
-// `template` also stamps any.template {id, version}. The returned
-// source drives copyDatasets after the bootstrap.
+// minus the registered markers ahead of the request's, its synced
+// `any.*` values and the declared synced values of every owner the new
+// object has, then the request's InitialProperties over them. A source
+// filed under `template` also stamps any.template {id, version}. The
+// returned source drives copyDatasets after the bootstrap.
 func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObjectOpts) (*copySource, space.CreateObjectOpts, error) {
 	row, err := o.Get(ctx, opts.From)
 	if err != nil {
@@ -46,7 +51,10 @@ func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObject
 	}
 	srcType := string(row.GetStringBytes(anytype.TypeId, anytype.FieldType))
 	if srcType == "" {
-		return nil, opts, fmt.Errorf("%w: CreateObjectOpts.From %s has no type", space.ErrTypeRequired, opts.From)
+		// A tree without its row: the bootstrap has not landed here
+		// (parked behind its type definition, or still syncing). Not
+		// addressable yet, like an unknown id; a retry after sync works.
+		return nil, opts, fmt.Errorf("%w: CreateObjectOpts.From %s has no row here yet", space.ErrObjectNotFound, opts.From)
 	}
 	if properties.IsMetaType(srcType) || srcType == typetype.MetaTypeMarker || srcType == collectiontype.MetaMarker {
 		return nil, opts, fmt.Errorf("%w: CreateObjectOpts.From %s is a definition", space.ErrMetaType, opts.From)
@@ -57,6 +65,14 @@ func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObject
 	}
 	opts.Type = srcType
 
+	// Registered collections are markers of the source object — binned,
+	// pinned, a template — never content: none travels. The request's
+	// collections are added afterwards, so a copy can be filed under
+	// one deliberately (save as template).
+	markers := make(map[string]struct{})
+	for _, c := range o.parent.store.ExternalCollections() {
+		markers[c.Id] = struct{}{}
+	}
 	isTemplate := false
 	seen := make(map[string]struct{})
 	var collections []string
@@ -74,6 +90,8 @@ func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObject
 		id := string(v.GetStringBytes())
 		if id == template.CollectionId {
 			isTemplate = true
+		}
+		if _, marker := markers[id]; marker {
 			continue
 		}
 		add(id)
@@ -92,10 +110,11 @@ func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObject
 		}
 		group[prop] = v
 	}
-	// `any`: the synced display values; membership and the stamp are
-	// the copy's own.
+	// `any`: every synced value but membership. The stamp travels too
+	// — a duplicate keeps the lineage of what it was copied from —
+	// and is replaced below when the source is itself a template.
 	for _, p := range anytype.Properties {
-		if p.Scope != schema.ScopeSynced || p.Id == anytype.FieldType || p.Id == anytype.FieldCollections || p.Id == anytype.FieldTemplate {
+		if p.Scope != schema.ScopeSynced || p.Id == anytype.FieldType || p.Id == anytype.FieldCollections {
 			continue
 		}
 		if v := row.Get(anytype.TypeId, p.Id); v != nil {
@@ -175,11 +194,14 @@ func (o *objectService) copyableDatasets(ctx context.Context, typeId string) ([]
 }
 
 // copyDatasets writes the source's live records into the new object,
-// one change per dataset, after the bootstrap set the type that admits
-// them. Record ids are kept — a per-object dataset is its own
-// collection and a shared one prefixes the new object's id — except
-// where the generic schema handler derives them (IdAuto), which
-// refuses an explicit id.
+// dataset by dataset in changes of at most copyBatch records, after the
+// bootstrap set the type that admits them. Record ids are kept — a
+// per-object dataset is its own collection and a shared one prefixes
+// the new object's id — except where the generic schema handler
+// derives them, which refuses an explicit id. A record the dataset's
+// create rules refuse today, or a handler rejects at apply, fails the
+// copy (ErrFromRecordRefused): a silent partial copy is worse than
+// none.
 func (o *objectService) copyDatasets(ctx context.Context, src *copySource, objectId string) error {
 	if len(src.datasets) == 0 {
 		return nil
@@ -191,63 +213,120 @@ func (o *objectService) copyDatasets(ctx context.Context, src *copySource, objec
 	}
 	srcObj, err := o.parent.store.Get(ctx, src.id)
 	if err != nil {
+		if deleted, derr := o.parent.store.TreeDeleted(ctx, src.id); derr == nil && deleted {
+			return fmt.Errorf("spaceimpl: copy from %s: %w", src.id, space.ErrObjectDeleted)
+		}
 		return fmt.Errorf("spaceimpl: copy from %s: %w", src.id, err)
 	}
+	ctrl := srcObj.Controller()
 	for i := range src.datasets {
 		ds := &src.datasets[i]
-		rows := srcObj.Controller().Records(ctx, ds.Name)
-		records := make([]space.RecordModify, 0, len(rows))
-		for _, row := range rows {
-			if rec, ok := copyRecord(src.id, ds, row); ok {
-				records = append(records, rec)
-			}
+		rows, err := copyRows(ctx, ctrl, ds.Name)
+		if err != nil {
+			return fmt.Errorf("spaceimpl: copy %s from %s: %w", ds.Name, src.id, err)
 		}
-		if len(records) == 0 {
+		if len(rows) == 0 {
 			continue
 		}
-		if _, err := o.parent.Modify(ctx, space.ModifyBatch{ObjectId: objectId, Dataset: ds.Name, Records: records}); err != nil {
-			return fmt.Errorf("spaceimpl: copy %s from %s: %w", ds.Name, src.id, err)
+		decl, ok := ctrl.DatasetSchema(ds.Name)
+		if !ok {
+			decl = ds.Schema.Normalized()
+		}
+		deriveIds := ctrl.DerivesRecordIds(ds.Name)
+		records := make([]space.RecordModify, 0, len(rows))
+		for _, row := range rows {
+			records = append(records, copyRecord(src.id, &decl, deriveIds, row))
+		}
+		for start := 0; start < len(records); start += copyBatch {
+			end := min(start+copyBatch, len(records))
+			res, err := o.parent.Modify(ctx, space.ModifyBatch{ObjectId: objectId, Dataset: ds.Name, Records: records[start:end]})
+			if err != nil {
+				if errors.Is(err, crdt.ErrValidation) {
+					return fmt.Errorf("%w: %s from %s: %w", space.ErrFromRecordRefused, ds.Name, src.id, err)
+				}
+				return fmt.Errorf("spaceimpl: copy %s from %s: %w", ds.Name, src.id, err)
+			}
+			if len(res.Rejections) > 0 {
+				rj := res.Rejections[0]
+				return fmt.Errorf("%w: %s from %s: record %q: %s", space.ErrFromRecordRefused, ds.Name, src.id, rj.RecordId, rj.Reason)
+			}
 		}
 	}
 	return nil
 }
 
-// copyRecord turns one live source row into the upsert that recreates
-// it: every field but the id, the `_`-prefixed system fields and the
-// fields the dataset declares derived, stamped or local.
-func copyRecord(srcId string, ds *types.CompiledDataset, row *anyenc.Value) (space.RecordModify, bool) {
-	obj, err := row.Object()
+// copyRows reads the dataset's live records of the controller's object,
+// each cloned off the iterator's buffer. A dataset with no collection
+// here has no records; a read that fails is an error, never an empty
+// copy.
+func copyRows(ctx context.Context, ctrl *crdt.Controller, dataset string) ([]*anyenc.Value, error) {
+	coll, err := ctrl.OpenForRead(ctx, dataset)
 	if err != nil {
-		return space.RecordModify{}, false
+		return nil, err
 	}
-	skip := make(map[string]struct{}, len(ds.Schema.Fields))
-	for _, f := range ds.Schema.Fields {
-		if f.Stamp != 0 || (f.Scope != 0 && f.Scope != schema.ScopeSynced) {
-			skip[f.Id] = struct{}{}
+	if coll == nil {
+		return nil, nil
+	}
+	var filter any
+	if ctrl.IsKeyed(dataset) {
+		filter = crdt.KeyedRows(ctrl.ObjectId())
+	}
+	iter, err := coll.Find(filter).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []*anyenc.Value
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return nil, err
 		}
+		v := doc.Value()
+		if v.Get(crdt.DeletedAtField) != nil {
+			continue
+		}
+		if cloned := anyencx.Clone(v); cloned != nil {
+			out = append(out, cloned)
+		}
+	}
+	return out, iter.Err()
+}
+
+// copyRecord turns one live source row into the upsert that recreates
+// it: the id and the `_`-prefixed system fields stay behind, so do the
+// fields the dataset declares derived, stamped or local, and on a
+// dataset that is not Dynamic every undeclared field (one a removed
+// definition left on the record). A record with nothing else is still
+// recreated — its id is what it says.
+func copyRecord(srcId string, decl *schema.Dataset, deriveIds bool, row *anyenc.Value) space.RecordModify {
+	keep := make(map[string]bool, len(decl.Fields))
+	for _, f := range decl.Fields {
+		keep[f.Id] = f.Stamp == 0 && (f.Scope == 0 || f.Scope == schema.ScopeSynced)
 	}
 	a := &anyenc.Arena{}
 	fields := a.NewObject()
-	n := 0
-	obj.Visit(func(k []byte, v *anyenc.Value) {
-		key := string(k)
-		if key == recordIdField || strings.HasPrefix(key, "_") {
-			return
-		}
-		if _, s := skip[key]; s {
-			return
-		}
-		fields.Set(key, v)
-		n++
-	})
-	if n == 0 {
-		return space.RecordModify{}, false
+	if obj, err := row.Object(); err == nil {
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			key := string(k)
+			if key == recordIdField || strings.HasPrefix(key, "_") {
+				return
+			}
+			if declared, ok := keep[key]; ok {
+				if !declared {
+					return
+				}
+			} else if !decl.Dynamic {
+				return
+			}
+			fields.Set(key, v)
+		})
 	}
 	rec := space.RecordModify{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: fields}}}
-	if !(ds.Module == types.RecordsModule && ds.Schema.IdRule == schema.IdAuto) {
+	if !deriveIds {
 		rec.Id = crdt.KeyedRecordId(srcId, string(row.GetStringBytes(recordIdField)))
 	}
-	return rec, true
+	return rec
 }
 
 // recordIdField is the record's own id on an any-store row.

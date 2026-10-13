@@ -230,8 +230,7 @@ sticky tombstone would block the account's well-known id forever.
 - Enforcement: `Delete` refuses flagged rows (and the tech space id,
   `ErrIsTechSpace`); the space-index handler rejects
   `remoteStatus=deleted` on flagged rows from any writer; the deletion
-  reconciler skips them (a coordinator `NotExists` for a space derived
-  offline must not tombstone it).
+  reconciler skips them.
 - 1-1 spaces keep their own re-derivable local-delete path.
 
 ### Space Lifecycle
@@ -254,7 +253,11 @@ local half and a deferred network half.
 The reconciler also polls the coordinator (`StatusCheckMany`); a space it
 reports gone (deleted on another device, or the owner deleted a space you
 joined) is marked `deleted` and offloaded. The row is never physically
-removed: it stays in `List` with `StatusDeleted`.
+removed: it stays in `List` with `StatusDeleted`. A coordinator
+`NotExists` is not "gone": the coordinator registers a space on its first
+push and never purges a registered record, so `NotExists` means the space
+was never registered (its first push has not landed, it was deleted
+before it could push, or the push was refused) and the row is left alone.
 
 **1-1 and guest spaces** delete locally only. `Delete` writes a synced,
 non-terminal marker (`oneToOneDeleted` / `guestDeleted`) and offloads;

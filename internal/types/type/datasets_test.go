@@ -429,7 +429,8 @@ func TestCompileDatasetDefs_FoldsRecords(t *testing.T) {
 		byId[f.Id] = f
 	}
 	assert.Equal(t, schema.KindString, byId["title"].Schema.Kind, "first writer wins the duplicate key")
-	assert.True(t, byId["title"].Required)
+	assert.True(t, byId["title"].Additive, "declared by a later change than the head")
+	assert.False(t, byId["title"].Required, "an additive field is never required")
 	assert.Equal(t, schema.MutableByAuthor, byId["body"].MutableBy)
 	assert.Equal(t, "The article body", byId["body"].Description)
 	assert.Equal(t, map[string]any{"type": "longtext", "icon": "text"}, byId["body"].XFormat)
@@ -839,6 +840,160 @@ func TestDatasetDefs_PreflightSubsetOfHandler(t *testing.T) {
 			if !rec.pinned {
 				assert.Empty(t, res.Rejections, "%s preflight admits %v, the handler must too", rec.preflit, p)
 			}
+		}
+	}
+}
+
+func defsChangeMulti(versionId crdt.VersionId, changeId string, recs ...crdt.RecordChange) crdt.Change {
+	return crdt.Change{
+		ObjectId:    testObjectId,
+		Dataset:     typetype.DatasetDefs,
+		ChangeId:    changeId,
+		VersionId:   versionId,
+		DataVersion: defsDataVer,
+		Records:     recs,
+	}
+}
+
+// Fields declared in one change share a creation id: the compiled order
+// falls back to the key, so Types().Datasets and the schema revision are
+// the same on every compile. A field declared by a later change is
+// additive.
+func TestCompileDatasetDefs_SameChangeFieldOrderAndAdditive(t *testing.T) {
+	ctrl, db := newDefsController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
+
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChangeMulti("v1", "c1",
+		crdt.RecordChange{Id: "head-1", Upsert: true, Ops: []crdt.Op{headPayload(arena, "scores", map[string]any{typetype.DefFieldDynamic: true})}},
+		crdt.RecordChange{Id: "f-zeta", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-1", "zeta", "string", map[string]any{typetype.DefFieldRequired: true})}},
+		crdt.RecordChange{Id: "f-alpha", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-1", "alpha", "string", map[string]any{typetype.DefFieldRequired: true})}},
+		crdt.RecordChange{Id: "f-mid", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-1", "mid", "number", nil)}},
+	)))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v2", "c2", "f-beta", true,
+		fieldPayload(arena, "head-1", "beta", "number", nil))))
+
+	var rev string
+	for i := 0; i < 25; i++ {
+		compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
+		require.NoError(t, err)
+		require.Len(t, compiled, 1)
+		ds := compiled[0]
+		var keys []string
+		for _, f := range ds.Schema.Fields {
+			keys = append(keys, f.Id)
+			assert.Equal(t, f.Id == "beta", f.Additive, f.Id)
+		}
+		require.Equal(t, []string{"alpha", "mid", "zeta", "beta"}, keys)
+		require.Equal(t, []string{"f-alpha", "f-mid", "f-zeta", "f-beta"}, ds.FieldDefIds)
+		if i == 0 {
+			rev = ds.SchemaRev
+			require.NotEmpty(t, rev)
+		}
+		require.Equal(t, rev, ds.SchemaRev)
+	}
+
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
+	require.NoError(t, err)
+	raw, err := compiled[0].Schema.MarshalJSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"beta":{"type":"number","x-additive":true`)
+	assert.NotContains(t, string(raw), `"mid":{"type":"number","x-additive"`)
+	assert.Contains(t, string(raw), `"required":["alpha","zeta"]`)
+}
+
+// A field counts as declared with its dataset only when every live head
+// of the key declared it in the head's own change, identically. Any
+// other field is additive: never required, and on a Dynamic dataset
+// synced, unstamped and mutable by anyone.
+func TestCompileDatasetDefs_ConcurrentHeadsAndAdditiveNormalization(t *testing.T) {
+	ctrl, db := newDefsController(t)
+	ctx := context.Background()
+	arena := &anyenc.Arena{}
+	seedPart(t, ctrl, arena)
+
+	// Two concurrent declarations of "notes" (Dynamic): they agree on
+	// `same`, disagree on `x`, and each declares one key of its own.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChangeMulti("v1", "c1",
+		crdt.RecordChange{Id: "head-a", Upsert: true, Ops: []crdt.Op{headPayload(arena, "notes", map[string]any{typetype.DefFieldDynamic: true})}},
+		crdt.RecordChange{Id: "a-same", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-a", "same", "string", nil)}},
+		crdt.RecordChange{Id: "a-x", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-a", "x", "string", nil)}},
+		crdt.RecordChange{Id: "a-creator", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-a", "creator", "string", map[string]any{typetype.DefFieldStamp: "creator"})}},
+	)))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChangeMulti("v2", "c2",
+		crdt.RecordChange{Id: "head-b", Upsert: true, Ops: []crdt.Op{headPayload(arena, "notes", map[string]any{typetype.DefFieldDynamic: true})}},
+		crdt.RecordChange{Id: "b-same", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-b", "same", "string", nil)}},
+		crdt.RecordChange{Id: "b-x", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-b", "x", "number", nil)}},
+		crdt.RecordChange{Id: "b-extra", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-b", "extra", "string", map[string]any{typetype.DefFieldMutableBy: "author", typetype.DefFieldRequired: true})}},
+	)))
+	// A non-Dynamic dataset with a late required field.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChangeMulti("v3", "c3",
+		crdt.RecordChange{Id: "head-s", Upsert: true, Ops: []crdt.Op{headPayload(arena, "strict", nil)}},
+		crdt.RecordChange{Id: "s-p", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-s", "p", "string", nil)}},
+	)))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChange("v4", "c4", "s-q", true,
+		fieldPayload(arena, "head-s", "q", "string", map[string]any{typetype.DefFieldRequired: true, typetype.DefFieldMutableBy: "any"}))))
+
+	compiled, err := types.CompileDatasetDefs(ctx, db, testObjectId, nil)
+	require.NoError(t, err)
+	require.Len(t, compiled, 2)
+	byKey := map[string]types.CompiledDataset{}
+	for _, ds := range compiled {
+		byKey[ds.Key] = ds
+	}
+
+	notes := byKey["notes"]
+	require.False(t, notes.Invalid, notes.InvalidReason)
+	assert.Equal(t, "head-a", notes.DefId)
+	fields := map[string]schema.Field{}
+	for _, f := range notes.Schema.Fields {
+		fields[f.Id] = f
+	}
+	require.Len(t, fields, 4)
+	assert.False(t, fields["same"].Additive, "declared identically by every head")
+	assert.True(t, fields["x"].Additive, "the heads disagree on the shape")
+	assert.Equal(t, schema.KindString, fields["x"].Schema.Kind, "the earlier declaration's shape")
+	assert.True(t, fields["extra"].Additive, "declared by one head only")
+	assert.True(t, fields["creator"].Additive, "declared by one head only")
+	for _, id := range []string{"x", "extra", "creator"} {
+		f := fields[id]
+		assert.False(t, f.Required, id)
+		assert.Equal(t, schema.MutableByAnyone, f.MutableBy, id)
+		assert.Equal(t, schema.StampNone, f.Stamp, id)
+		assert.Equal(t, schema.ScopeSynced, f.Scope, id)
+	}
+	assert.Equal(t, schema.MutableNever, fields["same"].MutableBy)
+
+	strict := byKey["strict"]
+	require.False(t, strict.Invalid, strict.InvalidReason)
+	for _, f := range strict.Schema.Fields {
+		switch f.Id {
+		case "p":
+			assert.False(t, f.Additive)
+		case "q":
+			assert.True(t, f.Additive)
+			assert.False(t, f.Required, "required fields exist only from the dataset's declaration")
+			assert.Equal(t, schema.MutableByAnyone, f.MutableBy, "a non-Dynamic dataset keeps the rest")
+		}
+	}
+
+	// The same key declared concurrently with the same fields: nothing
+	// is additive.
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChangeMulti("v5", "c5",
+		crdt.RecordChange{Id: "head-c", Upsert: true, Ops: []crdt.Op{headPayload(arena, "twins", map[string]any{typetype.DefFieldDynamic: true})}},
+		crdt.RecordChange{Id: "c-a", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-c", "a", "string", map[string]any{typetype.DefFieldMutableBy: "any"})}},
+	)))
+	require.NoError(t, ctrl.ApplyChange(ctx, defsChangeMulti("v6", "c6",
+		crdt.RecordChange{Id: "head-d", Upsert: true, Ops: []crdt.Op{headPayload(arena, "twins", map[string]any{typetype.DefFieldDynamic: true})}},
+		crdt.RecordChange{Id: "d-a", Upsert: true, Ops: []crdt.Op{fieldPayload(arena, "head-d", "a", "string", map[string]any{typetype.DefFieldMutableBy: "any"})}},
+	)))
+	compiled, err = types.CompileDatasetDefs(ctx, db, testObjectId, nil)
+	require.NoError(t, err)
+	for _, ds := range compiled {
+		if ds.Key == "twins" {
+			require.Len(t, ds.Schema.Fields, 1)
+			assert.False(t, ds.Schema.Fields[0].Additive)
 		}
 	}
 }

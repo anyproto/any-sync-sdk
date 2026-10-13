@@ -116,7 +116,8 @@ Object load (spaceobjects/reindex.go, spaceobjects/store.go::loadObject):
      the shared objects row also by per-property scope from the registry),
      or, for a rebuild already in flight, take the leaves persisted by
      the earlier attempt
-  5. ResetForReindex: watermark to 0 and the leaves onto the `_meta`
+  5. ResetForReindex: AddSeq watermark to 0 (the applySeq watermark
+     stays) and the leaves onto the `_meta`
      row, one upsert, persisted before anything is wiped
   6. Wipe the object's row in each shared collection, every
      `<objectId>_*` collection, the space-level history rows

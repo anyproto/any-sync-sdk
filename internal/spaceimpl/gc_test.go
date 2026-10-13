@@ -105,10 +105,24 @@ func TestSweepOrphans(t *testing.T) {
 	require.NoError(t, crdt.PersistMeta(ctx, metaColl, emptyDeadObj, 5, 5, nil, emptyDeadSpace))
 	require.NoError(t, crdt.PersistSpaceMaxAddSeq(ctx, metaColl, emptyDeadSpace, 6))
 
+	// Read-state rows: the dead spaces' go, the live space's stay.
+	seedReadState(t, ctx, db, liveSpace, liveObj)
+	seedReadState(t, ctx, db, deadSpace, deadSpaceObj)
+	seedReadState(t, ctx, db, emptyDeadSpace, emptyDeadObj)
+
 	s := &Service{db: db}
 	liveSet := map[string]struct{}{liveSpace: {}}
 	deadSet := map[string]struct{}{deadSpace: {}, emptyDeadSpace: {}}
 	require.NoError(t, s.sweepOrphans(ctx, liveSet, deadSet))
+
+	for _, dead := range []string{deadSpace, emptyDeadSpace} {
+		state, unread := readStateRows(t, ctx, db, dead)
+		assert.Zero(t, state, "dead-space read state must be purged")
+		assert.Zero(t, unread)
+	}
+	state, unread := readStateRows(t, ctx, db, liveSpace)
+	assert.Equal(t, 1, state, "live-space read state must survive")
+	assert.Equal(t, 1, unread)
 
 	got := collNames(t, ctx, db)
 	for _, n := range []string{

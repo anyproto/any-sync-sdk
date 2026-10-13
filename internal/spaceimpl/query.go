@@ -465,6 +465,22 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	if err != nil {
 		return nil, err
 	}
+	if !scope.Shared && !scope.AllObjects {
+		// The object was resolved before the registration; a purge in
+		// between closed the object's subscriptions before this one
+		// existed, so it would stay open for good. An id not yet local
+		// can be deleted before it lands the same way. One head-storage
+		// read, after the fence.
+		deleted, derr := q.store.TreeDeleted(ctx, q.objectId)
+		if derr != nil {
+			_ = sub.Close()
+			return nil, derr
+		}
+		if deleted {
+			_ = sub.Close()
+			return nil, fmt.Errorf("query: %s: %w", q.objectId, space.ErrObjectNotFound)
+		}
+	}
 
 	if opts.IncludeTotal {
 		// Run a separate Count(filter) outside the snapshot fence (engine.mu

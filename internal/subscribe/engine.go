@@ -230,6 +230,33 @@ func (e *Engine) NotifyRecordsDeleted(spaceId, dataset, objectId string, ids []s
 	}, func(int) *anyenc.Value { return nil })
 }
 
+// CloseObject closes every per-object subscription on objectId, across
+// its datasets, with reason as the close error: the object was purged,
+// so nothing will ever reach those subscriptions again. Runs after
+// NotifyDeleted, so a Removed batch precedes the close. Shared and
+// per-dataset subscriptions are untouched. The held set goes now;
+// like an overflow close, the sub stays registered until the
+// consumer's Close releases it. reason must be a plain sentinel (the
+// close reason is an atomic value of one concrete type).
+func (e *Engine) CloseObject(objectId string, reason error) {
+	if e.closed.Load() || e.counter.Load() == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, perDs := range e.scope.perObj[objectId] {
+		for _, s := range perDs {
+			if s.closed {
+				continue
+			}
+			s.err.Store(reason)
+			_ = s.mb.Close()
+			s.closed = true
+			s.release()
+		}
+	}
+}
+
 // closeSub removes a sub from the engine and releases its held set;
 // the consumer's Sub handle keeps only the mailbox. Called via
 // Sub.Close.
@@ -283,7 +310,9 @@ func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 
 // Err returns the close reason — nil while live or after user Close,
 // space.ErrSubscriptionOverflow on mailbox overflow,
-// space.ErrSubscriptionDrifted on drift-budget exceeded.
+// space.ErrSubscriptionDrifted on drift-budget exceeded,
+// space.ErrObjectDeleted when the object a per-object sub reads was
+// purged (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {
 		return v

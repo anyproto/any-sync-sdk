@@ -933,6 +933,35 @@ func (e *Engine) ChangedSince(ctx context.Context, since uint64, limit int) ([]O
 	return out, nil
 }
 
+// MaxStateSeq returns the highest stateSeq persisted for spaceId, 0
+// when the space has no read-state rows (or the table does not exist
+// yet). Read marks mint their stateSeq from the space's apply-sequence
+// allocator and persist it only here, so the allocator's seed takes
+// this into account next to the objects' apply watermarks.
+func MaxStateSeq(ctx context.Context, db anystore.DB, spaceId string) (uint64, error) {
+	coll, err := db.OpenCollection(ctx, StateCollectionName)
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	filter := query.Key{Path: []string{fSpace}, Filter: query.NewComp(query.CompOpEq, spaceId)}
+	it, err := coll.Find(filter).Sort("-" + fStateSeq).Limit(1).Iter(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer it.Close()
+	if !it.Next() {
+		return 0, it.Err()
+	}
+	doc, err := it.Doc()
+	if err != nil {
+		return 0, err
+	}
+	return uint64(doc.Value().GetInt(fStateSeq)), nil
+}
+
 // SubscribeState registers a best-effort ping fired after a committed
 // read-state change (new unread, mark, merge). cb runs synchronously
 // on the notifying path — keep it small. Cancel is idempotent. A

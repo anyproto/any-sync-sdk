@@ -3,6 +3,8 @@ package spaceimpl
 import (
 	"context"
 	"fmt"
+	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -285,12 +287,15 @@ func TestRemotelyGone(t *testing.T) {
 		coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
 		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted,
 		coordinatorproto.SpaceStatus_SpaceStatusDeleted,
-		coordinatorproto.SpaceStatus_SpaceStatusNotExists,
 	}
 	for _, st := range gone {
 		assert.True(t, remotelyGone(st), "status %v should be gone", st)
 	}
 	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusCreated))
+	// Not registered on the coordinator yet (first push pending), not deleted.
+	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusNotExists))
+	// Unknown future statuses must never offload.
+	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus(99)))
 }
 
 // TestDecideReconcile exhaustively covers the reconcile decision: who
@@ -305,6 +310,7 @@ func TestDecideReconcile(t *testing.T) {
 	}
 	C := coordinatorproto.SpaceStatus_SpaceStatusCreated
 	P := coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
+	S := coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted
 	D := coordinatorproto.SpaceStatus_SpaceStatusDeleted
 	NX := coordinatorproto.SpaceStatus_SpaceStatusNotExists
 
@@ -320,8 +326,11 @@ func TestDecideReconcile(t *testing.T) {
 		{"member deleted locally, active -> none (cannot delete)", true, st(C, reader), actionNone},
 		{"active not-deleted owner -> none", false, st(C, owner), actionNone},
 		{"inbound pending, not deleted -> offload", false, st(P, owner), actionOffload},
+		{"inbound deletion started, not deleted -> offload", false, st(S, reader), actionOffload},
 		{"inbound deleted, not deleted -> offload", false, st(D, reader), actionOffload},
-		{"inbound not-exists, not deleted -> offload", false, st(NX, owner), actionOffload},
+		{"unknown status, not deleted -> none", false, st(coordinatorproto.SpaceStatus(99), owner), actionNone},
+		{"not-exists (unpushed), not deleted -> none", false, st(NX, owner), actionNone},
+		{"not-exists (unpushed), deleted locally -> none (nothing to drive)", true, st(NX, owner), actionNone},
 		{"nil status -> none", true, nil, actionNone},
 	}
 	for _, c := range cases {
@@ -360,4 +369,61 @@ func TestShouldPruneReadState(t *testing.T) {
 	for _, r := range keep {
 		require.False(t, shouldPruneReadState(r), r.Id)
 	}
+}
+
+// seedReadState writes one read-state row (and one unread row) for
+// objectId under spaceId, the shape the readstate engine persists.
+func seedReadState(t *testing.T, ctx context.Context, db anystore.DB, spaceId, objectId string) {
+	t.Helper()
+	eng := readstate.New(db, spaceId, func(context.Context) (uint64, error) { return 1, nil }, nil)
+	require.NoError(t, eng.TrackChange(ctx, readstate.Track{
+		ObjectId: objectId, ChangeId: objectId + "-c1", VersionId: "v1", AddSeq: 1, ApplySeq: 1,
+		RecordIds: []string{"r1"}, Tags: []string{"msg"}, Tracked: true,
+	}))
+}
+
+func readStateRows(t *testing.T, ctx context.Context, db anystore.DB, spaceId string) (state, unread int) {
+	t.Helper()
+	count := func(name, field string) int {
+		coll, err := db.OpenCollection(ctx, name)
+		require.NoError(t, err)
+		n, err := coll.Find(query.Key{Path: []string{field}, Filter: query.NewComp(query.CompOpEq, spaceId)}).Count(ctx)
+		require.NoError(t, err)
+		return n
+	}
+	return count(readstate.StateCollectionName, "sp"), count(readstate.UnreadCollectionName, "sp")
+}
+
+// The offload sweep purges the space's read-state rows — state and
+// unread — and leaves a sibling space's rows alone; the purge is its
+// own committed chunk, reported after the meta chunk.
+func TestDropSpaceCollectionsPurgesReadState(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "sdk.db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	const spaceId = "spaceA.1"
+	const otherSpace = "spaceB.2"
+	mustColl(t, ctx, db, spaceId+"_objects")
+	mustColl(t, ctx, db, "_meta")
+	seedReadState(t, ctx, db, spaceId, "objX")
+	seedReadState(t, ctx, db, spaceId, "objY")
+	seedReadState(t, ctx, db, otherSpace, "objZ")
+
+	var chunks []int
+	sweepChunkCommitted = func(n int) { chunks = append(chunks, n) }
+	defer func() { sweepChunkCommitted = nil }()
+
+	s := &Service{db: db}
+	require.NoError(t, s.dropSpaceCollections(ctx, spaceId))
+
+	// meta chunk, read-state chunk (2 objects), objects chunk.
+	assert.Equal(t, []int{1, 2, 1}, chunks)
+	state, unread := readStateRows(t, ctx, db, spaceId)
+	assert.Zero(t, state)
+	assert.Zero(t, unread)
+	state, unread = readStateRows(t, ctx, db, otherSpace)
+	assert.Equal(t, 1, state)
+	assert.Equal(t, 1, unread)
 }

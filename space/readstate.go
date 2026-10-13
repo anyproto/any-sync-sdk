@@ -77,7 +77,8 @@ type ReadStateAPI interface {
 
 	// MarkRead covers the given changes and their causal ancestry,
 	// then publishes the account's read frontier to the account's
-	// other devices.
+	// other devices. ErrObjectDeleted for an object deleted here: its
+	// read state went with it.
 	MarkRead(ctx context.Context, objectId string, changeIds []string) error
 
 	// MarkReadUpTo covers every unread change with VersionId <= upTo —

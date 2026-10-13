@@ -3,9 +3,11 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/cheggaaa/mb/v3"
 	"github.com/stretchr/testify/require"
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
@@ -30,7 +32,10 @@ func (r untouchedReader) Read([]byte) (int, error) {
 // gate of its own). Registration refuses the same way, for an owner
 // deleted while its upload was spooling, and the deleted owners' files
 // stop listing, resolving and counting at once — the derived child's
-// too, though its payloads object outlives it.
+// too, though its payloads object outlives it. Live file queries on
+// the deleted owners close with ErrObjectDeleted; the index entry of a
+// file goes with its row — with the cascade-deleted payloads object of
+// a signed owner, and not before the retired rows of a derived one.
 func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -70,12 +75,58 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	require.NoError(t, err)
 	childPayloads, err := payloadsSurface(t, sp).ObjectId(ctx, child)
 	require.NoError(t, err)
+	pa := payloadsSurface(t, sp)
+
+	// Live file queries and index entries, to be ended by the deletes;
+	// a Query held across the delete, to be refused by it.
+	subs := map[string]space.QuerySubscription{}
+	held := map[string]space.Query{}
+	for name, id := range map[string]string{"had files": withFiles, "cascade-deleted child": child} {
+		q, err := sp.Files().Query(id)
+		require.NoError(t, err, name)
+		res, err := q.Subscribe(ctx, space.QueryOpts{})
+		require.NoError(t, err, name)
+		require.Len(t, res.Initial, 1, name)
+		subs[name] = res.Sub
+		held[name] = q
+	}
+	for name, f := range map[string]space.FileInfo{"had files": attached, "cascade-deleted child": childFile} {
+		_, ok, err := pa.IndexedPayloadsObject(ctx, f.FileId)
+		require.NoError(t, err)
+		require.True(t, ok, "%s: the attach indexed the file", name)
+	}
 
 	require.NoError(t, sp.Objects().Delete(ctx, bare))
 	require.NoError(t, sp.Objects().Delete(ctx, withFiles))
 	require.NoError(t, sp.Objects().Delete(ctx, root))
 
-	pa := payloadsSurface(t, sp)
+	for name, sub := range subs {
+		waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+		for {
+			_, err := sub.Events().WaitOne(waitCtx)
+			if err != nil {
+				require.True(t, errors.Is(err, mb.ErrClosed), "%s: the subscription must close, got %v", name, err)
+				break
+			}
+		}
+		cancelWait()
+		require.ErrorIs(t, sub.Err(), space.ErrObjectDeleted, "%s: close reason", name)
+		require.NoError(t, sub.Close())
+	}
+	require.Eventually(t, func() bool {
+		_, ok, err := pa.IndexedPayloadsObject(ctx, attached.FileId)
+		return err == nil && !ok
+	}, 30*time.Second, 100*time.Millisecond, "the index entry goes with the purged payloads object")
+	indexed, ok, err := pa.IndexedPayloadsObject(ctx, childFile.FileId)
+	require.NoError(t, err)
+	require.True(t, ok, "a derived owner's rows outlive it and keep their index entries")
+	require.Equal(t, childPayloads, indexed)
+	for name, q := range held {
+		_, err := q.All(ctx)
+		require.ErrorIs(t, err, space.ErrNotFound, "%s: a held query reads nothing after the delete", name)
+		_, err = q.Subscribe(ctx, space.QueryOpts{})
+		require.ErrorIs(t, err, space.ErrNotFound, "%s: a held query subscribes to nothing after the delete", name)
+	}
 	late := []byte("spooled before the delete")
 	for name, id := range map[string]string{"never had files": bare, "had files": withFiles, "cascade-deleted child": child} {
 		_, err := sp.Files().Attach(ctx, id, untouchedReader{t}, space.AttachOpts{Name: "late.bin"})
@@ -94,6 +145,13 @@ func TestE2E_FilesV2_AttachToDeletedOwner(t *testing.T) {
 	all, err := sp.Files().List(ctx, space.FileListOpts{})
 	require.NoError(t, err)
 	require.Empty(t, all, "the space lists no files of deleted owners")
+	_, ok, err = pa.IndexedPayloadsObject(ctx, attached.FileId)
+	require.NoError(t, err)
+	require.False(t, ok, "a lookup of a purged row writes no index entry")
+	indexed, ok, err = pa.IndexedPayloadsObject(ctx, childFile.FileId)
+	require.NoError(t, err)
+	require.True(t, ok, "a lookup of a deleted owner's live row keeps its entry")
+	require.Equal(t, childPayloads, indexed)
 	rows, err := sp.Payloads().ListRows(ctx, childPayloads)
 	require.NoError(t, err)
 	require.Empty(t, rows, "the payloads view skips a deleted owner's rows")

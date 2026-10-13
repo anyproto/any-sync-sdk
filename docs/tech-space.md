@@ -174,9 +174,8 @@ guest mode.
 (re-running Derive adds it to an unflagged row). It makes derived spaces
 permanent (`space.ErrIsDerivedSpace`): `Service.Delete` refuses flagged
 rows, the handler rejects `remoteStatus=deleted` on them from any writer,
-and the deletion reconciler skips them (a coordinator `NotExists` is
-expected for a space derived offline before its first push). Absent on
-created, joined, tracked and 1-1 rows; surfaced as `SpaceInfo.Derived`.
+and the deletion reconciler skips them. Absent on created, joined,
+tracked and 1-1 rows; surfaced as `SpaceInfo.Derived`.
 
 ### Identities directory (`identities` dataset)
 

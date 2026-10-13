@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	mrand "math/rand"
 	"os"
@@ -377,6 +378,11 @@ func TestDeleteSpace(t *testing.T) {
 	info := addFile(t, s, plain, key)
 	require.NoError(t, s.RecordContent(ctx, spaceId, bytes.Repeat([]byte{1}, 32), info.Root, "f", "o"))
 
+	// The space's KV entries go too; another space's stay.
+	require.NoError(t, s.SetKV(ctx, FileIndexKey(spaceId, "f"), "o"))
+	require.NoError(t, s.SetKV(ctx, IntentKey(spaceId, info.Root), "o"))
+	require.NoError(t, s.SetKV(ctx, FileIndexKey("other", "f"), "o2"))
+
 	require.NoError(t, s.DeleteSpace(ctx, spaceId))
 	_, err := s.Info(ctx, spaceId, info.Root)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -385,6 +391,83 @@ func TestDeleteSpace(t *testing.T) {
 	require.False(t, ok)
 	_, err = os.Stat(filepath.Join(s.root, spaceId))
 	require.ErrorIs(t, err, os.ErrNotExist)
+	for _, key := range []string{FileIndexKey(spaceId, "f"), IntentKey(spaceId, info.Root)} {
+		_, ok, err = s.GetKV(ctx, key)
+		require.NoError(t, err)
+		require.False(t, ok, "%s must be gone", key)
+	}
+	_, ok, err = s.GetKV(ctx, FileIndexKey("other", "f"))
+	require.NoError(t, err)
+	require.True(t, ok)
+}
+
+func TestDeleteKVsAndPrefix(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	keys := make([]string, 0, deleteKVsChunk+3)
+	for i := 0; i < deleteKVsChunk+3; i++ {
+		keys = append(keys, FileIndexKey(spaceId, fmt.Sprintf("f%04d", i)))
+	}
+	for _, k := range keys {
+		require.NoError(t, s.SetKV(ctx, k, "o"))
+	}
+	require.NoError(t, s.SetKV(ctx, FileIndexKey(spaceId+"x", "f0000"), "o"))
+	require.NoError(t, s.SetKV(ctx, "fidx0", "o"))
+
+	// Batch delete spans chunks; missing keys are a no-op.
+	batch := append([]string{"missing"}, keys[:deleteKVsChunk+1]...)
+	require.NoError(t, s.DeleteKVs(ctx, batch))
+	_, ok, err := s.GetKV(ctx, keys[0])
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, ok, err = s.GetKV(ctx, keys[deleteKVsChunk+1])
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, s.DeleteKVs(ctx, nil))
+
+	// Prefix delete takes the rest of the space's entries and nothing
+	// that merely sorts next to the prefix.
+	require.NoError(t, s.DeleteKVPrefix(ctx, FileIndexKey(spaceId, "")))
+	for _, k := range keys {
+		_, ok, err = s.GetKV(ctx, k)
+		require.NoError(t, err)
+		require.False(t, ok, "%s must be gone", k)
+	}
+	for _, k := range []string{FileIndexKey(spaceId+"x", "f0000"), "fidx0"} {
+		_, ok, err = s.GetKV(ctx, k)
+		require.NoError(t, err)
+		require.True(t, ok, "%s must survive", k)
+	}
+	require.Error(t, s.DeleteKVPrefix(ctx, ""))
+}
+
+func TestPrefixUpperBound(t *testing.T) {
+	for _, tc := range []struct {
+		prefix, hi string
+		ok         bool
+	}{
+		{"fidx/sp/", "fidx/sp0", true},
+		{"a\x7f", "a\x80", true},
+		{"a\xfe", "a\xff", true},
+		{"a\xff", "b", true},
+		{"\xff\xff", "", false},
+	} {
+		hi, ok := prefixUpperBound(tc.prefix)
+		require.Equal(t, tc.ok, ok, "%q", tc.prefix)
+		require.Equal(t, tc.hi, hi, "%q", tc.prefix)
+	}
+	// Keys under a prefix ending in a high byte are bounded, siblings kept.
+	ctx := context.Background()
+	s := newStore(t)
+	for _, k := range []string{"p\xff/a", "p\xff/b", "p\xff", "q"} {
+		require.NoError(t, s.SetKV(ctx, k, "o"))
+	}
+	require.NoError(t, s.DeleteKVPrefix(ctx, "p\xff/"))
+	for k, want := range map[string]bool{"p\xff/a": false, "p\xff/b": false, "p\xff": true, "q": true} {
+		_, ok, err := s.GetKV(ctx, k)
+		require.NoError(t, err)
+		require.Equal(t, want, ok, "%q", k)
+	}
 }
 
 func TestListSpace(t *testing.T) {

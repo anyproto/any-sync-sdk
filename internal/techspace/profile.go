@@ -90,17 +90,6 @@ func DecodeProfileRecord(v *anyenc.Value) ProfileRecord {
 	}
 }
 
-// encodeUpsert packs the record into the multi-field $set payload the
-// handler accepts on first-write or full-replace.
-func (r ProfileRecord) encodeUpsert(a *anyenc.Arena) *anyenc.Value {
-	obj := a.NewObject()
-	obj.Set(FieldProfileName, a.NewString(r.Name))
-	obj.Set(FieldProfileDescription, a.NewString(r.Description))
-	obj.Set(FieldProfileIcon, a.NewString(r.IconCID))
-	obj.Set(FieldProfileIconFileId, a.NewString(r.IconFileId))
-	return obj
-}
-
 // ProfileHandler validates ops on the profile dataset. The dataset
 // holds exactly one row (id = ProfileSelfId); we reject deletes and
 // any non-self id wholesale. Every other op passes — the schema is

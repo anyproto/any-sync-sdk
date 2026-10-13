@@ -149,8 +149,23 @@ func (t *techSpace) AggregateDataset(dataset string, pipeline any) space.Agg {
 	return t.inner.AggregateDataset(dataset, pipeline)
 }
 func (t *techSpace) Aggregate(objectId, dataset string, pipeline any) space.Agg {
+	// Same fence as Query: the identities rows carry decryption secrets.
+	if objectId == t.tsp.IndexObjectId() && dataset == techspace.IdentitiesDataset {
+		return failAgg{err: fmt.Errorf("spaceimpl: %w: identities carry decryption secrets — read them via SDK.Identities()", space.ErrUnsupported)}
+	}
 	return t.inner.Aggregate(objectId, dataset, pipeline)
 }
+
+// failAgg is an Agg whose terminal calls fail with a fixed error.
+type failAgg struct{ err error }
+
+func (q failAgg) GroupLimit(int) space.Agg                     { return q }
+func (q failAgg) AccumArrayLimit(int) space.Agg                { return q }
+func (q failAgg) MemoryLimit(int) space.Agg                    { return q }
+func (q failAgg) Iter(context.Context) (space.Iterator, error) { return nil, q.err }
+func (q failAgg) All(context.Context) ([]*anyenc.Value, error) { return nil, q.err }
+func (q failAgg) Count(context.Context) (int, error)           { return 0, q.err }
+func (q failAgg) Explain(context.Context) (string, error)      { return "", q.err }
 func (t *techSpace) AggregateObjects(pipeline any) space.Agg {
 	return t.inner.AggregateObjects(pipeline)
 }

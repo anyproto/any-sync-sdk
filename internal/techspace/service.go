@@ -578,11 +578,29 @@ func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
 	return DecodeProfileRecord(v), true
 }
 
-// SetProfile writes (or replaces) the local profile row. Called by
-// Account.UpdateMetadata to persist the value before pushing it to
-// identityRepo, so a subsequent boot can republish without the user
-// re-calling UpdateMetadata.
-func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
+// SetProfileMetadata writes the name and description of the profile
+// row, leaving the avatar fields to SetProfileIcon: each writer owns
+// its fields, so devices editing different parts of the profile
+// converge per field instead of the last full-row write winning.
+func (s *Service) SetProfileMetadata(ctx context.Context, name, description string) error {
+	return s.setProfileFields(ctx, [][2]string{
+		{FieldProfileName, name},
+		{FieldProfileDescription, description},
+	})
+}
+
+// SetProfileIcon writes the avatar fields of the profile row: the
+// content address and the tech-space file row behind it, both empty
+// to clear.
+func (s *Service) SetProfileIcon(ctx context.Context, iconCID, iconFileId string) error {
+	return s.setProfileFields(ctx, [][2]string{
+		{FieldProfileIcon, iconCID},
+		{FieldProfileIconFileId, iconFileId},
+	})
+}
+
+// setProfileFields upserts the profile row with one $set per field.
+func (s *Service) setProfileFields(ctx context.Context, fields [][2]string) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
@@ -591,15 +609,15 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 		return err
 	}
 	arena := &anyenc.Arena{}
+	ops := make([]crdt.Op, 0, len(fields))
+	for _, f := range fields {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: []string{f[0]}, Payload: arena.NewString(f[1])})
+	}
 	change := crdt.Change{
 		Dataset:     ProfileDataset,
 		DataVersion: ProfileHandlerVersion,
 		Records: []crdt.RecordChange{
-			{
-				Id:     ProfileSelfId,
-				Upsert: true,
-				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: rec.encodeUpsert(arena)}},
-			},
+			{Id: ProfileSelfId, Upsert: true, Ops: ops},
 		},
 	}
 	_, err = obj.LocalWrite(ctx, change)

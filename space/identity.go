@@ -118,6 +118,9 @@ var (
 	// ErrProfileIconReadOnly — UpdateMetadata was handed an IconCID.
 	// The icon is a file: SetIcon stores the bytes and derives the cid.
 	ErrProfileIconReadOnly = errors.New("space: the profile icon is set through SetIcon")
+	// ErrProfileFieldInvalid — a name or description carries a NUL
+	// byte, the profile record's field separator.
+	ErrProfileFieldInvalid = errors.New("space: profile fields must not contain NUL")
 )
 
 // IconOpts is the caller metadata of an avatar upload; both fields are

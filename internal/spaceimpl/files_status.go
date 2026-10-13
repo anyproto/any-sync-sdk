@@ -196,13 +196,9 @@ func (s *Service) SpaceFiles(ctx context.Context, spaceId string) (map[string]bo
 // ownerId whose rootCid is root (the attach crash window left the row
 // without its CAR ref).
 func (s *Service) ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) (fileId string, ok bool, err error) {
-	sp, err := s.Get(ctx, spaceId)
+	impl, err := s.implFor(ctx, spaceId)
 	if err != nil {
 		return "", false, err
-	}
-	impl, ok := sp.(*spaceImpl)
-	if !ok {
-		return "", false, fmt.Errorf("spaceimpl: ResolveIntent: %s has no file surface", spaceId)
 	}
 	rows, err := impl.PayloadsInternal().ListRows(ctx, ownerId)
 	if err != nil {

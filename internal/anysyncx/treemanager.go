@@ -67,6 +67,12 @@ type SpaceRegistry interface {
 	// within the round that found the trees, in diff order (the tech
 	// space, selective sync).
 	PullFirstTypes(spaceId string) []string
+
+	// ReleaseTree closes the cached object of a tree the sync job
+	// fetched and materialized once it has gone a second unused,
+	// instead of at the cache's TTL: a backlog loads objects faster than
+	// the TTL evicts them. A later GetTree loads it again.
+	ReleaseTree(spaceId, treeId string)
 }
 
 // treeManagerAdapter implements treemanager.TreeManager by routing

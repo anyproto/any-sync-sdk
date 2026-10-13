@@ -2398,6 +2398,18 @@ func (s *Service) PullFirstTypes(spaceId string) []string {
 	return pullFirstTypes
 }
 
+// ReleaseTree hands a tree the sync job materialized to its store's
+// release (Store.Release). A space with no store holds nothing to
+// release, and none is built for it.
+func (s *Service) ReleaseTree(spaceId, treeId string) {
+	s.mu.Lock()
+	st := s.stores[spaceId]
+	s.mu.Unlock()
+	if st != nil {
+		st.Release(treeId)
+	}
+}
+
 // Compile-time check that we satisfy the registry contract.
 var _ anysyncx.SpaceRegistry = (*Service)(nil)
 

@@ -264,8 +264,8 @@ func (j *syncJob) pass() (worked bool) {
 				rest = append(rest, it)
 			}
 		}
-		j.each(defs, 1, j.materialize)
-		j.each(rest, treeSyncWorkers, j.materialize)
+		j.each(defs, 1, func(it *syncItem) { j.materialize(it, false) })
+		j.each(rest, treeSyncWorkers, func(it *syncItem) { j.materialize(it, true) })
 		t.logPass("materialized fetched trees", len(fetched), start, zap.Int("definitions", len(defs)))
 	}
 	for _, kind := range []syncKind{syncChanged, syncRetry} {
@@ -388,9 +388,13 @@ func (j *syncJob) fetch(it *syncItem) {
 // takes no request slot and names no peer: the tree is local, and one
 // that is not any more (deleted meanwhile) fails and parks rather than
 // fetch outside the budget. A tree that was local before the pass is
-// pinged like a changed one; a fetched tree is in sync with the peer
-// by construction and is reported as such.
-func (j *syncJob) materialize(it *syncItem) {
+// pinged like a changed one and stays loaded for the answer; a fetched
+// tree is in sync with the peer by construction and is reported as
+// such. A fetched object tree is released when release is set: the
+// replay was all the job loaded it for. Definitions are not: the
+// registry and the type APIs read their collections by name, through
+// handles a close would close under them.
+func (j *syncJob) materialize(it *syncItem, release bool) {
 	t := j.t
 	tree, err := t.registry.GetTree(j.ctx, t.spaceId, it.id)
 	if err != nil {
@@ -408,5 +412,8 @@ func (j *syncJob) materialize(it *syncItem) {
 	}
 	t.recovered(it.peer.Id(), it.id)
 	t.synced(j.ctx, it.peer, it.peers, it.id, tree, !it.local)
+	if release && !it.local {
+		t.registry.ReleaseTree(t.spaceId, it.id)
+	}
 	j.finish(it)
 }

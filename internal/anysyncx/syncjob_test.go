@@ -464,6 +464,30 @@ func TestSyncJobPingsTreesThatWereLocal(t *testing.T) {
 	require.Equal(t, []string{"m1"}, reported)
 }
 
+// A fetched object tree is released once it is materialized: the replay
+// was all the job loaded it for. A definition stays loaded, and so does
+// a tree that was local (pinged for the answer) and the trees handled in
+// one step (pull-first, changed). A tree that failed to load has nothing
+// to release.
+func TestSyncJobReleasesMaterializedTrees(t *testing.T) {
+	trees := map[string]objecttree.ObjectTree{}
+	for _, id := range []string{"index", "d1", "m1", "m2", "e1"} {
+		trees[id] = &pingTree{}
+	}
+	reg := &scriptedRegistry{first: []string{"index"}, trees: trees, fail: map[string]error{"m3": errors.New("boom")}}
+	f := &scriptedFetcher{types: map[string]string{"d1": "type"}, local: map[string]bool{"m2": true}}
+	ts := jobSyncer(t, reg, f)
+	var reported []string
+	ts.onFetched = func(_, treeId string, _ []string) { reported = append(reported, treeId) }
+	require.NoError(t, ts.SyncAll(context.Background(), fakePeer{id: "peer1"}, []string{"e1"}, []string{"index", "d1", "m1", "m2", "m3"}))
+	require.Equal(t, []string{"index", "d1", "m1", "m2", "m3", "e1"}, reg.got())
+	require.Equal(t, []string{"m1"}, reg.releasedIds())
+	require.Equal(t, []string{"index", "d1", "m1"}, reported)
+	for _, id := range []string{"m2", "e1"} {
+		require.Equal(t, int64(1), trees[id].(*pingTree).pings.Load(), id)
+	}
+}
+
 // A space the registry names no pull-first types for syncs within the
 // round, one tree at a time, fetcher or not.
 func TestSyncJobIsNotUsedWithoutPullFirstTypes(t *testing.T) {

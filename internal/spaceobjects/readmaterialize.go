@@ -2,15 +2,18 @@ package spaceobjects
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"time"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
 )
@@ -113,11 +116,22 @@ func (m *readMaterializer) run() {
 			if m.ctx.Err() != nil {
 				return
 			}
-			if err := m.processObject(m.ctx, objectId); err != nil && m.ctx.Err() == nil {
+			if err := processRetry(m.ctx, objectId, m.processObject); err != nil && m.ctx.Err() == nil {
 				storeLog.Warn("materialize read state", zap.String("objectId", objectId), zap.Error(err))
 			}
 		}
 	}
+}
+
+// processRetry runs process once more when the Object closed under it,
+// evicted or released between its Get and a write: the next Get loads
+// it again, and process derives what to write from the current state.
+func processRetry(ctx context.Context, objectId string, process func(context.Context, string) error) error {
+	err := process(ctx, objectId)
+	if errors.Is(err, object.ErrClosed) || errors.Is(err, anystore.ErrCollectionClosed) {
+		err = process(ctx, objectId)
+	}
+	return err
 }
 
 func (m *readMaterializer) processObject(ctx context.Context, objectId string) error {

@@ -57,6 +57,7 @@ import (
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
+	"github.com/anyproto/any-sync-sdk/internal/types/template"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -636,9 +637,10 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 			}
 		}
 	}
-	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, cfg.ExtCollections, cfg.Modules))
+	extCollections := withBuiltInCollections(cfg.ExtCollections)
+	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, extCollections, cfg.Modules))
 	s.extTypes = cfg.ExtTypes
-	s.extCollections = cfg.ExtCollections
+	s.extCollections = extCollections
 	s.dataVersions = dv
 	s.datasetOwners = owners
 	s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
@@ -785,6 +787,33 @@ var ReservedTypeIds = map[string]struct{}{
 	collectiontype.TypeId: {},
 }
 
+// BuiltInCollections are the collections the SDK registers itself, in
+// listing order, ahead of the consumer's: the template marker. A
+// consumer declaration under one of their ids is refused at Open.
+func BuiltInCollections() []handler.Collection {
+	return []handler.Collection{template.Collection()}
+}
+
+// withBuiltInCollections is the registered set a store serves: the
+// SDK's own first, then the consumer's.
+func withBuiltInCollections(ext []handler.Collection) []handler.Collection {
+	builtIn := BuiltInCollections()
+	out := make([]handler.Collection, 0, len(builtIn)+len(ext))
+	out = append(out, builtIn...)
+	return append(out, ext...)
+}
+
+// isBuiltInCollectionId reports whether id names a collection the SDK
+// registers itself.
+func isBuiltInCollectionId(id string) bool {
+	for _, c := range BuiltInCollections() {
+		if c.Id == id {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateExternalCollections checks the caller-supplied collections:
 // non-empty unique ids, disjoint from the registered types and the
 // reserved ids, and well-formed property declarations. Called once at
@@ -808,6 +837,9 @@ func ValidateExternalCollections(extTypes []handler.Type, extCollections []handl
 		}
 		if _, reserved := ReservedTypeIds[c.Id]; reserved {
 			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is reserved for a built-in", i, c.Id)
+		}
+		if isBuiltInCollectionId(c.Id) {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is a built-in collection", i, c.Id)
 		}
 		if c.Id == typetype.MetaTypeMarker || c.Id == collectiontype.MetaMarker {
 			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is a reserved marker", i, c.Id)
@@ -849,6 +881,9 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			// that breaks every Types().Create carrying an XKey. Fail at
 			// boot instead.
 			return fmt.Errorf("spaceobjects: type[%d]: Id %q is reserved for a built-in type", i, t.Id)
+		}
+		if isBuiltInCollectionId(t.Id) {
+			return fmt.Errorf("spaceobjects: type[%d]: Id %q is a built-in collection", i, t.Id)
 		}
 		seenTypeIds[t.Id] = struct{}{}
 		// A type may own datasets, properties, both, or neither (a pure
@@ -948,6 +983,11 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 		}
 		if _, reserved := ReservedTypeIds[m.Name]; reserved {
 			return fmt.Errorf("spaceobjects: module[%d]: name %q is reserved for a built-in type", i, m.Name)
+		}
+		if isBuiltInCollectionId(m.Name) {
+			// Modules own an objects-row namespace under their name;
+			// the built-in collection's would shadow it.
+			return fmt.Errorf("spaceobjects: module[%d]: name %q is a built-in collection", i, m.Name)
 		}
 		for _, t := range extTypes {
 			if t.Id == m.Name {

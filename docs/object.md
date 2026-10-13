@@ -61,7 +61,7 @@ builder), `commonspace/object/tree/treechangeproto`,
 ## Object API
 
 ```go
-space.Objects().Create(ctx, CreateObjectOpts{Type, Collections, InitialProperties}) // → objectId
+space.Objects().Create(ctx, CreateObjectOpts{Type, Collections, InitialProperties, From}) // → objectId
 space.Objects().Derive(ctx, DeriveObjectOpts{Seed, Type, Collections, ParentId})    // → objectId, idempotent
 space.Objects().Get(ctx, objectId)    // the objects row; ErrNotFound / ErrObjectDeleted
 space.Objects().Delete(ctx, objectId)
@@ -76,6 +76,26 @@ space.Modify(ctx, ModifyBatch)  // → ModifyResult{VersionId, ChangeId, RecordI
 space.Delete(ctx, DeleteBatch)
 space.Upsert(ctx, UpsertBatch)
 ```
+
+`Create` with a `From` copies an object: the new one takes the source's
+type (`Type` is then optional and must equal it, `ErrFromTypeMismatch`),
+its collections minus every registered marker (a consumer's registered
+collections and `template` are states of the source, never content),
+its synced `any.*` values, the declared synced values of every owner
+the new object has and the live records of every dataset the source's
+type declares through its parts (a reserved module's excepted), in
+changes of at most a thousand records after the bootstrap. `Collections`
+are added to the copied ones and `InitialProperties` are written over
+the copied values; a value is replaced, never cleared. A source filed
+under the built-in `template` collection (`space.TemplateCollectionId`)
+is a template: the row is stamped `any.template = {id, version}` with
+the source's `template.version`; any other source keeps the stamp it
+has, so a duplicate keeps its lineage. Record ids are kept, so a
+per-object dataset's references between records survive; an `IdAuto`
+records dataset derives fresh ones, and on a dataset that is not
+`Dynamic` only the declared fields travel. A record the dataset's
+create rules refuse today is `ErrFromRecordRefused`, and the half copy
+is deleted.
 
 `Derive` with a `ParentId` binds the child to its parent: the parent id is
 hashed into the child's id, and deleting the parent deletes the child. Creating

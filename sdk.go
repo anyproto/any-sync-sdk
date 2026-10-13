@@ -1,6 +1,7 @@
 package anysyncsdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -566,6 +567,7 @@ func (s *SDK) bootstrap(ctx context.Context) {
 	// Best-effort: a failed push doesn't prevent SDK use. The next
 	// successful push (next UpdateMetadata or next boot) heals it.
 	warn("republish profile", s.account.republishStoredProfile(ctx))
+	s.account.startProfileSync()
 
 	// Eager-load every non-deleted space from the tech-space index so
 	// per-space headsync / syncacl start running at boot rather than
@@ -996,7 +998,7 @@ type AccountAPI interface {
 	// `present` is false when no profile has been written yet on this
 	// device (fresh wallet). The same `present` and zero-value distinction
 	// the SDK exposes via tsp.GetProfile. IconCID is set only while an
-	// avatar file backs it.
+	// avatar file id backs it.
 	Metadata(ctx context.Context) (meta space.AccountMetadata, present bool, err error)
 
 	// UpdateMetadata publishes the account's display metadata — name
@@ -1021,17 +1023,18 @@ type AccountAPI interface {
 	DeleteIcon(ctx context.Context) error
 
 	// OpenIcon returns a reader over the own avatar's bytes. ErrNotFound
-	// when none is set; ErrFileNotAvailable on a device of the account
-	// that holds the avatar's row but not yet its bytes.
+	// when none is set; ErrFileNotAvailable when this device of the
+	// account holds the profile row but not yet the avatar's file row
+	// or its bytes.
 	OpenIcon(ctx context.Context) (space.FileReader, error)
 }
 
 // accountImpl exposes the account-level surface. Id() returns the
 // account's StrKey-encoded identity (PubKey.Account()), the same form
-// used for change authorship and identityRepo; the profile writers
-// persist to the tech-space and push to identityRepo, then kick every
-// running members watcher so the new profile becomes visible across
-// already-loaded spaces without waiting for the slow tick.
+// used for change authorship and identityRepo. The profile row in the
+// tech space is the source of truth; every writer pushes it to
+// identityRepo, and so does any change to the row that arrives by
+// sync, so each device of the account mirrors the row it holds.
 type accountImpl struct {
 	app    *anysyncx.App
 	tsp    *techspace.Service
@@ -1045,6 +1048,9 @@ type accountImpl struct {
 	// watch is armed and stopped under it too, so the watched file is
 	// always the one the profile row names.
 	pushMu sync.Mutex
+	// lastPushed is the plaintext of the last record this device put
+	// successfully; a sync-driven push that would repeat it is skipped.
+	lastPushed []byte
 
 	// The avatar watch: one goroutine at a time waiting for the
 	// pending avatar file's custody receipt, to republish the profile
@@ -1055,29 +1061,42 @@ type accountImpl struct {
 	watchMu   sync.Mutex
 	watchFile string
 	watchStop chan struct{}
-	watchWG   sync.WaitGroup
-	closed    chan struct{}
-	closeOnce sync.Once
+
+	// closeCtx bounds every push the background goroutines make; it is
+	// cancelled by close(), which then joins them through wg.
+	closeCtx    context.Context
+	closeCancel context.CancelFunc
+	wg          sync.WaitGroup
+	closeOnce   sync.Once
 }
 
 const (
 	// iconWatchPoll is how often the avatar watch re-reads the file row.
 	iconWatchPoll = 30 * time.Second
-	// iconPushTimeout bounds one republish attempt from the watch.
+	// iconPushTimeout bounds one republish attempt from a background
+	// goroutine.
 	iconPushTimeout = 30 * time.Second
+	// profileSyncDebounce coalesces a burst of profile-row events into
+	// one sync-driven push.
+	profileSyncDebounce = 2 * time.Second
 )
 
 func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl.Service) *accountImpl {
-	return &accountImpl{app: app, tsp: tsp, spaces: spaces, closed: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &accountImpl{app: app, tsp: tsp, spaces: spaces, closeCtx: ctx, closeCancel: cancel}
 }
 
-// close stops the avatar watch and joins it. Called by SDK.Close
-// before the services it reads are torn down.
+// close stops the background pushes and joins them. Called by
+// SDK.Close before the services they read are torn down. A push in
+// flight is cancelled; one queued behind a caller that holds pushMu
+// waits for that caller's own RPC.
 func (a *accountImpl) close() {
-	a.closeOnce.Do(func() { close(a.closed) })
+	a.closeOnce.Do(a.closeCancel)
 	a.stopIconWatch()
-	a.watchWG.Wait()
+	a.wg.Wait()
 }
+
+func (a *accountImpl) closed() bool { return a.closeCtx.Err() != nil }
 
 func (a *accountImpl) Id() string {
 	keys := a.app.AccountKeys()
@@ -1103,7 +1122,7 @@ func (a *accountImpl) Metadata(ctx context.Context) (space.AccountMetadata, bool
 }
 
 // recordMetadata is the public view of the profile row. A cid with no
-// file row behind it (written by a client before avatars were files)
+// file id behind it (written by a client before avatars were files)
 // names nothing fetchable and is not reported.
 func recordMetadata(rec techspace.ProfileRecord) space.AccountMetadata {
 	meta := space.AccountMetadata{Name: rec.Name, Description: rec.Description}
@@ -1181,7 +1200,7 @@ func (a *accountImpl) SetIcon(ctx context.Context, r io.Reader, opts space.IconO
 		_ = a.spaces.DeleteTechFile(ctx, info.FileId)
 		return space.AccountMetadata{}, fmt.Errorf("anysyncsdk: persist profile: %w", err)
 	}
-	rec.IconCID, rec.IconFileId = info.RootCid, info.FileId
+	rec.IconCID, rec.IconFileId, rec.IconPublished = info.RootCid, info.FileId, false
 	// A dedup hit on already-durable content publishes at once;
 	// otherwise the push arms the watch that republishes on the flip.
 	err = a.pushProfile(ctx, rec, false)
@@ -1219,7 +1238,7 @@ func (a *accountImpl) DeleteIcon(ctx context.Context) error {
 		a.pushMu.Unlock()
 		return fmt.Errorf("anysyncsdk: persist profile: %w", err)
 	}
-	rec.IconCID, rec.IconFileId = "", ""
+	rec.IconCID, rec.IconFileId, rec.IconPublished = "", "", false
 	err := a.pushProfile(ctx, rec, false)
 	a.pushMu.Unlock()
 	if prev != "" {
@@ -1234,7 +1253,10 @@ func (a *accountImpl) DeleteIcon(ctx context.Context) error {
 	return nil
 }
 
-// OpenIcon opens the own avatar's bytes. See AccountAPI.OpenIcon.
+// OpenIcon opens the own avatar's bytes. See AccountAPI.OpenIcon. The
+// profile row and the file row sync separately, so a row the profile
+// names but this device does not hold yet is "not available", not
+// "none"; so is any failure past the row, since the bytes exist.
 func (a *accountImpl) OpenIcon(ctx context.Context) (space.FileReader, error) {
 	if a.tsp == nil || a.spaces == nil {
 		return nil, errors.New("anysyncsdk: OpenIcon: account not open")
@@ -1243,7 +1265,18 @@ func (a *accountImpl) OpenIcon(ctx context.Context) (space.FileReader, error) {
 	if !ok || rec.IconFileId == "" {
 		return nil, fmt.Errorf("anysyncsdk: OpenIcon: no avatar: %w", space.ErrNotFound)
 	}
-	return a.spaces.OpenTechFile(ctx, rec.IconFileId)
+	f, err := a.spaces.OpenTechFile(ctx, rec.IconFileId)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(err, space.ErrFileNotAvailable) {
+			return nil, err
+		}
+		log.Debug("own avatar open", zap.String("fileId", rec.IconFileId), zap.Error(err))
+		return nil, fmt.Errorf("anysyncsdk: OpenIcon: avatar not available on this device yet: %w", space.ErrFileNotAvailable)
+	}
+	return f, nil
 }
 
 // kickProfiles wakes every running members watcher so a just-published
@@ -1258,10 +1291,8 @@ func (a *accountImpl) kickProfiles() {
 // republishStoredProfile reads the locally-stored profile (if any) and
 // pushes it to identityRepo. Called on SDK boot to mirror heart's
 // ownProfileSubscription.Run path. No-op when no profile has been
-// written yet (fresh device, never called UpdateMetadata). With an
-// avatar pending — uploading, or its receipt not yet synced to this
-// device — the push waits for the watch instead of publishing a
-// profile that would drop the avatar for every contact.
+// written yet (fresh device, never called UpdateMetadata). See
+// pushProfile for how a pending avatar is treated.
 func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
 	if a.tsp == nil {
 		return nil
@@ -1278,28 +1309,47 @@ func (a *accountImpl) republishStoredProfile(ctx context.Context) error {
 	return a.pushProfile(ctx, rec, true)
 }
 
+// profileFor builds the record to push from the profile row. ready
+// reports whether the avatar reference is in it: the file row is here
+// with its key, and either carries the custody receipt or another
+// device already published the reference (IconPublished — the file is
+// durable, the receipt just has not synced to this device yet).
+func (a *accountImpl) profileFor(ctx context.Context, rec techspace.ProfileRecord) (profile space.Profile, ready bool) {
+	profile = space.Profile{AccountMetadata: space.AccountMetadata{Name: rec.Name, Description: rec.Description}}
+	if rec.IconFileId == "" || a.spaces == nil {
+		return profile, false
+	}
+	row, err := a.spaces.TechFileRow(ctx, rec.IconFileId)
+	if err != nil || row.RootCid == "" || len(row.Enc.Key) == 0 || (row.NetworkSign == "" && !rec.IconPublished) {
+		return profile, false
+	}
+	profile.IconCID = row.RootCid
+	profile.IconSpaceId = a.spaces.TechSpaceId()
+	profile.IconKey = space.EncodeIconKey(row.Enc.Key)
+	return profile, true
+}
+
 // pushProfile signs and uploads the profile bytes to the coordinator's
-// identityRepo. The avatar reference rides along only once its file
-// row carries the custody receipt — the public read path serves
-// nothing else — and the avatar watch is armed while it is pending,
-// so the flip republishes. A pending avatar makes a boot republish
-// (waitForIcon) a no-op. Returns the raw error from the RPC so
-// callers can decide whether to surface it. Runs under pushMu.
-func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileRecord, waitForIcon bool) error {
+// identityRepo. The avatar reference rides along only when profileFor
+// reports it ready — the public read path serves nothing else. While
+// an avatar is pending the watch is armed so the flip republishes;
+// with fromSync set (a boot or a sync-driven push), a pending avatar
+// that another device already published is left alone — pushing
+// without it would drop it for every contact — and the push waits for
+// the row to sync here. A pending avatar never published yet drops
+// nothing, so the push goes out without it. The watch, if any, is
+// stopped only after a successful put. Returns the raw error from the
+// RPC so callers can decide whether to surface it. Runs under pushMu.
+func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileRecord, fromSync bool) error {
 	keys := a.app.AccountKeys()
 	symKey, err := space.DeriveAccountMetadataSymKey(keys.SignKey)
 	if err != nil {
 		return fmt.Errorf("anysyncsdk: derive metadata key: %w", err)
 	}
-	profile := space.Profile{AccountMetadata: space.AccountMetadata{Name: rec.Name, Description: rec.Description}}
-	switch {
-	case rec.IconFileId == "" || a.spaces == nil:
-		a.stopIconWatch()
-	case a.iconDurable(ctx, rec.IconFileId, &profile):
-		a.stopIconWatch()
-	default:
+	profile, ready := a.profileFor(ctx, rec)
+	if rec.IconFileId != "" && !ready {
 		a.armIconWatch(rec.IconFileId)
-		if waitForIcon {
+		if fromSync && rec.IconPublished {
 			return nil
 		}
 	}
@@ -1308,7 +1358,8 @@ func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileReco
 	// a 1-1 invite) can read it. The signature is over the CIPHERTEXT so
 	// the fetch path verifies before it decrypts (matches
 	// decodeIdentityRepoProfile).
-	payload, err := space.EncryptProfile(profile, symKey)
+	plain := space.EncodeProfile(profile)
+	payload, err := symKey.Encrypt(plain)
 	if err != nil {
 		return fmt.Errorf("anysyncsdk: encrypt profile: %w", err)
 	}
@@ -1320,26 +1371,23 @@ func (a *accountImpl) pushProfile(ctx context.Context, rec techspace.ProfileReco
 	// "account address" form for the identity, not the libp2p PeerId
 	// our public Account.Id() returns. Translate at the boundary.
 	identity := keys.SignKey.GetPublic().Account()
-	return a.app.Coordinator().IdentityRepoPut(ctx, identity, []*identityrepoproto.Data{{
+	if err := a.app.Coordinator().IdentityRepoPut(ctx, identity, []*identityrepoproto.Data{{
 		Kind:      space.IdentityProfileKind,
 		Data:      payload,
 		Signature: signature,
-	}})
-}
-
-// iconDurable fills the avatar reference into profile from the file
-// row when the row is here and carries its custody receipt. A missing
-// row is a row that has not synced to this device yet (or one deleted
-// on another device): not durable either way.
-func (a *accountImpl) iconDurable(ctx context.Context, fileId string, profile *space.Profile) bool {
-	row, err := a.spaces.TechFileRow(ctx, fileId)
-	if err != nil || row.NetworkSign == "" || row.RootCid == "" || len(row.Enc.Key) == 0 {
-		return false
+	}}); err != nil {
+		return err
 	}
-	profile.IconCID = row.RootCid
-	profile.IconSpaceId = a.spaces.TechSpaceId()
-	profile.IconKey = space.EncodeIconKey(row.Enc.Key)
-	return true
+	a.lastPushed = plain
+	if ready || rec.IconFileId == "" {
+		a.stopIconWatch()
+	}
+	if ready && !rec.IconPublished {
+		if perr := a.tsp.SetProfileIconPublished(ctx, true); perr != nil {
+			log.Warn("mark avatar published", zap.Error(perr))
+		}
+	}
+	return nil
 }
 
 // armIconWatch starts the watch for fileId's receipt unless one is
@@ -1353,15 +1401,13 @@ func (a *accountImpl) armIconWatch(fileId string) {
 		}
 		close(a.watchStop)
 	}
-	select {
-	case <-a.closed:
+	if a.closed() {
 		a.watchStop, a.watchFile = nil, ""
 		return
-	default:
 	}
 	stop := make(chan struct{})
 	a.watchStop, a.watchFile = stop, fileId
-	a.watchWG.Add(1)
+	a.wg.Add(1)
 	go a.runIconWatch(fileId, stop)
 }
 
@@ -1382,9 +1428,17 @@ func (a *accountImpl) stopIconWatch() {
 // account), and once right away so a receipt that landed before the
 // subscription existed is not missed. A failed republish is retried
 // on the next tick. The watch ends when the profile row stops naming
-// fileId, when it is replaced or stopped, or when the SDK closes.
-func (a *accountImpl) runIconWatch(fileId string, stop <-chan struct{}) {
-	defer a.watchWG.Done()
+// fileId, when it is replaced or stopped, or when the SDK closes; on
+// the way out it clears the slot if the slot is still its own.
+func (a *accountImpl) runIconWatch(fileId string, stop chan struct{}) {
+	defer func() {
+		a.watchMu.Lock()
+		if a.watchStop == stop {
+			a.watchStop, a.watchFile = nil, ""
+		}
+		a.watchMu.Unlock()
+		a.wg.Done()
+	}()
 	kick := make(chan struct{}, 1)
 	unsub := a.spaces.SubscribeTechFileStatus(func(st space.FileStatus) {
 		if st.FileId != fileId || st.State != space.FileStateDurable {
@@ -1405,7 +1459,7 @@ func (a *accountImpl) runIconWatch(fileId string, stop <-chan struct{}) {
 		select {
 		case <-stop:
 			return
-		case <-a.closed:
+		case <-a.closeCtx.Done():
 			return
 		case <-kick:
 		case <-t.C:
@@ -1415,18 +1469,24 @@ func (a *accountImpl) runIconWatch(fileId string, stop <-chan struct{}) {
 
 // tryPublishIcon republishes the profile with fileId's reference when
 // the row is durable. It reports whether the watch is done: published,
-// or no longer wanted because the profile row names another avatar.
+// or no longer wanted because the profile row names another avatar or
+// the SDK is closing.
 func (a *accountImpl) tryPublishIcon(fileId string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), iconPushTimeout)
-	defer cancel()
+	if a.closed() {
+		return true
+	}
 	a.pushMu.Lock()
 	defer a.pushMu.Unlock()
+	if a.closed() {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(a.closeCtx, iconPushTimeout)
+	defer cancel()
 	rec, ok := a.tsp.GetProfile(ctx)
 	if !ok || rec.IconFileId != fileId {
 		return true
 	}
-	var probe space.Profile
-	if !a.iconDurable(ctx, fileId, &probe) {
+	if _, ready := a.profileFor(ctx, rec); !ready {
 		return false
 	}
 	if err := a.pushProfile(ctx, rec, false); err != nil {
@@ -1435,6 +1495,74 @@ func (a *accountImpl) tryPublishIcon(fileId string) bool {
 	}
 	a.kickProfiles()
 	return true
+}
+
+// startProfileSync mirrors profile-row changes that arrive by sync to
+// identityRepo: a name edited on another device, an avatar whose
+// fields reach this device after it published without them, the
+// published mark. A burst of events coalesces into one push; a push
+// that would repeat this device's last successful one is skipped.
+// Called once by the bootstrap after the boot republish; the goroutine
+// ends with closeCtx and is joined by close().
+func (a *accountImpl) startProfileSync() {
+	if a.tsp == nil || a.closed() {
+		return
+	}
+	sub, err := a.tsp.SubEngine().Subscribe(subscribe.SubConfig{
+		Scope: subscribe.Scope{ObjectId: a.tsp.IndexObjectId(), Dataset: techspace.ProfileDataset},
+	}, func(func(id string, doc *anyenc.Value)) error { return nil })
+	if err != nil {
+		log.Warn("profile sync: subscribe", zap.Error(err))
+		return
+	}
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		defer func() { _ = sub.Close() }()
+		events := sub.Events()
+		for {
+			if _, err := events.Wait(a.closeCtx); err != nil {
+				return
+			}
+			// Coalesce: drain what lands in the next window.
+			timer := time.NewTimer(profileSyncDebounce)
+			select {
+			case <-timer.C:
+			case <-a.closeCtx.Done():
+				timer.Stop()
+				return
+			}
+			a.syncPush()
+		}
+	}()
+}
+
+// syncPush pushes the profile row as it now stands, unless this device
+// pushed exactly that record already.
+func (a *accountImpl) syncPush() {
+	if a.closed() {
+		return
+	}
+	a.pushMu.Lock()
+	defer a.pushMu.Unlock()
+	if a.closed() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(a.closeCtx, iconPushTimeout)
+	defer cancel()
+	rec, ok := a.tsp.GetProfile(ctx)
+	if !ok || rec.IsEmpty() {
+		return
+	}
+	profile, _ := a.profileFor(ctx, rec)
+	if bytes.Equal(space.EncodeProfile(profile), a.lastPushed) {
+		return
+	}
+	if err := a.pushProfile(ctx, rec, true); err != nil {
+		log.Warn("profile sync: push", zap.Error(err))
+		return
+	}
+	a.kickProfiles()
 }
 
 // InitPageBuffer sizes the process-global any-store v2 page pool: 128 MiB

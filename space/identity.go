@@ -113,7 +113,9 @@ const iconKeySize = 32
 const MaxIconSize = 1 << 20
 
 var (
-	// ErrIconTooLarge — SetIcon read more than MaxIconSize bytes.
+	// ErrIconTooLarge — SetIcon read more than MaxIconSize bytes, or a
+	// contact's profile names an object over the cap, which
+	// Identities.OpenIcon refuses unread.
 	ErrIconTooLarge = errors.New("space: profile icon exceeds the size cap")
 	// ErrProfileIconReadOnly — UpdateMetadata was handed an IconCID.
 	// The icon is a file: SetIcon stores the bytes and derives the cid.

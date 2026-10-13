@@ -8,6 +8,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -69,24 +70,38 @@ func (s *Service) openIdentityIcon(ctx context.Context, identity string, p techs
 		return nil, fmt.Errorf("identities: %s: avatar cid: %w", identity, space.ErrNotFound)
 	}
 	// An avatar is published only once durable, so the public read
-	// path is always eligible. Whatever stops the fetch — no public
+	// path is always eligible. The object is capped at the probe (its
+	// size is known before the index or any block is read) and the
+	// plaintext size again once the root loads; a refused object leaves
+	// no cached row behind. Whatever else stops the fetch — no public
 	// read base, an object the store no longer serves, a transport
-	// failure — is the same retry-later state to the caller, and the
-	// underlying error (which names the owner's space) stays in the log.
-	f, err := s.fetch.Open(ctx, p.IconSpaceId, root, key, true, identityIconRef(identity))
+	// failure, a peer budget — is the same retry-later state to the
+	// caller, and the underlying error (which names the owner's space)
+	// stays in the debug log.
+	f, err := s.fetch.OpenLimited(ctx, p.IconSpaceId, root, key, true, identityIconRef(identity), identityIconObjectCap)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(err, fetch.ErrObjectTooLarge) {
+			s.releaseIdentityIcon(ctx, identity, p.IconSpaceId, p.IconCID)
+			return nil, fmt.Errorf("identities: %s: avatar object over the cap: %w", identity, space.ErrIconTooLarge)
 		}
 		filesLog.Debug("identity icon fetch", zap.String("identity", identity), zap.Error(err))
 		return nil, fmt.Errorf("identities: %s: avatar not fetchable: %w", identity, space.ErrFileNotAvailable)
 	}
 	if f.Size() > space.MaxIconSize {
 		_ = f.Close()
+		s.releaseIdentityIcon(ctx, identity, p.IconSpaceId, p.IconCID)
 		return nil, fmt.Errorf("identities: %s: avatar of %d bytes: %w", identity, f.Size(), space.ErrIconTooLarge)
 	}
 	return f, nil
 }
+
+// identityIconObjectCap bounds the remote object a contact's avatar
+// may be: the plaintext cap plus the CARv2 framing of a file that
+// size (headers, index, block prefixes).
+const identityIconObjectCap = space.MaxIconSize + 64<<10
 
 // safeSpaceId reports whether id has the shape of an any-sync space id
 // — letters and digits around one dot — so a profile-supplied value

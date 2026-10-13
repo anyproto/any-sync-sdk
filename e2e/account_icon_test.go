@@ -3,6 +3,8 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	crand "crypto/rand"
 	"io"
 	mrand "math/rand"
 	"testing"
@@ -41,24 +43,25 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
-	mkSDK := func(name string, files config.Files) *anysyncsdk.SDK {
+	mkSDK := func(name string, provider *fixedSeedProvider, files config.Files) *anysyncsdk.SDK {
 		t.Helper()
 		cfg := config.Config{
 			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
 			Network: config.Network{NodeConfYAML: netYaml},
 			Files:   files,
 		}
-		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+		sdk, err := anysyncsdk.Open(ctx, cfg, provider)
 		require.NoError(t, err, "%s: Open", name)
 		t.Cleanup(func() { _ = sdk.Close() })
 		return sdk
 	}
 
-	owner := mkSDK("owner", config.Files{})
+	ownerKeys := newFixedSeedProvider(t)
+	owner := mkSDK("owner", ownerKeys, config.Files{})
 	ownerId := owner.Account().Id()
 	cdn := newBlobCDN(t, ctx, owner, fileV2Peers, owner.TechSpaceId())
 	t.Cleanup(cdn.Close)
-	joiner := mkSDK("joiner", config.Files{PublicReadBaseUrl: cdn.URL})
+	joiner := mkSDK("joiner", newFixedSeedProvider(t), config.Files{PublicReadBaseUrl: cdn.URL})
 	require.NotEqual(t, ownerId, joiner.Account().Id())
 
 	// Under the inline cutoff on purpose: the avatar path pins the full
@@ -157,6 +160,33 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before, cdn.Requests(), "a cached avatar is not refetched")
 
+	// A second device of the owner (same account key, its own device
+	// key): it syncs the profile row and then the avatar's file row,
+	// serves the avatar itself, and its boot republish must not drop
+	// the avatar for the contact.
+	_, device2, err := ed25519.GenerateKey(crand.Reader)
+	require.NoError(t, err)
+	owner2 := mkSDK("owner-2", &fixedSeedProvider{account: ownerKeys.account, device: device2}, config.Files{PublicReadBaseUrl: cdn.URL})
+	require.Eventually(t, func() bool {
+		m, present, err := owner2.Account().Metadata(ctx)
+		return err == nil && present && m.IconCID == meta.IconCID
+	}, 120*time.Second, 2*time.Second, "the second device should sync the profile row with the avatar")
+	require.Eventually(t, func() bool {
+		rd, err := owner2.Account().OpenIcon(ctx)
+		if err != nil {
+			return false
+		}
+		got, err = io.ReadAll(rd)
+		_ = rd.Close()
+		return err == nil && bytes.Equal(got, icon)
+	}, 120*time.Second, 2*time.Second, "the second device should serve the avatar once its file row syncs")
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		info, ok, _ := joiner.Identities().Get(ctx, ownerId)
+		require.True(t, ok && info.IconCID == meta.IconCID, "a second device's boot must not drop the published avatar; got %+v", info)
+		time.Sleep(2 * time.Second)
+	}
+
 	// Delete: the owner has none, and the joiner's directory follows.
 	require.NoError(t, owner.Account().DeleteIcon(ctx))
 	stored, _, err = owner.Account().Metadata(ctx)
@@ -170,4 +200,8 @@ func TestE2E_AccountIcon_ContactFetch(t *testing.T) {
 	}, 90*time.Second, 2*time.Second, "joiner directory should drop the avatar cid")
 	_, err = joiner.Identities().OpenIcon(ctx, ownerId)
 	assert.ErrorIs(t, err, space.ErrNotFound)
+	require.Eventually(t, func() bool {
+		m, _, err := owner2.Account().Metadata(ctx)
+		return err == nil && m.IconCID == ""
+	}, 90*time.Second, 2*time.Second, "the second device should see the avatar removed")
 }

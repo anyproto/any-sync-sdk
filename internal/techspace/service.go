@@ -583,7 +583,7 @@ func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
 // its fields, so devices editing different parts of the profile
 // converge per field instead of the last full-row write winning.
 func (s *Service) SetProfileMetadata(ctx context.Context, name, description string) error {
-	return s.setProfileFields(ctx, [][2]string{
+	return s.setProfileFields(ctx, []profileField{
 		{FieldProfileName, name},
 		{FieldProfileDescription, description},
 	})
@@ -591,16 +591,28 @@ func (s *Service) SetProfileMetadata(ctx context.Context, name, description stri
 
 // SetProfileIcon writes the avatar fields of the profile row: the
 // content address and the tech-space file row behind it, both empty
-// to clear.
+// to clear. A new avatar starts unpublished.
 func (s *Service) SetProfileIcon(ctx context.Context, iconCID, iconFileId string) error {
-	return s.setProfileFields(ctx, [][2]string{
+	return s.setProfileFields(ctx, []profileField{
 		{FieldProfileIcon, iconCID},
 		{FieldProfileIconFileId, iconFileId},
+		{FieldProfileIconPublished, false},
 	})
 }
 
+// SetProfileIconPublished records that the avatar reference reached
+// identityRepo.
+func (s *Service) SetProfileIconPublished(ctx context.Context, published bool) error {
+	return s.setProfileFields(ctx, []profileField{{FieldProfileIconPublished, published}})
+}
+
+type profileField struct {
+	id    string
+	value any // string or bool
+}
+
 // setProfileFields upserts the profile row with one $set per field.
-func (s *Service) setProfileFields(ctx context.Context, fields [][2]string) error {
+func (s *Service) setProfileFields(ctx context.Context, fields []profileField) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
@@ -611,7 +623,18 @@ func (s *Service) setProfileFields(ctx context.Context, fields [][2]string) erro
 	arena := &anyenc.Arena{}
 	ops := make([]crdt.Op, 0, len(fields))
 	for _, f := range fields {
-		ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: []string{f[0]}, Payload: arena.NewString(f[1])})
+		var payload *anyenc.Value
+		switch v := f.value.(type) {
+		case string:
+			payload = arena.NewString(v)
+		case bool:
+			if v {
+				payload = arena.NewTrue()
+			} else {
+				payload = arena.NewFalse()
+			}
+		}
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: []string{f.id}, Payload: payload})
 	}
 	change := crdt.Change{
 		Dataset:     ProfileDataset,

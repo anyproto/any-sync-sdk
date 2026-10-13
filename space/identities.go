@@ -19,9 +19,11 @@ type IdentitiesAPI interface {
 	// OpenIcon returns a reader over the identity's avatar — the file
 	// its resolved profile names, fetched through the public read path
 	// and decrypted with the key the profile carries. ErrNotFound when
-	// the identity is unknown or its profile names no avatar;
-	// ErrFileNotAvailable when the bytes are neither cached nor
-	// fetchable yet. The account's own avatar opens here too.
+	// the identity is unknown or its profile names no avatar (or a
+	// malformed reference); ErrIconTooLarge when the object is over
+	// MaxIconSize, refused unread; ErrFileNotAvailable whenever the
+	// bytes cannot be fetched now. The account's own avatar opens here
+	// too.
 	OpenIcon(ctx context.Context, identity string) (FileReader, error)
 }
 

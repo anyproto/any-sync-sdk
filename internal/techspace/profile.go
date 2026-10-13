@@ -22,6 +22,8 @@ func ProfileSchema() schema.Dataset {
 			Description: "Avatar content address: the rootCid of the avatar file."},
 		{Id: FieldProfileIconFileId, Name: "Icon file", Schema: str(), Scope: schema.ScopeSynced,
 			Description: "Payloads row id of the avatar file in the tech space."},
+		{Id: FieldProfileIconPublished, Name: "Icon published", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced,
+			Description: "Whether the avatar reference has reached identityRepo (set by the device that pushed it)."},
 	}}
 }
 
@@ -54,10 +56,11 @@ const (
 	// FieldProfileName / FieldProfileDescription / FieldProfileIcon
 	// match the on-the-wire layout EncodeProfile produces;
 	// FieldProfileIconFileId stays local to the account's devices.
-	FieldProfileName        = "name"
-	FieldProfileDescription = "description"
-	FieldProfileIcon        = "iconCID"
-	FieldProfileIconFileId  = "iconFileId"
+	FieldProfileName          = "name"
+	FieldProfileDescription   = "description"
+	FieldProfileIcon          = "iconCID"
+	FieldProfileIconFileId    = "iconFileId"
+	FieldProfileIconPublished = "iconPublished"
 )
 
 // ProfileRecord is the typed view of the single profile row.
@@ -69,6 +72,10 @@ type ProfileRecord struct {
 	// IconFileId is the avatar's file row in the tech space, the source
 	// of its rootCid, file key and durability.
 	IconFileId string
+	// IconPublished records that a device of the account pushed the
+	// profile with the avatar reference: the file is durable, so every
+	// device may publish it even before the receipt syncs to it.
+	IconPublished bool
 }
 
 // IsEmpty reports whether the record has nothing worth pushing.
@@ -83,10 +90,11 @@ func DecodeProfileRecord(v *anyenc.Value) ProfileRecord {
 		return ProfileRecord{}
 	}
 	return ProfileRecord{
-		Name:        v.GetString(FieldProfileName),
-		Description: v.GetString(FieldProfileDescription),
-		IconCID:     v.GetString(FieldProfileIcon),
-		IconFileId:  v.GetString(FieldProfileIconFileId),
+		Name:          v.GetString(FieldProfileName),
+		Description:   v.GetString(FieldProfileDescription),
+		IconCID:       v.GetString(FieldProfileIcon),
+		IconFileId:    v.GetString(FieldProfileIconFileId),
+		IconPublished: v.GetBool(FieldProfileIconPublished),
 	}
 }
 

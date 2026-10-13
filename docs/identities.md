@@ -126,22 +126,40 @@ the only writer.
   the last full-row write winning. `UpdateMetadata` refuses an
   `IconCID` (`ErrProfileIconReadOnly`) and a NUL byte in a field
   (`ErrProfileFieldInvalid`: NUL is the record separator). A cid with no
-  file row behind it is not reported by `Metadata` and never pushed.
+  file id behind it is not reported by `Metadata` and never pushed.
 - **Publish only once durable.** The pushed profile carries the avatar
   reference (`IconSpaceId`, `IconKey`) only when the file row on this
-  device carries the custody receipt: the public read path serves
-  durable objects alone, so a reader never holds a reference it cannot
-  fetch. While the avatar is pending, a push from `SetIcon` or
-  `UpdateMetadata` names no avatar (contacts see none until the flip),
-  and the boot republish is skipped altogether rather than drop an
-  avatar another device already published. The pending state arms the
-  avatar watch (`runIconWatch`): one goroutine that re-reads the row
-  on every status event for the file (the uploading device's queue),
-  every `iconWatchPoll` (the receipt reaches the account's other
-  devices through sync of the row, which raises no event), and once at
-  start. It republishes under `pushMu` with a bounded context, retries
-  a failed push on the next tick, and ends when published, when the
-  row names another avatar, or on `SDK.Close`, which joins it.
+  device has its key and either carries the custody receipt or the
+  row's synced `iconPublished` mark says another device already
+  published it (the file is durable; the receipt just has not synced
+  here yet): the public read path serves durable objects alone, so a
+  reader never holds a reference it cannot fetch. The device whose
+  push includes the reference sets `iconPublished`; `SetIcon` and
+  `DeleteIcon` clear it.
+- **While an avatar is pending** — uploading, or its row not here yet
+  — a push from `SetIcon` or `UpdateMetadata` names no avatar
+  (contacts see none until the flip). A boot or sync-driven push does
+  the same when the avatar was never published (nothing is dropped),
+  and is skipped when it was (`iconPublished`): pushing without it
+  would drop it for every contact, so the push waits for the row. The
+  pending state arms the avatar watch (`runIconWatch`): one goroutine
+  that re-reads the row on every status event for the file (the
+  uploading device's queue), every `iconWatchPoll` (the receipt reaches
+  the account's other devices through sync of the row, which raises no
+  event), and once at start. It republishes under `pushMu` with a
+  bounded, close-cancelled context; the watch is stopped only after a
+  successful put, so a failed one is retried on the next tick. It ends
+  when published, when the row names another avatar, or on
+  `SDK.Close`, which cancels and joins it (a push queued behind a
+  caller holding `pushMu` waits for that caller's own RPC).
+- **The row is mirrored.** The profile row is the source of truth, and
+  it syncs between the account's devices. After the boot republish the
+  SDK subscribes to the row (`startProfileSync`) and pushes it again
+  whenever it changes — a name edited elsewhere, avatar fields that
+  arrive after this device published without them, the published mark
+  — coalescing a burst into one push and skipping a record identical
+  to the last one this device put. So a device never needs the event
+  it missed: the row it holds is what it publishes.
 - **Read.** `Identities().OpenIcon(ctx, identity)` opens the avatar a
   cached profile names: the space id must have the shape of a space id
   (letters and digits around one dot — it reaches a store path and a
@@ -150,16 +168,21 @@ the only writer.
   `{base}/blob/{spaceId}/{rootCid}` — decrypted with the key from the
   profile. The reader never joins or syncs the owner's space and
   nothing on the network checks membership on that path, which is the
-  same path every file download already takes. An object larger than
-  `MaxIconSize` is refused (`ErrIconTooLarge`) once its size is known
-  from the DAG root, before its bytes are read. The own avatar opens
-  through the tech-space file. `ErrNotFound` when the identity, its
-  avatar or the reference is unknown or malformed; `ErrFileNotAvailable`
-  whenever the bytes cannot be fetched now — no public read base, an
-  object the store no longer serves (a stale reference after the owner
-  replaced or removed the avatar), a transport failure — with the
-  underlying cause in the debug log only, since it names the owner's
-  space.
+  same path every file download already takes. The remote object is
+  capped at the probe (`fetch.OpenLimited`: its total size is known
+  from the first range before the index or any block is read) and the
+  plaintext size is checked again once the root loads; a refused
+  object (`ErrIconTooLarge`) leaves no cached row behind. The own
+  avatar opens through the tech-space file (`Account.OpenIcon`), where
+  a file row the profile names but this device has not synced yet is
+  `ErrFileNotAvailable`, not "none". `ErrNotFound` when the identity,
+  its avatar or the reference is unknown or malformed;
+  `ErrFileNotAvailable` whenever the bytes cannot be fetched now — no
+  public read base, an object the store no longer serves (a stale
+  reference after the owner replaced or removed the avatar), a
+  transport failure, a peer budget — with the underlying cause in the
+  debug log only, since it names the owner's space. The caller's own
+  context error is returned as is.
 - **Cache.** A contact's avatar is cached under the ref
   `identity/<identity>`. The safety sweep retains rows of a space it
   cannot resolve, so the directory write-through

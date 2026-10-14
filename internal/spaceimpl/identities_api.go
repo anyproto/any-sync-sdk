@@ -2,6 +2,7 @@ package spaceimpl
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 
@@ -14,13 +15,37 @@ import (
 // `identities` directory dataset. Account-global, device-local reads; the
 // Subscribe stream reuses the same SubEngine as the space list.
 type identitiesAPI struct {
-	tsp *techspace.Service
+	tsp    *techspace.Service
+	parent *Service
 }
 
 // NewIdentitiesAPI builds the account-global identities directory surface
-// over the tech space.
-func NewIdentitiesAPI(tsp *techspace.Service) space.IdentitiesAPI {
-	return &identitiesAPI{tsp: tsp}
+// over the tech space; parent supplies the byte layer behind OpenIcon.
+func NewIdentitiesAPI(tsp *techspace.Service, parent *Service) space.IdentitiesAPI {
+	return &identitiesAPI{tsp: tsp, parent: parent}
+}
+
+// OpenIcon opens the avatar the identity's cached profile names. See
+// space.IdentitiesAPI. The account's own avatar is a tech-space file
+// read through the member path; a contact's is fetched by (space,
+// rootCid) and decrypted with the key from the profile, under a ref
+// named after the identity so the cached bytes outlive any one read.
+func (a *identitiesAPI) OpenIcon(ctx context.Context, identity string) (space.FileReader, error) {
+	if identity == "" {
+		return nil, fmt.Errorf("identities: identity required: %w", space.ErrNotFound)
+	}
+	if keys := a.parent.app.AccountKeys(); keys != nil && identity == keys.SignKey.GetPublic().Account() {
+		rec, ok := a.tsp.GetProfile(ctx)
+		if !ok || rec.IconFileId == "" {
+			return nil, fmt.Errorf("identities: no avatar: %w", space.ErrNotFound)
+		}
+		return a.parent.OpenOwnIcon(ctx, rec.IconFileId)
+	}
+	r, ok := a.tsp.GetIdentity(ctx, identity)
+	if !ok {
+		return nil, fmt.Errorf("identities: %s: %w", identity, space.ErrNotFound)
+	}
+	return a.parent.openIdentityIcon(ctx, identity, r.IdentityProfile)
 }
 
 func (a *identitiesAPI) List(ctx context.Context) ([]space.IdentityInfo, error) {

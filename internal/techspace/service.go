@@ -564,25 +564,64 @@ func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
 // when a profile has ever been written; false on a fresh device that
 // hasn't seen UpdateMetadata yet.
 func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
+	rec, present, err := s.GetProfileState(ctx)
+	return rec, err == nil && present
+}
+
+// GetProfileState is GetProfile for callers that must tell a row that
+// is absent from a read that failed (a closed service, an index object
+// that could not be loaded): the former is final, the latter is
+// retried.
+func (s *Service) GetProfileState(ctx context.Context) (rec ProfileRecord, present bool, err error) {
 	if !s.open.Load() {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, err
 	}
-	v := obj.Controller().Get(ctx, ProfileDataset, ProfileSelfId)
+	v, err := obj.Controller().Lookup(ctx, ProfileDataset, ProfileSelfId)
+	if err != nil {
+		return ProfileRecord{}, false, err
+	}
 	if v == nil {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, nil
 	}
-	return DecodeProfileRecord(v), true
+	return DecodeProfileRecord(v), true, nil
 }
 
-// SetProfile writes (or replaces) the local profile row. Called by
-// Account.UpdateMetadata to persist the value before pushing it to
-// identityRepo, so a subsequent boot can republish without the user
-// re-calling UpdateMetadata.
-func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
+// SetProfileMetadata writes the name and description of the profile
+// row, leaving the avatar fields to SetProfileIcon: each writer owns
+// its fields, so devices editing different parts of the profile
+// converge per field instead of the last full-row write winning.
+func (s *Service) SetProfileMetadata(ctx context.Context, name, description string) error {
+	return s.setProfileFields(ctx, [][2]string{
+		{FieldProfileName, name},
+		{FieldProfileDescription, description},
+	})
+}
+
+// SetProfileIcon writes the avatar fields of the profile row: the
+// content address and the tech-space file row behind it, both empty
+// to clear. The published mark is cleared with them: it names a file,
+// and a new avatar has not been pushed yet.
+func (s *Service) SetProfileIcon(ctx context.Context, iconCID, iconFileId string) error {
+	return s.setProfileFields(ctx, [][2]string{
+		{FieldProfileIcon, iconCID},
+		{FieldProfileIconFileId, iconFileId},
+		{FieldProfileIconPublished, ""},
+	})
+}
+
+// SetProfileIconPublished records that the reference of the avatar
+// file fileId reached identityRepo. Tied to the file: a mark written
+// for one avatar never vouches for the next.
+func (s *Service) SetProfileIconPublished(ctx context.Context, fileId string) error {
+	return s.setProfileFields(ctx, [][2]string{{FieldProfileIconPublished, fileId}})
+}
+
+// setProfileFields upserts the profile row with one $set per field.
+func (s *Service) setProfileFields(ctx context.Context, fields [][2]string) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
@@ -591,15 +630,15 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 		return err
 	}
 	arena := &anyenc.Arena{}
+	ops := make([]crdt.Op, 0, len(fields))
+	for _, f := range fields {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: []string{f[0]}, Payload: arena.NewString(f[1])})
+	}
 	change := crdt.Change{
 		Dataset:     ProfileDataset,
 		DataVersion: ProfileHandlerVersion,
 		Records: []crdt.RecordChange{
-			{
-				Id:     ProfileSelfId,
-				Upsert: true,
-				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: rec.encodeUpsert(arena)}},
-			},
+			{Id: ProfileSelfId, Upsert: true, Ops: ops},
 		},
 	}
 	_, err = obj.LocalWrite(ctx, change)
@@ -689,15 +728,14 @@ func (s *Service) SetIdentityMetaKey(ctx context.Context, identity, symKey strin
 // SetIdentityProfile caches a contact's resolved identityRepo profile.
 // DEVICE-LOCAL (LocalSet → never synced): each device re-resolves from
 // the synced symkey + identityRepo. No-op when unchanged.
-func (s *Service) SetIdentityProfile(ctx context.Context, identity, name, description, iconCID string) error {
+func (s *Service) SetIdentityProfile(ctx context.Context, identity string, p IdentityProfile) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
 	if identity == "" {
 		return nil
 	}
-	if rec, ok := s.GetIdentity(ctx, identity); ok &&
-		rec.Name == name && rec.Description == description && rec.IconCID == iconCID {
+	if rec, ok := s.GetIdentity(ctx, identity); ok && rec.IdentityProfile == p {
 		return nil
 	}
 	obj, err := s.indexObj(ctx)
@@ -706,9 +744,11 @@ func (s *Service) SetIdentityProfile(ctx context.Context, identity, name, descri
 	}
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
-	payload.Set(FieldIdentityName, arena.NewString(name))
-	payload.Set(FieldIdentityDescription, arena.NewString(description))
-	payload.Set(FieldIdentityIcon, arena.NewString(iconCID))
+	payload.Set(FieldIdentityName, arena.NewString(p.Name))
+	payload.Set(FieldIdentityDescription, arena.NewString(p.Description))
+	payload.Set(FieldIdentityIcon, arena.NewString(p.IconCID))
+	payload.Set(FieldIdentityIconSpaceId, arena.NewString(p.IconSpaceId))
+	payload.Set(FieldIdentityIconKey, arena.NewString(p.IconKey))
 	change := crdt.Change{
 		Dataset:     IdentitiesDataset,
 		DataVersion: IdentitiesHandlerVersion,

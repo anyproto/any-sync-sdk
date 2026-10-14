@@ -19,7 +19,11 @@ func ProfileSchema() schema.Dataset {
 		{Id: FieldProfileDescription, Name: "Description", Schema: str(), Scope: schema.ScopeSynced,
 			Description: "Account description.", XFormat: map[string]any{"type": "longtext"}},
 		{Id: FieldProfileIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeSynced,
-			Description: "Account icon CID."},
+			Description: "Avatar content address: the rootCid of the avatar file."},
+		{Id: FieldProfileIconFileId, Name: "Icon file", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Payloads row id of the avatar file in the tech space."},
+		{Id: FieldProfileIconPublished, Name: "Icon published", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "The avatar file id whose reference reached identityRepo (set by the device that pushed it)."},
 	}}
 }
 
@@ -27,9 +31,11 @@ func ProfileSchema() schema.Dataset {
 //
 // One row per account, keyed by the constant ProfileSelfId. The dataset
 // holds the local source-of-truth for the account's identityRepo
-// profile (Name, Description, IconCID). The SDK reads it on boot and
-// republishes to identityRepo so a fresh-boot or freshly-restored
-// device pushes the latest profile without an explicit user call.
+// profile: Name, Description, and the avatar as IconCID (its content
+// address) plus IconFileId (the tech-space file row that holds the
+// bytes and the file key). The SDK reads it on boot and republishes to
+// identityRepo so a fresh-boot or freshly-restored device pushes the
+// latest profile without an explicit user call.
 
 const (
 	// ProfileDataset name on the space-index tree. We piggyback on the
@@ -45,20 +51,34 @@ const (
 
 	// ProfileHandlerVersion stamped on every change. Bump when adding
 	// new validated fields.
-	ProfileHandlerVersion = "profileHandler-v1"
+	ProfileHandlerVersion = "profileHandler-v2"
 
 	// FieldProfileName / FieldProfileDescription / FieldProfileIcon
-	// match the on-the-wire layout EncodeAccountMetadata produces.
-	FieldProfileName        = "name"
-	FieldProfileDescription = "description"
-	FieldProfileIcon        = "iconCID"
+	// match the on-the-wire layout EncodeProfile produces;
+	// FieldProfileIconFileId stays local to the account's devices.
+	FieldProfileName          = "name"
+	FieldProfileDescription   = "description"
+	FieldProfileIcon          = "iconCID"
+	FieldProfileIconFileId    = "iconFileId"
+	FieldProfileIconPublished = "iconPublishedFileId"
 )
 
 // ProfileRecord is the typed view of the single profile row.
 type ProfileRecord struct {
 	Name        string
 	Description string
-	IconCID     string
+	// IconCID is the avatar's content address; empty without an avatar.
+	IconCID string
+	// IconFileId is the avatar's file row in the tech space, the source
+	// of its rootCid, file key and durability.
+	IconFileId string
+	// IconPublishedFileId names the avatar file whose reference a
+	// device of the account pushed to identityRepo: that file is
+	// durable, so every device may publish it even before the receipt
+	// syncs to it. It equals IconFileId once the current avatar is out;
+	// a replaced avatar leaves it naming the old file until the new one
+	// is published.
+	IconPublishedFileId string
 }
 
 // IsEmpty reports whether the record has nothing worth pushing.
@@ -73,20 +93,12 @@ func DecodeProfileRecord(v *anyenc.Value) ProfileRecord {
 		return ProfileRecord{}
 	}
 	return ProfileRecord{
-		Name:        v.GetString(FieldProfileName),
-		Description: v.GetString(FieldProfileDescription),
-		IconCID:     v.GetString(FieldProfileIcon),
+		Name:                v.GetString(FieldProfileName),
+		Description:         v.GetString(FieldProfileDescription),
+		IconCID:             v.GetString(FieldProfileIcon),
+		IconFileId:          v.GetString(FieldProfileIconFileId),
+		IconPublishedFileId: v.GetString(FieldProfileIconPublished),
 	}
-}
-
-// encodeUpsert packs the record into the multi-field $set payload the
-// handler accepts on first-write or full-replace.
-func (r ProfileRecord) encodeUpsert(a *anyenc.Arena) *anyenc.Value {
-	obj := a.NewObject()
-	obj.Set(FieldProfileName, a.NewString(r.Name))
-	obj.Set(FieldProfileDescription, a.NewString(r.Description))
-	obj.Set(FieldProfileIcon, a.NewString(r.IconCID))
-	return obj
 }
 
 // ProfileHandler validates ops on the profile dataset. The dataset

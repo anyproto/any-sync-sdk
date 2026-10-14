@@ -52,7 +52,7 @@ func TestE2E_Identities_DirectoryResolveAndPrune(t *testing.T) {
 	joinerId := joiner.Account().Id()
 
 	// Both publish profiles up-front so the peer can resolve them.
-	require.NoError(t, owner.Account().UpdateMetadata(ctx, space.AccountMetadata{Name: "Owner Name", IconCID: "owner-cid"}))
+	require.NoError(t, owner.Account().UpdateMetadata(ctx, space.AccountMetadata{Name: "Owner Name"}))
 	require.NoError(t, joiner.Account().UpdateMetadata(ctx, space.AccountMetadata{Name: "Joiner Name"}))
 
 	// Owner creates + shares a space; joiner requests; owner accepts.

@@ -17,11 +17,13 @@ import (
 //   - symKey  (ScopeSynced)  — the contact's metadata symkey, the secret
 //     a device needs to decrypt their identityRepo profile. It MUST cross
 //     devices, so it rides the tech-space DAG.
-//   - name / description / iconCID / spaceIds (ScopeLocal) — derived,
-//     device-local cache: the last resolved profile and the set of spaces
-//     where we've seen this identity. Persistent on disk but never synced
-//     — any device re-derives these from the synced symkey + identityRepo
-//     + its own membership, so syncing them would only add staleness.
+//   - name / description / iconCID / iconSpaceId / iconKey / spaceIds
+//     (ScopeLocal) — derived, device-local cache: the last resolved
+//     profile (the avatar reference included: where its ciphertext lives
+//     and the key that opens it) and the set of spaces where we've seen
+//     this identity. Persistent on disk but never synced — any device
+//     re-derives these from the synced symkey + identityRepo + its own
+//     membership, so syncing them would only add staleness.
 //
 // "Sync the key, derive the value." Exposed to consumers via the public
 // Identities API.
@@ -32,7 +34,7 @@ const (
 	IdentitiesDataset = "identities"
 
 	// IdentitiesHandlerVersion stamped on every change.
-	IdentitiesHandlerVersion = "identitiesHandler-v1"
+	IdentitiesHandlerVersion = "identitiesHandler-v2"
 
 	// FieldIdentitySymKey holds the contact's metadata symkey (synced).
 	FieldIdentitySymKey = "symKey"
@@ -41,6 +43,10 @@ const (
 	FieldIdentityName        = "name"
 	FieldIdentityDescription = "description"
 	FieldIdentityIcon        = "iconCID"
+	// FieldIdentityIconSpaceId / FieldIdentityIconKey locate and unlock
+	// the avatar named by iconCID (device-local, like the profile).
+	FieldIdentityIconSpaceId = "iconSpaceId"
+	FieldIdentityIconKey     = "iconKey"
 	// FieldIdentitySpaceIds is the set of spaces where we've seen this
 	// identity (device-local array of space ids).
 	FieldIdentitySpaceIds = "spaceIds"
@@ -58,7 +64,11 @@ func IdentitiesSchema() schema.Dataset {
 		{Id: FieldIdentityDescription, Name: "Description", Schema: str(), Scope: schema.ScopeLocal,
 			Description: "Cached profile description.", XFormat: map[string]any{"type": "longtext"}},
 		{Id: FieldIdentityIcon, Name: "Icon", Schema: str(), Scope: schema.ScopeLocal,
-			Description: "Cached profile icon CID."},
+			Description: "Cached avatar content address."},
+		{Id: FieldIdentityIconSpaceId, Name: "Icon space", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "Space holding the avatar file."},
+		{Id: FieldIdentityIconKey, Name: "Icon key", Schema: str(), Scope: schema.ScopeLocal,
+			Description: "Key that decrypts the avatar file."},
 		{Id: FieldIdentitySpaceIds, Name: "Space ids", Schema: &schema.Schema{Kind: schema.KindArray, Items: str()}, Scope: schema.ScopeLocal,
 			Description: "Spaces this identity was seen in on this device."},
 	}}
@@ -66,12 +76,21 @@ func IdentitiesSchema() schema.Dataset {
 
 // IdentityRecord is the typed view of one identities row.
 type IdentityRecord struct {
-	Identity    string
-	SymKey      string
+	Identity string
+	SymKey   string
+	IdentityProfile
+	SpaceIds []string
+}
+
+// IdentityProfile is the device-local profile slice of an identities
+// row: the contact's last resolved identityRepo profile, avatar
+// reference included.
+type IdentityProfile struct {
 	Name        string
 	Description string
 	IconCID     string
-	SpaceIds    []string
+	IconSpaceId string
+	IconKey     string
 }
 
 // IdentitiesIndexes backs by-space queries ("which identities are in
@@ -120,6 +139,8 @@ func DecodeIdentityRecord(v *anyenc.Value) IdentityRecord {
 	r.Name = v.GetString(FieldIdentityName)
 	r.Description = v.GetString(FieldIdentityDescription)
 	r.IconCID = v.GetString(FieldIdentityIcon)
+	r.IconSpaceId = v.GetString(FieldIdentityIconSpaceId)
+	r.IconKey = v.GetString(FieldIdentityIconKey)
 	if arr := v.GetArray(FieldIdentitySpaceIds); len(arr) > 0 {
 		r.SpaceIds = make([]string, 0, len(arr))
 		for _, e := range arr {

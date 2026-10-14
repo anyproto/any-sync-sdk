@@ -272,10 +272,10 @@ func (s *Service) resolveInviteSenderProfile(ctx context.Context, identity, spac
 		return
 	}
 	prof, ok := s.fetchIdentityProfile(ctx, identity, key)
-	if !ok || (prof.Name == "" && prof.Description == "" && prof.IconCID == "") {
+	if !ok || prof.IsEmpty() {
 		return
 	}
-	_ = s.tsp.SetIdentityProfile(ctx, identity, prof.Name, prof.Description, prof.IconCID)
+	s.setIdentityProfile(ctx, identity, prof)
 }
 
 // markRegularInvitesToSend queues one durable inbox notification per

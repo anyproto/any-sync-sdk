@@ -39,16 +39,15 @@ func takeoverDelay() time.Duration {
 // exists (the accept-vs-cancel race) is not a delete: its jobs wait for
 // the join controller's reload, Get refusing the row meanwhile.
 func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
-	if rec, ok := s.tsp.Get(ctx, job.SpaceId); !ok || (rec.IsDeleted() && !rec.JoinEnded()) {
-		return nil
+	if job.SpaceId != s.tsp.SpaceId() {
+		// The tech space has no registry row: it is the registry.
+		if rec, ok := s.tsp.Get(ctx, job.SpaceId); !ok || (rec.IsDeleted() && !rec.JoinEnded()) {
+			return nil
+		}
 	}
-	sp, err := s.Get(ctx, job.SpaceId)
+	impl, err := s.implFor(ctx, job.SpaceId)
 	if err != nil {
 		return err
-	}
-	impl, ok := sp.(*spaceImpl)
-	if !ok {
-		return fmt.Errorf("spaceimpl: RunFileJob: %s has no file surface", job.SpaceId)
 	}
 	pa := impl.PayloadsInternal()
 	row, err := pa.FindRow(ctx, job.FileId)
@@ -156,12 +155,8 @@ func (s *Service) OnFileJobChange(job status.Job, _ bool) {
 		return
 	}
 	ctx := context.Background()
-	sp, err := s.Get(ctx, job.SpaceId)
+	impl, err := s.implFor(ctx, job.SpaceId)
 	if err != nil {
-		return
-	}
-	impl, ok := sp.(*spaceImpl)
-	if !ok {
 		return
 	}
 	st, err := impl.fileStatus(ctx, job.FileId)
@@ -175,13 +170,9 @@ func (s *Service) OnFileJobChange(job status.Job, _ bool) {
 // every live file row of the space, one pass over its payloads
 // objects. An unloadable space is an error — GC retains on it.
 func (s *Service) SpaceFiles(ctx context.Context, spaceId string) (map[string]bool, error) {
-	sp, err := s.Get(ctx, spaceId)
+	impl, err := s.implFor(ctx, spaceId)
 	if err != nil {
 		return nil, err
-	}
-	impl, ok := sp.(*spaceImpl)
-	if !ok {
-		return nil, fmt.Errorf("spaceimpl: SpaceFiles: %s has no file surface", spaceId)
 	}
 	pa := impl.PayloadsInternal()
 	objIds, err := impl.store.TreeIdsByChangeType(ctx, payloads.ChangeType)
@@ -205,13 +196,9 @@ func (s *Service) SpaceFiles(ctx context.Context, spaceId string) (map[string]bo
 // ownerId whose rootCid is root (the attach crash window left the row
 // without its CAR ref).
 func (s *Service) ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) (fileId string, ok bool, err error) {
-	sp, err := s.Get(ctx, spaceId)
+	impl, err := s.implFor(ctx, spaceId)
 	if err != nil {
 		return "", false, err
-	}
-	impl, ok := sp.(*spaceImpl)
-	if !ok {
-		return "", false, fmt.Errorf("spaceimpl: ResolveIntent: %s has no file surface", spaceId)
 	}
 	rows, err := impl.PayloadsInternal().ListRows(ctx, ownerId)
 	if err != nil {

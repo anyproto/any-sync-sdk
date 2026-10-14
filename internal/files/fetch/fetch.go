@@ -27,6 +27,10 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+// ErrObjectTooLarge — the remote object is larger than the cap the
+// caller set (OpenLimited): refused before its index or blocks are read.
+var ErrObjectTooLarge = errors.New("filefetch: object exceeds the caller's size cap")
+
 // ErrNotAvailable — the content is not local and cannot be fetched:
 // the file is not durable (P2P arrives with SYN-24) or the network has
 // no public read base. Wraps the public sentinel so SDK consumers
@@ -74,12 +78,20 @@ func (f *File) Size() int64 { return f.size }
 // demand; durable=false with no local bytes is ErrNotAvailable. ref is
 // recorded on the local row (refcount for GC).
 func (s *Service) Open(ctx context.Context, spaceId string, root cid.Cid, key []byte, durable bool, ref string) (*File, error) {
+	return s.OpenLimited(ctx, spaceId, root, key, durable, ref, 0)
+}
+
+// OpenLimited is Open for an object the caller did not register
+// itself (a contact's avatar): a remote object whose total size exceeds
+// maxObject bytes fails with ErrObjectTooLarge at the probe, before
+// its index or any block is fetched. 0 means no cap.
+func (s *Service) OpenLimited(ctx context.Context, spaceId string, root cid.Cid, key []byte, durable bool, ref string, maxObject int64) (*File, error) {
 	h, err := s.store.Open(ctx, spaceId, root)
 	// seed hands back the sources it selected so a not-local file pays
 	// for peer selection once, not again for the reader.
 	var src *fetchSources
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrNoBytes) {
-		h, src, err = s.seed(ctx, spaceId, root, durable, ref)
+		h, src, err = s.seed(ctx, spaceId, root, durable, ref, maxObject)
 	}
 	if err != nil {
 		return nil, err
@@ -122,7 +134,7 @@ func (s *Service) Fetch(ctx context.Context, spaceId string, root cid.Cid, durab
 	h, err := s.store.Open(ctx, spaceId, root)
 	var src *fetchSources
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrNoBytes) {
-		h, src, err = s.seed(ctx, spaceId, root, durable, ref)
+		h, src, err = s.seed(ctx, spaceId, root, durable, ref, 0)
 	}
 	if err != nil {
 		return err
@@ -160,7 +172,7 @@ func (s *Service) Fetch(ctx context.Context, spaceId string, root cid.Cid, durab
 // Range (the embedded index), then CreateSparse. The skeleton's root
 // must match the requested root — a wrong object at the URL is
 // rejected before anything is recorded.
-func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durable bool, ref string) (*store.Handle, *fetchSources, error) {
+func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durable bool, ref string, maxObject int64) (*store.Handle, *fetchSources, error) {
 	src, err := s.source(ctx, spaceId, root, durable)
 	if err != nil {
 		return nil, nil, err
@@ -182,6 +194,9 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	if maxObject > 0 && total > maxObject {
+		return nil, nil, fmt.Errorf("%w: %d bytes, cap %d", ErrObjectTooLarge, total, maxObject)
 	}
 	hdr, err := carfile.ParseHeader(head)
 	if err != nil {

@@ -16,6 +16,15 @@ type IdentitiesAPI interface {
 	// Subscribe streams add/update/remove batches for the directory.
 	// The returned func cancels the subscription.
 	Subscribe(cb func(IdentityListEvent)) (cancel func())
+	// OpenIcon returns a reader over the identity's avatar — the file
+	// its resolved profile names, fetched through the public read path
+	// and decrypted with the key the profile carries. ErrNotFound when
+	// the identity is unknown or its profile names no avatar (or a
+	// malformed reference); ErrIconTooLarge when the object is over
+	// MaxIconSize, refused unread; ErrFileNotAvailable whenever the
+	// bytes cannot be fetched now. The account's own avatar opens here
+	// too.
+	OpenIcon(ctx context.Context, identity string) (FileReader, error)
 }
 
 // IdentityInfo is a point-in-time view of one directory entry.

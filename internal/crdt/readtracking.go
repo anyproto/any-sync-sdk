@@ -20,10 +20,10 @@ type ReadClassification struct {
 	// entry tracks only on replicas where the target record (post-
 	// apply) matches this typed any-store filter. On every other
 	// account the change applies as untracked — a Key still
-	// supersedes/clears. nil = everyone (except the change author, who
-	// is always born read). Build identity-relative conditions from
-	// ChangeCtx.SelfIdentity, e.g. "count a reaction only for the
-	// reacted-to message's author":
+	// supersedes/clears. nil = everyone (the change author stays born
+	// read unless TrackSelfAuthored). Build identity-relative
+	// conditions from ChangeCtx.SelfIdentity, e.g. "count a reaction
+	// only for the reacted-to message's author":
 	//
 	//	query.Key{Path: []string{"creator"},
 	//	    Filter: query.NewCompValue(query.CompOpEq, arena.NewString(ctx.SelfIdentity))}
@@ -37,6 +37,17 @@ type ReadClassification struct {
 	// not) so the verdict is replay-deterministic. Ignored when
 	// Track=false.
 	Audience query.Filter
+	// TrackSelfAuthored tracks the entry on the change signer's own
+	// account as well. A self-authored change is otherwise born read on
+	// every device of the account; set this when the account's key
+	// wrote the record on the user's behalf and the user has not seen
+	// it (an agent replying under the owner's identity). The change
+	// then classifies like any other member's: an unread entry on each
+	// of the account's replicas, the frontier not advanced past it,
+	// marks clearing it as usual. Derive it only from fields immutable
+	// post-create so the verdict is replay-deterministic. Ignored when
+	// Track=false.
+	TrackSelfAuthored bool
 }
 
 // ReadClassifier classifies one record change for read tracking. It
@@ -57,9 +68,9 @@ type ReadClassification struct {
 // incremental replays reapply from the persisted watermark, so
 // post-apply state at re-classification matches the original run
 // (first restore is seed-skipped). Self-authored changes are born read
-// regardless of the verdict; the classifier still runs for them so a
-// supersede Key can clear entries (own un-react clears the unread
-// reaction another device tracked).
+// unless the verdict sets TrackSelfAuthored; the classifier still runs
+// for them so a supersede Key can clear entries (own un-react clears
+// the unread reaction another device tracked).
 type ReadClassifier func(ctx *ChangeCtx, rec *RecordChange) ReadClassification
 
 // ReadSeedMode picks the initial frontier for an object that has no

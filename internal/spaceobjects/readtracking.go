@@ -135,6 +135,7 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			deletedIds []string
 			key        string
 			tracked    bool
+			trackSelf  bool
 		)
 		cctx := &crdt.ChangeCtx{Change: ch, SelfIdentity: s.selfIdentity,
 			// Classifiers may point-read the POST-apply record (the
@@ -177,6 +178,9 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 				continue
 			}
 			tracked = true
+			if cl.TrackSelfAuthored {
+				trackSelf = true
+			}
 			trackedIds = append(trackedIds, recordIds[i])
 			for _, tag := range cl.Tags {
 				if !slices.Contains(tags, tag) {
@@ -193,18 +197,20 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 		// no-ops cheaply, but must see the change to resolve a pending
 		// head another device marked before this change synced here.
 		return s.readState.TrackChange(txCtx, readstate.Track{
-			ObjectId:     ch.ObjectId,
-			Dataset:      ch.Dataset,
-			ChangeId:     ch.ChangeId,
-			VersionId:    string(ch.VersionId),
-			AddSeq:       ch.AddSeq,
-			ApplySeq:     ch.ApplySeq,
-			RecordIds:    trackedIds,
-			Tags:         tags,
-			Key:          key,
-			PrevIds:      ch.PrevIds,
-			Tracked:      tracked,
-			SelfAuthored: ch.Creator != "" && ch.Creator == s.selfIdentity,
+			ObjectId:  ch.ObjectId,
+			Dataset:   ch.Dataset,
+			ChangeId:  ch.ChangeId,
+			VersionId: string(ch.VersionId),
+			AddSeq:    ch.AddSeq,
+			ApplySeq:  ch.ApplySeq,
+			RecordIds: trackedIds,
+			Tags:      tags,
+			Key:       key,
+			PrevIds:   ch.PrevIds,
+			Tracked:   tracked,
+			// A tracked verdict may opt the signer's own change out of
+			// born-read (an agent writing under the owner's key).
+			SelfAuthored: !trackSelf && ch.Creator != "" && ch.Creator == s.selfIdentity,
 		})
 	}
 }

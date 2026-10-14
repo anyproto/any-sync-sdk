@@ -51,8 +51,9 @@ const HandlerVersion = "systemPropertyHandler-v1"
 // epoch numbers. v3: modifiedAt is also stamped by changes on the
 // object's other datasets (StampObject), so rows stamped by property
 // writes alone are stale. v4: modifiedBy is stamped next to
-// modifiedAt.
-const LocalVersion = 4
+// modifiedAt. v5: a create sheds only its failing keys, so a row that
+// lost its create to a removed property rebuilds with it.
+const LocalVersion = 5
 
 // SystemPropertiesHandler validates property writes on every user
 // object. Corresponds to the `baseProperty` handler named in

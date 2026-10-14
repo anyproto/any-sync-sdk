@@ -93,6 +93,17 @@ type PushAPI interface {
 	// hint, empty for none.
 	Notify(ctx context.Context, spaceId string, topics []string, payload []byte, groupId string) error
 
+	// NotifyOwnDevices is Notify with the account's own devices kept in
+	// the fan-out: the loud path otherwise drops the publisher's
+	// tokens. For a record the account's key wrote on the user's
+	// behalf (an agent reply) that the user has not seen. Pass
+	// identity-scoped topics only — the bare identity or a per-chat
+	// mention topic — so that nothing but the account's own devices
+	// matches; a shared topic would push every other subscriber a
+	// second time. A push node without the flag delivers to nobody on
+	// such a topic set.
+	NotifyOwnDevices(ctx context.Context, spaceId string, topics []string, payload []byte, groupId string) error
+
 	// NotifySilent wakes the account's OWN other devices with a
 	// data-only push (no user-visible message) — e.g. after a read-state
 	// change, so their badges refresh. It targets only the caller's

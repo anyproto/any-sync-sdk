@@ -14,7 +14,15 @@ counts are tags on its entries, not separate frontiers.
 - **Forward-only.** `MarkRead(objectId, changeIds)` marks the named
   changes and their entire causal past read. There is no mark-unread.
 - **Self-authored changes are born read.** Authorship compares account
-  identity, not peerId, so all of the account's devices agree.
+  identity, not peerId, so all of the account's devices agree. A
+  classifier opts a record out with `TrackSelfAuthored` when the
+  account's key wrote it on the user's behalf (an agent reply): it then
+  tracks unread on the author's own devices like any other member's
+  change. Every device must classify it the same way — a replica that
+  treats the change as born read advances and publishes its frontier
+  past it, and the merge clears the entry on the others. The writer's
+  own replica tracks it too, so a program writing on the user's behalf
+  must not mark read.
 - **Marks name arbitrary changes**, not just tree heads: the UI marks
   what it displayed, including concurrent branches inside the viewed
   range, so devices converge even though their local display orders
@@ -44,6 +52,7 @@ type ReadClassification struct {
     Tags     []string     // e.g. "message", "mention", "reaction"
     Key      string       // optional supersede key
     Audience query.Filter // optional audience restriction
+    TrackSelfAuthored bool // track on the signer's own account too
 }
 ```
 
@@ -52,9 +61,9 @@ the same transaction as the change. It runs after the record loop, so
 `ChangeCtx.Before` is nil. Local and injected changes are not
 classified. Per applied change on a tracked dataset:
 
-- Self-authored or already covered by the frontier: read, no entry. The
-  classifier still runs, so a `Key` can clear an entry another device
-  tracked.
+- Self-authored (unless the verdict sets `TrackSelfAuthored`) or already
+  covered by the frontier: read, no entry. The classifier still runs, so
+  a `Key` can clear an entry another device tracked.
 - Otherwise, if `Track` is true: insert an unread entry with the tags
   and bump the per-tag counters.
 

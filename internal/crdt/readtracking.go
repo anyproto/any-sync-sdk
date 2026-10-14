@@ -37,14 +37,20 @@ type ReadClassification struct {
 	// not) so the verdict is replay-deterministic. Ignored when
 	// Track=false.
 	Audience query.Filter
-	// TrackSelfAuthored tracks the entry on the change signer's own
+	// TrackSelfAuthored tracks this record on the change signer's own
 	// account as well. A self-authored change is otherwise born read on
 	// every device of the account; set this when the account's key
 	// wrote the record on the user's behalf and the user has not seen
-	// it (an agent replying under the owner's identity). The change
-	// then classifies like any other member's: an unread entry on each
-	// of the account's replicas, the frontier not advanced past it,
-	// marks clearing it as usual. Derive it only from fields immutable
+	// it (an agent replying under the owner's identity). The record
+	// then counts like any other member's: an unread entry on each of
+	// the account's replicas, the frontier not advanced past the
+	// change, marks clearing it as usual. In a self-authored change
+	// only the records whose verdict sets it count; the rest stay born
+	// read. Every device of the account must classify it the same way:
+	// a replica that treats the change as born read publishes a
+	// frontier covering it, and the merge clears the entry everywhere.
+	// The author's own replica tracks it too, so marks the writing
+	// program issues clear it. Derive it only from fields immutable
 	// post-create so the verdict is replay-deterministic. Ignored when
 	// Track=false.
 	TrackSelfAuthored bool

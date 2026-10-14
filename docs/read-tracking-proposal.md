@@ -15,10 +15,14 @@ counts are tags on its entries, not separate frontiers.
   changes and their entire causal past read. There is no mark-unread.
 - **Self-authored changes are born read.** Authorship compares account
   identity, not peerId, so all of the account's devices agree. A
-  classifier opts a change out with `TrackSelfAuthored` when the
+  classifier opts a record out with `TrackSelfAuthored` when the
   account's key wrote it on the user's behalf (an agent reply): it then
   tracks unread on the author's own devices like any other member's
-  change.
+  change. Every device must classify it the same way — a replica that
+  treats the change as born read advances and publishes its frontier
+  past it, and the merge clears the entry on the others. The writer's
+  own replica tracks it too, so a program writing on the user's behalf
+  must not mark read.
 - **Marks name arbitrary changes**, not just tree heads: the UI marks
   what it displayed, including concurrent branches inside the viewed
   range, so devices converge even though their local display orders

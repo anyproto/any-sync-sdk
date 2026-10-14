@@ -88,17 +88,18 @@ func TestReadTracking_TrackSelfAuthored(t *testing.T) {
 	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: rsType})
 	require.NoError(t, err)
 
-	send := func(id, text string, agent bool) {
+	send := func(id, text string, agent bool) space.ModifyResult {
 		t.Helper()
 		ops := []space.Op{{Type: space.OpSet, Path: "text", Value: text}}
 		if agent {
 			ops = append(ops, space.Op{Type: space.OpSet, Path: rsAgent, Value: true})
 		}
-		_, err := sp.Modify(ctx, space.ModifyBatch{
+		res, err := sp.Modify(ctx, space.ModifyBatch{
 			ObjectId: objId, Dataset: rsDataset,
 			Records: []space.RecordModify{{Id: id, Upsert: true, Ops: ops}},
 		})
 		require.NoError(t, err)
+		return res
 	}
 	count := func() int {
 		t.Helper()
@@ -132,8 +133,8 @@ func TestReadTracking_TrackSelfAuthored(t *testing.T) {
 	require.Len(t, snap, 1)
 	require.Equal(t, []string{"a1"}, snap[0].RecordIds)
 
-	// A later own message must not advance the frontier past it.
-	send("h2", "thanks", false)
+	// A later own message leaves the entry in place.
+	h2 := send("h2", "thanks", false)
 	require.Equal(t, 1, count(), "own follow-up must not swallow the agent entry")
 
 	// Flag and counter materialize on the record and the row.
@@ -141,10 +142,46 @@ func TestReadTracking_TrackSelfAuthored(t *testing.T) {
 		return unreadFlag("a1") && !unreadFlag("h1") && !unreadFlag("h2") && rowCount() == 1
 	}, 15*time.Second, 50*time.Millisecond, "unread flag / unreadCount row property")
 
-	// An ordinary mark clears it like any foreign entry.
-	require.NoError(t, sp.ReadState().MarkReadUpTo(ctx, objId, ""))
-	require.Equal(t, 0, count())
+	// Marking the follow-up read walks its causal past and reaches
+	// a1: proof the frontier was not advanced past the agent entry
+	// (a frontier already at h2 would stop the walk there and leave
+	// a1 unread).
+	require.NoError(t, sp.ReadState().MarkRead(ctx, objId, []string{h2.ChangeId}))
+	require.Equal(t, 0, count(), "closure walk from the own follow-up clears the agent entry")
 	require.Eventually(t, func() bool {
 		return !unreadFlag("a1") && rowCount() == 0
-	}, 15*time.Second, 50*time.Millisecond, "read-all clears flag and row property")
+	}, 15*time.Second, 50*time.Millisecond, "mark clears flag and row property")
+
+	// Deleting an unread agent record clears it without a mark.
+	send("a2", "stale", true)
+	require.Equal(t, 1, count())
+	_, err = sp.Delete(ctx, space.DeleteBatch{ObjectId: objId, Dataset: rsDataset, RecordIds: []string{"a2"}})
+	require.NoError(t, err)
+	require.Equal(t, 0, count(), "deleting the agent record clears its entry")
+
+	// Per record: in one self-authored change only the opted-in record
+	// counts; its sibling stays born read.
+	_, err = sp.Modify(ctx, space.ModifyBatch{
+		ObjectId: objId, Dataset: rsDataset,
+		Records: []space.RecordModify{
+			{Id: "h3", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Path: "text", Value: "plain"}}},
+			{Id: "a3", Upsert: true, Ops: []space.Op{
+				{Type: space.OpSet, Path: "text", Value: "agent"},
+				{Type: space.OpSet, Path: rsAgent, Value: true},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, count())
+	snap, _, err = sp.ReadState().UnreadSnapshot(ctx, objId)
+	require.NoError(t, err)
+	require.Len(t, snap, 1)
+	require.Equal(t, []string{"a3"}, snap[0].RecordIds, "only the opted-in record is in the entry")
+	require.Eventually(t, func() bool {
+		return unreadFlag("a3") && !unreadFlag("h3")
+	}, 15*time.Second, 50*time.Millisecond, "flag only on the opted-in record")
+
+	// Read-all clears like any foreign entry.
+	require.NoError(t, sp.ReadState().MarkReadUpTo(ctx, objId, ""))
+	require.Equal(t, 0, count())
 }

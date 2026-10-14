@@ -129,6 +129,7 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			return nil
 		}
 		rejected := rejectedOps(res)
+		selfAuthored := ch.Creator != "" && ch.Creator == s.selfIdentity
 		var (
 			tags       []string
 			trackedIds []string
@@ -177,8 +178,13 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 				// key above still supersedes/clears.
 				continue
 			}
+			if selfAuthored && !cl.TrackSelfAuthored {
+				// Born read for its own author: in a self-authored
+				// change only records whose verdict opts in count.
+				continue
+			}
 			tracked = true
-			if cl.TrackSelfAuthored {
+			if selfAuthored {
 				trackSelf = true
 			}
 			trackedIds = append(trackedIds, recordIds[i])
@@ -210,7 +216,7 @@ func (s *Store) readApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
 			Tracked:   tracked,
 			// A tracked verdict may opt the signer's own change out of
 			// born-read (an agent writing under the owner's key).
-			SelfAuthored: !trackSelf && ch.Creator != "" && ch.Creator == s.selfIdentity,
+			SelfAuthored: selfAuthored && !trackSelf,
 		})
 	}
 }

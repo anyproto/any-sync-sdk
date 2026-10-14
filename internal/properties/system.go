@@ -82,9 +82,12 @@ const LocalVersion = 4
 //
 // Path shape for a single-path op: `[typeId, propId]`. Multi-field
 // $set with empty Path expects an object payload whose keys are dotted
-// "{typeId}.{propId}" pairs; same rules per key; if any key fails the
-// whole op drops (payloads aren't mutated to filter individual keys in
-// v1). $unset / $delete touch no value and are always valid.
+// "{typeId}.{propId}" pairs; same rules per key. On the pre-flight one
+// failing key rejects the write; at apply time only the failing keys
+// are shed and the rest of the op applies (the op drops when every
+// key fails): BeforeCreate sheds them itself, a rejected modify op is
+// re-probed per key by the controller. $unset / $delete touch no value
+// and are always valid.
 type SystemPropertiesHandler struct {
 	// Registry resolves declared kinds. May be nil — when nil the
 	// handler skips kind validation entirely (passes everything),
@@ -146,7 +149,13 @@ func (*SystemPropertiesHandler) Init(_ context.Context) error { return nil }
 // Validation is per-op drop, same as BeforeModify: ops that fail the
 // current schema are filtered out and the rest of the record still
 // lands (spec §"Validation atomicity" — drop per op, skip the record
-// only if every op drops). Local creates never hit this with bad ops
+// only if every op drops). A multi-field op sheds only its failing
+// keys: the create path applies the surviving ops without the modify
+// gate, so the per-key re-probe the controller runs for a rejected
+// modify op (crdt.recordModifier.beforeModifyApply) never sees a
+// create, and a whole-op drop here would cost the row its type, its
+// collections and every value over one removed property. Local
+// creates never hit this with bad ops
 // (PreValidate rejected the whole write upstream); inbound creates
 // that reach here have passed the DataVersion gate, so a dropped op
 // means a removed-property replay or cross-peer bug, not a sync gap.
@@ -155,7 +164,7 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 	if h.Registry != nil && len(rec.Ops) > 0 {
 		kept := rec.Ops[:0]
 		for i := range rec.Ops {
-			if verr := h.validateOp(&rec.Ops[i], nil); verr != nil {
+			if verr := h.validateOp(&rec.Ops[i], nil, true); verr != nil {
 				continue // per-op drop
 			}
 			kept = append(kept, rec.Ops[i])
@@ -265,7 +274,10 @@ func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 
 // BeforeModify validates one inbound op against the current schema.
 // Drops the op silently (records a Rejection) on any validation
-// failure; other ops in the same RecordChange still apply. This is
+// failure; other ops in the same RecordChange still apply, and a
+// rejected multi-field op is re-probed per key by the controller
+// (crdt.recordModifier.beforeModifyApply), so only its failing keys
+// are shed. This is
 // the spec's defensive per-op layer (outcome 2): it only ever sees
 // changes whose DataVersion is known (the gate parks not-synced ones),
 // so a drop here means a removed-property replay, a cross-peer bug, or
@@ -284,7 +296,7 @@ func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // and reads as "latest valid write attempt".
 func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
 	if h.Registry != nil {
-		if verr := h.validateOp(op, nil); verr != nil {
+		if verr := h.validateOp(op, nil, false); verr != nil {
 			return verr
 		}
 	}
@@ -341,7 +353,7 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 	for ri := range ch.Records {
 		rc := &ch.Records[ri]
 		for oi := range rc.Ops {
-			if verr := h.validateOp(&rc.Ops[oi], pf); verr != nil {
+			if verr := h.validateOp(&rc.Ops[oi], pf, false); verr != nil {
 				return verr
 			}
 		}
@@ -611,14 +623,16 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 }
 
 // validateOp routes by op shape. pf != nil enables the local pre-flight
-// membership check; nil is apply-time mode. $unset / $delete touch no
-// value and are always valid (no `required` keyword in v1).
-func (h *SystemPropertiesHandler) validateOp(op *crdt.Op, pf *preflight) *ValidationError {
+// membership check; nil is apply-time mode. shed lets an apply-time
+// multi-field op keep its passing keys (see validateMultiField).
+// $unset / $delete touch no value and are always valid (no `required`
+// keyword in v1).
+func (h *SystemPropertiesHandler) validateOp(op *crdt.Op, pf *preflight, shed bool) *ValidationError {
 	if op.Type == crdt.OpUnset || op.Type == crdt.OpDelete {
 		return nil
 	}
 	if len(op.Path) == 0 {
-		return h.validateMultiField(op, pf)
+		return h.validateMultiField(op, pf, shed && pf == nil)
 	}
 	return h.validateSinglePath(op.Path, op.Payload, op.Type, pf)
 }
@@ -632,36 +646,70 @@ func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *any
 
 // validateMultiField walks a multi-field $set payload. Every top-level
 // key is a dotted "typeId.propId" pair, or "typeId.propId.sub…" for a
-// leaf under an object-kind property; the first failing key rejects
-// the whole op.
-func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight) *ValidationError {
+// leaf under an object-kind property. The first failing key rejects
+// the whole op, unless shed is set: then every failing key is removed
+// from the payload and the surviving keys apply, and the op is
+// rejected only when no key survives (spec §"Validation atomicity").
+// BeforeCreate sheds; BeforeModify and the pre-flight report the whole
+// op (the controller re-probes a rejected modify op per key, the
+// pre-flight refuses the write).
+func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight, shed bool) *ValidationError {
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return nil
 	}
 	obj, _ := op.Payload.Object()
-	var firstErr *ValidationError
+	var (
+		firstErr *ValidationError
+		failed   []int // positions in the payload; a key may repeat
+		pos      int
+	)
 	obj.Visit(func(k []byte, v *anyenc.Value) {
-		if firstErr != nil {
+		pos++
+		if !shed && firstErr != nil {
 			return
 		}
-		key := string(k)
-		dot := strings.IndexByte(key, '.')
-		if dot <= 0 || dot == len(key)-1 {
-			firstErr = &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
+		verr := h.validateMultiFieldKey(string(k), v, op.Type, pf)
+		if verr == nil {
 			return
 		}
-		typeId, rest := key[:dot], key[dot+1:]
-		propId, nested := rest, false
-		if sub := strings.IndexByte(rest, '.'); sub >= 0 {
-			if sub == 0 || sub == len(rest)-1 {
-				firstErr = &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
-				return
-			}
-			propId, nested = rest[:sub], true
+		if firstErr == nil {
+			firstErr = verr
 		}
-		firstErr = h.validateFieldPath(typeId, propId, nested, v, op.Type, pf)
+		failed = append(failed, pos-1)
 	})
-	return firstErr
+	if firstErr == nil || !shed || len(failed) == obj.Len() {
+		return firstErr
+	}
+	// The op takes a new payload holding the survivors; the decoded
+	// payload itself is left as the codec produced it, and the kept
+	// values are referenced, not copied, as in crdt.filterOpFields.
+	kept := (&anyenc.Arena{}).NewObject()
+	pos = 0
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if !slices.Contains(failed, pos) {
+			kept.Set(string(k), v)
+		}
+		pos++
+	})
+	op.Payload = kept
+	return nil
+}
+
+// validateMultiFieldKey checks one dotted key of a multi-field op.
+func (h *SystemPropertiesHandler) validateMultiFieldKey(key string, v *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
+	dot := strings.IndexByte(key, '.')
+	if dot <= 0 || dot == len(key)-1 {
+		return &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
+	}
+	typeId, rest := key[:dot], key[dot+1:]
+	propId, nested := rest, false
+	if sub := strings.IndexByte(rest, '.'); sub >= 0 {
+		if sub == 0 || sub == len(rest)-1 {
+			return &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
+		}
+		propId, nested = rest[:sub], true
+	}
+	return h.validateFieldPath(typeId, propId, nested, v, opType, pf)
 }
 
 // validateFieldPath is validateField for a path that may descend below

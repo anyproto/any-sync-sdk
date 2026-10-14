@@ -92,8 +92,9 @@ The `typePropertyHandler` enforces:
 
 - **Add a property**: allowed; mints a shortId.
 - **Remove a property**: allowed; mints a shortId. Stored values stay on
-  object rows; later ops touching the property are dropped (unknown
-  property).
+  a row that applied them before the removal; an apply after it sheds
+  the removed key (§ Validation atomicity). Later ops touching the
+  property are dropped (unknown property).
 - **Schema-bearing fields** (`key`, `kind`, `scope`, `items`, `properties`,
   with their subtrees) are pinned after the first write. An op editing them
   on an existing record is dropped, and `PatchProperty` refuses such a patch

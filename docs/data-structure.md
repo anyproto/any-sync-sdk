@@ -372,8 +372,10 @@ converge on every peer:
   every peer. An apply-side membership guard, or parking such writes,
   would be non-convergent (§ Membership and the local write pre-flight).
 - **Removed definitions.** `RemoveProperty` leaves per-object values in
-  place; later writes to that propId drop per op via the
-  unknown-property rule.
+  place on a row that applied them before the removal; any apply after
+  it (a later sync, a rebuild, a history view) sheds the removed key
+  and keeps the rest of the op. Later writes to that propId drop per
+  op via the unknown-property rule.
 - **No kind conflicts per propId.** A propId's kind is pinned for life;
   changing a kind means removing and re-adding, which mints a new
   propId. A live propId validates identically on all peers, and stale

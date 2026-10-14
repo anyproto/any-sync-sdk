@@ -6,7 +6,7 @@ require (
 	github.com/anyproto/any-store v1.0.3
 	github.com/anyproto/any-store/v2 v2.3.0
 	github.com/anyproto/any-sync v0.13.8
-	github.com/anyproto/anytype-push-server/pushclient v0.0.0-20250801122506-553f6c085a23
+	github.com/anyproto/anytype-push-server/pushclient v0.0.0-20261014142306-d1f65393fe20
 	github.com/anyproto/go-slip10 v1.0.1
 	github.com/anyproto/go-sqlite v1.4.2-any
 	github.com/anyproto/lexid v0.0.6
@@ -107,7 +107,7 @@ require (
 	github.com/whyrusleeping/cbor-gen v0.3.1 // indirect
 	github.com/whyrusleeping/chunker v0.0.0-20181014151217-fe64bd25879f // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
-	github.com/zeebo/errs v1.3.0 // indirect
+	github.com/zeebo/errs v1.4.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.46.0 // indirect
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect

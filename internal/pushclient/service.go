@@ -184,6 +184,16 @@ func (s *Service) Subscriptions(ctx context.Context) ([]space.PushSubscription, 
 // Notify publishes an encrypted, account-signed notification to the
 // given topics within spaceId.
 func (s *Service) Notify(ctx context.Context, spaceId string, topics []string, payload []byte, groupId string) error {
+	return s.notify(ctx, spaceId, topics, payload, groupId, false)
+}
+
+// NotifyOwnDevices is Notify with the publisher's own devices kept in
+// the fan-out (NotifyRequest.IncludeOwnDevices).
+func (s *Service) NotifyOwnDevices(ctx context.Context, spaceId string, topics []string, payload []byte, groupId string) error {
+	return s.notify(ctx, spaceId, topics, payload, groupId, true)
+}
+
+func (s *Service) notify(ctx context.Context, spaceId string, topics []string, payload []byte, groupId string, ownDevices bool) error {
 	if err := s.configured(); err != nil {
 		return err
 	}
@@ -202,7 +212,7 @@ func (s *Service) Notify(ctx context.Context, spaceId string, topics []string, p
 	if err != nil {
 		return err
 	}
-	return s.client.Notify(ctx, &pushapi.NotifyRequest{Topics: tps, Message: msg, GroupId: groupId})
+	return s.client.Notify(ctx, &pushapi.NotifyRequest{Topics: tps, Message: msg, GroupId: groupId, IncludeOwnDevices: ownDevices})
 }
 
 // NotifySilent wakes the account's own other devices: a body-less

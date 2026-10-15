@@ -73,7 +73,10 @@ type Service struct {
 	// objMu serializes merges and marks per object — the engine holds
 	// no locks of its own. Entries are reference-counted and evicted
 	// on last release, so the map doesn't grow with every object ever
-	// touched.
+	// touched. Lock order: object lock, then the key-value store
+	// (publish runs under the object lock); nothing takes an object
+	// lock from inside a store callback — OnKeyValues runs under the
+	// store mutex and only enqueues, without blocking.
 	mu    sync.Mutex
 	objMu map[string]*objLock
 
@@ -401,6 +404,10 @@ func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 	// silently per key; one debug line per space keeps boot logs quiet
 	// even when a dead space left hundreds of frontier keys behind.
 	skipped := map[string]struct{}{}
+	// Merges run after Iterate returns. Iterate holds the store mutex
+	// across its callback, and merge takes the object lock that a
+	// concurrent mark holds while it publishes under that same mutex.
+	var jobs []mergeJob
 	err = store.Iterate(ctx, func(decryptor keyvaluestorage.Decryptor, key string, values []innerstorage.KeyValue) (bool, error) {
 		spaceId, objectId, ok := parseKey(key)
 		if !ok || (onlySpaceId != "" && spaceId != onlySpaceId) {
@@ -436,12 +443,18 @@ func (s *Service) reconcile(ctx context.Context, onlySpaceId string) error {
 			if len(val.Heads) == 0 {
 				continue
 			}
-			s.merge(ctx, mergeJob{spaceId: spaceId, objectId: objectId, heads: val.Heads})
+			jobs = append(jobs, mergeJob{spaceId: spaceId, objectId: objectId, heads: val.Heads})
 		}
 		return true, nil
 	})
 	if err != nil {
 		return err
+	}
+	for _, job := range jobs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.merge(ctx, job)
 	}
 	// Frontier reads and republishes run after the full iteration: every
 	// row has merged by now, so the published row is the converged union

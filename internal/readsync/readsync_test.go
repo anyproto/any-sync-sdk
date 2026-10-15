@@ -43,6 +43,10 @@ type fakeKV struct {
 	split    bool
 	// deletePrefixes records DeletePrefix calls in order.
 	deletePrefixes []string
+	// beforeSet runs before Set takes the store mutex; inIterate runs
+	// once Iterate holds it, before the first callback. Test schedules.
+	beforeSet func()
+	inIterate func()
 }
 
 func newFakeKV() *fakeKV {
@@ -50,6 +54,9 @@ func newFakeKV() *fakeKV {
 }
 
 func (f *fakeKV) Set(_ context.Context, key string, value []byte) error {
+	if f.beforeSet != nil {
+		f.beforeSet()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sets[key] = append([]byte(nil), value...)
@@ -70,6 +77,9 @@ func (f *fakeKV) Set(_ context.Context, key string, value []byte) error {
 func (f *fakeKV) Iterate(_ context.Context, fn func(decryptor keyvaluestorage.Decryptor, key string, values []innerstorage.KeyValue) (bool, error)) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.inIterate != nil {
+		f.inIterate()
+	}
 	for key, values := range f.rows {
 		// The real store hides watermark rows from Iterate.
 		if len(values) > 0 && values[0].DeletePrefix != "" {

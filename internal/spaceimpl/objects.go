@@ -401,9 +401,9 @@ func needsBootstrap(opts space.CreateObjectOpts) bool {
 // One change regardless of how many owners / properties are being
 // seeded — keeps the DAG clean — carrying one multi-field op for the
 // membership and one per owner's values, with the template stamp on
-// its own: a peer that does not know an owner or a field drops the
-// op that carries it and keeps the rest of the row (a create has no
-// per-key salvage), so an object stays typed and named everywhere.
+// its own: a peer that does not know a field sheds that key, one that
+// does not know an owner drops the op that carries it, and the rest of
+// the row lands, so an object stays typed and named everywhere.
 func (o *objectService) bootstrap(ctx context.Context, objectId string, opts space.CreateObjectOpts) (space.ModifyResult, error) {
 	arena := &anyenc.Arena{}
 	var ops []crdt.Op

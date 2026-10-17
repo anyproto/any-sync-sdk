@@ -37,9 +37,6 @@ func (f *fakePlaintextTree) Lock()         { f.mu.Lock() }
 func (f *fakePlaintextTree) Unlock()       { f.mu.Unlock() }
 func (f *fakePlaintextTree) TryLock() bool { return f.mu.TryLock() }
 func (f *fakePlaintextTree) Id() string    { return f.id }
-func (f *fakePlaintextTree) Heads() []string {
-	return []string{f.id}
-}
 func (f *fakePlaintextTree) Root() *objecttree.Change {
 	return f.root
 }

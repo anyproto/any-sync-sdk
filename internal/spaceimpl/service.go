@@ -105,7 +105,6 @@ type Service struct {
 	extTypes       []handler.Type
 	extCollections []handler.Collection
 	modules        []handler.Module
-	objectIndexes  []anystore.IndexInfo
 
 	// files/fetch/fstore/fqueue are the SDK-level byte-layer services
 	// behind every space's Files() surface. Set once by SetFiles right
@@ -250,7 +249,7 @@ type Service struct {
 // the seam through which the tech-space mirrors converged in-space
 // spaceIndex state into its rows; usually tsp itself (which
 // satisfies space.Indexer).
-func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module, objectIndexes []anystore.IndexInfo) *Service {
+func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) *Service {
 	s := &Service{
 		app:                 app,
 		tsp:                 tsp,
@@ -259,7 +258,6 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		extTypes:            extTypes,
 		extCollections:      extCollections,
 		modules:             modules,
-		objectIndexes:       objectIndexes,
 		stores:              make(map[string]*spaceobjects.Store),
 		allocs:              make(map[string]*object.VersionAllocator),
 		spaceIndexIds:       make(map[string]string),
@@ -321,7 +319,7 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	}
 	alloc := object.NewVersionAllocator("")
 	s.allocs[spaceId] = alloc
-	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.extCollections, s.modules, s.objectIndexes)
+	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.extCollections, s.modules)
 	// Account-wide gate: once the tech space carries a CRDT version
 	// above this SDK's, every synced write fails with
 	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).

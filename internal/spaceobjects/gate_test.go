@@ -38,7 +38,7 @@ func TestGate_ParkAndDrain(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 
 	// Park a fake parked change. payload bytes are opaque to the
 	// gate's bookkeeping; we use a short marker.
@@ -110,7 +110,7 @@ func TestDrain_UnparksDeletedObject(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	ctrl, err := crdt.NewController(ctx, "obj-marked", db, crdt.HandlerReg{Name: "blocks", Handler: &crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}})
 	require.NoError(t, err)
 	marked, err := object.New(object.Config{SpaceId: "spaceA", Controller: ctrl},

@@ -13,7 +13,7 @@ in the local DB:
 
 Every object has one row in its space's `objects` collection,
 `id` = any-sync objectId. The row holds the derived fields (`id`,
-`author`, `spaceId`, `createdAt`, `modifiedAt`, `modifiedBy`, `meta`), the
+`author`, `spaceId`, `createdAt`, `modifiedAt`, `modifiedBy`), the
 universal `any` properties (name, description, icon, tags, `template`, `type`,
 `collections`) and the values of every property its type and
 collections define.
@@ -28,7 +28,7 @@ with a new propId. Design and rationale:
 
 | Scope | Write route | Version domain | Syncs to |
 |------|------|------|------|
-| **derived** | Handler-stamped: `id`, `author`, `spaceId`, `createdAt`, `modifiedAt`, `modifiedBy`; `meta` from the creating change's input | Triggering change | Computed convergently on every peer |
+| **derived** | Handler-stamped: `id`, `author`, `spaceId`, `createdAt`, `modifiedAt`, `modifiedBy` | Triggering change | Computed convergently on every peer |
 | **synced** | The object's own CRDT change | Object tree | Everyone with access |
 | **account** | Carrier record in the tech space, mirrored per device | Tech tree | This account's devices |
 | **local** | `Object.LocalSet`, no DAG | Local lexid | This device only |
@@ -68,32 +68,6 @@ any of its datasets (editor blocks, chat messages, runtime datasets).
 - `modifiedAt` is indexed (the default list sort); `modifiedBy` is not,
   so filtering by it scans the collection.
 
-**`meta` is the creation bag** — an opaque object the creator supplies
-(`Objects().Create` with `Meta`; the consumer defines the keys, e.g.
-the object a task was made in) and the SDK never reads. It is written
-whole as a bare key of the bootstrap — the object's first change after
-its root — and the `objects` handler admits that key on a change
-parented on the root alone, judged by the change's DAG parents: a
-bootstrap parked behind its type's definition and draining after a
-later write still stamps the row, no change parented elsewhere may set,
-extend or unset it, and concurrent root-parented writes (a raw write on
-a tree still root-only on that device) resolve by the field's LWW, so
-every peer lands the same value in any delivery order. `From` does not
-copy the source's. Absent means none; nothing backfills. A filter on a
-key inside it (`{"meta.<key>": …}`) scans the collection unless the
-consumer indexes the key.
-
-**Consumer indexes on the objects collection.** `config.ObjectIndexes`
-lists `anystore.IndexInfo` declarations the SDK keeps on every space's
-`objects` collection next to its own (`idx_any_type`,
-`idx_any_collections`, `modifiedAt`): the consumer's filters over row
-fields it defines, a bag key above all. `Open` validates them (a name
-the SDK does not use, unique and short; dotted field paths; never
-unique — a unique violation would reject a synced change on every
-peer), and a space's first open of its objects collection ensures
-them. A name redefined between releases replaces the stored index; a
-name dropped from the list leaves its index in place.
-
 ### Storage
 
 Values of every scope sit at `{ownerId}.{propId}` in the object's row;
@@ -106,7 +80,6 @@ plus apply-side route enforcement, CRDT spec §9).
   "id": "objectId",
   "author": "accountId", "createdAt": { "$date": "…" },
   "modifiedBy": "accountId", "modifiedAt": { "$date": "…" },
-  "meta": { "createdIn": "objectId" },
   "any":            { "name": "Heat" },
   "{movieTypeId}":  { "Y9Hxx5xmYmF": ["personA"], "EwyHGrtTdxB": 1995 },
   "_ver":           { "id": "…", "any": { "name": "…" } }
@@ -114,7 +87,7 @@ plus apply-side route enforcement, CRDT spec §9).
 ```
 
 The derived built-ins are the exception: `id`, `author`, `spaceId`,
-`createdAt`, `modifiedAt`, `modifiedBy` and `meta` sit at the row root, although
+`createdAt`, `modifiedAt` and `modifiedBy` sit at the row root, although
 `Types().Properties("any")` lists them. Filter and sort them by bare
 name (`{"modifiedBy": …}`, `sort: ["-modifiedAt"]`); `any.modifiedBy`
 matches nothing.

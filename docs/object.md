@@ -61,7 +61,7 @@ builder), `commonspace/object/tree/treechangeproto`,
 ## Object API
 
 ```go
-space.Objects().Create(ctx, CreateObjectOpts{Type, Collections, InitialProperties, From, Meta}) // → objectId
+space.Objects().Create(ctx, CreateObjectOpts{Type, Collections, InitialProperties, From}) // → objectId
 space.Objects().Derive(ctx, DeriveObjectOpts{Seed, Type, Collections, ParentId})    // → objectId, idempotent
 space.Objects().Get(ctx, objectId)    // the objects row; ErrNotFound / ErrObjectDeleted
 space.Objects().Delete(ctx, objectId)
@@ -96,11 +96,6 @@ records dataset derives fresh ones, and on a dataset that is not
 `Dynamic` only the declared fields travel. A record the dataset's
 create rules refuse today is `ErrFromRecordRefused`, and the half copy
 is deleted.
-
-`Meta` is an opaque creation bag — the consumer's keys, never read by
-the SDK. It lands whole at the row root as `meta` by the object's first
-change alone (docs/data-structure.md § Object Properties); `From` does
-not copy the source's.
 
 `Derive` with a `ParentId` binds the child to its parent: the parent id is
 hashed into the child's id, and deleting the parent deletes the child. Creating

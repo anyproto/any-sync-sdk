@@ -7,8 +7,6 @@ import (
 	"errors"
 	"time"
 
-	anystore "github.com/anyproto/any-store/v2"
-
 	"github.com/anyproto/any-sync-sdk/handler"
 )
 
@@ -58,18 +56,6 @@ type Config struct {
 	// and disjoint from Types and the reserved ids. Empty or nil =
 	// none registered.
 	Collections []handler.Collection
-
-	// ObjectIndexes are indexes the consumer keeps on every space's
-	// `objects` collection, next to the SDK's own (`idx_any_type`,
-	// `idx_any_collections`, `modifiedAt`): its filters over row fields
-	// it defines, such as a key of the creation bag (`meta.<key>`,
-	// sparse). Validated by Open (spaceobjects.ValidateObjectIndexes: a
-	// name the SDK does not use, unique and short; dotted field paths;
-	// never unique) and ensured when a space's objects collection is
-	// first opened. A name redefined between releases replaces the
-	// stored index then; a name dropped from the list leaves its index
-	// in place.
-	ObjectIndexes []anystore.IndexInfo
 
 	// Modules is the optional list of caller-defined dataset modules —
 	// compiled-in behaviours (an editor, a chat) that types declare at

@@ -137,7 +137,7 @@ func TestCatalog_BootScanAndBuildRegs(t *testing.T) {
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
 	coll := types.CollectionName(catTypeId, "notes")
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 
 	ds, ok := store.RuntimeDataset(coll)
@@ -225,7 +225,7 @@ func TestCatalog_CollectionRowIsNotAType(t *testing.T) {
 	// not scanned as a type.
 	seedDatasetDefs(t, ctx, db, collId, "notes", "b")
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 
 	ids, err := store.catalogTypeIds(ctx)
@@ -270,8 +270,8 @@ func TestStore_Classify(t *testing.T) {
 	seedDefinitionObject(t, ctx, db, "spaceA", "live-coll", collectiontype.MetaMarker)
 	seedDefinitionObject(t, ctx, db, "spaceA", "plain", "live-type")
 
-	store := NewStore(nil, db, nil, "spaceA", nil, []handler.Type{{Id: "reg-type"}}, []handler.Collection{{Id: "reg-coll"}}, nil, nil)
-
+	store := NewStore(nil, db, nil, "spaceA", nil,
+		[]handler.Type{{Id: "reg-type"}}, []handler.Collection{{Id: "reg-coll"}}, nil)
 	t.Cleanup(func() { _ = store.Close() })
 
 	for id, want := range map[string]properties.OwnerKind{
@@ -313,7 +313,7 @@ func TestCatalog_RefreshTypeAddsAndRemoves(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	coll := types.CollectionName(catTypeId, "notes")
 	_, ok := store.RuntimeDataset(coll)
@@ -346,7 +346,7 @@ func TestControllerStaleFor_RemovedDataset(t *testing.T) {
 
 	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "a")
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	coll := types.CollectionName(catTypeId, "notes")
 
@@ -429,7 +429,7 @@ func TestCatalog_ModuleCanonicalAndInstances(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, []handler.Module{testModule()}, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, []handler.Module{testModule()})
 	t.Cleanup(func() { _ = store.Close() })
 
 	regs, _, err := store.buildRegs()

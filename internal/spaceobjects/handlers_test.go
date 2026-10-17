@@ -230,7 +230,7 @@ func TestStore_DataVersion_External(t *testing.T) {
 	}
 	require.NoError(t, ValidateExternalTypes(extTypes))
 
-	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil, nil, nil)
+	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil, nil)
 
 	// Built-in still resolves.
 	v, err := store.DataVersion("objects")
@@ -256,7 +256,7 @@ func TestStore_DatasetOwner(t *testing.T) {
 		{Id: "nav", Properties: []handler.PropertyDecl{{Id: "pos", Kind: handler.PropertyKindString}}},
 	}
 	require.NoError(t, ValidateExternalTypes(extTypes))
-	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil, nil, nil)
+	store := NewStore(nil, nil, nil, "spaceA", nil, extTypes, nil, nil)
 
 	// Both datasets of one type map to that owner (N→1).
 	owners, ok := store.DatasetOwners("scenes")

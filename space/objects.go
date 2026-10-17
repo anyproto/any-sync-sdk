@@ -103,16 +103,6 @@ type CreateObjectOpts struct {
 	// own row ErrMetaType; a record the dataset's create rules refuse
 	// today ErrFromRecordRefused, and the half copy is deleted.
 	From string
-
-	// Meta is creation metadata the caller supplies — an opaque object
-	// whose keys mean what the consumer says (the object a task was
-	// made in, say). Optional. It lands whole at the row root as
-	// `meta`, beside `createdAt`, by the object's first change alone:
-	// no later write sets, extends or clears it, and From does not copy
-	// the source's (a copy's own Meta applies). Absent means none. The
-	// SDK neither reads nor validates the keys; values follow the
-	// Op.Value rules.
-	Meta map[string]any
 }
 
 // ErrFromTypeMismatch is returned by Objects().Create when Type names a

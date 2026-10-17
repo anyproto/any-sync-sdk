@@ -89,18 +89,6 @@ func (p *propertiesAPI) Set(ctx context.Context, objectId, typeId string, patch 
 		return p.setLocal(ctx, objectId, typeId, patch, props)
 	case schema.ScopeAccount:
 		return p.setAccount(ctx, objectId, typeId, patch, props)
-	case schema.ScopeDerived:
-		// A stamp (createdAt, modifiedBy, the creation bag …): handler-written,
-		// no route of this surface reaches it — a client error, not a
-		// fault. Named in the type's declaration order.
-		for _, pi := range props {
-			if _, ok := patch[pi.Id]; ok && pi.EffectiveScope() == schema.ScopeDerived {
-				return space.ModifyResult{}, &properties.ValidationError{
-					Reason: properties.ReasonScopeMismatch, TypeId: typeId, PropId: pi.Id, PropName: pi.Name,
-					DeclaredScope: schema.ScopeDerived, WriteRoute: schema.ScopeSynced,
-				}
-			}
-		}
 	}
 	return space.ModifyResult{}, fmt.Errorf("propertiesAPI: unroutable scope %s", route)
 }

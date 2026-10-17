@@ -72,17 +72,10 @@ func TestBuiltInDescriptiveSlice(t *testing.T) {
 			assert.NotEmpty(t, d.Description, "%s.%s: description dropped by the view", typeId, d.Id)
 		}
 	}
-	anyProp := func(id string) space.PropertyDef {
-		for _, d := range builtInAnyProperties() {
-			if d.Id == id {
-				return d
-			}
-		}
-		t.Fatalf("any.%s not listed", id)
-		return space.PropertyDef{}
-	}
-	anyProp("name").XFormat["type"] = "mutated"
-	assert.Equal(t, "text", anyProp("name").XFormat["type"], "view aliases the shared table")
+	anyName := builtInAnyProperties()[6]
+	assert.Equal(t, "name", anyName.Id)
+	anyName.XFormat["type"] = "mutated"
+	assert.Equal(t, "text", builtInAnyProperties()[6].XFormat["type"], "view aliases the shared table")
 	for name, ds := range map[string]schema.Dataset{
 		techspace.SpaceIndexDataset:  techspace.SpaceIndexSchema(),
 		techspace.DevicesDataset:     techspace.DevicesSchema(),

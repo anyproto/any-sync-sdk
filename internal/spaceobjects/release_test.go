@@ -152,7 +152,7 @@ func TestStoreReleaseLoop(t *testing.T) {
 // Store.Get restarts a released Object's wait, and Store.Close stops the
 // release loop.
 func TestStoreReleaseGetAndClose(t *testing.T) {
-	s := NewStore(nil, nil, nil, "spaceA", nil, nil, nil, nil)
+	s := NewStore(nil, nil, nil, "spaceA", nil, nil, nil, nil, nil)
 	_ = s.cache.Close()
 	s.cache = ocache.New(func(context.Context, string) (ocache.Object, error) { return &object.Object{}, nil })
 

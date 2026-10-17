@@ -144,7 +144,7 @@ func TestIndexes_PerObjectDatasetFollowsItsRegistration(t *testing.T) {
 	seedIndexDef(t, ctx, db, catTypeId, "notes", "by_title", "b1", "title")
 	notes := types.CollectionName(catTypeId, "notes")
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 
 	reg := store.catalog.snapshot().regs[notes]
@@ -257,7 +257,7 @@ func TestIndexes_StartAndClose(t *testing.T) {
 	writeTitle(t, ctx, ctrl, "obj1", samples, "r1", "v1", "one")
 	seedIndexDef(t, ctx, store.db, catTypeId, "samples", "by_title", "c1", "title")
 
-	reopened := NewStore(nil, store.db, nil, "spaceA", nil, nil, nil, nil)
+	reopened := NewStore(nil, store.db, nil, "spaceA", nil, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = reopened.Close() })
 	// Not started: a refresh kicks nothing, and nothing builds.
 	reopened.refreshType(ctx, catTypeId)

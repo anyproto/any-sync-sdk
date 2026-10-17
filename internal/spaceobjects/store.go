@@ -173,7 +173,13 @@ type Store struct {
 	// properties only, surfaced by Collections().List next to the
 	// user-created ones.
 	extCollections []handler.Collection
-	dataVersions   map[string]string
+	// objectIndexes are the consumer's indexes on the objects
+	// collection (config.ObjectIndexes), ensured next to the SDK's own;
+	// objectIndexMu serializes the ensure, which may drop and recreate
+	// one.
+	objectIndexes []anystore.IndexInfo
+	objectIndexMu sync.Mutex
+	dataVersions  map[string]string
 	// datasetOwners maps an external type-owned dataset name to the
 	// typeId that owns it (N datasets → one owner). Built from extTypes.
 	// Used to enforce that an object implements a type before writing to
@@ -442,6 +448,10 @@ type StoreConfig struct {
 	// records module is always present).
 	Modules []handler.Module
 
+	// ObjectIndexes are the consumer's indexes on the objects
+	// collection (config.ObjectIndexes).
+	ObjectIndexes []anystore.IndexInfo
+
 	// SystemDatasets are extra ungated built-ins for this store.
 	SystemDatasets []SystemDataset
 
@@ -466,7 +476,7 @@ type StoreConfig struct {
 // catalog. Validation happens in ValidateExternalTypes /
 // ValidateExternalModules — call them before NewStore at the SDK
 // boundary so collisions are caught at Open time.
-func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) *Store {
+func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module, objectIndexes []anystore.IndexInfo) *Store {
 	var selectiveTypes []string
 	if app != nil {
 		selectiveTypes = app.SelectiveTreeTypes()
@@ -474,6 +484,7 @@ func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId
 	return NewStoreWithConfig(StoreConfig{
 		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes, ExtCollections: extCollections, Modules: modules,
 		SelectiveTypes: selectiveTypes,
+		ObjectIndexes:  objectIndexes,
 	})
 }
 
@@ -641,6 +652,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, extCollections, cfg.Modules))
 	s.extTypes = cfg.ExtTypes
 	s.extCollections = extCollections
+	s.objectIndexes = cfg.ObjectIndexes
 	s.dataVersions = dv
 	s.datasetOwners = owners
 	s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
@@ -785,6 +797,9 @@ var ReservedTypeIds = map[string]struct{}{
 	spaceindex.TypeId:     {},
 	typetype.TypeId:       {},
 	collectiontype.TypeId: {},
+	// The creation bag's row-root key: a namespace there would collide
+	// with it.
+	anytype.FieldMeta: {},
 }
 
 // BuiltInCollections are the collections the SDK registers itself, in
@@ -1600,6 +1615,25 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	}); err != nil {
 		return nil, fmt.Errorf("spaceobjects: ensure modifiedAt index: %w", err)
 	}
+	// The consumer's indexes over row fields it defines
+	// (config.ObjectIndexes), validated at open. A name the consumer
+	// redefined between releases replaces the stored index; the drop
+	// and recreate runs under objectIndexMu so two first opens of the
+	// same space never race it.
+	s.objectIndexMu.Lock()
+	for _, idx := range s.objectIndexes {
+		err := coll.EnsureIndex(ctx, idx)
+		if errors.Is(err, anystore.ErrIndexMismatch) {
+			if err = coll.DropIndex(ctx, idx.Name); err == nil {
+				err = coll.EnsureIndex(ctx, idx)
+			}
+		}
+		if err != nil {
+			s.objectIndexMu.Unlock()
+			return nil, fmt.Errorf("spaceobjects: ensure object index %s: %w", idx.Name, err)
+		}
+	}
+	s.objectIndexMu.Unlock()
 	s.mu.Lock()
 	if s.sharedColl == nil {
 		s.sharedColl = coll
@@ -2877,7 +2911,12 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // objectsDatasetSchema is the per-space `objects` (properties) dataset
 // schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
 // synced) with the derived row-root fields (id/author/spaceId/
-// createdAt/modifiedAt/modifiedBy) declared handler-only.
+// createdAt/modifiedAt/modifiedBy) declared handler-only, and the
+// `meta` creation bag declared synced and write-once: the bootstrap's
+// input op writes it (the controller's route check admits a synced
+// head), and the handler, not the schema, enforces the write-once rule
+// (properties.SystemPropertiesHandler). The `any` type lists it
+// derived — read-only through the property surfaces.
 //
 // Only TOP-LEVEL field heads can be declared, and the synced `any`
 // values (name/description/icon/types/tags) are not heads — they live
@@ -2893,10 +2932,14 @@ func objectsDatasetSchema() schema.Dataset {
 		if p.Scope != schema.ScopeDerived {
 			continue
 		}
-		fields = append(fields, schema.Field{
+		f := schema.Field{
 			Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: p.Scope,
 			Description: p.Description, XFormat: types.CloneXFormat(p.XFormat),
-		})
+		}
+		if p.Id == anytype.FieldMeta {
+			f.Scope, f.MutableBy = schema.ScopeSynced, schema.MutableNever
+		}
+		fields = append(fields, f)
 	}
 	return schema.Dataset{Fields: fields, Dynamic: true}
 }
@@ -3217,4 +3260,63 @@ func (s *Store) historyApplyHook() crdt.ApplyHook {
 		}
 		return nil
 	}
+}
+
+// sdkObjectIndexNames are the names the SDK's own objects-collection
+// indexes take (the modifiedAt index keeps any-store's auto name) and
+// the auto names of earlier builds that every open drops as stale.
+var sdkObjectIndexNames = map[string]struct{}{
+	"idx_any_type": {}, "idx_any_collections": {}, "modifiedAt": {}, "any.type": {}, "any.types": {},
+}
+
+// maxObjectIndexName bounds a consumer index name: any-store turns it
+// into a SQLite index name with a prefix of its own.
+const maxObjectIndexName = 64
+
+// ValidateObjectIndexes checks the consumer's objects-collection index
+// declarations (config.ObjectIndexes) up front, so a bad one fails the
+// open and not every object load after it: a name the SDK does not
+// use, unique and short; at least one field, each a dotted path of
+// non-empty segments (a leading "-" sorts it descending) with no "$"
+// or "*" segment; never unique — a unique violation would reject a
+// synced change on every peer and every replay — and a range index
+// only.
+func ValidateObjectIndexes(indexes []anystore.IndexInfo) error {
+	seen := map[string]struct{}{}
+	for i, idx := range indexes {
+		if idx.Name == "" {
+			return fmt.Errorf("spaceobjects: ObjectIndexes[%d]: a name is required", i)
+		}
+		if len(idx.Name) > maxObjectIndexName {
+			return fmt.Errorf("spaceobjects: ObjectIndexes[%d]: name longer than %d", i, maxObjectIndexName)
+		}
+		if _, sdk := sdkObjectIndexNames[idx.Name]; sdk {
+			return fmt.Errorf("spaceobjects: ObjectIndexes[%d]: %q is the SDK's own index", i, idx.Name)
+		}
+		if _, dup := seen[idx.Name]; dup {
+			return fmt.Errorf("spaceobjects: ObjectIndexes[%d]: %q is declared twice", i, idx.Name)
+		}
+		seen[idx.Name] = struct{}{}
+		if idx.Unique {
+			return fmt.Errorf("spaceobjects: ObjectIndexes[%d] %q: unique is not supported on the objects collection", i, idx.Name)
+		}
+		if idx.Kind != anystore.IndexKindRange || idx.Fulltext != nil || idx.Vector != nil {
+			return fmt.Errorf("spaceobjects: ObjectIndexes[%d] %q: only a range index is supported on the objects collection", i, idx.Name)
+		}
+		if len(idx.Fields) == 0 {
+			return fmt.Errorf("spaceobjects: ObjectIndexes[%d] %q: at least one field is required", i, idx.Name)
+		}
+		for _, f := range idx.Fields {
+			path := strings.TrimPrefix(f, "-")
+			if path == "" {
+				return fmt.Errorf("spaceobjects: ObjectIndexes[%d] %q: an empty field path", i, idx.Name)
+			}
+			for _, seg := range strings.Split(path, ".") {
+				if seg == "" || seg == "*" || strings.HasPrefix(seg, "$") {
+					return fmt.Errorf("spaceobjects: ObjectIndexes[%d] %q: field path %q", i, idx.Name, f)
+				}
+			}
+		}
+	}
+	return nil
 }

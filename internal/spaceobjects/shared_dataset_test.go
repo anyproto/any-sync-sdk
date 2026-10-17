@@ -35,7 +35,7 @@ func sharedDatasetStore(t *testing.T) (context.Context, *Store, string, string) 
 	seedSharedDatasetDefs(t, ctx, db, catTypeId, "samples", "a")
 	seedDatasetDefs(t, ctx, db, catTypeId, "notes", "b")
 
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	return ctx, store, types.CollectionName(catTypeId, "samples"), types.CollectionName(catTypeId, "notes")
 }
@@ -289,7 +289,7 @@ func TestSharedDataset_PurgeCoversARemovedDefinition(t *testing.T) {
 	require.NoError(t, store.purgeObject(ctx, "obj1"))
 	assert.Equal(t, []string{"obj2/r1"}, collectionIds(t, ctx, coll))
 
-	fresh := NewStore(nil, store.db, nil, "spaceA", nil, nil, nil, nil)
+	fresh := NewStore(nil, store.db, nil, "spaceA", nil, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = fresh.Close() })
 	require.NoError(t, fresh.purgeObject(ctx, "obj2"))
 	assert.Equal(t, []string{"obj2/r1"}, collectionIds(t, ctx, coll))
@@ -383,7 +383,7 @@ func TestSharedDataset_ReindexKeepsLocalValues(t *testing.T) {
 	seedTypeObject(t, ctx, db, "spaceA", catTypeId)
 	seedSharedDatasetDefs(t, ctx, db, catTypeId, "samples", "a")
 	seedFieldDef(t, ctx, db, catTypeId, "samples", "seen", "boolean", "local", "a9")
-	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	store := NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	samples := types.CollectionName(catTypeId, "samples")
 

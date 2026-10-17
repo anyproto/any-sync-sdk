@@ -39,6 +39,9 @@ func (f *fakeLocalWriteTree) Lock()         { f.mu.Lock() }
 func (f *fakeLocalWriteTree) Unlock()       { f.mu.Unlock() }
 func (f *fakeLocalWriteTree) TryLock() bool { return f.mu.TryLock() }
 func (f *fakeLocalWriteTree) Id() string    { return f.id }
+func (f *fakeLocalWriteTree) Heads() []string {
+	return []string{f.id}
+}
 func (f *fakeLocalWriteTree) Root() *objecttree.Change {
 	return f.root
 }

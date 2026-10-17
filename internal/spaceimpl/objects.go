@@ -385,7 +385,7 @@ func (o *objectService) Delete(ctx context.Context, objectId string) error {
 // needsBootstrap returns true when CreateObjectOpts carries any
 // caller-supplied initial state.
 func needsBootstrap(opts space.CreateObjectOpts) bool {
-	if opts.Type != "" || len(opts.Collections) > 0 {
+	if opts.Type != "" || len(opts.Collections) > 0 || len(opts.Meta) > 0 {
 		return true
 	}
 	for _, props := range opts.InitialProperties {
@@ -400,10 +400,11 @@ func needsBootstrap(opts space.CreateObjectOpts) bool {
 // per-owner property values) into the object's `properties` dataset.
 // One change regardless of how many owners / properties are being
 // seeded — keeps the DAG clean — carrying one multi-field op for the
-// membership and one per owner's values, with the template stamp on
-// its own: a peer that does not know a field sheds that key, one that
-// does not know an owner drops the op that carries it, and the rest of
-// the row lands, so an object stays typed and named everywhere.
+// membership and one per owner's values, with the template stamp and
+// the meta bag each on its own: a peer that does not know a field
+// sheds that key, one that does not know an owner drops the op that
+// carries it, and the rest of the row lands, so an object stays typed
+// and named everywhere.
 func (o *objectService) bootstrap(ctx context.Context, objectId string, opts space.CreateObjectOpts) (space.ModifyResult, error) {
 	arena := &anyenc.Arena{}
 	var ops []crdt.Op
@@ -456,6 +457,18 @@ func (o *objectService) bootstrap(ctx context.Context, objectId string, opts spa
 			only.Set(anytype.TypeId+"."+anytype.FieldTemplate, stamp)
 			ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: only})
 		}
+	}
+	if len(opts.Meta) > 0 {
+		// The row-root creation bag, written whole and admitted on the
+		// object's first change alone (properties.SystemPropertiesHandler):
+		// a bare key, not an `any.*` value.
+		bag, err := goToAnyenc(arena, opts.Meta)
+		if err != nil {
+			return space.ModifyResult{}, fmt.Errorf("Meta: %w", err)
+		}
+		stamp := arena.NewObject()
+		stamp.Set(anytype.FieldMeta, bag)
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: stamp})
 	}
 
 	// Compute DataVersion across every owner touched: the type, the

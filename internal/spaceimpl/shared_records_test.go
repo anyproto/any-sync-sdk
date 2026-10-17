@@ -85,7 +85,7 @@ func sharedRecordsSpace(t *testing.T) (s *spaceImpl, samples, plain string) {
 	seedRecordsDataset(t, ctx, db, sharedTypeId, "samples", true, "a")
 	seedRecordsDataset(t, ctx, db, sharedTypeId, "plain", false, "b")
 
-	store := spaceobjects.NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil)
+	store := spaceobjects.NewStore(nil, db, nil, "spaceA", nil, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	samples, plain = types.CollectionName(sharedTypeId, "samples"), types.CollectionName(sharedTypeId, "plain")
 	require.True(t, store.IsKeyedDataset(samples))

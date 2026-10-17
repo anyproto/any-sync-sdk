@@ -29,6 +29,9 @@ type closeSpyTree struct {
 }
 
 func (s *closeSpyTree) Id() string { return "obj-close" }
+func (s *closeSpyTree) Heads() []string {
+	return []string{"obj-close"}
+}
 
 func (s *closeSpyTree) Lock() { s.locked = true }
 

@@ -1,8 +1,8 @@
 // Package anytype is the built-in `any` type — the universal shape
 // every object in a space implements: name, description, icon
 // (synced, CRDT-mutable), plus id, author, spaceId, createdAt,
-// modifiedAt, modifiedBy (derived, read-only, stamped from any-sync
-// context).
+// modifiedAt, modifiedBy, meta (derived, read-only, stamped from
+// any-sync context — meta by the object's first change alone).
 //
 // Directory is internal/types/any/; the package is declared `anytype`
 // because `any` is a predeclared identifier and shadowing it inside
@@ -52,6 +52,14 @@ const (
 	TemplateStampVersion = "version"
 )
 
+// FieldMeta is the row-root creation bag: an opaque object the creator
+// supplies (CreateObjectOpts.Meta) whose keys mean what the consumer
+// says they mean — the SDK never reads them. The one derived field a
+// writer supplies: the object's first change carries it whole, as a
+// bare key of a multi-field $set, and no other change may set or unset
+// it or anything under it (properties.SystemPropertiesHandler).
+const FieldMeta = "meta"
+
 // BuiltInProperty is one hardcoded property definition for the `any`
 // type. Uses human-readable ids (e.g. "name") that never collide with
 // generated user propIds (11-char base58). Scope uses the unified
@@ -97,6 +105,14 @@ var Properties = []BuiltInProperty{
 	// converge together (properties.SystemPropertiesHandler).
 	{Id: "modifiedBy", Name: "Modified by", Kind: schema.KindString, Scope: schema.ScopeDerived,
 		Description: "Account identity that signed the change modifiedAt names; derived."},
+	// `meta` is set once, by the object's first change, from the
+	// creator's CreateObjectOpts.Meta; a copy (From) does not carry
+	// the source's. Absent means none. Derived here — read-only through
+	// the property surfaces — while the objects dataset schema declares
+	// the head synced and write-once, which is what the bootstrap's op
+	// needs to pass the route check.
+	{Id: FieldMeta, Name: "Meta", Kind: schema.KindObject, Scope: schema.ScopeDerived,
+		Description: "Creation metadata the creator supplied, an opaque object; set at creation, absent otherwise."},
 	{Id: "name", Name: "Name", Kind: schema.KindString, Scope: schema.ScopeSynced,
 		Description: "Display name.",
 		XFormat:     map[string]any{"type": "text"}},

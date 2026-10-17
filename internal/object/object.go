@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
@@ -615,7 +616,16 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	// change out of any-sync entirely (no AddContent). Runs under
 	// tree.Lock so the pre-state read and the apply below are
 	// consistent with concurrent local writers. No-op for datasets
-	// whose handler doesn't implement LocalPreValidator.
+	// whose handler doesn't implement LocalPreValidator. The change's
+	// DAG parents are the heads it is about to be built on — read under
+	// the same lock AddContent builds on, so they are the parents the
+	// tree will record; a verdict that hangs on the change's position
+	// (the objects handler's rule for the creation bag) needs them
+	// before the change exists. Cloned: Heads returns the tree's own
+	// slice, and PrevIds is persisted by read tracking.
+	if o.tree != nil {
+		ch.PrevIds = slices.Clone(o.tree.Heads())
+	}
 	if err := o.ctrl.PreValidateLocal(ctx, &ch); err != nil {
 		return WriteResult{}, err
 	}

@@ -52,8 +52,10 @@ const HandlerVersion = "systemPropertyHandler-v1"
 // object's other datasets (StampObject), so rows stamped by property
 // writes alone are stale. v4: modifiedBy is stamped next to
 // modifiedAt. v5: a create sheds only its failing keys, so a row that
-// lost its create to a removed property rebuilds with it.
-const LocalVersion = 5
+// lost its create to a removed property rebuilds with it. v6: the
+// bootstrap's meta bag is admitted, so a row built before it never
+// gained one.
+const LocalVersion = 6
 
 // SystemPropertiesHandler validates property writes on every user
 // object. Corresponds to the `baseProperty` handler named in
@@ -165,7 +167,7 @@ func (h *SystemPropertiesHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.Re
 	if h.Registry != nil && len(rec.Ops) > 0 {
 		kept := rec.Ops[:0]
 		for i := range rec.Ops {
-			if verr := h.validateOp(&rec.Ops[i], nil, true); verr != nil {
+			if verr := h.validateOp(&rec.Ops[i], nil, true, isBootstrap(ctx.Change)); verr != nil {
 				continue // per-op drop
 			}
 			kept = append(kept, rec.Ops[i])
@@ -297,7 +299,7 @@ func stampModified(ctx *crdt.ChangeCtx, sink *crdt.Sink) {
 // and reads as "latest valid write attempt".
 func (h *SystemPropertiesHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
 	if h.Registry != nil {
-		if verr := h.validateOp(op, nil, false); verr != nil {
+		if verr := h.validateOp(op, nil, false, isBootstrap(ctx.Change)); verr != nil {
 			return verr
 		}
 	}
@@ -351,10 +353,11 @@ func (h *SystemPropertiesHandler) PreValidate(ch *crdt.Change, before *anyenc.Va
 		return verr
 	}
 	pf := h.buildPreflight(ch, before, adds)
+	bootstrap := isBootstrap(ch)
 	for ri := range ch.Records {
 		rc := &ch.Records[ri]
 		for oi := range rc.Ops {
-			if verr := h.validateOp(&rc.Ops[oi], pf, false); verr != nil {
+			if verr := h.validateOp(&rc.Ops[oi], pf, false, bootstrap); verr != nil {
 				return verr
 			}
 		}
@@ -626,19 +629,38 @@ func (h *SystemPropertiesHandler) buildPreflight(ch *crdt.Change, before *anyenc
 // validateOp routes by op shape. pf != nil enables the local pre-flight
 // membership check; nil is apply-time mode. shed lets an apply-time
 // multi-field op keep its passing keys (see validateMultiField).
-// $unset / $delete touch no value and are always valid (no `required`
-// keyword in v1).
-func (h *SystemPropertiesHandler) validateOp(op *crdt.Op, pf *preflight, shed bool) *ValidationError {
-	if op.Type == crdt.OpUnset || op.Type == crdt.OpDelete {
+// bootstrap marks the object's first change (isBootstrap), the one
+// that may carry the meta bag. $unset / $delete touch no value and are
+// always valid (no `required` keyword in v1) — except an $unset under
+// meta, which no change may move.
+func (h *SystemPropertiesHandler) validateOp(op *crdt.Op, pf *preflight, shed, bootstrap bool) *ValidationError {
+	if op.Type == crdt.OpDelete {
+		return nil
+	}
+	if op.Type == crdt.OpUnset {
+		if unsetsMeta(op) {
+			return h.metaRefused()
+		}
 		return nil
 	}
 	if len(op.Path) == 0 {
-		return h.validateMultiField(op, pf, shed && pf == nil)
+		return h.validateMultiField(op, pf, shed && pf == nil, bootstrap)
 	}
-	return h.validateSinglePath(op.Path, op.Payload, op.Type, pf)
+	return h.validateSinglePath(op.Path, op.Payload, op.Type, pf, bootstrap)
 }
 
-func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
+// validateSinglePath checks one single-path op. The bare meta path is
+// the multi-field key's twin — what the controller re-probes a rejected
+// modify op with, key by key — and takes the same verdict, so a
+// bootstrap that drains late keeps its bag whatever else it packed. A
+// path below meta is refused: the bag is written whole.
+func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *anyenc.Value, opType crdt.OpType, pf *preflight, bootstrap bool) *ValidationError {
+	if path[0] == anytype.FieldMeta {
+		if len(path) > 1 {
+			return h.metaRefused()
+		}
+		return h.validateMeta(payload, opType, bootstrap)
+	}
 	if len(path) < 2 {
 		return &ValidationError{Reason: ReasonInvalidPath, Path: path}
 	}
@@ -647,14 +669,15 @@ func (h *SystemPropertiesHandler) validateSinglePath(path []string, payload *any
 
 // validateMultiField walks a multi-field $set payload. Every top-level
 // key is a dotted "typeId.propId" pair, or "typeId.propId.sub…" for a
-// leaf under an object-kind property. The first failing key rejects
-// the whole op, unless shed is set: then every failing key is removed
-// from the payload and the surviving keys apply, and the op is
-// rejected only when no key survives (spec §"Validation atomicity").
-// BeforeCreate sheds; BeforeModify and the pre-flight report the whole
-// op (the controller re-probes a rejected modify op per key, the
-// pre-flight refuses the write).
-func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight, shed bool) *ValidationError {
+// leaf under an object-kind property — or the bare meta bag on the
+// object's bootstrap. The first failing key rejects the whole op,
+// unless shed is set: then every failing key is removed from the
+// payload and the surviving keys apply, and the op is rejected only
+// when no key survives (spec §"Validation atomicity"). BeforeCreate
+// sheds; BeforeModify and the pre-flight report the whole op (the
+// controller re-probes a rejected modify op per key, the pre-flight
+// refuses the write).
+func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight, shed, bootstrap bool) *ValidationError {
 	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return nil
 	}
@@ -669,7 +692,7 @@ func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight,
 		if !shed && firstErr != nil {
 			return
 		}
-		verr := h.validateMultiFieldKey(string(k), v, op.Type, pf)
+		verr := h.validateMultiFieldKey(string(k), v, op.Type, pf, bootstrap)
 		if verr == nil {
 			return
 		}
@@ -697,7 +720,13 @@ func (h *SystemPropertiesHandler) validateMultiField(op *crdt.Op, pf *preflight,
 }
 
 // validateMultiFieldKey checks one dotted key of a multi-field op.
-func (h *SystemPropertiesHandler) validateMultiFieldKey(key string, v *anyenc.Value, opType crdt.OpType, pf *preflight) *ValidationError {
+func (h *SystemPropertiesHandler) validateMultiFieldKey(key string, v *anyenc.Value, opType crdt.OpType, pf *preflight, bootstrap bool) *ValidationError {
+	if head, _, dotted := strings.Cut(key, "."); head == anytype.FieldMeta {
+		if dotted {
+			return h.metaRefused() // the bag is written whole
+		}
+		return h.validateMeta(v, opType, bootstrap)
+	}
 	dot := strings.IndexByte(key, '.')
 	if dot <= 0 || dot == len(key)-1 {
 		return &ValidationError{Reason: ReasonInvalidPath, Path: []string{key}}
@@ -711,6 +740,90 @@ func (h *SystemPropertiesHandler) validateMultiFieldKey(key string, v *anyenc.Va
 		propId, nested = rest[:sub], true
 	}
 	return h.validateFieldPath(typeId, propId, nested, v, opType, pf)
+}
+
+// validateMeta admits the row-root `meta` bag — the one derived field a
+// writer supplies — on a change parented on the root alone (the
+// bootstrap Objects().Create writes), as a $set of an object: a bare
+// key of a multi-field $set, or its single-path twin, always the whole
+// bag. The verdict hangs on the change's DAG position, not on whether
+// the row exists here yet: a bootstrap parked behind its type's
+// definition and draining after a later write still stamps the row,
+// and every other change is refused as a derived-scope write, so every
+// peer lands the same value in any delivery order. Concurrent
+// root-parented writes (a raw write on a tree still root-only here) resolve by
+// the field's LWW like any value. The keys inside are the consumer's:
+// never read, never validated here.
+func (h *SystemPropertiesHandler) validateMeta(v *anyenc.Value, opType crdt.OpType, bootstrap bool) *ValidationError {
+	if !bootstrap {
+		return h.metaRefused()
+	}
+	expected, got, ok := kindCheck(opType, schema.KindObject, v)
+	if v == nil || !ok {
+		return &ValidationError{
+			Reason: ReasonKindMismatch, TypeId: anytype.TypeId, PropId: anytype.FieldMeta,
+			PropName: h.propName(anytype.TypeId, anytype.FieldMeta), Expected: expected, Got: got,
+		}
+	}
+	return nil
+}
+
+// metaRefused is the rejection of a write to meta, or below it, by any
+// change but the bootstrap: a derived field reached over the synced
+// route.
+func (h *SystemPropertiesHandler) metaRefused() *ValidationError {
+	return &ValidationError{
+		Reason: ReasonScopeMismatch, TypeId: anytype.TypeId, PropId: anytype.FieldMeta,
+		PropName:      h.propName(anytype.TypeId, anytype.FieldMeta),
+		DeclaredScope: schema.ScopeDerived, WriteRoute: schema.ScopeSynced,
+	}
+}
+
+// unsetsMeta reports whether an $unset addresses the meta bag: a path
+// under it, or a multi-field key whose head is it.
+func unsetsMeta(op *crdt.Op) bool {
+	if len(op.Path) > 0 {
+		return op.Path[0] == anytype.FieldMeta
+	}
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+		return false
+	}
+	obj, _ := op.Payload.Object()
+	hit := false
+	obj.Visit(func(k []byte, _ *anyenc.Value) {
+		if head, _, _ := strings.Cut(string(k), "."); head == anytype.FieldMeta {
+			hit = true
+		}
+	})
+	return hit
+}
+
+// isBootstrap reports whether ch is the object's first change after
+// its root — the bootstrap Objects().Create writes: its DAG parents
+// name the root alone, and the root's id is the object's. The apply
+// pipeline stamps PrevIds from the tree on every synced change; the
+// local pre-flight sees the heads the change is about to be built on.
+// A hand-built change without parents is never the bootstrap.
+func isBootstrap(ch *crdt.Change) bool {
+	return ch != nil && len(ch.PrevIds) == 1 && ch.PrevIds[0] == ch.ObjectId
+}
+
+// propName is the display name the registry carries for a property,
+// "" when it has none.
+func (h *SystemPropertiesHandler) propName(typeId, propId string) string {
+	if h.Registry == nil {
+		return ""
+	}
+	props, ok := h.Registry.PropsOf(typeId)
+	if !ok {
+		return ""
+	}
+	for _, p := range props {
+		if p.Id == propId {
+			return p.Name
+		}
+	}
+	return ""
 }
 
 // validateFieldPath is validateField for a path that may descend below

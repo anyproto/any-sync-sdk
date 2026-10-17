@@ -23,7 +23,8 @@ type fakeTree struct {
 	changes map[string]*objecttree.Change
 }
 
-func (f *fakeTree) Id() string             { return f.id }
+func (f *fakeTree) Id() string               { return f.id }
+func (f *fakeTree) Heads() []string          { return []string{f.id} }
 func (f *fakeTree) Root() *objecttree.Change { return f.root }
 func (f *fakeTree) GetChange(id string) (*objecttree.Change, error) {
 	if c, ok := f.changes[id]; ok {

@@ -68,3 +68,34 @@ func TestChangedSince_KeyedScopedToObject(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, changed)
 }
+
+func TestChangedSince_SharedObjectRow(t *testing.T) {
+	ctrl, _ := newStampFixture(t, notesSchema)
+	ctrl.SetApplySeqAllocator(NewApplySeqAllocator(nil))
+	createObjectsRow(t, ctrl, "v1", 1)
+	seq := uint64(ctrl.Get(ctx, stampShared, stampObjectId).GetInt(ApplySeqField))
+	require.NotZero(t, seq)
+	changed, err := ctrl.ChangedSince(ctx, stampShared, seq)
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	// A different object shares this collection, but not this precondition.
+	coll, err := ctrl.openForRead(ctx, stampShared)
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"other","_applySeq":999}`)))
+	changed, err = ctrl.ChangedSince(ctx, stampShared, seq)
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	// A synced dataset change stamps this object's row as well.
+	a := &anyenc.Arena{}
+	require.NoError(t, ctrl.ApplyChange(ctx, stampChange(stampNotes, "v2", 2,
+		RecordChange{Id: "body", Upsert: true, Ops: []Op{setOp(a, "name", "edited")}})))
+	changed, err = ctrl.ChangedSince(ctx, stampShared, seq)
+	require.NoError(t, err)
+	require.True(t, changed)
+	latest := uint64(ctrl.Get(ctx, stampShared, stampObjectId).GetInt(ApplySeqField))
+	changed, err = ctrl.ChangedSince(ctx, stampShared, latest)
+	require.NoError(t, err)
+	require.False(t, changed, "another object's row must not poison the guard")
+}

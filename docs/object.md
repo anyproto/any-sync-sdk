@@ -166,3 +166,19 @@ storage, where version history reads them
 1. **Snapshot policy.** When the SDK should write snapshot changes to bound
    sync and load cost; anytype-heart's chat and store-source heuristics are
    the reference.
+
+## Conditional writes
+
+`ModifyBatch.IfUnchangedSince` guards the target dataset, including tombstones,
+against its highest observed `_applySeq`. On `objects` it checks only this object's
+shared row. `IfObjectUnchangedSince` additionally guards that row while writing a
+different dataset. Both are checked under the tree lock before any DAG change;
+a stale read returns `space.ErrPreconditionFailed` and writes nothing.
+
+Use the object revision from the same row that informed the operation. Dataset
+reads include deleted records and use their maximum stamp (zero only if empty).
+The objects row is also stamped by synced body changes, but not by every local
+field mutation in other datasets. An applied peer edit invalidates a stale read;
+an unseen offline edit arriving later follows ordinary CRDT convergence. Guards
+are local process/store-generation tokens, not distributed compare-and-swap.
+They are supported by synced `Modify`, not local scope or `ModifyMany`.

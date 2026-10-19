@@ -25,13 +25,9 @@ var applySeqPath = []string{ApplySeqField}
 // nothing rewinds it (a reindex rebuilds rows with fresh stamps above
 // it), so a watermark at or below seq answers without a scan. A keyed
 // dataset's collection holds every object's rows; the scan is bounded
-// to this object's. A shared dataset (on main, the per-space objects
-// collection) is refused: its rows carry no object prefix, and Modify
-// refuses a precondition on objects before the object loads.
+// to this object's. A shared dataset stores one row per object, so its
+// check uses the object's id instead of a keyed-record prefix.
 func (c *Controller) ChangedSince(ctx context.Context, dataset string, seq uint64) (bool, error) {
-	if c.IsShared(dataset) {
-		return false, fmt.Errorf("crdt: ChangedSince: %q is a shared dataset", dataset)
-	}
 	if c.maxApplySeq <= seq {
 		return false, nil
 	}
@@ -45,7 +41,9 @@ func (c *Controller) ChangedSince(ctx context.Context, dataset string, seq uint6
 		return false, nil
 	}
 	var filter query.Filter = query.Key{Path: applySeqPath, Filter: query.NewComp(query.CompOpGt, seq)}
-	if c.IsKeyed(dataset) {
+	if c.IsShared(dataset) {
+		filter = query.And{query.Key{Path: []string{"id"}, Filter: query.NewComp(query.CompOpEq, c.objectId)}, filter}
+	} else if c.IsKeyed(dataset) {
 		filter = query.And{KeyedRows(c.objectId), filter}
 	}
 	it, err := coll.Find(filter).Limit(1).Iter(ctx)

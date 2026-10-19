@@ -331,13 +331,12 @@ func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, datase
 // resident handles, and an in-flight caller must not surface that
 // transient as a user error.
 func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
-	return s.localWriteRetryIf(ctx, obj, objectId, ch, nil)
+	return s.localWriteRetryIf(ctx, obj, objectId, ch, nil, nil)
 }
 
-// localWriteRetryIf is localWriteRetry with an optional precondition
-// (ModifyBatch.IfUnchangedSince).
-func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change, ifUnchangedSince *uint64) (object.WriteResult, error) {
-	res, err := obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
+// localWriteRetryIf preserves both revision guards across a closed-handle retry.
+func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change, ifUnchangedSince, ifObjectUnchangedSince *uint64) (object.WriteResult, error) {
+	res, err := obj.LocalWriteGuarded(ctx, ch, ifUnchangedSince, ifObjectUnchangedSince)
 	if !errors.Is(err, object.ErrClosed) {
 		return res, wrapSlotErr(err)
 	}
@@ -345,7 +344,7 @@ func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, o
 	if gerr != nil {
 		return object.WriteResult{}, gerr
 	}
-	res, err = obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
+	res, err = obj.LocalWriteGuarded(ctx, ch, ifUnchangedSince, ifObjectUnchangedSince)
 	return res, wrapSlotErr(err)
 }
 
@@ -413,7 +412,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 		return space.ModifyResult{}, err
 	}
 
-	res, err := s.localWriteRetryIf(ctx, obj, batch.ObjectId, change, batch.IfUnchangedSince)
+	res, err := s.localWriteRetryIf(ctx, obj, batch.ObjectId, change, batch.IfUnchangedSince, batch.IfObjectUnchangedSince)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -449,8 +448,8 @@ func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (s
 	if len(batch.TraceIds) > 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: Modify: TraceIds ride the any-sync change and are not supported on the local scope")
 	}
-	if batch.IfUnchangedSince != nil {
-		return space.ModifyResult{}, errors.Join(crdt.ErrValidation, errors.New("spaceimpl: Modify: IfUnchangedSince is supported on the synced scope only"))
+	if batch.IfUnchangedSince != nil || batch.IfObjectUnchangedSince != nil {
+		return space.ModifyResult{}, errors.Join(crdt.ErrValidation, errors.New("spaceimpl: Modify: conditional guards are supported on the synced scope only"))
 	}
 	for i := range batch.Records {
 		if isDelete(&batch.Records[i]) {
@@ -520,8 +519,8 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		}
 		// Each batch is its own change, so a precondition could not hold
 		// across them.
-		if batches[i].IfUnchangedSince != nil {
-			return nil, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: ModifyMany: batch %d: IfUnchangedSince is supported by Modify only", i))
+		if batches[i].IfUnchangedSince != nil || batches[i].IfObjectUnchangedSince != nil {
+			return nil, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: ModifyMany: batch %d: conditional guards are supported by Modify only", i))
 		}
 		if err := checkObjectsRowBatch(batches[i]); err != nil {
 			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: %w", i, err)
@@ -715,14 +714,10 @@ func checkRecordShapes(records []space.RecordModify) error {
 // checkObjectsRowBatch refuses what the objects dataset cannot take
 // through Modify: every record there lands on the object's one row, so
 // a delete in a batch tombstones that row for good whatever record id
-// it names, and the row is stamped by every change to the object, so a
-// precondition on it would mean "nothing in the object changed".
+// it names. Conditional writes are allowed and guard this object's row.
 func checkObjectsRowBatch(batch space.ModifyBatch) error {
 	if batch.Dataset != properties.Dataset {
 		return nil
-	}
-	if batch.IfUnchangedSince != nil {
-		return errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Modify: IfUnchangedSince is not supported on the %s dataset", properties.Dataset))
 	}
 	for i := range batch.Records {
 		if isDelete(&batch.Records[i]) {

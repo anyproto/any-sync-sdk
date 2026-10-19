@@ -47,7 +47,17 @@ func TestModify_ConditionalGuards(t *testing.T) {
 		b.IfUnchangedSince = &seq
 		_, err := s.Modify(ctx, b)
 		require.ErrorIs(t, err, crdt.ErrValidation)
-		assert.Contains(t, err.Error(), "IfUnchangedSince")
+		assert.Contains(t, err.Error(), "conditional guards")
+	})
+
+	t.Run("object guard rejects unsupported routes", func(t *testing.T) {
+		b := scopedBatch(space.ScopeLocal)
+		b.IfObjectUnchangedSince = &seq
+		_, err := s.Modify(ctx, b)
+		require.ErrorIs(t, err, crdt.ErrValidation)
+		b.Scope = space.ScopeSynced
+		_, err = s.ModifyMany(ctx, []space.ModifyBatch{b})
+		require.ErrorIs(t, err, crdt.ErrValidation)
 	})
 
 	t.Run("local scope: delete rejected", func(t *testing.T) {
@@ -67,12 +77,11 @@ func TestModify_ConditionalGuards(t *testing.T) {
 	})
 
 	// Every record of the objects dataset is the object's one row.
-	t.Run("objects: precondition rejected", func(t *testing.T) {
+	t.Run("objects: precondition accepted", func(t *testing.T) {
 		b := scopedBatch(space.ScopeSynced)
 		b.Dataset = "objects"
 		b.IfUnchangedSince = &seq
-		_, err := s.Modify(ctx, b)
-		require.ErrorIs(t, err, crdt.ErrValidation)
+		require.NoError(t, checkObjectsRowBatch(b))
 	})
 
 	t.Run("ModifyMany: malformed delete rejected before loading", func(t *testing.T) {

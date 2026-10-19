@@ -557,6 +557,12 @@ func (o *Object) LocalWrite(ctx context.Context, ch crdt.Change) (WriteResult, e
 // the write; a dataset that changed is crdt.ErrPreconditionFailed with
 // nothing written.
 func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSince *uint64) (WriteResult, error) {
+	return o.LocalWriteGuarded(ctx, ch, ifUnchangedSince, nil)
+}
+
+// LocalWriteGuarded checks the dataset and shared object-row revisions
+// under the same tree lock before committing a change.
+func (o *Object) LocalWriteGuarded(ctx context.Context, ch crdt.Change, ifUnchangedSince, ifObjectUnchangedSince *uint64) (WriteResult, error) {
 	if o.tree == nil {
 		return WriteResult{}, ErrTreeNotSet
 	}
@@ -599,6 +605,15 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	// The precondition runs before the state-dependent pre-flight: a
 	// write built on a stale read is a precondition failure (re-read
 	// and retry), not a validation error against state it never saw.
+	if ifObjectUnchangedSince != nil {
+		changed, err := o.ctrl.ChangedSince(ctx, "objects", *ifObjectUnchangedSince)
+		if err != nil {
+			return WriteResult{}, fmt.Errorf("object: object precondition: %w", err)
+		}
+		if changed {
+			return WriteResult{}, crdt.ErrPreconditionFailed
+		}
+	}
 	if ifUnchangedSince != nil {
 		changed, err := o.ctrl.ChangedSince(ctx, ch.Dataset, *ifUnchangedSince)
 		if err != nil {

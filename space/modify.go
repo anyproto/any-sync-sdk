@@ -79,9 +79,19 @@ type ModifyBatch struct {
 	// _applySeq, so after a restart re-read the dataset instead of
 	// reusing a value from before it.
 	//
-	// Synced scope only; not for ModifyMany or the objects dataset, whose
-	// row every change to the object stamps.
+	// On the shared objects dataset, the check covers only ObjectId's
+	// row, not other objects. Any change stamping that row (including a
+	// body edit) invalidates the token. Read it from Objects().Get or
+	// QueryObjects; never reuse a token with values from another read.
+	// Synced scope only; not for ModifyMany.
 	IfUnchangedSince *uint64
+
+	// IfObjectUnchangedSince additionally guards this object's shared
+	// objects row, using its _applySeq from Objects().Get. It protects
+	// metadata read before a dataset write. It does not cover local-scope
+	// changes in other datasets that do not stamp the objects row.
+	// Both guards are checked under the same write lock. Synced Modify only.
+	IfObjectUnchangedSince *uint64
 }
 
 // RecordModify groups ops applied to one record id.

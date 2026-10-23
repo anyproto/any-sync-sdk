@@ -42,6 +42,13 @@ var (
 	// for this account. CreateInvite, CreateGuestKey and AddAccounts
 	// return it from make-shareable, which is owner-only.
 	ErrCoordinatorForbidden = coordinatorproto.ErrForbidden
+
+	// ErrCoordinatorLimitReached is the network refusing an operation
+	// because the account reached a limit of its network plan: shared
+	// spaces on make-shareable (CreateInvite, CreateGuestKey,
+	// AddAccounts), or members on an ACL record that adds or promotes
+	// one (AcceptRequest, ChangePermissions, AddAccounts).
+	ErrCoordinatorLimitReached = coordinatorproto.ErrSpaceLimitReached
 )
 
 // ACL is the owner/admin-side ACL surface: invite lifecycle, join

@@ -11,6 +11,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/consensus/consensusproto"
+	"github.com/anyproto/any-sync/net/rpc/rpcerr"
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
@@ -102,7 +103,7 @@ func callWaitingForLog(ctx context.Context, call func() error) error {
 		if err := call(); err != nil {
 			lastErr = err
 			if !isLogNotReady(err) {
-				return err
+				return liftLimitReached(err)
 			}
 			select {
 			case <-ctx.Done():
@@ -114,6 +115,20 @@ func callWaitingForLog(ctx context.Context, call func() error) error {
 		return nil
 	}
 	return fmt.Errorf("consensus log not ready after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// liftLimitReached puts space.ErrCoordinatorLimitReached on the chain
+// of a limit refusal. Make-shareable already returns the registered
+// coordinator error; an ACL record goes out through the sync node,
+// whose refusal arrives as a bare wire code that errors.Is misses.
+func liftLimitReached(err error) error {
+	if err == nil || errors.Is(err, space.ErrCoordinatorLimitReached) {
+		return err
+	}
+	if errors.Is(rpcerr.Unwrap(err), space.ErrCoordinatorLimitReached) {
+		return fmt.Errorf("%w: %w", space.ErrCoordinatorLimitReached, err)
+	}
+	return err
 }
 
 // isLogNotReady matches the "log not found" rejection returned while a
@@ -234,10 +249,10 @@ func (a *aclAPI) AcceptRequest(ctx context.Context, requestRecordId string, perm
 	if err != nil {
 		return err
 	}
-	return cl.AcceptRequest(ctx, list.RequestAcceptPayload{
+	return liftLimitReached(cl.AcceptRequest(ctx, list.RequestAcceptPayload{
 		RequestRecordId: requestRecordId,
 		Permissions:     toAclPermissions(perm),
-	})
+	}))
 }
 
 func (a *aclAPI) DeclineRequest(ctx context.Context, identity string) error {
@@ -271,7 +286,7 @@ func (a *aclAPI) ChangePermissions(ctx context.Context, changes []space.Permissi
 			Permissions: toAclPermissions(ch.Permission),
 		})
 	}
-	return cl.ChangePermissions(ctx, list.PermissionChangesPayload{Changes: out})
+	return liftLimitReached(cl.ChangePermissions(ctx, list.PermissionChangesPayload{Changes: out}))
 }
 
 func (a *aclAPI) RemoveAccounts(ctx context.Context, identities []string) error {

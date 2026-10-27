@@ -61,4 +61,7 @@ func TestAclSentinelAliases(t *testing.T) {
 	if ErrCoordinatorForbidden != coordinatorproto.ErrForbidden { //nolint:errorlint
 		t.Error("ErrCoordinatorForbidden is not coordinatorproto.ErrForbidden")
 	}
+	if ErrCoordinatorLimitReached != coordinatorproto.ErrSpaceLimitReached { //nolint:errorlint
+		t.Error("ErrCoordinatorLimitReached is not coordinatorproto.ErrSpaceLimitReached")
+	}
 }

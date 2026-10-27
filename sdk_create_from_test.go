@@ -374,24 +374,28 @@ func TestCreateFrom_TemplateIdReserved(t *testing.T) {
 }
 
 // A NoCopy module's records stay behind: the copy carries the type's
-// other datasets and starts the module's collection empty.
+// other datasets and starts the module's collections empty — and
+// writable. Covered on a registered type's static parts (a
+// canonical-only module and a namespaced instance of another) and on
+// a user type's runtime part.
 func TestCreateFrom_NoCopyModule(t *testing.T) {
 	dataDir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	dynamic := func(handler.ModuleInstance) handler.Dataset {
+		return handler.Dataset{Schema: handler.Schema{Dynamic: true}}
+	}
 	cfg := cfConfig(t, dataDir)
-	cfg.Modules = append(cfg.Modules, handler.Module{
-		Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true, DataVersion: "tr-v1",
-		New: func(handler.ModuleInstance) handler.Dataset {
-			return handler.Dataset{Schema: handler.Schema{Dynamic: true}}
-		},
-	})
+	cfg.Modules = append(cfg.Modules,
+		handler.Module{Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true, DataVersion: "tr-v1", New: dynamic},
+		handler.Module{Name: "journal", Canonical: "journal_log", NoCopy: true, DataVersion: "jr-v1", New: dynamic},
+	)
 	cfg.Types = append(cfg.Types, handler.Type{
 		Id: "tr-doc", Name: "Thread",
 		Datasets: []handler.Dataset{{Name: "tr_meta", DataVersion: "tr-v1", Handler: handler.DefaultHandler{}}},
 		Parts: []handler.Part{
 			{Key: "meta", Datasets: []handler.PartDataset{{Name: "tr_meta"}}},
-			{Key: "log", Datasets: []handler.PartDataset{{Module: "transcript"}}},
+			{Key: "log", Datasets: []handler.PartDataset{{Module: "transcript"}, {Module: "journal", Key: "side"}}},
 		},
 	})
 	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
@@ -400,29 +404,41 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "NoCopy"})
 	require.NoError(t, err)
 
+	note := func(objectId, dataset, text string) {
+		t.Helper()
+		_, err := sp.Modify(ctx, space.ModifyBatch{ObjectId: objectId, Dataset: dataset, Records: []space.RecordModify{
+			{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": text}}}},
+		}})
+		require.NoError(t, err)
+	}
+	// leftBehind copies src and checks each NoCopy dataset: one record
+	// on the source, none on the copy, and the copy's own collection
+	// takes a write — empty, not absent.
+	leftBehind := func(src string, datasets ...string) string {
+		t.Helper()
+		dup, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: src})
+		require.NoError(t, err)
+		for _, ds := range datasets {
+			assert.Len(t, cfRecordsOf(t, ctx, sp, src, ds), 1, ds)
+			assert.Empty(t, cfRecordsOf(t, ctx, sp, dup, ds), ds)
+			note(dup, ds, "fresh")
+			assert.Len(t, cfRecordsOf(t, ctx, sp, dup, ds), 1, ds)
+			assert.Len(t, cfRecordsOf(t, ctx, sp, src, ds), 1, ds)
+		}
+		return dup
+	}
+
+	// Static parts: the canonical-only module and a namespaced instance.
 	src, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "tr-doc"})
 	require.NoError(t, err)
 	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: src, Dataset: "tr_meta", Records: []space.RecordModify{
 		{Id: "m1", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "kept"}}}},
 	}})
 	require.NoError(t, err)
-	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: src, Dataset: "transcript_log", Records: []space.RecordModify{
-		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "left behind"}}}},
-	}})
-	require.NoError(t, err)
-
-	dup, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: src})
-	require.NoError(t, err)
+	note(src, "transcript_log", "left behind")
+	note(src, "tr-doc_side", "left behind")
+	dup := leftBehind(src, "transcript_log", "tr-doc_side")
 	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "tr_meta"), cfRecordsOf(t, ctx, sp, dup, "tr_meta"))
-	assert.Len(t, cfRecordsOf(t, ctx, sp, src, "transcript_log"), 1)
-	assert.Empty(t, cfRecordsOf(t, ctx, sp, dup, "transcript_log"))
-	// Empty, not absent: the copy's own transcript takes writes.
-	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: dup, Dataset: "transcript_log", Records: []space.RecordModify{
-		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "fresh"}}}},
-	}})
-	require.NoError(t, err)
-	assert.Len(t, cfRecordsOf(t, ctx, sp, dup, "transcript_log"), 1)
-	assert.Len(t, cfRecordsOf(t, ctx, sp, src, "transcript_log"), 1)
 
 	// The runtime-declared path: a user type's part names the module.
 	roomType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Room"})
@@ -433,20 +449,9 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 		Type: roomType, InitialProperties: map[string]map[string]any{"any": {"name": "Room"}},
 	})
 	require.NoError(t, err)
-	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: room, Dataset: "transcript_log", Records: []space.RecordModify{
-		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "left behind"}}}},
-	}})
-	require.NoError(t, err)
-	roomDup, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: room})
-	require.NoError(t, err)
+	note(room, "transcript_log", "left behind")
+	roomDup := leftBehind(room, "transcript_log")
 	row, err := sp.Objects().Get(ctx, roomDup)
 	require.NoError(t, err)
 	assert.Equal(t, "Room", string(row.GetStringBytes("any", "name")))
-	assert.Len(t, cfRecordsOf(t, ctx, sp, room, "transcript_log"), 1)
-	assert.Empty(t, cfRecordsOf(t, ctx, sp, roomDup, "transcript_log"))
-	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: roomDup, Dataset: "transcript_log", Records: []space.RecordModify{
-		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "fresh"}}}},
-	}})
-	require.NoError(t, err)
-	assert.Len(t, cfRecordsOf(t, ctx, sp, roomDup, "transcript_log"), 1)
 }

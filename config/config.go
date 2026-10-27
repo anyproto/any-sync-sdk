@@ -64,7 +64,9 @@ type Config struct {
 	// collection names must be unique across the catalog. A Reserved
 	// module is declarable only by the caller's own bundle installs
 	// (the space.SystemInstall option) or a registered type's static part.
-	// Empty or nil = the built-in `records` module only.
+	// A NoCopy module's datasets stay behind when an object is copied
+	// (Objects().Create with From). Empty or nil = the built-in `records`
+	// module only.
 	Modules []handler.Module
 }
 

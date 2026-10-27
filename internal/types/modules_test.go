@@ -14,16 +14,18 @@ func testModules() Modules {
 		ModuleInfo{Name: "editor", Canonical: "editor_blocks"},
 		ModuleInfo{Name: "chat", Canonical: "chat_messages", CanonicalOnly: true},
 		ModuleInfo{Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true},
+		ModuleInfo{Name: "secret", Canonical: "secret_inbox", CanonicalOnly: true, Reserved: true},
 		ModuleInfo{Name: "plain"},
 	)
 }
 
-// NoCopy is the registered flag; an unknown module is not NoCopy.
-func TestModules_NoCopy(t *testing.T) {
+// A copy skips a NoCopy module's and a reserved module's datasets; an
+// unknown module is neither.
+func TestModules_SkipsCopy(t *testing.T) {
 	modules := testModules()
-	for module, want := range map[string]bool{"transcript": true, "chat": false, RecordsModule: false, "nope": false} {
-		if got := modules.NoCopy(module); got != want {
-			t.Errorf("NoCopy(%q) = %v, want %v", module, got, want)
+	for module, want := range map[string]bool{"transcript": true, "secret": true, "chat": false, RecordsModule: false, "nope": false} {
+		if got := modules.SkipsCopy(module); got != want {
+			t.Errorf("SkipsCopy(%q) = %v, want %v", module, got, want)
 		}
 	}
 }

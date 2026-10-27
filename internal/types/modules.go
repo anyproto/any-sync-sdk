@@ -37,11 +37,13 @@ func (m Modules) Reserved(module string) bool {
 	return ok && mi.Reserved
 }
 
-// NoCopy reports whether module keeps its datasets out of an object
-// copy. Unknown modules do not.
-func (m Modules) NoCopy(module string) bool {
+// SkipsCopy reports whether an object copy leaves module's datasets
+// behind: a reserved module's (the consumer's own install root carries
+// them) or a NoCopy module's (their records are their author's).
+// Unknown modules do not.
+func (m Modules) SkipsCopy(module string) bool {
 	mi, ok := m[module]
-	return ok && mi.NoCopy
+	return ok && (mi.Reserved || mi.NoCopy)
 }
 
 // NewModules builds a catalog from the caller's modules plus records.

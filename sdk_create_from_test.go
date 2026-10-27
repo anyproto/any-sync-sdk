@@ -441,9 +441,13 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	note(src, "scratch_pad", "travels")
 	dup := leftBehind(src, "transcript_log", "tr-doc_side")
 	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "tr_meta"), cfRecordsOf(t, ctx, sp, dup, "tr_meta"))
-	// The control: a module without the flag copies like any dataset.
-	assert.Len(t, cfRecordsOf(t, ctx, sp, dup, "scratch_pad"), 1)
-	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "scratch_pad"), cfRecordsOf(t, ctx, sp, dup, "scratch_pad"))
+	// The control: a module without the flag copies like any dataset
+	// (the dynamic schema derives ids, so the copy's record is fresh).
+	copied := cfRecordsOf(t, ctx, sp, dup, "scratch_pad")
+	require.Len(t, copied, 1)
+	for _, fields := range copied {
+		assert.Equal(t, "travels", fields["text"])
+	}
 
 	// The runtime-declared path: a user type's part names the module.
 	roomType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Room"})

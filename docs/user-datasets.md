@@ -47,8 +47,10 @@ Type
   object carries at most one collection of the module; `NoCopy` keeps
   its datasets out of an object copy (`Objects().Create` with `From`):
   records whose author is the content, a chat transcript, never travel.
-  A module may also declare a namespace on the objects row
-  (`Properties`); see docs/data-structure.md § Module namespaces.
+  Like `Reserved`, it is read from the copying device's own module
+  registration, not from space state. A module may also declare a
+  namespace on the objects row (`Properties`); see
+  docs/data-structure.md § Module namespaces.
 
 ### Reserved modules
 

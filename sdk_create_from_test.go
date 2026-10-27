@@ -416,4 +416,25 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "tr_meta"), cfRecordsOf(t, ctx, sp, dup, "tr_meta"))
 	assert.Len(t, cfRecordsOf(t, ctx, sp, src, "transcript_log"), 1)
 	assert.Empty(t, cfRecordsOf(t, ctx, sp, dup, "transcript_log"))
+
+	// The runtime-declared path: a user type's part names the module.
+	roomType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Room"})
+	require.NoError(t, err)
+	_, err = sp.Types().AddPart(ctx, roomType, space.PartDraft{Key: "log", Datasets: []space.DatasetDraft{{Module: "transcript"}}})
+	require.NoError(t, err)
+	room, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: roomType, InitialProperties: map[string]map[string]any{"any": {"name": "Room"}},
+	})
+	require.NoError(t, err)
+	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: room, Dataset: "transcript_log", Records: []space.RecordModify{
+		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "left behind"}}}},
+	}})
+	require.NoError(t, err)
+	roomDup, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: room})
+	require.NoError(t, err)
+	row, err := sp.Objects().Get(ctx, roomDup)
+	require.NoError(t, err)
+	assert.Equal(t, "Room", string(row.GetStringBytes("any", "name")))
+	assert.Len(t, cfRecordsOf(t, ctx, sp, room, "transcript_log"), 1)
+	assert.Empty(t, cfRecordsOf(t, ctx, sp, roomDup, "transcript_log"))
 }

@@ -84,9 +84,9 @@ collections and `template` are states of the source, never content),
 its synced `any.*` values, the declared synced values of every owner
 the new object has and the live records of every dataset the source's
 type declares through its parts (a reserved or `NoCopy` module's
-excepted), in
-changes of at most a thousand records after the bootstrap. `Collections`
-are added to the copied ones and `InitialProperties` are written over
+excepted), in changes of at most a thousand records after the
+bootstrap. `Collections` are added to the copied ones and
+`InitialProperties` are written over
 the copied values; a value is replaced, never cleared. A source filed
 under the built-in `template` collection (`space.TemplateCollectionId`)
 is a template: the row is stamped `any.template = {id, version}` with

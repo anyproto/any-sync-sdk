@@ -562,7 +562,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	infos := make([]types.ModuleInfo, 0, len(cfg.Modules))
 	for _, m := range cfg.Modules {
 		s.modules[m.Name] = m
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved, NoCopy: m.NoCopy})
 		if m.Canonical != "" {
 			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true})
 			if err != nil {
@@ -1058,7 +1058,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 	infos := make([]types.ModuleInfo, 0, len(modules))
 	byName := make(map[string]handler.Module, len(modules))
 	for _, m := range modules {
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
+		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved, NoCopy: m.NoCopy})
 		byName[m.Name] = m
 	}
 	catalog := types.NewModules(infos...)

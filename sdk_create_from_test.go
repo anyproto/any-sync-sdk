@@ -372,3 +372,48 @@ func TestCreateFrom_TemplateIdReserved(t *testing.T) {
 	_, err = Open(ctx, cfg, wmProvider(t, dataDir))
 	require.Error(t, err)
 }
+
+// A NoCopy module's records stay behind: the copy carries the type's
+// other datasets and starts the module's collection empty.
+func TestCreateFrom_NoCopyModule(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cfg := cfConfig(t, dataDir)
+	cfg.Modules = append(cfg.Modules, handler.Module{
+		Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true, DataVersion: "tr-v1",
+		New: func(handler.ModuleInstance) handler.Dataset {
+			return handler.Dataset{Schema: handler.Schema{Dynamic: true}}
+		},
+	})
+	cfg.Types = append(cfg.Types, handler.Type{
+		Id: "tr-doc", Name: "Thread",
+		Datasets: []handler.Dataset{{Name: "tr_meta", DataVersion: "tr-v1", Handler: handler.DefaultHandler{}}},
+		Parts: []handler.Part{
+			{Key: "meta", Datasets: []handler.PartDataset{{Name: "tr_meta"}}},
+			{Key: "log", Datasets: []handler.PartDataset{{Module: "transcript"}}},
+		},
+	})
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "NoCopy"})
+	require.NoError(t, err)
+
+	src, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "tr-doc"})
+	require.NoError(t, err)
+	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: src, Dataset: "tr_meta", Records: []space.RecordModify{
+		{Id: "m1", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "kept"}}}},
+	}})
+	require.NoError(t, err)
+	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: src, Dataset: "transcript_log", Records: []space.RecordModify{
+		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "left behind"}}}},
+	}})
+	require.NoError(t, err)
+
+	dup, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: src})
+	require.NoError(t, err)
+	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "tr_meta"), cfRecordsOf(t, ctx, sp, dup, "tr_meta"))
+	assert.Len(t, cfRecordsOf(t, ctx, sp, src, "transcript_log"), 1)
+	assert.Empty(t, cfRecordsOf(t, ctx, sp, dup, "transcript_log"))
+}

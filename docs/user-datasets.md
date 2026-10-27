@@ -44,9 +44,11 @@ Type
   handler, schema, indexes, read-tracking and history flags for one
   collection. A module may own a **canonical collection**
   (`Canonical`); `CanonicalOnly` refuses namespaced instances so an
-  object carries at most one collection of the module. A module may also
-  declare a namespace on the objects row (`Properties`); see
-  docs/data-structure.md § Module namespaces.
+  object carries at most one collection of the module; `NoCopy` keeps
+  its datasets out of an object copy (`Objects().Create` with `From`):
+  records whose author is the content, a chat transcript, never travel.
+  A module may also declare a namespace on the objects row
+  (`Properties`); see docs/data-structure.md § Module namespaces.
 
 ### Reserved modules
 
@@ -663,7 +665,7 @@ PatchDatasetField(ctx, typeId, fieldDefId, DatasetDefPatch) error
 Datasets(ctx, typeId) ([]DatasetDef, error)               // flat, with Collection
 
 // modules (config.Config.Modules)
-handler.Module{Name, Canonical, CanonicalOnly, Reserved, DataVersion, HandlerVersion, Properties, New}
+handler.Module{Name, Canonical, CanonicalOnly, Reserved, NoCopy, DataVersion, HandlerVersion, Properties, New}
 
 // static parts (config.Config.Types)
 handler.Type{…, Parts: []handler.Part{{Key, Name, Icon, Pos, Hidden, UI, Uses,

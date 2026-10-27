@@ -416,6 +416,13 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "tr_meta"), cfRecordsOf(t, ctx, sp, dup, "tr_meta"))
 	assert.Len(t, cfRecordsOf(t, ctx, sp, src, "transcript_log"), 1)
 	assert.Empty(t, cfRecordsOf(t, ctx, sp, dup, "transcript_log"))
+	// Empty, not absent: the copy's own transcript takes writes.
+	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: dup, Dataset: "transcript_log", Records: []space.RecordModify{
+		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "fresh"}}}},
+	}})
+	require.NoError(t, err)
+	assert.Len(t, cfRecordsOf(t, ctx, sp, dup, "transcript_log"), 1)
+	assert.Len(t, cfRecordsOf(t, ctx, sp, src, "transcript_log"), 1)
 
 	// The runtime-declared path: a user type's part names the module.
 	roomType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Room"})
@@ -437,4 +444,9 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	assert.Equal(t, "Room", string(row.GetStringBytes("any", "name")))
 	assert.Len(t, cfRecordsOf(t, ctx, sp, room, "transcript_log"), 1)
 	assert.Empty(t, cfRecordsOf(t, ctx, sp, roomDup, "transcript_log"))
+	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: roomDup, Dataset: "transcript_log", Records: []space.RecordModify{
+		{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "fresh"}}}},
+	}})
+	require.NoError(t, err)
+	assert.Len(t, cfRecordsOf(t, ctx, sp, roomDup, "transcript_log"), 1)
 }

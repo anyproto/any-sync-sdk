@@ -16,8 +16,8 @@ const RecordsModule = "records"
 // name, the canonical collection it owns (empty = none), whether it
 // admits namespaced instances, whether runtime declarations may name
 // it at all (Reserved — a draft-time refusal; the compile keeps an
-// applied declaration valid), and whether an object copy carries its
-// records (NoCopy).
+// applied declaration valid), and whether an object copy leaves its
+// records behind (NoCopy).
 type ModuleInfo struct {
 	Name          string
 	Canonical     string

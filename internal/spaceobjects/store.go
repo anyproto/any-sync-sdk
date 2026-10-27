@@ -513,6 +513,18 @@ func (s *Store) CheckWrite() error {
 	return nil
 }
 
+// moduleInfoOf is the compiler's view of a registered module, built the
+// same way for the live catalog and for ValidateExternalModules.
+func moduleInfoOf(m handler.Module) types.ModuleInfo {
+	return types.ModuleInfo{
+		Name:          m.Name,
+		Canonical:     m.Canonical,
+		CanonicalOnly: m.CanonicalOnly,
+		Reserved:      m.Reserved,
+		NoCopy:        m.NoCopy,
+	}
+}
+
 // NewStoreWithConfig constructs a Store from cfg. The async drainer is
 // built and started here — it lives until Close.
 func NewStoreWithConfig(cfg StoreConfig) *Store {
@@ -563,6 +575,9 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	for _, m := range cfg.Modules {
 		s.modules[m.Name] = m
 		infos = append(infos, moduleInfoOf(m))
+		if m.Reserved {
+			s.reservedModules = append(s.reservedModules, m.Name)
+		}
 		if m.Canonical != "" {
 			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true})
 			if err != nil {
@@ -587,11 +602,6 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	s.moduleInfos = types.NewModules(infos...)
-	for _, m := range cfg.Modules {
-		if m.Reserved {
-			s.reservedModules = append(s.reservedModules, m.Name)
-		}
-	}
 	// Static parts: a registered type's module datasets are ownership
 	// (canonical) or registrations (namespaced), settled once here — the
 	// same footing a runtime declaration reaches through the catalog.
@@ -3216,18 +3226,5 @@ func (s *Store) historyApplyHook() crdt.ApplyHook {
 			}
 		}
 		return nil
-	}
-}
-
-// moduleInfoOf is the compiler's view of a registered module — the one
-// place its flags are copied, for the live catalog and for
-// ValidateExternalModules alike.
-func moduleInfoOf(m handler.Module) types.ModuleInfo {
-	return types.ModuleInfo{
-		Name:          m.Name,
-		Canonical:     m.Canonical,
-		CanonicalOnly: m.CanonicalOnly,
-		Reserved:      m.Reserved,
-		NoCopy:        m.NoCopy,
 	}
 }

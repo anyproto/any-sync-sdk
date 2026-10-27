@@ -45,11 +45,8 @@ Type
   collection. A module may own a **canonical collection**
   (`Canonical`); `CanonicalOnly` refuses namespaced instances so an
   object carries at most one collection of the module; `NoCopy` keeps
-  its datasets out of an object copy (`Objects().Create` with `From`):
-  records whose author is the content, a chat transcript, never travel.
-  Like `Reserved`, it is read from the copying device's own module
-  registration, not from space state. A module may also declare a
-  namespace on the objects row (`Properties`); see
+  its datasets out of an object copy (§ NoCopy modules). A module may
+  also declare a namespace on the objects row (`Properties`); see
   docs/data-structure.md § Module namespaces.
 
 ### Reserved modules
@@ -78,6 +75,21 @@ Limits:
 - Inbound apply is read-tolerant: a peer that lands the type on another
   row is applied, and that row keeps writing (only additions are
   checked).
+
+### NoCopy modules
+
+A **NoCopy** module keeps its datasets out of `Objects().Create` with
+`From`: the copy carries every other dataset the source's type declares
+and starts this module's collection empty, writable like any other. It
+is for records whose author and time are the content — a chat
+transcript, whose `creator` and `createdAt` come from the change
+envelope — which a copy would re-attribute to the copier.
+
+Limits:
+
+- The flag is the copying process's own module registration, not space
+  state: a consumer build that registers the module without it copies
+  the records.
 
 ### Static parts on registered types
 

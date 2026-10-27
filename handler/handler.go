@@ -533,7 +533,8 @@ type Module struct {
 	// declares; this one starts empty. For records whose author and
 	// time are the content (a chat transcript — creator and createdAt
 	// come from the change envelope), a copy would re-attribute them
-	// to the copier.
+	// to the copier. Like Reserved it is read from the copying
+	// process's own registration, not from space state.
 	NoCopy bool
 
 	// DataVersion is stamped on changes to the Canonical collection —

@@ -13,8 +13,19 @@ func testModules() Modules {
 	return NewModules(
 		ModuleInfo{Name: "editor", Canonical: "editor_blocks"},
 		ModuleInfo{Name: "chat", Canonical: "chat_messages", CanonicalOnly: true},
+		ModuleInfo{Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true},
 		ModuleInfo{Name: "plain"},
 	)
+}
+
+// NoCopy is the registered flag; an unknown module is not NoCopy.
+func TestModules_NoCopy(t *testing.T) {
+	modules := testModules()
+	for module, want := range map[string]bool{"transcript": true, "chat": false, RecordsModule: false, "nope": false} {
+		if got := modules.NoCopy(module); got != want {
+			t.Errorf("NoCopy(%q) = %v, want %v", module, got, want)
+		}
+	}
 }
 
 // A declaration follows its key: the module's canonical name is the

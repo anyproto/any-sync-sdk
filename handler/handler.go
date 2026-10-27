@@ -529,8 +529,9 @@ type Module struct {
 	Reserved bool
 
 	// NoCopy keeps the module's datasets out of Objects().Create with
-	// From: the copy carries every other dataset the source's type
-	// declares; this one starts empty. For records whose author and
+	// From: the copy carries the other datasets it copies at all (an
+	// invalid or reserved declaration is skipped too); this one starts
+	// empty. For records whose author and
 	// time are the content (a chat transcript — creator and createdAt
 	// come from the change envelope), a copy would re-attribute them
 	// to the copier. Like Reserved's draft-time refusal, it is read from

@@ -374,10 +374,10 @@ func TestCreateFrom_TemplateIdReserved(t *testing.T) {
 }
 
 // A NoCopy module's records stay behind: the copy carries the type's
-// other datasets and starts the module's collections empty — and
-// writable. Covered on a registered type's static parts (a
-// canonical-only module and a namespaced instance of another) and on
-// a user type's runtime part.
+// other datasets — a plain module's included — and starts the NoCopy
+// collections empty, and writable. Covered on a registered type's
+// static parts (a canonical-only module and a namespaced instance of
+// another) and on a user type's runtime part.
 func TestCreateFrom_NoCopyModule(t *testing.T) {
 	dataDir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -389,13 +389,14 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	cfg.Modules = append(cfg.Modules,
 		handler.Module{Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true, DataVersion: "tr-v1", New: dynamic},
 		handler.Module{Name: "journal", Canonical: "journal_log", NoCopy: true, DataVersion: "jr-v1", New: dynamic},
+		handler.Module{Name: "scratch", Canonical: "scratch_pad", DataVersion: "sc-v1", New: dynamic},
 	)
 	cfg.Types = append(cfg.Types, handler.Type{
 		Id: "tr-doc", Name: "Thread",
 		Datasets: []handler.Dataset{{Name: "tr_meta", DataVersion: "tr-v1", Handler: handler.DefaultHandler{}}},
 		Parts: []handler.Part{
 			{Key: "meta", Datasets: []handler.PartDataset{{Name: "tr_meta"}}},
-			{Key: "log", Datasets: []handler.PartDataset{{Module: "transcript"}, {Module: "journal", Key: "side"}}},
+			{Key: "log", Datasets: []handler.PartDataset{{Module: "transcript"}, {Module: "journal", Key: "side"}, {Module: "scratch"}}},
 		},
 	})
 	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
@@ -437,8 +438,12 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	require.NoError(t, err)
 	note(src, "transcript_log", "left behind")
 	note(src, "tr-doc_side", "left behind")
+	note(src, "scratch_pad", "travels")
 	dup := leftBehind(src, "transcript_log", "tr-doc_side")
 	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "tr_meta"), cfRecordsOf(t, ctx, sp, dup, "tr_meta"))
+	// The control: a module without the flag copies like any dataset.
+	assert.Len(t, cfRecordsOf(t, ctx, sp, dup, "scratch_pad"), 1)
+	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "scratch_pad"), cfRecordsOf(t, ctx, sp, dup, "scratch_pad"))
 
 	// The runtime-declared path: a user type's part names the module.
 	roomType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Room"})

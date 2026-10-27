@@ -372,3 +372,95 @@ func TestCreateFrom_TemplateIdReserved(t *testing.T) {
 	_, err = Open(ctx, cfg, wmProvider(t, dataDir))
 	require.Error(t, err)
 }
+
+// A NoCopy module's records stay behind: the copy carries the type's
+// other datasets — a plain module's included — and starts the NoCopy
+// collections empty, and writable. Covered on a registered type's
+// static parts (a canonical-only module and a namespaced instance of
+// another) and on a user type's runtime part.
+func TestCreateFrom_NoCopyModule(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dynamic := func(handler.ModuleInstance) handler.Dataset {
+		return handler.Dataset{Schema: handler.Schema{Dynamic: true}}
+	}
+	cfg := cfConfig(t, dataDir)
+	cfg.Modules = append(cfg.Modules,
+		handler.Module{Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true, DataVersion: "tr-v1", New: dynamic},
+		handler.Module{Name: "journal", NoCopy: true, DataVersion: "jr-v1", New: dynamic},
+		handler.Module{Name: "scratch", Canonical: "scratch_pad", DataVersion: "sc-v1", New: dynamic},
+	)
+	cfg.Types = append(cfg.Types, handler.Type{
+		Id: "tr-doc", Name: "Thread",
+		Datasets: []handler.Dataset{{Name: "tr_meta", DataVersion: "tr-v1", Handler: handler.DefaultHandler{}}},
+		Parts: []handler.Part{
+			{Key: "meta", Datasets: []handler.PartDataset{{Name: "tr_meta"}}},
+			{Key: "log", Datasets: []handler.PartDataset{{Module: "transcript"}, {Module: "journal", Key: "side"}, {Module: "scratch"}}},
+		},
+	})
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "NoCopy"})
+	require.NoError(t, err)
+
+	note := func(objectId, dataset, text string) {
+		t.Helper()
+		_, err := sp.Modify(ctx, space.ModifyBatch{ObjectId: objectId, Dataset: dataset, Records: []space.RecordModify{
+			{Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": text}}}},
+		}})
+		require.NoError(t, err)
+	}
+	// leftBehind copies src and checks each NoCopy dataset: one record
+	// on the source, none on the copy, and the copy's own collection
+	// takes a write — empty, not absent.
+	leftBehind := func(src string, datasets ...string) string {
+		t.Helper()
+		dup, err := sp.Objects().Create(ctx, space.CreateObjectOpts{From: src})
+		require.NoError(t, err)
+		for _, ds := range datasets {
+			assert.Len(t, cfRecordsOf(t, ctx, sp, src, ds), 1, ds)
+			assert.Empty(t, cfRecordsOf(t, ctx, sp, dup, ds), ds)
+			note(dup, ds, "fresh")
+			assert.Len(t, cfRecordsOf(t, ctx, sp, dup, ds), 1, ds)
+			assert.Len(t, cfRecordsOf(t, ctx, sp, src, ds), 1, ds)
+		}
+		return dup
+	}
+
+	// Static parts: the canonical-only module and a namespaced instance.
+	src, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "tr-doc"})
+	require.NoError(t, err)
+	_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: src, Dataset: "tr_meta", Records: []space.RecordModify{
+		{Id: "m1", Upsert: true, Ops: []space.Op{{Type: space.OpSet, Value: map[string]any{"text": "kept"}}}},
+	}})
+	require.NoError(t, err)
+	note(src, "transcript_log", "left behind")
+	note(src, "tr-doc_side", "left behind")
+	note(src, "scratch_pad", "travels")
+	dup := leftBehind(src, "transcript_log", "tr-doc_side")
+	assert.Equal(t, cfRecordsOf(t, ctx, sp, src, "tr_meta"), cfRecordsOf(t, ctx, sp, dup, "tr_meta"))
+	// The control: a module without the flag copies like any dataset
+	// (the dynamic schema derives ids, so the copy's record is fresh).
+	copied := cfRecordsOf(t, ctx, sp, dup, "scratch_pad")
+	require.Len(t, copied, 1)
+	for _, fields := range copied {
+		assert.Equal(t, "travels", fields["text"])
+	}
+
+	// The runtime-declared path: a user type's part names the module.
+	roomType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Room"})
+	require.NoError(t, err)
+	_, err = sp.Types().AddPart(ctx, roomType, space.PartDraft{Key: "log", Datasets: []space.DatasetDraft{{Module: "transcript"}}})
+	require.NoError(t, err)
+	room, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: roomType, InitialProperties: map[string]map[string]any{"any": {"name": "Room"}},
+	})
+	require.NoError(t, err)
+	note(room, "transcript_log", "left behind")
+	roomDup := leftBehind(room, "transcript_log")
+	row, err := sp.Objects().Get(ctx, roomDup)
+	require.NoError(t, err)
+	assert.Equal(t, "Room", string(row.GetStringBytes("any", "name")))
+}

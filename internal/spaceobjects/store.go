@@ -513,6 +513,18 @@ func (s *Store) CheckWrite() error {
 	return nil
 }
 
+// moduleInfoOf is the compiler's view of a registered module, built the
+// same way for the live catalog and for ValidateExternalModules.
+func moduleInfoOf(m handler.Module) types.ModuleInfo {
+	return types.ModuleInfo{
+		Name:          m.Name,
+		Canonical:     m.Canonical,
+		CanonicalOnly: m.CanonicalOnly,
+		Reserved:      m.Reserved,
+		NoCopy:        m.NoCopy,
+	}
+}
+
 // NewStoreWithConfig constructs a Store from cfg. The async drainer is
 // built and started here — it lives until Close.
 func NewStoreWithConfig(cfg StoreConfig) *Store {
@@ -562,7 +574,10 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	infos := make([]types.ModuleInfo, 0, len(cfg.Modules))
 	for _, m := range cfg.Modules {
 		s.modules[m.Name] = m
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
+		infos = append(infos, moduleInfoOf(m))
+		if m.Reserved {
+			s.reservedModules = append(s.reservedModules, m.Name)
+		}
 		if m.Canonical != "" {
 			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true})
 			if err != nil {
@@ -587,11 +602,6 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	s.moduleInfos = types.NewModules(infos...)
-	for _, m := range cfg.Modules {
-		if m.Reserved {
-			s.reservedModules = append(s.reservedModules, m.Name)
-		}
-	}
 	// Static parts: a registered type's module datasets are ownership
 	// (canonical) or registrations (namespaced), settled once here — the
 	// same footing a runtime declaration reaches through the catalog.
@@ -1058,7 +1068,7 @@ func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) 
 	infos := make([]types.ModuleInfo, 0, len(modules))
 	byName := make(map[string]handler.Module, len(modules))
 	for _, m := range modules {
-		infos = append(infos, types.ModuleInfo{Name: m.Name, Canonical: m.Canonical, CanonicalOnly: m.CanonicalOnly, Reserved: m.Reserved})
+		infos = append(infos, moduleInfoOf(m))
 		byName[m.Name] = m
 	}
 	catalog := types.NewModules(infos...)

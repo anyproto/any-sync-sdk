@@ -169,8 +169,8 @@ func (o *objectService) resolveCopy(ctx context.Context, opts space.CreateObject
 }
 
 // copyableDatasets lists the datasets the source's type declares
-// through its parts, minus an invalid declaration and a reserved
-// module's (the consumer's own install root carries that one).
+// through its parts, minus an invalid declaration and the modules a
+// copy skips (Modules.SkipsCopy: reserved and NoCopy).
 func (o *objectService) copyableDatasets(ctx context.Context, typeId string) ([]types.CompiledDataset, error) {
 	var compiled []types.CompiledDataset
 	if rt, ok := o.parent.types.findRegisteredType(typeId); ok {
@@ -188,7 +188,7 @@ func (o *objectService) copyableDatasets(ctx context.Context, typeId string) ([]
 	modules := o.parent.store.Modules()
 	out := make([]types.CompiledDataset, 0, len(compiled))
 	for _, ds := range compiled {
-		if ds.Invalid || modules.Reserved(ds.Module) {
+		if ds.Invalid || modules.SkipsCopy(ds.Module) {
 			continue
 		}
 		out = append(out, ds)

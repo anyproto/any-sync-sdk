@@ -528,6 +528,16 @@ type Module struct {
 	// registered type's static declaration stays attachable.
 	Reserved bool
 
+	// NoCopy keeps the module's datasets out of Objects().Create with
+	// From: the copy carries the type's other datasets (an invalid
+	// declaration's and a reserved module's are skipped as well); this
+	// one starts empty. For records whose author and time are the
+	// content (a chat transcript — creator and createdAt come from the
+	// change envelope), a copy would re-attribute them to the copier.
+	// Like Reserved's draft-time refusal, it is read from the copying
+	// process's own registration, not from space state.
+	NoCopy bool
+
 	// DataVersion is stamped on changes to the Canonical collection —
 	// the same opaque string a Dataset carries. Namespaced instances
 	// stamp the declaring type's schema state instead.

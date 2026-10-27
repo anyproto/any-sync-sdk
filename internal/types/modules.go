@@ -14,14 +14,16 @@ const RecordsModule = "records"
 
 // ModuleInfo is what the compiler needs to know about a module: its
 // name, the canonical collection it owns (empty = none), whether it
-// admits namespaced instances, and whether runtime declarations may
-// name it at all (Reserved — a draft-time refusal; the compile keeps
-// an applied declaration valid).
+// admits namespaced instances, whether runtime declarations may name
+// it at all (Reserved — a draft-time refusal; the compile keeps an
+// applied declaration valid), and whether an object copy leaves its
+// records behind (NoCopy).
 type ModuleInfo struct {
 	Name          string
 	Canonical     string
 	CanonicalOnly bool
 	Reserved      bool
+	NoCopy        bool
 }
 
 // Modules is the module catalog keyed by name. Always carries the
@@ -33,6 +35,15 @@ type Modules map[string]ModuleInfo
 func (m Modules) Reserved(module string) bool {
 	mi, ok := m[module]
 	return ok && mi.Reserved
+}
+
+// SkipsCopy reports whether an object copy leaves module's datasets
+// behind: a reserved module's (never copied, whichever row carries it)
+// or a NoCopy module's (their records are their author's). Unknown
+// modules do not.
+func (m Modules) SkipsCopy(module string) bool {
+	mi, ok := m[module]
+	return ok && (mi.Reserved || mi.NoCopy)
 }
 
 // NewModules builds a catalog from the caller's modules plus records.

@@ -70,8 +70,16 @@ const (
 // Idempotent — safe to call on every open. The (sp, as) compound index
 // backs QueryChangedObjects' "objects in this space with applySeq > N,
 // ordered by applySeq" scan; the legacy (sp, q) index stays for the
-// restore-watermark reads.
+// restore-watermark reads. The single-field sp index backs space cleanup,
+// including legacy scoped rows missing either compound index's watermark.
 func ensureMetaIndexes(ctx context.Context, coll anystore.Collection) error {
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Name:   "idx__meta_sp",
+		Fields: []string{metaSpaceIdKey},
+		Sparse: true,
+	}); err != nil {
+		return err
+	}
 	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
 		Name:   "idx__meta_sp_q",
 		Fields: []string{metaSpaceIdKey, metaAddSeqKey},

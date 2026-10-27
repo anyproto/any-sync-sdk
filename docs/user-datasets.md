@@ -79,8 +79,9 @@ Limits:
 ### NoCopy modules
 
 A **NoCopy** module keeps its datasets out of `Objects().Create` with
-`From`: the copy carries every other dataset the source's type declares
-and starts this module's collection empty, writable like any other. It
+`From`: the copy carries the type's other datasets (an invalid
+declaration's and a reserved module's are skipped as well) and starts
+this module's collection empty, writable like any other. It
 is for records whose author and time are the content — a chat
 transcript, whose `creator` and `createdAt` come from the change
 envelope — which a copy would re-attribute to the copier.

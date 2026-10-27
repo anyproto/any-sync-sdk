@@ -388,7 +388,7 @@ func TestCreateFrom_NoCopyModule(t *testing.T) {
 	cfg := cfConfig(t, dataDir)
 	cfg.Modules = append(cfg.Modules,
 		handler.Module{Name: "transcript", Canonical: "transcript_log", CanonicalOnly: true, NoCopy: true, DataVersion: "tr-v1", New: dynamic},
-		handler.Module{Name: "journal", Canonical: "journal_log", NoCopy: true, DataVersion: "jr-v1", New: dynamic},
+		handler.Module{Name: "journal", NoCopy: true, DataVersion: "jr-v1", New: dynamic},
 		handler.Module{Name: "scratch", Canonical: "scratch_pad", DataVersion: "sc-v1", New: dynamic},
 	)
 	cfg.Types = append(cfg.Types, handler.Type{

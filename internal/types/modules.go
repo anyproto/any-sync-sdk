@@ -38,9 +38,9 @@ func (m Modules) Reserved(module string) bool {
 }
 
 // SkipsCopy reports whether an object copy leaves module's datasets
-// behind: a reserved module's (the consumer's own install root carries
-// them) or a NoCopy module's (their records are their author's).
-// Unknown modules do not.
+// behind: a reserved module's (never copied, whichever row carries it)
+// or a NoCopy module's (their records are their author's). Unknown
+// modules do not.
 func (m Modules) SkipsCopy(module string) bool {
 	mi, ok := m[module]
 	return ok && (mi.Reserved || mi.NoCopy)

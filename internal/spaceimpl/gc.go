@@ -128,6 +128,12 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 	var metaColl anystore.Collection
 	if coll, merr := s.db.OpenCollection(ctx, crdt.MetaCollectionName); merr == nil {
 		metaColl = coll
+		// The per-space purge below scans on sp; without the index each
+		// dead space costs a pass over every row. A failed build only
+		// loses the speed-up.
+		if ierr := crdt.EnsureMetaIndexes(ctx, metaColl); ierr != nil {
+			gcLog.Warn("ensure meta indexes", zap.Error(ierr))
+		}
 	} else if !errors.Is(merr, anystore.ErrCollectionNotFound) {
 		return fmt.Errorf("open meta: %w", merr)
 	}

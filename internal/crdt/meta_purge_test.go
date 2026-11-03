@@ -1,7 +1,9 @@
 package crdt
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -20,6 +22,33 @@ func (c observedMetaCollection) Find(filter any) anystore.Query {
 	q := c.Collection.Find(filter)
 	c.onFind(q)
 	return q
+}
+
+type countingMetaCollection struct {
+	anystore.Collection
+	ensures int
+}
+
+func (c *countingMetaCollection) EnsureIndex(ctx context.Context, info ...anystore.IndexInfo) error {
+	c.ensures++
+	return c.Collection.EnsureIndex(ctx, info...)
+}
+
+// EnsureMetaIndexes runs on every object load: a complete set must cost
+// no EnsureIndex call, which in any-store takes the global writer even
+// for an index that exists.
+func TestEnsureMetaIndexes_CompleteSetTakesNoWrite(t *testing.T) {
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "meta.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	coll, err := db.Collection(ctx, MetaCollectionName)
+	require.NoError(t, err)
+	counting := &countingMetaCollection{Collection: coll}
+	require.NoError(t, EnsureMetaIndexes(ctx, counting))
+	require.Equal(t, 1, counting.ensures, "one call builds the whole set")
+	require.Empty(t, MissingIndexes(coll, metaIndexes))
+	require.NoError(t, EnsureMetaIndexes(ctx, counting))
+	require.Equal(t, 1, counting.ensures, "a complete set is not re-ensured")
 }
 
 func TestPurgeSpaceMeta_SpaceIndexAfterUpgrade(t *testing.T) {
@@ -53,8 +82,8 @@ func TestPurgeSpaceMeta_SpaceIndexAfterUpgrade(t *testing.T) {
 
 	db, err = anystore.Open(ctx, dbPath, nil)
 	require.NoError(t, err)
-	// Controller construction installs metadata indexes before startup GC.
-	// A second controller exercises idempotent opens on the shared DB.
+	// The first controller on the upgraded database builds the missing
+	// index; the second finds the set complete.
 	_, err = NewController(ctx, "first-controller", db)
 	require.NoError(t, err)
 	_, err = NewController(ctx, "second-controller", db)
@@ -99,7 +128,7 @@ func BenchmarkPurgeSpaceMeta_AlreadyPurged(b *testing.B) {
 			coll, err := db.Collection(ctx, MetaCollectionName)
 			require.NoError(b, err)
 			seedUnrelatedMetaRows(b, db, coll, rows)
-			require.NoError(b, ensureMetaIndexes(ctx, coll))
+			require.NoError(b, EnsureMetaIndexes(ctx, coll))
 			require.NoError(b, PurgeSpaceMeta(ctx, coll, "deleted-space", nil))
 			b.ReportAllocs()
 			for b.Loop() {
@@ -118,9 +147,14 @@ func BenchmarkEnsureMetaIndexes_Upgrade(b *testing.B) {
 		b.Run(fmt.Sprintf("live_rows_%d", rows), func(b *testing.B) {
 			b.ReportAllocs()
 			b.StopTimer()
+			dir := b.TempDir()
 			for range b.N {
 				func() {
-					dbPath := filepath.Join(b.TempDir(), "meta.db")
+					// One database on disk at a time, whatever b.N is.
+					iterDir := filepath.Join(dir, "db")
+					require.NoError(b, os.MkdirAll(iterDir, 0o755))
+					defer func() { _ = os.RemoveAll(iterDir) }()
+					dbPath := filepath.Join(iterDir, "meta.db")
 					db, err := anystore.Open(ctx, dbPath, nil)
 					require.NoError(b, err)
 					defer func() {
@@ -138,21 +172,29 @@ func BenchmarkEnsureMetaIndexes_Upgrade(b *testing.B) {
 					coll, err = db.Collection(ctx, MetaCollectionName)
 					require.NoError(b, err)
 					b.StartTimer()
-					err = ensureMetaIndexes(ctx, coll)
+					err = EnsureMetaIndexes(ctx, coll)
 					b.StopTimer()
 					require.NoError(b, err)
+					require.NoError(b, db.Close())
+					db = nil
 				}()
 			}
 		})
 	}
 }
 
+// ensurePreSpaceMetaIndexes installs the index set of a database
+// written before idx__meta_sp existed.
 func ensurePreSpaceMetaIndexes(tb testing.TB, coll anystore.Collection) {
 	tb.Helper()
-	require.NoError(tb, coll.EnsureIndex(ctx,
-		anystore.IndexInfo{Name: "idx__meta_sp_q", Fields: []string{metaSpaceIdKey, metaAddSeqKey}, Sparse: true},
-		anystore.IndexInfo{Name: "idx__meta_sp_as", Fields: []string{metaSpaceIdKey, metaApplySeqKey}, Sparse: true},
-	))
+	var legacy []anystore.IndexInfo
+	for _, idx := range metaIndexes {
+		if idx.Name != "idx__meta_sp" {
+			legacy = append(legacy, idx)
+		}
+	}
+	require.Len(tb, legacy, len(metaIndexes)-1)
+	require.NoError(tb, coll.EnsureIndex(ctx, legacy...))
 }
 
 func seedUnrelatedMetaRows(tb testing.TB, db anystore.DB, coll anystore.Collection, count int) {

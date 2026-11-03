@@ -9,7 +9,7 @@ import (
 
 func TestQueryChangedObjects_FiltersBySpaceAndSince(t *testing.T) {
 	_, coll := openMetaColl(t)
-	require.NoError(t, ensureMetaIndexes(ctx, coll))
+	require.NoError(t, EnsureMetaIndexes(ctx, coll))
 
 	// Space A objects at various AddSeqs.
 	require.NoError(t, PersistMeta(ctx, coll, "a1", 5, 5, nil, "spaceA"))
@@ -30,7 +30,7 @@ func TestQueryChangedObjects_FiltersBySpaceAndSince(t *testing.T) {
 
 func TestQueryChangedObjects_PaginatesByAddSeq(t *testing.T) {
 	_, coll := openMetaColl(t)
-	require.NoError(t, ensureMetaIndexes(ctx, coll))
+	require.NoError(t, EnsureMetaIndexes(ctx, coll))
 
 	for i, id := range []string{"o1", "o2", "o3", "o4"} {
 		require.NoError(t, PersistMeta(ctx, coll, id, uint64((i+1)*10), uint64((i+1)*10), nil, "s"))
@@ -52,7 +52,7 @@ func TestQueryChangedObjects_PaginatesByAddSeq(t *testing.T) {
 
 func TestQueryChangedObjects_SkipsUnscopedRows(t *testing.T) {
 	_, coll := openMetaColl(t)
-	require.NoError(t, ensureMetaIndexes(ctx, coll))
+	require.NoError(t, EnsureMetaIndexes(ctx, coll))
 
 	// A row written before space-scoping (no `sp`) — invisible until its
 	// next change backfills the field (lazy "index from now on").
@@ -67,7 +67,7 @@ func TestQueryChangedObjects_SkipsUnscopedRows(t *testing.T) {
 
 func TestMaxObjectApplySeq(t *testing.T) {
 	_, coll := openMetaColl(t)
-	require.NoError(t, ensureMetaIndexes(ctx, coll))
+	require.NoError(t, EnsureMetaIndexes(ctx, coll))
 
 	got, err := MaxObjectApplySeq(ctx, coll, "s")
 	require.NoError(t, err)
@@ -86,7 +86,7 @@ func TestMaxObjectApplySeq(t *testing.T) {
 // once, leaving rows that already carry an applySeq untouched.
 func TestBackfillApplySeq(t *testing.T) {
 	_, coll := openMetaColl(t)
-	require.NoError(t, ensureMetaIndexes(ctx, coll))
+	require.NoError(t, EnsureMetaIndexes(ctx, coll))
 
 	// Legacy rows: addSeq only (pre-applySeq schema).
 	require.NoError(t, PersistMeta(ctx, coll, "old1", 5, 0, nil, "s"))

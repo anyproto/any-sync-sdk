@@ -324,10 +324,13 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // read-state collections, the applySeq backfill writes), so it runs
 // outside s.mu: one builder per space, callers for the same space
 // wait on its done channel (building), every other s.mu user
-// proceeds. A store published while the service is closing comes out
-// closed with no background work started: Close waits out the builds
-// in flight and closes what it finds published, this covers a sync
-// message during app teardown (callers dereference the result).
+// proceeds. The two teardown paths wait for a build in flight before
+// they act on the map: closeSpaceRuntime (awaitBuildLocked) so an
+// offload closes the store a build publishes, closeStores
+// (waitStoreBuilds) so no build writes the db after Close returns. A
+// store published while the service is closing comes out closed with
+// no background work started: a sync message during app teardown
+// (callers dereference the result).
 func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing bool) *spaceobjects.Store) *spaceobjects.Store {
 	for {
 		s.mu.Lock()
@@ -372,8 +375,8 @@ func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing b
 }
 
 // waitStoreBuilds blocks until every store build in flight at the call
-// has published. Close calls it right after setting closing: a build
-// writes the db the caller closes once Close returns.
+// has published. Builds that start later are not covered: closeStores
+// calls it on both sides of its pass over the map.
 func (s *Service) waitStoreBuilds() {
 	s.mu.Lock()
 	building := make([]chan struct{}, 0, len(s.building))
@@ -386,9 +389,24 @@ func (s *Service) waitStoreBuilds() {
 	}
 }
 
+// awaitBuildLocked returns once no build of spaceId's store is in
+// flight. Called and returns with s.mu held; the lock is dropped while
+// waiting.
+func (s *Service) awaitBuildLocked(spaceId string) {
+	for {
+		done, ok := s.building[spaceId]
+		if !ok {
+			return
+		}
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
+}
+
 // buildStore constructs spaceId's Store and primes it. Runs outside
-// s.mu (storeOnce). closing hands back the bare store: nothing primed,
-// no DB write beyond the constructor's own.
+// s.mu (storeOnce). closing hands back the bare store, nothing primed;
+// storeOnce closes it on publish.
 func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
 	s.mu.Lock()
@@ -2173,7 +2191,6 @@ func (s *Service) Close(_ context.Context) error {
 	s.mu.Lock()
 	s.closing = true
 	s.mu.Unlock()
-	s.waitStoreBuilds()
 	s.seedCancel()
 	s.seedWG.Wait()
 	// Stop the 1-1 inbox notifier + send-retry loop before draining the
@@ -2195,13 +2212,23 @@ func (s *Service) Close(_ context.Context) error {
 	s.joinWG.Wait()
 	s.stopJoinWaiters()
 	s.watchers.stopAll()
-	// Close every loaded space's Store: its drainer, read-state
-	// materializer and reindex sweep write the SDK db, which the caller
-	// closes next. Offload closes a store on its own; this covers the
-	// spaces still loaded at shutdown. The closed stores stay in the
-	// map, and storeFor builds only closed ones from here on, so a
-	// sync message during app teardown starts nothing new. Concurrent:
-	// a store waits out its sweep's tree replay and in-flight applies.
+	s.closeStores()
+	return nil
+}
+
+// closeStores closes every loaded space's Store: its drainer, read-state
+// materializer and reindex sweep write the SDK db, which the caller
+// closes next. Offload closes a store on its own; this covers the
+// spaces still loaded at shutdown. The closed stores stay in the map,
+// and storeOnce publishes only closed ones from here on, so a sync
+// message during app teardown starts nothing new. Builds in flight are
+// waited out on both sides of the pass: before it, so the store a build
+// publishes is in the snapshot; after it, so a build that started while
+// the snapshot closed (its store comes out closed) has finished its db
+// work before the caller closes the db. Concurrent: a store waits out
+// its sweep's tree replay and in-flight applies.
+func (s *Service) closeStores() {
+	s.waitStoreBuilds()
 	s.mu.Lock()
 	stores := make(map[string]*spaceobjects.Store, len(s.stores))
 	for id, st := range s.stores {
@@ -2219,7 +2246,7 @@ func (s *Service) Close(_ context.Context) error {
 		}()
 	}
 	wg.Wait()
-	return nil
+	s.waitStoreBuilds()
 }
 
 // goSeed launches the spaceIndex lazy-seed in the background, tracked by

@@ -147,9 +147,9 @@ type Engine struct {
 	subs fanout.Registry[statePing]
 
 	// opened publishes Open's outcome; nil until Open ran. Every
-	// method gates on it through ready() and none opens the
-	// collections itself: the DDL takes any-store's write lock, and
-	// most callers already hold a write tx.
+	// collection-backed method gates on it through ready() and none
+	// opens the collections itself: the DDL takes any-store's write
+	// lock, and most callers already hold a write tx.
 	openMu sync.Mutex
 	opened atomic.Pointer[openResult]
 	unread anystore.Collection
@@ -158,7 +158,8 @@ type Engine struct {
 
 type openResult struct{ err error }
 
-// ErrNotOpen is returned by every method until Open succeeded.
+// ErrNotOpen is what the collection-backed methods return until Open
+// ran; after a failed Open they return its error.
 var ErrNotOpen = errors.New("readstate: engine not opened")
 
 // New builds the engine over the space's share of db. No I/O: Open
@@ -171,8 +172,8 @@ func New(db anystore.DB, spaceId string, seq SeqFunc, resolve Resolver) *Engine 
 // any-store's write lock, so ctx must not carry a write tx and the
 // caller must not hold one: the store build runs Open before the store
 // is published, and every later method only reads and writes rows. A
-// failed Open leaves the engine returning its error; calling Open again
-// retries the DDL. A no-op once it succeeded.
+// failed Open leaves the engine returning its error from every call
+// until an Open succeeds; a no-op once it has.
 func (e *Engine) Open(ctx context.Context) error {
 	e.openMu.Lock()
 	defer e.openMu.Unlock()

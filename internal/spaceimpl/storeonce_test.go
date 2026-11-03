@@ -7,6 +7,7 @@ import (
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -27,6 +28,32 @@ func newStoreOnceService(t *testing.T) (*Service, func(spaceId string) *spaceobj
 		return st
 	}
 	return s, bare
+}
+
+// requireClosed: a closed store's object cache refuses loads.
+func requireClosed(t *testing.T, st *spaceobjects.Store) {
+	t.Helper()
+	_, err := st.Get(t.Context(), "obj")
+	require.ErrorIs(t, err, ocache.ErrClosed)
+}
+
+// requireBlocked: fn has not returned after a grace period.
+func requireBlocked(t *testing.T, returned <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-returned:
+		t.Fatalf("%s returned while the build was in flight", what)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func requireReturned(t *testing.T, returned <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not return after the build published", what)
+	}
 }
 
 func TestStoreOnce_OneBuildPerSpace(t *testing.T) {
@@ -70,20 +97,23 @@ func TestStoreOnce_SpacesBuildIndependently(t *testing.T) {
 		}
 		return bare(spaceId)
 	}
-	go s.storeOnce("a", build)
+	aDone := make(chan struct{})
+	go func() {
+		s.storeOnce("a", build)
+		close(aDone)
+	}()
 	<-started
-	defer close(release)
-	done := make(chan *spaceobjects.Store, 1)
-	go func() { done <- s.storeOnce("b", build) }()
-	select {
-	case st := <-done:
-		require.NotNil(t, st)
-	case <-time.After(5 * time.Second):
-		t.Fatal("storeOnce(b) waited on a's build")
-	}
+	bDone := make(chan struct{})
+	go func() {
+		require.NotNil(t, s.storeOnce("b", build))
+		close(bDone)
+	}()
+	requireReturned(t, bDone, "storeOnce(b)")
+	close(release)
+	<-aDone
 }
 
-func TestStoreOnce_CloseWaitsForTheBuild(t *testing.T) {
+func TestCloseStores_WaitsForTheBuildAndClosesIt(t *testing.T) {
 	s, bare := newStoreOnceService(t)
 	started, release := make(chan struct{}), make(chan struct{})
 	var sawClosing atomic.Bool
@@ -98,35 +128,68 @@ func TestStoreOnce_CloseWaitsForTheBuild(t *testing.T) {
 	<-started
 	require.False(t, sawClosing.Load(), "the build started before closing")
 
+	// Close's head, then its store pass.
 	s.mu.Lock()
 	s.closing = true
 	s.mu.Unlock()
-	waited := make(chan struct{})
-	go func() { s.waitStoreBuilds(); close(waited) }()
-	select {
-	case <-waited:
-		t.Fatal("waitStoreBuilds returned while the build was in flight")
-	case <-time.After(50 * time.Millisecond):
-	}
+	closed := make(chan struct{})
+	go func() {
+		s.closeStores()
+		close(closed)
+	}()
+	requireBlocked(t, closed, "closeStores")
 	close(release)
-	select {
-	case <-waited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("waitStoreBuilds did not return after the build published")
-	}
+	requireReturned(t, closed, "closeStores")
 	st := <-published
 	s.mu.Lock()
 	require.Same(t, st, s.stores["a"])
 	s.mu.Unlock()
+	requireClosed(t, st)
 
-	// After closing, a build starts with closing=true.
-	require.Same(t, s.storeOnce("a", build), st)
-	go func() {
-		published <- s.storeOnce("b", func(_ string, closing bool) *spaceobjects.Store {
-			sawClosing.Store(closing)
-			return bare("b")
-		})
-	}()
-	<-published
+	// A build after Close: the store is published closed.
+	late := s.storeOnce("b", func(_ string, closing bool) *spaceobjects.Store {
+		sawClosing.Store(closing)
+		return bare("b")
+	})
 	require.True(t, sawClosing.Load())
+	requireClosed(t, late)
+	require.Same(t, late, s.storeOnce("b", build), "a closed store stays published")
+}
+
+func TestAwaitBuildLocked_WaitsForTheBuild(t *testing.T) {
+	s, bare := newStoreOnceService(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	build := func(spaceId string, _ bool) *spaceobjects.Store {
+		close(started)
+		<-release
+		return bare(spaceId)
+	}
+	published := make(chan *spaceobjects.Store, 1)
+	go func() { published <- s.storeOnce("a", build) }()
+	<-started
+
+	// The offload's critical section: take the store once no build is in flight.
+	taken := make(chan *spaceobjects.Store, 1)
+	go func() {
+		s.mu.Lock()
+		s.awaitBuildLocked("a")
+		st := s.stores["a"]
+		delete(s.stores, "a")
+		s.mu.Unlock()
+		taken <- st
+	}()
+	returned := make(chan struct{})
+	go func() {
+		<-taken
+		close(returned)
+	}()
+	requireBlocked(t, returned, "awaitBuildLocked")
+	close(release)
+	requireReturned(t, returned, "awaitBuildLocked")
+	st := <-published
+	s.mu.Lock()
+	_, present := s.stores["a"]
+	s.mu.Unlock()
+	require.False(t, present, "the offload took the store the build published")
+	require.NotNil(t, st)
 }

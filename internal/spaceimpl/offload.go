@@ -140,6 +140,9 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	s.app.PubSubCloseSpace(spaceId)
 
 	s.mu.Lock()
+	// A store build in flight publishes after this section otherwise,
+	// then starts its workers on the collections the offload drops.
+	s.awaitBuildLocked(spaceId)
 	store := s.stores[spaceId]
 	delete(s.stores, spaceId)
 	delete(s.allocs, spaceId)

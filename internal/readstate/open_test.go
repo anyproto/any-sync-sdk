@@ -35,15 +35,29 @@ func TestOpen_ReadOutsideHeldWriteTx(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestOpen_GatesEveryCall(t *testing.T) {
+func TestOpen_NotOpenGate(t *testing.T) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "readstate.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	e := New(db, "space1", nil, nil)
 
-	_, err = e.Seeded(ctx, "obj")
-	require.ErrorIs(t, err, ErrNotOpen)
-	require.ErrorIs(t, e.TrackChange(ctx, mkTrack("obj", "c1", "v01", nil)), ErrNotOpen)
+	calls := map[string]func() error{
+		"Seeded":        func() error { _, err := e.Seeded(ctx, "obj"); return err },
+		"TrackChange":   func() error { return e.TrackChange(ctx, mkTrack("obj", "c1", "v01", nil)) },
+		"MarkRead":      func() error { _, err := e.MarkRead(ctx, "obj", []string{"c1"}); return err },
+		"MarkReadUpTo":  func() error { _, err := e.MarkReadUpTo(ctx, "obj", ""); return err },
+		"MergeHeads":    func() error { _, err := e.MergeHeads(ctx, "obj", []string{"c1"}); return err },
+		"ClearRecords":  func() error { return e.ClearRecords(ctx, "obj", []string{"r1"}, 1) },
+		"UnreadEntries": func() error { _, _, err := e.UnreadEntries(ctx, "obj"); return err },
+		"Counts":        func() error { _, err := e.Counts(ctx, "obj"); return err },
+		"Frontier":      func() error { _, _, err := e.Frontier(ctx, "obj"); return err },
+		"ChangedSince":  func() error { _, err := e.ChangedSince(ctx, 0, 0); return err },
+		"MarkSeeded":    func() error { return e.MarkSeeded(ctx, "obj") },
+		"SeedFrontier":  func() error { _, err := e.SeedFrontier(ctx, "obj", []string{"c1"}); return err },
+	}
+	for name, call := range calls {
+		require.ErrorIs(t, call(), ErrNotOpen, name)
+	}
 
 	require.NoError(t, e.Open(ctx))
 	require.NoError(t, e.Open(ctx), "a second Open is a no-op")

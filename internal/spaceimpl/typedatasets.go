@@ -300,7 +300,7 @@ func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetD
 			payload.Set(typetype.DefFieldIdMaxLen, arena.NewNumberInt(draft.IdMaxLen))
 		}
 	}
-	if draft.DeleteBy == space.DeleteByAuthor {
+	if draft.DeleteBy != space.DeleteByAnyone {
 		payload.Set(typetype.DefFieldDeleteBy, arena.NewString(draft.DeleteBy.String()))
 	}
 	if draft.Shared {

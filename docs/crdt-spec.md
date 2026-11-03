@@ -131,6 +131,8 @@ Delete keeps the record as a tombstone:
 
 **Tombstones are sticky.** Every later modify on a tombstone is dropped regardless of version; the CRDT has no resurrection. An undelete feature belongs above the CRDT.
 
+A dataset declared `DeleteBy: none` (user-datasets.md § Declaration vocabulary) never holds a tombstone: the local pre-flight refuses the delete with `ErrDatasetUndeletable` and apply drops one written elsewhere.
+
 The local writer sees the drop: a non-delete modify (upsert included) on a tombstone adds a whole-record rejection (`OpIndex -1`, `ErrRecordDeleted`, re-exported as `space.ErrRecordDeleted`) to the apply result. The creation-marker min rule still applies. Deleting a tombstone is not a rejection; repeated deletes are idempotent.
 
 ### 3.5 `_ver.id` creation-version marker

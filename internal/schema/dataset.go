@@ -199,22 +199,33 @@ const (
 	// DeleteByAuthor: only the record's creator (StampCreator field)
 	// may delete it.
 	DeleteByAuthor
+	// DeleteByNone: no writer may delete a record. The local pre-flight
+	// refuses the delete before a change exists and apply drops one
+	// written elsewhere, so the dataset never holds a tombstone and an
+	// id is never burned. Needs no creator stamp, so a dataset with
+	// caller ids stays convergent under concurrent same-id creates.
+	DeleteByNone
 )
 
 func (p DeletePolicy) String() string {
-	if p == DeleteByAuthor {
+	switch p {
+	case DeleteByAuthor:
 		return "author"
+	case DeleteByNone:
+		return "none"
 	}
 	return "anyone"
 }
 
-// ParseDeletePolicy parses a delete-policy label ("anyone"/"author").
+// ParseDeletePolicy parses a delete-policy label ("anyone"/"author"/"none").
 func ParseDeletePolicy(label string) (DeletePolicy, bool) {
 	switch label {
 	case "", "anyone":
 		return DeleteByAnyone, true
 	case "author":
 		return DeleteByAuthor, true
+	case "none":
+		return DeleteByNone, true
 	}
 	return 0, false
 }

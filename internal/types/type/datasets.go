@@ -89,7 +89,7 @@ const (
 	DefFieldIdRule      = "idRule"      // "auto"/"user" (head), pinned ("id" is a reserved head)
 	DefFieldIdPattern   = "idPattern"   // RE2 (head), pinned
 	DefFieldIdMaxLen    = "idMaxLen"    // number (head), pinned
-	DefFieldDeleteBy    = "deleteBy"    // "anyone"/"author" (head), pinned
+	DefFieldDeleteBy    = "deleteBy"    // "anyone"/"author"/"none" (head), pinned
 	DefFieldSkipHistory = "skipHistory" // bool (head), pinned
 	// DefFieldPerSpace — bool (head), pinned — marks a shared dataset:
 	// its records from every object live in one collection per space.

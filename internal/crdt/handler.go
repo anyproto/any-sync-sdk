@@ -32,6 +32,11 @@ var ErrValidation = errors.New("crdt: validation rejected")
 // Deleting an already-deleted record stays silent (idempotent).
 var ErrRecordDeleted = errors.New("crdt: record is deleted; the id cannot be reused")
 
+// ErrDatasetUndeletable is the rejection sentinel of a delete on a
+// dataset declared DeleteByNone. The local pre-flight returns it before
+// the change exists; apply records it for a delete written elsewhere.
+var ErrDatasetUndeletable = errors.New("crdt: the dataset refuses record deletes")
+
 // ChangeCtx is the per-callback context handed to a Handler. It carries the
 // originating Change (read-only metadata: VersionId, ChangeId, Timestamp,
 // Creator, ObjectAuthor, …) and the record's pre-op state.

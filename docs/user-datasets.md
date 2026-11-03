@@ -193,7 +193,7 @@ Per dataset:
 |---|---|
 | `Dynamic` | free-form keyspace next to declared fields |
 | `IdRule` | `auto` (zero: ids derived from the change, the empty-id sugar) / `user` (caller ids, pattern + max length constrained) |
-| `DeleteBy` | record-delete gate: `anyone` (zero) / `author` |
+| `DeleteBy` | record-delete gate: `anyone` (zero) / `author` / `none` (no record delete at all: the local pre-flight refuses with `ErrDatasetUndeletable`, apply drops one written elsewhere, so the dataset never holds a tombstone and no id is ever burned; object deletion still purges) |
 | `SkipHistory` | keep out of the version-history index |
 | `Shared` | every object's records in one collection per space (§ Shared datasets); pinned |
 | `Search` | `{title, text}` field mapping plus an optional `scope` slug (which index scope the entries land under), surfaced as `x-search` for external indexers; SDK-opaque. `text` names one or more field keys, which the indexer joins into one body; on the wire a single key is a bare string, several are an array (a single-element array marshals as the string) |
@@ -232,9 +232,11 @@ Enforcement:
   bump on accepted mutable writes. Writes descending below the
   declared shape (under a scalar, into an undeclared closed-object
   property) are rejected.
-- **BeforeDelete**: the `DeleteBy: author` gate.
+- **BeforeDelete**: the `DeleteBy: author` gate; under `DeleteBy: none`
+  every delete is dropped.
 - **PreValidateMulti**: the strict local mirror with caller-readable
-  errors (spec §7.2 disposition split).
+  errors (spec §7.2 disposition split); under `DeleteBy: none` it
+  refuses a delete before the change enters the DAG.
 
 ### Convergence rules
 
@@ -254,6 +256,10 @@ contract of spec §8):
   create→delete is self-causally ordered: a delete arriving before
   its record's create can only be a non-author's, which both orderings
   reject.
+- **`DeleteBy: none` rejects every delete**, whoever wrote it and
+  whether or not the record exists here, so no replica ever holds a
+  tombstone of the dataset. It reads no record fact and needs no
+  creator stamp.
 - **Stamps come from the change envelope**, never from replica state.
 - **An additive field of a Dynamic dataset is free keyspace at apply
   time** (§ Evolution rules): a declaration that arrives after a

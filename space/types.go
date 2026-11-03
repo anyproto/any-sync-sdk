@@ -354,6 +354,7 @@ const (
 
 	DeleteByAnyone = handler.DeleteByAnyone
 	DeleteByAuthor = handler.DeleteByAuthor
+	DeleteByNone   = handler.DeleteByNone
 )
 
 // RecordsModule is the built-in generic module: a schema-enforced

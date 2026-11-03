@@ -201,8 +201,8 @@ const (
 	DeleteByAuthor
 	// DeleteByNone: no writer may delete a record. The local pre-flight
 	// refuses the delete before a change exists and apply drops one
-	// written elsewhere, so the dataset never holds a tombstone and an
-	// id is never burned. Needs no creator stamp, so a dataset with
+	// written elsewhere, so the dataset never writes a tombstone and an
+	// id is never burned by a delete. Needs no creator stamp, so a dataset with
 	// caller ids stays convergent under concurrent same-id creates.
 	DeleteByNone
 )

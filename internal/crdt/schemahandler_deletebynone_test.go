@@ -71,6 +71,24 @@ func TestSchemaHandler_DeleteByNone(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, res.Rejections)
 	assert.Equal(t, "n", string(st.Get(ctx, shTestDS, "row-1").GetStringBytes("note")))
+
+	// A change written elsewhere that mixes deletes with other records
+	// loses only the deletes: the create lands, the live record stays,
+	// the absent id stays absent.
+	res, err = st.ApplyChangeWithResult(ctx, shChange("v7", shAuthorB, 500,
+		shCreateRecord(a, "row-2", map[string]string{"title": "two"}),
+		RecordChange{Id: "row-1", Ops: []Op{{Type: OpDelete}}},
+		RecordChange{Id: "row-x", Ops: []Op{{Type: OpDelete}}}))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 2)
+	for _, rej := range res.Rejections {
+		assert.ErrorIs(t, rej.Err, ErrDatasetUndeletable)
+	}
+	assert.Equal(t, "two", string(st.Get(ctx, shTestDS, "row-2").GetStringBytes("title")))
+	rec = st.Get(ctx, shTestDS, "row-1")
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(DeletedAtField))
+	assert.Nil(t, st.Get(ctx, shTestDS, "row-x"))
 }
 
 // The local pre-flight refuses the delete before a change exists, with

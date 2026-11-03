@@ -231,9 +231,10 @@ type OpRejection struct {
 // already-deleted record stays silent (idempotent).
 var ErrRecordDeleted = crdt.ErrRecordDeleted
 
-// ErrDatasetUndeletable is Delete's refusal on a dataset declared
-// DeleteByNone (match with errors.Is). Nothing was written: the record
-// stays live and its id stays writable.
+// ErrDatasetUndeletable is the refusal of a delete op on a dataset
+// declared DeleteByNone: Delete, or a delete op in Modify or ModifyMany
+// (match with errors.Is). Nothing was written: the record stays live
+// and its id stays writable.
 var ErrDatasetUndeletable = crdt.ErrDatasetUndeletable
 
 // ErrPreconditionFailed is a conditional Modify's refusal

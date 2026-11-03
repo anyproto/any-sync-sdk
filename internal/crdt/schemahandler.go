@@ -454,7 +454,7 @@ func (h *SchemaHandler) bumpModifyTime(ctx *ChangeCtx, sink *Sink) {
 // BeforeDelete enforces the dataset's delete gate. DeleteByNone drops
 // every delete, whoever wrote it and whether or not the record exists
 // here, so the verdict is the same in every delivery order and the
-// dataset never holds a tombstone. Author-gated deletes require the
+// dataset never writes a tombstone. Author-gated deletes require the
 // record's creator stamp to match the deleting change's Creator; a
 // never-created record (no creation marker) is rejected — convergent
 // because an author's own create→delete is causally ordered, so a

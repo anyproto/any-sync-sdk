@@ -151,6 +151,9 @@ func draftToDecl(draft *space.DatasetDraft) (schema.Dataset, error) {
 		if len(draft.Indexes) > 0 {
 			return ds, fmt.Errorf("%w: dataset %q: a %q dataset declares no indexes", space.ErrModuleOwned, draft.Key, draft.Module)
 		}
+		if draft.DeleteBy != space.DeleteByAnyone {
+			return ds, fmt.Errorf("%w: dataset %q: a %q dataset keeps its module's delete rule", space.ErrModuleOwned, draft.Key, draft.Module)
+		}
 		return ds, nil
 	}
 	for i := range draft.Fields {

@@ -139,9 +139,27 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	// never kill live subscriptions.
 	s.app.PubSubCloseSpace(spaceId)
 
+	store := s.takeSpaceRuntime(spaceId)
+	if store != nil {
+		if err := store.Close(); err != nil {
+			offloadLog.Warn("close store", zap.String("spaceId", spaceId), zap.Error(err))
+		}
+	}
+
+	if err := s.app.EvictSpace(ctx, spaceId); err != nil && !errors.Is(err, ocache.ErrNotExists) {
+		offloadLog.Warn("evict space", zap.String("spaceId", spaceId), zap.Error(err))
+	}
+}
+
+// takeSpaceRuntime forgets spaceId's Store and per-space wiring and
+// returns the store for the caller to close. One critical section, so
+// a concurrent load sees either everything or nothing. A store build
+// in flight is waited out first: it would publish after this section
+// otherwise, then start its workers on the collections the offload
+// drops.
+func (s *Service) takeSpaceRuntime(spaceId string) *spaceobjects.Store {
 	s.mu.Lock()
-	// A store build in flight publishes after this section otherwise,
-	// then starts its workers on the collections the offload drops.
+	defer s.mu.Unlock()
 	s.awaitBuildLocked(spaceId)
 	store := s.stores[spaceId]
 	delete(s.stores, spaceId)
@@ -155,16 +173,7 @@ func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
 	// The mux only holds the stopped watchers above; drop it so a
 	// reload starts from an empty subscriber list (rewiring re-adds).
 	delete(s.aclMuxes, spaceId)
-	s.mu.Unlock()
-	if store != nil {
-		if err := store.Close(); err != nil {
-			offloadLog.Warn("close store", zap.String("spaceId", spaceId), zap.Error(err))
-		}
-	}
-
-	if err := s.app.EvictSpace(ctx, spaceId); err != nil && !errors.Is(err, ocache.ErrNotExists) {
-		offloadLog.Warn("evict space", zap.String("spaceId", spaceId), zap.Error(err))
-	}
+	return store
 }
 
 // dropSpaceCollections deletes every any-store collection belonging to

@@ -325,12 +325,13 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // outside s.mu: one builder per space, callers for the same space
 // wait on its done channel (building), every other s.mu user
 // proceeds. The two teardown paths wait for a build in flight before
-// they act on the map: closeSpaceRuntime (awaitBuildLocked) so an
+// they act on the map: takeSpaceRuntime (awaitBuildLocked) so an
 // offload closes the store a build publishes, closeStores
-// (waitStoreBuilds) so no build writes the db after Close returns. A
-// store published while the service is closing comes out closed with
-// no background work started: a sync message during app teardown
-// (callers dereference the result).
+// (waitStoreBuilds) so the builds in flight finish their db work
+// before Close returns. A store published while the service is
+// closing is closed before anyone sees it, with no background work
+// started: a sync message during app teardown (callers dereference
+// the result).
 func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing bool) *spaceobjects.Store) *spaceobjects.Store {
 	for {
 		s.mu.Lock()
@@ -348,17 +349,20 @@ func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing b
 		closing := s.closing
 		s.mu.Unlock()
 
-		st := build(spaceId, closing)
+		st := s.runBuild(spaceId, done, closing, build)
 
 		s.mu.Lock()
 		closed := s.closing
+		if closed {
+			// Nothing runs on the store yet, so this is quick; waiters
+			// and closeStores see it closed.
+			_ = st.Close()
+		}
 		s.stores[spaceId] = st
 		delete(s.building, spaceId)
 		close(done)
 		s.mu.Unlock()
 		if closed {
-			// Idempotent with Close's own pass over the map.
-			_ = st.Close()
 			return st
 		}
 		// Converge any pending re-index in the background instead of waiting
@@ -374,9 +378,27 @@ func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing b
 	}
 }
 
+// runBuild runs build for spaceId. A panicking build drops its
+// building entry and closes done, so its waiters rebuild instead of
+// waiting forever; the panic propagates to the builder's caller.
+func (s *Service) runBuild(spaceId string, done chan struct{}, closing bool, build func(spaceId string, closing bool) *spaceobjects.Store) *spaceobjects.Store {
+	built := false
+	defer func() {
+		if built {
+			return
+		}
+		s.mu.Lock()
+		delete(s.building, spaceId)
+		close(done)
+		s.mu.Unlock()
+	}()
+	st := build(spaceId, closing)
+	built = true
+	return st
+}
+
 // waitStoreBuilds blocks until every store build in flight at the call
-// has published. Builds that start later are not covered: closeStores
-// calls it on both sides of its pass over the map.
+// has published. Builds that start later are not covered.
 func (s *Service) waitStoreBuilds() {
 	s.mu.Lock()
 	building := make([]chan struct{}, 0, len(s.building))
@@ -2220,15 +2242,13 @@ func (s *Service) Close(_ context.Context) error {
 // materializer and reindex sweep write the SDK db, which the caller
 // closes next. Offload closes a store on its own; this covers the
 // spaces still loaded at shutdown. The closed stores stay in the map,
-// and storeOnce publishes only closed ones from here on, so a sync
-// message during app teardown starts nothing new. Builds in flight are
-// waited out on both sides of the pass: before it, so the store a build
-// publishes is in the snapshot; after it, so a build that started while
-// the snapshot closed (its store comes out closed) has finished its db
-// work before the caller closes the db. Concurrent: a store waits out
-// its sweep's tree replay and in-flight applies.
+// and storeOnce publishes only closed ones from here on (closing is
+// set), so a sync message during app teardown starts nothing new.
+// Builds in flight at the end of the pass are waited out: the
+// constructor writes the db, and the caller closes it once Close
+// returns. Concurrent: a store waits out its sweep's tree replay and
+// in-flight applies.
 func (s *Service) closeStores() {
-	s.waitStoreBuilds()
 	s.mu.Lock()
 	stores := make(map[string]*spaceobjects.Store, len(s.stores))
 	for id, st := range s.stores {

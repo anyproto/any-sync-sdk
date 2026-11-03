@@ -676,9 +676,9 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		// Eager: the open takes any-store's write lock, and every
 		// later engine call runs inside a write tx or next to one.
 		// The constructor runs outside any tx, before the store is
-		// published. A failure stays with the engine and surfaces on
-		// every call: a tracked change then fails to apply instead
-		// of applying untracked.
+		// published. A failure stays with the engine: every engine
+		// call returns it, and inbound changes to read-tracked
+		// datasets fail to apply rather than applying untracked.
 		if err := s.readState.Open(context.Background()); err != nil {
 			storeLog.Error("read state: open", zap.String("spaceId", s.spaceId), zap.Error(err))
 		}

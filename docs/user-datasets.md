@@ -264,9 +264,9 @@ contract of spec §8):
 
 ### The IdRule: user contract
 
-A caller-supplied record id doubles as the upsert idempotency key, so
-members can create the same id concurrently. Only the first create of
-an id that a replica applies runs `BeforeCreate`; a later concurrent
+Members can create one caller-supplied id concurrently (the id doubles
+as the upsert idempotency key). Only the first create of an id that a
+replica applies runs `BeforeCreate`; a later concurrent
 one is screened as a modify (`BeforeModify`, per key). The ops merge
 per field through gating and `_ver.id` takes the minimum creating
 version (spec §3.3, §3.5). The first-applied create decides, so these

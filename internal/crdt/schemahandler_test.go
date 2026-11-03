@@ -434,6 +434,59 @@ func TestSchemaHandler_ConvergenceAuthorEditOrders(t *testing.T) {
 	assert.Equal(t, "by-author", apply(t, []Change{create, editByOther, editByAuthor}))
 }
 
+// Two members creating one IdUser id concurrently converge when the
+// declaration has no write-once field, stamp or author gate: the
+// later-applied create merges per field and _ver.id takes the minimum.
+func TestSchemaHandler_ConvergenceConcurrentSameIdCreates(t *testing.T) {
+	decl := schema.Dataset{
+		Dynamic: true,
+		IdRule:  schema.IdUser,
+		Fields: []schema.Field{
+			{Id: "title", Schema: schema.Leaf(schema.KindString), MutableBy: schema.MutableByAnyone},
+			{Id: "layout", Schema: schema.Leaf(schema.KindObject), MutableBy: schema.MutableByAnyone},
+		},
+	}
+	a := &anyenc.Arena{}
+	create := func(version, creator string, ts int64, fields map[string]any) Change {
+		return shChange(version, creator, ts, RecordChange{
+			Id: "w:chat", Upsert: true, Ops: []Op{{Type: OpSet, Payload: recordPayload(a, fields)}},
+		})
+	}
+	// Overlapping declared and dynamic keys, disjoint keys, and a whole
+	// object racing a leaf write under it.
+	byA := create("v1", shAuthorA, 100, map[string]any{
+		"title": "a", "layout": map[string]any{"x": 1, "y": 2}, "pinned": true, "onlyA": "a",
+	})
+	byB := create("v2", shAuthorB, 200, map[string]any{
+		"title": "b", "layout.y": 3, "pinned": false, "onlyB": "b",
+	})
+
+	apply := func(t *testing.T, order ...Change) map[string]any {
+		st := newSchemaHandlerController(t, decl)
+		for i := range order {
+			res, err := st.ApplyChangeWithResult(ctx, order[i])
+			require.NoError(t, err)
+			require.Empty(t, res.Rejections)
+		}
+		rec := st.Get(ctx, shTestDS, "w:chat")
+		require.NotNil(t, rec)
+		out := anyencToGo(rec).(map[string]any)
+		delete(out, AddSeqField) // peer-local delivery counters
+		delete(out, ApplySeqField)
+		return out
+	}
+
+	ab := apply(t, byA, byB)
+	ba := apply(t, byB, byA)
+	require.Equal(t, ab, ba, "delivery orders diverged")
+	assert.Equal(t, "b", ab["title"])
+	assert.Equal(t, map[string]any{"x": float64(1), "y": float64(3)}, ab["layout"])
+	assert.Equal(t, false, ab["pinned"])
+	assert.Equal(t, "a", ab["onlyA"])
+	assert.Equal(t, "b", ab["onlyB"])
+	assert.Equal(t, "v1", ab[VersionsKey].(map[string]any)[IdField])
+}
+
 // The accept path of BeforeModify must not allocate: cold restore replays
 // millions of ops through this hook.
 func BenchmarkSchemaHandler_BeforeModifyAccept(b *testing.B) {

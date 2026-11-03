@@ -36,7 +36,8 @@ const SchemaHandlerVersion = 2
 // field declared after its Dynamic dataset (schema.Field.Additive) is
 // free keyspace at apply time: a change written under the earlier
 // schema is valid, and every replica keeps it whether the declaration
-// or the change arrived first.
+// or the change arrived first. The exception: of concurrent creates of
+// one IdUser id, only the first-applied runs BeforeCreate.
 //
 // The declaration is compiled once at construction into a flat rule
 // table; the accept path of BeforeModify is one map lookup with zero

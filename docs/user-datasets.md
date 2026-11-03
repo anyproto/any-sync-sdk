@@ -258,15 +258,37 @@ contract of spec §8):
 - **An additive field of a Dynamic dataset is free keyspace at apply
   time** (§ Evolution rules): a declaration that arrives after a
   change's writes cannot change their verdict.
+- **Concurrent creates of one caller-supplied id** are the exception:
+  which one a replica runs as the create depends on arrival order
+  (§ The IdRule: user contract).
 
 ### The IdRule: user contract
 
-A caller-supplied record id must have a single writer (it doubles
-as the upsert idempotency key). Concurrent creates of the same id by
-different members take arrival-order-dependent creation verdicts
-(required checks, the creator stamp behind author gates) and are
-outside the convergence guarantee. One ingest writer per dataset (or
-per id range) keeps the contract.
+A caller-supplied record id doubles as the upsert idempotency key, so
+members can create the same id concurrently. Only the first create of
+an id that a replica applies runs `BeforeCreate`; a later concurrent
+one is screened as a modify (`BeforeModify`, per key). The ops merge
+per field through gating and `_ver.id` takes the minimum creating
+version (spec §3.3, §3.5). The first-applied create decides, so these
+depend on arrival order:
+
+- **Write-once fields** (`MutableBy: never`, the zero value): only the
+  first-applied create sets them; the other's writes to them are
+  rejected.
+- **Stamps** (`creator`, `createTime`, `modifyTime`): taken from the
+  first-applied create's envelope.
+- **Author gates** (`MutableBy: author`, `DeleteBy: author`): they
+  read that creator stamp.
+
+A dataset that declares none of these converges on concurrent creates
+of one id by different members, in every delivery order: one record,
+merged per field. A dataset that declares any of them needs one writer
+per id: one ingest writer per dataset (or per id range).
+
+`Required` and value shapes screen the first-applied create whole and
+a later one per key, so a create that fails them diverges too. The
+local pre-flight refuses such a create; only a writer that skips it
+produces one.
 
 ## Definitions on the type object
 

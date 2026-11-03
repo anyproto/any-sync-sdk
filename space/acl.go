@@ -43,11 +43,15 @@ var (
 	// return it from make-shareable, which is owner-only.
 	ErrCoordinatorForbidden = coordinatorproto.ErrForbidden
 
-	// ErrCoordinatorLimitReached is the network refusing an operation
-	// because the account reached a limit of its network plan: shared
-	// spaces on make-shareable (CreateInvite, CreateGuestKey,
-	// AddAccounts), or members on an ACL record that adds or promotes
-	// one (AcceptRequest, ChangePermissions, AddAccounts).
+	// ErrCoordinatorLimitReached is the coordinator refusing an
+	// operation because the space owner's plan reached a limit, whoever
+	// the caller is: shared spaces on make-shareable (CreateInvite,
+	// CreateGuestKey, AddAccounts), or members on an ACL record that
+	// raises the reader or writer count past the plan's cap
+	// (AcceptRequest, ChangePermissions, AddAccounts, CreateGuestKey).
+	// A plan allowing at most one reader and one writer refuses every
+	// ACL record, removals and the joiner's Join and CancelJoin
+	// included.
 	ErrCoordinatorLimitReached = coordinatorproto.ErrSpaceLimitReached
 )
 

@@ -289,7 +289,7 @@ func NewControllerWithShared(ctx context.Context, objectId string, db anystore.D
 		return nil, fmt.Errorf("crdt: open meta collection: %w", err)
 	}
 	c.metaColl = metaColl
-	if err := ensureMetaIndexes(ctx, metaColl); err != nil {
+	if err := EnsureMetaIndexes(ctx, metaColl); err != nil {
 		return nil, fmt.Errorf("crdt: ensure meta indexes: %w", err)
 	}
 	stored, err := c.LoadAndSeedMeta(ctx, metaColl)

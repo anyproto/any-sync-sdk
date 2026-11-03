@@ -11,7 +11,7 @@ import (
 
 func TestPersistDeletionMark_StampsAndProjects(t *testing.T) {
 	_, coll := openMetaColl(t)
-	require.NoError(t, ensureMetaIndexes(ctx, coll))
+	require.NoError(t, EnsureMetaIndexes(ctx, coll))
 
 	// A content-bearing object row: q=5, as=5, handler versions.
 	require.NoError(t, PersistMeta(ctx, coll, "o1", 5, 5, map[string]int{"ds": 3}, "spaceA"))

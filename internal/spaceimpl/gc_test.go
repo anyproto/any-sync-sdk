@@ -115,6 +115,16 @@ func TestSweepOrphans(t *testing.T) {
 	deadSet := map[string]struct{}{deadSpace: {}, emptyDeadSpace: {}}
 	require.NoError(t, s.sweepOrphans(ctx, liveSet, deadSet))
 
+	// The sweep installs the sp index its per-space purge scans on; no
+	// controller opened _meta before it here.
+	metaAfter, err := db.OpenCollection(ctx, crdt.MetaCollectionName)
+	require.NoError(t, err)
+	hasSpaceIndex := false
+	for _, idx := range metaAfter.GetIndexes() {
+		hasSpaceIndex = hasSpaceIndex || idx.Info().Name == "idx__meta_sp"
+	}
+	assert.True(t, hasSpaceIndex, "sweep must install the meta space index")
+
 	for _, dead := range []string{deadSpace, emptyDeadSpace} {
 		state, unread := readStateRows(t, ctx, db, dead)
 		assert.Zero(t, state, "dead-space read state must be purged")

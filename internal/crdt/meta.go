@@ -66,24 +66,29 @@ const (
 	spaceMetaKeyPrefix = "space:"
 )
 
-// ensureMetaIndexes ensures the indexes the _meta collection needs.
-// Idempotent — safe to call on every open. The (sp, as) compound index
-// backs QueryChangedObjects' "objects in this space with applySeq > N,
-// ordered by applySeq" scan; the legacy (sp, q) index stays for the
-// restore-watermark reads.
-func ensureMetaIndexes(ctx context.Context, coll anystore.Collection) error {
-	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
-		Name:   "idx__meta_sp_q",
-		Fields: []string{metaSpaceIdKey, metaAddSeqKey},
-		Sparse: true,
-	}); err != nil {
-		return err
+// metaIndexes are the indexes every opener of the _meta collection
+// ensures. The single-field sp index backs the space-wide scans
+// (PurgeSpaceMeta, StaleObjects, MaxObjectApplySeq), including legacy
+// scoped rows that lack a watermark and so are absent from the sparse
+// compound indexes. (sp, as) backs QueryChangedObjects' "objects in this
+// space with applySeq > N, ordered by applySeq" scan. (sp, q) is legacy:
+// no query reads it.
+var metaIndexes = []anystore.IndexInfo{
+	{Name: "idx__meta_sp", Fields: []string{metaSpaceIdKey}, Sparse: true},
+	{Name: "idx__meta_sp_q", Fields: []string{metaSpaceIdKey, metaAddSeqKey}, Sparse: true},
+	{Name: "idx__meta_sp_as", Fields: []string{metaSpaceIdKey, metaApplySeqKey}, Sparse: true},
+}
+
+// EnsureMetaIndexes builds the metaIndexes the collection lacks. The
+// catalog check costs no write transaction, so it runs on every
+// Controller construction and before the startup space sweep; a
+// collection that already holds the set pays nothing.
+func EnsureMetaIndexes(ctx context.Context, coll anystore.Collection) error {
+	missing := MissingIndexes(coll, metaIndexes)
+	if len(missing) == 0 {
+		return nil
 	}
-	return coll.EnsureIndex(ctx, anystore.IndexInfo{
-		Name:   "idx__meta_sp_as",
-		Fields: []string{metaSpaceIdKey, metaApplySeqKey},
-		Sparse: true,
-	})
+	return coll.EnsureIndex(ctx, missing...)
 }
 
 // SpaceMetaKey returns the _meta document id for a space's row.

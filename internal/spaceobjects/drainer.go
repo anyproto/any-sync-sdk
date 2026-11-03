@@ -102,6 +102,9 @@ func (d *drainer) Close() error {
 	}
 	d.cancel()
 	err := d.queue.Close()
+	if errors.Is(err, mb.ErrClosed) {
+		err = nil
+	}
 	<-d.done
 	return err
 }

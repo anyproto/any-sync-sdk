@@ -376,6 +376,7 @@ func TestShouldPruneReadState(t *testing.T) {
 func seedReadState(t *testing.T, ctx context.Context, db anystore.DB, spaceId, objectId string) {
 	t.Helper()
 	eng := readstate.New(db, spaceId, func(context.Context) (uint64, error) { return 1, nil }, nil)
+	require.NoError(t, eng.Open(ctx))
 	require.NoError(t, eng.TrackChange(ctx, readstate.Track{
 		ObjectId: objectId, ChangeId: objectId + "-c1", VersionId: "v1", AddSeq: 1, ApplySeq: 1,
 		RecordIds: []string{"r1"}, Tags: []string{"msg"}, Tracked: true,

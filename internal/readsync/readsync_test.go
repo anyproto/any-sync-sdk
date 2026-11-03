@@ -125,6 +125,7 @@ func newFixture(t *testing.T) *fixture {
 		seq++
 		return seq, nil
 	}, nil)
+	require.NoError(t, eng.Open(ctx))
 	kv := newFakeKV()
 	svc := New(
 		func(spaceId string) *readstate.Engine {

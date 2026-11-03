@@ -327,6 +327,7 @@ const (
 
 	DeleteByAnyone = schema.DeleteByAnyone
 	DeleteByAuthor = schema.DeleteByAuthor
+	DeleteByNone   = schema.DeleteByNone
 )
 
 // Leaf builds an unconstrained scalar value shape for a PropertyKind —

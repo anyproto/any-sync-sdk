@@ -451,12 +451,18 @@ func (h *SchemaHandler) bumpModifyTime(ctx *ChangeCtx, sink *Sink) {
 	sink.Derive(Op{Type: OpSet, Path: []string{h.modifyTimeField}, Payload: a.NewDateTimeMillis(ctx.Change.Timestamp * 1000)})
 }
 
-// BeforeDelete enforces the dataset's delete gate. Author-gated deletes
-// require the record's creator stamp to match the deleting change's
-// Creator; a never-created record (no creation marker) is rejected —
-// convergent because an author's own create→delete is causally ordered,
-// so a delete racing ahead of its create is never the author's.
+// BeforeDelete enforces the dataset's delete gate. DeleteByNone drops
+// every delete, whoever wrote it and whether or not the record exists
+// here, so the verdict is the same in every delivery order and the
+// dataset never writes a tombstone. Author-gated deletes require the
+// record's creator stamp to match the deleting change's Creator; a
+// never-created record (no creation marker) is rejected — convergent
+// because an author's own create→delete is causally ordered, so a
+// delete racing ahead of its create is never the author's.
 func (h *SchemaHandler) BeforeDelete(ctx *ChangeCtx, _ *RecordChange, _ *Sink) error {
+	if h.deleteBy == schema.DeleteByNone {
+		return fmt.Errorf("%w: %w", ErrValidation, ErrDatasetUndeletable)
+	}
 	if h.deleteBy != schema.DeleteByAuthor {
 		return nil
 	}
@@ -481,6 +487,9 @@ func (h *SchemaHandler) BeforeDelete(ctx *ChangeCtx, _ *RecordChange, _ *Sink) e
 // Dynamic dataset included. Author-identity gates are left to apply time — the
 // local change's Creator isn't stamped yet at pre-validation, and local
 // apply is synchronous, surfacing those rejections in the ModifyResult.
+// A DeleteByNone dataset refuses deletes here: the verdict needs no
+// identity, and refusing before the DAG keeps a change that could only
+// be dropped out of every replica's tree.
 func (h *SchemaHandler) PreValidateMulti(ch *Change, get RecordGetter) error {
 	if ch == nil {
 		return nil
@@ -488,6 +497,9 @@ func (h *SchemaHandler) PreValidateMulti(ch *Change, get RecordGetter) error {
 	for i := range ch.Records {
 		rec := &ch.Records[i]
 		if hasDelete(rec.Ops) {
+			if h.deleteBy == schema.DeleteByNone {
+				return fmt.Errorf("record %q: %w: %w", rec.Id, ErrValidation, ErrDatasetUndeletable)
+			}
 			continue
 		}
 		var before *anyenc.Value

@@ -151,6 +151,9 @@ func draftToDecl(draft *space.DatasetDraft) (schema.Dataset, error) {
 		if len(draft.Indexes) > 0 {
 			return ds, fmt.Errorf("%w: dataset %q: a %q dataset declares no indexes", space.ErrModuleOwned, draft.Key, draft.Module)
 		}
+		if draft.DeleteBy != space.DeleteByAnyone {
+			return ds, fmt.Errorf("%w: dataset %q: a %q dataset keeps its module's delete rule", space.ErrModuleOwned, draft.Key, draft.Module)
+		}
 		return ds, nil
 	}
 	for i := range draft.Fields {
@@ -300,7 +303,7 @@ func encodeDatasetHead(arena *anyenc.Arena, partId string, draft *space.DatasetD
 			payload.Set(typetype.DefFieldIdMaxLen, arena.NewNumberInt(draft.IdMaxLen))
 		}
 	}
-	if draft.DeleteBy == space.DeleteByAuthor {
+	if draft.DeleteBy != space.DeleteByAnyone {
 		payload.Set(typetype.DefFieldDeleteBy, arena.NewString(draft.DeleteBy.String()))
 	}
 	if draft.Shared {

@@ -133,6 +133,8 @@ Delete keeps the record as a tombstone:
 
 The local writer sees the drop: a non-delete modify (upsert included) on a tombstone adds a whole-record rejection (`OpIndex -1`, `ErrRecordDeleted`, re-exported as `space.ErrRecordDeleted`) to the apply result. The creation-marker min rule still applies. Deleting a tombstone is not a rejection; repeated deletes are idempotent.
 
+A dataset declared `DeleteBy: none` (user-datasets.md § Declaration vocabulary) never writes a tombstone: the local pre-flight refuses the delete with `ErrDatasetUndeletable` before the change exists, and apply drops one written elsewhere.
+
 ### 3.5 `_ver.id` creation-version marker
 
 `_ver.id` holds the version of the record's earliest upsert. Callers use it as an indexed creation-order key; chat datasets, for example, sort messages by `_ver.id` descending.

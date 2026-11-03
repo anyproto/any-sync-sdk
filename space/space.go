@@ -175,7 +175,9 @@ type Space interface {
 	ModifyMany(ctx context.Context, batches []ModifyBatch) ([]ModifyResult, error)
 
 	// Delete produces sticky tombstones for the listed record ids.
-	// Returned RecordIds mirror the input order.
+	// Returned RecordIds mirror the input order. A dataset declared
+	// DeleteByNone refuses the call with ErrDatasetUndeletable before
+	// anything is written.
 	Delete(ctx context.Context, batch DeleteBatch) (ModifyResult, error)
 
 	// Upsert is the generic schema-driven batch ingest: upsert by

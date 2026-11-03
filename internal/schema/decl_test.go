@@ -99,7 +99,7 @@ func TestParseLabels_RoundTrip(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, r, got)
 	}
-	for _, p := range []DeletePolicy{DeleteByAnyone, DeleteByAuthor} {
+	for _, p := range []DeletePolicy{DeleteByAnyone, DeleteByAuthor, DeleteByNone} {
 		got, ok := ParseDeletePolicy(p.String())
 		require.True(t, ok)
 		assert.Equal(t, p, got)

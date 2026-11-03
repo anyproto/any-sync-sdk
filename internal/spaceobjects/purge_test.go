@@ -173,6 +173,7 @@ func TestPurgeObjects_Batch(t *testing.T) {
 func trackRead(t *testing.T, ctx context.Context, s *Store, objectId, changeId string) *readstate.Engine {
 	t.Helper()
 	eng := readstate.New(s.db, s.spaceId, s.applySeqs.Next, nil)
+	require.NoError(t, eng.Open(ctx))
 	require.NoError(t, eng.TrackChange(ctx, readstate.Track{
 		ObjectId: objectId, ChangeId: changeId, VersionId: "v" + changeId,
 		AddSeq: 1, ApplySeq: 1, RecordIds: []string{"r1"}, Tags: []string{"msg"}, Tracked: true,

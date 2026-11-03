@@ -16,9 +16,11 @@
 // All mutating methods take the caller's tx context: the apply path
 // calls Track inside the same WriteTx as the record mutations, so an
 // unread entry is atomic with its change; marks and merges open their
-// own tx at the service layer. The engine holds no locks and no
-// in-memory state — callers serialize per object (the apply path via
-// the tree lock, merges/marks via the service's per-object mutex).
+// own tx at the service layer. Open creates the collections once,
+// before the store is published; after that the engine holds no locks
+// and no in-memory state — callers serialize per object (the apply
+// path via the tree lock, merges/marks via the service's per-object
+// mutex).
 //
 // Read marking is forward-only: MarkRead covers the given changes and
 // their causal ancestry. The ancestor walk runs over unread rows
@@ -37,6 +39,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -143,42 +146,75 @@ type Engine struct {
 	// inside one — so a subscriber's ChangedSince pull sees the data.
 	subs fanout.Registry[statePing]
 
-	openOnce sync.Once
-	openErr  error
-	unread   anystore.Collection
-	state    anystore.Collection
+	// opened publishes Open's outcome; nil until Open ran. Every
+	// method gates on it through ready() and none opens the
+	// collections itself: the DDL takes any-store's write lock, and
+	// most callers already hold a write tx.
+	openMu sync.Mutex
+	opened atomic.Pointer[openResult]
+	unread anystore.Collection
+	state  anystore.Collection
 }
 
+type openResult struct{ err error }
+
+// ErrNotOpen is returned by every method until Open succeeded.
+var ErrNotOpen = errors.New("readstate: engine not opened")
+
+// New builds the engine over the space's share of db. No I/O: Open
+// creates the collections.
 func New(db anystore.DB, spaceId string, seq SeqFunc, resolve Resolver) *Engine {
 	return &Engine{db: db, spaceId: spaceId, seq: seq, resolve: resolve}
 }
 
-func (e *Engine) collections(ctx context.Context) error {
-	e.openOnce.Do(func() {
-		open := func(name string, indexes ...anystore.IndexInfo) (anystore.Collection, error) {
-			coll, err := e.db.Collection(ctx, name)
-			if err != nil {
+// Open creates the collections and their indexes. The DDL takes
+// any-store's write lock, so ctx must not carry a write tx and the
+// caller must not hold one: the store build runs Open before the store
+// is published, and every later method only reads and writes rows. A
+// failed Open leaves the engine returning its error; calling Open again
+// retries the DDL. A no-op once it succeeded.
+func (e *Engine) Open(ctx context.Context) error {
+	e.openMu.Lock()
+	defer e.openMu.Unlock()
+	if r := e.opened.Load(); r != nil && r.err == nil {
+		return nil
+	}
+	open := func(name string, indexes ...anystore.IndexInfo) (anystore.Collection, error) {
+		coll, err := e.db.Collection(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		for _, idx := range indexes {
+			if err = coll.EnsureIndex(ctx, idx); err != nil {
 				return nil, err
 			}
-			for _, idx := range indexes {
-				if err = coll.EnsureIndex(ctx, idx); err != nil {
-					return nil, err
-				}
-			}
-			return coll, nil
 		}
-		e.unread, e.openErr = open(UnreadCollectionName,
-			anystore.IndexInfo{Name: "idx__read_ob_v", Fields: []string{fObject, fVersion}},
-			anystore.IndexInfo{Name: "idx__read_ob_k", Fields: []string{fObject, fKey}, Sparse: true},
-		)
-		if e.openErr != nil {
-			return
-		}
-		e.state, e.openErr = open(StateCollectionName,
+		return coll, nil
+	}
+	unread, err := open(UnreadCollectionName,
+		anystore.IndexInfo{Name: "idx__read_ob_v", Fields: []string{fObject, fVersion}},
+		anystore.IndexInfo{Name: "idx__read_ob_k", Fields: []string{fObject, fKey}, Sparse: true},
+	)
+	var state anystore.Collection
+	if err == nil {
+		state, err = open(StateCollectionName,
 			anystore.IndexInfo{Name: "idx__read_state_sp_ss", Fields: []string{fSpace, fStateSeq}},
 		)
-	})
-	return e.openErr
+	}
+	if err == nil {
+		e.unread, e.state = unread, state
+	}
+	e.opened.Store(&openResult{err: err})
+	return err
+}
+
+// ready gates a method on Open's outcome.
+func (e *Engine) ready() error {
+	r := e.opened.Load()
+	if r == nil {
+		return ErrNotOpen
+	}
+	return r.err
 }
 
 func unreadRowId(objectId, changeId string) string { return objectId + ":" + changeId }
@@ -344,7 +380,7 @@ func (e *Engine) insertEntry(ctx context.Context, t Track) error {
 // Track records one classified change from the apply path. Must run
 // inside the apply's WriteTx (pass tx.Context()).
 func (e *Engine) TrackChange(ctx context.Context, t Track) error {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return err
 	}
 	st, err := e.loadState(ctx, t.ObjectId)
@@ -471,7 +507,7 @@ func (e *Engine) removeEntries(ctx context.Context, st *objState, entries []Entr
 // Ids not yet arrived on this device are persisted as pending heads.
 // Runs in the caller's tx; the caller serializes per object.
 func (e *Engine) MarkRead(ctx context.Context, objectId string, changeIds []string) (MarkResult, error) {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return MarkResult{}, err
 	}
 	return e.markLocked(ctx, objectId, changeIds, 0)
@@ -727,7 +763,7 @@ func (e *Engine) MarkReadUpTo(ctx context.Context, objectId, upTo string) (MarkR
 // tx and a crash mid-way just resumes — the huge-ReadAll path uses
 // this to keep transactions bounded.
 func (e *Engine) MarkReadUpToChunk(ctx context.Context, objectId, upTo string, maxEntries int) (MarkResult, bool, error) {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return MarkResult{}, true, err
 	}
 	st, err := e.loadState(ctx, objectId)
@@ -795,7 +831,7 @@ func (e *Engine) MergeHeads(ctx context.Context, objectId string, heads []string
 // updated); an entry also touching surviving records just sheds the
 // deleted ids.
 func (e *Engine) ClearRecords(ctx context.Context, objectId string, recordIds []string, stateSeq uint64) error {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return err
 	}
 	deleted := map[string]struct{}{}
@@ -857,7 +893,7 @@ func (e *Engine) ClearRecords(ctx context.Context, objectId string, recordIds []
 // UnreadEntries returns the object's current unread set, ascending by
 // versionId ("" upTo = all).
 func (e *Engine) UnreadEntries(ctx context.Context, objectId string) ([]Entry, uint64, error) {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return nil, 0, err
 	}
 	st, err := e.loadState(ctx, objectId)
@@ -873,7 +909,7 @@ func (e *Engine) UnreadEntries(ctx context.Context, objectId string) ([]Entry, u
 
 // Counts returns the per-tag unread counters for an object.
 func (e *Engine) Counts(ctx context.Context, objectId string) (map[string]int, error) {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return nil, err
 	}
 	st, err := e.loadState(ctx, objectId)
@@ -886,7 +922,7 @@ func (e *Engine) Counts(ctx context.Context, objectId string) (map[string]int, e
 // Frontier returns the object's current seen-heads frontier and
 // pending remote heads.
 func (e *Engine) Frontier(ctx context.Context, objectId string) (heads, pending []string, err error) {
-	if err = e.collections(ctx); err != nil {
+	if err = e.ready(); err != nil {
 		return nil, nil, err
 	}
 	st, err := e.loadState(ctx, objectId)
@@ -902,7 +938,7 @@ func (e *Engine) Frontier(ctx context.Context, objectId string) (heads, pending 
 // consumer re-pulls UnreadEntries for each dirty object and diffs
 // against what it holds. Page by passing the last StateSeq back.
 func (e *Engine) ChangedSince(ctx context.Context, since uint64, limit int) ([]ObjectState, error) {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return nil, err
 	}
 	filter := query.And{
@@ -990,7 +1026,7 @@ func (e *Engine) NotifyState(objectId string, stateSeq uint64) {
 // object. Durable: only SeedFrontier sets it, in the same tx as the
 // seed itself, so the answer survives crashes on either side.
 func (e *Engine) Seeded(ctx context.Context, objectId string) (bool, error) {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return false, err
 	}
 	st, err := e.loadState(ctx, objectId)
@@ -1005,7 +1041,7 @@ func (e *Engine) Seeded(ctx context.Context, objectId string) (bool, error) {
 // account's published frontiers, merged separately in the same tx,
 // are the real seed. Idempotent.
 func (e *Engine) MarkSeeded(ctx context.Context, objectId string) error {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return err
 	}
 	st, err := e.loadState(ctx, objectId)
@@ -1027,7 +1063,7 @@ func (e *Engine) MarkSeeded(ctx context.Context, objectId string) error {
 // Idempotent: a second call on a seeded object is a no-op. Returns
 // whether the seed ran.
 func (e *Engine) SeedFrontier(ctx context.Context, objectId string, heads []string) (bool, error) {
-	if err := e.collections(ctx); err != nil {
+	if err := e.ready(); err != nil {
 		return false, err
 	}
 	st, err := e.loadState(ctx, objectId)

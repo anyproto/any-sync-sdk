@@ -673,6 +673,14 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs, append(append([]crdt.HandlerReg(nil), s.canonicalRegs...), s.staticInstanceRegs...))
 	if len(s.readTracking) > 0 || s.modulesTracked {
 		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
+		// Eager: the open takes any-store's write lock, and every
+		// later engine call runs inside a write tx or next to one.
+		// The constructor runs outside any tx, before the store is
+		// published. A failure stays with the engine: each call
+		// returns it, read tracking is never silently off.
+		if err := s.readState.Open(context.Background()); err != nil {
+			storeLog.Error("read state: open", zap.String("spaceId", s.spaceId), zap.Error(err))
+		}
 		if needsReadMaterializer(s.readTracking) {
 			s.readMat = newReadMaterializer(s)
 		}

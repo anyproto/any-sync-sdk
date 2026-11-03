@@ -122,6 +122,9 @@ type Service struct {
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
+	// building holds the done channel of each store build in flight
+	// (storeOnce), closed when the store is published.
+	building map[string]chan struct{}
 	// techSpace is the restricted handle over the tech space, built on
 	// first Get(techSpaceId). One instance per process: its bundles
 	// API holds per-id install locks.
@@ -260,6 +263,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		modules:             modules,
 		stores:              make(map[string]*spaceobjects.Store),
 		allocs:              make(map[string]*object.VersionAllocator),
+		building:            make(map[string]chan struct{}),
 		spaceIndexIds:       make(map[string]string),
 		spaceIndexWatchers:  make(map[string]*spaceIndexWatcher),
 		oneToOneKeyWatchers: make(map[string]*oneToOneKeysWatcher),
@@ -312,25 +316,90 @@ func (s *Service) filesStore() *filestore.Store { return s.fstore }
 // drain of the per-space _detached collection — picks up any
 // changes whose missing shortIds landed during a previous session.
 func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
-	s.mu.Lock()
-	if st, ok := s.stores[spaceId]; ok {
+	return s.storeOnce(spaceId, s.buildStore)
+}
+
+// storeOnce returns spaceId's Store, running build once on first
+// access. The build does DB work (the store constructor opens the
+// read-state collections, the applySeq backfill writes), so it runs
+// outside s.mu: one builder per space, callers for the same space
+// wait on its done channel (building), every other s.mu user
+// proceeds. A store published while the service is closing comes out
+// closed with no background work started: Close waits out the builds
+// in flight and closes what it finds published, this covers a sync
+// message during app teardown (callers dereference the result).
+func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing bool) *spaceobjects.Store) *spaceobjects.Store {
+	for {
+		s.mu.Lock()
+		if st, ok := s.stores[spaceId]; ok {
+			s.mu.Unlock()
+			return st
+		}
+		if done, ok := s.building[spaceId]; ok {
+			s.mu.Unlock()
+			<-done
+			continue
+		}
+		done := make(chan struct{})
+		s.building[spaceId] = done
+		closing := s.closing
 		s.mu.Unlock()
+
+		st := build(spaceId, closing)
+
+		s.mu.Lock()
+		closed := s.closing
+		s.stores[spaceId] = st
+		delete(s.building, spaceId)
+		close(done)
+		s.mu.Unlock()
+		if closed {
+			// Idempotent with Close's own pass over the map.
+			_ = st.Close()
+			return st
+		}
+		// Converge any pending re-index in the background instead of waiting
+		// for every object to be opened (spaceobjects/reindex.go). No-op when
+		// no handler version changed.
+		st.StartReindexSweep()
+		// Shared datasets' declared indexes missing from a previous run.
+		st.StartIndexSync()
+		// Kick the drainer once so prior-session parked rows whose
+		// dependencies have since landed get picked up on first touch.
+		st.NotifyDrainer(types.DataVersionPair{})
 		return st
 	}
+}
+
+// waitStoreBuilds blocks until every store build in flight at the call
+// has published. Close calls it right after setting closing: a build
+// writes the db the caller closes once Close returns.
+func (s *Service) waitStoreBuilds() {
+	s.mu.Lock()
+	building := make([]chan struct{}, 0, len(s.building))
+	for _, done := range s.building {
+		building = append(building, done)
+	}
+	s.mu.Unlock()
+	for _, done := range building {
+		<-done
+	}
+}
+
+// buildStore constructs spaceId's Store and primes it. Runs outside
+// s.mu (storeOnce). closing hands back the bare store: nothing primed,
+// no DB write beyond the constructor's own.
+func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
+	s.mu.Lock()
 	s.allocs[spaceId] = alloc
+	s.mu.Unlock()
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.extCollections, s.modules)
 	// Account-wide gate: once the tech space carries a CRDT version
 	// above this SDK's, every synced write fails with
 	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).
 	st.SetGlobalGate(s.tsp.WriteGate)
-	if s.closing {
-		// A sync message during app teardown: hand back a closed store
-		// (callers dereference the result) with no background work
-		// started on a db that is closing.
-		_ = st.Close()
-		s.stores[spaceId] = st
-		s.mu.Unlock()
+	if closing {
 		return st
 	}
 	// Read-only gate on every user-authored synced write
@@ -360,22 +429,12 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 	// inside the applySeqMeta sync.Once. That lazy path otherwise
 	// lock-order-inverts against any-store's write mutex (an apply holds
 	// writeMu then wants the Once; a concurrent ChangedObjects holds the
-	// Once then wants writeMu) and deadlocks. storeFor is single-threaded
-	// per space and its caller never holds the write mutex, so forcing the
-	// backfill here is the safe, race-free place. Best-effort: a transient
-	// error is cached by the Once and resurfaces on the next feed read.
+	// Once then wants writeMu) and deadlocks. storeOnce runs one build
+	// per space and its caller never holds the write mutex, so forcing
+	// the backfill here is the safe, race-free place. Best-effort: a
+	// transient error is cached by the Once and resurfaces on the next
+	// feed read.
 	_ = st.EnsureApplySeq(context.Background())
-	s.stores[spaceId] = st
-	s.mu.Unlock()
-	// Converge any pending re-index in the background instead of waiting
-	// for every object to be opened (spaceobjects/reindex.go). No-op when
-	// no handler version changed.
-	st.StartReindexSweep()
-	// Shared datasets' declared indexes missing from a previous run.
-	st.StartIndexSync()
-	// Kick the drainer once so prior-session parked rows whose
-	// dependencies have since landed get picked up on first touch.
-	st.NotifyDrainer(types.DataVersionPair{})
 	return st
 }
 
@@ -2114,6 +2173,7 @@ func (s *Service) Close(_ context.Context) error {
 	s.mu.Lock()
 	s.closing = true
 	s.mu.Unlock()
+	s.waitStoreBuilds()
 	s.seedCancel()
 	s.seedWG.Wait()
 	// Stop the 1-1 inbox notifier + send-retry loop before draining the

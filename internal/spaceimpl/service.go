@@ -123,7 +123,8 @@ type Service struct {
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
 	// building holds the done channel of each store build in flight
-	// (storeOnce), closed when the store is published.
+	// (storeOnce), closed when the build ends: the store is published,
+	// or the build panicked (runBuild).
 	building map[string]chan struct{}
 	// techSpace is the restricted handle over the tech space, built on
 	// first Get(techSpaceId). One instance per process: its bundles
@@ -324,14 +325,14 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // read-state collections, the applySeq backfill writes), so it runs
 // outside s.mu: one builder per space, callers for the same space
 // wait on its done channel (building), every other s.mu user
-// proceeds. The two teardown paths wait for a build in flight before
-// they act on the map: takeSpaceRuntime (awaitBuildLocked) so an
-// offload closes the store a build publishes, closeStores
-// (waitStoreBuilds) so the builds in flight finish their db work
-// before Close returns. A store published while the service is
-// closing is closed before anyone sees it, with no background work
-// started: a sync message during app teardown (callers dereference
-// the result).
+// proceeds. The two teardown paths wait for a build in flight:
+// takeSpaceRuntime (awaitBuildLocked) before it acts on the map, so
+// an offload closes the store a build publishes; closeStores
+// (waitStoreBuilds) after its pass, so the builds in flight finish
+// their db work before Close returns. A store published while the
+// service is closing is closed before anyone sees it, with no
+// background work started: a sync message during app teardown
+// (callers dereference the result).
 func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing bool) *spaceobjects.Store) *spaceobjects.Store {
 	for {
 		s.mu.Lock()
@@ -354,8 +355,9 @@ func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing b
 		s.mu.Lock()
 		closed := s.closing
 		if closed {
-			// Nothing runs on the store yet, so this is quick; waiters
-			// and closeStores see it closed.
+			// Only idle goroutines run on the store, so this is quick;
+			// waiters get it closed. Store.Close is idempotent for
+			// closeStores' own pass.
 			_ = st.Close()
 		}
 		s.stores[spaceId] = st
@@ -398,7 +400,8 @@ func (s *Service) runBuild(spaceId string, done chan struct{}, closing bool, bui
 }
 
 // waitStoreBuilds blocks until every store build in flight at the call
-// has published. Builds that start later are not covered.
+// has ended (published, or panicked). Builds that start later are not
+// covered.
 func (s *Service) waitStoreBuilds() {
 	s.mu.Lock()
 	building := make([]chan struct{}, 0, len(s.building))
@@ -427,8 +430,8 @@ func (s *Service) awaitBuildLocked(spaceId string) {
 }
 
 // buildStore constructs spaceId's Store and primes it. Runs outside
-// s.mu (storeOnce). closing hands back the bare store, nothing primed;
-// storeOnce closes it on publish.
+// s.mu (storeOnce). closing hands back the store with only the global
+// gate set; storeOnce closes it on publish.
 func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 	alloc := object.NewVersionAllocator("")
 	s.mu.Lock()

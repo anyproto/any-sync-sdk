@@ -95,7 +95,7 @@ There is no `insert` op. `RecordChange.upsert` controls creation:
 - `false` (default, strict): when no record has the id, the record's modify ops don't apply, and the apply result carries an `ErrStrictSkipAbsent` rejection for it. Typos and stale ids can't create records.
 - `true`: an absent record is created empty, stamped `_ver.id = versionId` (§3.5), and the ops run.
 
-A create is usually `upsert: true` with a multi-field `$set` (§5.1). Concurrent creates of one id merge per field through gating.
+A create is usually `upsert: true` with a multi-field `$set` (§5.1). Concurrent creates of one id merge per field through gating. Handler hooks see only the first one a replica applies as a create (`BeforeCreate`); a later one runs `BeforeModify`, so a create-only rule depends on arrival order ([user-datasets.md](user-datasets.md) § The IdRule: user contract).
 
 `delete` ignores the flag: deleting an absent record writes a tombstone, so a delete beats a create it hasn't seen.
 

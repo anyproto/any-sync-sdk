@@ -45,13 +45,10 @@ type UpsertRecord struct {
 // window resolves by per-path LWW like any other write. The intended
 // deployment is a single ingest writer per dataset.
 //
-// Contract: a user-supplied record id must have a single writer. The
-// id doubles as the idempotency key, and CONCURRENT creates of the
-// same id by different members are outside the contract — creation
-// verdicts (required fields, the creator stamp behind author gates)
-// are taken by whichever create a replica applies first, so racing
-// writers can observe different creators per replica. One ingest
-// writer per dataset (or per id range) keeps this trivially true.
+// Concurrent creates of one id by different members merge per field.
+// Write-once fields, stamps and the author gates reading the creator
+// stamp follow whichever create a replica applies first, so a dataset
+// declaring them needs one writer per id (docs/user-datasets.md).
 type UpsertBatch struct {
 	ObjectId string
 	Dataset  string

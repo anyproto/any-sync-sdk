@@ -166,10 +166,9 @@ const (
 	IdAuto IdRule = iota
 	// IdUser: the caller supplies the id, constrained by
 	// IdPattern/IdMaxLen. The id doubles as the upsert idempotency
-	// key. Contract: one writer per id — concurrent creates of the
-	// same id by different members take arrival-order-dependent
-	// creation verdicts (required checks, creator stamp) and are
-	// outside the convergence guarantee.
+	// key. Concurrent creates of one id merge per field unless the
+	// dataset declares write-once fields, stamps or author gates, which
+	// the first-applied create decides (docs/user-datasets.md).
 	IdUser
 )
 

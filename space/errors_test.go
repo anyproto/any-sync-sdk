@@ -1,11 +1,14 @@
 package space
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+	"github.com/anyproto/any-sync/net/rpc/rpcerr"
+	"storj.io/drpc/drpcerr"
 )
 
 // TestSentinelMessages pins the message phrases downstream consumers
@@ -60,5 +63,18 @@ func TestAclSentinelAliases(t *testing.T) {
 	}
 	if ErrCoordinatorForbidden != coordinatorproto.ErrForbidden { //nolint:errorlint
 		t.Error("ErrCoordinatorForbidden is not coordinatorproto.ErrForbidden")
+	}
+	if ErrCoordinatorLimitReached != coordinatorproto.ErrSpaceLimitReached { //nolint:errorlint
+		t.Error("ErrCoordinatorLimitReached is not coordinatorproto.ErrSpaceLimitReached")
+	}
+}
+
+// An ACL record refused by the coordinator crosses the sync node as a
+// bare DRPC code; any-sync's node client resolves it with rpcerr.Unwrap
+// to the registered coordinator error, so errors.Is matches the alias.
+func TestCoordinatorLimitReachedFromWire(t *testing.T) {
+	wire := drpcerr.WithCode(errors.New("space limit reached"), rpcerr.Code(coordinatorproto.ErrSpaceLimitReached))
+	if !errors.Is(rpcerr.Unwrap(wire), ErrCoordinatorLimitReached) {
+		t.Error("unwrapped wire code does not match ErrCoordinatorLimitReached")
 	}
 }

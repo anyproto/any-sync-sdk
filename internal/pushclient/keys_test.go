@@ -77,36 +77,36 @@ func TestDeriveSpaceKey_NilInput(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// Every derived space of an account shares one root read key, so the
-// space id alone must separate their push identities.
+// The account key is the same for every derived space of the account,
+// so the space id alone must separate their push identities.
 func TestDeriveDerivedSpaceKey_PerSpace(t *testing.T) {
-	rootReadKey := testSymKey(t, 0x05)
+	account := testPrivKey(t, 0x05)
 
-	k1, err := DeriveDerivedSpaceKey(rootReadKey, "space-a")
+	k1, err := DeriveDerivedSpaceKey(account, "space-a")
 	require.NoError(t, err)
-	k2, err := DeriveDerivedSpaceKey(rootReadKey, "space-a")
+	k2, err := DeriveDerivedSpaceKey(account, "space-a")
 	require.NoError(t, err)
-	assert.Equal(t, rawKey(t, k1), rawKey(t, k2), "same root read key and space id must derive the same push key")
+	assert.Equal(t, rawKey(t, k1), rawKey(t, k2), "same account key and space id must derive the same push key")
 
-	other, err := DeriveDerivedSpaceKey(rootReadKey, "space-b")
+	other, err := DeriveDerivedSpaceKey(account, "space-b")
 	require.NoError(t, err)
-	assert.NotEqual(t, rawKey(t, k1), rawKey(t, other), "derived spaces sharing a root read key must get different push keys")
+	assert.NotEqual(t, rawKey(t, k1), rawKey(t, other), "derived spaces of one account must get different push keys")
 
-	otherKey, err := DeriveDerivedSpaceKey(testSymKey(t, 0x06), "space-a")
+	otherAccount, err := DeriveDerivedSpaceKey(testPrivKey(t, 0x06), "space-a")
 	require.NoError(t, err)
-	assert.NotEqual(t, rawKey(t, k1), rawKey(t, otherKey), "different root read keys must derive different push keys")
+	assert.NotEqual(t, rawKey(t, k1), rawKey(t, otherAccount), "different accounts must derive different push keys")
 }
 
 // Pins the SLIP-21 path: an edit would re-key every derived space on
 // the push server. The inline re-derivation hardcodes the literal.
 func TestDeriveDerivedSpaceKey_MatchesInlineDerivation(t *testing.T) {
-	rootReadKey := testSymKey(t, 0x2c)
+	account := testPrivKey(t, 0x2c)
 	const spaceId = "bafyreiexample.derived"
 
-	got, err := DeriveDerivedSpaceKey(rootReadKey, spaceId)
+	got, err := DeriveDerivedSpaceKey(account, spaceId)
 	require.NoError(t, err)
 
-	seed, err := crypto.DeriveSymmetricKey(rawKey(t, rootReadKey), "m/SLIP-0021/anysync-sdk/push/derived-space/"+spaceId)
+	seed, err := crypto.DeriveSymmetricKey(rawKey(t, account), "m/SLIP-0021/anysync-sdk/push/derived-space/"+spaceId)
 	require.NoError(t, err)
 	want, _, err := crypto.GenerateEd25519Key(bytes.NewReader(rawKey(t, seed)))
 	require.NoError(t, err)
@@ -118,15 +118,15 @@ func TestDeriveDerivedSpaceKey_MatchesInlineDerivation(t *testing.T) {
 // ed25519 computation): catches a change inside the any-sync derivation
 // helpers, which the inline re-derivation above shares.
 func TestDeriveDerivedSpaceKey_KnownAnswer(t *testing.T) {
-	got, err := DeriveDerivedSpaceKey(testSymKey(t, 0x2c), "bafyreiexample.derived")
+	got, err := DeriveDerivedSpaceKey(testPrivKey(t, 0x2c), "bafyreiexample.derived")
 	require.NoError(t, err)
-	assert.Equal(t, "072219e4e88f302d0572a8e97a8f8082e4ef8b7dca076312c42a31e23cb51b4b", hex.EncodeToString(rawKey(t, got.GetPublic())))
+	assert.Equal(t, "b88cb16ec07bad5dc746e04a49a2ce2a950089cc3bdb251fb8f96fa08ffd4180", hex.EncodeToString(rawKey(t, got.GetPublic())))
 }
 
 func TestDeriveDerivedSpaceKey_InvalidInput(t *testing.T) {
 	_, err := DeriveDerivedSpaceKey(nil, "space-a")
 	assert.Error(t, err)
-	_, err = DeriveDerivedSpaceKey(testSymKey(t, 0x07), "")
+	_, err = DeriveDerivedSpaceKey(testPrivKey(t, 0x07), "")
 	assert.Error(t, err)
 }
 

@@ -135,9 +135,9 @@ var ErrSelfPair = errors.New("cannot pair with self")
 // with an opaque remote error — Track rejects it up front instead.
 var ErrBadSpaceId = errors.New("invalid space id")
 
-// ErrIsTechSpace is returned by Track when the given id is the
-// account's own tech space — the tech space is system-owned and never
-// appears in the space list.
+// ErrIsTechSpace is returned by Track, Delete and the push key lookup
+// when the given id is the account's own tech space — the tech space is
+// system-owned and never appears in the space list.
 var ErrIsTechSpace = errors.New("cannot track the tech space")
 
 // ErrIsDerivedSpace is returned by Delete when the target is a

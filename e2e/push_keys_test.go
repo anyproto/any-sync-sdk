@@ -85,7 +85,7 @@ func TestPushKeys_MirroredToSpaceRow(t *testing.T) {
 }
 
 // TestPushKeys_DerivedSpace: a derived space's ACL has no metadata key,
-// so its push space key comes from the root read key and the space id.
+// so its push space key comes from the account key and the space id.
 // Both devices of the account must derive the same keys, two derived
 // spaces (which share the read key) must get distinct push identities,
 // and the row must mirror the sender-side keys.
@@ -143,6 +143,9 @@ func TestPushKeys_DerivedSpace(t *testing.T) {
 		encRaw, err := base64.StdEncoding.DecodeString(got.EncKey)
 		require.NoError(t, err)
 		assert.Equal(t, rawSymKey(t, encKey), encRaw, "mirrored enc key must match the sender-side derivation")
+
+		got2 := waitMirroredPushKeys(t, ctx, sdk2, sp2.Id())
+		assert.Equal(t, *got, *got2, "both devices must mirror the same push keys")
 	}
 
 	require.Len(t, spaceKeys, 2)

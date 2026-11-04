@@ -53,14 +53,9 @@ func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	got, err := lockedPushSpaceKey(acl, "derived-a")
 	require.NoError(t, err)
 
-	// A derived root's read key is any-sync's account-derived key.
-	signRaw, err := keys.SignKey.Raw()
+	want, err := pushclient.DeriveDerivedSpaceKey(keys.SignKey, "derived-a")
 	require.NoError(t, err)
-	rootReadKey, err := crypto.DeriveSymmetricKey(signRaw, crypto.AnysyncSpacePath)
-	require.NoError(t, err)
-	want, err := pushclient.DeriveDerivedSpaceKey(rootReadKey, "derived-a")
-	require.NoError(t, err)
-	assert.True(t, want.Equals(got))
+	assert.True(t, want.Equals(got), "a derived space's key comes from the deriving account's key")
 
 	// Another derived space of the account has the same root: only
 	// the space id separates the push identities.
@@ -85,7 +80,9 @@ func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	assert.True(t, got.Equals(rotated), "the push space key is fixed for the space's life")
 }
 
-func TestPushSpaceKey_DerivedAclWithoutRootReadKey(t *testing.T) {
+// Another account that tracks or joined the derived space gets no push
+// key: only the deriving account's devices can derive it.
+func TestPushSpaceKey_DerivedAclOfAnotherAccount(t *testing.T) {
 	owner, err := accountdata.NewRandom()
 	require.NoError(t, err)
 	tracker, err := accountdata.NewRandom()
@@ -95,7 +92,7 @@ func TestPushSpaceKey_DerivedAclWithoutRootReadKey(t *testing.T) {
 	acl := testAcl(t, owner, tracker, master, list.ReadKeyChangePayload{})
 
 	_, err = lockedPushSpaceKey(acl, "derived-a")
-	assert.ErrorIs(t, err, list.ErrNoReadKey)
+	assert.ErrorContains(t, err, "belongs to another account")
 }
 
 func TestPushSpaceKey_RegularAcl(t *testing.T) {

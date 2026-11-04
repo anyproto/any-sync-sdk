@@ -11,8 +11,9 @@
 // Trust model (mirrors anytype-heart's core/pushnotification): the
 // server never sees space content or space keys. Each space gets a
 // dedicated ed25519 "push space key" derived from the ACL's first
-// metadata key (a derived space has none: DeriveDerivedSpaceKey) —
-// topics are signed with it so only members can subscribe/publish,
+// metadata key (a derived space has none: DeriveDerivedSpaceKey, held
+// by the deriving account only) — topics are signed with it so only
+// members can subscribe/publish,
 // and the server verifies against the raw public
 // key it was handed at CreateSpace time. Notification payloads are
 // encrypted with a symmetric key derived from the space's CURRENT read
@@ -44,8 +45,8 @@ const (
 	encKeyDerivationPath = "m/SLIP-0021/anytype/space/key"
 )
 
-// derivedSpaceKeyPathPrefix + spaceId is the SLIP-21 path from a
-// derived space's root read key to its push signing key seed. SDK only
+// derivedSpaceKeyPathPrefix + spaceId is the SLIP-21 path from the
+// deriving account's key to a derived space's push signing key seed. SDK only
 // (heart never pushes for derived spaces); MUST NOT change either — the
 // keys_test known-answer vector pins it.
 const derivedSpaceKeyPathPrefix = "m/SLIP-0021/anysync-sdk/push/derived-space/"
@@ -73,18 +74,18 @@ func DeriveSpaceKey(firstMetadataKey crypto.PrivKey) (crypto.PrivKey, error) {
 }
 
 // DeriveDerivedSpaceKey derives the push signing key of a derived
-// space, whose ACL carries no metadata key, from its root read key.
-// That read key comes from the account key alone and is shared by
-// every derived space of the account, so the space id is part of the
-// path: one push-server identity per space, the same on every device.
-func DeriveDerivedSpaceKey(rootReadKey crypto.SymKey, spaceId string) (crypto.PrivKey, error) {
-	if rootReadKey == nil {
-		return nil, errors.New("pushclient: nil root read key")
+// space, whose ACL carries no metadata key, from the deriving account's
+// key and the space id. The account key never enters an ACL record, so
+// an invite into one derived space opens no other space's push
+// identity; only the deriving account's devices hold the key.
+func DeriveDerivedSpaceKey(accountKey crypto.PrivKey, spaceId string) (crypto.PrivKey, error) {
+	if accountKey == nil {
+		return nil, errors.New("pushclient: nil account key")
 	}
 	if spaceId == "" {
 		return nil, errors.New("pushclient: empty space id")
 	}
-	raw, err := rootReadKey.Raw()
+	raw, err := accountKey.Raw()
 	if err != nil {
 		return nil, err
 	}

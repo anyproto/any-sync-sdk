@@ -19,7 +19,7 @@ import (
 
 // pushKeyCache holds the per-space derived push keys. The space
 // signing key derives from the ACL's FIRST metadata key (a derived
-// space: root read key + space id) — fixed for the space's life, so it
+// space: account key + space id) — fixed for the space's life, so it
 // caches per spaceId; the payload enc key derives from the CURRENT
 // read key, which rotates, so it caches per (spaceId, readKeyId).
 // Derivation is deterministic — a stale entry is impossible, only a
@@ -38,7 +38,7 @@ type pushKeyCache struct {
 // matching the server's members-only trust model.
 func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto.PrivKey, encKey crypto.SymKey, err error) {
 	// The tech space has a derived root too, but never pushes.
-	if s.tsp != nil && spaceId == s.tsp.SpaceId() {
+	if s.tsp != nil && spaceId != "" && spaceId == s.tsp.SpaceId() {
 		return nil, nil, fmt.Errorf("push: %w", space.ErrIsTechSpace)
 	}
 	handle, err := s.app.GetSpace(ctx, spaceId)
@@ -97,29 +97,30 @@ func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto
 // pushSpaceKey derives the space's push signing key from its ACL;
 // the caller holds the read lock. A derived ACL — the root record
 // carries no read key, the test any-sync's applyRoot uses — has no
-// metadata key, so its key comes from the root read key and the space
-// id: every derived space of an account has the same root.
+// metadata key, so its key comes from the deriving account's key and
+// the space id; another account that joined it gets no push key.
 func pushSpaceKey(acl list.AclList, spaceId string) (crypto.PrivKey, error) {
 	recs := acl.Records()
 	if len(recs) == 0 {
 		return nil, fmt.Errorf("push: space %q: empty acl", spaceId)
 	}
-	var key crypto.PrivKey
-	var err error
+	state := acl.AclState()
 	if root, ok := recs[0].Model.(*aclrecordproto.AclRoot); ok &&
 		root.EncryptedReadKey == nil && root.OneToOneInfo == nil {
-		rootReadKey := acl.AclState().Keys()[acl.Id()].ReadKey
-		if rootReadKey == nil {
-			return nil, fmt.Errorf("push: derived space %q: root %w", spaceId, list.ErrNoReadKey)
+		if state.AccountKey() == nil || !recs[0].Identity.Equals(state.Identity()) {
+			return nil, fmt.Errorf("push: derived space %q belongs to another account", spaceId)
 		}
-		key, err = pushclient.DeriveDerivedSpaceKey(rootReadKey, spaceId)
-	} else {
-		firstMeta, fmErr := acl.AclState().FirstMetadataKey()
-		if fmErr != nil {
-			return nil, fmt.Errorf("push: first metadata key for %q: %w", spaceId, fmErr)
+		key, err := pushclient.DeriveDerivedSpaceKey(state.AccountKey(), spaceId)
+		if err != nil {
+			return nil, fmt.Errorf("push: derive space key for %q: %w", spaceId, err)
 		}
-		key, err = pushclient.DeriveSpaceKey(firstMeta)
+		return key, nil
 	}
+	firstMeta, err := state.FirstMetadataKey()
+	if err != nil {
+		return nil, fmt.Errorf("push: first metadata key for %q: %w", spaceId, err)
+	}
+	key, err := pushclient.DeriveSpaceKey(firstMeta)
 	if err != nil {
 		return nil, fmt.Errorf("push: derive space key for %q: %w", spaceId, err)
 	}

@@ -1,4 +1,4 @@
-// Package pushclient is the client of the anytype-push-server (SYN-47):
+// Package pushclient is the client of the anytype-push-server:
 // per-space key derivation, the signed/encrypted request builders, the
 // thin DRPC transport, and the account-level service behind
 // SDK.Push() / space.PushAPI.
@@ -11,8 +11,10 @@
 // Trust model (mirrors anytype-heart's core/pushnotification): the
 // server never sees space content or space keys. Each space gets a
 // dedicated ed25519 "push space key" derived from the ACL's first
-// metadata key — topics are signed with it so only members can
-// subscribe/publish, and the server verifies against the raw public
+// metadata key (a derived space has none and is never shared: the SDK
+// stands one in, DeriveDerivedSpaceMetadataKey) — topics are signed
+// with it so only members can subscribe/publish, and the server
+// verifies against the raw public
 // key it was handed at CreateSpace time. Notification payloads are
 // encrypted with a symmetric key derived from the space's CURRENT read
 // key, so the server relays opaque ciphertext; receivers pick the
@@ -43,6 +45,12 @@ const (
 	encKeyDerivationPath = "m/SLIP-0021/anytype/space/key"
 )
 
+// derivedSpaceMetadataPathPrefix + spaceId is the SLIP-21 path from the
+// deriving account's key to the seed of a derived space's push metadata
+// key. SDK only (heart never pushes for derived spaces); MUST NOT change
+// either — the keys_test known-answer vector pins it.
+const derivedSpaceMetadataPathPrefix = "m/SLIP-0021/anysync-sdk/push/derived-space-metadata/"
+
 // DeriveSpaceKey derives the per-space push signing key from the ACL's
 // FIRST metadata key (aclState.FirstMetadataKey — fixed at space
 // creation, never rotates, held by every member). Its raw public key
@@ -62,6 +70,36 @@ func DeriveSpaceKey(firstMetadataKey crypto.PrivKey) (crypto.PrivKey, error) {
 		return nil, err
 	}
 	key, _, err := crypto.GenerateEd25519Key(bytes.NewReader(node.RawSeed()))
+	return key, err
+}
+
+// DeriveDerivedSpaceMetadataKey stands in for the metadata key a
+// derived space's ACL lacks, the way any-sync derives one for a 1-1
+// space: an ed25519 key from the deriving account's key and the space
+// id. DeriveSpaceKey turns it into the push space key, as for every
+// other space. The space id is in the path because every derived space
+// of an account has the same ACL root. A derived space is never shared,
+// so only the deriving account's devices hold it.
+func DeriveDerivedSpaceMetadataKey(accountKey crypto.PrivKey, spaceId string) (crypto.PrivKey, error) {
+	if accountKey == nil {
+		return nil, errors.New("pushclient: nil account key")
+	}
+	if spaceId == "" {
+		return nil, errors.New("pushclient: empty space id")
+	}
+	raw, err := accountKey.Raw()
+	if err != nil {
+		return nil, err
+	}
+	seed, err := crypto.DeriveSymmetricKey(raw, derivedSpaceMetadataPathPrefix+spaceId)
+	if err != nil {
+		return nil, err
+	}
+	seedRaw, err := seed.Raw()
+	if err != nil {
+		return nil, err
+	}
+	key, _, err := crypto.GenerateEd25519Key(bytes.NewReader(seedRaw))
 	return key, err
 }
 

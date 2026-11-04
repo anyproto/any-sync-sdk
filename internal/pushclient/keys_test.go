@@ -77,6 +77,47 @@ func TestDeriveSpaceKey_NilInput(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// The account key is the same for every derived space of the account,
+// so the space id alone must separate their push identities.
+func TestDeriveDerivedSpaceMetadataKey_PerSpace(t *testing.T) {
+	account := testPrivKey(t, 0x05)
+
+	k1, err := DeriveDerivedSpaceMetadataKey(account, "space-a")
+	require.NoError(t, err)
+	k2, err := DeriveDerivedSpaceMetadataKey(account, "space-a")
+	require.NoError(t, err)
+	assert.Equal(t, rawKey(t, k1), rawKey(t, k2), "same account key and space id must derive the same key")
+
+	other, err := DeriveDerivedSpaceMetadataKey(account, "space-b")
+	require.NoError(t, err)
+	assert.NotEqual(t, rawKey(t, k1), rawKey(t, other), "derived spaces of one account must get different keys")
+
+	otherAccount, err := DeriveDerivedSpaceMetadataKey(testPrivKey(t, 0x06), "space-a")
+	require.NoError(t, err)
+	assert.NotEqual(t, rawKey(t, k1), rawKey(t, otherAccount), "different accounts must derive different keys")
+}
+
+// Known-answer vectors, checked against an independent SLIP-21 +
+// SLIP-10 + ed25519 computation: pin the derived-space metadata path and
+// the push space key it yields through DeriveSpaceKey. An edit would
+// re-key every derived space on the push server.
+func TestDeriveDerivedSpaceMetadataKey_KnownAnswer(t *testing.T) {
+	meta, err := DeriveDerivedSpaceMetadataKey(testPrivKey(t, 0x2c), "bafyreiexample.derived")
+	require.NoError(t, err)
+	assert.Equal(t, "a4ce4407f82dc46be7abc4a8119f10d3e434eeb5967a8253ee3988617f97fdf1", hex.EncodeToString(rawKey(t, meta.GetPublic())))
+
+	spaceKey, err := DeriveSpaceKey(meta)
+	require.NoError(t, err)
+	assert.Equal(t, "3cf0a83aded0a9e9e3521b24d712d351aa2cfb6e7723943ccac68179afd0035d", hex.EncodeToString(rawKey(t, spaceKey.GetPublic())))
+}
+
+func TestDeriveDerivedSpaceMetadataKey_InvalidInput(t *testing.T) {
+	_, err := DeriveDerivedSpaceMetadataKey(nil, "space-a")
+	assert.Error(t, err)
+	_, err = DeriveDerivedSpaceMetadataKey(testPrivKey(t, 0x07), "")
+	assert.Error(t, err)
+}
+
 func TestDeriveEncKey_Deterministic(t *testing.T) {
 	readKey := testSymKey(t, 0x03)
 

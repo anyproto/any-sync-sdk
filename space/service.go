@@ -135,9 +135,9 @@ var ErrSelfPair = errors.New("cannot pair with self")
 // with an opaque remote error — Track rejects it up front instead.
 var ErrBadSpaceId = errors.New("invalid space id")
 
-// ErrIsTechSpace is returned by Track when the given id is the
-// account's own tech space — the tech space is system-owned and never
-// appears in the space list.
+// ErrIsTechSpace is returned by Track, Delete and the push key lookup
+// when the given id is the account's own tech space — the tech space is
+// system-owned and never appears in the space list.
 var ErrIsTechSpace = errors.New("cannot track the tech space")
 
 // ErrIsDerivedSpace is returned by Delete when the target is a
@@ -148,9 +148,7 @@ var ErrIsTechSpace = errors.New("cannot track the tech space")
 // would otherwise wedge the account's well-known derived id forever.
 // The deriving account's row carries a synced set-once `derived` flag
 // (surfaced as SpaceInfo.Derived) that every enforcement point keys
-// on; a joiner of someone else's derived space never gets the flag —
-// they cannot re-derive it, so their removal stays allowed. 1-1
-// spaces keep their own re-derivable delete path.
+// on. 1-1 spaces keep their own re-derivable delete path.
 var ErrIsDerivedSpace = errors.New("derived spaces cannot be deleted")
 
 // ErrBadSpaceType is returned by Create when CreateRequest.SpaceType

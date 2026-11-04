@@ -110,10 +110,14 @@ type PushKeys struct {
 	// SpaceKey is the base64 (std) of the protobuf-marshalled ed25519
 	// private key that identifies the space on the push server
 	// (pushapi Topic.SpaceKey is its public half). Derived from the
-	// ACL's first metadata key — fixed for the space's life.
+	// ACL's first metadata key — for a derived space, which has none, one
+	// derived from the deriving account's key and the space id. Fixed
+	// for the space's life.
 	SpaceKey string
 	// EncKey is the base64 (std) of the raw AES payload key derived
-	// from the CURRENT ACL read key.
+	// from the CURRENT ACL read key. Derived spaces of one account start
+	// with the same read key, so their EncKey and EncKeyId can coincide:
+	// an EncKeyId alone does not name a space.
 	EncKey string
 	// EncKeyId is hex(sha256(raw EncKey bytes)) — the value stamped
 	// into pushapi.Message.KeyId, i.e. the cache key a receiver looks

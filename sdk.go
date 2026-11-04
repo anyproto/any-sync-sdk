@@ -246,7 +246,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 		return !ok || rec.P2PAdvertise
 	})
 
-	// Push notifications (SYN-47): the push node is a direct out-of-band
+	// Push notifications: the push node is a direct out-of-band
 	// peer — register its dial addresses so the pool can reach it, then
 	// bind the client to spaceimpl's ACL-derived key provider. The
 	// service is ALWAYS constructed; unconfigured, its transport is nil

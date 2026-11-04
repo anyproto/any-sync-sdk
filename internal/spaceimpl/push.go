@@ -1,4 +1,4 @@
-// Push-notification key provider (SYN-47) — resolves a space's push
+// Push-notification key provider — resolves a space's push
 // keys from its ACL for internal/pushclient. Same ACL access pattern
 // as payloads.go's aclKeyProvider.
 
@@ -110,10 +110,10 @@ func pushSpaceKey(acl list.AclList, spaceId string) (crypto.PrivKey, error) {
 }
 
 // pushMetadataKey is the ACL's first metadata key — for a 1-1 space the
-// one any-sync derives from the two accounts' keys. A derived ACL (the
-// root record carries no read key, the test any-sync's applyRoot uses)
-// has none, so the SDK derives one from the deriving account's key and
-// the space id; another account (a tracker) gets none.
+// one any-sync derives from the two accounts' keys. A derived ACL (not
+// 1-1, and the root record carries no read key: the test any-sync's
+// applyRoot uses) has none, so the SDK derives one from the deriving
+// account's key and the space id; another account (a tracker) gets none.
 func pushMetadataKey(acl list.AclList, spaceId string) (crypto.PrivKey, error) {
 	recs := acl.Records()
 	if len(recs) == 0 {
@@ -121,7 +121,7 @@ func pushMetadataKey(acl list.AclList, spaceId string) (crypto.PrivKey, error) {
 	}
 	state := acl.AclState()
 	if root, ok := recs[0].Model.(*aclrecordproto.AclRoot); ok &&
-		root.EncryptedReadKey == nil && root.OneToOneInfo == nil {
+		root.EncryptedReadKey == nil && !state.IsOneToOne() {
 		if state.AccountKey() == nil || !recs[0].Identity.Equals(state.Identity()) {
 			return nil, fmt.Errorf("push: derived space %q belongs to another account", spaceId)
 		}

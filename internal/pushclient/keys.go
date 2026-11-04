@@ -1,4 +1,4 @@
-// Package pushclient is the client of the anytype-push-server (SYN-47):
+// Package pushclient is the client of the anytype-push-server:
 // per-space key derivation, the signed/encrypted request builders, the
 // thin DRPC transport, and the account-level service behind
 // SDK.Push() / space.PushAPI.

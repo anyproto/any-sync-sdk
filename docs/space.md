@@ -225,8 +225,9 @@ sticky tombstone would block the account's well-known id forever.
 
 - The deriving account's row carries a synced set-once `derived` flag
   (`SpaceInfo.Derived`; re-running `Derive` adds it to an unflagged row).
-- A joiner of someone else's derived space never gets the flag; they
-  can't re-derive it, so removal stays allowed.
+- A derived space is never shared: the coordinator gives personal and
+  tech spaces no shared-space allowance, so `CreateInvite`,
+  `AddAccounts` and `CreateGuestKey` fail.
 - Enforcement: `Delete` refuses flagged rows (and the tech space id,
   `ErrIsTechSpace`); the space-index handler rejects
   `remoteStatus=deleted` on flagged rows from any writer; the deletion

@@ -148,9 +148,7 @@ var ErrIsTechSpace = errors.New("cannot track the tech space")
 // would otherwise wedge the account's well-known derived id forever.
 // The deriving account's row carries a synced set-once `derived` flag
 // (surfaced as SpaceInfo.Derived) that every enforcement point keys
-// on; a joiner of someone else's derived space never gets the flag —
-// they cannot re-derive it, so their removal stays allowed. 1-1
-// spaces keep their own re-derivable delete path.
+// on. 1-1 spaces keep their own re-derivable delete path.
 var ErrIsDerivedSpace = errors.New("derived spaces cannot be deleted")
 
 // ErrBadSpaceType is returned by Create when CreateRequest.SpaceType

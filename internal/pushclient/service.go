@@ -22,9 +22,9 @@ import (
 var log = logger.NewNamed("pushclient")
 
 // KeysProvider resolves a space's push keys from its ACL: the derived
-// push signing key (from the first metadata key, or for a derived space
-// the deriving account's key and the space id — fixed for the space's
-// life) and the payload
+// push signing key (from the first metadata key — for a derived space
+// one derived from the account key and the space id; fixed for the
+// space's life) and the payload
 // encryption key (from the CURRENT read key — rotates with it).
 // Implemented by spaceimpl.Service.PushKeys.
 type KeysProvider interface {

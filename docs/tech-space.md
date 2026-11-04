@@ -143,9 +143,10 @@ space-view push keys:
 - `spaceKey` — base64 (std) of the protobuf-marshalled ed25519 private
   key identifying the space on the push server (SLIP-10 `m/99999'/1'`
   off the ACL's first metadata key; fixed for the space's life). A
-  derived space's ACL has no metadata key: its seed is SLIP-21
-  `m/SLIP-0021/anysync-sdk/push/derived-space/<spaceId>` off the
-  deriving account's key, so only that account's devices hold it.
+  derived space's ACL has no metadata key, so the SDK derives one per
+  space, as any-sync does for a 1-1 space: an ed25519 key seeded by
+  SLIP-21 `m/SLIP-0021/anysync-sdk/push/derived-space-metadata/<spaceId>`
+  off the deriving account's key. Only that account's devices hold it.
 - `encKey` — base64 (std) of the raw AES payload key (SLIP-21
   `m/SLIP-0021/anytype/space/key` off the current read key; rotates with
   it).

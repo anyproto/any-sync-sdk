@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
+	"github.com/anyproto/any-sync/commonspace/object/acl/aclrecordproto"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list/listtest"
 	"github.com/anyproto/any-sync/commonspace/object/acl/recordverifier"
@@ -53,9 +54,11 @@ func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	got, err := lockedPushSpaceKey(acl, "derived-a")
 	require.NoError(t, err)
 
-	want, err := pushclient.DeriveDerivedSpaceKey(keys.SignKey, "derived-a")
+	meta, err := pushclient.DeriveDerivedSpaceMetadataKey(keys.SignKey, "derived-a")
 	require.NoError(t, err)
-	assert.True(t, want.Equals(got), "a derived space's key comes from the deriving account's key")
+	want, err := pushclient.DeriveSpaceKey(meta)
+	require.NoError(t, err)
+	assert.True(t, want.Equals(got), "a derived space's key comes from a metadata key derived off the account key")
 
 	// Another derived space of the account has the same root: only
 	// the space id separates the push identities.
@@ -113,4 +116,45 @@ func TestPushSpaceKey_RegularAcl(t *testing.T) {
 	want, err := pushclient.DeriveSpaceKey(metaKey)
 	require.NoError(t, err)
 	assert.True(t, want.Equals(got), "a regular space keeps the first-metadata-key derivation")
+}
+
+// A 1-1 space keeps the standard path: any-sync derives its metadata key
+// from the two accounts' keys, so both participants get the same push
+// space key, the one heart derives too.
+func TestPushSpaceKey_OneToOneAcl(t *testing.T) {
+	alice, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	bob, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	shared, err := crypto.GenerateSharedKey(alice.SignKey, bob.SignKey.GetPublic(), crypto.AnysyncOneToOneSpacePath)
+	require.NoError(t, err)
+	sharedPub, err := shared.GetPublic().Marshall()
+	require.NoError(t, err)
+	var writers [][]byte
+	for _, k := range []*accountdata.AccountKeys{alice, bob} {
+		w, err := k.SignKey.GetPublic().Marshall()
+		require.NoError(t, err)
+		writers = append(writers, w)
+	}
+	builder := list.NewAclRecordBuilder("", crypto.NewKeyStorage(), nil, recordverifier.NewValidateFull())
+	root, err := builder.BuildOneToOneRoot(list.RootContent{PrivKey: shared, MasterKey: shared},
+		&aclrecordproto.AclOneToOneInfo{Owner: sharedPub, Writers: writers})
+	require.NoError(t, err)
+
+	var keys []crypto.PrivKey
+	for _, as := range []*accountdata.AccountKeys{alice, bob} {
+		st, err := list.NewInMemoryStorage(root.Id, []*consensusproto.RawRecordWithId{root})
+		require.NoError(t, err)
+		acl, err := list.BuildAclListWithIdentity(as, st, recordverifier.NewValidateFull())
+		require.NoError(t, err)
+		got, err := lockedPushSpaceKey(acl, "one-to-one")
+		require.NoError(t, err)
+		meta, err := acl.AclState().FirstMetadataKey()
+		require.NoError(t, err)
+		want, err := pushclient.DeriveSpaceKey(meta)
+		require.NoError(t, err)
+		assert.True(t, want.Equals(got), "a 1-1 space derives from the ACL's first metadata key")
+		keys = append(keys, got)
+	}
+	assert.True(t, keys[0].Equals(keys[1]), "both 1-1 participants must get the same push space key")
 }

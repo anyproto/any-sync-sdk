@@ -150,6 +150,8 @@ space-view push keys:
   `m/SLIP-0021/anytype/space/key` off the current read key; rotates with
   it).
 - `encKeyId` — hex(sha256(raw `encKey`)) = `pushapi.Message.KeyId`.
+  Derived spaces of one account share a read key, so they share
+  `encKey` and `encKeyId`: a `keyId` alone does not name a space.
 
 Clients read it from `SpaceInfo.PushKeys` and cache
 `{encKeyId → encKey}` append-only in the OS keystore. Absent until the

@@ -42,11 +42,13 @@ const (
 	// encKeyDerivationPath is the SLIP-21 path from the current ACL
 	// read key to the payload encryption key.
 	encKeyDerivationPath = "m/SLIP-0021/anytype/space/key"
-	// derivedSpaceKeyPathPrefix + spaceId is the SLIP-21 path from a
-	// derived space's root read key to its push signing key seed. SDK
-	// only: heart never pushes for derived spaces.
-	derivedSpaceKeyPathPrefix = "m/SLIP-0021/anysync-sdk/push/derived-space/"
 )
+
+// derivedSpaceKeyPathPrefix + spaceId is the SLIP-21 path from a
+// derived space's root read key to its push signing key seed. SDK only
+// (heart never pushes for derived spaces); MUST NOT change either — the
+// keys_test known-answer vector pins it.
+const derivedSpaceKeyPathPrefix = "m/SLIP-0021/anysync-sdk/push/derived-space/"
 
 // DeriveSpaceKey derives the per-space push signing key from the ACL's
 // FIRST metadata key (aclState.FirstMetadataKey — fixed at space

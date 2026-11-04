@@ -114,7 +114,8 @@ type PushKeys struct {
 	// id — fixed for the space's life.
 	SpaceKey string
 	// EncKey is the base64 (std) of the raw AES payload key derived
-	// from the CURRENT ACL read key.
+	// from the CURRENT ACL read key. Derived spaces of one account share
+	// a read key, so they share EncKey and EncKeyId too.
 	EncKey string
 	// EncKeyId is hex(sha256(raw EncKey bytes)) — the value stamped
 	// into pushapi.Message.KeyId, i.e. the cache key a receiver looks

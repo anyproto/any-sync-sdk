@@ -14,47 +14,44 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/pushclient"
 )
 
-// testAcl builds an in-memory ACL from a single root record. A root
-// without a read key change is the derived shape.
-func testAcl(t *testing.T, keys *accountdata.AccountKeys, spaceId string, change list.ReadKeyChangePayload) list.AclList {
+// testAcl builds an in-memory ACL from a single root record, read as
+// the identity `as`. A root without a read key change and without a
+// SpaceId is the derive-V1 shape: every derived space of an account has
+// this same root.
+func testAcl(t *testing.T, owner, as *accountdata.AccountKeys, master crypto.PrivKey, change list.ReadKeyChangePayload) list.AclList {
 	t.Helper()
-	master, _, err := crypto.GenerateRandomEd25519KeyPair()
-	require.NoError(t, err)
-	builder := list.NewAclRecordBuilder("", crypto.NewKeyStorage(), keys, recordverifier.NewValidateFull())
+	builder := list.NewAclRecordBuilder("", crypto.NewKeyStorage(), owner, recordverifier.NewValidateFull())
 	root, err := builder.BuildRoot(list.RootContent{
-		PrivKey:   keys.SignKey,
+		PrivKey:   owner.SignKey,
 		MasterKey: master,
-		SpaceId:   spaceId,
 		Change:    change,
 	})
 	require.NoError(t, err)
 	st, err := list.NewInMemoryStorage(root.Id, []*consensusproto.RawRecordWithId{root})
 	require.NoError(t, err)
-	acl, err := list.BuildAclListWithIdentity(keys, st, recordverifier.NewValidateFull())
+	acl, err := list.BuildAclListWithIdentity(as, st, recordverifier.NewValidateFull())
 	require.NoError(t, err)
 	return acl
 }
 
-func derivePushSpaceKey(t *testing.T, acl list.AclList, spaceId string) crypto.PrivKey {
-	t.Helper()
+func lockedPushSpaceKey(acl list.AclList, spaceId string) (crypto.PrivKey, error) {
 	acl.RLock()
-	derive, err := pushSpaceKeySource(acl, spaceId)
-	acl.RUnlock()
-	require.NoError(t, err)
-	key, err := derive()
-	require.NoError(t, err)
-	return key
+	defer acl.RUnlock()
+	return pushSpaceKey(acl, spaceId)
 }
 
-func TestPushSpaceKeySource_DerivedAcl(t *testing.T) {
+func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	keys, err := accountdata.NewRandom()
 	require.NoError(t, err)
-	acl := testAcl(t, keys, "derived-a", list.ReadKeyChangePayload{})
+	master, _, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	acl := testAcl(t, keys, keys, master, list.ReadKeyChangePayload{})
 
 	_, fmErr := acl.AclState().FirstMetadataKey()
 	require.ErrorIs(t, fmErr, list.ErrNoMetadataKey, "a derived root carries no metadata key")
 
-	got := derivePushSpaceKey(t, acl, "derived-a")
+	got, err := lockedPushSpaceKey(acl, "derived-a")
+	require.NoError(t, err)
 
 	rootReadKey := acl.AclState().Keys()[acl.Id()].ReadKey
 	require.NotNil(t, rootReadKey)
@@ -62,23 +59,40 @@ func TestPushSpaceKeySource_DerivedAcl(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, want.Equals(got))
 
-	// Same account, another derived space: same root read key, a
-	// different push identity.
-	other := derivePushSpaceKey(t, testAcl(t, keys, "derived-b", list.ReadKeyChangePayload{}), "derived-b")
+	// Another derived space of the account has the same root: only
+	// the space id separates the push identities.
+	other, err := lockedPushSpaceKey(acl, "derived-b")
+	require.NoError(t, err)
 	assert.False(t, got.Equals(other))
 }
 
-func TestPushSpaceKeySource_RegularAcl(t *testing.T) {
+func TestPushSpaceKey_DerivedAclWithoutRootReadKey(t *testing.T) {
+	owner, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	tracker, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	master, _, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	acl := testAcl(t, owner, tracker, master, list.ReadKeyChangePayload{})
+
+	_, err = lockedPushSpaceKey(acl, "derived-a")
+	assert.ErrorIs(t, err, list.ErrNoReadKey)
+}
+
+func TestPushSpaceKey_RegularAcl(t *testing.T) {
 	keys, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	master, _, err := crypto.GenerateRandomEd25519KeyPair()
 	require.NoError(t, err)
 	metaKey, _, err := crypto.GenerateRandomEd25519KeyPair()
 	require.NoError(t, err)
-	acl := testAcl(t, keys, "regular", list.ReadKeyChangePayload{
+	acl := testAcl(t, keys, keys, master, list.ReadKeyChangePayload{
 		MetadataKey: metaKey,
 		ReadKey:     crypto.NewAES(),
 	})
 
-	got := derivePushSpaceKey(t, acl, "regular")
+	got, err := lockedPushSpaceKey(acl, "regular")
+	require.NoError(t, err)
 
 	want, err := pushclient.DeriveSpaceKey(metaKey)
 	require.NoError(t, err)

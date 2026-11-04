@@ -30,9 +30,9 @@ type pushKeyCache struct {
 }
 
 // PushKeys implements pushclient.KeysProvider: loads the space (via
-// the app cache), reads the push-key source (pushSpaceKeySource) +
-// CurrentReadKey off its ACL state under RLock, and
-// returns the derived push signing key and payload encryption key.
+// the app cache), reads its push signing key (pushSpaceKey, on a cache
+// miss) and CurrentReadKey off its ACL state under RLock, and returns
+// the push signing key and the derived payload encryption key.
 // Requires read access — a keyless reader/tracker gets an error,
 // matching the server's members-only trust model.
 func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto.PrivKey, encKey crypto.SymKey, err error) {
@@ -44,34 +44,36 @@ func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto
 	if acl == nil {
 		return nil, nil, fmt.Errorf("push: space %q has no acl", spaceId)
 	}
+	c := &s.pushKeys
+	c.mu.Lock()
+	spaceKey, cached := c.spaceKeys[spaceId]
+	c.mu.Unlock()
+
 	acl.RLock()
-	deriveSpaceKey, skErr := pushSpaceKeySource(acl, spaceId)
+	if !cached {
+		spaceKey, err = pushSpaceKey(acl, spaceId)
+	}
 	state := acl.AclState()
 	kid := state.CurrentReadKeyId()
 	readKey, rkErr := state.CurrentReadKey()
 	acl.RUnlock()
-	if skErr != nil {
-		return nil, nil, skErr
+	if err != nil {
+		return nil, nil, err
 	}
 	if rkErr != nil || readKey == nil {
 		return nil, nil, fmt.Errorf("push: current read key for %q: %w", spaceId, rkErr)
 	}
 
-	c := &s.pushKeys
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	spaceKey, ok := c.spaceKeys[spaceId]
-	if !ok {
-		if spaceKey, err = deriveSpaceKey(); err != nil {
-			return nil, nil, fmt.Errorf("push: derive space key for %q: %w", spaceId, err)
-		}
+	if !cached {
 		if c.spaceKeys == nil {
 			c.spaceKeys = make(map[string]crypto.PrivKey)
 		}
 		c.spaceKeys[spaceId] = spaceKey
 	}
 	encCacheKey := spaceId + "/" + kid
-	encKey, ok = c.encKeys[encCacheKey]
+	encKey, ok := c.encKeys[encCacheKey]
 	if !ok {
 		if encKey, err = pushclient.DeriveEncKey(readKey); err != nil {
 			return nil, nil, fmt.Errorf("push: derive enc key for %q: %w", spaceId, err)
@@ -84,31 +86,34 @@ func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto
 	return spaceKey, encKey, nil
 }
 
-// pushSpaceKeySource reads the input of the space's push signing key
-// off its ACL (caller holds the read lock) and returns the derivation
-// to run outside it. A derived ACL — the root record carries no read
-// key, the test any-sync's applyRoot uses — has no metadata key, so its
-// key comes from the root read key and the space id.
-func pushSpaceKeySource(acl list.AclList, spaceId string) (func() (crypto.PrivKey, error), error) {
+// pushSpaceKey derives the space's push signing key from its ACL;
+// the caller holds the read lock. A derived ACL — the root record
+// carries no read key, the test any-sync's applyRoot uses — has no
+// metadata key, so its key comes from the root read key and the space
+// id: every derived space of an account has the same root.
+func pushSpaceKey(acl list.AclList, spaceId string) (crypto.PrivKey, error) {
 	recs := acl.Records()
 	if len(recs) == 0 {
 		return nil, fmt.Errorf("push: space %q: empty acl", spaceId)
 	}
+	var key crypto.PrivKey
+	var err error
 	if root, ok := recs[0].Model.(*aclrecordproto.AclRoot); ok &&
 		root.EncryptedReadKey == nil && root.OneToOneInfo == nil {
 		rootReadKey := acl.AclState().Keys()[acl.Id()].ReadKey
 		if rootReadKey == nil {
-			return nil, fmt.Errorf("push: derived space %q: no root read key", spaceId)
+			return nil, fmt.Errorf("push: derived space %q: root %w", spaceId, list.ErrNoReadKey)
 		}
-		return func() (crypto.PrivKey, error) {
-			return pushclient.DeriveDerivedSpaceKey(rootReadKey, spaceId)
-		}, nil
+		key, err = pushclient.DeriveDerivedSpaceKey(rootReadKey, spaceId)
+	} else {
+		firstMeta, fmErr := acl.AclState().FirstMetadataKey()
+		if fmErr != nil {
+			return nil, fmt.Errorf("push: first metadata key for %q: %w", spaceId, fmErr)
+		}
+		key, err = pushclient.DeriveSpaceKey(firstMeta)
 	}
-	firstMeta, err := acl.AclState().FirstMetadataKey()
 	if err != nil {
-		return nil, fmt.Errorf("push: first metadata key for %q: %w", spaceId, err)
+		return nil, fmt.Errorf("push: derive space key for %q: %w", spaceId, err)
 	}
-	return func() (crypto.PrivKey, error) {
-		return pushclient.DeriveSpaceKey(firstMeta)
-	}, nil
+	return key, nil
 }

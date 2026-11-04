@@ -60,20 +60,7 @@ func TestPushKeys_MirroredToSpaceRow(t *testing.T) {
 
 	// The mirror is primed at wiring time but runs on its own
 	// goroutine — poll the space list until the row carries it.
-	var got *space.PushKeys
-	require.Eventually(t, func() bool {
-		list, lerr := sdk.Spaces().List(ctx)
-		if lerr != nil {
-			return false
-		}
-		for _, info := range list {
-			if info.Id == sp.Id() && info.PushKeys != nil {
-				got = info.PushKeys
-				return true
-			}
-		}
-		return false
-	}, 15*time.Second, 100*time.Millisecond, "push keys should be mirrored onto the space row")
+	got := waitMirroredPushKeys(t, ctx, sdk, sp.Id())
 
 	// EncKeyId is recomputable from EncKey alone — the client-side
 	// cache invariant.

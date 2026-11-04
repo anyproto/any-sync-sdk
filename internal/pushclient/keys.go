@@ -75,9 +75,8 @@ func DeriveSpaceKey(firstMetadataKey crypto.PrivKey) (crypto.PrivKey, error) {
 
 // DeriveDerivedSpaceKey derives the push signing key of a derived
 // space, whose ACL carries no metadata key, from the deriving account's
-// key and the space id. The account key never enters an ACL record, so
-// an invite into one derived space opens no other space's push
-// identity; only the deriving account's devices hold the key.
+// key and the space id. A derived space is never shared, so only the
+// deriving account's devices hold the key.
 func DeriveDerivedSpaceKey(accountKey crypto.PrivKey, spaceId string) (crypto.PrivKey, error) {
 	if accountKey == nil {
 		return nil, errors.New("pushclient: nil account key")

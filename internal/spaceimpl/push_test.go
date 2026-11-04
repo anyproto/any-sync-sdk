@@ -80,8 +80,8 @@ func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	assert.True(t, got.Equals(rotated), "the push space key is fixed for the space's life")
 }
 
-// Another account that tracks or joined the derived space gets no push
-// key: only the deriving account's devices can derive it.
+// Another account that tracks the derived space gets no push key: only
+// the deriving account's devices can derive it.
 func TestPushSpaceKey_DerivedAclOfAnotherAccount(t *testing.T) {
 	owner, err := accountdata.NewRandom()
 	require.NoError(t, err)

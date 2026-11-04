@@ -98,7 +98,7 @@ func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto
 // the caller holds the read lock. A derived ACL — the root record
 // carries no read key, the test any-sync's applyRoot uses — has no
 // metadata key, so its key comes from the deriving account's key and
-// the space id; another account that joined it gets no push key.
+// the space id; another account (a tracker) gets no push key.
 func pushSpaceKey(acl list.AclList, spaceId string) (crypto.PrivKey, error) {
 	recs := acl.Records()
 	if len(recs) == 0 {

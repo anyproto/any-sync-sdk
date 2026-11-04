@@ -5,6 +5,7 @@ import (
 
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list/listtest"
 	"github.com/anyproto/any-sync/commonspace/object/acl/recordverifier"
 	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/util/crypto"
@@ -43,9 +44,8 @@ func lockedPushSpaceKey(acl list.AclList, spaceId string) (crypto.PrivKey, error
 func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	keys, err := accountdata.NewRandom()
 	require.NoError(t, err)
-	master, _, err := crypto.GenerateRandomEd25519KeyPair()
-	require.NoError(t, err)
-	acl := testAcl(t, keys, keys, master, list.ReadKeyChangePayload{})
+	// derive-V1 signs the root with the account key as the master key
+	acl := testAcl(t, keys, keys, keys.SignKey, list.ReadKeyChangePayload{})
 
 	_, fmErr := acl.AclState().FirstMetadataKey()
 	require.ErrorIs(t, fmErr, list.ErrNoMetadataKey, "a derived root carries no metadata key")
@@ -53,8 +53,11 @@ func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	got, err := lockedPushSpaceKey(acl, "derived-a")
 	require.NoError(t, err)
 
-	rootReadKey := acl.AclState().Keys()[acl.Id()].ReadKey
-	require.NotNil(t, rootReadKey)
+	// A derived root's read key is any-sync's account-derived key.
+	signRaw, err := keys.SignKey.Raw()
+	require.NoError(t, err)
+	rootReadKey, err := crypto.DeriveSymmetricKey(signRaw, crypto.AnysyncSpacePath)
+	require.NoError(t, err)
 	want, err := pushclient.DeriveDerivedSpaceKey(rootReadKey, "derived-a")
 	require.NoError(t, err)
 	assert.True(t, want.Equals(got))
@@ -64,6 +67,22 @@ func TestPushSpaceKey_DerivedAcl(t *testing.T) {
 	other, err := lockedPushSpaceKey(acl, "derived-b")
 	require.NoError(t, err)
 	assert.False(t, got.Equals(other))
+
+	// A read-key rotation leaves the push identity unchanged.
+	metaKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	acl.Lock()
+	rec, err := acl.RecordBuilder().BuildReadKeyChange(list.ReadKeyChangePayload{
+		MetadataKey: metaKey,
+		ReadKey:     crypto.NewAES(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, acl.AddRawRecord(listtest.WrapAclRecord(rec)))
+	acl.Unlock()
+	require.NotEqual(t, acl.Id(), acl.AclState().CurrentReadKeyId(), "the rotation must have applied")
+	rotated, err := lockedPushSpaceKey(acl, "derived-a")
+	require.NoError(t, err)
+	assert.True(t, got.Equals(rotated), "the push space key is fixed for the space's life")
 }
 
 func TestPushSpaceKey_DerivedAclWithoutRootReadKey(t *testing.T) {

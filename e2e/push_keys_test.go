@@ -75,9 +75,7 @@ func TestPushKeys_MirroredToSpaceRow(t *testing.T) {
 	spaceKey, encKey, err := prov.PushKeys(ctx, sp.Id())
 	require.NoError(t, err)
 
-	wantEncRaw, err := encKey.Raw()
-	require.NoError(t, err)
-	assert.Equal(t, wantEncRaw, encRaw, "mirrored enc key must match the sender-side derivation")
+	assert.Equal(t, rawSymKey(t, encKey), encRaw, "mirrored enc key must match the sender-side derivation")
 
 	skRaw, err := base64.StdEncoding.DecodeString(got.SpaceKey)
 	require.NoError(t, err)

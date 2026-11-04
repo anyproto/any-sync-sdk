@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/internal/pushclient"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // pushKeyCache holds the per-space derived push keys. The space
@@ -36,6 +37,10 @@ type pushKeyCache struct {
 // Requires read access — a keyless reader/tracker gets an error,
 // matching the server's members-only trust model.
 func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto.PrivKey, encKey crypto.SymKey, err error) {
+	// The tech space has a derived root too, but never pushes.
+	if s.tsp != nil && spaceId == s.tsp.SpaceId() {
+		return nil, nil, fmt.Errorf("push: %w", space.ErrIsTechSpace)
+	}
 	handle, err := s.app.GetSpace(ctx, spaceId)
 	if err != nil {
 		return nil, nil, fmt.Errorf("push: load space %q: %w", spaceId, err)
@@ -60,7 +65,10 @@ func (s *Service) PushKeys(ctx context.Context, spaceId string) (spaceKey crypto
 	if err != nil {
 		return nil, nil, err
 	}
-	if rkErr != nil || readKey == nil {
+	if rkErr == nil && readKey == nil {
+		rkErr = list.ErrNoReadKey
+	}
+	if rkErr != nil {
 		return nil, nil, fmt.Errorf("push: current read key for %q: %w", spaceId, rkErr)
 	}
 

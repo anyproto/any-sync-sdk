@@ -114,6 +114,15 @@ func TestDeriveDerivedSpaceKey_MatchesInlineDerivation(t *testing.T) {
 	assert.Equal(t, rawKey(t, want), rawKey(t, got))
 }
 
+// Known-answer vector (checked against an independent SLIP-21 +
+// ed25519 computation): catches a change inside the any-sync derivation
+// helpers, which the inline re-derivation above shares.
+func TestDeriveDerivedSpaceKey_KnownAnswer(t *testing.T) {
+	got, err := DeriveDerivedSpaceKey(testSymKey(t, 0x2c), "bafyreiexample.derived")
+	require.NoError(t, err)
+	assert.Equal(t, "072219e4e88f302d0572a8e97a8f8082e4ef8b7dca076312c42a31e23cb51b4b", hex.EncodeToString(rawKey(t, got.GetPublic())))
+}
+
 func TestDeriveDerivedSpaceKey_InvalidInput(t *testing.T) {
 	_, err := DeriveDerivedSpaceKey(nil, "space-a")
 	assert.Error(t, err)

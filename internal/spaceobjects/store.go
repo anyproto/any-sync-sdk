@@ -2792,7 +2792,8 @@ func (s *Store) releaseHistoryHandle(objectId string) {
 
 // openTree picks PutTree vs BuildTree based on whether the caller has
 // a creation payload in hand. Falls through to BuildTree when PutTree
-// reports ErrTreeExists — supports idempotent Derive.
+// reports ErrTreeExists — supports idempotent Derive. BuildTree itself
+// is retried once on ErrTreeExists (buildTreeOrStored).
 //
 // Sets SetDeferredUpdater(true) on the resulting tree: any-sync's
 // default order in AddRawChangesWithUpdater is
@@ -2836,12 +2837,17 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 		opts.Probe = true
 		opts.TreeValidator = s.selectiveTreeValidator(true)
 	}
-	tree, err := tb.BuildTree(ctx, objectId, opts)
+	build := func(o objecttreebuilder.BuildTreeOpts) (objecttree.ObjectTree, error) {
+		return buildTreeOrStored(func() (objecttree.ObjectTree, error) {
+			return tb.BuildTree(ctx, objectId, o)
+		})
+	}
+	tree, err := build(opts)
 	if errors.Is(err, errProbeSelectedType) {
 		// Selected type — fetch for real. The validator re-checks the
 		// type (a different peer may serve this request) and then
 		// delegates to any-sync's default validation.
-		tree, err = tb.BuildTree(ctx, objectId, objecttreebuilder.BuildTreeOpts{
+		tree, err = build(objecttreebuilder.BuildTreeOpts{
 			Listener:      listener,
 			TreeValidator: s.selectiveTreeValidator(false),
 		})
@@ -2851,6 +2857,23 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 	}
 	deferIfSyncTree(tree)
 	return tree, nil
+}
+
+// buildTreeOrStored runs build, and once more when it reports
+// treestorage.ErrTreeExists. BuildTree fetches a tree missing from
+// storage from a peer, and the sync job's storage fetcher
+// (anysyncx.storageFetcher) stores trees outside the object cache's
+// per-id load lock: when it stores this tree while the request is out,
+// any-sync refuses the peer's answer with ErrTreeExists instead of
+// opening the stored copy. The tree is in storage by then, so the second
+// build takes the local path, which never reports ErrTreeExists; one
+// retry is enough, and any other error is returned as is.
+func buildTreeOrStored(build func() (objecttree.ObjectTree, error)) (objecttree.ObjectTree, error) {
+	tree, err := build()
+	if errors.Is(err, treestorage.ErrTreeExists) {
+		tree, err = build()
+	}
+	return tree, err
 }
 
 // treeOpenError wraps a failure to open an object's tree, joining

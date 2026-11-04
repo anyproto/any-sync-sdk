@@ -398,18 +398,59 @@ const (
 	objectCacheGC  = 20 * time.Second
 )
 
-// loadPayloadKey is the context-key type for the optional
-// TreeStorageCreatePayload threaded into LoadFunc by Create / Derive
-// / PutTreeFromPayload. Absent → LoadFunc takes the BuildTree path.
+// loadPayloadKey is the context-key type for the optional creation
+// payload getWithPayload threads into the cache's LoadFunc. Absent →
+// the load takes the BuildTree path.
 type loadPayloadKey struct{}
 
-func ctxWithLoadPayload(ctx context.Context, p *treestorage.TreeStorageCreatePayload) context.Context {
-	return context.WithValue(ctx, loadPayloadKey{}, p)
+// loadPayload carries a TreeStorageCreatePayload to the LoadFunc; ran
+// records that a load started under the caller's ctx.
+type loadPayload struct {
+	payload *treestorage.TreeStorageCreatePayload
+	ran     atomic.Bool
 }
 
+// loadPayloadFromCtx is the LoadFunc's first step: it marks the
+// caller's payload as run and returns it, nil when the load carries
+// none.
 func loadPayloadFromCtx(ctx context.Context) *treestorage.TreeStorageCreatePayload {
-	p, _ := ctx.Value(loadPayloadKey{}).(*treestorage.TreeStorageCreatePayload)
-	return p
+	lp, _ := ctx.Value(loadPayloadKey{}).(*loadPayload)
+	if lp == nil {
+		return nil
+	}
+	lp.ran.Store(true)
+	return lp.payload
+}
+
+// maxForeignRetries bounds how many times getWithPayload runs Get
+// again after a load another caller ran.
+const maxForeignRetries = 3
+
+// getWithPayload is Get for a caller that holds objectId's creation
+// payload (Create, Derive, PutTreeFromPayload). ocache runs one load
+// per id, under the first caller's ctx, and hands its outcome to every
+// caller waiting on the id: a Get that arrives while another caller's
+// load of the same id is in flight (a sync pull of a tree another peer
+// derived) gets that load's outcome, with its own payload unread. That
+// load's failure says nothing about this caller, whose payload is
+// enough on its own, so Get runs again; the failure of a load that ran
+// under this caller's ctx is returned. A closed cache and a cancelled
+// ctx end the loop.
+func (s *Store) getWithPayload(ctx context.Context, objectId string, payload *treestorage.TreeStorageCreatePayload) (*object.Object, error) {
+	for retries := 0; ; retries++ {
+		lp := &loadPayload{payload: payload}
+		obj, err := s.Get(context.WithValue(ctx, loadPayloadKey{}, lp), objectId)
+		if err == nil || lp.ran.Load() || retries == maxForeignRetries || errors.Is(err, ocache.ErrClosed) || ctx.Err() != nil {
+			return obj, err
+		}
+	}
+}
+
+// load is the cache's LoadFunc. The caller's payload is read first, so
+// a load under the caller's ctx is marked as run before anything can
+// fail (getWithPayload).
+func (s *Store) load(ctx context.Context, objectId string) (ocache.Object, error) {
+	return s.loadObject(ctx, objectId, loadPayloadFromCtx(ctx))
 }
 
 // SystemDataset is a per-store type-less built-in: a handler
@@ -687,7 +728,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 		}
 	}
 	s.cache = ocache.New(
-		s.loadObject,
+		s.load,
 		ocache.WithTTL(objectCacheTTL),
 		ocache.WithGCPeriod(objectCacheGC),
 	)
@@ -1789,7 +1830,7 @@ func (s *Store) Drop(objectId string) {
 // locally yet. Falls back to BuildTree on ErrTreeExists, matching
 // the Derive idempotency contract.
 func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.TreeStorageCreatePayload) (*object.Object, error) {
-	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
+	return s.getWithPayload(ctx, payload.RootRawChange.Id, &payload)
 }
 
 // DeleteTree reflects an any-sync tree deletion into local state: it
@@ -2447,7 +2488,7 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: CreateTree: %w", err)
 	}
-	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
+	return s.getWithPayload(ctx, payload.RootRawChange.Id, &payload)
 }
 
 // DeriveId computes the deterministic objectId Derive(opts) would
@@ -2536,8 +2577,8 @@ func (s *Store) TreeIdsByChangeType(ctx context.Context, changeType string) ([]s
 
 // Derive makes a deterministic object on the space. Idempotent — a
 // second Derive with the same opts.ChangePayload returns the same
-// objectId. If the tree already exists locally, ocache's per-id
-// LoadFunc serialization deduplicates parallel callers.
+// objectId. ocache shares one load among parallel callers;
+// getWithPayload retries one it did not run.
 //
 // A child (opts.ParentId set) that is already stored here is loaded as
 // is, whatever its parent's local state: any-sync stores a child in any
@@ -2576,7 +2617,7 @@ func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, er
 		Changes:       []*treechangeproto.RawTreeChangeWithId{root},
 		Heads:         []string{root.Id},
 	}
-	return s.Get(ctxWithLoadPayload(ctx, &payload), root.Id)
+	return s.getWithPayload(ctx, root.Id, &payload)
 }
 
 // CheckDeriveParent runs deriveChildGate for the child childId bound to
@@ -2636,14 +2677,13 @@ func deriveChildGate(ctx context.Context, getEntry func(context.Context, string)
 	return false, nil
 }
 
-// loadObject is the ocache.LoadFunc. Builds Controller + Object +
-// any-sync tree + ColdRestore in one atomic step under ocache's
-// per-id load lock. Reads an optional TreeStorageCreatePayload from
-// ctx (set by Create / Derive / PutTreeFromPayload via
-// ctxWithLoadPayload) — payload present takes the PutTree path with
-// BuildTree fallback on ErrTreeExists; absent takes BuildTree
-// directly.
-func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object, error) {
+// loadObject is the body of the cache's LoadFunc (load). Builds
+// Controller + Object + any-sync tree + ColdRestore in one atomic step
+// under ocache's per-id load lock. payload is the caller's creation
+// payload (getWithPayload: Create / Derive / PutTreeFromPayload):
+// present takes the PutTree path with BuildTree fallback on
+// ErrTreeExists; absent takes BuildTree directly.
+func (s *Store) loadObject(ctx context.Context, objectId string, payload *treestorage.TreeStorageCreatePayload) (ocache.Object, error) {
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
@@ -2661,7 +2701,6 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	stale := ctrl.StaleDatasets()
 	resume := len(stale) == 0 && ctrl.ReindexPending()
 	rebuilding := len(stale) > 0 || resume
-	payload := loadPayloadFromCtx(ctx)
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
 	// tracking ON and merge the published frontiers after. Only when
@@ -2792,7 +2831,8 @@ func (s *Store) releaseHistoryHandle(objectId string) {
 
 // openTree picks PutTree vs BuildTree based on whether the caller has
 // a creation payload in hand. Falls through to BuildTree when PutTree
-// reports ErrTreeExists — supports idempotent Derive.
+// reports ErrTreeExists — supports idempotent Derive. BuildTree itself
+// is retried once on ErrTreeExists (buildTreeOrStored).
 //
 // Sets SetDeferredUpdater(true) on the resulting tree: any-sync's
 // default order in AddRawChangesWithUpdater is
@@ -2836,12 +2876,17 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 		opts.Probe = true
 		opts.TreeValidator = s.selectiveTreeValidator(true)
 	}
-	tree, err := tb.BuildTree(ctx, objectId, opts)
+	build := func(o objecttreebuilder.BuildTreeOpts) (objecttree.ObjectTree, error) {
+		return buildTreeOrStored(func() (objecttree.ObjectTree, error) {
+			return tb.BuildTree(ctx, objectId, o)
+		})
+	}
+	tree, err := build(opts)
 	if errors.Is(err, errProbeSelectedType) {
 		// Selected type — fetch for real. The validator re-checks the
 		// type (a different peer may serve this request) and then
 		// delegates to any-sync's default validation.
-		tree, err = tb.BuildTree(ctx, objectId, objecttreebuilder.BuildTreeOpts{
+		tree, err = build(objecttreebuilder.BuildTreeOpts{
 			Listener:      listener,
 			TreeValidator: s.selectiveTreeValidator(false),
 		})
@@ -2851,6 +2896,23 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 	}
 	deferIfSyncTree(tree)
 	return tree, nil
+}
+
+// buildTreeOrStored runs build, and once more when it reports
+// treestorage.ErrTreeExists. BuildTree fetches a tree missing from
+// storage from a peer, and the sync job's storage fetcher
+// (anysyncx.storageFetcher) stores trees outside the object cache's
+// per-id load lock: when it stores this tree while the request is out,
+// any-sync refuses the peer's answer with ErrTreeExists instead of
+// opening the stored copy. The tree is in storage by then, so the second
+// build takes the local path, which never reports ErrTreeExists; one
+// retry is enough, and any other error is returned as is.
+func buildTreeOrStored(build func() (objecttree.ObjectTree, error)) (objecttree.ObjectTree, error) {
+	tree, err := build()
+	if errors.Is(err, treestorage.ErrTreeExists) {
+		tree, err = build()
+	}
+	return tree, err
 }
 
 // treeOpenError wraps a failure to open an object's tree, joining

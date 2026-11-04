@@ -11,8 +11,9 @@
 // Trust model (mirrors anytype-heart's core/pushnotification): the
 // server never sees space content or space keys. Each space gets a
 // dedicated ed25519 "push space key" derived from the ACL's first
-// metadata key — topics are signed with it so only members can
-// subscribe/publish, and the server verifies against the raw public
+// metadata key (a derived space has none: DeriveDerivedSpaceKey) —
+// topics are signed with it so only members can subscribe/publish,
+// and the server verifies against the raw public
 // key it was handed at CreateSpace time. Notification payloads are
 // encrypted with a symmetric key derived from the space's CURRENT read
 // key, so the server relays opaque ciphertext; receivers pick the
@@ -41,6 +42,10 @@ const (
 	// encKeyDerivationPath is the SLIP-21 path from the current ACL
 	// read key to the payload encryption key.
 	encKeyDerivationPath = "m/SLIP-0021/anytype/space/key"
+	// derivedSpaceKeyPathPrefix + spaceId is the SLIP-21 path from a
+	// derived space's root read key to its push signing key seed. SDK
+	// only: heart never pushes for derived spaces.
+	derivedSpaceKeyPathPrefix = "m/SLIP-0021/anysync-sdk/push/derived-space/"
 )
 
 // DeriveSpaceKey derives the per-space push signing key from the ACL's
@@ -62,6 +67,34 @@ func DeriveSpaceKey(firstMetadataKey crypto.PrivKey) (crypto.PrivKey, error) {
 		return nil, err
 	}
 	key, _, err := crypto.GenerateEd25519Key(bytes.NewReader(node.RawSeed()))
+	return key, err
+}
+
+// DeriveDerivedSpaceKey derives the push signing key of a derived
+// space, whose ACL carries no metadata key, from its root read key.
+// That read key comes from the account key alone and is shared by
+// every derived space of the account, so the space id is part of the
+// path: one push-server identity per space, the same on every device.
+func DeriveDerivedSpaceKey(rootReadKey crypto.SymKey, spaceId string) (crypto.PrivKey, error) {
+	if rootReadKey == nil {
+		return nil, errors.New("pushclient: nil root read key")
+	}
+	if spaceId == "" {
+		return nil, errors.New("pushclient: empty space id")
+	}
+	raw, err := rootReadKey.Raw()
+	if err != nil {
+		return nil, err
+	}
+	seed, err := crypto.DeriveSymmetricKey(raw, derivedSpaceKeyPathPrefix+spaceId)
+	if err != nil {
+		return nil, err
+	}
+	seedRaw, err := seed.Raw()
+	if err != nil {
+		return nil, err
+	}
+	key, _, err := crypto.GenerateEd25519Key(bytes.NewReader(seedRaw))
 	return key, err
 }
 

@@ -77,6 +77,50 @@ func TestDeriveSpaceKey_NilInput(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// Every derived space of an account shares one root read key, so the
+// space id alone must separate their push identities.
+func TestDeriveDerivedSpaceKey_PerSpace(t *testing.T) {
+	rootReadKey := testSymKey(t, 0x05)
+
+	k1, err := DeriveDerivedSpaceKey(rootReadKey, "space-a")
+	require.NoError(t, err)
+	k2, err := DeriveDerivedSpaceKey(rootReadKey, "space-a")
+	require.NoError(t, err)
+	assert.Equal(t, rawKey(t, k1), rawKey(t, k2), "same root read key and space id must derive the same push key")
+
+	other, err := DeriveDerivedSpaceKey(rootReadKey, "space-b")
+	require.NoError(t, err)
+	assert.NotEqual(t, rawKey(t, k1), rawKey(t, other), "derived spaces sharing a root read key must get different push keys")
+
+	otherKey, err := DeriveDerivedSpaceKey(testSymKey(t, 0x06), "space-a")
+	require.NoError(t, err)
+	assert.NotEqual(t, rawKey(t, k1), rawKey(t, otherKey), "different root read keys must derive different push keys")
+}
+
+// Pins the SLIP-21 path: an edit would re-key every derived space on
+// the push server. The inline re-derivation hardcodes the literal.
+func TestDeriveDerivedSpaceKey_MatchesInlineDerivation(t *testing.T) {
+	rootReadKey := testSymKey(t, 0x2c)
+	const spaceId = "bafyreiexample.derived"
+
+	got, err := DeriveDerivedSpaceKey(rootReadKey, spaceId)
+	require.NoError(t, err)
+
+	seed, err := crypto.DeriveSymmetricKey(rawKey(t, rootReadKey), "m/SLIP-0021/anysync-sdk/push/derived-space/"+spaceId)
+	require.NoError(t, err)
+	want, _, err := crypto.GenerateEd25519Key(bytes.NewReader(rawKey(t, seed)))
+	require.NoError(t, err)
+
+	assert.Equal(t, rawKey(t, want), rawKey(t, got))
+}
+
+func TestDeriveDerivedSpaceKey_InvalidInput(t *testing.T) {
+	_, err := DeriveDerivedSpaceKey(nil, "space-a")
+	assert.Error(t, err)
+	_, err = DeriveDerivedSpaceKey(testSymKey(t, 0x07), "")
+	assert.Error(t, err)
+}
+
 func TestDeriveEncKey_Deterministic(t *testing.T) {
 	readKey := testSymKey(t, 0x03)
 

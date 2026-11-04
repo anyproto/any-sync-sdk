@@ -98,3 +98,71 @@ func TestPushKeys_MirroredToSpaceRow(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, spaceKey.Equals(skBack), "mirrored space key must match the sender-side derivation")
 }
+
+// TestPushKeys_DerivedSpace: a derived space's ACL has no metadata key,
+// so its push space key comes from the root read key and the space id.
+// Two derived spaces of one account share that read key and must still
+// get distinct push identities, each mirrored onto its space row.
+func TestPushKeys_DerivedSpace(t *testing.T) {
+	t.Parallel()
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("staging config not available at %s: %v", confPath, err)
+	}
+
+	cfg := config.Config{
+		Storage: config.Storage{
+			DataDir:  t.TempDir(),
+			Topology: config.StorageShared,
+		},
+		Network: config.Network{NodeConfYAML: yaml},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+
+	prov, ok := sdk.Spaces().(pushKeysProvider)
+	require.True(t, ok, "Spaces() impl should expose PushKeys")
+
+	spaceKeys := map[string]crypto.PrivKey{}
+	for _, seed := range []string{"push-keys-derived-a", "push-keys-derived-b"} {
+		sp, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: []byte(seed), Name: seed})
+		require.NoError(t, err)
+
+		spaceKey, _, err := prov.PushKeys(ctx, sp.Id())
+		require.NoError(t, err, "a derived space must have push keys")
+		spaceKeys[sp.Id()] = spaceKey
+
+		var got *space.PushKeys
+		require.Eventually(t, func() bool {
+			list, lerr := sdk.Spaces().List(ctx)
+			if lerr != nil {
+				return false
+			}
+			for _, info := range list {
+				if info.Id == sp.Id() && info.PushKeys != nil {
+					got = info.PushKeys
+					return true
+				}
+			}
+			return false
+		}, 15*time.Second, 100*time.Millisecond, "push keys should be mirrored onto the derived space's row")
+
+		skRaw, err := base64.StdEncoding.DecodeString(got.SpaceKey)
+		require.NoError(t, err)
+		skBack, err := crypto.UnmarshalEd25519PrivateKeyProto(skRaw)
+		require.NoError(t, err)
+		assert.True(t, spaceKey.Equals(skBack), "mirrored space key must match the sender-side derivation")
+	}
+
+	require.Len(t, spaceKeys, 2)
+	var keys []crypto.PrivKey
+	for _, k := range spaceKeys {
+		keys = append(keys, k)
+	}
+	assert.False(t, keys[0].Equals(keys[1]), "derived spaces must get distinct push space keys")
+}

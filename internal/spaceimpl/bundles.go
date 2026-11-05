@@ -826,52 +826,56 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	if bd.RootId == "" || loserRootId == bd.RootId || !slices.Contains(bd.Roots, loserRootId) {
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleNotLoser, loserRootId)
 	}
-	present, err := b.deleteRootTree(ctx, loserRootId)
-	if err != nil {
-		return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
+	if e, err := b.parent.store.TreeEntry(ctx, loserRootId); err == nil {
+		if e.Deleted {
+			return nil // already resolved
+		}
+		// Deletion needs the loser's local head entry (any-sync settings
+		// delete has no delete-by-id) — absent means "not synced here
+		// yet", a retryable state with its own sentinel.
+		if !e.Present {
+			return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, loserRootId)
+		}
 	}
-	if !present {
-		// Not synced here yet: a retryable state with its own sentinel,
-		// not a storage error.
-		return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, loserRootId)
+	if err := b.deleteRootTree(ctx, loserRootId); err != nil {
+		// Entry raced away between the probe and the delete — the same
+		// retryable state.
+		if e, derr := b.parent.store.TreeEntry(ctx, loserRootId); derr == nil && !e.Present {
+			return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, loserRootId)
+		}
+		return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
 	}
 	return nil
 }
 
-// deleteRootTree deletes a root's tree, idempotently: a tree already
-// deleted is nil. Deletion needs the tree's local head entry (any-sync
-// settings delete has no delete-by-id), so an absent tree is reported
-// as present=false and left alone, the caller's sentinel to choose.
-func (b *bundlesAPI) deleteRootTree(ctx context.Context, rootId string) (present bool, err error) {
-	if deleted, derr := b.parent.store.TreeDeleted(ctx, rootId); derr == nil && deleted {
-		return true, nil
+// deleteRootTree deletes a root's tree; a tree another deleter raced
+// us to is nil, like one already deleted.
+func (b *bundlesAPI) deleteRootTree(ctx context.Context, rootId string) error {
+	err := b.parent.objects.Delete(ctx, rootId)
+	if err == nil {
+		return nil
 	}
-	if _, present, perr := b.parent.store.TreeIsDerived(ctx, rootId); perr == nil && !present {
-		return false, nil
+	if e, derr := b.parent.store.TreeEntry(ctx, rootId); derr == nil && e.Deleted {
+		return nil
 	}
-	if err = b.parent.objects.Delete(ctx, rootId); err == nil {
-		return true, nil
-	}
-	// Another deleter may have raced us — re-check before surfacing.
-	if deleted, derr := b.parent.store.TreeDeleted(ctx, rootId); derr == nil && deleted {
-		return true, nil
-	}
-	// Entry raced away between the probe above and the delete.
-	if _, present, perr := b.parent.store.TreeIsDerived(ctx, rootId); perr == nil && !present {
-		return false, nil
-	}
-	return true, err
+	return err
 }
 
-// Uninstall deletes the losers first, then the winner: the winner's
-// death is what reads as uninstalled, so by the time a reader sees it
-// every loser this device could delete is gone, and a fresh install
-// inherits nothing. A loser whose tree is not local stays claimed and
-// surfaces as a loser of the next install.
+// Uninstall checks every tree before the first delete, so a refusal
+// leaves the install whole, then deletes the losers and the winner
+// last: the winner's death is what reads as uninstalled, so by then no
+// loser is left for a fresh install to inherit.
 func (b *bundlesAPI) Uninstall(ctx context.Context, bundleId string) error {
 	if bundleId == "" {
 		return fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
 	}
+	if err := b.parent.writeGate(ctx); err != nil {
+		return err
+	}
+	l := b.lockFor(bundleId)
+	l.Lock()
+	defer l.Unlock()
+
 	obj, err := b.readIndexObj(ctx)
 	if err != nil {
 		return err
@@ -884,25 +888,33 @@ func (b *bundlesAPI) Uninstall(ctx context.Context, bundleId string) error {
 	if bd.Derived {
 		return fmt.Errorf("spaceimpl: bundles: uninstall %q: %w: the install is derived", bundleId, settings.ErrCantDeleteDerivedObject)
 	}
-	for _, loser := range bd.Losers {
-		present, err := b.deleteRootTree(ctx, loser)
+	if bd.RootId == "" {
+		return nil // nothing registered yet
+	}
+	var todo []string
+	for _, id := range append(slices.Clone(bd.Losers), bd.RootId) {
+		e, err := b.parent.store.TreeEntry(ctx, id)
 		if err != nil {
-			return fmt.Errorf("spaceimpl: bundles: uninstall %q: delete loser %q: %w", bundleId, loser, err)
+			return fmt.Errorf("spaceimpl: bundles: uninstall %q: tree %q: %w", bundleId, id, err)
 		}
-		if !present {
-			bundleLog.Warn("uninstall leaves a loser whose tree is not local",
-				zap.String("bundle", bundleId), zap.String("spaceId", b.parent.id), zap.String("root", loser))
+		switch {
+		case e.Deleted:
+			continue
+		case e.Derived:
+			// The register's verdict falls back to rootId when the
+			// canonical id cannot be computed; the tree itself cannot lie.
+			return fmt.Errorf("spaceimpl: bundles: uninstall %q: %w: root %q", bundleId, settings.ErrCantDeleteDerivedObject, id)
+		case !e.Present && id == bd.RootId:
+			return fmt.Errorf("spaceimpl: %w: root %q", space.ErrBundleRootNotSynced, id)
+		case !e.Present:
+			return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, id)
 		}
+		todo = append(todo, id)
 	}
-	if bd.RootId == "" || b.winnerDeleted(ctx, &bd) {
-		return nil // already uninstalled; the sweep above is the work
-	}
-	present, err := b.deleteRootTree(ctx, bd.RootId)
-	if err != nil {
-		return fmt.Errorf("spaceimpl: bundles: uninstall %q: delete root %q: %w", bundleId, bd.RootId, err)
-	}
-	if !present {
-		return fmt.Errorf("spaceimpl: %w: root %q", space.ErrBundleRootNotSynced, bd.RootId)
+	for _, id := range todo {
+		if err := b.deleteRootTree(ctx, id); err != nil {
+			return fmt.Errorf("spaceimpl: bundles: uninstall %q: delete %q: %w", bundleId, id, err)
+		}
 	}
 	return nil
 }

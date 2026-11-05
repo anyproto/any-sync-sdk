@@ -348,15 +348,18 @@ shared by the account's devices and nobody else.
   they meet. Idempotent. `ErrBundleNotLoser` for the winner or an
   unclaimed root; `ErrLoserNotSynced` until the loser's tree is local
   (any-sync's settings-tree delete reads the local head entry).
-- **`Uninstall(bundleId)`** — deletes the install: every losing root
-  whose tree is local, then the winner. Losers first, so a reader that
-  sees the bundle as uninstalled never finds a loser this device could
-  have deleted. Idempotent: a row whose winner is already dead still
-  sweeps its losers. `ErrBundleUnknown` for a bundle never registered;
-  `ErrBundleRootNotSynced` while the winner's tree is not local; a
-  derived install is refused with any-sync's derived-delete error and
-  nothing is deleted. A loser whose tree is not local is skipped and
-  surfaces as a loser of the next install.
+- **`Uninstall(bundleId)`** — deletes the install: every losing root,
+  then the winner, and only once every one of them is local, so a
+  refusal deletes nothing. Losers first, so a reader that sees the
+  bundle as uninstalled never finds a loser left behind, and a fresh
+  install inherits none. Idempotent: a row whose winner is already
+  dead still sweeps its losers. `ErrBundleUnknown` for a bundle never
+  registered; `ErrLoserNotSynced` while a loser's tree is not local,
+  `ErrBundleRootNotSynced` while the winner's is (any-sync's
+  settings-tree delete reads the local head entry); a derived install
+  is refused with any-sync's derived-delete error. No grace, unlike
+  `ResolveLoser`: an uninstall discards, so a loser is deleted at the
+  head this device holds.
 
 Errors: `ErrBundleUnknown`, `ErrBundleBadRequest`, `ErrBundleNotLoser`,
 `ErrLoserNotSynced`, `ErrBundleRootNotSynced` (the registry references a

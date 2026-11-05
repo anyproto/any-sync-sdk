@@ -353,19 +353,14 @@ type BundlesAPI interface {
 	// an explicit caller decision.
 	ResolveLoser(ctx context.Context, bundleId, loserRootId string) error
 
-	// Uninstall deletes the bundle's install: every losing root whose
-	// tree is local, then the winner. A deleted winner alone reads as
-	// uninstalled but leaves its live losers in the add-only claim set,
-	// where the next Ensure's fresh root inherits them as losers and a
-	// client's fork merge brings their content back; this call takes
-	// the losers with the winner. Losers go first, so a reader that
-	// sees the bundle as uninstalled never finds a loser this device
-	// could have deleted. Idempotent: a row whose winner is already
-	// deleted still sweeps its losers; a bundle never registered is
-	// ErrBundleUnknown. A derived install is refused with any-sync's
-	// derived-delete error and nothing is deleted. A winner whose tree
-	// is not local is ErrBundleRootNotSynced; a loser whose tree is not
-	// local is skipped and surfaces as a loser of the next install,
-	// since any-sync's settings delete needs the local head entry.
+	// Uninstall deletes the install: every losing root, then the
+	// winner, and only once every one of them is local, so a fresh
+	// install inherits no loser (docs/bundles.md § Known edges for what
+	// a winner deleted on its own leaves behind). Idempotent: a row
+	// whose winner is already deleted still sweeps its losers.
+	// ErrBundleUnknown for a bundle never registered; ErrLoserNotSynced
+	// while a loser's tree is not local and ErrBundleRootNotSynced
+	// while the winner's is, nothing deleted; a derived install is
+	// refused with any-sync's derived-delete error.
 	Uninstall(ctx context.Context, bundleId string) error
 }

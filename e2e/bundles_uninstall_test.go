@@ -3,16 +3,11 @@ package e2e
 import (
 	"context"
 	"errors"
-	"io/fs"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/anyproto/any-sync/commonspace/settings"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v3"
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
 	"github.com/anyproto/any-sync-sdk/config"
@@ -28,7 +23,7 @@ import (
 //     read the bundle as uninstalled, and a fresh install lists no
 //     loser, so nothing of the old install can be merged back.
 //  3. Deleting the winner object alone leaves the loser claimed and
-//     the next install inherits it; Uninstall on the dead row sweeps
+//     the next install inherits it; Uninstall on that install sweeps
 //     it.
 //  4. An unknown bundle is ErrBundleUnknown; a derived install is
 //     refused with any-sync's derived-delete error and stays.
@@ -43,7 +38,9 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 		t.Skip("bundles e2e is slow; rerun without -short")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	// Budgeted from the waits below: two convergences, five syncs and
+	// the restore gates, each at its own cap.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
 	provider := newFixedSeedProvider(t)
@@ -102,8 +99,8 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 	}
 	_ = spA.SyncHeads(ctx)
 
-	restore := parkStoredNodeconf(t, dirB)
-	sdkB = open("device B apart", dirB, deadNetwork(t, netYAML))
+	forgetStoredNodeConf(t, dirB)
+	sdkB = open("device B apart", dirB, nodeConfUnreachable(t, netYAML))
 	spB, err = sdkB.Spaces().Get(ctx, spA.Id())
 	require.NoError(t, err, "device B apart: Spaces().Get")
 	for _, id := range ids {
@@ -113,7 +110,6 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 		require.NotEqual(t, rootA[id], bd.RootId, "%s: B minted A's root while apart", id)
 	}
 	require.NoError(t, sdkB.Close(), "device B apart: Close")
-	restore()
 
 	// --- B back online: each fork converges on both devices. ---
 	sdkB = open("device B", dirB, netYAML)
@@ -135,24 +131,32 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 		require.Len(t, a.Losers, 1, "%s: the fork must list one loser", id)
 		return a
 	}
-	// Uninstall deletes what is local; both trees of the fork must have
-	// reached A before it runs, or the test would measure sync timing.
-	heldByA := func(roots []string) bool {
-		for _, id := range roots {
-			if spA.SyncStatus().Object(id).State != space.SyncStateSynced {
+	// Uninstall refuses, deleting nothing, until every tree of the
+	// install is local. A root minted on the other device arrives after
+	// the row that names it, so the call is retried the way a client
+	// retries a 409; anything but the two not-local sentinels is final.
+	notLocal := func(err error) bool {
+		return errors.Is(err, space.ErrLoserNotSynced) || errors.Is(err, space.ErrBundleRootNotSynced)
+	}
+	uninstall := func(id string) {
+		var uerr error
+		refused := 0
+		require.True(t, waitFor(ctx, 90*time.Second, time.Second, func() bool {
+			_ = spA.SyncHeads(ctx)
+			uerr = spA.Bundles().Uninstall(ctx, id)
+			if notLocal(uerr) {
+				refused++
 				return false
 			}
-		}
-		return true
+			return true
+		}), "device A: Uninstall(%s) never held every tree: %v", id, uerr)
+		require.NoError(t, uerr, "device A: Uninstall(%s)", id)
+		t.Logf("%s: uninstall refused %d time(s) before every tree was local", id, refused)
 	}
 
 	// --- reset/v1: Uninstall deletes the loser and the winner. ---
 	reset := converged(resetId)
-	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
-		_ = spA.SyncHeads(ctx)
-		return heldByA(reset.Roots)
-	}), "device A never held both reset/v1 trees")
-	require.NoError(t, spA.Bundles().Uninstall(ctx, resetId), "device A: Uninstall(reset/v1)")
+	uninstall(resetId)
 	_, err = spA.Bundles().Get(ctx, resetId)
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "device A: uninstalled")
 	require.NoError(t, spA.Bundles().Uninstall(ctx, resetId), "Uninstall is idempotent")
@@ -176,11 +180,13 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 
 	// --- stale/v1: a deleted winner alone leaves the loser claimed. ---
 	stale := converged(staleId)
-	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
+	// The winner may be B's root, which deletes only once it is local.
+	var derr error
+	require.True(t, waitFor(ctx, 90*time.Second, time.Second, func() bool {
 		_ = spA.SyncHeads(ctx)
-		return heldByA(stale.Roots)
-	}), "device A never held both stale/v1 trees")
-	require.NoError(t, spA.Objects().Delete(ctx, stale.RootId), "device A: delete the winner object")
+		derr = spA.Objects().Delete(ctx, stale.RootId)
+		return derr == nil
+	}), "device A: delete the winner object: %v", derr)
 	_, err = spA.Bundles().Get(ctx, staleId)
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "a dead winner reads as uninstalled")
 	inherited, did, err := spA.Bundles().Ensure(ctx, declared(staleId))
@@ -189,7 +195,7 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 	require.Equal(t, stale.Losers, inherited.Losers, "the next install inherits the loser the object delete left")
 
 	// Uninstall takes the inherited loser with the fresh winner.
-	require.NoError(t, spA.Bundles().Uninstall(ctx, staleId), "device A: Uninstall(stale/v1)")
+	uninstall(staleId)
 	clean, did, err := spA.Bundles().Ensure(ctx, declared(staleId))
 	require.NoError(t, err, "device A: reinstall stale/v1 after Uninstall")
 	require.True(t, did)
@@ -207,42 +213,4 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 	still, err := spA.Bundles().Get(ctx, "fixed/v1")
 	require.NoError(t, err, "a refused uninstall deletes nothing")
 	require.Equal(t, derived.RootId, still.RootId)
-}
-
-// deadNetwork is the nodeconf with every node address unreachable: a
-// device opened on it holds its data and cannot sync.
-func deadNetwork(t *testing.T, online []byte) []byte {
-	t.Helper()
-	var conf map[string]any
-	require.NoError(t, yaml.Unmarshal(online, &conf), "parse nodeconf")
-	nodes, _ := conf["nodes"].([]any)
-	for _, n := range nodes {
-		n.(map[string]any)["addresses"] = []string{"127.0.0.1:1"}
-	}
-	dead, err := yaml.Marshal(conf)
-	require.NoError(t, err, "marshal nodeconf")
-	return dead
-}
-
-// parkStoredNodeconf moves the nodeconf any-sync stored in the data
-// dir aside, since a stored copy beats the configured one, and returns
-// the restore.
-func parkStoredNodeconf(t *testing.T, dataDir string) (restore func()) {
-	t.Helper()
-	var parked []string
-	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		if filepath.Base(filepath.Dir(path)) == "nodeconf" && strings.HasSuffix(path, ".yml") {
-			require.NoError(t, os.Rename(path, path+".parked"), "park stored nodeconf")
-			parked = append(parked, path)
-		}
-		return nil
-	})
-	return func() {
-		for _, path := range parked {
-			_ = os.Rename(path+".parked", path)
-		}
-	}
 }

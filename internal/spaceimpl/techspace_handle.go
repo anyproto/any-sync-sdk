@@ -288,9 +288,10 @@ func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, er
 
 // techObjects keeps Get (a local row read) and refuses free lifecycle:
 // tech-space objects exist only as bundle roots. Delete is allowed for
-// exactly those — a deleted created winner reads as uninstalled, which
-// is how a bundle uninstalls; a derived root stays undeletable (the
-// object layer refuses derived deletion).
+// exactly those — a deleted created winner reads as uninstalled, but
+// leaves its losers claimed, so the uninstall is Bundles().Uninstall;
+// a derived root stays undeletable (the object layer refuses derived
+// deletion).
 type techObjects struct {
 	inner *objectService
 	t     *techSpace

@@ -923,16 +923,21 @@ func (b *bundlesAPI) Uninstall(ctx context.Context, bundleId string) error {
 	if err != nil {
 		return fmt.Errorf("spaceimpl: bundles: uninstall %q: %w", bundleId, err)
 	}
+	// The final verdict first: a derived tree anywhere refuses for good,
+	// and must not hide behind a retryable sentinel for an earlier root.
+	// The register's verdict falls back to rootId when the canonical id
+	// cannot be computed; the tree itself cannot lie.
+	for i, id := range roots {
+		if entries[i].Derived && !entries[i].Deleted {
+			return uninstallDerived(bundleId, id)
+		}
+	}
 	var todo []string
 	for i, id := range roots {
 		e := entries[i]
 		switch {
 		case e.Deleted:
 			continue
-		case e.Derived:
-			// The register's verdict falls back to rootId when the
-			// canonical id cannot be computed; the tree itself cannot lie.
-			return uninstallDerived(bundleId, id)
 		case !e.Present:
 			return notLocalErr(id, id == bd.RootId)
 		}

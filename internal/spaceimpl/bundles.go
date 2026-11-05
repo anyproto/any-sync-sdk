@@ -810,19 +810,13 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	if bundleId == "" || loserRootId == "" {
 		return fmt.Errorf("spaceimpl: %w: bundle id and loser root id required", space.ErrBundleBadRequest)
 	}
-	obj, err := b.readIndexObj(ctx)
+	// With a canonical derived root claimed, the created root the
+	// register may still name is a LOSER, and deleting it is exactly
+	// what the caller is here for.
+	bd, err := b.claimedRow(ctx, bundleId)
 	if err != nil {
 		return err
 	}
-	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, bundleId)
-	if !liveBundleRow(row) {
-		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
-	}
-	// Same winner the readers see: with a canonical derived root
-	// claimed, the created root the register may still name is a
-	// LOSER, and deleting it is exactly what the caller is here for.
-	bd := decodeBundleRecord(row)
-	b.preferDerivedRoot(ctx, &bd)
 	if bd.RootId == "" || loserRootId == bd.RootId || !slices.Contains(bd.Roots, loserRootId) {
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleNotLoser, loserRootId)
 	}
@@ -848,6 +842,23 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 		return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
 	}
 	return nil
+}
+
+// claimedRow reads a bundle's row and resolves the winner the readers
+// see; ErrBundleUnknown for a bundle never registered. The live
+// conflict set is the caller's to derive.
+func (b *bundlesAPI) claimedRow(ctx context.Context, bundleId string) (space.Bundle, error) {
+	obj, err := b.readIndexObj(ctx)
+	if err != nil {
+		return space.Bundle{}, err
+	}
+	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, bundleId)
+	if !liveBundleRow(row) {
+		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
+	}
+	bd := decodeBundleRecord(row)
+	b.preferDerivedRoot(ctx, &bd)
+	return bd, nil
 }
 
 // treeEntry is the strict head read: a space without storage is an
@@ -889,18 +900,10 @@ func (b *bundlesAPI) Uninstall(ctx context.Context, bundleId string) error {
 	l.Lock()
 	defer l.Unlock()
 
-	obj, err := b.readIndexObj(ctx)
+	bd, err := b.claimedRow(ctx, bundleId)
 	if err != nil {
 		return err
 	}
-	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, bundleId)
-	if !liveBundleRow(row) {
-		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
-	}
-	// The same winner the readers see; the live conflict set is derived
-	// below from one head read per claimed root, winner last.
-	bd := decodeBundleRecord(row)
-	b.preferDerivedRoot(ctx, &bd)
 	if bd.RootId == "" {
 		return fmt.Errorf("spaceimpl: %w: %q (no root registered)", space.ErrBundleUnknown, bundleId)
 	}

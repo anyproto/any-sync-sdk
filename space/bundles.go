@@ -365,8 +365,8 @@ type BundlesAPI interface {
 	// ErrBundleUnknown for a bundle never registered; ErrLoserNotSynced
 	// while a loser's tree is not local and ErrBundleRootNotSynced
 	// while the winner's is, nothing deleted; a derived install is
-	// ErrBundleDerived. A refusal any-sync raises inside a delete can
-	// land after the losers went: the install stays, a retry meets it
-	// again.
+	// ErrBundleDerived, its created losers ResolveLoser's. A refusal
+	// any-sync raises inside a delete can land after the losers went:
+	// the install stays, a retry meets it again.
 	Uninstall(ctx context.Context, bundleId string) error
 }

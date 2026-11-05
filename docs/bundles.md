@@ -358,7 +358,8 @@ shared by the account's devices and nobody else.
   loser's tree is not local, `ErrBundleRootNotSynced` while the
   winner's is (any-sync's settings-tree delete reads the local head
   entry), each before the first delete; a derived install is
-  `ErrBundleDerived` (any-sync's derived-delete error wrapped with it).
+  `ErrBundleDerived` (any-sync's derived-delete error wrapped with it),
+  and its created losers are `ResolveLoser`'s.
   No readiness gate of its own: an uninstall discards, so a loser is
   deleted at the head this device holds; a consumer that wants to
   merge first runs `ResolveLoser` behind its own gate. A refusal
@@ -408,7 +409,10 @@ avoid demoting an unseen created install (§ Derived roots).
   claimed: the fresh root inherits them as losers, and a client's fork
   merge brings their content back. `Uninstall` deletes the losers with
   the winner, and refuses while one of them is not local: a loser whose
-  tree never reaches anyone blocks it, as it blocks `ResolveLoser`.
+  tree never reaches anyone blocks it, as it blocks `ResolveLoser`. An
+  install another device made while apart can arrive after the
+  uninstall: a live claim the next `Ensure`'s root inherits as a loser,
+  which the next `Uninstall` takes.
 - A crash between `NewRoot` and the registering write leaves one
   unreferenced object; the retried Ensure installs a fresh root. The
   orphan is unlisted, not a conflict.

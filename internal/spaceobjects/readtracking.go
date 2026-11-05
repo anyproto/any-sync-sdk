@@ -98,8 +98,9 @@ func (s *Store) readResolver() readstate.Resolver {
 		// Unknown tree or change — not arrived on this device yet, so
 		// the engine parks it as a pending head. Not for a deleted
 		// tree (its changes are gone and none will arrive): parking
-		// would re-create the state row the purge removed.
-		e, err := s.TreeEntry(ctx, objectId)
+		// would re-create the state row the purge removed. Read from
+		// the peeked handle: TreeEntry goes through GetSpace again.
+		e, err := treeEntryOf(ctx, st.HeadStorage(), objectId)
 		if err != nil {
 			return nil, "", false, err
 		}

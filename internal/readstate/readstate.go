@@ -84,7 +84,9 @@ type SeqFunc func(ctx context.Context) (uint64, error)
 // It runs inside the caller's write tx, so it must not wait on the
 // network: when the lookup needs the space loaded it fails with
 // ErrSpaceNotResident, and WriteTx loads the space through the Loader
-// with the lock released before rerunning the caller.
+// with the lock released before rerunning the caller. The apply path
+// runs on a resident space and has no retry: there the refusal fails
+// the apply, which the next replay repeats.
 type Resolver func(ctx context.Context, objectId, changeId string) (prevIds []string, versionId string, ok bool, err error)
 
 // Loader loads the Resolver's space. WriteTx calls it outside any tx.

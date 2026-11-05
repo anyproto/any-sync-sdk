@@ -288,9 +288,10 @@ func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, er
 
 // techObjects keeps Get (a local row read) and refuses free lifecycle:
 // tech-space objects exist only as bundle roots. Delete is allowed for
-// exactly those — a deleted created winner reads as uninstalled, which
-// is how a bundle uninstalls; a derived root stays undeletable (the
-// object layer refuses derived deletion).
+// exactly those — a deleted created winner reads as uninstalled, but
+// leaves its losers claimed, so the uninstall is Bundles().Uninstall;
+// a derived root stays undeletable (the object layer refuses derived
+// deletion).
 type techObjects struct {
 	inner *objectService
 	t     *techSpace
@@ -450,8 +451,9 @@ func (x techTypes) PatchProperty(ctx context.Context, typeId, propId string, pat
 	return x.inner.PatchProperty(ctx, typeId, propId, patch)
 }
 
-// techBundles: derived-only installs that declare datasets; no loser
-// resolution (derived roots have none).
+// techBundles: installs that declare datasets, on a derived or a
+// created root; a created one forks, resolves and uninstalls like in
+// any space.
 type techBundles struct{ inner *bundlesAPI }
 
 func (x techBundles) Get(ctx context.Context, bundleId string) (space.Bundle, error) {
@@ -483,6 +485,12 @@ func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	// any space. The delete runs on the inner object service — the
 	// public techObjects fence is about free lifecycle, not this.
 	return x.inner.ResolveLoser(ctx, bundleId, loserRootId)
+}
+
+func (x techBundles) Uninstall(ctx context.Context, bundleId string) error {
+	// Same inner service as ResolveLoser: a created tech install is
+	// deletable, and its losers go with it.
+	return x.inner.Uninstall(ctx, bundleId)
 }
 
 // validateTechEnsureRequest adds the tech-space rules on top of the

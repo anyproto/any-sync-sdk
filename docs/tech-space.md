@@ -48,8 +48,8 @@ Supported:
   carry the profile-decryption `symKey`); use `SDK.Identities()`.
 - `Bundles()`: a request must declare a type or collection (`Parts`,
   `Properties` or `XKey`); roots are minted by `Ensure` (derived or
-  SDK-created); `ResolveLoser`. No `NewRoot`, `RootType`,
-  `RootCollections`, `RootProperties`.
+  SDK-created); `ResolveLoser` and `Uninstall`. No `NewRoot`,
+  `RootType`, `RootCollections`, `RootProperties`.
 - Dataset declarations on bundle roots only: `Types().AddDataset`,
   `AddDatasetField`, `RemoveDataset*`, `PatchDataset` refuse any other
   `typeId`.
@@ -57,8 +57,9 @@ Supported:
   datasets a bundle root declared. Type-system built-ins (`objects`,
   `properties`, `shortIds`, `datasets`) and the system datasets are
   readable but refuse generic writes.
-- `Objects().Delete` on bundle roots only (uninstalls a created winner;
-  derived roots refuse).
+- `Objects().Delete` on bundle roots only (derived roots refuse). The
+  uninstall is `Bundles().Uninstall`: a winner deleted on its own
+  leaves its losers claimed (`bundles.md` § Known edges).
 - `Info()` (synthetic: owner-only, derived, `any.techspace`),
   `SyncStatus`, `Debug`, `SyncHeads`, `TreeHeads`, `WaitIndexSynced`
   (same as `WaitListSynced`).

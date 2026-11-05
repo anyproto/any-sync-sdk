@@ -2415,6 +2415,11 @@ func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error)
 	if err != nil || !ok {
 		return TreeEntry{}, err
 	}
+	return treeEntryOf(ctx, hs, treeId)
+}
+
+// treeEntryOf reads one head entry; an absent tree is the zero value.
+func treeEntryOf(ctx context.Context, hs headstorage.HeadStorage, treeId string) (TreeEntry, error) {
 	entry, err := hs.GetEntry(ctx, treeId)
 	if err != nil {
 		if isDocNotFound(err) {
@@ -2427,6 +2432,31 @@ func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error)
 		Deleted: entry.DeletedStatus != headstorage.DeletedStatusNotDeleted,
 		Derived: entry.IsDerived,
 	}, nil
+}
+
+// ErrSpaceStorageUnavailable: the space holds no storage to read head
+// entries from (closing, or not fully opened). Not a sync state.
+var ErrSpaceStorageUnavailable = errors.New("spaceobjects: space storage unavailable")
+
+// TreeEntries reads the head entries of several trees over one storage
+// handle, in the order given; an absent tree is the zero value. Unlike
+// TreeEntry, a space without storage is an error, so a caller that
+// acts on absence never mistakes a closed space for trees not synced.
+func (s *Store) TreeEntries(ctx context.Context, treeIds []string) ([]TreeEntry, error) {
+	hs, ok, err := s.headStorage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrSpaceStorageUnavailable
+	}
+	out := make([]TreeEntry, len(treeIds))
+	for i, id := range treeIds {
+		if out[i], err = treeEntryOf(ctx, hs, id); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // isDocNotFound matches any-store's document-not-found across BOTH

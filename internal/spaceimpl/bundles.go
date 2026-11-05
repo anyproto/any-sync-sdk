@@ -18,6 +18,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
+	"github.com/anyproto/any-sync/commonspace/settings"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -809,45 +810,162 @@ func (b *bundlesAPI) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	if bundleId == "" || loserRootId == "" {
 		return fmt.Errorf("spaceimpl: %w: bundle id and loser root id required", space.ErrBundleBadRequest)
 	}
-	obj, err := b.readIndexObj(ctx)
+	// With a canonical derived root claimed, the created root the
+	// register may still name is a LOSER, and deleting it is exactly
+	// what the caller is here for.
+	bd, err := b.claimedRow(ctx, bundleId)
 	if err != nil {
 		return err
 	}
-	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, bundleId)
-	if !liveBundleRow(row) {
-		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
-	}
-	// Same winner the readers see: with a canonical derived root
-	// claimed, the created root the register may still name is a
-	// LOSER, and deleting it is exactly what the caller is here for.
-	bd := decodeBundleRecord(row)
-	b.preferDerivedRoot(ctx, &bd)
 	if bd.RootId == "" || loserRootId == bd.RootId || !slices.Contains(bd.Roots, loserRootId) {
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleNotLoser, loserRootId)
 	}
-	if deleted, derr := b.parent.store.TreeDeleted(ctx, loserRootId); derr == nil && deleted {
+	e, err := b.treeEntry(ctx, loserRootId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: bundles: resolve loser %q: %w", loserRootId, err)
+	}
+	if e.Deleted {
 		return nil // already resolved
 	}
 	// Deletion needs the loser's local head entry (any-sync settings
 	// delete has no delete-by-id) — absent means "not synced here yet",
-	// a retryable state with its own sentinel, not a storage error.
-	if _, present, perr := b.parent.store.TreeIsDerived(ctx, loserRootId); perr == nil && !present {
-		return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, loserRootId)
+	// a retryable state with its own sentinel.
+	if !e.Present {
+		return notLocalErr(loserRootId, false)
 	}
-	err = b.parent.objects.Delete(ctx, loserRootId)
-	if err == nil {
+	if err := b.deleteRootTree(ctx, loserRootId); err != nil {
+		// Entry raced away between the probe and the delete — the same
+		// retryable state.
+		if e, derr := b.treeEntry(ctx, loserRootId); derr == nil && !e.Present {
+			return notLocalErr(loserRootId, false)
+		}
+		return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
+	}
+	return nil
+}
+
+// claimedRow reads a bundle's row and resolves the winner the readers
+// see; ErrBundleUnknown for a bundle never registered. The live
+// conflict set is the caller's to derive.
+func (b *bundlesAPI) claimedRow(ctx context.Context, bundleId string) (space.Bundle, error) {
+	obj, err := b.readIndexObj(ctx)
+	if err != nil {
+		return space.Bundle{}, err
+	}
+	row := obj.Controller().Get(ctx, spaceindex.BundlesDataset, bundleId)
+	if !liveBundleRow(row) {
+		return space.Bundle{}, fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
+	}
+	bd := decodeBundleRecord(row)
+	b.preferDerivedRoot(ctx, &bd)
+	return bd, nil
+}
+
+// treeEntry is the strict head read: a space without storage is an
+// error, never "not synced".
+func (b *bundlesAPI) treeEntry(ctx context.Context, rootId string) (spaceobjects.TreeEntry, error) {
+	es, err := b.parent.store.TreeEntries(ctx, []string{rootId})
+	if err != nil {
+		return spaceobjects.TreeEntry{}, err
+	}
+	return es[0], nil
+}
+
+// deleteRootTree deletes a root's tree; a tree another deleter raced
+// us to is nil, like one already deleted. any-sync answers the race
+// with ErrAlreadyDeleted before the head entry carries the mark.
+func (b *bundlesAPI) deleteRootTree(ctx context.Context, rootId string) error {
+	err := b.parent.objects.Delete(ctx, rootId)
+	if err == nil || errors.Is(err, settings.ErrAlreadyDeleted) {
 		return nil
 	}
-	// Another resolver may have raced us — re-check before surfacing.
-	if deleted, derr := b.parent.store.TreeDeleted(ctx, loserRootId); derr == nil && deleted {
+	if e, derr := b.treeEntry(ctx, rootId); derr == nil && e.Deleted {
 		return nil
 	}
-	// Entry raced away between the probe above and the delete — same
-	// retryable state.
-	if _, present, perr := b.parent.store.TreeIsDerived(ctx, loserRootId); perr == nil && !present {
-		return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, loserRootId)
+	return err
+}
+
+// Uninstall checks every tree before the first delete, so a refusal
+// leaves the install whole, then deletes the losers and the winner
+// last: the winner's death is what reads as uninstalled, so by then no
+// loser is left for a fresh install to inherit.
+func (b *bundlesAPI) Uninstall(ctx context.Context, bundleId string) error {
+	if bundleId == "" {
+		return fmt.Errorf("spaceimpl: %w: empty bundle id", space.ErrBundleBadRequest)
 	}
-	return fmt.Errorf("spaceimpl: bundles: delete loser %q: %w", loserRootId, err)
+	if err := b.parent.writeGate(ctx); err != nil {
+		return err
+	}
+	l := b.lockFor(bundleId)
+	l.Lock()
+	defer l.Unlock()
+
+	bd, err := b.claimedRow(ctx, bundleId)
+	if err != nil {
+		return err
+	}
+	if bd.RootId == "" {
+		return fmt.Errorf("spaceimpl: %w: %q (no root registered)", space.ErrBundleUnknown, bundleId)
+	}
+	if bd.Derived {
+		return uninstallDerived(bundleId, bd.RootId)
+	}
+	// Losers first, the winner last: its death is what reads as
+	// uninstalled.
+	roots := make([]string, 0, len(bd.Roots)+1)
+	for _, id := range bd.Roots {
+		if id != bd.RootId {
+			roots = append(roots, id)
+		}
+	}
+	roots = append(roots, bd.RootId)
+	entries, err := b.parent.store.TreeEntries(ctx, roots)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: bundles: uninstall %q: %w", bundleId, err)
+	}
+	// The final verdict first: a derived tree anywhere refuses for good,
+	// and must not hide behind a retryable sentinel for an earlier root.
+	// The register's verdict falls back to rootId when the canonical id
+	// cannot be computed; the tree itself cannot lie.
+	for i, id := range roots {
+		if entries[i].Derived && !entries[i].Deleted {
+			return uninstallDerived(bundleId, id)
+		}
+	}
+	var todo []string
+	for i, id := range roots {
+		e := entries[i]
+		switch {
+		case e.Deleted:
+			continue
+		case !e.Present:
+			return notLocalErr(id, id == bd.RootId)
+		}
+		todo = append(todo, id)
+	}
+	// Past this point a failure is final, never the not-local sentinel:
+	// the sentinel promises nothing was deleted.
+	for _, id := range todo {
+		if err := b.deleteRootTree(ctx, id); err != nil {
+			return fmt.Errorf("spaceimpl: bundles: uninstall %q: delete %q: %w", bundleId, id, err)
+		}
+	}
+	return nil
+}
+
+// notLocalErr is the retryable refusal for a tree this device does not
+// hold: the winner's and a loser's each have their sentinel.
+func notLocalErr(id string, winner bool) error {
+	if winner {
+		return fmt.Errorf("spaceimpl: %w: root %q", space.ErrBundleRootNotSynced, id)
+	}
+	return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, id)
+}
+
+// uninstallDerived carries both the SDK's sentinel and any-sync's, so
+// a consumer classifies it with either.
+func uninstallDerived(bundleId, id string) error {
+	return fmt.Errorf("spaceimpl: bundles: uninstall %q: root %q: %w: %w", bundleId, id, space.ErrBundleDerived, settings.ErrCantDeleteDerivedObject)
 }
 
 // stampRoot writes a bundle root's first content change: its

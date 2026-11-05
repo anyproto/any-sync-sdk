@@ -259,8 +259,11 @@ delivers it → the KV hook hands it to a single worker → merge.
 **A merge never loads the object.** Each incoming head either has an
 unread row (closure over rows), or is already read, or has not synced
 yet; a point lookup in any-sync's change storage distinguishes the last
-two, and an unsynced head is stored as pending. Merges serialize against
-marks through the per-object mutex and commit in their own transaction.
+two, and an unsynced head is stored as pending. The lookup answers only
+from a resident space: a merge or mark that finds its space cold rolls
+its transaction back, loads the space with the write lock released, and
+reruns. Merges serialize against marks through the per-object mutex and
+commit in their own transaction.
 
 The KV hook is best-effort, so durability comes from a boot reconcile
 (`ReconcileAll`): one pass over the tech-space KV store replays every

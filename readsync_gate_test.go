@@ -41,7 +41,7 @@ func TestReadSyncEngineFor_Gate(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	eng := readstate.New(db, "sp-live", func(context.Context) (uint64, error) { return 1, nil }, nil)
+	eng := readstate.New(db, "sp-live", func(context.Context) (uint64, error) { return 1, nil }, nil, nil)
 	require.NoError(t, eng.Open(ctx))
 
 	rows := map[string]techspace.SpaceIndexRecord{

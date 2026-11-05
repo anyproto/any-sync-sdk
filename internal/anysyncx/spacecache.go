@@ -86,15 +86,21 @@ func (s *spaceWrapper) TryClose(ttl time.Duration) (bool, error) {
 	return closed, err
 }
 
+// spaceCache is the ocache plus its non-blocking Peek.
+type spaceCache interface {
+	ocache.OCache
+	ocache.Peeker
+}
+
 // newSpaceCache builds the cache. The loader fully wires a space —
 // NewSpace, Init, register — so callers reach a ready Space straight
 // from Get.
-func (a *App) newSpaceCache() ocache.OCache {
+func (a *App) newSpaceCache() spaceCache {
 	return ocache.New(
 		a.loadSpaceForCache,
 		ocache.WithTTL(spaceLoaderTTL),
 		ocache.WithGCPeriod(spaceLoaderGC),
-	)
+	).(spaceCache)
 }
 
 // loadSpaceForCache is the ocache LoadFunc. Independent of "is this a
@@ -222,6 +228,21 @@ func (a *App) PickSpace(ctx context.Context, id string) (SpaceHandle, bool) {
 	}
 	v, err := a.spaceCache.Pick(ctx, id)
 	if err != nil {
+		return nil, false
+	}
+	return v.(SpaceHandle), true
+}
+
+// PeekSpace returns the handle of a loaded space without loading or
+// waiting: ok is false while the space is absent, still loading or
+// closing. PickSpace waits on a load in flight; this never does, so a
+// caller holding a lock can use it.
+func (a *App) PeekSpace(id string) (SpaceHandle, bool) {
+	if a.spaceCache == nil {
+		return nil, false
+	}
+	v, state := a.spaceCache.Peek(id, false)
+	if state != ocache.PeekHit {
 		return nil, false
 	}
 	return v.(SpaceHandle), true

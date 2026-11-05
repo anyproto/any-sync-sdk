@@ -713,7 +713,7 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 	}
 	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs, append(append([]crdt.HandlerReg(nil), s.canonicalRegs...), s.staticInstanceRegs...))
 	if len(s.readTracking) > 0 || s.modulesTracked {
-		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver())
+		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver(), s.readLoader())
 		// Eager: the open takes any-store's write lock, and every
 		// later engine call runs inside a write tx or next to one.
 		// The constructor runs outside any tx, before the store is

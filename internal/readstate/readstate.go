@@ -81,7 +81,18 @@ type SeqFunc func(ctx context.Context) (uint64, error)
 // Resolver looks up a change the unread rows no longer (or never did)
 // cover — the gap-traversal fallback backed by any-sync's change
 // storage. ok=false means the change has not arrived on this device.
+// It runs inside the caller's write tx, so it must not wait on the
+// network: when the lookup needs the space loaded it fails with
+// ErrSpaceNotResident, and WriteTx loads the space through the Loader
+// with the lock released before rerunning the caller.
 type Resolver func(ctx context.Context, objectId, changeId string) (prevIds []string, versionId string, ok bool, err error)
+
+// Loader loads the Resolver's space. WriteTx calls it outside any tx.
+type Loader func(ctx context.Context) error
+
+// ErrSpaceNotResident is the Resolver's refusal to answer from a space
+// that is not loaded.
+var ErrSpaceNotResident = errors.New("readstate: space not resident")
 
 // Track is the apply-path input: one tracked change, classified.
 type Track struct {
@@ -140,6 +151,7 @@ type Engine struct {
 	spaceId string
 	seq     SeqFunc
 	resolve Resolver
+	load    Loader
 
 	// subs are the best-effort state pings (objectId, stateSeq).
 	// Callers fire NotifyState AFTER their tx commits — never from
@@ -163,9 +175,10 @@ type openResult struct{ err error }
 var ErrNotOpen = errors.New("readstate: engine not opened")
 
 // New builds the engine over the space's share of db. No I/O: Open
-// creates the collections.
-func New(db anystore.DB, spaceId string, seq SeqFunc, resolve Resolver) *Engine {
-	return &Engine{db: db, spaceId: spaceId, seq: seq, resolve: resolve}
+// creates the collections. A nil load leaves ErrSpaceNotResident to
+// the caller.
+func New(db anystore.DB, spaceId string, seq SeqFunc, resolve Resolver, load Loader) *Engine {
+	return &Engine{db: db, spaceId: spaceId, seq: seq, resolve: resolve, load: load}
 }
 
 // Open creates the collections and their indexes. The DDL takes
@@ -656,7 +669,9 @@ func (e *Engine) markLocked(ctx context.Context, objectId string, changeIds []st
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
 	}
-	e.compactFrontier(ctx, objectId, st)
+	if err = e.compactFrontier(ctx, objectId, st); err != nil {
+		return MarkResult{}, err
+	}
 	if err = e.persistState(ctx, objectId, st); err != nil {
 		return MarkResult{}, err
 	}
@@ -704,7 +719,9 @@ func (e *Engine) markNoEntries(ctx context.Context, objectId string, st *objStat
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
 	}
-	e.compactFrontier(ctx, objectId, st)
+	if err := e.compactFrontier(ctx, objectId, st); err != nil {
+		return MarkResult{}, err
+	}
 	if err := e.persistState(ctx, objectId, st); err != nil {
 		return MarkResult{}, err
 	}
@@ -723,15 +740,20 @@ const maxFrontierSize = 64
 // the watermark's job. The published-coverage trade-off: a dropped
 // member that was NOT an ancestor of the remaining set shrinks what
 // other devices mark read, costing them a bounded re-read, never
-// corruption; oldest-first makes that case rare.
-func (e *Engine) compactFrontier(ctx context.Context, objectId string, st *objState) {
+// corruption; oldest-first makes that case rare. Only a cold space
+// is an error: with the resolver silent, every member would rank as
+// unresolvable and the drop would be arbitrary.
+func (e *Engine) compactFrontier(ctx context.Context, objectId string, st *objState) error {
 	if len(st.frontier) <= maxFrontierSize {
-		return
+		return nil
 	}
 	type member struct{ id, v string }
 	members := make([]member, 0, len(st.frontier))
 	for id := range st.frontier {
 		_, v, ok, err := e.resolveGap(ctx, objectId, id)
+		if errors.Is(err, ErrSpaceNotResident) {
+			return err
+		}
 		if err != nil || !ok {
 			v = ""
 		}
@@ -741,6 +763,7 @@ func (e *Engine) compactFrontier(ctx context.Context, objectId string, st *objSt
 	for _, m := range members[:len(members)-maxFrontierSize] {
 		delete(st.frontier, m.id)
 	}
+	return nil
 }
 
 func (e *Engine) resolveGap(ctx context.Context, objectId, changeId string) ([]string, string, bool, error) {
@@ -813,7 +836,9 @@ func (e *Engine) MarkReadUpToChunk(ctx context.Context, objectId, upTo string, m
 	if stateSeq > st.stateSeq {
 		st.stateSeq = stateSeq
 	}
-	e.compactFrontier(ctx, objectId, st)
+	if err = e.compactFrontier(ctx, objectId, st); err != nil {
+		return MarkResult{}, done, err
+	}
 	if err = e.persistState(ctx, objectId, st); err != nil {
 		return MarkResult{}, done, err
 	}
@@ -1109,7 +1134,23 @@ func (e *Engine) SeedFrontier(ctx context.Context, objectId string, heads []stri
 // WriteTx runs fn inside a write transaction on the engine's DB —
 // the tx opener for callers outside the apply path (marks, merges,
 // reconcile). fn's error rolls the tx back and is returned.
+//
+// A gap walk may need the space, and loading one can wait on an
+// unreachable sync node. When fn fails with ErrSpaceNotResident the
+// tx is rolled back, the Loader runs with the write lock released,
+// and fn reruns once in a fresh tx.
 func (e *Engine) WriteTx(ctx context.Context, fn func(txCtx context.Context) error) error {
+	err := e.writeTx(ctx, fn)
+	if e.load == nil || !errors.Is(err, ErrSpaceNotResident) {
+		return err
+	}
+	if err = e.load(ctx); err != nil {
+		return err
+	}
+	return e.writeTx(ctx, fn)
+}
+
+func (e *Engine) writeTx(ctx context.Context, fn func(txCtx context.Context) error) error {
 	tx, err := e.db.WriteTx(ctx)
 	if err != nil {
 		return err

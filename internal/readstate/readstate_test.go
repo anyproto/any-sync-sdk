@@ -43,7 +43,7 @@ func newFixture(t *testing.T) *fixture {
 			return nil, "", false, nil
 		}
 		return ch.prev, ch.v, true, nil
-	})
+	}, nil)
 	require.NoError(t, f.Open(ctx))
 	return f
 }

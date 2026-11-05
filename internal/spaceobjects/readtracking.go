@@ -74,12 +74,17 @@ func (s *Store) trackedDatasets() map[string]*crdt.ReadTracking {
 func (s *Store) ReadState() *readstate.Engine { return s.readState }
 
 // readResolver backs the engine's gap traversal with any-sync's
-// persisted change storage — a point lookup, never a tree load.
+// persisted change storage — a point lookup, never a tree load. It
+// answers only from a resident space: the lookup runs inside the
+// caller's write tx, and a space load can wait on an unreachable sync
+// node with the whole account's writes queued behind the lock. A cold
+// space refuses with ErrSpaceNotResident; the engine loads it through
+// readLoader between transactions.
 func (s *Store) readResolver() readstate.Resolver {
 	return func(ctx context.Context, objectId, changeId string) ([]string, string, bool, error) {
-		handle, err := s.app.GetSpace(ctx, s.spaceId)
-		if err != nil {
-			return nil, "", false, err
+		handle, ok := s.app.PeekSpace(s.spaceId)
+		if !ok {
+			return nil, "", false, readstate.ErrSpaceNotResident
 		}
 		st := handle.Inner().Storage()
 		if st == nil {
@@ -102,6 +107,15 @@ func (s *Store) readResolver() readstate.Resolver {
 			return nil, "", false, readstate.ErrObjectDeleted
 		}
 		return nil, "", false, nil
+	}
+}
+
+// readLoader loads the space for readResolver. The engine calls it
+// with no tx open.
+func (s *Store) readLoader() readstate.Loader {
+	return func(ctx context.Context) error {
+		_, err := s.app.GetSpace(ctx, s.spaceId)
+		return err
 	}
 }
 

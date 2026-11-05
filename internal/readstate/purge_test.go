@@ -22,7 +22,7 @@ func twoSpaces(t *testing.T) (anystore.DB, *Engine, *Engine) {
 	seq := uint64(1000)
 	next := func(context.Context) (uint64, error) { seq++; return seq, nil }
 	resolve := func(_ context.Context, _, _ string) ([]string, string, bool, error) { return nil, "", false, nil }
-	e1, e2 := New(db, "space1", next, resolve), New(db, "space2", next, resolve)
+	e1, e2 := New(db, "space1", next, resolve, nil), New(db, "space2", next, resolve, nil)
 	require.NoError(t, e1.Open(ctx))
 	require.NoError(t, e2.Open(ctx))
 	return db, e1, e2
@@ -135,7 +135,7 @@ func TestMergeHeads_DeletedObjectPersistsNothing(t *testing.T) {
 				return nil, "", false, ErrObjectDeleted
 			}
 			return nil, "", false, nil
-		})
+		}, nil)
 	require.NoError(t, e.Open(ctx))
 
 	_, err = e.MergeHeads(ctx, "gone", []string{"h1"})

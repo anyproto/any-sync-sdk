@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/settings"
 	"github.com/stretchr/testify/require"
 
@@ -180,13 +181,15 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 
 	// --- stale/v1: a deleted winner alone leaves the loser claimed. ---
 	stale := converged(staleId)
-	// The winner may be B's root, which deletes only once it is local.
+	// The winner may be B's root, which deletes only once it is local;
+	// any other refusal is final.
 	var derr error
 	require.True(t, waitFor(ctx, 90*time.Second, time.Second, func() bool {
 		_ = spA.SyncHeads(ctx)
 		derr = spA.Objects().Delete(ctx, stale.RootId)
-		return derr == nil
-	}), "device A: delete the winner object: %v", derr)
+		return !errors.Is(derr, treestorage.ErrUnknownTreeId)
+	}), "device A: the winner object never arrived: %v", derr)
+	require.NoError(t, derr, "device A: delete the winner object")
 	_, err = spA.Bundles().Get(ctx, staleId)
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "a dead winner reads as uninstalled")
 	inherited, did, err := spA.Bundles().Ensure(ctx, declared(staleId))

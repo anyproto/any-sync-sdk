@@ -450,8 +450,9 @@ func (x techTypes) PatchProperty(ctx context.Context, typeId, propId string, pat
 	return x.inner.PatchProperty(ctx, typeId, propId, patch)
 }
 
-// techBundles: derived-only installs that declare datasets; no loser
-// resolution (derived roots have none).
+// techBundles: installs that declare datasets, on a derived or a
+// created root; a created one forks, resolves and uninstalls like in
+// any space.
 type techBundles struct{ inner *bundlesAPI }
 
 func (x techBundles) Get(ctx context.Context, bundleId string) (space.Bundle, error) {

@@ -36,6 +36,10 @@ var (
 	// this device yet (deletion needs the local head entry). Retry
 	// after sync, or resolve from a device that holds the tree.
 	ErrLoserNotSynced = errors.New("bundle loser tree not synced locally")
+	// ErrBundleDerived — Uninstall on a derived install: derived trees
+	// are permanent. any-sync's ErrCantDeleteDerivedObject is wrapped
+	// with it.
+	ErrBundleDerived = errors.New("bundle install is derived")
 
 	// ErrBundleRootNotSynced: the registry references a root whose tree
 	// (or objects row) has not arrived on this device yet. Transient —
@@ -361,6 +365,6 @@ type BundlesAPI interface {
 	// ErrBundleUnknown for a bundle never registered; ErrLoserNotSynced
 	// while a loser's tree is not local and ErrBundleRootNotSynced
 	// while the winner's is, nothing deleted; a derived install is
-	// refused with any-sync's derived-delete error.
+	// ErrBundleDerived.
 	Uninstall(ctx context.Context, bundleId string) error
 }

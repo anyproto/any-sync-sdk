@@ -884,15 +884,23 @@ func (b *bundlesAPI) Uninstall(ctx context.Context, bundleId string) error {
 	if !liveBundleRow(row) {
 		return fmt.Errorf("spaceimpl: %w: %q", space.ErrBundleUnknown, bundleId)
 	}
-	bd := b.materialize(ctx, row)
-	if bd.Derived {
-		return fmt.Errorf("spaceimpl: bundles: uninstall %q: %w: the install is derived", bundleId, settings.ErrCantDeleteDerivedObject)
-	}
+	// The same winner the readers see; the live conflict set is derived
+	// below from one head read per claimed root, winner last.
+	bd := decodeBundleRecord(row)
+	b.preferDerivedRoot(ctx, &bd)
 	if bd.RootId == "" {
-		return nil // nothing registered yet
+		return fmt.Errorf("spaceimpl: %w: %q (no root registered)", space.ErrBundleUnknown, bundleId)
+	}
+	if bd.Derived {
+		return uninstallDerived(bundleId, bd.RootId)
+	}
+	roots := bd.Roots
+	if !slices.Contains(roots, bd.RootId) {
+		roots = append(slices.Clone(roots), bd.RootId)
 	}
 	var todo []string
-	for _, id := range append(slices.Clone(bd.Losers), bd.RootId) {
+	winnerLive := false
+	for _, id := range roots {
 		e, err := b.parent.store.TreeEntry(ctx, id)
 		if err != nil {
 			return fmt.Errorf("spaceimpl: bundles: uninstall %q: tree %q: %w", bundleId, id, err)
@@ -903,20 +911,44 @@ func (b *bundlesAPI) Uninstall(ctx context.Context, bundleId string) error {
 		case e.Derived:
 			// The register's verdict falls back to rootId when the
 			// canonical id cannot be computed; the tree itself cannot lie.
-			return fmt.Errorf("spaceimpl: bundles: uninstall %q: %w: root %q", bundleId, settings.ErrCantDeleteDerivedObject, id)
-		case !e.Present && id == bd.RootId:
-			return fmt.Errorf("spaceimpl: %w: root %q", space.ErrBundleRootNotSynced, id)
+			return uninstallDerived(bundleId, id)
 		case !e.Present:
-			return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, id)
+			return uninstallNotLocal(id, id == bd.RootId)
+		case id == bd.RootId:
+			winnerLive = true
+		default:
+			todo = append(todo, id)
 		}
-		todo = append(todo, id)
+	}
+	if winnerLive {
+		todo = append(todo, bd.RootId)
 	}
 	for _, id := range todo {
 		if err := b.deleteRootTree(ctx, id); err != nil {
+			// Entry raced away between the probe and the delete — the
+			// same retryable state the probe reports.
+			if e, derr := b.parent.store.TreeEntry(ctx, id); derr == nil && !e.Present {
+				return uninstallNotLocal(id, id == bd.RootId)
+			}
 			return fmt.Errorf("spaceimpl: bundles: uninstall %q: delete %q: %w", bundleId, id, err)
 		}
 	}
 	return nil
+}
+
+// uninstallNotLocal is the retryable refusal for a tree this device
+// does not hold: the winner's and a loser's each have their sentinel.
+func uninstallNotLocal(id string, winner bool) error {
+	if winner {
+		return fmt.Errorf("spaceimpl: %w: root %q", space.ErrBundleRootNotSynced, id)
+	}
+	return fmt.Errorf("spaceimpl: %w: %q", space.ErrLoserNotSynced, id)
+}
+
+// uninstallDerived carries both the SDK's sentinel and any-sync's, so
+// a consumer classifies it with either.
+func uninstallDerived(bundleId, id string) error {
+	return fmt.Errorf("spaceimpl: bundles: uninstall %q: root %q: %w: %w", bundleId, id, space.ErrBundleDerived, settings.ErrCantDeleteDerivedObject)
 }
 
 // stampRoot writes a bundle root's first content change: its

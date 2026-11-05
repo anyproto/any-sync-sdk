@@ -354,16 +354,22 @@ shared by the account's devices and nobody else.
   bundle as uninstalled never finds a loser left behind, and a fresh
   install inherits none. Idempotent: a row whose winner is already
   dead still sweeps its losers. `ErrBundleUnknown` for a bundle never
-  registered; `ErrLoserNotSynced` while a loser's tree is not local,
-  `ErrBundleRootNotSynced` while the winner's is (any-sync's
-  settings-tree delete reads the local head entry); a derived install
-  is refused with any-sync's derived-delete error. No grace, unlike
-  `ResolveLoser`: an uninstall discards, so a loser is deleted at the
-  head this device holds.
+  registered or with no root registered; `ErrLoserNotSynced` while a
+  loser's tree is not local, `ErrBundleRootNotSynced` while the
+  winner's is (any-sync's settings-tree delete reads the local head
+  entry), each before the first delete; a derived install is
+  `ErrBundleDerived` (any-sync's derived-delete error wrapped with it).
+  No readiness gate of its own: an uninstall discards, so a loser is
+  deleted at the head this device holds; a consumer that wants to
+  merge first runs `ResolveLoser` behind its own gate. A refusal
+  any-sync raises inside a delete (a space that restricts deletes to
+  the author) can land after the losers went; the install stays and a
+  retry meets the same refusal.
 
 Errors: `ErrBundleUnknown`, `ErrBundleBadRequest`, `ErrBundleNotLoser`,
 `ErrLoserNotSynced`, `ErrBundleRootNotSynced` (the registry references a
-root whose tree or row hasn't arrived; retry after sync).
+root whose tree or row hasn't arrived; retry after sync),
+`ErrBundleDerived`.
 
 ## Wait primitives
 
@@ -401,7 +407,8 @@ avoid demoting an unseen created install (§ Derived roots).
   winner deleted through `Objects().Delete` leaves its live losers
   claimed: the fresh root inherits them as losers, and a client's fork
   merge brings their content back. `Uninstall` deletes the losers with
-  the winner.
+  the winner, and refuses while one of them is not local: a loser whose
+  tree never reaches anyone blocks it, as it blocks `ResolveLoser`.
 - A crash between `NewRoot` and the registering write leaves one
   unreferenced object; the retried Ensure installs a fresh root. The
   orphan is unlisted, not a conflict.

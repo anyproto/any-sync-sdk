@@ -485,6 +485,12 @@ func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId str
 	return x.inner.ResolveLoser(ctx, bundleId, loserRootId)
 }
 
+func (x techBundles) Uninstall(ctx context.Context, bundleId string) error {
+	// Same inner service as ResolveLoser: a created tech install is
+	// deletable, and its losers go with it.
+	return x.inner.Uninstall(ctx, bundleId)
+}
+
 // validateTechEnsureRequest adds the tech-space rules on top of the
 // structural gate: Parts or Properties required (the root is its own
 // type — that declaration is the install), roots minted by Ensure only

@@ -306,8 +306,8 @@ Account-level product data (favourites, pinned items, personal settings)
 lives in bundles on the tech space, reached through
 `Spaces().Get(SDK.TechSpaceId())`, the restricted handle described in
 `tech-space.md`. Same registry (`bundles` on the tech index object)
-and the same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`,
-with three rules:
+and the same `Ensure` / `Get` / `List` / `DerivedRootId` / `ResolveLoser`
+/ `Uninstall`, with three rules:
 
 - Roots are minted by `Ensure` only: `NewRoot` is refused because free
   object create is fenced on the tech handle.
@@ -317,9 +317,8 @@ with three rules:
 
 Both strategies are available. `DerivedRoot` suits bundles that must
 never fork or uninstall. The SDK-created root suits ordinary app
-installs: `Objects().Delete` works on bundle roots, so deleting the
-created winner reads as uninstalled (derived roots refuse at the object
-layer), and concurrent offline installs fork and resolve as in any
+installs: `Uninstall` deletes a created install (a derived one
+refuses), and concurrent offline installs fork and resolve as in any
 space. The account is always the tech space's owner, so an app rule
 letting the owner install after the convergence wait expires always
 applies. Bundle ids are a versioned vocabulary (`favorites/v1`), never a
@@ -349,6 +348,15 @@ shared by the account's devices and nobody else.
   they meet. Idempotent. `ErrBundleNotLoser` for the winner or an
   unclaimed root; `ErrLoserNotSynced` until the loser's tree is local
   (any-sync's settings-tree delete reads the local head entry).
+- **`Uninstall(bundleId)`** — deletes the install: every losing root
+  whose tree is local, then the winner. Losers first, so a reader that
+  sees the bundle as uninstalled never finds a loser this device could
+  have deleted. Idempotent: a row whose winner is already dead still
+  sweeps its losers. `ErrBundleUnknown` for a bundle never registered;
+  `ErrBundleRootNotSynced` while the winner's tree is not local; a
+  derived install is refused with any-sync's derived-delete error and
+  nothing is deleted. A loser whose tree is not local is skipped and
+  surfaces as a loser of the next install.
 
 Errors: `ErrBundleUnknown`, `ErrBundleBadRequest`, `ErrBundleNotLoser`,
 `ErrLoserNotSynced`, `ErrBundleRootNotSynced` (the registry references a
@@ -386,7 +394,11 @@ avoid demoting an unseen created install (§ Derived roots).
 - A deleted winning root reads as **uninstalled** everywhere: `Get` /
   `List` report it absent and `Ensure` reinstalls on a fresh root.
   Otherwise the bundle id would be wedged, since record deletes are
-  rejected and `rootId` has no unset.
+  rejected and `rootId` has no unset. The claim set is add-only, so a
+  winner deleted through `Objects().Delete` leaves its live losers
+  claimed: the fresh root inherits them as losers, and a client's fork
+  merge brings their content back. `Uninstall` deletes the losers with
+  the winner.
 - A crash between `NewRoot` and the registering write leaves one
   unreferenced object; the retried Ensure installs a fresh root. The
   orphan is unlisted, not a conflict.

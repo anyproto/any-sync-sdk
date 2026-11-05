@@ -2411,22 +2411,14 @@ type TreeEntry struct {
 // TreeEntry reads treeId's head entry once: HasTree, TreeDeleted and
 // TreeIsDerived in one lookup. A tree absent here is the zero value.
 func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error) {
-	hs, ok, err := s.headStorage(ctx)
-	if err != nil || !ok {
-		return TreeEntry{}, err
+	es, err := s.TreeEntries(ctx, []string{treeId})
+	if errors.Is(err, ErrSpaceStorageUnavailable) {
+		return TreeEntry{}, nil // no storage reads as no entry here
 	}
-	entry, err := hs.GetEntry(ctx, treeId)
 	if err != nil {
-		if isDocNotFound(err) {
-			return TreeEntry{}, nil
-		}
 		return TreeEntry{}, err
 	}
-	return TreeEntry{
-		Present: true,
-		Deleted: entry.DeletedStatus != headstorage.DeletedStatusNotDeleted,
-		Derived: entry.IsDerived,
-	}, nil
+	return es[0], nil
 }
 
 // ErrSpaceStorageUnavailable: the space holds no storage to read head

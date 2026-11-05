@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/settings"
 	"github.com/stretchr/testify/require"
 
@@ -181,15 +180,15 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 
 	// --- stale/v1: a deleted winner alone leaves the loser claimed. ---
 	stale := converged(staleId)
-	// The winner may be B's root, which deletes only once it is local;
-	// any other refusal is final.
-	var derr error
+	// The winner may be B's root, which deletes only once it is local:
+	// wait until A reads it, then the delete must go through.
+	var gerr error
 	require.True(t, waitFor(ctx, 90*time.Second, time.Second, func() bool {
 		_ = spA.SyncHeads(ctx)
-		derr = spA.Objects().Delete(ctx, stale.RootId)
-		return !errors.Is(derr, treestorage.ErrUnknownTreeId)
-	}), "device A: the winner object never arrived: %v", derr)
-	require.NoError(t, derr, "device A: delete the winner object")
+		_, gerr = spA.Objects().Get(ctx, stale.RootId)
+		return gerr == nil
+	}), "device A: the winner object never arrived: %v", gerr)
+	require.NoError(t, spA.Objects().Delete(ctx, stale.RootId), "device A: delete the winner object")
 	_, err = spA.Bundles().Get(ctx, staleId)
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "a dead winner reads as uninstalled")
 	inherited, did, err := spA.Bundles().Ensure(ctx, declared(staleId))
@@ -212,7 +211,7 @@ func TestE2E_BundlesUninstall(t *testing.T) {
 	})
 	require.NoError(t, err, "device A: Ensure(fixed/v1, derived)")
 	require.True(t, derived.Derived)
-	derr = spA.Bundles().Uninstall(ctx, "fixed/v1")
+	derr := spA.Bundles().Uninstall(ctx, "fixed/v1")
 	require.ErrorIs(t, derr, space.ErrBundleDerived)
 	require.ErrorIs(t, derr, settings.ErrCantDeleteDerivedObject, "the any-sync sentinel rides along")
 	still, err := spA.Bundles().Get(ctx, "fixed/v1")

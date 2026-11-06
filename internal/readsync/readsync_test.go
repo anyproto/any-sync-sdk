@@ -111,11 +111,19 @@ func frontierKV(key, peerId string, heads []string) innerstorage.KeyValue {
 
 type fixture struct {
 	*Service
+	db  anystore.DB
 	eng *readstate.Engine
 	kv  *fakeKV
 }
 
 func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	return newFixtureWith(t, nil, nil)
+}
+
+// newFixtureWith builds the fixture over an engine with the given gap
+// resolver and space loader.
+func newFixtureWith(t *testing.T, resolve readstate.Resolver, load readstate.Loader) *fixture {
 	t.Helper()
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "readsync.db"), nil)
 	require.NoError(t, err)
@@ -124,7 +132,7 @@ func newFixture(t *testing.T) *fixture {
 	eng := readstate.New(db, testSpace, func(context.Context) (uint64, error) {
 		seq++
 		return seq, nil
-	}, nil)
+	}, resolve, load)
 	require.NoError(t, eng.Open(ctx))
 	kv := newFakeKV()
 	svc := New(
@@ -138,7 +146,7 @@ func newFixture(t *testing.T) *fixture {
 		selfPeer,
 	)
 	t.Cleanup(svc.Close)
-	return &fixture{Service: svc, eng: eng, kv: kv}
+	return &fixture{Service: svc, db: db, eng: eng, kv: kv}
 }
 
 func (f *fixture) trackUnread(t *testing.T, changeId, versionId string, prev []string) {

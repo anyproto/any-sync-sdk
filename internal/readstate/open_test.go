@@ -39,7 +39,7 @@ func TestOpen_NotOpenGate(t *testing.T) {
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "readstate.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	e := New(db, "space1", nil, nil)
+	e := New(db, "space1", nil, nil, nil)
 
 	calls := map[string]func() error{
 		"Seeded":        func() error { _, err := e.Seeded(ctx, "obj"); return err },

@@ -11,7 +11,6 @@ import (
 	"github.com/anyproto/any-sync/accountservice"
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/app/debugstat"
-	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
@@ -84,7 +83,7 @@ type App struct {
 	p2pEnabled    bool
 	globalEnabled bool
 
-	spaceCache ocache.OCache
+	spaceCache spaceCache
 	headCache  *HeadCache
 
 	syncStatus *syncstatus.Service

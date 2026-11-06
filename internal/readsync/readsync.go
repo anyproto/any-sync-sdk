@@ -13,10 +13,12 @@
 // A merge NEVER loads the object: it runs against the readstate rows
 // (plus point lookups into any-sync's change storage for gap
 // traversal), serialized per object by keyed mutexes, in its own
-// write transaction. The live hook (App.OnKeyValues) hands work to a
-// single worker goroutine; durability comes from Reconcile, which
-// replays every published frontier for a space through the same
-// idempotent merge (one state read per already-merged object).
+// write transaction. A lookup needs the space resident; the engine
+// loads a cold one between transactions, never under the write lock.
+// The live hook (App.OnKeyValues) hands work to a single worker
+// goroutine; durability comes from Reconcile, which replays every
+// published frontier for a space through the same idempotent merge
+// (one state read per already-merged object).
 package readsync
 
 import (
@@ -80,8 +82,11 @@ type Service struct {
 	mu    sync.Mutex
 	objMu map[string]*objLock
 
-	queue  chan mergeJob
-	stop   chan struct{}
+	queue chan mergeJob
+	// ctx bounds the worker's merges: Close cancels it, so a merge
+	// loading a cold space stops waiting on the network.
+	ctx    context.Context
+	cancel context.CancelFunc
 	worker sync.WaitGroup
 }
 
@@ -102,15 +107,15 @@ func New(engineFor EngineFor, kvStore KVStore, selfPeerId string) *Service {
 		selfPeerId: selfPeerId,
 		objMu:      map[string]*objLock{},
 		queue:      make(chan mergeJob, 256),
-		stop:       make(chan struct{}),
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.worker.Add(1)
 	go s.run()
 	return s
 }
 
 func (s *Service) Close() {
-	close(s.stop)
+	s.cancel()
 	s.worker.Wait()
 }
 
@@ -318,10 +323,10 @@ func (s *Service) run() {
 	defer s.worker.Done()
 	for {
 		select {
-		case <-s.stop:
+		case <-s.ctx.Done():
 			return
 		case job := <-s.queue:
-			s.merge(context.Background(), job)
+			s.merge(s.ctx, job)
 		}
 	}
 }
@@ -345,6 +350,9 @@ func (s *Service) merge(ctx context.Context, job mergeJob) {
 			// there is nothing left to merge them into.
 			log.Debug("merge frontier: object deleted", zap.String("objectId", job.objectId))
 			return
+		}
+		if ctx.Err() != nil {
+			return // shutdown; Reconcile replays the row on next boot
 		}
 		log.Warn("merge frontier", zap.String("objectId", job.objectId), zap.Error(err))
 		return

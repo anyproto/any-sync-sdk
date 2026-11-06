@@ -172,7 +172,7 @@ func TestPurgeObjects_Batch(t *testing.T) {
 // engine on the store's DB, as the apply path would.
 func trackRead(t *testing.T, ctx context.Context, s *Store, objectId, changeId string) *readstate.Engine {
 	t.Helper()
-	eng := readstate.New(s.db, s.spaceId, s.applySeqs.Next, nil)
+	eng := readstate.New(s.db, s.spaceId, s.applySeqs.Next, nil, nil)
 	require.NoError(t, eng.Open(ctx))
 	require.NoError(t, eng.TrackChange(ctx, readstate.Track{
 		ObjectId: objectId, ChangeId: changeId, VersionId: "v" + changeId,

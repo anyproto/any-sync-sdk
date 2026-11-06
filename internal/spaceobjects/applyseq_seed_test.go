@@ -23,7 +23,7 @@ func TestApplySeq_SeedCoversReadState(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "obj1", 10, 100, nil, s.spaceId))
 
-	rs := readstate.New(s.db, s.spaceId, func(context.Context) (uint64, error) { return 250, nil }, nil)
+	rs := readstate.New(s.db, s.spaceId, func(context.Context) (uint64, error) { return 250, nil }, nil, nil)
 	require.NoError(t, rs.Open(ctx))
 	require.NoError(t, rs.TrackChange(ctx, readstate.Track{
 		ObjectId: "obj1", ChangeId: "c1", VersionId: "v01", AddSeq: 1, ApplySeq: 100,

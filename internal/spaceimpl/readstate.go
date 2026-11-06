@@ -100,11 +100,12 @@ func (r *readStateAPI) MarkReadUpTo(ctx context.Context, objectId string, upTo c
 	return mapMarkErr(err)
 }
 
-// mapMarkErr translates readsync's internal untracked sentinel into the
-// public, errors.Is-matchable one: a mark racing a delete/leave passes
-// the engine check above but hits the readsync liveness gate.
+// mapMarkErr translates the internal sentinels of a mark racing a
+// delete/leave into the public, errors.Is-matchable one: the mark
+// passes the engine check above but hits the readsync liveness gate,
+// or finds the space gone again right after the engine loaded it.
 func mapMarkErr(err error) error {
-	if errors.Is(err, readsync.ErrUntracked) {
+	if errors.Is(err, readsync.ErrUntracked) || errors.Is(err, readstate.ErrSpaceNotResident) {
 		return space.ErrSpaceNotTracked
 	}
 	return err

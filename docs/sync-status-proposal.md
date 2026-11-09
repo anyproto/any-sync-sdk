@@ -80,8 +80,8 @@ HeadsApply   (senderId, treeId, heads, allAdded) // post-apply
   arrives by push still reaches `Synced`.
 - A diff round against a responsible peer that reports zero new and
   zero changed trees marks every tracked tree `Synced` and anchors the
-  space-level sync time. Trees the tracker has never seen then read as
-  `Synced` too.
+  space-level sync time. Trees in local storage that the tracker has
+  never seen then read as `Synced` too.
 
 **Responsible senders** are the space's sync nodes plus connected
 direct peers (LAN and global), so a space synced purely peer-to-peer
@@ -100,7 +100,8 @@ still reaches `Synced`.
   time yet → `Unknown`; else `Synced`.
 
 `Object(id)` returns the tree's tracked state; for an untracked id,
-`Synced` if a zero-diff round has been seen, otherwise `Unknown`.
+`Synced` if it is a non-deleted tree in local storage and a zero-diff
+round has been seen, otherwise `Unknown`.
 
 ## Components
 

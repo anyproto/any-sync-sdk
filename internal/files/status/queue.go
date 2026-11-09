@@ -306,6 +306,9 @@ func (q *Queue) ListSpace(ctx context.Context, spaceId string) ([]Job, error) {
 		}
 		out = append(out, jobFromValue(doc.Value()))
 	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -431,8 +434,11 @@ func (q *Queue) nextDue() (Job, bool) {
 
 func (q *Queue) runOne(ctx context.Context, job Job) {
 	err := q.runner(ctx, job)
+	// The settlement lands after Close too: a write on a context that
+	// has ended writes nothing, and the job would run again.
+	settleCtx := context.WithoutCancel(q.ctx)
 	if err == nil {
-		if derr := q.coll.DeleteId(q.ctx, job.id()); derr != nil && !errors.Is(derr, anystore.ErrDocNotFound) {
+		if derr := q.coll.DeleteId(settleCtx, job.id()); derr != nil && !errors.Is(derr, anystore.ErrDocNotFound) {
 			log.Warn("dequeue failed", zap.String("job", job.id()), zap.Error(derr))
 		}
 		q.notify(job, true)
@@ -468,7 +474,7 @@ func (q *Queue) runOne(ctx context.Context, job Job) {
 		}
 		return v, true, nil
 	})
-	if _, uerr := q.coll.UpdateId(q.ctx, job.id(), mod); uerr != nil && !errors.Is(uerr, anystore.ErrDocNotFound) {
+	if _, uerr := q.coll.UpdateId(settleCtx, job.id(), mod); uerr != nil && !errors.Is(uerr, anystore.ErrDocNotFound) {
 		log.Warn("job update failed", zap.String("job", job.id()), zap.Error(uerr))
 	}
 	q.notify(job, false)

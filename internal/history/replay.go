@@ -334,9 +334,10 @@ func (v *View) Record(ctx context.Context, dataset, recordId string) *anyenc.Val
 	return v.ctrl.GetStored(ctx, dataset, recordId)
 }
 
-// Records returns all live (non-tombstone) records of a dataset.
-func (v *View) Records(ctx context.Context, dataset string) []*anyenc.Value {
-	return v.ctrl.Records(ctx, dataset)
+// Records returns all live (non-tombstone) records of a dataset; a
+// read the context ended is an error, never a short result.
+func (v *View) Records(ctx context.Context, dataset string) ([]*anyenc.Value, error) {
+	return v.ctrl.ListRecords(ctx, dataset)
 }
 
 // AllRecords returns every record of a dataset INCLUDING tombstones —
@@ -359,6 +360,9 @@ func (v *View) AllRecords(ctx context.Context, dataset string) ([]*anyenc.Value,
 			return nil, err
 		}
 		out = append(out, anyencutil.Copy(a, doc.Value()))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("history: iterate %s: %w", dataset, err)
 	}
 	return out, nil
 }

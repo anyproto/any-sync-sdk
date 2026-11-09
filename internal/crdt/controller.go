@@ -904,10 +904,27 @@ func KeyedNames(regs []HandlerReg) []string {
 // (any-store's iter.Doc reuses one DocBuffer across Next() calls).
 // For streaming over many rows, hit Collection(dataset).Find(...) +
 // Iter directly and clone selectively — Records always materialises.
+//
+// nil on a read that failed as well as for a dataset without a
+// collection; ListRecords tells the two apart.
 func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Value {
-	coll := c.collectionForRead(ctx, dataset)
-	if coll == nil {
+	out, err := c.ListRecords(ctx, dataset)
+	if err != nil {
 		return nil
+	}
+	return out
+}
+
+// ListRecords is Records with the read's error: a scan the context
+// ended, or a row that failed to load, is an error, never a short
+// result. A dataset without a collection is (nil, nil).
+func (c *Controller) ListRecords(ctx context.Context, dataset string) ([]*anyenc.Value, error) {
+	coll, err := c.openForRead(ctx, dataset)
+	if err != nil {
+		return nil, err
+	}
+	if coll == nil {
+		return nil, nil
 	}
 	var filter any
 	if c.IsKeyed(dataset) {
@@ -915,14 +932,14 @@ func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Valu
 	}
 	iter, err := coll.Find(filter).Iter(ctx)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("crdt: records iter: %w", err)
 	}
 	defer iter.Close()
 	var out []*anyenc.Value
 	for iter.Next() {
 		doc, err := iter.Doc()
 		if err != nil {
-			continue
+			return nil, err
 		}
 		v := doc.Value()
 		if isTombstone(v) {
@@ -932,7 +949,10 @@ func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Valu
 			out = append(out, cloned)
 		}
 	}
-	return out
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("crdt: records iter: %w", err)
+	}
+	return out, nil
 }
 
 // ValidateChange runs the cheap up-front checks ApplyChange would

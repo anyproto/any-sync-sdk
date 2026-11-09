@@ -57,6 +57,11 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 		offloadLog.Warn("drop collections; storage kept for retry", zap.String("spaceId", spaceId), zap.Error(sweepErr))
 	}
 
+	// There is no retry gate once the storage is gone, and a write on
+	// a context that has ended writes nothing: the rest runs on a
+	// context the caller cannot end.
+	ctx = context.WithoutCancel(ctx)
+
 	// 5. Remove the any-sync per-space DB file (the bulk of the
 	// footprint) — only when the sweep fully committed: the file is the
 	// retry gate, and removing it over a partial sweep would leak the

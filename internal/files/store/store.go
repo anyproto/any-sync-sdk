@@ -236,7 +236,7 @@ func (s *Store) iterate(ctx context.Context, q anystore.Query, fn func(Info) (bo
 			return err
 		}
 	}
-	return nil
+	return iter.Err()
 }
 
 func infoFromValue(v *anyenc.Value) (Info, error) {

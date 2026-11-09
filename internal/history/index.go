@@ -507,6 +507,9 @@ func (ix *Index) listDirect(ctx context.Context, f Filter, limit int, cursor str
 		}
 		out = append(out, changeMetaFromRow(doc.Value(), f.ObjectId))
 	}
+	if err := iter.Err(); err != nil {
+		return nil, "", fmt.Errorf("history: list changes: %w", err)
+	}
 	if !hasMore || len(out) == 0 {
 		return out, "", nil
 	}
@@ -623,6 +626,9 @@ func (ix *Index) pageJoin(
 		}
 		out = append(out, meta)
 	}
+	if err := iter.Err(); err != nil {
+		return nil, "", fmt.Errorf("history: list via %s: %w", side.Name(), err)
+	}
 	if !hasMore {
 		return out, "", nil
 	}
@@ -668,6 +674,9 @@ func (ix *Index) TouchedChangeIds(ctx context.Context, objectId, dataset, record
 		if len(out) > maxTouchedChangeIds {
 			return nil, nil
 		}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("history: touched change ids: %w", err)
 	}
 	return out, nil
 }

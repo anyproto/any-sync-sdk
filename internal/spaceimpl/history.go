@@ -368,7 +368,7 @@ func (v *historicalView) Record(ctx context.Context, dataset, recordId string) (
 }
 
 func (v *historicalView) Records(ctx context.Context, dataset string) ([]*anyenc.Value, error) {
-	return v.view.Records(ctx, dataset), nil
+	return v.view.Records(ctx, dataset)
 }
 
 func publicMetas(metas []history.ChangeMeta) []space.ChangeMeta {

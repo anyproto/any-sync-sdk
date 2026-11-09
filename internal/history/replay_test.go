@@ -201,7 +201,7 @@ func TestReplayBuildsProjection(t *testing.T) {
 	assert.NotNil(t, n1.Get(crdt.VersionsKey))
 	assert.Nil(t, n1.Get(crdt.ApplySeqField))
 
-	assert.Len(t, v.Records(ctx, "notes"), 2)
+	assert.Equal(t, 2, recordCount(t, v, "notes"))
 	assert.Equal(t, []string{"notes", "tasks"}, v.Datasets())
 	assert.Equal(t, "cid-003", v.Version)
 }
@@ -259,7 +259,7 @@ func TestReplayTombstones(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Len(t, v.Records(ctx, "notes"), 1) // live only
+	assert.Equal(t, 1, recordCount(t, v, "notes")) // live only
 	all, err := v.AllRecords(ctx, "notes")
 	require.NoError(t, err)
 	assert.Len(t, all, 2) // tombstone included for the diff engine
@@ -337,4 +337,11 @@ func mustVal(t *testing.T, json string) *anyenc.Value {
 	v, err := anyenc.ParseJson(json)
 	require.NoError(t, err)
 	return v
+}
+
+func recordCount(t *testing.T, v *View, dataset string) int {
+	t.Helper()
+	recs, err := v.Records(context.Background(), dataset)
+	require.NoError(t, err)
+	return len(recs)
 }

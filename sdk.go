@@ -858,6 +858,14 @@ func (s *SDK) snapshotWatermarks(ctx context.Context) {
 				zap.String("spaceId", id), zap.Int("parked", n))
 			continue
 		}
+		// An object with a stored change its apply never committed is
+		// caught up by the boot replay only while the watermark stays
+		// below that change.
+		if n := s.applyGapCount(id); n > 0 {
+			log.Info("close: watermark snapshot skipped — unapplied changes keep the boot replay",
+				zap.String("spaceId", id), zap.Int("objects", n))
+			continue
+		}
 		handle, ok := s.app.PickSpace(ctx, id)
 		if !ok {
 			continue
@@ -872,6 +880,19 @@ func (s *SDK) snapshotWatermarks(ctx context.Context) {
 // simulating parked trees without a failing network. Always nil in
 // production.
 var parkedCountHook func(spaceId string) int
+
+// applyGapCountHook overrides applyGapCount in tests. Always nil in
+// production.
+var applyGapCountHook func(spaceId string) int
+
+// applyGapCount is the number of objects of spaceId with a stored
+// change that may be unapplied (spaceimpl.Service.ApplyGapCount).
+func (s *SDK) applyGapCount(spaceId string) int {
+	if h := applyGapCountHook; h != nil {
+		return h(spaceId)
+	}
+	return s.spaces.ApplyGapCount(spaceId)
+}
 
 // parkedTreeCount is the number of trees of spaceId that may be in
 // storage without being in the projection: parked in its treesyncer,

@@ -206,3 +206,44 @@ func TestClose_WatermarkSkipsParkedTrees(t *testing.T) {
 	}
 	assert.Greater(t, wmRead(t, dataDir, spaceId), w1)
 }
+
+// Close must not snapshot a space with an object whose stored change
+// may be unapplied: the boot replay is what catches it up, and only
+// while the watermark stays below the change.
+func TestClose_WatermarkSkipsApplyGaps(t *testing.T) {
+	dataDir := t.TempDir()
+	provider := wmProvider(t, dataDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var spaceId string
+	{
+		sdk, err := Open(ctx, wmConfig(t, dataDir), provider)
+		require.NoError(t, err)
+		sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "WMGap"})
+		require.NoError(t, err)
+		spaceId = sp.Id()
+		wmWrite(t, ctx, sp, 5)
+		require.NoError(t, sdk.Close())
+	}
+	w1 := wmRead(t, dataDir, spaceId)
+	require.Greater(t, w1, uint64(0))
+
+	applyGapCountHook = func(string) int { return 1 }
+	t.Cleanup(func() { applyGapCountHook = nil })
+	{
+		sdk, err := Open(ctx, wmConfig(t, dataDir), provider)
+		require.NoError(t, err)
+		select {
+		case <-sdk.BootstrapDone():
+		case <-ctx.Done():
+			t.Fatal("bootstrap did not complete")
+		}
+		sp, err := sdk.Spaces().Get(ctx, spaceId)
+		require.NoError(t, err)
+		wmWrite(t, ctx, sp, 5)
+		require.NoError(t, sdk.Close())
+	}
+	assert.Equal(t, w1, wmRead(t, dataDir, spaceId),
+		"Close must not snapshot a space with an apply gap")
+}

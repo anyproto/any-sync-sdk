@@ -285,6 +285,9 @@ func replayIntoScratch(ctx context.Context, db anystore.DB, tree objecttree.Hist
 		// per-change apply errors are infrastructure-level here (the
 		// scratch store is ours), so abort rather than salvage.
 		if applyErr := ctrl.ApplyChange(txCtx, *decoded); applyErr != nil {
+			if errors.Is(applyErr, crdt.ErrInvalidChange) {
+				return true // skipped by the live replay too
+			}
 			fatalErr = fmt.Errorf("history: apply %s: %w", ch.Id, applyErr)
 			return false
 		}

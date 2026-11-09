@@ -122,6 +122,9 @@ type Service struct {
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
+	// gapSets holds each space's apply-gap set across store rebuilds
+	// (an evict and reload keeps it); an offload drops it.
+	gapSets map[string]*spaceobjects.GapSet
 	// building holds the done channel of each store build in flight
 	// (storeOnce), closed when the build ends: the store is published,
 	// or the build panicked (runBuild).
@@ -264,6 +267,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		modules:             modules,
 		stores:              make(map[string]*spaceobjects.Store),
 		allocs:              make(map[string]*object.VersionAllocator),
+		gapSets:             make(map[string]*spaceobjects.GapSet),
 		building:            make(map[string]chan struct{}),
 		spaceIndexIds:       make(map[string]string),
 		spaceIndexWatchers:  make(map[string]*spaceIndexWatcher),
@@ -438,6 +442,7 @@ func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 	s.allocs[spaceId] = alloc
 	s.mu.Unlock()
 	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.extCollections, s.modules)
+	st.SetGapSet(s.gapSetFor(spaceId))
 	// Account-wide gate: once the tech space carries a CRDT version
 	// above this SDK's, every synced write fails with
 	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).
@@ -486,6 +491,38 @@ func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 // spacesync catch-up driver invoked from SDK.Open) that need the
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
+
+// ApplyGapCount is the number of spaceId's objects with a stored
+// change that may be unapplied (spaceobjects.GapSet), 0 for a space
+// never loaded this session.
+func (s *Service) ApplyGapCount(spaceId string) int {
+	s.mu.Lock()
+	g := s.gapSets[spaceId]
+	s.mu.Unlock()
+	if g == nil {
+		return 0
+	}
+	return g.Count()
+}
+
+// gapSetFor returns spaceId's gap set, creating it on first use.
+func (s *Service) gapSetFor(spaceId string) *spaceobjects.GapSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.gapSets[spaceId]
+	if !ok {
+		g = spaceobjects.NewGapSet()
+		s.gapSets[spaceId] = g
+	}
+	return g
+}
+
+// dropGapSet forgets spaceId's gap set: the space's state is gone.
+func (s *Service) dropGapSet(spaceId string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.gapSets, spaceId)
+}
 
 // peekStore returns spaceId's Store only if already built — never
 // constructs. Used by watchers that must not create runtime state.

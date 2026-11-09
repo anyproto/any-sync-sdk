@@ -49,6 +49,7 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	// 1–3. Stop watchers, close + forget the Store, evict the any-sync
 	// space — the shared close-without-delete teardown Evict also uses.
 	s.closeSpaceRuntime(ctx, spaceId)
+	s.dropGapSet(spaceId)
 
 	// 4. Drop every SDK CRDT collection for the space from the shared DB
 	// (meta watermarks purged first — see dropSpaceCollections).

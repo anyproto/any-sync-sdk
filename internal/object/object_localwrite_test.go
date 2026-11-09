@@ -3,6 +3,7 @@ package object
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -23,6 +24,8 @@ import (
 // just enough to walk LocalWrite end-to-end without spinning a full
 // any-sync stack. Records the timestamp AddContent was called with so
 // the test can assert the apply-time and on-the-wire values agree.
+// Every AddContent is kept in stored with its cleartext payload, so
+// IterateAfterAddSeq replays it the way the real tree does.
 type fakeLocalWriteTree struct {
 	objecttree.ObjectTree
 	mu       sync.Mutex
@@ -33,6 +36,20 @@ type fakeLocalWriteTree struct {
 	nextId   string
 	nextOrd  string
 	nextSeq  uint64
+	calls    int
+	stored   []*objecttree.Change
+	// addErr fails AddContent before anything is stored; storeThenErr
+	// stores the change and fails after it, like a failed head update.
+	addErr       error
+	storeThenErr error
+}
+
+// Heads is the last stored change, the root when none is.
+func (f *fakeLocalWriteTree) Heads() []string {
+	if len(f.stored) == 0 {
+		return []string{f.root.Id}
+	}
+	return []string{f.stored[len(f.stored)-1].Id}
 }
 
 func (f *fakeLocalWriteTree) Lock()         { f.mu.Lock() }
@@ -46,17 +63,66 @@ func (f *fakeLocalWriteTree) GetChange(id string) (*objecttree.Change, error) {
 	if c, ok := f.changes[id]; ok {
 		return c, nil
 	}
+	for _, c := range f.stored {
+		if c.Id == id {
+			return c, nil
+		}
+	}
 	return nil, errors.New("not found")
 }
+
+// AddContent hands out nextId/nextOrd/nextSeq on the first call and
+// "ch-N" / "a00000000N" / nextSeq+N-1 after it.
 func (f *fakeLocalWriteTree) AddContent(_ context.Context, content objecttree.SignableChangeContent) (objecttree.AddResult, error) {
 	f.captured = content.Timestamp
+	if f.addErr != nil {
+		return objecttree.AddResult{}, f.addErr
+	}
+	f.calls++
+	id, ord, seq := f.nextId, f.nextOrd, f.nextSeq
+	if f.calls > 1 {
+		id = fmt.Sprintf("ch-%d", f.calls)
+		ord = fmt.Sprintf("a%09d", f.calls)
+		seq = f.nextSeq + uint64(f.calls-1)
+	}
+	f.stored = append(f.stored, &objecttree.Change{
+		Id:        id,
+		OrderId:   ord,
+		AddSeq:    seq,
+		Data:      append([]byte(nil), content.Data...),
+		Timestamp: content.Timestamp,
+		Identity:  f.root.Identity,
+	})
+	if f.storeThenErr != nil {
+		return objecttree.AddResult{}, f.storeThenErr
+	}
 	return objecttree.AddResult{
 		Added: []objecttree.StorageChange{{
-			Id:      f.nextId,
-			OrderId: f.nextOrd,
-			AddSeq:  f.nextSeq,
+			Id:      id,
+			OrderId: ord,
+			AddSeq:  seq,
 		}},
 	}, nil
+}
+
+// IterateAfterAddSeq replays stored changes above addSeq: convert runs
+// on the cleartext payload, its result lands on Model, iterate runs
+// until it returns false.
+func (f *fakeLocalWriteTree) IterateAfterAddSeq(_ context.Context, addSeq uint64, convert objecttree.ChangeConvertFunc, iterate objecttree.ChangeIterateFunc) error {
+	for _, c := range f.stored {
+		if c.AddSeq <= addSeq {
+			continue
+		}
+		model, err := convert(c, c.Data)
+		if err != nil {
+			return err
+		}
+		c.Model = model
+		if !iterate(c) {
+			return nil
+		}
+	}
+	return nil
 }
 
 // timestampHandler records the ctx.Change.Timestamp it observes on

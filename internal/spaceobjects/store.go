@@ -325,6 +325,11 @@ type Store struct {
 	// readSeedPending marks objects mid-first-restore: the apply hook
 	// skips tracking for them (the seed covers everything present).
 	readSeedPending sync.Map
+	// gaps holds the ids of objects whose stored changes may sit above
+	// their watermark unapplied (see GapSet). The space service owns
+	// it across store rebuilds (SetGapSet); a store built without one
+	// keeps its own.
+	gaps *GapSet
 	// seedHeads consults the account's published frontiers before
 	// first-sight seeding — see SetSeedHeadsProvider.
 	seedHeads SeedHeadsProvider
@@ -570,6 +575,7 @@ func moduleInfoOf(m handler.Module) types.ModuleInfo {
 // built and started here — it lives until Close.
 func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s := &Store{
+		gaps:           NewGapSet(),
 		app:            cfg.App,
 		db:             cfg.DB,
 		signKey:        cfg.SignKey,
@@ -1945,6 +1951,8 @@ func (s *Store) markCachedDeleted(ctx context.Context, objectId string) {
 // missing stamp would leave it forever in a consumer's index). The
 // per-object data-collection drop and the notifications stay best-effort.
 func (s *Store) purgeObject(ctx context.Context, objectId string) error {
+	// A purged object has nothing left to catch up.
+	s.gaps.Set(objectId, false)
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
 		return fmt.Errorf("spaceobjects: purge open shared objects %s: %w", objectId, err)
@@ -2707,6 +2715,14 @@ func deriveChildGate(ctx context.Context, getEntry func(context.Context, string)
 	return false, nil
 }
 
+// SetGapSet replaces the store's gap set with one the caller owns
+// across store rebuilds. Call before the store serves loads.
+func (s *Store) SetGapSet(g *GapSet) {
+	if g != nil {
+		s.gaps = g
+	}
+}
+
 // loadObject is the body of the cache's LoadFunc (load). Builds
 // Controller + Object + any-sync tree + ColdRestore in one atomic step
 // under ocache's per-id load lock. payload is the caller's creation
@@ -2771,6 +2787,8 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 			s.releaseHistoryHandle(objectId)
 			s.stampPending.Delete(objectId)
 		},
+		ApplyGap: s.gaps.Has(objectId),
+		OnGap:    func(gap bool) { s.gaps.Set(objectId, gap) },
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
 	})

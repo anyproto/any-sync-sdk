@@ -161,6 +161,9 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 		}
 		if _, isBase := ancestors[decoded.ChangeId]; isBase {
 			if applyErr := ctrl.ApplyChange(txCtx, *decoded); applyErr != nil {
+				if errors.Is(applyErr, crdt.ErrInvalidChange) {
+					return true // skipped by the live replay too
+				}
 				fatalErr = fmt.Errorf("history: apply %s: %w", decoded.ChangeId, applyErr)
 				return false
 			}
@@ -250,6 +253,9 @@ func DiffRange(ctx context.Context, p ViewParams, baseHeads []string, version Ve
 			}
 		}
 		if applyErr := ctrl.ApplyChange(txCtx, *ent.decoded); applyErr != nil {
+			if errors.Is(applyErr, crdt.ErrInvalidChange) {
+				continue // skipped by the live replay too
+			}
 			_ = tx.Rollback()
 			return DiffResult{}, fmt.Errorf("history: apply %s: %w", ent.decoded.ChangeId, applyErr)
 		}

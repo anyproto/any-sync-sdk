@@ -414,11 +414,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// The network refusing this client's protocol version is the
 	// rollup's Error state: nothing syncs until the app updates.
 	out.syncStatus.SetNetworkIncompatibleFn(func() bool {
-		switch nc.NetworkCompatibilityStatus() {
-		case nodeconf.NetworkCompatibilityStatusIncompatible, nodeconf.NetworkCompatibilityStatusNeedsUpdate:
-			return true
-		}
-		return false
+		return networkRefusesClient(nc.NetworkCompatibilityStatus())
 	})
 	// Connected direct peers (LAN or global) are responsible senders
 	// too, so a space synced purely peer-to-peer still advances to
@@ -437,7 +433,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// non-dialing pool.Pick, refreshed when the p2p peer store or the
 	// discovery possibility changes (docs/sync-status-proposal.md).
 	poolComp := a.MustComponent(pool.CName).(pool.Pool)
-	pickable := func(id string) bool { return pickLive(poolComp, id) }
+	pickable := newLivePicks(func(id string) bool { return pickLive(poolComp, id) }).pickable
 	out.syncStatus.SetPeerCountsFn(func(spaceId string) (networkPeers, localPeers, globalPeers int) {
 		for _, id := range nc.NodeIds(spaceId) {
 			if pickable(id) {

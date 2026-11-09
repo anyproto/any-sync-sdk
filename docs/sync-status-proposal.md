@@ -97,7 +97,8 @@ still reaches `Synced`.
 - `Synced` = `Total − pending`, clamped at 0. A tree with no hook
   history counts as synced.
 - `State`, first match wins: the network refuses this client's protocol
-  version (nodeconf compatibility) → `Error`; no responsible node and no
+  version (nodeconf reports the handshake turned it away; a network that
+  merely needs an update still syncs) → `Error`; no responsible node and no
   direct peer connected → `Offline`; any pending tree → `Syncing`; a
   responsible sender confirmed heads in this run (`LastSyncedAt` set) →
   `Synced`; else `Unknown`. A space synced over the LAN alone is never
@@ -123,10 +124,12 @@ round has been seen, otherwise `Unknown`.
   dirty at creation so the space's first rollup goes out. A 1s tick
   drains the dirty set, recomputes each rollup, and dispatches when it
   differs from the last emitted one (`LastSyncedAt` alone does not
-  trigger an event). A node connection dropping has no hook, so each
-  tick also re-reads the presence slice (peer counts, `P2P`,
-  compatibility) of every space with an emitted rollup and dirties the
-  ones that moved.
+  trigger an event). A node connection dropping has no hook, so while
+  someone subscribes each tick also re-reads the presence slice (peer
+  counts, `P2P`, compatibility) of every tracked space with an emitted
+  rollup and dirties the ones that moved; a peer's liveness answer is
+  cached for half a second, so a tick costs the distinct peers, not
+  spaces × peers. Offloading a space forgets its tracker and rollup.
 - **Peer presence.** Counts use the non-dialing live-connection check
   (`pool.Pick`), read at rollup time.
 

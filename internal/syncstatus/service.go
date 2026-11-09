@@ -106,6 +106,10 @@ type Service struct {
 	// tests that call Tick directly).
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
+
+	// tickMu serializes Tick: two ticks interleaving would let an
+	// older rollup overwrite a newer one in lastEvent.
+	tickMu sync.Mutex
 }
 
 // NewService constructs an empty Service. Wire NodeIdsFn / TotalFn /
@@ -145,29 +149,37 @@ func (s *Service) Run(ctx context.Context) {
 
 // Tick drains the dirty set once and dispatches changed rollups.
 // Exposed for tests; the production path uses the goroutine started
-// by Run. Safe to call from any goroutine.
+// by Run. Safe to call from any goroutine; ticks run one at a time.
 //
 // Presence has no hook of its own: a node connection appearing or
 // dropping, or the network refusing this client, moves the rollup
-// with no tracker event. Every space with an emitted rollup has its
-// presence re-read on each tick and is dirtied when it moved.
+// with no tracker event. While someone subscribes, every tracked
+// space with an emitted rollup has its presence re-read on each tick
+// and is dirtied when it moved. Without a subscriber nothing listens,
+// and Status reads presence live.
 func (s *Service) Tick() {
+	s.tickMu.Lock()
+	defer s.tickMu.Unlock()
 	type emitted struct {
 		spaceId string
 		ev      space.SpaceSyncStatus
 	}
+	hasSubs := s.spaceSubs.HasSubscribers()
 	s.dirtyMu.Lock()
 	dirty := s.dirty
 	s.dirty = map[string]struct{}{}
-	polled := make([]emitted, 0, len(s.lastEvent))
-	for spaceId, ev := range s.lastEvent {
-		if _, ok := dirty[spaceId]; !ok {
-			polled = append(polled, emitted{spaceId, ev})
+	var polled []emitted
+	if hasSubs {
+		polled = make([]emitted, 0, len(s.lastEvent))
+		for spaceId, ev := range s.lastEvent {
+			if _, ok := dirty[spaceId]; !ok {
+				polled = append(polled, emitted{spaceId, ev})
+			}
 		}
 	}
 	s.dirtyMu.Unlock()
 	for _, p := range polled {
-		if s.presenceMoved(p.spaceId, p.ev) {
+		if s.trackerNoCreate(p.spaceId) != nil && s.presenceMoved(p.spaceId, p.ev) {
 			dirty[p.spaceId] = struct{}{}
 		}
 	}
@@ -175,7 +187,6 @@ func (s *Service) Tick() {
 		return
 	}
 
-	hasSubs := s.spaceSubs.HasSubscribers()
 	for spaceId := range dirty {
 		cur := s.Status(spaceId)
 		s.dirtyMu.Lock()
@@ -322,8 +333,8 @@ func (s *Service) For(spaceId string) *Tracker {
 	t = newTracker(spaceId, s, excl)
 	s.trackers[spaceId] = t
 	s.mu.Unlock()
-	// The space's first rollup goes out on the next tick: subscribers
-	// see every loaded space, and the presence poll has its baseline.
+	// The space's first rollup goes out on the next tick to whoever
+	// subscribes by then, and the presence poll has its baseline.
 	s.refresh(spaceId)
 	return t
 }
@@ -447,6 +458,24 @@ func (s *Service) RefreshAll() {
 	}
 }
 
+// Forget drops spaceId's tracker, its emitted rollup and its dirty
+// mark. For a space whose local state is being dropped (deleted or
+// left): it stops being polled and emitted. A space merely evicted
+// keeps its tracker, so its rollup stays reported.
+func (s *Service) Forget(spaceId string) {
+	s.mu.Lock()
+	t := s.trackers[spaceId]
+	delete(s.trackers, spaceId)
+	s.mu.Unlock()
+	if t != nil {
+		t.close()
+	}
+	s.dirtyMu.Lock()
+	delete(s.dirty, spaceId)
+	delete(s.lastEvent, spaceId)
+	s.dirtyMu.Unlock()
+}
+
 // rollupsEqual reports whether two SpaceSyncStatus values would
 // project to the same wire event. Excludes LastSyncedAt — that's a
 // continuously-moving timestamp that would force a dispatch on every
@@ -502,9 +531,9 @@ func (s *Service) trackerNoCreate(spaceId string) *Tracker {
 	return s.trackers[spaceId]
 }
 
-// totalFor reads the configured TotalFn for spaceId. Zero is the
-// safe default — the rollup interprets it as "no objects, so
-// trivially Synced".
+// totalFor reads the configured TotalFn for spaceId. Zero when
+// unwired: the counts then read 0/0, and the state comes from
+// presence and confirmations alone.
 func (s *Service) totalFor(spaceId string) int {
 	s.mu.Lock()
 	fn := s.totalFn

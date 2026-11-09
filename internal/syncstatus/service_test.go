@@ -337,6 +337,9 @@ func TestService_RunStartsTicker(t *testing.T) {
 
 	done := make(chan struct{}, 1)
 	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
+		if ev.State != space.SyncStateSyncing {
+			return
+		}
 		select {
 		case done <- struct{}{}:
 		default:

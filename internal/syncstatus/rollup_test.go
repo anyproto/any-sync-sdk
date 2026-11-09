@@ -161,3 +161,101 @@ func TestFor_EmitsBaselineRollup(t *testing.T) {
 	assert.Equal(t, "space-1", seen[0].SpaceId)
 	assert.Equal(t, space.SyncStateOffline, seen[0].State)
 }
+
+// Presence is polled for tracked spaces only: an id that was merely
+// refreshed emits its one rollup and stays quiet when the peers move.
+func TestTick_PollsTrackedSpacesOnly(t *testing.T) {
+	svc := NewService()
+	defer svc.Close()
+	var nodes atomic.Int32
+	nodes.Store(1)
+	svc.SetPeerCountsFn(func(string) (int, int, int) { return int(nodes.Load()), 0, 0 })
+	var mu sync.Mutex
+	seen := map[string][]space.SyncState{}
+	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
+		mu.Lock()
+		seen[ev.SpaceId] = append(seen[ev.SpaceId], ev.State)
+		mu.Unlock()
+	})
+
+	svc.For("tracked")
+	svc.Refresh("refreshed-only")
+	svc.Tick()
+	nodes.Store(0)
+	svc.Tick()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []space.SyncState{space.SyncStateUnknown, space.SyncStateOffline}, seen["tracked"])
+	assert.Equal(t, []space.SyncState{space.SyncStateUnknown}, seen["refreshed-only"], "no tracker, no poll")
+}
+
+// Without a subscriber the poll is skipped; the first tick after one
+// subscribes catches up on the presence that moved meanwhile.
+func TestTick_PollsOnlyWithSubscribers(t *testing.T) {
+	svc := NewService()
+	defer svc.Close()
+	var nodes atomic.Int32
+	nodes.Store(1)
+	var reads atomic.Int32
+	svc.SetPeerCountsFn(func(string) (int, int, int) {
+		reads.Add(1)
+		return int(nodes.Load()), 0, 0
+	})
+	svc.For("space-1")
+	svc.Tick()
+	before := reads.Load()
+	svc.Tick()
+	assert.Equal(t, before, reads.Load(), "nobody listens: presence is not read")
+
+	var mu sync.Mutex
+	var seen []space.SyncState
+	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
+		mu.Lock()
+		seen = append(seen, ev.State)
+		mu.Unlock()
+	})
+	nodes.Store(0)
+	svc.Tick()
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []space.SyncState{space.SyncStateOffline}, seen)
+}
+
+// A forgotten space stops being polled and emitted and reads Unknown;
+// For starts it afresh.
+func TestForget_StopsPollingAndEmitting(t *testing.T) {
+	svc := NewService()
+	defer svc.Close()
+	var nodes atomic.Int32
+	nodes.Store(1)
+	svc.SetPeerCountsFn(func(string) (int, int, int) { return int(nodes.Load()), 0, 0 })
+	var mu sync.Mutex
+	var seen []space.SyncState
+	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
+		mu.Lock()
+		seen = append(seen, ev.State)
+		mu.Unlock()
+	})
+	states := func() []space.SyncState {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]space.SyncState(nil), seen...)
+	}
+
+	tr := svc.For("space-1")
+	tr.HeadsChange("obj", []string{"h"})
+	tr.HeadsApply("node", "obj", []string{"h"}, true)
+	svc.Tick()
+	require.Equal(t, []space.SyncState{space.SyncStateSynced}, states())
+
+	svc.Forget("space-1")
+	nodes.Store(0)
+	svc.Tick()
+	assert.Equal(t, []space.SyncState{space.SyncStateSynced}, states(), "forgotten: nothing emitted")
+	assert.Equal(t, space.SyncStateUnknown, svc.Status("space-1").State)
+
+	svc.For("space-1")
+	svc.Tick()
+	assert.Equal(t, []space.SyncState{space.SyncStateSynced, space.SyncStateOffline}, states(), "a fresh tracker starts over")
+}

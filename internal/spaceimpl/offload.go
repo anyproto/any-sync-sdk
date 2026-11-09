@@ -50,6 +50,10 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	// space — the shared close-without-delete teardown Evict also uses.
 	s.closeSpaceRuntime(ctx, spaceId)
 	s.dropGapSet(spaceId)
+	// The space's sync status stops being polled and emitted.
+	if ss := s.app.SyncStatus(); ss != nil {
+		ss.Forget(spaceId)
+	}
 
 	// 4. Drop every SDK CRDT collection for the space from the shared DB
 	// (meta watermarks purged first — see dropSpaceCollections).

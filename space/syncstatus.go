@@ -10,8 +10,8 @@ import "time"
 //  1. Error   — the network refuses this client's protocol version
 //  2. Offline — no responsible node and no direct peer connected
 //  3. Syncing — at least one tracked tree has pending heads
-//  4. Synced  — a responsible node or direct peer confirmed the
-//     space's heads in this run and nothing is pending
+//  4. Synced  — a responsible node or direct peer confirmed heads of
+//     this space in this run and nothing is pending
 //  5. Unknown — a peer is connected but none has confirmed yet
 type SyncState uint8
 

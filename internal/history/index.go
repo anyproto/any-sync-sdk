@@ -278,7 +278,7 @@ func (ix *Index) PurgeObject(ctx context.Context, objectId string) error {
 		}
 		ids = append(ids, string(doc.Value().GetStringBytes("id")))
 	}
-	if err := iter.Close(); err != nil {
+	if err := errors.Join(iter.Err(), iter.Close()); err != nil {
 		return err
 	}
 	for _, id := range ids {
@@ -507,6 +507,9 @@ func (ix *Index) listDirect(ctx context.Context, f Filter, limit int, cursor str
 		}
 		out = append(out, changeMetaFromRow(doc.Value(), f.ObjectId))
 	}
+	if err := iter.Err(); err != nil {
+		return nil, "", fmt.Errorf("history: list changes: %w", err)
+	}
 	if !hasMore || len(out) == 0 {
 		return out, "", nil
 	}
@@ -623,6 +626,9 @@ func (ix *Index) pageJoin(
 		}
 		out = append(out, meta)
 	}
+	if err := iter.Err(); err != nil {
+		return nil, "", fmt.Errorf("history: list via %s: %w", side.Name(), err)
+	}
 	if !hasMore {
 		return out, "", nil
 	}
@@ -669,6 +675,9 @@ func (ix *Index) TouchedChangeIds(ctx context.Context, objectId, dataset, record
 			return nil, nil
 		}
 	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("history: touched change ids: %w", err)
+	}
 	return out, nil
 }
 
@@ -695,7 +704,8 @@ func (ix *Index) HasState(ctx context.Context, objectId string) (bool, error) {
 		return false, err
 	}
 	defer iter.Close()
-	return iter.Next(), nil
+	has := iter.Next()
+	return has, iter.Err()
 }
 
 // changeMetaFromRow assembles a ChangeMeta from a `__history` row

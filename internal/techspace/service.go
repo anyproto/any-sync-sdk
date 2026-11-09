@@ -541,22 +541,26 @@ func (s *Service) Get(ctx context.Context, spaceId string) (SpaceIndexRecord, bo
 
 // List returns every live space-index record. Inbound head-sync
 // changes are projected live by the resident index object's
-// deferred-updater listener, so a plain controller read is current —
-// the old read-time drain is gone.
-func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
+// deferred-updater listener, so a plain controller read is current.
+// Unavailability (service not open, index object not loadable, a scan
+// the context ended) is an error, never an empty list.
+func (s *Service) List(ctx context.Context) ([]SpaceIndexRecord, error) {
 	if !s.open.Load() {
-		return nil
+		return nil, errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	rows := obj.Controller().Records(ctx, SpaceIndexDataset)
+	rows, err := obj.Controller().ListRecords(ctx, SpaceIndexDataset)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]SpaceIndexRecord, 0, len(rows))
 	for _, v := range rows {
 		out = append(out, DecodeSpaceIndexRecord(v))
 	}
-	return out
+	return out, nil
 }
 
 // GetProfile returns the locally-stored profile (the source-of-truth
@@ -662,21 +666,25 @@ func (s *Service) GetIdentity(ctx context.Context, identity string) (IdentityRec
 	return DecodeIdentityRecord(v), true
 }
 
-// ListIdentities returns every identities-directory row.
-func (s *Service) ListIdentities(ctx context.Context) []IdentityRecord {
+// ListIdentities returns every identities-directory row. Unavailability
+// is an error, never an empty list, as for List.
+func (s *Service) ListIdentities(ctx context.Context) ([]IdentityRecord, error) {
 	if !s.open.Load() {
-		return nil
+		return nil, errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	rows := obj.Controller().Records(ctx, IdentitiesDataset)
+	rows, err := obj.Controller().ListRecords(ctx, IdentitiesDataset)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]IdentityRecord, 0, len(rows))
 	for _, v := range rows {
 		out = append(out, DecodeIdentityRecord(v))
 	}
-	return out
+	return out, nil
 }
 
 // GetIdentityMetaKey returns the cached metadata symkey (string form, per
@@ -812,7 +820,11 @@ func (s *Service) RemoveSpaceFromIdentities(ctx context.Context, spaceId string)
 	if spaceId == "" {
 		return nil
 	}
-	for _, rec := range s.ListIdentities(ctx) {
+	recs, err := s.ListIdentities(ctx)
+	if err != nil {
+		return err
+	}
+	for _, rec := range recs {
 		for _, id := range rec.SpaceIds {
 			if id == spaceId {
 				_ = s.RemoveIdentitySpace(ctx, rec.Identity, spaceId)

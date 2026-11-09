@@ -61,9 +61,14 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 	// 5. Remove the any-sync per-space DB file (the bulk of the
 	// footprint) — only when the sweep fully committed: the file is the
 	// retry gate, and removing it over a partial sweep would leak the
-	// remaining collections permanently.
+	// remaining collections permanently. Past this point there is no
+	// retry gate, and a write on a context that has ended writes
+	// nothing: the removal and the cleanups below run on a context the
+	// caller cannot end. With the file kept, the caller's context stays
+	// in force and the next boot redoes what it cuts short.
 	if claim != nil {
 		if sweepErr == nil {
+			ctx = context.WithoutCancel(ctx)
 			if err := claim.Delete(ctx); err != nil {
 				offloadLog.Warn("delete storage", zap.String("spaceId", spaceId), zap.Error(err))
 			}

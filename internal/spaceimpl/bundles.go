@@ -418,8 +418,12 @@ func (b *bundlesAPI) declareProperties(ctx context.Context, rootId string, draft
 		return fmt.Errorf("spaceimpl: bundles: load root %q: %w", rootId, err)
 	}
 	ctrl := obj.Controller()
+	defs, err := ctrl.ListRecords(ctx, typetype.DatasetPropertyDefs)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: bundles: property definitions: %w", err)
+	}
 	handles := map[string]struct{}{}
-	for _, v := range ctrl.Records(ctx, typetype.DatasetPropertyDefs) {
+	for _, v := range defs {
 		if v == nil || v.Get(crdt.DeletedAtField) != nil {
 			continue
 		}
@@ -785,7 +789,10 @@ func (b *bundlesAPI) List(ctx context.Context) ([]space.Bundle, error) {
 		}
 		return nil, err
 	}
-	rows := obj.Controller().Records(ctx, spaceindex.BundlesDataset)
+	rows, err := obj.Controller().ListRecords(ctx, spaceindex.BundlesDataset)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]space.Bundle, 0, len(rows))
 	for _, v := range rows {
 		bd, live := b.view(ctx, v)

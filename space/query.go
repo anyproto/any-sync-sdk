@@ -121,6 +121,9 @@ type QueryResult struct {
 //	    doc, err := it.Doc()
 //	    ...
 //	}
+//	if err := it.Err(); err != nil {
+//	    ...
+//	}
 type Iterator interface {
 	Next() bool
 	Doc() (*anyenc.Value, error)

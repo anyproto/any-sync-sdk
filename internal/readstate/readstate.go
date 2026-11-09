@@ -369,6 +369,9 @@ func (e *Engine) loadEntries(ctx context.Context, objectId, upTo string) ([]Entr
 		}
 		out = append(out, entryFromDoc(doc.Value()))
 	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -490,7 +493,7 @@ func (e *Engine) findByKey(ctx context.Context, objectId, key string) (*Entry, e
 	}
 	defer it.Close()
 	if !it.Next() {
-		return nil, nil
+		return nil, it.Err()
 	}
 	doc, err := it.Doc()
 	if err != nil {
@@ -993,6 +996,9 @@ func (e *Engine) ChangedSince(ctx context.Context, since uint64, limit int) ([]O
 			ObjectId: string(v.GetStringBytes("id")),
 			StateSeq: uint64(v.GetInt(fStateSeq)),
 		})
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

@@ -89,7 +89,11 @@ func (s *Service) deletionLoop(ctx context.Context) {
 // coordinator is unreachable the StatusCheckMany call errors and the
 // pass is skipped, so the next tick retries — no local state changes.
 func (s *Service) reconcileDeletions(ctx context.Context) {
-	rows := s.tsp.List(ctx)
+	rows, lerr := s.tsp.List(ctx)
+	if lerr != nil {
+		delLog.Debug("skip deletion pass: space list", zap.Error(lerr))
+		return
+	}
 	if len(rows) == 0 {
 		return
 	}

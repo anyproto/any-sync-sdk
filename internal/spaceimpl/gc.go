@@ -49,14 +49,16 @@ var gcLog = logger.NewNamed("sdk.collectiongc")
 // this same per-DB pass — run against each space DB — keeps healing
 // object-purge leaks inside live spaces.
 func (s *Service) SweepOrphanCollections(ctx context.Context) {
-	rows := s.tsp.List(ctx)
+	rows, lerr := s.tsp.List(ctx)
+	if lerr != nil {
+		// An errored list carries no tombstones: nothing could be
+		// positively swept, and a meta row scoped to a then-unlisted
+		// live space would read as dead.
+		gcLog.Debug("skip sweep: space list", zap.Error(lerr))
+		return
+	}
 	if len(rows) == 0 {
-		// List returns nil for "no spaces" AND for every error (index
-		// not open, ocache failure). An errored list carries no
-		// tombstones — nothing could be positively swept anyway (and a
-		// meta row scoped to a then-unlisted live space would read as
-		// dead) — and a genuinely fresh account has nothing to sweep,
-		// so zero rows always means skip.
+		// A fresh account has nothing to sweep.
 		gcLog.Debug("skip sweep: empty space list")
 		return
 	}

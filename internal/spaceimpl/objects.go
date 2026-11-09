@@ -85,8 +85,8 @@ var objectLog = logger.NewNamed("sdk.objects")
 // every deriver of the same object must pass the same value.
 const objectChangeType = "object"
 
-// copyCleanupTimeout bounds the delete that reclaims a half copy.
-const copyCleanupTimeout = 30 * time.Second
+// cleanupTimeout bounds the purge that reclaims a half-made object.
+const cleanupTimeout = 30 * time.Second
 
 // objectService implements space.ObjectService backed by the
 // per-space spaceobjects.Store.
@@ -126,8 +126,13 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 			// A refused bootstrap (a wrong slot, an owner the object
 			// does not have) would leave a bare tree nothing references.
 			// A root-only tree is outside head-sync, so a local purge
-			// reclaims it without a settings-tree deletion record.
-			if derr := o.parent.store.DeleteTree(ctx, objectId); derr != nil {
+			// reclaims it without a settings-tree deletion record. The
+			// purge runs on a context the failure's own cancellation
+			// cannot take down.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			derr := o.parent.store.DeleteTree(cleanupCtx, objectId)
+			cancel()
+			if derr != nil {
 				objectLog.Warn("orphaned tree after a refused bootstrap", zap.String("objectId", objectId), zap.Error(derr))
 			}
 			return "", err
@@ -138,7 +143,7 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 			// The row is already written: a half copy is reclaimed the
 			// way a user delete is, best effort, on a context the
 			// failure's own cancellation cannot take down.
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), copyCleanupTimeout)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 			derr := o.Delete(cleanupCtx, objectId)
 			cancel()
 			if derr != nil {

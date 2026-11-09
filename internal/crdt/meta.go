@@ -242,6 +242,9 @@ func QueryChangedObjects(ctx context.Context, coll anystore.Collection, spaceId 
 			Deleted:  v.GetBool(metaDeletedKey),
 		})
 	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("crdt: changed-objects iter: %w", err)
+	}
 	return out, nil
 }
 
@@ -270,6 +273,9 @@ func MaxObjectApplySeq(ctx context.Context, coll anystore.Collection, spaceId st
 			return 0, derr
 		}
 		return uint64(doc.Value().GetInt(metaApplySeqKey)), nil
+	}
+	if err := iter.Err(); err != nil {
+		return 0, fmt.Errorf("crdt: max-applyseq iter: %w", err)
 	}
 	return 0, nil
 }

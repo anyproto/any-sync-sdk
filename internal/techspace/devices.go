@@ -452,7 +452,11 @@ func PlanClaimActive(ctx context.Context, ctrl *crdt.Controller, self, target, a
 	if own := ctrl.Get(ctx, DevicesDataset, self); own != nil && !liveDeviceRow(own) {
 		return crdt.RecordChange{}, fmt.Errorf("techspace: %w: %q", space.ErrDevicePruned, self)
 	}
-	return ClaimActiveOps(&anyenc.Arena{}, DecodeDevices(ctrl.Records(ctx, DevicesDataset)), self, target, app, now)
+	rows, err := ctrl.ListRecords(ctx, DevicesDataset)
+	if err != nil {
+		return crdt.RecordChange{}, err
+	}
+	return ClaimActiveOps(&anyenc.Arena{}, DecodeDevices(rows), self, target, app, now)
 }
 
 // ClaimActiveOps plans the record change for a ClaimActive: devices is
@@ -584,5 +588,9 @@ func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
 	if err != nil {
 		return nil, err
 	}
-	return DecodeDevices(obj.Controller().Records(ctx, DevicesDataset)), nil
+	rows, err := obj.Controller().ListRecords(ctx, DevicesDataset)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeDevices(rows), nil
 }

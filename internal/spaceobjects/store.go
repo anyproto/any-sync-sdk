@@ -2426,16 +2426,21 @@ func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error)
 	return treeEntryOf(ctx, hs, treeId)
 }
 
-// PeekTreeEntry is TreeEntry for a space that is already loaded: it
-// never loads the space or waits on a load in flight. ok is false
-// while the space is not resident or holds no storage.
-func (s *Store) PeekTreeEntry(ctx context.Context, treeId string) (e TreeEntry, ok bool, err error) {
+// HoldsTree reports whether this device stores treeId's content: a
+// non-deleted head entry that is not a selective-sync stub. It reads
+// only a loaded space — never loads one or waits on a load in flight —
+// and a space that is not loaded holds no tree it can vouch for.
+func (s *Store) HoldsTree(ctx context.Context, treeId string) bool {
 	st, resident := s.peekStorage()
 	if !resident || st == nil {
-		return TreeEntry{}, false, nil
+		return false
 	}
-	e, err = treeEntryOf(ctx, st.HeadStorage(), treeId)
-	return e, err == nil, err
+	e, err := treeEntryOf(ctx, st.HeadStorage(), treeId)
+	if err != nil || !e.Present || e.Deleted {
+		return false
+	}
+	skipped, err := s.IsTreeSkipped(ctx, treeId)
+	return err == nil && !skipped
 }
 
 // peekStorage returns the storage of the space if it is already

@@ -145,7 +145,7 @@ func (t *Tracker) lookup(treeId string, withPending bool) (row treeState, ok boo
 	if row, ok = t.rowLocked(treeId, withPending); ok {
 		return row, true, time.Time{}
 	}
-	return treeState{}, false, allSyncedAt
+	return treeState{}, false, t.lastAllSyncedAt
 }
 
 // rowLocked returns a copy of treeId's row, its pending heads copied

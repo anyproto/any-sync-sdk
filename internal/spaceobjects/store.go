@@ -2426,6 +2426,25 @@ func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error)
 	return treeEntryOf(ctx, hs, treeId)
 }
 
+// PeekTreeEntry is TreeEntry for a space that is already loaded: it
+// never loads the space or waits on a load in flight. ok is false
+// while the space is not resident.
+func (s *Store) PeekTreeEntry(ctx context.Context, treeId string) (e TreeEntry, ok bool, err error) {
+	if s.app == nil {
+		return TreeEntry{}, false, nil
+	}
+	handle, loaded := s.app.PeekSpace(s.spaceId)
+	if !loaded {
+		return TreeEntry{}, false, nil
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return TreeEntry{}, false, nil
+	}
+	e, err = treeEntryOf(ctx, st.HeadStorage(), treeId)
+	return e, err == nil, err
+}
+
 // treeEntryOf reads one head entry; an absent tree is the zero value.
 func treeEntryOf(ctx context.Context, hs headstorage.HeadStorage, treeId string) (TreeEntry, error) {
 	entry, err := hs.GetEntry(ctx, treeId)

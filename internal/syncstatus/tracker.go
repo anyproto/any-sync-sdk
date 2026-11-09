@@ -114,41 +114,48 @@ func (t *Tracker) AddExcluded(treeIds ...string) {
 // Object returns the snapshot for objectId. An id with no per-tree
 // row reads Synced only when it is a tree in local storage and a
 // responsible peer has confirmed space-level convergence; any other
-// id — never seen, deleted, from another space — reads Unknown.
+// id with no row — never stored, deleted before this run saw it, from
+// another space — reads Unknown.
 func (t *Tracker) Object(objectId string) space.ObjectSyncStatus {
-	t.mu.Lock()
-	st, ok := t.trees[objectId]
-	var out space.ObjectSyncStatus
-	if ok {
-		out = space.ObjectSyncStatus{
-			ObjectId:   objectId,
-			State:      st.state,
-			LastSyncAt: st.lastApplied,
-		}
-	}
-	allSyncedAt := t.lastAllSyncedAt
-	t.mu.Unlock()
-	if ok {
-		return out
-	}
-	if t.inheritsAllSynced(objectId, allSyncedAt) {
-		return space.ObjectSyncStatus{
-			ObjectId:   objectId,
-			State:      space.SyncStateSynced,
-			LastSyncAt: allSyncedAt,
-		}
+	row, ok, inherited := t.lookup(objectId)
+	switch {
+	case ok:
+		return space.ObjectSyncStatus{ObjectId: objectId, State: row.state, LastSyncAt: row.lastApplied}
+	case !inherited.IsZero():
+		return space.ObjectSyncStatus{ObjectId: objectId, State: space.SyncStateSynced, LastSyncAt: inherited}
 	}
 	return space.ObjectSyncStatus{ObjectId: objectId, State: space.SyncStateUnknown}
 }
 
-// inheritsAllSynced reports whether a tree with no per-tree row takes
-// the space-level synced state confirmed at allSyncedAt: only a tree
-// this device stores. Called without t.mu — the lookup reads storage.
-func (t *Tracker) inheritsAllSynced(treeId string, allSyncedAt time.Time) bool {
-	if allSyncedAt.IsZero() || t.parent == nil {
-		return false
+// lookup returns a copy of treeId's row, or, with no row, the
+// space-level sync time the tree inherits: non-zero only for a tree
+// this device stores, once a responsible peer confirmed convergence.
+// The storage lookup runs without t.mu; a row created meanwhile wins.
+func (t *Tracker) lookup(treeId string) (row treeState, ok bool, inherited time.Time) {
+	t.mu.Lock()
+	row, ok = t.rowLocked(treeId)
+	allSyncedAt := t.lastAllSyncedAt
+	t.mu.Unlock()
+	if ok || allSyncedAt.IsZero() || t.parent == nil || !t.parent.hasTree(t.spaceId, treeId) {
+		return row, ok, time.Time{}
 	}
-	return t.parent.hasTree(t.spaceId, treeId)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if row, ok = t.rowLocked(treeId); ok {
+		return row, true, time.Time{}
+	}
+	return treeState{}, false, allSyncedAt
+}
+
+// rowLocked returns a copy of treeId's row. Caller holds t.mu.
+func (t *Tracker) rowLocked(treeId string) (treeState, bool) {
+	st, ok := t.trees[treeId]
+	if !ok {
+		return treeState{}, false
+	}
+	row := *st
+	row.pending = append([]string(nil), st.pending...)
+	return row, true
 }
 
 // Detail returns the full per-tree snapshot used by the debug
@@ -159,20 +166,15 @@ func (t *Tracker) inheritsAllSynced(treeId string, allSyncedAt time.Time) bool {
 // Object's rule — Synced for a stored tree after a 0/0
 // responsible-peer round, Unknown with zero values otherwise.
 func (t *Tracker) Detail(objectId string) (state space.SyncState, pending []string, lastApplied time.Time, known bool) {
-	t.mu.Lock()
-	if st, ok := t.trees[objectId]; ok {
-		var p []string
-		if len(st.pending) > 0 {
-			p = append(p, st.pending...)
+	row, ok, inherited := t.lookup(objectId)
+	switch {
+	case ok:
+		if len(row.pending) == 0 {
+			row.pending = nil
 		}
-		state, lastApplied = st.state, st.lastApplied
-		t.mu.Unlock()
-		return state, p, lastApplied, true
-	}
-	allSyncedAt := t.lastAllSyncedAt
-	t.mu.Unlock()
-	if t.inheritsAllSynced(objectId, allSyncedAt) {
-		return space.SyncStateSynced, nil, allSyncedAt, false
+		return row.state, row.pending, row.lastApplied, true
+	case !inherited.IsZero():
+		return space.SyncStateSynced, nil, inherited, false
 	}
 	return space.SyncStateUnknown, nil, time.Time{}, false
 }

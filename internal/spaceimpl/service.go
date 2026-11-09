@@ -307,10 +307,12 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 }
 
 // hasLiveTree reports whether treeId is a non-deleted tree in
-// spaceId's local storage. A space with no store yet holds no tree.
+// spaceId's local storage. It backs a context-free status read, so it
+// never loads a space: a space with no store yet, or not loaded, holds
+// no tree it can vouch for.
 func (s *Service) hasLiveTree(spaceId, treeId string) bool {
 	var store *spaceobjects.Store
-	if spaceId == s.tsp.SpaceId() {
+	if s.tsp != nil && spaceId == s.tsp.SpaceId() {
 		store = s.tsp.Store()
 	} else {
 		s.mu.Lock()
@@ -320,8 +322,8 @@ func (s *Service) hasLiveTree(spaceId, treeId string) bool {
 	if store == nil {
 		return false
 	}
-	e, err := store.TreeEntry(context.Background(), treeId)
-	return err == nil && e.Present && !e.Deleted
+	e, ok, _ := store.PeekTreeEntry(context.Background(), treeId)
+	return ok && e.Present && !e.Deleted
 }
 
 // SetFiles wires the SDK-level files byte-layer services. Called once

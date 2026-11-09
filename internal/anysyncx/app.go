@@ -411,6 +411,15 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// filter inbound HeadsApply senders.
 	nc := out.nodeConf
 	out.syncStatus.SetNodeIdsFn(nc.NodeIds)
+	// The network refusing this client's protocol version is the
+	// rollup's Error state: nothing syncs until the app updates.
+	out.syncStatus.SetNetworkIncompatibleFn(func() bool {
+		switch nc.NetworkCompatibilityStatus() {
+		case nodeconf.NetworkCompatibilityStatusIncompatible, nodeconf.NetworkCompatibilityStatusNeedsUpdate:
+			return true
+		}
+		return false
+	})
 	// Connected direct peers (LAN or global) are responsible senders
 	// too, so a space synced purely peer-to-peer still advances to
 	// Synced.

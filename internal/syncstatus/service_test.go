@@ -39,6 +39,7 @@ func TestTracker_HeadsChangeThenApply(t *testing.T) {
 	// Constant total = 1 so Synced math is well-defined when the
 	// tree converges.
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	tr := svc.For("space-1")
 
@@ -96,6 +97,7 @@ func TestSubscribeStatus_FanOut(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	var fired atomic.Int64
 	cancel := svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
@@ -129,6 +131,7 @@ func TestSubscribeStatus_Dedupe(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	var fired atomic.Int64
 	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
@@ -326,6 +329,7 @@ func TestService_RunStartsTicker(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -348,3 +352,7 @@ func TestService_RunStartsTicker(t *testing.T) {
 		t.Fatalf("ticker did not dispatch within 3s")
 	}
 }
+
+// connectedNode is the presence of a space with one responsible node
+// connected and no direct peer.
+func connectedNode(string) (networkPeers, localPeers, globalPeers int) { return 1, 0, 0 }

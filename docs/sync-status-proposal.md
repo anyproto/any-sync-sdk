@@ -47,9 +47,9 @@ type ObjectSyncStatus struct {
 }
 ```
 
-`SyncState` declares `Unknown`, `Offline`, `Syncing`, `Synced`, `Error`.
-The rollup produces only `Unknown`, `Syncing` and `Synced`; connectivity
-is reported through the peer counts and `P2P`.
+`SyncState` declares `Unknown`, `Offline`, `Syncing`, `Synced`, `Error`;
+the rollup produces all five (see Rollup). The peer counts and `P2P` say
+who is connected.
 
 `P2PState`: `NotPossible` (p2p disabled, or no usable interface),
 `NotConnected`, `Connected` (a live LAN or global peer),
@@ -96,8 +96,13 @@ still reaches `Synced`.
   (`spaceobjects.Store.RegularObjectCount`).
 - `Synced` = `Total − pending`, clamped at 0. A tree with no hook
   history counts as synced.
-- `State`: any pending tree → `Syncing`; else `Total == 0` with no sync
-  time yet → `Unknown`; else `Synced`.
+- `State`, first match wins: the network refuses this client's protocol
+  version (nodeconf compatibility) → `Error`; no responsible node and no
+  direct peer connected → `Offline`; any pending tree → `Syncing`; a
+  responsible sender confirmed heads in this run (`LastSyncedAt` set) →
+  `Synced`; else `Unknown`. A space synced over the LAN alone is never
+  `Offline`: its peers count. A device that reached nobody never reads
+  `Synced`, whatever it holds.
 
 `Object(id)` returns the tree's tracked state; for an untracked id,
 `Synced` if it is a non-deleted tree in local storage and a zero-diff
@@ -114,10 +119,14 @@ round has been seen, otherwise `Unknown`.
 - **Tracker** (per space). Per-tree state machine and per-object
   subscriber registry.
 - **Rollup loop.** Every tracker update, peer-store change and
-  discovery-possibility change marks the space dirty. A 1s tick drains
-  the dirty set, recomputes each rollup, and dispatches when it differs
-  from the last emitted one (`LastSyncedAt` alone does not trigger an
-  event).
+  discovery-possibility change marks the space dirty; a new tracker is
+  dirty at creation so the space's first rollup goes out. A 1s tick
+  drains the dirty set, recomputes each rollup, and dispatches when it
+  differs from the last emitted one (`LastSyncedAt` alone does not
+  trigger an event). A node connection dropping has no hook, so each
+  tick also re-reads the presence slice (peer counts, `P2P`,
+  compatibility) of every space with an emitted rollup and dirties the
+  ones that moved.
 - **Peer presence.** Counts use the non-dialing live-connection check
   (`pool.Pick`), read at rollup time.
 

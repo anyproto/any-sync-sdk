@@ -172,6 +172,10 @@ type Config struct {
 	// AfterReplay runs once per replay batch after its applies (see
 	// the AfterReplay type). Optional.
 	AfterReplay AfterReplay
+	// ApplyGap seeds Object.applyGap: true for an object the store
+	// recorded a gap for before it was evicted, so the replay that
+	// closes the gap reports it closed. Optional.
+	ApplyGap bool
 	// OnGap runs under the tree lock whenever the object's apply gap
 	// appears (true) or closes (false); see Object.applyGap. Optional.
 	OnGap func(gap bool)
@@ -226,6 +230,7 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 		gate:           cfg.Gate,
 		afterApply:     cfg.AfterApply,
 		afterReplay:    cfg.AfterReplay,
+		applyGap:       cfg.ApplyGap,
 		onGap:          cfg.OnGap,
 		writeGate:      cfg.WriteGate,
 		plaintextSpecs: cfg.PlaintextSpecs,
@@ -680,6 +685,11 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	// Plaintext-class changes go out with ShouldBeEncrypted:false —
 	// any-sync stamps ReadKeyId=="" and writes Data verbatim, which is
 	// what lets a keyless reader (filenode-v2 broker) materialize them.
+	//
+	// AddContent can store the change and still fail (the head update
+	// after the store): the heads tell a stored change from one that
+	// never reached the storage, and only the former leaves a gap.
+	headsBefore := o.tree.Heads()
 	res, err := o.tree.AddContent(ctx, objecttree.SignableChangeContent{
 		Data:              payload,
 		Key:               o.signKey,
@@ -688,14 +698,15 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 		Timestamp:         ch.Timestamp,
 	})
 	if err != nil {
-		// AddContent can store the change and still fail (the head
-		// update after the store); the mark costs one empty replay
-		// when it did not.
-		o.setApplyGap(true)
+		if headsMoved(headsBefore, o.tree.Heads()) {
+			o.setApplyGap(true)
+		}
 		return WriteResult{}, fmt.Errorf("object: AddContent: %w", err)
 	}
 	if len(res.Added) == 0 {
-		o.setApplyGap(true)
+		if headsMoved(headsBefore, o.tree.Heads()) {
+			o.setApplyGap(true)
+		}
 		return WriteResult{}, errors.New("object: AddContent returned no changes")
 	}
 
@@ -733,7 +744,9 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	// deadline or disconnect cannot end. any-store ends a lock wait
 	// and a running scan with the context's error, and a request that
 	// ends here would leave the change in the DAG and out of the
-	// local store. The store's close still frees the wait.
+	// local store. A wait for the writer lock here ends when its
+	// holder releases it, as before v2.4.2: the objects close before
+	// the store does.
 	applyRes, applyErr := o.applyDecodedLocked(context.WithoutCancel(ctx), ch)
 	if applyErr != nil {
 		// Stored above the watermark and not applied: the next
@@ -1052,6 +1065,24 @@ func (o *Object) Replaying() bool { return o.replaying }
 type replayItem struct {
 	decoded crdt.Change
 	raw     []byte
+}
+
+// headsMoved reports whether the tree's heads differ from before: a
+// change reached the storage.
+func headsMoved(before, after []string) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	set := make(map[string]struct{}, len(before))
+	for _, h := range before {
+		set[h] = struct{}{}
+	}
+	for _, h := range after {
+		if _, ok := set[h]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ts replaces a zero/negative timestamp with time.Now — matches the

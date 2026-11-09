@@ -40,6 +40,12 @@ func (f *fakePlaintextTree) Id() string    { return f.id }
 func (f *fakePlaintextTree) Root() *objecttree.Change {
 	return f.root
 }
+func (f *fakePlaintextTree) Heads() []string {
+	if len(f.captured) == 0 {
+		return []string{f.root.Id}
+	}
+	return []string{"ch-local"}
+}
 func (f *fakePlaintextTree) ChangeInfo() *treechangeproto.TreeChangeInfo {
 	return &treechangeproto.TreeChangeInfo{ChangeType: f.changeType}
 }

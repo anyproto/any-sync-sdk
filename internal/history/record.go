@@ -175,6 +175,9 @@ func recordFromTree(ctx context.Context, tree objecttree.HistoryTree, p RecordAt
 		// sibling rows in the scratch are invisible to this API — it
 		// returns one record, not a store (proposal §4.2 caveats).
 		if applyErr := ctrl.ApplyChange(txCtx, *decoded); applyErr != nil {
+			if errors.Is(applyErr, crdt.ErrInvalidChange) {
+				return true // skipped by the live replay too
+			}
 			fatalErr = fmt.Errorf("history: apply %s: %w", ch.Id, applyErr)
 			return false
 		}

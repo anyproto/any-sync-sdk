@@ -38,7 +38,18 @@ type fakeLocalWriteTree struct {
 	nextSeq  uint64
 	calls    int
 	stored   []*objecttree.Change
-	addErr   error
+	// addErr fails AddContent before anything is stored; storeThenErr
+	// stores the change and fails after it, like a failed head update.
+	addErr       error
+	storeThenErr error
+}
+
+// Heads is the last stored change, the root when none is.
+func (f *fakeLocalWriteTree) Heads() []string {
+	if len(f.stored) == 0 {
+		return []string{f.root.Id}
+	}
+	return []string{f.stored[len(f.stored)-1].Id}
 }
 
 func (f *fakeLocalWriteTree) Lock()         { f.mu.Lock() }
@@ -82,6 +93,9 @@ func (f *fakeLocalWriteTree) AddContent(_ context.Context, content objecttree.Si
 		Timestamp: content.Timestamp,
 		Identity:  f.root.Identity,
 	})
+	if f.storeThenErr != nil {
+		return objecttree.AddResult{}, f.storeThenErr
+	}
 	return objecttree.AddResult{
 		Added: []objecttree.StorageChange{{
 			Id:      id,

@@ -23,9 +23,11 @@ var (
 	ErrEmptyIdRequiresUpsert = errors.New("crdt: RecordChange.Id is empty but Upsert is false")
 	ErrMissingDataVersion    = errors.New("crdt: Change.DataVersion is empty")
 	// ErrInvalidChange wraps the change-level checks of ApplyChange that
-	// no retry can pass: the change itself is malformed. The inbound
-	// replay skips such a change; a halt would freeze the object on
-	// every device that receives it.
+	// no retry and no later schema can pass: the change itself is
+	// malformed. The inbound replay skips such a change; a halt would
+	// freeze the object on every device that receives it. A change on
+	// a dataset this controller has no handler for is not one: a later
+	// schema can carry the handler, so it stays ErrUnknownDataset.
 	ErrInvalidChange = errors.New("crdt: invalid change")
 
 	// ErrStrictSkipAbsent surfaces the documented strict-mode behaviour
@@ -1070,7 +1072,7 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	}
 	handler, ok := c.handlers[ch.Dataset]
 	if !ok {
-		return res, fmt.Errorf("%w: %w", ErrInvalidChange, ErrUnknownDataset)
+		return res, ErrUnknownDataset
 	}
 	// A change on a shared dataset may create its row: forget that it
 	// was absent (see objectStamper.absent).

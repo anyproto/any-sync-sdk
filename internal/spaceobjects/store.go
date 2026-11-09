@@ -325,11 +325,11 @@ type Store struct {
 	// readSeedPending marks objects mid-first-restore: the apply hook
 	// skips tracking for them (the seed covers everything present).
 	readSeedPending sync.Map
-	// applyGaps holds the ids of objects whose stored changes may sit
-	// above their watermark unapplied (object.Config.OnGap). It outlives
-	// the objects' eviction, so the clean-close watermark snapshot can
-	// leave the boot catch-up to them; a purge removes the entry.
-	applyGaps sync.Map
+	// gaps holds the ids of objects whose stored changes may sit above
+	// their watermark unapplied (see GapSet). The space service owns
+	// it across store rebuilds (SetGapSet); a store built without one
+	// keeps its own.
+	gaps *GapSet
 	// seedHeads consults the account's published frontiers before
 	// first-sight seeding — see SetSeedHeadsProvider.
 	seedHeads SeedHeadsProvider
@@ -575,6 +575,7 @@ func moduleInfoOf(m handler.Module) types.ModuleInfo {
 // built and started here — it lives until Close.
 func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s := &Store{
+		gaps:           NewGapSet(),
 		app:            cfg.App,
 		db:             cfg.DB,
 		signKey:        cfg.SignKey,
@@ -1951,7 +1952,7 @@ func (s *Store) markCachedDeleted(ctx context.Context, objectId string) {
 // per-object data-collection drop and the notifications stay best-effort.
 func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	// A purged object has nothing left to catch up.
-	s.applyGaps.Delete(objectId)
+	s.gaps.Set(objectId, false)
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
 		return fmt.Errorf("spaceobjects: purge open shared objects %s: %w", objectId, err)
@@ -2714,18 +2715,19 @@ func deriveChildGate(ctx context.Context, getEntry func(context.Context, string)
 	return false, nil
 }
 
+// SetGapSet replaces the store's gap set with one the caller owns
+// across store rebuilds. Call before the store serves loads.
+func (s *Store) SetGapSet(g *GapSet) {
+	if g != nil {
+		s.gaps = g
+	}
+}
+
 // ApplyGapCount is the number of objects with a stored change that
-// may be unapplied (see applyGaps). Non-zero means the projection is
+// may be unapplied (see GapSet). Non-zero means the projection is
 // behind the head store, and a watermark snapshot taken now would hide
 // the gap from the boot catch-up.
-func (s *Store) ApplyGapCount() int {
-	n := 0
-	s.applyGaps.Range(func(_, _ any) bool {
-		n++
-		return true
-	})
-	return n
-}
+func (s *Store) ApplyGapCount() int { return s.gaps.Count() }
 
 // loadObject is the body of the cache's LoadFunc (load). Builds
 // Controller + Object + any-sync tree + ColdRestore in one atomic step
@@ -2791,13 +2793,8 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 			s.releaseHistoryHandle(objectId)
 			s.stampPending.Delete(objectId)
 		},
-		OnGap: func(gap bool) {
-			if gap {
-				s.applyGaps.Store(objectId, struct{}{})
-			} else {
-				s.applyGaps.Delete(objectId)
-			}
-		},
+		ApplyGap: s.gaps.Has(objectId),
+		OnGap:    func(gap bool) { s.gaps.Set(objectId, gap) },
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
 	})

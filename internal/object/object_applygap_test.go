@@ -222,11 +222,42 @@ func TestLocalWrite_CatchUpFailureWritesNothing(t *testing.T) {
 	assert.Equal(t, uint64(0), o.ctrl.MaxAddSeq())
 }
 
-// AddContent failing marks the gap: the change may be stored.
-func TestLocalWrite_AddContentErrorMarksGap(t *testing.T) {
+// An AddContent that fails before anything is stored leaves no gap;
+// one that stores the change and fails after it (a failed head update)
+// marks the gap, and the next write replays the stored change.
+func TestLocalWrite_AddContentErrorMarksGapOnlyWhenStored(t *testing.T) {
+	ctx := context.Background()
 	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
-	tree.addErr = errors.New("head update")
-	_, err := o.LocalWrite(context.Background(), setRecord(t, "rec-1", "name", "a"))
+	tree.addErr = errors.New("context canceled")
+	_, err := o.LocalWrite(ctx, setRecord(t, "rec-1", "name", "a"))
 	require.ErrorContains(t, err, "AddContent")
+	assert.False(t, o.applyGap, "nothing stored, nothing to catch up")
+
+	tree.addErr = nil
+	tree.storeThenErr = errors.New("head update")
+	_, err = o.LocalWrite(ctx, setRecord(t, "rec-1", "name", "a"))
+	require.ErrorContains(t, err, "AddContent")
+	require.Len(t, tree.stored, 1)
 	assert.True(t, o.applyGap)
+
+	tree.storeThenErr = nil
+	_, err = o.LocalWrite(ctx, setRecord(t, "rec-2", "name", "b"))
+	require.NoError(t, err)
+	assert.False(t, o.applyGap)
+	requireRecords(t, o, map[string]string{"rec-1": "a", "rec-2": "b"})
+}
+
+// An object the store recorded a gap for starts marked, so the replay
+// that closes the gap reports it closed.
+func TestColdRestore_ClosesSeededGap(t *testing.T) {
+	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
+	storedInbound(t, o, tree, "ch-in", 5, setRecord(t, "rec-in", "name", "peer"))
+	o.applyGap = true
+	var gaps []bool
+	o.onGap = func(gap bool) { gaps = append(gaps, gap) }
+
+	require.NoError(t, o.ColdRestore(context.Background()))
+	assert.False(t, o.applyGap)
+	assert.Equal(t, []bool{false}, gaps)
+	requireRecords(t, o, map[string]string{"rec-in": "peer"})
 }

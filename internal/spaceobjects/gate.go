@@ -396,10 +396,11 @@ func (s *Store) Drain(ctx context.Context) error {
 	}
 	for _, row := range ready {
 		if err := s.replayParked(ctx, row); err != nil {
-			if parkedObjectDeleted(err) {
-				// The object is gone for good; the change can never
-				// apply. The purge removes these rows too — this
-				// covers a row it did not reach.
+			if parkedObjectDeleted(err) || errors.Is(err, crdt.ErrInvalidChange) {
+				// The object is gone for good, or the change itself is
+				// malformed: it can never apply. The purge removes the
+				// rows of a deleted object too — this covers a row it
+				// did not reach.
 				_ = s.Unpark(ctx, row.ChangeId)
 			}
 			// Don't surface — keep draining the rest. A stuck row

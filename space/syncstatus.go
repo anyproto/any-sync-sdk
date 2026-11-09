@@ -7,11 +7,15 @@ import "time"
 //
 // Rollup priority (highest match wins, see Service.Status):
 //
-//  1. Error   — incompatible network / needs update
-//  2. Offline — no responsible node reachable
+//  1. Error   — the network refuses this client's protocol version
+//  2. Offline — no responsible node and no direct peer connected
 //  3. Syncing — at least one tracked tree has pending heads
-//  4. Synced  — every tracked tree converged with a responsible node
-//  5. Unknown — bootstrap; no hooks fired yet, no peers polled yet
+//  4. Synced  — a responsible node or direct peer confirmed heads of
+//     this space in this run and nothing is pending
+//  5. Unknown — a peer is connected but none has confirmed yet
+//
+// A space this device does not track reads Unknown whatever the
+// presence.
 type SyncState uint8
 
 const (

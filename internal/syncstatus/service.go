@@ -32,8 +32,15 @@ type HasTreeFn func(spaceId, treeId string) bool
 
 // PeerCountsFn reports live-connection counts for spaceId: responsible
 // sync nodes, local-network peers and global peers sharing the space.
-// Wired from anysyncx (non-dialing pool.Pick reads). nil ⇒ all report 0.
+// Wired from anysyncx (non-dialing pool.Pick reads). nil ⇒ all report
+// 0, which the rollup reads as Offline.
 type PeerCountsFn func(spaceId string) (networkPeers, localPeers, globalPeers int)
+
+// NetworkIncompatibleFn reports whether the network refused this
+// client's protocol version at the handshake (nodeconf compatibility
+// Incompatible; a network that merely needs an update still syncs).
+// Wired from anysyncx. nil ⇒ compatible.
+type NetworkIncompatibleFn func() bool
 
 // P2PStateFn resolves the per-space local-network state. Wired from
 // anysyncx over discovery possibility + the p2p peer store. nil ⇒
@@ -76,6 +83,10 @@ type Service struct {
 	peerCountsFn PeerCountsFn
 	p2pStateFn   P2PStateFn
 
+	// networkIncompatible supplies the rollup's Error state. nil ⇒
+	// compatible.
+	networkIncompatible NetworkIncompatibleFn
+
 	// spaceSubs is the account-wide subscriber registry for
 	// SpaceSyncStatus events. Fired by the rollup loop.
 	spaceSubs *fanout.Registry[space.SpaceSyncStatus]
@@ -87,7 +98,9 @@ type Service struct {
 	excludedTreesFn func(spaceId string) []string
 
 	// dirty is the set of spaceIds whose rollup has changed since the
-	// last tick. refresh() inserts; tick() drains.
+	// last tick. refresh() inserts; tick() drains. lastEvent holds the
+	// rollup last recorded per tracked space. dirtyMu may be held while
+	// taking mu, never the reverse, and no callback runs under either.
 	dirtyMu   sync.Mutex
 	dirty     map[string]struct{}
 	lastEvent map[string]space.SpaceSyncStatus
@@ -96,6 +109,10 @@ type Service struct {
 	// tests that call Tick directly).
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
+
+	// tickMu serializes Tick: two ticks interleaving would let an
+	// older rollup overwrite a newer one in lastEvent.
+	tickMu sync.Mutex
 }
 
 // NewService constructs an empty Service. Wire NodeIdsFn / TotalFn /
@@ -135,21 +152,61 @@ func (s *Service) Run(ctx context.Context) {
 
 // Tick drains the dirty set once and dispatches changed rollups.
 // Exposed for tests; the production path uses the goroutine started
-// by Run. Safe to call from any goroutine.
+// by Run. Safe to call from any goroutine; ticks run one at a time.
+//
+// Presence has no hook of its own: a node connection appearing or
+// dropping, or the network refusing this client, moves the rollup
+// with no tracker event. While someone subscribes, every tracked
+// space with a recorded rollup has its presence re-read on each tick
+// and is dirtied when it moved. Without a subscriber nothing listens,
+// and Status reads presence live.
 func (s *Service) Tick() {
-	s.dirtyMu.Lock()
-	if len(s.dirty) == 0 {
-		s.dirtyMu.Unlock()
-		return
+	s.tickMu.Lock()
+	defer s.tickMu.Unlock()
+	type emitted struct {
+		spaceId string
+		ev      space.SpaceSyncStatus
 	}
+	hasSubs := s.spaceSubs.HasSubscribers()
+	s.dirtyMu.Lock()
 	dirty := s.dirty
 	s.dirty = map[string]struct{}{}
+	var polled []emitted
+	if hasSubs {
+		polled = make([]emitted, 0, len(s.lastEvent))
+		for spaceId, ev := range s.lastEvent {
+			if _, ok := dirty[spaceId]; !ok {
+				polled = append(polled, emitted{spaceId, ev})
+			}
+		}
+	}
 	s.dirtyMu.Unlock()
+	for _, p := range polled {
+		if s.trackerNoCreate(p.spaceId) != nil && s.presenceMoved(p.spaceId, p.ev) {
+			dirty[p.spaceId] = struct{}{}
+		}
+	}
+	if len(dirty) == 0 {
+		return
+	}
 
-	hasSubs := s.spaceSubs.HasSubscribers()
 	for spaceId := range dirty {
+		// Only a tracked space is recorded and emitted: an id that was
+		// merely refreshed leaves no baseline behind, and the rollup
+		// read from a tracker forgotten or replaced meanwhile is
+		// dropped (the replacement is dirty and reads on the next
+		// tick). Checked under dirtyMu, where Forget removes the
+		// tracker and the baseline together.
+		t := s.trackerNoCreate(spaceId)
+		if t == nil {
+			continue
+		}
 		cur := s.Status(spaceId)
 		s.dirtyMu.Lock()
+		if s.trackerNoCreate(spaceId) != t {
+			s.dirtyMu.Unlock()
+			continue
+		}
 		prev, had := s.lastEvent[spaceId]
 		s.lastEvent[spaceId] = cur
 		s.dirtyMu.Unlock()
@@ -230,6 +287,37 @@ func (s *Service) SetP2PStateFn(fn P2PStateFn) {
 	s.p2pStateFn = fn
 }
 
+// SetNetworkIncompatibleFn wires the network compatibility verdict.
+// Pass a closure over nodeconf.Service.NetworkCompatibilityStatus.
+func (s *Service) SetNetworkIncompatibleFn(fn NetworkIncompatibleFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.networkIncompatible = fn
+}
+
+// incompatible reads the configured NetworkIncompatibleFn. Compatible
+// when unwired.
+func (s *Service) incompatible() bool {
+	s.mu.Lock()
+	fn := s.networkIncompatible
+	s.mu.Unlock()
+	return fn != nil && fn()
+}
+
+// presenceMoved reports whether spaceId's presence slice — peer
+// counts, P2P state, the network's compatibility verdict — differs
+// from the rollup last emitted for it.
+func (s *Service) presenceMoved(spaceId string, prev space.SpaceSyncStatus) bool {
+	n, l, g := s.peerCountsFor(spaceId)
+	if n != prev.NetworkPeers || l != prev.LocalPeers || g != prev.GlobalPeers {
+		return true
+	}
+	if s.p2pStateFor(spaceId) != prev.P2P {
+		return true
+	}
+	return s.incompatible() != (prev.State == space.SyncStateError)
+}
+
 // SetExcludedTreesFn wires the per-space non-user-visible tree
 // id list (ACL / spaceIndex / settings / members system). nil ⇒ the
 // tracker tracks every tree.
@@ -255,13 +343,29 @@ func (s *Service) For(spaceId string) *Tracker {
 		s.mu.Unlock()
 		return t
 	}
+	// The callback runs outside mu: a resolver that reaches back into
+	// the service must not deadlock it.
+	exclFn := s.excludedTreesFn
+	s.mu.Unlock()
 	var excl []string
-	if s.excludedTreesFn != nil {
-		excl = s.excludedTreesFn(spaceId)
+	if exclFn != nil {
+		excl = exclFn(spaceId)
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return newTracker(spaceId, nil, nil)
+	}
+	if t, ok = s.trackers[spaceId]; ok {
+		s.mu.Unlock()
+		return t
 	}
 	t = newTracker(spaceId, s, excl)
 	s.trackers[spaceId] = t
 	s.mu.Unlock()
+	// The space's first rollup goes out on the next tick to whoever
+	// subscribes by then, and the presence poll has its baseline.
+	s.refresh(spaceId)
 	return t
 }
 
@@ -290,7 +394,7 @@ func (s *Service) Status(spaceId string) space.SpaceSyncStatus {
 	} else {
 		out.Synced = out.Total - pending
 	}
-	out.State = computeRollup(out, pending)
+	out.State = computeRollup(out, pending, s.incompatible())
 	return out
 }
 
@@ -384,6 +488,24 @@ func (s *Service) RefreshAll() {
 	}
 }
 
+// Forget drops spaceId's tracker, its emitted rollup and its dirty
+// mark. For a space whose local state is being dropped (deleted or
+// left): it stops being polled and emitted. A space merely evicted
+// keeps its tracker, so its rollup stays reported.
+func (s *Service) Forget(spaceId string) {
+	s.dirtyMu.Lock()
+	s.mu.Lock()
+	t := s.trackers[spaceId]
+	delete(s.trackers, spaceId)
+	s.mu.Unlock()
+	delete(s.dirty, spaceId)
+	delete(s.lastEvent, spaceId)
+	s.dirtyMu.Unlock()
+	if t != nil {
+		t.close()
+	}
+}
+
 // rollupsEqual reports whether two SpaceSyncStatus values would
 // project to the same wire event. Excludes LastSyncedAt — that's a
 // continuously-moving timestamp that would force a dispatch on every
@@ -430,18 +552,18 @@ func (s *Service) isResponsibleSender(spaceId, senderId string) bool {
 }
 
 // trackerNoCreate returns the existing tracker or nil. Used by
-// Status — readers shouldn't create trackers as a side effect (that
-// would mark every queried space as "tracked" even if it never sees
-// a hook).
+// Status and Tick — readers shouldn't create trackers as a side
+// effect (that would mark every queried space as "tracked" even if it
+// never sees a hook).
 func (s *Service) trackerNoCreate(spaceId string) *Tracker {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.trackers[spaceId]
 }
 
-// totalFor reads the configured TotalFn for spaceId. Zero is the
-// safe default — the rollup interprets it as "no objects, so
-// trivially Synced".
+// totalFor reads the configured TotalFn for spaceId. Zero when
+// unwired: the counts then read 0/0, and the state comes from
+// presence and confirmations alone.
 func (s *Service) totalFor(spaceId string) int {
 	s.mu.Lock()
 	fn := s.totalFn
@@ -453,19 +575,28 @@ func (s *Service) totalFor(spaceId string) int {
 }
 
 // computeRollup picks the SyncState for a SpaceSyncStatus given its
-// counts. Peer connectivity is reported through the peer counts and
-// P2P state, not through the rollup.
+// counts. Synced needs a confirmation from this run: a responsible
+// node or a direct peer applied or acknowledged the space's heads
+// (LastSyncedAt), which only a connected peer can give. A space
+// synced over the LAN alone is never Offline — its peers count.
 //
 // Priority:
-//   - pending > 0       → Syncing
-//   - Total == 0        → Unknown (no trees seen yet)
-//   - default           → Synced
-func computeRollup(s space.SpaceSyncStatus, pending int) space.SyncState {
-	if pending > 0 {
+//   - network refuses this client     → Error
+//   - no node and no direct peer live → Offline
+//   - pending > 0                     → Syncing
+//   - LastSyncedAt set                → Synced
+//   - default                         → Unknown (nothing confirmed yet)
+func computeRollup(s space.SpaceSyncStatus, pending int, incompatible bool) space.SyncState {
+	switch {
+	case incompatible:
+		return space.SyncStateError
+	case s.NetworkPeers+s.LocalPeers+s.GlobalPeers == 0:
+		return space.SyncStateOffline
+	case pending > 0:
 		return space.SyncStateSyncing
-	}
-	if s.Total == 0 && s.LastSyncedAt.Equal(time.Time{}) {
+	case !s.LastSyncedAt.IsZero():
+		return space.SyncStateSynced
+	default:
 		return space.SyncStateUnknown
 	}
-	return space.SyncStateSynced
 }

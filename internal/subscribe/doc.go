@@ -16,10 +16,11 @@
 // the largest-tuple entry serves as a sentinel; single-event shifts
 // (top-of-sort arrivals) absorb cleanly without an any-store query.
 // When Limit == 0 there is no boundary and an entry is membership
-// only. When too many records leave the held
-// window without replacement (>= DriftBudgetPercent of limit), the sub
-// closes with space.ErrSubscriptionDrifted; mailbox overflow closes
-// with space.ErrSubscriptionOverflow. Both signal "resubscribe".
+// only. When too many records leave the held window without
+// replacement (>= DriftBudgetPercent of limit) while matches lie past
+// its edge, the sub closes with space.ErrSubscriptionDrifted; a window
+// that holds every match never drifts. Mailbox overflow closes with
+// space.ErrSubscriptionOverflow. Both signal "resubscribe".
 //
 // Locking: a single engine.mu serializes register / close / OnApply.
 // No per-sub locks. Holding engine.mu during the initial snapshot

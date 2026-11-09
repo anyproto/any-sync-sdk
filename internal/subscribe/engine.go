@@ -35,6 +35,7 @@ type SubConfig struct {
 	Filter      query.Filter // already ANDed with `_deletedAt missing`
 	Sort        query.Sort   // required when Limit > 0
 	Limit       int          // 0 = unbounded; no sentinel, no fast-reject
+	Offset      int          // rows the snapshot skipped; a window past offset 0 never holds every match
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
 }
@@ -134,12 +135,11 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 		e.counter.Add(-1)
 		return nil, err
 	}
-	sub.initialHeld = len(sub.entries)
 	if cfg.Limit > 0 {
-		sub.driftBudgetAbs = (cfg.Limit * cfg.DriftBudget) / 100
-		if sub.driftBudgetAbs < 1 {
-			sub.driftBudgetAbs = 1 // at least one loss triggers when limit*budget rounds to 0
-		}
+		// The snapshot reads limit+1 rows; fewer means nothing lies
+		// past the window's edge.
+		sub.complete = cfg.Offset == 0 && len(sub.entries) <= cfg.Limit
+		sub.lostLimit = lossLimit(cfg.Limit, cfg.DriftBudget)
 	}
 
 	sub.id = e.nextId.Add(1)

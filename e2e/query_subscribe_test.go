@@ -310,11 +310,12 @@ func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
 	}
 }
 
-// TestSDK_QuerySubscribe_DriftCloseAndResubscribe drives the held
-// window past its drift budget by deleting most of its records,
-// confirms the sub closes with ErrSubscriptionDrifted, and verifies
-// that a follow-up Subscribe rebuilds a correct snapshot — the
-// resubscribe path is the engine's primary recovery contract.
+// TestSDK_QuerySubscribe_DriftCloseAndResubscribe drives a window
+// with rows past its edge beyond its drift budget by deleting its
+// records, confirms the sub closes with ErrSubscriptionDrifted, and
+// verifies that a follow-up Subscribe rebuilds a correct snapshot —
+// the resubscribe path is the engine's primary recovery contract. A
+// window over the same query that holds every match stays open.
 func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -336,11 +337,12 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	require.NoError(t, err)
 	typeId, titleProp := setupMovieType(t, ctx, sp)
 
-	// Seed 10 movies. Limit=10 → drift budget defaults to 30% → 3 losses
-	// closes the sub. We'll delete 5 to be safely over the threshold.
-	titles := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+	// Seed 15 movies. Limit=10 leaves 5 past the edge; the drift
+	// budget defaults to 30% → 3 losses close the sub. We'll delete 5
+	// to be safely over the threshold.
+	titles := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O"}
 	ids := seedMovies(t, ctx, sp, typeId, titleProp, titles)
-	require.Len(t, ids, 10)
+	require.Len(t, ids, 15)
 
 	res, err := sp.QueryObjects().
 		Filter(map[string]any{"any.type": typeId}).
@@ -349,6 +351,16 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
 	assert.Len(t, res.Initial, 10)
+
+	// Limit=20 holds every match: nothing past the edge to backfill.
+	whole, err := sp.QueryObjects().
+		Filter(map[string]any{"any.type": typeId}).
+		Sort(typeId+"."+titleProp).
+		Limit(20).
+		Subscribe(ctx, space.QueryOpts{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = whole.Sub.Close() })
+	assert.Len(t, whole.Initial, 15)
 
 	// Delete the first 5 — well past 30% of limit.
 	for _, id := range ids[:5] {
@@ -368,6 +380,18 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	assert.True(t, errors.Is(res.Sub.Err(), space.ErrSubscriptionDrifted),
 		"sub must close with ErrSubscriptionDrifted after losing >30%% of limit; got %v", res.Sub.Err())
 
+	removed := map[string]bool{}
+	for len(removed) < 5 {
+		evs, err := whole.Sub.Events().Wait(closedCtx)
+		require.NoError(t, err, "a window holding every match must stay open")
+		for _, ev := range evs {
+			for _, r := range ev.Removed {
+				removed[r.Id] = true
+			}
+		}
+	}
+	assert.NoError(t, whole.Sub.Err())
+
 	// Resubscribe — fresh snapshot of the *current* state.
 	res2, err := sp.QueryObjects().
 		Filter(map[string]any{"any.type": typeId}).
@@ -377,7 +401,7 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = res2.Sub.Close() })
 
-	assert.Equal(t, 5, res2.Total, "remaining-movies count must match (10 created - 5 deleted)")
+	assert.Equal(t, 10, res2.Total, "remaining-movies count must match (15 created - 5 deleted)")
 	remainingTitles := titles[5:]
 	assert.ElementsMatch(t, remainingTitles, extractTitles(t, res2.Initial, typeId, titleProp),
 		"resubscribe must show only the still-alive records")

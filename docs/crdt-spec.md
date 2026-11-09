@@ -766,7 +766,7 @@ Callers receive their own writes and recognize them by matching `ModifyResult.Ve
 
 ### 13.7 Backpressure + Recovery
 
-Each subscription has a bounded mailbox (`QueryOpts.MailboxCapacity`, default 256, minimum 16). When it fills, the subscription closes with `ErrSubscriptionOverflow`. It closes with `ErrSubscriptionDrifted` when more than `DriftBudgetPercent` (default 30) of `Limit` records leave the held window without replacements; the engine never re-queries any-store to backfill.
+Each subscription has a bounded mailbox (`QueryOpts.MailboxCapacity`, default 256, minimum 16). When it fills, the subscription closes with `ErrSubscriptionOverflow`. It closes with `ErrSubscriptionDrifted` when `DriftBudgetPercent` (default 30) of `Limit` records leave the held window without replacements while matches lie past its edge; the engine never re-queries any-store to backfill. A window that holds every match (offset 0, no match past its edge since the snapshot) never drifts.
 
 Either error means: resubscribe, and the new snapshot reconciles state. Nothing is dropped silently.
 

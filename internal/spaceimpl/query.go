@@ -410,6 +410,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		Filter:      combined,
 		Sort:        q.sort,
 		Limit:       int(q.limit),
+		Offset:      int(q.offset),
 		MailboxCap:  opts.MailboxCapacity,
 		DriftBudget: opts.DriftBudgetPercent,
 	}

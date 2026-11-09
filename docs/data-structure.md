@@ -556,9 +556,11 @@ an open question.
   subscription is registered. The snapshot callback must not load
   objects or write to the DAG: both need `engine.mu` and deadlock.
 - **Overflow and drift** close the subscription: a full mailbox with
-  `ErrSubscriptionOverflow`; more than `DriftBudgetPercent` (default 30)
-  of `Limit` records leaving the window without replacement with
-  `ErrSubscriptionDrifted`. Resubscribing is the only recovery.
+  `ErrSubscriptionOverflow`; `DriftBudgetPercent` (default 30) of
+  `Limit` records leaving the window without replacement, while matches
+  lie past its edge, with `ErrSubscriptionDrifted`. A window that holds
+  every match (offset 0, no match past its edge since the snapshot)
+  never drifts. Resubscribing is the only recovery.
 - **Total**: `IncludeTotal` runs one `Count` at snapshot time; it is not
   maintained live.
 

@@ -3,6 +3,7 @@ package subscribe
 import (
 	"bytes"
 	"errors"
+	"math"
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -26,10 +27,14 @@ type querySub struct {
 	minRef  *entry
 	maxRef  *entry
 
-	// Drift accounting.
-	initialHeld    int
-	lost           int
-	driftBudgetAbs int // precomputed limit*budget/100 (not used; we compare via lost*100 vs limit*budget)
+	// Drift accounting. complete: the window holds every match — its
+	// snapshot started at offset 0 and found nothing past the window's
+	// edge, and no match has been left past the edge since. A row that
+	// leaves a complete window has nothing to be backfilled from, so it
+	// is not a loss. lostLimit: lost*100 at or above it closes the sub.
+	complete  bool
+	lost      int
+	lostLimit int
 
 	docBuf *syncpool.DocBuffer
 	encBuf []byte // scratch for encoding a held row
@@ -224,12 +229,17 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if postDoc != nil {
 			// Fast-reject: at capacity, not held, post tuple already
 			// past the sentinel ⇒ no chance of entering window.
-			// Skips filter eval, allocation, mutation.
+			// Skips allocation and mutation, and filter eval unless
+			// the window is complete: a match landing past the edge
+			// ends completeness.
 			if !wasHeld && s.atCapacity() {
 				s.ensureMaxRef()
 				if s.maxRef != nil {
 					postKey = s.tupleFor(postDoc)
 					if bytes.Compare(postKey, s.maxRef.tuple) >= 0 {
+						if s.complete && (s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)) {
+							s.complete = false
+						}
 						return
 					}
 				}
@@ -251,13 +261,17 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		s.updateEntry(oldEntry, postKey, raw)
 	case wasHeld && !matches:
 		s.removeEntry(oldEntry)
-		s.lost++
+		if !s.complete {
+			s.lost++
+		}
 	case !wasHeld && matches:
 		if s.atCapacity() {
 			s.ensureMaxRef()
 			if s.maxRef != nil {
+				// Not a loss: the evicted sentinel still matches,
+				// now past the window's edge.
 				s.removeEntry(s.maxRef)
-				// Not a "loss" — steady-state add.
+				s.complete = false
 			}
 		}
 		var raw []byte
@@ -325,9 +339,19 @@ func (s *querySub) checkDrift() {
 	if s.cfg.Limit <= 0 || s.closed {
 		return
 	}
-	if s.lost*100 >= s.cfg.Limit*s.cfg.DriftBudget {
+	if s.lost*100 >= s.lostLimit {
 		s.err.Store(space.ErrSubscriptionDrifted)
 		_ = s.mb.Close()
 		s.closed = true
 	}
+}
+
+// lossLimit returns limit*budget, saturated at math.MaxInt: a budget
+// large enough to overflow the product never closes the sub, where a
+// wrapped negative product would close it on the first apply.
+func lossLimit(limit, budget int) int {
+	if budget > math.MaxInt/limit {
+		return math.MaxInt
+	}
+	return limit * budget
 }

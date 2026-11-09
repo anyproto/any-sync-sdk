@@ -176,8 +176,8 @@ func TestApply_UpdateHeldRecordEmitsUpdated(t *testing.T) {
 
 // Update that flips a record out of the filter's match set emits a
 // Removed (the record is still in the database, just no longer in the
-// query's window). lost is incremented so accumulated filter-evictions
-// can trip the drift bound.
+// query's window). The window holds every match, so the departure is
+// no loss.
 func TestApply_UpdateOutOfFilterEmitsRemoved(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
@@ -202,9 +202,8 @@ func TestApply_UpdateOutOfFilterEmitsRemoved(t *testing.T) {
 	assert.Empty(t, ev.Updated)
 	assert.Equal(t, []space.RemovedRecord{{Id: "m1", Reason: space.RemoveFilteredOut}}, ev.Removed, "filter-rejected update must emit Removed with RemoveFilteredOut")
 
-	// Engine state: entry dropped, lost bumped (counts toward drift).
 	assert.Equal(t, 0, len(sub.entries), "entry must leave the held set when the filter rejects the post-apply doc")
-	assert.Equal(t, 1, sub.lost, "filter-rejected updates count toward the drift budget")
+	assert.Equal(t, 0, sub.lost, "a window that holds every match counts no loss")
 }
 
 // Same record updating BACK to a filter-matching state re-enters the

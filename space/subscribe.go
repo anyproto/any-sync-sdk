@@ -141,10 +141,10 @@ type SubRecord struct {
 var ErrSubscriptionOverflow = errors.New("space: subscription overflowed; resubscribe required")
 
 // ErrSubscriptionDrifted is returned by QuerySubscription.Err when
-// the engine has lost more than QueryOpts.DriftBudgetPercent of the
-// held window without replacements. The engine never re-queries
-// any-store on the hot path to backfill — it closes the subscription
-// and the client is expected to resubscribe.
+// the engine has lost QueryOpts.DriftBudgetPercent of the held window
+// without replacements while matches lie past the window's edge. The
+// engine never re-queries any-store on the hot path to backfill — it
+// closes the subscription and the client is expected to resubscribe.
 var ErrSubscriptionDrifted = errors.New("space: subscription drifted (too many records left the held window); resubscribe required")
 
 // ErrSubscribeUnsupported is returned by Query.Subscribe for query

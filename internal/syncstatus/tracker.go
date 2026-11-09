@@ -36,11 +36,12 @@ type Tracker struct {
 	lastSync time.Time
 	// lastAllSyncedAt is the most recent moment a responsible
 	// peer reported a fully-converged diff round (0 new, 0
-	// changed). When non-zero, Detail/Object for a tree the
-	// tracker has never seen returns Synced anchored to this
-	// timestamp — covers cold-restored trees that haven't had a
-	// per-tree hook fire yet but are demonstrably in sync at the
-	// space level.
+	// changed). When non-zero, Detail/Object for a tree in local
+	// storage that the tracker has never seen returns Synced
+	// anchored to this timestamp — covers cold-restored trees that
+	// haven't had a per-tree hook fire yet but are demonstrably in
+	// sync at the space level. An id with no local tree stays
+	// Unknown: the round says nothing about it.
 	lastAllSyncedAt time.Time
 	subs            *fanout.Registry[space.ObjectSyncStatus]
 }
@@ -110,55 +111,71 @@ func (t *Tracker) AddExcluded(treeIds ...string) {
 	}
 }
 
-// Object returns the snapshot for objectId. Unknown ids return
-// State=Unknown; the tracker doesn't distinguish "never seen" from
-// "no work needed" via the returned value — that's the rollup loop's
-// job (which counts pending against Total).
+// Object returns the snapshot for objectId. An id with no per-tree
+// row reads Synced only when it is a tree in local storage and a
+// responsible peer has confirmed space-level convergence; any other
+// id with no row — never stored, deleted before this run saw it, from
+// another space — reads Unknown.
 func (t *Tracker) Object(objectId string) space.ObjectSyncStatus {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if st, ok := t.trees[objectId]; ok {
-		return space.ObjectSyncStatus{
-			ObjectId:   objectId,
-			State:      st.state,
-			LastSyncAt: st.lastApplied,
-		}
-	}
-	// No per-tree row, but a responsible peer has confirmed
-	// space-level convergence at lastAllSyncedAt — that anchors
-	// this tree's state to Synced. Otherwise Unknown.
-	if !t.lastAllSyncedAt.IsZero() {
-		return space.ObjectSyncStatus{
-			ObjectId:   objectId,
-			State:      space.SyncStateSynced,
-			LastSyncAt: t.lastAllSyncedAt,
-		}
+	row, ok, inherited := t.lookup(objectId, false)
+	switch {
+	case ok:
+		return space.ObjectSyncStatus{ObjectId: objectId, State: row.state, LastSyncAt: row.lastApplied}
+	case !inherited.IsZero():
+		return space.ObjectSyncStatus{ObjectId: objectId, State: space.SyncStateSynced, LastSyncAt: inherited}
 	}
 	return space.ObjectSyncStatus{ObjectId: objectId, State: space.SyncStateUnknown}
+}
+
+// lookup returns a copy of treeId's row (with its pending heads when
+// withPending), or, with no row, the space-level sync time the tree
+// inherits: non-zero only for a tree this device stores, once a
+// responsible peer confirmed convergence. The storage lookup runs
+// without t.mu; a row created meanwhile wins.
+func (t *Tracker) lookup(treeId string, withPending bool) (row treeState, ok bool, inherited time.Time) {
+	t.mu.Lock()
+	row, ok = t.rowLocked(treeId, withPending)
+	allSyncedAt := t.lastAllSyncedAt
+	t.mu.Unlock()
+	if ok || allSyncedAt.IsZero() || t.parent == nil || !t.parent.hasTree(t.spaceId, treeId) {
+		return row, ok, time.Time{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if row, ok = t.rowLocked(treeId, withPending); ok {
+		return row, true, time.Time{}
+	}
+	return treeState{}, false, t.lastAllSyncedAt
+}
+
+// rowLocked returns a copy of treeId's row, its pending heads copied
+// only when withPending. Caller holds t.mu.
+func (t *Tracker) rowLocked(treeId string, withPending bool) (treeState, bool) {
+	st, ok := t.trees[treeId]
+	if !ok {
+		return treeState{}, false
+	}
+	row := treeState{state: st.state, lastApplied: st.lastApplied}
+	if withPending && len(st.pending) > 0 {
+		row.pending = append([]string(nil), st.pending...)
+	}
+	return row, true
 }
 
 // Detail returns the full per-tree snapshot used by the debug
 // API: state, a copy of the pending-heads slice, lastApplied,
 // and whether the tracker has seen this id at all.
 //
-// Unknown ids return known=false and zero values — debug callers
-// pre-distinguish "we never saw a hook" from "we saw it and it
-// converged" (the latter has lastApplied set).
+// Ids with no per-tree row return known=false; their state follows
+// Object's rule — Synced for a stored tree after a 0/0
+// responsible-peer round, Unknown with zero values otherwise.
 func (t *Tracker) Detail(objectId string) (state space.SyncState, pending []string, lastApplied time.Time, known bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if st, ok := t.trees[objectId]; ok {
-		var p []string
-		if len(st.pending) > 0 {
-			p = append(p, st.pending...)
-		}
-		return st.state, p, st.lastApplied, true
-	}
-	if !t.lastAllSyncedAt.IsZero() {
-		// Synced anchored to the last 0/0 responsible-peer round.
-		// known=false signals "no per-tree hook history" but the
-		// state is still meaningful — callers can render it.
-		return space.SyncStateSynced, nil, t.lastAllSyncedAt, false
+	row, ok, inherited := t.lookup(objectId, true)
+	switch {
+	case ok:
+		return row.state, row.pending, row.lastApplied, true
+	case !inherited.IsZero():
+		return space.SyncStateSynced, nil, inherited, false
 	}
 	return space.SyncStateUnknown, nil, time.Time{}, false
 }
@@ -295,8 +312,8 @@ func (t *Tracker) HeadsApply(senderId, treeId string, heads []string, allAdded b
 // changed trees from our side), every locally-known tree is by
 // definition in sync with that peer. Sweep the tracker: clear
 // pending heads on every recorded tree, flip to Synced, anchor
-// lastSync to now. Unknown-to-tracker trees inherit Synced via
-// lastAllSyncedAt on the next Detail/Object read.
+// lastSync to now. Stored trees the tracker has no row for inherit
+// Synced via lastAllSyncedAt on the next Detail/Object read.
 //
 // Non-responsible senders and empty peerIds are ignored — same
 // rule HeadsApply uses, prevents a stray reply from collapsing

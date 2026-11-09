@@ -410,6 +410,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		Filter:      combined,
 		Sort:        q.sort,
 		Limit:       int(q.limit),
+		Offset:      int(q.offset),
 		MailboxCap:  opts.MailboxCapacity,
 		DriftBudget: opts.DriftBudgetPercent,
 	}
@@ -445,19 +446,19 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 				return err
 			}
 			v := doc.Value()
-			if v == nil {
-				continue
-			}
-			id := string(v.GetStringBytes("id"))
-			if id == "" {
-				continue
+			var id string
+			if v != nil {
+				id = string(v.GetStringBytes("id"))
 			}
 			// Initial's copy of the visible rows, cloned off the
 			// iterator's reused buffer. The sentinel is the engine's
 			// alone, and an unbounded sub keeps no copy of its own.
-			if q.limit == 0 || len(snapshotRows) < int(q.limit) {
+			if id != "" && (q.limit == 0 || len(snapshotRows) < int(q.limit)) {
 				snapshotRows = append(snapshotRows, anyencx.Clone(v))
 			}
+			// Every row read is yielded, a row without an id too: it
+			// took a slot of the limit+1 read, and the engine counts
+			// slots to tell whether anything lies past the edge.
 			yield(id, v)
 		}
 		return it.Err()

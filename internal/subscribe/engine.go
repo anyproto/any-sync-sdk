@@ -35,6 +35,7 @@ type SubConfig struct {
 	Filter      query.Filter // already ANDed with `_deletedAt missing`
 	Sort        query.Sort   // required when Limit > 0
 	Limit       int          // 0 = unbounded; no sentinel, no fast-reject
+	Offset      int          // rows the snapshot skipped; a window past offset 0 never starts complete
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
 }
@@ -42,8 +43,10 @@ type SubConfig struct {
 // SnapshotFn is the caller-supplied populator. It runs UNDER engine.mu
 // (held by Subscribe), so apply events fired during the read block
 // waiting on engine.mu and process after the new sub is registered.
-// The callback yields each result row's (id, post-doc) to the engine,
-// which extracts the sort tuple via cfg.Sort and inserts the entry.
+// The callback yields every row its read returns, in sort order, as
+// (id, post-doc); the engine extracts the sort tuple via cfg.Sort and
+// inserts the entry, skipping a row with no doc or id. Every yield
+// counts toward telling whether anything lies past the window's edge.
 //
 // The callback must only read already-materialised rows. Anything that
 // can apply a change — loading an object (its replay runs OnApply),
@@ -128,18 +131,19 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 
 	e.counter.Add(1)
 	sub := newSub(cfg)
+	read := 0
 	if err := snapshot(func(id string, doc *anyenc.Value) {
+		read++
 		sub.appendInitial(id, doc)
 	}); err != nil {
 		e.counter.Add(-1)
 		return nil, err
 	}
-	sub.initialHeld = len(sub.entries)
 	if cfg.Limit > 0 {
-		sub.driftBudgetAbs = (cfg.Limit * cfg.DriftBudget) / 100
-		if sub.driftBudgetAbs < 1 {
-			sub.driftBudgetAbs = 1 // at least one loss triggers when limit*budget rounds to 0
-		}
+		// The snapshot reads limit+1 rows; fewer means nothing lies
+		// past the window's edge. Every row read counts, held or not.
+		sub.complete = cfg.Offset == 0 && read <= cfg.Limit
+		sub.lostLimit = lossLimit(cfg.Limit, cfg.DriftBudget)
 	}
 
 	sub.id = e.nextId.Add(1)

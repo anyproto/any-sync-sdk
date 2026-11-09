@@ -2426,6 +2426,38 @@ func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error)
 	return treeEntryOf(ctx, hs, treeId)
 }
 
+// HoldsTree reports whether this device stores treeId's content: a
+// non-deleted head entry that is not a selective-sync stub. It reads
+// only a loaded space — never loads one or waits on a load in flight —
+// and a space that is not loaded holds no tree it can vouch for.
+func (s *Store) HoldsTree(ctx context.Context, treeId string) bool {
+	st, resident := s.peekStorage()
+	if !resident || st == nil {
+		return false
+	}
+	e, err := treeEntryOf(ctx, st.HeadStorage(), treeId)
+	if err != nil || !e.Present || e.Deleted {
+		return false
+	}
+	skipped, err := s.IsTreeSkipped(ctx, treeId)
+	return err == nil && !skipped
+}
+
+// peekStorage returns the storage of the space if it is already
+// loaded, without loading it or waiting on a load in flight. resident
+// is false while it is not; st is nil for a resident space that holds
+// no storage (closing, or not fully opened).
+func (s *Store) peekStorage() (st spacestorage.SpaceStorage, resident bool) {
+	if s.app == nil {
+		return nil, false
+	}
+	handle, ok := s.app.PeekSpace(s.spaceId)
+	if !ok {
+		return nil, false
+	}
+	return handle.Inner().Storage(), true
+}
+
 // treeEntryOf reads one head entry; an absent tree is the zero value.
 func treeEntryOf(ctx context.Context, hs headstorage.HeadStorage, treeId string) (TreeEntry, error) {
 	entry, err := hs.GetEntry(ctx, treeId)

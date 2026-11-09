@@ -125,8 +125,10 @@ type SyncStatusAPI interface {
 	// to call on every UI render.
 	Space() SpaceSyncStatus
 
-	// Object returns the state for a specific objectId. Unknown ids
-	// return ObjectSyncStatus{State: SyncStateUnknown}.
+	// Object returns the state for a specific objectId. An id with no
+	// sync activity this run returns ObjectSyncStatus{State:
+	// SyncStateUnknown} unless its tree is stored locally (not
+	// deleted) and a responsible peer has confirmed the space.
 	Object(objectId string) ObjectSyncStatus
 
 	// SubscribeObject delivers an ObjectSyncStatus event for

@@ -547,18 +547,20 @@ an open question.
   - `RemoveDeleted` — tombstoned, gone;
   - `RemoveFilteredOut` — no longer matches the filter, still exists;
   - `RemoveDisplaced` — pushed past `Limit`, still matches.
-- **Window**: with `Limit > 0` the engine holds `Limit + 1` rows; the
-  extra row is a hidden sentinel, so a single arrival at the top of the
-  sort needs no re-query. `Limit == 0` is unbounded; memory grows with
-  the matching set.
+- **Window**: with `Limit > 0` the engine holds `Limit + 1` rows, each
+  at about its stored size; the extra row is a hidden sentinel, so a
+  single arrival at the top of the sort needs no re-query. `Limit == 0`
+  is unbounded and holds ids only; memory grows with the matching set.
 - **Snapshot fence**: the initial read runs under `engine.mu`, so events
   applied during the read queue behind it and process after the
   subscription is registered. The snapshot callback must not load
   objects or write to the DAG: both need `engine.mu` and deadlock.
 - **Overflow and drift** close the subscription: a full mailbox with
-  `ErrSubscriptionOverflow`; more than `DriftBudgetPercent` (default 30)
-  of `Limit` records leaving the window without replacement with
-  `ErrSubscriptionDrifted`. Resubscribing is the only recovery.
+  `ErrSubscriptionOverflow`; `DriftBudgetPercent` (default 30) of
+  `Limit` records leaving the window without replacement with
+  `ErrSubscriptionDrifted`. A window whose snapshot, at offset 0, read
+  at most `Limit` rows counts no departures until a match lands past
+  its edge. Resubscribing is the only recovery.
 - **Total**: `IncludeTotal` runs one `Count` at snapshot time; it is not
   maintained live.
 

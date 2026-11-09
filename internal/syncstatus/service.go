@@ -26,6 +26,10 @@ type NodeIdsFn func(spaceId string) []string
 // case (matches a freshly-created space and is harmless for v1).
 type TotalFn func(spaceId string) int
 
+// HasTreeFn reports whether treeId is a tree in spaceId's local
+// storage that is not deleted. Wired from the space layer.
+type HasTreeFn func(spaceId, treeId string) bool
+
 // PeerCountsFn reports live-connection counts for spaceId: responsible
 // sync nodes, local-network peers and global peers sharing the space.
 // Wired from anysyncx (non-dialing pool.Pick reads). nil ⇒ all report 0.
@@ -62,6 +66,10 @@ type Service struct {
 	// totalFn supplies the per-space regular-object count for the
 	// rollup. May be nil in tests; then Total reports 0.
 	totalFn TotalFn
+
+	// hasTreeFn gates the space-level synced state a tree with no
+	// per-tree row inherits. nil ⇒ no tree is known to be local.
+	hasTreeFn HasTreeFn
 
 	// peerCountsFn / p2pStateFn supply the peer-presence slice of the
 	// rollup. May be nil in tests — counts then read 0 / Unknown.
@@ -188,6 +196,23 @@ func (s *Service) SetTotalFn(fn TotalFn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.totalFn = fn
+}
+
+// SetHasTreeFn wires the local tree lookup. Pass a closure over the
+// space's head storage from the space layer.
+func (s *Service) SetHasTreeFn(fn HasTreeFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hasTreeFn = fn
+}
+
+// hasTree reports whether treeId is a live tree in spaceId's local
+// storage; false while no lookup is wired.
+func (s *Service) hasTree(spaceId, treeId string) bool {
+	s.mu.Lock()
+	fn := s.hasTreeFn
+	s.mu.Unlock()
+	return fn != nil && fn(spaceId, treeId)
 }
 
 // SetPeerCountsFn wires the live-connection counters (nodes + local

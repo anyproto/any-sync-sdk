@@ -3,6 +3,8 @@ package subscribe
 import (
 	"bytes"
 	"errors"
+	"math"
+	"sync"
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -26,10 +28,14 @@ type querySub struct {
 	minRef  *entry
 	maxRef  *entry
 
-	// Drift accounting.
-	initialHeld    int
-	lost           int
-	driftBudgetAbs int // precomputed limit*budget/100 (not used; we compare via lost*100 vs limit*budget)
+	// Drift accounting. complete: the window holds every match — its
+	// snapshot started at offset 0 and found nothing past the window's
+	// edge, and no match has been left past the edge since. A row that
+	// leaves a complete window has nothing to be backfilled from, so it
+	// is not a loss. lostLimit: lost*100 at or above it closes the sub.
+	complete  bool
+	lost      int
+	lostLimit int
 
 	docBuf *syncpool.DocBuffer
 
@@ -62,31 +68,64 @@ func (s *querySub) appendInitial(id string, doc *anyenc.Value) {
 	if doc == nil || id == "" {
 		return
 	}
-	var kept *anyenc.Value
+	var raw []byte
 	if s.windowed() {
-		kept = anyencx.Clone(doc)
+		raw = encode(doc)
 	}
-	s.insertEntry(id, s.tupleFor(doc), kept)
+	s.insertEntry(id, s.tupleFor(doc), raw)
 }
 
 // windowed reports whether the sub has a boundary (Limit > 0). A
-// windowed sub keeps each held row's tuple and doc: the sentinel is
-// compared against arrivals and ships its doc when an unrelated event
-// promotes it into view. An unbounded sub has no sentinel and tracks
-// membership only — one entry per row, no doc and no tuple — so a
-// subscription over a whole collection costs its id set, not a parsed
-// copy of every row for its lifetime.
+// windowed sub keeps each held row's tuple and encoded doc: the
+// sentinel is compared against arrivals and ships its doc when an
+// unrelated event promotes it into view. An unbounded sub has no
+// sentinel and tracks membership only — one entry per row, no doc and
+// no tuple — so a subscription over a whole collection costs its id
+// set, not a copy of every row for its lifetime.
 func (s *querySub) windowed() bool {
 	return s.cfg.Limit > 0
 }
 
-// held returns what the entry keeps of a freshly cloned post doc: the
-// clone itself for a windowed sub, nothing otherwise.
-func (s *querySub) held(doc *anyenc.Value) *anyenc.Value {
-	if s.windowed() {
-		return doc
+// encode returns doc's encoding in a slice of its own. A held row
+// costs its encoded size; a parsed copy would cost about ten times
+// that for as long as the window holds it.
+func encode(doc *anyenc.Value) []byte {
+	bp := encBufs.Get().(*[]byte)
+	*bp = doc.MarshalTo((*bp)[:0])
+	raw := bytes.Clone(*bp)
+	if cap(*bp) <= maxPooledEncBuf {
+		encBufs.Put(bp)
 	}
-	return nil
+	return raw
+}
+
+// encBufs pools the encoding scratch; a buffer grown past
+// maxPooledEncBuf by one large row is dropped, not kept.
+var encBufs = sync.Pool{New: func() any { return new([]byte) }}
+
+const maxPooledEncBuf = 64 << 10
+
+// parseHeld parses a held encoding in place: raw is never mutated
+// once encoded, so the value may alias it. A row that does not parse
+// back (nested past the parser's depth limit) ships no doc, as a
+// failed clone does.
+func parseHeld(raw []byte) *anyenc.Value {
+	v, err := new(anyenc.Parser).ParseOwned(raw)
+	if err != nil {
+		return nil
+	}
+	return v
+}
+
+// capture takes what the sub needs of a post doc before the apply
+// moves on: a windowed sub keeps the encoding on its entry and parses
+// the event's copy from it only if an event ships the row; an
+// unbounded sub keeps nothing and ships a clone.
+func (s *querySub) capture(doc *anyenc.Value) (eventDoc *anyenc.Value, raw []byte) {
+	if !s.windowed() {
+		return anyencx.Clone(doc), nil
+	}
+	return nil, encode(doc)
 }
 
 // tupleFor builds the sort tuple for doc; nil for an unbounded sub,
@@ -135,8 +174,17 @@ type subPending struct {
 
 type pendingRec struct {
 	e   *entry
-	doc *anyenc.Value   // the event's clone of the post doc, or the held doc for an implicit transition
+	doc *anyenc.Value   // the event's copy of the post doc (unbounded sub)
+	raw []byte          // the held encoding the event parses its doc from (windowed sub)
 	ops []space.EventOp // nil for implicit transitions
+}
+
+// value returns the doc the event ships for the record.
+func (pr pendingRec) value() *anyenc.Value {
+	if pr.doc != nil {
+		return pr.doc
+	}
+	return parseHeld(pr.raw)
 }
 
 // apply processes one wire event. Builds at most one SubscriptionEvent
@@ -166,13 +214,13 @@ func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	if len(p.added) > 0 {
 		subev.Added = make([]space.SubRecord, 0, len(p.added))
 		for _, pr := range p.added {
-			subev.Added = append(subev.Added, space.SubRecord{Id: pr.e.id, Doc: pr.doc, Ops: pr.ops})
+			subev.Added = append(subev.Added, space.SubRecord{Id: pr.e.id, Doc: pr.value(), Ops: pr.ops})
 		}
 	}
 	if len(p.updated) > 0 {
 		subev.Updated = make([]space.SubRecord, 0, len(p.updated))
 		for _, pr := range p.updated {
-			subev.Updated = append(subev.Updated, space.SubRecord{Id: pr.e.id, Doc: pr.doc, Ops: pr.ops})
+			subev.Updated = append(subev.Updated, space.SubRecord{Id: pr.e.id, Doc: pr.value(), Ops: pr.ops})
 		}
 	}
 	if len(p.removed) > 0 {
@@ -213,12 +261,17 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if postDoc != nil {
 			// Fast-reject: at capacity, not held, post tuple already
 			// past the sentinel ⇒ no chance of entering window.
-			// Skips filter eval, allocation, mutation.
+			// Skips allocation and mutation, and filter eval unless
+			// the window is complete: a match landing past the edge
+			// ends completeness.
 			if !wasHeld && s.atCapacity() {
 				s.ensureMaxRef()
 				if s.maxRef != nil {
 					postKey = s.tupleFor(postDoc)
 					if bytes.Compare(postKey, s.maxRef.tuple) >= 0 {
+						if s.complete && (s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)) {
+							s.complete = false
+						}
 						return
 					}
 				}
@@ -230,26 +283,31 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		}
 	}
 
-	// Apply transition to held set. The event ships its own clone of
-	// the post doc; a windowed sub keeps that clone on the entry too.
+	// Apply transition to held set. The event ships its own copy of
+	// the post doc; a windowed sub keeps its encoding on the entry.
 	var eventDoc *anyenc.Value
+	var raw []byte
 	switch {
 	case wasHeld && matches:
-		eventDoc = anyencx.Clone(postDoc)
-		s.updateEntry(oldEntry, postKey, s.held(eventDoc))
+		eventDoc, raw = s.capture(postDoc)
+		s.updateEntry(oldEntry, postKey, raw)
 	case wasHeld && !matches:
 		s.removeEntry(oldEntry)
-		s.lost++
+		if !s.complete {
+			s.lost++
+		}
 	case !wasHeld && matches:
 		if s.atCapacity() {
 			s.ensureMaxRef()
 			if s.maxRef != nil {
+				// Not a loss: the evicted sentinel still matches,
+				// now past the window's edge.
 				s.removeEntry(s.maxRef)
-				// Not a "loss" — steady-state add.
+				s.complete = false
 			}
 		}
-		eventDoc = anyencx.Clone(postDoc)
-		s.insertEntry(rc.Id, postKey, s.held(eventDoc))
+		eventDoc, raw = s.capture(postDoc)
+		s.insertEntry(rc.Id, postKey, raw)
 	default:
 		return
 	}
@@ -261,9 +319,9 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 
 	switch {
 	case !wasVisible && isVisible:
-		p.added = append(p.added, pendingRec{e: newEntry, doc: eventDoc, ops: rc.Ops})
+		p.added = append(p.added, pendingRec{e: newEntry, doc: eventDoc, raw: raw, ops: rc.Ops})
 	case wasVisible && isVisible:
-		p.updated = append(p.updated, pendingRec{e: newEntry, doc: eventDoc, ops: rc.Ops})
+		p.updated = append(p.updated, pendingRec{e: newEntry, doc: eventDoc, raw: raw, ops: rc.Ops})
 	case wasVisible && !isVisible:
 		// isHeld ⇒ the record updated and became the sentinel via its
 		// own sort move: still matches, just slid out of view.
@@ -287,7 +345,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if prevSentinelId != "" && prevSentinelId != rc.Id {
 			if _, alreadySeen := p.seen[prevSentinelId]; !alreadySeen {
 				if e := s.entries[prevSentinelId]; e != nil && e != s.sentinel() {
-					p.added = append(p.added, pendingRec{e: e, doc: e.doc}) // implicit: no ops, the held doc
+					p.added = append(p.added, pendingRec{e: e, raw: e.raw}) // implicit: no ops, the held doc
 					p.seen[prevSentinelId] = struct{}{}
 				}
 			}
@@ -312,9 +370,19 @@ func (s *querySub) checkDrift() {
 	if s.cfg.Limit <= 0 || s.closed {
 		return
 	}
-	if s.lost*100 >= s.cfg.Limit*s.cfg.DriftBudget {
+	if s.lost*100 >= s.lostLimit {
 		s.err.Store(space.ErrSubscriptionDrifted)
 		_ = s.mb.Close()
 		s.closed = true
 	}
+}
+
+// lossLimit returns limit*budget, saturated at math.MaxInt: a budget
+// large enough to overflow the product never closes the sub, where a
+// wrapped negative product would close it on the first apply.
+func lossLimit(limit, budget int) int {
+	if budget > math.MaxInt/limit {
+		return math.MaxInt
+	}
+	return limit * budget
 }

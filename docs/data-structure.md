@@ -561,8 +561,10 @@ an open question.
   `ErrSubscriptionDrifted`. A window whose snapshot, at offset 0, read
   at most `Limit` rows counts no departures until a match lands past
   its edge. Resubscribing is the only recovery.
-- **Total**: `IncludeTotal` runs one `Count` at snapshot time; it is not
-  maintained live.
+- **Total**: `IncludeTotal` counts in the snapshot's read, after the
+  fence, so `Total` and `HasNext` describe exactly the rows returned; a
+  snapshot that holds every match needs no count. It is not maintained
+  live.
 
 ### Consistency
 

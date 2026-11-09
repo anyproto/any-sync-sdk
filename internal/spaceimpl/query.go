@@ -249,7 +249,7 @@ func (q *queryImpl) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.
 	total := -1
 	hasNext := false
 	if opts.IncludeTotal {
-		total, err = q.totalWithin(tx.Context(), coll, combined, len(initial))
+		total, err = q.totalWithin(tx.Context(), coll, combined, int(q.limit), len(initial))
 		if err != nil {
 			return nil, err
 		}
@@ -290,14 +290,15 @@ func (q *queryImpl) page(ctx context.Context, coll anystore.Collection, combined
 }
 
 // totalWithin returns the count of `combined` matches ignoring
-// limit/offset, reading within the supplied context. When the page
-// already reached the end of the result set the total is offset+pageLen
-// and no count query runs: that holds for an unbounded query (limit 0)
-// or a page shorter than the limit, with the pageLen>0 || offset==0
-// guard ruling out an offset past the end of the result set.
-func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, combined query.Filter, pageLen int) (int, error) {
-	if (q.limit == 0 || pageLen < int(q.limit)) && (pageLen > 0 || q.offset == 0) {
-		return int(q.offset) + pageLen, nil
+// limit/offset, reading within the supplied context. asked is the row
+// cap the page read used (0 for none) and got the rows it returned.
+// When the page already reached the end of the result set the total
+// is offset+got and no count query runs: that holds for an uncapped
+// read or one shorter than its cap, with the got>0 || offset==0 guard
+// ruling out an offset past the end of the result set.
+func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, combined query.Filter, asked, got int) (int, error) {
+	if (asked == 0 || got < asked) && (got > 0 || q.offset == 0) {
+		return int(q.offset) + got, nil
 	}
 	return coll.Find(combined).Count(ctx)
 }
@@ -305,6 +306,9 @@ func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, c
 // Subscribe is the live-query terminal. Builds a windowed sub via the
 // per-space engine; the snapshot read runs under engine.mu so apply
 // events are fenced between the snapshot and the sub's registration.
+// The snapshot's read transaction outlives the fence: IncludeTotal
+// counts in it once the lock is released, so Total describes exactly
+// the rows the snapshot read and no apply waits on the count.
 //
 // The object is resolved BEFORE the engine lock. Store.Get can load
 // the object, and a load replays stored changes through Engine.OnApply,
@@ -401,9 +405,19 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	}
 
 	// One iteration feeds both the engine's initial population and the
-	// user-visible Initial slice.
-	var snapshotRows []*anyenc.Value
-	totalCount := -1
+	// user-visible Initial slice. It runs in snapshotTx, a read
+	// transaction left open past the fence for the count.
+	var (
+		snapshotRows []*anyenc.Value
+		snapshotColl anystore.Collection
+		snapshotTx   anystore.ReadTx
+		yielded      int
+	)
+	defer func() {
+		if snapshotTx != nil {
+			_ = snapshotTx.Commit()
+		}
+	}()
 
 	cfg := subscribe.SubConfig{
 		Scope:       scope,
@@ -423,6 +437,11 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		if coll == nil {
 			return nil // dataset has no materialised collection yet → empty
 		}
+		tx, err := coll.ReadTx(ctx)
+		if err != nil {
+			return err
+		}
+		snapshotColl, snapshotTx = coll, tx
 		aq := coll.Find(combined)
 		if q.sort != nil {
 			aq = aq.Sort(q.sort)
@@ -435,7 +454,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		if q.offset > 0 {
 			aq = aq.Offset(q.offset)
 		}
-		it, err := aq.Iter(ctx)
+		it, err := aq.Iter(tx.Context())
 		if err != nil {
 			return err
 		}
@@ -450,6 +469,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			if v != nil {
 				id = string(v.GetStringBytes("id"))
 			}
+			yielded++
 			// Initial's copy of the visible rows, cloned off the
 			// iterator's reused buffer. The sentinel is the engine's
 			// alone, and an unbounded sub keeps no copy of its own.
@@ -466,6 +486,31 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	if err != nil {
 		return nil, err
 	}
+
+	totalCount := -1
+	if opts.IncludeTotal {
+		totalCount = 0
+		if snapshotTx != nil {
+			// Counted in the snapshot's read after the fence: the total
+			// describes exactly the rows the snapshot saw, and no apply
+			// waits on the count. The snapshot asked for limit+1 rows.
+			asked := 0
+			if q.limit > 0 {
+				asked = int(q.limit) + 1
+			}
+			totalCount, err = q.totalWithin(snapshotTx.Context(), snapshotColl, combined, asked, yielded)
+			if err != nil {
+				_ = sub.Close()
+				return nil, err
+			}
+		}
+	}
+	if snapshotTx != nil {
+		// Released before the head-storage read below, so one
+		// subscribe never holds two reader slots.
+		_ = snapshotTx.Commit()
+		snapshotTx = nil
+	}
 	if !scope.Shared && !scope.AllObjects {
 		// The object was resolved before the registration; a purge in
 		// between closed the object's subscriptions before this one
@@ -480,21 +525,6 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		if deleted {
 			_ = sub.Close()
 			return nil, fmt.Errorf("query: %s: %w", q.objectId, space.ErrObjectNotFound)
-		}
-	}
-
-	if opts.IncludeTotal {
-		// Run a separate Count(filter) outside the snapshot fence (engine.mu
-		// already released). Slightly stale relative to events that fired
-		// after we released, but documented as snapshot-only semantics.
-		totalCount = 0
-		coll, err := collection(ctx, false)
-		if err == nil && coll != nil {
-			totalCount, err = coll.Find(combined).Count(ctx)
-		}
-		if err != nil {
-			_ = sub.Close()
-			return nil, err
 		}
 	}
 

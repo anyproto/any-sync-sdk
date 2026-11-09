@@ -83,9 +83,11 @@ type Query interface {
 type QueryOpts struct {
 	// IncludeTotal asks for a one-shot count of filter-matching records
 	// (independent of limit/offset), returned in QueryResult.Total, and
-	// derives QueryResult.HasNext from it. No live total events are
-	// emitted by Subscribe; callers who need a refreshed count call
-	// Snapshot again. When false, Total is -1 and HasNext is false.
+	// derives QueryResult.HasNext from it. The count is taken in the
+	// same read as Initial, so Total and HasNext describe exactly the
+	// returned rows. No live total events are emitted by Subscribe;
+	// callers who need a refreshed count call Snapshot again. When
+	// false, Total is -1 and HasNext is false.
 	IncludeTotal bool
 
 	// MailboxCapacity bounds the per-subscription event queue. Default

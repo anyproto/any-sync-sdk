@@ -53,8 +53,8 @@ type Event struct {
 type EventRecord struct {
 	Id string
 	// Created is true when this change first materialised the record.
-	// The engine uses it (combined with sentinel/visibility state) to
-	// decide Added vs Updated emit semantics.
+	// The engine does not read it: a consumer tells a creation from an
+	// update by it.
 	Created bool
 	// Deleted is true when the change tombstoned this record. Ops is
 	// empty in that case; the engine drops the entry from its held

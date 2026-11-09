@@ -594,12 +594,6 @@ func (c *Controller) collectionForRead(ctx context.Context, dataset string) anys
 	return coll
 }
 
-// Released reports whether CloseOwnedCollections has run: the instance
-// was evicted, and a read through it opens its own collections by name.
-func (c *Controller) Released() bool {
-	return c.collsReleased.Load()
-}
-
 // openForRead is collectionForRead reporting why an open failed: a nil
 // collection with a nil error means the collection does not exist.
 func (c *Controller) openForRead(ctx context.Context, dataset string) (anystore.Collection, error) {

@@ -2566,23 +2566,19 @@ func isDocNotFound(err error) bool {
 }
 
 // PeekLoaded returns the resident, loaded object for objectId without
-// loading or waiting, and reports whether an entry exists that is
-// still loading or closing. Safe under the subscribe engine's fence,
-// where a Get on an object whose load fired the apply would wait on
-// itself.
-func (s *Store) PeekLoaded(objectId string) (obj *object.Object, busy bool) {
+// loading or waiting: nil when none is loaded, or one is still
+// loading or closing. Safe under the subscribe engine's fence, where a
+// Get on an object whose load fired the apply would wait on itself.
+func (s *Store) PeekLoaded(objectId string) *object.Object {
 	peeker, ok := s.cache.(ocache.Peeker)
 	if !ok {
-		return nil, false
+		return nil
 	}
 	v, state := peeker.Peek(objectId, false)
-	switch state {
-	case ocache.PeekHit:
-		return v.(*object.Object), false
-	case ocache.PeekBusy:
-		return nil, true
+	if state != ocache.PeekHit {
+		return nil
 	}
-	return nil, false
+	return v.(*object.Object)
 }
 
 // Get returns the *object.Object for objectId, lazy-loading on first

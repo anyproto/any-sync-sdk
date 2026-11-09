@@ -305,8 +305,9 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 // Live subscriptions are not notified of the wipe of the object's own
 // collections: a window keeps its rows and sees the replay as one
 // update per change in the tree, converging when it ends. A refill
-// during the rebuild finds the object loading and fails, so departures
-// in the replay count as losses, as they did before refills. The object's
+// during the rebuild finds the object loading and fails: a departure
+// in the replay counts as a loss, and the window refills on the first
+// apply after the load. The object's
 // rows in a shared dataset's collection are the exception — a reader
 // across objects holds them without having loaded the object, so it is
 // told they left, and the replay adds back the ones it rebuilds.

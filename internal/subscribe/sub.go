@@ -30,21 +30,20 @@ type querySub struct {
 	maxRef  *entry
 
 	// Window state. complete: the window holds every match — its
-	// snapshot started at offset 0 and found nothing past the window's
-	// edge, and no match has been left past the edge since. unranked:
-	// the sentinel holds its slot with a key larger than the one it
-	// was ranked at (a held row's own sort move, an insert below
-	// capacity), so matches past the edge may sort below it and the
-	// next promotion could lift the wrong row into view. departed:
-	// held rows that left during the current apply. A refill
-	// (SubConfig.Refill) settles both from storage; a window that
-	// cannot refill counts departures as losses, and lost*100 at or
-	// above lostLimit closes the sub.
-	complete  bool
-	unranked  bool
-	departed  int
-	lost      int
-	lostLimit int
+	// snapshot started at offset 0 and held at most limit rows, and no
+	// match has been left past the edge since. unranked: the sentinel
+	// holds its slot with a key larger than the one it was ranked at
+	// (a held row's own sort move, an insert below capacity), so
+	// matches past the edge may sort below it and the next promotion
+	// could lift the wrong row into view; unrankedLoss: that state has
+	// been counted as a loss once. A refill (SubConfig.Refill) settles
+	// both from storage; a window that cannot refill counts departures
+	// as losses, and lost*100 at or above lostLimit closes the sub.
+	complete     bool
+	unranked     bool
+	unrankedLoss bool
+	lost         int
+	lostLimit    int
 
 	docBuf *syncpool.DocBuffer
 
@@ -189,6 +188,7 @@ type subPending struct {
 	recs       map[string]*recOutcome
 	gone       map[string]*entry // held rows a refill found absent
 	edge       bool              // the refilled window is at capacity: matches may lie past it
+	departed   int               // held rows that left a window with matches past its edge
 	unreadable int               // records whose post value could not be read
 }
 
@@ -200,6 +200,7 @@ type recOutcome struct {
 	deleted    bool          // the last record tombstoned it
 	present    bool          // the last record found a post doc
 	matched    bool          // the last record's post doc passes the filter
+	landed     bool          // a readable record wrote the held row
 	unreadable bool          // a record's post value could not be read
 	changed    bool          // a refill found its stored value changed
 }
@@ -304,8 +305,14 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 				if s.maxRef != nil {
 					postKey = s.tupleFor(postDoc)
 					if bytes.Compare(postKey, s.maxRef.tuple) >= 0 {
-						if s.complete && (s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)) {
-							s.complete = false
+						// The filter is read only where the verdict
+						// matters: completeness, or the reason for a
+						// row this apply took out of view earlier.
+						if s.complete || p.before[rc.Id] {
+							out.matched = s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)
+							if out.matched {
+								s.complete = false
+							}
 						}
 						return
 					}
@@ -325,6 +332,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 	switch {
 	case wasHeld && matches:
 		out.doc, raw = s.capture(postDoc)
+		out.landed = true
 		oldTuple := oldEntry.tuple
 		s.updateEntry(oldEntry, postKey, raw)
 		if s.ranks() && s.sentinel() == oldEntry && bytes.Compare(postKey, oldTuple) > 0 {
@@ -336,7 +344,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 	case wasHeld && !matches:
 		s.removeEntry(oldEntry)
 		if s.windowed() && !s.complete {
-			s.departed++
+			p.departed++
 		}
 	case !wasHeld && matches:
 		if s.atCapacity() {
@@ -353,6 +361,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 			s.unranked = true
 		}
 		out.doc, raw = s.capture(postDoc)
+		out.landed = true
 		s.insertEntry(rc.Id, postKey, raw)
 	default:
 		return
@@ -386,11 +395,11 @@ func (s *querySub) emit(versionId crdt.VersionId, p *subPending) space.Subscript
 		case !was && is:
 			subev.Added = append(subev.Added, s.record(e, out))
 		case was && is:
-			// A record of this apply landed on it, or a refill found
-			// it changed; a row promoted and demoted back, or whose
+			// A readable record wrote it, or a refill found it
+			// changed; a row promoted and demoted back, or whose only
 			// record could not be read and whose stored value did not
 			// change, ships nothing.
-			if out != nil && (!out.unreadable || out.changed) {
+			if out != nil && (out.landed || out.changed) {
 				subev.Updated = append(subev.Updated, s.record(e, out))
 			}
 		case was && !is:
@@ -418,11 +427,11 @@ func (s *querySub) record(e *entry, out *recOutcome) space.SubRecord {
 
 // removeReason classifies a row that was visible before the apply and
 // is not now. Still held, it is the sentinel: displaced. Gone by its
-// own record: deleted when the record tombstoned it or found no row,
-// filtered out when the post doc failed the filter, displaced when it
-// matched and a later arrival evicted it. Gone through a refill (or
-// unreadable): displaced when its last known position is at or past
-// the refilled window's edge, else it stopped matching.
+// own readable record: deleted when the record tombstoned it or found
+// no row, filtered out when the post doc failed the filter. Gone with
+// no refill behind it, an arrival evicted it: displaced. Gone through
+// a refill: displaced when its last known position is at or past the
+// refilled window's edge, else it stopped matching.
 func removeReason(id string, e *entry, out *recOutcome, p *subPending, sent *entry) space.RemoveReason {
 	g := p.gone[id]
 	switch {
@@ -432,9 +441,9 @@ func removeReason(id string, e *entry, out *recOutcome, p *subPending, sent *ent
 		return space.RemoveDeleted
 	case out != nil && !out.unreadable && !out.matched:
 		return space.RemoveFilteredOut
-	case out != nil && !out.unreadable && g == nil:
+	case g == nil:
 		return space.RemoveDisplaced
-	case g != nil && p.edge && sent != nil && bytes.Compare(g.tuple, sent.tuple) >= 0:
+	case p.edge && sent != nil && bytes.Compare(g.tuple, sent.tuple) >= 0:
 		return space.RemoveDisplaced
 	}
 	return space.RemoveFilteredOut
@@ -446,12 +455,11 @@ func removeReason(id string, e *entry, out *recOutcome, p *subPending, sent *ent
 // its edge, an unranked sentinel, and a row the apply could not read
 // all break it. A refill re-reads the window from storage and records
 // the difference in p. A departure the window cannot refill counts as
-// a loss, and so does a refill that fails; an unreadable row with no
-// refill closes the sub, whose window can no longer be trusted to
-// match storage. Reports whether the sub is still open.
+// a loss, and an unranked sentinel it cannot rank counts once; the
+// next apply tries the refill again at no further cost. An unreadable
+// row with no refill closes the sub, whose window can no longer be
+// trusted to match storage. Reports whether the sub is still open.
 func (s *querySub) settle(p *subPending) bool {
-	departed := s.departed
-	s.departed = 0
 	unreadable := p.unreadable > 0
 	if unreadable || s.needsRefill() {
 		if s.canRefill() && s.refillWindow(p) == nil {
@@ -461,14 +469,12 @@ func (s *querySub) settle(p *subPending) bool {
 			s.closeWith(space.ErrSubscriptionDrifted)
 			return false
 		}
-		// The refill failed: a loss even with no departure, so a
-		// window whose refills keep failing closes.
-		s.unranked = false
-		if departed == 0 {
-			departed = 1
+		if s.unranked && !s.unrankedLoss {
+			s.unrankedLoss = true
+			s.lost++
 		}
 	}
-	s.lost += departed
+	s.lost += p.departed
 	return true
 }
 
@@ -565,9 +571,12 @@ func (s *querySub) refillWindow(p *subPending) error {
 		s.removeEntry(e)
 	}
 	if s.windowed() {
+		// Rows the read returned without an id or doc took no slot:
+		// a window that holds at most limit rows holds every match
+		// it can, as at Subscribe.
 		s.complete = len(s.entries) <= s.cfg.Limit
 		p.edge = s.atCapacity()
-		s.unranked = false
+		s.unranked, s.unrankedLoss = false, false
 	}
 	if s1 := s.sentinel(); s1 != nil {
 		// A row the refill demoted to sentinel was visible before.

@@ -3,6 +3,8 @@ package subscribe
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"math/rand"
 	"sort"
 	"testing"
 
@@ -127,21 +129,40 @@ type clientView struct {
 func (v *clientView) fold(t *testing.T, sub *Sub) {
 	t.Helper()
 	for _, ev := range sub.Events().GetAll() {
-		for _, r := range ev.Added {
-			require.NotNil(t, r.Doc, "added %s ships a doc", r.Id)
-			v.docs[r.Id] = r.Doc
-		}
-		for _, r := range ev.Updated {
-			_, shown := v.docs[r.Id]
-			require.True(t, shown, "updated %s is in view", r.Id)
-			require.NotNil(t, r.Doc, "updated %s ships a doc", r.Id)
-			v.docs[r.Id] = r.Doc
-		}
-		for _, r := range ev.Removed {
-			_, shown := v.docs[r.Id]
-			require.True(t, shown, "removed %s was in view", r.Id)
-			delete(v.docs, r.Id)
-		}
+		v.foldChecked(t, ev)
+	}
+}
+
+// foldChecked folds one event and asserts the client's contract: an id
+// at most once per event, Added only for ids not shown, Updated and
+// Removed only for ids shown, a doc on every Added and Updated.
+func (v *clientView) foldChecked(t *testing.T, ev space.SubscriptionEvent) {
+	t.Helper()
+	seen := map[string]struct{}{}
+	once := func(id string) {
+		_, dup := seen[id]
+		require.False(t, dup, "%s twice in one event", id)
+		seen[id] = struct{}{}
+	}
+	for _, r := range ev.Added {
+		once(r.Id)
+		_, shown := v.docs[r.Id]
+		require.False(t, shown, "added %s is already in view", r.Id)
+		require.NotNil(t, r.Doc, "added %s ships a doc", r.Id)
+		v.docs[r.Id] = r.Doc
+	}
+	for _, r := range ev.Updated {
+		once(r.Id)
+		_, shown := v.docs[r.Id]
+		require.True(t, shown, "updated %s is in view", r.Id)
+		require.NotNil(t, r.Doc, "updated %s ships a doc", r.Id)
+		v.docs[r.Id] = r.Doc
+	}
+	for _, r := range ev.Removed {
+		once(r.Id)
+		_, shown := v.docs[r.Id]
+		require.True(t, shown, "removed %s was in view", r.Id)
+		delete(v.docs, r.Id)
 	}
 }
 
@@ -162,7 +183,7 @@ func (v *clientView) apply(evs []space.SubscriptionEvent) {
 
 // ids returns the view's ids in the model's order.
 func (v *clientView) ids(m *storeModel) []string {
-	var ids []string
+	ids := make([]string, 0, len(v.docs))
 	for id := range v.docs {
 		ids = append(ids, id)
 	}
@@ -182,7 +203,7 @@ func agrees(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
 	t.Helper()
 	view.fold(t, sub)
 	require.Equal(t, m.visible(), view.ids(m), "client view vs fresh query")
-	var held []string
+	held := make([]string, 0, len(sub.entries))
 	sent := sub.sentinel()
 	for id, e := range sub.entries {
 		if e != sent {
@@ -190,7 +211,7 @@ func agrees(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
 		}
 	}
 	sort.Strings(held)
-	want := append([]string(nil), m.visible()...)
+	want := append(make([]string, 0, len(held)), m.visible()...)
 	sort.Strings(want)
 	require.Equal(t, want, held, "engine view vs fresh query")
 	for id, d := range view.docs {
@@ -684,23 +705,112 @@ func TestRefill_SentinelOwnKeyGrowthIsRanked(t *testing.T) {
 	assert.NoError(t, sub.Err())
 }
 
-// A refill that fails on an unranked sentinel with no departure still
-// costs a loss: the window cannot be trusted, and repeated failures
-// close it.
+// A refill that fails on an unranked sentinel with no departure costs
+// one loss: the window cannot be trusted. Later applies retry the
+// refill at no further cost, and the one that succeeds settles the
+// window.
 func TestRefill_FailedRankingIsALoss(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
 	arena := newArena()
 	m := newStoreModel(t, nil, 2, driftRows(6)...)
-	sub, _ := subscribeModel(t, eng, m, 100)
+	sub, view := subscribeModel(t, eng, m, 100)
 	m.fail = errors.New("busy")
 
 	grown := makeRow(arena, "r2", 10, nil)
 	m.set(grown)
 	fireEvent(eng, "obj1", "chat", "r2", grown.d, false, nil)
-	drain(t, sub)
+	view.fold(t, sub)
 	assert.Equal(t, 1, sub.lost)
-	assert.False(t, sub.unranked, "not retried on every apply")
+	assert.Equal(t, 1, m.reads)
+	assert.True(t, sub.unranked, "still to be ranked")
+
+	edited := makeRow(arena, "r0", 0, map[string]any{"edited": true})
+	m.set(edited)
+	fireEvent(eng, "obj1", "chat", "r0", edited.d, false, nil)
+	view.fold(t, sub)
+	assert.Equal(t, 1, sub.lost, "a retry costs nothing")
+	assert.Equal(t, 2, m.reads, "retried")
+	assert.NoError(t, sub.Err())
+
+	m.fail = nil
+	fireEvent(eng, "obj1", "chat", "r0", edited.d, false, nil)
+	agrees(t, sub, view, m)
+	assert.Equal(t, "r3", sub.sentinel().id)
+	assert.False(t, sub.unranked)
+}
+
+// A window below capacity after a failed refill retries on every apply
+// and costs nothing more until a row leaves it: one departure is one
+// loss however many applies follow.
+func TestRefill_RetriesCostNoExtraLoss(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 10, driftRows(20)...)
+	sub, view := subscribeModel(t, eng, m, 30) // three losses close
+	m.fail = errors.New("busy")
+
+	m.delete("r0")
+	fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
+	view.fold(t, sub)
+	require.Equal(t, 1, sub.lost)
+
+	for i := 0; i < 5; i++ {
+		edited := makeRow(arena, "r5", 5, map[string]any{"edit": i})
+		m.set(edited)
+		fireEvent(eng, "obj1", "chat", "r5", edited.d, false, nil)
+		view.fold(t, sub)
+	}
+	assert.Equal(t, 1, sub.lost)
+	assert.Equal(t, 6, m.reads, "every apply retried")
+	assert.NoError(t, sub.Err())
+
+	m.fail = nil
+	m.delete("r1")
+	fireEvent(eng, "obj1", "chat", "r1", nil, true, nil)
+	agrees(t, sub, view, m)
+	assert.Equal(t, 1, sub.lost)
+	assert.True(t, sub.atCapacity())
+}
+
+// A refill that fails after yielding rows changes nothing: the rows it
+// yielded are not held, and the departure counts as a loss.
+func TestRefill_FailureMidwayChangesNothing(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	m := newStoreModel(t, nil, 3, driftRows(8)...)
+	reads := 0
+	sub, err := eng.Subscribe(SubConfig{
+		Scope: driftScope, Sort: m.sort, Limit: 3, MailboxCap: minMailboxCap, DriftBudget: 100,
+		Refill: func(yield func(id string, doc *anyenc.Value)) error {
+			reads++
+			for _, r := range m.window()[:2] {
+				yield(r.id, r.d)
+			}
+			return errors.New("torn")
+		},
+	}, snapshotFromRows(m.window()))
+	require.NoError(t, err)
+	held := func() []string {
+		var ids []string
+		for id := range sub.entries {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return ids
+	}
+
+	m.delete("r0")
+	fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"r3"}, idsOf(ev.Added), "the promoted sentinel")
+	assert.Equal(t, []string{"r0"}, removedIdsOf(ev.Removed))
+	assert.Equal(t, []string{"r1", "r2", "r3"}, held())
+	assert.Equal(t, 1, reads)
+	assert.Equal(t, 1, sub.lost)
+	assert.False(t, sub.complete)
 	assert.NoError(t, sub.Err())
 }
 
@@ -929,4 +1039,173 @@ func TestRefill_RowWithoutIdDoesNotLoop(t *testing.T) {
 	drain(t, sub)
 	assert.Equal(t, 1, reads, "a complete window reads nothing")
 	assert.NoError(t, sub.Err())
+}
+
+// One apply with a readable and an unreadable record on the same
+// visible id ships the readable record's value: the refill finds
+// storage equal to what the record wrote, and the update still goes
+// out, with the ops dropped.
+func TestUnreadable_ReadableAndUnreadableRecordsOnOneId(t *testing.T) {
+	for _, order := range []string{"readable first", "unreadable first"} {
+		t.Run(order, func(t *testing.T) {
+			eng := New("test")
+			defer eng.Close()
+			arena := newArena()
+			m := newStoreModel(t, nil, 3, driftRows(6)...)
+			sub, view := subscribeModel(t, eng, m, 30)
+
+			edited := makeRow(arena, "r1", 1, map[string]any{"edited": true})
+			m.set(edited)
+			op := []space.EventOp{{Type: crdt.OpSet, Path: []string{"edited"}}}
+			records := []EventRecord{{Id: "r1", Ops: op}, {Id: "r1", Ops: op}}
+			readable := 0
+			if order == "unreadable first" {
+				readable = 1
+			}
+			eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", Records: records},
+				func(i int) (*anyenc.Value, error) {
+					if i == readable {
+						return edited.d, nil
+					}
+					return nil, errors.New("read failed")
+				})
+			ev, err := waitOne(t, sub)
+			require.NoError(t, err)
+			require.Equal(t, []string{"r1"}, idsOf(ev.Updated))
+			assert.True(t, ev.Updated[0].Doc.GetBool("edited"))
+			assert.Nil(t, ev.Updated[0].Ops)
+			view.foldChecked(t, ev)
+			agrees(t, sub, view, m)
+		})
+	}
+}
+
+// A visible row demoted to sentinel by one arrival and evicted by the
+// next in the same apply still matches: displaced.
+func TestApply_DemotedThenEvictedIsDisplaced(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	sub := subscribeSorted(t, eng, driftScope, nil, 2, driftRows(3))
+	fireRecords(eng, "obj1", "chat",
+		[]EventRecord{{Id: "n1"}, {Id: "n2"}},
+		[]*anyenc.Value{makeRow(arena, "n1", -2, nil).d, makeRow(arena, "n2", -1, nil).d})
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"n1", "n2"}, idsOf(ev.Added))
+	reasons := map[string]space.RemoveReason{}
+	for _, r := range ev.Removed {
+		reasons[r.Id] = r.Reason
+	}
+	assert.Equal(t, map[string]space.RemoveReason{"r0": space.RemoveDisplaced, "r1": space.RemoveDisplaced}, reasons)
+}
+
+// A row that moved past the edge, was evicted, and moved again in the
+// same apply is fast-rejected on its last record; it still matches, so
+// it leaves as displaced, not filtered out.
+func TestApply_FastRejectedAfterVisibleIsDisplaced(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	sub := subscribeSorted(t, eng, driftScope, nil, 2, driftRows(3))
+	fireRecords(eng, "obj1", "chat",
+		[]EventRecord{{Id: "r1"}, {Id: "new"}, {Id: "r1"}},
+		[]*anyenc.Value{makeRow(arena, "r1", 10, nil).d, makeRow(arena, "new", -1, nil).d, makeRow(arena, "r1", 11, nil).d})
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"new"}, idsOf(ev.Added))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDisplaced}}, ev.Removed)
+}
+
+// Random applies against a storage model: single and multi-record
+// changes with repeated ids, creates, edits, sort moves, filter-outs,
+// deletes and unreadable records, over windows of every size. After
+// every apply the client's folded view, the engine's held set and a
+// fresh query of the model agree, and the sub stays open.
+func TestRefill_RandomizedAgreesWithStorage(t *testing.T) {
+	for seed := int64(0); seed < 300; seed++ {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			rng := rand.New(rand.NewSource(seed))
+			eng := New("test")
+			defer eng.Close()
+			arena := newArena()
+			limit := rng.Intn(5)
+			var filter query.Filter
+			if rng.Intn(2) == 0 {
+				filter = activeOnly
+			}
+			// Sort keys are unique: ties at the edge are a known limit.
+			usedN := map[int]struct{}{}
+			freshN := func() int {
+				for {
+					n := rng.Intn(60)
+					if _, used := usedN[n]; !used {
+						usedN[n] = struct{}{}
+						return n
+					}
+				}
+			}
+			status := func() string {
+				if rng.Intn(4) == 0 {
+					return "read"
+				}
+				return "active"
+			}
+			var rows []row
+			for i := 0; i < 3+rng.Intn(8); i++ {
+				rows = append(rows, makeRow(arena, "r"+itoa(i), freshN(), map[string]any{"status": status()}))
+			}
+			m := newStoreModel(t, filter, limit, rows...)
+			sub, view := subscribeModel(t, eng, m, 100)
+			known := func() []string {
+				ids := make([]string, 0, len(m.rows))
+				for id := range m.rows {
+					ids = append(ids, id)
+				}
+				sort.Strings(ids)
+				return ids
+			}
+
+			for step := 0; step < 25; step++ {
+				var records []EventRecord
+				var unreadable []bool
+				count := 1 + rng.Intn(3)
+				for j := 0; j < count; j++ {
+					ids := known()
+					var id string
+					if len(ids) == 0 || rng.Intn(4) == 0 {
+						id = fmt.Sprintf("x%d_%d", step, j)
+					} else {
+						id = ids[rng.Intn(len(ids))]
+					}
+					switch rng.Intn(5) {
+					case 0:
+						m.delete(id)
+						records = append(records, EventRecord{Id: id, Deleted: true})
+						unreadable = append(unreadable, false)
+					default:
+						n := freshN()
+						if cur, ok := m.rows[id]; ok && rng.Intn(2) == 0 {
+							n = cur.GetInt("n")
+						}
+						m.set(makeRow(arena, id, n, map[string]any{"status": status()}))
+						records = append(records, EventRecord{Id: id})
+						unreadable = append(unreadable, rng.Intn(6) == 0)
+					}
+				}
+				eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", Records: records},
+					func(i int) (*anyenc.Value, error) {
+						if unreadable[i] {
+							return nil, errors.New("read failed")
+						}
+						return m.rows[records[i].Id], nil
+					})
+				for _, ev := range sub.Events().GetAll() {
+					view.foldChecked(t, ev)
+				}
+				require.NoError(t, sub.Err(), "step %d", step)
+				agrees(t, sub, view, m)
+			}
+		})
+	}
 }

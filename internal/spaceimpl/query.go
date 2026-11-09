@@ -439,30 +439,25 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	base, sort, limit, offset := q.filter, q.sort, q.limit, q.offset
 	// refillSource resolves the collection and the filter a refill
 	// reads. A shared-scope read has its collection from the Store. A
-	// per-object read goes through the object's controller, resolved
-	// again on every refill without loading: the object resolved before
-	// the lock may not have been local then and may have been evicted
-	// since. The resident loaded instance serves when there is one; an
-	// evicted instance still opens its own collections by name. With
-	// no instance to read through (the object not local, loading or
-	// rebuilding right now, or an instance from before the dataset was
-	// known) the refill fails, and the engine counts the departure as a
-	// loss, as it does for every refill it cannot run.
+	// per-object read goes through the loaded object's controller,
+	// looked up on every refill without loading or waiting: the event
+	// behind a refill came from an apply on the object, so the object
+	// is loaded unless its load is what fired the apply (a replay) or
+	// it was evicted since. The object resolved before the lock is not
+	// kept: it may not have been local then, and holding it would keep
+	// an evicted object's tree reachable for the subscription's life.
+	// With no loaded instance, or one from before the dataset was
+	// known, the refill fails: the engine counts the departure as a
+	// loss and tries again on the next apply.
 	refillSource := func(ctx context.Context) (anystore.Collection, query.Filter, error) {
 		if scope.Shared || scope.AllObjects {
 			return sharedColl, combined, nil
 		}
-		o := obj
-		if o == nil || o.Controller().Released() {
-			loaded, busy := q.store.PeekLoaded(q.objectId)
-			switch {
-			case loaded != nil:
-				o = loaded
-			case busy || o == nil:
-				return nil, nil, errRefillNoObject
-			}
+		loaded := q.store.PeekLoaded(q.objectId)
+		if loaded == nil {
+			return nil, nil, errRefillNoObject
 		}
-		ctrl := o.Controller()
+		ctrl := loaded.Controller()
 		if !ctrl.HasDataset(q.dataset) {
 			return nil, nil, errRefillNoObject
 		}
@@ -585,9 +580,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 
 // readWindow runs the window's read — limit+1 rows past the offset in
 // sort order, so the engine seeds a sentinel beyond the limit rows the
-// user sees — and hands every row it returns to row, one without an
-// id too: it took a slot of the limit+1 read, and the engine counts
-// slots to tell whether anything lies past the edge. The value is the
+// user sees — and hands every row it returns to row. The value is the
 // iterator's and lasts until the next row.
 func readWindow(ctx context.Context, coll anystore.Collection, filter query.Filter, sort query.Sort, limit, offset uint, row func(id string, v *anyenc.Value)) error {
 	aq := coll.Find(filter)

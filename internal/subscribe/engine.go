@@ -54,8 +54,9 @@ type SubConfig struct {
 // waiting on engine.mu and process after the new sub is registered.
 // The callback yields every row its read returns, in sort order, as
 // (id, post-doc); the engine extracts the sort tuple via cfg.Sort and
-// inserts the entry, skipping a row with no doc or id. Every yield
-// counts toward telling whether anything lies past the window's edge.
+// inserts the entry, skipping a row with no doc or id. A windowed sub
+// that then holds at most Limit rows holds every match: the read asked
+// for Limit+1.
 //
 // The callback must only read already-materialised rows. Anything that
 // can apply a change — loading an object (its replay runs OnApply),
@@ -140,18 +141,14 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 
 	e.counter.Add(1)
 	sub := newSub(cfg)
-	read := 0
-	if err := snapshot(func(id string, doc *anyenc.Value) {
-		read++
-		sub.appendInitial(id, doc)
-	}); err != nil {
+	if err := snapshot(sub.appendInitial); err != nil {
 		e.counter.Add(-1)
 		return nil, err
 	}
 	if cfg.Limit > 0 {
-		// The snapshot reads limit+1 rows; fewer means nothing lies
-		// past the window's edge. Every row read counts, held or not.
-		sub.complete = cfg.Offset == 0 && read <= cfg.Limit
+		// The snapshot reads limit+1 rows; holding fewer means nothing
+		// lies past the window's edge.
+		sub.complete = cfg.Offset == 0 && len(sub.entries) <= cfg.Limit
 		sub.lostLimit = lossLimit(cfg.Limit, cfg.DriftBudget)
 	}
 

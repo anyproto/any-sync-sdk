@@ -13,7 +13,10 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-var driftScope = Scope{ObjectId: "obj1", Dataset: "chat"}
+var (
+	driftScope = Scope{ObjectId: "obj1", Dataset: "chat"}
+	activeOnly = query.Key{Path: []string{"status"}, Filter: query.NewComp(query.CompOpEq, "active")}
+)
 
 func driftRows(n int) []row {
 	arena := newArena()
@@ -43,10 +46,8 @@ func drain(t *testing.T, sub *Sub) {
 func TestDrift_CompleteWindowNeverDrifts(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
-	filter, err := query.ParseCondition(map[string]any{"status": "active"})
-	require.NoError(t, err)
 
-	sub := subscribeSorted(t, eng, driftScope, filter, 10, driftRows(5))
+	sub := subscribeSorted(t, eng, driftScope, activeOnly, 10, driftRows(5))
 	require.True(t, sub.complete)
 
 	arena := newArena()
@@ -111,9 +112,7 @@ func TestDrift_EvictionPastEdgeEndsCompleteness(t *testing.T) {
 func TestDrift_MatchPastFullWindowEndsCompleteness(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
-	filter, err := query.ParseCondition(map[string]any{"status": "active"})
-	require.NoError(t, err)
-	sub := subscribeSorted(t, eng, driftScope, filter, 2, driftRows(2))
+	sub := subscribeSorted(t, eng, driftScope, activeOnly, 2, driftRows(2))
 	arena := newArena()
 	fireEvent(eng, "obj1", "chat", "a", makeRow(arena, "a", 10, map[string]any{"status": "active"}).d, false, nil)
 	drain(t, sub)

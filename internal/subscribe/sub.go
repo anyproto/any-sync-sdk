@@ -37,7 +37,7 @@ type querySub struct {
 	lostLimit int
 
 	docBuf *syncpool.DocBuffer
-	encBuf []byte // scratch for encoding a held row
+	encBuf []byte // scratch for encoding a held row; dropped past maxEncBuf
 
 	mb     *mb.MB[space.SubscriptionEvent]
 	closed bool         // guarded by engine.mu
@@ -58,6 +58,7 @@ func newSub(cfg SubConfig) *querySub {
 func (s *querySub) release() {
 	s.entries = nil
 	s.minRef, s.maxRef = nil, nil
+	s.encBuf = nil
 }
 
 // appendInitial is called by Engine.Subscribe once per snapshot row.
@@ -91,7 +92,24 @@ func (s *querySub) windowed() bool {
 // that for as long as the window holds it.
 func (s *querySub) encode(doc *anyenc.Value) []byte {
 	s.encBuf = doc.MarshalTo(s.encBuf[:0])
-	return bytes.Clone(s.encBuf)
+	raw := bytes.Clone(s.encBuf)
+	if cap(s.encBuf) > maxEncBuf {
+		s.encBuf = nil // one large row must not pin its buffer for the sub's life
+	}
+	return raw
+}
+
+// maxEncBuf bounds the encoding scratch a sub keeps between rows.
+const maxEncBuf = 64 << 10
+
+// parseHeld parses a held encoding in place: raw is never mutated
+// once encoded, so the value may alias it.
+func parseHeld(raw []byte) *anyenc.Value {
+	v, err := new(anyenc.Parser).ParseOwned(raw)
+	if err != nil {
+		panic(err) // raw is this sub's own MarshalTo output
+	}
+	return v
 }
 
 // capture returns the event's own copy of a post doc and what the
@@ -102,7 +120,7 @@ func (s *querySub) capture(doc *anyenc.Value) (*anyenc.Value, []byte) {
 		return anyencx.Clone(doc), nil
 	}
 	raw := s.encode(doc)
-	return anyenc.MustParse(raw), raw
+	return parseHeld(raw), raw
 }
 
 // tupleFor builds the sort tuple for doc; nil for an unbounded sub,
@@ -314,7 +332,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if prevSentinelId != "" && prevSentinelId != rc.Id {
 			if _, alreadySeen := p.seen[prevSentinelId]; !alreadySeen {
 				if e := s.entries[prevSentinelId]; e != nil && e != s.sentinel() {
-					p.added = append(p.added, pendingRec{e: e, doc: anyenc.MustParse(e.raw)}) // implicit: no ops, the held doc
+					p.added = append(p.added, pendingRec{e: e, doc: parseHeld(e.raw)}) // implicit: no ops, the held doc
 					p.seen[prevSentinelId] = struct{}{}
 				}
 			}

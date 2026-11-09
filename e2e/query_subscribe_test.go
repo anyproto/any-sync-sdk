@@ -380,9 +380,11 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	assert.True(t, errors.Is(res.Sub.Err(), space.ErrSubscriptionDrifted),
 		"sub must close with ErrSubscriptionDrifted after losing >30%% of limit; got %v", res.Sub.Err())
 
+	wholeCtx, wholeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer wholeCancel()
 	removed := map[string]bool{}
 	for len(removed) < 5 {
-		evs, err := whole.Sub.Events().Wait(closedCtx)
+		evs, err := whole.Sub.Events().Wait(wholeCtx)
 		require.NoError(t, err, "a window holding every match must stay open")
 		for _, ev := range evs {
 			for _, r := range ev.Removed {

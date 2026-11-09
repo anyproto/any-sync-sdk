@@ -42,7 +42,8 @@ func heapPerRow(t *testing.T, rows []row) int {
 	runtime.GC()
 	runtime.ReadMemStats(&after)
 	runtime.KeepAlive(sub)
-	return int(after.HeapAlloc-before.HeapAlloc) / len(rows)
+	runtime.KeepAlive(rows)
+	return int((int64(after.HeapAlloc) - int64(before.HeapAlloc)) / int64(len(rows)))
 }
 
 // A windowed subscription holds each row at about its encoded size,
@@ -52,6 +53,7 @@ func TestWindow_HeldRowCostsItsEncodedSize(t *testing.T) {
 		rows, encoded := objectRows(1001, size)
 		perRow := heapPerRow(t, rows)
 		t.Logf("encoded %d B/row, held %d B/row", encoded, perRow)
+		require.Positive(t, perRow, "held row heap")
 		require.Less(t, perRow, 2*encoded, "held row heap")
 	}
 }

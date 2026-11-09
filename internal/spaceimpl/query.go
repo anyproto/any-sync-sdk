@@ -308,7 +308,7 @@ func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, c
 // events are fenced between the snapshot and the sub's registration.
 // The snapshot's read transaction outlives the fence: IncludeTotal
 // counts in it once the lock is released, so Total describes exactly
-// the rows the snapshot read and no apply waits on the count.
+// the rows the snapshot read while applies run on.
 //
 // The object is resolved BEFORE the engine lock. Store.Get can load
 // the object, and a load replays stored changes through Engine.OnApply,
@@ -460,6 +460,9 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		}
 		defer it.Close()
 		for it.Next() {
+			// Every row the read returned counts toward the cap,
+			// including one skipped below.
+			yielded++
 			doc, err := it.Doc()
 			if err != nil {
 				return err
@@ -469,7 +472,6 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			if v != nil {
 				id = string(v.GetStringBytes("id"))
 			}
-			yielded++
 			// Initial's copy of the visible rows, cloned off the
 			// iterator's reused buffer. The sentinel is the engine's
 			// alone, and an unbounded sub keeps no copy of its own.
@@ -488,26 +490,25 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	}
 
 	totalCount := -1
+	var countErr error
 	if opts.IncludeTotal {
 		totalCount = 0
 		if snapshotTx != nil {
 			// Counted in the snapshot's read after the fence: the total
-			// describes exactly the rows the snapshot saw, and no apply
-			// waits on the count. The snapshot asked for limit+1 rows.
+			// describes exactly the rows the snapshot saw, and applies
+			// run on meanwhile. The snapshot asked for limit+1 rows.
 			asked := 0
 			if q.limit > 0 {
 				asked = int(q.limit) + 1
 			}
-			totalCount, err = q.totalWithin(snapshotTx.Context(), snapshotColl, combined, asked, yielded)
-			if err != nil {
-				_ = sub.Close()
-				return nil, err
-			}
+			totalCount, countErr = q.totalWithin(snapshotTx.Context(), snapshotColl, combined, asked, yielded)
 		}
 	}
 	if snapshotTx != nil {
-		// Released before the head-storage read below, so one
-		// subscribe never holds two reader slots.
+		// The count was the transaction's last use. It is released
+		// before anything below takes engine.mu: sub.Close with the
+		// reader slot still held would order slot → lock, the reverse
+		// of an apply's lock → slot in its post-value read.
 		_ = snapshotTx.Commit()
 		snapshotTx = nil
 	}
@@ -516,7 +517,8 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		// between closed the object's subscriptions before this one
 		// existed, so it would stay open for good. An id not yet local
 		// can be deleted before it lands the same way. One head-storage
-		// read, after the fence.
+		// read, after the fence. A count that failed on the purged
+		// collection reports the deletion too.
 		deleted, derr := q.store.TreeDeleted(ctx, q.objectId)
 		if derr != nil {
 			_ = sub.Close()
@@ -526,6 +528,10 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			_ = sub.Close()
 			return nil, fmt.Errorf("query: %s: %w", q.objectId, space.ErrObjectNotFound)
 		}
+	}
+	if countErr != nil {
+		_ = sub.Close()
+		return nil, countErr
 	}
 
 	hasNext := false

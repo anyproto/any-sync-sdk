@@ -422,25 +422,41 @@ func mustDB(t *testing.T) anystore.DB {
 	return db
 }
 
-// A runner's nil after its context ended is not a success: the job
-// stays queued across Close and runs again at the next start.
-func TestQueueCloseKeepsJobWhoseRunnerEndedWithItsContext(t *testing.T) {
+// A runner's nil after its own context ended is not a success: the job
+// settles as a failed attempt and stays queued while the queue runs
+// on. (The gate a runner reads on an ended context reads "space gone"
+// and returns nil.)
+func TestQueueRunnerNilAfterJobContextEndedKeepsJob(t *testing.T) {
 	ctx := context.Background()
 	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "meta.db"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	started := make(chan struct{})
+	started := make(chan struct{}, 8)
 	q, err := NewQueue(ctx, db, func(jobCtx context.Context, _ Job) error {
-		close(started)
+		started <- struct{}{}
 		<-jobCtx.Done()
 		return nil
 	}, nil)
 	require.NoError(t, err)
 	q.Run()
+	t.Cleanup(q.Close)
+	id := Job{Kind: KindDurable, SpaceId: "sp1", FileId: "f1"}.id()
 	require.NoError(t, q.Enqueue(ctx, KindDurable, "sp1", "f1"))
 	<-started
-	q.Close()
-	_, ok, err := q.Get(ctx, KindDurable, "sp1", "f1")
+	q.mu.Lock()
+	cancel := q.running[id]
+	q.mu.Unlock()
+	require.NotNil(t, cancel)
+	cancel()
+	waitFor(t, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		_, running := q.running[id]
+		return !running
+	})
+	job, ok, err := q.Get(ctx, KindDurable, "sp1", "f1")
 	require.NoError(t, err)
-	assert.True(t, ok, "the job survives Close")
+	require.True(t, ok, "the job survives its runner's ended context")
+	assert.Equal(t, 1, job.Attempts)
+	assert.Contains(t, job.LastErr, "context canceled")
 }

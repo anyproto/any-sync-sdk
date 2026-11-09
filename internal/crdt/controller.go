@@ -915,11 +915,12 @@ func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Valu
 	return out
 }
 
-// ListRecords is Records with the read's error: a failed open or a
-// scan the context ended is an error, never a short result. A stored
-// row that fails to load is skipped with a warning, so one damaged row
-// does not hide the dataset. A dataset without a collection is
-// (nil, nil).
+// ListRecords is Records with the read's error: a failed open, a scan
+// the context ended or a row the store cannot read is an error, never
+// a short result. A damaged page fails the whole list on purpose: the
+// registries read through here (devices, spaces) are only safe when
+// complete, so an incomplete list must not pass as the whole. A
+// dataset without a collection is (nil, nil).
 func (c *Controller) ListRecords(ctx context.Context, dataset string) ([]*anyenc.Value, error) {
 	coll, err := c.openForRead(ctx, dataset)
 	if err != nil {
@@ -941,11 +942,7 @@ func (c *Controller) ListRecords(ctx context.Context, dataset string) ([]*anyenc
 	for iter.Next() {
 		doc, err := iter.Doc()
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, fmt.Errorf("crdt: records iter: %w", err)
-			}
-			warnSkippedRow(c.objectId, dataset, err)
-			continue
+			return nil, fmt.Errorf("crdt: records doc: %w", err)
 		}
 		v := doc.Value()
 		if isTombstone(v) {

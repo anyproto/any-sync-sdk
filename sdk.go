@@ -596,7 +596,7 @@ func (s *SDK) bootstrap(ctx context.Context) {
 	// tombstone guard on the load path itself — follow-up material.
 	//
 	// A failed list loads nothing; the read-state reconcile below still
-	// runs for the spaces that are loaded.
+	// runs.
 	rows, lerr := s.tsp.List(ctx)
 	warn("boot: space list", lerr)
 	for _, boot := range rows {

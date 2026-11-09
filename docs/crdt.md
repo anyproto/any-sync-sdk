@@ -229,9 +229,11 @@ so it stays bounded by the record's live version count. Rules: spec §3.6.
 ## Events
 
 - **Recovery.** `Query.Subscribe` is the only recovery surface. On
-  `ErrSubscriptionOverflow` (mailbox full) or `ErrSubscriptionDrifted` (held
-  window depleted past its budget) the consumer resubscribes, and the new
-  `QueryResult.Initial` reconciles state.
+  `ErrSubscriptionOverflow` (mailbox full) or `ErrSubscriptionDrifted` (the
+  engine could not keep the window equal to storage) the consumer
+  resubscribes, and the new `QueryResult.Initial` reconciles state. A
+  window at offset 0 refills from storage when rows leave it, so it
+  drifts only when a refill fails.
 - **Own writes** arrive as events too; callers recognize them by the
   `VersionId` returned from the write. Per-session suppression is not
   supported.

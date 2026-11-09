@@ -70,10 +70,12 @@ type EventRecord struct {
 // change being built. Provided by the per-space layer (the
 // spaceobjects Store holds the controller). Index is into ch.Records.
 //
-// May return nil for tombstoned / dropped records (e.g. a gated op
-// that didn't land); callers should treat nil as "the record no
-// longer exists at this point in the timeline".
-type PostValueFn func(recordIndex int) *anyenc.Value
+// (nil, nil) is a record that no longer exists at this point in the
+// timeline: tombstoned, dropped, a gated op that didn't land. An
+// error is a row that could not be read, which is not the same as
+// absent: the engine re-reads the window from storage or closes the
+// subscription rather than treat the record as gone.
+type PostValueFn func(recordIndex int) (*anyenc.Value, error)
 
 // BuildEvent projects (ch, recordIds, derivedOps, postValue) into the
 // wire Event shape — runs the same per-record projection an engine
@@ -125,9 +127,11 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 			out = append(out, er)
 			continue
 		}
+		// A row that cannot be read projects against no post value;
+		// the engine settles its subscriptions from storage.
 		var post *anyenc.Value
 		if postValue != nil {
-			post = postValue(i)
+			post, _ = postValue(i)
 		}
 		for _, op := range rc.Ops {
 			projected, ok := projectOp(op, post)

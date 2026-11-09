@@ -30,8 +30,8 @@ type EventOp struct {
 // The mailbox closes for one of four reasons:
 //   - Caller invoked Close: Err() returns nil.
 //   - Mailbox overflowed: Err() returns ErrSubscriptionOverflow.
-//   - Held window drifted past its budget: Err() returns
-//     ErrSubscriptionDrifted.
+//   - The engine could not keep the window equal to storage: Err()
+//     returns ErrSubscriptionDrifted.
 //   - The object a per-object query reads was deleted: Err() returns
 //     ErrObjectDeleted, after a Removed for its row where one applies.
 //     Nothing will reach the query again; there is nothing to
@@ -141,11 +141,11 @@ type SubRecord struct {
 var ErrSubscriptionOverflow = errors.New("space: subscription overflowed; resubscribe required")
 
 // ErrSubscriptionDrifted is returned by QuerySubscription.Err when
-// the engine has lost QueryOpts.DriftBudgetPercent of the held window
-// without replacements; departures count once a match has been past
-// the window's edge. The engine never re-queries any-store on the hot
-// path to backfill — it closes the subscription and the client is
-// expected to resubscribe.
+// the engine could not keep the window equal to storage: a window
+// past an offset lost QueryOpts.DriftBudgetPercent of its rows, the
+// re-read that refills a window at offset 0 failed that often, or a
+// change's row could not be read and no re-read could settle it. The
+// client is expected to resubscribe.
 var ErrSubscriptionDrifted = errors.New("space: subscription drifted (too many records left the held window); resubscribe required")
 
 // ErrSubscribeUnsupported is returned by Query.Subscribe for query

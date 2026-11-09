@@ -38,6 +38,15 @@ type SubConfig struct {
 	Offset      int          // rows the snapshot skipped; a window past offset 0 never starts complete
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
+	// Refill re-reads the window: the same query as the snapshot, the
+	// first Limit+1 matching rows in sort order, under the snapshot
+	// callback's contract (it runs under engine.mu and must only read
+	// materialised rows). The engine calls it when a windowed sub at
+	// offset 0 with matches past its edge loses a held row, holds a
+	// sentinel it could not rank, or could not read a row of a change.
+	// nil disables refills: departures then count toward the drift
+	// budget, and an unreadable row closes the sub.
+	Refill SnapshotFn
 }
 
 // SnapshotFn is the caller-supplied populator. It runs UNDER engine.mu
@@ -153,9 +162,20 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 	return &Sub{querySub: sub}, nil
 }
 
+// errNoPostValue is the read error of a change that came with no
+// post-apply lookup: every live record of it is unreadable.
+var errNoPostValue = errors.New("subscribe: change carries no post-apply lookup")
+
+// noPostValue stands in for a nil PostValueFn. A deleted record never
+// reads its post value; any other record of the change is unreadable,
+// and each sub in scope settles from storage or closes.
+func noPostValue(int) (*anyenc.Value, error) { return nil, errNoPostValue }
+
 // OnApply is the apply-path hook. afterApply calls this with the same
 // Event built once for the dispatcher, plus the PostValueFn that
 // lets the engine evaluate filter / sort against the post-apply doc.
+// A nil postValue serves an event of deleted records only; for any
+// other record it reads as an error.
 //
 // Cheap when there are no subs (HasSubscribers check returns false
 // before this is even invoked by the caller). When subs exist, takes
@@ -168,9 +188,7 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 		return
 	}
 	if postValue == nil {
-		// Apply path couldn't provide a post-apply lookup (rare; see
-		// gate.go.postValueFor). No filter / sort eval possible — skip.
-		return
+		postValue = noPostValue
 	}
 
 	e.mu.Lock()
@@ -198,9 +216,9 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 // The delete-callback path (spaceobjects.Store.DeleteTree, fired when
 // any-sync catches a settings-tree deletion) uses this: it removes the
 // materialized row directly, device-local, instead of writing a CRDT
-// tombstone into the tree that is being reclaimed. The post-value
-// lookup is a constant nil — a deleted record carries no post-apply
-// doc, and applyRecord skips the lookup for Deleted records anyway.
+// tombstone into the tree that is being reclaimed. There is no
+// post-value lookup: a deleted record carries no post-apply doc, and
+// applyRecord never reads one for a Deleted record.
 //
 // The emitted SubscriptionEvent carries an empty VersionId (there is no
 // underlying DAG change to draw an orderId from). A Removed{RemoveDeleted}
@@ -212,7 +230,7 @@ func (e *Engine) NotifyDeleted(spaceId, dataset, objectId string) {
 		Dataset:  dataset,
 		ObjectId: objectId,
 		Records:  []EventRecord{{Id: objectId, Deleted: true}},
-	}, func(int) *anyenc.Value { return nil })
+	}, nil)
 }
 
 // NotifyRecordsDeleted emits a synthetic delete for records ids of
@@ -231,7 +249,7 @@ func (e *Engine) NotifyRecordsDeleted(spaceId, dataset, objectId string, ids []s
 		Dataset:  dataset,
 		ObjectId: objectId,
 		Records:  records,
-	}, func(int) *anyenc.Value { return nil })
+	}, nil)
 }
 
 // CloseObject closes every per-object subscription on objectId, across
@@ -253,9 +271,7 @@ func (e *Engine) CloseObject(objectId string, reason error) {
 			if s.closed {
 				continue
 			}
-			s.err.Store(reason)
-			_ = s.mb.Close()
-			s.closed = true
+			s.closeWith(reason)
 			s.release()
 		}
 	}
@@ -314,9 +330,10 @@ func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 
 // Err returns the close reason — nil while live or after user Close,
 // space.ErrSubscriptionOverflow on mailbox overflow,
-// space.ErrSubscriptionDrifted on drift-budget exceeded,
-// space.ErrObjectDeleted when the object a per-object sub reads was
-// purged (CloseObject).
+// space.ErrSubscriptionDrifted on drift-budget exceeded or when a
+// change could not be evaluated against the window and no refill
+// could settle it, space.ErrObjectDeleted when the object a
+// per-object sub reads was purged (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {
 		return v

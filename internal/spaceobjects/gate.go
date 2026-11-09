@@ -300,11 +300,11 @@ func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, spac
 		VersionId: versionId,
 		Records:   []crdt.RecordChange{{Id: st.RowId}},
 	}
-	postValue := func(i int) *anyenc.Value {
+	postValue := func(i int) (*anyenc.Value, error) {
 		if i != 0 {
-			return nil
+			return nil, nil
 		}
-		return ctrl.Get(ctx, st.Dataset, st.RowId)
+		return ctrl.Lookup(ctx, st.Dataset, st.RowId)
 	}
 	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, postValue)
 	s.engine.OnApply(ev, postValue)
@@ -322,9 +322,15 @@ func (s *Store) afterReplayFor() object.AfterReplay {
 	}
 }
 
+// errNoController is the post-value read error of a change whose
+// object has no controller to read rows from.
+var errNoController = errors.New("spaceobjects: no controller for the post-apply read")
+
 // postValueFor returns the row-id slice and the per-record post-apply
 // lookup the dispatcher needs to project $inc / $addToSet / etc. ops
-// down to a $set against the merged value.
+// down to a $set against the merged value. The lookup reports a read
+// that failed as an error, never as an absent row: a live window must
+// not drop a row it could not read.
 //
 // Shared datasets (per-space `objects`): the controller stores all
 // rows under ch.ObjectId regardless of the change's RecordChange.Id;
@@ -339,13 +345,13 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 	// id would block on the load channel that hasn't closed yet,
 	// producing a self-recursive deadlock that any-sync surfaces as
 	// `panic: app.Close timeout`.
-	if obj == nil {
-		return ids, nil
+	if obj == nil || obj.Controller() == nil {
+		// Nothing to read rows from: every record of the change is
+		// unreadable, and each window in scope settles from storage
+		// or closes.
+		return ids, func(int) (*anyenc.Value, error) { return nil, errNoController }
 	}
 	ctrl := obj.Controller()
-	if ctrl == nil {
-		return ids, nil
-	}
 	rowIds := ids
 	if ctrl.IsShared(ch.Dataset) {
 		rowIds = make([]string, len(ids))
@@ -353,15 +359,25 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 			rowIds[i] = ch.ObjectId
 		}
 	}
-	return rowIds, func(i int) *anyenc.Value {
+	var logged bool
+	return rowIds, func(i int) (*anyenc.Value, error) {
 		if i < 0 || i >= len(rowIds) {
-			return nil
+			return nil, nil
 		}
 		rowId := rowIds[i]
 		if rowId == "" {
-			return nil
+			return nil, nil
 		}
-		return ctrl.GetStored(ctx, ch.Dataset, rowId)
+		v, err := ctrl.LookupStored(ctx, ch.Dataset, rowId)
+		if err != nil && !logged {
+			// One line per change: the event builder and every sub
+			// in scope read the same row.
+			logged = true
+			storeLog.Warn("post-apply row read failed; live windows settle from storage or close",
+				zap.String("objectId", ch.ObjectId), zap.String("dataset", ch.Dataset),
+				zap.String("rowId", rowId), zap.Error(err))
+		}
+		return v, err
 	}
 }
 

@@ -555,12 +555,18 @@ an open question.
   applied during the read queue behind it and process after the
   subscription is registered. The snapshot callback must not load
   objects or write to the DAG: both need `engine.mu` and deadlock.
+- **Refill**: a window at offset 0 stays equal to a fresh query of the
+  same body. When a held row leaves a window with matches past its
+  edge, or a row's own sort move puts it in the sentinel slot
+  unranked, the engine re-reads the window and ships the difference;
+  a window that holds every match reads nothing. A change whose
+  post-apply row cannot be read settles the same way.
 - **Overflow and drift** close the subscription: a full mailbox with
-  `ErrSubscriptionOverflow`; `DriftBudgetPercent` (default 30) of
-  `Limit` records leaving the window without replacement with
-  `ErrSubscriptionDrifted`. A window whose snapshot, at offset 0, read
-  at most `Limit` rows counts no departures until a match lands past
-  its edge. Resubscribing is the only recovery.
+  `ErrSubscriptionOverflow`; `ErrSubscriptionDrifted` when the engine
+  cannot keep the window equal to storage: a window past an offset
+  loses `DriftBudgetPercent` (default 30) of `Limit` records, a
+  re-read fails that often, or a row cannot be read and no re-read
+  can settle it. Resubscribing is the only recovery.
 - **Total**: `IncludeTotal` counts in the snapshot's read, after the
   fence, so `Total` and `HasNext` describe exactly the rows returned; a
   snapshot that holds every match needs no count. It is not maintained

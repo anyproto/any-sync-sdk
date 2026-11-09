@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -310,13 +312,12 @@ func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
 	}
 }
 
-// TestSDK_QuerySubscribe_DriftCloseAndResubscribe drives a window
-// with rows past its edge beyond its drift budget by deleting its
-// records, confirms the sub closes with ErrSubscriptionDrifted, and
-// verifies that a follow-up Subscribe rebuilds a correct snapshot —
-// the resubscribe path is the engine's primary recovery contract. A
-// window over the same query that holds every match stays open.
-func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
+// TestSDK_QuerySubscribe_WindowRefillsPastEdge deletes rows from a
+// window with rows past its edge, well past the drift budget, and
+// confirms the window refills from storage: the subscription stays
+// open and its folded view equals a fresh snapshot of the same body.
+// A window over the same query that holds every match stays open too.
+func TestSDK_QuerySubscribe_WindowRefillsPastEdge(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
@@ -333,13 +334,12 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk.Close() })
 
-	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Drift"})
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Refill"})
 	require.NoError(t, err)
 	typeId, titleProp := setupMovieType(t, ctx, sp)
 
 	// Seed 15 movies. Limit=10 leaves 5 past the edge; the drift
-	// budget defaults to 30% → 3 losses close the sub. We'll delete 5
-	// to be safely over the threshold.
+	// budget defaults to 30% of the limit, which 5 deletions exceed.
 	titles := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O"}
 	ids := seedMovies(t, ctx, sp, typeId, titleProp, titles)
 	require.Len(t, ids, 15)
@@ -350,9 +350,14 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 		Limit(10).
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	assert.Len(t, res.Initial, 10)
+	t.Cleanup(func() { _ = res.Sub.Close() })
+	require.Len(t, res.Initial, 10)
+	view := map[string]*anyenc.Value{}
+	for _, v := range res.Initial {
+		view[string(v.GetStringBytes("id"))] = v
+	}
 
-	// Limit=20 holds every match: nothing past the edge to backfill.
+	// Limit=20 holds every match: nothing past the edge to refill.
 	whole, err := sp.QueryObjects().
 		Filter(map[string]any{"any.type": typeId}).
 		Sort(typeId+"."+titleProp).
@@ -367,18 +372,33 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 		require.NoError(t, sp.Objects().Delete(ctx, id))
 	}
 
-	// Drain whatever events arrived before the close. The mailbox
-	// eventually closes; subsequent Wait returns mb.ErrClosed.
-	closedCtx, closedCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer closedCancel()
+	// Fold events until the view shows the ten survivors: each delete
+	// removes one row and the refill adds one from past the edge.
+	remainingTitles := titles[5:]
+	foldCtx, foldCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer foldCancel()
 	for {
-		if _, err := res.Sub.Events().Wait(closedCtx); err != nil {
-			assert.True(t, errors.Is(err, mb.ErrClosed), "expected mailbox closed, got %v", err)
+		titlesNow := extractTitles(t, valuesOf(view), typeId, titleProp)
+		sort.Strings(titlesNow)
+		if slices.Equal(titlesNow, remainingTitles) {
 			break
 		}
+		evs, err := res.Sub.Events().Wait(foldCtx)
+		require.NoError(t, err, "the window must stay open while it refills; view %v", titlesNow)
+		for _, ev := range evs {
+			for _, r := range ev.Added {
+				view[r.Id] = r.Doc
+			}
+			for _, r := range ev.Updated {
+				view[r.Id] = r.Doc
+			}
+			for _, r := range ev.Removed {
+				assert.Equal(t, space.RemoveDeleted, r.Reason)
+				delete(view, r.Id)
+			}
+		}
 	}
-	assert.True(t, errors.Is(res.Sub.Err(), space.ErrSubscriptionDrifted),
-		"sub must close with ErrSubscriptionDrifted after losing >30%% of limit; got %v", res.Sub.Err())
+	assert.NoError(t, res.Sub.Err(), "a window that refills from storage does not drift")
 
 	wholeCtx, wholeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer wholeCancel()
@@ -394,19 +414,24 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	}
 	assert.NoError(t, whole.Sub.Err())
 
-	// Resubscribe — fresh snapshot of the *current* state.
-	res2, err := sp.QueryObjects().
+	// A fresh snapshot of the same body agrees with the folded view.
+	fresh, err := sp.QueryObjects().
 		Filter(map[string]any{"any.type": typeId}).
 		Sort(typeId+"."+titleProp).
 		Limit(10).
-		Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
+		Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = res2.Sub.Close() })
+	assert.Equal(t, 10, fresh.Total, "remaining-movies count must match (15 created - 5 deleted)")
+	assert.Equal(t, remainingTitles, extractTitles(t, fresh.Initial, typeId, titleProp))
+}
 
-	assert.Equal(t, 10, res2.Total, "remaining-movies count must match (15 created - 5 deleted)")
-	remainingTitles := titles[5:]
-	assert.ElementsMatch(t, remainingTitles, extractTitles(t, res2.Initial, typeId, titleProp),
-		"resubscribe must show only the still-alive records")
+// valuesOf returns the rows of a folded view.
+func valuesOf(view map[string]*anyenc.Value) []*anyenc.Value {
+	out := make([]*anyenc.Value, 0, len(view))
+	for _, v := range view {
+		out = append(out, v)
+	}
+	return out
 }
 
 // setupMovieType creates a "Movie" type with a Title property and

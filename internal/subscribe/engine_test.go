@@ -91,13 +91,26 @@ func fireEvent(eng *Engine, objectId, dataset, id string, postDoc *anyenc.Value,
 		VersionId: crdt.VersionId("v" + id),
 		Records:   []EventRecord{{Id: id, Deleted: deleted, Ops: ops}},
 	}
-	postValue := func(i int) *anyenc.Value {
+	postValue := func(i int) (*anyenc.Value, error) {
 		if i == 0 {
-			return postDoc
+			return postDoc, nil
 		}
-		return nil
+		return nil, nil
 	}
 	eng.OnApply(ev, postValue)
+}
+
+// fireUnreadable invokes engine.OnApply with a single-record event
+// whose post value cannot be read.
+func fireUnreadable(eng *Engine, objectId, dataset, id string) {
+	ev := Event{
+		SpaceId:   "test",
+		ObjectId:  objectId,
+		Dataset:   dataset,
+		VersionId: crdt.VersionId("v" + id),
+		Records:   []EventRecord{{Id: id}},
+	}
+	eng.OnApply(ev, func(int) (*anyenc.Value, error) { return nil, errors.New("read failed") })
 }
 
 func waitOne(t *testing.T, sub *Sub) (space.SubscriptionEvent, error) {

@@ -419,6 +419,11 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		}
 	}()
 
+	// A refill is the snapshot's read again, in a read transaction of
+	// its own that closes with it, under the same fence and the same
+	// contract. It runs for as long as the subscription lives, after
+	// the subscribe call's context may have ended.
+	refillCtx := context.WithoutCancel(ctx)
 	cfg := subscribe.SubConfig{
 		Scope:       scope,
 		Filter:      combined,
@@ -427,6 +432,21 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		Offset:      int(q.offset),
 		MailboxCap:  opts.MailboxCapacity,
 		DriftBudget: opts.DriftBudgetPercent,
+		Refill: func(yield func(id string, doc *anyenc.Value)) error {
+			coll, err := collection(refillCtx, true)
+			if err != nil {
+				return err
+			}
+			if coll == nil {
+				return nil
+			}
+			tx, err := coll.ReadTx(refillCtx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Commit() }()
+			return q.readWindow(tx.Context(), coll, combined, yield)
+		},
 	}
 
 	sub, err := q.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
@@ -442,48 +462,18 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			return err
 		}
 		snapshotColl, snapshotTx = coll, tx
-		aq := coll.Find(combined)
-		if q.sort != nil {
-			aq = aq.Sort(q.sort)
-		}
-		// Snapshot pulls limit+1 to seed the sentinel; the user sees only the
-		// first `limit` rows in Initial.
-		if q.limit > 0 {
-			aq = aq.Limit(q.limit + 1)
-		}
-		if q.offset > 0 {
-			aq = aq.Offset(q.offset)
-		}
-		it, err := aq.Iter(tx.Context())
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.Next() {
+		return q.readWindow(tx.Context(), coll, combined, func(id string, v *anyenc.Value) {
 			// Every row the read returned counts toward the cap,
 			// including one skipped below.
 			yielded++
-			doc, err := it.Doc()
-			if err != nil {
-				return err
-			}
-			v := doc.Value()
-			var id string
-			if v != nil {
-				id = string(v.GetStringBytes("id"))
-			}
 			// Initial's copy of the visible rows, cloned off the
 			// iterator's reused buffer. The sentinel is the engine's
 			// alone, and an unbounded sub keeps no copy of its own.
 			if id != "" && (q.limit == 0 || len(snapshotRows) < int(q.limit)) {
 				snapshotRows = append(snapshotRows, anyencx.Clone(v))
 			}
-			// Every row read is yielded, a row without an id too: it
-			// took a slot of the limit+1 read, and the engine counts
-			// slots to tell whether anything lies past the edge.
 			yield(id, v)
-		}
-		return it.Err()
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -539,6 +529,43 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		hasNext = int(q.offset)+len(snapshotRows) < totalCount
 	}
 	return &space.QueryResult{Initial: snapshotRows, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
+}
+
+// readWindow runs the window's read — limit+1 rows past the offset in
+// sort order, so the engine seeds a sentinel beyond the limit rows the
+// user sees — and hands every row it returns to row, one without an
+// id too: it took a slot of the limit+1 read, and the engine counts
+// slots to tell whether anything lies past the edge. The value is the
+// iterator's and lasts until the next row.
+func (q *queryImpl) readWindow(ctx context.Context, coll anystore.Collection, filter query.Filter, row func(id string, v *anyenc.Value)) error {
+	aq := coll.Find(filter)
+	if q.sort != nil {
+		aq = aq.Sort(q.sort)
+	}
+	if q.limit > 0 {
+		aq = aq.Limit(q.limit + 1)
+	}
+	if q.offset > 0 {
+		aq = aq.Offset(q.offset)
+	}
+	it, err := aq.Iter(ctx)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return err
+		}
+		v := doc.Value()
+		var id string
+		if v != nil {
+			id = string(v.GetStringBytes("id"))
+		}
+		row(id, v)
+	}
+	return it.Err()
 }
 
 // tombstoneSkip matches live rows only: a tombstone keeps _deletedAt

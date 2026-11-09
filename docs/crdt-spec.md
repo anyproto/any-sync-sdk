@@ -768,9 +768,9 @@ Callers receive their own writes and recognize them by matching `ModifyResult.Ve
 
 Each subscription has a bounded mailbox (`QueryOpts.MailboxCapacity`, default 256, minimum 16). When it fills, the subscription closes with `ErrSubscriptionOverflow`.
 
-A window at offset 0 stays equal to a fresh query of the same body: when a held row leaves a window with matches past its edge, or a row's own sort move puts it in the sentinel slot unranked, the engine re-reads the window from any-store and ships the difference. A window that holds every match reads nothing. A change whose post-apply row cannot be read is settled the same way.
+A window at offset 0 stays equal to a fresh query of the same body: when a held row leaves a window with matches past its edge, or a row's own sort move puts it in the sentinel slot with a larger key than it was ranked at, the engine re-reads the window from any-store and ships the difference. A window that holds every match reads nothing when rows leave it. A change whose post-apply row cannot be read is settled by the same re-read, for an unbounded subscription too.
 
-`ErrSubscriptionDrifted` closes a subscription the engine cannot keep equal to storage: a window past an offset, whose rows shift with rows before it, loses `DriftBudgetPercent` (default 30) of `Limit` records; a re-read fails that often; or a row cannot be read and no re-read can settle it.
+`ErrSubscriptionDrifted` closes a subscription the engine cannot keep equal to storage: a window past an offset, whose rows shift with rows before it, loses `DriftBudgetPercent` (default 30) of `Limit` records; a re-read fails that often (each failed re-read counts as one loss); or a row cannot be read and no re-read can settle it.
 
 Either error means: resubscribe, and the new snapshot reconciles state. Nothing is dropped silently.
 

@@ -2565,6 +2565,26 @@ func isDocNotFound(err error) bool {
 	return errors.Is(err, anystore.ErrDocNotFound) || errors.Is(err, anystorev1.ErrDocNotFound)
 }
 
+// PeekLoaded returns the resident, loaded object for objectId without
+// loading or waiting, and reports whether an entry exists that is
+// still loading or closing. Safe under the subscribe engine's fence,
+// where a Get on an object whose load fired the apply would wait on
+// itself.
+func (s *Store) PeekLoaded(objectId string) (obj *object.Object, busy bool) {
+	peeker, ok := s.cache.(ocache.Peeker)
+	if !ok {
+		return nil, false
+	}
+	v, state := peeker.Peek(objectId, false)
+	switch state {
+	case ocache.PeekHit:
+		return v.(*object.Object), false
+	case ocache.PeekBusy:
+		return nil, true
+	}
+	return nil, false
+}
+
 // Get returns the *object.Object for objectId, lazy-loading on first
 // access via the ocache LoadFunc. Concurrent Get on the same id
 // share one load; the LoadFunc runs Controller build, tree open,

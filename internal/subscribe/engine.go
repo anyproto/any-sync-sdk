@@ -38,14 +38,14 @@ type SubConfig struct {
 	Offset      int          // rows the snapshot skipped; a window past offset 0 never starts complete
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
-	// Refill re-reads the window: the same query as the snapshot, the
-	// first Limit+1 matching rows in sort order, under the snapshot
-	// callback's contract (it runs under engine.mu and must only read
-	// materialised rows). The engine calls it when a windowed sub at
-	// offset 0 with matches past its edge loses a held row, holds a
-	// sentinel it could not rank, or could not read a row of a change.
-	// nil disables refills: departures then count toward the drift
-	// budget, and an unreadable row closes the sub.
+	// Refill re-reads the sub's rows: the same query as the snapshot,
+	// under the snapshot callback's contract (it runs under engine.mu
+	// and must only read materialised rows). The engine calls it at
+	// offset 0 when a windowed sub with matches past its edge loses a
+	// held row or holds a sentinel it could not rank, and when any sub
+	// could not read a row of a change. nil disables refills:
+	// departures then count toward the drift budget, and an unreadable
+	// row closes the sub.
 	Refill SnapshotFn
 }
 

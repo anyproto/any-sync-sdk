@@ -63,14 +63,24 @@ func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
 // scoped is the filter a read runs: the caller's, narrowed to the
 // object's rows when the collection holds every object's (q.rows).
 func (q *queryImpl) scoped() query.Filter {
-	switch {
-	case q.rows == nil:
-		return q.filter
-	case q.filter == nil:
-		return q.rows
-	}
-	return query.And{q.rows, q.filter}
+	return scopedFilter(q.rows, q.filter)
 }
+
+// scopedFilter is filter narrowed to rows; either may be nil.
+func scopedFilter(rows, filter query.Filter) query.Filter {
+	switch {
+	case rows == nil:
+		return filter
+	case filter == nil:
+		return rows
+	}
+	return query.And{rows, filter}
+}
+
+// errRefillNoObject is a refill with no object instance to read the
+// rows through: the object is not local, is loading or rebuilding, or
+// the instance at hand predates the dataset.
+var errRefillNoObject = errors.New("query: refill: no loaded object to read through")
 
 // newDatasetQuery builds a queryImpl over the per-space collection of a
 // shared dataset — every object's records, no object named.
@@ -422,30 +432,72 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	// A refill is the snapshot's read again, in a read transaction of
 	// its own that closes with it, under the same fence and the same
 	// contract. It runs for as long as the subscription lives, after
-	// the subscribe call's context may have ended.
+	// the subscribe call's context may have ended, and reads the query
+	// as it was at Subscribe: the builder is single-shot, and a call
+	// chained on it later must not reach a live subscription.
 	refillCtx := context.WithoutCancel(ctx)
+	base, sort, limit, offset := q.filter, q.sort, q.limit, q.offset
+	// refillSource resolves the collection and the filter a refill
+	// reads. A shared-scope read has its collection from the Store. A
+	// per-object read goes through the object's controller, resolved
+	// again on every refill without loading: the object resolved before
+	// the lock may not have been local then and may have been evicted
+	// since. The resident loaded instance serves when there is one; an
+	// evicted instance still opens its own collections by name. With
+	// no instance to read through (the object not local, loading or
+	// rebuilding right now, or an instance from before the dataset was
+	// known) the refill fails, and the engine counts the departure as a
+	// loss, as it does for every refill it cannot run.
+	refillSource := func(ctx context.Context) (anystore.Collection, query.Filter, error) {
+		if scope.Shared || scope.AllObjects {
+			return sharedColl, combined, nil
+		}
+		o := obj
+		if o == nil || o.Controller().Released() {
+			loaded, busy := q.store.PeekLoaded(q.objectId)
+			switch {
+			case loaded != nil:
+				o = loaded
+			case busy || o == nil:
+				return nil, nil, errRefillNoObject
+			}
+		}
+		ctrl := o.Controller()
+		if !ctrl.HasDataset(q.dataset) {
+			return nil, nil, errRefillNoObject
+		}
+		coll, err := ctrl.PeekCollection(ctx, q.dataset)
+		if err != nil {
+			return nil, nil, err
+		}
+		var rows query.Filter
+		if ctrl.IsKeyed(q.dataset) {
+			rows = crdt.KeyedRows(q.objectId)
+		}
+		return coll, withoutTombstones(scopedFilter(rows, base)), nil
+	}
 	cfg := subscribe.SubConfig{
 		Scope:       scope,
 		Filter:      combined,
-		Sort:        q.sort,
-		Limit:       int(q.limit),
-		Offset:      int(q.offset),
+		Sort:        sort,
+		Limit:       int(limit),
+		Offset:      int(offset),
 		MailboxCap:  opts.MailboxCapacity,
 		DriftBudget: opts.DriftBudgetPercent,
 		Refill: func(yield func(id string, doc *anyenc.Value)) error {
-			coll, err := collection(refillCtx, true)
+			coll, filter, err := refillSource(refillCtx)
 			if err != nil {
 				return err
 			}
 			if coll == nil {
-				return nil
+				return nil // no collection on disk: no rows
 			}
 			tx, err := coll.ReadTx(refillCtx)
 			if err != nil {
 				return err
 			}
 			defer func() { _ = tx.Commit() }()
-			return q.readWindow(tx.Context(), coll, combined, yield)
+			return readWindow(tx.Context(), coll, filter, sort, limit, offset, yield)
 		},
 	}
 
@@ -462,7 +514,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			return err
 		}
 		snapshotColl, snapshotTx = coll, tx
-		return q.readWindow(tx.Context(), coll, combined, func(id string, v *anyenc.Value) {
+		return readWindow(tx.Context(), coll, combined, sort, limit, offset, func(id string, v *anyenc.Value) {
 			// Every row the read returned counts toward the cap,
 			// including one skipped below.
 			yielded++
@@ -537,16 +589,16 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 // id too: it took a slot of the limit+1 read, and the engine counts
 // slots to tell whether anything lies past the edge. The value is the
 // iterator's and lasts until the next row.
-func (q *queryImpl) readWindow(ctx context.Context, coll anystore.Collection, filter query.Filter, row func(id string, v *anyenc.Value)) error {
+func readWindow(ctx context.Context, coll anystore.Collection, filter query.Filter, sort query.Sort, limit, offset uint, row func(id string, v *anyenc.Value)) error {
 	aq := coll.Find(filter)
-	if q.sort != nil {
-		aq = aq.Sort(q.sort)
+	if sort != nil {
+		aq = aq.Sort(sort)
 	}
-	if q.limit > 0 {
-		aq = aq.Limit(q.limit + 1)
+	if limit > 0 {
+		aq = aq.Limit(limit + 1)
 	}
-	if q.offset > 0 {
-		aq = aq.Offset(q.offset)
+	if offset > 0 {
+		aq = aq.Offset(offset)
 	}
 	it, err := aq.Iter(ctx)
 	if err != nil {

@@ -268,7 +268,15 @@ func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, ob
 	}
 	pending := v.(pendingStamps)
 	for _, st := range pending.stamps {
-		row := ctrl.Get(ctx, st.Dataset, st.RowId)
+		row, err := ctrl.Lookup(ctx, st.Dataset, st.RowId)
+		if err != nil {
+			// The row could not be read: the event still goes out,
+			// with an unreadable post value, so each window in scope
+			// settles from storage or closes.
+			s.emitObjectStampWith(ctx, s.spaceId, objectId, pending.versionId, st,
+				func(int) (*anyenc.Value, error) { return nil, err })
+			continue
+		}
 		if row == nil {
 			continue
 		}
@@ -293,18 +301,23 @@ func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, ob
 // the stamped row carrying only the stamp ops; the row's post value is
 // read on demand like any other apply event.
 func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp) {
+	s.emitObjectStampWith(ctx, spaceId, objectId, versionId, st, func(i int) (*anyenc.Value, error) {
+		if i != 0 {
+			return nil, nil
+		}
+		return ctrl.Lookup(ctx, st.Dataset, st.RowId)
+	})
+}
+
+// emitObjectStampWith is emitObjectStamp with the post-value lookup
+// supplied.
+func (s *Store) emitObjectStampWith(_ context.Context, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp, postValue subscribe.PostValueFn) {
 	synthetic := crdt.Change{
 		SpaceId:   spaceId,
 		ObjectId:  objectId,
 		Dataset:   st.Dataset,
 		VersionId: versionId,
 		Records:   []crdt.RecordChange{{Id: st.RowId}},
-	}
-	postValue := func(i int) (*anyenc.Value, error) {
-		if i != 0 {
-			return nil, nil
-		}
-		return ctrl.Lookup(ctx, st.Dataset, st.RowId)
 	}
 	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, postValue)
 	s.engine.OnApply(ev, postValue)

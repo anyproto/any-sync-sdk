@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -64,7 +65,7 @@ func (m *storeModel) matching() []row {
 // refill read.
 func (m *storeModel) window() []row {
 	rows := m.matching()
-	if len(rows) > m.limit+1 {
+	if m.limit > 0 && len(rows) > m.limit+1 {
 		rows = rows[:m.limit+1]
 	}
 	return rows
@@ -73,7 +74,7 @@ func (m *storeModel) window() []row {
 // visible returns the ids a fresh query of the window's body shows.
 func (m *storeModel) visible() []string {
 	rows := m.matching()
-	if len(rows) > m.limit {
+	if m.limit > 0 && len(rows) > m.limit {
 		rows = rows[:m.limit]
 	}
 	ids := make([]string, 0, len(rows))
@@ -252,21 +253,22 @@ func TestRefill_FailureCountsAsLoss(t *testing.T) {
 	defer eng.Close()
 	arena := newArena()
 	m := newStoreModel(t, nil, 3, driftRows(6)...)
-	sub, _ := subscribeModel(t, eng, m, 50) // lostLimit 150: two losses close
+	sub, view := subscribeModel(t, eng, m, 50) // lostLimit 150: two losses close
 	m.fail = errors.New("busy")
 
 	m.delete("r0")
 	fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
-	drain(t, sub)
+	view.fold(t, sub)
 	assert.Equal(t, 1, sub.lost)
 	assert.NoError(t, sub.Err())
 	assert.Len(t, sub.entries, 3, "a failed refill changes nothing")
+	assert.Equal(t, []string{"r1", "r2", "r3"}, view.ids(m), "the promoted sentinel; nothing read")
 
 	// A refill that recovers settles the window.
 	m.fail = nil
 	m.set(activeRow(arena, "r9", 9))
 	fireEvent(eng, "obj1", "chat", "r9", m.rows["r9"], false, nil)
-	drain(t, sub)
+	agrees(t, sub, view, m)
 	assert.Len(t, sub.entries, 4)
 	assert.NoError(t, sub.Err())
 
@@ -352,11 +354,14 @@ func TestRefill_InsertBelowCapacityIsRanked(t *testing.T) {
 	require.Equal(t, 1, sub.lost)
 
 	m.fail = nil
+	reads := m.reads
 	rewritten := makeRow(arena, "r14", 14, map[string]any{"touched": true})
 	m.set(rewritten)
 	fireEvent(eng, "obj1", "chat", "r14", rewritten.d, false, nil)
 	agrees(t, sub, view, m)
+	assert.Equal(t, reads+1, m.reads, "the insert below capacity ranks the window at once")
 	require.Len(t, sub.entries, 11)
+	assert.False(t, sub.unranked)
 
 	m.delete("r1")
 	fireEvent(eng, "obj1", "chat", "r1", nil, true, nil)
@@ -513,7 +518,7 @@ func TestUnreadable_WindowRefillsFromStorage(t *testing.T) {
 	evs := sub.Events().GetAll()
 	require.Len(t, evs, 1)
 	assert.Equal(t, []string{"r2"}, idsOf(evs[0].Updated))
-	assert.Nil(t, evs[0].Updated[0].Ops, "the record's ops are unknown")
+	assert.Nil(t, evs[0].Updated[0].Ops, "the record's op is dropped: whether it landed is unknown")
 	view.docs["r2"] = evs[0].Updated[0].Doc
 	agrees(t, sub, view, m)
 
@@ -652,4 +657,276 @@ func TestRefill_CompletenessFollowsTheRead(t *testing.T) {
 	fireEvent(eng, "obj1", "chat", "r2", nil, true, nil)
 	agrees(t, sub, view, m)
 	assert.Equal(t, 2, m.reads)
+}
+
+// A sentinel whose own key grows is re-ranked: matches past the edge
+// may now sort below it, and the next own move of a visible row must
+// not keep that row in view ahead of them.
+func TestRefill_SentinelOwnKeyGrowthIsRanked(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2, driftRows(6)...)
+	sub, view := subscribeModel(t, eng, m, 30)
+
+	grown := makeRow(arena, "r2", 10, nil) // the sentinel
+	m.set(grown)
+	fireEvent(eng, "obj1", "chat", "r2", grown.d, false, nil)
+	agrees(t, sub, view, m)
+	assert.Equal(t, 1, m.reads, "the sentinel's growth is ranked at once")
+	assert.Equal(t, "r3", sub.sentinel().id)
+
+	moved := makeRow(arena, "r1", 6, nil)
+	m.set(moved)
+	fireEvent(eng, "obj1", "chat", "r1", moved.d, false, nil)
+	agrees(t, sub, view, m)
+	assert.Equal(t, []string{"r0", "r3"}, view.ids(m))
+	assert.NoError(t, sub.Err())
+}
+
+// A refill that fails on an unranked sentinel with no departure still
+// costs a loss: the window cannot be trusted, and repeated failures
+// close it.
+func TestRefill_FailedRankingIsALoss(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2, driftRows(6)...)
+	sub, _ := subscribeModel(t, eng, m, 100)
+	m.fail = errors.New("busy")
+
+	grown := makeRow(arena, "r2", 10, nil)
+	m.set(grown)
+	fireEvent(eng, "obj1", "chat", "r2", grown.d, false, nil)
+	drain(t, sub)
+	assert.Equal(t, 1, sub.lost)
+	assert.False(t, sub.unranked, "not retried on every apply")
+	assert.NoError(t, sub.Err())
+}
+
+// A row the window held past the edge that a record moved far beyond
+// it leaves as displaced when the refill no longer returns it: its
+// last known position is past the refilled edge.
+func TestRefill_MovedRowAbsentFromRefillIsDisplaced(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2, driftRows(6)...)
+	sub, view := subscribeModel(t, eng, m, 30)
+
+	moved := makeRow(arena, "r0", 100, nil)
+	m.set(moved)
+	fireEvent(eng, "obj1", "chat", "r0", moved.d, false, nil)
+	evs := sub.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, []string{"r2"}, idsOf(evs[0].Added))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDisplaced}}, evs[0].Removed)
+	view.apply(evs)
+	agrees(t, sub, view, m)
+}
+
+// A window past an offset counts departures only: arrivals below
+// capacity and own sort moves are not losses there, since no refill
+// can rank them.
+func TestRefill_OffsetWindowArrivalsAreNotLosses(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 3, driftRows(3)...)
+	sub, err := eng.Subscribe(SubConfig{
+		Scope:  driftScope,
+		Sort:   m.sort,
+		Limit:  3,
+		Offset: 1,
+		Refill: m.refill(),
+	}, snapshotFromRows(m.matching()[1:]))
+	require.NoError(t, err)
+	require.False(t, sub.complete)
+
+	fireEvent(eng, "obj1", "chat", "a", makeRow(arena, "a", 10, nil).d, false, nil)
+	fireEvent(eng, "obj1", "chat", "a", makeRow(arena, "a", 20, nil).d, false, nil)
+	drain(t, sub)
+	assert.Equal(t, 0, sub.lost)
+	assert.Equal(t, 0, m.reads)
+	assert.NoError(t, sub.Err())
+
+	fireEvent(eng, "obj1", "chat", "r1", nil, true, nil)
+	drain(t, sub)
+	assert.Equal(t, 1, sub.lost)
+	assert.ErrorIs(t, sub.Err(), space.ErrSubscriptionDrifted)
+}
+
+// A row promoted from sentinel and then removed within one apply ships
+// nothing: it was never in the client's view. A purge of two held rows
+// where one is the sentinel removes only the visible one.
+func TestApply_PromotedThenRemovedInOneApply(t *testing.T) {
+	t.Run("with refill", func(t *testing.T) {
+		eng := New("test")
+		defer eng.Close()
+		m := newStoreModel(t, nil, 2, driftRows(6)...)
+		sub, view := subscribeModel(t, eng, m, 30)
+
+		m.delete("r1")
+		m.delete("r2")
+		eng.NotifyRecordsDeleted("test", "chat", "obj1", []string{"r1", "r2"})
+		evs := sub.Events().GetAll()
+		require.Len(t, evs, 1)
+		assert.Equal(t, []string{"r3"}, idsOf(evs[0].Added))
+		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDeleted}}, evs[0].Removed)
+		view.apply(evs)
+		agrees(t, sub, view, m)
+	})
+	t.Run("without refill", func(t *testing.T) {
+		eng := New("test")
+		defer eng.Close()
+		sub := subscribeSorted(t, eng, driftScope, nil, 2, driftRows(3))
+		eng.NotifyRecordsDeleted("test", "chat", "obj1", []string{"r1", "r2"})
+		evs := sub.Events().GetAll()
+		require.Len(t, evs, 1)
+		assert.Empty(t, evs[0].Added)
+		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDeleted}}, evs[0].Removed)
+	})
+}
+
+// Several records of one apply that touch the sentinel slot ship the
+// net transition per row: a sentinel updated in place and promoted by
+// a later delete is added, a visible row demoted by a later arrival is
+// displaced, a visible row that moves past the edge and is promoted
+// back by a later delete is updated.
+func TestApply_ImplicitTransitionsWithinOneApply(t *testing.T) {
+	arena := newArena()
+	fullComplete := func(t *testing.T, eng *Engine) *Sub {
+		// Limit 2 over r0, r1; r2 arrives: at capacity and complete.
+		sub := subscribeSorted(t, eng, driftScope, nil, 2, driftRows(2))
+		fireEvent(eng, "obj1", "chat", "r2", makeRow(arena, "r2", 2, nil).d, false, nil)
+		drain(t, sub)
+		require.True(t, sub.complete)
+		require.Equal(t, "r2", sub.sentinel().id)
+		return sub
+	}
+	t.Run("sentinel updated then promoted", func(t *testing.T) {
+		eng := New("test")
+		defer eng.Close()
+		sub := fullComplete(t, eng)
+		edited := makeRow(arena, "r2", 2, map[string]any{"edited": true})
+		fireRecords(eng, "obj1", "chat",
+			[]EventRecord{{Id: "r2"}, {Id: "r0", Deleted: true}},
+			[]*anyenc.Value{edited.d, nil})
+		ev, err := waitOne(t, sub)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"r2"}, idsOf(ev.Added))
+		assert.True(t, ev.Added[0].Doc.GetBool("edited"))
+		assert.Empty(t, ev.Updated)
+		assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, ev.Removed)
+	})
+	t.Run("visible row updated then demoted", func(t *testing.T) {
+		eng := New("test")
+		defer eng.Close()
+		sub := subscribeSorted(t, eng, driftScope, nil, 2, driftRows(3))
+		fireRecords(eng, "obj1", "chat",
+			[]EventRecord{{Id: "r1"}, {Id: "w"}},
+			[]*anyenc.Value{makeRow(arena, "r1", 1, map[string]any{"edited": true}).d, makeRow(arena, "w", -1, nil).d})
+		ev, err := waitOne(t, sub)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"w"}, idsOf(ev.Added))
+		assert.Empty(t, ev.Updated)
+		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDisplaced}}, ev.Removed)
+	})
+	t.Run("own move past the edge then promoted back", func(t *testing.T) {
+		eng := New("test")
+		defer eng.Close()
+		sub := fullComplete(t, eng)
+		fireRecords(eng, "obj1", "chat",
+			[]EventRecord{{Id: "r0"}, {Id: "r1", Deleted: true}},
+			[]*anyenc.Value{makeRow(arena, "r0", 10, nil).d, nil})
+		ev, err := waitOne(t, sub)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"r2"}, idsOf(ev.Added))
+		assert.Equal(t, []string{"r0"}, idsOf(ev.Updated))
+		assert.Equal(t, 10, ev.Updated[0].Doc.GetInt("n"))
+		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDeleted}}, ev.Removed)
+	})
+}
+
+// Two records of one apply on the same id ship one record whose ops
+// are both records' ops in order.
+func TestApply_RepeatedIdConcatenatesOps(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	sub := subscribeSorted(t, eng, driftScope, nil, 3, driftRows(2))
+	op := func(path string) []space.EventOp { return []space.EventOp{{Type: crdt.OpSet, Path: []string{path}}} }
+	fireRecords(eng, "obj1", "chat",
+		[]EventRecord{{Id: "r0", Ops: op("a")}, {Id: "r0", Ops: op("b")}},
+		[]*anyenc.Value{makeRow(arena, "r0", 0, nil).d, makeRow(arena, "r0", 0, map[string]any{"b": 1}).d})
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	require.Len(t, ev.Updated, 1)
+	assert.Equal(t, []string{"a", "b"}, []string{ev.Updated[0].Ops[0].Path[0], ev.Updated[0].Ops[1].Path[0]})
+	assert.Equal(t, 1, ev.Updated[0].Doc.GetInt("b"))
+}
+
+// An unbounded sub settles an unreadable row by re-reading its
+// membership: rows storage no longer returns leave, rows it returns
+// enter, and the unreadable row ships its stored value.
+func TestUnreadable_UnboundedRefillsMembership(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 0, driftRows(3)...)
+	sub, err := eng.Subscribe(SubConfig{Scope: driftScope, Refill: m.refill()}, snapshotFromRows(m.matching()))
+	require.NoError(t, err)
+
+	m.delete("r1")                     // without an event
+	m.set(makeRow(arena, "z", 9, nil)) // without an event
+	m.set(makeRow(arena, "r2", 2, map[string]any{"edited": true}))
+	fireUnreadable(eng, "obj1", "chat", "r2")
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"z"}, idsOf(ev.Added))
+	assert.Equal(t, []string{"r2"}, idsOf(ev.Updated))
+	assert.True(t, ev.Updated[0].Doc.GetBool("edited"))
+	assert.Nil(t, ev.Updated[0].Ops)
+	assert.Equal(t, []string{"r1"}, removedIdsOf(ev.Removed))
+	assert.NoError(t, sub.Err())
+	assert.Len(t, sub.entries, 3)
+	for _, e := range sub.entries {
+		assert.Nil(t, e.raw, "an unbounded sub keeps no values")
+	}
+}
+
+// A refill whose read returns a row without an id fills the window as
+// far as it can and marks it complete, rather than refilling on every
+// following apply.
+func TestRefill_RowWithoutIdDoesNotLoop(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	m := newStoreModel(t, nil, 2, driftRows(5)...)
+	reads := 0
+	sub, err := eng.Subscribe(SubConfig{
+		Scope: driftScope, Sort: m.sort, Limit: 2, MailboxCap: minMailboxCap, DriftBudget: 30,
+		Refill: func(yield func(id string, doc *anyenc.Value)) error {
+			reads++
+			rows := m.window()
+			yield(rows[0].id, rows[0].d)
+			yield(rows[1].id, rows[1].d)
+			yield("", nil)
+			return nil
+		},
+	}, snapshotFromRows(m.window()))
+	require.NoError(t, err)
+
+	m.delete("r0")
+	fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
+	drain(t, sub)
+	assert.Equal(t, 1, reads)
+	assert.True(t, sub.complete)
+	assert.Len(t, sub.entries, 2)
+
+	for i := 0; i < 3; i++ {
+		fireEvent(eng, "obj1", "chat", "r1", m.rows["r1"], false, nil)
+	}
+	drain(t, sub)
+	assert.Equal(t, 1, reads, "a complete window reads nothing")
+	assert.NoError(t, sub.Err())
 }

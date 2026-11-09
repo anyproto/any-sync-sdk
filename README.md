@@ -111,7 +111,7 @@ Implemented:
 - Types (one per object), collections, property definitions with scopes, runtime datasets and parts, bundles
 - Writes: `Modify`, `ModifyMany`, `Delete`, `Upsert`
 - Queries: per-object `Space.Query` and per-space `Space.QueryObjects` with `Filter`/`Sort`/`Limit`/`Offset`/`Projection` and terminals `Iter`/`All`/`One`/`Count`/`Snapshot`/`Subscribe`; aggregation pipelines (`Aggregate`, `AggregateObjects`)
-- Live windowed subscriptions: `Query.Subscribe(ctx, opts)` returns `*QueryResult{Initial, Total, Sub}`. `Sub.Events()` carries `SubscriptionEvent{VersionId, Added, Updated, Removed}` with the full post-apply doc and projected `$set`/`$unset` ops per record. Overflow closes with `ErrSubscriptionOverflow`; drift past `DriftBudgetPercent` (default 30%) closes with `ErrSubscriptionDrifted` (a window that started with every match counts no departures until a match lands past its edge); resubscribe to recover
+- Live windowed subscriptions: `Query.Subscribe(ctx, opts)` returns `*QueryResult{Initial, Total, Sub}`. `Sub.Events()` carries `SubscriptionEvent{VersionId, Added, Updated, Removed}` with the full post-apply doc and projected `$set`/`$unset` ops per record. A window re-reads storage when rows leave it, so it stays equal to a fresh query of the same body. Overflow closes with `ErrSubscriptionOverflow`; a window the engine cannot keep equal to storage closes with `ErrSubscriptionDrifted`; resubscribe to recover
 - Change index for consumer-side indexers: `Space.Changes()`
 - Version history: `Space.History()` (`ListChanges`, `ViewAt`, `RecordAt`, `Diff`)
 - Read tracking: `Space.ReadState()`

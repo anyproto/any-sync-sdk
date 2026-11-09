@@ -143,10 +143,11 @@ var ErrSubscriptionOverflow = errors.New("space: subscription overflowed; resubs
 // ErrSubscriptionDrifted is returned by QuerySubscription.Err when
 // the engine could not keep the window equal to storage: a window
 // past an offset lost QueryOpts.DriftBudgetPercent of its rows, the
-// re-read that refills a window at offset 0 failed that often, or a
-// change's row could not be read and no re-read could settle it. The
-// client is expected to resubscribe.
-var ErrSubscriptionDrifted = errors.New("space: subscription drifted (too many records left the held window); resubscribe required")
+// re-read that refills a window at offset 0 failed that often (each
+// failed refill counts as one loss), or a change's row could not be
+// read and no re-read could settle it. The client is expected to
+// resubscribe.
+var ErrSubscriptionDrifted = errors.New("space: subscription drifted (the window could not be kept equal to storage); resubscribe required")
 
 // ErrSubscribeUnsupported is returned by Query.Subscribe for query
 // shapes the engine doesn't support yet (members in v1).

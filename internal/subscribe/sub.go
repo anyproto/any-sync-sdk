@@ -106,11 +106,13 @@ var encBufs = sync.Pool{New: func() any { return new([]byte) }}
 const maxPooledEncBuf = 64 << 10
 
 // parseHeld parses a held encoding in place: raw is never mutated
-// once encoded, so the value may alias it.
+// once encoded, so the value may alias it. A row that does not parse
+// back (nested past the parser's depth limit) ships no doc, as a
+// failed clone does.
 func parseHeld(raw []byte) *anyenc.Value {
 	v, err := new(anyenc.Parser).ParseOwned(raw)
 	if err != nil {
-		panic(err) // raw is this sub's own MarshalTo output
+		return nil
 	}
 	return v
 }

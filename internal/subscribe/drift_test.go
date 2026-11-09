@@ -154,6 +154,21 @@ func TestDrift_IncompleteSnapshot(t *testing.T) {
 	}
 }
 
+// In a window with rows past its edge, a held row the filter rejects
+// counts as a loss just like a delete.
+func TestDrift_FilterOutCountsInIncompleteWindow(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	sub := subscribeSorted(t, eng, driftScope, activeOnly, 3, driftRows(4))
+	require.False(t, sub.complete)
+
+	arena := newArena()
+	fireEvent(eng, "obj1", "chat", "r0", makeRow(arena, "r0", 0, map[string]any{"status": "read"}).d, false, nil)
+	drain(t, sub)
+	assert.Equal(t, 1, sub.lost)
+	assert.ErrorIs(t, sub.Err(), space.ErrSubscriptionDrifted)
+}
+
 // A row the snapshot read but the engine skipped (no id) still took a
 // slot of the limit+1 read: a match may lie past the edge.
 func TestDrift_SkippedSnapshotRowCounts(t *testing.T) {

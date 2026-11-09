@@ -487,6 +487,15 @@ func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
 
+// ApplyGapCount is spaceobjects.Store.ApplyGapCount for a built
+// store, 0 for a space with none.
+func (s *Service) ApplyGapCount(spaceId string) int {
+	if st := s.peekStore(spaceId); st != nil {
+		return st.ApplyGapCount()
+	}
+	return 0
+}
+
 // peekStore returns spaceId's Store only if already built — never
 // constructs. Used by watchers that must not create runtime state.
 func (s *Service) peekStore(spaceId string) *spaceobjects.Store {

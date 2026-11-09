@@ -119,14 +119,17 @@ type Object struct {
 	// the AfterApply hook (same lock) to tell a bulk replay from a
 	// single local write. See Replaying.
 	replaying bool
-	// applyGap is set when a change is in the tree's storage above the
-	// controller's watermark and its apply did not commit: a local
-	// write whose post-AddContent apply failed, or a replay that
-	// halted. While set, the next LocalWrite replays from the
-	// watermark before it writes, so its own apply cannot move the
+	// applyGap is set when a change may be in the tree's storage above
+	// the controller's watermark with its apply not committed: a local
+	// write whose AddContent or post-AddContent apply failed, or a
+	// replay that halted. While set, the next LocalWrite replays from
+	// the watermark before it writes, so its own apply cannot move the
 	// watermark past the unapplied change. Cleared by a replay that
 	// runs to the end. Guarded by tree.Lock.
 	applyGap bool
+	// onGap reports every flip of applyGap to the store, which keeps
+	// the set of gapped objects across evictions. Optional.
+	onGap func(gap bool)
 	// writeGate, when set, is consulted at the top of LocalWrite — the
 	// sole entry for user-authored DAG changes. A non-nil error rejects
 	// the write (read-only guest spaces). Local-set and inbound apply
@@ -169,6 +172,9 @@ type Config struct {
 	// AfterReplay runs once per replay batch after its applies (see
 	// the AfterReplay type). Optional.
 	AfterReplay AfterReplay
+	// OnGap runs under the tree lock whenever the object's apply gap
+	// appears (true) or closes (false); see Object.applyGap. Optional.
+	OnGap func(gap bool)
 	// WriteGate rejects user-authored DAG writes when it returns a
 	// non-nil error (read-only guest spaces). Optional — nil means
 	// writable.
@@ -220,6 +226,7 @@ func New(cfg Config, treeFunc TreeFunc) (*Object, error) {
 		gate:           cfg.Gate,
 		afterApply:     cfg.AfterApply,
 		afterReplay:    cfg.AfterReplay,
+		onGap:          cfg.OnGap,
 		writeGate:      cfg.WriteGate,
 		plaintextSpecs: cfg.PlaintextSpecs,
 		onClose:        cfg.OnClose,
@@ -402,10 +409,25 @@ func (o *Object) applyDecodedLocked(ctx context.Context, ch crdt.Change) (crdt.A
 	if err != nil {
 		return res, err
 	}
+	// The change is committed: the dispatch that follows (live
+	// windows, the type catalog, read state) runs on a context the
+	// caller cannot end, or a committed change would go unreported.
 	if o.afterApply != nil {
-		o.afterApply(ctx, o, &ch, &res)
+		o.afterApply(context.WithoutCancel(ctx), o, &ch, &res)
 	}
 	return res, nil
+}
+
+// setApplyGap flips the gap mark and reports the flip. Caller holds
+// tree.Lock.
+func (o *Object) setApplyGap(gap bool) {
+	if o.applyGap == gap {
+		return
+	}
+	o.applyGap = gap
+	if o.onGap != nil {
+		o.onGap(gap)
+	}
 }
 
 // stampObjectMeta fills ch.ObjectAuthor / ObjectCreatedAt from the
@@ -666,9 +688,14 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 		Timestamp:         ch.Timestamp,
 	})
 	if err != nil {
+		// AddContent can store the change and still fail (the head
+		// update after the store); the mark costs one empty replay
+		// when it did not.
+		o.setApplyGap(true)
 		return WriteResult{}, fmt.Errorf("object: AddContent: %w", err)
 	}
 	if len(res.Added) == 0 {
+		o.setApplyGap(true)
 		return WriteResult{}, errors.New("object: AddContent returned no changes")
 	}
 
@@ -711,7 +738,7 @@ func (o *Object) LocalWriteIf(ctx context.Context, ch crdt.Change, ifUnchangedSi
 	if applyErr != nil {
 		// Stored above the watermark and not applied: the next
 		// LocalWrite, inbound update, reload or boot replays it.
-		o.applyGap = true
+		o.setApplyGap(true)
 		log.Warn("local change stored but not applied; replayed before the next write",
 			zap.String("objectId", ch.ObjectId),
 			zap.String("changeId", ch.ChangeId),
@@ -969,12 +996,23 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		}
 
 		// Same per-change primitive as LocalWrite and the drain path.
-		// Apply errors here are infrastructure-level (any-store / disk)
-		// — abort the iter so maxAddSeq doesn't leapfrog the failed
-		// change. Per-op handler rejections (kind mismatch, etc.) are
-		// surfaced inside ApplyResult.Rejections, NOT through err, and
-		// don't halt the iter.
+		// A malformed change (crdt.ErrInvalidChange) can never apply:
+		// it is skipped, as a halt would freeze the object on every
+		// device the peer reaches. Any other apply error is
+		// infrastructure-level (any-store / disk) — abort the iter so
+		// maxAddSeq doesn't leapfrog the failed change. Per-op handler
+		// rejections (kind mismatch, etc.) are surfaced inside
+		// ApplyResult.Rejections, NOT through err, and don't halt the
+		// iter.
 		if _, applyErr := o.applyDecodedLocked(ctx, decoded); applyErr != nil {
+			if errors.Is(applyErr, crdt.ErrInvalidChange) {
+				log.Warn("skipping invalid inbound change",
+					zap.String("objectId", rootId),
+					zap.String("changeId", ch.Id),
+					zap.String("dataset", decoded.Dataset),
+					zap.Error(applyErr))
+				return true
+			}
 			fatalErr = fmt.Errorf("object: apply %s: %w", ch.Id, applyErr)
 			return false
 		}
@@ -988,16 +1026,17 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		return tree.IterateAfterAddSeq(ctx, from, convert, iter)
 	}()
 	// Applied changes are committed whatever ended the iteration, so
-	// the batch hook runs on the error paths too.
+	// the batch hook runs on the error paths too, on a context the
+	// caller cannot end.
 	if applied > 0 && o.afterReplay != nil {
-		o.afterReplay(ctx, o)
+		o.afterReplay(context.WithoutCancel(ctx), o)
 	}
 	if iterErr == nil {
 		iterErr = fatalErr
 	}
 	// A halted replay leaves stored changes above the watermark; a
 	// finished one has applied, parked or skipped every stored change.
-	o.applyGap = iterErr != nil
+	o.setApplyGap(iterErr != nil)
 	return iterErr
 }
 

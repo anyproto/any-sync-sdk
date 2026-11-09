@@ -38,6 +38,7 @@ type fakeLocalWriteTree struct {
 	nextSeq  uint64
 	calls    int
 	stored   []*objecttree.Change
+	addErr   error
 }
 
 func (f *fakeLocalWriteTree) Lock()         { f.mu.Lock() }
@@ -63,6 +64,9 @@ func (f *fakeLocalWriteTree) GetChange(id string) (*objecttree.Change, error) {
 // "ch-N" / "a00000000N" / nextSeq+N-1 after it.
 func (f *fakeLocalWriteTree) AddContent(_ context.Context, content objecttree.SignableChangeContent) (objecttree.AddResult, error) {
 	f.captured = content.Timestamp
+	if f.addErr != nil {
+		return objecttree.AddResult{}, f.addErr
+	}
 	f.calls++
 	id, ord, seq := f.nextId, f.nextOrd, f.nextSeq
 	if f.calls > 1 {

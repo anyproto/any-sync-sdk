@@ -22,6 +22,11 @@ var (
 	ErrMissingRecordId       = errors.New("crdt: RecordChange.Id is empty and Change.ChangeId is also empty")
 	ErrEmptyIdRequiresUpsert = errors.New("crdt: RecordChange.Id is empty but Upsert is false")
 	ErrMissingDataVersion    = errors.New("crdt: Change.DataVersion is empty")
+	// ErrInvalidChange wraps the change-level checks of ApplyChange that
+	// no retry can pass: the change itself is malformed. The inbound
+	// replay skips such a change; a halt would freeze the object on
+	// every device that receives it.
+	ErrInvalidChange = errors.New("crdt: invalid change")
 
 	// ErrStrictSkipAbsent surfaces the documented strict-mode behaviour
 	// (Upsert=false on an absent record = silent no-op) as a per-record
@@ -1058,14 +1063,14 @@ func (c *Controller) ApplyChange(ctx context.Context, ch Change) error {
 func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (ApplyResult, error) {
 	var res ApplyResult
 	if ch.DataVersion == "" {
-		return res, ErrMissingDataVersion
+		return res, fmt.Errorf("%w: %w", ErrInvalidChange, ErrMissingDataVersion)
 	}
 	if ch.ObjectId != "" && c.objectId != "" && ch.ObjectId != c.objectId {
-		return res, fmt.Errorf("crdt: change for object %q applied to controller for %q", ch.ObjectId, c.objectId)
+		return res, fmt.Errorf("%w: change for object %q applied to controller for %q", ErrInvalidChange, ch.ObjectId, c.objectId)
 	}
 	handler, ok := c.handlers[ch.Dataset]
 	if !ok {
-		return res, ErrUnknownDataset
+		return res, fmt.Errorf("%w: %w", ErrInvalidChange, ErrUnknownDataset)
 	}
 	// A change on a shared dataset may create its row: forget that it
 	// was absent (see objectStamper.absent).
@@ -1086,7 +1091,7 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// change's ObjectId — collapse all resolved ids onto that.
 	resolvedIds, err := resolveRecordIds(ch)
 	if err != nil {
-		return res, err
+		return res, fmt.Errorf("%w: %w", ErrInvalidChange, err)
 	}
 	if c.IsShared(ch.Dataset) && ch.ObjectId != "" {
 		for i := range resolvedIds {
@@ -1108,7 +1113,7 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// Local+Injected mutual exclusion is a constructed-change invariant
 	// (a DAG change is neither), so it stays a hard abort.
 	if ch.Local && ch.Injected {
-		return res, errors.Join(ErrValidation, errors.New("crdt: Local and Injected are mutually exclusive"))
+		return res, fmt.Errorf("%w: %w", ErrInvalidChange, errors.Join(ErrValidation, errors.New("crdt: Local and Injected are mutually exclusive")))
 	}
 	// Per-op content validation (op-path syntax + field-class scope) is
 	// NON-fatal here: an invalid op is dropped and recorded in

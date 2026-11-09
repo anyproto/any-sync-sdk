@@ -20,9 +20,15 @@ func TestSDK_SyncStatusInheritsSyncedOnlyForStoredTrees(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
 
-	sdk, err := Open(ctx, wmConfig(t, dataDir), wmProvider(t, dataDir))
+	first, err := Open(ctx, wmConfig(t, dataDir), wmProvider(t, dataDir))
 	require.NoError(t, err)
-	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Status"})
+	firstClosed := false
+	t.Cleanup(func() {
+		if !firstClosed {
+			_ = first.Close()
+		}
+	})
+	sp, err := first.Spaces().Create(ctx, space.CreateRequest{Name: "Status"})
 	require.NoError(t, err)
 	spaceId := sp.Id()
 	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Note"})
@@ -32,10 +38,11 @@ func TestSDK_SyncStatusInheritsSyncedOnlyForStoredTrees(t *testing.T) {
 	deleted, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	require.NoError(t, sp.Objects().Delete(ctx, deleted))
-	require.NoError(t, sdk.Close())
+	firstClosed = true
+	require.NoError(t, first.Close())
 
 	// A reopened SDK has no per-tree rows.
-	sdk, err = Open(ctx, wmConfig(t, dataDir), wmProvider(t, dataDir))
+	sdk, err := Open(ctx, wmConfig(t, dataDir), wmProvider(t, dataDir))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk.Close() })
 	sp, err = sdk.Spaces().Get(ctx, spaceId)

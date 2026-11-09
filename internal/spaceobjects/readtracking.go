@@ -82,11 +82,10 @@ func (s *Store) ReadState() *readstate.Engine { return s.readState }
 // readLoader between transactions.
 func (s *Store) readResolver() readstate.Resolver {
 	return func(ctx context.Context, objectId, changeId string) ([]string, string, bool, error) {
-		handle, ok := s.app.PeekSpace(s.spaceId)
-		if !ok {
+		st, resident := s.peekStorage()
+		if !resident {
 			return nil, "", false, readstate.ErrSpaceNotResident
 		}
-		st := handle.Inner().Storage()
 		if st == nil {
 			return nil, "", false, nil
 		}

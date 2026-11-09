@@ -315,9 +315,7 @@ func (s *Service) hasLiveTree(spaceId, treeId string) bool {
 	if s.tsp != nil && spaceId == s.tsp.SpaceId() {
 		store = s.tsp.Store()
 	} else {
-		s.mu.Lock()
-		store = s.stores[spaceId]
-		s.mu.Unlock()
+		store = s.peekStore(spaceId)
 	}
 	if store == nil {
 		return false

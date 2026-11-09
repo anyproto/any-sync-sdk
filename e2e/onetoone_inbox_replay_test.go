@@ -78,11 +78,36 @@ func proxyNodeconf(t *testing.T, data []byte, basePort int) (out []byte, routes 
 }
 
 // startTCPProxies brings up plain TCP forwarders for routes. Returns a
-// stop func. Until this is called, dials to the proxy addrs are refused.
+// stop func that closes the listeners and every forwarded connection, so
+// peers see the drop at once. Until this is called, and after stop, dials
+// to the proxy addrs are refused.
 func startTCPProxies(t *testing.T, routes map[string]string) (stop func()) {
 	t.Helper()
-	var lns []net.Listener
-	var wg sync.WaitGroup
+	var (
+		lns     []net.Listener
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		conns   = map[net.Conn]struct{}{}
+		stopped bool
+	)
+	track := func(cs ...net.Conn) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if stopped {
+			return false
+		}
+		for _, c := range cs {
+			conns[c] = struct{}{}
+		}
+		return true
+	}
+	untrack := func(cs ...net.Conn) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range cs {
+			delete(conns, c)
+		}
+	}
 	for proxy, real := range routes {
 		ln, err := net.Listen("tcp", proxy)
 		require.NoError(t, err, "listen %s", proxy)
@@ -95,24 +120,39 @@ func startTCPProxies(t *testing.T, routes map[string]string) (stop func()) {
 				if err != nil {
 					return
 				}
+				wg.Add(1)
 				go func(c net.Conn) {
+					defer wg.Done()
 					defer c.Close()
 					up, err := net.Dial("tcp", real)
 					if err != nil {
 						return
 					}
 					defer up.Close()
+					if !track(c, up) {
+						return
+					}
+					defer untrack(c, up)
 					go func() { _, _ = io.Copy(up, c); up.(*net.TCPConn).CloseWrite() }()
 					_, _ = io.Copy(c, up)
 				}(c)
 			}
 		}(ln, real)
 	}
+	var once sync.Once
 	return func() {
-		for _, ln := range lns {
-			_ = ln.Close()
-		}
-		wg.Wait()
+		once.Do(func() {
+			for _, ln := range lns {
+				_ = ln.Close()
+			}
+			mu.Lock()
+			stopped = true
+			for c := range conns {
+				_ = c.Close()
+			}
+			mu.Unlock()
+			wg.Wait()
+		})
 	}
 }
 

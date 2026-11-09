@@ -278,7 +278,7 @@ func (ix *Index) PurgeObject(ctx context.Context, objectId string) error {
 		}
 		ids = append(ids, string(doc.Value().GetStringBytes("id")))
 	}
-	if err := iter.Close(); err != nil {
+	if err := errors.Join(iter.Err(), iter.Close()); err != nil {
 		return err
 	}
 	for _, id := range ids {

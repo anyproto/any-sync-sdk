@@ -291,5 +291,8 @@ func recordsWithFlag(ctx context.Context, ctrl *crdt.Controller, dataset, field 
 		}
 		out[string(doc.Value().GetStringBytes("id"))] = struct{}{}
 	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }

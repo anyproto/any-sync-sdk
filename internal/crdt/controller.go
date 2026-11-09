@@ -905,10 +905,11 @@ func KeyedNames(regs []HandlerReg) []string {
 // For streaming over many rows, hit Collection(dataset).Find(...) +
 // Iter directly and clone selectively — Records always materialises.
 //
-// nil on a read that failed as well as for a dataset without a
-// collection; ListRecords tells the two apart.
+// A row that fails to load is skipped; nil for a dataset without a
+// collection and for a scan that did not run to the end. ListRecords
+// tells those apart.
 func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Value {
-	out, err := c.ListRecords(ctx, dataset)
+	out, err := c.records(ctx, dataset, true)
 	if err != nil {
 		return nil
 	}
@@ -919,6 +920,10 @@ func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Valu
 // ended, or a row that failed to load, is an error, never a short
 // result. A dataset without a collection is (nil, nil).
 func (c *Controller) ListRecords(ctx context.Context, dataset string) ([]*anyenc.Value, error) {
+	return c.records(ctx, dataset, false)
+}
+
+func (c *Controller) records(ctx context.Context, dataset string, skipBadRows bool) ([]*anyenc.Value, error) {
 	coll, err := c.openForRead(ctx, dataset)
 	if err != nil {
 		return nil, err
@@ -939,6 +944,9 @@ func (c *Controller) ListRecords(ctx context.Context, dataset string) ([]*anyenc
 	for iter.Next() {
 		doc, err := iter.Doc()
 		if err != nil {
+			if skipBadRows {
+				continue
+			}
 			return nil, err
 		}
 		v := doc.Value()

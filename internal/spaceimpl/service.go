@@ -995,7 +995,10 @@ func (s *Service) WaitListSynced(ctx context.Context) error {
 
 // List returns the space-index snapshot.
 func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
-	rows := s.tsp.List(ctx)
+	rows, err := s.tsp.List(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]space.SpaceInfo, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, s.recordToInfo(ctx, r))

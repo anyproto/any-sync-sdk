@@ -519,7 +519,12 @@ func (s *SDK) kickIndexFollower() {
 // or a direct peer that has the space; a failure is retried on the next
 // index change.
 func (s *SDK) pullMissingSpaces(ctx context.Context) {
-	for _, boot := range s.tsp.List(ctx) {
+	rows, lerr := s.tsp.List(ctx)
+	if lerr != nil {
+		log.Debug("pull missing spaces: space list", zap.Error(lerr))
+		return
+	}
+	for _, boot := range rows {
 		if ctx.Err() != nil {
 			return
 		}
@@ -589,7 +594,12 @@ func (s *SDK) bootstrap(ctx context.Context) {
 	// and resurrect it until the next boot. The fresh read shrinks that
 	// race to one iteration's processing time; the airtight fix is a
 	// tombstone guard on the load path itself — follow-up material.
-	for _, boot := range s.tsp.List(ctx) {
+	rows, lerr := s.tsp.List(ctx)
+	if lerr != nil {
+		log.Warn("boot: space list", zap.Error(lerr))
+		return
+	}
+	for _, boot := range rows {
 		if ctx.Err() != nil {
 			// Close cancelled the pass; the remaining spaces never
 			// enter the caughtUp allowlist, so the next boot replays.
@@ -683,7 +693,9 @@ func (s *SDK) registerIndexWatch() {
 	lan, global := s.app.P2PEnabled(), s.app.GlobalP2PEnabled()
 	if lan {
 		s.app.SetKnownSpaceIdsFn(func() []string {
-			recs := s.tsp.List(context.Background())
+			// A failed read lists no spaces; the probe runs again on
+			// the next index change.
+			recs, _ := s.tsp.List(context.Background())
 			ids := make([]string, 0, len(recs))
 			for _, rec := range recs {
 				if !rec.IsDeleted() {

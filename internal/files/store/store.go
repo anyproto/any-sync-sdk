@@ -198,6 +198,9 @@ func (s *Store) ListSpace(ctx context.Context, spaceId string) ([]Info, error) {
 		}
 		out = append(out, info)
 	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -365,7 +368,7 @@ func (s *Store) DeleteSpace(ctx context.Context, spaceId string) error {
 			}
 			ids = append(ids, string(doc.Value().GetStringBytes(idField)))
 		}
-		if err = iter.Close(); err != nil {
+		if err = errors.Join(iter.Err(), iter.Close()); err != nil {
 			return err
 		}
 		for _, id := range ids {

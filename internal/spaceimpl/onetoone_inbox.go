@@ -377,7 +377,12 @@ func (s *Service) reconcileInvites(ctx context.Context) {
 		_, err := s.tsp.SetOneToOneInviteState(ctx, spaceId, "")
 		return err
 	}
-	reconcileInviteOutbox(ctx, s.tsp.List(ctx),
+	rows, lerr := s.tsp.List(ctx)
+	if lerr != nil {
+		inboxLog.Debug("skip invite pass: space list", zap.Error(lerr))
+		return
+	}
+	reconcileInviteOutbox(ctx, rows,
 		s.sendOneToOneInvite, clearOneToOne,
 		s.sendRegularInvite, s.tsp.ClearInviteNotify)
 }

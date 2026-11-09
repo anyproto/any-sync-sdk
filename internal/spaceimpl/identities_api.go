@@ -49,7 +49,10 @@ func (a *identitiesAPI) OpenIcon(ctx context.Context, identity string) (space.Fi
 }
 
 func (a *identitiesAPI) List(ctx context.Context) ([]space.IdentityInfo, error) {
-	recs := a.tsp.ListIdentities(ctx)
+	recs, err := a.tsp.ListIdentities(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]space.IdentityInfo, 0, len(recs))
 	for _, r := range recs {
 		out = append(out, identityInfo(r))

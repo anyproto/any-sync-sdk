@@ -493,7 +493,7 @@ func (e *Engine) findByKey(ctx context.Context, objectId, key string) (*Entry, e
 	}
 	defer it.Close()
 	if !it.Next() {
-		return nil, nil
+		return nil, it.Err()
 	}
 	doc, err := it.Doc()
 	if err != nil {

@@ -434,8 +434,19 @@ func (q *Queue) nextDue() (Job, bool) {
 
 func (q *Queue) runOne(ctx context.Context, job Job) {
 	err := q.runner(ctx, job)
-	// The settlement lands after Close too: a write on a context that
-	// has ended writes nothing, and the job would run again.
+	if err == nil && ctx.Err() != nil {
+		// A nil from a runner whose context ended is not a verdict: a
+		// registry read on an ended context reads as "space gone".
+		err = ctx.Err()
+	}
+	if q.ctx.Err() != nil {
+		// Closing: the attempt is not settled, the job is due again at
+		// the next start.
+		return
+	}
+	// The settlement lands even if Close starts now: a write on a
+	// context that has ended writes nothing, and the job would run
+	// again.
 	settleCtx := context.WithoutCancel(q.ctx)
 	if err == nil {
 		if derr := q.coll.DeleteId(settleCtx, job.id()); derr != nil && !errors.Is(derr, anystore.ErrDocNotFound) {

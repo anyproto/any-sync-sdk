@@ -1201,9 +1201,13 @@ func (s *Service) ResolveIdentityProfiles(ctx context.Context) {
 		key crypto.SymKey
 		pk  crypto.PubKey
 	}
+	recs, lerr := s.tsp.ListIdentities(ctx)
+	if lerr != nil {
+		return
+	}
 	todo := make(map[string]pending)
 	ids := make([]string, 0)
-	for _, r := range s.tsp.ListIdentities(ctx) {
+	for _, r := range recs {
 		if r.SymKey == "" || r.Name != "" {
 			continue // no key, or already resolved
 		}

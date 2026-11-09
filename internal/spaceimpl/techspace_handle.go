@@ -281,6 +281,9 @@ func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, er
 					}
 				}
 			}
+			if err := iter.Err(); err != nil {
+				return false, err
+			}
 		}
 	}
 	return false, nil

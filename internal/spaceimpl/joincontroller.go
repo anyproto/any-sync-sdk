@@ -147,8 +147,13 @@ func (s *Service) joinLoop(ctx context.Context) {
 // a burst of index changes cannot turn into a burst of network rounds.
 // Single-threaded: only joinLoop calls it.
 func (s *Service) reconcileJoins(ctx context.Context, full bool) {
+	rows, lerr := s.tsp.List(ctx)
+	if lerr != nil {
+		joinLog.Debug("skip join pass: space list", zap.Error(lerr))
+		return
+	}
 	joining := make(map[string]techspace.SpaceIndexRecord)
-	for _, r := range s.tsp.List(ctx) {
+	for _, r := range rows {
 		switch {
 		case mapStatus(r.Type, r.LocalStatus, r.RemoteStatus) == space.StatusJoining:
 			joining[r.Id] = r

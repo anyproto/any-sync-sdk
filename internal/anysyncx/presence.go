@@ -1,10 +1,11 @@
 package anysyncx
 
 import (
-	"sync"
-	"time"
+	"context"
 
 	"github.com/anyproto/any-sync/nodeconf"
+
+	"github.com/anyproto/any-sync-sdk/internal/p2p"
 )
 
 // networkRefusesClient reports whether the nodeconf compatibility
@@ -16,43 +17,14 @@ func networkRefusesClient(st nodeconf.NetworkCompatibilityStatus) bool {
 	return st == nodeconf.NetworkCompatibilityStatusIncompatible
 }
 
-// livePickTTL is how long a peer's liveness answer is reused.
-const livePickTTL = 500 * time.Millisecond
-
-// livePicks answers "is this peer connected" from a short-lived cache
-// per peer id. The sync-status presence poll asks about the same few
-// node ids for every space once a second, and a pick of a peer still
-// dialing waits out p2p.PickTimeout each time; the cache bounds a
-// tick's cost to the distinct peers, not spaces × peers.
-type livePicks struct {
-	pick func(id string) bool
-	mu   sync.Mutex
-	seen map[string]livePick
-}
-
-type livePick struct {
-	live bool
-	at   time.Time
-}
-
-// newLivePicks caches pick, which must never dial.
-func newLivePicks(pick func(id string) bool) *livePicks {
-	return &livePicks{pick: pick, seen: map[string]livePick{}}
-}
-
-// pickable reports whether a live connection to id exists, as of at
-// most livePickTTL ago.
-func (c *livePicks) pickable(id string) bool {
-	now := time.Now()
-	c.mu.Lock()
-	if e, ok := c.seen[id]; ok && now.Sub(e.at) < livePickTTL {
-		c.mu.Unlock()
-		return e.live
-	}
-	c.mu.Unlock()
-	live := c.pick(id)
-	c.mu.Lock()
-	c.seen[id] = livePick{live: live, at: now}
-	c.mu.Unlock()
-	return live
+// pickNow reports whether a live pool connection to id exists right
+// now. It never dials and never waits: a peer still being dialed is
+// not connected, and a spent context makes pool.Pick answer at once
+// instead of waiting on the dial. The sync-status presence poll asks
+// this for every tracked space's nodes once a second.
+func pickNow(p p2p.Picker, id string) bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	pr, err := p.Pick(ctx, id)
+	return err == nil && pr != nil
 }

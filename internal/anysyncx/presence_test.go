@@ -1,8 +1,12 @@
 package anysyncx
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/anyproto/any-sync/net/peer"
 	"github.com/anyproto/any-sync/nodeconf"
 	"github.com/stretchr/testify/assert"
 )
@@ -21,16 +25,29 @@ func TestNetworkRefusesClient(t *testing.T) {
 	}
 }
 
-// Within the TTL a peer is picked once however many spaces ask.
-func TestLivePicks_OnePickPerPeer(t *testing.T) {
-	picks := map[string]int{}
-	c := newLivePicks(func(id string) bool {
-		picks[id]++
-		return id == "up"
+// pickFn is a Picker over a function.
+type pickFn func(ctx context.Context, id string) (peer.Peer, error)
+
+func (f pickFn) Pick(ctx context.Context, id string) (peer.Peer, error) { return f(ctx, id) }
+
+// A live peer answers true; a peer that would make the pick wait, as
+// one still being dialed does, answers false at once.
+func TestPickNow(t *testing.T) {
+	live := pickFn(func(context.Context, string) (peer.Peer, error) { return fakePeer{id: "up"}, nil })
+	assert.True(t, pickNow(live, "up"))
+
+	absent := pickFn(func(context.Context, string) (peer.Peer, error) { return nil, errors.New("not found") })
+	assert.False(t, pickNow(absent, "gone"))
+
+	dialing := pickFn(func(ctx context.Context, _ string) (peer.Peer, error) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+			return fakePeer{id: "dialing"}, nil
+		}
 	})
-	for i := 0; i < 5; i++ {
-		assert.True(t, c.pickable("up"))
-		assert.False(t, c.pickable("down"))
-	}
-	assert.Equal(t, map[string]int{"up": 1, "down": 1}, picks)
+	start := time.Now()
+	assert.False(t, pickNow(dialing, "dialing"))
+	assert.Less(t, time.Since(start), 200*time.Millisecond, "a dial in flight is not waited on")
 }

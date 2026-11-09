@@ -433,7 +433,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	// non-dialing pool.Pick, refreshed when the p2p peer store or the
 	// discovery possibility changes (docs/sync-status-proposal.md).
 	poolComp := a.MustComponent(pool.CName).(pool.Pool)
-	pickable := newLivePicks(func(id string) bool { return pickLive(poolComp, id) }).pickable
+	pickable := func(id string) bool { return pickNow(poolComp, id) }
 	out.syncStatus.SetPeerCountsFn(func(spaceId string) (networkPeers, localPeers, globalPeers int) {
 		for _, id := range nc.NodeIds(spaceId) {
 			if pickable(id) {

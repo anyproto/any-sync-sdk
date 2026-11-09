@@ -12,7 +12,8 @@ import "time"
 //  3. Syncing — at least one tracked tree has pending heads
 //  4. Synced  — a responsible node or direct peer confirmed heads of
 //     this space in this run and nothing is pending
-//  5. Unknown — a peer is connected but none has confirmed yet
+//  5. Unknown — a peer is connected but none has confirmed yet, or
+//     the space is not tracked on this device
 type SyncState uint8
 
 const (

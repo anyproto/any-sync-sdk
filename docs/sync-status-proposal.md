@@ -121,17 +121,19 @@ round has been seen, otherwise `Unknown`.
   subscriber registry.
 - **Rollup loop.** Every tracker update, peer-store change and
   discovery-possibility change marks the space dirty; a new tracker is
-  dirty at creation so the space's first rollup goes out. A 1s tick
-  drains the dirty set, recomputes each rollup, and dispatches when it
-  differs from the last emitted one (`LastSyncedAt` alone does not
-  trigger an event). A node connection dropping has no hook, so while
-  someone subscribes each tick also re-reads the presence slice (peer
-  counts, `P2P`, compatibility) of every tracked space with an emitted
-  rollup and dirties the ones that moved; a peer's liveness answer is
-  cached for half a second, so a tick costs the distinct peers, not
-  spaces × peers. Offloading a space forgets its tracker and rollup.
+  dirty at creation so the space's first rollup goes out to the
+  subscribers present at that tick. A 1s tick drains the dirty set,
+  recomputes each rollup, and dispatches when it differs from the last
+  emitted one (`LastSyncedAt` alone does not trigger an event). Only
+  tracked spaces are recorded and emitted; a dirty id with no tracker
+  leaves nothing behind. A node connection dropping has no hook, so
+  while someone subscribes each tick also re-reads the presence slice
+  (peer counts, `P2P`, compatibility) of every tracked space with an
+  emitted rollup and dirties the ones that moved. Offloading a space
+  forgets its tracker and rollup.
 - **Peer presence.** Counts use the non-dialing live-connection check
-  (`pool.Pick`), read at rollup time.
+  (`pool.Pick` with a spent context), read at rollup time: a peer
+  still being dialed is not connected and is not waited on.
 
 ## SDK vs middleware
 

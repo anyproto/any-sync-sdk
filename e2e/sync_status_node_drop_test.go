@@ -2,6 +2,8 @@ package e2e
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -32,7 +34,7 @@ func TestE2E_SyncStatusOfflineOnNodeDrop(t *testing.T) {
 
 	// The boot refresh replaces a nodeconf whose id differs from the
 	// coordinator's, so the rewrite starts from the served one.
-	proxYAML, routes := proxyNodeconf(t, capturedServedNodeconf(t, ctx, netYAML), 36430)
+	proxYAML, routes := proxyNodeconf(t, capturedServedNodeconf(t, ctx, netYAML), freeBasePort(t, 3))
 	stop := startTCPProxies(t, routes)
 	defer func() { stop() }()
 
@@ -145,4 +147,34 @@ func TestE2E_SyncStatusOfflineOnNodeDrop(t *testing.T) {
 		t.Logf("event +%.2fs %s nodes=%d", e.at.Sub(openedAt).Seconds(), e.st.State, e.st.NetworkPeers)
 	}
 	mu.Unlock()
+}
+
+// freeBasePort returns a port p such that p..p+n-1 are free to listen
+// on right now, so two suites on one machine do not collide.
+func freeBasePort(t *testing.T, n int) int {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		probe, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		base := probe.Addr().(*net.TCPAddr).Port
+		_ = probe.Close()
+		var held []net.Listener
+		ok := true
+		for p := base; p < base+n; p++ {
+			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+			if err != nil {
+				ok = false
+				break
+			}
+			held = append(held, ln)
+		}
+		for _, ln := range held {
+			_ = ln.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+	t.Fatalf("no %d consecutive free ports found", n)
+	return 0
 }

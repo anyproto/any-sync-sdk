@@ -162,8 +162,8 @@ func TestFor_EmitsBaselineRollup(t *testing.T) {
 	assert.Equal(t, space.SyncStateOffline, seen[0].State)
 }
 
-// Presence is polled for tracked spaces only: an id that was merely
-// refreshed emits its one rollup and stays quiet when the peers move.
+// Only tracked spaces are recorded, emitted and polled: an id that was
+// merely refreshed emits nothing and leaves no baseline behind.
 func TestTick_PollsTrackedSpacesOnly(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
@@ -187,7 +187,10 @@ func TestTick_PollsTrackedSpacesOnly(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, []space.SyncState{space.SyncStateUnknown, space.SyncStateOffline}, seen["tracked"])
-	assert.Equal(t, []space.SyncState{space.SyncStateUnknown}, seen["refreshed-only"], "no tracker, no poll")
+	assert.Empty(t, seen["refreshed-only"], "no tracker, no rollup")
+	svc.dirtyMu.Lock()
+	defer svc.dirtyMu.Unlock()
+	assert.Len(t, svc.lastEvent, 1, "no baseline for an untracked id")
 }
 
 // Without a subscriber the poll is skipped; the first tick after one

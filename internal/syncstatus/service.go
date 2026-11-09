@@ -36,9 +36,10 @@ type HasTreeFn func(spaceId, treeId string) bool
 // 0, which the rollup reads as Offline.
 type PeerCountsFn func(spaceId string) (networkPeers, localPeers, globalPeers int)
 
-// NetworkIncompatibleFn reports whether the network refuses this
-// client's protocol version (nodeconf compatibility: incompatible or
-// needs update). Wired from anysyncx. nil ⇒ compatible.
+// NetworkIncompatibleFn reports whether the network refused this
+// client's protocol version at the handshake (nodeconf compatibility
+// Incompatible; a network that merely needs an update still syncs).
+// Wired from anysyncx. nil ⇒ compatible.
 type NetworkIncompatibleFn func() bool
 
 // P2PStateFn resolves the per-space local-network state. Wired from
@@ -97,7 +98,9 @@ type Service struct {
 	excludedTreesFn func(spaceId string) []string
 
 	// dirty is the set of spaceIds whose rollup has changed since the
-	// last tick. refresh() inserts; tick() drains.
+	// last tick. refresh() inserts; tick() drains. lastEvent holds the
+	// rollup last recorded per tracked space. dirtyMu may be held while
+	// taking mu, never the reverse.
 	dirtyMu   sync.Mutex
 	dirty     map[string]struct{}
 	lastEvent map[string]space.SpaceSyncStatus
@@ -190,6 +193,14 @@ func (s *Service) Tick() {
 	for spaceId := range dirty {
 		cur := s.Status(spaceId)
 		s.dirtyMu.Lock()
+		// Only a tracked space is recorded and emitted: an id that was
+		// merely refreshed, or forgotten since the drain, leaves no
+		// baseline behind. Checked under dirtyMu, where Forget removes
+		// the tracker and the baseline together.
+		if s.trackerNoCreate(spaceId) == nil {
+			s.dirtyMu.Unlock()
+			continue
+		}
 		prev, had := s.lastEvent[spaceId]
 		s.lastEvent[spaceId] = cur
 		s.dirtyMu.Unlock()
@@ -463,17 +474,17 @@ func (s *Service) RefreshAll() {
 // left): it stops being polled and emitted. A space merely evicted
 // keeps its tracker, so its rollup stays reported.
 func (s *Service) Forget(spaceId string) {
+	s.dirtyMu.Lock()
 	s.mu.Lock()
 	t := s.trackers[spaceId]
 	delete(s.trackers, spaceId)
 	s.mu.Unlock()
-	if t != nil {
-		t.close()
-	}
-	s.dirtyMu.Lock()
 	delete(s.dirty, spaceId)
 	delete(s.lastEvent, spaceId)
 	s.dirtyMu.Unlock()
+	if t != nil {
+		t.close()
+	}
 }
 
 // rollupsEqual reports whether two SpaceSyncStatus values would

@@ -421,3 +421,26 @@ func mustDB(t *testing.T) anystore.DB {
 	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
+
+// A runner's nil after its context ended is not a success: the job
+// stays queued across Close and runs again at the next start.
+func TestQueueCloseKeepsJobWhoseRunnerEndedWithItsContext(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "meta.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	started := make(chan struct{})
+	q, err := NewQueue(ctx, db, func(jobCtx context.Context, _ Job) error {
+		close(started)
+		<-jobCtx.Done()
+		return nil
+	}, nil)
+	require.NoError(t, err)
+	q.Run()
+	require.NoError(t, q.Enqueue(ctx, KindDurable, "sp1", "f1"))
+	<-started
+	q.Close()
+	_, ok, err := q.Get(ctx, KindDurable, "sp1", "f1")
+	require.NoError(t, err)
+	assert.True(t, ok, "the job survives Close")
+}

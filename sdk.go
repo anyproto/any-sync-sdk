@@ -594,11 +594,11 @@ func (s *SDK) bootstrap(ctx context.Context) {
 	// and resurrect it until the next boot. The fresh read shrinks that
 	// race to one iteration's processing time; the airtight fix is a
 	// tombstone guard on the load path itself — follow-up material.
+	//
+	// A failed list loads nothing; the read-state reconcile below still
+	// runs for the spaces that are loaded.
 	rows, lerr := s.tsp.List(ctx)
-	if lerr != nil {
-		log.Warn("boot: space list", zap.Error(lerr))
-		return
-	}
+	warn("boot: space list", lerr)
 	for _, boot := range rows {
 		if ctx.Err() != nil {
 			// Close cancelled the pass; the remaining spaces never

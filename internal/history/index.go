@@ -704,7 +704,8 @@ func (ix *Index) HasState(ctx context.Context, objectId string) (bool, error) {
 		return false, err
 	}
 	defer iter.Close()
-	return iter.Next(), nil
+	has := iter.Next()
+	return has, iter.Err()
 }
 
 // changeMetaFromRow assembles a ChangeMeta from a `__history` row

@@ -100,7 +100,7 @@ type Service struct {
 	// dirty is the set of spaceIds whose rollup has changed since the
 	// last tick. refresh() inserts; tick() drains. lastEvent holds the
 	// rollup last recorded per tracked space. dirtyMu may be held while
-	// taking mu, never the reverse.
+	// taking mu, never the reverse, and no callback runs under either.
 	dirtyMu   sync.Mutex
 	dirty     map[string]struct{}
 	lastEvent map[string]space.SpaceSyncStatus
@@ -157,7 +157,7 @@ func (s *Service) Run(ctx context.Context) {
 // Presence has no hook of its own: a node connection appearing or
 // dropping, or the network refusing this client, moves the rollup
 // with no tracker event. While someone subscribes, every tracked
-// space with an emitted rollup has its presence re-read on each tick
+// space with a recorded rollup has its presence re-read on each tick
 // and is dirtied when it moved. Without a subscriber nothing listens,
 // and Status reads presence live.
 func (s *Service) Tick() {
@@ -191,13 +191,19 @@ func (s *Service) Tick() {
 	}
 
 	for spaceId := range dirty {
+		// Only a tracked space is recorded and emitted: an id that was
+		// merely refreshed leaves no baseline behind, and the rollup
+		// read from a tracker forgotten or replaced meanwhile is
+		// dropped (the replacement is dirty and reads on the next
+		// tick). Checked under dirtyMu, where Forget removes the
+		// tracker and the baseline together.
+		t := s.trackerNoCreate(spaceId)
+		if t == nil {
+			continue
+		}
 		cur := s.Status(spaceId)
 		s.dirtyMu.Lock()
-		// Only a tracked space is recorded and emitted: an id that was
-		// merely refreshed, or forgotten since the drain, leaves no
-		// baseline behind. Checked under dirtyMu, where Forget removes
-		// the tracker and the baseline together.
-		if s.trackerNoCreate(spaceId) == nil {
+		if s.trackerNoCreate(spaceId) != t {
 			s.dirtyMu.Unlock()
 			continue
 		}
@@ -337,9 +343,22 @@ func (s *Service) For(spaceId string) *Tracker {
 		s.mu.Unlock()
 		return t
 	}
+	// The callback runs outside mu: a resolver that reaches back into
+	// the service must not deadlock it.
+	exclFn := s.excludedTreesFn
+	s.mu.Unlock()
 	var excl []string
-	if s.excludedTreesFn != nil {
-		excl = s.excludedTreesFn(spaceId)
+	if exclFn != nil {
+		excl = exclFn(spaceId)
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return newTracker(spaceId, nil, nil)
+	}
+	if t, ok = s.trackers[spaceId]; ok {
+		s.mu.Unlock()
+		return t
 	}
 	t = newTracker(spaceId, s, excl)
 	s.trackers[spaceId] = t
@@ -533,9 +552,9 @@ func (s *Service) isResponsibleSender(spaceId, senderId string) bool {
 }
 
 // trackerNoCreate returns the existing tracker or nil. Used by
-// Status — readers shouldn't create trackers as a side effect (that
-// would mark every queried space as "tracked" even if it never sees
-// a hook).
+// Status and Tick — readers shouldn't create trackers as a side
+// effect (that would mark every queried space as "tracked" even if it
+// never sees a hook).
 func (s *Service) trackerNoCreate(spaceId string) *Tracker {
 	s.mu.Lock()
 	defer s.mu.Unlock()

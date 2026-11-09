@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"testing"
@@ -150,14 +151,13 @@ func TestE2E_SyncStatusOfflineOnNodeDrop(t *testing.T) {
 }
 
 // freeBasePort returns a port p such that p..p+n-1 are free to listen
-// on right now, so two suites on one machine do not collide.
+// on right now, so two suites on one machine do not collide. The
+// candidates sit below the ephemeral range, which outgoing connections
+// draw from: a proxy port must stay free while the proxies are down.
 func freeBasePort(t *testing.T, n int) int {
 	t.Helper()
-	for attempt := 0; attempt < 20; attempt++ {
-		probe, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		base := probe.Addr().(*net.TCPAddr).Port
-		_ = probe.Close()
+	for attempt := 0; attempt < 50; attempt++ {
+		base := 20000 + rand.IntN(10000)
 		var held []net.Listener
 		ok := true
 		for p := base; p < base+n; p++ {

@@ -262,3 +262,53 @@ func TestForget_StopsPollingAndEmitting(t *testing.T) {
 	svc.Tick()
 	assert.Equal(t, []space.SyncState{space.SyncStateSynced, space.SyncStateOffline}, states(), "a fresh tracker starts over")
 }
+
+// A space forgotten while the tick reads its status leaves no event
+// and no baseline; one recreated in the same window is not stamped
+// with the old tracker's rollup and reads on the next tick instead.
+func TestTick_ForgetDuringStatusLeavesNothing(t *testing.T) {
+	svc := NewService()
+	defer svc.Close()
+	var during atomic.Value
+	during.Store(func() {})
+	svc.SetPeerCountsFn(func(string) (int, int, int) {
+		during.Swap(func() {}).(func())()
+		return 1, 0, 0
+	})
+	var mu sync.Mutex
+	var seen []space.SyncState
+	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
+		mu.Lock()
+		seen = append(seen, ev.State)
+		mu.Unlock()
+	})
+	states := func() []space.SyncState {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]space.SyncState(nil), seen...)
+	}
+	baselines := func() int {
+		svc.dirtyMu.Lock()
+		defer svc.dirtyMu.Unlock()
+		return len(svc.lastEvent)
+	}
+
+	tr := svc.For("space-1")
+	tr.HeadsChange("obj", []string{"h"})
+	during.Store(func() { svc.Forget("space-1") })
+	svc.Tick()
+	assert.Empty(t, states(), "forgotten mid-read: nothing emitted")
+	assert.Zero(t, baselines())
+
+	tr = svc.For("space-1")
+	tr.HeadsChange("obj", []string{"h"})
+	during.Store(func() {
+		svc.Forget("space-1")
+		svc.For("space-1")
+	})
+	svc.Tick()
+	assert.Empty(t, states(), "replaced mid-read: the old rollup is dropped")
+	svc.Tick()
+	assert.Equal(t, []space.SyncState{space.SyncStateUnknown}, states(), "the new tracker reads on the next tick")
+	assert.Equal(t, 1, baselines())
+}

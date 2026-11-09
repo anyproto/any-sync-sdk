@@ -128,8 +128,8 @@ round has been seen, otherwise `Unknown`.
   tracked spaces are recorded and emitted; a dirty id with no tracker
   leaves nothing behind. A node connection dropping has no hook, so
   while someone subscribes each tick also re-reads the presence slice
-  (peer counts, `P2P`, compatibility) of every tracked space with an
-  emitted rollup and dirties the ones that moved. Offloading a space
+  (peer counts, `P2P`, compatibility) of every tracked space with a
+  recorded rollup and dirties the ones that moved. Offloading a space
   forgets its tracker and rollup.
 - **Peer presence.** Counts use the non-dialing live-connection check
   (`pool.Pick` with a spent context), read at rollup time: a peer

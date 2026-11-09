@@ -429,9 +429,10 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	out.tree.onFetched = func(spaceId, peerId, treeId string, heads []string) {
 		out.syncStatus.For(spaceId).HeadsApply(peerId, treeId, heads, true)
 	}
-	// Peer presence for sync status: live-connection counts via the
-	// non-dialing pool.Pick, refreshed when the p2p peer store or the
-	// discovery possibility changes (docs/sync-status-proposal.md).
+	// Peer presence for sync status: live-connection counts via a
+	// pool.Pick that never dials or waits, refreshed when the p2p peer
+	// store or the discovery possibility changes and polled each tick
+	// for the tracked spaces (docs/sync-status-proposal.md).
 	poolComp := a.MustComponent(pool.CName).(pool.Pool)
 	pickable := func(id string) bool { return pickNow(poolComp, id) }
 	out.syncStatus.SetPeerCountsFn(func(spaceId string) (networkPeers, localPeers, globalPeers int) {

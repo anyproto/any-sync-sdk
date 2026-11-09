@@ -1,11 +1,10 @@
 package subscribe
 
 import (
-	"context"
 	"math"
 	"testing"
-	"time"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,17 +26,11 @@ func driftRows(n int) []row {
 	return rows
 }
 
-// drain reads every queued event.
+// drain discards every queued event. Events are queued synchronously
+// by OnApply, so nothing is in flight.
 func drain(t *testing.T, sub *Sub) {
 	t.Helper()
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-		_, err := sub.Events().WaitOne(ctx)
-		cancel()
-		if err != nil {
-			return
-		}
-	}
+	sub.Events().GetAll()
 }
 
 // A window whose snapshot holds every match stays open however many
@@ -159,6 +152,27 @@ func TestDrift_IncompleteSnapshot(t *testing.T) {
 			assert.ErrorIs(t, sub.Err(), space.ErrSubscriptionDrifted)
 		})
 	}
+}
+
+// A row the snapshot read but the engine skipped (no id) still took a
+// slot of the limit+1 read: a match may lie past the edge.
+func TestDrift_SkippedSnapshotRowCounts(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	rows := driftRows(3)
+	sub, err := eng.Subscribe(SubConfig{
+		Scope: driftScope,
+		Sort:  mustParseSort(t, "n"),
+		Limit: 2,
+	}, func(yield func(id string, doc *anyenc.Value)) error {
+		yield(rows[0].id, rows[0].d)
+		yield("", nil)
+		yield(rows[1].id, rows[1].d)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, sub.entries, 2)
+	assert.False(t, sub.complete)
 }
 
 // A budget whose product with the limit overflows int disables the

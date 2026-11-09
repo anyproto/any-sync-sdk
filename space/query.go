@@ -72,8 +72,8 @@ type Query interface {
 	//
 	// Sub closes with ErrSubscriptionOverflow when its mailbox fills,
 	// or ErrSubscriptionDrifted when too many in-window records leave
-	// without replacements while matches lie past the window's edge.
-	// Both signal "resubscribe to recover".
+	// without replacements (see QueryOpts.DriftBudgetPercent). Both
+	// signal "resubscribe to recover".
 	Subscribe(ctx context.Context, opts QueryOpts) (*QueryResult, error)
 }
 
@@ -96,10 +96,10 @@ type QueryOpts struct {
 
 	// DriftBudgetPercent: when this fraction of Limit records leave
 	// the held window without replacements, the subscription closes
-	// with ErrSubscriptionDrifted. Default 30. A window that holds
-	// every match (offset 0, no match past its edge since the
-	// snapshot) has nothing to backfill and never drifts. Ignored
-	// when Limit == 0. Subscribe-only.
+	// with ErrSubscriptionDrifted. Default 30. A window whose
+	// snapshot, at offset 0, read at most Limit rows held every match
+	// and counts no departures until a match lands past its edge.
+	// Ignored when Limit == 0. Subscribe-only.
 	DriftBudgetPercent int
 }
 

@@ -17,9 +17,10 @@
 // (top-of-sort arrivals) absorb cleanly without an any-store query.
 // When Limit == 0 there is no boundary and an entry is membership
 // only. When too many records leave the held window without
-// replacement (>= DriftBudgetPercent of limit) while matches lie past
-// its edge, the sub closes with space.ErrSubscriptionDrifted; a window
-// that holds every match never drifts. Mailbox overflow closes with
+// replacement (>= DriftBudgetPercent of limit), the sub closes with
+// space.ErrSubscriptionDrifted. A window whose snapshot, at offset 0,
+// read at most limit rows counts no departures until a match lands
+// past its edge. Mailbox overflow closes with
 // space.ErrSubscriptionOverflow. Both signal "resubscribe".
 //
 // Locking: a single engine.mu serializes register / close / OnApply.

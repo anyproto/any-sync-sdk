@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"math"
+	"sync"
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -37,7 +38,6 @@ type querySub struct {
 	lostLimit int
 
 	docBuf *syncpool.DocBuffer
-	encBuf []byte // scratch for encoding a held row; dropped past maxEncBuf
 
 	mb     *mb.MB[space.SubscriptionEvent]
 	closed bool         // guarded by engine.mu
@@ -58,7 +58,6 @@ func newSub(cfg SubConfig) *querySub {
 func (s *querySub) release() {
 	s.entries = nil
 	s.minRef, s.maxRef = nil, nil
-	s.encBuf = nil
 }
 
 // appendInitial is called by Engine.Subscribe once per snapshot row.
@@ -71,7 +70,7 @@ func (s *querySub) appendInitial(id string, doc *anyenc.Value) {
 	}
 	var raw []byte
 	if s.windowed() {
-		raw = s.encode(doc)
+		raw = encode(doc)
 	}
 	s.insertEntry(id, s.tupleFor(doc), raw)
 }
@@ -90,17 +89,21 @@ func (s *querySub) windowed() bool {
 // encode returns doc's encoding in a slice of its own. A held row
 // costs its encoded size; a parsed copy would cost about ten times
 // that for as long as the window holds it.
-func (s *querySub) encode(doc *anyenc.Value) []byte {
-	s.encBuf = doc.MarshalTo(s.encBuf[:0])
-	raw := bytes.Clone(s.encBuf)
-	if cap(s.encBuf) > maxEncBuf {
-		s.encBuf = nil // one large row must not pin its buffer for the sub's life
+func encode(doc *anyenc.Value) []byte {
+	bp := encBufs.Get().(*[]byte)
+	*bp = doc.MarshalTo((*bp)[:0])
+	raw := bytes.Clone(*bp)
+	if cap(*bp) <= maxPooledEncBuf {
+		encBufs.Put(bp)
 	}
 	return raw
 }
 
-// maxEncBuf bounds the encoding scratch a sub keeps between rows.
-const maxEncBuf = 64 << 10
+// encBufs pools the encoding scratch; a buffer grown past
+// maxPooledEncBuf by one large row is dropped, not kept.
+var encBufs = sync.Pool{New: func() any { return new([]byte) }}
+
+const maxPooledEncBuf = 64 << 10
 
 // parseHeld parses a held encoding in place: raw is never mutated
 // once encoded, so the value may alias it.
@@ -112,15 +115,15 @@ func parseHeld(raw []byte) *anyenc.Value {
 	return v
 }
 
-// capture returns the event's own copy of a post doc and what the
-// entry keeps of it: the encoding for a windowed sub, which the copy
-// is parsed from, nothing otherwise.
-func (s *querySub) capture(doc *anyenc.Value) (*anyenc.Value, []byte) {
+// capture takes what the sub needs of a post doc before the apply
+// moves on: a windowed sub keeps the encoding on its entry and parses
+// the event's copy from it only if an event ships the row; an
+// unbounded sub keeps nothing and ships a clone.
+func (s *querySub) capture(doc *anyenc.Value) (eventDoc *anyenc.Value, raw []byte) {
 	if !s.windowed() {
 		return anyencx.Clone(doc), nil
 	}
-	raw := s.encode(doc)
-	return parseHeld(raw), raw
+	return nil, encode(doc)
 }
 
 // tupleFor builds the sort tuple for doc; nil for an unbounded sub,
@@ -169,8 +172,17 @@ type subPending struct {
 
 type pendingRec struct {
 	e   *entry
-	doc *anyenc.Value   // the event's copy of the post doc, or the held doc for an implicit transition
+	doc *anyenc.Value   // the event's copy of the post doc (unbounded sub)
+	raw []byte          // the held encoding the event parses its doc from (windowed sub)
 	ops []space.EventOp // nil for implicit transitions
+}
+
+// value returns the doc the event ships for the record.
+func (pr pendingRec) value() *anyenc.Value {
+	if pr.doc != nil {
+		return pr.doc
+	}
+	return parseHeld(pr.raw)
 }
 
 // apply processes one wire event. Builds at most one SubscriptionEvent
@@ -200,13 +212,13 @@ func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	if len(p.added) > 0 {
 		subev.Added = make([]space.SubRecord, 0, len(p.added))
 		for _, pr := range p.added {
-			subev.Added = append(subev.Added, space.SubRecord{Id: pr.e.id, Doc: pr.doc, Ops: pr.ops})
+			subev.Added = append(subev.Added, space.SubRecord{Id: pr.e.id, Doc: pr.value(), Ops: pr.ops})
 		}
 	}
 	if len(p.updated) > 0 {
 		subev.Updated = make([]space.SubRecord, 0, len(p.updated))
 		for _, pr := range p.updated {
-			subev.Updated = append(subev.Updated, space.SubRecord{Id: pr.e.id, Doc: pr.doc, Ops: pr.ops})
+			subev.Updated = append(subev.Updated, space.SubRecord{Id: pr.e.id, Doc: pr.value(), Ops: pr.ops})
 		}
 	}
 	if len(p.removed) > 0 {
@@ -272,9 +284,9 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 	// Apply transition to held set. The event ships its own copy of
 	// the post doc; a windowed sub keeps its encoding on the entry.
 	var eventDoc *anyenc.Value
+	var raw []byte
 	switch {
 	case wasHeld && matches:
-		var raw []byte
 		eventDoc, raw = s.capture(postDoc)
 		s.updateEntry(oldEntry, postKey, raw)
 	case wasHeld && !matches:
@@ -292,7 +304,6 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 				s.complete = false
 			}
 		}
-		var raw []byte
 		eventDoc, raw = s.capture(postDoc)
 		s.insertEntry(rc.Id, postKey, raw)
 	default:
@@ -306,9 +317,9 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 
 	switch {
 	case !wasVisible && isVisible:
-		p.added = append(p.added, pendingRec{e: newEntry, doc: eventDoc, ops: rc.Ops})
+		p.added = append(p.added, pendingRec{e: newEntry, doc: eventDoc, raw: raw, ops: rc.Ops})
 	case wasVisible && isVisible:
-		p.updated = append(p.updated, pendingRec{e: newEntry, doc: eventDoc, ops: rc.Ops})
+		p.updated = append(p.updated, pendingRec{e: newEntry, doc: eventDoc, raw: raw, ops: rc.Ops})
 	case wasVisible && !isVisible:
 		// isHeld ⇒ the record updated and became the sentinel via its
 		// own sort move: still matches, just slid out of view.
@@ -332,7 +343,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if prevSentinelId != "" && prevSentinelId != rc.Id {
 			if _, alreadySeen := p.seen[prevSentinelId]; !alreadySeen {
 				if e := s.entries[prevSentinelId]; e != nil && e != s.sentinel() {
-					p.added = append(p.added, pendingRec{e: e, doc: parseHeld(e.raw)}) // implicit: no ops, the held doc
+					p.added = append(p.added, pendingRec{e: e, raw: e.raw}) // implicit: no ops, the held doc
 					p.seen[prevSentinelId] = struct{}{}
 				}
 			}

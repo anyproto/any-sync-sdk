@@ -547,10 +547,10 @@ an open question.
   - `RemoveDeleted` — tombstoned, gone;
   - `RemoveFilteredOut` — no longer matches the filter, still exists;
   - `RemoveDisplaced` — pushed past `Limit`, still matches.
-- **Window**: with `Limit > 0` the engine holds `Limit + 1` rows; the
-  extra row is a hidden sentinel, so a single arrival at the top of the
-  sort needs no re-query. `Limit == 0` is unbounded; memory grows with
-  the matching set.
+- **Window**: with `Limit > 0` the engine holds `Limit + 1` rows, each
+  at about its stored size; the extra row is a hidden sentinel, so a
+  single arrival at the top of the sort needs no re-query. `Limit == 0`
+  is unbounded and holds ids only; memory grows with the matching set.
 - **Snapshot fence**: the initial read runs under `engine.mu`, so events
   applied during the read queue behind it and process after the
   subscription is registered. The snapshot callback must not load

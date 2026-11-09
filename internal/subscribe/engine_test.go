@@ -373,7 +373,7 @@ func TestUnbounded_TracksMembershipOnly(t *testing.T) {
 	membershipOnly := func() {
 		t.Helper()
 		for id, e := range sub.entries {
-			assert.Nil(t, e.doc, id)
+			assert.Nil(t, e.raw, id)
 			assert.Nil(t, e.tuple, id)
 		}
 	}

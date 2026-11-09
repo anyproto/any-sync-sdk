@@ -7,16 +7,17 @@ import (
 )
 
 // entry is one held record in a querySub's window. tuple is the sort
-// key (query.Sort.AppendKey, owned) and doc the record's last post
-// value (cloned, owned); a windowed sub keeps both — an implicit
-// transition (a record promoted from sentinel into visibility by an
-// unrelated event) ships doc, since postValue covers only the ids of
-// the triggering change. An unbounded sub tracks membership only
-// (querySub.windowed): id alone, tuple and doc nil.
+// key (query.Sort.AppendKey, owned) and raw the encoding of the
+// record's last post value (owned, never mutated); a windowed sub
+// keeps both — an implicit transition (a record promoted from
+// sentinel into visibility by an unrelated event) ships raw parsed,
+// since postValue covers only the ids of the triggering change. An
+// unbounded sub tracks membership only (querySub.windowed): id alone,
+// tuple and raw nil.
 type entry struct {
 	id    string
 	tuple anyenc.Tuple
-	doc   *anyenc.Value
+	raw   []byte
 }
 
 // insertEntry adds a fresh entry to the window. Caller is responsible
@@ -27,8 +28,8 @@ type entry struct {
 // a fresh O(|entries|) scan rather than guessing — otherwise we'd
 // install the new entry as the boundary even when an existing one is
 // extremal.
-func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, doc *anyenc.Value) {
-	e := &entry{id: id, tuple: tuple, doc: doc}
+func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, raw []byte) {
+	e := &entry{id: id, tuple: tuple, raw: raw}
 	s.entries[id] = e
 	switch {
 	case s.maxRef == nil && len(s.entries) > 1:
@@ -49,13 +50,13 @@ func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, doc *anyenc.Value)
 	}
 }
 
-// updateEntry overwrites an existing entry's tuple + doc. If the
+// updateEntry overwrites an existing entry's tuple + raw. If the
 // entry was the boundary holder and moved out of its position,
 // invalidates the pointer for lazy recompute on the next access.
-func (s *querySub) updateEntry(e *entry, tuple anyenc.Tuple, doc *anyenc.Value) {
+func (s *querySub) updateEntry(e *entry, tuple anyenc.Tuple, raw []byte) {
 	old := e.tuple
 	e.tuple = tuple
-	e.doc = doc
+	e.raw = raw
 	// Was the max — did it stay the max?
 	if e == s.maxRef {
 		if bytes.Compare(tuple, old) < 0 {

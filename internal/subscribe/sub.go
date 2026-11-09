@@ -32,6 +32,7 @@ type querySub struct {
 	driftBudgetAbs int // precomputed limit*budget/100 (not used; we compare via lost*100 vs limit*budget)
 
 	docBuf *syncpool.DocBuffer
+	encBuf []byte // scratch for encoding a held row
 
 	mb     *mb.MB[space.SubscriptionEvent]
 	closed bool         // guarded by engine.mu
@@ -62,31 +63,41 @@ func (s *querySub) appendInitial(id string, doc *anyenc.Value) {
 	if doc == nil || id == "" {
 		return
 	}
-	var kept *anyenc.Value
+	var raw []byte
 	if s.windowed() {
-		kept = anyencx.Clone(doc)
+		raw = s.encode(doc)
 	}
-	s.insertEntry(id, s.tupleFor(doc), kept)
+	s.insertEntry(id, s.tupleFor(doc), raw)
 }
 
 // windowed reports whether the sub has a boundary (Limit > 0). A
-// windowed sub keeps each held row's tuple and doc: the sentinel is
-// compared against arrivals and ships its doc when an unrelated event
-// promotes it into view. An unbounded sub has no sentinel and tracks
-// membership only — one entry per row, no doc and no tuple — so a
-// subscription over a whole collection costs its id set, not a parsed
-// copy of every row for its lifetime.
+// windowed sub keeps each held row's tuple and encoded doc: the
+// sentinel is compared against arrivals and ships its doc when an
+// unrelated event promotes it into view. An unbounded sub has no
+// sentinel and tracks membership only — one entry per row, no doc and
+// no tuple — so a subscription over a whole collection costs its id
+// set, not a copy of every row for its lifetime.
 func (s *querySub) windowed() bool {
 	return s.cfg.Limit > 0
 }
 
-// held returns what the entry keeps of a freshly cloned post doc: the
-// clone itself for a windowed sub, nothing otherwise.
-func (s *querySub) held(doc *anyenc.Value) *anyenc.Value {
-	if s.windowed() {
-		return doc
+// encode returns doc's encoding in a slice of its own. A held row
+// costs its encoded size; a parsed copy would cost about ten times
+// that for as long as the window holds it.
+func (s *querySub) encode(doc *anyenc.Value) []byte {
+	s.encBuf = doc.MarshalTo(s.encBuf[:0])
+	return bytes.Clone(s.encBuf)
+}
+
+// capture returns the event's own copy of a post doc and what the
+// entry keeps of it: the encoding for a windowed sub, which the copy
+// is parsed from, nothing otherwise.
+func (s *querySub) capture(doc *anyenc.Value) (*anyenc.Value, []byte) {
+	if !s.windowed() {
+		return anyencx.Clone(doc), nil
 	}
-	return nil
+	raw := s.encode(doc)
+	return anyenc.MustParse(raw), raw
 }
 
 // tupleFor builds the sort tuple for doc; nil for an unbounded sub,
@@ -135,7 +146,7 @@ type subPending struct {
 
 type pendingRec struct {
 	e   *entry
-	doc *anyenc.Value   // the event's clone of the post doc, or the held doc for an implicit transition
+	doc *anyenc.Value   // the event's copy of the post doc, or the held doc for an implicit transition
 	ops []space.EventOp // nil for implicit transitions
 }
 
@@ -230,13 +241,14 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		}
 	}
 
-	// Apply transition to held set. The event ships its own clone of
-	// the post doc; a windowed sub keeps that clone on the entry too.
+	// Apply transition to held set. The event ships its own copy of
+	// the post doc; a windowed sub keeps its encoding on the entry.
 	var eventDoc *anyenc.Value
 	switch {
 	case wasHeld && matches:
-		eventDoc = anyencx.Clone(postDoc)
-		s.updateEntry(oldEntry, postKey, s.held(eventDoc))
+		var raw []byte
+		eventDoc, raw = s.capture(postDoc)
+		s.updateEntry(oldEntry, postKey, raw)
 	case wasHeld && !matches:
 		s.removeEntry(oldEntry)
 		s.lost++
@@ -248,8 +260,9 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 				// Not a "loss" — steady-state add.
 			}
 		}
-		eventDoc = anyencx.Clone(postDoc)
-		s.insertEntry(rc.Id, postKey, s.held(eventDoc))
+		var raw []byte
+		eventDoc, raw = s.capture(postDoc)
+		s.insertEntry(rc.Id, postKey, raw)
 	default:
 		return
 	}
@@ -287,7 +300,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if prevSentinelId != "" && prevSentinelId != rc.Id {
 			if _, alreadySeen := p.seen[prevSentinelId]; !alreadySeen {
 				if e := s.entries[prevSentinelId]; e != nil && e != s.sentinel() {
-					p.added = append(p.added, pendingRec{e: e, doc: e.doc}) // implicit: no ops, the held doc
+					p.added = append(p.added, pendingRec{e: e, doc: anyenc.MustParse(e.raw)}) // implicit: no ops, the held doc
 					p.seen[prevSentinelId] = struct{}{}
 				}
 			}

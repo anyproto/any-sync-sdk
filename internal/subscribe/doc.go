@@ -12,8 +12,8 @@
 //
 // Per-sub window: entries map[string]*entry plus minRef/maxRef
 // pointers for O(1) boundary access. When Limit > 0 the engine holds
-// limit+1 entries, each with its sort tuple and last doc, so the
-// largest-tuple entry serves as a sentinel; single-event shifts
+// limit+1 entries, each with its sort tuple and last doc encoded, so
+// the largest-tuple entry serves as a sentinel; single-event shifts
 // (top-of-sort arrivals) absorb cleanly without an any-store query.
 // When Limit == 0 there is no boundary and an entry is membership
 // only. When too many records leave the held

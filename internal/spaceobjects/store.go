@@ -2723,12 +2723,6 @@ func (s *Store) SetGapSet(g *GapSet) {
 	}
 }
 
-// ApplyGapCount is the number of objects with a stored change that
-// may be unapplied (see GapSet). Non-zero means the projection is
-// behind the head store, and a watermark snapshot taken now would hide
-// the gap from the boot catch-up.
-func (s *Store) ApplyGapCount() int { return s.gaps.Count() }
-
 // loadObject is the body of the cache's LoadFunc (load). Builds
 // Controller + Object + any-sync tree + ColdRestore in one atomic step
 // under ocache's per-id load lock. payload is the caller's creation

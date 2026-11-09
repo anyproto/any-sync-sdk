@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -247,14 +248,21 @@ func TestLocalWrite_AddContentErrorMarksGapOnlyWhenStored(t *testing.T) {
 	requireRecords(t, o, map[string]string{"rec-1": "a", "rec-2": "b"})
 }
 
-// An object the store recorded a gap for starts marked, so the replay
-// that closes the gap reports it closed.
+// An object the store recorded a gap for starts marked (Config.ApplyGap
+// through New), so the replay that closes the gap reports it closed.
 func TestColdRestore_ClosesSeededGap(t *testing.T) {
-	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
-	storedInbound(t, o, tree, "ch-in", 5, setRecord(t, "rec-in", "name", "peer"))
-	o.applyGap = true
+	seed, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
+	storedInbound(t, seed, tree, "ch-in", 5, setRecord(t, "rec-in", "name", "peer"))
 	var gaps []bool
-	o.onGap = func(gap bool) { gaps = append(gaps, gap) }
+	o, err := New(Config{
+		SpaceId:    seed.spaceId,
+		SignKey:    seed.signKey,
+		Controller: seed.ctrl,
+		ApplyGap:   true,
+		OnGap:      func(gap bool) { gaps = append(gaps, gap) },
+	}, func(updatelistener.UpdateListener) (objecttree.ObjectTree, error) { return tree, nil })
+	require.NoError(t, err)
+	require.True(t, o.applyGap, "New seeds the mark from the config")
 
 	require.NoError(t, o.ColdRestore(context.Background()))
 	assert.False(t, o.applyGap)

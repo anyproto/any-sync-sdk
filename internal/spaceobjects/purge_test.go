@@ -87,8 +87,11 @@ func TestPurgeObject_StampsDeletionAboveContentSeq(t *testing.T) {
 	var live []ObjectChange
 	cancel := s.SubscribeChanges(func(ev ObjectChange) { live = append(live, ev) })
 	defer cancel()
+	s.gaps = NewGapSet()
+	s.gaps.Set("o1", true)
 
 	require.NoError(t, s.purgeObject(ctx, "o1"))
+	assert.False(t, s.gaps.Has("o1"), "a purged object has nothing left to catch up")
 
 	// Row gone; deletion surfaces in the feed at a fresh seq > 5.
 	assert.False(t, objectRowExists(t, ctx, s, "o1"))

@@ -45,6 +45,11 @@ type Event struct {
 	Dataset   string
 	VersionId crdt.VersionId
 	Records   []EventRecord
+	// Source is what the apply ran on, handed to a refill
+	// (SubConfig.Refill) as it is: the object instance, which may still
+	// be loading when its replay fired the apply and is then reachable
+	// no other way. nil for a notification.
+	Source any
 }
 
 // EventRecord is one record's worth of projected change inside an
@@ -60,6 +65,10 @@ type EventRecord struct {
 	// empty in that case; the engine drops the entry from its held
 	// set.
 	Deleted bool
+	// Unreadable is true when the record's post value could not be
+	// read as the event was built. Ops is empty in that case; the
+	// engine settles the row from storage or closes the subscription.
+	Unreadable bool
 	// Ops is the projected $set / $unset operations on the post-apply
 	// record. Empty when Deleted is true. Surfaced verbatim to
 	// SubscriptionEvent SubRecord.Ops for atomic-update consumers.
@@ -127,11 +136,17 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 			out = append(out, er)
 			continue
 		}
-		// A row that cannot be read projects against no post value;
-		// the engine settles its subscriptions from storage.
+		// A row that cannot be read projects no ops: a projection
+		// against no post value would turn $inc into $unset. The engine
+		// settles its subscriptions from storage.
 		var post *anyenc.Value
 		if postValue != nil {
-			post, _ = postValue(i)
+			var err error
+			if post, err = postValue(i); err != nil {
+				er.Unreadable = true
+				out = append(out, er)
+				continue
+			}
 		}
 		for _, op := range rc.Ops {
 			projected, ok := projectOp(op, post)

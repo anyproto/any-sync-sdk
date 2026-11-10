@@ -735,9 +735,9 @@ RemovedRecord {
 }
 ```
 
-`ops` are projected: `$inc`, `$addToSet`, `$pull` and `$incGated` arrive as a `$set` of the post-apply value, or an `$unset` when the path is gone. A client can apply `ops` to a JSON mirror without a CRDT engine, or rerender from `doc`.
+`ops` are projected: `$inc`, `$addToSet`, `$pull` and `$incGated` arrive as a `$set` of the post-apply value, or an `$unset` when the path is gone. A client can apply `ops` to a JSON mirror without a CRDT engine, or rerender from `doc`. A record with no `ops` and a `doc` is the state to take as a whole.
 
-Deleting an object removes its local state without a CRDT apply. The resulting `deleted` removal carries an empty `versionId`; act on it directly rather than filtering it by version.
+An event with an empty `versionId` is not a change's own: the engine re-read the window from storage (a refill of rows that left it, or a change whose row it could not read) and ships what storage held that no change said, in an event that follows the own event of the change behind it; or an object was deleted without a CRDT apply. Its records carry `doc` and no `ops`. Act on such an event directly rather than filtering it by version.
 
 ### 13.2 Window Semantics
 
@@ -758,11 +758,11 @@ Account- and local-scope writes produce events like synced ones: one per applied
 
 ### 13.5 Ordering
 - Events follow apply order, after commit.
-- All record transitions of one change arrive in one event.
+- All record transitions of one change arrive in one event. What a re-read of storage found arrives in the event after it, with no `versionId`.
 - There is no ordering across objects.
 
 ### 13.6 Own-write events
-Callers receive their own writes and recognize them by matching `ModifyResult.VersionId` with `SubscriptionEvent.VersionId`. The SDK doesn't suppress them.
+Callers receive their own writes and recognize them by matching `ModifyResult.VersionId` with `SubscriptionEvent.VersionId`. The SDK doesn't suppress them. An event with an empty `versionId` is never an own write (§13.1).
 
 ### 13.7 Backpressure + Recovery
 
@@ -770,7 +770,7 @@ Each subscription has a bounded mailbox (`QueryOpts.MailboxCapacity`, default 25
 
 A window at offset 0 stays equal to a fresh query of the same body: when a held row leaves a window with matches past its edge, or a row's own sort move puts it in the sentinel slot with a larger key than it was ranked at, the engine re-reads the window from any-store and ships the difference. A window that holds every match reads nothing when rows leave it. A change whose post-apply row cannot be read is settled by the same re-read, for an unbounded subscription too.
 
-`ErrSubscriptionDrifted` closes a subscription the engine cannot keep equal to storage: a window past an offset, whose rows shift with rows before it, loses `DriftBudgetPercent` (default 30) of `Limit` records; a re-read fails that often (each failed re-read counts as one loss); or a row cannot be read and no re-read can settle it.
+`ErrSubscriptionDrifted` closes a subscription the engine cannot keep equal to storage: a window past an offset, whose rows shift with rows before it, loses `DriftBudgetPercent` (default 30) of `Limit` records; a window at offset 0 loses that many while its re-read fails (a row that leaves counts once, an arrival the window cannot rank once, a re-read that fails again nothing); or a row cannot be read and no re-read can settle it.
 
 Either error means: resubscribe, and the new snapshot reconciles state. Nothing is dropped silently.
 

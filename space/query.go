@@ -71,11 +71,13 @@ type Query interface {
 	// snapshot only.
 	//
 	// A window at offset 0 refills from storage when rows leave it,
-	// so it stays equal to a fresh query of the same body. Sub closes
-	// with ErrSubscriptionOverflow when its mailbox fills, or
-	// ErrSubscriptionDrifted when the engine cannot keep the window
-	// equal to storage (see QueryOpts.DriftBudgetPercent). Both
-	// signal "resubscribe to recover".
+	// so it stays equal to a fresh query of the same body; what a
+	// refill finds arrives in an event of its own, with no VersionId
+	// (see SubscriptionEvent). Sub closes with ErrSubscriptionOverflow
+	// when its mailbox fills, or ErrSubscriptionDrifted when the engine
+	// cannot keep the window equal to storage (see
+	// QueryOpts.DriftBudgetPercent). Both signal "resubscribe to
+	// recover".
 	Subscribe(ctx context.Context, opts QueryOpts) (*QueryResult, error)
 }
 
@@ -103,9 +105,10 @@ type QueryOpts struct {
 	// the held window without replacement, the subscription closes
 	// with ErrSubscriptionDrifted. Default 30. A window at offset 0
 	// refills from storage when rows leave it, so a departure counts
-	// only when the refill fails; a window past an offset shifts with
-	// rows before it and counts every departure. Ignored when
-	// Limit == 0. Subscribe-only.
+	// only when the refill fails (and an arrival the window cannot
+	// rank counts once); a window past an offset shifts with rows
+	// before it and counts every departure. Ignored when Limit == 0.
+	// Subscribe-only.
 	DriftBudgetPercent int
 }
 

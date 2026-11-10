@@ -163,6 +163,12 @@ func (s *Store) afterApplyFor() object.AfterApply {
 				derivedOps = res.DerivedOps
 			}
 			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
+			if obj != nil {
+				// A refill reads through the object the apply ran on:
+				// during a replay it is loading, and reachable no
+				// other way.
+				ev.Source = obj
+			}
 			s.engine.OnApply(ev, postValue)
 			if res != nil && len(res.ObjectStamps) > 0 && obj != nil {
 				s.dispatchObjectStamps(ctx, obj.Controller(), obj.Replaying(), ch, res.ObjectStamps)

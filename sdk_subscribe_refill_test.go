@@ -65,7 +65,7 @@ func TestSDK_SubscribeRefillResolvesObjectAndQuery(t *testing.T) {
 		require.NoError(t, err)
 		return idsOfRows(rows)
 	}
-	for i := 1; i <= 6; i++ {
+	for i := 1; i <= 8; i++ {
 		write(fmt.Sprintf("r%d", i), i)
 	}
 
@@ -106,7 +106,8 @@ func TestSDK_SubscribeRefillResolvesObjectAndQuery(t *testing.T) {
 	assert.NoError(t, res.Sub.Err())
 
 	// A builder chained on after Subscribe does not reach the live
-	// window: the refill keeps the limit of 3.
+	// window: the refill keeps the limit of 3 where a leaked limit of
+	// 6 would show six of the seven rows left.
 	base := sp.Query(objId, wmDataset).Sort("n").Limit(3)
 	res2, err := base.Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
@@ -114,14 +115,16 @@ func TestSDK_SubscribeRefillResolvesObjectAndQuery(t *testing.T) {
 	require.Equal(t, []string{"r2", "r3", "r4"}, idsOfRows(res2.Initial))
 	wide, err := base.Limit(6).All(ctx)
 	require.NoError(t, err)
-	require.Len(t, wide, 5)
+	require.Len(t, wide, 6)
 	view = map[string]*anyenc.Value{}
 	for _, v := range res2.Initial {
 		view[v.GetString("id")] = v
 	}
 	del("r2")
 	waitView(res2.Sub, []string{"r3", "r4", "r5"})
-	assert.Len(t, view, 3)
+	// Let a leaked limit show: the refill's event has landed when the
+	// view reached three rows, so a wider one would be visible now.
+	assert.Equal(t, []string{"r3", "r4", "r5"}, idsOfView(view))
 	assert.NoError(t, res2.Sub.Err())
 }
 

@@ -77,6 +77,111 @@ func scopedFilter(rows, filter query.Filter) query.Filter {
 	return query.And{rows, filter}
 }
 
+// refillSource resolves what one refill reads: the collection, the
+// window's filter, and the filter of every row stored in the window's
+// scope (this object's rows of a shared collection, tombstones
+// skipped), which a lookup by id applies. source is the Event.Source
+// of the apply behind the refill.
+type refillSource func(source any) (coll anystore.Collection, filter, stored query.Filter, err error)
+
+// objectSource resolves a per-object refill through the object the
+// apply ran on when source is that object, else through the loaded
+// instance, without loading or waiting: the event behind a refill came
+// from an apply on the object, so the object is loaded or is the one
+// loading (a replay fired the apply, and the instance under
+// construction is reachable only through the event). No instance is
+// kept across refills: the object may not have been local at
+// Subscribe, and holding it would keep an evicted object's tree
+// reachable for the subscription's life. With no instance, or one from
+// before the dataset was known, the refill fails: the engine counts
+// the departure as a loss and tries again on the next apply.
+func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, dataset string, filter query.Filter) refillSource {
+	return func(source any) (anystore.Collection, query.Filter, query.Filter, error) {
+		obj, _ := source.(*object.Object)
+		if obj == nil || obj.Controller() == nil || obj.Controller().ObjectId() != objectId {
+			obj = store.PeekLoaded(objectId)
+		}
+		if obj == nil {
+			return nil, nil, nil, errRefillNoObject
+		}
+		ctrl := obj.Controller()
+		if !ctrl.HasDataset(dataset) {
+			return nil, nil, nil, errRefillNoObject
+		}
+		coll, err := ctrl.PeekCollection(ctx, dataset)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		var rows query.Filter
+		if ctrl.IsKeyed(dataset) {
+			rows = crdt.KeyedRows(objectId)
+		}
+		return coll, withoutTombstones(scopedFilter(rows, filter)), withoutTombstones(rows), nil
+	}
+}
+
+// newRefill returns a window's refill: one read transaction per call,
+// closed by the engine, over the body captured here.
+func newRefill(ctx context.Context, source refillSource, sort query.Sort, limit, offset uint) subscribe.RefillFn {
+	return func(src any) (subscribe.RefillRead, error) {
+		coll, filter, stored, err := source(src)
+		if err != nil {
+			return subscribe.RefillRead{}, err
+		}
+		if coll == nil {
+			// Nothing materialised: no rows, and no held row is stored.
+			return subscribe.RefillRead{
+				Rows:   func(func(id string, doc *anyenc.Value)) error { return nil },
+				Lookup: func(string) (*anyenc.Value, error) { return nil, nil },
+				Close:  func() {},
+			}, nil
+		}
+		tx, err := coll.ReadTx(ctx)
+		if err != nil {
+			return subscribe.RefillRead{}, err
+		}
+		return subscribe.RefillRead{
+			Rows: func(yield func(id string, doc *anyenc.Value)) error {
+				return readWindow(tx.Context(), coll, filter, sort, limit, offset, yield)
+			},
+			Lookup: func(id string) (*anyenc.Value, error) {
+				return lookupStored(tx.Context(), coll, stored, id)
+			},
+			Close: func() { _ = tx.Commit() },
+		}, nil
+	}
+}
+
+// ObjectRefill returns the refill of an unbounded, unfiltered
+// subscription to one object's dataset (subscribe.SubConfig.Refill):
+// what a watcher that follows a dataset through engine events alone
+// supplies, so a row it cannot read is settled from storage instead of
+// closing it.
+func ObjectRefill(store *spaceobjects.Store, objectId, dataset string) subscribe.RefillFn {
+	ctx := context.Background()
+	return newRefill(ctx, objectSource(ctx, store, objectId, dataset, nil), nil, 0, 0)
+}
+
+// lookupStored reads one row of coll by id as the scope stores it:
+// nil when the row is absent or stored fails on it (a tombstone, or a
+// row of another object in a shared collection).
+func lookupStored(ctx context.Context, coll anystore.Collection, stored query.Filter, id string) (*anyenc.Value, error) {
+	it, err := coll.Find(query.And{query.Key{Path: []string{crdt.IdField}, Filter: query.NewComp(query.CompOpEq, id)}, stored}).Limit(1).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var v *anyenc.Value
+	if it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return nil, err
+		}
+		v = anyencx.Clone(doc.Value())
+	}
+	return v, it.Err()
+}
+
 // errRefillNoObject is a refill with no object instance to read the
 // rows through: the object is not local, is loading or rebuilding, or
 // the instance at hand predates the dataset.
@@ -436,64 +541,23 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	// as it was at Subscribe: the builder is single-shot, and a call
 	// chained on it later must not reach a live subscription.
 	refillCtx := context.WithoutCancel(ctx)
-	base, sort, limit, offset := q.filter, q.sort, q.limit, q.offset
-	// refillSource resolves the collection and the filter a refill
-	// reads. A shared-scope read has its collection from the Store. A
-	// per-object read goes through the loaded object's controller,
-	// looked up on every refill without loading or waiting: the event
-	// behind a refill came from an apply on the object, so the object
-	// is loaded unless its load is what fired the apply (a replay) or
-	// it was evicted since. The object resolved before the lock is not
-	// kept: it may not have been local then, and holding it would keep
-	// an evicted object's tree reachable for the subscription's life.
-	// With no loaded instance, or one from before the dataset was
-	// known, the refill fails: the engine counts the departure as a
-	// loss and tries again on the next apply.
-	refillSource := func(ctx context.Context) (anystore.Collection, query.Filter, error) {
-		if scope.Shared || scope.AllObjects {
-			return sharedColl, combined, nil
+	var source refillSource
+	if scope.Shared || scope.AllObjects {
+		source = func(any) (anystore.Collection, query.Filter, query.Filter, error) {
+			return sharedColl, combined, tombstoneSkip, nil
 		}
-		loaded := q.store.PeekLoaded(q.objectId)
-		if loaded == nil {
-			return nil, nil, errRefillNoObject
-		}
-		ctrl := loaded.Controller()
-		if !ctrl.HasDataset(q.dataset) {
-			return nil, nil, errRefillNoObject
-		}
-		coll, err := ctrl.PeekCollection(ctx, q.dataset)
-		if err != nil {
-			return nil, nil, err
-		}
-		var rows query.Filter
-		if ctrl.IsKeyed(q.dataset) {
-			rows = crdt.KeyedRows(q.objectId)
-		}
-		return coll, withoutTombstones(scopedFilter(rows, base)), nil
+	} else {
+		source = objectSource(refillCtx, q.store, q.objectId, q.dataset, q.filter)
 	}
 	cfg := subscribe.SubConfig{
 		Scope:       scope,
 		Filter:      combined,
-		Sort:        sort,
-		Limit:       int(limit),
-		Offset:      int(offset),
+		Sort:        q.sort,
+		Limit:       int(q.limit),
+		Offset:      int(q.offset),
 		MailboxCap:  opts.MailboxCapacity,
 		DriftBudget: opts.DriftBudgetPercent,
-		Refill: func(yield func(id string, doc *anyenc.Value)) error {
-			coll, filter, err := refillSource(refillCtx)
-			if err != nil {
-				return err
-			}
-			if coll == nil {
-				return nil // no collection on disk: no rows
-			}
-			tx, err := coll.ReadTx(refillCtx)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = tx.Commit() }()
-			return readWindow(tx.Context(), coll, filter, sort, limit, offset, yield)
-		},
+		Refill:      newRefill(refillCtx, source, q.sort, q.limit, q.offset),
 	}
 
 	sub, err := q.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
@@ -509,7 +573,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			return err
 		}
 		snapshotColl, snapshotTx = coll, tx
-		return readWindow(tx.Context(), coll, combined, sort, limit, offset, func(id string, v *anyenc.Value) {
+		return readWindow(tx.Context(), coll, combined, q.sort, q.limit, q.offset, func(id string, v *anyenc.Value) {
 			// Every row the read returned counts toward the cap,
 			// including one skipped below.
 			yielded++

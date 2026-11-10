@@ -38,15 +38,36 @@ type SubConfig struct {
 	Offset      int          // rows the snapshot skipped; a window past offset 0 never starts complete
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
-	// Refill re-reads the sub's rows: the same query as the snapshot,
-	// under the snapshot callback's contract (it runs under engine.mu
-	// and must only read materialised rows). The engine calls it at
-	// offset 0 when a windowed sub with matches past its edge loses a
-	// held row or holds a sentinel it could not rank, and when any sub
-	// could not read a row of a change. nil disables refills:
+	// Refill opens a re-read of the sub's rows: the same query as the
+	// snapshot, under the snapshot callback's contract (it runs under
+	// engine.mu and must only read materialised rows). The engine
+	// calls it at offset 0 when a windowed sub with matches past its
+	// edge loses a held row or holds a row it could not rank, and when
+	// any sub could not read a row of a change. nil disables refills:
 	// departures then count toward the drift budget, and an unreadable
 	// row closes the sub.
-	Refill SnapshotFn
+	Refill RefillFn
+}
+
+// RefillFn opens one read of the sub's rows under the engine's fence.
+// source is Event.Source of the apply behind the refill, nil for a
+// notification: a per-object read goes through it when it is that
+// object's instance, which may still be loading. The engine closes the
+// read once it has reconciled the held set.
+type RefillFn func(source any) (RefillRead, error)
+
+// RefillRead is one read a refill reconciles the held set from, in a
+// single transaction so its rows and lookups agree.
+type RefillRead struct {
+	// Rows yields the sub's query in order, as the snapshot did.
+	Rows func(yield func(id string, doc *anyenc.Value)) error
+	// Lookup reads one row by id regardless of the query's filter,
+	// sort and window: nil when the row is absent, a tombstone or out
+	// of the sub's scope. It classifies a held row Rows no longer
+	// returned; a nil Lookup leaves such a row displaced.
+	Lookup func(id string) (*anyenc.Value, error)
+	// Close ends the read.
+	Close func()
 }
 
 // SnapshotFn is the caller-supplied populator. It runs UNDER engine.mu

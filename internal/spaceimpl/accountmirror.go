@@ -94,6 +94,7 @@ func newAccountMirror(ctx context.Context, store *spaceobjects.Store, tsp *techs
 			ObjectId: carrier.Id(),
 			Dataset:  accountvalues.Dataset,
 		},
+		Refill: ObjectRefill(tsp.Store(), carrier.Id(), accountvalues.Dataset),
 	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
 
 	m := &accountMirror{

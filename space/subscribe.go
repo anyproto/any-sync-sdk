@@ -113,6 +113,13 @@ type RemovedRecord struct {
 // locally-scoped: each peer assigns its own; don't compare across
 // peers.
 //
+// An event with an empty VersionId is not a change's own and is never
+// skipped: the engine re-read the window from storage (to refill rows
+// that left it, or after a change whose row it could not read) and
+// ships what storage held that no change said, or an object was
+// deleted without a CRDT apply. Its records carry Doc and no Ops. A
+// re-read's event follows the own event of the change that caused it.
+//
 // Total is intentionally absent — the live counter is not maintained.
 // Callers who need a refreshed count call Snapshot.
 type SubscriptionEvent struct {
@@ -127,7 +134,9 @@ type SubscriptionEvent struct {
 // the event). Ops carries the per-field $set / $unset ops from the
 // triggering change — same payload shape as EventOp on the raw event
 // stream, so callers can apply atomic updates against a local mirror
-// without re-materialising the whole record.
+// without re-materialising the whole record. Ops is empty in an event
+// with no VersionId, and for a record of a change the engine could not
+// read: Doc is then the state to take as a whole.
 type SubRecord struct {
 	Id  string
 	Doc *anyenc.Value
@@ -142,11 +151,12 @@ var ErrSubscriptionOverflow = errors.New("space: subscription overflowed; resubs
 
 // ErrSubscriptionDrifted is returned by QuerySubscription.Err when
 // the engine could not keep the window equal to storage: a window
-// past an offset lost QueryOpts.DriftBudgetPercent of its rows, the
-// re-read that refills a window at offset 0 failed that often (each
-// failed refill counts as one loss), or a change's row could not be
-// read and no re-read could settle it. The client is expected to
-// resubscribe.
+// past an offset lost QueryOpts.DriftBudgetPercent of its rows; a
+// window at offset 0 lost that many while its re-read of storage
+// failed (a row that left counts once, an arrival the window cannot
+// rank once, a re-read that fails again nothing); or a change's row
+// could not be read and no re-read could settle it. The client is
+// expected to resubscribe.
 var ErrSubscriptionDrifted = errors.New("space: subscription drifted (the window could not be kept equal to storage); resubscribe required")
 
 // ErrSubscribeUnsupported is returned by Query.Subscribe for query

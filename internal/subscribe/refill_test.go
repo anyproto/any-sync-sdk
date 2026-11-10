@@ -28,8 +28,12 @@ type storeModel struct {
 	sort   query.Sort
 	limit  int
 	reads  int
+	closed int
 	fail   error
 	buf    *syncpool.DocBuffer
+
+	sources []any    // Event.Source of each refill
+	lookups []string // ids the refills looked up
 }
 
 func newStoreModel(t *testing.T, filter query.Filter, limit int, rows ...row) *storeModel {
@@ -67,7 +71,7 @@ func (m *storeModel) matching() []row {
 // refill read.
 func (m *storeModel) window() []row {
 	rows := m.matching()
-	if m.limit > 0 && len(rows) > m.limit+1 {
+	if m.limit > 0 && len(rows)-1 > m.limit {
 		rows = rows[:m.limit+1]
 	}
 	return rows
@@ -86,16 +90,36 @@ func (m *storeModel) visible() []string {
 	return ids
 }
 
-func (m *storeModel) refill() SnapshotFn {
-	return func(yield func(id string, doc *anyenc.Value)) error {
+// refill is the model's RefillFn: the window read, and a lookup of
+// any stored row by id. fail makes every read fail; lookups records
+// the ids looked up.
+func (m *storeModel) refill() RefillFn {
+	return func(source any) (RefillRead, error) {
 		m.reads++
+		m.sources = append(m.sources, source)
 		if m.fail != nil {
-			return m.fail
+			return RefillRead{}, m.fail
 		}
-		for _, r := range m.window() {
-			yield(r.id, r.d)
-		}
-		return nil
+		return RefillRead{
+			Rows: func(yield func(id string, doc *anyenc.Value)) error {
+				for _, r := range m.window() {
+					yield(r.id, r.d)
+				}
+				return nil
+			},
+			Lookup: func(id string) (*anyenc.Value, error) {
+				m.lookups = append(m.lookups, id)
+				return m.rows[id], nil
+			},
+			Close: func() { m.closed++ },
+		}, nil
+	}
+}
+
+// rowsOnly wraps a window read as a RefillFn with no lookup.
+func rowsOnly(rows func(yield func(id string, doc *anyenc.Value)) error) RefillFn {
+	return func(any) (RefillRead, error) {
+		return RefillRead{Rows: rows, Close: func() {}}, nil
 	}
 }
 
@@ -197,12 +221,43 @@ func (v *clientView) ids(m *storeModel) []string {
 	return ids
 }
 
+// ownAndResync drains the sub after one apply with a VersionId that
+// refilled: the change's own event, then the refill's. Either may be
+// empty when the apply had nothing of that kind to say; the refill's
+// never carries a VersionId or ops.
+func ownAndResync(t *testing.T, sub *Sub) (own, resync space.SubscriptionEvent) {
+	t.Helper()
+	evs := sub.Events().GetAll()
+	require.LessOrEqual(t, len(evs), 2, "%v", evs)
+	for _, ev := range evs {
+		if ev.VersionId != "" {
+			own = ev
+			continue
+		}
+		resync = ev
+		for _, r := range append(ev.Added, ev.Updated...) {
+			assert.Nil(t, r.Ops, "resync ships no ops")
+		}
+	}
+	return own, resync
+}
+
 // agrees asserts the client's view equals a fresh query of the window
 // and the engine's view equals the client's.
 func agrees(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
 	t.Helper()
 	view.fold(t, sub)
 	require.Equal(t, m.visible(), view.ids(m), "client view vs fresh query")
+	agreesWithEngine(t, sub, view, m)
+	for id, d := range view.docs {
+		require.Equal(t, string(m.rows[id].MarshalTo(nil)), string(d.MarshalTo(nil)), "doc of %s", id)
+	}
+}
+
+// agreesWithEngine asserts the engine's visible rows are the client's:
+// what holds whether or not refills work.
+func agreesWithEngine(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
+	t.Helper()
 	held := make([]string, 0, len(sub.entries))
 	sent := sub.sentinel()
 	for id, e := range sub.entries {
@@ -211,12 +266,12 @@ func agrees(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
 		}
 	}
 	sort.Strings(held)
-	want := append(make([]string, 0, len(held)), m.visible()...)
-	sort.Strings(want)
-	require.Equal(t, want, held, "engine view vs fresh query")
-	for id, d := range view.docs {
-		require.Equal(t, string(m.rows[id].MarshalTo(nil)), string(d.MarshalTo(nil)), "doc of %s", id)
+	want := make([]string, 0, len(view.docs))
+	for id := range view.docs {
+		want = append(want, id)
 	}
+	sort.Strings(want)
+	require.Equal(t, want, held, "engine view vs client view")
 }
 
 func activeRow(arena *anyenc.Arena, id string, n int) row {
@@ -413,40 +468,34 @@ func TestRefill_ReconcilesHeldRowsWithStorage(t *testing.T) {
 
 	m.delete("r0")
 	fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
-	evs := sub.Events().GetAll()
-	require.Len(t, evs, 1)
-	assert.Equal(t, []string{"r1"}, idsOf(evs[0].Updated))
-	assert.ElementsMatch(t, []string{"r0", "r2"}, removedIdsOf(evs[0].Removed))
-	for _, r := range evs[0].Removed {
-		switch r.Id {
-		case "r0":
-			assert.Equal(t, space.RemoveDeleted, r.Reason)
-		case "r2":
-			assert.Equal(t, space.RemoveFilteredOut, r.Reason, "gone from storage within the window")
-		}
-	}
-	assert.ElementsMatch(t, []string{"r3", "r4"}, idsOf(evs[0].Added))
-	for _, r := range evs[0].Added {
-		assert.Nil(t, r.Ops, "a refilled row carries no ops")
-	}
-	view.apply(evs)
+	own, resync := ownAndResync(t, sub)
+	// The change's own event: its delete and the sentinel it promoted.
+	assert.Equal(t, crdt.VersionId("vr0"), own.VersionId)
+	assert.Equal(t, []string{"r3"}, idsOf(own.Added))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, own.Removed)
+	// The refill's: what storage held that the change did not say.
+	assert.Equal(t, []string{"r4"}, idsOf(resync.Added))
+	assert.Equal(t, []string{"r1"}, idsOf(resync.Updated))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r2", Reason: space.RemoveDeleted}}, resync.Removed, "gone from storage")
+	view.apply([]space.SubscriptionEvent{own, resync})
 	agrees(t, sub, view, m)
 
 	// The queued events arrive: nothing left to do.
 	fireEvent(eng, "obj1", "chat", "r2", nil, true, nil)
 	fireEvent(eng, "obj1", "chat", "r1", m.rows["r1"], false, nil)
-	evs = sub.Events().GetAll()
+	evs := sub.Events().GetAll()
 	require.Len(t, evs, 1, "the update re-ships; the delete of an unheld row is silent")
 	assert.Equal(t, []string{"r1"}, idsOf(evs[0].Updated))
 	agrees(t, sub, view, m)
 }
 
-// A held row absent from the refill leaves as displaced when its last
-// known position is at or past the refilled window's edge, and as
-// filtered out when it sorted inside it: the engine knows the row's
-// last tuple, not what storage did to it.
-func TestRefill_AbsentHeldRowReasonFollowsItsLastPosition(t *testing.T) {
-	t.Run("past the new edge", func(t *testing.T) {
+// A held row a refill no longer returns is classified by a lookup of
+// storage in the same read: absent, it was deleted; stored but failing
+// the filter, it stopped matching; stored and matching, it sorts past
+// the window. The change that moved it, arriving later, finds the row
+// unheld and ships nothing more.
+func TestRefill_AbsentHeldRowReasonComesFromStorage(t *testing.T) {
+	t.Run("deleted past the new edge", func(t *testing.T) {
 		eng := New("test")
 		defer eng.Close()
 		arena := newArena()
@@ -462,17 +511,22 @@ func TestRefill_AbsentHeldRowReasonFollowsItsLastPosition(t *testing.T) {
 
 		m.delete("r0")
 		fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
-		evs := sub.Events().GetAll()
-		require.Len(t, evs, 1)
-		assert.Equal(t, []string{"a", "b"}, idsOf(evs[0].Added))
-		assert.Equal(t, []space.RemovedRecord{
-			{Id: "r0", Reason: space.RemoveDeleted},
-			{Id: "r1", Reason: space.RemoveDisplaced},
-		}, evs[0].Removed)
-		view.apply(evs)
+		own, resync := ownAndResync(t, sub)
+		assert.Equal(t, []string{"r2"}, idsOf(own.Added), "the sentinel the delete promoted")
+		assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, own.Removed)
+		assert.Equal(t, []string{"a", "b"}, idsOf(resync.Added))
+		assert.ElementsMatch(t, []space.RemovedRecord{
+			{Id: "r2", Reason: space.RemoveDisplaced},
+			{Id: "r1", Reason: space.RemoveDeleted},
+		}, resync.Removed)
+		assert.ElementsMatch(t, []string{"r1", "r2"}, m.lookups, "the held rows the read did not return")
+		view.apply([]space.SubscriptionEvent{own, resync})
 		agrees(t, sub, view, m)
+
+		fireEvent(eng, "obj1", "chat", "r1", nil, true, nil)
+		assert.Empty(t, sub.Events().GetAll(), "the delete of an unheld row is silent")
 	})
-	t.Run("inside the new edge", func(t *testing.T) {
+	t.Run("deleted inside the new edge", func(t *testing.T) {
 		eng := New("test")
 		defer eng.Close()
 		m := newStoreModel(t, nil, 2, driftRows(6)...)
@@ -482,14 +536,48 @@ func TestRefill_AbsentHeldRowReasonFollowsItsLastPosition(t *testing.T) {
 
 		m.delete("r0")
 		fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
-		evs := sub.Events().GetAll()
-		require.Len(t, evs, 1)
-		assert.Equal(t, []string{"r2", "r3"}, idsOf(evs[0].Added))
-		assert.Equal(t, []space.RemovedRecord{
-			{Id: "r0", Reason: space.RemoveDeleted},
-			{Id: "r1", Reason: space.RemoveFilteredOut},
-		}, evs[0].Removed)
-		view.apply(evs)
+		own, resync := ownAndResync(t, sub)
+		assert.Equal(t, []string{"r2"}, idsOf(own.Added))
+		assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, own.Removed)
+		assert.Equal(t, []string{"r3"}, idsOf(resync.Added))
+		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDeleted}}, resync.Removed)
+		view.apply([]space.SubscriptionEvent{own, resync})
+		agrees(t, sub, view, m)
+	})
+	t.Run("filtered out", func(t *testing.T) {
+		eng := New("test")
+		defer eng.Close()
+		arena := newArena()
+		m := newStoreModel(t, activeOnly, 2, driftRows(6)...)
+		sub, view := subscribeModel(t, eng, m, 30)
+
+		m.set(readRow(arena, "r1", 1)) // without an event
+
+		m.delete("r0")
+		fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
+		own, resync := ownAndResync(t, sub)
+		assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, own.Removed)
+		assert.Equal(t, []string{"r3"}, idsOf(resync.Added))
+		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveFilteredOut}}, resync.Removed)
+		view.apply([]space.SubscriptionEvent{own, resync})
+		agrees(t, sub, view, m)
+	})
+	t.Run("moved past the edge", func(t *testing.T) {
+		eng := New("test")
+		defer eng.Close()
+		arena := newArena()
+		m := newStoreModel(t, nil, 2, driftRows(6)...)
+		sub, view := subscribeModel(t, eng, m, 30)
+
+		m.set(activeRow(arena, "r1", 100)) // without an event
+
+		m.delete("r0")
+		fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
+		own, resync := ownAndResync(t, sub)
+		assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, own.Removed)
+		assert.Equal(t, []string{"r3"}, idsOf(resync.Added))
+		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDisplaced}}, resync.Removed)
+		view.apply([]space.SubscriptionEvent{own, resync})
 		agrees(t, sub, view, m)
 	})
 }
@@ -634,12 +722,14 @@ func TestUnreadable_MixedApplySettlesAsOne(t *testing.T) {
 		}
 		return nil, nil
 	})
-	evs := sub.Events().GetAll()
-	require.Len(t, evs, 1)
-	assert.Equal(t, []string{"r3"}, idsOf(evs[0].Added))
-	assert.Equal(t, []string{"r2"}, idsOf(evs[0].Updated))
-	assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, evs[0].Removed)
-	view.apply(evs)
+	own, resync := ownAndResync(t, sub)
+	assert.Equal(t, crdt.VersionId("v"), own.VersionId)
+	assert.Equal(t, []string{"r3"}, idsOf(own.Added))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, own.Removed)
+	assert.Empty(t, own.Updated, "the unreadable record ships nothing of its own")
+	assert.Equal(t, crdt.VersionId(""), resync.VersionId)
+	assert.Equal(t, []string{"r2"}, idsOf(resync.Updated), "storage settles it")
+	view.apply([]space.SubscriptionEvent{own, resync})
 	agrees(t, sub, view, m)
 	assert.NoError(t, sub.Err())
 }
@@ -783,13 +873,13 @@ func TestRefill_FailureMidwayChangesNothing(t *testing.T) {
 	reads := 0
 	sub, err := eng.Subscribe(SubConfig{
 		Scope: driftScope, Sort: m.sort, Limit: 3, MailboxCap: minMailboxCap, DriftBudget: 100,
-		Refill: func(yield func(id string, doc *anyenc.Value)) error {
+		Refill: rowsOnly(func(yield func(id string, doc *anyenc.Value)) error {
 			reads++
 			for _, r := range m.window()[:2] {
 				yield(r.id, r.d)
 			}
 			return errors.New("torn")
-		},
+		}),
 	}, snapshotFromRows(m.window()))
 	require.NoError(t, err)
 	held := func() []string {
@@ -880,9 +970,11 @@ func TestApply_PromotedThenRemovedInOneApply(t *testing.T) {
 		m.delete("r2")
 		eng.NotifyRecordsDeleted("test", "chat", "obj1", []string{"r1", "r2"})
 		evs := sub.Events().GetAll()
-		require.Len(t, evs, 1)
-		assert.Equal(t, []string{"r3"}, idsOf(evs[0].Added))
+		require.Len(t, evs, 2)
+		assert.Empty(t, evs[0].Added, "r2 was promoted and deleted within the change")
 		assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDeleted}}, evs[0].Removed)
+		assert.Equal(t, []string{"r3"}, idsOf(evs[1].Added), "the refill's event")
+		assert.Empty(t, evs[1].Removed)
 		view.apply(evs)
 		agrees(t, sub, view, m)
 	})
@@ -1015,14 +1107,14 @@ func TestRefill_RowWithoutIdDoesNotLoop(t *testing.T) {
 	reads := 0
 	sub, err := eng.Subscribe(SubConfig{
 		Scope: driftScope, Sort: m.sort, Limit: 2, MailboxCap: minMailboxCap, DriftBudget: 30,
-		Refill: func(yield func(id string, doc *anyenc.Value)) error {
+		Refill: rowsOnly(func(yield func(id string, doc *anyenc.Value)) error {
 			reads++
 			rows := m.window()
 			yield(rows[0].id, rows[0].d)
 			yield(rows[1].id, rows[1].d)
 			yield("", nil)
 			return nil
-		},
+		}),
 	}, snapshotFromRows(m.window()))
 	require.NoError(t, err)
 
@@ -1117,95 +1209,185 @@ func TestApply_FastRejectedAfterVisibleIsDisplaced(t *testing.T) {
 	assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDisplaced}}, ev.Removed)
 }
 
-// Random applies against a storage model: single and multi-record
-// changes with repeated ids, creates, edits, sort moves, filter-outs,
-// deletes and unreadable records, over windows of every size. After
+// Random applies over windows of every size, with repeated ids,
+// creates, edits, sort moves, filter-outs, deletes and unreadable
+// records, in three regimes: storage in step with the events; storage
+// a batch ahead of them, as when a later change commits before an
+// earlier one's event runs; and refills that fail for a while. After
 // every apply the client's folded view, the engine's held set and a
-// fresh query of the model agree, and the sub stays open.
+// fresh query of the model are compared, every event is checked
+// against the client's contract, each removal's reason against
+// storage, and no loss is counted while refills work.
 func TestRefill_RandomizedAgreesWithStorage(t *testing.T) {
-	for seed := int64(0); seed < 300; seed++ {
-		t.Run(fmt.Sprint(seed), func(t *testing.T) {
-			rng := rand.New(rand.NewSource(seed))
-			eng := New("test")
-			defer eng.Close()
-			arena := newArena()
-			limit := rng.Intn(5)
-			var filter query.Filter
-			if rng.Intn(2) == 0 {
-				filter = activeOnly
-			}
-			// Sort keys are unique: ties at the edge are a known limit.
-			usedN := map[int]struct{}{}
-			freshN := func() int {
-				for {
-					n := rng.Intn(60)
-					if _, used := usedN[n]; !used {
-						usedN[n] = struct{}{}
-						return n
-					}
-				}
-			}
-			status := func() string {
-				if rng.Intn(4) == 0 {
-					return "read"
-				}
-				return "active"
-			}
-			var rows []row
-			for i := 0; i < 3+rng.Intn(8); i++ {
-				rows = append(rows, makeRow(arena, "r"+itoa(i), freshN(), map[string]any{"status": status()}))
-			}
-			m := newStoreModel(t, filter, limit, rows...)
-			sub, view := subscribeModel(t, eng, m, 100)
-			known := func() []string {
-				ids := make([]string, 0, len(m.rows))
-				for id := range m.rows {
-					ids = append(ids, id)
-				}
-				sort.Strings(ids)
-				return ids
-			}
-
-			for step := 0; step < 25; step++ {
-				var records []EventRecord
-				var unreadable []bool
-				count := 1 + rng.Intn(3)
-				for j := 0; j < count; j++ {
-					ids := known()
-					var id string
-					if len(ids) == 0 || rng.Intn(4) == 0 {
-						id = fmt.Sprintf("x%d_%d", step, j)
-					} else {
-						id = ids[rng.Intn(len(ids))]
-					}
-					switch rng.Intn(5) {
-					case 0:
-						m.delete(id)
-						records = append(records, EventRecord{Id: id, Deleted: true})
-						unreadable = append(unreadable, false)
-					default:
-						n := freshN()
-						if cur, ok := m.rows[id]; ok && rng.Intn(2) == 0 {
-							n = cur.GetInt("n")
-						}
-						m.set(makeRow(arena, id, n, map[string]any{"status": status()}))
-						records = append(records, EventRecord{Id: id})
-						unreadable = append(unreadable, rng.Intn(6) == 0)
-					}
-				}
-				eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", Records: records},
-					func(i int) (*anyenc.Value, error) {
-						if unreadable[i] {
-							return nil, errors.New("read failed")
-						}
-						return m.rows[records[i].Id], nil
-					})
-				for _, ev := range sub.Events().GetAll() {
-					view.foldChecked(t, ev)
-				}
-				require.NoError(t, sub.Err(), "step %d", step)
-				agrees(t, sub, view, m)
+	for _, regime := range []string{"in step", "storage ahead", "refills failing"} {
+		t.Run(regime, func(t *testing.T) {
+			for seed := int64(0); seed < 400; seed++ {
+				t.Run(fmt.Sprint(seed), func(t *testing.T) {
+					randomizedRun(t, regime, seed)
+				})
 			}
 		})
+	}
+}
+
+func randomizedRun(t *testing.T, regime string, seed int64) {
+	rng := rand.New(rand.NewSource(seed))
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	limit := rng.Intn(5)
+	var filter query.Filter
+	if rng.Intn(2) == 0 {
+		filter = activeOnly
+	}
+	// Sort keys are unique: ties at the edge are a known limit.
+	usedN := map[int]struct{}{}
+	freshN := func() int {
+		for {
+			n := rng.Intn(100000)
+			if _, used := usedN[n]; !used {
+				usedN[n] = struct{}{}
+				return n
+			}
+		}
+	}
+	status := func() string {
+		if rng.Intn(4) == 0 {
+			return "read"
+		}
+		return "active"
+	}
+	var rows []row
+	for i := 0; i < 3+rng.Intn(8); i++ {
+		rows = append(rows, makeRow(arena, "r"+itoa(i), freshN(), map[string]any{"status": status()}))
+	}
+	m := newStoreModel(t, filter, limit, rows...)
+	sub, view := subscribeModel(t, eng, m, 100)
+	known := func() []string {
+		ids := make([]string, 0, len(m.rows))
+		for id := range m.rows {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return ids
+	}
+
+	// batch builds one apply: it moves the model and returns the event
+	// with its records' readability.
+	type batch struct {
+		ev         Event
+		unreadable []bool
+		after      map[string]*anyenc.Value // the model after this batch
+	}
+	build := func(step int) batch {
+		var b batch
+		count := 1 + rng.Intn(3)
+		for j := 0; j < count; j++ {
+			ids := known()
+			var id string
+			if len(ids) == 0 || rng.Intn(4) == 0 {
+				id = fmt.Sprintf("x%d_%d", step, j)
+			} else {
+				id = ids[rng.Intn(len(ids))]
+			}
+			switch rng.Intn(5) {
+			case 0:
+				m.delete(id)
+				b.ev.Records = append(b.ev.Records, EventRecord{Id: id, Deleted: true})
+				b.unreadable = append(b.unreadable, false)
+			default:
+				n := freshN()
+				if cur, ok := m.rows[id]; ok && rng.Intn(2) == 0 {
+					n = cur.GetInt("n")
+				}
+				m.set(makeRow(arena, id, n, map[string]any{"status": status()}))
+				b.ev.Records = append(b.ev.Records, EventRecord{Id: id})
+				b.unreadable = append(b.unreadable, rng.Intn(6) == 0)
+			}
+		}
+		b.ev.SpaceId, b.ev.ObjectId, b.ev.Dataset = "test", "obj1", "chat"
+		b.ev.VersionId = crdt.VersionId(fmt.Sprintf("v%d", step))
+		b.after = make(map[string]*anyenc.Value, len(m.rows))
+		for id, d := range m.rows {
+			b.after[id] = d
+		}
+		return b
+	}
+	fire := func(b batch) {
+		eng.OnApply(b.ev, func(i int) (*anyenc.Value, error) {
+			if b.unreadable[i] {
+				return nil, errors.New("read failed")
+			}
+			return m.rows[b.ev.Records[i].Id], nil
+		})
+	}
+	// check folds the events of one apply and verifies each against the
+	// client's contract and against storage: a deleted row is absent
+	// from storage now; a row filtered out or displaced existed after
+	// the change that removed it.
+	check := func(step int, b batch) {
+		evs := sub.Events().GetAll()
+		require.LessOrEqual(t, len(evs), 2, "step %d: %v", step, evs)
+		for i, ev := range evs {
+			if i == 0 && ev.VersionId != "" {
+				require.Equal(t, b.ev.VersionId, ev.VersionId, "step %d", step)
+			} else {
+				require.Equal(t, crdt.VersionId(""), ev.VersionId, "step %d: the resync carries no version", step)
+				for _, r := range append(ev.Added, ev.Updated...) {
+					require.Nil(t, r.Ops, "step %d: the resync ships no ops", step)
+				}
+			}
+			view.foldChecked(t, ev)
+			for _, r := range ev.Removed {
+				_, now := m.rows[r.Id]
+				_, then := b.after[r.Id]
+				switch r.Reason {
+				case space.RemoveDeleted:
+					require.False(t, now, "step %d: %s removed as deleted but stored", step, r.Id)
+				default:
+					require.True(t, then, "step %d: %s removed as %s but never stored after its change", step, r.Id, r.Reason)
+				}
+			}
+		}
+	}
+
+	for step := 0; step < 25; step++ {
+		switch regime {
+		case "storage ahead":
+			// Two changes commit, then their events run in order: the
+			// first apply's refill sees the second's rows.
+			a := build(step)
+			b := build(step)
+			b.ev.VersionId += "b"
+			fire(a)
+			check(step, a)
+			require.NoError(t, sub.Err(), "step %d", step)
+			fire(b)
+			check(step, b)
+		case "refills failing":
+			if step%7 == 0 {
+				m.fail = errors.New("busy")
+			} else if step%7 == 4 {
+				m.fail = nil
+			}
+			b := build(step)
+			fire(b)
+			check(step, b)
+		default:
+			b := build(step)
+			fire(b)
+			check(step, b)
+		}
+		if sub.Err() != nil {
+			require.NotNil(t, m.fail, "step %d: closed while refills work", step)
+			return
+		}
+		agreesWithEngine(t, sub, view, m)
+		if m.fail == nil {
+			agrees(t, sub, view, m)
+		}
+		if regime != "refills failing" {
+			assert.Equal(t, 0, sub.lost, "step %d: a loss while refills work", step)
+		}
 	}
 }

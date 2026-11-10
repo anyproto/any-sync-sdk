@@ -148,7 +148,8 @@ type oneToOneKeysWatcher struct {
 
 func newOneToOneKeysWatcher(ctx context.Context, parent *Service, store *spaceobjects.Store, spaceId, spaceIndexObjectId string) *oneToOneKeysWatcher {
 	sub, err := store.SubEngine().Subscribe(subscribe.SubConfig{
-		Scope: subscribe.Scope{ObjectId: spaceIndexObjectId, Dataset: spaceindex.IdentityKeysDataset},
+		Scope:  subscribe.Scope{ObjectId: spaceIndexObjectId, Dataset: spaceindex.IdentityKeysDataset},
+		Refill: ObjectRefill(store, spaceIndexObjectId, spaceindex.IdentityKeysDataset),
 	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
 	if err != nil {
 		oneToOneKeysLog.Warn("subscribe identityKeys", zap.String("spaceId", spaceId), zap.Error(err))

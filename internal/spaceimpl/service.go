@@ -1261,7 +1261,8 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 // cancel func stops the drain goroutine and closes the sub.
 func (s *Service) Subscribe(cb func(space.SpaceListEvent)) (cancel func()) {
 	sub, err := s.tsp.SubEngine().Subscribe(subscribe.SubConfig{
-		Scope: subscribe.Scope{ObjectId: s.tsp.IndexObjectId(), Dataset: techspace.SpaceIndexDataset},
+		Scope:  subscribe.Scope{ObjectId: s.tsp.IndexObjectId(), Dataset: techspace.SpaceIndexDataset},
+		Refill: ObjectRefill(s.tsp.Store(), s.tsp.IndexObjectId(), techspace.SpaceIndexDataset),
 	}, func(func(id string, doc *anyenc.Value)) error { return nil })
 	if err != nil {
 		return func() {}

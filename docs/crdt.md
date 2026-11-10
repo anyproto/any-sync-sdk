@@ -233,10 +233,12 @@ so it stays bounded by the record's live version count. Rules: spec §3.6.
   engine could not keep the window equal to storage) the consumer
   resubscribes, and the new `QueryResult.Initial` reconciles state. A
   window at offset 0 refills from storage when rows leave it, so it
-  drifts only when a refill fails.
+  drifts only when a refill fails; a row the engine cannot read closes
+  it at once when no refill can settle it.
 - **Own writes** arrive as events too; callers recognize them by the
   `VersionId` returned from the write. Per-session suppression is not
-  supported.
+  supported. An event with no `VersionId` is a re-read of storage or an
+  object deletion, never an own write.
 - **Ordering.** Events follow apply order; cross-object order is not
   guaranteed.
 

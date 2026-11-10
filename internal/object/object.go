@@ -910,8 +910,7 @@ func (o *Object) ColdRestore(ctx context.Context) error {
 // codec can't parse (manifests as "unknown type N" anyenc errors and,
 // crucially, silent drops of every inbound change on a fresh joiner /
 // new device). The convert callback receives the already-decrypted
-// bytes; we hand off the parsed Change to the iterate callback via
-// Change.Model.
+// bytes; a copy reaches the iterate callback via Change.Model.
 func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) error {
 	if o.closed || o.deleted {
 		// Stale callback after Close (listener detach race) or a
@@ -930,50 +929,69 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	// strict side (LocalWrite hard-errors before AddContent).
 	spec := o.plaintextSpecFor(tree)
 
-	// captured outside the iterate closure so we can surface fatal
-	// errors past IterateAfterAddSeq's bool return.
-	var fatalErr error
-	applied := 0
+	// A pass buffers changes while the storage cursor is open and
+	// applies them after it closes: the cursor holds one of the space
+	// db's pooled read connections, and an apply waits for the SDK db
+	// writer, whose holder may itself be waiting for such a connection.
+	// A pass that fills the buffer is followed by another that resumes
+	// past the last buffered OrderId (the cursor's sort key).
+	var (
+		batch    []*replayItem
+		size     int
+		full     bool
+		resume   string
+		fatalErr error
+		applied  int
+	)
 
 	convert := func(ch *objecttree.Change, decrypted []byte) (any, error) {
 		// root has no CRDT payload by construction.
-		if ch.Id == rootId {
+		if ch.Id == rootId || len(decrypted) == 0 {
 			return nil, nil
 		}
-		if len(decrypted) == 0 {
+		if resume != "" && ch.OrderId <= resume {
 			return nil, nil
 		}
-		decoded, decodeErr := o.codec.Decode(decrypted)
-		if decodeErr != nil {
-			// Non-CRDT payload (settings-tree change, foreign data
-			// type, etc.) — skip silently. Returning the error here
-			// would halt the entire iteration, which we explicitly
-			// don't want; we want one bad row to not poison the rest.
-			return nil, nil
-		}
-		// any-sync reuses `decrypted` across iterations, so anything we
-		// retain past this callback (the parked-payload bytes for the
-		// schema gate) must be cloned now.
-		raw := append([]byte(nil), decrypted...)
-		return &replayItem{decoded: decoded, raw: raw}, nil
+		// any-sync reuses `decrypted` across iterations.
+		return &replayItem{raw: append([]byte(nil), decrypted...)}, nil
 	}
 
-	iter := func(ch *objecttree.Change) bool {
+	collect := func(ch *objecttree.Change) bool {
 		item, ok := ch.Model.(*replayItem)
 		if !ok || item == nil {
 			return true
 		}
-		decoded := item.decoded
+		item.changeId = ch.Id
+		item.orderId = ch.OrderId
+		item.addSeq = ch.AddSeq
+		item.timestamp = ch.Timestamp
+		batch = append(batch, item)
+		size += len(item.raw)
+		full = len(batch) >= replayBatchChanges || size >= replayBatchBytes
+		return !full
+	}
+
+	// apply reports whether the replay goes on to the next change.
+	apply := func(item *replayItem) bool {
+		// Op payloads alias the codec arena until the next Decode, so
+		// each change is decoded right before its apply.
+		decoded, decodeErr := o.codec.Decode(item.raw)
+		if decodeErr != nil {
+			// Non-CRDT payload (settings-tree change, foreign data
+			// type, etc.) — skip silently, so one bad row does not
+			// poison the rest.
+			return true
+		}
 		decoded.SpaceId = o.spaceId
 		decoded.ObjectId = rootId
-		decoded.ChangeId = ch.Id
-		decoded.AddSeq = ch.AddSeq
-		decoded.Timestamp = ch.Timestamp
-		decoded.VersionId = crdt.VersionId(ch.OrderId)
+		decoded.ChangeId = item.changeId
+		decoded.AddSeq = item.addSeq
+		decoded.Timestamp = item.timestamp
+		decoded.VersionId = crdt.VersionId(item.orderId)
 		if err := checkPlaintextDataset(spec, decoded.Dataset); err != nil {
 			log.Warn("skipping inbound change on plaintext object",
 				zap.String("objectId", rootId),
-				zap.String("changeId", ch.Id),
+				zap.String("changeId", item.changeId),
 				zap.String("dataset", decoded.Dataset))
 			return true
 		}
@@ -994,13 +1012,13 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		// drainer picks it up later.
 		//
 		// gateErr means Park itself failed (disk, etc.) — abort the
-		// iter so the watermark doesn't leapfrog this AddSeq. The
+		// replay so the watermark doesn't leapfrog this AddSeq. The
 		// next replay (Update / Rebuild / boot) re-tries the whole
 		// remainder.
 		if o.gate != nil {
 			proceed, gateErr := o.gate(ctx, &decoded, item.raw)
 			if gateErr != nil {
-				fatalErr = fmt.Errorf("object: gate %s: %w", ch.Id, gateErr)
+				fatalErr = fmt.Errorf("object: gate %s: %w", item.changeId, gateErr)
 				return false
 			}
 			if !proceed {
@@ -1012,21 +1030,21 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		// A malformed change (crdt.ErrInvalidChange) can never apply:
 		// it is skipped, as a halt would freeze the object on every
 		// device the peer reaches. Any other apply error is
-		// infrastructure-level (any-store / disk) — abort the iter so
-		// maxAddSeq doesn't leapfrog the failed change. Per-op handler
-		// rejections (kind mismatch, etc.) are surfaced inside
+		// infrastructure-level (any-store / disk) — abort the replay
+		// so maxAddSeq doesn't leapfrog the failed change. Per-op
+		// handler rejections (kind mismatch, etc.) are surfaced inside
 		// ApplyResult.Rejections, NOT through err, and don't halt the
-		// iter.
+		// replay.
 		if _, applyErr := o.applyDecodedLocked(ctx, decoded); applyErr != nil {
 			if errors.Is(applyErr, crdt.ErrInvalidChange) {
 				log.Warn("skipping invalid inbound change",
 					zap.String("objectId", rootId),
-					zap.String("changeId", ch.Id),
+					zap.String("changeId", item.changeId),
 					zap.String("dataset", decoded.Dataset),
 					zap.Error(applyErr))
 				return true
 			}
-			fatalErr = fmt.Errorf("object: apply %s: %w", ch.Id, applyErr)
+			fatalErr = fmt.Errorf("object: apply %s: %w", item.changeId, applyErr)
 			return false
 		}
 		applied++
@@ -1036,7 +1054,20 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	o.replaying = true
 	iterErr := func() error {
 		defer func() { o.replaying = false }()
-		return tree.IterateAfterAddSeq(ctx, from, convert, iter)
+		for {
+			batch, size, full = batch[:0], 0, false
+			// Changes buffered before a cursor error are applied too.
+			err := tree.IterateAfterAddSeq(ctx, from, convert, collect)
+			for _, item := range batch {
+				if !apply(item) {
+					return err
+				}
+			}
+			if err != nil || !full {
+				return err
+			}
+			resume = batch[len(batch)-1].orderId
+		}
 	}()
 	// Applied changes are committed whatever ended the iteration, so
 	// the batch hook runs on the error paths too, on a context the
@@ -1059,13 +1090,21 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 // AfterApply hook, which runs under the same lock.
 func (o *Object) Replaying() bool { return o.replaying }
 
-// replayItem couples a decoded crdt.Change with the (cloned) decrypted
-// bytes that produced it. The bytes are needed by the schema gate's
-// Park path; the decoded Change is what applyDecodedLocked consumes.
+// replayItem is one stored change buffered by a replay pass: its
+// envelope and its decrypted payload, which the schema gate parks.
 type replayItem struct {
-	decoded crdt.Change
-	raw     []byte
+	changeId  string
+	orderId   string
+	addSeq    uint64
+	timestamp int64
+	raw       []byte
 }
+
+// A replay pass stops buffering at either bound.
+const (
+	replayBatchChanges = 4096
+	replayBatchBytes   = 4 << 20
+)
 
 // headsMoved reports whether the tree's heads differ from before: a
 // change reached the storage.

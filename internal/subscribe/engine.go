@@ -42,10 +42,11 @@ type SubConfig struct {
 	// snapshot, under the snapshot callback's contract (it runs under
 	// engine.mu and must only read materialised rows). The engine
 	// calls it at offset 0 when a windowed sub with matches past its
-	// edge loses a held row or holds a row it could not rank, and when
-	// any sub could not read a row of a change. nil disables refills:
-	// departures then count toward the drift budget, and an unreadable
-	// row closes the sub.
+	// edge loses a held row or holds a row it could not rank, when any
+	// sub could not read a row of a change, and from Resync. nil
+	// disables refills: departures then count toward the drift budget,
+	// an unreadable row closes the sub, and so does a Resync of the
+	// sub's object.
 	Refill RefillFn
 }
 
@@ -62,8 +63,8 @@ type RefillFn func(source any) (RefillRead, error)
 // ErrRefillDeferred is the error a RefillFn or a RefillRead.Lookup
 // wraps when storage is not final for the rows asked: an object is
 // rebuilding them from its tree. The engine counts nothing for such a
-// refill and re-reads the window when Resync tells it the rows are
-// back.
+// refill, keeps the window as it is, and re-reads it when Resync tells
+// it the rows are back.
 var ErrRefillDeferred = errors.New("subscribe: refill deferred: storage is not final")
 
 // RefillRead is one read a refill reconciles the held set from, in a
@@ -242,12 +243,17 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 // when a load has rebuilt the object's rows from its tree: the windows
 // saw the rebuild as applies whose refills were deferred (storage was
 // not final), and a row the rebuild dropped without a change may still
-// be held. source is the object instance, as Event.Source. A shared
-// window is re-read too when it owes a re-read (a lookup of this
-// object's row deferred it) or still holds the object's row, which the
-// rebuild wiped without notice. A window that cannot refill closes with
-// space.ErrSubscriptionDrifted: storage moved under it with no event it
-// could follow.
+// be held. source is the object instance, as Event.Source. A window on
+// the object that cannot refill closes with space.ErrSubscriptionDrifted:
+// storage moved under it with no event it could follow.
+//
+// A shared window that can refill is re-read too when its last refill
+// was deferred, by any object's rebuild, or when it still holds this
+// object's row, which the rebuild wiped without notice: a windowed one
+// in full (at most limit+1 rows, for at most limit+1 rebuilt objects),
+// an unbounded one by a lookup of that row alone, so a sweep that
+// rebuilds every object costs it one lookup per object. A shared
+// window that cannot refill is left to the replay's own events.
 func (e *Engine) Resync(objectId string, source any) {
 	if e.closed.Load() || e.counter.Load() == 0 {
 		return
@@ -262,8 +268,14 @@ func (e *Engine) Resync(objectId string, source any) {
 		}
 	}
 	for _, s := range e.scope.shared {
-		if !s.closed && (s.deferred || s.entries[objectId] != nil) {
-			s.resync(nil)
+		switch {
+		case s.closed || !s.canRefill():
+		case s.deferred || s.windowed():
+			if s.deferred || s.entries[objectId] != nil {
+				s.resync(nil)
+			}
+		case s.entries[objectId] != nil:
+			s.resettleRow(objectId, nil)
 		}
 	}
 }

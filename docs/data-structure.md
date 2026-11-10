@@ -570,8 +570,10 @@ an open question.
   load rebuilds the object's rows from the tree, storage is not
   final: re-reads are deferred at no cost, and once the rebuild ends
   every window on the object is re-read (or closed as drifted when it
-  cannot re-read, past an offset), as is every window across objects
-  that still holds the object's row or owes a re-read.
+  cannot re-read, past an offset, or when the re-read fails), as is
+  every window across objects that still holds the object's row or was
+  deferred: a windowed one in full, an unbounded one by a lookup of
+  that row alone.
 - **Overflow and drift** close the subscription: a full mailbox with
   `ErrSubscriptionOverflow`; `ErrSubscriptionDrifted` when the engine
   cannot keep the window equal to storage: a window past an offset

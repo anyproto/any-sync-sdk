@@ -27,7 +27,8 @@ type storeModel struct {
 	filter query.Filter
 	sort   query.Sort
 	limit  int
-	reads  int
+	reads  int // refills opened
+	scans  int // window reads
 	closed int
 	fail   error
 	buf    *syncpool.DocBuffer
@@ -103,6 +104,7 @@ func (m *storeModel) refill() RefillFn {
 		}
 		return RefillRead{
 			Rows: func(yield func(id string, doc *anyenc.Value)) error {
+				m.scans++
 				for _, r := range m.window() {
 					yield(r.id, r.d)
 				}

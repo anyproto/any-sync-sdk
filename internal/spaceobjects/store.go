@@ -304,13 +304,17 @@ type Store struct {
 	rowEvents *fanout.Registry[RowEvent]
 
 	// rebuilding holds the ids of objects whose rows a load is
-	// rebuilding from the tree (reindex.go), from the wipe to the end of
-	// the load: storage is not final in between, so a refill of a window
-	// on the object, or a lookup of its row by a window across objects,
-	// is deferred instead of taking a row not rebuilt yet for a deleted
-	// one. A load that fails leaves the rows as they are and no mark:
-	// storage then reads as it is, and the object's next load, which
-	// resumes the rebuild, marks it again before touching a row.
+	// rebuilding from the tree (reindex.go), from the wipe (or from the
+	// start of a load that resumes an interrupted rebuild) to the end
+	// of the load: storage is not final in between, so a refill of a
+	// window on the object, or a lookup of its row by a window across
+	// objects, is deferred instead of taking a row not rebuilt yet for
+	// a deleted one. A load that fails leaves the rows as they are and
+	// no mark: storage then reads as it is, which for a load that
+	// failed past the wipe means the object's row is absent until its
+	// next load puts it back (a window across objects reports it
+	// deleted, then added), and that load marks the object again before
+	// touching a row.
 	rebuilding sync.Map
 
 	// stampPending holds, per objectId, the object stamps landed during

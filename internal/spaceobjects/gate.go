@@ -164,9 +164,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			}
 			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
 			if obj != nil {
-				// A refill reads through the object the apply ran on:
-				// during a replay it is loading, and reachable no
-				// other way.
+				// A refill reads through the object the apply ran on.
 				ev.Source = obj
 			}
 			s.engine.OnApply(ev, postValue)
@@ -251,8 +249,7 @@ type pendingStamps struct {
 // catch-up of a large object cannot flood an objects subscription with
 // one event per change and overflow its mailbox.
 //
-// source is the object the apply ran on, carried on the event for a
-// refill to read through while the object loads.
+// source is the object the apply ran on, carried as Event.Source.
 func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller, replaying bool, source any, ch *crdt.Change, stamps []crdt.ObjectStamp) {
 	if len(stamps) == 0 || ctrl == nil {
 		return
@@ -319,8 +316,7 @@ func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, sour
 }
 
 // emitObjectStampWith is emitObjectStamp with the post-value lookup
-// supplied. The event carries source, the object the apply ran on, so
-// a per-object window's refill reads through it while the object loads.
+// supplied; source is carried as Event.Source.
 func (s *Store) emitObjectStampWith(_ context.Context, source any, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp, postValue subscribe.PostValueFn) {
 	synthetic := crdt.Change{
 		SpaceId:   spaceId,

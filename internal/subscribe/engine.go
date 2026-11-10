@@ -38,33 +38,20 @@ type SubConfig struct {
 	Offset      int          // rows the snapshot skipped; a window past offset 0 never starts complete
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
-	// Refill opens a re-read of the sub's rows: the same query as the
-	// snapshot, under the snapshot callback's contract (it runs under
-	// engine.mu and must only read materialised rows). The engine
-	// calls it at offset 0 when a windowed sub with matches past its
-	// edge loses a held row or holds a row it could not rank, when any
-	// sub could not read a row of a change, and from Resync. nil
-	// disables refills: departures then count toward the drift budget,
-	// an unreadable row closes the sub, and so does a Resync of the
-	// sub's object.
+	// Refill opens a re-read of the sub's rows under engine.mu (the
+	// snapshot's contract). nil disables refills: departures count
+	// toward the drift budget and an unreadable row closes the sub.
 	Refill RefillFn
 }
 
-// RefillFn opens one read of the sub's rows under the engine's fence.
-// source is Event.Source of the apply behind the refill, nil for a
-// notification: a per-object read goes through it when it is that
-// object's instance, which may still be loading. Behind Resync it is
-// the rebuilt object, or nil for a window elsewhere. The engine closes
-// the read once it has reconciled the held set. A RefillFn or a Lookup
-// that cannot answer because storage is not final returns an error
-// wrapping ErrRefillDeferred.
+// RefillFn opens one read of the sub's rows. source is Event.Source of
+// the apply behind the refill (nil for a notification; the rebuilt
+// object behind Resync). The engine closes the read. Storage not final:
+// return an error wrapping ErrRefillDeferred.
 type RefillFn func(source any) (RefillRead, error)
 
-// ErrRefillDeferred is the error a RefillFn or a RefillRead.Lookup
-// wraps when storage is not final for the rows asked: an object is
-// rebuilding them from its tree. The engine counts nothing for such a
-// refill, keeps the window as it is, and re-reads it when Resync tells
-// it the rows are back.
+// ErrRefillDeferred marks a read of rows an object is rebuilding: the
+// engine counts nothing and re-reads the window at Resync.
 var ErrRefillDeferred = errors.New("subscribe: refill deferred: storage is not final")
 
 // RefillRead is one read a refill reconciles the held set from, in a
@@ -72,10 +59,9 @@ var ErrRefillDeferred = errors.New("subscribe: refill deferred: storage is not f
 type RefillRead struct {
 	// Rows yields the sub's query in order, as the snapshot did.
 	Rows func(yield func(id string, doc *anyenc.Value)) error
-	// Lookup reads one row by id regardless of the query's filter,
-	// sort and window: nil when the row is absent, a tombstone or out
-	// of the sub's scope. It classifies a held row Rows no longer
-	// returned; a nil Lookup leaves such a row displaced.
+	// Lookup reads one row by id, ignoring the query: nil when absent, a
+	// tombstone or out of scope. A nil Lookup leaves a dropped row
+	// displaced.
 	Lookup func(id string) (*anyenc.Value, error)
 	// Close ends the read.
 	Close func()
@@ -238,24 +224,10 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 	clear(e.scratch)
 }
 
-// Resync re-reads every window on objectId from storage and ships the
-// difference as a resync event, with no VersionId. The store calls it
-// when a load has rebuilt the object's rows from its tree: the windows
-// saw the rebuild as applies whose refills were deferred (storage was
-// not final), and a row the rebuild dropped without a change may still
-// be held. source is the object instance, as Event.Source. A window on
-// the object that cannot refill closes with space.ErrSubscriptionDrifted:
-// storage moved under it with no event it could follow.
-//
-// A shared window is re-read too when its last refill was deferred, by
-// any object's rebuild, or when it still holds this object's row, which
-// the rebuild wiped without notice: a deferred one in full, as is a
-// windowed one at offset 0 holding the row (at most limit+1 rows, for
-// at most limit+1 rebuilt objects); an unbounded one holding the row by
-// a lookup of that row alone, so a sweep that rebuilds every object
-// costs it one lookup per object. A shared window that cannot re-read
-// its rows (past an offset) looks the row up as well, and closes when
-// the lookup no longer finds a matching row, or fails.
+// Resync re-reads the windows an object's rebuild may have left behind:
+// every window on objectId (one that cannot re-read closes), and every
+// shared window that was deferred or holds the object's row, the latter
+// by one lookup when the window is unbounded or past an offset.
 func (e *Engine) Resync(objectId string, source any) {
 	if e.closed.Load() || e.counter.Load() == 0 {
 		return
@@ -401,13 +373,10 @@ type Sub struct {
 // delivery or WaitOne for single events.
 func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 
-// Err returns the close reason — nil while live or after user Close,
-// space.ErrSubscriptionOverflow on mailbox overflow,
-// space.ErrSubscriptionDrifted on drift-budget exceeded, when a change
-// could not be evaluated against the window and no refill could settle
-// it, or when an object's rows were rebuilt under the window and it
-// could not be re-read (Resync), space.ErrObjectDeleted when the object
-// a per-object sub reads was purged (CloseObject).
+// Err returns the close reason: nil while live or after Close,
+// space.ErrSubscriptionOverflow, space.ErrSubscriptionDrifted (drift
+// budget spent, a row that could not be settled, a failed re-read), or
+// space.ErrObjectDeleted (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {
 		return v

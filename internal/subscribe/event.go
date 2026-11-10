@@ -45,10 +45,8 @@ type Event struct {
 	Dataset   string
 	VersionId crdt.VersionId
 	Records   []EventRecord
-	// Source is what the apply ran on, handed to a refill
-	// (SubConfig.Refill) as it is: the object instance, which may still
-	// be loading when its replay fired the apply and is then reachable
-	// no other way. nil for a notification.
+	// Source is the object the apply ran on, handed to a refill as is;
+	// nil for a notification.
 	Source any
 }
 
@@ -65,9 +63,8 @@ type EventRecord struct {
 	// empty in that case; the engine drops the entry from its held
 	// set.
 	Deleted bool
-	// Unreadable is true when the record's post value could not be
-	// read as the event was built. Ops is empty in that case; the
-	// engine settles the row from storage or closes the subscription.
+	// Unreadable: the post value could not be read when the event was
+	// built; Ops is empty.
 	Unreadable bool
 	// Ops is the projected $set / $unset operations on the post-apply
 	// record. Empty when Deleted is true. Surfaced verbatim to

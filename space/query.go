@@ -70,14 +70,12 @@ type Query interface {
 	// chained filter / sort / limit; offset applies to the initial
 	// snapshot only.
 	//
-	// A window at offset 0 refills from storage when rows leave it,
-	// so it stays equal to a fresh query of the same body; what a
-	// refill finds arrives in an event of its own, with no VersionId
-	// (see SubscriptionEvent). Sub closes with ErrSubscriptionOverflow
-	// when its mailbox fills, or ErrSubscriptionDrifted when the engine
-	// cannot keep the window equal to storage (see
-	// QueryOpts.DriftBudgetPercent). Both signal "resubscribe to
-	// recover".
+	// A window at offset 0 refills from storage when rows leave it, so
+	// it stays equal to a fresh query; a refill's rows arrive in an
+	// event of their own, with no VersionId. Sub closes with
+	// ErrSubscriptionOverflow when its mailbox fills, or
+	// ErrSubscriptionDrifted when the window cannot be kept equal to
+	// storage (see QueryOpts.DriftBudgetPercent); both mean resubscribe.
 	Subscribe(ctx context.Context, opts QueryOpts) (*QueryResult, error)
 }
 
@@ -98,20 +96,14 @@ type QueryOpts struct {
 	// MailboxCapacity bounds the per-subscription event queue. Default
 	// 256, minimum 16. On overflow the subscription closes; Wait
 	// returns mb.ErrClosed and Err() returns ErrSubscriptionOverflow.
-	// A change after which the window refilled from storage takes up
-	// to two slots: its own event and the refill's. Subscribe-only.
+	// A refill's event takes a slot of its own. Subscribe-only.
 	MailboxCapacity int
 
-	// DriftBudgetPercent: when this fraction of Limit records leave
-	// the held window without replacement, the subscription closes
-	// with ErrSubscriptionDrifted. Default 30. A window at offset 0
-	// refills from storage when rows leave it, so a departure counts
-	// only when the refill fails, and not when the window ended the
-	// change at capacity with every row ranked; a held row's sort move
-	// while the window holds a row it cannot rank counts, and that
-	// state counts once itself, until a refill ranks it. A window past
-	// an offset shifts with rows before it and counts every departure.
-	// Ignored when Limit == 0. Subscribe-only.
+	// DriftBudgetPercent: the subscription closes with
+	// ErrSubscriptionDrifted once this fraction of Limit rows is lost.
+	// Default 30. A window at offset 0 refills from storage, so losses
+	// accrue only while refills fail; a window past an offset counts
+	// every departure. Ignored when Limit == 0. Subscribe-only.
 	DriftBudgetPercent int
 }
 

@@ -29,32 +29,18 @@ type querySub struct {
 	minRef  *entry
 	maxRef  *entry
 
-	// Window state. complete: the window holds every match — its
-	// snapshot started at offset 0 and held at most limit rows, and no
-	// match has been left past the edge since. edge: while matches lie
-	// past the window, a key every match the window does not hold
-	// sorts at or past; taken from the sentinel when a departure takes
-	// the window below capacity, so an arrival below it is ranked.
-	// unranked: a held row holds its slot with a key the window cannot
-	// rank (the sentinel's own sort move grew its key, an arrival below
-	// capacity sorts at or past edge), so matches past the edge may
-	// sort below it and the next promotion could lift the wrong row
-	// into view; unrankedLoss: that state has been counted as a loss
-	// once. A refill (SubConfig.Refill) settles all of it from storage;
-	// a window that cannot refill counts departures as losses, and
-	// lost*100 at or above lostLimit closes the sub.
+	// Window state: complete, the window holds every match; edge, a key
+	// every match the window does not hold sorts at or past; unranked, a
+	// held row's rank against those matches is unknown; unrankedLoss,
+	// that state was counted once; lost*100 at lostLimit closes the sub.
 	complete     bool
 	edge         anyenc.Tuple
 	unranked     bool
 	unrankedLoss bool
 	lost         int
 	lostLimit    int
-	// deferred: the last refill found storage not final
-	// (ErrRefillDeferred). A windowed sub retries on every apply (at
-	// most limit+1 rows each); an unbounded one, whose retry would read
-	// the whole collection, waits for Engine.Resync. unread: rows of an
-	// unbounded sub whose value a change could not read and no refill
-	// has re-read; the next refill ships their stored value.
+	// deferred: the last refill found storage not final, pending Resync.
+	// unread: rows of an unbounded sub the next refill re-reads.
 	deferred bool
 	unread   map[string]struct{}
 
@@ -189,16 +175,9 @@ func (s *querySub) sentinel() *entry {
 	return s.maxRef
 }
 
-// subPending is the per-apply scratch: the ids this apply touched, in
-// first-touch order, each with whether it was visible when the apply
-// began and, once a refill started, whether it was visible after the
-// apply's records; what the records did to each; and why a refill
-// dropped each held row it dropped. The events are built from it once
-// the held set has settled: the change's own event ships each id's one
-// transition from its view before the apply to its view after the
-// records, however many records or sentinel moves touched it in
-// between, and the refill's event the transition from there to its
-// view now.
+// subPending is the per-apply scratch: the ids the apply touched in
+// first-touch order, each row's view before the apply and after the
+// records, what the records did to each, and why a refill dropped a row.
 type subPending struct {
 	source     any // Event.Source, handed to the refill
 	order      []string
@@ -218,9 +197,8 @@ type midState struct {
 	raw     []byte // the held encoding then (windowed sub)
 }
 
-// recOutcome is what this apply did to one id: its records' ops in
-// order and the verdict of the last record that settled one, plus what
-// a refill found. A record that could not be read settles no verdict.
+// recOutcome is what the apply did to one id: its records' ops, the
+// last settled verdict, and what a refill found.
 type recOutcome struct {
 	ops        []space.EventOp
 	doc        *anyenc.Value // the event's copy of the post doc (unbounded sub)
@@ -311,12 +289,9 @@ func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	s.checkDrift()
 }
 
-// resync re-reads the window from storage outside any apply, after
-// storage moved under it with no event it could follow, and ships the
-// difference as a resync event. A window that cannot re-read closes,
-// as does one whose read fails: neither can be kept equal to storage.
-// A read deferred because storage is not final again changes nothing;
-// the next Resync re-reads the window.
+// resync re-reads the window outside any apply and ships the difference
+// as a resync event. A window that cannot re-read, or whose read fails,
+// closes; a deferred read waits for the next Resync.
 func (s *querySub) resync(source any) {
 	if !s.canRefill() {
 		s.closeWith(space.ErrSubscriptionDrifted)
@@ -336,17 +311,10 @@ func (s *querySub) resync(source any) {
 	}
 }
 
-// resettleRow re-reads one row a shared sub holds, after the row's
-// object was rebuilt from its tree: the rebuild wiped the row without
-// notice, and the replay put back what the object still writes. One
-// lookup, not a read of the whole collection. Present and matching, the
-// row was re-added by the replay's own events and nothing ships. Gone
-// from storage, or stored but failing the filter, it leaves an
-// unbounded sub with storage's reason; a sub that cannot re-read its
-// window (past an offset) closes instead, as it does when the lookup
-// fails: neither can be kept equal to storage. A read deferred again
-// waits for the next Resync; a read with no lookup falls back to the
-// whole window.
+// resettleRow re-reads one held row by lookup after its object's
+// rebuild. Present and matching: nothing. Gone or filtered out: an
+// unbounded sub drops it with storage's reason, a sub that cannot
+// re-read its window closes. No lookup: the whole window.
 func (s *querySub) resettleRow(id string, source any) {
 	if s.cfg.Refill == nil {
 		s.closeWith(space.ErrSubscriptionDrifted)
@@ -393,11 +361,8 @@ func (s *querySub) resettleRow(id string, source any) {
 	s.deliver(resync)
 }
 
-// readFailed settles a re-read that could not run outside any apply:
-// deferred because storage is not final, the window waits for the next
-// Resync (a window that cannot refill carries no such state: its
-// refills never run); failed for any other reason, it closes, since it
-// can no longer be kept equal to storage.
+// readFailed settles a re-read that could not run: deferred, the window
+// waits for the next Resync; failed otherwise, it closes.
 func (s *querySub) readFailed(err error) {
 	if errors.Is(err, ErrRefillDeferred) {
 		if s.canRefill() {
@@ -561,12 +526,9 @@ func (s *querySub) ranks() bool {
 	return s.windowed() && s.canRefill() && !s.complete
 }
 
-// emit builds the apply's events from the touched ids. The change's
-// own event ships, under its VersionId, each id's one transition from
-// its view before the apply to its view after the apply's records. The
-// refill's event, with no VersionId and no ops, ships each id's
-// transition from there to its view now: what storage held that the
-// change did not say.
+// emit builds the change's own event (each id's transition from before
+// the apply to after its records, with ops) and the refill's resync
+// event (from there to now, no VersionId, no ops).
 func (s *querySub) emit(versionId crdt.VersionId, p *subPending) (own, resync space.SubscriptionEvent) {
 	own.VersionId = versionId
 	sent := s.sentinel()
@@ -619,10 +581,8 @@ func (s *querySub) emit(versionId crdt.VersionId, p *subPending) (own, resync sp
 	return own, resync
 }
 
-// ownRecord builds the change's record for a row: its doc after the
-// apply's records (the held encoding then, parsed; the event's copy
-// for an unbounded sub), with the ops of the apply's records on it
-// when every one of them could be read.
+// ownRecord is the change's record for a row: its doc after the records,
+// with the records' ops when every one of them could be read.
 func (s *querySub) ownRecord(id string, raw []byte, out *recOutcome) space.SubRecord {
 	rec := space.SubRecord{Id: id}
 	if s.windowed() {
@@ -669,24 +629,13 @@ func recordReason(id string, out *recOutcome, p *subPending) space.RemoveReason 
 	return space.RemoveDisplaced
 }
 
-// settle restores the window's invariant after the records of one
-// apply. A windowed sub at offset 0 holds either every match or
-// limit+1 ranked rows; a departure from a window with matches past
-// its edge, an unranked row, and a row the apply could not read all
-// break it. A refill re-reads the window from storage and records the
-// difference in p. A window that ends the apply at capacity and
-// ranked needs no refill: every departure in it was replaced. A
-// refill deferred because storage is not final counts nothing: a
-// windowed sub retries it on every apply, and Engine.Resync re-reads
-// the window when the rows are back. When the refill fails, every
-// departure of the apply counts as a loss unless the window ends the
-// apply at capacity with every row ranked (then each was replaced by
-// the right row); a held row's key growth while the window holds a row
-// it cannot rank counts, since the row may have moved past a match the
-// window does not hold; the unranked state itself counts once. The
-// next apply tries the refill again at no further cost. An unreadable
-// row with no refill closes the sub, whose window can no longer be
-// trusted to match storage. Reports whether the sub is still open.
+// settle restores the window's invariant after one apply's records with
+// a refill where the window is short, unranked, deferred or holds a row
+// the apply could not read. A refill deferred by a rebuild counts
+// nothing. Otherwise a failed refill counts every departure unless the
+// window ends at capacity and ranked, a key growth while unranked, and
+// the unranked state once; an unreadable row with no refill closes the
+// sub. Reports whether the sub is still open.
 func (s *querySub) settle(p *subPending) bool {
 	unreadable := p.unreadable > 0
 	if !unreadable && !s.needsRefill() && !(s.deferred && s.windowed()) {
@@ -745,8 +694,7 @@ func (s *querySub) needsRefill() bool {
 	return s.ranks() && (s.unranked || len(s.entries) <= s.cfg.Limit)
 }
 
-// refilled records that a refill reconciled the held set: the window
-// owes nothing, and every row it could not read has been re-read.
+// refilled clears what a successful refill settles.
 func (s *querySub) refilled() {
 	s.deferred = false
 	s.unread = nil
@@ -769,18 +717,11 @@ type freshRow struct {
 	doc   *anyenc.Value // unbounded: a copy for a row the event ships
 }
 
-// refillWindow re-reads the sub's rows from storage and reconciles the
-// held set with them: rows storage returns enter, held rows it no
-// longer returns leave, and a held row whose stored value differs is
-// updated. Every row that moved is touched in p with its view before,
-// so emit ships the difference. A held row the read no longer returns
-// is classified by a lookup in the same read, before anything changes:
-// absent or a tombstone, it was deleted; stored but failing the
-// filter, it stopped matching; a match the read did not reach sorts
-// past the window. For a windowed sub a read whose rows fit within
-// limit leaves the window complete; an unbounded sub holds no values,
-// so only its membership is reconciled, plus the value of each row
-// whose record could not be read.
+// refillWindow reconciles the held set with a fresh read: rows the read
+// returns enter or update, held rows it no longer returns leave with
+// the reason a lookup gives (deleted, filtered out, else displaced),
+// each touched in p so emit ships the difference. A failed read
+// changes nothing.
 func (s *querySub) refillWindow(p *subPending) error {
 	read, err := s.cfg.Refill(p.source)
 	if err != nil {
@@ -818,13 +759,9 @@ func (s *querySub) refillWindow(p *subPending) error {
 	for _, fr := range rows {
 		fresh[fr.id] = struct{}{}
 	}
-	// Rows the read did not return are classified from storage before
-	// the held set changes: every held row, and every row the records
-	// took out of view without a verdict on it (an unreadable record,
-	// another row's arrival), whose reason would otherwise be the
-	// engine's guess. The reasons reach p only once every lookup
-	// succeeded: a read that fails changes nothing, its reasons
-	// included.
+	// Look up every held row the read did not return, and every row the
+	// records took out of view without a verdict, before anything
+	// changes; the reasons reach p only once every lookup succeeded.
 	var gone map[string]space.RemoveReason
 	lookup := func(id string) error {
 		doc, err := read.Lookup(id)

@@ -96,12 +96,8 @@ func rowIs(id string) query.Filter {
 }
 
 // refillTarget is what one refill reads: the collection, the window's
-// filter, and the filter of every row stored in the window's scope
-// (this object's rows of a shared collection, tombstones skipped),
-// which a lookup by id applies. final reports whether storage's word
-// on a row is final; a lookup holds off on a row it is not (its object
-// is rebuilding its rows), where an absent row may be one not rebuilt
-// yet.
+// filter, the filter of every row stored in the window's scope (for a
+// lookup by id), and final, false for a row whose object is rebuilding.
 type refillTarget struct {
 	coll   anystore.Collection
 	filter query.Filter
@@ -109,18 +105,15 @@ type refillTarget struct {
 	final  func(id string) bool
 }
 
-// refillSource resolves a refill's target. source is the Event.Source
-// of the apply behind the refill.
+// refillSource resolves a refill's target from the apply's Event.Source.
 type refillSource func(source any) (refillTarget, error)
 
-// errRefillRebuilding is a refill, or a lookup, of rows an object is
-// rebuilding from its tree: storage is not final until a load finishes
-// the rebuild, and the engine re-reads the window then.
+// errRefillRebuilding defers a refill or lookup of rows an object is
+// rebuilding.
 var errRefillRebuilding = fmt.Errorf("%w: the object is rebuilding its rows", subscribe.ErrRefillDeferred)
 
-// sharedSource resolves a refill across objects: the shared collection,
-// with lookups held off for an object mid-rebuild, whose row the wipe
-// removed without notice and the replay puts back.
+// sharedSource reads the shared collection; a lookup of a rebuilding
+// object's row is deferred.
 func sharedSource(store *spaceobjects.Store, coll anystore.Collection, filter query.Filter) refillSource {
 	return func(any) (refillTarget, error) {
 		return refillTarget{
@@ -132,20 +125,10 @@ func sharedSource(store *spaceobjects.Store, coll anystore.Collection, filter qu
 	}
 }
 
-// objectSource resolves a per-object refill through the object the
-// apply ran on when source is that object, else through the loaded
-// instance, without loading or waiting: the event behind a refill came
-// from an apply on the object, so the object is loaded or is the one
-// loading (a replay fired the apply, and the instance under
-// construction is reachable only through the event). No instance is
-// kept across refills: the object may not have been local at
-// Subscribe, and holding it would keep an evicted object's tree
-// reachable for the subscription's life. With no instance, or one
-// from before the dataset was known, the refill fails: the engine
-// counts the loss and tries again on the next apply.
-// While the object rebuilds its rows, the refill is deferred instead:
-// it counts nothing, and the engine re-reads the window when the
-// rebuild ends.
+// objectSource reads a per-object window through the object the apply
+// ran on (source) or the loaded instance, without loading, waiting or
+// keeping either. No instance, or one without the dataset: the refill
+// fails. A rebuilding object: the refill is deferred.
 func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, dataset string, filter query.Filter) refillSource {
 	return func(source any) (refillTarget, error) {
 		if store.Rebuilding(objectId) {
@@ -175,8 +158,8 @@ func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, data
 	}
 }
 
-// newRefill returns a window's refill: one read transaction per call,
-// closed by the engine, over the body captured here.
+// newRefill returns a window's refill: one read transaction per call
+// over the body captured here.
 func newRefill(ctx context.Context, source refillSource, sort query.Sort, limit, offset uint) subscribe.RefillFn {
 	return func(src any) (subscribe.RefillRead, error) {
 		t, err := source(src)
@@ -210,19 +193,14 @@ func newRefill(ctx context.Context, source refillSource, sort query.Sort, limit,
 	}
 }
 
-// ObjectRefill returns the refill of an unbounded, unfiltered
-// subscription to one object's dataset (subscribe.SubConfig.Refill):
-// what a watcher that follows a dataset through engine events alone
-// supplies, so a row it cannot read is settled from storage instead of
-// closing it.
+// ObjectRefill is the refill of an unbounded, unfiltered subscription
+// to one object's dataset, for watchers that read engine events alone.
 func ObjectRefill(store *spaceobjects.Store, objectId, dataset string) subscribe.RefillFn {
 	ctx := context.Background()
 	return newRefill(ctx, objectSource(ctx, store, objectId, dataset, nil), nil, 0, 0)
 }
 
-// lookupStored reads one row of coll by id as the scope stores it:
-// nil when the row is absent or stored fails on it (a tombstone, or a
-// row of another object in a shared collection).
+// lookupStored reads one row by id: nil when absent or outside stored.
 func lookupStored(ctx context.Context, coll anystore.Collection, stored query.Filter, id string) (*anyenc.Value, error) {
 	it, err := coll.Find(query.And{rowIs(id), stored}).Limit(1).Iter(ctx)
 	if err != nil {
@@ -240,10 +218,7 @@ func lookupStored(ctx context.Context, coll anystore.Collection, stored query.Fi
 	return v, it.Err()
 }
 
-// errRefillNoObject is a refill with no object instance to read the
-// rows through: the object is not local, is loading behind an event
-// that did not come from it, or the instance at hand predates the
-// dataset.
+// errRefillNoObject: no object instance to read the rows through.
 var errRefillNoObject = errors.New("query: refill: no loaded object to read through")
 
 // newDatasetQuery builds a queryImpl over the per-space collection of a
@@ -592,11 +567,8 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	}()
 
 	// A refill is the snapshot's read again, in a read transaction of
-	// its own that closes with it, under the same fence and the same
-	// contract. It runs for as long as the subscription lives, after
-	// the subscribe call's context may have ended, and reads the query
-	// as it was at Subscribe: the builder is single-shot, and a call
-	// chained on it later must not reach a live subscription.
+	// its own, with the builder's state as it is now: a call chained on
+	// later must not reach the live window.
 	refillCtx := context.WithoutCancel(ctx)
 	var source refillSource
 	if scope.Shared || scope.AllObjects {

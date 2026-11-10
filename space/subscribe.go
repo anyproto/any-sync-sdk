@@ -113,20 +113,11 @@ type RemovedRecord struct {
 // locally-scoped: each peer assigns its own; don't compare across
 // peers.
 //
-// A change's own event also carries the rows the change moved into or
-// out of view, such as the row promoted into the window when the
-// change deleted one above it: apply every event. Within an own
-// write's event, the records that carry Ops are the write's own; a
-// record without Ops is a row the write moved, or one of its own whose
-// row the engine could not read, and its Doc is the state to take.
-//
-// An event with an empty VersionId is not a change's own and is never
-// skipped: the engine re-read the window from storage (to refill rows
-// that left it, after a change whose row it could not read, or after
-// the object's rows were rebuilt from its tree) and ships what storage
-// held that no change said, or an object was deleted without a CRDT
-// apply. Its records carry Doc and no Ops. A re-read behind a change
-// follows the change's own event.
+// An own write's event also carries the rows the change moved into or
+// out of view, so apply every event; its records with Ops are the
+// write's own. An event with an empty VersionId is a re-read of the
+// window from storage, or an object deletion: its records carry Doc
+// and no Ops, and it is never an own write.
 //
 // Total is intentionally absent — the live counter is not maintained.
 // Callers who need a refreshed count call Snapshot.
@@ -157,19 +148,11 @@ type SubRecord struct {
 // client should resubscribe to recover.
 var ErrSubscriptionOverflow = errors.New("space: subscription overflowed; resubscribe required")
 
-// ErrSubscriptionDrifted is returned by QuerySubscription.Err when
-// the engine could not keep the window equal to storage: a window
-// past an offset lost QueryOpts.DriftBudgetPercent of its rows, or its
-// object's rows were rebuilt from the tree under it (a window across
-// objects past an offset: when the rebuild dropped a row it held); a
-// window at offset 0 lost that many while its re-read of storage
-// failed (a row that left counts unless the window ended the change at
-// capacity with every row ranked, a held row's sort move while the
-// window holds a row it cannot rank counts, the unranked state once
-// until a re-read ranks it, a re-read that fails again nothing); a
-// change's row could not be read and no re-read could settle it; or
-// the re-read after a rebuild failed. The client is expected to
-// resubscribe.
+// ErrSubscriptionDrifted is returned by QuerySubscription.Err when the
+// engine could not keep the window equal to storage: the drift budget
+// (QueryOpts.DriftBudgetPercent) is spent, a change's row could not be
+// read and no re-read could settle it, or the window could not be
+// re-read after its object's rebuild. Resubscribe to recover.
 var ErrSubscriptionDrifted = errors.New("space: subscription drifted (the window could not be kept equal to storage); resubscribe required")
 
 // ErrSubscribeUnsupported is returned by Query.Subscribe for query

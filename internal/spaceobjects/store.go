@@ -304,13 +304,13 @@ type Store struct {
 	rowEvents *fanout.Registry[RowEvent]
 
 	// rebuilding holds the ids of objects whose rows a load is
-	// rebuilding from the tree (reindex.go), or whose rebuild a failed
-	// load left unfinished: storage is not final until a load finishes
-	// the rebuild, so a refill of a window on the object, or a lookup of
-	// its row by a window across objects, is deferred instead of taking
-	// a row not rebuilt yet for a deleted one. In memory only: after a
-	// restart an unfinished rebuild (ReindexPending on the meta row) is
-	// marked again by the object's next load, before it touches a row.
+	// rebuilding from the tree (reindex.go), from the wipe to the end of
+	// the load: storage is not final in between, so a refill of a window
+	// on the object, or a lookup of its row by a window across objects,
+	// is deferred instead of taking a row not rebuilt yet for a deleted
+	// one. A load that fails leaves the rows as they are and no mark:
+	// storage then reads as it is, and the object's next load, which
+	// resumes the rebuild, marks it again before touching a row.
 	rebuilding sync.Map
 
 	// stampPending holds, per objectId, the object stamps landed during
@@ -2594,10 +2594,9 @@ func (s *Store) PeekLoaded(objectId string) *object.Object {
 	return v.(*object.Object)
 }
 
-// Rebuilding reports whether objectId's rows are being rebuilt from the
-// tree, by the load in progress or by one that failed partway since the
-// store opened: its collections were wiped and no replay has finished
-// putting the rows back, so a read of them is not storage's final word.
+// Rebuilding reports whether a load in progress is rebuilding
+// objectId's rows from the tree: its collections are being wiped and
+// replayed, so a read of them is not storage's final word.
 func (s *Store) Rebuilding(objectId string) bool {
 	_, ok := s.rebuilding.Load(objectId)
 	return ok
@@ -2877,8 +2876,9 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	rebuilding := len(stale) > 0 || resume
 	if resume {
 		// The rows a failed load left half-rebuilt are not final until
-		// this load, or a later one, finishes the rebuild.
+		// this load finishes the rebuild.
 		s.rebuilding.Store(objectId, struct{}{})
+		defer s.rebuilding.Delete(objectId)
 	}
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
@@ -2936,10 +2936,10 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	var reindexLeaves []localLeaf
 	if len(stale) > 0 {
 		// The wipe starts here: the rows are not final until the rebuild
-		// finishes below, or a later load finishes it when this one
-		// fails. Marked no earlier, so a load that fails before touching
-		// a row leaves the rows final and unmarked.
+		// finishes below. Marked no earlier, so a load that fails before
+		// reaching the wipe never marks rows it left final.
 		s.rebuilding.Store(objectId, struct{}{})
+		defer s.rebuilding.Delete(objectId)
 		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale); err != nil {
 			return nil, err
 		}
@@ -2977,8 +2977,9 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
 		s.rebuilding.Delete(objectId)
 		if s.engine != nil {
-			// The windows on the object saw the rebuild as applies they
-			// could not refill through: re-read them now that the rows
+			// The windows on the object deferred their refills through
+			// the rebuild, and a window across objects may still hold
+			// the row the wipe removed: re-read them now that the rows
 			// are back.
 			s.engine.Resync(objectId, obj)
 		}

@@ -49,9 +49,14 @@ type querySub struct {
 	unrankedLoss bool
 	lost         int
 	lostLimit    int
-	// deferred: the last refill found storage not final
-	// (ErrRefillDeferred); Engine.Resync re-reads the window when it is.
+	// deferred: the window owes a re-read: its last refill found
+	// storage not final (ErrRefillDeferred), or a resync's read failed.
+	// Every later apply retries it, and Engine.Resync re-reads it when
+	// the rows are back. unread: rows of an unbounded sub whose value a
+	// change could not read and no refill has re-read; the next refill
+	// ships their stored value.
 	deferred bool
+	unread   map[string]struct{}
 
 	docBuf *syncpool.DocBuffer
 
@@ -309,7 +314,8 @@ func (s *querySub) apply(ev Event, postValue PostValueFn) {
 // storage moved under it with no event it could follow, and ships the
 // difference as a resync event. A window that cannot re-read closes:
 // it can no longer be kept equal to storage. A read that fails changes
-// nothing: no row departed, so nothing is counted.
+// nothing and counts nothing (no row departed); the window keeps owing
+// the re-read, which the next apply in scope retries.
 func (s *querySub) resync(source any) {
 	if !s.canRefill() {
 		s.closeWith(space.ErrSubscriptionDrifted)
@@ -317,11 +323,11 @@ func (s *querySub) resync(source any) {
 	}
 	p := newPending(source)
 	p.beginRefill(s)
-	if err := s.refillWindow(&p); err != nil {
-		s.deferred = errors.Is(err, ErrRefillDeferred)
+	if s.refillWindow(&p) != nil {
+		s.deferred = true
 		return
 	}
-	s.deferred = false
+	s.refilled()
 	p.refilled = true
 	_, resync := s.emit("", &p)
 	if s.deliver(resync) {
@@ -588,20 +594,21 @@ func recordReason(id string, out *recOutcome, p *subPending) space.RemoveReason 
 // settle restores the window's invariant after the records of one
 // apply. A windowed sub at offset 0 holds either every match or
 // limit+1 ranked rows; a departure from a window with matches past
-// its edge, an unranked row, and a row the apply could not read all
-// break it. A refill re-reads the window from storage and records the
-// difference in p. A window that ends the apply at capacity and
-// ranked needs no refill: every departure in it was replaced. A
-// refill deferred because storage is not final counts nothing: the
-// engine is told to re-read the window when it is. A departure the
-// window cannot refill counts as a loss, and an unranked row it cannot
-// rank counts once; the next apply tries the refill again at no
-// further cost. An unreadable row with no refill closes the sub, whose
-// window can no longer be trusted to match storage. Reports whether
-// the sub is still open.
+// its edge, an unranked row, a row the apply could not read, and a
+// re-read the window owes all break it. A refill re-reads the window
+// from storage and records the difference in p. A window that ends
+// the apply at capacity and ranked, owing nothing, needs no refill:
+// every departure in it was replaced. A refill deferred because
+// storage is not final counts nothing: the window owes the re-read,
+// which every later apply retries and Engine.Resync runs when the rows
+// are back. A departure the window cannot refill counts as a loss, and
+// an unranked row it cannot rank counts once; the next apply tries the
+// refill again at no further cost. An unreadable row with no refill
+// closes the sub, whose window can no longer be trusted to match
+// storage. Reports whether the sub is still open.
 func (s *querySub) settle(p *subPending) bool {
 	unreadable := p.unreadable > 0
-	if !unreadable && !s.needsRefill() {
+	if !unreadable && !s.deferred && !s.needsRefill() {
 		if !s.ranks() {
 			// No refill behind the window: every departure is a loss.
 			s.lost += p.departed
@@ -612,12 +619,24 @@ func (s *querySub) settle(p *subPending) bool {
 		p.beginRefill(s)
 		err := s.refillWindow(p)
 		if err == nil {
-			s.deferred = false
+			s.refilled()
 			p.refilled = true
 			return true
 		}
 		if errors.Is(err, ErrRefillDeferred) {
 			s.deferred = true
+			if !s.windowed() {
+				// The stored value of a row no record could read is
+				// shipped by the re-read, whenever it runs.
+				for id, out := range p.recs {
+					if out.unreadable {
+						if s.unread == nil {
+							s.unread = map[string]struct{}{}
+						}
+						s.unread[id] = struct{}{}
+					}
+				}
+			}
 			return true
 		}
 	}
@@ -638,6 +657,13 @@ func (s *querySub) settle(p *subPending) bool {
 // holds an unranked row. Only a window that can refill tracks either.
 func (s *querySub) needsRefill() bool {
 	return s.ranks() && (s.unranked || len(s.entries) <= s.cfg.Limit)
+}
+
+// refilled records that a refill reconciled the held set: the window
+// owes nothing, and every row it could not read has been re-read.
+func (s *querySub) refilled() {
+	s.deferred = false
+	s.unread = nil
 }
 
 // canRefill reports whether the sub can be re-read: a refill was
@@ -684,7 +710,8 @@ func (s *querySub) refillWindow(p *subPending) error {
 		fr := freshRow{id: id, held: e != nil}
 		switch {
 		case !s.windowed():
-			if out := p.recs[id]; e == nil || (out != nil && out.unreadable) {
+			_, unread := s.unread[id]
+			if out := p.recs[id]; e == nil || unread || (out != nil && out.unreadable) {
 				fr.doc = anyencx.Clone(doc)
 			}
 		case e == nil:
@@ -771,6 +798,9 @@ func (s *querySub) refillWindow(p *subPending) error {
 			s.updateEntry(e, fr.tuple, fr.raw)
 			p.rec(fr.id).changed = true
 		case fr.doc != nil:
+			// An unbounded sub: held is visible, and the stored value
+			// of a row no record could read ships.
+			p.touch(fr.id, true)
 			out := p.rec(fr.id)
 			out.doc, out.changed = fr.doc, true
 		}

@@ -242,11 +242,12 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 // when a load has rebuilt the object's rows from its tree: the windows
 // saw the rebuild as applies whose refills were deferred (storage was
 // not final), and a row the rebuild dropped without a change may still
-// be held. source is the object instance, as Event.Source. A window
-// elsewhere whose last refill was deferred (a lookup of this object's
-// row in a shared collection) is re-read too. A window that cannot
-// refill closes with space.ErrSubscriptionDrifted: storage moved under
-// it with no event it could follow.
+// be held. source is the object instance, as Event.Source. A shared
+// window is re-read too when it owes a re-read (a lookup of this
+// object's row deferred it) or still holds the object's row, which the
+// rebuild wiped without notice. A window that cannot refill closes with
+// space.ErrSubscriptionDrifted: storage moved under it with no event it
+// could follow.
 func (e *Engine) Resync(objectId string, source any) {
 	if e.closed.Load() || e.counter.Load() == 0 {
 		return
@@ -261,15 +262,8 @@ func (e *Engine) Resync(objectId string, source any) {
 		}
 	}
 	for _, s := range e.scope.shared {
-		if !s.closed && s.deferred {
+		if !s.closed && (s.deferred || s.entries[objectId] != nil) {
 			s.resync(nil)
-		}
-	}
-	for _, perDs := range e.scope.perDataset {
-		for _, s := range perDs {
-			if !s.closed && s.deferred {
-				s.resync(nil)
-			}
 		}
 	}
 }
@@ -395,9 +389,10 @@ func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 
 // Err returns the close reason — nil while live or after user Close,
 // space.ErrSubscriptionOverflow on mailbox overflow,
-// space.ErrSubscriptionDrifted on drift-budget exceeded or when a
-// change could not be evaluated against the window and no refill
-// could settle it, space.ErrObjectDeleted when the object a
+// space.ErrSubscriptionDrifted on drift-budget exceeded, when a change
+// could not be evaluated against the window and no refill could settle
+// it, or when the object's rows were rebuilt under a window that
+// cannot refill (Resync), space.ErrObjectDeleted when the object a
 // per-object sub reads was purged (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {

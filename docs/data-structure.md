@@ -569,8 +569,9 @@ an open question.
   so a replay that fires while the object loads refills too. While a
   load rebuilds the object's rows from the tree, storage is not
   final: re-reads are deferred at no cost, and once the rebuild ends
-  every window on the object is re-read, or closed as drifted when it
-  cannot re-read (past an offset).
+  every window on the object is re-read (or closed as drifted when it
+  cannot re-read, past an offset), as is every window across objects
+  that still holds the object's row or owes a re-read.
 - **Overflow and drift** close the subscription: a full mailbox with
   `ErrSubscriptionOverflow`; `ErrSubscriptionDrifted` when the engine
   cannot keep the window equal to storage: a window past an offset

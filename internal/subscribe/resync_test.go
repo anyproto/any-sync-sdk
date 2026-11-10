@@ -351,9 +351,9 @@ func TestRefill_DeferredCountsNothingUntilResync(t *testing.T) {
 	assert.Equal(t, src, m.sources[len(m.sources)-1])
 }
 
-// Resync re-reads a window elsewhere whose last refill was deferred (a
-// shared window that could not classify the rebuilding object's row)
-// and leaves other shared windows alone.
+// Resync re-reads a shared window whose last refill was deferred by a
+// lookup of the rebuilding object's row, as production defers it, and
+// leaves a shared window that owes nothing alone.
 func TestEngine_ResyncReReadsDeferredSharedWindow(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
@@ -364,9 +364,15 @@ func TestEngine_ResyncReReadsDeferredSharedWindow(t *testing.T) {
 	otherSub, err := eng.Subscribe(SubConfig{Scope: Scope{Shared: true}, Sort: otherM.sort, Limit: 2, MailboxCap: minMailboxCap, Refill: otherM.refill()}, snapshotFromRows(otherM.window()))
 	require.NoError(t, err)
 
-	// Two departures leave both windows one visible row short; the
-	// deferred one could not refill, the other did.
-	deferredM.fail = fmt.Errorf("%w: rebuilding", ErrRefillDeferred)
+	// x rebuilds: its row is wiped without an event. r0 and r1 leave
+	// both windows; the first one's refills no longer read x and defer
+	// on its lookup, the other one, which never held x, refills.
+	deferredM.set(makeRow(newArena(), "x", -1, nil))
+	eng.OnApply(Event{SpaceId: "test", ObjectId: "x", Dataset: "objects", VersionId: "vx", Records: []EventRecord{{Id: "x"}}},
+		func(int) (*anyenc.Value, error) { return deferredM.rows["x"], nil })
+	drain(t, deferredSub)
+	deferredM.delete("x")
+	deferredM.lookupFail = map[string]error{"x": fmt.Errorf("%w: rebuilding", ErrRefillDeferred)}
 	for _, id := range []string{"r0", "r1"} {
 		deferredM.delete(id)
 		otherM.delete(id)
@@ -376,16 +382,112 @@ func TestEngine_ResyncReReadsDeferredSharedWindow(t *testing.T) {
 	drain(t, otherSub)
 	require.True(t, deferredSub.deferred)
 	require.False(t, otherSub.deferred)
+	require.Equal(t, 0, deferredSub.lost, "a deferred refill costs nothing")
 	otherReads := otherM.reads
 
-	deferredM.fail = nil
-	eng.Resync("some-object", nil)
+	// x's rebuild ends with its row back.
+	deferredM.lookupFail = nil
+	deferredM.set(makeRow(newArena(), "x", -1, nil))
+	eng.Resync("x", nil)
 	evs := deferredSub.Events().GetAll()
 	require.Len(t, evs, 1)
-	assert.Equal(t, []string{"r3"}, idsOf(evs[0].Added), "the row past the edge the deferred refill owed")
+	assert.Equal(t, []string{"r2"}, idsOf(evs[0].Added), "the row the deferred refills owed")
 	assert.False(t, deferredSub.deferred)
-	assert.Equal(t, otherReads, otherM.reads, "a window not deferred is not re-read")
+	assert.Equal(t, otherReads, otherM.reads, "a window owing nothing is not re-read")
 	assert.Empty(t, otherSub.Events().GetAll())
+}
+
+// Resync re-reads a shared window that still holds the rebuilt
+// object's row, which the rebuild may have dropped without a change.
+func TestEngine_ResyncReReadsSharedWindowHoldingTheRow(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	m := newStoreModel(t, nil, 2, driftRows(5)...)
+	sub, view := subscribeModel(t, eng, m, 30)
+	sub.cfg.Scope = Scope{Shared: true}
+	holder, err := eng.Subscribe(SubConfig{Scope: Scope{Shared: true}, Sort: m.sort, Limit: 2, MailboxCap: minMailboxCap, Refill: m.refill()}, snapshotFromRows(m.window()))
+	require.NoError(t, err)
+	_ = sub
+	_ = view
+
+	// r0's rebuild dropped its row; nothing told the window.
+	m.delete("r0")
+	eng.Resync("r0", nil)
+	evs := holder.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, evs[0].Removed)
+	assert.Equal(t, []string{"r2"}, idsOf(evs[0].Added))
+
+	// A window that never held r0 is not read.
+	reads := m.reads
+	eng.Resync("r0", nil)
+	assert.Equal(t, reads, m.reads)
+}
+
+// An unbounded window remembers the rows no record could read while
+// its refill was deferred, and ships their stored value when a re-read
+// runs.
+func TestRefill_UnboundedDeferredUnreadableShipsOnResync(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 0, driftRows(3)...)
+	sub, err := eng.Subscribe(SubConfig{Scope: driftScope, MailboxCap: minMailboxCap, Refill: m.refill()}, snapshotFromRows(m.matching()))
+	require.NoError(t, err)
+	view := &clientView{docs: map[string]*anyenc.Value{}}
+	for id, d := range m.rows {
+		view.docs[id] = d
+	}
+
+	m.fail = fmt.Errorf("%w: rebuilding", ErrRefillDeferred)
+	edited := makeRow(arena, "r1", 1, map[string]any{"edited": true})
+	m.set(edited)
+	fireUnreadable(eng, "obj1", "chat", "r1")
+	view.fold(t, sub)
+	require.True(t, sub.deferred)
+	require.NoError(t, sub.Err())
+
+	m.fail = nil
+	eng.Resync("obj1", nil)
+	evs := sub.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, []string{"r1"}, idsOf(evs[0].Updated))
+	view.apply(evs)
+	agrees(t, sub, view, m)
+	assert.Nil(t, sub.unread)
+}
+
+// A re-read that fails for another reason keeps the window owing it:
+// the next apply in scope retries, whether or not the window would
+// otherwise need a refill.
+func TestRefill_FailedResyncKeepsTheObligation(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2, driftRows(5)...)
+	sub, view := subscribeModel(t, eng, m, 30)
+
+	// At capacity and ranked, with an unreadable edit deferred.
+	m.fail = fmt.Errorf("%w: rebuilding", ErrRefillDeferred)
+	m.set(makeRow(arena, "r1", 1, map[string]any{"edited": true}))
+	fireUnreadable(eng, "obj1", "chat", "r1")
+	view.fold(t, sub)
+	require.True(t, sub.deferred)
+
+	m.fail = errors.New("busy")
+	eng.Resync("obj1", nil)
+	assert.True(t, sub.deferred, "the re-read is still owed")
+	assert.NoError(t, sub.Err())
+
+	// An unrelated change past the edge, which needs no refill of its
+	// own, retries the owed re-read.
+	m.fail = nil
+	far := makeRow(arena, "r9", 9, nil)
+	m.set(far)
+	fireEvent(eng, "obj1", "chat", "r9", far.d, false, nil)
+	agrees(t, sub, view, m)
+	assert.False(t, sub.deferred)
+	assert.Equal(t, 0, sub.lost)
 }
 
 // A window that cannot re-read closes when storage moved under it with

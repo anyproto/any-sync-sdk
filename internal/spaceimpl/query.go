@@ -140,10 +140,12 @@ func sharedSource(store *spaceobjects.Store, coll anystore.Collection, filter qu
 // construction is reachable only through the event). No instance is
 // kept across refills: the object may not have been local at
 // Subscribe, and holding it would keep an evicted object's tree
-// reachable for the subscription's life. With no instance, one from
-// before the dataset was known, or one rebuilding its rows, the refill
-// fails: the engine counts the departure as a loss and tries again on
-// the next apply.
+// reachable for the subscription's life. With no instance, or one
+// from before the dataset was known, the refill fails: the engine
+// counts the departure as a loss and tries again on the next apply.
+// While the object rebuilds its rows, the refill is deferred instead:
+// it counts nothing, and the engine re-reads the window when the
+// rebuild ends.
 func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, dataset string, filter query.Filter) refillSource {
 	return func(source any) (refillTarget, error) {
 		if store.Rebuilding(objectId) {

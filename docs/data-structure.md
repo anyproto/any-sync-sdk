@@ -575,16 +575,16 @@ an open question.
   across objects that was deferred or still holds the object's row: a
   deferred one or a windowed one at offset 0 in full, an unbounded one
   by a lookup of that row alone, one past an offset by the same lookup,
-  closing when storage no longer has the row.
+  closing when the lookup no longer finds a matching row or fails.
 - **Overflow and drift** close the subscription: a full mailbox with
   `ErrSubscriptionOverflow`; `ErrSubscriptionDrifted` when the engine
   cannot keep the window equal to storage: a window past an offset
   loses `DriftBudgetPercent` (default 30) of `Limit` records, a
   window at offset 0 loses that many while its re-read fails (a row
-  that leaves counts once, the window's unranked state once until a
-  re-read ranks it, a re-read that fails again nothing), or a row
-  cannot be read and no re-read can settle it. Resubscribing is the
-  only recovery.
+  that leaves counts when the window ends short or while it holds a
+  row it cannot rank, the unranked state once until a re-read ranks it,
+  a re-read that fails again nothing), or a row cannot be read and no
+  re-read can settle it. Resubscribing is the only recovery.
 - **Total**: `IncludeTotal` counts in the snapshot's read, after the
   fence, so `Total` and `HasNext` describe exactly the rows returned; a
   snapshot that holds every match needs no count. It is not maintained

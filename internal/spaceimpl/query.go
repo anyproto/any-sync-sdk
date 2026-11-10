@@ -142,7 +142,7 @@ func sharedSource(store *spaceobjects.Store, coll anystore.Collection, filter qu
 // Subscribe, and holding it would keep an evicted object's tree
 // reachable for the subscription's life. With no instance, or one
 // from before the dataset was known, the refill fails: the engine
-// counts the departure as a loss and tries again on the next apply.
+// counts what left the window short and tries again on the next apply.
 // While the object rebuilds its rows, the refill is deferred instead:
 // it counts nothing, and the engine re-reads the window when the
 // rebuild ends.

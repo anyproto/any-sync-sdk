@@ -249,12 +249,13 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 //
 // A shared window is re-read too when its last refill was deferred, by
 // any object's rebuild, or when it still holds this object's row, which
-// the rebuild wiped without notice: a windowed one at offset 0 in full
-// (at most limit+1 rows, for at most limit+1 rebuilt objects), an
-// unbounded one by a lookup of that row alone, so a sweep that rebuilds
-// every object costs it one lookup per object. A shared window that
-// cannot re-read its rows (past an offset) looks the row up as well,
-// and closes when storage no longer has it.
+// the rebuild wiped without notice: a deferred one in full, as is a
+// windowed one at offset 0 holding the row (at most limit+1 rows, for
+// at most limit+1 rebuilt objects); an unbounded one holding the row by
+// a lookup of that row alone, so a sweep that rebuilds every object
+// costs it one lookup per object. A shared window that cannot re-read
+// its rows (past an offset) looks the row up as well, and closes when
+// the lookup no longer finds a matching row, or fails.
 func (e *Engine) Resync(objectId string, source any) {
 	if e.closed.Load() || e.counter.Load() == 0 {
 		return

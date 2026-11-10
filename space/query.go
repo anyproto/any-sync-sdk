@@ -98,18 +98,18 @@ type QueryOpts struct {
 	// MailboxCapacity bounds the per-subscription event queue. Default
 	// 256, minimum 16. On overflow the subscription closes; Wait
 	// returns mb.ErrClosed and Err() returns ErrSubscriptionOverflow.
-	// A change after which the window refilled from storage takes two
-	// slots: its own event and the refill's. Subscribe-only.
+	// A change after which the window refilled from storage takes up
+	// to two slots: its own event and the refill's. Subscribe-only.
 	MailboxCapacity int
 
 	// DriftBudgetPercent: when this fraction of Limit records leave
 	// the held window without replacement, the subscription closes
 	// with ErrSubscriptionDrifted. Default 30. A window at offset 0
 	// refills from storage when rows leave it, so a departure counts
-	// only when the refill fails (and an arrival the window cannot
-	// rank counts once); a window past an offset shifts with rows
-	// before it and counts every departure. Ignored when Limit == 0.
-	// Subscribe-only.
+	// only when the refill fails (and a row the window cannot rank,
+	// arrived or moved, counts once); a window past an offset shifts
+	// with rows before it and counts every departure. Ignored when
+	// Limit == 0. Subscribe-only.
 	DriftBudgetPercent int
 }
 

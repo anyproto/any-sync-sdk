@@ -566,7 +566,10 @@ an open question.
   What a re-read finds arrives in an event of its own, with no
   `VersionId` and no ops, after the own event of the change behind
   it; a per-object re-read goes through the object the apply ran on,
-  so a replay that fires while the object loads refills too.
+  so a replay that fires while the object loads refills too. While a
+  load rebuilds the object's rows from the tree, storage is not
+  final: re-reads hold off, and every window on the object is re-read
+  once the rebuild ends.
 - **Overflow and drift** close the subscription: a full mailbox with
   `ErrSubscriptionOverflow`; `ErrSubscriptionDrifted` when the engine
   cannot keep the window equal to storage: a window past an offset

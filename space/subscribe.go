@@ -115,8 +115,9 @@ type RemovedRecord struct {
 //
 // A change's own event also carries the rows the change moved into or
 // out of view, such as the row promoted into the window when the
-// change deleted one above it: apply every event, and use VersionId
-// to tell which records are the caller's own write.
+// change deleted one above it: apply every event. Within an own
+// write's event, the records that carry Ops are the write's own; the
+// rows it moved carry none.
 //
 // An event with an empty VersionId is not a change's own and is never
 // skipped: the engine re-read the window from storage (to refill rows

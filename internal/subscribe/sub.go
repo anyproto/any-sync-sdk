@@ -302,6 +302,25 @@ func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	s.checkDrift()
 }
 
+// resync re-reads the window from storage outside any apply and ships
+// the difference as a resync event. A read that fails changes nothing:
+// no row departed, so nothing is counted.
+func (s *querySub) resync(source any) {
+	if !s.canRefill() {
+		return
+	}
+	p := newPending(source)
+	p.beginRefill(s)
+	if s.refillWindow(&p) != nil {
+		return
+	}
+	p.refilled = true
+	_, resync := s.emit("", &p)
+	if s.deliver(resync) {
+		s.checkDrift()
+	}
+}
+
 // deliver queues one event unless it is empty. Reports whether the sub
 // is still open.
 func (s *querySub) deliver(subev space.SubscriptionEvent) bool {
@@ -674,7 +693,10 @@ func (s *querySub) refillWindow(p *subPending) error {
 	// the held set changes: every held row, and every row the records
 	// took out of view without a verdict on it (an unreadable record,
 	// another row's arrival), whose reason would otherwise be the
-	// engine's guess.
+	// engine's guess. The reasons reach p only once every lookup
+	// succeeded: a read that fails changes nothing, its reasons
+	// included.
+	var gone map[string]space.RemoveReason
 	lookup := func(id string) error {
 		doc, err := read.Lookup(id)
 		if err != nil {
@@ -687,10 +709,10 @@ func (s *querySub) refillWindow(p *subPending) error {
 		case s.cfg.Filter != nil && !s.cfg.Filter.Ok(doc, s.docBuf):
 			reason = space.RemoveFilteredOut
 		}
-		if p.gone == nil {
-			p.gone = map[string]space.RemoveReason{}
+		if gone == nil {
+			gone = map[string]space.RemoveReason{}
 		}
-		p.gone[id] = reason
+		gone[id] = reason
 		return nil
 	}
 	if read.Lookup != nil {
@@ -713,6 +735,7 @@ func (s *querySub) refillWindow(p *subPending) error {
 			}
 		}
 	}
+	p.gone = gone
 
 	s0 := s.sentinel()
 	if s0 != nil {

@@ -762,7 +762,7 @@ Account- and local-scope writes produce events like synced ones: one own event p
 - There is no ordering across objects.
 
 ### 13.6 Own-write events
-Callers receive their own writes and recognize them by matching `ModifyResult.VersionId` with `SubscriptionEvent.VersionId`. The SDK doesn't suppress them. An own write's event also carries the rows the change moved into or out of view (the row promoted into the window when the write deleted one above it), so apply every event; the match tells which records are the write's own. An event with an empty `versionId` is never an own write (§13.1).
+Callers receive their own writes and recognize them by matching `ModifyResult.VersionId` with `SubscriptionEvent.VersionId`. The SDK doesn't suppress them. An own write's event also carries the rows the change moved into or out of view (the row promoted into the window when the write deleted one above it), so apply every event; within it, the records that carry `ops` are the write's own, and the rows it moved carry none. An event with an empty `versionId` is never an own write (§13.1).
 
 ### 13.7 Backpressure + Recovery
 
@@ -770,7 +770,7 @@ Each subscription has a bounded mailbox (`QueryOpts.MailboxCapacity`, default 25
 
 A window at offset 0 stays equal to a fresh query of the same body: when a held row leaves a window with matches past its edge, or a held row's own sort move or an arrival puts a row in the window at or past the key the window was last ranked at, the engine re-reads the window from any-store and ships the difference. A window that holds every match reads nothing when rows leave it. A change whose post-apply row cannot be read is settled by the same re-read, for an unbounded subscription too.
 
-`ErrSubscriptionDrifted` closes a subscription the engine cannot keep equal to storage: a window past an offset, whose rows shift with rows before it, loses `DriftBudgetPercent` (default 30) of `Limit` records; a window at offset 0 loses that many while its re-read fails (a row that leaves counts once, an arrival the window cannot rank once, a re-read that fails again nothing); or a row cannot be read and no re-read can settle it.
+`ErrSubscriptionDrifted` closes a subscription the engine cannot keep equal to storage: a window past an offset, whose rows shift with rows before it, loses `DriftBudgetPercent` (default 30) of `Limit` records; a window at offset 0 loses that many while its re-read fails (a row that leaves counts once, a row the window cannot rank, arrived or moved, once, a re-read that fails again nothing); or a row cannot be read and no re-read can settle it.
 
 Either error means: resubscribe, and the new snapshot reconciles state. Nothing is dropped silently.
 

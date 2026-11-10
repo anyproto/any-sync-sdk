@@ -166,3 +166,45 @@ func TestObjectStamps_FlushWithoutListenerDrops(t *testing.T) {
 	_, pending := f.store.stampPending.Load(stampObj)
 	assert.False(t, pending, "flush clears the entry even without listeners")
 }
+
+// An object stamp whose row cannot be read reaches a per-object window
+// as an unreadable record carrying the apply's object as its source, so
+// the window refills through it; a window with no refill closes.
+func TestObjectStamps_UnreadableStampCarriesSource(t *testing.T) {
+	f := newStampFixture(t)
+	var sources []any
+	rows := func(yield func(id string, doc *anyenc.Value)) error {
+		yield(stampObj, f.ctrl.Get(f.ctx, properties.Dataset, stampObj))
+		return nil
+	}
+	sub, err := f.store.engine.Subscribe(subscribe.SubConfig{
+		Scope: subscribe.Scope{ObjectId: stampObj, Dataset: properties.Dataset},
+		Refill: func(source any) (subscribe.RefillRead, error) {
+			sources = append(sources, source)
+			return subscribe.RefillRead{Rows: rows, Lookup: func(string) (*anyenc.Value, error) { return nil, nil }, Close: func() {}}, nil
+		},
+	}, rows)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sub.Close() })
+
+	src := &struct{ id string }{stampObj}
+	stamp := crdt.ObjectStamp{Dataset: properties.Dataset, RowId: stampObj, Ops: []crdt.Op{{Type: crdt.OpSet, Path: []string{"modifiedAt"}}}}
+	f.store.emitObjectStampWith(f.ctx, src, "spaceA", stampObj, "v9", stamp,
+		func(int) (*anyenc.Value, error) { return nil, errors.New("read failed") })
+	require.Len(t, sources, 1)
+	assert.Same(t, src, sources[0])
+	assert.NoError(t, sub.Err(), "the refill settled the row")
+	assert.ErrorIs(t, f.sub.Err(), space.ErrSubscriptionDrifted, "no refill behind the shared window")
+}
+
+// An object marked as rebuilding its rows is not a loaded instance a
+// refill may read through.
+func TestStore_RebuildingHidesTheObject(t *testing.T) {
+	s := &Store{}
+	assert.False(t, s.Rebuilding("o1"))
+	s.rebuilding.Store("o1", struct{}{})
+	assert.True(t, s.Rebuilding("o1"))
+	assert.Nil(t, s.PeekLoaded("o1"))
+	s.rebuilding.Delete("o1")
+	assert.False(t, s.Rebuilding("o1"))
+}

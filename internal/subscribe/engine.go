@@ -227,6 +227,29 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 	clear(e.scratch)
 }
 
+// Resync re-reads every window on objectId from storage and ships the
+// difference as a resync event, with no VersionId. The store calls it
+// when a load has rebuilt the object's rows from its tree: the windows
+// saw the rebuild as applies they could not refill through (storage was
+// incomplete), and a row the rebuild dropped without a change may still
+// be held. source is the object instance, as Event.Source. A window
+// that cannot refill keeps its rows.
+func (e *Engine) Resync(objectId string, source any) {
+	if e.closed.Load() || e.counter.Load() == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, perDs := range e.scope.perObj[objectId] {
+		for _, s := range perDs {
+			if s.closed {
+				continue
+			}
+			s.resync(source)
+		}
+	}
+}
+
 // NotifyDeleted emits a synthetic delete event for objectId in the
 // given dataset scope, so live subscriptions drop the row and report
 // RemoveDeleted — without an underlying CRDT apply.

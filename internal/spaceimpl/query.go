@@ -238,8 +238,9 @@ func lookupStored(ctx context.Context, coll anystore.Collection, stored query.Fi
 }
 
 // errRefillNoObject is a refill with no object instance to read the
-// rows through: the object is not local, is loading or rebuilding, or
-// the instance at hand predates the dataset.
+// rows through: the object is not local, is loading behind an event
+// that did not come from it, or the instance at hand predates the
+// dataset.
 var errRefillNoObject = errors.New("query: refill: no loaded object to read through")
 
 // newDatasetQuery builds a queryImpl over the per-space collection of a

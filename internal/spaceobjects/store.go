@@ -303,11 +303,12 @@ type Store struct {
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *fanout.Registry[RowEvent]
 
-	// rebuilding holds the ids of objects whose load is rebuilding their
-	// rows from the tree (reindex.go): storage is incomplete until the
-	// load returns, so a refill of a window on the object, or a lookup
-	// of its row by a window across objects, holds off instead of
-	// taking a row not rebuilt yet for a deleted one.
+	// rebuilding holds the ids of objects whose rows a load is
+	// rebuilding from the tree (reindex.go), or whose rebuild a failed
+	// load left unfinished: storage is incomplete until a load finishes
+	// the rebuild, so a refill of a window on the object, or a lookup of
+	// its row by a window across objects, holds off instead of taking a
+	// row not rebuilt yet for a deleted one.
 	rebuilding sync.Map
 
 	// stampPending holds, per objectId, the object stamps landed during
@@ -2591,10 +2592,10 @@ func (s *Store) PeekLoaded(objectId string) *object.Object {
 	return v.(*object.Object)
 }
 
-// Rebuilding reports whether objectId's load is rebuilding its rows from
-// the tree right now: its collections were wiped and the replay has not
-// finished putting the rows back, so a read of them is not storage's
-// final word.
+// Rebuilding reports whether objectId's rows are being rebuilt from the
+// tree, by the load in progress or by one that failed partway: its
+// collections were wiped and no replay has finished putting the rows
+// back, so a read of them is not storage's final word.
 func (s *Store) Rebuilding(objectId string) bool {
 	_, ok := s.rebuilding.Load(objectId)
 	return ok
@@ -2873,8 +2874,10 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	resume := len(stale) == 0 && ctrl.ReindexPending()
 	rebuilding := len(stale) > 0 || resume
 	if rebuilding {
+		// Cleared when the rebuild finishes below; a load that fails
+		// before then leaves the rows half-rebuilt, and the mark, until
+		// a later load resumes and finishes it.
 		s.rebuilding.Store(objectId, struct{}{})
-		defer s.rebuilding.Delete(objectId)
 	}
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
@@ -2966,6 +2969,13 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	}
 	if rebuilding {
 		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
+		s.rebuilding.Delete(objectId)
+		if s.engine != nil {
+			// The windows on the object saw the rebuild as applies they
+			// could not refill through: re-read them now that the rows
+			// are back.
+			s.engine.Resync(objectId, obj)
+		}
 	}
 	if seedPending {
 		if len(publishedSets) > 0 {

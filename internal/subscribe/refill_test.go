@@ -32,8 +32,9 @@ type storeModel struct {
 	fail   error
 	buf    *syncpool.DocBuffer
 
-	sources []any    // Event.Source of each refill
-	lookups []string // ids the refills looked up
+	sources    []any            // Event.Source of each refill
+	lookups    []string         // ids the refills looked up
+	lookupFail map[string]error // ids whose lookup fails
 }
 
 func newStoreModel(t *testing.T, filter query.Filter, limit int, rows ...row) *storeModel {
@@ -109,6 +110,9 @@ func (m *storeModel) refill() RefillFn {
 			},
 			Lookup: func(id string) (*anyenc.Value, error) {
 				m.lookups = append(m.lookups, id)
+				if err := m.lookupFail[id]; err != nil {
+					return nil, err
+				}
 				return m.rows[id], nil
 			},
 			Close: func() { m.closed++ },
@@ -1211,16 +1215,17 @@ func TestApply_FastRejectedAfterVisibleIsDisplaced(t *testing.T) {
 
 // Random applies over windows of every size, with repeated ids,
 // creates, edits, sort moves, filter-outs, deletes and unreadable
-// records, in three regimes: storage in step with the events; storage
+// records, in four regimes: storage in step with the events; storage
 // a batch ahead of them, as when a later change commits before an
-// earlier one's event runs; and refills that fail for a while. After
+// earlier one's event runs; refills that fail for a while; and churn,
+// small windows under long changes of mostly deletes and moves. After
 // every apply the client's folded view and the engine's held set are
 // compared, and both against a fresh query of the model whenever
 // refills work or the engine certifies its window; every event is
 // checked against the client's contract and each removal's reason
 // against storage, and no loss is counted while refills work.
 func TestRefill_RandomizedAgreesWithStorage(t *testing.T) {
-	for _, regime := range []string{"in step", "storage ahead", "refills failing"} {
+	for _, regime := range []string{"in step", "storage ahead", "refills failing", "churn"} {
 		t.Run(regime, func(t *testing.T) {
 			for seed := int64(0); seed < 1000; seed++ {
 				t.Run(fmt.Sprint(seed), func(t *testing.T) {
@@ -1236,7 +1241,11 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 	eng := New("test")
 	defer eng.Close()
 	arena := newArena()
+	churn := regime == "churn"
 	limit := rng.Intn(5)
+	if churn {
+		limit = 1 + rng.Intn(3)
+	}
 	var filter query.Filter
 	if rng.Intn(2) == 0 {
 		filter = activeOnly
@@ -1259,7 +1268,11 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 		return "active"
 	}
 	var rows []row
-	for i := 0; i < 3+rng.Intn(8); i++ {
+	initial := 3 + rng.Intn(8)
+	if churn {
+		initial = 8 + rng.Intn(7)
+	}
+	for i := 0; i < initial; i++ {
 		rows = append(rows, makeRow(arena, "r"+itoa(i), freshN(), map[string]any{"status": status()}))
 	}
 	m := newStoreModel(t, filter, limit, rows...)
@@ -1283,22 +1296,29 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 	build := func(step int, tag string) batch {
 		var b batch
 		count := 1 + rng.Intn(6)
+		if churn {
+			count = 3 + rng.Intn(6)
+		}
 		for j := 0; j < count; j++ {
 			ids := known()
 			var id string
-			if len(ids) == 0 || rng.Intn(4) == 0 {
+			if len(ids) == 0 || (!churn && rng.Intn(4) == 0) || (churn && rng.Intn(7) == 0) {
 				id = fmt.Sprintf("x%d%s_%d", step, tag, j)
 			} else {
 				id = ids[rng.Intn(len(ids))]
 			}
-			switch rng.Intn(5) {
-			case 0:
+			del := rng.Intn(5) == 0
+			if churn {
+				del = rng.Intn(100) < 15
+			}
+			switch {
+			case del:
 				m.delete(id)
 				b.ev.Records = append(b.ev.Records, EventRecord{Id: id, Deleted: true})
 				b.unreadable = append(b.unreadable, false)
 			default:
 				n := freshN()
-				if cur, ok := m.rows[id]; ok && rng.Intn(2) == 0 {
+				if cur, ok := m.rows[id]; ok && !churn && rng.Intn(2) == 0 {
 					n = cur.GetInt("n")
 				}
 				m.set(makeRow(arena, id, n, map[string]any{"status": status()}))

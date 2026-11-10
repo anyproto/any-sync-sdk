@@ -269,6 +269,98 @@ func TestApply_DeleteWithUnreadableRecordIsDeleted(t *testing.T) {
 	}
 }
 
+// A refill whose lookups fail partway keeps none of the reasons it had
+// looked up: the change's own event classifies the rows the records
+// moved from the records alone, and the window stays as it was.
+func TestRefill_FailedLookupKeepsNoReason(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2, driftRows(5)...)
+	sub, view := subscribeModel(t, eng, m, 500)
+
+	// Below capacity with an edge: r2 left while refills failed.
+	m.fail = errors.New("busy")
+	m.delete("r2")
+	fireEvent(eng, "obj1", "chat", "r2", nil, true, nil)
+	view.fold(t, sub)
+	m.fail = nil
+	require.Equal(t, 2, len(sub.entries))
+
+	// Storage is ahead: r1 deleted, r0 moved far, events still queued.
+	m.delete("r1")
+	m.set(makeRow(arena, "r0", 100, nil))
+	m.lookupFail = map[string]error{"r0": errors.New("torn")}
+
+	// n arrives past the edge (unranked), m below it and evicts n; r1
+	// ends as the sentinel. The refill looks r0 and r1 up and fails.
+	m.set(makeRow(arena, "n", 35, nil))
+	m.set(makeRow(arena, "m", -5, nil))
+	records := []EventRecord{{Id: "n"}, {Id: "m"}}
+	eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", VersionId: "v", Records: records},
+		func(i int) (*anyenc.Value, error) { return m.rows[records[i].Id], nil })
+	own, resync := ownAndResync(t, sub)
+	assert.Equal(t, 2, m.reads, "the failed refill behind the departure, and this one")
+	assert.Equal(t, []string{"m"}, idsOf(own.Added))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDisplaced}}, own.Removed, "still held as the sentinel")
+	assert.Empty(t, resync.Added)
+	assert.Empty(t, resync.Removed)
+	assert.NotNil(t, sub.entries["r1"])
+	view.apply([]space.SubscriptionEvent{own})
+	agreesWithEngine(t, sub, view, m)
+	assert.NoError(t, sub.Err())
+}
+
+// Resync re-reads every window on an object from storage outside any
+// apply: a windowed and an unbounded window on the object ship what
+// storage holds that they do not, as resync events through the given
+// source; a window on another object and a shared one are not read.
+func TestEngine_ResyncReReadsObjectWindows(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	windowed := newStoreModel(t, nil, 2, driftRows(5)...)
+	sub, view := subscribeModel(t, eng, windowed, 30)
+	unbounded := newStoreModel(t, nil, 0, driftRows(5)...)
+	all, err := eng.Subscribe(SubConfig{Scope: driftScope, Refill: unbounded.refill()}, snapshotFromRows(unbounded.matching()))
+	require.NoError(t, err)
+	other := newStoreModel(t, nil, 2, driftRows(5)...)
+	otherSub, err := eng.Subscribe(SubConfig{Scope: Scope{ObjectId: "obj2", Dataset: "chat"}, Sort: other.sort, Limit: 2, Refill: other.refill()}, snapshotFromRows(other.window()))
+	require.NoError(t, err)
+	shared := newStoreModel(t, nil, 2, driftRows(5)...)
+	sharedSub, err := eng.Subscribe(SubConfig{Scope: Scope{Shared: true}, Sort: shared.sort, Limit: 2, Refill: shared.refill()}, snapshotFromRows(shared.window()))
+	require.NoError(t, err)
+
+	// Storage moved without events, as a rebuild's wipe and replay do.
+	for _, m := range []*storeModel{windowed, unbounded} {
+		m.delete("r0")
+		m.set(makeRow(arena, "x", -1, nil))
+	}
+	src := &struct{ name string }{"obj1"}
+	eng.Resync("obj1", src)
+
+	evs := sub.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, crdt.VersionId(""), evs[0].VersionId)
+	assert.Equal(t, []string{"x"}, idsOf(evs[0].Added))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, evs[0].Removed)
+	view.apply(evs)
+	agrees(t, sub, view, windowed)
+	assert.Equal(t, []any{src}, windowed.sources)
+	assert.Equal(t, 0, sub.lost)
+
+	evs = all.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, []string{"x"}, idsOf(evs[0].Added))
+	assert.Equal(t, []space.RemovedRecord{{Id: "r0", Reason: space.RemoveDeleted}}, evs[0].Removed)
+	assert.Equal(t, []any{src}, unbounded.sources)
+
+	assert.Equal(t, 0, other.reads)
+	assert.Equal(t, 0, shared.reads)
+	assert.Empty(t, otherSub.Events().GetAll())
+	assert.Empty(t, sharedSub.Events().GetAll())
+}
+
 // A refill sizes its buffer from the rows it holds, not from a limit a
 // caller may set as large as it likes.
 func TestRefill_HugeLimit(t *testing.T) {

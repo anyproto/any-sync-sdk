@@ -116,15 +116,17 @@ type RemovedRecord struct {
 // A change's own event also carries the rows the change moved into or
 // out of view, such as the row promoted into the window when the
 // change deleted one above it: apply every event. Within an own
-// write's event, the records that carry Ops are the write's own; the
-// rows it moved carry none.
+// write's event, the records that carry Ops are the write's own; a
+// record without Ops is a row the write moved, or one of its own whose
+// row the engine could not read, and its Doc is the state to take.
 //
 // An event with an empty VersionId is not a change's own and is never
 // skipped: the engine re-read the window from storage (to refill rows
-// that left it, or after a change whose row it could not read) and
-// ships what storage held that no change said, or an object was
-// deleted without a CRDT apply. Its records carry Doc and no Ops. A
-// re-read's event follows the own event of the change that caused it.
+// that left it, after a change whose row it could not read, or after
+// the object's rows were rebuilt from its tree) and ships what storage
+// held that no change said, or an object was deleted without a CRDT
+// apply. Its records carry Doc and no Ops. A re-read behind a change
+// follows the change's own event.
 //
 // Total is intentionally absent — the live counter is not maintained.
 // Callers who need a refreshed count call Snapshot.

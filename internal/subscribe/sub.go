@@ -49,6 +49,9 @@ type querySub struct {
 	unrankedLoss bool
 	lost         int
 	lostLimit    int
+	// deferred: the last refill found storage not final
+	// (ErrRefillDeferred); Engine.Resync re-reads the window when it is.
+	deferred bool
 
 	docBuf *syncpool.DocBuffer
 
@@ -302,18 +305,23 @@ func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	s.checkDrift()
 }
 
-// resync re-reads the window from storage outside any apply and ships
-// the difference as a resync event. A read that fails changes nothing:
-// no row departed, so nothing is counted.
+// resync re-reads the window from storage outside any apply, after
+// storage moved under it with no event it could follow, and ships the
+// difference as a resync event. A window that cannot re-read closes:
+// it can no longer be kept equal to storage. A read that fails changes
+// nothing: no row departed, so nothing is counted.
 func (s *querySub) resync(source any) {
 	if !s.canRefill() {
+		s.closeWith(space.ErrSubscriptionDrifted)
 		return
 	}
 	p := newPending(source)
 	p.beginRefill(s)
-	if s.refillWindow(&p) != nil {
+	if err := s.refillWindow(&p); err != nil {
+		s.deferred = errors.Is(err, ErrRefillDeferred)
 		return
 	}
+	s.deferred = false
 	p.refilled = true
 	_, resync := s.emit("", &p)
 	if s.deliver(resync) {
@@ -584,11 +592,13 @@ func recordReason(id string, out *recOutcome, p *subPending) space.RemoveReason 
 // break it. A refill re-reads the window from storage and records the
 // difference in p. A window that ends the apply at capacity and
 // ranked needs no refill: every departure in it was replaced. A
-// departure the window cannot refill counts as a loss, and an unranked
-// row it cannot rank counts once; the next apply tries the refill
-// again at no further cost. An unreadable row with no refill closes
-// the sub, whose window can no longer be trusted to match storage.
-// Reports whether the sub is still open.
+// refill deferred because storage is not final counts nothing: the
+// engine is told to re-read the window when it is. A departure the
+// window cannot refill counts as a loss, and an unranked row it cannot
+// rank counts once; the next apply tries the refill again at no
+// further cost. An unreadable row with no refill closes the sub, whose
+// window can no longer be trusted to match storage. Reports whether
+// the sub is still open.
 func (s *querySub) settle(p *subPending) bool {
 	unreadable := p.unreadable > 0
 	if !unreadable && !s.needsRefill() {
@@ -600,8 +610,14 @@ func (s *querySub) settle(p *subPending) bool {
 	}
 	if s.canRefill() {
 		p.beginRefill(s)
-		if s.refillWindow(p) == nil {
+		err := s.refillWindow(p)
+		if err == nil {
+			s.deferred = false
 			p.refilled = true
+			return true
+		}
+		if errors.Is(err, ErrRefillDeferred) {
+			s.deferred = true
 			return true
 		}
 	}

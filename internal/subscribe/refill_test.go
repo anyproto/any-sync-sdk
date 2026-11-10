@@ -1218,7 +1218,7 @@ func TestApply_FastRejectedAfterVisibleIsDisplaced(t *testing.T) {
 // records, in four regimes: storage in step with the events; storage
 // a batch ahead of them, as when a later change commits before an
 // earlier one's event runs; refills that fail for a while; and churn,
-// small windows under long changes of mostly deletes and moves. After
+// small windows under long changes of mostly moves. After
 // every apply the client's folded view and the engine's held set are
 // compared, and both against a fresh query of the model whenever
 // refills work or the engine certifies its window; every event is

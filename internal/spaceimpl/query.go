@@ -114,8 +114,9 @@ type refillTarget struct {
 type refillSource func(source any) (refillTarget, error)
 
 // errRefillRebuilding is a refill, or a lookup, of rows an object is
-// rebuilding from its tree: storage is incomplete until the load ends.
-var errRefillRebuilding = errors.New("query: refill: the object is rebuilding its rows")
+// rebuilding from its tree: storage is not final until a load finishes
+// the rebuild, and the engine re-reads the window then.
+var errRefillRebuilding = fmt.Errorf("%w: the object is rebuilding its rows", subscribe.ErrRefillDeferred)
 
 // sharedSource resolves a refill across objects: the shared collection,
 // with lookups held off for an object mid-rebuild, whose row the wipe

@@ -271,7 +271,9 @@ func TestApply_DeleteWithUnreadableRecordIsDeleted(t *testing.T) {
 
 // A refill whose lookups fail partway keeps none of the reasons it had
 // looked up: the change's own event classifies the rows the records
-// moved from the records alone, and the window stays as it was.
+// moved from the records alone, and the window stays as it was. The
+// held row's lookup runs first and succeeds; the lookup of a row the
+// records evicted runs after it and fails.
 func TestRefill_FailedLookupKeepsNoReason(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
@@ -287,28 +289,122 @@ func TestRefill_FailedLookupKeepsNoReason(t *testing.T) {
 	m.fail = nil
 	require.Equal(t, 2, len(sub.entries))
 
-	// Storage is ahead: r1 deleted, r0 moved far, events still queued.
+	// Storage is ahead: r0 and r1 deleted, their events still queued.
+	m.delete("r0")
 	m.delete("r1")
-	m.set(makeRow(arena, "r0", 100, nil))
-	m.lookupFail = map[string]error{"r0": errors.New("torn")}
+	m.lookupFail = map[string]error{"r1": errors.New("torn")}
 
-	// n arrives past the edge (unranked), m below it and evicts n; r1
-	// ends as the sentinel. The refill looks r0 and r1 up and fails.
+	// n arrives past the edge (unranked); m evicts n; k evicts r1. r0
+	// ends as the sentinel and is looked up first (held, not read
+	// back: deleted); r1 was evicted, and its lookup fails.
 	m.set(makeRow(arena, "n", 35, nil))
 	m.set(makeRow(arena, "m", -5, nil))
-	records := []EventRecord{{Id: "n"}, {Id: "m"}}
+	m.set(makeRow(arena, "k", -7, nil))
+	records := []EventRecord{{Id: "n"}, {Id: "m"}, {Id: "k"}}
 	eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", VersionId: "v", Records: records},
 		func(i int) (*anyenc.Value, error) { return m.rows[records[i].Id], nil })
 	own, resync := ownAndResync(t, sub)
 	assert.Equal(t, 2, m.reads, "the failed refill behind the departure, and this one")
-	assert.Equal(t, []string{"m"}, idsOf(own.Added))
-	assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDisplaced}}, own.Removed, "still held as the sentinel")
+	assert.Equal(t, []string{"r0", "r1"}, m.lookups[len(m.lookups)-2:])
+	assert.ElementsMatch(t, []string{"k", "m"}, idsOf(own.Added))
+	assert.ElementsMatch(t, []space.RemovedRecord{
+		{Id: "r0", Reason: space.RemoveDisplaced},
+		{Id: "r1", Reason: space.RemoveDisplaced},
+	}, own.Removed, "r0 is still held as the sentinel; the records alone say displaced")
 	assert.Empty(t, resync.Added)
 	assert.Empty(t, resync.Removed)
-	assert.NotNil(t, sub.entries["r1"])
+	assert.NotNil(t, sub.entries["r0"])
 	view.apply([]space.SubscriptionEvent{own})
 	agreesWithEngine(t, sub, view, m)
 	assert.NoError(t, sub.Err())
+}
+
+// A refill deferred because storage is not final counts nothing, keeps
+// an unreadable row open, and marks the window for the re-read Resync
+// runs when storage is final again.
+func TestRefill_DeferredCountsNothingUntilResync(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2, driftRows(6)...)
+	sub, view := subscribeModel(t, eng, m, 30)
+	m.fail = fmt.Errorf("%w: rebuilding", ErrRefillDeferred)
+
+	m.delete("r0")
+	fireEvent(eng, "obj1", "chat", "r0", nil, true, nil)
+	m.delete("r1")
+	fireEvent(eng, "obj1", "chat", "r1", nil, true, nil)
+	edited := makeRow(arena, "r3", 3, map[string]any{"edited": true})
+	m.set(edited)
+	fireUnreadable(eng, "obj1", "chat", "r3")
+	view.fold(t, sub)
+	assert.Equal(t, 0, sub.lost, "deferred refills cost nothing")
+	assert.True(t, sub.deferred)
+	assert.NoError(t, sub.Err(), "an unreadable row waits for the re-read")
+	assert.Equal(t, 3, m.reads)
+
+	m.fail = nil
+	src := &struct{ name string }{"obj1"}
+	eng.Resync("obj1", src)
+	agrees(t, sub, view, m)
+	assert.False(t, sub.deferred)
+	assert.Equal(t, src, m.sources[len(m.sources)-1])
+}
+
+// Resync re-reads a window elsewhere whose last refill was deferred (a
+// shared window that could not classify the rebuilding object's row)
+// and leaves other shared windows alone.
+func TestEngine_ResyncReReadsDeferredSharedWindow(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	deferredM := newStoreModel(t, nil, 2, driftRows(5)...)
+	deferredSub, err := eng.Subscribe(SubConfig{Scope: Scope{Shared: true}, Sort: deferredM.sort, Limit: 2, MailboxCap: minMailboxCap, Refill: deferredM.refill()}, snapshotFromRows(deferredM.window()))
+	require.NoError(t, err)
+	otherM := newStoreModel(t, nil, 2, driftRows(5)...)
+	otherSub, err := eng.Subscribe(SubConfig{Scope: Scope{Shared: true}, Sort: otherM.sort, Limit: 2, MailboxCap: minMailboxCap, Refill: otherM.refill()}, snapshotFromRows(otherM.window()))
+	require.NoError(t, err)
+
+	// Two departures leave both windows one visible row short; the
+	// deferred one could not refill, the other did.
+	deferredM.fail = fmt.Errorf("%w: rebuilding", ErrRefillDeferred)
+	for _, id := range []string{"r0", "r1"} {
+		deferredM.delete(id)
+		otherM.delete(id)
+		eng.OnApply(Event{SpaceId: "test", ObjectId: id, Dataset: "objects", VersionId: "v", Records: []EventRecord{{Id: id, Deleted: true}}}, nil)
+	}
+	drain(t, deferredSub)
+	drain(t, otherSub)
+	require.True(t, deferredSub.deferred)
+	require.False(t, otherSub.deferred)
+	otherReads := otherM.reads
+
+	deferredM.fail = nil
+	eng.Resync("some-object", nil)
+	evs := deferredSub.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, []string{"r3"}, idsOf(evs[0].Added), "the row past the edge the deferred refill owed")
+	assert.False(t, deferredSub.deferred)
+	assert.Equal(t, otherReads, otherM.reads, "a window not deferred is not re-read")
+	assert.Empty(t, otherSub.Events().GetAll())
+}
+
+// A window that cannot re-read closes when storage moved under it with
+// no event it could follow.
+func TestEngine_ResyncClosesWindowsThatCannotRefill(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	m := newStoreModel(t, nil, 2, driftRows(5)...)
+	offset, err := eng.Subscribe(SubConfig{Scope: driftScope, Sort: m.sort, Limit: 2, Offset: 1, MailboxCap: minMailboxCap, Refill: m.refill()}, snapshotFromRows(m.window()[1:]))
+	require.NoError(t, err)
+	plain, err := eng.Subscribe(SubConfig{Scope: driftScope, Sort: m.sort, Limit: 2, MailboxCap: minMailboxCap}, snapshotFromRows(m.window()))
+	require.NoError(t, err)
+	other, err := eng.Subscribe(SubConfig{Scope: Scope{ObjectId: "obj2", Dataset: "chat"}, Sort: m.sort, Limit: 2, Offset: 1, MailboxCap: minMailboxCap}, snapshotFromRows(m.window()[1:]))
+	require.NoError(t, err)
+
+	eng.Resync("obj1", nil)
+	assert.ErrorIs(t, offset.Err(), space.ErrSubscriptionDrifted)
+	assert.ErrorIs(t, plain.Err(), space.ErrSubscriptionDrifted)
+	assert.NoError(t, other.Err(), "another object's window is untouched")
 }
 
 // Resync re-reads every window on an object from storage outside any

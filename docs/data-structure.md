@@ -568,16 +568,18 @@ an open question.
   it; a per-object re-read goes through the object the apply ran on,
   so a replay that fires while the object loads refills too. While a
   load rebuilds the object's rows from the tree, storage is not
-  final: re-reads hold off, and every window on the object is re-read
-  once the rebuild ends.
+  final: re-reads are deferred at no cost, and once the rebuild ends
+  every window on the object is re-read, or closed as drifted when it
+  cannot re-read (past an offset).
 - **Overflow and drift** close the subscription: a full mailbox with
   `ErrSubscriptionOverflow`; `ErrSubscriptionDrifted` when the engine
   cannot keep the window equal to storage: a window past an offset
   loses `DriftBudgetPercent` (default 30) of `Limit` records, a
   window at offset 0 loses that many while its re-read fails (a row
-  that leaves counts once, an arrival the window cannot rank once, a
-  re-read that fails again nothing), or a row cannot be read and no
-  re-read can settle it. Resubscribing is the only recovery.
+  that leaves counts once, the window's unranked state once until a
+  re-read ranks it, a re-read that fails again nothing), or a row
+  cannot be read and no re-read can settle it. Resubscribing is the
+  only recovery.
 - **Total**: `IncludeTotal` counts in the snapshot's read, after the
   fence, so `Total` and `HasNext` describe exactly the rows returned; a
   snapshot that holds every match needs no count. It is not maintained

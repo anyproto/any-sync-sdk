@@ -28,11 +28,14 @@
 // the apply ran on, so a replay that fires while the object loads
 // refills as well; it looks up each held row it no longer returns, so
 // the row's reason is storage's. While the re-read fails, a departure
-// counts toward the drift budget once and an arrival the window
-// cannot rank once, and the sub closes with
+// counts toward the drift budget once and the window's unranked state
+// once, until a re-read ranks it, and the sub closes with
 // space.ErrSubscriptionDrifted at DriftBudgetPercent of limit; an
-// unreadable row with no refill closes it at once. Mailbox overflow
-// closes with space.ErrSubscriptionOverflow. Both signal
+// unreadable row with no refill closes it at once. A re-read deferred
+// because storage is not final (an object rebuilding its rows from
+// its tree) counts nothing: the store calls Engine.Resync when the
+// rows are back, and every window on the object is re-read. Mailbox
+// overflow closes with space.ErrSubscriptionOverflow. Both signal
 // "resubscribe".
 //
 // Events are built from the ids an apply touched, each with its view

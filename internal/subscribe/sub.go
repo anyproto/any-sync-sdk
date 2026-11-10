@@ -462,9 +462,10 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		oldTuple := oldEntry.tuple
 		s.updateEntry(oldEntry, postKey, raw)
 		if s.ranks() && bytes.Compare(postKey, oldTuple) > 0 {
-			if s.unranked {
+			if s.unranked && !(oldEntry == prevSentinel && s.sentinel() == oldEntry) {
 				// A move past rows the window does not hold may put
-				// the row where one of them belongs.
+				// the row where one of them belongs; a sentinel that
+				// stays the sentinel moves nothing into view.
 				p.moved++
 			}
 			switch {

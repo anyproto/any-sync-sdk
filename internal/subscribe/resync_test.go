@@ -610,6 +610,27 @@ func TestDrift_DeparturesBeforeTheUnrankedArrivalCount(t *testing.T) {
 	assert.ErrorIs(t, sub.Err(), space.ErrSubscriptionDrifted)
 }
 
+// A sentinel that grows and stays the sentinel moves nothing into view:
+// after the first growth made the window unranked, further growth
+// costs nothing.
+func TestDrift_SentinelGrowthWhileUnrankedIsFree(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 10, driftRows(40)...)
+	sub, view := subscribeModel(t, eng, m, 30)
+	m.fail = errors.New("busy")
+
+	for _, n := range []int{1000, 1001, 1002} {
+		m.set(makeRow(arena, "r10", n, nil))
+		fireEvent(eng, "obj1", "chat", "r10", m.rows["r10"], false, nil)
+		view.fold(t, sub)
+	}
+	assert.Equal(t, 1, sub.lost, "the unranked state once")
+	assert.NoError(t, sub.Err())
+	agrees(t, sub, view, m)
+}
+
 // A held row's own sort move while the window holds an unranked row
 // counts: it may have moved past a match the window does not hold.
 func TestDrift_MovesWhileUnrankedCount(t *testing.T) {

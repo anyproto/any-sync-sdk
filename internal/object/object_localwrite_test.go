@@ -110,16 +110,18 @@ func (f *fakeLocalWriteTree) AddContent(_ context.Context, content objecttree.Si
 }
 
 // IterateAfterAddSeq replays stored changes above addSeq: convert runs
-// on the cleartext payload, its result lands on Model, iterate runs
-// until it returns false.
+// on the cleartext payload in a buffer reused across changes, its
+// result lands on Model, iterate runs until it returns false.
 func (f *fakeLocalWriteTree) IterateAfterAddSeq(_ context.Context, addSeq uint64, convert objecttree.ChangeConvertFunc, iterate objecttree.ChangeIterateFunc) error {
 	f.cursorOpen = true
 	defer func() { f.cursorOpen = false }()
+	var buf []byte
 	for _, c := range f.stored {
 		if c.AddSeq <= addSeq {
 			continue
 		}
-		model, err := convert(c, c.Data)
+		buf = append(buf[:0], c.Data...)
+		model, err := convert(c, buf)
 		if err != nil {
 			return err
 		}

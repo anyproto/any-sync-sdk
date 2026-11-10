@@ -949,6 +949,11 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	}
 
 	collect := func(ch *objecttree.Change) bool {
+		// The cursor itself does not watch ctx.
+		if err := ctx.Err(); err != nil {
+			fatalErr = err
+			return false
+		}
 		item, ok := ch.Model.(*replayItem)
 		if !ok || item == nil {
 			return true
@@ -961,8 +966,8 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		return true
 	}
 
-	// apply reports whether the replay goes on to the next change.
-	apply := func(item *replayItem) bool {
+	// apply sets fatalErr when the replay must halt.
+	apply := func(item *replayItem) {
 		// Op payloads alias the codec arena until the next Decode, so
 		// each change is decoded right before its apply.
 		decoded, decodeErr := o.codec.Decode(item.raw)
@@ -970,7 +975,7 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 			// Non-CRDT payload (settings-tree change, foreign data
 			// type, etc.) — skip silently, so one bad row does not
 			// poison the rest.
-			return true
+			return
 		}
 		decoded.SpaceId = o.spaceId
 		decoded.ObjectId = rootId
@@ -983,7 +988,7 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 				zap.String("objectId", rootId),
 				zap.String("changeId", item.changeId),
 				zap.String("dataset", decoded.Dataset))
-			return true
+			return
 		}
 		// Stamp ObjectAuthor / ObjectCreatedAt / Creator from the tree
 		// we're iterating — applyDecodedLocked's o.stampObjectMeta
@@ -1009,10 +1014,10 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 			proceed, gateErr := o.gate(ctx, &decoded, item.raw)
 			if gateErr != nil {
 				fatalErr = fmt.Errorf("object: gate %s: %w", item.changeId, gateErr)
-				return false
+				return
 			}
 			if !proceed {
-				return true
+				return
 			}
 		}
 
@@ -1032,25 +1037,28 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 					zap.String("changeId", item.changeId),
 					zap.String("dataset", decoded.Dataset),
 					zap.Error(applyErr))
-				return true
+				return
 			}
 			fatalErr = fmt.Errorf("object: apply %s: %w", item.changeId, applyErr)
-			return false
+			return
 		}
 		applied++
-		return true
 	}
 
 	o.replaying = true
-	// Changes buffered before a cursor error are applied too.
-	iterErr := tree.IterateAfterAddSeq(ctx, from, convert, collect)
-	for i, item := range batch {
-		batch[i] = nil
-		if !apply(item) {
-			break
+	iterErr := func() error {
+		defer func() { o.replaying = false }()
+		// Changes buffered before a cursor error are applied too.
+		err := tree.IterateAfterAddSeq(ctx, from, convert, collect)
+		for i, item := range batch {
+			if fatalErr != nil {
+				break
+			}
+			batch[i] = nil
+			apply(item)
 		}
-	}
-	o.replaying = false
+		return err
+	}()
 	// Applied changes are committed whatever ended the iteration, so
 	// the batch hook runs on the error paths too, on a context the
 	// caller cannot end.

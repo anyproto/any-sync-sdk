@@ -18,7 +18,7 @@ import (
 func storeInboundN(t *testing.T, o *Object, tree *fakeLocalWriteTree, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
-		payload, err := o.codec.Encode(new(setRecord(t, fmt.Sprintf("rec-%d", i), "name", "v")))
+		payload, err := o.codec.Encode(new(setRecord(t, fmt.Sprintf("rec-%d", i), "name", fmt.Sprintf("v%d", i))))
 		require.NoError(t, err)
 		tree.stored = append(tree.stored, &objecttree.Change{
 			Id:       fmt.Sprintf("ch-in-%d", i),
@@ -47,6 +47,22 @@ func TestReplay_AppliesWithCursorClosed(t *testing.T) {
 	assert.Equal(t, []string{"ch-in-0", "ch-in-1", "ch-in-2"}, order)
 	assert.Equal(t, uint64(7), o.ctrl.MaxAddSeq())
 	assert.False(t, o.applyGap)
+	// Each change decoded from its own payload, not from the cursor's
+	// reused buffer.
+	requireRecords(t, o, map[string]string{"rec-0": "v0", "rec-1": "v1", "rec-2": "v2"})
+}
+
+// A replay whose context has ended stops reading the cursor, applies
+// nothing and reports the gap.
+func TestReplay_EndedContextStopsCursor(t *testing.T) {
+	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
+	storeInboundN(t, o, tree, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, o.ColdRestore(ctx), context.Canceled)
+	assert.Nil(t, o.ctrl.Get(context.Background(), "blocks", "rec-0"))
+	assert.True(t, o.applyGap)
 }
 
 // The cursor fails after yielding changes: they are applied and the
@@ -57,7 +73,7 @@ func TestReplay_CursorErrorAppliesBufferedChanges(t *testing.T) {
 	tree.cursorErr = errors.New("cursor")
 
 	require.ErrorContains(t, o.Update(tree), "cursor")
-	requireRecords(t, o, map[string]string{"rec-0": "v", "rec-1": "v"})
+	requireRecords(t, o, map[string]string{"rec-0": "v0", "rec-1": "v1"})
 	assert.True(t, o.applyGap)
 }
 

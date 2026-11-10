@@ -97,9 +97,12 @@ func TestE2E_BundlesConvergeAndRestore(t *testing.T) {
 	require.False(t, didInstall, "adopting must not report an install")
 	require.Equal(t, installed.RootId, adopted.RootId)
 
-	// Push before B pulls (see cold_sync_test for why).
+	// A's install reaches a node before B restores.
 	_ = sdkA.Spaces().SyncSpaceList(ctx)
-	_ = spA.SyncHeads(ctx)
+	require.True(t, waitFor(ctx, 90*time.Second, 500*time.Millisecond, func() bool {
+		_ = spA.SyncHeads(ctx)
+		return sdkA.Spaces().Status(spA.Id()).State == space.SyncStateSynced
+	}), "device A: the space never reached synced")
 
 	// --- Device B: restore through the intended gate sequence. ---
 	sdkB := newDevice("device B")
@@ -119,9 +122,20 @@ func TestE2E_BundlesConvergeAndRestore(t *testing.T) {
 	require.NoError(t, spB.WaitIndexSynced(waitCtx), "device B: WaitIndexSynced")
 	waitCancel()
 
-	// After the index gate, the registry is readable and Ensure adopts.
-	got, err := spB.Bundles().Get(ctx, "bao/v1")
-	require.NoError(t, err, "device B: Bundles().Get after WaitIndexSynced")
+	// The gate guarantees a seeded index, not one carrying every write
+	// another device made: A's synced status means one responsible node
+	// took its heads, and B can restore from another that has not yet.
+	// Once the install is local, Ensure adopts.
+	var (
+		got    space.Bundle
+		getErr error
+	)
+	arrived := waitFor(ctx, 60*time.Second, 500*time.Millisecond, func() bool {
+		_ = spB.SyncHeads(ctx)
+		got, getErr = spB.Bundles().Get(ctx, "bao/v1")
+		return getErr == nil
+	})
+	require.True(t, arrived, "device B: Bundles().Get never returned the install: %v", getErr)
 	require.Equal(t, installed.RootId, got.RootId)
 
 	gotEnsure, _, err := spB.Bundles().Ensure(ctx, space.EnsureBundleRequest{

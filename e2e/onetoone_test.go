@@ -221,10 +221,18 @@ func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
 	peerID := peerPub.Account()
 
 	// A initiates; B also materializes the same 1-1 so it has a local copy
-	// to offload.
+	// to offload. B takes A's row first: without it, B's OneToOne writes
+	// a row of its own, concurrent with A's delete, and the merge may
+	// keep the 1-1 active on both devices — a valid outcome for a
+	// non-terminal delete, not the one under test.
 	aSp, err := a.Spaces().OneToOne(ctx, peerID)
 	require.NoError(t, err)
 	id := aSp.Id()
+	require.True(t, waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = b.Spaces().SyncSpaceList(ctx)
+		_, ok := infoByID(t, ctx, b, id)
+		return ok
+	}), "device B never received A's 1-1 row")
 	_, err = b.Spaces().OneToOne(ctx, peerID)
 	require.NoError(t, err)
 
@@ -234,17 +242,12 @@ func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, space.StatusDeleted, aInfo.Status, "A sees its own delete")
 
-	// B should converge on Deleted via tech-space sync. Best-effort.
-	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
+	// B converges on Deleted via tech-space sync.
+	require.True(t, waitFor(ctx, 2*time.Minute, 2*time.Second, func() bool {
 		_ = b.Spaces().SyncSpaceList(ctx)
-		if si, ok := infoByID(t, ctx, b, id); ok && si.Status == space.StatusDeleted {
-			t.Logf("device B converged on the 1-1 delete")
-			return
-		}
-		time.Sleep(2 * time.Second)
-	}
-	t.Skipf("device B did not converge on the 1-1 delete in time (tech-space sync / node reachability)")
+		si, ok := infoByID(t, ctx, b, id)
+		return ok && si.Status == space.StatusDeleted
+	}), "device B never converged on the 1-1 delete")
 }
 
 // TestE2E_OneToOne_ApproveIncoming is the full two-account happy path:

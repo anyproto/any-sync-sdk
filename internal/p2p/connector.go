@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -16,7 +17,8 @@ import (
 
 const (
 	// activeBackoffMin / activeBackoffMax bound the exponential backoff
-	// of an active peer that fails to answer.
+	// of an active peer that fails to answer; a retry comes up to
+	// retryJitter of its backoff early (see jittered).
 	activeBackoffMin = 30 * time.Second
 	activeBackoffMax = 30 * time.Minute
 	// staleProbe / dormantProbe are the fixed cadences of the slower
@@ -34,6 +36,10 @@ const (
 	// refusedWindow is how long after a successful dial a close still
 	// counts as the peer refusing us.
 	refusedWindow = 2 * time.Second
+	// retryJitter is the largest share of a failed dial's wait a retry
+	// comes early by, at random, so peers that failed together do not
+	// retry in lockstep.
+	retryJitter = 0.25
 )
 
 // connector is the only dialer of global peers. It keeps at most
@@ -357,7 +363,7 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 	if ok {
 		delete(c.next, peerId)
 	} else {
-		c.next[peerId] = now.Add(backoffFor(g.status.Tier(peerId), rec.Failures))
+		c.next[peerId] = now.Add(jittered(backoffFor(g.status.Tier(peerId), rec.Failures)))
 	}
 	c.mu.Unlock()
 	if ok {
@@ -370,6 +376,11 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 // errRefusedAfterHandshake is a dial the peer closed within
 // refusedWindow of success: its handshake filter turned us down.
 var errRefusedAfterHandshake = errors.New("peer closed the connection after the handshake")
+
+// jittered takes a random share of up to retryJitter off d.
+func jittered(d time.Duration) time.Duration {
+	return d - time.Duration(rand.Int64N(int64(float64(d)*retryJitter)+1))
+}
 
 // backoffFor is the wait after a failed dial, by tier: exponential for
 // active peers, a fixed slow cadence otherwise.

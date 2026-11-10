@@ -568,12 +568,14 @@ an open question.
   it; a per-object re-read goes through the object the apply ran on,
   so a replay that fires while the object loads refills too. While a
   load rebuilds the object's rows from the tree, storage is not
-  final: re-reads are deferred at no cost, and once the rebuild ends
-  every window on the object is re-read (or closed as drifted when it
-  cannot re-read, past an offset, or when the re-read fails), as is
-  every window across objects that still holds the object's row or was
-  deferred: a windowed one in full, an unbounded one by a lookup of
-  that row alone.
+  final: re-reads are deferred at no cost (a windowed subscription
+  retries on every change), and once the rebuild ends every window on
+  the object is re-read (or closed as drifted when it cannot re-read,
+  past an offset, or when the re-read fails), as is every window
+  across objects that was deferred or still holds the object's row: a
+  deferred one or a windowed one at offset 0 in full, an unbounded one
+  by a lookup of that row alone, one past an offset by the same lookup,
+  closing when storage no longer has the row.
 - **Overflow and drift** close the subscription: a full mailbox with
   `ErrSubscriptionOverflow`; `ErrSubscriptionDrifted` when the engine
   cannot keep the window equal to storage: a window past an offset

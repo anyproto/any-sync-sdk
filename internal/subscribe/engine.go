@@ -247,13 +247,14 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 // the object that cannot refill closes with space.ErrSubscriptionDrifted:
 // storage moved under it with no event it could follow.
 //
-// A shared window that can refill is re-read too when its last refill
-// was deferred, by any object's rebuild, or when it still holds this
-// object's row, which the rebuild wiped without notice: a windowed one
-// in full (at most limit+1 rows, for at most limit+1 rebuilt objects),
-// an unbounded one by a lookup of that row alone, so a sweep that
-// rebuilds every object costs it one lookup per object. A shared
-// window that cannot refill is left to the replay's own events.
+// A shared window is re-read too when its last refill was deferred, by
+// any object's rebuild, or when it still holds this object's row, which
+// the rebuild wiped without notice: a windowed one at offset 0 in full
+// (at most limit+1 rows, for at most limit+1 rebuilt objects), an
+// unbounded one by a lookup of that row alone, so a sweep that rebuilds
+// every object costs it one lookup per object. A shared window that
+// cannot re-read its rows (past an offset) looks the row up as well,
+// and closes when storage no longer has it.
 func (e *Engine) Resync(objectId string, source any) {
 	if e.closed.Load() || e.counter.Load() == 0 {
 		return
@@ -269,13 +270,13 @@ func (e *Engine) Resync(objectId string, source any) {
 	}
 	for _, s := range e.scope.shared {
 		switch {
-		case s.closed || !s.canRefill():
-		case s.deferred || s.windowed():
-			if s.deferred || s.entries[objectId] != nil {
-				s.resync(nil)
+		case s.closed:
+		case !s.canRefill() || (!s.deferred && !s.windowed()):
+			if s.entries[objectId] != nil {
+				s.resettleRow(objectId, nil)
 			}
-		case s.entries[objectId] != nil:
-			s.resettleRow(objectId, nil)
+		case s.deferred || s.entries[objectId] != nil:
+			s.resync(nil)
 		}
 	}
 }
@@ -403,9 +404,9 @@ func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 // space.ErrSubscriptionOverflow on mailbox overflow,
 // space.ErrSubscriptionDrifted on drift-budget exceeded, when a change
 // could not be evaluated against the window and no refill could settle
-// it, or when the object's rows were rebuilt under a window that
-// cannot refill (Resync), space.ErrObjectDeleted when the object a
-// per-object sub reads was purged (CloseObject).
+// it, or when an object's rows were rebuilt under the window and it
+// could not be re-read (Resync), space.ErrObjectDeleted when the object
+// a per-object sub reads was purged (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {
 		return v

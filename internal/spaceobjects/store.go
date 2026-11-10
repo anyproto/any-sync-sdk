@@ -311,10 +311,10 @@ type Store struct {
 	// objects, is deferred instead of taking a row not rebuilt yet for
 	// a deleted one. A load that fails leaves the rows as they are and
 	// no mark: storage then reads as it is, which for a load that
-	// failed past the wipe means the object's row is absent until its
-	// next load puts it back (a window across objects reports it
-	// deleted, then added), and that load marks the object again before
-	// touching a row.
+	// failed past the wipe means whatever the replay had put back, and
+	// a window that reads the object's rows before its next load sees
+	// that; the next load resumes the rebuild, marks the object again
+	// before touching a row, and ends with the windows re-read.
 	rebuilding sync.Map
 
 	// stampPending holds, per objectId, the object stamps landed during

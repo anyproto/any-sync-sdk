@@ -120,7 +120,7 @@ func TestRefill_HeldMoveBelowCapacityRanks(t *testing.T) {
 		view.fold(t, sub)
 		assert.True(t, sub.unranked, "the window is not certified")
 		assert.True(t, sub.needsRefill())
-		assert.Equal(t, 3, sub.lost, "two departures and the unranked row")
+		assert.Equal(t, 1, sub.lost, "the unranked row; both departures were replaced")
 	})
 }
 
@@ -435,6 +435,22 @@ func TestEngine_ResyncReReadsSharedWindowHoldingTheRow(t *testing.T) {
 	eng.Resync("r1", nil)
 	assert.Empty(t, all.Events().GetAll())
 	assert.Equal(t, 0, unbounded.scans)
+
+	// r2's rebuild left its row failing the filter of a filtered
+	// unbounded window: it leaves as filtered out.
+	filtered := newStoreModel(t, activeOnly, 0, driftRows(5)...)
+	active, err := eng.Subscribe(SubConfig{Scope: Scope{Shared: true}, Filter: activeOnly, MailboxCap: minMailboxCap, Refill: filtered.refill()}, snapshotFromRows(filtered.matching()))
+	require.NoError(t, err)
+	filtered.set(readRow(newArena(), "r2", 2))
+	eng.Resync("r2", nil)
+	evs = active.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, []space.RemovedRecord{{Id: "r2", Reason: space.RemoveFilteredOut}}, evs[0].Removed)
+
+	// A lookup that fails closes the window: it cannot be re-read.
+	unbounded.lookupFail = map[string]error{"r3": errors.New("torn")}
+	eng.Resync("r3", nil)
+	assert.ErrorIs(t, all.Err(), space.ErrSubscriptionDrifted)
 }
 
 // An unbounded window remembers the rows no record could read while
@@ -516,8 +532,57 @@ func TestEngine_ResyncClosesWindowsThatCannotRefill(t *testing.T) {
 	assert.ErrorIs(t, offset.Err(), space.ErrSubscriptionDrifted)
 	assert.ErrorIs(t, plain.Err(), space.ErrSubscriptionDrifted)
 	assert.NoError(t, other.Err(), "another object's window is untouched")
+
+	// A shared window past an offset holding the rebuilt object's row
+	// stays open while storage still has the row, and closes when the
+	// rebuild dropped it: it cannot re-read its rows.
 	eng.Resync("r1", nil)
-	assert.NoError(t, shared.Err(), "a shared window past an offset is left to the replay's events")
+	assert.NoError(t, shared.Err())
+	assert.Equal(t, 0, m.scans)
+	m.delete("r1")
+	eng.Resync("r1", nil)
+	assert.ErrorIs(t, shared.Err(), space.ErrSubscriptionDrifted)
+}
+
+// A windowed sub whose refill was deferred retries on every apply, and
+// a departure the apply replaced costs nothing while the retry fails.
+func TestRefill_DeferredWindowedRetriesOnApply(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2, driftRows(5)...)
+	sub, view := subscribeModel(t, eng, m, 30)
+
+	// At capacity and ranked, with an unreadable edit deferred.
+	m.fail = fmt.Errorf("%w: rebuilding", ErrRefillDeferred)
+	m.set(makeRow(arena, "r1", 1, map[string]any{"edited": true}))
+	fireUnreadable(eng, "obj1", "chat", "r1")
+	view.fold(t, sub)
+	require.True(t, sub.deferred)
+	reads := m.reads
+
+	// A departure replaced within its change: retried, deferred again,
+	// and no loss.
+	m.delete("r0")
+	x := makeRow(arena, "x", -1, nil)
+	m.set(x)
+	records := []EventRecord{{Id: "r0", Deleted: true}, {Id: "x"}}
+	eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", VersionId: "v", Records: records},
+		func(i int) (*anyenc.Value, error) { return m.rows[records[i].Id], nil })
+	view.fold(t, sub)
+	assert.Equal(t, reads+1, m.reads, "the deferred window retries")
+	assert.Equal(t, 0, sub.lost)
+	assert.True(t, sub.deferred)
+
+	// Storage is final again: the next apply's retry settles the
+	// window, r1's edit included.
+	m.fail = nil
+	far := makeRow(arena, "r9", 9, nil)
+	m.set(far)
+	fireEvent(eng, "obj1", "chat", "r9", far.d, false, nil)
+	agrees(t, sub, view, m)
+	assert.False(t, sub.deferred)
+	assert.Equal(t, 0, sub.lost)
 }
 
 // Resync re-reads every window on an object from storage outside any

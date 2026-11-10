@@ -557,11 +557,12 @@ an open question.
   objects or write to the DAG: both need `engine.mu` and deadlock.
 - **Refill**: a window at offset 0 stays equal to a fresh query of the
   same body. When a held row leaves a window with matches past its
-  edge, or a row's own sort move puts it in the sentinel slot with a
-  larger key than it was ranked at, the engine re-reads the window and
-  ships the difference; a window that holds every match reads nothing
-  when rows leave it. A change whose post-apply row cannot be read
-  settles by the same re-read, for an unbounded subscription too.
+  edge, or a held row's own sort move or an arrival puts a row in the
+  window at or past the key the window was last ranked at, the engine
+  re-reads the window and ships the difference; a window that holds
+  every match reads nothing when rows leave it. A change whose
+  post-apply row cannot be read settles by the same re-read, for an
+  unbounded subscription too.
   What a re-read finds arrives in an event of its own, with no
   `VersionId` and no ops, after the own event of the change behind
   it; a per-object re-read goes through the object the apply ran on,

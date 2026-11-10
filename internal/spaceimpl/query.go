@@ -77,12 +77,59 @@ func scopedFilter(rows, filter query.Filter) query.Filter {
 	return query.And{rows, filter}
 }
 
-// refillSource resolves what one refill reads: the collection, the
-// window's filter, and the filter of every row stored in the window's
-// scope (this object's rows of a shared collection, tombstones
-// skipped), which a lookup by id applies. source is the Event.Source
+// objectRows narrows a collection to one object's rows: the owner's
+// range of a keyed dataset, the object's own row of a shared dataset,
+// nothing for a collection of the object's own.
+func objectRows(ctrl *crdt.Controller, objectId, dataset string) query.Filter {
+	switch {
+	case ctrl.IsKeyed(dataset):
+		return crdt.KeyedRows(objectId)
+	case ctrl.IsShared(dataset):
+		return rowIs(objectId)
+	}
+	return nil
+}
+
+// rowIs matches the row stored under id.
+func rowIs(id string) query.Filter {
+	return query.Key{Path: []string{crdt.IdField}, Filter: query.NewComp(query.CompOpEq, id)}
+}
+
+// refillTarget is what one refill reads: the collection, the window's
+// filter, and the filter of every row stored in the window's scope
+// (this object's rows of a shared collection, tombstones skipped),
+// which a lookup by id applies. final reports whether storage's word
+// on a row is final; a lookup holds off on a row it is not (its object
+// is rebuilding its rows), where an absent row may be one not rebuilt
+// yet.
+type refillTarget struct {
+	coll   anystore.Collection
+	filter query.Filter
+	stored query.Filter
+	final  func(id string) bool
+}
+
+// refillSource resolves a refill's target. source is the Event.Source
 // of the apply behind the refill.
-type refillSource func(source any) (coll anystore.Collection, filter, stored query.Filter, err error)
+type refillSource func(source any) (refillTarget, error)
+
+// errRefillRebuilding is a refill, or a lookup, of rows an object is
+// rebuilding from its tree: storage is incomplete until the load ends.
+var errRefillRebuilding = errors.New("query: refill: the object is rebuilding its rows")
+
+// sharedSource resolves a refill across objects: the shared collection,
+// with lookups held off for an object mid-rebuild, whose row the wipe
+// removed without notice and the replay puts back.
+func sharedSource(store *spaceobjects.Store, coll anystore.Collection, filter query.Filter) refillSource {
+	return func(any) (refillTarget, error) {
+		return refillTarget{
+			coll:   coll,
+			filter: filter,
+			stored: tombstoneSkip,
+			final:  func(id string) bool { return !store.Rebuilding(id) },
+		}, nil
+	}
+}
 
 // objectSource resolves a per-object refill through the object the
 // apply ran on when source is that object, else through the loaded
@@ -92,31 +139,36 @@ type refillSource func(source any) (coll anystore.Collection, filter, stored que
 // construction is reachable only through the event). No instance is
 // kept across refills: the object may not have been local at
 // Subscribe, and holding it would keep an evicted object's tree
-// reachable for the subscription's life. With no instance, or one from
-// before the dataset was known, the refill fails: the engine counts
-// the departure as a loss and tries again on the next apply.
+// reachable for the subscription's life. With no instance, one from
+// before the dataset was known, or one rebuilding its rows, the refill
+// fails: the engine counts the departure as a loss and tries again on
+// the next apply.
 func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, dataset string, filter query.Filter) refillSource {
-	return func(source any) (anystore.Collection, query.Filter, query.Filter, error) {
+	return func(source any) (refillTarget, error) {
+		if store.Rebuilding(objectId) {
+			return refillTarget{}, errRefillRebuilding
+		}
 		obj, _ := source.(*object.Object)
 		if obj == nil || obj.Controller() == nil || obj.Controller().ObjectId() != objectId {
 			obj = store.PeekLoaded(objectId)
 		}
 		if obj == nil {
-			return nil, nil, nil, errRefillNoObject
+			return refillTarget{}, errRefillNoObject
 		}
 		ctrl := obj.Controller()
 		if !ctrl.HasDataset(dataset) {
-			return nil, nil, nil, errRefillNoObject
+			return refillTarget{}, errRefillNoObject
 		}
 		coll, err := ctrl.PeekCollection(ctx, dataset)
 		if err != nil {
-			return nil, nil, nil, err
+			return refillTarget{}, err
 		}
-		var rows query.Filter
-		if ctrl.IsKeyed(dataset) {
-			rows = crdt.KeyedRows(objectId)
-		}
-		return coll, withoutTombstones(scopedFilter(rows, filter)), withoutTombstones(rows), nil
+		rows := objectRows(ctrl, objectId, dataset)
+		return refillTarget{
+			coll:   coll,
+			filter: withoutTombstones(scopedFilter(rows, filter)),
+			stored: withoutTombstones(rows),
+		}, nil
 	}
 }
 
@@ -124,11 +176,11 @@ func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, data
 // closed by the engine, over the body captured here.
 func newRefill(ctx context.Context, source refillSource, sort query.Sort, limit, offset uint) subscribe.RefillFn {
 	return func(src any) (subscribe.RefillRead, error) {
-		coll, filter, stored, err := source(src)
+		t, err := source(src)
 		if err != nil {
 			return subscribe.RefillRead{}, err
 		}
-		if coll == nil {
+		if t.coll == nil {
 			// Nothing materialised: no rows, and no held row is stored.
 			return subscribe.RefillRead{
 				Rows:   func(func(id string, doc *anyenc.Value)) error { return nil },
@@ -136,16 +188,19 @@ func newRefill(ctx context.Context, source refillSource, sort query.Sort, limit,
 				Close:  func() {},
 			}, nil
 		}
-		tx, err := coll.ReadTx(ctx)
+		tx, err := t.coll.ReadTx(ctx)
 		if err != nil {
 			return subscribe.RefillRead{}, err
 		}
 		return subscribe.RefillRead{
 			Rows: func(yield func(id string, doc *anyenc.Value)) error {
-				return readWindow(tx.Context(), coll, filter, sort, limit, offset, yield)
+				return readWindow(tx.Context(), t.coll, t.filter, sort, limit, offset, yield)
 			},
 			Lookup: func(id string) (*anyenc.Value, error) {
-				return lookupStored(tx.Context(), coll, stored, id)
+				if t.final != nil && !t.final(id) {
+					return nil, errRefillRebuilding
+				}
+				return lookupStored(tx.Context(), t.coll, t.stored, id)
 			},
 			Close: func() { _ = tx.Commit() },
 		}, nil
@@ -166,7 +221,7 @@ func ObjectRefill(store *spaceobjects.Store, objectId, dataset string) subscribe
 // nil when the row is absent or stored fails on it (a tombstone, or a
 // row of another object in a shared collection).
 func lookupStored(ctx context.Context, coll anystore.Collection, stored query.Filter, id string) (*anyenc.Value, error) {
-	it, err := coll.Find(query.And{query.Key{Path: []string{crdt.IdField}, Filter: query.NewComp(query.CompOpEq, id)}, stored}).Limit(1).Iter(ctx)
+	it, err := coll.Find(query.And{rowIs(id), stored}).Limit(1).Iter(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -491,9 +546,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			// collection that appears in between is peeked without
 			// that write.
 			obj.Controller().Collection(ctx, q.dataset)
-			if obj.Controller().IsKeyed(q.dataset) {
-				q.rows = crdt.KeyedRows(q.objectId)
-			}
+			q.rows = objectRows(obj.Controller(), q.objectId, q.dataset)
 		}
 	}
 	// The tombstone-skip clause is part of the filter, so the engine's
@@ -543,9 +596,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	refillCtx := context.WithoutCancel(ctx)
 	var source refillSource
 	if scope.Shared || scope.AllObjects {
-		source = func(any) (anystore.Collection, query.Filter, query.Filter, error) {
-			return sharedColl, combined, tombstoneSkip, nil
-		}
+		source = sharedSource(q.store, sharedColl, combined)
 	} else {
 		source = objectSource(refillCtx, q.store, q.objectId, q.dataset, q.filter)
 	}
@@ -749,9 +800,10 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 	if q.allObjects {
 		return resolveDatasetCollection(ctx, q.store, q.dataset)
 	}
-	coll, keyed, err := resolveCollection(ctx, q.store, q.objectId, q.dataset)
-	if keyed {
-		q.rows = crdt.KeyedRows(q.objectId)
+	coll, ctrl, err := resolveCollection(ctx, q.store, q.objectId, q.dataset)
+	q.rows = nil
+	if ctrl != nil {
+		q.rows = objectRows(ctrl, q.objectId, q.dataset)
 	}
 	return coll, err
 }
@@ -761,10 +813,10 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 // "<shared:objects>" selects the per-space objects collection;
 // anything else goes through the object's controller. See
 // queryImpl.collection for the (nil, nil) empty-dataset contract.
-func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (coll anystore.Collection, keyed bool, err error) {
+func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (coll anystore.Collection, ctrl *crdt.Controller, err error) {
 	if dataset == sharedObjectsDataset {
 		coll, err = store.SharedObjects(ctx)
-		return coll, false, err
+		return coll, nil, err
 	}
 	// A resident controller built before a runtime dataset was defined
 	// doesn't know its collection; reload it so a just-defined dataset
@@ -772,10 +824,11 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	store.EnsureDatasetRegistered(ctx, objectId, dataset)
 	obj, err := store.Get(ctx, objectId)
 	if err != nil {
-		return nil, false, fmt.Errorf("query: %w", err)
+		return nil, nil, fmt.Errorf("query: %w", err)
 	}
-	// keyed comes from the controller that supplies the collection.
-	return obj.Controller().Collection(ctx, dataset), obj.Controller().IsKeyed(dataset), nil
+	// The controller that supplies the collection says how the object's
+	// rows are scoped in it (objectRows).
+	return obj.Controller().Collection(ctx, dataset), obj.Controller(), nil
 }
 
 // emptyIterator is the Iter() result when the dataset has no

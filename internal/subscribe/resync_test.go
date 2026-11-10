@@ -2,6 +2,7 @@ package subscribe
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 
@@ -51,9 +52,12 @@ func TestRefill_ReinsertedRowShipsItsStoredValue(t *testing.T) {
 	agrees(t, sub, view, m)
 }
 
-// The refill's event is a resync from storage: it carries no VersionId
-// and no ops, so a client that recognises its own write by VersionId
-// and skips that event still receives what the refill found.
+// The change's own event carries the change's effect on the window,
+// under its VersionId: its records' transitions and the rows they
+// moved into or out of view. The refill's event is a resync from
+// storage with no VersionId and no ops, so a client's own-write check
+// by VersionId sees exactly the write's effect, and a fence on
+// VersionId cannot drop what the refill found.
 func TestRefill_OwnEventCarriesOnlyTheChange(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
@@ -73,10 +77,94 @@ func TestRefill_OwnEventCarriesOnlyTheChange(t *testing.T) {
 	assert.Equal(t, []space.RemovedRecord{{Id: "r1", Reason: space.RemoveDeleted}}, resync.Removed)
 	assert.Empty(t, resync.Updated)
 
-	// The client skipped its own write: its view is one row behind
-	// until the resync, then equal.
-	view.apply([]space.SubscriptionEvent{{Removed: own.Removed}, {Added: own.Added}, resync})
+	view.apply([]space.SubscriptionEvent{own, resync})
 	agrees(t, sub, view, m)
+}
+
+// A held row's own sort move while the window is below capacity ranks
+// against the edge: moved to or past it, the row sorts among the
+// matches the window does not hold, and an arrival below the edge does
+// not certify the window around it.
+func TestRefill_HeldMoveBelowCapacityRanks(t *testing.T) {
+	seed := func(t *testing.T, fail bool) (*Engine, *storeModel, *Sub, *clientView) {
+		eng := New("test")
+		arena := newArena()
+		m := newStoreModel(t, nil, 2, makeRow(arena, "a", 10, nil), makeRow(arena, "b", 20, nil),
+			makeRow(arena, "c", 30, nil), makeRow(arena, "d", 40, nil), makeRow(arena, "e", 50, nil))
+		sub, view := subscribeModel(t, eng, m, 100)
+		if fail {
+			m.fail = errors.New("busy")
+		}
+		// One change: a deleted, b moved past the edge, x landed below
+		// it, c deleted, y landed between the edge and b.
+		m.delete("a")
+		m.set(makeRow(arena, "b", 100, nil))
+		m.set(makeRow(arena, "x", 0, nil))
+		m.delete("c")
+		m.set(makeRow(arena, "y", 45, nil))
+		records := []EventRecord{{Id: "a", Deleted: true}, {Id: "b"}, {Id: "x"}, {Id: "c", Deleted: true}, {Id: "y"}}
+		eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", VersionId: "v", Records: records},
+			func(i int) (*anyenc.Value, error) { return m.rows[records[i].Id], nil })
+		return eng, m, sub, view
+	}
+	t.Run("refill ranks it", func(t *testing.T) {
+		eng, m, sub, view := seed(t, false)
+		defer eng.Close()
+		assert.Equal(t, 1, m.reads)
+		assert.Equal(t, 0, sub.lost)
+		agrees(t, sub, view, m)
+	})
+	t.Run("no refill: unranked", func(t *testing.T) {
+		eng, _, sub, view := seed(t, true)
+		defer eng.Close()
+		view.fold(t, sub)
+		assert.True(t, sub.unranked, "the window is not certified")
+		assert.True(t, sub.needsRefill())
+		assert.Equal(t, 3, sub.lost, "two departures and the unranked row")
+	})
+}
+
+// A row the records took out of view without a verdict on it (its
+// record could not be read; another row's arrival demoted or evicted
+// it) leaves with the reason storage gives when the refill looks it up.
+func TestRefill_VerdictlessLeaverReasonComesFromStorage(t *testing.T) {
+	for name, arrivals := range map[string]int{"demoted": 1, "evicted": 2} {
+		t.Run(name, func(t *testing.T) {
+			eng := New("test")
+			defer eng.Close()
+			arena := newArena()
+			m := newStoreModel(t, activeOnly, 2, driftRows(4)...)
+			sub, view := subscribeModel(t, eng, m, 30)
+
+			// Storage has r1 filtered out; its record cannot be read.
+			m.set(readRow(arena, "r1", 1))
+			records := []EventRecord{{Id: "r1"}}
+			for i := 0; i < arrivals; i++ {
+				id := fmt.Sprintf("x%d", i)
+				m.set(activeRow(arena, id, -10-i))
+				records = append(records, EventRecord{Id: id})
+			}
+			eng.OnApply(Event{SpaceId: "test", ObjectId: "obj1", Dataset: "chat", VersionId: "v", Records: records},
+				func(i int) (*anyenc.Value, error) {
+					if i == 0 {
+						return nil, errors.New("read failed")
+					}
+					return m.rows[records[i].Id], nil
+				})
+			own, resync := ownAndResync(t, sub)
+			var r1 *space.RemovedRecord
+			for i := range own.Removed {
+				if own.Removed[i].Id == "r1" {
+					r1 = &own.Removed[i]
+				}
+			}
+			require.NotNil(t, r1, "%v", own.Removed)
+			assert.Equal(t, space.RemoveFilteredOut, r1.Reason)
+			assert.Contains(t, m.lookups, "r1")
+			view.apply([]space.SubscriptionEvent{own, resync})
+			agrees(t, sub, view, m)
+		})
+	}
 }
 
 // A refill receives Event.Source of the apply behind it, and nil behind

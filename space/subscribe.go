@@ -113,6 +113,11 @@ type RemovedRecord struct {
 // locally-scoped: each peer assigns its own; don't compare across
 // peers.
 //
+// A change's own event also carries the rows the change moved into or
+// out of view, such as the row promoted into the window when the
+// change deleted one above it: apply every event, and use VersionId
+// to tell which records are the caller's own write.
+//
 // An event with an empty VersionId is not a change's own and is never
 // skipped: the engine re-read the window from storage (to refill rows
 // that left it, or after a change whose row it could not read) and

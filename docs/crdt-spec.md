@@ -713,7 +713,7 @@ QueryDataset(dataset).Filter(...).Sort(...).Limit(n).Subscribe(ctx, opts)
 
 ### 13.1 Event Shape
 
-One `SubscriptionEvent` per apply that touches the subscription's scope, emitted after the write transaction commits, so a query run on receipt sees the new state.
+A change that touches the subscription's scope produces one `SubscriptionEvent`, emitted after the write transaction commits so a query run on receipt sees the new state, and a second one when the engine re-read storage after it (below).
 
 ```
 SubscriptionEvent {
@@ -754,7 +754,7 @@ An event with an empty `versionId` is not a change's own: the engine re-read the
 Drop the record for good only on `deleted`. After the other two, `Snapshot` or `Query.One` still returns it.
 
 ### 13.4 Property Scopes in Events
-Account- and local-scope writes produce events like synced ones: one per applied change, with the versionId of that change's domain. Consumers don't need a path's scope to apply the ops.
+Account- and local-scope writes produce events like synced ones: one own event per applied change, with the versionId of that change's domain. Consumers don't need a path's scope to apply the ops.
 
 ### 13.5 Ordering
 - Events follow apply order, after commit.
@@ -762,13 +762,13 @@ Account- and local-scope writes produce events like synced ones: one per applied
 - There is no ordering across objects.
 
 ### 13.6 Own-write events
-Callers receive their own writes and recognize them by matching `ModifyResult.VersionId` with `SubscriptionEvent.VersionId`. The SDK doesn't suppress them. An event with an empty `versionId` is never an own write (§13.1).
+Callers receive their own writes and recognize them by matching `ModifyResult.VersionId` with `SubscriptionEvent.VersionId`. The SDK doesn't suppress them. An own write's event also carries the rows the change moved into or out of view (the row promoted into the window when the write deleted one above it), so apply every event; the match tells which records are the write's own. An event with an empty `versionId` is never an own write (§13.1).
 
 ### 13.7 Backpressure + Recovery
 
 Each subscription has a bounded mailbox (`QueryOpts.MailboxCapacity`, default 256, minimum 16). When it fills, the subscription closes with `ErrSubscriptionOverflow`.
 
-A window at offset 0 stays equal to a fresh query of the same body: when a held row leaves a window with matches past its edge, or a row's own sort move puts it in the sentinel slot with a larger key than it was ranked at, the engine re-reads the window from any-store and ships the difference. A window that holds every match reads nothing when rows leave it. A change whose post-apply row cannot be read is settled by the same re-read, for an unbounded subscription too.
+A window at offset 0 stays equal to a fresh query of the same body: when a held row leaves a window with matches past its edge, or a held row's own sort move or an arrival puts a row in the window at or past the key the window was last ranked at, the engine re-reads the window from any-store and ships the difference. A window that holds every match reads nothing when rows leave it. A change whose post-apply row cannot be read is settled by the same re-read, for an unbounded subscription too.
 
 `ErrSubscriptionDrifted` closes a subscription the engine cannot keep equal to storage: a window past an offset, whose rows shift with rows before it, loses `DriftBudgetPercent` (default 30) of `Limit` records; a window at offset 0 loses that many while its re-read fails (a row that leaves counts once, an arrival the window cannot rank once, a re-read that fails again nothing); or a row cannot be read and no re-read can settle it.
 

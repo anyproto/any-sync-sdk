@@ -171,7 +171,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 			}
 			s.engine.OnApply(ev, postValue)
 			if res != nil && len(res.ObjectStamps) > 0 && obj != nil {
-				s.dispatchObjectStamps(ctx, obj.Controller(), obj.Replaying(), ch, res.ObjectStamps)
+				s.dispatchObjectStamps(ctx, obj.Controller(), obj.Replaying(), obj, ch, res.ObjectStamps)
 			}
 		}
 
@@ -250,7 +250,10 @@ type pendingStamps struct {
 // per object after the batch, with the row's final values — so a bulk
 // catch-up of a large object cannot flood an objects subscription with
 // one event per change and overflow its mailbox.
-func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller, replaying bool, ch *crdt.Change, stamps []crdt.ObjectStamp) {
+//
+// source is the object the apply ran on, carried on the event for a
+// refill to read through while the object loads.
+func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller, replaying bool, source any, ch *crdt.Change, stamps []crdt.ObjectStamp) {
 	if len(stamps) == 0 || ctrl == nil {
 		return
 	}
@@ -259,7 +262,7 @@ func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller,
 		return
 	}
 	for _, st := range stamps {
-		s.emitObjectStamp(ctx, ctrl, ch.SpaceId, ch.ObjectId, ch.VersionId, st)
+		s.emitObjectStamp(ctx, ctrl, source, ch.SpaceId, ch.ObjectId, ch.VersionId, st)
 	}
 }
 
@@ -267,7 +270,7 @@ func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller,
 // replay batch as one update event per shared row, re-reading each
 // stamped path from the row so the event carries the batch's final
 // values. No-op when nothing was recorded or nobody listens.
-func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, objectId string) {
+func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, source any, objectId string) {
 	v, ok := s.stampPending.LoadAndDelete(objectId)
 	if !ok || ctrl == nil || s.engine == nil || !s.engine.HasSubscribers() {
 		return
@@ -279,7 +282,7 @@ func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, ob
 			// The row could not be read: the event still goes out,
 			// with an unreadable post value, so each window in scope
 			// settles from storage or closes.
-			s.emitObjectStampWith(ctx, s.spaceId, objectId, pending.versionId, st,
+			s.emitObjectStampWith(ctx, source, s.spaceId, objectId, pending.versionId, st,
 				func(int) (*anyenc.Value, error) { return nil, err })
 			continue
 		}
@@ -298,7 +301,7 @@ func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, ob
 		if len(ops) == 0 {
 			continue
 		}
-		s.emitObjectStamp(ctx, ctrl, s.spaceId, objectId, pending.versionId,
+		s.emitObjectStamp(ctx, ctrl, source, s.spaceId, objectId, pending.versionId,
 			crdt.ObjectStamp{Dataset: st.Dataset, RowId: st.RowId, Ops: ops})
 	}
 }
@@ -306,8 +309,8 @@ func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, ob
 // emitObjectStamp feeds the engine one event shaped like an update of
 // the stamped row carrying only the stamp ops; the row's post value is
 // read on demand like any other apply event.
-func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp) {
-	s.emitObjectStampWith(ctx, spaceId, objectId, versionId, st, func(i int) (*anyenc.Value, error) {
+func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, source any, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp) {
+	s.emitObjectStampWith(ctx, source, spaceId, objectId, versionId, st, func(i int) (*anyenc.Value, error) {
 		if i != 0 {
 			return nil, nil
 		}
@@ -316,8 +319,9 @@ func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, spac
 }
 
 // emitObjectStampWith is emitObjectStamp with the post-value lookup
-// supplied.
-func (s *Store) emitObjectStampWith(_ context.Context, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp, postValue subscribe.PostValueFn) {
+// supplied. The event carries source, the object the apply ran on, so
+// a per-object window's refill reads through it while the object loads.
+func (s *Store) emitObjectStampWith(_ context.Context, source any, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp, postValue subscribe.PostValueFn) {
 	synthetic := crdt.Change{
 		SpaceId:   spaceId,
 		ObjectId:  objectId,
@@ -326,6 +330,9 @@ func (s *Store) emitObjectStampWith(_ context.Context, spaceId, objectId string,
 		Records:   []crdt.RecordChange{{Id: st.RowId}},
 	}
 	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, postValue)
+	if source != nil {
+		ev.Source = source
+	}
 	s.engine.OnApply(ev, postValue)
 }
 
@@ -336,7 +343,7 @@ func (s *Store) afterReplayFor() object.AfterReplay {
 		if obj == nil || obj.Controller() == nil {
 			return
 		}
-		s.flushObjectStamps(ctx, obj.Controller(), obj.Controller().ObjectId())
+		s.flushObjectStamps(ctx, obj.Controller(), obj, obj.Controller().ObjectId())
 		s.releaseIndexSync(obj.Controller().ObjectId())
 	}
 }

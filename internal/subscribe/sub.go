@@ -390,11 +390,20 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		out.landed = true
 		oldTuple := oldEntry.tuple
 		s.updateEntry(oldEntry, postKey, raw)
-		if s.ranks() && s.sentinel() == oldEntry && bytes.Compare(postKey, oldTuple) > 0 {
-			// The row's own sort move put or kept it in the sentinel
-			// slot with a larger key than it was ranked at: matches
-			// past the edge may now sort below it.
-			s.unranked = true
+		if s.ranks() && bytes.Compare(postKey, oldTuple) > 0 {
+			switch {
+			case s.atCapacity():
+				// The row's own sort move put or kept it in the
+				// sentinel slot with a larger key than it was ranked
+				// at: matches past the edge may now sort below it.
+				if s.sentinel() == oldEntry {
+					s.unranked = true
+				}
+			case s.edge == nil || bytes.Compare(postKey, s.edge) >= 0:
+				// Below capacity, the row moved to or past the edge:
+				// it sorts among the matches the window does not hold.
+				s.unranked = true
+			}
 		}
 	case wasHeld && !matches:
 		if prevSentinel != nil && s.ranks() && !s.unranked {
@@ -474,7 +483,7 @@ func (s *querySub) emit(versionId crdt.VersionId, p *subPending) (own, resync sp
 				own.Updated = append(own.Updated, s.ownRecord(id, midRaw, out))
 			}
 		case was && !mid:
-			own.Removed = append(own.Removed, space.RemovedRecord{Id: id, Reason: recordReason(out)})
+			own.Removed = append(own.Removed, space.RemovedRecord{Id: id, Reason: recordReason(id, out, p)})
 		}
 		if !p.refilled {
 			continue
@@ -530,12 +539,16 @@ func (s *querySub) storedRecord(e *entry, out *recOutcome) space.SubRecord {
 
 // recordReason classifies a row the apply's records took out of view:
 // deleted when the last settled record on it tombstoned it or found no
-// row, filtered out when that record's post doc failed the filter;
-// otherwise another row's arrival evicted it or its own sort move
-// demoted it, and it still matches past the edge.
-func recordReason(out *recOutcome) space.RemoveReason {
+// row, filtered out when that record's post doc failed the filter.
+// With no verdict, another row's arrival evicted it or its own sort
+// move demoted it: it still matches past the edge, unless a refill
+// looked it up and storage said otherwise.
+func recordReason(id string, out *recOutcome, p *subPending) space.RemoveReason {
 	switch {
 	case out == nil || !out.verdict:
+		if r, ok := p.gone[id]; ok {
+			return r
+		}
 		return space.RemoveDisplaced
 	case out.deleted || !out.present:
 		return space.RemoveDeleted
@@ -657,10 +670,12 @@ func (s *querySub) refillWindow(p *subPending) error {
 	for _, fr := range rows {
 		fresh[fr.id] = struct{}{}
 	}
-	for id := range s.entries {
-		if _, ok := fresh[id]; ok || read.Lookup == nil {
-			continue
-		}
+	// Rows the read did not return are classified from storage before
+	// the held set changes: every held row, and every row the records
+	// took out of view without a verdict on it (an unreadable record,
+	// another row's arrival), whose reason would otherwise be the
+	// engine's guess.
+	lookup := func(id string) error {
 		doc, err := read.Lookup(id)
 		if err != nil {
 			return err
@@ -676,6 +691,27 @@ func (s *querySub) refillWindow(p *subPending) error {
 			p.gone = map[string]space.RemoveReason{}
 		}
 		p.gone[id] = reason
+		return nil
+	}
+	if read.Lookup != nil {
+		for id := range s.entries {
+			if _, ok := fresh[id]; ok {
+				continue
+			}
+			if err := lookup(id); err != nil {
+				return err
+			}
+		}
+		for _, id := range p.order {
+			if _, ok := fresh[id]; ok || s.entries[id] != nil || !p.before[id] || p.mid[id].visible {
+				continue
+			}
+			if out := p.recs[id]; out == nil || !out.verdict {
+				if err := lookup(id); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	s0 := s.sentinel()

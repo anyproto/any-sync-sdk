@@ -82,7 +82,7 @@ func (f *stampFixture) noteWrite(t *testing.T, ver crdt.VersionId, ts int64, rep
 	res, err := f.ctrl.ApplyChangeWithResult(f.ctx, ch)
 	require.NoError(t, err)
 	require.Len(t, res.ObjectStamps, 1)
-	f.store.dispatchObjectStamps(f.ctx, f.ctrl, replaying, &ch, res.ObjectStamps)
+	f.store.dispatchObjectStamps(f.ctx, f.ctrl, replaying, nil, &ch, res.ObjectStamps)
 }
 
 func (f *stampFixture) noEvent(t *testing.T) {
@@ -143,7 +143,7 @@ func TestObjectStamps_ReplayBatchCoalesces(t *testing.T) {
 	f.noteWrite(t, "v3", 400, true)
 	f.noEvent(t)
 
-	f.store.flushObjectStamps(f.ctx, f.ctrl, stampObj)
+	f.store.flushObjectStamps(f.ctx, f.ctrl, nil, stampObj)
 	rec := f.oneUpdate(t)
 	assert.Equal(t, stampObj, rec.Id)
 	at, by := stampOf(t, rec)
@@ -152,7 +152,7 @@ func TestObjectStamps_ReplayBatchCoalesces(t *testing.T) {
 	f.noEvent(t)
 
 	// Nothing pending: a second flush is a no-op.
-	f.store.flushObjectStamps(f.ctx, f.ctrl, stampObj)
+	f.store.flushObjectStamps(f.ctx, f.ctrl, nil, stampObj)
 	f.noEvent(t)
 }
 
@@ -162,7 +162,7 @@ func TestObjectStamps_FlushWithoutListenerDrops(t *testing.T) {
 	f := newStampFixture(t)
 	f.noteWrite(t, "v1", 200, true)
 	require.NoError(t, f.sub.Close())
-	f.store.flushObjectStamps(f.ctx, f.ctrl, stampObj)
+	f.store.flushObjectStamps(f.ctx, f.ctrl, nil, stampObj)
 	_, pending := f.store.stampPending.Load(stampObj)
 	assert.False(t, pending, "flush clears the entry even without listeners")
 }

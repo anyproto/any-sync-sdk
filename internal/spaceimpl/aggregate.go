@@ -36,8 +36,10 @@ type aggImpl struct {
 	// holds it (Space.AggregateDataset); objectId is unused.
 	allObjects bool
 	// keyed: the resolved collection holds every object's rows, so the
-	// pipeline starts from this object's key range. Set by collection.
-	keyed bool
+	// pipeline starts from this object's key range; shared: it holds one
+	// row per object, so the pipeline starts from this object's row.
+	// Set by collection.
+	keyed, shared bool
 
 	// pipeline is the normalized user pipeline (an anyenc array; nil
 	// for an absent/empty pipeline). arena owns the values aggImpl
@@ -75,8 +77,9 @@ func (a *aggImpl) collection(ctx context.Context) (anystore.Collection, error) {
 	if a.allObjects {
 		return resolveDatasetCollection(ctx, a.store, a.dataset)
 	}
-	coll, keyed, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
-	a.keyed = keyed
+	coll, ctrl, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	a.keyed = ctrl != nil && ctrl.IsKeyed(a.dataset)
+	a.shared = ctrl != nil && !a.keyed && ctrl.IsShared(a.dataset)
 	return coll, err
 }
 
@@ -130,13 +133,16 @@ func (a *aggImpl) combined() *anyenc.Value {
 	exists.Set("$exists", a.arena.NewFalse())
 	match := a.arena.NewObject()
 	match.Set(crdt.DeletedAtField, exists)
-	if a.keyed {
+	switch {
+	case a.keyed:
 		// A shared dataset's collection holds every object's rows.
 		lo, hi := crdt.KeyedBounds(a.objectId)
 		idRange := a.arena.NewObject()
 		idRange.Set("$gte", a.arena.NewString(lo))
 		idRange.Set("$lt", a.arena.NewString(hi))
 		match.Set(crdt.IdField, idRange)
+	case a.shared:
+		match.Set(crdt.IdField, a.arena.NewString(a.objectId))
 	}
 	skipStage := a.arena.NewObject()
 	skipStage.Set("$match", match)

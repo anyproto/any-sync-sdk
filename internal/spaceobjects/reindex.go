@@ -304,15 +304,15 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 //
 // Live subscriptions are not notified of the wipe of the object's own
 // collections: a window keeps its rows and sees the replay as one
-// update per change in the tree, converging when it ends; a refill in
-// the replay reads through the rebuilding instance and shows storage
-// as the replay has rebuilt it so far. The object's rows in a shared
-// dataset's collection are the exception — a reader across objects
-// holds them without having loaded the object, so it is told they
-// left, and the replay adds back the ones it rebuilds. The object's
-// row in the objects collection goes the same way without a
-// notification: a refill of a window across objects during the rebuild
-// finds it absent and reports it deleted, and the replay adds it back.
+// update per change in the tree, converging when it ends. Storage is
+// not final until the load returns (Store.Rebuilding), so a refill of
+// the window fails until then, and a departure in the replay counts as
+// a loss. The object's rows in a shared dataset's collection are the
+// exception — a reader across objects holds them without having loaded
+// the object, so it is told they left, and the replay adds back the
+// ones it rebuilds. The object's row in the objects collection goes
+// the same way without a notification: a window across objects that
+// no longer reads it holds off classifying it until the rebuild ends.
 func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crdt.Controller) error {
 	for _, dataset := range ctrl.RegisteredDatasets() {
 		if !ctrl.IsShared(dataset) {

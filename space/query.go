@@ -98,7 +98,8 @@ type QueryOpts struct {
 	// MailboxCapacity bounds the per-subscription event queue. Default
 	// 256, minimum 16. On overflow the subscription closes; Wait
 	// returns mb.ErrClosed and Err() returns ErrSubscriptionOverflow.
-	// Subscribe-only.
+	// A change after which the window refilled from storage takes two
+	// slots: its own event and the refill's. Subscribe-only.
 	MailboxCapacity int
 
 	// DriftBudgetPercent: when this fraction of Limit records leave

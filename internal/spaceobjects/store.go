@@ -303,6 +303,13 @@ type Store struct {
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *fanout.Registry[RowEvent]
 
+	// rebuilding holds the ids of objects whose load is rebuilding their
+	// rows from the tree (reindex.go): storage is incomplete until the
+	// load returns, so a refill of a window on the object, or a lookup
+	// of its row by a window across objects, holds off instead of
+	// taking a row not rebuilt yet for a deleted one.
+	rebuilding sync.Map
+
 	// stampPending holds, per objectId, the object stamps landed during
 	// the current replay batch, emitted as one event per object by the
 	// AfterReplay hook. See dispatchObjectStamps.
@@ -2570,6 +2577,9 @@ func isDocNotFound(err error) bool {
 // loading or closing. Safe under the subscribe engine's fence, where a
 // Get on an object whose load fired the apply would wait on itself.
 func (s *Store) PeekLoaded(objectId string) *object.Object {
+	if s.Rebuilding(objectId) {
+		return nil
+	}
 	peeker, ok := s.cache.(ocache.Peeker)
 	if !ok {
 		return nil
@@ -2579,6 +2589,15 @@ func (s *Store) PeekLoaded(objectId string) *object.Object {
 		return nil
 	}
 	return v.(*object.Object)
+}
+
+// Rebuilding reports whether objectId's load is rebuilding its rows from
+// the tree right now: its collections were wiped and the replay has not
+// finished putting the rows back, so a read of them is not storage's
+// final word.
+func (s *Store) Rebuilding(objectId string) bool {
+	_, ok := s.rebuilding.Load(objectId)
+	return ok
 }
 
 // Get returns the *object.Object for objectId, lazy-loading on first
@@ -2853,6 +2872,10 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	stale := ctrl.StaleDatasets()
 	resume := len(stale) == 0 && ctrl.ReindexPending()
 	rebuilding := len(stale) > 0 || resume
+	if rebuilding {
+		s.rebuilding.Store(objectId, struct{}{})
+		defer s.rebuilding.Delete(objectId)
+	}
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
 	// tracking ON and merge the published frontiers after. Only when

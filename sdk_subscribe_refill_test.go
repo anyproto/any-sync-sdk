@@ -122,8 +122,12 @@ func TestSDK_SubscribeRefillResolvesObjectAndQuery(t *testing.T) {
 	}
 	del("r2")
 	waitView(res2.Sub, []string{"r3", "r4", "r5"})
-	// Let a leaked limit show: the refill's event has landed when the
-	// view reached three rows, so a wider one would be visible now.
+	// With a leaked limit the refill's event, queued with the change's
+	// own, would widen the view past three rows; nothing more arrives.
+	quietCtx, quietCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer quietCancel()
+	evs, err := res2.Sub.Events().Wait(quietCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "unexpected events %v", evs)
 	assert.Equal(t, []string{"r3", "r4", "r5"}, idsOfView(view))
 	assert.NoError(t, res2.Sub.Err())
 }

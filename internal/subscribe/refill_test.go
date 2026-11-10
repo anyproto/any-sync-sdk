@@ -1214,14 +1214,15 @@ func TestApply_FastRejectedAfterVisibleIsDisplaced(t *testing.T) {
 // records, in three regimes: storage in step with the events; storage
 // a batch ahead of them, as when a later change commits before an
 // earlier one's event runs; and refills that fail for a while. After
-// every apply the client's folded view, the engine's held set and a
-// fresh query of the model are compared, every event is checked
-// against the client's contract, each removal's reason against
-// storage, and no loss is counted while refills work.
+// every apply the client's folded view and the engine's held set are
+// compared, and both against a fresh query of the model whenever
+// refills work or the engine certifies its window; every event is
+// checked against the client's contract and each removal's reason
+// against storage, and no loss is counted while refills work.
 func TestRefill_RandomizedAgreesWithStorage(t *testing.T) {
 	for _, regime := range []string{"in step", "storage ahead", "refills failing"} {
 		t.Run(regime, func(t *testing.T) {
-			for seed := int64(0); seed < 400; seed++ {
+			for seed := int64(0); seed < 1000; seed++ {
 				t.Run(fmt.Sprint(seed), func(t *testing.T) {
 					randomizedRun(t, regime, seed)
 				})
@@ -1279,14 +1280,14 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 		unreadable []bool
 		after      map[string]*anyenc.Value // the model after this batch
 	}
-	build := func(step int) batch {
+	build := func(step int, tag string) batch {
 		var b batch
-		count := 1 + rng.Intn(3)
+		count := 1 + rng.Intn(6)
 		for j := 0; j < count; j++ {
 			ids := known()
 			var id string
 			if len(ids) == 0 || rng.Intn(4) == 0 {
-				id = fmt.Sprintf("x%d_%d", step, j)
+				id = fmt.Sprintf("x%d%s_%d", step, tag, j)
 			} else {
 				id = ids[rng.Intn(len(ids))]
 			}
@@ -1321,11 +1322,18 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 			return m.rows[b.ev.Records[i].Id], nil
 		})
 	}
+	matches := func(d *anyenc.Value) bool {
+		return d != nil && (m.filter == nil || m.filter.Ok(d, m.buf))
+	}
 	// check folds the events of one apply and verifies each against the
 	// client's contract and against storage: a deleted row is absent
-	// from storage now; a row filtered out or displaced existed after
-	// the change that removed it.
+	// from storage now; a row filtered out failed the filter after the
+	// change that removed it or fails it now; a displaced row matched
+	// then or matches now. The last two hold only while refills work:
+	// a window that cannot re-read reports a row it lost sight of as
+	// displaced.
 	check := func(step int, b batch) {
+		refills := m.fail == nil
 		evs := sub.Events().GetAll()
 		require.LessOrEqual(t, len(evs), 2, "step %d: %v", step, evs)
 		for i, ev := range evs {
@@ -1339,13 +1347,18 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 			}
 			view.foldChecked(t, ev)
 			for _, r := range ev.Removed {
-				_, now := m.rows[r.Id]
-				_, then := b.after[r.Id]
+				now, then := m.rows[r.Id], b.after[r.Id]
 				switch r.Reason {
 				case space.RemoveDeleted:
-					require.False(t, now, "step %d: %s removed as deleted but stored", step, r.Id)
+					require.Nil(t, now, "step %d: %s removed as deleted but stored", step, r.Id)
+				case space.RemoveFilteredOut:
+					require.True(t, (then != nil && !matches(then)) || (now != nil && !matches(now)),
+						"step %d: %s removed as filtered out but matching", step, r.Id)
 				default:
-					require.True(t, then, "step %d: %s removed as %s but never stored after its change", step, r.Id, r.Reason)
+					require.NotNil(t, then, "step %d: %s removed as %s but never stored after its change", step, r.Id, r.Reason)
+					if refills {
+						require.True(t, matches(then) || matches(now), "step %d: %s removed as displaced but not matching", step, r.Id)
+					}
 				}
 			}
 		}
@@ -1356,8 +1369,8 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 		case "storage ahead":
 			// Two changes commit, then their events run in order: the
 			// first apply's refill sees the second's rows.
-			a := build(step)
-			b := build(step)
+			a := build(step, "a")
+			b := build(step, "b")
 			b.ev.VersionId += "b"
 			fire(a)
 			check(step, a)
@@ -1370,11 +1383,11 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 			} else if step%7 == 4 {
 				m.fail = nil
 			}
-			b := build(step)
+			b := build(step, "")
 			fire(b)
 			check(step, b)
 		default:
-			b := build(step)
+			b := build(step, "")
 			fire(b)
 			check(step, b)
 		}
@@ -1383,7 +1396,11 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 			return
 		}
 		agreesWithEngine(t, sub, view, m)
-		if m.fail == nil {
+		// A window the engine certifies (it holds every match, or is at
+		// capacity with every row ranked) equals a fresh query whether
+		// or not refills work.
+		certified := sub.complete || (sub.atCapacity() && !sub.unranked)
+		if m.fail == nil || certified {
 			agrees(t, sub, view, m)
 		}
 		if regime != "refills failing" {

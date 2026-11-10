@@ -106,10 +106,11 @@ type QueryOpts struct {
 	// the held window without replacement, the subscription closes
 	// with ErrSubscriptionDrifted. Default 30. A window at offset 0
 	// refills from storage when rows leave it, so a departure counts
-	// only when the refill fails and it left the window short, or
-	// happened while the window held a row it cannot rank (that state
-	// counts once itself, until a refill ranks it); a window past an
-	// offset shifts with rows before it and counts every departure.
+	// only when the refill fails, and not when the window ended the
+	// change at capacity with every row ranked; a held row's sort move
+	// while the window holds a row it cannot rank counts, and that
+	// state counts once itself, until a refill ranks it. A window past
+	// an offset shifts with rows before it and counts every departure.
 	// Ignored when Limit == 0. Subscribe-only.
 	DriftBudgetPercent int
 }

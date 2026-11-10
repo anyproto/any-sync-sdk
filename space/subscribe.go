@@ -159,14 +159,17 @@ var ErrSubscriptionOverflow = errors.New("space: subscription overflowed; resubs
 
 // ErrSubscriptionDrifted is returned by QuerySubscription.Err when
 // the engine could not keep the window equal to storage: a window
-// past an offset lost QueryOpts.DriftBudgetPercent of its rows, or
-// held a row an object's rebuild from the tree dropped; a window at
-// offset 0 lost that many while its re-read of storage failed (a row
-// that left counts when the window ends short or while it holds a row
-// it cannot rank, the unranked state once until a re-read ranks it, a
-// re-read that fails again nothing); a change's row could not be read
-// and no re-read could settle it; or the re-read after a rebuild
-// failed. The client is expected to resubscribe.
+// past an offset lost QueryOpts.DriftBudgetPercent of its rows, or its
+// object's rows were rebuilt from the tree under it (a window across
+// objects past an offset: when the rebuild dropped a row it held); a
+// window at offset 0 lost that many while its re-read of storage
+// failed (a row that left counts unless the window ended the change at
+// capacity with every row ranked, a held row's sort move while the
+// window holds a row it cannot rank counts, the unranked state once
+// until a re-read ranks it, a re-read that fails again nothing); a
+// change's row could not be read and no re-read could settle it; or
+// the re-read after a rebuild failed. The client is expected to
+// resubscribe.
 var ErrSubscriptionDrifted = errors.New("space: subscription drifted (the window could not be kept equal to storage); resubscribe required")
 
 // ErrSubscribeUnsupported is returned by Query.Subscribe for query

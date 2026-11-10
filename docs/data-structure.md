@@ -581,10 +581,11 @@ an open question.
   cannot keep the window equal to storage: a window past an offset
   loses `DriftBudgetPercent` (default 30) of `Limit` records, a
   window at offset 0 loses that many while its re-read fails (a row
-  that leaves counts when the window ends short or while it holds a
-  row it cannot rank, the unranked state once until a re-read ranks it,
-  a re-read that fails again nothing), or a row cannot be read and no
-  re-read can settle it. Resubscribing is the only recovery.
+  that leaves counts unless the window ends the change at capacity with
+  every row ranked, a held row's sort move while the window holds a row
+  it cannot rank counts, the unranked state once until a re-read ranks
+  it, a re-read that fails again nothing), or a row cannot be read and
+  no re-read can settle it. Resubscribing is the only recovery.
 - **Total**: `IncludeTotal` counts in the snapshot's read, after the
   fence, so `Total` and `HasNext` describe exactly the rows returned; a
   snapshot that holds every match needs no count. It is not maintained

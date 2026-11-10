@@ -27,9 +27,10 @@
 // unbounded sub too. The re-read runs through Event.Source, the object
 // the apply ran on, so a replay that fires while the object loads
 // refills as well; it looks up each held row it no longer returns, so
-// the row's reason is storage's. While the re-read fails, a departure
-// counts toward the drift budget when it leaves the window short or
-// happens while the window holds a row it cannot rank, and the
+// the row's reason is storage's. While the re-read fails, every
+// departure counts toward the drift budget unless the window ends the
+// apply at capacity with every row ranked, a held row's key growth
+// while the window holds a row it cannot rank counts, and the
 // unranked state itself once, until a re-read ranks it, and the sub
 // closes with space.ErrSubscriptionDrifted at DriftBudgetPercent of
 // limit; an
@@ -37,10 +38,11 @@
 // because storage is not final (an object rebuilding its rows from
 // its tree) counts nothing: a windowed sub retries on every apply, and
 // the store calls Engine.Resync when the rows are back, which re-reads
-// every window on the object and every shared window that was deferred
-// or holds its row, the latter by one lookup where the window is
-// unbounded or past an offset. Mailbox overflow closes with
-// space.ErrSubscriptionOverflow. Both signal "resubscribe".
+// every window on the object (one past an offset closes instead) and
+// every shared window that was deferred or holds its row, the latter
+// by one lookup where the window is unbounded or past an offset.
+// Mailbox overflow closes with space.ErrSubscriptionOverflow. Both
+// signal "resubscribe".
 //
 // Events are built from the ids an apply touched, each with its view
 // before the apply: the change's own event ships, under its

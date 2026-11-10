@@ -208,7 +208,7 @@ type subPending struct {
 	recs       map[string]*recOutcome
 	gone       map[string]space.RemoveReason // why a refill dropped a held row
 	departed   int                           // held rows that left a window with matches past its edge
-	unranked   int                           // of those, the ones that left while the window held an unranked row
+	moved      int                           // held rows whose key grew while the window held an unranked row
 	unreadable int                           // records whose post value could not be read
 }
 
@@ -358,12 +358,10 @@ func (s *querySub) resettleRow(id string, source any) {
 		return
 	}
 	if read.Lookup == nil {
+		// No way to classify one row: the whole window, which a sub
+		// that cannot refill closes over.
 		read.Close()
-		if s.canRefill() {
-			s.resync(source)
-		} else {
-			s.closeWith(space.ErrSubscriptionDrifted)
-		}
+		s.resync(source)
 		return
 	}
 	doc, err := read.Lookup(id)
@@ -499,6 +497,11 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		oldTuple := oldEntry.tuple
 		s.updateEntry(oldEntry, postKey, raw)
 		if s.ranks() && bytes.Compare(postKey, oldTuple) > 0 {
+			if s.unranked {
+				// A move past rows the window does not hold may put
+				// the row where one of them belongs.
+				p.moved++
+			}
 			switch {
 			case s.atCapacity():
 				// The row's own sort move put or kept it in the
@@ -522,9 +525,6 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		s.removeEntry(oldEntry)
 		if s.windowed() && !s.complete {
 			p.departed++
-			if s.unranked {
-				p.unranked++
-			}
 		}
 	case !wasHeld && matches:
 		if s.atCapacity() {
@@ -678,14 +678,15 @@ func recordReason(id string, out *recOutcome, p *subPending) space.RemoveReason 
 // ranked needs no refill: every departure in it was replaced. A
 // refill deferred because storage is not final counts nothing: a
 // windowed sub retries it on every apply, and Engine.Resync re-reads
-// the window when the rows are back. When the refill fails, a
-// departure counts as a loss if the window ends the apply short of
-// rows, or if it happened while the window held a row it cannot rank
-// (what replaced it may be the wrong row); the unranked state itself
-// counts once. The next apply tries the refill again at no further
-// cost. An unreadable row with no refill closes the sub, whose window
-// can no longer be trusted to match storage. Reports whether the sub
-// is still open.
+// the window when the rows are back. When the refill fails, every
+// departure of the apply counts as a loss unless the window ends the
+// apply at capacity with every row ranked (then each was replaced by
+// the right row); a held row's key growth while the window holds a row
+// it cannot rank counts, since the row may have moved past a match the
+// window does not hold; the unranked state itself counts once. The
+// next apply tries the refill again at no further cost. An unreadable
+// row with no refill closes the sub, whose window can no longer be
+// trusted to match storage. Reports whether the sub is still open.
 func (s *querySub) settle(p *subPending) bool {
 	unreadable := p.unreadable > 0
 	if !unreadable && !s.needsRefill() && !(s.deferred && s.windowed()) {
@@ -728,14 +729,12 @@ func (s *querySub) settle(p *subPending) bool {
 		s.unrankedLoss = true
 		s.lost++
 	}
-	if len(s.entries) <= s.cfg.Limit {
-		// Short of rows: the departures were not replaced.
+	if len(s.entries) <= s.cfg.Limit || s.unranked {
+		// Short of rows, or holding a row it cannot rank: what
+		// replaced each departure may be the wrong row.
 		s.lost += p.departed
-	} else {
-		// At capacity, but a departure while a row was unranked may
-		// have been replaced by the wrong row.
-		s.lost += p.unranked
 	}
+	s.lost += p.moved
 	return true
 }
 

@@ -2,9 +2,8 @@ package object
 
 import (
 	"context"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
@@ -15,16 +14,11 @@ import (
 )
 
 // storeInboundN appends n peer changes sharing one addSeq, each
-// setting record rec-<i> to a random value of valSize bytes. The
-// codec compresses a payload to no less than half of that.
-func storeInboundN(t *testing.T, o *Object, tree *fakeLocalWriteTree, n, valSize int) {
+// creating record rec-<i>.
+func storeInboundN(t *testing.T, o *Object, tree *fakeLocalWriteTree, n int) {
 	t.Helper()
-	rnd := rand.New(rand.NewSource(1))
-	buf := make([]byte, valSize/2)
 	for i := 0; i < n; i++ {
-		rnd.Read(buf)
-		val := hex.EncodeToString(buf)
-		payload, err := o.codec.Encode(new(setRecord(t, fmt.Sprintf("rec-%d", i), "name", val)))
+		payload, err := o.codec.Encode(new(setRecord(t, fmt.Sprintf("rec-%d", i), "name", "v")))
 		require.NoError(t, err)
 		tree.stored = append(tree.stored, &objecttree.Change{
 			Id:       fmt.Sprintf("ch-in-%d", i),
@@ -41,27 +35,7 @@ func storeInboundN(t *testing.T, o *Object, tree *fakeLocalWriteTree, n, valSize
 // the SDK db writer.
 func TestReplay_AppliesWithCursorClosed(t *testing.T) {
 	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
-	storeInboundN(t, o, tree, 3, 1)
-	hooks := 0
-	o.ctrl.SetApplyHook(func(context.Context, *crdt.Change, []string, *crdt.ApplyResult) error {
-		hooks++
-		assert.False(t, tree.cursorOpen, "apply ran under the open cursor")
-		return nil
-	})
-
-	require.NoError(t, o.Update(tree))
-	assert.Equal(t, 3, hooks)
-	assert.Equal(t, 1, tree.passes)
-	assert.Equal(t, uint64(7), o.ctrl.MaxAddSeq())
-}
-
-// More stored changes than one pass buffers: later passes resume past
-// the last buffered change, so each change applies once, in order.
-func TestReplay_ResumesAfterFullBatch(t *testing.T) {
-	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
-	const valSize = 64 << 10
-	n := 4 * replayBatchBytes / valSize
-	storeInboundN(t, o, tree, n, valSize)
+	storeInboundN(t, o, tree, 3)
 	var order []string
 	o.ctrl.SetApplyHook(func(_ context.Context, ch *crdt.Change, _ []string, _ *crdt.ApplyResult) error {
 		order = append(order, ch.ChangeId)
@@ -70,24 +44,32 @@ func TestReplay_ResumesAfterFullBatch(t *testing.T) {
 	})
 
 	require.NoError(t, o.Update(tree))
-	require.Len(t, order, n)
-	for i, id := range order {
-		require.Equal(t, fmt.Sprintf("ch-in-%d", i), id)
-	}
-	assert.Greater(t, tree.passes, 1)
+	assert.Equal(t, []string{"ch-in-0", "ch-in-1", "ch-in-2"}, order)
+	assert.Equal(t, uint64(7), o.ctrl.MaxAddSeq())
 	assert.False(t, o.applyGap)
 }
 
-// A replay halted by an apply error stops at the failed change and
-// does not start another pass.
-func TestReplay_HaltStopsPasses(t *testing.T) {
+// The cursor fails after yielding changes: they are applied and the
+// cursor error is returned.
+func TestReplay_CursorErrorAppliesBufferedChanges(t *testing.T) {
 	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
-	const valSize = 64 << 10
-	storeInboundN(t, o, tree, 4*replayBatchBytes/valSize, valSize)
+	storeInboundN(t, o, tree, 2)
+	tree.cursorErr = errors.New("cursor")
+
+	require.ErrorContains(t, o.Update(tree), "cursor")
+	requireRecords(t, o, map[string]string{"rec-0": "v", "rec-1": "v"})
+	assert.True(t, o.applyGap)
+}
+
+// Both the cursor and an apply fail: the apply error, which halted the
+// replay, is the one returned.
+func TestReplay_ApplyErrorOutranksCursorError(t *testing.T) {
+	o, tree := newLocalWriteFixture(t, "blocks", &crdt.DefaultHandler{})
+	storeInboundN(t, o, tree, 2)
+	tree.cursorErr = errors.New("cursor")
 	o.ctrl.SetApplyHook(failOnce())
 
 	require.ErrorContains(t, o.Update(tree), "apply ch-in-0")
-	assert.Equal(t, 1, tree.passes)
+	assert.Nil(t, o.ctrl.Get(context.Background(), "blocks", "rec-1"))
 	assert.True(t, o.applyGap)
-	assert.Equal(t, uint64(0), o.ctrl.MaxAddSeq())
 }

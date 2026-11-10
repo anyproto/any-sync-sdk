@@ -42,10 +42,10 @@ type fakeLocalWriteTree struct {
 	// stores the change and fails after it, like a failed head update.
 	addErr       error
 	storeThenErr error
-	// cursorOpen is true while IterateAfterAddSeq runs; passes counts
-	// its calls.
+	// cursorOpen is true while IterateAfterAddSeq runs; cursorErr ends
+	// it after the stored changes.
 	cursorOpen bool
-	passes     int
+	cursorErr  error
 }
 
 // Heads is the last stored change, the root when none is.
@@ -113,7 +113,6 @@ func (f *fakeLocalWriteTree) AddContent(_ context.Context, content objecttree.Si
 // on the cleartext payload, its result lands on Model, iterate runs
 // until it returns false.
 func (f *fakeLocalWriteTree) IterateAfterAddSeq(_ context.Context, addSeq uint64, convert objecttree.ChangeConvertFunc, iterate objecttree.ChangeIterateFunc) error {
-	f.passes++
 	f.cursorOpen = true
 	defer func() { f.cursorOpen = false }()
 	for _, c := range f.stored {
@@ -129,7 +128,7 @@ func (f *fakeLocalWriteTree) IterateAfterAddSeq(_ context.Context, addSeq uint64
 			return nil
 		}
 	}
-	return nil
+	return f.cursorErr
 }
 
 // timestampHandler records the ctx.Change.Timestamp it observes on

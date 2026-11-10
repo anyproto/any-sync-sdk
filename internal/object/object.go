@@ -929,17 +929,12 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	// strict side (LocalWrite hard-errors before AddContent).
 	spec := o.plaintextSpecFor(tree)
 
-	// A pass buffers changes while the storage cursor is open and
-	// applies them after it closes: the cursor holds one of the space
-	// db's pooled read connections, and an apply waits for the SDK db
-	// writer, whose holder may itself be waiting for such a connection.
-	// A pass that fills the buffer is followed by another that resumes
-	// past the last buffered OrderId (the cursor's sort key).
+	// Changes are buffered while the storage cursor is open and applied
+	// after it closes: the cursor holds one of the space db's pooled
+	// read connections, and an apply waits for the SDK db writer, whose
+	// holder may itself be waiting for such a connection.
 	var (
 		batch    []*replayItem
-		size     int
-		full     bool
-		resume   string
 		fatalErr error
 		applied  int
 	)
@@ -947,9 +942,6 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	convert := func(ch *objecttree.Change, decrypted []byte) (any, error) {
 		// root has no CRDT payload by construction.
 		if ch.Id == rootId || len(decrypted) == 0 {
-			return nil, nil
-		}
-		if resume != "" && ch.OrderId <= resume {
 			return nil, nil
 		}
 		// any-sync reuses `decrypted` across iterations.
@@ -966,9 +958,7 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 		item.addSeq = ch.AddSeq
 		item.timestamp = ch.Timestamp
 		batch = append(batch, item)
-		size += len(item.raw)
-		full = len(batch) >= replayBatchChanges || size >= replayBatchBytes
-		return !full
+		return true
 	}
 
 	// apply reports whether the replay goes on to the next change.
@@ -1052,30 +1042,23 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 	}
 
 	o.replaying = true
-	iterErr := func() error {
-		defer func() { o.replaying = false }()
-		for {
-			batch, size, full = batch[:0], 0, false
-			// Changes buffered before a cursor error are applied too.
-			err := tree.IterateAfterAddSeq(ctx, from, convert, collect)
-			for _, item := range batch {
-				if !apply(item) {
-					return err
-				}
-			}
-			if err != nil || !full {
-				return err
-			}
-			resume = batch[len(batch)-1].orderId
+	// Changes buffered before a cursor error are applied too.
+	iterErr := tree.IterateAfterAddSeq(ctx, from, convert, collect)
+	for i, item := range batch {
+		batch[i] = nil
+		if !apply(item) {
+			break
 		}
-	}()
+	}
+	o.replaying = false
 	// Applied changes are committed whatever ended the iteration, so
 	// the batch hook runs on the error paths too, on a context the
 	// caller cannot end.
 	if applied > 0 && o.afterReplay != nil {
 		o.afterReplay(context.WithoutCancel(ctx), o)
 	}
-	if iterErr == nil {
+	// The error that halted the applies outranks the cursor's.
+	if fatalErr != nil {
 		iterErr = fatalErr
 	}
 	// A halted replay leaves stored changes above the watermark; a
@@ -1090,7 +1073,7 @@ func (o *Object) replayLocked(ctx context.Context, tree objecttree.ObjectTree) e
 // AfterApply hook, which runs under the same lock.
 func (o *Object) Replaying() bool { return o.replaying }
 
-// replayItem is one stored change buffered by a replay pass: its
+// replayItem is one stored change buffered by a replay: its
 // envelope and its decrypted payload, which the schema gate parks.
 type replayItem struct {
 	changeId  string
@@ -1099,12 +1082,6 @@ type replayItem struct {
 	timestamp int64
 	raw       []byte
 }
-
-// A replay pass stops buffering at either bound.
-const (
-	replayBatchChanges = 4096
-	replayBatchBytes   = 4 << 20
-)
 
 // headsMoved reports whether the tree's heads differ from before: a
 // change reached the storage.

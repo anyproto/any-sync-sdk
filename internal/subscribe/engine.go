@@ -38,6 +38,33 @@ type SubConfig struct {
 	Offset      int          // rows the snapshot skipped; a window past offset 0 never starts complete
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
+	// Refill opens a re-read of the sub's rows under engine.mu (the
+	// snapshot's contract). nil disables refills: departures count
+	// toward the drift budget and an unreadable row closes the sub.
+	Refill RefillFn
+}
+
+// RefillFn opens one read of the sub's rows. source is Event.Source of
+// the apply behind the refill (nil for a notification; the rebuilt
+// object behind Resync). The engine closes the read. Storage not final:
+// return an error wrapping ErrRefillDeferred.
+type RefillFn func(source any) (RefillRead, error)
+
+// ErrRefillDeferred marks a read of rows an object is rebuilding: the
+// engine counts nothing and re-reads the window at Resync.
+var ErrRefillDeferred = errors.New("subscribe: refill deferred: storage is not final")
+
+// RefillRead is one read a refill reconciles the held set from, in a
+// single transaction so its rows and lookups agree.
+type RefillRead struct {
+	// Rows yields the sub's query in order, as the snapshot did.
+	Rows func(yield func(id string, doc *anyenc.Value)) error
+	// Lookup reads one row by id, ignoring the query: nil when absent, a
+	// tombstone or out of scope. A nil Lookup leaves a dropped row
+	// displaced.
+	Lookup func(id string) (*anyenc.Value, error)
+	// Close ends the read.
+	Close func()
 }
 
 // SnapshotFn is the caller-supplied populator. It runs UNDER engine.mu
@@ -45,8 +72,9 @@ type SubConfig struct {
 // waiting on engine.mu and process after the new sub is registered.
 // The callback yields every row its read returns, in sort order, as
 // (id, post-doc); the engine extracts the sort tuple via cfg.Sort and
-// inserts the entry, skipping a row with no doc or id. Every yield
-// counts toward telling whether anything lies past the window's edge.
+// inserts the entry, skipping a row with no doc or id. A windowed sub
+// that then holds at most Limit rows holds every match: the read asked
+// for Limit+1.
 //
 // The callback must only read already-materialised rows. Anything that
 // can apply a change — loading an object (its replay runs OnApply),
@@ -131,18 +159,14 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 
 	e.counter.Add(1)
 	sub := newSub(cfg)
-	read := 0
-	if err := snapshot(func(id string, doc *anyenc.Value) {
-		read++
-		sub.appendInitial(id, doc)
-	}); err != nil {
+	if err := snapshot(sub.appendInitial); err != nil {
 		e.counter.Add(-1)
 		return nil, err
 	}
 	if cfg.Limit > 0 {
-		// The snapshot reads limit+1 rows; fewer means nothing lies
-		// past the window's edge. Every row read counts, held or not.
-		sub.complete = cfg.Offset == 0 && read <= cfg.Limit
+		// The snapshot reads limit+1 rows; holding fewer means nothing
+		// lies past the window's edge.
+		sub.complete = cfg.Offset == 0 && len(sub.entries) <= cfg.Limit
 		sub.lostLimit = lossLimit(cfg.Limit, cfg.DriftBudget)
 	}
 
@@ -153,9 +177,20 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 	return &Sub{querySub: sub}, nil
 }
 
+// errNoPostValue is the read error of a change that came with no
+// post-apply lookup: every live record of it is unreadable.
+var errNoPostValue = errors.New("subscribe: change carries no post-apply lookup")
+
+// noPostValue stands in for a nil PostValueFn. A deleted record never
+// reads its post value; any other record of the change is unreadable,
+// and each sub in scope settles from storage or closes.
+func noPostValue(int) (*anyenc.Value, error) { return nil, errNoPostValue }
+
 // OnApply is the apply-path hook. afterApply calls this with the same
 // Event built once for the dispatcher, plus the PostValueFn that
 // lets the engine evaluate filter / sort against the post-apply doc.
+// A nil postValue serves an event of deleted records only; for any
+// other record it reads as an error.
 //
 // Cheap when there are no subs (HasSubscribers check returns false
 // before this is even invoked by the caller). When subs exist, takes
@@ -168,9 +203,7 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 		return
 	}
 	if postValue == nil {
-		// Apply path couldn't provide a post-apply lookup (rare; see
-		// gate.go.postValueFor). No filter / sort eval possible — skip.
-		return
+		postValue = noPostValue
 	}
 
 	e.mu.Lock()
@@ -191,6 +224,36 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 	clear(e.scratch)
 }
 
+// Resync re-reads the windows an object's rebuild may have left behind:
+// every window on objectId (one that cannot re-read closes), and every
+// shared window that was deferred or holds the object's row, the latter
+// by one lookup when the window is unbounded or past an offset.
+func (e *Engine) Resync(objectId string, source any) {
+	if e.closed.Load() || e.counter.Load() == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, perDs := range e.scope.perObj[objectId] {
+		for _, s := range perDs {
+			if !s.closed {
+				s.resync(source)
+			}
+		}
+	}
+	for _, s := range e.scope.shared {
+		switch {
+		case s.closed:
+		case !s.canRefill() || (!s.deferred && !s.windowed()):
+			if s.entries[objectId] != nil {
+				s.resettleRow(objectId, nil)
+			}
+		case s.deferred || s.entries[objectId] != nil:
+			s.resync(nil)
+		}
+	}
+}
+
 // NotifyDeleted emits a synthetic delete event for objectId in the
 // given dataset scope, so live subscriptions drop the row and report
 // RemoveDeleted — without an underlying CRDT apply.
@@ -198,9 +261,9 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 // The delete-callback path (spaceobjects.Store.DeleteTree, fired when
 // any-sync catches a settings-tree deletion) uses this: it removes the
 // materialized row directly, device-local, instead of writing a CRDT
-// tombstone into the tree that is being reclaimed. The post-value
-// lookup is a constant nil — a deleted record carries no post-apply
-// doc, and applyRecord skips the lookup for Deleted records anyway.
+// tombstone into the tree that is being reclaimed. There is no
+// post-value lookup: a deleted record carries no post-apply doc, and
+// applyRecord never reads one for a Deleted record.
 //
 // The emitted SubscriptionEvent carries an empty VersionId (there is no
 // underlying DAG change to draw an orderId from). A Removed{RemoveDeleted}
@@ -212,7 +275,7 @@ func (e *Engine) NotifyDeleted(spaceId, dataset, objectId string) {
 		Dataset:  dataset,
 		ObjectId: objectId,
 		Records:  []EventRecord{{Id: objectId, Deleted: true}},
-	}, func(int) *anyenc.Value { return nil })
+	}, nil)
 }
 
 // NotifyRecordsDeleted emits a synthetic delete for records ids of
@@ -231,7 +294,7 @@ func (e *Engine) NotifyRecordsDeleted(spaceId, dataset, objectId string, ids []s
 		Dataset:  dataset,
 		ObjectId: objectId,
 		Records:  records,
-	}, func(int) *anyenc.Value { return nil })
+	}, nil)
 }
 
 // CloseObject closes every per-object subscription on objectId, across
@@ -253,9 +316,7 @@ func (e *Engine) CloseObject(objectId string, reason error) {
 			if s.closed {
 				continue
 			}
-			s.err.Store(reason)
-			_ = s.mb.Close()
-			s.closed = true
+			s.closeWith(reason)
 			s.release()
 		}
 	}
@@ -312,11 +373,10 @@ type Sub struct {
 // delivery or WaitOne for single events.
 func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 
-// Err returns the close reason — nil while live or after user Close,
-// space.ErrSubscriptionOverflow on mailbox overflow,
-// space.ErrSubscriptionDrifted on drift-budget exceeded,
-// space.ErrObjectDeleted when the object a per-object sub reads was
-// purged (CloseObject).
+// Err returns the close reason: nil while live or after Close,
+// space.ErrSubscriptionOverflow, space.ErrSubscriptionDrifted (drift
+// budget spent, a row that could not be settled, a failed re-read), or
+// space.ErrObjectDeleted (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {
 		return v

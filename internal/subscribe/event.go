@@ -45,6 +45,9 @@ type Event struct {
 	Dataset   string
 	VersionId crdt.VersionId
 	Records   []EventRecord
+	// Source is the object the apply ran on, handed to a refill as is;
+	// nil for a notification.
+	Source any
 }
 
 // EventRecord is one record's worth of projected change inside an
@@ -53,13 +56,16 @@ type Event struct {
 type EventRecord struct {
 	Id string
 	// Created is true when this change first materialised the record.
-	// The engine uses it (combined with sentinel/visibility state) to
-	// decide Added vs Updated emit semantics.
+	// The engine does not read it: a consumer tells a creation from an
+	// update by it.
 	Created bool
 	// Deleted is true when the change tombstoned this record. Ops is
 	// empty in that case; the engine drops the entry from its held
 	// set.
 	Deleted bool
+	// Unreadable: the post value could not be read when the event was
+	// built; Ops is empty.
+	Unreadable bool
 	// Ops is the projected $set / $unset operations on the post-apply
 	// record. Empty when Deleted is true. Surfaced verbatim to
 	// SubscriptionEvent SubRecord.Ops for atomic-update consumers.
@@ -70,10 +76,12 @@ type EventRecord struct {
 // change being built. Provided by the per-space layer (the
 // spaceobjects Store holds the controller). Index is into ch.Records.
 //
-// May return nil for tombstoned / dropped records (e.g. a gated op
-// that didn't land); callers should treat nil as "the record no
-// longer exists at this point in the timeline".
-type PostValueFn func(recordIndex int) *anyenc.Value
+// (nil, nil) is a record that no longer exists at this point in the
+// timeline: tombstoned, dropped, a gated op that didn't land. An
+// error is a row that could not be read, which is not the same as
+// absent: the engine re-reads the window from storage or closes the
+// subscription rather than treat the record as gone.
+type PostValueFn func(recordIndex int) (*anyenc.Value, error)
 
 // BuildEvent projects (ch, recordIds, derivedOps, postValue) into the
 // wire Event shape — runs the same per-record projection an engine
@@ -125,9 +133,17 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 			out = append(out, er)
 			continue
 		}
+		// A row that cannot be read projects no ops: a projection
+		// against no post value would turn $inc into $unset. The engine
+		// settles its subscriptions from storage.
 		var post *anyenc.Value
 		if postValue != nil {
-			post = postValue(i)
+			var err error
+			if post, err = postValue(i); err != nil {
+				er.Unreadable = true
+				out = append(out, er)
+				continue
+			}
 		}
 		for _, op := range rc.Ops {
 			projected, ok := projectOp(op, post)

@@ -16,12 +16,23 @@
 // the largest-tuple entry serves as a sentinel; single-event shifts
 // (top-of-sort arrivals) absorb cleanly without an any-store query.
 // When Limit == 0 there is no boundary and an entry is membership
-// only. When too many records leave the held window without
-// replacement (>= DriftBudgetPercent of limit), the sub closes with
-// space.ErrSubscriptionDrifted. A window whose snapshot, at offset 0,
-// read at most limit rows counts no departures until a match lands
-// past its edge. Mailbox overflow closes with
-// space.ErrSubscriptionOverflow. Both signal "resubscribe".
+// only.
+//
+// A window at offset 0 with matches past its edge refills from storage
+// (SubConfig.Refill) when a row leaves it, a row's rank becomes
+// unknown, or a change's row cannot be read; the refill reads through
+// Event.Source and looks up dropped rows for their reason. A refill
+// deferred by an object's rebuild counts nothing, and Engine.Resync
+// re-reads the window afterwards; a failed refill counts toward the
+// drift budget (see settle), and the sub closes with
+// space.ErrSubscriptionDrifted at DriftBudgetPercent of limit. Mailbox
+// overflow closes with space.ErrSubscriptionOverflow. Both signal
+// "resubscribe".
+//
+// Events: the change's own event ships, under its VersionId, each
+// touched row's transition from before the apply to after the
+// records; the refill's event, with no VersionId and no ops, the
+// transition from there to now.
 //
 // Locking: a single engine.mu serializes register / close / OnApply.
 // No per-sub locks. Holding engine.mu during the initial snapshot

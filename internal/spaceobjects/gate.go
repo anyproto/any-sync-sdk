@@ -163,9 +163,13 @@ func (s *Store) afterApplyFor() object.AfterApply {
 				derivedOps = res.DerivedOps
 			}
 			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
+			if obj != nil {
+				// A refill reads through the object the apply ran on.
+				ev.Source = obj
+			}
 			s.engine.OnApply(ev, postValue)
 			if res != nil && len(res.ObjectStamps) > 0 && obj != nil {
-				s.dispatchObjectStamps(ctx, obj.Controller(), obj.Replaying(), ch, res.ObjectStamps)
+				s.dispatchObjectStamps(ctx, obj.Controller(), obj.Replaying(), obj, ch, res.ObjectStamps)
 			}
 		}
 
@@ -244,7 +248,9 @@ type pendingStamps struct {
 // per object after the batch, with the row's final values — so a bulk
 // catch-up of a large object cannot flood an objects subscription with
 // one event per change and overflow its mailbox.
-func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller, replaying bool, ch *crdt.Change, stamps []crdt.ObjectStamp) {
+//
+// source is the object the apply ran on, carried as Event.Source.
+func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller, replaying bool, source any, ch *crdt.Change, stamps []crdt.ObjectStamp) {
 	if len(stamps) == 0 || ctrl == nil {
 		return
 	}
@@ -253,7 +259,7 @@ func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller,
 		return
 	}
 	for _, st := range stamps {
-		s.emitObjectStamp(ctx, ctrl, ch.SpaceId, ch.ObjectId, ch.VersionId, st)
+		s.emitObjectStamp(ctx, ctrl, source, ch.SpaceId, ch.ObjectId, ch.VersionId, st)
 	}
 }
 
@@ -261,14 +267,22 @@ func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller,
 // replay batch as one update event per shared row, re-reading each
 // stamped path from the row so the event carries the batch's final
 // values. No-op when nothing was recorded or nobody listens.
-func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, objectId string) {
+func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, source any, objectId string) {
 	v, ok := s.stampPending.LoadAndDelete(objectId)
 	if !ok || ctrl == nil || s.engine == nil || !s.engine.HasSubscribers() {
 		return
 	}
 	pending := v.(pendingStamps)
 	for _, st := range pending.stamps {
-		row := ctrl.Get(ctx, st.Dataset, st.RowId)
+		row, err := ctrl.Lookup(ctx, st.Dataset, st.RowId)
+		if err != nil {
+			// The row could not be read: the event still goes out,
+			// with an unreadable post value, so each window in scope
+			// settles from storage or closes.
+			s.emitObjectStampWith(ctx, source, s.spaceId, objectId, pending.versionId, st,
+				func(int) (*anyenc.Value, error) { return nil, err })
+			continue
+		}
 		if row == nil {
 			continue
 		}
@@ -284,7 +298,7 @@ func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, ob
 		if len(ops) == 0 {
 			continue
 		}
-		s.emitObjectStamp(ctx, ctrl, s.spaceId, objectId, pending.versionId,
+		s.emitObjectStamp(ctx, ctrl, source, s.spaceId, objectId, pending.versionId,
 			crdt.ObjectStamp{Dataset: st.Dataset, RowId: st.RowId, Ops: ops})
 	}
 }
@@ -292,7 +306,18 @@ func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, ob
 // emitObjectStamp feeds the engine one event shaped like an update of
 // the stamped row carrying only the stamp ops; the row's post value is
 // read on demand like any other apply event.
-func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp) {
+func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, source any, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp) {
+	s.emitObjectStampWith(ctx, source, spaceId, objectId, versionId, st, func(i int) (*anyenc.Value, error) {
+		if i != 0 {
+			return nil, nil
+		}
+		return ctrl.Lookup(ctx, st.Dataset, st.RowId)
+	})
+}
+
+// emitObjectStampWith is emitObjectStamp with the post-value lookup
+// supplied; source is carried as Event.Source.
+func (s *Store) emitObjectStampWith(_ context.Context, source any, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp, postValue subscribe.PostValueFn) {
 	synthetic := crdt.Change{
 		SpaceId:   spaceId,
 		ObjectId:  objectId,
@@ -300,13 +325,10 @@ func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, spac
 		VersionId: versionId,
 		Records:   []crdt.RecordChange{{Id: st.RowId}},
 	}
-	postValue := func(i int) *anyenc.Value {
-		if i != 0 {
-			return nil
-		}
-		return ctrl.Get(ctx, st.Dataset, st.RowId)
-	}
 	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, postValue)
+	if source != nil {
+		ev.Source = source
+	}
 	s.engine.OnApply(ev, postValue)
 }
 
@@ -317,14 +339,20 @@ func (s *Store) afterReplayFor() object.AfterReplay {
 		if obj == nil || obj.Controller() == nil {
 			return
 		}
-		s.flushObjectStamps(ctx, obj.Controller(), obj.Controller().ObjectId())
+		s.flushObjectStamps(ctx, obj.Controller(), obj, obj.Controller().ObjectId())
 		s.releaseIndexSync(obj.Controller().ObjectId())
 	}
 }
 
+// errNoController is the post-value read error of a change whose
+// object has no controller to read rows from.
+var errNoController = errors.New("spaceobjects: no controller for the post-apply read")
+
 // postValueFor returns the row-id slice and the per-record post-apply
 // lookup the dispatcher needs to project $inc / $addToSet / etc. ops
-// down to a $set against the merged value.
+// down to a $set against the merged value. The lookup reports a read
+// that failed as an error, never as an absent row: a live window must
+// not drop a row it could not read.
 //
 // Shared datasets (per-space `objects`): the controller stores all
 // rows under ch.ObjectId regardless of the change's RecordChange.Id;
@@ -339,13 +367,13 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 	// id would block on the load channel that hasn't closed yet,
 	// producing a self-recursive deadlock that any-sync surfaces as
 	// `panic: app.Close timeout`.
-	if obj == nil {
-		return ids, nil
+	if obj == nil || obj.Controller() == nil {
+		// Nothing to read rows from: every record of the change is
+		// unreadable, and each window in scope settles from storage
+		// or closes.
+		return ids, func(int) (*anyenc.Value, error) { return nil, errNoController }
 	}
 	ctrl := obj.Controller()
-	if ctrl == nil {
-		return ids, nil
-	}
 	rowIds := ids
 	if ctrl.IsShared(ch.Dataset) {
 		rowIds = make([]string, len(ids))
@@ -353,15 +381,25 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 			rowIds[i] = ch.ObjectId
 		}
 	}
-	return rowIds, func(i int) *anyenc.Value {
+	var logged bool
+	return rowIds, func(i int) (*anyenc.Value, error) {
 		if i < 0 || i >= len(rowIds) {
-			return nil
+			return nil, nil
 		}
 		rowId := rowIds[i]
 		if rowId == "" {
-			return nil
+			return nil, nil
 		}
-		return ctrl.GetStored(ctx, ch.Dataset, rowId)
+		v, err := ctrl.LookupStored(ctx, ch.Dataset, rowId)
+		if err != nil && !logged {
+			// One line per change: the event builder and every sub
+			// in scope read the same row.
+			logged = true
+			storeLog.Warn("post-apply row read failed; live windows settle from storage or close",
+				zap.String("objectId", ch.ObjectId), zap.String("dataset", ch.Dataset),
+				zap.String("rowId", rowId), zap.Error(err))
+		}
+		return v, err
 	}
 }
 

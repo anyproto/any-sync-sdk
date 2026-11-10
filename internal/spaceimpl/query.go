@@ -63,14 +63,163 @@ func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
 // scoped is the filter a read runs: the caller's, narrowed to the
 // object's rows when the collection holds every object's (q.rows).
 func (q *queryImpl) scoped() query.Filter {
-	switch {
-	case q.rows == nil:
-		return q.filter
-	case q.filter == nil:
-		return q.rows
-	}
-	return query.And{q.rows, q.filter}
+	return scopedFilter(q.rows, q.filter)
 }
+
+// scopedFilter is filter narrowed to rows; either may be nil.
+func scopedFilter(rows, filter query.Filter) query.Filter {
+	switch {
+	case rows == nil:
+		return filter
+	case filter == nil:
+		return rows
+	}
+	return query.And{rows, filter}
+}
+
+// objectRows narrows a collection to one object's rows: the owner's
+// range of a keyed dataset, the object's own row of a shared dataset,
+// nothing for a collection of the object's own.
+func objectRows(ctrl *crdt.Controller, objectId, dataset string) query.Filter {
+	switch {
+	case ctrl.IsKeyed(dataset):
+		return crdt.KeyedRows(objectId)
+	case ctrl.IsShared(dataset):
+		return rowIs(objectId)
+	}
+	return nil
+}
+
+// rowIs matches the row stored under id.
+func rowIs(id string) query.Filter {
+	return query.Key{Path: []string{crdt.IdField}, Filter: query.NewComp(query.CompOpEq, id)}
+}
+
+// refillTarget is what one refill reads: the collection, the window's
+// filter, the filter of every row stored in the window's scope (for a
+// lookup by id), and final, false for a row whose object is rebuilding.
+type refillTarget struct {
+	coll   anystore.Collection
+	filter query.Filter
+	stored query.Filter
+	final  func(id string) bool
+}
+
+// refillSource resolves a refill's target from the apply's Event.Source.
+type refillSource func(source any) (refillTarget, error)
+
+// errRefillRebuilding defers a refill or lookup of rows an object is
+// rebuilding.
+var errRefillRebuilding = fmt.Errorf("%w: the object is rebuilding its rows", subscribe.ErrRefillDeferred)
+
+// sharedSource reads the shared collection; a lookup of a rebuilding
+// object's row is deferred.
+func sharedSource(store *spaceobjects.Store, coll anystore.Collection, filter query.Filter) refillSource {
+	return func(any) (refillTarget, error) {
+		return refillTarget{
+			coll:   coll,
+			filter: filter,
+			stored: tombstoneSkip,
+			final:  func(id string) bool { return !store.Rebuilding(id) },
+		}, nil
+	}
+}
+
+// objectSource reads a per-object window through the object the apply
+// ran on (source) or the loaded instance, without loading, waiting or
+// keeping either. No instance, or one without the dataset: the refill
+// fails. A rebuilding object: the refill is deferred.
+func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, dataset string, filter query.Filter) refillSource {
+	return func(source any) (refillTarget, error) {
+		if store.Rebuilding(objectId) {
+			return refillTarget{}, errRefillRebuilding
+		}
+		obj, _ := source.(*object.Object)
+		if obj == nil || obj.Controller() == nil || obj.Controller().ObjectId() != objectId {
+			obj = store.PeekLoaded(objectId)
+		}
+		if obj == nil {
+			return refillTarget{}, errRefillNoObject
+		}
+		ctrl := obj.Controller()
+		if !ctrl.HasDataset(dataset) {
+			return refillTarget{}, errRefillNoObject
+		}
+		coll, err := ctrl.PeekCollection(ctx, dataset)
+		if err != nil {
+			return refillTarget{}, err
+		}
+		rows := objectRows(ctrl, objectId, dataset)
+		return refillTarget{
+			coll:   coll,
+			filter: withoutTombstones(scopedFilter(rows, filter)),
+			stored: withoutTombstones(rows),
+		}, nil
+	}
+}
+
+// newRefill returns a window's refill: one read transaction per call
+// over the body captured here.
+func newRefill(ctx context.Context, source refillSource, sort query.Sort, limit, offset uint) subscribe.RefillFn {
+	return func(src any) (subscribe.RefillRead, error) {
+		t, err := source(src)
+		if err != nil {
+			return subscribe.RefillRead{}, err
+		}
+		if t.coll == nil {
+			// Nothing materialised: no rows, and no held row is stored.
+			return subscribe.RefillRead{
+				Rows:   func(func(id string, doc *anyenc.Value)) error { return nil },
+				Lookup: func(string) (*anyenc.Value, error) { return nil, nil },
+				Close:  func() {},
+			}, nil
+		}
+		tx, err := t.coll.ReadTx(ctx)
+		if err != nil {
+			return subscribe.RefillRead{}, err
+		}
+		return subscribe.RefillRead{
+			Rows: func(yield func(id string, doc *anyenc.Value)) error {
+				return readWindow(tx.Context(), t.coll, t.filter, sort, limit, offset, yield)
+			},
+			Lookup: func(id string) (*anyenc.Value, error) {
+				if t.final != nil && !t.final(id) {
+					return nil, errRefillRebuilding
+				}
+				return lookupStored(tx.Context(), t.coll, t.stored, id)
+			},
+			Close: func() { _ = tx.Commit() },
+		}, nil
+	}
+}
+
+// ObjectRefill is the refill of an unbounded, unfiltered subscription
+// to one object's dataset, for watchers that read engine events alone.
+func ObjectRefill(store *spaceobjects.Store, objectId, dataset string) subscribe.RefillFn {
+	ctx := context.Background()
+	return newRefill(ctx, objectSource(ctx, store, objectId, dataset, nil), nil, 0, 0)
+}
+
+// lookupStored reads one row by id: nil when absent or outside stored.
+func lookupStored(ctx context.Context, coll anystore.Collection, stored query.Filter, id string) (*anyenc.Value, error) {
+	it, err := coll.Find(query.And{rowIs(id), stored}).Limit(1).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var v *anyenc.Value
+	if it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return nil, err
+		}
+		v = anyencx.Clone(doc.Value())
+	}
+	return v, it.Err()
+}
+
+// errRefillNoObject: no object instance to read the rows through.
+var errRefillNoObject = errors.New("query: refill: no loaded object to read through")
 
 // newDatasetQuery builds a queryImpl over the per-space collection of a
 // shared dataset — every object's records, no object named.
@@ -376,9 +525,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			// collection that appears in between is peeked without
 			// that write.
 			obj.Controller().Collection(ctx, q.dataset)
-			if obj.Controller().IsKeyed(q.dataset) {
-				q.rows = crdt.KeyedRows(q.objectId)
-			}
+			q.rows = objectRows(obj.Controller(), q.objectId, q.dataset)
 		}
 	}
 	// The tombstone-skip clause is part of the filter, so the engine's
@@ -419,6 +566,16 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		}
 	}()
 
+	// A refill is the snapshot's read again, in a read transaction of
+	// its own, with the builder's state as it is now: a call chained on
+	// later must not reach the live window.
+	refillCtx := context.WithoutCancel(ctx)
+	var source refillSource
+	if scope.Shared || scope.AllObjects {
+		source = sharedSource(q.store, sharedColl, combined)
+	} else {
+		source = objectSource(refillCtx, q.store, q.objectId, q.dataset, q.filter)
+	}
 	cfg := subscribe.SubConfig{
 		Scope:       scope,
 		Filter:      combined,
@@ -427,6 +584,7 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		Offset:      int(q.offset),
 		MailboxCap:  opts.MailboxCapacity,
 		DriftBudget: opts.DriftBudgetPercent,
+		Refill:      newRefill(refillCtx, source, q.sort, q.limit, q.offset),
 	}
 
 	sub, err := q.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
@@ -442,48 +600,18 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			return err
 		}
 		snapshotColl, snapshotTx = coll, tx
-		aq := coll.Find(combined)
-		if q.sort != nil {
-			aq = aq.Sort(q.sort)
-		}
-		// Snapshot pulls limit+1 to seed the sentinel; the user sees only the
-		// first `limit` rows in Initial.
-		if q.limit > 0 {
-			aq = aq.Limit(q.limit + 1)
-		}
-		if q.offset > 0 {
-			aq = aq.Offset(q.offset)
-		}
-		it, err := aq.Iter(tx.Context())
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.Next() {
+		return readWindow(tx.Context(), coll, combined, q.sort, q.limit, q.offset, func(id string, v *anyenc.Value) {
 			// Every row the read returned counts toward the cap,
 			// including one skipped below.
 			yielded++
-			doc, err := it.Doc()
-			if err != nil {
-				return err
-			}
-			v := doc.Value()
-			var id string
-			if v != nil {
-				id = string(v.GetStringBytes("id"))
-			}
 			// Initial's copy of the visible rows, cloned off the
 			// iterator's reused buffer. The sentinel is the engine's
 			// alone, and an unbounded sub keeps no copy of its own.
 			if id != "" && (q.limit == 0 || len(snapshotRows) < int(q.limit)) {
 				snapshotRows = append(snapshotRows, anyencx.Clone(v))
 			}
-			// Every row read is yielded, a row without an id too: it
-			// took a slot of the limit+1 read, and the engine counts
-			// slots to tell whether anything lies past the edge.
 			yield(id, v)
-		}
-		return it.Err()
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -539,6 +667,41 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		hasNext = int(q.offset)+len(snapshotRows) < totalCount
 	}
 	return &space.QueryResult{Initial: snapshotRows, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
+}
+
+// readWindow runs the window's read — limit+1 rows past the offset in
+// sort order, so the engine seeds a sentinel beyond the limit rows the
+// user sees — and hands every row it returns to row. The value is the
+// iterator's and lasts until the next row.
+func readWindow(ctx context.Context, coll anystore.Collection, filter query.Filter, sort query.Sort, limit, offset uint, row func(id string, v *anyenc.Value)) error {
+	aq := coll.Find(filter)
+	if sort != nil {
+		aq = aq.Sort(sort)
+	}
+	if limit > 0 {
+		aq = aq.Limit(limit + 1)
+	}
+	if offset > 0 {
+		aq = aq.Offset(offset)
+	}
+	it, err := aq.Iter(ctx)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return err
+		}
+		v := doc.Value()
+		var id string
+		if v != nil {
+			id = string(v.GetStringBytes("id"))
+		}
+		row(id, v)
+	}
+	return it.Err()
 }
 
 // tombstoneSkip matches live rows only: a tombstone keeps _deletedAt
@@ -613,9 +776,10 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 	if q.allObjects {
 		return resolveDatasetCollection(ctx, q.store, q.dataset)
 	}
-	coll, keyed, err := resolveCollection(ctx, q.store, q.objectId, q.dataset)
-	if keyed {
-		q.rows = crdt.KeyedRows(q.objectId)
+	coll, ctrl, err := resolveCollection(ctx, q.store, q.objectId, q.dataset)
+	q.rows = nil
+	if ctrl != nil {
+		q.rows = objectRows(ctrl, q.objectId, q.dataset)
 	}
 	return coll, err
 }
@@ -625,10 +789,10 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 // "<shared:objects>" selects the per-space objects collection;
 // anything else goes through the object's controller. See
 // queryImpl.collection for the (nil, nil) empty-dataset contract.
-func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (coll anystore.Collection, keyed bool, err error) {
+func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (coll anystore.Collection, ctrl *crdt.Controller, err error) {
 	if dataset == sharedObjectsDataset {
 		coll, err = store.SharedObjects(ctx)
-		return coll, false, err
+		return coll, nil, err
 	}
 	// A resident controller built before a runtime dataset was defined
 	// doesn't know its collection; reload it so a just-defined dataset
@@ -636,10 +800,11 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	store.EnsureDatasetRegistered(ctx, objectId, dataset)
 	obj, err := store.Get(ctx, objectId)
 	if err != nil {
-		return nil, false, fmt.Errorf("query: %w", err)
+		return nil, nil, fmt.Errorf("query: %w", err)
 	}
-	// keyed comes from the controller that supplies the collection.
-	return obj.Controller().Collection(ctx, dataset), obj.Controller().IsKeyed(dataset), nil
+	// The controller that supplies the collection says how the object's
+	// rows are scoped in it (objectRows).
+	return obj.Controller().Collection(ctx, dataset), obj.Controller(), nil
 }
 
 // emptyIterator is the Iter() result when the dataset has no

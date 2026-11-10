@@ -63,6 +63,7 @@ func newSpaceIndexWatcher(ctx context.Context, store *spaceobjects.Store, indexe
 			ObjectId: spaceIndexObjectId,
 			Dataset:  properties.Dataset,
 		},
+		Refill: ObjectRefill(store, spaceIndexObjectId, properties.Dataset),
 	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
 	w := &spaceIndexWatcher{
 		store:    store,

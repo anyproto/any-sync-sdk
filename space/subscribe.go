@@ -30,8 +30,8 @@ type EventOp struct {
 // The mailbox closes for one of four reasons:
 //   - Caller invoked Close: Err() returns nil.
 //   - Mailbox overflowed: Err() returns ErrSubscriptionOverflow.
-//   - Held window drifted past its budget: Err() returns
-//     ErrSubscriptionDrifted.
+//   - The engine could not keep the window equal to storage: Err()
+//     returns ErrSubscriptionDrifted.
 //   - The object a per-object query reads was deleted: Err() returns
 //     ErrObjectDeleted, after a Removed for its row where one applies.
 //     Nothing will reach the query again; there is nothing to
@@ -113,6 +113,12 @@ type RemovedRecord struct {
 // locally-scoped: each peer assigns its own; don't compare across
 // peers.
 //
+// An own write's event also carries the rows the change moved into or
+// out of view, so apply every event; its records with Ops are the
+// write's own. An event with an empty VersionId is a re-read of the
+// window from storage, or an object deletion: its records carry Doc
+// and no Ops, and it is never an own write.
+//
 // Total is intentionally absent — the live counter is not maintained.
 // Callers who need a refreshed count call Snapshot.
 type SubscriptionEvent struct {
@@ -127,7 +133,9 @@ type SubscriptionEvent struct {
 // the event). Ops carries the per-field $set / $unset ops from the
 // triggering change — same payload shape as EventOp on the raw event
 // stream, so callers can apply atomic updates against a local mirror
-// without re-materialising the whole record.
+// without re-materialising the whole record. Ops is empty in an event
+// with no VersionId, and for a record of a change the engine could not
+// read: Doc is then the state to take as a whole.
 type SubRecord struct {
 	Id  string
 	Doc *anyenc.Value
@@ -140,13 +148,12 @@ type SubRecord struct {
 // client should resubscribe to recover.
 var ErrSubscriptionOverflow = errors.New("space: subscription overflowed; resubscribe required")
 
-// ErrSubscriptionDrifted is returned by QuerySubscription.Err when
-// the engine has lost QueryOpts.DriftBudgetPercent of the held window
-// without replacements; departures count once a match has been past
-// the window's edge. The engine never re-queries any-store on the hot
-// path to backfill — it closes the subscription and the client is
-// expected to resubscribe.
-var ErrSubscriptionDrifted = errors.New("space: subscription drifted (too many records left the held window); resubscribe required")
+// ErrSubscriptionDrifted is returned by QuerySubscription.Err when the
+// engine could not keep the window equal to storage: the drift budget
+// (QueryOpts.DriftBudgetPercent) is spent, a change's row could not be
+// read and no re-read could settle it, or the window could not be
+// re-read after its object's rebuild. Resubscribe to recover.
+var ErrSubscriptionDrifted = errors.New("space: subscription drifted (the window could not be kept equal to storage); resubscribe required")
 
 // ErrSubscribeUnsupported is returned by Query.Subscribe for query
 // shapes the engine doesn't support yet (members in v1).

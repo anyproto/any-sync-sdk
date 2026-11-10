@@ -70,7 +70,8 @@ func (a *identitiesAPI) Get(ctx context.Context, identity string) (space.Identit
 
 func (a *identitiesAPI) Subscribe(cb func(space.IdentityListEvent)) (cancel func()) {
 	sub, err := a.tsp.SubEngine().Subscribe(subscribe.SubConfig{
-		Scope: subscribe.Scope{ObjectId: a.tsp.IndexObjectId(), Dataset: techspace.IdentitiesDataset},
+		Scope:  subscribe.Scope{ObjectId: a.tsp.IndexObjectId(), Dataset: techspace.IdentitiesDataset},
+		Refill: ObjectRefill(a.tsp.Store(), a.tsp.IndexObjectId(), techspace.IdentitiesDataset),
 	}, func(func(id string, doc *anyenc.Value)) error { return nil })
 	if err != nil {
 		return func() {}

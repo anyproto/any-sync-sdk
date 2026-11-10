@@ -169,9 +169,10 @@ func TestDrift_FilterOutCountsInIncompleteWindow(t *testing.T) {
 	assert.ErrorIs(t, sub.Err(), space.ErrSubscriptionDrifted)
 }
 
-// A row the snapshot read but the engine skipped (no id) still took a
-// slot of the limit+1 read: a match may lie past the edge.
-func TestDrift_SkippedSnapshotRowCounts(t *testing.T) {
+// A row the snapshot read but the engine skipped (no id) takes no
+// slot: a window that holds at most limit rows holds every match it
+// can, the same rule a refill applies.
+func TestDrift_SkippedSnapshotRowTakesNoSlot(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
 	rows := driftRows(3)
@@ -187,7 +188,7 @@ func TestDrift_SkippedSnapshotRowCounts(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, sub.entries, 2)
-	assert.False(t, sub.complete)
+	assert.True(t, sub.complete)
 }
 
 // A budget whose product with the limit overflows int disables the

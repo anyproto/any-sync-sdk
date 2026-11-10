@@ -302,12 +302,12 @@ func captureRecordFields(ctx context.Context, coll anystore.Collection, dataset 
 // once the replay lands the defs; only local writes see a transient
 // type_unknown rejection.
 //
-// Live subscriptions are not notified of the wipe of the object's own
-// collections: a window keeps its rows and sees the replay as one
-// update per change in the tree, converging when it ends. The object's
-// rows in a shared dataset's collection are the exception — a reader
-// across objects holds them without having loaded the object, so it is
-// told they left, and the replay adds back the ones it rebuilds.
+// Live subscriptions are not told of the wipe: refills of the object's
+// windows are deferred while it rebuilds (Store.Rebuilding) and the
+// engine re-reads them when the load ends. The object's keyed rows in a
+// shared collection are the exception — a reader across objects holds
+// them without having loaded the object, so it is told they left, and
+// the replay adds back the ones it rebuilds.
 func (s *Store) wipeMaterialized(ctx context.Context, objectId string, ctrl *crdt.Controller) error {
 	for _, dataset := range ctrl.RegisteredDatasets() {
 		if !ctrl.IsShared(dataset) {

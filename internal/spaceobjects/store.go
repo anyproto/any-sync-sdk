@@ -303,6 +303,11 @@ type Store struct {
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
 	rowEvents *fanout.Registry[RowEvent]
 
+	// rebuilding marks objects whose rows a load is rebuilding from the
+	// tree (reindex.go): refills and lookups of their rows are deferred
+	// until the load ends. A failed load leaves no mark.
+	rebuilding sync.Map
+
 	// stampPending holds, per objectId, the object stamps landed during
 	// the current replay batch, emitted as one event per object by the
 	// AfterReplay hook. See dispatchObjectStamps.
@@ -2565,6 +2570,31 @@ func isDocNotFound(err error) bool {
 	return errors.Is(err, anystore.ErrDocNotFound) || errors.Is(err, anystorev1.ErrDocNotFound)
 }
 
+// PeekLoaded returns the resident, loaded object for objectId without
+// loading or waiting: nil when none is loaded, or one is still
+// loading or closing. Safe under the subscribe engine's fence, where a
+// Get on an object whose load fired the apply would wait on itself.
+func (s *Store) PeekLoaded(objectId string) *object.Object {
+	if s.Rebuilding(objectId) {
+		return nil
+	}
+	peeker, ok := s.cache.(ocache.Peeker)
+	if !ok {
+		return nil
+	}
+	v, state := peeker.Peek(objectId, false)
+	if state != ocache.PeekHit {
+		return nil
+	}
+	return v.(*object.Object)
+}
+
+// Rebuilding reports whether a load is rebuilding objectId's rows.
+func (s *Store) Rebuilding(objectId string) bool {
+	_, ok := s.rebuilding.Load(objectId)
+	return ok
+}
+
 // Get returns the *object.Object for objectId, lazy-loading on first
 // access via the ocache LoadFunc. Concurrent Get on the same id
 // share one load; the LoadFunc runs Controller build, tree open,
@@ -2837,6 +2867,11 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	stale := ctrl.StaleDatasets()
 	resume := len(stale) == 0 && ctrl.ReindexPending()
 	rebuilding := len(stale) > 0 || resume
+	if resume {
+		// A resumed rebuild: the rows are not final until this load ends.
+		s.rebuilding.Store(objectId, struct{}{})
+		defer s.rebuilding.Delete(objectId)
+	}
 	// First tracked load: prefer the account's published read state
 	// (tech-space KV usually syncs before chat trees) — restore with
 	// tracking ON and merge the published frontiers after. Only when
@@ -2892,6 +2927,9 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	// values dropped on the error path.
 	var reindexLeaves []localLeaf
 	if len(stale) > 0 {
+		// The wipe starts here.
+		s.rebuilding.Store(objectId, struct{}{})
+		defer s.rebuilding.Delete(objectId)
 		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale); err != nil {
 			return nil, err
 		}
@@ -2927,6 +2965,11 @@ func (s *Store) loadObject(ctx context.Context, objectId string, payload *treest
 	}
 	if rebuilding {
 		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
+		s.rebuilding.Delete(objectId)
+		if s.engine != nil {
+			// Re-read the windows the rebuild deferred.
+			s.engine.Resync(objectId, obj)
+		}
 	}
 	if seedPending {
 		if len(publishedSets) > 0 {

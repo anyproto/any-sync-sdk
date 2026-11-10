@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 
 	"github.com/anyproto/any-sync-sdk/internal/anyencx"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 )
 
 // querySub is the per-subscription state. Mutated only under
@@ -28,14 +29,20 @@ type querySub struct {
 	minRef  *entry
 	maxRef  *entry
 
-	// Drift accounting. complete: the window holds every match — its
-	// snapshot started at offset 0 and found nothing past the window's
-	// edge, and no match has been left past the edge since. A row that
-	// leaves a complete window has nothing to be backfilled from, so it
-	// is not a loss. lostLimit: lost*100 at or above it closes the sub.
-	complete  bool
-	lost      int
-	lostLimit int
+	// Window state: complete, the window holds every match; edge, a key
+	// every match the window does not hold sorts at or past; unranked, a
+	// held row's rank against those matches is unknown; unrankedLoss,
+	// that state was counted once; lost*100 at lostLimit closes the sub.
+	complete     bool
+	edge         anyenc.Tuple
+	unranked     bool
+	unrankedLoss bool
+	lost         int
+	lostLimit    int
+	// deferred: the last refill found storage not final, pending Resync.
+	// unread: rows of an unbounded sub the next refill re-reads.
+	deferred bool
+	unread   map[string]struct{}
 
 	docBuf *syncpool.DocBuffer
 
@@ -58,6 +65,14 @@ func newSub(cfg SubConfig) *querySub {
 func (s *querySub) release() {
 	s.entries = nil
 	s.minRef, s.maxRef = nil, nil
+}
+
+// closeWith closes the mailbox with reason as the close error. The
+// held set stays until the consumer's Close releases it.
+func (s *querySub) closeWith(reason error) {
+	s.err.Store(reason)
+	_ = s.mb.Close()
+	s.closed = true
 }
 
 // appendInitial is called by Engine.Subscribe once per snapshot row.
@@ -86,16 +101,22 @@ func (s *querySub) windowed() bool {
 	return s.cfg.Limit > 0
 }
 
-// encode returns doc's encoding in a slice of its own. A held row
-// costs its encoded size; a parsed copy would cost about ten times
-// that for as long as the window holds it.
-func encode(doc *anyenc.Value) []byte {
+// withEncoding marshals doc into a pooled scratch buffer and hands the
+// encoding to f for the duration of the call.
+func withEncoding(doc *anyenc.Value, f func(enc []byte)) {
 	bp := encBufs.Get().(*[]byte)
 	*bp = doc.MarshalTo((*bp)[:0])
-	raw := bytes.Clone(*bp)
+	f(*bp)
 	if cap(*bp) <= maxPooledEncBuf {
 		encBufs.Put(bp)
 	}
+}
+
+// encode returns doc's encoding in a slice of its own. A held row
+// costs its encoded size; a parsed copy would cost about ten times
+// that for as long as the window holds it.
+func encode(doc *anyenc.Value) (raw []byte) {
+	withEncoding(doc, func(enc []byte) { raw = bytes.Clone(enc) })
 	return raw
 }
 
@@ -154,147 +175,322 @@ func (s *querySub) sentinel() *entry {
 	return s.maxRef
 }
 
-// sentinelId returns the sentinel's id or "" when there's no sentinel.
-func (s *querySub) sentinelId() string {
-	if e := s.sentinel(); e != nil {
-		return e.id
-	}
-	return ""
-}
-
-// subPending is the per-apply scratch — collects added/updated entries
-// and removed ids before assembling the wire SubscriptionEvent. Lives
-// on the stack of querySub.apply.
+// subPending is the per-apply scratch: the ids the apply touched in
+// first-touch order, each row's view before the apply and after the
+// records, what the records did to each, and why a refill dropped a row.
 type subPending struct {
-	added   []pendingRec
-	updated []pendingRec
-	removed []space.RemovedRecord
-	seen    map[string]struct{}
+	source     any // Event.Source, handed to the refill
+	order      []string
+	before     map[string]bool
+	mid        map[string]midState // each id's view after the records; nil until a refill starts
+	refilled   bool                // a refill reconciled the held set
+	recs       map[string]*recOutcome
+	gone       map[string]space.RemoveReason // why a refill dropped a held row
+	departed   int                           // held rows that left a window with matches past its edge
+	moved      int                           // held rows whose key grew while the window held an unranked row
+	unreadable int                           // records whose post value could not be read
 }
 
-type pendingRec struct {
-	e   *entry
-	doc *anyenc.Value   // the event's copy of the post doc (unbounded sub)
-	raw []byte          // the held encoding the event parses its doc from (windowed sub)
-	ops []space.EventOp // nil for implicit transitions
+// midState is a row's view after the apply's records, before a refill.
+type midState struct {
+	visible bool
+	raw     []byte // the held encoding then (windowed sub)
 }
 
-// value returns the doc the event ships for the record.
-func (pr pendingRec) value() *anyenc.Value {
-	if pr.doc != nil {
-		return pr.doc
+// recOutcome is what the apply did to one id: its records' ops, the
+// last settled verdict, and what a refill found.
+type recOutcome struct {
+	ops        []space.EventOp
+	doc        *anyenc.Value // the event's copy of the post doc (unbounded sub)
+	verdict    bool          // a record settled deleted / present / matched
+	deleted    bool          // the last settled record tombstoned it
+	present    bool          // the last settled record found a post doc
+	matched    bool          // the last settled record's post doc passes the filter
+	landed     bool          // a readable record wrote the held row
+	unreadable bool          // a record's post value could not be read
+	changed    bool          // a refill found its stored value changed
+}
+
+func newPending(source any) subPending {
+	return subPending{source: source, before: map[string]bool{}, recs: map[string]*recOutcome{}}
+}
+
+// touch records id as touched by this apply with its visibility now.
+// The first touch wins: nothing moved the row before it, so its state
+// then is its state when the apply began; once a refill has started,
+// the first touch also fixes its state after the records.
+func (p *subPending) touch(id string, visible bool) {
+	if _, ok := p.before[id]; !ok {
+		p.before[id] = visible
+		p.order = append(p.order, id)
 	}
-	return parseHeld(pr.raw)
+	if p.mid != nil {
+		if _, ok := p.mid[id]; !ok {
+			p.mid[id] = midState{visible: visible}
+		}
+	}
 }
 
-// apply processes one wire event. Builds at most one SubscriptionEvent
-// per call. Per-record classification, sentinel transitions, drift +
-// overflow checks all happen here under Engine.mu (so other engine
-// methods observe consistent state).
+// beginRefill fixes each touched id's view after the apply's records:
+// the state the refill's event ships transitions from.
+func (p *subPending) beginRefill(s *querySub) {
+	p.mid = make(map[string]midState, len(p.order))
+	sent := s.sentinel()
+	for _, id := range p.order {
+		e := s.entries[id]
+		m := midState{visible: e != nil && e != sent}
+		if m.visible {
+			m.raw = e.raw
+		}
+		p.mid[id] = m
+	}
+}
+
+// markUnreadable records that a record on id could not be read.
+func (p *subPending) markUnreadable(id string) {
+	p.rec(id).unreadable = true
+	p.unreadable++
+}
+
+func (p *subPending) rec(id string) *recOutcome {
+	r := p.recs[id]
+	if r == nil {
+		r = &recOutcome{}
+		p.recs[id] = r
+	}
+	return r
+}
+
+// apply processes one wire event. Builds at most two SubscriptionEvents
+// per call: the change's own, and the refill's when one ran.
+// Per-record classification, sentinel transitions, drift + overflow
+// checks all happen here under Engine.mu (so other engine methods
+// observe consistent state).
 func (s *querySub) apply(ev Event, postValue PostValueFn) {
 	if s.closed {
 		return
 	}
 
-	p := subPending{seen: map[string]struct{}{}}
-
+	p := newPending(ev.Source)
 	for i, rc := range ev.Records {
 		if rc.Id == "" {
 			continue
 		}
 		s.applyRecord(i, rc, postValue, &p)
 	}
-
-	if len(p.added) == 0 && len(p.updated) == 0 && len(p.removed) == 0 {
-		s.checkDrift()
+	if !s.settle(&p) {
 		return
 	}
 
-	subev := space.SubscriptionEvent{VersionId: ev.VersionId}
-	if len(p.added) > 0 {
-		subev.Added = make([]space.SubRecord, 0, len(p.added))
-		for _, pr := range p.added {
-			subev.Added = append(subev.Added, space.SubRecord{Id: pr.e.id, Doc: pr.value(), Ops: pr.ops})
-		}
-	}
-	if len(p.updated) > 0 {
-		subev.Updated = make([]space.SubRecord, 0, len(p.updated))
-		for _, pr := range p.updated {
-			subev.Updated = append(subev.Updated, space.SubRecord{Id: pr.e.id, Doc: pr.value(), Ops: pr.ops})
-		}
-	}
-	if len(p.removed) > 0 {
-		subev.Removed = p.removed
-	}
-
-	if err := s.mb.TryAdd(subev); err != nil {
-		if errors.Is(err, mb.ErrOverflowed) {
-			s.err.Store(space.ErrSubscriptionOverflow)
-			_ = s.mb.Close()
-			s.closed = true
-			return
-		}
-		// Other errors (mb closed) — already shutting down.
+	own, resync := s.emit(ev.VersionId, &p)
+	if !s.deliver(own) || !s.deliver(resync) {
 		return
 	}
-
 	s.checkDrift()
 }
 
-// applyRecord classifies one EventRecord and updates p accordingly.
-// Pulls postKey / postDoc lazily and short-circuits via the maxKey
-// fast-reject when possible.
-func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *subPending) {
-	p.seen[rc.Id] = struct{}{}
+// resync re-reads the window outside any apply and ships the difference
+// as a resync event. A window that cannot re-read, or whose read fails,
+// closes; a deferred read waits for the next Resync.
+func (s *querySub) resync(source any) {
+	if !s.canRefill() {
+		s.closeWith(space.ErrSubscriptionDrifted)
+		return
+	}
+	p := newPending(source)
+	p.beginRefill(s)
+	if err := s.refillWindow(&p); err != nil {
+		s.readFailed(err)
+		return
+	}
+	s.refilled()
+	p.refilled = true
+	_, resync := s.emit("", &p)
+	if s.deliver(resync) {
+		s.checkDrift()
+	}
+}
 
-	prevSentinelId := s.sentinelId()
+// resettleRow re-reads one held row by lookup after its object's
+// rebuild. Present and matching: nothing. Gone or filtered out: an
+// unbounded sub drops it with storage's reason, a sub that cannot
+// re-read its window closes. No lookup: the whole window.
+func (s *querySub) resettleRow(id string, source any) {
+	if s.cfg.Refill == nil {
+		s.closeWith(space.ErrSubscriptionDrifted)
+		return
+	}
+	read, err := s.cfg.Refill(source)
+	if err != nil {
+		s.readFailed(err)
+		return
+	}
+	if read.Lookup == nil {
+		// No way to classify one row: the whole window, which a sub
+		// that cannot refill closes over.
+		read.Close()
+		s.resync(source)
+		return
+	}
+	doc, err := read.Lookup(id)
+	read.Close()
+	if err != nil {
+		s.readFailed(err)
+		return
+	}
+	reason := space.RemoveDisplaced
+	switch {
+	case doc == nil:
+		reason = space.RemoveDeleted
+	case s.cfg.Filter != nil && !s.cfg.Filter.Ok(doc, s.docBuf):
+		reason = space.RemoveFilteredOut
+	default:
+		return
+	}
+	if !s.canRefill() {
+		s.closeWith(space.ErrSubscriptionDrifted)
+		return
+	}
+	p := newPending(source)
+	p.beginRefill(s)
+	p.touch(id, true)
+	p.gone = map[string]space.RemoveReason{id: reason}
+	s.removeEntry(s.entries[id])
+	p.refilled = true
+	_, resync := s.emit("", &p)
+	s.deliver(resync)
+}
+
+// readFailed settles a re-read that could not run: deferred, the window
+// waits for the next Resync; failed otherwise, it closes.
+func (s *querySub) readFailed(err error) {
+	if errors.Is(err, ErrRefillDeferred) {
+		if s.canRefill() {
+			s.deferred = true
+		}
+		return
+	}
+	s.closeWith(space.ErrSubscriptionDrifted)
+}
+
+// deliver queues one event unless it is empty. Reports whether the sub
+// is still open.
+func (s *querySub) deliver(subev space.SubscriptionEvent) bool {
+	if len(subev.Added) == 0 && len(subev.Updated) == 0 && len(subev.Removed) == 0 {
+		return true
+	}
+	if err := s.mb.TryAdd(subev); err != nil {
+		if errors.Is(err, mb.ErrOverflowed) {
+			s.closeWith(space.ErrSubscriptionOverflow)
+		}
+		// Other errors (mb closed) — already shutting down.
+		return false
+	}
+	return true
+}
+
+// applyRecord applies one EventRecord to the held set and records in p
+// what it touched. Pulls postKey / postDoc lazily and short-circuits
+// via the maxKey fast-reject when possible.
+func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *subPending) {
+	prevSentinel := s.sentinel()
 	oldEntry := s.entries[rc.Id]
 	wasHeld := oldEntry != nil
-	wasVisible := wasHeld && oldEntry != s.sentinel()
+	p.touch(rc.Id, wasHeld && oldEntry != prevSentinel)
+	if prevSentinel != nil {
+		p.touch(prevSentinel.id, false)
+	}
+	out := p.rec(rc.Id)
+	out.ops = append(out.ops, rc.Ops...)
 
 	// Determine post-state: matches + tuple + doc.
 	var matches bool
 	var postKey anyenc.Tuple
 	var postDoc *anyenc.Value
 	if !rc.Deleted {
-		postDoc = postValue(i)
-		if postDoc != nil {
-			// Fast-reject: at capacity, not held, post tuple already
-			// past the sentinel ⇒ no chance of entering window.
-			// Skips allocation and mutation, and filter eval unless
-			// the window is complete: a match landing past the edge
-			// ends completeness.
-			if !wasHeld && s.atCapacity() {
-				s.ensureMaxRef()
-				if s.maxRef != nil {
-					postKey = s.tupleFor(postDoc)
-					if bytes.Compare(postKey, s.maxRef.tuple) >= 0 {
-						if s.complete && (s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)) {
-							s.complete = false
-						}
-						return
-					}
-				}
-			}
-			matches = s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)
-			if matches && postKey == nil {
-				postKey = s.tupleFor(postDoc)
-			}
+		if rc.Unreadable {
+			p.markUnreadable(rc.Id)
+			return
+		}
+		var err error
+		if postDoc, err = postValue(i); err != nil {
+			// The row's state is unknown: no transition now; settle
+			// re-reads the window or closes the sub.
+			p.markUnreadable(rc.Id)
+			return
 		}
 	}
+	out.verdict, out.deleted, out.present, out.matched = true, rc.Deleted, postDoc != nil, false
+	if postDoc != nil {
+		// Fast-reject: at capacity, not held, post tuple already
+		// past the sentinel ⇒ no chance of entering window.
+		// Skips allocation and mutation, and filter eval unless
+		// the window is complete: a match landing past the edge
+		// ends completeness.
+		if !wasHeld && s.atCapacity() {
+			s.ensureMaxRef()
+			if s.maxRef != nil {
+				postKey = s.tupleFor(postDoc)
+				if bytes.Compare(postKey, s.maxRef.tuple) >= 0 {
+					// The filter is read only where the verdict
+					// matters: completeness, or the reason for a
+					// row this apply took out of view earlier.
+					if s.complete || p.before[rc.Id] {
+						out.matched = s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)
+						if out.matched {
+							s.complete = false
+						}
+					}
+					return
+				}
+			}
+		}
+		matches = s.cfg.Filter == nil || s.cfg.Filter.Ok(postDoc, s.docBuf)
+		if matches && postKey == nil {
+			postKey = s.tupleFor(postDoc)
+		}
+	}
+	out.matched = matches
 
 	// Apply transition to held set. The event ships its own copy of
 	// the post doc; a windowed sub keeps its encoding on the entry.
-	var eventDoc *anyenc.Value
 	var raw []byte
 	switch {
 	case wasHeld && matches:
-		eventDoc, raw = s.capture(postDoc)
+		out.doc, raw = s.capture(postDoc)
+		out.landed = true
+		oldTuple := oldEntry.tuple
 		s.updateEntry(oldEntry, postKey, raw)
+		if s.ranks() && bytes.Compare(postKey, oldTuple) > 0 {
+			if s.unranked && !(oldEntry == prevSentinel && s.sentinel() == oldEntry) {
+				// A move past rows the window does not hold may put
+				// the row where one of them belongs; a sentinel that
+				// stays the sentinel moves nothing into view.
+				p.moved++
+			}
+			switch {
+			case s.atCapacity():
+				// The row's own sort move put or kept it in the
+				// sentinel slot with a larger key than it was ranked
+				// at: matches past the edge may now sort below it.
+				if s.sentinel() == oldEntry {
+					s.unranked = true
+				}
+			case s.edge == nil || bytes.Compare(postKey, s.edge) >= 0:
+				// Below capacity, the row moved to or past the edge:
+				// it sorts among the matches the window does not hold.
+				s.unranked = true
+			}
+		}
 	case wasHeld && !matches:
+		if prevSentinel != nil && s.ranks() && !s.unranked {
+			// The window leaves capacity ranked: every match it does
+			// not hold sorts at or past its sentinel.
+			s.edge = prevSentinel.tuple
+		}
 		s.removeEntry(oldEntry)
-		if !s.complete {
-			s.lost++
+		if s.windowed() && !s.complete {
+			p.departed++
 		}
 	case !wasHeld && matches:
 		if s.atCapacity() {
@@ -305,63 +501,354 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 				s.removeEntry(s.maxRef)
 				s.complete = false
 			}
+		} else if s.ranks() && (s.edge == nil || bytes.Compare(postKey, s.edge) >= 0) {
+			// Below capacity with matches past the edge, and the row
+			// sorts among them: its rank is unknown.
+			s.unranked = true
 		}
-		eventDoc, raw = s.capture(postDoc)
+		out.doc, raw = s.capture(postDoc)
+		out.landed = true
 		s.insertEntry(rc.Id, postKey, raw)
 	default:
 		return
 	}
 
-	// Post-mutation visibility for this record.
-	newEntry := s.entries[rc.Id]
-	isHeld := newEntry != nil
-	isVisible := isHeld && newEntry != s.sentinel()
+	if ns := s.sentinel(); ns != nil {
+		// A row this record demoted to sentinel was visible before:
+		// held, and not the sentinel. (A row touched earlier keeps
+		// its recorded state.)
+		p.touch(ns.id, true)
+	}
+}
 
+// ranks reports whether the window keeps track of its sentinel's
+// rank: it has matches past its edge, and it can refill to rank them.
+func (s *querySub) ranks() bool {
+	return s.windowed() && s.canRefill() && !s.complete
+}
+
+// emit builds the change's own event (each id's transition from before
+// the apply to after its records, with ops) and the refill's resync
+// event (from there to now, no VersionId, no ops).
+func (s *querySub) emit(versionId crdt.VersionId, p *subPending) (own, resync space.SubscriptionEvent) {
+	own.VersionId = versionId
+	sent := s.sentinel()
+	for _, id := range p.order {
+		was := p.before[id]
+		out := p.recs[id]
+		e := s.entries[id]
+		now := e != nil && e != sent
+		mid, midRaw := now, []byte(nil)
+		if e != nil {
+			midRaw = e.raw
+		}
+		if p.refilled {
+			m := p.mid[id]
+			mid, midRaw = m.visible, m.raw
+		}
+		switch {
+		case !was && mid:
+			own.Added = append(own.Added, s.ownRecord(id, midRaw, out))
+		case was && mid:
+			// A readable record wrote it; a row promoted and demoted
+			// back, or whose only record could not be read, ships
+			// nothing.
+			if out != nil && out.landed {
+				own.Updated = append(own.Updated, s.ownRecord(id, midRaw, out))
+			}
+		case was && !mid:
+			own.Removed = append(own.Removed, space.RemovedRecord{Id: id, Reason: recordReason(id, out, p)})
+		}
+		if !p.refilled {
+			continue
+		}
+		switch {
+		case !mid && now:
+			resync.Added = append(resync.Added, s.storedRecord(e, out))
+		case mid && now:
+			if out != nil && out.changed {
+				resync.Updated = append(resync.Updated, s.storedRecord(e, out))
+			}
+		case mid && !now:
+			// Still held, it is the sentinel the refill demoted it to;
+			// gone, storage said why.
+			reason := space.RemoveDisplaced
+			if r, ok := p.gone[id]; e == nil && ok {
+				reason = r
+			}
+			resync.Removed = append(resync.Removed, space.RemovedRecord{Id: id, Reason: reason})
+		}
+	}
+	return own, resync
+}
+
+// ownRecord is the change's record for a row: its doc after the records,
+// with the records' ops when every one of them could be read.
+func (s *querySub) ownRecord(id string, raw []byte, out *recOutcome) space.SubRecord {
+	rec := space.SubRecord{Id: id}
+	if s.windowed() {
+		rec.Doc = parseHeld(raw)
+	} else if out != nil {
+		rec.Doc = out.doc
+	}
+	if out != nil && !out.unreadable {
+		rec.Ops = out.ops
+	}
+	return rec
+}
+
+// storedRecord builds the refill's record for a held row: its stored
+// doc and no ops.
+func (s *querySub) storedRecord(e *entry, out *recOutcome) space.SubRecord {
+	rec := space.SubRecord{Id: e.id}
+	if s.windowed() {
+		rec.Doc = parseHeld(e.raw)
+	} else if out != nil {
+		rec.Doc = out.doc
+	}
+	return rec
+}
+
+// recordReason classifies a row the apply's records took out of view:
+// deleted when the last settled record on it tombstoned it or found no
+// row, filtered out when that record's post doc failed the filter.
+// With no verdict, another row's arrival evicted it or its own sort
+// move demoted it: it still matches past the edge, unless a refill
+// looked it up and storage said otherwise.
+func recordReason(id string, out *recOutcome, p *subPending) space.RemoveReason {
 	switch {
-	case !wasVisible && isVisible:
-		p.added = append(p.added, pendingRec{e: newEntry, doc: eventDoc, raw: raw, ops: rc.Ops})
-	case wasVisible && isVisible:
-		p.updated = append(p.updated, pendingRec{e: newEntry, doc: eventDoc, raw: raw, ops: rc.Ops})
-	case wasVisible && !isVisible:
-		// isHeld ⇒ the record updated and became the sentinel via its
-		// own sort move: still matches, just slid out of view.
-		// Otherwise it left the held set: tombstoned (or dropped) ⇒
-		// deleted, else the post-apply doc failed the filter.
-		reason := space.RemoveDisplaced
-		if !isHeld {
-			if rc.Deleted || postDoc == nil {
-				reason = space.RemoveDeleted
-			} else {
-				reason = space.RemoveFilteredOut
-			}
+	case out == nil || !out.verdict:
+		if r, ok := p.gone[id]; ok {
+			return r
 		}
-		p.removed = append(p.removed, space.RemovedRecord{Id: rc.Id, Reason: reason})
+		return space.RemoveDisplaced
+	case out.deleted || !out.present:
+		return space.RemoveDeleted
+	case !out.matched:
+		return space.RemoveFilteredOut
 	}
+	return space.RemoveDisplaced
+}
 
-	// Implicit transitions caused by sentinel movement.
-	newSentinelId := s.sentinelId()
-	if prevSentinelId != newSentinelId {
-		// Previous sentinel may have been promoted into visibility.
-		if prevSentinelId != "" && prevSentinelId != rc.Id {
-			if _, alreadySeen := p.seen[prevSentinelId]; !alreadySeen {
-				if e := s.entries[prevSentinelId]; e != nil && e != s.sentinel() {
-					p.added = append(p.added, pendingRec{e: e, raw: e.raw}) // implicit: no ops, the held doc
-					p.seen[prevSentinelId] = struct{}{}
+// settle restores the window's invariant after one apply's records with
+// a refill where the window is short, unranked, deferred or holds a row
+// the apply could not read. A refill deferred by a rebuild counts
+// nothing. Otherwise a failed refill counts every departure unless the
+// window ends at capacity and ranked, a key growth while unranked, and
+// the unranked state once; an unreadable row with no refill closes the
+// sub. Reports whether the sub is still open.
+func (s *querySub) settle(p *subPending) bool {
+	unreadable := p.unreadable > 0
+	if !unreadable && !s.needsRefill() && !(s.deferred && s.windowed()) {
+		if !s.ranks() {
+			// No refill behind the window: every departure is a loss.
+			s.lost += p.departed
+		}
+		return true
+	}
+	if s.canRefill() {
+		p.beginRefill(s)
+		err := s.refillWindow(p)
+		if err == nil {
+			s.refilled()
+			p.refilled = true
+			return true
+		}
+		if errors.Is(err, ErrRefillDeferred) {
+			s.deferred = true
+			if !s.windowed() {
+				// The stored value of a row no record could read is
+				// shipped by the re-read, whenever it runs.
+				for id, out := range p.recs {
+					if out.unreadable {
+						if s.unread == nil {
+							s.unread = map[string]struct{}{}
+						}
+						s.unread[id] = struct{}{}
+					}
 				}
 			}
+			return true
 		}
-		// New sentinel may have been demoted out of visibility.
-		if newSentinelId != "" && newSentinelId != rc.Id {
-			if _, alreadySeen := p.seen[newSentinelId]; !alreadySeen {
-				if newSentinelId != prevSentinelId {
-					// Demoted to sentinel by another record's arrival: still
-					// matches the filter, just lost its visible slot.
-					p.removed = append(p.removed, space.RemovedRecord{Id: newSentinelId, Reason: space.RemoveDisplaced})
-					p.seen[newSentinelId] = struct{}{}
+	}
+	if unreadable {
+		s.closeWith(space.ErrSubscriptionDrifted)
+		return false
+	}
+	if s.unranked && !s.unrankedLoss {
+		s.unrankedLoss = true
+		s.lost++
+	}
+	if len(s.entries) <= s.cfg.Limit || s.unranked {
+		// Short of rows, or holding a row it cannot rank: what
+		// replaced each departure may be the wrong row.
+		s.lost += p.departed
+	}
+	s.lost += p.moved
+	return true
+}
+
+// needsRefill reports whether the window may differ from storage past
+// its edge: matches lie there and the window is below capacity or
+// holds an unranked row. Only a window that can refill tracks either.
+func (s *querySub) needsRefill() bool {
+	return s.ranks() && (s.unranked || len(s.entries) <= s.cfg.Limit)
+}
+
+// refilled clears what a successful refill settles.
+func (s *querySub) refilled() {
+	s.deferred = false
+	s.unread = nil
+}
+
+// canRefill reports whether the sub can be re-read: a refill was
+// supplied and the window starts at offset 0. A window past an offset
+// shifts with rows before it, which no re-read of its own rows shows.
+func (s *querySub) canRefill() bool {
+	return s.cfg.Refill != nil && s.cfg.Offset == 0
+}
+
+// freshRow is one row of a refill read, held until the read completes
+// so a read that fails midway changes nothing.
+type freshRow struct {
+	id    string
+	held  bool
+	tuple anyenc.Tuple
+	raw   []byte        // windowed: the encoding; nil for a held row whose stored value is unchanged
+	doc   *anyenc.Value // unbounded: a copy for a row the event ships
+}
+
+// refillWindow reconciles the held set with a fresh read: rows the read
+// returns enter or update, held rows it no longer returns leave with
+// the reason a lookup gives (deleted, filtered out, else displaced),
+// each touched in p so emit ships the difference. A failed read
+// changes nothing.
+func (s *querySub) refillWindow(p *subPending) error {
+	read, err := s.cfg.Refill(p.source)
+	if err != nil {
+		return err
+	}
+	defer read.Close()
+	rows := make([]freshRow, 0, len(s.entries)+1)
+	err = read.Rows(func(id string, doc *anyenc.Value) {
+		if id == "" || doc == nil {
+			return
+		}
+		e := s.entries[id]
+		fr := freshRow{id: id, held: e != nil}
+		switch {
+		case !s.windowed():
+			_, unread := s.unread[id]
+			if out := p.recs[id]; e == nil || unread || (out != nil && out.unreadable) {
+				fr.doc = anyencx.Clone(doc)
+			}
+		case e == nil:
+			fr.tuple, fr.raw = s.tupleFor(doc), encode(doc)
+		default:
+			withEncoding(doc, func(enc []byte) {
+				if !bytes.Equal(enc, e.raw) {
+					fr.tuple, fr.raw = s.tupleFor(doc), bytes.Clone(enc)
+				}
+			})
+		}
+		rows = append(rows, fr)
+	})
+	if err != nil {
+		return err
+	}
+	fresh := make(map[string]struct{}, len(rows))
+	for _, fr := range rows {
+		fresh[fr.id] = struct{}{}
+	}
+	// Look up every held row the read did not return, and every row the
+	// records took out of view without a verdict, before anything
+	// changes; the reasons reach p only once every lookup succeeded.
+	var gone map[string]space.RemoveReason
+	lookup := func(id string) error {
+		doc, err := read.Lookup(id)
+		if err != nil {
+			return err
+		}
+		reason := space.RemoveDisplaced
+		switch {
+		case doc == nil:
+			reason = space.RemoveDeleted
+		case s.cfg.Filter != nil && !s.cfg.Filter.Ok(doc, s.docBuf):
+			reason = space.RemoveFilteredOut
+		}
+		if gone == nil {
+			gone = map[string]space.RemoveReason{}
+		}
+		gone[id] = reason
+		return nil
+	}
+	if read.Lookup != nil {
+		for id := range s.entries {
+			if _, ok := fresh[id]; ok {
+				continue
+			}
+			if err := lookup(id); err != nil {
+				return err
+			}
+		}
+		for _, id := range p.order {
+			if _, ok := fresh[id]; ok || s.entries[id] != nil || !p.before[id] || p.mid[id].visible {
+				continue
+			}
+			if out := p.recs[id]; out == nil || !out.verdict {
+				if err := lookup(id); err != nil {
+					return err
 				}
 			}
 		}
 	}
+	p.gone = gone
+
+	s0 := s.sentinel()
+	if s0 != nil {
+		p.touch(s0.id, false)
+	}
+	for _, fr := range rows {
+		switch {
+		case !fr.held:
+			p.touch(fr.id, false)
+			s.insertEntry(fr.id, fr.tuple, fr.raw)
+			if fr.doc != nil {
+				p.rec(fr.id).doc = fr.doc
+			}
+		case fr.raw != nil:
+			e := s.entries[fr.id]
+			p.touch(fr.id, e != s0)
+			s.updateEntry(e, fr.tuple, fr.raw)
+			p.rec(fr.id).changed = true
+		case fr.doc != nil:
+			// An unbounded sub: held is visible, and the stored value
+			// of a row no record could read ships.
+			p.touch(fr.id, true)
+			out := p.rec(fr.id)
+			out.doc, out.changed = fr.doc, true
+		}
+	}
+	for id, e := range s.entries {
+		if _, ok := fresh[id]; ok {
+			continue
+		}
+		p.touch(id, e != s0)
+		s.removeEntry(e)
+	}
+	if s.windowed() {
+		// Rows the read returned without an id or doc took no slot:
+		// a window that holds at most limit rows holds every match
+		// it can, as at Subscribe.
+		s.complete = len(s.entries) <= s.cfg.Limit
+		s.edge = nil
+		s.unranked, s.unrankedLoss = false, false
+	}
+	if s1 := s.sentinel(); s1 != nil {
+		// A row the refill demoted to sentinel was visible before.
+		p.touch(s1.id, true)
+	}
+	return nil
 }
 
 // checkDrift closes the sub with ErrSubscriptionDrifted when the
@@ -371,9 +858,7 @@ func (s *querySub) checkDrift() {
 		return
 	}
 	if s.lost*100 >= s.lostLimit {
-		s.err.Store(space.ErrSubscriptionDrifted)
-		_ = s.mb.Close()
-		s.closed = true
+		s.closeWith(space.ErrSubscriptionDrifted)
 	}
 }
 

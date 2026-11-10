@@ -770,6 +770,7 @@ func watchSpaceIndex(tsp *techspace.Service, onChange func()) (stop func()) {
 			ObjectId: tsp.IndexObjectId(),
 			Dataset:  techspace.SpaceIndexDataset,
 		},
+		Refill: spaceimpl.ObjectRefill(tsp.Store(), tsp.IndexObjectId(), techspace.SpaceIndexDataset),
 	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
 	if err != nil || sub == nil {
 		return func() {}
@@ -1585,7 +1586,8 @@ func (a *accountImpl) runProfileSync() {
 	retry := retryMin
 	for !a.closed() {
 		sub, err := a.tsp.SubEngine().Subscribe(subscribe.SubConfig{
-			Scope: subscribe.Scope{ObjectId: a.tsp.IndexObjectId(), Dataset: techspace.ProfileDataset},
+			Scope:  subscribe.Scope{ObjectId: a.tsp.IndexObjectId(), Dataset: techspace.ProfileDataset},
+			Refill: spaceimpl.ObjectRefill(a.tsp.Store(), a.tsp.IndexObjectId(), techspace.ProfileDataset),
 		}, func(func(id string, doc *anyenc.Value)) error { return nil })
 		if err != nil {
 			log.Warn("profile sync: subscribe", zap.Error(err))

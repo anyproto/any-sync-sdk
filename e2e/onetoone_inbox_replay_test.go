@@ -272,7 +272,7 @@ func TestE2E_OneToOne_ColdRestoreInboxReplay(t *testing.T) {
 	// config instead: prime a throwaway SDK, grab the stored <netId>.yml,
 	// rewrite that — same id ⇒ the refresh no-ops and the proxy addrs hold.
 	servedYAML := capturedServedNodeconf(t, ctx, netYAML)
-	proxYAML, routes := proxyNodeconf(t, servedYAML, 34430)
+	proxYAML, routes := proxyNodeconf(t, servedYAML, freeBasePort(t, 3))
 	t.Logf("proxy routes: %v (down for phase 1)", routes)
 
 	bob2 := open("bob2-cold", bobProv, proxYAML)

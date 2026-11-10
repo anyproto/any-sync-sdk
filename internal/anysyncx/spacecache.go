@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
@@ -108,6 +109,9 @@ func (a *App) newSpaceCache() spaceCache {
 // must already exist (caller is expected to Create / Derive first if
 // the space is new).
 func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, error) {
+	if tok, ok := ctx.Value(loadTokenKey{}).(*loadToken); ok {
+		tok.ran.Store(true)
+	}
 	// The Tracker is constructed lazily and reused across reloads of
 	// the same spaceId; we wire it as commonspace.Deps.SyncStatus so
 	// any-sync dispatches HeadsChange / ObjectReceive / HeadsApply
@@ -213,6 +217,37 @@ func (a *App) GetSpace(ctx context.Context, id string) (SpaceHandle, error) {
 		return nil, err
 	}
 	return v.(SpaceHandle), nil
+}
+
+// createLoadAttempts bounds the loads GetSpaceCreating runs.
+const createLoadAttempts = 3
+
+// loadToken tells a GetSpaceCreating call whether the space cache ran
+// the load on its ctx: the cache runs one load per id, on the ctx of the
+// caller that started it, and hands the result to every caller.
+type loadToken struct{ ran atomic.Bool }
+
+type loadTokenKey struct{}
+
+// GetSpaceCreating is GetSpace for a caller whose ctx carries the
+// space's create description (commonspace's AddSpaceCtxKey): Derive and
+// OneToOne, whose load builds missing storage locally and never asks the
+// nodes. Such a caller can join a load another caller started without
+// the description — the index follower pulling a space another device
+// of the account has just derived — and get that load's failure: "space
+// is missing" while the nodes lack the space, a network error while
+// they are unreachable. A failure of a load it did not run is retried,
+// up to createLoadAttempts loads; the failed load has left the cache, so
+// the next one is likely its own. A failure of its own load, or a
+// closed cache, is final.
+func (a *App) GetSpaceCreating(ctx context.Context, id string) (SpaceHandle, error) {
+	for attempt := 1; ; attempt++ {
+		tok := &loadToken{}
+		h, err := a.GetSpace(context.WithValue(ctx, loadTokenKey{}, tok), id)
+		if err == nil || tok.ran.Load() || attempt == createLoadAttempts || errors.Is(err, ocache.ErrClosed) || ctx.Err() != nil {
+			return h, err
+		}
+	}
 }
 
 // PickSpace returns a handle only if the space is already resident in

@@ -322,6 +322,10 @@ func TestSharedDataset_PurgeInChunks(t *testing.T) {
 		want = append(want, id)
 	}
 	insert("obj2", "obj2/r1")
+	// Every apply persists the object's _meta row with its rows.
+	metaColl, err := store.metaCollection(ctx)
+	require.NoError(t, err)
+	require.NoError(t, crdt.PersistMeta(tx.Context(), metaColl, "obj1", 1, 1, nil, store.spaceId))
 	require.NoError(t, tx.Commit())
 
 	all := subscribeKeyedRows(t, ctx, store, coll, subscribe.Scope{AllObjects: true, Dataset: samples}, nil)

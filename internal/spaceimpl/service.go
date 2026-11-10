@@ -1405,7 +1405,7 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	// Load (creating storage from the armed ctx on first derive) BEFORE
 	// writing the active row — an active row without storage is a state
 	// plain Get can't heal (see activateOneToOne).
-	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+	if _, err := s.app.GetSpaceCreating(ctx, spaceId); err != nil {
 		return nil, err
 	}
 	if rec, ok := s.tsp.Get(ctx, spaceId); !ok {
@@ -1723,7 +1723,7 @@ func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity stri
 // peerIdentity is recorded on a freshly-created row so any of the account's
 // devices can re-derive the space.
 func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity string) (space.Space, error) {
-	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
+	if _, err := s.app.GetSpaceCreating(ctx, spaceId); err != nil {
 		return nil, err
 	}
 	if rec, ok := s.tsp.Get(ctx, spaceId); ok {

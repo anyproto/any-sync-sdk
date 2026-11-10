@@ -191,11 +191,19 @@ func TestReadPrune_TwoDevicesLive(t *testing.T) {
 	defer cancel()
 
 	walletDir := t.TempDir()
-	provider, err := auth.NewFileProvider(auth.FileProviderConfig{
-		Path: filepath.Join(walletDir, "wallet.key"),
+	providerA, err := auth.NewFileProvider(auth.FileProviderConfig{
+		Path: filepath.Join(walletDir, "walletA.key"),
 	})
 	require.NoError(t, err)
-	open := func(name string) *SDK {
+	// Same account, its own device key: two SDKs on one device key are
+	// one peer to the network, and the nodes keep dropping one of the
+	// two connections.
+	providerB, err := auth.NewFileProvider(auth.FileProviderConfig{
+		Path:     filepath.Join(walletDir, "walletB.key"),
+		Mnemonic: providerA.Mnemonic(),
+	})
+	require.NoError(t, err)
+	open := func(name string, provider *auth.FileProvider) *SDK {
 		sdk, oerr := Open(ctx, config.Config{
 			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
 			Network: config.Network{NodeConfYAML: yaml},
@@ -205,7 +213,7 @@ func TestReadPrune_TwoDevicesLive(t *testing.T) {
 		return sdk
 	}
 
-	devA := open("devA")
+	devA := open("devA", providerA)
 	sp, err := devA.Spaces().Create(ctx, space.CreateRequest{Name: "ReadPrune2Dev"})
 	if err != nil {
 		t.Skipf("space create failed (network?): %v", err)
@@ -216,7 +224,9 @@ func TestReadPrune_TwoDevicesLive(t *testing.T) {
 	prunePublish(t, ctx, devA, prefix, "obj1")
 	prunePublish(t, ctx, devA, prefix, "obj2")
 
-	devB := open("devB")
+	devB := open("devB", providerB)
+	require.Equal(t, devA.Account().Id(), devB.Account().Id())
+	require.NotEqual(t, devA.P2PStatus().PeerId, devB.P2PStatus().PeerId)
 	select {
 	case <-devB.BootstrapDone():
 	case <-ctx.Done():

@@ -381,9 +381,14 @@ func (o *objectService) Delete(ctx context.Context, objectId string) error {
 	if err := handle.Inner().DeleteTree(ctx, objectId); err != nil {
 		return fmt.Errorf("spaceimpl: DeleteTree %s: %w", objectId, err)
 	}
-	// Best-effort local reclaim; whichever of this call and the async
-	// cascade runs first tombstones the tree, the other no-ops on it.
-	_ = o.parent.store.DeleteTree(ctx, objectId)
+	// Local reclaim, so the object leaves local reads before Delete
+	// returns. The async cascade runs DeleteTree as well and retries a
+	// failure here; the tree is never purged without its tombstone, or a
+	// reload of the live tree would bring the rows back.
+	if err := o.parent.store.DeleteTree(ctx, objectId); err != nil {
+		objectLog.Warn("delete: local reclaim failed; the deletion cascade retries it",
+			zap.String("spaceId", o.parent.id), zap.String("objectId", objectId), zap.Error(err))
+	}
 	return nil
 }
 

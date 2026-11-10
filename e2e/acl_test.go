@@ -439,7 +439,6 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.NoError(t, owner.Account().UpdateMetadata(ctx, space.AccountMetadata{
 		Name:        "Owner Live Name",
 		Description: "Live description",
-		IconCID:     "owner-icon-cid",
 	}))
 
 	// After the kick, the watcher's profileLoop fetches in a
@@ -451,8 +450,7 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 			return false
 		}
 		return me.Name == "Owner Live Name" &&
-			me.Description == "Live description" &&
-			me.IconCID == "owner-icon-cid"
+			me.Description == "Live description"
 	}, 5*time.Second, 100*time.Millisecond, "owner profile override never applied")
 
 	// And the materialised members collection picks up the same

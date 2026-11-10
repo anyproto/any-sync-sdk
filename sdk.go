@@ -267,8 +267,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	filesRoot := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "files")
 	filesStore, err := filestore.New(ctx, filesRoot, db)
 	if err != nil {
-		_ = db.Close()
+		_ = spaces.Close(ctx)
 		_ = app.Close(ctx)
+		_ = db.Close()
 		return nil, fmt.Errorf("anysyncsdk: open files store: %w", err)
 	}
 	filesBroker := broker.New(app.Pool(), app.FileV2Peers, app.NetworkId(), app.FileNetworkId)
@@ -286,8 +287,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// spaces exist (jobs resolve rows through them); closed first.
 	filesQueue, err := status.NewQueue(ctx, db, spaces.RunFileJob, spaces.OnFileJobChange)
 	if err != nil {
-		_ = db.Close()
+		_ = spaces.Close(ctx)
 		_ = app.Close(ctx)
+		_ = db.Close()
 		return nil, fmt.Errorf("anysyncsdk: open files queue: %w", err)
 	}
 	filesUpload.SetQueue(filesQueue)
@@ -316,9 +318,13 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// the tech-space's own indexId back to techspace.
 	app.SetSpaceRegistry(spaces)
 
+	// A failed Open stops the space service's background loops, then
+	// any-sync, whose callbacks write sdk.db, and closes the db last.
 	if err := tsp.Open(ctx); err != nil {
-		_ = db.Close()
+		_ = spaces.Close(ctx)
+		_ = tsp.Close(ctx)
 		_ = app.Close(ctx)
+		_ = db.Close()
 		return nil, fmt.Errorf("anysyncsdk: open techspace: %w", err)
 	}
 	// The CRDT version mark: an account a newer SDK has written refuses
@@ -326,9 +332,10 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// stamped with this SDK's version. Before any other boot work so a
 	// refused account is touched by nothing.
 	if err := tsp.EnsureCRDTVersion(ctx); err != nil {
+		_ = spaces.Close(ctx)
 		_ = tsp.Close(ctx)
-		_ = db.Close()
 		_ = app.Close(ctx)
+		_ = db.Close()
 		return nil, fmt.Errorf("anysyncsdk: %w", err)
 	}
 	// Orphan-collection GC: drop CRDT collections whose owner space /
@@ -793,7 +800,7 @@ func watchSpaceIndex(tsp *techspace.Service, onChange func()) (stop func()) {
 
 // Close tears down the SDK: joins the bootstrap pass, snapshots
 // per-space catch-up watermarks, stops the files queue, closes loaded
-// spaces, the tech space, the SDK DB, and finally the any-sync app.
+// spaces, the tech space, the any-sync app, and finally the SDK DB.
 func (s *SDK) Close() error {
 	ctx := context.Background()
 	// Cancel and JOIN the bootstrap pass before any teardown: it
@@ -836,13 +843,18 @@ func (s *SDK) Close() error {
 	if s.tsp != nil {
 		_ = s.tsp.Close(ctx)
 	}
+	// any-sync's per-space loops (deletion, sync, selective sync) call
+	// back into the stores and write sdk.db until app.Close stops them,
+	// so the db closes last: a commit racing db.Close crashes the
+	// engine.
+	var err error
+	if s.app != nil {
+		err = s.app.Close(ctx)
+	}
 	if s.db != nil {
 		_ = s.db.Close()
 	}
-	if s.app != nil {
-		return s.app.Close(ctx)
-	}
-	return nil
+	return err
 }
 
 // snapshotWatermarks persists the catch-up watermark for every space

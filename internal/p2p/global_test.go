@@ -590,6 +590,19 @@ func TestBackoffFor(t *testing.T) {
 	require.Equal(t, dormantProbe, backoffFor(TierDormant, 1))
 }
 
+// Peers whose dials failed together must not retry at the same instant,
+// and a retry never waits past its backoff.
+func TestJittered_SpreadsRetries(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for range 100 {
+		d := jittered(activeBackoffMax)
+		require.LessOrEqual(t, d, activeBackoffMax)
+		require.GreaterOrEqual(t, d, activeBackoffMax-activeBackoffMax/4)
+		seen[d] = true
+	}
+	require.Greater(t, len(seen), 50, "retry waits spread out")
+}
+
 func TestConnectorDialsBoundedAndRateLimited(t *testing.T) {
 	fx := newGlobalFixture(t, config.GlobalP2P{MaxConnections: 2, MaxDialsPerMinute: 2, DialTimeout: 50 * time.Millisecond})
 	a := newTestPeer(t, "a")

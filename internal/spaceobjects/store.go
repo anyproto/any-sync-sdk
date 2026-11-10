@@ -34,6 +34,7 @@ import (
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
@@ -259,6 +260,8 @@ type Store struct {
 	// transaction committed and before the object's collections
 	// drop, so it can still read them. See SetPurgeHook.
 	purgeHook func(ctx context.Context, objectId string)
+	// purgeMu runs one deletion purge at a time; see purgeAndDrop.
+	purgeMu sync.Mutex
 
 	// engine drives windowed live queries (Query.Subscribe). The
 	// afterApply hook gates on engine.HasSubscribers so the cold-
@@ -1858,21 +1861,26 @@ func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.Tree
 // so returning an error keeps it Queued and the deletion loop re-fires
 // the callback until the purge commits — the at-least-once self-heal for
 // a crash between tree.Delete() and the purge.
+//
+// Objects.Delete and any-sync's deletion loop both call it for one
+// tree. Whichever comes second, finding the tree deleted already, still
+// purges, after the first one's purge if it is still running (see
+// purgeAndDrop), so a successful call returns after the object's rows
+// are gone.
 func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	obj, err := s.Get(ctx, treeId)
 	if err != nil {
+		if treeDeleted(err) {
+			return s.purgeAbsent(ctx, treeId)
+		}
 		return fmt.Errorf("spaceobjects: load %s: %w", treeId, err)
 	}
 	tree := obj.Tree()
 	if tree == nil {
 		obj.MarkDeleted()
-		if err := s.purgeObject(ctx, treeId); err != nil {
-			return err
-		}
-		s.Drop(treeId)
-		return nil
+		return s.purgeAndDrop(ctx, treeId)
 	}
-	if err := tree.Delete(); err != nil {
+	if err := tree.Delete(); err != nil && !treeDeleted(err) {
 		return fmt.Errorf("spaceobjects: tree.Delete %s: %w", treeId, err)
 	}
 	// Deleted in any-sync; now the cached Object refuses every write
@@ -1881,11 +1889,7 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	// resurrect rows. After tree.Delete, so a failed delete leaves the
 	// object unmarked over its live tree.
 	obj.MarkDeleted()
-	if err := s.purgeObject(ctx, treeId); err != nil {
-		return err
-	}
-	s.Drop(treeId)
-	return nil
+	return s.purgeAndDrop(ctx, treeId)
 }
 
 // MarkTreeDeleted is the soft-delete callback any-sync fires when it
@@ -1896,12 +1900,38 @@ func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 // DeleteTree, a purge failure is returned so the deletion loop re-fires
 // until it commits.
 func (s *Store) MarkTreeDeleted(ctx context.Context, treeId string) error {
+	return s.purgeAbsent(ctx, treeId)
+}
+
+// purgeAbsent purges an object whose tree is not here to tombstone:
+// absent from local storage, or deleted already.
+func (s *Store) purgeAbsent(ctx context.Context, treeId string) error {
 	s.markCachedDeleted(ctx, treeId)
-	if err := s.purgeObject(ctx, treeId); err != nil {
+	return s.purgeAndDrop(ctx, treeId)
+}
+
+// purgeAndDrop purges objectId and evicts it, one purge at a time.
+// Objects.Delete and the deletion loop both purge each object; the
+// second waits for the first one's reclaim, which removes the object's
+// shared-dataset rows, so neither returns while those are still
+// readable. Its own purge then removes, stamps and reclaims nothing.
+func (s *Store) purgeAndDrop(ctx context.Context, objectId string) error {
+	s.purgeMu.Lock()
+	defer s.purgeMu.Unlock()
+	if err := s.purgeObject(ctx, objectId); err != nil {
 		return err
 	}
-	s.Drop(treeId)
+	s.Drop(objectId)
 	return nil
+}
+
+// treeDeleted reports an error that means the object's tree is deleted:
+// the cached Object refuses writes (MarkDeleted), the synctree is
+// deleted, or head storage records it deleted and refuses to open it.
+func treeDeleted(err error) bool {
+	return errors.Is(err, synctree.ErrSyncTreeDeleted) ||
+		errors.Is(err, spacestorage.ErrTreeStorageAlreadyDeleted) ||
+		errors.Is(err, object.ErrDeleted)
 }
 
 // markCachedDeleted flags the cached Object for objectId as deleted
@@ -1942,7 +1972,8 @@ func (s *Store) markCachedDeleted(ctx context.Context, objectId string) {
 // deletion unannounced, nor announced but the row still live.
 //
 // Device-local: no DAG or ACL write; idempotent (a second call with the
-// row already gone removes nothing and fires no Removed event).
+// row already gone and the mark set removes, stamps and reclaims nothing
+// and fires no event).
 //
 // Error contract: the correctness-critical steps — removing the shared
 // `objects` row and stamping the deletion — RETURN an error on failure so
@@ -1966,7 +1997,7 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	if err != nil {
 		return fmt.Errorf("spaceobjects: purge tx %s: %w", objectId, err)
 	}
-	removed, seq, stamped, perr := s.purgeRowInTx(tx.Context(), coll, metaColl, objectId)
+	res, perr := s.purgeRowInTx(tx.Context(), coll, metaColl, objectId)
 	if perr != nil {
 		_ = tx.Rollback()
 		return perr
@@ -1976,14 +2007,24 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	}
 
 	// Best-effort from here — disk reclaim + notifications, not correctness.
-	// The purge hook reads the object's collections, so it runs first.
+	// A purge that removed and stamped nothing repeats one that ran
+	// already (Objects.Delete and the deletion loop both purge each
+	// object), so it skips the reclaim and only closes what came up
+	// since: subscriptions, parked changes, the skip marker. A reclaim
+	// cut short (a crash, a cancelled ctx) leaves collections the next
+	// boot's deletion reconcile reclaims (PurgeObjects reclaims every
+	// materialized id). The purge hook reads the object's collections,
+	// so it runs first.
 	// dropObjectCollections sweeps every `<objectId>_*` collection, which
 	// includes the per-object history collections; the space-level history
 	// leftovers (trace rows, stale-flag row) need their own purge.
-	s.runPurgeHook(ctx, objectId)
-	s.dropObjectCollections(ctx, objectId)
-	s.purgeKeyedRows(ctx, objectId)
-	s.purgeHistoryRows(ctx, objectId)
+	reclaim := (res.removed || res.stamped) && ctx.Err() == nil
+	if reclaim {
+		s.runPurgeHook(ctx, objectId)
+		s.dropObjectCollections(ctx, objectId)
+		s.purgeKeyedRows(ctx, objectId)
+		s.purgeHistoryRows(ctx, objectId)
+	}
 	s.unparkObject(ctx, objectId)
 	_ = s.unmarkSkipped(ctx, objectId)
 	// A deleted TYPE object must leave the runtime catalog, or its
@@ -1992,55 +2033,72 @@ func (s *Store) purgeObject(ctx context.Context, objectId string) error {
 	// dropped defs collection — empty — and removes the entry. Gated
 	// on catalog membership so a bulk purge of ordinary objects never
 	// pays a rebuild per row.
-	if s.catalogHasType(objectId) {
+	if reclaim && s.catalogHasType(objectId) {
 		s.refreshType(ctx, objectId)
 	}
-	s.fireDeletionEvents(objectId, removed, stamped, seq)
+	s.fireDeletionEvents(objectId, res.removed, res.stamped, res.seq)
 	return nil
+}
+
+// purgeResult is one object's outcome in a purge transaction.
+type purgeResult struct {
+	// removed: a live `objects` row was removed.
+	removed bool
+	// materialized: the object had a live row or a scoped `_meta` row
+	// here, so its per-object collections and rows are the caller's to
+	// reclaim.
+	materialized bool
+	// stamped: a deletion mark was written, at seq.
+	stamped bool
+	seq     uint64
 }
 
 // purgeRowInTx removes the shared `objects` row for objectId (if present),
 // its read state, and stamps its kept `_meta` row as deleted with a fresh
-// applySeq — all inside the caller's WriteTx. Returns whether a live row
-// was removed, the stamped applySeq, and whether a del-stamp was written.
-// Stamps whenever the object was materialized in the feed: a live `objects`
-// row (removed) OR a base-dataset-only object with a scoped `_meta` row. A
-// never-materialized id (a delete callback for an object this device never
-// had) stamps nothing. The read-state rows go unconditionally: an object
-// tracked on this device has them whether or not it has an `objects` row,
-// and a surviving row would skip first-sight seeding for a re-materialized
-// id (see readstate.PurgeObject).
-func (s *Store) purgeRowInTx(txCtx context.Context, coll, metaColl anystore.Collection, objectId string) (removed bool, seq uint64, stamped bool, err error) {
+// applySeq — all inside the caller's WriteTx. Stamps when the object was
+// materialized in the feed — a live `objects` row (removed) OR a
+// base-dataset-only object with a scoped `_meta` row — and the mark is not
+// set yet: a second purge (another caller, a re-fired callback, a
+// reconcile pass) stamps and announces nothing, yet still reports the
+// object materialized so its leftovers are reclaimed. A never-materialized
+// id (a delete callback for an object this device never had) stamps
+// nothing. The read-state rows go unconditionally: an object tracked on
+// this device has them whether or not it has an `objects` row, and a
+// surviving row would skip first-sight seeding for a re-materialized id
+// (see readstate.PurgeObject).
+func (s *Store) purgeRowInTx(txCtx context.Context, coll, metaColl anystore.Collection, objectId string) (res purgeResult, err error) {
 	if rerr := readstate.PurgeObject(txCtx, s.db, objectId); rerr != nil {
-		return false, 0, false, fmt.Errorf("spaceobjects: purge read state %s: %w", objectId, rerr)
+		return res, fmt.Errorf("spaceobjects: purge read state %s: %w", objectId, rerr)
 	}
 	if _, ferr := coll.FindId(txCtx, objectId); ferr == nil {
 		if derr := coll.DeleteId(txCtx, objectId); derr != nil {
-			return false, 0, false, fmt.Errorf("spaceobjects: purge remove row %s: %w", objectId, derr)
+			return res, fmt.Errorf("spaceobjects: purge remove row %s: %w", objectId, derr)
 		}
-		removed = true
+		res.removed = true
 	} else if !errors.Is(ferr, anystore.ErrDocNotFound) {
-		return false, 0, false, fmt.Errorf("spaceobjects: purge read row %s: %w", objectId, ferr)
+		return res, fmt.Errorf("spaceobjects: purge read row %s: %w", objectId, ferr)
 	}
 
-	stamp := removed
-	if !stamp {
-		ok, merr := crdt.MetaExists(txCtx, metaColl, objectId, s.spaceId)
+	stamp := res.removed
+	res.materialized = res.removed
+	if !res.removed {
+		exists, deleted, merr := crdt.MetaStatus(txCtx, metaColl, objectId, s.spaceId)
 		if merr != nil {
-			return false, 0, false, fmt.Errorf("spaceobjects: purge meta check %s: %w", objectId, merr)
+			return res, fmt.Errorf("spaceobjects: purge meta check %s: %w", objectId, merr)
 		}
-		stamp = ok
+		res.materialized = exists
+		stamp = exists && !deleted
 	}
 	if stamp {
-		if seq, err = s.applySeqs.Next(txCtx); err != nil {
-			return false, 0, false, fmt.Errorf("spaceobjects: purge alloc applySeq %s: %w", objectId, err)
+		if res.seq, err = s.applySeqs.Next(txCtx); err != nil {
+			return res, fmt.Errorf("spaceobjects: purge alloc applySeq %s: %w", objectId, err)
 		}
-		if err = crdt.PersistDeletionMark(txCtx, metaColl, objectId, s.spaceId, seq); err != nil {
-			return false, 0, false, fmt.Errorf("spaceobjects: purge stamp del %s: %w", objectId, err)
+		if err = crdt.PersistDeletionMark(txCtx, metaColl, objectId, s.spaceId, res.seq); err != nil {
+			return res, fmt.Errorf("spaceobjects: purge stamp del %s: %w", objectId, err)
 		}
-		stamped = true
+		res.stamped = true
 	}
-	return removed, seq, stamped, nil
+	return res, nil
 }
 
 // fireDeletionEvents emits the best-effort notifications after a committed
@@ -2085,7 +2143,7 @@ func (s *Store) unparkObject(ctx context.Context, objectId string) {
 
 // PurgeObjects hard-removes the local projection for a batch of objectIds in
 // ONE WriteTx (row removal + read-state purge + del-stamp per materialized
-// id), then reclaims per-object collections listing collection names ONCE,
+// id not marked yet), then reclaims per-object collections listing collection names ONCE,
 // drops the cache, and emits one deletion feed entry per stamped id. Used by
 // the startup deletion-reconcile to purge many stale rows off the SDK.Open
 // path without the O(N x all-collections) cost of per-id purgeObject. Ids
@@ -2098,6 +2156,17 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 	if len(objectIds) == 0 {
 		return nil
 	}
+	// One pass per object: a repeated id would find what its first
+	// occurrence removed and stamped, and announce nothing.
+	seen := make(map[string]struct{}, len(objectIds))
+	unique := objectIds[:0:0]
+	for _, id := range objectIds {
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			unique = append(unique, id)
+		}
+	}
+	objectIds = unique
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
 		return fmt.Errorf("spaceobjects: batch purge open shared objects: %w", err)
@@ -2115,22 +2184,14 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 		return fmt.Errorf("spaceobjects: batch purge tx: %w", err)
 	}
 	txCtx := tx.Context()
-	type purgedRow struct {
-		id      string
-		seq     uint64
-		removed bool
-		stamped bool
-	}
-	var purged []purgedRow
+	purged := make(map[string]purgeResult, len(objectIds))
 	for _, id := range objectIds {
-		removed, seq, stamped, perr := s.purgeRowInTx(txCtx, coll, metaColl, id)
+		res, perr := s.purgeRowInTx(txCtx, coll, metaColl, id)
 		if perr != nil {
 			_ = tx.Rollback()
 			return perr
 		}
-		if removed || stamped {
-			purged = append(purged, purgedRow{id, seq, removed, stamped})
-		}
+		purged[id] = res
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("spaceobjects: batch purge commit: %w", err)
@@ -2146,12 +2207,9 @@ func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
 	if perr != nil {
 		storeLog.Warn("batch purge: list parked changes", zap.Error(perr))
 	}
-	purgedById := make(map[string]purgedRow, len(purged))
-	for _, p := range purged {
-		purgedById[p.id] = p
-	}
 	for _, id := range objectIds {
-		p, materialized := purgedById[id]
+		p := purged[id]
+		materialized := p.materialized
 		s.runPurgeHook(ctx, id)
 		if materialized {
 			if nerr == nil {

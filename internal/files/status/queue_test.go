@@ -158,16 +158,13 @@ func TestQueuePersistsAcrossRestart(t *testing.T) {
 	waitFor(t, func() bool { return rec.runCount("pin/sp1/f1") == 1 })
 	q.Close()
 
-	// New process: the persisted job is picked up and, once kicked due,
-	// runs to success.
+	// New process: the persisted job is picked up — a job that ran
+	// before is due at once — and runs to success.
 	rec2 := &recorder{}
 	q2, err := NewQueue(ctx, db, rec2.run, rec2.onChange)
 	require.NoError(t, err)
 	t.Cleanup(q2.Close)
 	q2.Run()
-	kicked, err := q2.KickJob(ctx, KindPin, "sp1", "f1")
-	require.NoError(t, err)
-	require.True(t, kicked)
 	waitFor(t, func() bool { return rec2.runCount("pin/sp1/f1") == 1 })
 	waitFor(t, func() bool {
 		_, ok, err := q2.Get(ctx, KindPin, "sp1", "f1")

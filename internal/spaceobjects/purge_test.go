@@ -5,18 +5,26 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-sync/app/ocache"
+	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/fanout"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/readstate"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
 // purgeStore builds a Store wired with exactly what the purge path needs: a
@@ -106,7 +114,7 @@ func TestPurgeObject_StampsDeletionAboveContentSeq(t *testing.T) {
 	assert.Equal(t, changed[0], live[0])
 }
 
-func TestPurgeObject_MetaExistsGate(t *testing.T) {
+func TestPurgeObject_MetaStatusGate(t *testing.T) {
 	ctx, s := purgeStore(t)
 	metaColl, err := s.metaCollection(ctx)
 	require.NoError(t, err)
@@ -115,7 +123,7 @@ func TestPurgeObject_MetaExistsGate(t *testing.T) {
 	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "base", 2, 2, nil, "spaceA"))
 	require.NoError(t, s.EnsureApplySeq(ctx))
 
-	require.NoError(t, s.purgeObject(ctx, "base"))  // stamps via MetaExists
+	require.NoError(t, s.purgeObject(ctx, "base"))  // stamps via MetaStatus
 	require.NoError(t, s.purgeObject(ctx, "never")) // never materialised → nothing
 
 	changed, err := s.ChangedObjects(ctx, 0, 0)
@@ -123,6 +131,16 @@ func TestPurgeObject_MetaExistsGate(t *testing.T) {
 	require.Len(t, changed, 1, "only the materialised id announces a deletion")
 	assert.Equal(t, "base", changed[0].ObjectId)
 	assert.True(t, changed[0].Deleted)
+
+	// A second purge of the deleted object stamps nothing.
+	var announced []ObjectChange
+	defer s.SubscribeChanges(func(c ObjectChange) { announced = append(announced, c) })()
+	require.NoError(t, s.purgeObject(ctx, "base"))
+	again, err := s.ChangedObjects(ctx, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, again, 1)
+	assert.Equal(t, changed[0].ApplySeq, again[0].ApplySeq, "the mark keeps its applySeq")
+	assert.Empty(t, announced, "nothing is announced again")
 }
 
 func TestPurgeObject_DelStickyAcrossLateContentApply(t *testing.T) {
@@ -169,6 +187,51 @@ func TestPurgeObjects_Batch(t *testing.T) {
 		ids[c.ObjectId] = true
 	}
 	assert.Equal(t, map[string]bool{"live": true, "base": true}, ids)
+}
+
+// A reconcile pass over an object already purged and marked reclaims
+// what the first purge's best-effort tail left behind, without stamping
+// or announcing the deletion again.
+func TestPurgeObjects_ReclaimsLeftoversOfAMarkedObject(t *testing.T) {
+	ctx, s := purgeStore(t)
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	writeObjectRow(t, ctx, s, "o1")
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "o1", 5, 5, nil, "spaceA"))
+	require.NoError(t, s.EnsureApplySeq(ctx))
+	require.NoError(t, s.purgeObject(ctx, "o1"))
+	before, err := s.ChangedObjects(ctx, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, before, 1)
+
+	// A leftover the first tail did not drop.
+	_, err = s.db.Collection(ctx, "o1_blocks")
+	require.NoError(t, err)
+
+	require.NoError(t, s.PurgeObjects(ctx, []string{"o1"}))
+	_, err = s.db.OpenCollection(ctx, "o1_blocks")
+	assert.True(t, errors.Is(err, anystore.ErrCollectionNotFound), "the leftover is reclaimed")
+	after, err := s.ChangedObjects(ctx, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+	assert.Equal(t, before[0].ApplySeq, after[0].ApplySeq, "no second deletion mark")
+}
+
+// A repeated id announces the deletion its first occurrence stamped.
+func TestPurgeObjects_RepeatedIdAnnouncesOnce(t *testing.T) {
+	ctx, s := purgeStore(t)
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	writeObjectRow(t, ctx, s, "o1")
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "o1", 5, 5, nil, "spaceA"))
+	require.NoError(t, s.EnsureApplySeq(ctx))
+
+	var announced []ObjectChange
+	defer s.SubscribeChanges(func(c ObjectChange) { announced = append(announced, c) })()
+	require.NoError(t, s.PurgeObjects(ctx, []string{"o1", "o1"}))
+	require.Len(t, announced, 1)
+	assert.True(t, announced[0].Deleted)
+	assert.Greater(t, announced[0].ApplySeq, uint64(5))
 }
 
 // trackRead records one unread change for objectId through a read-state
@@ -269,4 +332,104 @@ func TestPurgeObject_ClearsReadStateParkedAndRunsHook(t *testing.T) {
 		ids[c.ObjectId] = true
 	}
 	assert.Equal(t, map[string]bool{"o1": true, "o2": true}, ids, "only materialized ids announce a deletion")
+}
+
+// deletedStubTree is a tree another caller has already deleted.
+type deletedStubTree struct{ closableStubTree }
+
+func (s *deletedStubTree) Delete() error { return synctree.ErrSyncTreeDeleted }
+
+// Objects.Delete and any-sync's deletion loop both call DeleteTree for
+// one tree. The call that finds the tree deleted already still purges,
+// so it never returns while the object's row is live.
+func TestDeleteTree_PurgesATreeDeletedAlready(t *testing.T) {
+	t.Run("load refused", func(t *testing.T) {
+		ctx, s := purgeStore(t)
+		writeObjectRow(t, ctx, s, "o1")
+		_ = s.cache.Close()
+		s.cache = ocache.New(func(context.Context, string) (ocache.Object, error) {
+			return nil, fmt.Errorf("load: %w", spacestorage.ErrTreeStorageAlreadyDeleted)
+		})
+		require.NoError(t, s.DeleteTree(ctx, "o1"))
+		assert.False(t, objectRowExists(t, ctx, s, "o1"))
+	})
+	t.Run("tree deleted under a cached object", func(t *testing.T) {
+		ctx, s := purgeStore(t)
+		writeObjectRow(t, ctx, s, "o1")
+		ctrl, err := crdt.NewController(ctx, "o1", s.db, crdt.HandlerReg{Name: "blocks", Handler: &crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}})
+		require.NoError(t, err)
+		obj, err := object.New(object.Config{SpaceId: "spaceA", Controller: ctrl},
+			func(updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
+				return &deletedStubTree{closableStubTree{stubTree{id: "o1"}}}, nil
+			})
+		require.NoError(t, err)
+		_ = s.cache.Close()
+		s.cache = ocache.New(func(context.Context, string) (ocache.Object, error) { return obj, nil })
+		require.NoError(t, s.DeleteTree(ctx, "o1"))
+		assert.False(t, objectRowExists(t, ctx, s, "o1"))
+	})
+}
+
+// A caller arriving while a purge of the object runs returns only after
+// that purge's reclaim finished, which removes the object's
+// shared-dataset rows; its own purge is a repeat and stamps, announces
+// and reclaims nothing.
+func TestPurgeAndDrop_SecondCallerWaitsForTheRunningReclaim(t *testing.T) {
+	ctx, s := purgeStore(t)
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	writeObjectRow(t, ctx, s, "o1")
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "o1", 5, 5, nil, "spaceA"))
+	require.NoError(t, s.EnsureApplySeq(ctx))
+
+	var (
+		hooks   atomic.Int32
+		entered = make(chan struct{})
+		release = make(chan struct{})
+	)
+	s.SetPurgeHook(func(context.Context, string) {
+		if hooks.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	})
+	first := make(chan error, 1)
+	go func() { first <- s.MarkTreeDeleted(ctx, "o1") }()
+	<-entered
+	second := make(chan error, 1)
+	go func() { second <- s.MarkTreeDeleted(ctx, "o1") }()
+	select {
+	case err := <-second:
+		t.Fatalf("the second caller returned during the first one's reclaim: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	require.NoError(t, <-first)
+	require.NoError(t, <-second)
+	assert.Equal(t, int32(1), hooks.Load(), "reclaimed once")
+	changed, err := s.ChangedObjects(ctx, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, changed, 1)
+}
+
+// A purge repeating one that ran (Objects.Delete and the deletion loop
+// both purge each object) removes, stamps and reclaims nothing; leftovers
+// of a cut-short reclaim are the boot reconcile's (see
+// TestPurgeObjects_ReclaimsLeftoversOfAMarkedObject).
+func TestPurgeAndDrop_ARepeatSkipsTheReclaim(t *testing.T) {
+	ctx, s := purgeStore(t)
+	metaColl, err := s.metaCollection(ctx)
+	require.NoError(t, err)
+	writeObjectRow(t, ctx, s, "o1")
+	require.NoError(t, crdt.PersistMeta(ctx, metaColl, "o1", 5, 5, nil, "spaceA"))
+	require.NoError(t, s.EnsureApplySeq(ctx))
+	var hooks atomic.Int32
+	s.SetPurgeHook(func(context.Context, string) { hooks.Add(1) })
+
+	require.NoError(t, s.MarkTreeDeleted(ctx, "o1"))
+	require.NoError(t, s.MarkTreeDeleted(ctx, "o1"))
+	assert.Equal(t, int32(1), hooks.Load(), "reclaimed once")
+	changed, err := s.ChangedObjects(ctx, 0, 0)
+	require.NoError(t, err)
+	assert.Len(t, changed, 1, "announced once")
 }

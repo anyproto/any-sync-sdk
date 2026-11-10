@@ -31,21 +31,28 @@ func TestPersistDeletionMark_StampsAndProjects(t *testing.T) {
 	assert.Equal(t, map[string]int{"ds": 3}, hv)
 }
 
-func TestMetaExists_SpaceScoped(t *testing.T) {
+func TestMetaStatus_SpaceScoped(t *testing.T) {
 	_, coll := openMetaColl(t)
 	require.NoError(t, PersistMeta(ctx, coll, "o1", 1, 1, nil, "spaceA"))
 
-	ok, err := MetaExists(ctx, coll, "o1", "spaceA")
+	ok, deleted, err := MetaStatus(ctx, coll, "o1", "spaceA")
 	require.NoError(t, err)
 	assert.True(t, ok)
+	assert.False(t, deleted)
 
-	ok, err = MetaExists(ctx, coll, "o1", "spaceB") // right id, wrong space
+	ok, _, err = MetaStatus(ctx, coll, "o1", "spaceB") // right id, wrong space
 	require.NoError(t, err)
 	assert.False(t, ok)
 
-	ok, err = MetaExists(ctx, coll, "missing", "spaceA")
+	ok, _, err = MetaStatus(ctx, coll, "missing", "spaceA")
 	require.NoError(t, err)
 	assert.False(t, ok)
+
+	require.NoError(t, PersistDeletionMark(ctx, coll, "o1", "spaceA", 2))
+	ok, deleted, err = MetaStatus(ctx, coll, "o1", "spaceA")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.True(t, deleted)
 }
 
 func TestLoadOrInitGeneration_MintsStableUnique(t *testing.T) {

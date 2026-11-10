@@ -465,19 +465,25 @@ func PersistDeletionMark(ctx context.Context, coll anystore.Collection, objectId
 	return err
 }
 
-// MetaExists reports whether a space-scoped per-object _meta row exists —
-// i.e. the object was ever materialized/indexed in this space. Gates the
-// del-stamp for objects that were fed but never got a shared `objects` row
-// (base-dataset-only). Read with the caller's (tx) ctx.
-func MetaExists(ctx context.Context, coll anystore.Collection, objectId, spaceId string) (bool, error) {
+// MetaStatus reports whether a space-scoped per-object _meta row exists —
+// i.e. the object was ever materialized/indexed in this space — and
+// whether it carries the deletion mark. Gates the del-stamp for objects
+// that were fed but never got a shared `objects` row (base-dataset-only),
+// and keeps a second purge from stamping again. Read with the caller's
+// (tx) ctx.
+func MetaStatus(ctx context.Context, coll anystore.Collection, objectId, spaceId string) (exists, deleted bool, err error) {
 	doc, err := coll.FindId(ctx, objectId)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, err
+		return false, false, err
 	}
-	return doc.Value().GetString(metaSpaceIdKey) == spaceId, nil
+	sp, del := MetaOwnership(doc.Value())
+	if sp != spaceId {
+		return false, false, nil
+	}
+	return true, del, nil
 }
 
 // LoadOrInitGeneration returns the per-space rebuild epoch on the

@@ -742,7 +742,7 @@ An event with an empty `versionId` is not a change's own: the engine re-read the
 ### 13.2 Window Semantics
 
 - `Limit > 0` needs a `Sort`; `Subscribe` fails without one. The engine holds `Limit + 1` rows, the last being a hidden sentinel, so a single arrival at the top emits `added` for it and a `displaced` removal for the row it pushes out, without re-querying any-store.
-- Rows with equal sort keys keep the order the read returned them in: `Initial` and the live window leave out the same row of a tie across the edge. A row that arrives on, or moves to, the sort key of the last held row sorts after it, until a re-read from storage places it. Add `id` to the sort for an order that does not depend on the read.
+- Rows with equal sort keys keep the order the read returned them in: `Initial` and the live window leave out the same row of a tie across the edge. A row that arrives on the sort key of the last held row sorts after it, until a re-read from storage places it.
 - `Limit == 0` is unbounded; memory grows with the matching set.
 - `Offset` applies to the initial snapshot only.
 

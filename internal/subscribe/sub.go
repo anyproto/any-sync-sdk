@@ -433,7 +433,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 			s.ensureMaxRef()
 			if s.maxRef != nil {
 				postKey = s.tupleFor(postDoc)
-				if bytes.Compare(postKey, s.maxRef.tuple) >= 0 {
+				if string(postKey) >= s.maxRef.tuple {
 					// The filter is read only where the verdict
 					// matters: completeness, or the reason for a
 					// row this apply took out of view earlier.
@@ -463,7 +463,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		out.landed = true
 		oldTuple := oldEntry.tuple
 		s.updateEntry(oldEntry, postKey, raw)
-		if s.ranks() && bytes.Compare(postKey, oldTuple) > 0 {
+		if s.ranks() && string(postKey) > oldTuple {
 			if s.unranked && !(oldEntry == prevSentinel && s.sentinel() == oldEntry) {
 				// A move past rows the window does not hold may put
 				// the row where one of them belongs; a sentinel that
@@ -488,7 +488,7 @@ func (s *querySub) applyRecord(i int, rc EventRecord, postValue PostValueFn, p *
 		if prevSentinel != nil && s.ranks() && !s.unranked {
 			// The window leaves capacity ranked: every match it does
 			// not hold sorts at or past its sentinel.
-			s.edge = prevSentinel.tuple
+			s.edge = anyenc.Tuple(prevSentinel.tuple)
 		}
 		s.removeEntry(oldEntry)
 		if s.windowed() && !s.complete {

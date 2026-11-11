@@ -3,10 +3,12 @@ package anysyncsdk
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"testing"
 	"time"
 
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -22,7 +24,11 @@ func TestSDK_SubscribeTiedWindowEdge(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	sdk, err := Open(ctx, wmConfig(t, dataDir), wmProvider(t, dataDir))
+	// An index on the sort key: the descending read is a reverse scan,
+	// which returns ties by descending id.
+	cfg := wmConfig(t, dataDir)
+	cfg.Types[0].Datasets[0].Indexes = []anystore.IndexInfo{{Fields: []string{"n"}}}
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
 	require.NoError(t, err)
 	defer func() { _ = sdk.Close() }()
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Ties"})
@@ -38,11 +44,17 @@ func TestSDK_SubscribeTiedWindowEdge(t *testing.T) {
 				}}})
 				require.NoError(t, err, id)
 			}
-			// Six rows on one sort key: the edge of a window of 2 falls
-			// among ties whichever way it is sorted.
-			for i := 1; i <= 6; i++ {
-				set(fmt.Sprintf("r%d", i), "n", 7)
+			// Every row on one sort key: the edge of a window of 2 falls
+			// among ties whichever way it is sorted. Enough rows for the
+			// read to scan the index.
+			var seed []space.RecordModify
+			for i := 100; i < 400; i++ {
+				seed = append(seed, space.RecordModify{
+					Id: fmt.Sprintf("r%d", i), Upsert: true, Ops: []space.Op{{Type: space.OpSet, Path: "n", Value: 7}},
+				})
 			}
+			_, err = sp.Modify(ctx, space.ModifyBatch{ObjectId: objId, Dataset: wmDataset, Records: seed})
+			require.NoError(t, err)
 			q := func(limit int) space.Query { return sp.Query(objId, wmDataset).Sort(sortKey).Limit(limit) }
 			fresh := func(limit int) []string {
 				rows, err := q(limit).All(ctx)
@@ -54,6 +66,7 @@ func TestSDK_SubscribeTiedWindowEdge(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = res.Sub.Close() }()
 			window := fresh(3)
+			require.Equal(t, sortKey == "-n", window[0] > window[1], "ties descend under the reverse scan: %v", window)
 			require.Equal(t, window[:2], idsOfRows(res.Initial))
 			shown, hidden := window[0], window[2]
 
@@ -75,16 +88,17 @@ func TestSDK_SubscribeTiedWindowEdge(t *testing.T) {
 				Id: shown, Ops: []space.Op{{Type: space.OpDelete}},
 			}}})
 			require.NoError(t, err)
-			view := map[string]struct{}{window[0]: {}, window[1]: {}}
+			view := map[string]*anyenc.Value{window[0]: nil, window[1]: nil}
 			want := fresh(2)
-			for !equalStrings(sortedIds(view), sortedStrings(want)) {
+			slices.Sort(want)
+			for !slices.Equal(idsOfView(view), want) {
 				evs, err := res.Sub.Events().Wait(evCtx)
-				require.NoError(t, err, "want %v, view %v, sub err %v", want, sortedIds(view), res.Sub.Err())
+				require.NoError(t, err, "want %v, view %v, sub err %v", want, idsOfView(view), res.Sub.Err())
 				for _, ev := range evs {
 					for _, r := range ev.Added {
 						_, dup := view[r.Id]
 						require.False(t, dup, "added %s is already shown", r.Id)
-						view[r.Id] = struct{}{}
+						view[r.Id] = r.Doc
 					}
 					for _, r := range ev.Removed {
 						_, ok := view[r.Id]
@@ -97,18 +111,4 @@ func TestSDK_SubscribeTiedWindowEdge(t *testing.T) {
 			assert.NoError(t, res.Sub.Err())
 		})
 	}
-}
-
-func sortedIds(view map[string]struct{}) []string {
-	ids := make([]string, 0, len(view))
-	for id := range view {
-		ids = append(ids, id)
-	}
-	return sortedStrings(ids)
-}
-
-func sortedStrings(ids []string) []string {
-	out := append([]string(nil), ids...)
-	sort.Strings(out)
-	return out
 }

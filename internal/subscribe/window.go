@@ -1,23 +1,21 @@
 package subscribe
 
 import (
-	"bytes"
-
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // entry is one held record in a querySub's window. tuple is the sort
-// key (query.Sort.AppendKey, owned) and raw the encoding of the
+// key (query.Sort.AppendKey) and raw the encoding of the
 // record's last post value (owned, never mutated); a windowed sub
 // keeps both — an implicit transition (a record promoted from
 // sentinel into visibility by an unrelated event) ships raw parsed,
 // since postValue covers only the ids of the triggering change. An
 // unbounded sub tracks membership only (querySub.windowed): id alone,
-// tuple and raw nil. seq orders entries with equal tuples: storage's
+// tuple and raw empty. seq orders entries with equal tuples: storage's
 // order for rows a read returned, arrival order for the rest.
 type entry struct {
 	id    string
-	tuple anyenc.Tuple
+	tuple string
 	raw   []byte
 	seq   uint64
 }
@@ -25,8 +23,7 @@ type entry struct {
 // after reports whether e sorts after o: a larger tuple, or an equal
 // one placed later.
 func (e *entry) after(o *entry) bool {
-	c := bytes.Compare(e.tuple, o.tuple)
-	return c > 0 || (c == 0 && e.seq > o.seq)
+	return e.tuple > o.tuple || (e.tuple == o.tuple && e.seq > o.seq)
 }
 
 // place puts e last among the entries that share its tuple.
@@ -44,7 +41,7 @@ func (s *querySub) place(e *entry) {
 // install the new entry as the boundary even when an existing one is
 // extremal.
 func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, raw []byte) {
-	e := &entry{id: id, tuple: tuple, raw: raw}
+	e := &entry{id: id, tuple: string(tuple), raw: raw}
 	s.place(e)
 	s.entries[id] = e
 	switch {
@@ -66,21 +63,17 @@ func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, raw []byte) {
 	}
 }
 
-// updateEntry overwrites an existing entry's tuple + raw. A changed
-// tuple places the entry last among its new ties; an unchanged one
-// keeps its place. If the entry was the boundary holder and moved out
+// updateEntry overwrites an existing entry's tuple + raw; the entry
+// keeps its place among ties. If the entry was the boundary holder and moved out
 // of its position, invalidates the pointer for lazy recompute on the
 // next access.
 func (s *querySub) updateEntry(e *entry, tuple anyenc.Tuple, raw []byte) {
 	old := e.tuple
-	e.tuple = tuple
+	e.tuple = string(tuple)
 	e.raw = raw
-	if !bytes.Equal(tuple, old) {
-		s.place(e)
-	}
 	// Was the max — did it stay the max?
 	if e == s.maxRef {
-		if bytes.Compare(tuple, old) < 0 {
+		if e.tuple < old {
 			s.maxRef = nil // may no longer be max; recompute lazily
 		}
 		// Else still the max (key grew or stayed) — no change.
@@ -90,7 +83,7 @@ func (s *querySub) updateEntry(e *entry, tuple anyenc.Tuple, raw []byte) {
 	}
 	// Symmetric for min.
 	if e == s.minRef {
-		if bytes.Compare(tuple, old) > 0 {
+		if e.tuple > old {
 			s.minRef = nil
 		}
 	} else if s.minRef != nil && s.minRef.after(e) {

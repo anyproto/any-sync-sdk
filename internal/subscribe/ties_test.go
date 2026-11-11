@@ -1,11 +1,14 @@
 package subscribe
 
 import (
+	"fmt"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -23,32 +26,34 @@ func sameWindow(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
 // order storage returns ties.
 func TestTie_EdgeHidesTheRowStorageReturnedLast(t *testing.T) {
 	for _, tieDesc := range []bool{false, true} {
-		eng := New("test")
-		arena := newArena()
-		m := newStoreModel(t, nil, 2, makeRow(arena, "a", 1, nil), makeRow(arena, "b", 2, nil), makeRow(arena, "c", 2, nil))
-		m.tieDesc = tieDesc
-		sub, view := subscribeModel(t, eng, m, 30)
-		window := m.window()
-		shown, hidden := window[1].id, window[2].id
-		require.Equal(t, hidden, sub.sentinel().id, "tieDesc=%v", tieDesc)
+		t.Run(fmt.Sprintf("tieDesc=%v", tieDesc), func(t *testing.T) {
+			eng := New("test")
+			defer eng.Close()
+			arena := newArena()
+			m := newStoreModel(t, nil, 2, makeRow(arena, "a", 1, nil), makeRow(arena, "b", 2, nil), makeRow(arena, "c", 2, nil))
+			m.tieDesc = tieDesc
+			sub, view := subscribeModel(t, eng, m, 30)
+			window := m.window()
+			shown, hidden := window[1].id, window[2].id
+			require.Equal(t, hidden, sub.sentinel().id)
 
-		// The hidden row changes: nothing the consumer holds did.
-		upd := makeRow(arena, hidden, 2, map[string]any{"x": 1})
-		m.set(upd)
-		fireEvent(eng, "obj1", "chat", hidden, upd.d, false, nil)
-		waitNone(t, sub)
+			// The hidden row changes: nothing the consumer holds did.
+			upd := makeRow(arena, hidden, 2, map[string]any{"x": 1})
+			m.set(upd)
+			fireEvent(eng, "obj1", "chat", hidden, upd.d, false, nil)
+			waitNone(t, sub)
 
-		// The shown tied row leaves: the hidden one takes its place.
-		m.delete(shown)
-		fireEvent(eng, "obj1", "chat", shown, nil, true, nil)
-		own, _ := ownAndResync(t, sub)
-		assert.Equal(t, []space.RemovedRecord{{Id: shown, Reason: space.RemoveDeleted}}, own.Removed)
-		assert.Equal(t, []string{hidden}, idsOf(own.Added))
-		view.apply([]space.SubscriptionEvent{own})
-		sameWindow(t, sub, view, m)
-		assert.NoError(t, sub.Err())
-		assert.Equal(t, 0, sub.lost)
-		eng.Close()
+			// The shown tied row leaves: the hidden one takes its place.
+			m.delete(shown)
+			fireEvent(eng, "obj1", "chat", shown, nil, true, nil)
+			own, _ := ownAndResync(t, sub)
+			assert.Equal(t, []space.RemovedRecord{{Id: shown, Reason: space.RemoveDeleted}}, own.Removed)
+			assert.Equal(t, []string{hidden}, idsOf(own.Added))
+			view.apply([]space.SubscriptionEvent{own})
+			sameWindow(t, sub, view, m)
+			assert.NoError(t, sub.Err())
+			assert.Equal(t, 0, sub.lost)
+		})
 	}
 }
 
@@ -108,4 +113,36 @@ func TestTie_ArrivalAtTheEdgeStaysOut(t *testing.T) {
 	waitNone(t, sub)
 	agreesWithEngine(t, sub, view, m)
 	assert.Equal(t, "c", sub.sentinel().id)
+}
+
+// A shown row that moves onto the sentinel's key keeps its place: one
+// update with its ops, and no read of storage.
+func TestTie_ShownRowMovingOntoTheSentinelsKeyStays(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	m := newStoreModel(t, nil, 2,
+		makeRow(arena, "a", 0, nil), makeRow(arena, "b", 1, nil),
+		makeRow(arena, "c", 2, nil), makeRow(arena, "d", 3, nil))
+	sub, view := subscribeModel(t, eng, m, 30)
+
+	r := makeRow(arena, "b", 2, nil)
+	m.set(r)
+	ops := []space.EventOp{{Type: crdt.OpSet, Path: []string{"n"}}}
+	fireEvent(eng, "obj1", "chat", "b", r.d, false, ops)
+	evs := sub.Events().GetAll()
+	require.Len(t, evs, 1)
+	assert.Equal(t, []string{"b"}, idsOf(evs[0].Updated))
+	assert.Equal(t, ops, evs[0].Updated[0].Ops)
+	assert.Empty(t, evs[0].Added)
+	assert.Empty(t, evs[0].Removed)
+	assert.Equal(t, 0, m.reads)
+	view.apply(evs)
+	sameWindow(t, sub, view, m)
+}
+
+// An entry stays in the 64-byte size class: an unbounded sub holds one
+// per row of its collection.
+func TestEntry_Size(t *testing.T) {
+	assert.LessOrEqual(t, unsafe.Sizeof(entry{}), uintptr(64))
 }

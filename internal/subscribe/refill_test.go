@@ -27,11 +27,14 @@ type storeModel struct {
 	filter query.Filter
 	sort   query.Sort
 	limit  int
-	reads  int // refills opened
-	scans  int // window reads
-	closed int
-	fail   error
-	buf    *syncpool.DocBuffer
+	// tieDesc returns rows with equal sort keys by descending id, as a
+	// reverse index scan does.
+	tieDesc bool
+	reads   int // refills opened
+	scans   int // window reads
+	closed  int
+	fail    error
+	buf     *syncpool.DocBuffer
 
 	sources    []any            // Event.Source of each refill
 	lookups    []string         // ids the refills looked up
@@ -51,7 +54,7 @@ func (m *storeModel) set(r row)        { m.rows[r.id] = r.d }
 func (m *storeModel) delete(id string) { delete(m.rows, id) }
 
 // matching returns every stored row the filter accepts, in sort
-// order with ties broken by id.
+// order with ties broken by id (descending under tieDesc).
 func (m *storeModel) matching() []row {
 	var out []row
 	for id, d := range m.rows {
@@ -64,7 +67,7 @@ func (m *storeModel) matching() []row {
 		if c := bytes.Compare(m.sort.AppendKey(nil, out[i].d), m.sort.AppendKey(nil, out[j].d)); c != 0 {
 			return c < 0
 		}
-		return out[i].id < out[j].id
+		return (out[i].id < out[j].id) != m.tieDesc
 	})
 	return out
 }
@@ -1220,25 +1223,80 @@ func TestApply_FastRejectedAfterVisibleIsDisplaced(t *testing.T) {
 // records, in four regimes: storage in step with the events; storage
 // a batch ahead of them, as when a later change commits before an
 // earlier one's event runs; refills that fail for a while; and churn,
-// small windows under long changes of mostly moves. After
-// every apply the client's folded view and the engine's held set are
-// compared, and both against a fresh query of the model whenever
-// refills work or the engine certifies its window; every event is
-// checked against the client's contract and each removal's reason
-// against storage, and no loss is counted while refills work.
+// small windows under long changes of mostly moves. Sort keys are
+// unique. After every apply the client's folded view and the engine's
+// held set are compared, and both against a fresh query of the model
+// whenever refills work or the engine certifies its window; every
+// event is checked against the client's contract and each removal's
+// reason against storage, and no loss is counted while refills work.
 func TestRefill_RandomizedAgreesWithStorage(t *testing.T) {
-	for _, regime := range []string{"in step", "storage ahead", "refills failing", "churn"} {
+	for _, regime := range randomizedRegimes {
 		t.Run(regime, func(t *testing.T) {
 			for seed := int64(0); seed < 1000; seed++ {
 				t.Run(fmt.Sprint(seed), func(t *testing.T) {
-					randomizedRun(t, regime, seed)
+					randomizedRun(t, regime, seed, false)
 				})
 			}
 		})
 	}
 }
 
-func randomizedRun(t *testing.T, regime string, seed int64) {
+// The same regimes with sort keys drawn from four values, so rows tie
+// at every edge, and storage returning ties by ascending or descending
+// id. The engine places a row that ties at the edge without knowing
+// storage's order among ties, so where the unique-key run compares the
+// client's view with a fresh query id for id, this run checks it is a
+// window the query could return: the same sort keys, each row a stored
+// match with its stored doc, and the held set's keys those of the read
+// when the engine certifies it. Once a refill read storage as it is,
+// the engine holds the read and the view is its rows, id for id.
+func TestRefill_RandomizedTiesAgreeWithStorage(t *testing.T) {
+	for _, regime := range randomizedRegimes {
+		t.Run(regime, func(t *testing.T) {
+			for seed := int64(0); seed < 1000; seed++ {
+				t.Run(fmt.Sprint(seed), func(t *testing.T) {
+					randomizedRun(t, regime, seed, true)
+				})
+			}
+		})
+	}
+}
+
+var randomizedRegimes = []string{"in step", "storage ahead", "refills failing", "churn"}
+
+// validWindow asserts the client's view is a window a fresh query could
+// return among rows that tie at its edge: the same sort keys as the
+// query's, each row a stored match shipped with its stored doc; and the
+// engine's view equals the client's.
+func validWindow(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
+	t.Helper()
+	view.fold(t, sub)
+	agreesWithEngine(t, sub, view, m)
+	var got, want []int
+	for id, d := range view.docs {
+		stored := m.rows[id]
+		require.NotNil(t, stored, "%s in view but not stored", id)
+		require.True(t, m.filter == nil || m.filter.Ok(stored, m.buf), "%s in view but not matching", id)
+		require.Equal(t, string(stored.MarshalTo(nil)), string(d.MarshalTo(nil)), "doc of %s", id)
+		got = append(got, d.GetInt("n"))
+	}
+	for _, id := range m.visible() {
+		want = append(want, m.rows[id].GetInt("n"))
+	}
+	sort.Ints(got)
+	sort.Ints(want)
+	require.Equal(t, want, got, "sort keys of client view vs fresh query")
+}
+
+// sameRows asserts the client's view is the fresh query's rows, in
+// whichever order storage returns ties.
+func sameRows(t *testing.T, sub *Sub, view *clientView, m *storeModel) {
+	t.Helper()
+	validWindow(t, sub, view, m)
+	require.Equal(t, sortedCopy(m.visible()), sortedCopy(view.ids(m)), "client view vs fresh query")
+}
+
+func randomizedRun(t *testing.T, regime string, seed int64, ties bool) {
 	rng := rand.New(rand.NewSource(seed))
 	eng := New("test")
 	defer eng.Close()
@@ -1252,9 +1310,12 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 	if rng.Intn(2) == 0 {
 		filter = activeOnly
 	}
-	// Sort keys are unique: ties at the edge are a known limit.
+	// Sort keys are unique, or drawn from four values under ties.
 	usedN := map[int]struct{}{}
 	freshN := func() int {
+		if ties {
+			return rng.Intn(4)
+		}
 		for {
 			n := rng.Intn(100000)
 			if _, used := usedN[n]; !used {
@@ -1278,6 +1339,9 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 		rows = append(rows, makeRow(arena, "r"+itoa(i), freshN(), map[string]any{"status": status()}))
 	}
 	m := newStoreModel(t, filter, limit, rows...)
+	if ties {
+		m.tieDesc = rng.Intn(2) == 0
+	}
 	sub, view := subscribeModel(t, eng, m, 100)
 	known := func() []string {
 		ids := make([]string, 0, len(m.rows))
@@ -1336,13 +1400,17 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 		}
 		return b
 	}
-	fire := func(b batch) {
+	// fire runs one apply and reports whether a refill read storage
+	// (the model's lookups never fail, so a read that ran succeeded).
+	fire := func(b batch) (refilled bool) {
+		scans := m.scans
 		eng.OnApply(b.ev, func(i int) (*anyenc.Value, error) {
 			if b.unreadable[i] {
 				return nil, errors.New("read failed")
 			}
 			return m.rows[b.ev.Records[i].Id], nil
 		})
+		return m.scans > scans
 	}
 	matches := func(d *anyenc.Value) bool {
 		return d != nil && (m.filter == nil || m.filter.Ok(d, m.buf))
@@ -1386,7 +1454,28 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 		}
 	}
 
+	// settled asserts what a refill that read storage as it is now
+	// leaves: the engine holds the read, and the client shows its rows,
+	// with their stored docs when docs is set.
+	settled := func(docs bool) {
+		var held, read []string
+		for id := range sub.entries {
+			held = append(held, id)
+		}
+		for _, r := range m.window() {
+			read = append(read, r.id)
+		}
+		require.Equal(t, sortedCopy(read), sortedCopy(held), "held set vs the read")
+		if docs {
+			sameRows(t, sub, view, m)
+		} else {
+			sameWindow(t, sub, view, m)
+		}
+	}
+
 	for step := 0; step < 25; step++ {
+		var refilled bool
+		lost := sub.lost
 		switch regime {
 		case "storage ahead":
 			// Two changes commit, then their events run in order: the
@@ -1394,10 +1483,17 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 			a := build(step, "a")
 			b := build(step, "b")
 			b.ev.VersionId += "b"
-			fire(a)
+			refilled = fire(a)
 			check(step, a)
 			require.NoError(t, sub.Err(), "step %d", step)
-			fire(b)
+			if ties && refilled {
+				// The refill read storage as it is now. An unbounded one
+				// re-reads membership: a held row's new value ships with
+				// its own event, still queued.
+				settled(limit > 0)
+			}
+			// b's events carry what a's refill read: they move no row.
+			refilled = fire(b) || refilled
 			check(step, b)
 		case "refills failing":
 			if step%7 == 0 {
@@ -1406,11 +1502,11 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 				m.fail = nil
 			}
 			b := build(step, "")
-			fire(b)
+			refilled = fire(b)
 			check(step, b)
 		default:
 			b := build(step, "")
-			fire(b)
+			refilled = fire(b)
 			check(step, b)
 		}
 		if sub.Err() != nil {
@@ -1420,13 +1516,35 @@ func randomizedRun(t *testing.T, regime string, seed int64) {
 		agreesWithEngine(t, sub, view, m)
 		// A window the engine certifies (it holds every match, or is at
 		// capacity with every row ranked) equals a fresh query whether
-		// or not refills work.
+		// or not refills work: id for id with unique keys, as a valid
+		// window under ties, and as the read after a refill.
 		certified := sub.complete || (sub.atCapacity() && !sub.unranked)
-		if m.fail == nil || certified {
-			agrees(t, sub, view, m)
+		switch {
+		case !ties:
+			if m.fail == nil || certified {
+				agrees(t, sub, view, m)
+			}
+		case refilled:
+			settled(true)
+		case m.fail == nil || certified:
+			validWindow(t, sub, view, m)
+			if certified && limit > 0 {
+				// The sentinel too: the held rows are a valid read.
+				var held, read []int
+				for _, e := range sub.entries {
+					held = append(held, parseHeld(e.raw).GetInt("n"))
+				}
+				for _, r := range m.window() {
+					read = append(read, r.n)
+				}
+				sort.Ints(held)
+				require.Equal(t, read, held, "step %d: sort keys of held set vs fresh read", step)
+			}
 		}
 		if regime != "refills failing" {
 			assert.Equal(t, 0, sub.lost, "step %d: a loss while refills work", step)
+		} else if ties && m.fail == nil {
+			assert.Equal(t, lost, sub.lost, "step %d: a loss while refills work", step)
 		}
 	}
 }

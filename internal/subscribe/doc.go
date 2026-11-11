@@ -15,6 +15,10 @@
 // limit+1 entries, each with its sort tuple and last doc encoded, so
 // the largest-tuple entry serves as a sentinel; single-event shifts
 // (top-of-sort arrivals) absorb cleanly without an any-store query.
+// Entries with equal tuples keep the order storage returned them in,
+// a live arrival sorts after its ties, and a held row keeps its place
+// when its key changes: the sentinel of a tied edge is the row the
+// read returned last, the one Initial leaves out.
 // When Limit == 0 there is no boundary and an entry is membership
 // only.
 //

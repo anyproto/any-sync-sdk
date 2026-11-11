@@ -1,23 +1,35 @@
 package subscribe
 
 import (
-	"bytes"
-
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // entry is one held record in a querySub's window. tuple is the sort
-// key (query.Sort.AppendKey, owned) and raw the encoding of the
+// key (query.Sort.AppendKey) and raw the encoding of the
 // record's last post value (owned, never mutated); a windowed sub
 // keeps both — an implicit transition (a record promoted from
 // sentinel into visibility by an unrelated event) ships raw parsed,
 // since postValue covers only the ids of the triggering change. An
 // unbounded sub tracks membership only (querySub.windowed): id alone,
-// tuple and raw nil.
+// tuple and raw empty. seq orders entries with equal tuples: storage's
+// order for rows a read returned, arrival order for the rest.
 type entry struct {
 	id    string
-	tuple anyenc.Tuple
+	tuple string
 	raw   []byte
+	seq   uint64
+}
+
+// after reports whether e sorts after o: a larger tuple, or an equal
+// one placed later.
+func (e *entry) after(o *entry) bool {
+	return e.tuple > o.tuple || (e.tuple == o.tuple && e.seq > o.seq)
+}
+
+// place puts e last among the entries that share its tuple.
+func (s *querySub) place(e *entry) {
+	s.seq++
+	e.seq = s.seq
 }
 
 // insertEntry adds a fresh entry to the window. Caller is responsible
@@ -29,7 +41,8 @@ type entry struct {
 // install the new entry as the boundary even when an existing one is
 // extremal.
 func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, raw []byte) {
-	e := &entry{id: id, tuple: tuple, raw: raw}
+	e := &entry{id: id, tuple: string(tuple), raw: raw}
+	s.place(e)
 	s.entries[id] = e
 	switch {
 	case s.maxRef == nil && len(s.entries) > 1:
@@ -37,7 +50,7 @@ func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, raw []byte) {
 		s.ensureMaxRef()
 	case s.maxRef == nil:
 		s.maxRef = e
-	case bytes.Compare(e.tuple, s.maxRef.tuple) > 0:
+	case e.after(s.maxRef):
 		s.maxRef = e
 	}
 	switch {
@@ -45,34 +58,35 @@ func (s *querySub) insertEntry(id string, tuple anyenc.Tuple, raw []byte) {
 		s.ensureMinRef()
 	case s.minRef == nil:
 		s.minRef = e
-	case bytes.Compare(e.tuple, s.minRef.tuple) < 0:
+	case s.minRef.after(e):
 		s.minRef = e
 	}
 }
 
-// updateEntry overwrites an existing entry's tuple + raw. If the
-// entry was the boundary holder and moved out of its position,
-// invalidates the pointer for lazy recompute on the next access.
+// updateEntry overwrites an existing entry's tuple + raw; the entry
+// keeps its place among ties. If the entry was the boundary holder and moved out
+// of its position, invalidates the pointer for lazy recompute on the
+// next access.
 func (s *querySub) updateEntry(e *entry, tuple anyenc.Tuple, raw []byte) {
 	old := e.tuple
-	e.tuple = tuple
+	e.tuple = string(tuple)
 	e.raw = raw
 	// Was the max — did it stay the max?
 	if e == s.maxRef {
-		if bytes.Compare(tuple, old) < 0 {
+		if e.tuple < old {
 			s.maxRef = nil // may no longer be max; recompute lazily
 		}
 		// Else still the max (key grew or stayed) — no change.
-	} else if s.maxRef != nil && bytes.Compare(tuple, s.maxRef.tuple) > 0 {
+	} else if s.maxRef != nil && e.after(s.maxRef) {
 		// Wasn't max before, but now exceeds it. Promote.
 		s.maxRef = e
 	}
 	// Symmetric for min.
 	if e == s.minRef {
-		if bytes.Compare(tuple, old) > 0 {
+		if e.tuple > old {
 			s.minRef = nil
 		}
-	} else if s.minRef != nil && bytes.Compare(tuple, s.minRef.tuple) < 0 {
+	} else if s.minRef != nil && s.minRef.after(e) {
 		s.minRef = e
 	}
 }
@@ -91,7 +105,7 @@ func (s *querySub) removeEntry(e *entry) {
 }
 
 // ensureMaxRef recomputes maxRef on demand if it was invalidated. O(N)
-// scan over entries comparing tuples. For limit ≤ 10⁴ this is
+// scan over entries comparing tuples, then places. For limit ≤ 10⁴ this is
 // microseconds; no heap.
 func (s *querySub) ensureMaxRef() {
 	if s.maxRef != nil || len(s.entries) == 0 {
@@ -99,7 +113,7 @@ func (s *querySub) ensureMaxRef() {
 	}
 	var best *entry
 	for _, e := range s.entries {
-		if best == nil || bytes.Compare(e.tuple, best.tuple) > 0 {
+		if best == nil || e.after(best) {
 			best = e
 		}
 	}
@@ -115,7 +129,7 @@ func (s *querySub) ensureMinRef() {
 	}
 	var best *entry
 	for _, e := range s.entries {
-		if best == nil || bytes.Compare(e.tuple, best.tuple) < 0 {
+		if best == nil || best.after(e) {
 			best = e
 		}
 	}

@@ -44,9 +44,11 @@ var deletionReconcilePasses atomic.Int64
 // that received coordinator statuses since the process started.
 func DeletionReconcilePassesForTest() int64 { return deletionReconcilePasses.Load() }
 
-// startDeletionReconciler launches the background reconcile loop. Bound
-// to its own cancellable context; Close cancels it and drains delWG.
-func (s *Service) startDeletionReconciler() {
+// StartDeletionReconciler launches the background reconcile loop. Call
+// once, after the tech space is open: the loop's first pass reads the
+// space index, which lists nothing before then. Bound to its own
+// cancellable context; Close cancels it and drains delWG.
+func (s *Service) StartDeletionReconciler() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.delCancel = cancel
 	s.delWG.Add(1)
@@ -63,9 +65,8 @@ func (s *Service) kickDeletionReconciler() {
 }
 
 // deletionLoop reconciles space deletions with the coordinator until
-// ctx is cancelled. It runs one pass shortly after start (to retry
-// deletes marked offline in a previous session) and then on every tick
-// or kick.
+// ctx is cancelled. It runs one pass at start (to retry deletes marked
+// offline in a previous session) and then on every tick or kick.
 func (s *Service) deletionLoop(ctx context.Context) {
 	defer s.delWG.Done()
 	t := time.NewTicker(time.Duration(deletionReconcileInterval.Load()))

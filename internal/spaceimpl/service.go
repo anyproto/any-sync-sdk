@@ -194,6 +194,7 @@ type Service struct {
 	// spaces to the coordinator (signed SpaceDelete) and offloads spaces
 	// the coordinator reports gone. delKick wakes it immediately after a
 	// local Delete; otherwise it ticks on deletionReconcileInterval.
+	// Started by StartDeletionReconciler once the tech space is open;
 	// delCancel/delWG are drained in Close before watchers.stopAll.
 	delCancel context.CancelFunc
 	delWG     sync.WaitGroup
@@ -285,7 +286,6 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		inviteKick:          make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
-	s.startDeletionReconciler()
 	s.startJoinController()
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store

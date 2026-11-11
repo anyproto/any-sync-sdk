@@ -13,6 +13,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
@@ -42,6 +43,8 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+var storeLog = logger.NewNamed("sdk.spacestore")
 
 // normalizeSpaceType applies the SpaceType allow-list before
 // stamping the value into an immutable space header. The
@@ -500,7 +503,9 @@ func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 	// the backfill here is the safe, race-free place. Best-effort: a
 	// transient error is cached by the Once and resurfaces on the next
 	// feed read.
-	_ = st.EnsureApplySeq(context.Background())
+	if err := st.EnsureApplySeq(context.Background()); err != nil {
+		storeLog.Warn("eager applySeq seed failed", zap.String("spaceId", spaceId), zap.Error(err))
+	}
 	return st
 }
 

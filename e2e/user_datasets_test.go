@@ -378,6 +378,24 @@ func TestE2E_UserDatasets_DefineAndUpsert(t *testing.T) {
 	require.NoError(t, err)
 	_, err = sp.Types().AddDataset(ctx, typeId, partId, space.DatasetDraft{Key: "notes"})
 	require.Error(t, err, "duplicate key within the type")
+
+	// A field added to a Dynamic dataset is free keyspace: a draft asking
+	// for an author rule, a stamp or a non-synced scope is a validation
+	// refusal.
+	scratchType, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Scratch"})
+	require.NoError(t, err)
+	scratchPart, err := sp.Types().AddPart(ctx, scratchType, space.PartDraft{Key: "scratch"})
+	require.NoError(t, err)
+	scratchId, err := sp.Types().AddDataset(ctx, scratchType, scratchPart, space.DatasetDraft{Key: "scratch", Dynamic: true})
+	require.NoError(t, err)
+	for name, draft := range map[string]space.DatasetFieldDraft{
+		"author-mutable": {Key: "mine", Kind: space.PropertyKindString, MutableBy: space.MutableByAuthor},
+		"stamp":          {Key: "made", Stamp: space.StampCreateTime},
+		"local scope":    {Key: "draft", Kind: space.PropertyKindString, Scope: space.ScopeLocal, MutableBy: space.MutableByAnyone},
+	} {
+		_, err = sp.Types().AddDatasetField(ctx, scratchType, scratchId, draft)
+		assert.ErrorIs(t, err, handler.ErrValidation, name)
+	}
 	_, err = sp.Types().AddDataset(ctx, typeId, partId, space.DatasetDraft{
 		Fields: []space.DatasetFieldDraft{{Key: "text", Kind: space.PropertyKindString, MutableBy: space.MutableByAnyone}},
 	})

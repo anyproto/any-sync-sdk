@@ -68,10 +68,16 @@ key, and therefore a new device of the same account.
 ### `MnemonicProvider`
 
 `auth.NewMnemonicProvider(MnemonicConfig{Mnemonic, Index, DeviceKey})`
-derives the account key from the phrase and returns `DeviceKey` as
-given. The caller owns device-key storage: generate it once with
+derives the account key from the phrase on the first `AccountKey` call
+and returns `DeviceKey` as given. The caller owns device-key storage: generate it once with
 `auth.GenerateDeviceKey`, keep it in secure storage, pass it on every
 start.
+
+### `KeyProvider`
+
+`auth.NewKeyProvider(KeyConfig{AccountKey, DeviceKey})` serves keys the
+host already holds, both required: an account key from
+`auth.DeriveAccount` and the device key from the host's secure storage.
 
 ### Helpers
 
@@ -80,6 +86,12 @@ start.
   touching disk or starting the SDK; it equals `SDK.Account().Id()` for
   the same wallet. Callers use it to address per-account storage before
   a wallet exists.
+- `auth.DeriveAccount(mnemonic, index)` returns the account id and the
+  raw account key from one derivation; the key is the bytes a provider
+  built from that phrase returns from `AccountKey`. A host that needs
+  the account id before it can build a provider (to locate the
+  account's device key, for one) derives once with it and serves the
+  key through `NewKeyProvider`.
 
 ## Key encoding (StrKey)
 

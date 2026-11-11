@@ -5,7 +5,8 @@
 // provider's concern; the rest of the SDK only consumes the resulting
 // Ed25519 keys.
 //
-// Ships a built-in mnemonic provider (BIP-39 / SLIP-10 at
-// m/44'/2046'/[index]'). Key persistence is the caller's responsibility —
-// the SDK does not store keys or mnemonics. See docs/auth-module.md.
+// Ships providers built from a mnemonic (BIP-39 / SLIP-10 at
+// m/44'/2046'/[index]'), from a wallet file, and from keys the host
+// already holds. Key persistence is the caller's responsibility unless
+// the wallet file holds them. See docs/auth-module.md.
 package auth

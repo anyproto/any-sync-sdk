@@ -343,8 +343,8 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// historical purge leaks. Deliberately synchronous, unlike the
 	// eager loop (see bootstrap): its safety argument is "only the tech
 	// space is open, no applies are running, no caller holds the SDK
-	// handle yet", which only this spot provides — and at 1.6-40ms
-	// measured it costs Open nothing. Best-effort, never fails Open.
+	// handle yet", which only this spot provides. Best-effort, never
+	// fails Open.
 	spaces.SweepOrphanCollections(ctx)
 	// Guest-identity resolver for guest-mode (public-access) spaces:
 	// loadSpaceForCache opens a space whose row carries a guest key with

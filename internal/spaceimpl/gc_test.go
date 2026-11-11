@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -17,7 +18,7 @@ import (
 
 // testCid mints a deterministic valid CIDv1 from seed — collection
 // owners must be shape-valid for the sweep to classify them.
-func testCid(t *testing.T, seed string) string {
+func testCid(t testing.TB, seed string) string {
 	t.Helper()
 	h, err := mh.Sum([]byte(seed), mh.SHA2_256, -1)
 	require.NoError(t, err)
@@ -198,5 +199,33 @@ func TestCollectionOwner(t *testing.T) {
 		owner, kind := collectionOwner(c.name)
 		assert.Equal(t, c.kind, kind, c.name)
 		assert.Equal(t, c.owner, owner, c.name)
+	}
+}
+
+// BenchmarkSweepOrphans times a sweep over a healthy DB: per-object
+// collections whose meta rows are scoped to live spaces, nothing to drop.
+func BenchmarkSweepOrphans(b *testing.B) {
+	const spaces, objects = 20, 5000
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(b.TempDir(), "sdk.db"), nil)
+	require.NoError(b, err)
+	defer db.Close()
+	live := map[string]struct{}{}
+	spaceIds := make([]string, spaces)
+	for i := range spaceIds {
+		spaceIds[i] = testCid(b, "space-"+strconv.Itoa(i)) + ".1"
+		live[spaceIds[i]] = struct{}{}
+		mustColl(b, ctx, db, spaceIds[i]+"_objects")
+	}
+	metaColl := mustColl(b, ctx, db, crdt.MetaCollectionName)
+	for i := range objects {
+		objId := testCid(b, "obj-"+strconv.Itoa(i))
+		seedDoc(b, ctx, mustColl(b, ctx, db, objId+"_chat_messages"), "r")
+		seedDoc(b, ctx, mustColl(b, ctx, db, objId+"__history"), "c")
+		require.NoError(b, crdt.PersistMeta(ctx, metaColl, objId, 1, 1, nil, spaceIds[i%spaces]))
+	}
+	s := &Service{db: db}
+	for b.Loop() {
+		require.NoError(b, s.sweepOrphans(ctx, live, map[string]struct{}{}))
 	}
 }

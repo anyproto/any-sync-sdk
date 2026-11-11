@@ -51,8 +51,10 @@ type Event struct {
 }
 
 // EventRecord is one record's worth of projected change inside an
-// Event. Id is the record id within Dataset (for shared per-space
-// datasets like "objects" this equals ObjectId).
+// Event; Records[i] projects the change's record i, the index a
+// PostValueFn takes. Id is the record id within Dataset (for shared
+// per-space datasets like "objects" this equals ObjectId); empty for a
+// record nothing landed on, which the engine skips.
 type EventRecord struct {
 	Id string
 	// Created is true when this change first materialised the record.
@@ -87,10 +89,13 @@ type PostValueFn func(recordIndex int) (*anyenc.Value, error)
 // wire Event shape — runs the same per-record projection an engine
 // caller would need, with deep-cloned op payloads. afterApplyFor
 // builds this once per change before handing it to Engine.OnApply.
+// rejections are the apply's ApplyResult.Rejections: a record whose
+// delete the handler refused keeps its slot with an empty Id, since
+// nothing landed on it.
 //
 // Safe to call with a nil change — returns a zero Event in that case;
 // callers should check ch != nil themselves if they want to skip work.
-func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, postValue PostValueFn) Event {
+func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, rejections []crdt.OpRejection, postValue PostValueFn) Event {
 	if ch == nil {
 		return Event{}
 	}
@@ -99,7 +104,7 @@ func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, pos
 		ObjectId:  ch.ObjectId,
 		Dataset:   ch.Dataset,
 		VersionId: ch.VersionId,
-		Records:   projectRecords(ch, recordIds, derivedOps, postValue),
+		Records:   projectRecords(ch, recordIds, derivedOps, rejections, postValue),
 	}
 }
 
@@ -117,11 +122,12 @@ func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, pos
 //
 // Op.Payload values are deep-cloned via anyencutil.Value.FillCopy so
 // the resulting Event is safe to outlive the build call.
-func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, postValue PostValueFn) []EventRecord {
+func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, rejections []crdt.OpRejection, postValue PostValueFn) []EventRecord {
 	if len(ch.Records) == 0 {
 		return nil
 	}
 	out := make([]EventRecord, 0, len(ch.Records))
+	rejected := wholeRecordRejections(rejections)
 	for i, rc := range ch.Records {
 		rid := rc.Id
 		if i < len(recordIds) && recordIds[i] != "" {
@@ -129,6 +135,10 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 		}
 		er := EventRecord{Id: rid}
 		if hasRecordDelete(rc.Ops) {
+			if _, refused := rejected[i]; refused {
+				out = append(out, EventRecord{})
+				continue
+			}
 			er.Deleted = true
 			out = append(out, er)
 			continue
@@ -185,6 +195,21 @@ func hasRecordDelete(ops []crdt.Op) bool {
 		}
 	}
 	return false
+}
+
+// wholeRecordRejections indexes the records the apply dropped whole
+// (OpIndex -1); for a delete, the handler refused it. Nil when none.
+func wholeRecordRejections(rejections []crdt.OpRejection) map[int]struct{} {
+	var out map[int]struct{}
+	for _, rj := range rejections {
+		if rj.OpIndex == -1 {
+			if out == nil {
+				out = make(map[int]struct{}, len(rejections))
+			}
+			out[rj.RecordIndex] = struct{}{}
+		}
+	}
+	return out
 }
 
 // isCreationMarker reports whether op is the synthetic _ver.id stamp

@@ -26,8 +26,9 @@ const spaceId = "space.test"
 type rowFact struct{ durable, exists bool }
 
 type fakeRows struct {
-	m       map[string]rowFact
-	intents map[string]string // ownerId/rootCid → resolvable fileId
+	m         map[string]rowFact
+	intents   map[string][]string // ownerId/rootCid → resolvable fileIds
+	onResolve func()              // runs inside ResolveIntent when set
 }
 
 func (f *fakeRows) SpaceFiles(_ context.Context, _ string) (map[string]bool, error) {
@@ -40,9 +41,18 @@ func (f *fakeRows) SpaceFiles(_ context.Context, _ string) (map[string]bool, err
 	return out, nil
 }
 
-func (f *fakeRows) ResolveIntent(_ context.Context, _ string, ownerId string, root cid.Cid) (string, bool, error) {
-	fileId, ok := f.intents[ownerId+"/"+root.String()]
-	return fileId, ok, nil
+func (f *fakeRows) ResolveIntent(_ context.Context, _ string, ownerId string, root cid.Cid) ([]string, error) {
+	if f.onResolve != nil {
+		f.onResolve()
+	}
+	return f.intents[ownerId+"/"+root.String()], nil
+}
+
+func intentsOf(t *testing.T, st *store.Store, root cid.Cid) []store.Intent {
+	t.Helper()
+	intents, err := st.Intents(context.Background(), spaceId, root)
+	require.NoError(t, err)
+	return intents
 }
 
 func newStore(t *testing.T) *store.Store {
@@ -202,10 +212,10 @@ func TestSweepIntentHealsCrashOrphan(t *testing.T) {
 	info := addOrphanCar(t, st, 90_000)
 	// The attach died between RegisterFile and AddRefs/Enqueue: intent
 	// marker present, row exists but unreferenced and unqueued.
-	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root), "owner1"))
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "a1"), "owner1"))
 	rows := &fakeRows{
 		m:       map[string]rowFact{"fhealed": {durable: false, exists: true}},
-		intents: map[string]string{"owner1/" + info.Root.String(): "fhealed"},
+		intents: map[string][]string{"owner1/" + info.Root.String(): {"fhealed"}},
 	}
 	var enqueued []string
 	setClocks(t, -time.Second, StalePartialTTL)
@@ -219,9 +229,7 @@ func TestSweepIntentHealsCrashOrphan(t *testing.T) {
 	require.NoError(t, err, "the CAR must survive — it is the only copy")
 	assert.Equal(t, []string{"fhealed"}, healed.Refs, "row re-linked")
 	assert.Equal(t, []string{"fhealed"}, enqueued, "backup re-queued")
-	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, info.Root))
-	require.NoError(t, err)
-	assert.False(t, marked, "marker cleared after heal")
+	assert.Empty(t, intentsOf(t, st, info.Root), "marker cleared after heal")
 
 	// Idempotent: a second sweep leaves the healed state alone.
 	require.NoError(t, svc.Sweep(ctx))
@@ -235,13 +243,102 @@ func TestSweepIntentWithoutRowDeletes(t *testing.T) {
 	st := newStore(t)
 	info := addOrphanCar(t, st, 90_000)
 	// The crash preceded the row write: marker with nothing to heal.
-	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root), "owner1"))
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "a1"), "owner1"))
 	setClocks(t, -time.Second, StalePartialTTL)
 	svc := New(st, &fakeRows{m: map[string]rowFact{}}, nil)
 	require.NoError(t, svc.Sweep(ctx))
 
 	assert.Equal(t, "gone", stateOf(t, st, info.Root))
-	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, info.Root))
+	assert.Empty(t, intentsOf(t, st, info.Root))
+}
+
+// An attach that marks the root while the sweep heals it keeps the CAR:
+// the stale marker goes, the new one pins.
+func TestSweepIntentKeepsRootMarkedMeanwhile(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	info := addOrphanCar(t, st, 90_000)
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "stale"), "gone"))
+	fresh := store.IntentKey(spaceId, info.Root, "fresh")
+	rows := &fakeRows{m: map[string]rowFact{}, onResolve: func() {
+		require.NoError(t, st.SetKV(ctx, fresh, "owner2"))
+	}}
+	setClocks(t, -time.Second, StalePartialTTL)
+	require.NoError(t, New(st, rows, nil).Sweep(ctx))
+
+	assert.Equal(t, store.StateComplete, stateOf(t, st, info.Root), "the CAR an attach marked meanwhile stays")
+	intents := intentsOf(t, st, info.Root)
+	require.Len(t, intents, 1)
+	assert.Equal(t, fresh, intents[0].Key)
+}
+
+// Two attaches of the same bytes each leave a marker: owner L crashed
+// after its row write, owner B's registration failed. The sweep heals
+// through L, so the CAR L's row needs survives.
+func TestSweepIntentsHealEveryOwner(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	info := addOrphanCar(t, st, 90_000)
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "aL"), "ownerL"))
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "aB"), "ownerB"))
+	rows := &fakeRows{
+		m:       map[string]rowFact{"fL": {exists: true}},
+		intents: map[string][]string{"ownerL/" + info.Root.String(): {"fL"}},
+	}
+	setClocks(t, -time.Second, StalePartialTTL)
+	var enqueued []string
+	svc := New(st, rows, func(_ context.Context, _ string, fileId string) error {
+		enqueued = append(enqueued, fileId)
+		return nil
+	})
+	require.NoError(t, svc.Sweep(ctx))
+
+	healed, err := st.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err, "the CAR owner L's row needs must survive")
+	assert.Equal(t, []string{"fL"}, healed.Refs)
+	assert.Equal(t, []string{"fL"}, enqueued)
+	assert.Empty(t, intentsOf(t, st, info.Root))
+}
+
+// One owner can hold several rows of the same bytes; the heal re-links
+// all of them.
+func TestSweepIntentRelinksEveryRowOfOwner(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	info := addOrphanCar(t, st, 90_000)
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "a1"), "owner1"))
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "a2"), "owner1"))
+	rows := &fakeRows{
+		m:       map[string]rowFact{"f1": {exists: true}, "f2": {exists: true}},
+		intents: map[string][]string{"owner1/" + info.Root.String(): {"f1", "f2"}},
+	}
+	setClocks(t, -time.Second, StalePartialTTL)
+	require.NoError(t, New(st, rows, nil).Sweep(ctx))
+
+	healed, err := st.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"f1", "f2"}, healed.Refs)
+	assert.Empty(t, intentsOf(t, st, info.Root))
+}
+
+// A marker at the bare root key pins and heals like a per-attach one.
+func TestSweepIntentHealsBareRootMarker(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	info := addOrphanCar(t, st, 90_000)
+	bare := "intent/" + spaceId + "/" + info.Root.String()
+	require.NoError(t, st.SetKV(ctx, bare, "owner1"))
+	rows := &fakeRows{
+		m:       map[string]rowFact{"f1": {exists: true}},
+		intents: map[string][]string{"owner1/" + info.Root.String(): {"f1"}},
+	}
+	setClocks(t, -time.Second, StalePartialTTL)
+	require.NoError(t, New(st, rows, nil).Sweep(ctx))
+
+	healed, err := st.Info(ctx, spaceId, info.Root)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"f1"}, healed.Refs)
+	_, marked, err := st.GetKV(ctx, bare)
 	require.NoError(t, err)
 	assert.False(t, marked)
 }
@@ -250,7 +347,7 @@ func TestFreeUpRetainsIntentMarked(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)
 	info := addOrphanCar(t, st, 90_000)
-	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root), "owner1"))
+	require.NoError(t, st.SetKV(ctx, store.IntentKey(spaceId, info.Root, "a1"), "owner1"))
 	setClocks(t, -time.Second, StalePartialTTL) // even past grace
 	svc := New(st, &fakeRows{m: map[string]rowFact{}}, nil)
 

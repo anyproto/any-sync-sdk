@@ -109,16 +109,19 @@ Rows that share a root share one upload: drives of one root are
 serialized, and a row whose sibling already holds a receipt takes that
 receipt.
 
-Crash safety: an intent marker pins the root before the row write, and
-the job is persisted before Attach returns, so a crash never leaves
-an unsigned row that GC treats as garbage or the queue forgets. When
-registration fails before the row write, for any reason (the owner was
-deleted during the upload, the space key is unavailable, the context
-ended), no row references the new CAR, so it and its marker are
-dropped; a bound upload leaves the marker, which every attach of that
-content shares, to the sweep. A failure in the write itself keeps both
-for the sweep. A marker whose owner was deleted since resolves to no
-row, so the sweep drops its CAR.
+Crash safety: each attach writes its own intent marker on the root
+before the row write, and the job is persisted before Attach returns,
+so a crash never leaves an unsigned row that GC treats as garbage or
+the queue forgets. When registration fails before the row write, for
+any reason (the owner was deleted during the upload, the space key is
+unavailable, the context ended), no row references the new CAR, so it
+and its marker are dropped; a bound upload drops only its marker, the
+CAR being the donor's. A failure in the write itself keeps both for the
+sweep. For a root no live row references, the sweep keeps the CAR while
+any marker remains and re-links every row of each marking owner that
+holds the root; when no marking owner has such a row (its owner was
+deleted since, or the crash preceded the row), the markers and the CAR
+go.
 
 ## Background work
 

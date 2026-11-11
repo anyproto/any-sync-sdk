@@ -51,10 +51,10 @@ type RowResolver interface {
 	// objects. GC resolves refs against this map — a per-fileId lookup
 	// would cost a full tree scan for every dead ref.
 	SpaceFiles(ctx context.Context, spaceId string) (map[string]bool, error)
-	// ResolveIntent finds a live row of ownerId whose rootCid is root —
-	// the heal for the attach crash window (row written, ref/job not).
-	// ok=false when no such row exists (the crash preceded the row).
-	ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) (fileId string, ok bool, err error)
+	// ResolveIntent lists the live rows of ownerId whose rootCid is
+	// root — the heal for the attach crash window (row written, ref/job
+	// not). Empty when no such row exists (the crash preceded the row).
+	ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) (fileIds []string, err error)
 }
 
 // Enqueue schedules a drive-toward-durable job for a healed row
@@ -182,7 +182,7 @@ func (s *Service) FreeUp(ctx context.Context, want int64) (freed int64, err erro
 				// between any two lines). The sweep reaps it after grace.
 				return true, nil
 			}
-			if _, marked, kerr := s.store.GetKV(ctx, store.IntentKey(info.SpaceId, info.Root)); kerr != nil || marked {
+			if intents, kerr := s.store.Intents(ctx, info.SpaceId, info.Root); kerr != nil || len(intents) > 0 {
 				// An attach intent pins the root; Sweep owns healing it.
 				return true, nil
 			}
@@ -219,11 +219,11 @@ type sweepAction struct {
 	deadRefs  []string // refs whose rows are gone → prune
 	remove    bool     // unreferenced past grace → delete the CAR + row
 	stalePart bool     // durable partial past TTL → offload
-	// intentOwner is set (instead of remove) for an unreferenced CAR
-	// carrying an attach-intent marker past grace: resolve the owner's
-	// rows and either re-link the crash-orphaned row or, when no row
-	// exists, clear the marker and delete the CAR.
-	intentOwner string
+	// intents is set (instead of remove) for an unreferenced CAR
+	// carrying attach-intent markers past grace: resolve each owner's
+	// rows and re-link the crash-orphaned ones or, when no owner has a
+	// row, clear the markers and delete the CAR.
+	intents []store.Intent
 }
 
 // Sweep is the automatic safety pass: prune refs whose rows are gone,
@@ -260,8 +260,8 @@ func (s *Service) Sweep(ctx context.Context) error {
 		}
 		switch {
 		case live == 0 && now.Sub(info.LastAccess) > UnreferencedGrace:
-			if owner, marked, kerr := s.store.GetKV(ctx, store.IntentKey(info.SpaceId, info.Root)); kerr == nil && marked {
-				act.intentOwner = owner
+			if intents, kerr := s.store.Intents(ctx, info.SpaceId, info.Root); kerr == nil && len(intents) > 0 {
+				act.intents = intents
 			} else if kerr == nil {
 				act.remove = true
 			}
@@ -272,7 +272,7 @@ func (s *Service) Sweep(ctx context.Context) error {
 			// row gates the remote rung).
 			act.stalePart = true
 		}
-		if act.remove || act.stalePart || act.intentOwner != "" || len(act.deadRefs) > 0 {
+		if act.remove || act.stalePart || len(act.intents) > 0 || len(act.deadRefs) > 0 {
 			actions = append(actions, act)
 		}
 		return true, nil
@@ -290,8 +290,8 @@ func (s *Service) Sweep(ctx context.Context) error {
 			}
 		}
 		switch {
-		case act.intentOwner != "":
-			s.healIntent(ctx, act.spaceId, act.intentOwner, act.root)
+		case len(act.intents) > 0:
+			s.healIntents(ctx, act.spaceId, act.root, act.intents)
 		case act.remove:
 			if err := s.store.Delete(ctx, act.spaceId, act.root); err != nil {
 				log.Warn("gc delete failed", zap.String("root", act.root.String()), zap.Error(err))
@@ -305,34 +305,60 @@ func (s *Service) Sweep(ctx context.Context) error {
 	return nil
 }
 
-// healIntent resolves a stale attach-intent: the process died between
-// the row write and the ref/job writes. A surviving row is re-linked
-// (ref + durable job) and the marker cleared; no row means the crash
-// preceded the row — clear the marker and delete the orphaned CAR.
-func (s *Service) healIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) {
-	fileId, ok, err := s.rows.ResolveIntent(ctx, spaceId, ownerId, root)
-	if err != nil {
-		return // conservative: retry next sweep
-	}
-	if ok {
-		if err = s.store.AddRefs(ctx, spaceId, root, fileId); err != nil {
-			log.Warn("intent heal: re-ref failed", zap.String("root", root.String()), zap.Error(err))
-			return
+// healIntents resolves a root's stale attach intents: the process died
+// between an attach's row write and its ref/job writes. Every row of a
+// marking owner that holds root gets its durable job and its ref, and
+// the markers are cleared; when no owner has such a row, every crash
+// preceded its row — the markers go, then the orphaned CAR. Nothing is
+// referenced until every owner resolved and every job landed, so any
+// failure leaves the CAR unreferenced and marked for the next sweep.
+func (s *Service) healIntents(ctx context.Context, spaceId string, root cid.Cid, intents []store.Intent) {
+	resolved := map[string]struct{}{}
+	var fileIds []string
+	for _, in := range intents {
+		if _, done := resolved[in.OwnerId]; done {
+			continue
 		}
-		if s.enqueue != nil {
-			if err = s.enqueue(ctx, spaceId, fileId); err != nil {
+		resolved[in.OwnerId] = struct{}{}
+		ids, err := s.rows.ResolveIntent(ctx, spaceId, in.OwnerId, root)
+		if err != nil {
+			return // conservative: retry next sweep
+		}
+		fileIds = append(fileIds, ids...)
+	}
+	if s.enqueue != nil {
+		for _, fileId := range fileIds {
+			if err := s.enqueue(ctx, spaceId, fileId); err != nil {
 				log.Warn("intent heal: enqueue failed", zap.String("fileId", fileId), zap.Error(err))
 				return
 			}
 		}
-		log.Info("intent heal: re-linked crash-orphaned file",
-			zap.String("fileId", fileId), zap.String("root", root.String()))
-	} else if err = s.store.Delete(ctx, spaceId, root); err != nil {
-		log.Warn("intent heal: delete failed", zap.String("root", root.String()), zap.Error(err))
+	}
+	if err := s.store.AddRefs(ctx, spaceId, root, fileIds...); err != nil {
+		log.Warn("intent heal: re-ref failed", zap.String("root", root.String()), zap.Error(err))
 		return
 	}
-	if err = s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
-		log.Warn("intent heal: clear marker failed", zap.String("root", root.String()), zap.Error(err))
+	for _, fileId := range fileIds {
+		log.Info("intent heal: re-linked crash-orphaned file",
+			zap.String("fileId", fileId), zap.String("root", root.String()))
+	}
+	keys := make([]string, len(intents))
+	for i, in := range intents {
+		keys[i] = in.Key
+	}
+	if err := s.store.DeleteKVs(ctx, keys); err != nil {
+		log.Warn("intent heal: clear markers failed", zap.String("root", root.String()), zap.Error(err))
+		return
+	}
+	if len(fileIds) > 0 {
+		return
+	}
+	// An attach that marked the root since the sweep listed it pins it.
+	if left, err := s.store.Intents(ctx, spaceId, root); err != nil || len(left) > 0 {
+		return
+	}
+	if err := s.store.Delete(ctx, spaceId, root); err != nil {
+		log.Warn("intent heal: delete failed", zap.String("root", root.String()), zap.Error(err))
 	}
 }
 

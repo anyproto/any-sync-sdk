@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -207,7 +208,8 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 	}
 	// Same crash-window guard as addFull: the row must never exist
 	// without its CAR ref (the donor's ref alone dies with the donor).
-	if err = s.store.SetKV(ctx, store.IntentKey(spaceId, ref.Root), ownerId); err != nil {
+	marker := store.IntentKey(spaceId, ref.Root, newAttachId())
+	if err = s.store.SetKV(ctx, marker, ownerId); err != nil {
 		return Result{}, false, err
 	}
 	fileId, err := reg.RegisterFile(ctx, ownerId, RegisterOpts{
@@ -224,9 +226,10 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 		},
 	})
 	if err != nil {
-		// The marker stays even when no row was written: every attach of
-		// this content shares it. It pins nothing while the donor holds
-		// its ref, and the sweep heals it once the donor is gone.
+		if payloads.NotWritten(err) {
+			// No row: nothing for the marker to guard.
+			_ = s.store.DeleteKV(context.WithoutCancel(ctx), marker)
+		}
 		return Result{}, false, err
 	}
 	if err = s.store.AddRefs(ctx, spaceId, ref.Root, fileId); err != nil {
@@ -240,7 +243,7 @@ func (s *Service) addBound(ctx context.Context, reg Registrar, spaceId, ownerId 
 			return Result{}, false, err
 		}
 	}
-	if err = s.store.DeleteKV(ctx, store.IntentKey(spaceId, ref.Root)); err != nil {
+	if err = s.store.DeleteKV(ctx, marker); err != nil {
 		return Result{}, false, err
 	}
 	return Result{
@@ -284,7 +287,8 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 	// is unreferenced (and unqueued) must never look like garbage to
 	// GC. The marker pins the root; the GC's sweep heals a stale one
 	// by re-linking the row through the owner recorded here.
-	if err = s.store.SetKV(ctx, store.IntentKey(spaceId, root), ownerId); err != nil {
+	marker := store.IntentKey(spaceId, root, newAttachId())
+	if err = s.store.SetKV(ctx, marker, ownerId); err != nil {
 		return Result{}, err
 	}
 
@@ -304,7 +308,7 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		if payloads.NotWritten(err) {
 			// No row was written, so nothing will ever reference this
 			// CAR: drop it now rather than after the sweep's grace.
-			s.dropUnregistered(ctx, spaceId, root)
+			s.dropUnregistered(ctx, spaceId, root, marker)
 		}
 		return Result{}, err
 	}
@@ -322,7 +326,7 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 		}
 	}
 	// Row, ref and job all landed: the intent marker has done its job.
-	if err = s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
+	if err = s.store.DeleteKV(ctx, marker); err != nil {
 		return Result{}, err
 	}
 	return Result{FileId: fileId, RootCid: root.String(), Size: sp.Size()}, nil
@@ -331,12 +335,19 @@ func (s *Service) addFull(ctx context.Context, reg Registrar, spaceId, ownerId s
 // dropUnregistered removes a finalized CAR that no row will reference,
 // and its intent marker. The marker goes first: a CAR left without one
 // is unreferenced, and the sweep deletes it after the grace period.
-func (s *Service) dropUnregistered(ctx context.Context, spaceId string, root cid.Cid) {
+func (s *Service) dropUnregistered(ctx context.Context, spaceId string, root cid.Cid, marker string) {
 	ctx = context.WithoutCancel(ctx)
-	if err := s.store.DeleteKV(ctx, store.IntentKey(spaceId, root)); err != nil {
+	if err := s.store.DeleteKV(ctx, marker); err != nil {
 		return
 	}
 	_ = s.store.Delete(ctx, spaceId, root)
+}
+
+// newAttachId names one attach's intent marker.
+func newAttachId() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // DriveDurable drives an already registered row to a verified receipt

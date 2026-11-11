@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -495,14 +496,20 @@ func (s *Store) DeleteKVPrefix(ctx context.Context, prefix string) error {
 	if prefix == "" {
 		return errors.New("filestore: DeleteKVPrefix requires a prefix")
 	}
+	hi, _ := prefixUpperBound(prefix)
+	_, err := s.kv.Find(idRange(prefix, hi)).Delete(ctx)
+	return err
+}
+
+// idRange matches ids in [lo, hi); an empty hi leaves the range open.
+func idRange(lo, hi string) query.Filter {
 	filter := query.And{
-		query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpGte, prefix)},
+		query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpGte, lo)},
 	}
-	if hi, ok := prefixUpperBound(prefix); ok {
+	if hi != "" {
 		filter = append(filter, query.Key{Path: []string{idField}, Filter: query.NewComp(query.CompOpLt, hi)})
 	}
-	_, err := s.kv.Find(filter).Delete(ctx)
-	return err
+	return filter
 }
 
 // prefixUpperBound is the smallest string above every string with the
@@ -519,18 +526,59 @@ func prefixUpperBound(prefix string) (string, bool) {
 	return "", false
 }
 
-// IntentKey is the KV key of an attach-intent marker: written (with
-// the owning objectId as value) BEFORE a file's row is registered and
-// cleared once the CAR ref + retry job landed. GC treats a marked
-// root as pinned and heals a stale marker by re-linking the row the
-// crash orphaned — without it, a kill between the row write and the
-// ref write would leave the only copy of a never-uploaded file
-// unreferenced and GC would delete it.
-func IntentKey(spaceId string, root cid.Cid) string {
-	return intentPrefix(spaceId) + root.String()
+// IntentKey is the KV key of one attach's intent marker: written (with
+// the owning objectId as value) BEFORE the attach registers its row and
+// cleared once the CAR ref + retry job landed. attachId is unique per
+// attach, so attaches of the same content never clear each other's
+// marker. GC treats a root with any marker as pinned and heals a stale
+// one by re-linking the rows the crash orphaned — without it, a kill
+// between the row write and the ref write would leave the only copy of
+// a never-uploaded file unreferenced and GC would delete it.
+func IntentKey(spaceId string, root cid.Cid, attachId string) string {
+	return intentRootPrefix(spaceId, root) + attachId
 }
 
 func intentPrefix(spaceId string) string { return "intent/" + spaceId + "/" }
+
+func intentRootPrefix(spaceId string, root cid.Cid) string {
+	return intentPrefix(spaceId) + root.String() + "/"
+}
+
+// Intent is one attach-intent marker on a root.
+type Intent struct {
+	Key     string
+	OwnerId string
+}
+
+// Intents lists root's attach-intent markers: the per-attach keys and
+// the bare root key, which is a marker too. One range scan covers both:
+// a CID string has no byte below '0', so [bare, bare+"0") holds only
+// the bare key and the keys under bare+"/".
+func (s *Store) Intents(ctx context.Context, spaceId string, root cid.Cid) ([]Intent, error) {
+	bare := intentPrefix(spaceId) + root.String()
+	under := bare + "/"
+	iter, err := s.kv.Find(idRange(bare, bare+"0")).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []Intent
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		if derr != nil {
+			iter.Close()
+			return nil, derr
+		}
+		v := doc.Value()
+		key := string(v.GetStringBytes(idField))
+		if key == bare || strings.HasPrefix(key, under) {
+			out = append(out, Intent{Key: key, OwnerId: string(v.GetStringBytes("v"))})
+		}
+	}
+	if err = errors.Join(iter.Err(), iter.Close()); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 // FileIndexKey is the KV key of the local fileId → payloads-object
 // entry the space layer keeps per attached file.

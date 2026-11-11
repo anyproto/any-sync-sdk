@@ -380,7 +380,7 @@ func TestDeleteSpace(t *testing.T) {
 
 	// The space's KV entries go too; another space's stay.
 	require.NoError(t, s.SetKV(ctx, FileIndexKey(spaceId, "f"), "o"))
-	require.NoError(t, s.SetKV(ctx, IntentKey(spaceId, info.Root), "o"))
+	require.NoError(t, s.SetKV(ctx, IntentKey(spaceId, info.Root, "a1"), "o"))
 	require.NoError(t, s.SetKV(ctx, FileIndexKey("other", "f"), "o2"))
 
 	require.NoError(t, s.DeleteSpace(ctx, spaceId))
@@ -391,7 +391,7 @@ func TestDeleteSpace(t *testing.T) {
 	require.False(t, ok)
 	_, err = os.Stat(filepath.Join(s.root, spaceId))
 	require.ErrorIs(t, err, os.ErrNotExist)
-	for _, key := range []string{FileIndexKey(spaceId, "f"), IntentKey(spaceId, info.Root)} {
+	for _, key := range []string{FileIndexKey(spaceId, "f"), IntentKey(spaceId, info.Root, "a1")} {
 		_, ok, err = s.GetKV(ctx, key)
 		require.NoError(t, err)
 		require.False(t, ok, "%s must be gone", key)

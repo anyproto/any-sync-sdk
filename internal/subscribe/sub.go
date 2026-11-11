@@ -28,6 +28,7 @@ type querySub struct {
 	entries map[string]*entry
 	minRef  *entry
 	maxRef  *entry
+	seq     uint64 // the last place handed out (entry.seq)
 
 	// Window state: complete, the window holds every match; edge, a key
 	// every match the window does not hold sorts at or past; unranked, a
@@ -77,8 +78,9 @@ func (s *querySub) closeWith(reason error) {
 
 // appendInitial is called by Engine.Subscribe once per snapshot row.
 // Inserts the entry with what the sub keeps per row. Snapshot rows
-// arrive in sort order (ascending tuple), so the last row appended is
-// maxRef and the first is minRef when the loop completes.
+// arrive in sort order (ascending tuple, ties in storage's order), so
+// the last row appended is maxRef and the first is minRef when the
+// loop completes.
 func (s *querySub) appendInitial(id string, doc *anyenc.Value) {
 	if doc == nil || id == "" {
 		return
@@ -828,6 +830,10 @@ func (s *querySub) refillWindow(p *subPending) error {
 			out := p.rec(fr.id)
 			out.doc, out.changed = fr.doc, true
 		}
+		if s.windowed() {
+			// Ties take the read's order, whatever place they held.
+			s.place(s.entries[fr.id])
+		}
 	}
 	for id, e := range s.entries {
 		if _, ok := fresh[id]; ok {
@@ -837,6 +843,8 @@ func (s *querySub) refillWindow(p *subPending) error {
 		s.removeEntry(e)
 	}
 	if s.windowed() {
+		// The boundaries follow the new places.
+		s.minRef, s.maxRef = nil, nil
 		// Rows the read returned without an id or doc took no slot:
 		// a window that holds at most limit rows holds every match
 		// it can, as at Subscribe.

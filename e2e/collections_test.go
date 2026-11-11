@@ -134,6 +134,37 @@ func TestE2E_Collections(t *testing.T) {
 		assert.Equal(t, "A label", info.Description)
 	})
 
+	// Delete: each surface deletes its own definitions and refuses the
+	// other's ids and the built-ins; members keep the deleted ids.
+	t.Run("Delete", func(t *testing.T) {
+		typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: "Draft"})
+		require.NoError(t, err)
+		cId, err := sp.Collections().Create(ctx, space.CollectionCreateParams{Name: "Inbox"})
+		require.NoError(t, err)
+		objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId, Collections: []string{cId}})
+		require.NoError(t, err)
+
+		assert.ErrorIs(t, sp.Types().Delete(ctx, cId), space.ErrNotAType)
+		assert.ErrorIs(t, sp.Collections().Delete(ctx, typeId), space.ErrNotACollection)
+		assert.ErrorIs(t, sp.Types().Delete(ctx, "collection"), space.ErrTypeRegistered)
+		assert.ErrorIs(t, sp.Collections().Delete(ctx, "collection"), space.ErrTypeRegistered)
+		assert.ErrorIs(t, sp.Collections().Delete(ctx, "any"), space.ErrNotFound, "a built-in type id answers as Get does")
+		assert.ErrorIs(t, sp.Types().Delete(ctx, objId), space.ErrNotFound)
+		assert.ErrorIs(t, sp.Collections().Delete(ctx, "no-such-object"), space.ErrNotFound)
+
+		require.NoError(t, sp.Types().Delete(ctx, typeId))
+		require.NoError(t, sp.Collections().Delete(ctx, cId))
+		_, err = sp.Types().Get(ctx, typeId)
+		assert.ErrorIs(t, err, space.ErrNotFound)
+		_, err = sp.Collections().Get(ctx, cId)
+		assert.ErrorIs(t, err, space.ErrNotFound)
+		assert.ErrorIs(t, sp.Types().Delete(ctx, typeId), space.ErrNotFound, "a second delete finds nothing")
+
+		gotType, gotColls := collMembers(t, ctx, sp, objId)
+		assert.Equal(t, typeId, gotType, "the member keeps its type id")
+		assert.Equal(t, []string{cId}, gotColls, "the member keeps its collection id")
+	})
+
 	// Property definitions: one owner-agnostic surface reachable
 	// through either accessor.
 	t.Run("Definitions", func(t *testing.T) {

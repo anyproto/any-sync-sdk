@@ -10,6 +10,7 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/settings"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -640,8 +641,28 @@ func markerOf(rec *anyenc.Value) string {
 	return ""
 }
 
-func (t *typesAPI) Delete(_ context.Context, _ string) error {
-	return errors.New("typesAPI: Delete not implemented")
+// Delete removes a user type through the object deletion path
+// (Objects().Delete). Objects naming it in any.type keep the id. Any
+// other id answers as Get does.
+func (t *typesAPI) Delete(ctx context.Context, typeId string) error {
+	_, reserved := spaceobjects.ReservedTypeIds[typeId]
+	if _, registered := t.findRegisteredType(typeId); reserved || registered {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if _, err := t.Get(ctx, typeId); err != nil {
+		return err
+	}
+	return deleteDefinition(ctx, t.parent, typeId)
+}
+
+// deleteDefinition deletes a type or collection object the caller has
+// looked up; one already deleted meanwhile is ErrNotFound.
+func deleteDefinition(ctx context.Context, parent *spaceImpl, id string) error {
+	err := parent.objects.Delete(ctx, id)
+	if errors.Is(err, settings.ErrAlreadyDeleted) {
+		return fmt.Errorf("%w: %q: %w", space.ErrNotFound, id, err)
+	}
+	return err
 }
 
 // builtInMetaCollectionProperties translates collectiontype.Properties

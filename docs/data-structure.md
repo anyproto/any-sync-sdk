@@ -268,7 +268,7 @@ List(ctx) ([]CollectionInfo, error)                 // meta `collection` + regis
 Get(ctx, collectionId) (CollectionInfo, error)      // a type id → ErrNotACollection
 Create(ctx, CollectionCreateParams) (id, error)     // Name, Description, IconCID, XKey, Hidden, Meta
 Patch(ctx, collectionId, CollectionPatch) error     // registered → ErrTypeRegistered; a type id → ErrNotACollection
-Delete(ctx, collectionId) error                     // not implemented, like Types().Delete
+Delete(ctx, collectionId) error                     // members keep the id; built-in/registered → ErrTypeRegistered; otherwise as Get
 ```
 
 `Create` writes `any.{name,description,icon}`,

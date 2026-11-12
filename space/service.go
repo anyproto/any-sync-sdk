@@ -286,7 +286,8 @@ type Service interface {
 	// or a direct peer; with none reachable Get waits for ctx. A derived
 	// space is the exception: once DeriveId or Derive has computed its
 	// id in this process, Get builds the storage from the seed and
-	// needs no network.
+	// needs no network. A pull of that id already in flight is joined,
+	// not replaced, so a host computes its ids right after Open.
 	//
 	// The account's own tech space id (SDK.TechSpaceId) returns a
 	// restricted handle: reads, dataset declarations on bundle roots,

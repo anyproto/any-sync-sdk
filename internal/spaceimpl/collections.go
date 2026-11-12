@@ -181,8 +181,17 @@ func (c *collectionsAPI) Get(ctx context.Context, id string) (space.CollectionIn
 	return space.CollectionInfo{}, space.ErrNotFound
 }
 
-func (c *collectionsAPI) Delete(_ context.Context, _ string) error {
-	return errors.New("collectionsAPI: Delete not implemented")
+// Delete removes a user collection through the object deletion path
+// (Objects().Delete). Objects listing it keep the id. Any other id
+// answers as Get does.
+func (c *collectionsAPI) Delete(ctx context.Context, id string) error {
+	if _, registered := c.defs.findRegisteredCollection(id); registered || id == collectiontype.TypeId {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, id)
+	}
+	if _, err := c.Get(ctx, id); err != nil {
+		return err
+	}
+	return deleteDefinition(ctx, c.parent, id)
 }
 
 // Patch rewrites a user collection's display and listing metadata in

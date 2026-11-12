@@ -192,25 +192,26 @@ func (s *Service) SpaceFiles(ctx context.Context, spaceId string) (map[string]bo
 	return out, nil
 }
 
-// ResolveIntent is the gc.RowResolver heal hook: find a live row of
-// ownerId whose rootCid is root (the attach crash window left the row
-// without its CAR ref).
-func (s *Service) ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) (fileId string, ok bool, err error) {
+// ResolveIntent is the gc.RowResolver heal hook: the live rows of
+// ownerId whose rootCid is root (the attach crash window left them
+// without their CAR ref).
+func (s *Service) ResolveIntent(ctx context.Context, spaceId, ownerId string, root cid.Cid) ([]string, error) {
 	impl, err := s.implFor(ctx, spaceId)
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
 	rows, err := impl.PayloadsInternal().ListRows(ctx, ownerId)
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
 	rootStr := root.String()
+	var fileIds []string
 	for _, row := range rows {
 		if row.RootCid == rootStr {
-			return row.Id, true, nil
+			fileIds = append(fileIds, row.Id)
 		}
 	}
-	return "", false, nil
+	return fileIds, nil
 }
 
 // fileStatus derives one file's FileStatus on read: the row decides

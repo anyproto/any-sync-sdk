@@ -19,7 +19,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 )
 
-func seedDoc(t *testing.T, ctx context.Context, coll anystore.Collection, id string) {
+func seedDoc(t testing.TB, ctx context.Context, coll anystore.Collection, id string) {
 	t.Helper()
 	a := &anyenc.Arena{}
 	doc := a.NewObject()
@@ -27,7 +27,7 @@ func seedDoc(t *testing.T, ctx context.Context, coll anystore.Collection, id str
 	require.NoError(t, coll.UpsertOne(ctx, doc))
 }
 
-func mustColl(t *testing.T, ctx context.Context, db anystore.DB, name string) anystore.Collection {
+func mustColl(t testing.TB, ctx context.Context, db anystore.DB, name string) anystore.Collection {
 	t.Helper()
 	coll, err := db.Collection(ctx, name)
 	require.NoError(t, err)

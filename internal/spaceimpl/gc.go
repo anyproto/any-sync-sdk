@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/ipfs/go-cid"
 	"go.uber.org/zap"
@@ -40,8 +41,9 @@ var gcLog = logger.NewNamed("sdk.collectiongc")
 // the sweep stays synchronous in Open while the eager space-loading
 // loop runs on the background bootstrap pass: only the pre-return,
 // pre-bootstrap spot guarantees "no space loads, no caller holds the
-// handle", and the sweep is cheap (1.6-40ms measured). Best-effort:
-// a failed sweep is logged and boot continues.
+// handle", and on a healthy DB the sweep is one catalog listing plus
+// one read transaction of point lookups. Best-effort: a failed sweep
+// is logged and boot continues.
 //
 // The sweep is scoped to one DB: names, rosters and meta rows are all
 // read from s.db. If storage ever moves to per-space DBs (dbRouter,
@@ -93,19 +95,20 @@ func (s *Service) SweepOrphanCollections(ctx context.Context) {
 //
 // Sized for millions of objects: no live-object roster is ever
 // materialized. Candidates come from the collection catalog alone;
-// liveness is decided per unique owner with POINT reads — the `_meta`
-// row first (one FindId resolves every scoped object), the kept
-// spaces' `objects` rosters as FindId fallback for meta-less objects.
-// Names are sorted so an owner's collections are adjacent and the
-// decision runs once per owner, and every read errs toward "live" — a
-// collection is only ever dropped on positive evidence of a dead
-// owner.
+// liveness is decided per unique owner with POINT reads, all in one
+// read transaction — the `_meta` row first (one FindId resolves every
+// scoped object), the kept spaces' `objects` rosters as FindId
+// fallback for meta-less objects. Names are sorted so an owner's
+// collections are adjacent and the decision runs once per owner, and
+// every read errs toward "live" — a collection is only ever dropped on
+// positive evidence of a dead owner.
 func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[string]struct{}) error {
 	names, err := s.db.GetCollectionNames(ctx)
 	if err != nil {
 		return fmt.Errorf("list collections: %w", err)
 	}
 	slices.Sort(names)
+	owned := classifyCollections(names)
 
 	// keptSpaces = live rows + space-shaped owners with no row: both
 	// shield their objects from the sweep; only tombstones don't.
@@ -113,17 +116,16 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 	for id := range liveSpaces {
 		keptSpaces[id] = struct{}{}
 	}
-	for _, name := range names {
-		owner, kind := collectionOwner(name)
-		if kind != ownerSpace {
+	for _, c := range owned {
+		if c.kind != ownerSpace {
 			continue
 		}
-		if _, dead := deadSpaces[owner]; dead {
+		if _, dead := deadSpaces[c.owner]; dead {
 			continue
 		}
-		if _, live := liveSpaces[owner]; !live {
-			gcLog.Info("keeping collections of unknown space", zap.String("spaceId", owner))
-			keptSpaces[owner] = struct{}{}
+		if _, kept := keptSpaces[c.owner]; !kept {
+			gcLog.Info("keeping collections of unknown space", zap.String("spaceId", c.owner))
+			keptSpaces[c.owner] = struct{}{}
 		}
 	}
 
@@ -139,7 +141,6 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 	} else if !errors.Is(merr, anystore.ErrCollectionNotFound) {
 		return fmt.Errorf("open meta: %w", merr)
 	}
-	rosters := newRosterCache(s.db, keptSpaces)
 
 	// Meta dies BEFORE collections, always: a stale watermark on a
 	// re-materializable owner makes the rebuilt controllers skip the
@@ -167,44 +168,43 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 		}
 	}
 
+	deadObjects, err := s.deadObjects(ctx, metaColl, owned, keptSpaces)
+	if err != nil {
+		return err
+	}
+
 	var dropped int
 	sweptSpaces := map[string]struct{}{}
 	sweptObjects := map[string]struct{}{}
-	lastOwner, lastDead := "", false
-	for _, name := range names {
-		owner, kind := collectionOwner(name)
-		switch kind {
+	for i, c := range owned {
+		switch c.kind {
 		case ownerSpace:
-			if _, dead := deadSpaces[owner]; !dead {
+			if _, dead := deadSpaces[c.owner]; !dead {
 				continue
 			}
 			// Positive tombstone; its meta was purged above.
-			_ = s.dropCollection(ctx, name) // GC stays best-effort; error logged inside
-			dropped++
-			sweptSpaces[owner] = struct{}{}
+			sweptSpaces[c.owner] = struct{}{}
 		case ownerObject:
-			if owner != lastOwner {
-				lastOwner = owner
-				var keepMeta bool
-				lastDead, keepMeta = s.objectDead(ctx, metaColl, rosters, owner, keptSpaces)
-				if lastDead && !keepMeta {
-					// keepMeta exempts purged-object rows in live
-					// spaces: the sticky del marker is the
-					// change-feed deletion signal.
-					sweptObjects[owner] = struct{}{}
-					if metaColl != nil {
-						if derr := metaColl.DeleteId(ctx, owner); derr != nil && !errors.Is(derr, anystore.ErrDocNotFound) {
-							gcLog.Warn("purge object meta", zap.String("objectId", owner), zap.Error(derr))
-						}
+			keepMeta, dead := deadObjects[c.owner]
+			if !dead {
+				continue
+			}
+			if !keepMeta && (i == 0 || owned[i-1].owner != c.owner) {
+				// keepMeta exempts purged-object rows in live
+				// spaces: the sticky del marker is the
+				// change-feed deletion signal.
+				sweptObjects[c.owner] = struct{}{}
+				if metaColl != nil {
+					if derr := metaColl.DeleteId(ctx, c.owner); derr != nil && !errors.Is(derr, anystore.ErrDocNotFound) {
+						gcLog.Warn("purge object meta", zap.String("objectId", c.owner), zap.Error(derr))
 					}
 				}
 			}
-			if !lastDead {
-				continue
-			}
-			_ = s.dropCollection(ctx, name) // GC stays best-effort; error logged inside
-			dropped++
+		default:
+			continue
 		}
+		_ = s.dropCollection(ctx, c.name) // GC stays best-effort; error logged inside
+		dropped++
 	}
 
 	if dropped > 0 {
@@ -214,6 +214,29 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 			zap.Int("objects", len(sweptObjects)))
 	}
 	return nil
+}
+
+// deadObjects decides every object owner's fate in one read
+// transaction, before anything is dropped: dead owner → keepMeta.
+func (s *Service) deadObjects(ctx context.Context, metaColl anystore.Collection, owned []ownedCollection, keptSpaces map[string]struct{}) (map[string]bool, error) {
+	tx, err := s.db.ReadTx(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read tx: %w", err)
+	}
+	defer func() { _ = tx.Commit() }()
+	txCtx := tx.Context()
+	rosters := newRosterCache(s.db, keptSpaces)
+	parser := &anyenc.Parser{}
+	dead := map[string]bool{}
+	for i, c := range owned {
+		if c.kind != ownerObject || (i > 0 && owned[i-1].owner == c.owner) {
+			continue
+		}
+		if isDead, keepMeta := objectDead(txCtx, parser, metaColl, rosters, c.owner, keptSpaces); isDead {
+			dead[c.owner] = keepMeta
+		}
+	}
+	return dead, nil
 }
 
 // objectDead decides one object owner's fate. dead: no kept space —
@@ -227,10 +250,11 @@ func (s *Service) sweepOrphans(ctx context.Context, liveSpaces, deadSpaces map[s
 // candidate came from a catalog listing taken earlier, and both reads
 // here happen after it — an object materializing in between is seen
 // live. Any read error also resolves to live: never drop on
-// uncertainty.
-func (s *Service) objectDead(ctx context.Context, metaColl anystore.Collection, rosters *rosterCache, owner string, keptSpaces map[string]struct{}) (dead, keepMeta bool) {
+// uncertainty. parser is reused across calls; the meta doc is read
+// before the next lookup.
+func objectDead(ctx context.Context, parser *anyenc.Parser, metaColl anystore.Collection, rosters *rosterCache, owner string, keptSpaces map[string]struct{}) (dead, keepMeta bool) {
 	if metaColl != nil {
-		doc, err := metaColl.FindId(ctx, owner)
+		doc, err := metaColl.FindIdWithParser(ctx, parser, owner)
 		switch {
 		case err == nil:
 			spaceId, deleted := crdt.MetaOwnership(doc.Value())
@@ -311,6 +335,39 @@ const (
 	ownerObject
 )
 
+// ownedCollection is one collection name with its classified owner.
+type ownedCollection struct {
+	name  string
+	owner string
+	kind  ownerKind
+}
+
+// classifyCollections classifies sorted names; a name sharing the
+// previous one's prefix reuses its verdict.
+func classifyCollections(names []string) []ownedCollection {
+	out := make([]ownedCollection, len(names))
+	var (
+		prefix string
+		kind   ownerKind
+	)
+	for i, name := range names {
+		p, _, ok := strings.Cut(name, "_")
+		if !ok || p == "" {
+			out[i] = ownedCollection{name: name}
+			continue
+		}
+		if p != prefix {
+			prefix = p
+			_, kind = collectionOwner(name)
+		}
+		out[i] = ownedCollection{name: name, kind: kind}
+		if kind != ownerNone {
+			out[i].owner = p
+		}
+	}
+	return out
+}
+
 // collectionOwner splits a collection name at its first `_` and
 // classifies the prefix by shape: `<cid>.<repKey>` → space,
 // bare cid → object, anything else → none. The shape check is what
@@ -322,7 +379,7 @@ func collectionOwner(name string) (owner string, kind ownerKind) {
 		return "", ownerNone
 	}
 	owner = name[:i]
-	if validateSpaceId(owner) == nil {
+	if isSpaceId(owner) {
 		return owner, ownerSpace
 	}
 	if _, err := cid.Decode(owner); err == nil {

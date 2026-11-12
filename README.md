@@ -125,9 +125,6 @@ Implemented:
 - Direct sync with LAN peers (mDNS) and global peers (iroh, account-level discovery)
 - CRDT version mark: an SDK refuses an account written by a newer data model
 
-Not implemented:
-- `TypesAPI.Delete`, `CollectionsAPI.Delete`
-
 ## Specs
 
 See [`docs/`](docs/):

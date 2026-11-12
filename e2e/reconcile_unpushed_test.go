@@ -169,9 +169,15 @@ func TestE2E_Reconcile_UnpushedSpaceSurvivesNodeOutage(t *testing.T) {
 		registered := registeredSpaces(t, ctx, online, 6)
 		require.NoError(t, closeOnline())
 
-		// Sync nodes unreachable, coordinator reachable.
+		// Sync nodes unreachable, coordinator reachable. The pass Open
+		// starts judges only the registered spaces, so it settles before
+		// the unpushed ones exist and counts for none of them.
 		forgetStoredNodeConf(t, dir)
+		bootMark := spaceimpl.DeletionReconcilePassesForTest()
 		sdk, closeSDK := openAt(t, ctx, dir, prov, nodeConfUnreachable(t, netYAML, nodeconf.NodeTypeTree))
+		require.True(t, waitFor(ctx, 60*time.Second, 200*time.Millisecond, func() bool {
+			return spaceimpl.DeletionReconcilePassesForTest() > bootMark
+		}), "the boot reconcile pass never received coordinator statuses")
 		regular, oneToOne := unpushedSpaces(t, ctx, sdk)
 		last := slices.Max(registered)
 		if regular > last || oneToOne > last {
@@ -185,4 +191,30 @@ func TestE2E_Reconcile_UnpushedSpaceSurvivesNodeOutage(t *testing.T) {
 		return
 	}
 	t.Skip("an unpushed space held the largest id on every attempt")
+}
+
+// The deletion reconciler's first pass runs at Open over the space
+// index and reaches the coordinator without waiting out the poll
+// interval — the pass that drives a delete made offline last session.
+func TestE2E_Reconcile_FirstPassAtOpen(t *testing.T) {
+	netYAML, _, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	dir := t.TempDir()
+	prov := newFixedSeedProvider(t)
+
+	t.Cleanup(spaceimpl.SetDeletionReconcileIntervalForTest(2 * time.Second))
+	online, closeOnline := openAt(t, ctx, dir, prov, netYAML)
+	registeredSpaces(t, ctx, online, 1)
+	require.NoError(t, closeOnline())
+
+	spaceimpl.SetDeletionReconcileIntervalForTest(time.Hour)
+	mark := spaceimpl.DeletionReconcilePassesForTest()
+	openAt(t, ctx, dir, prov, netYAML)
+	require.True(t, waitFor(ctx, 30*time.Second, 200*time.Millisecond, func() bool {
+		return spaceimpl.DeletionReconcilePassesForTest() > mark
+	}), "no reconcile pass reached the coordinator after Open")
 }

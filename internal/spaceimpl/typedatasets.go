@@ -795,11 +795,11 @@ func (t *typesAPI) AddDatasetField(ctx context.Context, typeId, datasetDefId str
 		// more is refused rather than silently narrowed.
 		switch {
 		case decl.MutableBy == schema.MutableByAuthor:
-			return "", fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field cannot be author-mutable — declare it at AddDataset", def.Key)
+			return "", errors.Join(crdt.ErrValidation, fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field cannot be author-mutable — declare it at AddDataset", def.Key))
 		case decl.Stamp != schema.StampNone:
-			return "", fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field cannot carry a stamp — declare it at AddDataset", def.Key)
+			return "", errors.Join(crdt.ErrValidation, fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field cannot carry a stamp — declare it at AddDataset", def.Key))
 		case decl.Scope != 0 && decl.Scope != schema.ScopeSynced:
-			return "", fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field is synced — declare a %s field at AddDataset", def.Key, decl.Scope)
+			return "", errors.Join(crdt.ErrValidation, fmt.Errorf("typesAPI: dataset %q is dynamic: an additive field is synced — declare a %s field at AddDataset", def.Key, decl.Scope))
 		}
 	}
 	for _, f := range def.Fields {

@@ -343,8 +343,8 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// historical purge leaks. Deliberately synchronous, unlike the
 	// eager loop (see bootstrap): its safety argument is "only the tech
 	// space is open, no applies are running, no caller holds the SDK
-	// handle yet", which only this spot provides — and at 1.6-40ms
-	// measured it costs Open nothing. Best-effort, never fails Open.
+	// handle yet", which only this spot provides. Best-effort, never
+	// fails Open.
 	spaces.SweepOrphanCollections(ctx)
 	// Guest-identity resolver for guest-mode (public-access) spaces:
 	// loadSpaceForCache opens a space whose row carries a guest key with
@@ -377,6 +377,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// open/close-on-demand. (The tech space itself was already pinned
 	// local-only inside tsp.Open.)
 	if cfg.Headless {
+		spaces.StartDeletionReconciler()
 		return &SDK{
 			app:        app,
 			db:         db,
@@ -419,6 +420,10 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	)
 	app.OnKeyValues(tsp.SpaceId(), readSync.OnKeyValues)
 	spaces.SetReadSync(readSync)
+	// The deletion reconciler's first pass reads the space index and
+	// prunes removed spaces' read frontiers, so it starts once the tech
+	// space is open, the orphan sweep has run and read sync is wired.
+	spaces.StartDeletionReconciler()
 
 	// Resume any join left pending from a previous session now that the
 	// tech space is open (the join controller started in spaceimpl.New,

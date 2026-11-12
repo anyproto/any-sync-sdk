@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"fmt"
+	"slices"
+	"sync"
 
 	"github.com/anyproto/any-sync/util/crypto"
 )
@@ -22,7 +24,7 @@ type MnemonicConfig struct {
 }
 
 // NewMnemonicProvider validates the mnemonic and returns a Provider
-// that derives the account key on demand.
+// that derives the account key on first use.
 func NewMnemonicProvider(cfg MnemonicConfig) (Provider, error) {
 	m := crypto.Mnemonic(cfg.Mnemonic)
 	if _, err := m.Bytes(); err != nil {
@@ -44,15 +46,67 @@ func NewMnemonicProvider(cfg MnemonicConfig) (Provider, error) {
 // the matching wallet — callers use it to address per-account storage
 // before a wallet file exists.
 func AccountId(mnemonic string, index uint32) (string, error) {
+	priv, err := deriveIdentity(mnemonic, index)
+	if err != nil {
+		return "", err
+	}
+	return priv.GetPublic().Account(), nil
+}
+
+// DeriveAccount derives a mnemonic + account index's account id and
+// private key (raw Ed25519) in one derivation; the key is the one a
+// Provider built from the same mnemonic returns from AccountKey. A host
+// that needs the id before it can build a Provider derives once with
+// this and serves the key through NewKeyProvider.
+func DeriveAccount(mnemonic string, index uint32) (accountId string, accountKey []byte, err error) {
+	priv, err := deriveIdentity(mnemonic, index)
+	if err != nil {
+		return "", nil, err
+	}
+	if accountKey, err = priv.Raw(); err != nil {
+		return "", nil, err
+	}
+	return priv.GetPublic().Account(), accountKey, nil
+}
+
+// deriveIdentity derives the account identity key at
+// m/44'/2046'/[index]'/0'. crypto.Mnemonic.DeriveKeys also derives an
+// Ethereum key, which no SDK caller reads.
+func deriveIdentity(mnemonic string, index uint32) (crypto.PrivKey, error) {
 	m := crypto.Mnemonic(mnemonic)
 	if _, err := m.Bytes(); err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalidMnemonic, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidMnemonic, err)
 	}
-	res, err := m.DeriveKeys(index)
+	node, err := m.DeriveMasterNode(index)
 	if err != nil {
-		return "", fmt.Errorf("derive account key: %w", err)
+		return nil, fmt.Errorf("derive account key: %w", err)
 	}
-	return res.Identity.GetPublic().Account(), nil
+	res, err := crypto.DeriveKeysFromMasterNode(node)
+	if err != nil {
+		return nil, fmt.Errorf("derive account key: %w", err)
+	}
+	return res.Identity, nil
+}
+
+// accountKeyOnce derives a mnemonic's account key on first use and
+// hands out copies after.
+type accountKeyOnce struct {
+	once sync.Once
+	key  []byte
+	err  error
+}
+
+func (o *accountKeyOnce) get(mnemonic string, index uint32) ([]byte, error) {
+	o.once.Do(func() {
+		var priv crypto.PrivKey
+		if priv, o.err = deriveIdentity(mnemonic, index); o.err == nil {
+			o.key, o.err = priv.Raw()
+		}
+	})
+	if o.err != nil {
+		return nil, o.err
+	}
+	return slices.Clone(o.key), nil
 }
 
 // GenerateMnemonic returns a fresh 12-word BIP-39 mnemonic.
@@ -76,17 +130,14 @@ func GenerateDeviceKey(_ context.Context) ([]byte, error) {
 }
 
 type mnemonicProvider struct {
-	mnemonic  crypto.Mnemonic
-	index     uint32
-	deviceKey []byte
+	mnemonic   crypto.Mnemonic
+	index      uint32
+	deviceKey  []byte
+	accountKey accountKeyOnce
 }
 
 func (p *mnemonicProvider) AccountKey(_ context.Context) ([]byte, error) {
-	res, err := p.mnemonic.DeriveKeys(p.index)
-	if err != nil {
-		return nil, fmt.Errorf("derive account key: %w", err)
-	}
-	return res.Identity.Raw()
+	return p.accountKey.get(string(p.mnemonic), p.index)
 }
 
 func (p *mnemonicProvider) DeviceKey(_ context.Context) ([]byte, error) {

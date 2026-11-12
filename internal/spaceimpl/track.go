@@ -53,15 +53,36 @@ func (s *Service) Track(ctx context.Context, spaceId string) error {
 // opaque remote error; catching it here gives the caller an immediate,
 // attributable failure.
 func validateSpaceId(spaceId string) error {
-	dot := strings.LastIndexByte(spaceId, '.')
-	if dot <= 0 || dot == len(spaceId)-1 {
-		return fmt.Errorf("spaceimpl: %w: %q: want <cid>.<replication key>", space.ErrBadSpaceId, spaceId)
+	problem, cause := checkSpaceId(spaceId)
+	switch {
+	case problem == "":
+		return nil
+	case cause == nil:
+		return fmt.Errorf("spaceimpl: %w: %q: %s", space.ErrBadSpaceId, spaceId, problem)
+	default:
+		return fmt.Errorf("spaceimpl: %w: %q: %s: %w", space.ErrBadSpaceId, spaceId, problem, cause)
 	}
-	if _, err := cid.Decode(spaceId[:dot]); err != nil {
-		return fmt.Errorf("spaceimpl: %w: %q: bad cid: %w", space.ErrBadSpaceId, spaceId, err)
+}
+
+// isSpaceId reports whether id has the space-id shape, building no
+// error for the common miss.
+func isSpaceId(id string) bool {
+	problem, _ := checkSpaceId(id)
+	return problem == ""
+}
+
+// checkSpaceId names what keeps id from the `<cid>.<repKey-base36>`
+// shape, "" when it has it; cause is the parse error behind it, if any.
+func checkSpaceId(id string) (problem string, cause error) {
+	dot := strings.LastIndexByte(id, '.')
+	if dot <= 0 || dot == len(id)-1 {
+		return "want <cid>.<replication key>", nil
 	}
-	if _, err := strconv.ParseUint(spaceId[dot+1:], 36, 64); err != nil {
-		return fmt.Errorf("spaceimpl: %w: %q: bad replication key: %w", space.ErrBadSpaceId, spaceId, err)
+	if _, err := cid.Decode(id[:dot]); err != nil {
+		return "bad cid", err
 	}
-	return nil
+	if _, err := strconv.ParseUint(id[dot+1:], 36, 64); err != nil {
+		return "bad replication key", err
+	}
+	return "", nil
 }

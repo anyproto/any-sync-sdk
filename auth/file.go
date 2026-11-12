@@ -65,10 +65,11 @@ var ErrWrongPasskey = errors.New("decrypt wallet: wrong passkey or corrupted fil
 // Mnemonic so the caller can display it once on first generation for
 // the user to back up.
 type FileProvider struct {
-	path    string
-	passkey string
-	w       *wallet
-	created bool
+	path       string
+	passkey    string
+	w          *wallet
+	created    bool
+	accountKey accountKeyOnce
 }
 
 // NewFileProvider returns the default provider. On first use it
@@ -125,13 +126,9 @@ func (p *FileProvider) Created() bool { return p.created }
 // only surface to the user on first launch.
 func (p *FileProvider) Mnemonic() string { return p.w.Mnemonic }
 
-// AccountKey derives and returns the account private key.
+// AccountKey returns the account private key, derived on first use.
 func (p *FileProvider) AccountKey(_ context.Context) ([]byte, error) {
-	res, err := crypto.Mnemonic(p.w.Mnemonic).DeriveKeys(p.w.Index)
-	if err != nil {
-		return nil, fmt.Errorf("derive account key: %w", err)
-	}
-	return res.Identity.Raw()
+	return p.accountKey.get(p.w.Mnemonic, p.w.Index)
 }
 
 // DeviceKey returns the stored device private key (raw Ed25519).

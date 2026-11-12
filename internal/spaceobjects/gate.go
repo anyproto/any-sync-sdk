@@ -158,11 +158,14 @@ func (s *Store) afterApplyFor() object.AfterApply {
 
 		if s.engine != nil && s.engine.HasSubscribers() {
 			rowIds, postValue := s.postValueFor(ctx, obj, ch, ids)
-			var derivedOps [][]crdt.Op
+			var (
+				derivedOps [][]crdt.Op
+				rejections []crdt.OpRejection
+			)
 			if res != nil {
-				derivedOps = res.DerivedOps
+				derivedOps, rejections = res.DerivedOps, res.Rejections
 			}
-			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
+			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, rejections, postValue)
 			if obj != nil {
 				// A refill reads through the object the apply ran on.
 				ev.Source = obj
@@ -325,7 +328,7 @@ func (s *Store) emitObjectStampWith(_ context.Context, source any, spaceId, obje
 		VersionId: versionId,
 		Records:   []crdt.RecordChange{{Id: st.RowId}},
 	}
-	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, postValue)
+	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, nil, postValue)
 	if source != nil {
 		ev.Source = source
 	}

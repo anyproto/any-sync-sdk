@@ -171,8 +171,10 @@ type TypesAPI interface {
 	// type object's id.
 	Create(ctx context.Context, params TypeCreateParams) (typeId string, err error)
 
-	// Delete a type. Objects naming it in `any.type` keep the
-	// reference (orphan), per docs §"read tolerance".
+	// Delete a user type. Objects naming it in `any.type` keep the
+	// reference (orphan), per docs §"read tolerance". Built-in and
+	// registered types refuse (ErrTypeRegistered); any other id answers
+	// as Get does (a user collection ErrNotAType, else ErrNotFound).
 	Delete(ctx context.Context, typeId string) error
 
 	// Patch edits a user type's display and rendering metadata: name,
@@ -681,8 +683,10 @@ type CollectionsAPI interface {
 	// id.
 	Create(ctx context.Context, params CollectionCreateParams) (collectionId string, err error)
 
-	// Delete a collection. Objects listing it keep the reference
-	// (orphan), per docs §"read tolerance".
+	// Delete a user collection. Objects listing it keep the reference
+	// (orphan), per docs §"read tolerance". Built-in and registered
+	// collections refuse (ErrTypeRegistered); any other id answers as
+	// Get does (a user type ErrNotACollection, else ErrNotFound).
 	Delete(ctx context.Context, collectionId string) error
 
 	// Patch edits a user collection's display and listing metadata.

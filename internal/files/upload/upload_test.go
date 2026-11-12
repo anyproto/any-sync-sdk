@@ -437,9 +437,9 @@ func TestAddIntentMarkerLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	root, err := cid.Decode(res.RootCid)
 	require.NoError(t, err)
-	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
+	intents, err := st.Intents(ctx, spaceId, root)
 	require.NoError(t, err)
-	require.False(t, marked, "marker cleared after ref+job landed")
+	require.Empty(t, intents, "marker cleared after ref+job landed")
 
 	// Registration failure (standing in for a crash after the marker):
 	// the finalized CAR stays marked so GC pins and heals it.
@@ -455,10 +455,37 @@ func TestAddIntentMarkerLifecycle(t *testing.T) {
 		return true, nil
 	}))
 	require.True(t, orphanRoot.Defined(), "the finalized CAR exists unreferenced")
-	owner, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, orphanRoot))
+	intents, err = st.Intents(ctx, spaceId, orphanRoot)
 	require.NoError(t, err)
-	require.True(t, marked, "the orphan stays intent-marked for the sweep to heal")
-	require.Equal(t, "owner2", owner)
+	require.Len(t, intents, 1, "the orphan stays intent-marked for the sweep to heal")
+	require.Equal(t, "owner2", intents[0].OwnerId)
+}
+
+// Attaches of the same bytes keep separate markers: a bound attach that
+// completes clears only its own, never one a failed attach left.
+func TestAddBindKeepsAnotherAttachMarker(t *testing.T) {
+	ctx := context.Background()
+	s, st := newService(t, &fakeBroker{})
+	reg := newFakeRegistrar()
+	content := testContent(60_000)
+
+	donor, err := s.Add(ctx, reg, spaceId, "donor", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	root, err := cid.Decode(donor.RootCid)
+	require.NoError(t, err)
+
+	reg.registerErr = errors.New("register failed")
+	_, err = s.Add(ctx, reg, spaceId, "ownerB", bytes.NewReader(content), AddOpts{})
+	require.Error(t, err)
+	reg.registerErr = nil
+	bound, err := s.Add(ctx, reg, spaceId, "ownerL", bytes.NewReader(content), AddOpts{})
+	require.NoError(t, err)
+	require.True(t, bound.Bound)
+
+	intents, err := st.Intents(ctx, spaceId, root)
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	require.Equal(t, "ownerB", intents[0].OwnerId)
 }
 
 // TestAddBindUnsignedDonorEnqueues pins that a row bound to a
@@ -564,9 +591,9 @@ func TestAddNotWrittenDropsCar(t *testing.T) {
 	require.NoError(t, err)
 	_, err = st.Info(ctx, spaceId, root)
 	require.ErrorIs(t, err, store.ErrNotFound, "the refused CAR is dropped")
-	_, marked, err := st.GetKV(ctx, store.IntentKey(spaceId, root))
+	intents, err := st.Intents(ctx, spaceId, root)
 	require.NoError(t, err)
-	require.False(t, marked, "the refused CAR's marker is dropped")
+	require.Empty(t, intents, "the refused CAR's marker is dropped")
 }
 
 // On the bind path a registration that wrote no row leaves the donor's

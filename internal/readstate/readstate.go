@@ -1,12 +1,13 @@
 // Package readstate owns the per-space read/unread engine: the unread
-// entries, the per-object seen-heads frontier, per-tag counters, and
-// the transitions log backing the read-state feed. See
+// entries, the per-object seen-heads frontier and per-tag counters. See
 // docs/read-tracking-proposal.md.
 //
-// The engine persists three space-shared collections (one set per DB,
+// The engine persists two space-shared collections (one set per DB,
 // like _meta):
 //
-//   - _read_unread — one row per unread change, deleted when read.
+//   - _read_unread — one row per unread change, deleted when read. A
+//     row's stateSeq is the apply seq at which the change became unread
+//     here; UnreadSince pages the space's rows on it.
 //   - _read_state  — one row per tracked object: frontier heads,
 //     pending remote heads, per-tag counters, and the object's last
 //     stateSeq — the dirty-object feed (ChangedSince) reads THIS
@@ -37,6 +38,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -128,7 +130,9 @@ type Entry struct {
 	Tags      []string
 	Key       string
 	PrevIds   []string
-	StateSeq  uint64
+	// StateSeq orders entries by when they became unread on this
+	// device.
+	StateSeq uint64
 }
 
 // ObjectState is one dirty-object feed element: an object whose read
@@ -200,8 +204,20 @@ func (e *Engine) Open(ctx context.Context) error {
 		if err != nil {
 			return nil, err
 		}
+		// EnsureIndex takes a write transaction even for an index the
+		// collection already holds.
+		have := make(map[string]struct{})
+		for _, idx := range coll.GetIndexes() {
+			have[idx.Info().Name] = struct{}{}
+		}
+		var missing []anystore.IndexInfo
 		for _, idx := range indexes {
-			if err = coll.EnsureIndex(ctx, idx); err != nil {
+			if _, ok := have[idx.Name]; !ok {
+				missing = append(missing, idx)
+			}
+		}
+		if len(missing) > 0 {
+			if err = coll.EnsureIndex(ctx, missing...); err != nil {
 				return nil, err
 			}
 		}
@@ -210,6 +226,7 @@ func (e *Engine) Open(ctx context.Context) error {
 	unread, err := open(UnreadCollectionName,
 		anystore.IndexInfo{Name: "idx__read_ob_v", Fields: []string{fObject, fVersion}},
 		anystore.IndexInfo{Name: "idx__read_ob_k", Fields: []string{fObject, fKey}, Sparse: true},
+		anystore.IndexInfo{Name: "idx__read_sp_ss", Fields: []string{fSpace, fStateSeq}},
 	)
 	var state anystore.Collection
 	if err == nil {
@@ -1003,6 +1020,47 @@ func (e *Engine) ChangedSince(ctx context.Context, since uint64, limit int) ([]O
 	return out, nil
 }
 
+// UnreadSince returns the space's unread entries whose stateSeq exceeds
+// since, ascending by stateSeq, capped at limit (0 = no cap). Each entry
+// has its own stateSeq, so paging on the last one skips nothing.
+func (e *Engine) UnreadSince(ctx context.Context, since uint64, limit int) ([]Entry, error) {
+	if err := e.ready(); err != nil {
+		return nil, err
+	}
+	if since > math.MaxInt64 {
+		return nil, nil
+	}
+	it, err := e.unreadSinceQuery(since, limit).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var out []Entry
+	for it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, entryFromDoc(doc.Value()))
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (e *Engine) unreadSinceQuery(since uint64, limit int) anystore.Query {
+	filter := query.And{
+		query.Key{Path: []string{fSpace}, Filter: query.NewComp(query.CompOpEq, e.spaceId)},
+		query.Key{Path: []string{fStateSeq}, Filter: query.NewComp(query.CompOpGt, int(since))},
+	}
+	q := e.unread.Find(filter).Sort(fSpace, fStateSeq)
+	if limit > 0 {
+		q = q.Limit(uint(limit))
+	}
+	return q
+}
+
 // MaxStateSeq returns the highest stateSeq persisted for spaceId, 0
 // when the space has no read-state rows (or the table does not exist
 // yet). Read marks mint their stateSeq from the space's apply-sequence
@@ -1035,7 +1093,7 @@ func MaxStateSeq(ctx context.Context, db anystore.DB, spaceId string) (uint64, e
 // SubscribeState registers a best-effort ping fired after a committed
 // read-state change (new unread, mark, merge). cb runs synchronously
 // on the notifying path — keep it small. Cancel is idempotent. A
-// dropped ping is recovered by pulling TransitionsSince from the
+// dropped ping is recovered by pulling ChangedSince from the
 // consumer's cursor.
 func (e *Engine) SubscribeState(cb func(objectId string, stateSeq uint64)) (cancel func()) {
 	if cb == nil {

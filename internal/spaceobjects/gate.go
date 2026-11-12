@@ -188,7 +188,7 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// entry inside the committed tx; this fires the best-effort
 		// subscriber notification. Over-notifies (an apply whose
 		// classification changed nothing still pings) — consumers pull
-		// TransitionsSince and see an empty diff.
+		// ChangedSince and see an empty diff.
 		if s.readState != nil && s.readTrackingFor(ch.Dataset) != nil && !ch.Local && !ch.Injected {
 			s.readState.NotifyState(ch.ObjectId, applySeqOf(res))
 		}

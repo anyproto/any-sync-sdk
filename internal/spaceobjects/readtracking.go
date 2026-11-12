@@ -73,6 +73,36 @@ func (s *Store) trackedDatasets() map[string]*crdt.ReadTracking {
 // dataset in this space opted into tracking.
 func (s *Store) ReadState() *readstate.Engine { return s.readState }
 
+// UnreadSince pages the space's unread entries above seq, oldest
+// arrival first, and returns the cursor to resume from. A gen other
+// than the store's Generation starts at the present: no entries, and
+// the highest persisted apply seq. Every unread entry sits at or below
+// it and no later apply is stamped at or below it.
+func (s *Store) UnreadSince(ctx context.Context, gen string, seq uint64, limit int) ([]readstate.Entry, string, uint64, error) {
+	if s.readState == nil {
+		return nil, "", 0, readstate.ErrNotOpen
+	}
+	cur, err := s.Generation(ctx)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if gen != cur {
+		present, err := s.MaxApplySeq(ctx)
+		if err != nil {
+			return nil, "", 0, err
+		}
+		return nil, cur, present, nil
+	}
+	entries, err := s.readState.UnreadSince(ctx, seq, limit)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if n := len(entries); n > 0 {
+		seq = entries[n-1].StateSeq
+	}
+	return entries, cur, seq, nil
+}
+
 // readResolver backs the engine's gap traversal with any-sync's
 // persisted change storage — a point lookup, never a tree load. It
 // answers only from a resident space: the lookup runs inside the

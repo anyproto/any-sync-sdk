@@ -200,6 +200,9 @@ func (unsupportedReadState) ChangedSince(context.Context, uint64, int) ([]space.
 func (unsupportedReadState) UnreadSnapshot(context.Context, string) ([]space.UnreadChange, uint64, error) {
 	return nil, 0, errUnsupported("ReadState().UnreadSnapshot")
 }
+func (unsupportedReadState) UnreadSince(context.Context, space.ReadCursor, int) ([]space.UnreadChange, space.ReadCursor, error) {
+	return nil, space.ReadCursor{}, errUnsupported("ReadState().UnreadSince")
+}
 func (unsupportedReadState) UnreadCounts(context.Context, string) (map[string]int, error) {
 	return nil, errUnsupported("ReadState().UnreadCounts")
 }

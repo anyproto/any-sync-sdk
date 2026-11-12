@@ -110,7 +110,8 @@ Local, per space, in the space DB:
   versionId, addSeq, applySeq, recordIds, tags, supersede key, prevIds,
   stateSeq. The row is deleted when the change is read. `prevIds` is
   copied from the change at apply time, so the closure walk usually
-  needs no tree access.
+  needs no tree access. `stateSeq` is the apply seq at which the change
+  became unread here, indexed per space for `UnreadSince`.
 - `_read_state`: one row per tracked object: frontier heads, pending
   remote heads, per-tag counters, last stateSeq, seeded bit. Counters are
   maintained transactionally, so reading them is O(1).
@@ -172,6 +173,7 @@ type ReadStateAPI interface {
     Subscribe(cb func(objectId string, stateSeq uint64)) (cancel func())
     ChangedSince(ctx context.Context, since uint64, limit int) ([]ObjectReadState, error)
     UnreadSnapshot(ctx context.Context, objectId string) ([]UnreadChange, uint64, error)
+    UnreadSince(ctx context.Context, cur ReadCursor, limit int) ([]UnreadChange, ReadCursor, error)
     UnreadCounts(ctx context.Context, objectId string) (map[string]int, error) // per tag
     MarkRead(ctx context.Context, objectId string, changeIds []string) error
     MarkReadUpTo(ctx context.Context, objectId string, upTo crdt.VersionId) error
@@ -189,6 +191,39 @@ dirty objects; only a `Generation` change forces a full resync.
 `StateSeq` shares the per-space applySeq axis: a transition caused by an
 apply reuses that apply's ApplySeq; marks and merges allocate from the
 same allocator.
+
+**What became unread.** A consumer that turns new unread changes into
+notifications needs additions only, in the order they arrived on this
+device. A record's `_ver.id` cannot give that order: a change that merges
+into mid-history sorts below changes already seen. `UnreadSince` pages
+the space's unread entries by their `stateSeq`:
+
+```go
+type ReadCursor struct {
+    Generation string
+    StateSeq   uint64
+}
+```
+
+- It returns the changes that became unread after the cursor and still
+  are, across every tracked object, ascending by `StateSeq`, with the
+  cursor to resume from: the last returned change's, or the one passed in
+  when nothing came back.
+- A cursor from another `Generation`, the zero cursor included, starts at
+  the present: no changes, and a cursor at the space's highest persisted
+  apply seq. Every unread entry sits at or below it, and no later apply
+  is stamped at or below it.
+- The cursor is a value. A call is point reads and one indexed page, and
+  nothing is held between calls.
+- Entries keep their `stateSeq` across restarts and handler-version
+  rebuilds. A keyed change that replaces a still-unread entry (a re-edited
+  mention) is a new entry with its own: a consumer past the old one is
+  handed it.
+- The order is arrival on this device, not authorship. While a device
+  catches up (freshly linked, or back online) it lists history as it is
+  applied: a change the account read elsewhere is listed until that read
+  position is merged, and the account's unread backlog is listed in full.
+- Removals are not listed: counters, flags and `ChangedSince` carry them.
 
 A record-creating change's `versionId` equals the record's `_ver.id`, so
 unread entries join to records with no extra lookup.
@@ -321,6 +356,10 @@ with real commits, Ryzen 9950X):
 | Partial mark: 500 of 1 000 unread by versionId cutoff | 4.3 ms |
 | Boot reconcile per chat, nothing new | 2.3 µs (1 000 idle chats ≈ 2.4 ms) |
 | Per-tag counters from the engine | 1.6 µs per chat |
+
+The tracked-message and ReadAll rows do not include the
+`(space, stateSeq)` index, which adds one index write to each
+unread-entry insert and delete.
 
 ## Non-goals
 

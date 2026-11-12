@@ -57,6 +57,21 @@ func (r *readStateAPI) UnreadSnapshot(ctx context.Context, objectId string) ([]s
 	if err != nil {
 		return nil, 0, err
 	}
+	return unreadChanges(entries), stateSeq, nil
+}
+
+func (r *readStateAPI) UnreadSince(ctx context.Context, cur space.ReadCursor, limit int) ([]space.UnreadChange, space.ReadCursor, error) {
+	if r.engine() == nil {
+		return nil, space.ReadCursor{}, space.ErrReadTrackingDisabled
+	}
+	entries, gen, seq, err := r.parent.store.UnreadSince(ctx, cur.Generation, cur.StateSeq, limit)
+	if err != nil {
+		return nil, space.ReadCursor{}, err
+	}
+	return unreadChanges(entries), space.ReadCursor{Generation: gen, StateSeq: seq}, nil
+}
+
+func unreadChanges(entries []readstate.Entry) []space.UnreadChange {
 	out := make([]space.UnreadChange, len(entries))
 	for i, en := range entries {
 		out[i] = space.UnreadChange{
@@ -71,7 +86,7 @@ func (r *readStateAPI) UnreadSnapshot(ctx context.Context, objectId string) ([]s
 			StateSeq:  en.StateSeq,
 		}
 	}
-	return out, stateSeq, nil
+	return out
 }
 
 func (r *readStateAPI) UnreadCounts(ctx context.Context, objectId string) (map[string]int, error) {

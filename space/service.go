@@ -228,7 +228,8 @@ type Service interface {
 	// without creating or loading the space. Same id as Derive(...).Id()
 	// for the same request. Lets a consumer recompute a known derived
 	// space's id (from its own seed) to recognize or filter it
-	// client-side.
+	// client-side. The request is kept for the process lifetime: Get of
+	// that id builds missing storage from it.
 	DeriveId(ctx context.Context, req DeriveRequest) (string, error)
 
 	// OneToOne reaches out to — or explicitly accepts / un-declines — the
@@ -280,6 +281,12 @@ type Service interface {
 	// another of the account's devices (synced remote=active) is adopted
 	// transparently: Get materializes it locally, no per-device
 	// re-accept needed.
+	//
+	// A space with a row and no local storage is pulled from its nodes
+	// or a direct peer; with none reachable Get waits for ctx. A derived
+	// space is the exception: once DeriveId or Derive has computed its
+	// id in this process, Get builds the storage from the seed and
+	// needs no network.
 	//
 	// The account's own tech space id (SDK.TechSpaceId) returns a
 	// restricted handle: reads, dataset declarations on bundle roots,

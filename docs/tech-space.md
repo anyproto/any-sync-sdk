@@ -185,6 +185,12 @@ rows, the handler rejects `remoteStatus=deleted` on them from any writer,
 and the deletion reconciler skips them. Absent on created, joined,
 tracked and 1-1 rows; surfaced as `SpaceInfo.Derived`.
 
+The row carries no seed. A device that holds the row and no storage
+builds the storage locally in `Spaces().Get` once `DeriveId` or `Derive`
+has computed that id in the running process; a host calls `DeriveId` for
+each of its well-known seeds after `Open`. Without it `Get` pulls the
+space from its nodes and waits while none is reachable.
+
 ### Identities directory (`identities` dataset)
 
 Account-global directory of every identity seen across spaces, 1-1s and

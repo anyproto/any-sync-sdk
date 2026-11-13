@@ -1,7 +1,6 @@
 package spaceimpl
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -137,9 +136,6 @@ type Service struct {
 	// first Get(techSpaceId). One instance per process: its bundles
 	// API holds per-id install locks.
 	techSpace *techSpace
-	// derivations holds the request behind every space id DeriveId or
-	// Derive computed in this process. Get builds missing storage from it.
-	derivations map[string]space.DeriveRequest
 
 	// spaceIndexIds caches the deterministic spaceIndex object id per
 	// spaceId so SetMetadata / Info-side reads don't re-derive on every
@@ -277,7 +273,6 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		allocs:              make(map[string]*object.VersionAllocator),
 		gapSets:             make(map[string]*spaceobjects.GapSet),
 		building:            make(map[string]chan struct{}),
-		derivations:         make(map[string]space.DeriveRequest),
 		spaceIndexIds:       make(map[string]string),
 		spaceIndexWatchers:  make(map[string]*spaceIndexWatcher),
 		oneToOneKeyWatchers: make(map[string]*oneToOneKeysWatcher),
@@ -924,14 +919,6 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 		(rec.LocalStatus == "" || rec.LocalStatus == oneToOnePendingLocalStatus) {
 		return s.AcceptOneToOne(ctx, spaceId)
 	}
-	// A derived space another of this account's devices created: the row
-	// synced in, the storage did not. Build it from the seed — a bare
-	// load would wait for a node to pull it from.
-	if req, ok := s.derivation(spaceId); ok && !s.app.SpaceExists(spaceId) {
-		if _, err := s.loadDerived(ctx, req); err != nil {
-			return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
-		}
-	}
 	return s.load(ctx, spaceId)
 }
 
@@ -1407,11 +1394,24 @@ func (s *Service) SubscribeStatus(cb func(space.SpaceSyncStatus)) (cancel func()
 // repeat calls are idempotent and just return the existing space if
 // it already exists locally.
 func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Space, error) {
-	// Load (creating storage on first derive) BEFORE writing the active
-	// row — an active row without storage is a state Get heals only
-	// while this process knows the seed (see activateOneToOne).
-	spaceId, err := s.loadDerived(ctx, req)
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
+	}
+	storageCreate, err := spacepayloads.StoragePayloadForSpaceDeriveV1(s.derivePayload(keys, req))
 	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: derive: %w", err)
+	}
+	spaceId := storageCreate.SpaceHeaderWithId.Id
+	// Storage creation rides the GetSpace cache load below (see
+	// ctxWithCreatePayload): derived ids are deterministic, so an
+	// out-of-band exists-check + create here would let two concurrent
+	// Derives of the same seed race the storage create.
+	ctx = ctxWithCreatePayload(ctx, storageCreate)
+	// Load (creating storage from the armed ctx on first derive) BEFORE
+	// writing the active row — an active row without storage is a state
+	// plain Get can't heal (see activateOneToOne).
+	if _, err := s.app.GetSpaceCreating(ctx, spaceId); err != nil {
 		return nil, err
 	}
 	if rec, ok := s.tsp.Get(ctx, spaceId); !ok {
@@ -1445,48 +1445,6 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	return sp, nil
 }
 
-// loadDerived loads the space req derives and returns its id. A device
-// with no storage for it builds the storage from the seed; no node is
-// asked.
-func (s *Service) loadDerived(ctx context.Context, req space.DeriveRequest) (string, error) {
-	keys := s.app.AccountKeys()
-	if keys == nil {
-		return "", errors.New("spaceimpl: anysyncx app has no account keys")
-	}
-	storageCreate, err := spacepayloads.StoragePayloadForSpaceDeriveV1(s.derivePayload(keys, req))
-	if err != nil {
-		return "", fmt.Errorf("spaceimpl: derive: %w", err)
-	}
-	spaceId := storageCreate.SpaceHeaderWithId.Id
-	s.rememberDerivation(spaceId, req)
-	// Storage creation rides the GetSpace cache load (see
-	// ctxWithCreatePayload): derived ids are deterministic, so an
-	// out-of-band exists-check + create here would let two concurrent
-	// loads of the same seed race the storage create.
-	if _, err := s.app.GetSpaceCreating(ctxWithCreatePayload(ctx, storageCreate), spaceId); err != nil {
-		return "", err
-	}
-	return spaceId, nil
-}
-
-// rememberDerivation records the request spaceId derives from.
-func (s *Service) rememberDerivation(spaceId string, req space.DeriveRequest) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.derivations[spaceId]; !ok {
-		s.derivations[spaceId] = space.DeriveRequest{Seed: bytes.Clone(req.Seed), SpaceType: req.SpaceType}
-	}
-}
-
-// derivation returns the request spaceId derives from, when DeriveId or
-// Derive computed that id in this process.
-func (s *Service) derivation(spaceId string) (space.DeriveRequest, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	req, ok := s.derivations[spaceId]
-	return req, ok
-}
-
 // DeriveId returns the deterministic spaceId for req without creating
 // or loading the space — pure computation over the account keys and
 // seed. Same id as Derive(req).Id() for the same request.
@@ -1499,7 +1457,6 @@ func (s *Service) DeriveId(ctx context.Context, req space.DeriveRequest) (string
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: derive id: %w", err)
 	}
-	s.rememberDerivation(id, req)
 	return id, nil
 }
 

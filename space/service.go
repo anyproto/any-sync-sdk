@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrSpaceNotAccepted is returned by Service.Get for a space this
@@ -227,8 +228,7 @@ type Service interface {
 	// without creating or loading the space. Same id as Derive(...).Id()
 	// for the same request. Lets a consumer recompute a known derived
 	// space's id (from its own seed) to recognize or filter it
-	// client-side. The request is kept for the process lifetime: Get of
-	// that id builds missing storage from it.
+	// client-side.
 	DeriveId(ctx context.Context, req DeriveRequest) (string, error)
 
 	// OneToOne reaches out to — or explicitly accepts / un-declines — the
@@ -280,13 +280,6 @@ type Service interface {
 	// another of the account's devices (synced remote=active) is adopted
 	// transparently: Get materializes it locally, no per-device
 	// re-accept needed.
-	//
-	// A space with a row and no local storage is pulled from its nodes
-	// or a direct peer; with none reachable Get waits for ctx. A derived
-	// space is the exception: once DeriveId or Derive has computed its
-	// id in this process, Get builds the storage from the seed and
-	// needs no network. A pull of that id already in flight is joined,
-	// not replaced, so a host computes its ids right after Open.
 	//
 	// The account's own tech space id (SDK.TechSpaceId) returns a
 	// restricted handle: reads, dataset declarations on bundle roots,
@@ -507,6 +500,35 @@ type SpaceListEvent struct {
 	Added   []SpaceInfo
 	Updated []SpaceInfo
 	Removed []string
+}
+
+// AccountLimits is what the network grants the account. Returned by
+// Account().Limits. A part is nil while the network has never answered
+// for it on this device; Storage also on a network that has no file
+// nodes or keeps no account pool.
+type AccountLimits struct {
+	Storage      *StorageLimits
+	SharedSpaces *SharedSpacesLimits
+}
+
+// StorageLimits is the account's file-storage pool: every file is
+// charged to its uploader, across all spaces. The file nodes account
+// the pool on their own schedule, so a new grant or a finished backup
+// shows some minutes later.
+type StorageLimits struct {
+	// LimitBytes is the pool's cap; 0 when the network grants none.
+	LimitBytes uint64
+	// UsageBytes is the durable usage across the account's spaces.
+	UsageBytes uint64
+	// FetchedAt is when the network gave this answer.
+	FetchedAt time.Time
+}
+
+// SharedSpacesLimits bounds the shared spaces the account owns.
+type SharedSpacesLimits struct {
+	Limit uint32
+	// FetchedAt is when the network gave this answer.
+	FetchedAt time.Time
 }
 
 // AccountMetadata is the owner/member metadata attached to ACL join

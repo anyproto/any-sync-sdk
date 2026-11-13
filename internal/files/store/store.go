@@ -39,8 +39,8 @@ const (
 	// DedupCollection is the per-space whole-file dedup index:
 	// {id: "<spaceId>/<sha256 hex>", root, fileId}.
 	DedupCollection = "files_dedup"
-	// KVCollection holds small files-subsystem state ({id, v}) — e.g.
-	// the persisted publicReadBaseUrl per network.
+	// KVCollection holds small device-local state ({id, v}) — e.g. the
+	// persisted publicReadBaseUrl per network.
 	KVCollection = "files_kv"
 )
 
@@ -449,7 +449,7 @@ func (s *Store) LookupContent(ctx context.Context, spaceId string, sha256 []byte
 	}, true, nil
 }
 
-// SetKV persists one small files-subsystem value.
+// SetKV persists one small device-local value.
 func (s *Store) SetKV(ctx context.Context, key, value string) error {
 	mod := query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
 		v.Set("v", a.NewString(value))

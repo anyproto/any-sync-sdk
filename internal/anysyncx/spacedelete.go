@@ -2,6 +2,7 @@ package anysyncx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
@@ -43,4 +44,17 @@ func (a *App) SpaceStatuses(ctx context.Context, spaceIds []string) ([]*coordina
 		return nil, fmt.Errorf("anysyncx: StatusCheckMany: %w", err)
 	}
 	return statuses, nil
+}
+
+// SharedSpacesLimit fetches how many shared spaces the network lets
+// this account own.
+func (a *App) SharedSpacesLimit(ctx context.Context) (uint32, error) {
+	_, limits, err := a.coord.StatusCheckMany(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("anysyncx: StatusCheckMany: %w", err)
+	}
+	if limits == nil {
+		return 0, errors.New("anysyncx: coordinator reported no account limits")
+	}
+	return limits.SharedSpacesLimit, nil
 }

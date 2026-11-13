@@ -120,7 +120,7 @@ Implemented:
 - Tech space (per-account derived index of all spaces); spaces stay resident and are eager-loaded on boot; `Service.Subscribe` for space-list events
 - Space lifecycle: `Create` / `Join` / `JoinGuest` / `Derive` / `OneToOne` / `Get` / `List` / `Track` / `Evict` / `Delete`; direct-add and 1-1 accept/decline
 - Collaboration: `ACL` (`CreateInvite` / `RevokeInvite` / `RevokeAllInvites` / `AcceptRequest` / `DeclineRequest` / `ChangePermissions` / `AddAccounts` / `RemoveAccounts` / `OwnershipChange` / `RequestSelfRemove` / `CancelJoinRequest` / `StopSharing` / `CreateGuestKey`); `Members` (`List` / `Get` / `Me` / `JoinRequests` / `Invites` / `Subscribe` / `Query`)
-- Account: `Account.Metadata` / `UpdateMetadata`, persisted in the tech space and republished to identityRepo on boot; `SDK.Identities()` directory; devices
+- Account: `Account.Metadata` / `UpdateMetadata`, persisted in the tech space and republished to identityRepo on boot; `Account.Limits` — the network's file-storage pool and shared-spaces limit, served from the device's last answer while offline; `SDK.Identities()` directory; devices
 - Push notifications (`SDK.Push()`) and pub/sub (`SDK.PubSub()`, `Space.PubSub()`)
 - Direct sync with LAN peers (mDNS) and global peers (iroh, account-level discovery)
 - CRDT version mark: an SDK refuses an account written by a newer data model

@@ -367,7 +367,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// step — a failed Open must not leak goroutines polling a closed DB.
 	filesQueue.Run()
 	filesGC.Run(cfg.Files.GCInterval)
-	account := newAccountImpl(app, tsp, spaces)
+	account := newAccountImpl(app, tsp, spaces, filesBroker, filesStore)
 
 	// Headless: skip the account-facing boot work below — profile
 	// republish, the 1-1 inbox, identity resolution, pending-join
@@ -1079,6 +1079,22 @@ type AccountAPI interface {
 	// account holds the profile row but not yet the avatar's file row
 	// or its bytes.
 	OpenIcon(ctx context.Context) (space.FileReader, error)
+
+	// Limits returns what the network grants the account: the
+	// file-storage pool with its usage, and the shared-spaces limit.
+	// Each part is asked from the network, no more often than every
+	// ten seconds, and kept on the device. A call waits for the
+	// network no longer than five seconds, and not at all while the
+	// network is failing or slower than that: a part the network has
+	// not answered is the last answer it gave (FetchedAt says when),
+	// and the fetch goes on behind the call. A part is nil when there
+	// never was an answer — a device that has not reached the network,
+	// or a network without account pools — and Storage is nil on a
+	// network without file nodes. An unreachable network is never an
+	// error, and the caller's deadline only bounds the wait. The
+	// errors are the caller's cancellation and a failed read of the
+	// answer kept on the device.
+	Limits(ctx context.Context) (space.AccountLimits, error)
 }
 
 // accountImpl exposes the account-level surface. Id() returns the
@@ -1091,6 +1107,11 @@ type accountImpl struct {
 	app    *anysyncx.App
 	tsp    *techspace.Service
 	spaces *spaceimpl.Service
+	// limits is the network side of Limits; limitsKV keeps its answers.
+	limits             limitsSource
+	limitsKV           limitsKV
+	storageLimits      limitsPart[space.StorageLimits]
+	sharedSpacesLimits limitsPart[space.SharedSpacesLimits]
 	// pushMu serializes each local-profile-read/write → IdentityRepoPut
 	// sequence. The boot republish runs on the bootstrap goroutine,
 	// concurrent with user calls; without the lock its in-flight put of
@@ -1130,9 +1151,12 @@ const (
 	profileSyncDebounce = 2 * time.Second
 )
 
-func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl.Service) *accountImpl {
+func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl.Service, files *broker.Client, kv limitsKV) *accountImpl {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &accountImpl{app: app, tsp: tsp, spaces: spaces, closeCtx: ctx, closeCancel: cancel}
+	a := &accountImpl{app: app, tsp: tsp, spaces: spaces, limitsKV: kv, closeCtx: ctx, closeCancel: cancel}
+	a.limits = networkLimits{app: app, files: files, spaceId: tsp.SpaceId, account: a.Id}
+	a.initLimits()
+	return a
 }
 
 // close stops the background pushes and joins them. Called by
@@ -1142,6 +1166,8 @@ func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl
 func (a *accountImpl) close() {
 	a.closeOnce.Do(a.closeCancel)
 	a.stopIconWatch()
+	a.storageLimits.stop()
+	a.sharedSpacesLimits.stop()
 	a.wg.Wait()
 }
 

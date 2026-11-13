@@ -22,29 +22,24 @@ nodes:
   - 127.0.0.1:4432
   types:
   - tree
-- peerId: 12D3KooWQxiZ5a7vcy4DTJa8Gy1eVUmwb5ojN4SrJC9Rjxzigw6C
+- peerId: 12D3KooWALugeH6MKUszcqczFTdHjL22YvGW3wsRDHkb6C2Pgtgk
   addresses:
   - 127.0.0.1:4730
   types:
   - file
-- peerId: 12D3KooWNT4hbNKXeFuDtdQ13ZbhQ1oJJ2AVWgAQVRrCj6Zb5wxk
-  addresses:
-  - 127.0.0.1:4530
-  types:
-  - consensus
 - peerId: 12D3KooWCZ6ECPTSNz5ibuVg2qNYfkV6VFDkAqDRXMJcDfBiMsMK
   addresses:
   - 127.0.0.1:4740
   types:
   - fileV2
-- peerId: 12D3KooWAxi514CuA7Vizhuoay3pdpfGvsPDsecCqyb9xnDBiy5A
+- peerId: 12D3KooWNT4hbNKXeFuDtdQ13ZbhQ1oJJ2AVWgAQVRrCj6Zb5wxk
   addresses:
-  - 127.0.0.1:4741
+  - 127.0.0.1:4530
   types:
-  - fileV2
-- peerId: 12D3KooWP7F8umLMEphKNAraxUUQwETx5hDPZ9jRBWGvaMuHTvHK
+  - consensus
+- peerId: 12D3KooWJBKizwWxARVadgUcpXa4TthFTtKJQYECGFFrfpqyZ3t9
   addresses:
-  - 127.0.0.1:4742
+  - 127.0.0.1:8830
   types:
-  - fileV2
+  - paymentProcessingNode
 creationTime: '2023-04-13T20:29:23+02:00'

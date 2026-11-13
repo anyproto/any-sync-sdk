@@ -52,6 +52,7 @@ func TestOpen_NotOpenGate(t *testing.T) {
 		"Counts":        func() error { _, err := e.Counts(ctx, "obj"); return err },
 		"Frontier":      func() error { _, _, err := e.Frontier(ctx, "obj"); return err },
 		"ChangedSince":  func() error { _, err := e.ChangedSince(ctx, 0, 0); return err },
+		"UnreadSince":   func() error { _, err := e.UnreadSince(ctx, 0, 0); return err },
 		"MarkSeeded":    func() error { return e.MarkSeeded(ctx, "obj") },
 		"SeedFrontier":  func() error { _, err := e.SeedFrontier(ctx, "obj", []string{"c1"}); return err },
 	}
@@ -64,4 +65,45 @@ func TestOpen_NotOpenGate(t *testing.T) {
 	seeded, err := e.Seeded(ctx, "obj")
 	require.NoError(t, err)
 	require.False(t, seeded)
+}
+
+// Once a database holds the collections and their indexes, opening
+// another space's engine on it takes no write transaction: it completes
+// while one is held.
+func TestOpen_ExistingIndexesTakeNoWriteTx(t *testing.T) {
+	f := newFixture(t)
+	other := New(f.db, "space2", nil, nil, nil)
+	opened := make(chan error, 1)
+	err := f.WriteTx(ctx, func(context.Context) error {
+		go func() { opened <- other.Open(ctx) }()
+		select {
+		case err := <-opened:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Open waited on the held write tx")
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+// A database written before an index existed gets it on Open.
+func TestOpen_AddsMissingIndex(t *testing.T) {
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "readstate.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	coll, err := db.Collection(ctx, UnreadCollectionName)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		anystore.IndexInfo{Name: "idx__read_ob_v", Fields: []string{fObject, fVersion}},
+		anystore.IndexInfo{Name: "idx__read_ob_k", Fields: []string{fObject, fKey}, Sparse: true},
+	))
+
+	e := New(db, "space1", nil, nil, nil)
+	require.NoError(t, e.Open(ctx))
+	var names []string
+	for _, idx := range e.unread.GetIndexes() {
+		names = append(names, idx.Info().Name)
+	}
+	require.ElementsMatch(t, []string{"idx__read_ob_v", "idx__read_ob_k", "idx__read_sp_ss"}, names)
 }

@@ -3,6 +3,7 @@ package readstate
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -517,4 +518,138 @@ func TestMaxStateSeq_CoversReadMarks(t *testing.T) {
 	other, err := MaxStateSeq(ctx, f.db, "space2")
 	require.NoError(t, err)
 	assert.Zero(t, other, "scoped to the space")
+}
+
+func changeIds(entries []Entry) []string {
+	out := make([]string, len(entries))
+	for i, en := range entries {
+		out[i] = en.ChangeId
+	}
+	return out
+}
+
+// applied tracks a change the way an apply does: at the next seq of
+// the allocator marks share.
+func (f *fixture) applied(t *testing.T, tr Track) uint64 {
+	t.Helper()
+	f.seq++
+	tr.ApplySeq = f.seq
+	f.track(t, tr)
+	return tr.ApplySeq
+}
+
+// The order is the order changes became unread here, across objects: a
+// change that merges into mid-history (c3, the lowest versionId) comes
+// last.
+func TestUnreadSince_ArrivalOrder(t *testing.T) {
+	f := newFixture(t)
+	start := f.seq
+	s1 := f.applied(t, mkTrack("a", "c1", "v05", nil, "message"))
+	s2 := f.applied(t, mkTrack("b", "c2", "v01", nil, "message"))
+	s3 := f.applied(t, mkTrack("a", "c3", "v02", nil, "message"))
+
+	all, err := f.UnreadSince(ctx, start, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c1", "c2", "c3"}, changeIds(all))
+	assert.Equal(t, s3, all[2].StateSeq)
+
+	after, err := f.UnreadSince(ctx, s1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c2", "c3"}, changeIds(after))
+
+	none, err := f.UnreadSince(ctx, s3, 0)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+
+	page, err := f.UnreadSince(ctx, start, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c1", "c2"}, changeIds(page))
+	assert.Equal(t, s2, page[1].StateSeq)
+	page, err = f.UnreadSince(ctx, s2, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c3"}, changeIds(page))
+
+	out, err := f.UnreadSince(ctx, math.MaxUint64, 0)
+	require.NoError(t, err)
+	assert.Empty(t, out, "a seq past the axis has nothing above it")
+}
+
+// Marks and deletes allocate from the same axis and leave the entries
+// they do not cover where they were.
+func TestUnreadSince_OnlyStillUnread(t *testing.T) {
+	f := newFixture(t)
+	start := f.seq
+	f.applied(t, mkTrack("a", "c1", "v01", nil, "message"))
+	s2 := f.applied(t, mkTrack("a", "c2", "v02", nil, "message"))
+	f.applied(t, mkTrack("b", "c3", "v01", nil, "message"))
+
+	_, err := f.MarkReadUpTo(ctx, "a", "v01")
+	require.NoError(t, err)
+	require.NoError(t, f.ClearRecords(ctx, "b", []string{"rec-c3"}, 0))
+
+	left, err := f.UnreadSince(ctx, start, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c2"}, changeIds(left))
+	assert.Equal(t, s2, left[0].StateSeq)
+
+	s4 := f.applied(t, mkTrack("a", "c4", "v03", nil, "message"))
+	assert.Greater(t, s4, s2)
+	next, err := f.UnreadSince(ctx, s2, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c4"}, changeIds(next))
+}
+
+// A change that replaces a still-unread entry is a new entry at its own
+// seq: a consumer past the first one is handed the second.
+func TestUnreadSince_SupersedeIsNewEntry(t *testing.T) {
+	f := newFixture(t)
+	start := f.seq
+	first := mkTrack("a", "e1", "v02", nil, "mention")
+	first.Key = "mention:m1"
+	s1 := f.applied(t, first)
+	second := mkTrack("a", "e2", "v03", nil, "mention")
+	second.Key = "mention:m1"
+	s2 := f.applied(t, second)
+
+	after, err := f.UnreadSince(ctx, s1, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"e2"}, changeIds(after))
+	assert.Equal(t, s2, after[0].StateSeq)
+	all, err := f.UnreadSince(ctx, start, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"e2"}, changeIds(all))
+}
+
+// Spaces share the collections of one DB.
+func TestUnreadSince_SpaceScoped(t *testing.T) {
+	f := newFixture(t)
+	other := New(f.db, "space2", nil, nil, nil)
+	require.NoError(t, other.Open(ctx))
+	f.applied(t, mkTrack("a", "c1", "v01", nil, "message"))
+	theirs := mkTrack("x", "c9", "v01", nil, "message")
+	theirs.ApplySeq = 9
+	require.NoError(t, other.TrackChange(ctx, theirs))
+
+	mine, err := f.UnreadSince(ctx, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c1"}, changeIds(mine))
+	got, err := other.UnreadSince(ctx, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c9"}, changeIds(got))
+}
+
+func TestUnreadSince_IndexServed(t *testing.T) {
+	f := newFixture(t)
+	for i := 0; i < 200; i++ {
+		f.applied(t, mkTrack(fmt.Sprintf("o%d", i%7), fmt.Sprintf("c%d", i), fmt.Sprintf("v%03d", i), nil, "message"))
+	}
+	ex, err := f.unreadSinceQuery(f.seq-50, 10).Explain(ctx)
+	require.NoError(t, err)
+	used := ""
+	for _, ix := range ex.Indexes {
+		if ix.Used {
+			used = ix.Name
+		}
+	}
+	assert.Equal(t, "idx__read_sp_ss", used, ex.Plan)
 }

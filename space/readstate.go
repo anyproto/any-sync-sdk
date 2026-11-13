@@ -37,8 +37,18 @@ type UnreadChange struct {
 	// classifier's labels ("message", "mention", ...).
 	RecordIds []string
 	Tags      []string
-	// StateSeq is the feed watermark at which this entry became
-	// unread.
+	// StateSeq orders entries by when they became unread on this
+	// device.
+	StateSeq uint64
+}
+
+// ReadCursor positions a consumer on the space's unread feed
+// (ReadStateAPI.UnreadSince). The zero value starts at the present.
+type ReadCursor struct {
+	// Generation is the store epoch the cursor was issued in.
+	Generation string
+	// StateSeq is the position on the StateSeq axis: UnreadSince
+	// returns the changes above it.
 	StateSeq uint64
 }
 
@@ -53,7 +63,8 @@ type UnreadChange struct {
 // the durable catch-up returning dirty OBJECTS (state, not a log — it
 // never grows and never prunes); UnreadSnapshot is both the per-object
 // pull after a dirty mark and the full resync after a Generation
-// change.
+// change. A consumer that only needs what became unread (notifications)
+// pages UnreadSince instead.
 type ReadStateAPI interface {
 	// Subscribe fires after a committed read-state change for an
 	// object. cb runs synchronously on the notifying path — keep it
@@ -71,6 +82,16 @@ type ReadStateAPI interface {
 	// the per-object pull after a ChangedSince hit, and the cold
 	// start / resync entry point.
 	UnreadSnapshot(ctx context.Context, objectId string) ([]UnreadChange, uint64, error)
+
+	// UnreadSince returns the changes that became unread on this device
+	// after cur and still are, across the space's tracked objects,
+	// ascending by StateSeq and capped at limit (0 = no cap), with the
+	// cursor to resume from. A cursor from another Generation, the zero
+	// cursor included, starts at the present: no changes and a cursor
+	// past everything unread now. A change that replaces a still-unread
+	// one (a re-edited mention) is a new change: a consumer past the old
+	// one is handed it.
+	UnreadSince(ctx context.Context, cur ReadCursor, limit int) ([]UnreadChange, ReadCursor, error)
 
 	// UnreadCounts returns the object's per-tag unread counters.
 	UnreadCounts(ctx context.Context, objectId string) (map[string]int, error)

@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -418,6 +419,23 @@ func TestE2E_ReadTracking(t *testing.T) {
 	}) {
 		t.Fatalf("member device 3 never landed on the account's real read state (m7 unread, rest read)")
 	}
+	// The fresh device's unread feed from the start of its axis: the
+	// read history dropped out with the merged frontier, the account's
+	// unread backlog is listed.
+	gen3, err := m3Sp.ReadState().Generation(ctx)
+	require.NoError(t, err)
+	m3Feed := func() (records [][]string, tags [][]string) {
+		t.Helper()
+		news, _, nerr := m3Sp.ReadState().UnreadSince(ctx, space.ReadCursor{Generation: gen3}, 0)
+		require.NoError(t, nerr)
+		for _, ch := range news {
+			records = append(records, ch.RecordIds)
+			tags = append(tags, ch.Tags)
+		}
+		return records, tags
+	}
+	records, _ := m3Feed()
+	require.Equal(t, [][]string{{"m7"}}, records, "member device 3: unread feed")
 
 	// ---- (8) Audience-restricted entries (ReadClassification.Audience):
 	// a reaction counts unread ONLY on the replica whose account
@@ -455,6 +473,16 @@ func TestE2E_ReadTracking(t *testing.T) {
 		return reactionCount(mSp) == 1
 	}) {
 		t.Fatalf("member: reaction on the member's message never counted unread")
+	}
+	// On the fresh device the reaction arrives after the backlog.
+	if !waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = m3Sp.SyncHeads(ctx)
+		records, tags := m3Feed()
+		return len(records) == 2 && slices.Equal(records[1], []string{"m4"}) &&
+			slices.Equal(tags[1], []string{rtTagReaction})
+	}) {
+		records, tags := m3Feed()
+		t.Fatalf("member device 3: unread feed = %v %v, want m7 then the reaction on m4", records, tags)
 	}
 
 	// Owner reacts to its OWN m1: the member is not the audience — the

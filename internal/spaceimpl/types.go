@@ -456,8 +456,8 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 // config.Config.Types — both are statically declared at SDK init and
 // don't live in the space's tree storage.
 //
-// Reads from the per-space `objects` collection in any-store. No
-// any-sync calls.
+// Reads from the per-space `objects` collection in any-store; an id
+// with no live row also reads its tree's deleted flag.
 func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyTypeInfo(), nil

@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -1047,4 +1048,79 @@ func TestE2E_BundleDeclarationTakesMarker(t *testing.T) {
 	info, err := sp.Types().Get(ctx, b.RootId)
 	require.NoError(t, err)
 	assert.Equal(t, "marker_heal", info.XKey)
+}
+
+// TestE2E_Collections_DeletedOnPeer: a type and a collection deleted on
+// one device read as deleted on the other once the deletion syncs —
+// distinct from an id the device never held.
+func TestE2E_Collections_DeletedOnPeer(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	yaml, confPath, err := loadAnySyncNetwork()
+	if err != nil {
+		t.Skipf("no any-sync network config available: %v", err)
+	}
+	t.Logf("using any-sync network config from %s", confPath)
+	if testing.Short() {
+		t.Skip("two-device e2e is slow; rerun without -short")
+	}
+	provider := newFixedSeedProvider(t)
+	open := func() *anysyncsdk.SDK {
+		sdk, oerr := anysyncsdk.Open(ctx, config.Config{
+			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Network: config.Network{NodeConfYAML: yaml},
+		}, provider)
+		require.NoError(t, oerr)
+		t.Cleanup(func() { _ = sdk.Close() })
+		return sdk
+	}
+
+	sdkA := open()
+	spA, err := sdkA.Spaces().Create(ctx, space.CreateRequest{Name: "DeletedOnPeer"})
+	if err != nil {
+		if isNoNetworkErr(err) {
+			t.Skipf("network unreachable on space create: %v", err)
+		}
+		t.Fatal(err)
+	}
+	typeId, err := spA.Types().Create(ctx, space.TypeCreateParams{Name: "Draft"})
+	require.NoError(t, err)
+	cId, err := spA.Collections().Create(ctx, space.CollectionCreateParams{Name: "Inbox"})
+	require.NoError(t, err)
+	_ = sdkA.Spaces().SyncSpaceList(ctx)
+	_ = spA.SyncHeads(ctx)
+
+	sdkB := open()
+	var spB space.Space
+	require.True(t, waitFor(ctx, 90*time.Second, 250*time.Millisecond, func() bool {
+		_ = sdkB.Spaces().SyncSpaceList(ctx)
+		got, gerr := sdkB.Spaces().Get(ctx, spA.Id())
+		if gerr != nil {
+			return false
+		}
+		spB = got
+		return true
+	}), "device B must see the space")
+	require.True(t, waitFor(ctx, 120*time.Second, 500*time.Millisecond, func() bool {
+		_ = spB.SyncHeads(ctx)
+		_, terr := spB.Types().Get(ctx, typeId)
+		_, cerr := spB.Collections().Get(ctx, cId)
+		return terr == nil && cerr == nil
+	}), "device B must receive the type and the collection")
+
+	require.NoError(t, spA.Types().Delete(ctx, typeId))
+	require.NoError(t, spA.Collections().Delete(ctx, cId))
+	_ = spA.SyncHeads(ctx)
+
+	require.True(t, waitFor(ctx, 120*time.Second, 500*time.Millisecond, func() bool {
+		_ = spB.SyncHeads(ctx)
+		_, terr := spB.Types().Get(ctx, typeId)
+		_, cerr := spB.Collections().Get(ctx, cId)
+		return errors.Is(terr, space.ErrObjectDeleted) && errors.Is(cerr, space.ErrObjectDeleted)
+	}), "device B must read the peer's deletion as deleted")
+	assert.ErrorIs(t, spB.Types().Delete(ctx, typeId), space.ErrObjectDeleted)
+	assert.ErrorIs(t, spB.Objects().Delete(ctx, cId), space.ErrObjectDeleted)
+	_, err = spB.Types().Get(ctx, "bafyreinosuchtype")
+	assert.ErrorIs(t, err, space.ErrNotFound, "an id never held stays not found")
 }

@@ -16,9 +16,11 @@ import (
 var ErrTypeRequired = errors.New("space: an object needs a type")
 
 // ErrObjectDeleted is returned by ObjectService.Get for an object
-// whose tree any-sync records as deleted — here or on a peer, and by
-// Derive for a ParentId in that state. Distinct from ErrNotFound: the
-// id existed and is gone for good.
+// whose tree any-sync records as deleted — here or on a peer — by
+// Derive for a ParentId in that state, by Delete for an id already
+// deleted, and by the Get and Delete of TypesAPI and CollectionsAPI
+// for a deleted id. Distinct from ErrNotFound: the id existed and is
+// gone for good.
 var ErrObjectDeleted = errors.New("space: object deleted")
 
 // ErrObjectNotFound is returned by a per-object operation that has to
@@ -62,7 +64,8 @@ type ObjectService interface {
 	Derive(ctx context.Context, opts DeriveObjectOpts) (objectId string, err error)
 
 	// Delete marks the object as deleted (any-sync settings tree) and
-	// wipes local any-store state. See docs/object.md §"Deletion".
+	// wipes local any-store state; ErrObjectDeleted for an id already
+	// deleted. See docs/object.md §"Deletion".
 	Delete(ctx context.Context, objectId string) error
 }
 

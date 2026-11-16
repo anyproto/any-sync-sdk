@@ -9,6 +9,7 @@ import (
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/settings"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/anyencx"
@@ -379,6 +380,9 @@ func (o *objectService) Delete(ctx context.Context, objectId string) error {
 		return fmt.Errorf("spaceimpl: get space: %w", err)
 	}
 	if err := handle.Inner().DeleteTree(ctx, objectId); err != nil {
+		if errors.Is(err, settings.ErrAlreadyDeleted) {
+			return fmt.Errorf("spaceimpl: DeleteTree %s: %w: %w", objectId, space.ErrObjectDeleted, err)
+		}
 		return fmt.Errorf("spaceimpl: DeleteTree %s: %w", objectId, err)
 	}
 	// Local reclaim, so the object leaves local reads before Delete

@@ -10,7 +10,6 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-sync/commonspace/settings"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
@@ -450,8 +449,9 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 	return out, nil
 }
 
-// Get returns one type's display metadata or space.ErrNotFound when
-// the id isn't a meta-type instance on this space. Special-cases the
+// Get returns one type's display metadata, space.ErrObjectDeleted for
+// a deleted id, or space.ErrNotFound when the id isn't a meta-type
+// instance on this space. Special-cases the
 // synthetic `any` built-in and any caller-registered type from
 // config.Config.Types — both are statically declared at SDK init and
 // don't live in the space's tree storage.
@@ -481,13 +481,13 @@ func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, erro
 	doc, err := coll.FindId(ctx, typeId)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
-			return space.TypeInfo{}, space.ErrNotFound
+			return space.TypeInfo{}, definitionMiss(ctx, t.parent, typeId)
 		}
 		return space.TypeInfo{}, fmt.Errorf("typesAPI: find %s: %w", typeId, err)
 	}
 	v := doc.Value()
 	if v == nil || v.Get(crdt.DeletedAtField) != nil {
-		return space.TypeInfo{}, space.ErrNotFound
+		return space.TypeInfo{}, definitionMiss(ctx, t.parent, typeId)
 	}
 	switch markerOf(v) {
 	case typetype.MetaTypeMarker:
@@ -652,17 +652,21 @@ func (t *typesAPI) Delete(ctx context.Context, typeId string) error {
 	if _, err := t.Get(ctx, typeId); err != nil {
 		return err
 	}
-	return deleteDefinition(ctx, t.parent, typeId)
+	return t.parent.objects.Delete(ctx, typeId)
 }
 
-// deleteDefinition deletes a type or collection object the caller has
-// looked up; one already deleted meanwhile is ErrNotFound.
-func deleteDefinition(ctx context.Context, parent *spaceImpl, id string) error {
-	err := parent.objects.Delete(ctx, id)
-	if errors.Is(err, settings.ErrAlreadyDeleted) {
-		return fmt.Errorf("%w: %q: %w", space.ErrNotFound, id, err)
+// definitionMiss classifies a type or collection id that has no live
+// objects row: the row of a deleted object is purged, so the tree's
+// deleted flag tells it apart from an unknown id.
+func definitionMiss(ctx context.Context, parent *spaceImpl, id string) error {
+	deleted, err := parent.store.TreeDeleted(ctx, id)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: %s: deleted status: %w", id, err)
 	}
-	return err
+	if deleted {
+		return fmt.Errorf("spaceimpl: %q: %w", id, space.ErrObjectDeleted)
+	}
+	return space.ErrNotFound
 }
 
 // builtInMetaCollectionProperties translates collectiontype.Properties

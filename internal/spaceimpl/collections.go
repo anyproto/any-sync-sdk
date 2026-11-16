@@ -148,8 +148,8 @@ func (c *collectionsAPI) List(ctx context.Context) ([]space.CollectionInfo, erro
 	return out, nil
 }
 
-// Get returns one collection, or space.ErrNotFound — a type id
-// included: the two surfaces never alias.
+// Get returns one collection; space.ErrNotACollection for a type id,
+// space.ErrObjectDeleted for a deleted id, space.ErrNotFound otherwise.
 func (c *collectionsAPI) Get(ctx context.Context, id string) (space.CollectionInfo, error) {
 	if id == collectiontype.TypeId {
 		return builtInMetaCollectionInfo(), nil
@@ -164,13 +164,13 @@ func (c *collectionsAPI) Get(ctx context.Context, id string) (space.CollectionIn
 	doc, err := coll.FindId(ctx, id)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
-			return space.CollectionInfo{}, space.ErrNotFound
+			return space.CollectionInfo{}, definitionMiss(ctx, c.parent, id)
 		}
 		return space.CollectionInfo{}, fmt.Errorf("collectionsAPI: find %s: %w", id, err)
 	}
 	v := doc.Value()
 	if v == nil || v.Get(crdt.DeletedAtField) != nil {
-		return space.CollectionInfo{}, space.ErrNotFound
+		return space.CollectionInfo{}, definitionMiss(ctx, c.parent, id)
 	}
 	switch markerOf(v) {
 	case collectiontype.MetaMarker:
@@ -191,7 +191,7 @@ func (c *collectionsAPI) Delete(ctx context.Context, id string) error {
 	if _, err := c.Get(ctx, id); err != nil {
 		return err
 	}
-	return deleteDefinition(ctx, c.parent, id)
+	return c.parent.objects.Delete(ctx, id)
 }
 
 // Patch rewrites a user collection's display and listing metadata in

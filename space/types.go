@@ -165,6 +165,8 @@ type TypesAPI interface {
 	PropertyDefsAPI
 
 	List(ctx context.Context) ([]TypeInfo, error)
+	// Get returns one type; ErrNotAType for a collection id,
+	// ErrObjectDeleted for a deleted id, ErrNotFound otherwise.
 	Get(ctx context.Context, typeId string) (TypeInfo, error)
 
 	// Create a new user-defined type in this space. Returns the new
@@ -174,7 +176,8 @@ type TypesAPI interface {
 	// Delete a user type. Objects naming it in `any.type` keep the
 	// reference (orphan), per docs §"read tolerance". Built-in and
 	// registered types refuse (ErrTypeRegistered); any other id answers
-	// as Get does (a user collection ErrNotAType, else ErrNotFound).
+	// as Get does (a user collection ErrNotAType, a deleted id
+	// ErrObjectDeleted, else ErrNotFound).
 	Delete(ctx context.Context, typeId string) error
 
 	// Patch edits a user type's display and rendering metadata: name,
@@ -676,7 +679,7 @@ type CollectionsAPI interface {
 	// are included; the consumer filters.
 	List(ctx context.Context) ([]CollectionInfo, error)
 	// Get returns one collection; ErrNotACollection for a type id,
-	// ErrNotFound for anything else.
+	// ErrObjectDeleted for a deleted id, ErrNotFound otherwise.
 	Get(ctx context.Context, collectionId string) (CollectionInfo, error)
 
 	// Create a new user-defined collection. Returns the new object's
@@ -686,7 +689,8 @@ type CollectionsAPI interface {
 	// Delete a user collection. Objects listing it keep the reference
 	// (orphan), per docs §"read tolerance". Built-in and registered
 	// collections refuse (ErrTypeRegistered); any other id answers as
-	// Get does (a user type ErrNotACollection, else ErrNotFound).
+	// Get does (a user type ErrNotACollection, a deleted id
+	// ErrObjectDeleted, else ErrNotFound).
 	Delete(ctx context.Context, collectionId string) error
 
 	// Patch edits a user collection's display and listing metadata.

@@ -248,6 +248,8 @@ func TestE2E_TechBundle_EntriesConvergeAndRestore(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, space.ErrUnsupported, "ResolveLoser must be wired on the tech handle")
 	require.NoError(t, techA.Objects().Delete(ctx, pins.RootId), "uninstall: delete the created winner")
+	require.ErrorIs(t, techA.Objects().Delete(ctx, pins.RootId), space.ErrObjectDeleted,
+		"a second delete reports the deletion, not a root still syncing")
 	_, err = techA.Bundles().Get(ctx, "pins/v1")
 	require.ErrorIs(t, err, space.ErrBundleUnknown, "deleted winner reads as uninstalled")
 	pins2, didInstall, err := techA.Bundles().Ensure(ctx, space.EnsureBundleRequest{

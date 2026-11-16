@@ -305,6 +305,15 @@ func (x techObjects) Get(ctx context.Context, objectId string) (*anyenc.Value, e
 }
 
 func (x techObjects) Delete(ctx context.Context, objectId string) error {
+	// A deleted root's row is purged while the add-only registry still
+	// lists it, which isBundleRoot reads as a root not synced yet.
+	deleted, err := x.inner.parent.store.TreeDeleted(ctx, objectId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: tech Objects().Delete: deleted status: %w", err)
+	}
+	if deleted {
+		return fmt.Errorf("spaceimpl: tech Objects().Delete %s: %w", objectId, space.ErrObjectDeleted)
+	}
 	ok, err := x.t.isBundleRoot(ctx, objectId)
 	if err != nil {
 		return fmt.Errorf("spaceimpl: tech Objects().Delete: %w", err)

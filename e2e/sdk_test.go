@@ -536,6 +536,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	require.NoError(t, sp.Objects().Delete(ctx, objectId))
 	_, err = sp.Objects().Get(ctx, objectId)
 	require.ErrorIs(t, err, space.ErrObjectDeleted)
+	require.ErrorIs(t, sp.Objects().Delete(ctx, objectId), space.ErrObjectDeleted, "a second delete reports the deletion")
 
 	// A per-object op has to open the tree, and the deleted object has
 	// none: ErrObjectNotFound, so a consumer answers "not found"

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
@@ -38,7 +39,8 @@ func oldFormatSDKDB(t *testing.T) string {
 }
 
 // crashedSDKDB is oldFormatSDKDB as a process killed after a write leaves
-// it: the document "inlog" is only in the file's log.
+// it: the document "inlog" is only in the file's log. Windows does not let
+// an open database file be read, so there the write is checkpointed.
 func crashedSDKDB(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
@@ -48,6 +50,10 @@ func crashedSDKDB(t *testing.T) string {
 	coll, err := db.OpenCollection(ctx, "things")
 	require.NoError(t, err)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"inlog","n":50,"text":"x"}`)))
+	if runtime.GOOS == "windows" {
+		require.NoError(t, db.Close())
+		return src
+	}
 
 	// The database file and its log as they are with the handle open.
 	path := filepath.Join(t.TempDir(), "sdk.db")

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -201,35 +201,35 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// DB, owned by any-sync). The SDK's CRDT state lives at
 	// <DataDir>/sdk.db (v2 DB, owned by us) — separate file so the
 	// two any-store versions don't share schema/state.
+	sdkDBPath := filepath.Join(cfg.Storage.DataDir, "sdk.db")
 	cfg.Storage.DataDir = filepath.Join(cfg.Storage.DataDir, "anysync")
+
+	// An existing sdk.db opens before any-sync starts: moving it onto the
+	// latest on-disk format can take minutes, and a started app answers
+	// peers before the space registry is wired. So it is opened, and
+	// moved, before the provider is asked for keys. A new account's file
+	// is created once the app has made the data dir.
+	var db anystore.DB
+	if _, statErr := os.Stat(sdkDBPath); statErr == nil {
+		var err error
+		if db, err = openSDKDB(ctx, sdkDBPath); err != nil {
+			return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)
+		}
+	}
 
 	app, err := anysyncx.New(ctx, cfg, provider)
 	if err != nil {
+		if db != nil {
+			_ = db.Close()
+		}
 		return nil, err
 	}
 
-	sdkDBPath := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "sdk.db")
-	InitPageBuffer()
-	db, err := anystore.Open(ctx, sdkDBPath, &anystore.Config{
-		UseGlobalPageBuffer: true,
-		// One shared DB serves every space's reads; keep the engine's
-		// CPU scaling but never drop below 8 concurrent readers.
-		ReadConcurrency: max(runtime.NumCPU(), 8),
-		// Without the idle flush, checkpoints only happen when the WAL
-		// hits the commit-path threshold (10000 frames ≈ 40 MB) — a busy
-		// DB sits under a huge WAL that must be replayed on every open.
-		// Idle checkpointing keeps it bounded; the sentinel adds a
-		// quick-check after unclean shutdowns.
-		Durability: anystore.DurabilityConfig{
-			AutoFlush: true,
-			IdleAfter: 20 * time.Second,
-			FlushMode: anystore.FlushModeCheckpointPassive,
-			Sentinel:  true,
-		},
-	})
-	if err != nil {
-		_ = app.Close(ctx)
-		return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)
+	if db == nil {
+		if db, err = openSDKDB(ctx, sdkDBPath); err != nil {
+			_ = app.Close(ctx)
+			return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)
+		}
 	}
 
 	tsp := techspace.New(app, db)

@@ -78,7 +78,9 @@ Two any-store databases under `Config.Storage.DataDir`:
 
 any-sync stays on any-store v1 internally; the SDK uses v2 through the `/v2` import path. Separate files keep the two versions from sharing schema or state.
 
-`sdk.db` is kept in the latest on-disk format of the pinned any-store. `Open` replaces a file in an older format with a copy in the latest one before anything reads it; a copy that fails leaves the file as it is and the next `Open` tries again. The move is one-way: an SDK built on an any-store that does not know the format does not open the file.
+`sdk.db` is kept in the latest on-disk format of the pinned any-store. `Open` replaces a file in an older format with a copy in the latest one before any-sync starts and before anything reads it, and returns only after that: the copy takes as long as the file is large and needs room for a second one. When the copy cannot be made or put in place (no room, a host collection whose index does not build again, another process that has the file open) the old file stays, `Open` goes on with it and the next `Open` tries again. A cancelled `Open` fails with the old file or the complete copy in place.
+
+The move is one-way. An SDK built on an any-store that does not know the format refuses the file, releases before any-store v2.4.4 as a corrupt database: the file is intact, and removing it loses what lives only there. The host makes sure no other process opens `sdk.db` while `Open` runs.
 
 ## Custom types and datasets
 

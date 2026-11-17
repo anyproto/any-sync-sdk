@@ -6,9 +6,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,12 +37,19 @@ func oldFormatSDKDB(t *testing.T) string {
 // requireThings checks the fixture's content in db.
 func requireThings(t *testing.T, db anystore.DB) {
 	t.Helper()
+	requireThingsCount(t, db, 5)
+}
+
+// requireThingsCount checks the fixture's content in db, with count
+// documents in the collection.
+func requireThingsCount(t *testing.T, db anystore.DB, count int) {
+	t.Helper()
 	ctx := context.Background()
 	coll, err := db.OpenCollection(ctx, "things")
 	require.NoError(t, err)
 	n, err := coll.Count(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 5, n)
+	require.Equal(t, count, n)
 	doc, err := coll.FindId(ctx, "doc3")
 	require.NoError(t, err)
 	require.Equal(t, 3, doc.Value().GetInt("n"))
@@ -128,18 +137,110 @@ func TestOpenSDKDB_KeepsFileWhenCopyFails(t *testing.T) {
 	require.NoFileExists(t, path+sdkDBCopySuffix)
 }
 
-// A cancelled open fails and leaves the file in its format.
-func TestOpenSDKDB_Cancelled(t *testing.T) {
+// Documents written to the old-format file by this release are in the copy.
+func TestOpenSDKDB_CopiesLaterWrites(t *testing.T) {
+	ctx := context.Background()
 	path := oldFormatSDKDB(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
 
-	_, err := openSDKDB(ctx, path)
-	require.ErrorIs(t, err, context.Canceled)
-
-	db, err := anystore.Open(context.Background(), path, nil)
+	db, err := anystore.Open(ctx, path, nil)
 	require.NoError(t, err)
 	requireFormat(t, db, 5)
-	requireThings(t, db)
+	coll, err := db.OpenCollection(ctx, "things")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"later","n":99,"text":"x"}`)))
 	require.NoError(t, db.Close())
+
+	db, err = openSDKDB(ctx, path)
+	require.NoError(t, err)
+	requireFormat(t, db, anystore.LatestSchemaFormat)
+	requireThingsCount(t, db, 6)
+	coll, err = db.OpenCollection(ctx, "things")
+	require.NoError(t, err)
+	doc, err := coll.FindId(ctx, "later")
+	require.NoError(t, err)
+	require.Equal(t, 99, doc.Value().GetInt("n"))
+	require.NoError(t, db.Close())
+}
+
+// cancelAtCheck is a context that cancels itself at its nth Err or Done
+// call, so a test can cancel at each point an open consults its context.
+type cancelAtCheck struct {
+	context.Context
+	cancel context.CancelFunc
+	left   atomic.Int64
+}
+
+func newCancelAtCheck(n int64) *cancelAtCheck {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &cancelAtCheck{Context: ctx, cancel: cancel}
+	c.left.Store(n)
+	return c
+}
+
+func (c *cancelAtCheck) check() {
+	if c.left.Add(-1) == 0 {
+		c.cancel()
+	}
+}
+
+func (c *cancelAtCheck) Err() error {
+	c.check()
+	return c.Context.Err()
+}
+
+func (c *cancelAtCheck) Done() <-chan struct{} {
+	c.check()
+	return c.Context.Done()
+}
+
+// An open cancelled at any point fails with the old file or the complete
+// copy in place and none of the copy's own files left; the next open
+// finishes the move.
+func TestOpenSDKDB_Cancelled(t *testing.T) {
+	const maxChecks = 100000
+	var failed, replaced int
+	n := int64(1)
+	for ; n <= maxChecks; n++ {
+		path := oldFormatSDKDB(t)
+		ctx := newCancelAtCheck(n)
+		db, err := openSDKDB(ctx, path)
+		if err == nil {
+			// Either n is past the last check, or the cancel came when
+			// nothing was left to stop.
+			requireFormat(t, db, anystore.LatestSchemaFormat)
+			requireThings(t, db)
+			require.NoError(t, db.Close())
+			if ctx.left.Load() > 0 {
+				break
+			}
+			continue
+		}
+		failed++
+		require.ErrorIs(t, err, context.Canceled, "cancel at check %d", n)
+		for _, name := range dirNames(t, path) {
+			require.Contains(t, []string{"sdk.db", "sdk.db-wal", "sdk.db-wal-shm", "sdk.db.lock"}, name, "cancel at check %d", n)
+		}
+
+		plain, err := anystore.Open(context.Background(), path, nil)
+		require.NoError(t, err, "cancel at check %d", n)
+		format, err := anystore.SchemaFormat(plain)
+		require.NoError(t, err)
+		if format == anystore.LatestSchemaFormat {
+			replaced++
+		} else {
+			require.Equal(t, 5, format)
+		}
+		requireThings(t, plain)
+		require.NoError(t, plain.Close())
+
+		db, err = openSDKDB(context.Background(), path)
+		require.NoError(t, err, "cancel at check %d", n)
+		requireFormat(t, db, anystore.LatestSchemaFormat)
+		requireThings(t, db)
+		require.NoError(t, db.Close())
+	}
+	require.Less(t, n, int64(maxChecks), "the open never ran out of context checks")
+	// The loop has to reach into the copy, not stop at the first open.
+	require.Greater(t, failed, 10)
+	t.Logf("%d context checks, %d cancelled opens, %d of them after the copy was in place", n-1, failed, replaced)
 }

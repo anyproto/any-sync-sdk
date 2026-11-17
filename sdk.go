@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -200,18 +201,34 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// DB, owned by any-sync). The SDK's CRDT state lives at
 	// <DataDir>/sdk.db (v2 DB, owned by us) — separate file so the
 	// two any-store versions don't share schema/state.
+	sdkDBPath := filepath.Join(cfg.Storage.DataDir, "sdk.db")
 	cfg.Storage.DataDir = filepath.Join(cfg.Storage.DataDir, "anysync")
+
+	// An existing sdk.db opens before any-sync starts: moving it onto the
+	// latest on-disk format can take minutes, and a started app answers
+	// peers before the space registry is wired. A new account's file is
+	// created once the app has made the data dir.
+	var db anystore.DB
+	if _, statErr := os.Stat(sdkDBPath); statErr == nil {
+		var err error
+		if db, err = openSDKDB(ctx, sdkDBPath); err != nil {
+			return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)
+		}
+	}
 
 	app, err := anysyncx.New(ctx, cfg, provider)
 	if err != nil {
+		if db != nil {
+			_ = db.Close()
+		}
 		return nil, err
 	}
 
-	sdkDBPath := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "sdk.db")
-	db, err := openSDKDB(ctx, sdkDBPath)
-	if err != nil {
-		_ = app.Close(ctx)
-		return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)
+	if db == nil {
+		if db, err = openSDKDB(ctx, sdkDBPath); err != nil {
+			_ = app.Close(ctx)
+			return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)
+		}
 	}
 
 	tsp := techspace.New(app, db)

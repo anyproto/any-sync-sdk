@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"runtime"
 	"time"
 
@@ -16,6 +15,9 @@ import (
 // sdkDBCopySuffix names the copy of sdk.db in the latest on-disk format
 // until it takes the file's place.
 const sdkDBCopySuffix = ".migrate"
+
+// errSDKDBShared reports that another process has sdk.db open.
+var errSDKDBShared = errors.New("anysyncsdk: sdk.db is open in another process")
 
 // sdkDBConfig is the configuration sdk.db is opened with, and the one a
 // copy of it is written with. Open fills in defaults, so each open gets
@@ -42,8 +44,10 @@ func sdkDBConfig() *anystore.Config {
 
 // openSDKDB opens sdk.db. A file in an older on-disk format is replaced by
 // a copy in the latest one before anyone else holds the handle; no older
-// any-store release reads the result. A copy that fails leaves the file as
-// it is: the open goes on in the old format and the next open tries again.
+// any-store release reads the result. When the copy cannot be made or put
+// in place the old file stays: the open goes on with it and the next open
+// tries again. A cancelled open fails, with the old file or the complete
+// copy in place.
 func openSDKDB(ctx context.Context, path string) (anystore.DB, error) {
 	InitPageBuffer()
 	db, err := anystore.Open(ctx, path, sdkDBConfig())
@@ -77,16 +81,17 @@ func openSDKDB(ctx context.Context, path string) (anystore.DB, error) {
 		return copied, nil
 	default:
 		// The source is closed: path holds the old database or the copy.
-		log.Warn("sdk.db: replacing the file with its copy failed, opening what is in place", zap.Error(err))
+		log.Warn("sdk.db: the copy in the latest on-disk format was not put in place, opening what is there", zap.Error(err))
 		return anystore.Open(ctx, path, sdkDBConfig())
 	}
 }
 
 // replaceWithLatestFormat puts a copy of db in the latest on-disk format in
 // the place of the file at path, and returns the database opened from it.
-// db is the only handle on the file and nothing writes through it. The
-// steps and their order are any-store's (docs/migration-format-5-to-6.md):
-// a crash at any of them leaves the old file with its log, or the copy.
+// db is the only handle on the file in this process and nothing writes
+// through it. The steps and their order are any-store's
+// (docs/migration-format-5-to-6.md): a crash at any of them leaves the old
+// file with its log, or the copy.
 //
 // On an error before the source is closed it returns db, still open. After
 // that it returns nil, and path is to be opened again.
@@ -111,6 +116,15 @@ func replaceWithLatestFormat(ctx context.Context, db anystore.DB, path string) (
 		_ = os.Remove(tmp)
 		return nil, anystore.CopyReport{}, err
 	}
+	// A process that still has the file open would go on writing to the old
+	// file and its log, so the copy is not put in place under it. The lock
+	// also keeps a new opener out until the copy is the file.
+	unlock, err := lockUnsharedFile(path)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return nil, anystore.CopyReport{}, err
+	}
+	defer unlock()
 	// The copy must never sit beside the old file's log.
 	for _, sidecar := range []string{path + "-wal", path + "-wal-shm"} {
 		if err := os.Remove(sidecar); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -118,8 +132,7 @@ func replaceWithLatestFormat(ctx context.Context, db anystore.DB, path string) (
 			return nil, anystore.CopyReport{}, err
 		}
 	}
-	dir := filepath.Dir(path)
-	if err := syncDir(dir); err != nil {
+	if err := syncDirOf(path); err != nil {
 		_ = os.Remove(tmp)
 		return nil, anystore.CopyReport{}, err
 	}
@@ -127,7 +140,7 @@ func replaceWithLatestFormat(ctx context.Context, db anystore.DB, path string) (
 		_ = os.Remove(tmp)
 		return nil, anystore.CopyReport{}, err
 	}
-	if err := syncDir(dir); err != nil {
+	if err := syncDirOf(path); err != nil {
 		return nil, anystore.CopyReport{}, err
 	}
 	copied, err := anystore.Open(ctx, path, sdkDBConfig())
@@ -135,18 +148,4 @@ func replaceWithLatestFormat(ctx context.Context, db anystore.DB, path string) (
 		return nil, anystore.CopyReport{}, err
 	}
 	return copied, report, nil
-}
-
-// syncDir makes the names in dir durable. Windows has no directory sync:
-// NTFS journals the names.
-func syncDir(dir string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }

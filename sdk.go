@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -209,24 +208,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	}
 
 	sdkDBPath := filepath.Join(filepath.Dir(cfg.Storage.DataDir), "sdk.db")
-	InitPageBuffer()
-	db, err := anystore.Open(ctx, sdkDBPath, &anystore.Config{
-		UseGlobalPageBuffer: true,
-		// One shared DB serves every space's reads; keep the engine's
-		// CPU scaling but never drop below 8 concurrent readers.
-		ReadConcurrency: max(runtime.NumCPU(), 8),
-		// Without the idle flush, checkpoints only happen when the WAL
-		// hits the commit-path threshold (10000 frames ≈ 40 MB) — a busy
-		// DB sits under a huge WAL that must be replayed on every open.
-		// Idle checkpointing keeps it bounded; the sentinel adds a
-		// quick-check after unclean shutdowns.
-		Durability: anystore.DurabilityConfig{
-			AutoFlush: true,
-			IdleAfter: 20 * time.Second,
-			FlushMode: anystore.FlushModeCheckpointPassive,
-			Sentinel:  true,
-		},
-	})
+	db, err := openSDKDB(ctx, sdkDBPath)
 	if err != nil {
 		_ = app.Close(ctx)
 		return nil, fmt.Errorf("anysyncsdk: open sdk db: %w", err)

@@ -78,6 +78,8 @@ Two any-store databases under `Config.Storage.DataDir`:
 
 any-sync stays on any-store v1 internally; the SDK uses v2 through the `/v2` import path. Separate files keep the two versions from sharing schema or state.
 
+`sdk.db` is kept in the latest on-disk format of the pinned any-store. `Open` replaces a file in an older format with a copy in the latest one before anything reads it; a copy that fails leaves the file as it is and the next `Open` tries again. The move is one-way: an SDK built on an any-store that does not know the format does not open the file.
+
 ## Custom types and datasets
 
 Built-in definitions: `any` (universal properties: `id`, `author`, `spaceId`, `createdAt`, `modifiedAt`, `modifiedBy`, `name`, `description`, …), `type` (the meta-type that defines other types) and `collection`.

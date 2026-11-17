@@ -206,8 +206,9 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 
 	// An existing sdk.db opens before any-sync starts: moving it onto the
 	// latest on-disk format can take minutes, and a started app answers
-	// peers before the space registry is wired. A new account's file is
-	// created once the app has made the data dir.
+	// peers before the space registry is wired. So it is opened, and
+	// moved, before the provider is asked for keys. A new account's file
+	// is created once the app has made the data dir.
 	var db anystore.DB
 	if _, statErr := os.Stat(sdkDBPath); statErr == nil {
 		var err error

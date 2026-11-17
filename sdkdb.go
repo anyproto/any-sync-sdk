@@ -16,6 +16,13 @@ import (
 // until it takes the file's place.
 const sdkDBCopySuffix = ".migrate"
 
+// The two steps after the source is closed that decide which file is in
+// place; variables so a test can fail them.
+var (
+	renameFile = os.Rename
+	syncDir    = syncDirOf
+)
+
 // sdkDBConfig is the configuration sdk.db is opened with, and the one a
 // copy of it is written with. Open fills in defaults, so each open gets
 // its own.
@@ -78,17 +85,18 @@ func openSDKDB(ctx context.Context, path string) (anystore.DB, error) {
 		return copied, nil
 	default:
 		// The source is closed: path holds the old database or the copy.
-		log.Warn("sdk.db: the copy in the latest on-disk format was not put in place, opening what is there", zap.Error(err))
+		log.Warn("sdk.db: replacing the file with its copy did not finish, opening what is in place", zap.Error(err))
 		return anystore.Open(ctx, path, sdkDBConfig())
 	}
 }
 
 // replaceWithLatestFormat puts a copy of db in the latest on-disk format in
 // the place of the file at path, and returns the database opened from it.
-// db is the only handle on the file, in this process and any other (the
-// host keeps other processes off it), and nothing writes through it. The
-// steps and their order are any-store's (docs/migration-format-5-to-6.md):
-// a crash at any of them leaves the old file with its log, or the copy.
+// db is the only handle on the file and nothing writes through it: the
+// host opens a data dir once at a time and keeps other processes off the
+// file. The steps and their order are any-store's
+// (docs/migration-format-5-to-6.md): a crash at any of them leaves the old
+// file with its log, or the copy.
 //
 // On an error before the source is closed it returns db, still open. After
 // that it returns nil, and path is to be opened again.
@@ -120,15 +128,15 @@ func replaceWithLatestFormat(ctx context.Context, db anystore.DB, path string) (
 			return nil, anystore.CopyReport{}, err
 		}
 	}
-	if err := syncDirOf(path); err != nil {
+	if err := syncDir(path); err != nil {
 		_ = os.Remove(tmp)
 		return nil, anystore.CopyReport{}, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameFile(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return nil, anystore.CopyReport{}, err
 	}
-	if err := syncDirOf(path); err != nil {
+	if err := syncDir(path); err != nil {
 		return nil, anystore.CopyReport{}, err
 	}
 	copied, err := anystore.Open(ctx, path, sdkDBConfig())

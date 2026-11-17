@@ -16,9 +16,6 @@ import (
 // until it takes the file's place.
 const sdkDBCopySuffix = ".migrate"
 
-// errSDKDBShared reports that another process has sdk.db open.
-var errSDKDBShared = errors.New("anysyncsdk: sdk.db is open in another process")
-
 // sdkDBConfig is the configuration sdk.db is opened with, and the one a
 // copy of it is written with. Open fills in defaults, so each open gets
 // its own.
@@ -88,10 +85,10 @@ func openSDKDB(ctx context.Context, path string) (anystore.DB, error) {
 
 // replaceWithLatestFormat puts a copy of db in the latest on-disk format in
 // the place of the file at path, and returns the database opened from it.
-// db is the only handle on the file in this process and nothing writes
-// through it. The steps and their order are any-store's
-// (docs/migration-format-5-to-6.md): a crash at any of them leaves the old
-// file with its log, or the copy.
+// db is the only handle on the file, in this process and any other (the
+// host keeps other processes off it), and nothing writes through it. The
+// steps and their order are any-store's (docs/migration-format-5-to-6.md):
+// a crash at any of them leaves the old file with its log, or the copy.
 //
 // On an error before the source is closed it returns db, still open. After
 // that it returns nil, and path is to be opened again.
@@ -116,15 +113,6 @@ func replaceWithLatestFormat(ctx context.Context, db anystore.DB, path string) (
 		_ = os.Remove(tmp)
 		return nil, anystore.CopyReport{}, err
 	}
-	// A process that still has the file open would go on writing to the old
-	// file and its log, so the copy is not put in place under it. The lock
-	// also keeps a new opener out until the copy is the file.
-	unlock, err := lockUnsharedFile(path)
-	if err != nil {
-		_ = os.Remove(tmp)
-		return nil, anystore.CopyReport{}, err
-	}
-	defer unlock()
 	// The copy must never sit beside the old file's log.
 	for _, sidecar := range []string{path + "-wal", path + "-wal-shm"} {
 		if err := os.Remove(sidecar); err != nil && !errors.Is(err, fs.ErrNotExist) {

@@ -5,7 +5,7 @@ with its own ACL, read key and members. The parent's owner is the child's
 **legalOwner**: the child counts against that owner's limit, and that owner
 keeps control over the child without being able to read it.
 
-This is the design of the first version (V1). It is not implemented yet.
+This is the design of the first version (V1).
 
 "Organization" is application vocabulary. any-sync and the SDK speak only
 of parent, child and legalOwner, and the word does not appear in their
@@ -23,6 +23,9 @@ organization, a team or a workspace builds that on this primitive.
   parent: nesting has one level.
 - **The child is a regular space** with the V1 header, which binds its ACL
   root into the signed header.
+- **Only SDK spaces nest.** The coordinator signs a child only when the
+  parent and the child both carry the SDK's regular space type
+  (`any.space`). A derived space is neither a parent nor a child.
 - **Nothing else records the relation.** Nothing is written to the parent
   when a child is created, and the child's ACL stores nothing about the
   parent's owner.
@@ -42,7 +45,7 @@ organization, a team or a workspace builds that on this primitive.
 | Read or write a child's data | Members of the child |
 | List a parent's children | The parent's Admins and Owner |
 | Remove a member of a child | The child's Admins and Owner; the parent's Admins and Owner, without the child's read key |
-| Change a child's owner | The child's Owner; the parent's Owner |
+| Change a child's owner | The child's Owner; the parent's Owner. The new owner is a member of the child and of the parent |
 | Delete a child | The child's Owner; the parent's Owner |
 | Delete a parent | The parent's Owner, once it has no children |
 
@@ -79,9 +82,18 @@ the parent is therefore checked in one place.
 Two kinds of record are written in a child by an account that is not its
 member: a removal by the parent's Admins or Owner, and an ownership
 transfer by the parent's Owner. The coordinator resolves the author's role
-in the parent and gives the allowed authors to ACL validation. Code that
-re-validates a stored ACL without the network accepts these records as
-they are.
+in the parent and gives the allowed authors to ACL validation. A top-level
+space gets no such authority, so it never admits these records.
+
+A stored ACL that is rebuilt accepts these records as they are: the child
+stores nothing about the parent, so a rebuild cannot check them again.
+Without a network there is no coordinator and no authority from a parent,
+and a client that validates in full refuses these records when it
+receives them.
+
+The coordinator reads the parent's ACL from its cache, which can lag the
+network by seconds. In that window an account just removed from the parent
+can still be admitted to a child or act on one.
 
 ## Creating a child
 
@@ -90,18 +102,29 @@ they are.
 2. The child is created locally, like any other space. Its header carries
    `parentSpaceId` and the parent's replicationKey.
 3. At the child's first push the coordinator's `SpaceSign` checks that:
-   - the parent exists and is not deleted;
-   - the parent is a regular top-level space;
+   - the parent exists and is not deleted or in deletion;
+   - the parent and the child are regular SDK spaces, the parent is not
+     itself a child, and the child's header is V1;
    - the caller is a Writer or above in the parent at that moment;
    - the legalOwner's limit is not exceeded.
 4. The creator pushes the child with the receipt.
 
 Steps 1 and 2 work offline. The child exists on the network only after the
-push. A creator who loses the role before the first push is refused.
+push. A creator who loses the role before the first push is refused. A
+child of a parent that the same account created offline is sent after the
+parent.
+
+Only the sign that registers a child is checked this way. A registered
+child is signed again without the parent checks, so a later change in the
+parent never turns a working child into a refused one. A child needs no
+step to become shareable.
 
 A child the coordinator refuses is kept as a local space with a status
-that names the failed check. The client can retry the push or remove the
-space, and decides what to offer the user for each reason.
+that names the failed check: the parent is not available, the parent or
+the child cannot be nested, the creator's role in the parent is too low,
+or the limit is reached. The status is synced across the account's
+devices. The client can retry the push or remove the space, and decides
+what to offer the user for each reason.
 
 The creation role is fixed. A parent has no setting for it.
 
@@ -113,18 +136,24 @@ uses nobody's shared-spaces limit. It is one number per account, counted
 across the children of every parent that account owns. There is no cap per
 member or per parent.
 
+A child counts until its deletion is final. A network that configures no
+limit allows no children. An account's stored limit of zero means the
+network's default.
+
 ## Membership
 
 A child's own Admins and Owner manage its members, mainly by direct-add
 (`docs/direct-add-invites.md`).
 
 Only members of the parent can be added to a child. The coordinator checks
-this on every admission path: accepted join requests, direct-add batches
-and invite joins.
+this on every admission path: a join request when it is posted and when
+it is accepted, direct-add batches and invite joins. The new owner of a
+child must be a member of the parent too.
 
 The exception is a guest key. A child's Owner can create one, and its
 guest identity gives read-only access to holders who are not members of
-the parent.
+the parent. The coordinator admits a guest identity from outside the
+parent only in a record written by the child's Owner.
 
 ## The list of children
 
@@ -135,6 +164,10 @@ carries its parent id.
 
 This restricts the list, not the link: a child's header names its parent,
 and its id shares the parent's replication key.
+
+The parent's Admins and Owner can also read a child's accounts with their
+roles from the child's ACL. Names need the child's key and are not
+readable.
 
 ## Removing a member without the read key
 
@@ -150,7 +183,9 @@ key. The keyless removal is therefore its own record,
    in a "rotation pending" state.
 2. **Rotation.** An Admin or the Owner of the child, who holds the read
    key, writes the standard read-key rotation. The SDK does this by itself
-   on a device of such a member, and exposes the pending state.
+   on a device of such a member that holds the child, also after a
+   restart. The pending state is readable by the child's members and by
+   the parent's Admins and Owner.
 
 Between the two steps the removed member still holds the old key and can
 read content written with it.
@@ -159,6 +194,10 @@ A keyless removal cannot remove the child's owner. When no key-holder is
 left in a child, the rotation cannot happen and deleting the child is the
 only lever.
 
+An Admin of the parent cannot remove from a child an account it could not
+remove from the parent itself: the parent's Owner or another Admin. The
+parent's Owner can remove anyone but the child's owner.
+
 ## Changing a child's owner
 
 The parent's Owner can hand a child to any active member of that child and
@@ -166,16 +205,33 @@ names the role the previous owner keeps. The new owner is already a member
 and already holds the read key. The previous owner stays a member; removing
 them is a separate step.
 
+The new owner must also be a member of the parent, and a guest identity
+cannot become the owner.
+
 ## Deleting a child
 
 The parent's Owner can delete a child without access to its data. The
 coordinator accepts the parent's current owner in place of the child's
-owner.
+owner. The child's owner cannot undo a deletion made by the parent's
+Owner.
 
 ## Deleting a parent
 
 A parent that still has children cannot be deleted: the coordinator
-refuses the deletion. The parent's Owner deletes the children first.
+refuses the deletion. A child counts until its deletion is final. The
+parent's Owner deletes the children first, and deletes the parent once its
+list of children is empty.
+
+The deletion of an account is refused the same way while a space it owns
+has a child of another account.
+
+## Protocol version
+
+The any-sync change that adds child spaces raises the protocol version to
+14. A node on an older version skips a keyless removal and applies an
+ownership change by the parent's Owner wrongly, so every tree node and
+file node runs the new version before a coordinator admits these records.
+No gate refuses a client on an older version for a child space.
 
 ## SDK surface
 
@@ -183,13 +239,17 @@ The SDK exposes:
 
 - creating a child of a parent;
 - listing a parent's children;
+- reading a child's accounts and its "rotation pending" state as an Admin
+  or the Owner of the parent;
 - removing a member of a child as an Admin or the Owner of the parent;
 - changing a child's owner as the parent's Owner;
 - deleting a child as the parent's Owner;
 - the "rotation pending" state of a space;
-- the status of a refused child, with retry and removal.
+- the status of a refused child, with retry and removal;
+- the limit on child spaces in the account limits.
 
-`SpaceInfo` carries the parent id.
+`SpaceInfo` carries the parent id. The API is described in
+`docs/child-spaces.md`.
 
 ## Children as access scopes
 
@@ -211,6 +271,9 @@ is the client's work.
 - **Deleting a parent together with its children.** In V1 the children
   are deleted first.
 - **More than one level** of nesting.
+- **Other clients.** Child spaces exist only for applications built on the
+  SDK. Anytype clients neither create nor open them; support there comes
+  later.
 
 ## Open questions
 
@@ -224,9 +287,21 @@ is the client's work.
    - how the removal is finished when it stops halfway;
    - a member who leaves the parent by themselves;
    - whether a parent's Admin can remove from a child an Admin or the
-     Owner of the parent.
+     Owner of the parent. V1 refuses it.
+
+   Until this is decided nothing removes a member of the parent from its
+   children, and a child's owner who leaves the parent stays its owner.
 2. **Limits.** Whether a child's member limits and file storage are charged
-   to the legalOwner, as the number of children is.
-3. **Old clients.** The any-sync change that adds child spaces raises the
-   any-sync protocol version. Where a client on an older version is
-   refused for a child space is not chosen.
+   to the legalOwner, as the number of children is. A child still counts
+   toward its creator's cap on the total number of spaces.
+3. **A child in deletion.** V1 counts it as a child until the deletion is
+   final, for the limit and for the deletion of its parent. Whether a
+   pending deletion should stop counting is open.
+4. **A transfer of a parent over the limit.** V1 accepts a transfer to an
+   owner whose limit the parent's children exceed; that owner cannot
+   create more.
+5. **The limit and payments.** The payment service does not set the limit
+   on child spaces yet, so every account takes the network's default.
+6. **A parent handed to an account in deletion.** The ownership change does
+   not look at the new owner's account, so a parent can end up owned by a
+   deleted account, with nobody to govern its children.
